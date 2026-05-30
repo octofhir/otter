@@ -154,7 +154,7 @@ impl Interpreter {
             let Some(&v) = args.get(idx) else {
                 continue;
             };
-            // Skip primitives the intrinsic body already recognises
+            // Skip primitives the native method body already recognises
             // (`undefined` is the "absent" sentinel some §B.2.3.1
             // substr-style methods key on).
             if v.is_number() || v.is_boolean() || v.is_null() || v.is_undefined() {
@@ -182,9 +182,9 @@ impl Interpreter {
 
     /// Handle `Op::CallMethodValue`: the universal method-call op.
     /// Branches by receiver kind:
-    /// - `String` / `Array` — synchronous intrinsic-table dispatch.
-    ///   Result lands in the destination register without pushing
-    ///   a frame.
+    /// - Builtin prototype methods — synchronous native dispatch.
+    ///   Result lands in the destination register without pushing a
+    ///   frame.
     /// - `Object` — load the property; raise `NotCallable` if the
     ///   resolved value is not a function; otherwise call it with
     ///   `this = receiver`.
@@ -684,7 +684,7 @@ impl Interpreter {
     /// those itself).
     fn has_plain_builtin_method(&self, recv_value: Value, name: &str) -> bool {
         if recv_value.is_string() {
-            return string_prototype::lookup(name).is_some();
+            return string_prototype::is_builtin_method(name);
         }
         if recv_value.is_number() {
             return number::prototype::is_builtin_method(name);
@@ -693,31 +693,31 @@ impl Interpreter {
             return boolean_prototype::is_builtin_method(name);
         }
         if recv_value.is_big_int() {
-            return bigint::prototype::lookup(name).is_some();
+            return bigint::prototype::is_builtin_method(name);
         }
         if recv_value.is_symbol() {
             return symbol_prototype::is_builtin_method(name);
         }
         if recv_value.is_regexp() {
-            return regexp_prototype::lookup(name).is_some();
+            return regexp_prototype::is_builtin_method(name);
         }
         if recv_value.is_map() {
-            return collections_prototype::lookup_map(name).is_some();
+            return collections_prototype::is_map_builtin_method(name);
         }
         if recv_value.is_set() {
-            return collections_prototype::lookup_set(name).is_some();
+            return collections_prototype::is_set_builtin_method(name);
         }
         if recv_value.is_weak_map() {
-            return collections_prototype::lookup_weak_map(name).is_some();
+            return collections_prototype::is_weak_map_builtin_method(name);
         }
         if recv_value.is_weak_set() {
-            return collections_prototype::lookup_weak_set(name).is_some();
+            return collections_prototype::is_weak_set_builtin_method(name);
         }
         if recv_value.is_weak_ref() {
-            return weak_refs::lookup_weak_ref(name).is_some();
+            return weak_refs::is_weak_ref_builtin_method(name);
         }
         if recv_value.is_finalization_registry() {
-            return weak_refs::lookup_finalization_registry(name).is_some();
+            return weak_refs::is_finalization_registry_builtin_method(name);
         }
         if recv_value
             .as_object()
@@ -806,7 +806,7 @@ impl Interpreter {
     }
 
     /// Stage-4 `GetMethod` bridge for the slow `CallMethodValue`
-    /// fallback. Fast intrinsic arms still live above this helper; this
+    /// fallback. Builtin fast arms still live above this helper; this
     /// routine centralizes the ordinary property/getter path so the call
     /// opcode can be collapsed behind one `GetMethod + Call` boundary in
     /// smaller, reviewable steps.
@@ -837,7 +837,7 @@ impl Interpreter {
         if is_property_bearing {
             // Property-bearing exotic receivers route through
             // `ordinary_get_value` so user-installed own properties
-            // shadow the intrinsic-table miss path.
+            // shadow the builtin fallback path.
             let key = VmPropertyKey::String(name);
             return match self.ordinary_get_value(context, recv_value, recv_value, &key, 0)? {
                 VmGetOutcome::Value(value) => Ok(Some(value)),

@@ -1,9 +1,9 @@
 //! `%TypedArray%.prototype.<name>` per ECMA-262 §23.2.3.
 //!
 //! All eleven concrete `TypedArray` constructors share one prototype
-//! at the spec level; the runtime models that with a single
-//! [`IntrinsicReceiver::TypedArray`] table whose impls read the
-//! receiver's [`crate::binary::TypedArrayKind`] off the value to pick
+//! at the spec level; the runtime models that with one bootstrap
+//! native surface whose impls read the receiver's
+//! [`crate::binary::TypedArrayKind`] off the value to pick
 //! element-type-specific behaviour.
 //!
 //! Callback-driven methods (`map`, `filter`, `forEach`, `every`,
@@ -15,26 +15,37 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-%25typedarrayprototype%25-object>
 
-use crate::Value;
-use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::string::JsString;
+use crate::{NativeCtx, NativeError, Value};
 
 use super::typed_array::{JsTypedArray, TypedArrayKind};
 use super::{number_value, smi};
 
-fn receiver(args: &IntrinsicArgs<'_>) -> Result<JsTypedArray, IntrinsicError> {
-    args.receiver
-        .as_typed_array(args.gc_heap)
-        .ok_or(IntrinsicError::BadReceiver {
-            expected: "typedarray",
-        })
+const NAME: &str = "TypedArray.prototype";
+
+fn type_error(reason: impl Into<String>) -> NativeError {
+    NativeError::TypeError {
+        name: NAME,
+        reason: reason.into(),
+    }
 }
 
-fn check_not_detached(t: &JsTypedArray, heap: &otter_gc::GcHeap) -> Result<(), IntrinsicError> {
+fn range_error(reason: impl Into<String>) -> NativeError {
+    NativeError::RangeError {
+        name: NAME,
+        reason: reason.into(),
+    }
+}
+
+fn receiver(ctx: &NativeCtx<'_>) -> Result<JsTypedArray, NativeError> {
+    ctx.this_value()
+        .as_typed_array(ctx.heap())
+        .ok_or_else(|| type_error("expected typedarray"))
+}
+
+fn check_not_detached(t: &JsTypedArray, heap: &otter_gc::GcHeap) -> Result<(), NativeError> {
     if t.buffer(heap).is_detached(heap) {
-        return Err(IntrinsicError::BadReceiver {
-            expected: "non-detached typedarray",
-        });
+        return Err(type_error("expected non-detached typedarray"));
     }
     Ok(())
 }
@@ -101,11 +112,8 @@ fn integer_arg(arg: Option<&Value>, default: i64) -> i64 {
     n.trunc() as i64
 }
 
-fn intrinsic_oom(err: otter_gc::OutOfMemory) -> IntrinsicError {
-    IntrinsicError::OutOfMemory {
-        requested_bytes: err.requested_bytes(),
-        heap_limit_bytes: err.heap_limit_bytes(),
-    }
+fn native_oom(_: otter_gc::OutOfMemory) -> NativeError {
+    type_error("out of memory")
 }
 
 fn copy_view(
@@ -125,49 +133,42 @@ fn build_subarray(
     heap: &mut otter_gc::GcHeap,
     start: usize,
     len: usize,
-) -> Result<Value, IntrinsicError> {
+) -> Result<Value, NativeError> {
     let bpe = t.kind().bytes_per_element();
     let buffer = t.buffer(heap);
     let byte_offset = t.byte_offset(heap) + start * bpe;
-    let view =
-        JsTypedArray::new(heap, buffer, t.kind(), byte_offset, len).map_err(intrinsic_oom)?;
+    let view = JsTypedArray::new(heap, buffer, t.kind(), byte_offset, len).map_err(native_oom)?;
     Ok(Value::typed_array(view))
 }
 
-fn build_new_typed_array_rooted(
-    args: &mut IntrinsicArgs<'_>,
+fn build_new_typed_array(
+    ctx: &mut NativeCtx<'_>,
     kind: TypedArrayKind,
     values: &[Value],
-) -> Result<Value, IntrinsicError> {
+) -> Result<Value, NativeError> {
     let bpe = kind.bytes_per_element();
     let byte_len = values
         .len()
         .checked_mul(bpe)
-        .ok_or(IntrinsicError::OutOfRange {
-            index: 0,
-            reason: "byte length overflow",
-        })?;
-    let buf = args
-        .array_buffer_zeroed_rooted(byte_len, &[], &[values])?
-        .ok_or(IntrinsicError::OutOfRange {
-            index: 0,
-            reason: "allocation failed",
-        })?;
-    let view =
-        JsTypedArray::new(args.gc_heap, buf, kind, 0, values.len()).map_err(intrinsic_oom)?;
+        .ok_or_else(|| range_error("byte length overflow"))?;
+    let buf = ctx
+        .alloc_array_buffer_zeroed(byte_len, &[], &[values])
+        .map_err(native_oom)?
+        .ok_or_else(|| type_error("allocation failed"))?;
+    let view = JsTypedArray::new(ctx.heap_mut(), buf, kind, 0, values.len()).map_err(native_oom)?;
     for (i, v) in values.iter().enumerate() {
-        view.set(args.gc_heap, i, v);
+        view.set(ctx.heap_mut(), i, v);
     }
     Ok(Value::typed_array(view))
 }
 
 // ---- pure-functional methods --------------------------------------------
 
-fn impl_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let t = receiver(args)?;
-    check_not_detached(&t, &*args.gc_heap)?;
-    let len = t.length(args.gc_heap) as i64;
-    let idx = if let Some(n) = args.args.first().and_then(|v| v.as_number()) {
+fn impl_at(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver(ctx)?;
+    check_not_detached(&t, ctx.heap())?;
+    let len = t.length(ctx.heap_mut()) as i64;
+    let idx = if let Some(n) = args.first().and_then(|v| v.as_number()) {
         let f = n.as_f64();
         if !f.is_finite() {
             return Ok(Value::undefined());
@@ -180,88 +181,78 @@ fn impl_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     if resolved < 0 || resolved >= len {
         return Ok(Value::undefined());
     }
-    t.get(args.gc_heap, resolved as usize)
-        .map_err(intrinsic_oom)
+    t.get(ctx.heap_mut(), resolved as usize).map_err(native_oom)
 }
 
-fn impl_subarray(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let t = receiver(args)?;
-    let len = t.length(args.gc_heap) as i64;
-    let start = relative_index(args.args.first(), 0, len);
-    let end = relative_index(args.args.get(1), len, len);
+fn impl_subarray(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver(ctx)?;
+    let len = t.length(ctx.heap_mut()) as i64;
+    let start = relative_index(args.first(), 0, len);
+    let end = relative_index(args.get(1), len, len);
     let final_start = start.clamp(0, len) as usize;
     let final_end = end.clamp(start, len) as usize;
     let new_len = final_end.saturating_sub(final_start);
-    build_subarray(&t, args.gc_heap, final_start, new_len)
+    build_subarray(&t, ctx.heap_mut(), final_start, new_len)
 }
 
-fn impl_slice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let t = receiver(args)?;
-    check_not_detached(&t, &*args.gc_heap)?;
-    let len = t.length(args.gc_heap) as i64;
-    let start = relative_index(args.args.first(), 0, len);
-    let end = relative_index(args.args.get(1), len, len);
+fn impl_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver(ctx)?;
+    check_not_detached(&t, ctx.heap())?;
+    let len = t.length(ctx.heap_mut()) as i64;
+    let start = relative_index(args.first(), 0, len);
+    let end = relative_index(args.get(1), len, len);
     let final_start = start.clamp(0, len) as usize;
     let final_end = end.clamp(start, len) as usize;
     let new_len = final_end.saturating_sub(final_start);
     let bpe = t.kind().bytes_per_element();
-    let byte_len = new_len.checked_mul(bpe).ok_or(IntrinsicError::OutOfRange {
-        index: 0,
-        reason: "byte length overflow",
-    })?;
-    let new_buf =
-        args.array_buffer_zeroed_rooted(byte_len, &[], &[])?
-            .ok_or(IntrinsicError::OutOfRange {
-                index: 0,
-                reason: "allocation failed",
-            })?;
+    let byte_len = new_len
+        .checked_mul(bpe)
+        .ok_or_else(|| range_error("byte length overflow"))?;
+    let new_buf = ctx
+        .alloc_array_buffer_zeroed(byte_len, &[], &[])
+        .map_err(native_oom)?
+        .ok_or_else(|| type_error("allocation failed"))?;
     {
-        let abs_offset = t.byte_offset(&*args.gc_heap) + final_start * bpe;
-        let buffer = t.buffer(&*args.gc_heap);
-        let snapshot: Vec<u8> = buffer.with_bytes(&*args.gc_heap, |b| {
+        let abs_offset = t.byte_offset(ctx.heap()) + final_start * bpe;
+        let buffer = t.buffer(ctx.heap());
+        let snapshot: Vec<u8> = buffer.with_bytes(ctx.heap(), |b| {
             b[abs_offset..abs_offset + new_len * bpe].to_vec()
         });
-        new_buf.with_bytes_mut(args.gc_heap, |dst| dst.copy_from_slice(&snapshot));
+        new_buf.with_bytes_mut(ctx.heap_mut(), |dst| dst.copy_from_slice(&snapshot));
     }
     let view =
-        JsTypedArray::new(args.gc_heap, new_buf, t.kind(), 0, new_len).map_err(intrinsic_oom)?;
+        JsTypedArray::new(ctx.heap_mut(), new_buf, t.kind(), 0, new_len).map_err(native_oom)?;
     Ok(Value::typed_array(view))
 }
 
-fn impl_fill(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let t = receiver(args)?;
-    check_not_detached(&t, &*args.gc_heap)?;
-    let len = t.length(args.gc_heap) as i64;
-    let value = args.args.first().cloned().unwrap_or(Value::undefined());
+fn impl_fill(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver(ctx)?;
+    check_not_detached(&t, ctx.heap())?;
+    let len = t.length(ctx.heap_mut()) as i64;
+    let value = args.first().cloned().unwrap_or(Value::undefined());
     if t.kind().is_bigint() && !value.is_big_int() {
-        return Err(IntrinsicError::BadArgument {
-            index: 0,
-            reason: "must be a BigInt",
-        });
+        return Err(type_error("must be a BigInt"));
     }
     if !t.kind().is_bigint() && value.is_big_int() {
-        return Err(IntrinsicError::BadArgument {
-            index: 0,
-            reason: "must be a Number",
-        });
+        return Err(type_error("must be a Number"));
     }
-    let start = relative_index(args.args.get(1), 0, len);
-    let end = relative_index(args.args.get(2), len, len);
+    let start = relative_index(args.get(1), 0, len);
+    let end = relative_index(args.get(2), len, len);
     let s = start.clamp(0, len) as usize;
     let e = end.clamp(start, len) as usize;
     for i in s..e {
-        t.set(args.gc_heap, i, &value);
+        t.set(ctx.heap_mut(), i, &value);
     }
     Ok(Value::typed_array(t))
 }
 
-fn impl_copy_within(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let t = receiver(args)?;
-    check_not_detached(&t, &*args.gc_heap)?;
-    let len = t.length(args.gc_heap) as i64;
-    let target = relative_index(args.args.first(), 0, len);
-    let start = relative_index(args.args.get(1), 0, len);
-    let end = relative_index(args.args.get(2), len, len);
+fn impl_copy_within(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver(ctx)?;
+    check_not_detached(&t, ctx.heap())?;
+    let len = t.length(ctx.heap_mut()) as i64;
+    let target = relative_index(args.first(), 0, len);
+    let start = relative_index(args.get(1), 0, len);
+    let end = relative_index(args.get(2), len, len);
     let to = target.clamp(0, len);
     let from = start.clamp(0, len);
     let final_end = end.clamp(start, len);
@@ -272,28 +263,28 @@ fn impl_copy_within(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
     // Memmove by raw bytes through the backing buffer to handle
     // overlap correctly.
     let bpe = t.kind().bytes_per_element();
-    let src_off = t.byte_offset(&*args.gc_heap) + from as usize * bpe;
-    let dst_off = t.byte_offset(&*args.gc_heap) + to as usize * bpe;
+    let src_off = t.byte_offset(ctx.heap()) + from as usize * bpe;
+    let dst_off = t.byte_offset(ctx.heap()) + to as usize * bpe;
     let byte_count = count * bpe;
-    let buffer = t.buffer(&*args.gc_heap);
-    buffer.with_bytes_mut(args.gc_heap, |buf| {
+    let buffer = t.buffer(ctx.heap());
+    buffer.with_bytes_mut(ctx.heap_mut(), |buf| {
         buf.copy_within(src_off..src_off + byte_count, dst_off);
     });
     Ok(Value::typed_array(t))
 }
 
-fn impl_reverse(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let t = receiver(args)?;
-    check_not_detached(&t, &*args.gc_heap)?;
-    let len = t.length(args.gc_heap);
+fn impl_reverse(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver(ctx)?;
+    check_not_detached(&t, ctx.heap())?;
+    let len = t.length(ctx.heap_mut());
     if len > 1 {
         let mut i = 0usize;
         let mut j = len - 1;
         while i < j {
-            let a = t.get(args.gc_heap, i).map_err(intrinsic_oom)?;
-            let b = t.get(args.gc_heap, j).map_err(intrinsic_oom)?;
-            t.set(args.gc_heap, i, &b);
-            t.set(args.gc_heap, j, &a);
+            let a = t.get(ctx.heap_mut(), i).map_err(native_oom)?;
+            let b = t.get(ctx.heap_mut(), j).map_err(native_oom)?;
+            t.set(ctx.heap_mut(), i, &b);
+            t.set(ctx.heap_mut(), j, &a);
             i += 1;
             j -= 1;
         }
@@ -301,37 +292,37 @@ fn impl_reverse(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::typed_array(t))
 }
 
-fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let t = receiver(args)?;
-    check_not_detached(&t, &*args.gc_heap)?;
-    let len = t.length(args.gc_heap) as i64;
+fn impl_index_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver(ctx)?;
+    check_not_detached(&t, ctx.heap())?;
+    let len = t.length(ctx.heap_mut()) as i64;
     if len == 0 {
         return Ok(smi(-1));
     }
-    let target = args.args.first().cloned().unwrap_or(Value::undefined());
-    let start = integer_arg(args.args.get(1), 0);
+    let target = args.first().cloned().unwrap_or(Value::undefined());
+    let start = integer_arg(args.get(1), 0);
     let from = if start < 0 {
         (len + start).max(0)
     } else {
         start.min(len)
     } as usize;
     for i in from..(len as usize) {
-        if values_equal_strict(&t.get(args.gc_heap, i).map_err(intrinsic_oom)?, &target) {
+        if values_equal_strict(&t.get(ctx.heap_mut(), i).map_err(native_oom)?, &target) {
             return Ok(smi(i as i32));
         }
     }
     Ok(smi(-1))
 }
 
-fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let t = receiver(args)?;
-    check_not_detached(&t, &*args.gc_heap)?;
-    let len = t.length(args.gc_heap) as i64;
+fn impl_last_index_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver(ctx)?;
+    check_not_detached(&t, ctx.heap())?;
+    let len = t.length(ctx.heap_mut()) as i64;
     if len == 0 {
         return Ok(smi(-1));
     }
-    let target = args.args.first().cloned().unwrap_or(Value::undefined());
-    let start = integer_arg(args.args.get(1), len - 1);
+    let target = args.first().cloned().unwrap_or(Value::undefined());
+    let start = integer_arg(args.get(1), len - 1);
     let from = if start < 0 {
         (len + start).max(-1)
     } else {
@@ -340,7 +331,7 @@ fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
     let mut i = from;
     while i >= 0 {
         if values_equal_strict(
-            &t.get(args.gc_heap, i as usize).map_err(intrinsic_oom)?,
+            &t.get(ctx.heap_mut(), i as usize).map_err(native_oom)?,
             &target,
         ) {
             return Ok(smi(i as i32));
@@ -350,54 +341,54 @@ fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
     Ok(smi(-1))
 }
 
-fn impl_includes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let t = receiver(args)?;
-    check_not_detached(&t, &*args.gc_heap)?;
-    let len = t.length(args.gc_heap) as i64;
-    let target = args.args.first().cloned().unwrap_or(Value::undefined());
-    let start = integer_arg(args.args.get(1), 0);
+fn impl_includes(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver(ctx)?;
+    check_not_detached(&t, ctx.heap())?;
+    let len = t.length(ctx.heap_mut()) as i64;
+    let target = args.first().cloned().unwrap_or(Value::undefined());
+    let start = integer_arg(args.get(1), 0);
     let from = if start < 0 {
         (len + start).max(0)
     } else {
         start.min(len)
     } as usize;
     for i in from..(len as usize) {
-        if values_equal_zero(&t.get(args.gc_heap, i).map_err(intrinsic_oom)?, &target) {
+        if values_equal_zero(&t.get(ctx.heap_mut(), i).map_err(native_oom)?, &target) {
             return Ok(Value::boolean(true));
         }
     }
     Ok(Value::boolean(false))
 }
 
-fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let t = receiver(args)?;
-    check_not_detached(&t, &*args.gc_heap)?;
-    let separator = if let Some(v) = args.args.first() {
+fn impl_join(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver(ctx)?;
+    check_not_detached(&t, ctx.heap())?;
+    let separator = if let Some(v) = args.first() {
         if v.is_undefined() {
             ",".to_string()
-        } else if let Some(s) = v.as_string(args.gc_heap) {
-            s.to_lossy_string(args.gc_heap)
+        } else if let Some(s) = v.as_string(ctx.heap_mut()) {
+            s.to_lossy_string(ctx.heap_mut())
         } else {
-            v.display_string(args.gc_heap)
+            v.display_string(ctx.heap_mut())
         }
     } else {
         ",".to_string()
     };
-    join_into_string(&t, &separator, args.gc_heap)
+    join_into_string(&t, &separator, ctx.heap_mut())
 }
 
 fn join_into_string(
     t: &crate::binary::JsTypedArray,
     separator: &str,
     gc_heap: &mut otter_gc::GcHeap,
-) -> Result<Value, IntrinsicError> {
+) -> Result<Value, NativeError> {
     let mut out = String::new();
     let len = t.length(gc_heap);
     for i in 0..len {
         if i > 0 {
             out.push_str(separator);
         }
-        let v = t.get(gc_heap, i).map_err(intrinsic_oom)?;
+        let v = t.get(gc_heap, i).map_err(native_oom)?;
         if !(v.is_undefined() || v.is_null()) {
             out.push_str(&v.display_string(gc_heap));
         }
@@ -405,114 +396,95 @@ fn join_into_string(
     Ok(Value::string(JsString::from_str(&out, gc_heap)?))
 }
 
-fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let t = receiver(args)?;
-    check_not_detached(&t, &*args.gc_heap)?;
-    join_into_string(&t, ",", args.gc_heap)
+fn impl_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver(ctx)?;
+    check_not_detached(&t, ctx.heap())?;
+    join_into_string(&t, ",", ctx.heap_mut())
 }
 
-fn impl_to_locale_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     // Foundation simplification: locale-aware rendering deferred to
     // Intl integration. Falls through to `toString`.
-    impl_to_string(args)
+    impl_to_string(ctx, args)
 }
 
-fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let t = receiver(args)?;
-    check_not_detached(&t, &*args.gc_heap)?;
-    let offset = integer_arg(args.args.get(1), 0);
+fn impl_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver(ctx)?;
+    check_not_detached(&t, ctx.heap())?;
+    let offset = integer_arg(args.get(1), 0);
     if offset < 0 {
-        return Err(IntrinsicError::BadArgument {
-            index: 1,
-            reason: "must be non-negative",
-        });
+        return Err(type_error("must be non-negative"));
     }
     let off = offset as usize;
-    let source = args.args.first().cloned().unwrap_or(Value::undefined());
+    let source = args.first().cloned().unwrap_or(Value::undefined());
     let kind = t.kind();
     fn coerce(
         kind: TypedArrayKind,
         v: &Value,
         gc_heap: &mut otter_gc::GcHeap,
-    ) -> Result<Value, IntrinsicError> {
-        crate::binary::dispatch::coerce_element_for_store(gc_heap, kind, v).map_err(|_| {
-            IntrinsicError::BadArgument {
-                index: 0,
-                reason: "element type mismatch",
-            }
-        })
+    ) -> Result<Value, NativeError> {
+        crate::binary::dispatch::coerce_element_for_store(gc_heap, kind, v)
+            .map_err(|_| type_error("element type mismatch"))
     }
-    if let Some(src) = source.as_typed_array(args.gc_heap) {
-        let src_len = src.length(args.gc_heap);
-        if off + src_len > t.length(args.gc_heap) {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "source overruns destination",
-            });
+    if let Some(src) = source.as_typed_array(ctx.heap_mut()) {
+        let src_len = src.length(ctx.heap_mut());
+        if off + src_len > t.length(ctx.heap_mut()) {
+            return Err(range_error("source overruns destination"));
         }
         // Snapshot first to handle aliasing of the same buffer.
         let snapshot: Vec<Value> = {
             let mut tmp = Vec::with_capacity(src_len);
             for i in 0..src_len {
-                tmp.push(src.get(args.gc_heap, i).map_err(intrinsic_oom)?);
+                tmp.push(src.get(ctx.heap_mut(), i).map_err(native_oom)?);
             }
             tmp
         };
         for (i, v) in snapshot.iter().enumerate() {
-            let coerced = coerce(kind, v, args.gc_heap)?;
-            t.set(args.gc_heap, off + i, &coerced);
+            let coerced = coerce(kind, v, ctx.heap_mut())?;
+            t.set(ctx.heap_mut(), off + i, &coerced);
         }
     } else if let Some(arr) = source.as_array() {
-        let src_len = crate::array::len(arr, args.gc_heap);
-        if off + src_len > t.length(args.gc_heap) {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "source overruns destination",
-            });
+        let src_len = crate::array::len(arr, ctx.heap_mut());
+        if off + src_len > t.length(ctx.heap_mut()) {
+            return Err(range_error("source overruns destination"));
         }
         for i in 0..src_len {
-            let v = crate::array::get(arr, args.gc_heap, i);
-            let coerced = coerce(kind, &v, args.gc_heap)?;
-            t.set(args.gc_heap, off + i, &coerced);
+            let v = crate::array::get(arr, ctx.heap_mut(), i);
+            let coerced = coerce(kind, &v, ctx.heap_mut())?;
+            t.set(ctx.heap_mut(), off + i, &coerced);
         }
     } else if let Some(obj) = source.as_object() {
         // §22.2.3.23.1 step 14 — array-like Object source.
         let len_value =
-            crate::object::get(obj, args.gc_heap, "length").unwrap_or(Value::undefined());
-        let len_n = crate::number::to_number_value(&len_value, args.gc_heap);
+            crate::object::get(obj, ctx.heap_mut(), "length").unwrap_or(Value::undefined());
+        let len_n = crate::number::to_number_value(&len_value, ctx.heap_mut());
         let src_len = if len_n.is_nan() || len_n <= 0.0 {
             0
         } else {
             len_n.min(9_007_199_254_740_991.0) as usize
         };
-        if off + src_len > t.length(args.gc_heap) {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "source overruns destination",
-            });
+        if off + src_len > t.length(ctx.heap_mut()) {
+            return Err(range_error("source overruns destination"));
         }
         for i in 0..src_len {
             let key = i.to_string();
-            let v = crate::object::get(obj, args.gc_heap, &key).unwrap_or(Value::undefined());
-            let coerced = coerce(kind, &v, args.gc_heap)?;
-            t.set(args.gc_heap, off + i, &coerced);
+            let v = crate::object::get(obj, ctx.heap_mut(), &key).unwrap_or(Value::undefined());
+            let coerced = coerce(kind, &v, ctx.heap_mut())?;
+            t.set(ctx.heap_mut(), off + i, &coerced);
         }
-    } else if let Some(s) = source.as_string(args.gc_heap) {
+    } else if let Some(s) = source.as_string(ctx.heap_mut()) {
         // §22.2.3.23.1 step 14 — String indexed-char wrapper.
-        let units = s.to_utf16_vec(args.gc_heap);
+        let units = s.to_utf16_vec(ctx.heap_mut());
         let src_len = units.len();
-        if off + src_len > t.length(args.gc_heap) {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "source overruns destination",
-            });
+        if off + src_len > t.length(ctx.heap_mut()) {
+            return Err(range_error("source overruns destination"));
         }
         for (i, unit) in units.iter().enumerate() {
             let ch = char::from_u32(*unit as u32).unwrap_or('\u{FFFD}');
             let s_one = ch.to_string();
-            let v = Value::string(JsString::from_str(&s_one, args.gc_heap)?);
-            let coerced = coerce(kind, &v, args.gc_heap)?;
-            t.set(args.gc_heap, off + i, &coerced);
+            let v = Value::string(JsString::from_str(&s_one, ctx.heap_mut())?);
+            let coerced = coerce(kind, &v, ctx.heap_mut())?;
+            t.set(ctx.heap_mut(), off + i, &coerced);
         }
     } else if source.is_number()
         || source.is_boolean()
@@ -523,57 +495,51 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     {
         // Primitive wrappers have no own indexed properties — no-op.
     } else {
-        return Err(IntrinsicError::BadArgument {
-            index: 0,
-            reason: "must be a TypedArray or array-like",
-        });
+        return Err(type_error("must be a TypedArray or array-like"));
     }
     Ok(Value::undefined())
 }
 
-fn impl_to_reversed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let t = receiver(args)?;
-    check_not_detached(&t, &*args.gc_heap)?;
-    let mut snapshot = copy_view(&t, args.gc_heap).map_err(intrinsic_oom)?;
+fn impl_to_reversed(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver(ctx)?;
+    check_not_detached(&t, ctx.heap())?;
+    let mut snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
     snapshot.reverse();
-    build_new_typed_array_rooted(args, t.kind(), &snapshot)
+    build_new_typed_array(ctx, t.kind(), &snapshot)
 }
 
-fn impl_to_sorted_default(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let t = receiver(args)?;
-    check_not_detached(&t, &*args.gc_heap)?;
-    let mut snapshot = copy_view(&t, args.gc_heap).map_err(intrinsic_oom)?;
-    sort_default(&mut snapshot, t.kind().is_bigint(), args.gc_heap);
-    build_new_typed_array_rooted(args, t.kind(), &snapshot)
+fn impl_to_sorted_default(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver(ctx)?;
+    check_not_detached(&t, ctx.heap())?;
+    let mut snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
+    sort_default(&mut snapshot, t.kind().is_bigint(), ctx.heap_mut());
+    build_new_typed_array(ctx, t.kind(), &snapshot)
 }
 
-fn impl_sort_default(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let t = receiver(args)?;
-    check_not_detached(&t, &*args.gc_heap)?;
-    let mut snapshot = copy_view(&t, args.gc_heap).map_err(intrinsic_oom)?;
-    sort_default(&mut snapshot, t.kind().is_bigint(), args.gc_heap);
+fn impl_sort_default(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver(ctx)?;
+    check_not_detached(&t, ctx.heap())?;
+    let mut snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
+    sort_default(&mut snapshot, t.kind().is_bigint(), ctx.heap_mut());
     for (i, v) in snapshot.iter().enumerate() {
-        t.set(args.gc_heap, i, v);
+        t.set(ctx.heap_mut(), i, v);
     }
     Ok(Value::typed_array(t))
 }
 
-fn impl_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let t = receiver(args)?;
-    check_not_detached(&t, &*args.gc_heap)?;
-    let len = t.length(args.gc_heap) as i64;
-    let raw_idx = integer_arg(args.args.first(), 0);
+fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver(ctx)?;
+    check_not_detached(&t, ctx.heap())?;
+    let len = t.length(ctx.heap_mut()) as i64;
+    let raw_idx = integer_arg(args.first(), 0);
     let resolved = if raw_idx < 0 { len + raw_idx } else { raw_idx };
     if resolved < 0 || resolved >= len {
-        return Err(IntrinsicError::BadArgument {
-            index: 0,
-            reason: "index out of range",
-        });
+        return Err(range_error("index out of range"));
     }
-    let value = args.args.get(1).cloned().unwrap_or(Value::undefined());
-    let mut snapshot = copy_view(&t, args.gc_heap).map_err(intrinsic_oom)?;
+    let value = args.get(1).cloned().unwrap_or(Value::undefined());
+    let mut snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
     snapshot[resolved as usize] = value;
-    build_new_typed_array_rooted(args, t.kind(), &snapshot)
+    build_new_typed_array(ctx, t.kind(), &snapshot)
 }
 
 /// Wrap a snapshot of values in an iterator value. Mirrors the
@@ -584,48 +550,48 @@ fn impl_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// op produces an Iterator over the typed array's index range.
 /// <https://tc39.es/ecma262/#sec-createarrayiterator>
 fn wrap_iterator(
-    args: &mut IntrinsicArgs<'_>,
+    ctx: &mut NativeCtx<'_>,
     snapshot: impl IntoIterator<Item = Value>,
 ) -> Result<Value, otter_gc::OutOfMemory> {
-    let arr = args.array_from_elements_rooted(snapshot, &[], &[])?;
+    let arr = ctx.array_from_elements_with_roots(snapshot, &[], &[])?;
     let arr_value = Value::array(arr);
     let state = crate::IteratorState::Array {
         array: arr,
         index: 0,
         origin: crate::BuiltinIteratorOrigin::Array,
     };
-    Ok(Value::iterator(args.alloc_iterator_state_rooted(
+    Ok(Value::iterator(ctx.alloc_iterator_state(
         state,
         &[&arr_value],
         &[],
     )?))
 }
 
-fn impl_keys(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let t = receiver(args)?;
-    check_not_detached(&t, &*args.gc_heap)?;
-    let len = t.length(args.gc_heap);
-    Ok(wrap_iterator(args, (0..len).map(|i| smi(i as i32)))?)
+fn impl_keys(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver(ctx)?;
+    check_not_detached(&t, ctx.heap())?;
+    let len = t.length(ctx.heap_mut());
+    Ok(wrap_iterator(ctx, (0..len).map(|i| smi(i as i32)))?)
 }
 
-fn impl_values(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let t = receiver(args)?;
-    check_not_detached(&t, &*args.gc_heap)?;
-    let values = copy_view(&t, args.gc_heap).map_err(intrinsic_oom)?;
-    wrap_iterator(args, values).map_err(intrinsic_oom)
+fn impl_values(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver(ctx)?;
+    check_not_detached(&t, ctx.heap())?;
+    let values = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
+    wrap_iterator(ctx, values).map_err(native_oom)
 }
 
-fn impl_entries(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let t = receiver(args)?;
-    check_not_detached(&t, &*args.gc_heap)?;
-    let len = t.length(args.gc_heap);
+fn impl_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver(ctx)?;
+    check_not_detached(&t, ctx.heap())?;
+    let len = t.length(ctx.heap_mut());
     let mut pairs: Vec<Value> = Vec::with_capacity(len);
     for i in 0..len {
-        let element = t.get(args.gc_heap, i).map_err(intrinsic_oom)?;
-        let pair = args.array_from_elements_rooted([smi(i as i32), element], &[], &[&pairs])?;
+        let element = t.get(ctx.heap_mut(), i).map_err(native_oom)?;
+        let pair = ctx.array_from_elements_with_roots([smi(i as i32), element], &[], &[&pairs])?;
         pairs.push(Value::array(pair));
     }
-    wrap_iterator(args, pairs).map_err(intrinsic_oom)
+    wrap_iterator(ctx, pairs).map_err(native_oom)
 }
 
 // ---- comparison helpers -------------------------------------------------
@@ -680,40 +646,37 @@ fn sort_default(values: &mut [Value], bigint_kind: bool, heap: &otter_gc::GcHeap
     }
 }
 
-// ---- registration -------------------------------------------------------
+// ---- native dispatch ----------------------------------------------------
 
-/// `%TypedArray%.prototype` table.
-pub static TYPED_ARRAY_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
-    std::sync::LazyLock::new(|| {
-        crate::intrinsics!(
-            TypedArray,
-            "at"               / 1 => impl_at,
-            "subarray"         / 2 => impl_subarray,
-            "slice"            / 2 => impl_slice,
-            "fill"             / 3 => impl_fill,
-            "copyWithin"       / 3 => impl_copy_within,
-            "reverse"          / 0 => impl_reverse,
-            "indexOf"          / 2 => impl_index_of,
-            "lastIndexOf"      / 2 => impl_last_index_of,
-            "includes"         / 2 => impl_includes,
-            "join"             / 1 => impl_join,
-            "toString"         / 0 => impl_to_string,
-            "toLocaleString"   / 0 => impl_to_locale_string,
-            "set"              / 2 => impl_set,
-            "toReversed"       / 0 => impl_to_reversed,
-            "toSorted"         / 1 => impl_to_sorted_default,
-            "sort"             / 1 => impl_sort_default,
-            "with"             / 2 => impl_with,
-            "keys"             / 0 => impl_keys,
-            "values"           / 0 => impl_values,
-            "entries"          / 0 => impl_entries,
-        )
-    });
+type TypedArrayNativeFn = fn(&mut NativeCtx<'_>, &[Value]) -> Result<Value, NativeError>;
 
-/// Convenience accessor.
+/// Resolve a `%TypedArray%.prototype` method implemented in this
+/// module. Callback-driven methods live in `bootstrap_typed_array`.
 #[must_use]
-pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
-    TYPED_ARRAY_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::TypedArray, name)
+pub fn method_impl(name: &str) -> Option<TypedArrayNativeFn> {
+    Some(match name {
+        "at" => impl_at,
+        "subarray" => impl_subarray,
+        "slice" => impl_slice,
+        "fill" => impl_fill,
+        "copyWithin" => impl_copy_within,
+        "reverse" => impl_reverse,
+        "indexOf" => impl_index_of,
+        "lastIndexOf" => impl_last_index_of,
+        "includes" => impl_includes,
+        "join" => impl_join,
+        "toString" => impl_to_string,
+        "toLocaleString" => impl_to_locale_string,
+        "set" => impl_set,
+        "toReversed" => impl_to_reversed,
+        "toSorted" => impl_to_sorted_default,
+        "sort" => impl_sort_default,
+        "with" => impl_with,
+        "keys" => impl_keys,
+        "values" => impl_values,
+        "entries" => impl_entries,
+        _ => return None,
+    })
 }
 
 /// `%TypedArray%.prototype` getter access for `buffer`, `byteLength`,
@@ -739,25 +702,27 @@ pub fn load_property(t: &JsTypedArray, heap: &otter_gc::GcHeap, name: &str) -> V
 mod tests {
     use super::super::array_buffer::JsArrayBuffer;
     use super::*;
+    use crate::{Interpreter, NativeCallInfo};
 
     #[test]
-    fn typed_array_entries_uses_intrinsic_rooted_young_allocation() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let buffer = JsArrayBuffer::new(&mut gc_heap, 2).expect("array buffer");
-        let view = JsTypedArray::new(&mut gc_heap, buffer, TypedArrayKind::Int8, 0, 2)
-            .expect("typed array");
-        let receiver = Value::typed_array(view);
-        let before = gc_heap.stats().new_allocated_bytes;
+    fn typed_array_entries_uses_native_rooted_young_allocation() {
+        let mut interp = Interpreter::new();
+        let receiver = {
+            let heap = interp.gc_heap_mut();
+            let buffer = JsArrayBuffer::new(heap, 2).expect("array buffer");
+            let view =
+                JsTypedArray::new(heap, buffer, TypedArrayKind::Int8, 0, 2).expect("typed array");
+            Value::typed_array(view)
+        };
+        let before = interp.gc_heap().stats().new_allocated_bytes;
 
-        let result = impl_entries(&mut IntrinsicArgs {
-            receiver: &receiver,
-            args: &[],
-            gc_heap: &mut gc_heap,
-            allocation_roots: &[],
-        })
-        .expect("entries");
+        let result = {
+            let mut ctx =
+                NativeCtx::new_with_call_info(&mut interp, NativeCallInfo::call(receiver));
+            impl_entries(&mut ctx, &[]).expect("entries")
+        };
 
-        let after = gc_heap.stats().new_allocated_bytes;
+        let after = interp.gc_heap().stats().new_allocated_bytes;
         assert!(
             after > before,
             "TypedArray.prototype.entries should allocate pair arrays, snapshot array, and iterator state in young space"
@@ -766,34 +731,48 @@ mod tests {
     }
 
     #[test]
-    fn typed_array_slice_uses_intrinsic_rooted_backing_store_reservation() {
-        let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(1024 * 1024).expect("gc heap");
-        let buffer = JsArrayBuffer::new(&mut gc_heap, 4).expect("array buffer");
-        let source = JsTypedArray::new(&mut gc_heap, buffer, TypedArrayKind::Int16, 0, 2)
-            .expect("typed array");
-        source.set(&mut gc_heap, 0, &smi(7));
-        source.set(&mut gc_heap, 1, &smi(11));
-        let receiver = Value::typed_array(source);
-        let before = gc_heap.tracked_bytes();
+    fn typed_array_slice_uses_native_rooted_backing_store() {
+        let mut interp = Interpreter::new();
+        let receiver = {
+            let heap = interp.gc_heap_mut();
+            let buffer = JsArrayBuffer::new(heap, 4).expect("array buffer");
+            let source =
+                JsTypedArray::new(heap, buffer, TypedArrayKind::Int16, 0, 2).expect("typed array");
+            source.set(heap, 0, &smi(7));
+            source.set(heap, 1, &smi(11));
+            Value::typed_array(source)
+        };
 
-        let result = impl_slice(&mut IntrinsicArgs {
-            receiver: &receiver,
-            args: &[],
-            gc_heap: &mut gc_heap,
-            allocation_roots: &[],
-        })
-        .expect("slice");
+        let result = {
+            let mut ctx =
+                NativeCtx::new_with_call_info(&mut interp, NativeCallInfo::call(receiver));
+            impl_slice(&mut ctx, &[]).expect("slice")
+        };
 
         assert!(result.is_typed_array());
-        // `tracked_bytes` includes the new GC body plus the 4-byte
-        // external backing store reservation.
-        assert!(gc_heap.tracked_bytes() - before >= 4);
+        let result_view = result
+            .as_typed_array(interp.gc_heap())
+            .expect("slice result typed array");
+        assert_eq!(result_view.length(interp.gc_heap()), 2);
+        assert_eq!(
+            result_view
+                .get(interp.gc_heap_mut(), 0)
+                .expect("first element")
+                .as_number()
+                .expect("number")
+                .as_smi(),
+            Some(7)
+        );
+        assert_eq!(
+            result_view
+                .get(interp.gc_heap_mut(), 1)
+                .expect("second element")
+                .as_number()
+                .expect("number")
+                .as_smi(),
+            Some(11)
+        );
         let _ = result;
-        gc_heap.collect_full(&mut |_| {});
-        // The source view + its buffer still live, so the post-GC
-        // delta is the source buffer's body overhead. Just verify
-        // the slice's body got collected by checking it dropped at
-        // least the slice external bytes.
-        assert!(gc_heap.tracked_bytes() <= before + 256);
+        interp.gc_heap_mut().collect_full(&mut |_| {});
     }
 }

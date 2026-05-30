@@ -33,7 +33,7 @@ use crate::{
 /// Full property-bearing object-like family used by Object.* and
 /// Reflect.* static dispatchers. Excludes Iterator / Generator /
 /// Temporal / Intl which the existing dispatchers route through
-/// separate intrinsic tables.
+/// separate native surfaces.
 fn is_property_bearing_object(v: &Value) -> bool {
     v.is_object()
         || v.is_array()

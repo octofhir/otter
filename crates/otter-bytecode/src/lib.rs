@@ -125,8 +125,8 @@ pub enum Op {
     /// `dst, recv, name_const, argc, args...`.
     ///
     /// At runtime the dispatcher branches on the receiver kind:
-    /// - `String` / `Array` — looks the method up in the matching
-    ///   prototype intrinsic table.
+    /// - Builtin prototype methods — dispatches through the matching
+    ///   native method path.
     /// - `Object` — loads the property; raises `TypeMismatch` when
     ///   the property is missing or not callable; otherwise calls
     ///   the resolved function with `this` bound to the receiver.

@@ -1062,9 +1062,9 @@ fn native_own_property_is_enumerable(property: &NativeOwnProperty, builtin_defau
     }
 }
 
-/// Failure outcome from a native call. Mirrors the
-/// [`crate::IntrinsicError`] / [`crate::math::MathError`] shape so
-/// the runtime mapper can route everything through one path.
+/// Failure outcome from a native call. The runtime mapper routes
+/// these outcomes through the same VM error path as bytecode throws
+/// and allocation failures.
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum NativeError {

@@ -185,7 +185,7 @@ pub(crate) fn compile_expr(
         }
 
         // `recv.method(arg0, arg1, ...)` — dispatched through the
-        // String.prototype intrinsic table at run time.
+        // builtin/native method path at run time.
         Expression::CallExpression(call) => compile_method_call(cx, call),
 
         // `new Callee(args...)` — emits `Op::New`. The runtime

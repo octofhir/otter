@@ -6,8 +6,8 @@
 //! getters for `byteLength`, `maxByteLength`, `resizable`,
 //! `detached`.
 //!
-//! Prototype methods delegate to the existing
-//! [`crate::binary::array_buffer_prototype`] intrinsic table.
+//! Prototype methods delegate to
+//! [`crate::binary::array_buffer_prototype`] native helpers.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-arraybuffer-constructor>

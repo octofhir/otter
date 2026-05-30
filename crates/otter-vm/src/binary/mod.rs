@@ -15,7 +15,7 @@
 //! - [`dispatch`] — opcode dispatchers for `Op::ArrayBufferCall`,
 //!   `Op::DataViewCall`, `Op::TypedArrayCall`.
 //! - [`array_buffer_prototype`] / [`data_view_prototype`] /
-//!   [`typed_array_prototype`] — prototype-method intrinsic tables.
+//!   [`typed_array_prototype`] — prototype native method helpers.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-arraybuffer-objects>

@@ -1,20 +1,18 @@
-//! `RegExp.prototype.*` intrinsic implementations.
+//! `RegExp.prototype.*` shared native helpers.
 //!
-//! Slice 31. Method dispatch goes through the
-//! [`crate::intrinsics`] table; property reads (`.source`,
-//! `.flags`, `.global`, `.lastIndex`, …) handled at the
-//! `Op::LoadProperty` site since they don't go through
-//! `CallMethodValue`.
+//! Method dispatch is installed through the bootstrap native surface;
+//! property reads (`.source`, `.flags`, `.global`, `.lastIndex`, …)
+//! are handled at the `Op::LoadProperty` site since they don't go
+//! through `CallMethodValue`.
 //!
 //! # Contents
-//! - [`REGEXP_PROTOTYPE_TABLE`] — declarative registry built with
-//!   the `intrinsics!` macro.
-//! - One private `impl_*` function per method.
+//! - Native helpers shared by the bootstrap `RegExp.prototype`
+//!   methods and string regex overloads.
 //! - [`load_property`] — getter dispatch for non-method members.
 //!
 //! # Invariants
-//! - Receivers are validated as `Value::RegExp`; non-regex
-//!   receivers raise [`crate::intrinsics::IntrinsicError::BadReceiver`].
+//! - Receivers are validated as `Value::RegExp`; non-regex native
+//!   method receivers raise `TypeError`.
 //! - `exec` and `test` honour the `g` and `y` flag semantics — both
 //!   read and update `lastIndex`.
 //! - `lastIndex` is clamped to `[0, len]` before any match attempt
@@ -23,33 +21,33 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-regexp.prototype.exec>
 
-use crate::Value;
-use crate::VmError;
 use crate::array::JsArray;
-use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::regexp::JsRegExp;
 use crate::runtime_cx::NativeCtx;
 use crate::string::JsString;
+use crate::{NativeError, Value, VmError};
 
-fn receiver_regexp(args: &IntrinsicArgs<'_>) -> Result<JsRegExp, IntrinsicError> {
-    args.receiver
-        .as_regexp()
-        .ok_or(IntrinsicError::BadReceiver { expected: "regexp" })
+const REGEXP_EXEC_NAME: &str = "RegExp.prototype.exec";
+
+fn native_type_error(name: &'static str, reason: impl Into<String>) -> NativeError {
+    NativeError::TypeError {
+        name,
+        reason: reason.into(),
+    }
 }
 
-fn vm_shape_error_to_intrinsic(err: VmError) -> IntrinsicError {
+fn vm_shape_error_to_native(err: VmError) -> NativeError {
     match err {
         VmError::OutOfMemory {
             requested_bytes,
             heap_limit_bytes,
-        } => IntrinsicError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        },
-        _ => IntrinsicError::BadArgument {
-            index: 0,
-            reason: "property shape update failed",
-        },
+        } => native_type_error(
+            REGEXP_EXEC_NAME,
+            format!(
+                "out of memory: requested {requested_bytes} bytes with heap limit {heap_limit_bytes} bytes"
+            ),
+        ),
+        _ => native_type_error(REGEXP_EXEC_NAME, "property shape update failed"),
     }
 }
 
@@ -62,60 +60,12 @@ fn vm_shape_error_to_intrinsic(err: VmError) -> IntrinsicError {
 /// own properties — and, when the receiver has the `d` flag, an
 /// `indices` companion array (§22.2.7.7
 /// [`MakeMatchIndicesIndexPairArray`](https://tc39.es/ecma262/#sec-makematchindicesindexpairarray)).
-pub(crate) fn exec_once(
-    re: &JsRegExp,
-    text: JsString,
-    args: &mut IntrinsicArgs<'_>,
-) -> Result<Value, IntrinsicError> {
-    let units = text.to_utf16_vec(args.gc_heap);
-    let len = units.len();
-    let flags = re.flags(args.gc_heap);
-    let mut start = re.last_index(args.gc_heap) as usize;
-    if (flags.global || flags.sticky) && start > len {
-        re.set_last_index(args.gc_heap, 0);
-        return Ok(Value::null());
-    }
-    if !flags.global && !flags.sticky {
-        start = 0;
-    }
-    let m = re
-        .find_from_utf16(args.gc_heap, &units, start)
-        .into_iter()
-        .next();
-    let m = match m {
-        Some(m) => m,
-        None => {
-            if flags.global || flags.sticky {
-                re.set_last_index(args.gc_heap, 0);
-            }
-            return Ok(Value::null());
-        }
-    };
-    if flags.sticky && m.range.start != start {
-        re.set_last_index(args.gc_heap, 0);
-        return Ok(Value::null());
-    }
-    if flags.global || flags.sticky {
-        re.set_last_index(args.gc_heap, m.range.end as u32);
-    }
-
-    Ok(Value::array(build_match_result(
-        &m,
-        &units,
-        text,
-        flags.has_indices,
-        args,
-        &[],
-        &[],
-    )?))
-}
-
 pub(crate) fn exec_once_native(
     re: &JsRegExp,
     text: JsString,
     ctx: &mut NativeCtx<'_>,
     slice_roots: &[&[Value]],
-) -> Result<Value, IntrinsicError> {
+) -> Result<Value, NativeError> {
     let units = text.to_utf16_vec(ctx.heap());
     let len = units.len();
     let flags = re.flags(ctx.heap());
@@ -164,157 +114,6 @@ pub(crate) fn exec_once_native(
 /// reused by `String.prototype.match` / `.matchAll` so both surfaces
 /// produce identical shapes (full match + capture slots, plus
 /// `index` / `input` / `groups` / optionally `indices`).
-pub(crate) fn build_match_result(
-    m: &regress::Match,
-    units: &[u16],
-    input: JsString,
-    has_indices: bool,
-    args: &mut IntrinsicArgs<'_>,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
-) -> Result<JsArray, IntrinsicError> {
-    let full = JsString::from_utf16_units(&units[m.range.clone()], args.gc_heap)?;
-    let mut out: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
-    out.push(Value::string(full));
-    for cap in &m.captures {
-        match cap {
-            Some(r) => {
-                let s = JsString::from_utf16_units(&units[r.clone()], args.gc_heap)?;
-                out.push(Value::string(s));
-            }
-            None => out.push(Value::undefined()),
-        }
-    }
-    let input_value = Value::string(input);
-    let mut roots = Vec::with_capacity(value_roots.len() + 1);
-    roots.push(&input_value);
-    roots.extend_from_slice(value_roots);
-    let mut slices = Vec::with_capacity(slice_roots.len() + 1);
-    slices.push(out.as_slice());
-    slices.extend_from_slice(slice_roots);
-    let arr = args.array_from_elements_rooted(out.iter().cloned(), &roots, &slices)?;
-
-    crate::array::set_named_property(
-        arr,
-        args.gc_heap,
-        "index",
-        Value::number_i32(m.range.start as i32),
-    )?;
-    crate::array::set_named_property(arr, args.gc_heap, "input", input_value)?;
-
-    let mut named_iter = m.named_groups();
-    let first_named = named_iter.next();
-    if let Some((name, range)) = first_named {
-        let arr_value = Value::array(arr);
-        let mut roots = Vec::with_capacity(value_roots.len() + 2);
-        roots.push(&input_value);
-        roots.push(&arr_value);
-        roots.extend_from_slice(value_roots);
-        let groups_obj = args.alloc_object_rooted(&roots, &slices)?;
-        crate::object::set_prototype(groups_obj, args.gc_heap, None);
-        let value = match range {
-            Some(r) => Value::string(JsString::from_utf16_units(&units[r], args.gc_heap)?),
-            None => Value::undefined(),
-        };
-        crate::object::set(groups_obj, args.gc_heap, name, value);
-        for (name, range) in named_iter {
-            let value = match range {
-                Some(r) => Value::string(JsString::from_utf16_units(&units[r], args.gc_heap)?),
-                None => Value::undefined(),
-            };
-            crate::object::set(groups_obj, args.gc_heap, name, value);
-        }
-        crate::array::set_named_property(arr, args.gc_heap, "groups", Value::object(groups_obj))?;
-    } else {
-        crate::array::set_named_property(arr, args.gc_heap, "groups", Value::undefined())?;
-    }
-
-    if has_indices {
-        let arr_value = Value::array(arr);
-        let mut indices_elems: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
-        indices_elems.push(pair_array(
-            m.range.start,
-            m.range.end,
-            args,
-            &[&input_value, &arr_value],
-            &[out.as_slice()],
-        )?);
-        for cap in &m.captures {
-            match cap {
-                Some(r) => indices_elems.push(pair_array(
-                    r.start,
-                    r.end,
-                    args,
-                    &[&input_value, &arr_value],
-                    &[out.as_slice(), indices_elems.as_slice()],
-                )?),
-                None => indices_elems.push(Value::undefined()),
-            }
-        }
-        let mut roots = Vec::with_capacity(value_roots.len() + 2);
-        roots.push(&input_value);
-        roots.push(&arr_value);
-        roots.extend_from_slice(value_roots);
-        let mut index_slices = Vec::with_capacity(slice_roots.len() + 2);
-        index_slices.push(out.as_slice());
-        index_slices.push(indices_elems.as_slice());
-        index_slices.extend_from_slice(slice_roots);
-        let indices_arr =
-            args.array_from_elements_rooted(indices_elems.iter().cloned(), &roots, &index_slices)?;
-        let mut named_iter = m.named_groups();
-        let first_named = named_iter.next();
-        if let Some((name, range)) = first_named {
-            let indices_value = Value::array(indices_arr);
-            let mut roots = Vec::with_capacity(value_roots.len() + 3);
-            roots.push(&input_value);
-            roots.push(&arr_value);
-            roots.push(&indices_value);
-            roots.extend_from_slice(value_roots);
-            let g_obj = args.alloc_object_rooted(&roots, &index_slices)?;
-            crate::object::set_prototype(g_obj, args.gc_heap, None);
-            let v = match range {
-                Some(r) => pair_array(
-                    r.start,
-                    r.end,
-                    args,
-                    &roots,
-                    &[out.as_slice(), indices_elems.as_slice()],
-                )?,
-                None => Value::undefined(),
-            };
-            crate::object::set(g_obj, args.gc_heap, name, v);
-            for (name, range) in named_iter {
-                let v = match range {
-                    Some(r) => pair_array(
-                        r.start,
-                        r.end,
-                        args,
-                        &roots,
-                        &[out.as_slice(), indices_elems.as_slice()],
-                    )?,
-                    None => Value::undefined(),
-                };
-                crate::object::set(g_obj, args.gc_heap, name, v);
-            }
-            crate::array::set_named_property(
-                indices_arr,
-                args.gc_heap,
-                "groups",
-                Value::object(g_obj),
-            )?;
-        } else {
-            crate::array::set_named_property(
-                indices_arr,
-                args.gc_heap,
-                "groups",
-                Value::undefined(),
-            )?;
-        }
-        crate::array::set_named_property(arr, args.gc_heap, "indices", Value::array(indices_arr))?;
-    }
-    Ok(arr)
-}
-
 pub(crate) fn build_match_result_native(
     m: &regress::Match,
     units: &[u16],
@@ -323,7 +122,7 @@ pub(crate) fn build_match_result_native(
     ctx: &mut NativeCtx<'_>,
     value_roots: &[&Value],
     slice_roots: &[&[Value]],
-) -> Result<JsArray, IntrinsicError> {
+) -> Result<JsArray, NativeError> {
     let full = JsString::from_utf16_units(&units[m.range.clone()], ctx.heap_mut())?;
     let mut out: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
     out.push(Value::string(full));
@@ -368,14 +167,14 @@ pub(crate) fn build_match_result_native(
             None => Value::undefined(),
         };
         ctx.set_property_with_roots(groups_obj, name, value, &roots, &slices)
-            .map_err(vm_shape_error_to_intrinsic)?;
+            .map_err(vm_shape_error_to_native)?;
         for (name, range) in named_iter {
             let value = match range {
                 Some(r) => Value::string(JsString::from_utf16_units(&units[r], ctx.heap_mut())?),
                 None => Value::undefined(),
             };
             ctx.set_property_with_roots(groups_obj, name, value, &roots, &slices)
-                .map_err(vm_shape_error_to_intrinsic)?;
+                .map_err(vm_shape_error_to_native)?;
         }
         crate::array::set_named_property(arr, ctx.heap_mut(), "groups", Value::object(groups_obj))?;
     } else {
@@ -439,7 +238,7 @@ pub(crate) fn build_match_result_native(
                 None => Value::undefined(),
             };
             ctx.set_property_with_roots(g_obj, name, v, &roots, &index_slices)
-                .map_err(vm_shape_error_to_intrinsic)?;
+                .map_err(vm_shape_error_to_native)?;
             for (name, range) in named_iter {
                 let v = match range {
                     Some(r) => pair_array_native(
@@ -452,7 +251,7 @@ pub(crate) fn build_match_result_native(
                     None => Value::undefined(),
                 };
                 ctx.set_property_with_roots(g_obj, name, v, &roots, &index_slices)
-                    .map_err(vm_shape_error_to_intrinsic)?;
+                    .map_err(vm_shape_error_to_native)?;
             }
             crate::array::set_named_property(
                 indices_arr,
@@ -478,25 +277,6 @@ pub(crate) fn build_match_result_native(
     Ok(arr)
 }
 
-/// Build a `[start, end]` two-element array used by the `d`-flag
-/// indices companion (§22.2.7.7).
-fn pair_array(
-    start: usize,
-    end: usize,
-    args: &mut IntrinsicArgs<'_>,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
-) -> Result<Value, otter_gc::OutOfMemory> {
-    Ok(Value::array(args.array_from_elements_rooted(
-        [
-            Value::number_i32(start as i32),
-            Value::number_i32(end as i32),
-        ],
-        value_roots,
-        slice_roots,
-    )?))
-}
-
 fn pair_array_native(
     start: usize,
     end: usize,
@@ -512,80 +292,6 @@ fn pair_array_native(
         value_roots,
         slice_roots,
     )?))
-}
-
-fn impl_exec(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let re_clone = receiver_regexp(args)?;
-    let text = arg_to_string_primitive(args, 0)?;
-    exec_once(&re_clone, text, args)
-}
-
-fn impl_test(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let re_clone = receiver_regexp(args)?;
-    let text = arg_to_string_primitive(args, 0)?;
-    let result = exec_once(&re_clone, text, args)?;
-    Ok(Value::boolean(!result.is_null()))
-}
-
-/// §22.2.7.1 step 4 — `Let S be ? ToString(string)`. Coerces every
-/// primitive shape (Number / Boolean / Null / Undefined / BigInt /
-/// String) to a fresh `JsString`. Object operands fall back to
-/// "[object Object]" matching V8 for the no-context intrinsic path
-/// (full `@@toPrimitive` / `valueOf` / `toString` coercion belongs
-/// in the runtime entry point that already routes
-/// `RegExp.prototype.exec` calls through `evaluate_to_primitive`).
-fn arg_to_string_primitive(
-    args: &mut IntrinsicArgs<'_>,
-    index: usize,
-) -> Result<JsString, IntrinsicError> {
-    let raw = args.args.get(index).cloned().unwrap_or(Value::undefined());
-    if let Some(s) = raw.as_string(args.gc_heap) {
-        return Ok(s);
-    }
-    if raw.is_symbol() {
-        return Err(IntrinsicError::BadArgument {
-            index: index as u16,
-            reason: "cannot convert a Symbol to a string",
-        });
-    }
-    let text: String = if raw.is_undefined() {
-        "undefined".to_string()
-    } else if raw.is_null() {
-        "null".to_string()
-    } else if let Some(b) = raw.as_boolean() {
-        if b { "true" } else { "false" }.to_string()
-    } else if let Some(n) = raw.as_number() {
-        n.to_display_string()
-    } else if let Some(bi) = raw.as_big_int() {
-        bi.to_decimal_string(&*args.gc_heap)
-    } else if let Some(obj) = raw.as_object() {
-        // Built-in primitive wrappers ToString to their wrapped
-        // value (`new String("12")` -> "12", `new Number(1.0)` ->
-        // "1"). Plain objects fall back to the display form; a user
-        // `toString` callback would need interpreter re-entry the
-        // intrinsic layer lacks.
-        let gc = &*args.gc_heap;
-        if let Some(s) = crate::object::string_data(obj, gc) {
-            return Ok(s);
-        }
-        if let Some(n) = crate::object::number_data(obj, gc) {
-            n.to_display_string()
-        } else if let Some(b) = crate::object::boolean_data(obj, gc) {
-            if b { "true" } else { "false" }.to_string()
-        } else {
-            raw.display_string(gc)
-        }
-    } else {
-        raw.display_string(&*args.gc_heap)
-    };
-    Ok(JsString::from_str(&text, args.gc_heap)?)
-}
-
-fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let re = receiver_regexp(args)?;
-    let heap = &*args.gc_heap;
-    let rendered = format!("/{}/{}", re.source(heap), re.flags(heap).to_js_string());
-    Ok(Value::string(JsString::from_str(&rendered, args.gc_heap)?))
 }
 
 /// §22.2.6.8 `RegExp.prototype[@@match](string)` — invoked by
@@ -624,8 +330,7 @@ pub fn native_regexp_symbol_match(
     let flags = re.flags(ctx.heap());
     let units = text.to_utf16_vec(ctx.heap());
     if !flags.global {
-        return exec_once_native(&re, text, ctx, &[])
-            .map_err(intrinsic_to_native_error("RegExp.prototype[@@match]"));
+        return exec_once_native(&re, text, ctx, &[]);
     }
     let full_unicode = flags.unicode || flags.unicode_sets;
     re.set_last_index(ctx.heap_mut(), 0);
@@ -763,15 +468,6 @@ fn string_arg_to_jsstring(
         name: method_name,
         reason: "out of memory".to_string(),
     })
-}
-
-fn intrinsic_to_native_error(
-    method_name: &'static str,
-) -> impl Fn(IntrinsicError) -> crate::NativeError {
-    move |err| crate::NativeError::TypeError {
-        name: method_name,
-        reason: err.to_string(),
-    }
 }
 
 fn vm_err_to_native(name: &'static str) -> impl Fn(crate::VmError) -> crate::NativeError {
@@ -997,7 +693,7 @@ fn regexp_exec_runtime(
     }
     // Fall back to builtin exec only when `rx` is actually a RegExp.
     if let Some(re) = rx.as_regexp() {
-        return exec_once_native(&re, s, ctx, &[]).map_err(intrinsic_to_native_error(name));
+        return exec_once_native(&re, s, ctx, &[]);
     }
     Err(crate::NativeError::TypeError {
         name,
@@ -1806,21 +1502,10 @@ fn get_substitution(
     Ok(out)
 }
 
-/// Declarative `RegExp.prototype` table.
-pub static REGEXP_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
-    std::sync::LazyLock::new(|| {
-        crate::intrinsics!(
-            RegExp,
-            "exec"     / 1 => impl_exec,
-            "test"     / 1 => impl_test,
-            "toString" / 0 => impl_to_string,
-        )
-    });
-
-/// Convenience accessor used by the dispatcher.
+/// Whether `name` is installed on `RegExp.prototype`.
 #[must_use]
-pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
-    REGEXP_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::RegExp, name)
+pub fn is_builtin_method(name: &str) -> bool {
+    matches!(name, "exec" | "test" | "toString" | "compile")
 }
 
 /// Resolve a JS-visible property of a `RegExp` value. `None` when
@@ -1914,123 +1599,140 @@ pub fn escape_regexp_pattern(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Interpreter, NativeCallInfo};
 
-    fn make(pattern: &str, flags: &str, gc_heap: &mut otter_gc::GcHeap) -> Value {
+    fn make(pattern: &str, flags: &str, interp: &mut Interpreter) -> Value {
         let units: Vec<u16> = pattern.encode_utf16().collect();
-        Value::regexp(JsRegExp::compile(gc_heap, &units, flags).unwrap())
+        Value::regexp(JsRegExp::compile(interp.gc_heap_mut(), &units, flags).unwrap())
     }
 
-    fn call(method: &str, recv: &Value, args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Value {
-        let entry = lookup(method).unwrap();
-        (entry.impl_fn)(&mut IntrinsicArgs {
-            receiver: recv,
-            args,
-            gc_heap,
-            allocation_roots: &[],
-        })
-        .unwrap()
+    fn call(method: &str, recv: &Value, args: &[Value], interp: &mut Interpreter) -> Value {
+        let re = recv.as_regexp().unwrap();
+        let mut ctx = NativeCtx::new_with_call_info(interp, NativeCallInfo::call(*recv));
+        let text = string_arg_to_jsstring_for_test(args, 0, &mut ctx).unwrap();
+        match method {
+            "exec" => exec_once_native(&re, text, &mut ctx, &[]).unwrap(),
+            "test" => Value::boolean(
+                !exec_once_native(&re, text, &mut ctx, &[])
+                    .unwrap()
+                    .is_null(),
+            ),
+            _ => panic!("unknown regexp test method {method}"),
+        }
+    }
+
+    fn string_arg_to_jsstring_for_test(
+        args: &[Value],
+        index: usize,
+        ctx: &mut NativeCtx<'_>,
+    ) -> Result<JsString, NativeError> {
+        let raw = args.get(index).cloned().unwrap_or(Value::undefined());
+        if let Some(s) = raw.as_string(ctx.heap()) {
+            return Ok(s);
+        }
+        Ok(JsString::from_str(
+            &raw.display_string(ctx.heap()),
+            ctx.heap_mut(),
+        )?)
     }
 
     #[test]
     fn test_returns_boolean() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let re = make("ab+c", "", &mut gc_heap);
-        let text = Value::string(JsString::from_str("abbbc", &mut gc_heap).unwrap());
+        let mut interp = Interpreter::new();
+        let re = make("ab+c", "", &mut interp);
+        let text = Value::string(JsString::from_str("abbbc", interp.gc_heap_mut()).unwrap());
         assert_eq!(
-            call("test", &re, &[text], &mut gc_heap),
+            call("test", &re, &[text], &mut interp),
             Value::boolean(true)
         );
-        let no = Value::string(JsString::from_str("xy", &mut gc_heap).unwrap());
-        assert_eq!(
-            call("test", &re, &[no], &mut gc_heap),
-            Value::boolean(false)
-        );
+        let no = Value::string(JsString::from_str("xy", interp.gc_heap_mut()).unwrap());
+        assert_eq!(call("test", &re, &[no], &mut interp), Value::boolean(false));
     }
 
     #[test]
     fn exec_returns_array_or_null() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let re = make("(a)(b)", "", &mut gc_heap);
-        let text = Value::string(JsString::from_str("ab", &mut gc_heap).unwrap());
-        let r = call("exec", &re, &[text], &mut gc_heap);
+        let mut interp = Interpreter::new();
+        let re = make("(a)(b)", "", &mut interp);
+        let text = Value::string(JsString::from_str("ab", interp.gc_heap_mut()).unwrap());
+        let r = call("exec", &re, &[text], &mut interp);
         let Some(arr) = r.as_array() else {
             panic!("expected array");
         };
-        assert_eq!(crate::array::len(arr, &gc_heap), 3);
+        assert_eq!(crate::array::len(arr, interp.gc_heap()), 3);
         assert_eq!(
-            crate::array::get(arr, &gc_heap, 0).display_string(&gc_heap),
+            crate::array::get(arr, interp.gc_heap(), 0).display_string(interp.gc_heap()),
             "ab"
         );
         assert_eq!(
-            crate::array::get(arr, &gc_heap, 1).display_string(&gc_heap),
+            crate::array::get(arr, interp.gc_heap(), 1).display_string(interp.gc_heap()),
             "a"
         );
         assert_eq!(
-            crate::array::get(arr, &gc_heap, 2).display_string(&gc_heap),
+            crate::array::get(arr, interp.gc_heap(), 2).display_string(interp.gc_heap()),
             "b"
         );
         let miss = call(
             "exec",
             &re,
             &[Value::string(
-                JsString::from_str("zz", &mut gc_heap).unwrap(),
+                JsString::from_str("zz", interp.gc_heap_mut()).unwrap(),
             )],
-            &mut gc_heap,
+            &mut interp,
         );
         assert!(miss.is_null());
     }
 
     #[test]
-    fn exec_result_arrays_use_intrinsic_rooted_allocation() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let re = make("(?<first>a)(b)", "d", &mut gc_heap);
-        let text = Value::string(JsString::from_str("ab", &mut gc_heap).unwrap());
-        let before = gc_heap.stats().new_allocated_bytes;
-        let result = call("exec", &re, std::slice::from_ref(&text), &mut gc_heap);
-        let after = gc_heap.stats().new_allocated_bytes;
+    fn exec_result_arrays_use_native_rooted_allocation() {
+        let mut interp = Interpreter::new();
+        let re = make("(?<first>a)(b)", "d", &mut interp);
+        let text = Value::string(JsString::from_str("ab", interp.gc_heap_mut()).unwrap());
+        let before = interp.gc_heap().stats().new_allocated_bytes;
+        let result = call("exec", &re, std::slice::from_ref(&text), &mut interp);
+        let after = interp.gc_heap().stats().new_allocated_bytes;
 
         assert!(
             after > before,
-            "RegExp exec result arrays, groups, and indices should allocate through intrinsic roots"
+            "RegExp exec result arrays, groups, and indices should allocate through native roots"
         );
         let Some(arr) = result.as_array() else {
             panic!("expected RegExp exec result array");
         };
         assert!(
-            crate::array::get_named_property(arr, &gc_heap, "indices")
+            crate::array::get_named_property(arr, interp.gc_heap(), "indices")
                 .is_some_and(|v| v.is_array())
         );
         assert!(
-            crate::array::get_named_property(arr, &gc_heap, "groups")
+            crate::array::get_named_property(arr, interp.gc_heap(), "groups")
                 .is_some_and(|v| v.is_object())
         );
     }
 
     #[test]
     fn exec_global_walks_through_text() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let re = make("a", "g", &mut gc_heap);
-        let text = Value::string(JsString::from_str("abab", &mut gc_heap).unwrap());
+        let mut interp = Interpreter::new();
+        let re = make("a", "g", &mut interp);
+        let text = Value::string(JsString::from_str("abab", interp.gc_heap_mut()).unwrap());
         // First call → match at 0, lastIndex moves to 1.
-        let r1 = call("exec", &re, std::slice::from_ref(&text), &mut gc_heap);
+        let r1 = call("exec", &re, std::slice::from_ref(&text), &mut interp);
         let (Some(arr), Some(rx)) = (r1.as_array(), re.as_regexp()) else {
             panic!();
         };
         assert_eq!(
-            crate::array::get(arr, &gc_heap, 0).display_string(&gc_heap),
+            crate::array::get(arr, interp.gc_heap(), 0).display_string(interp.gc_heap()),
             "a"
         );
-        assert_eq!(rx.last_index(&gc_heap), 1);
+        assert_eq!(rx.last_index(interp.gc_heap()), 1);
         // Second call → match at 2, lastIndex → 3.
-        call("exec", &re, std::slice::from_ref(&text), &mut gc_heap);
+        call("exec", &re, std::slice::from_ref(&text), &mut interp);
         if let Some(rx) = re.as_regexp() {
-            assert_eq!(rx.last_index(&gc_heap), 3);
+            assert_eq!(rx.last_index(interp.gc_heap()), 3);
         }
         // Third call → no match, lastIndex → 0.
-        let r3 = call("exec", &re, &[text], &mut gc_heap);
+        let r3 = call("exec", &re, &[text], &mut interp);
         assert!(r3.is_null());
         if let Some(rx) = re.as_regexp() {
-            assert_eq!(rx.last_index(&gc_heap), 0);
+            assert_eq!(rx.last_index(interp.gc_heap()), 0);
         }
     }
 

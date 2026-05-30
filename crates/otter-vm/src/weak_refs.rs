@@ -39,7 +39,6 @@ use crate::collections::{
     WEAK_SET_BODY_TYPE_TAG, WeakMapBody, WeakSetBody,
 };
 use crate::execution_context::ExecutionContext;
-use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::object::{OBJECT_BODY_TYPE_TAG, ObjectBody};
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
@@ -418,96 +417,14 @@ fn raw_to_value(heap: &otter_gc::GcHeap, raw: RawGc) -> Option<Value> {
     }
 }
 
-fn receiver_weak_ref(args: &IntrinsicArgs<'_>) -> Result<JsWeakRef, IntrinsicError> {
-    args.receiver
-        .as_weak_ref()
-        .ok_or(IntrinsicError::BadReceiver {
-            expected: "WeakRef",
-        })
-}
-
-fn receiver_finalization_registry(
-    args: &mut IntrinsicArgs<'_>,
-) -> Result<JsFinalizationRegistry, IntrinsicError> {
-    args.receiver
-        .as_finalization_registry()
-        .ok_or(IntrinsicError::BadReceiver {
-            expected: "FinalizationRegistry",
-        })
-}
-
-fn impl_weak_ref_deref(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let weak_ref = receiver_weak_ref(args)?;
-    let heap = &*args.gc_heap;
-    Ok(weak_ref_deref(weak_ref, heap))
-}
-
-fn impl_finalization_registry_register(
-    args: &mut IntrinsicArgs<'_>,
-) -> Result<Value, IntrinsicError> {
-    let registry = receiver_finalization_registry(args)?;
-    let target = args.args.first().cloned().unwrap_or(Value::undefined());
-    let held_value = args.args.get(1).cloned().unwrap_or(Value::undefined());
-    let unregister_token = args.args.get(2);
-    let heap = &mut *args.gc_heap;
-    finalization_registry_register(registry, heap, &target, held_value, unregister_token)
-        .map_err(vm_to_intrinsic)?;
-    Ok(Value::undefined())
-}
-
-fn impl_finalization_registry_unregister(
-    args: &mut IntrinsicArgs<'_>,
-) -> Result<Value, IntrinsicError> {
-    let registry = receiver_finalization_registry(args)?;
-    let token = args.args.first().cloned().unwrap_or(Value::undefined());
-    let heap = &mut *args.gc_heap;
-    let removed =
-        finalization_registry_unregister(registry, heap, &token).map_err(vm_to_intrinsic)?;
-    Ok(Value::boolean(removed))
-}
-
-fn vm_to_intrinsic(err: crate::VmError) -> IntrinsicError {
-    match err {
-        crate::VmError::NotCallable => IntrinsicError::BadArgument {
-            index: 0,
-            reason: "must be callable",
-        },
-        _ => IntrinsicError::BadArgument {
-            index: 0,
-            reason: "must be an object",
-        },
-    }
-}
-
-/// `WeakRef.prototype` method table.
-pub static WEAK_REF_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
-    std::sync::LazyLock::new(|| {
-        crate::intrinsics!(
-            WeakRef,
-            "deref" / 0 => impl_weak_ref_deref,
-        )
-    });
-
-/// `FinalizationRegistry.prototype` method table.
-pub static FINALIZATION_REGISTRY_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
-    std::sync::LazyLock::new(|| {
-        crate::intrinsics!(
-            FinalizationRegistry,
-            "register"   / 2 => impl_finalization_registry_register,
-            "unregister" / 1 => impl_finalization_registry_unregister,
-        )
-    });
-
-/// Lookup for `WeakRef.prototype.<name>`.
+/// Whether `name` is installed on `WeakRef.prototype`.
 #[must_use]
-pub fn lookup_weak_ref(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
-    WEAK_REF_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::WeakRef, name)
+pub fn is_weak_ref_builtin_method(name: &str) -> bool {
+    matches!(name, "deref")
 }
 
-/// Lookup for `FinalizationRegistry.prototype.<name>`.
+/// Whether `name` is installed on `FinalizationRegistry.prototype`.
 #[must_use]
-pub fn lookup_finalization_registry(
-    name: &str,
-) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
-    FINALIZATION_REGISTRY_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::FinalizationRegistry, name)
+pub fn is_finalization_registry_builtin_method(name: &str) -> bool {
+    matches!(name, "register" | "unregister")
 }

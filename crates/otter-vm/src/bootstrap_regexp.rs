@@ -455,7 +455,6 @@ fn proto_exec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     let text_str = coerce_to_string(ctx, &text, "RegExp.prototype.exec")?;
 
     crate::regexp_prototype::exec_once_native(&re, text_str, ctx, &[args])
-        .map_err(|e| intrinsic_to_native(e, "RegExp.prototype.exec"))
 }
 
 fn proto_test(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -464,8 +463,8 @@ fn proto_test(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 }
 
 /// §B.2.4.1 `RegExp.prototype.compile(pattern, flags)` — native
-/// surface that mirrors the intrinsic-table dispatch path for users
-/// who call through `Function.prototype.call` / property reads.
+/// surface shared by direct calls, `Function.prototype.call`, and
+/// property reads.
 fn proto_compile(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let re = receiver_regexp(ctx, "RegExp.prototype.compile")?;
     if re.prototype_override(ctx.heap()).is_some() {
@@ -737,12 +736,5 @@ fn oom(name: &'static str) -> NativeError {
     NativeError::TypeError {
         name,
         reason: "out of memory".to_string(),
-    }
-}
-
-fn intrinsic_to_native(err: crate::intrinsics::IntrinsicError, name: &'static str) -> NativeError {
-    NativeError::TypeError {
-        name,
-        reason: err.to_string(),
     }
 }

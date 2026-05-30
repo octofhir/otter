@@ -7,9 +7,9 @@
 //! `Uint8Array.prototype[@@toStringTag] === "Uint8Array"`. The
 //! 20+ shared prototype methods (`at`, `subarray`, `slice`, …)
 //! delegate to the existing
-//! [`crate::binary::typed_array_prototype`] intrinsic table.
+//! [`crate::binary::typed_array_prototype`] native method table.
 //!
-//! The intrinsic table fast path at `Op::CallMethod` continues to
+//! The method table fast path at `Op::CallMethod` continues to
 //! serve `arr.at(...)` / `arr.fill(...)` calls; the installed
 //! `NativeFunction` properties are reached by reflective access
 //! and by `Function.prototype.call` / user overrides.
@@ -40,7 +40,6 @@ use smallvec::SmallVec;
 
 use crate::binary::typed_array::TypedArrayKind;
 use crate::binary::{dispatch, typed_array_prototype};
-use crate::intrinsics::IntrinsicArgs;
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject, PartialPropertyDescriptor, PropertyDescriptor};
 use crate::{NativeCtx, NativeError, Value, VmError};
@@ -1010,7 +1009,8 @@ const fn typed_array_name(kind: TypedArrayKind) -> &'static str {
 }
 
 // ---------------------------------------------------------------
-// Prototype method wrappers — all delegate to the intrinsic table
+// Prototype method wrappers — pure methods delegate to the shared
+// typed-array implementation module.
 // ---------------------------------------------------------------
 
 macro_rules! ta_proto_method {
@@ -1046,8 +1046,8 @@ fn ta_proto_dispatch(
     method_name: &str,
 ) -> Result<Value, NativeError> {
     const NAME: &str = "TypedArray.prototype";
-    let entry =
-        typed_array_prototype::lookup(method_name).ok_or_else(|| NativeError::TypeError {
+    let impl_fn =
+        typed_array_prototype::method_impl(method_name).ok_or_else(|| NativeError::TypeError {
             name: NAME,
             reason: format!("method {method_name} missing"),
         })?;
@@ -1100,18 +1100,7 @@ fn ta_proto_dispatch(
         }
     }
 
-    let allocation_roots = ctx.collect_native_roots();
-    let gc_heap = ctx.heap_mut();
-    let mut intrinsic_args = IntrinsicArgs {
-        receiver: &receiver,
-        args: &small_args,
-        gc_heap,
-        allocation_roots: allocation_roots.as_slice(),
-    };
-    (entry.impl_fn)(&mut intrinsic_args).map_err(|e| NativeError::TypeError {
-        name: NAME,
-        reason: e.to_string(),
-    })
+    impl_fn(ctx, &small_args)
 }
 
 // §23.2.3 callback-driven prototype methods re-enter the interpreter to

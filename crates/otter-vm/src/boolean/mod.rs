@@ -4,7 +4,7 @@
 //! - [`intrinsic`] — `BuiltinIntrinsic` impl that materialises the
 //!   global `Boolean` constructor + prototype + the
 //!   call/construct bridge.
-//! - [`prototype`] — `Boolean.prototype.*` intrinsic table consumed
+//! - [`prototype`] — `Boolean.prototype.*` native helpers consumed
 //!   by `Op::CallBoolean` and by the JS-visible methods installed
 //!   on the prototype object during bootstrap.
 //!

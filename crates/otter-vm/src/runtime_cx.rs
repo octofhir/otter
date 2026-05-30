@@ -39,8 +39,9 @@ use std::marker::PhantomData;
 use otter_gc::raw::RawGc;
 
 use crate::{
-    array, collections, native_function, object, promise::JsPromiseHandle, weak_refs,
     ExecutionContext, Interpreter, IteratorHandle, IteratorState, NativeError, Value, VmError,
+    array, binary::array_buffer::JsArrayBuffer, collections, native_function, object,
+    promise::JsPromiseHandle, weak_refs,
 };
 
 /// Internal VM context. Carried explicitly through the dispatch
@@ -696,6 +697,30 @@ impl<'rt> NativeCtx<'rt> {
         array::from_elements_with_roots(self.heap_mut(), elements, &mut external_visit)
     }
 
+    /// Allocate a zero-filled fixed-length `ArrayBuffer` through the native
+    /// root contract.
+    pub fn alloc_array_buffer_zeroed(
+        &mut self,
+        len: usize,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<Option<JsArrayBuffer>, otter_gc::OutOfMemory> {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(
+                visitor,
+                &roots,
+                &this_value,
+                new_target.as_ref(),
+                value_roots,
+                slice_roots,
+            );
+        };
+        JsArrayBuffer::try_new_with_roots(len, self.heap_mut(), &mut external_visit)
+    }
+
     /// Store an array element through the native root contract.
     pub fn array_set(
         &mut self,
@@ -911,7 +936,7 @@ pub(crate) fn visit_native_roots(
 #[cfg(test)]
 mod tests {
     use super::{NativeCallInfo, NativeCtx};
-    use crate::{error_classes::ErrorKind, native_value_static, Interpreter, NativeError, Value};
+    use crate::{Interpreter, NativeError, Value, error_classes::ErrorKind, native_value_static};
 
     #[test]
     fn native_ctx_object_allocation_uses_young_space() {
@@ -1024,7 +1049,9 @@ mod tests {
             let error = registry
                 .make_instance_native_rooted(&mut ctx, ErrorKind::TypeError, Some("boom"), &[], &[])
                 .expect("native error allocation");
-            assert!(crate::object::get(error, ctx.heap(), "message").is_some_and(|v| v.is_string()));
+            assert!(
+                crate::object::get(error, ctx.heap(), "message").is_some_and(|v| v.is_string())
+            );
         }
         let after = interp.gc_heap().stats().new_allocated_bytes;
         assert!(

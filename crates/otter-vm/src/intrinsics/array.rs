@@ -2,7 +2,7 @@
 //!
 //! Routes through `couch!`. Static methods come from
 //! `ARRAY_STATIC_METHODS` (also consumed by the `Op::CallMethod`
-//! intrinsic dispatch fast path), prototype methods from
+//! native dispatch fast path), prototype methods from
 //! `ARRAY_PROTOTYPE_METHODS`. The constructor body handles the
 //! §23.1.1.1 "single numeric arg = pre-sized sparse array" / "n+
 //! args = collected values" split internally, plus the

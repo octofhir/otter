@@ -1007,8 +1007,7 @@ Real callable-only `NativeFunction` for `BigInt` installed in
 `crates/otter-vm/src/bootstrap_bigint.rs`. The constructor is
 intentionally non-constructable (§21.2.1.1 step 1) — `new BigInt(x)`
 surfaces as `TypeError`. The ctor + statics + prototype methods all
-delegate to the existing [`crate::bigint::dispatch::call`] /
-prototype intrinsic table, so the body is thin glue.
+delegate to the bootstrap native surface, so the body is thin glue.
 
 Statics on the ctor: `asIntN` (length 2), `asUintN` (length 2).
 Prototype: `toString` (radix-aware), `valueOf`. `@@toStringTag =
@@ -1059,9 +1058,8 @@ plus a prototype carrying all 20 spec-listed methods
 (`getInt8` / `getUint8` / `getInt16` / … / `setBigUint64`) and
 the `buffer` / `byteLength` / `byteOffset` accessor getters. The
 prototype methods are thin `NativeFunction` wrappers that
-dispatch through the existing
-[`crate::binary::data_view_prototype::lookup`] intrinsic table,
-so the heavy lifting stays in `binary/data_view_prototype.rs`.
+dispatch through the direct DataView prototype helpers, so the
+heavy lifting stays in `binary/data_view_prototype.rs`.
 
 Substrate fix-ups:
 
@@ -1186,9 +1184,9 @@ Known remaining TypedArray gaps:
   compiler shortcut `Op::TypedArrayCall` so user overrides are
   not yet observable on these.
 - `subarray` / `slice` / `set` element-type coercion for
-  cross-kind copies still goes through the legacy intrinsic
-  bodies; spec `@@species`-driven derived-array allocation is
-  not implemented.
+  cross-kind copies still uses direct native prototype bodies;
+  spec `@@species`-driven derived-array allocation is not
+  implemented.
 
 ### §25.1 ArrayBuffer — slice 16 (fallible alloc + real ctor)
 
@@ -1207,8 +1205,8 @@ Two pieces landed together:
      `length` 1, `name` `"ArrayBuffer"`. Bare-call throws `TypeError`.
    - Static: `isView(arg)`.
    - Prototype methods: `slice`, `resize`, `transfer`,
-     `transferToFixedLength` (all wrappers over the existing
-     intrinsic table).
+     `transferToFixedLength` (all wrappers over the native
+     prototype method table).
    - Prototype accessors: `byteLength`, `maxByteLength`,
      `resizable`, `detached`.
    - `constructor` back-pointer + `@@toStringTag = "ArrayBuffer"`.
@@ -1847,9 +1845,8 @@ What landed:
 
 - `crates/otter-vm/src/array_prototype.rs` — install
   `Array.prototype.toString` (delegates to `join(",")` per
-  §23.1.3.36). Added to both the intrinsic dispatch table
-  (`ARRAY_PROTOTYPE_TABLE`) and the native-installed methods
-  list (`ARRAY_PROTOTYPE_METHODS`).
+  §23.1.3.36). Added to the native-installed methods list
+  (`ARRAY_PROTOTYPE_METHODS`).
 - `crates/otter-vm/src/lib.rs::Op::LoadProperty` — new
   `Value::Array` branch walks `Array.prototype` through
   `ordinary_get_value` when the own property is absent, so
@@ -1961,7 +1958,7 @@ Before:
 | 1962 | 1127 | 140 | 689 | 6 | 0 | 0 | 88.53% |
 
 After routing `RegExp.prototype.compile` through the native runtime
-method path instead of the no-context intrinsic fast path:
+method path instead of the old no-context fast path:
 
 | total | passed | failed | skipped | timeout | OOM | crash | pass rate |
 |---:|---:|---:|---:|---:|---:|---:|---:|

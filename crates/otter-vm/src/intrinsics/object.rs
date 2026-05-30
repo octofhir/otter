@@ -2,7 +2,7 @@
 //!
 //! Routes through `couch!`. Static reflection helpers come from
 //! `OBJECT_SPEC.methods` (also consumed by the `Op::CallMethod`
-//! intrinsic dispatch fast path) via `static_method_specs`; prototype
+//! native dispatch fast path) via `static_method_specs`; prototype
 //! methods come from `OBJECT_PROTOTYPE_METHODS` via the prototype
 //! `method_specs` field. The §B.2.2.1 `__proto__` accessor pair is
 //! pinned via `post_install` (`couch!` accessor rows take static

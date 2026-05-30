@@ -1,19 +1,18 @@
-//! `String.prototype.*` intrinsic implementations.
+//! `String.prototype.*` native implementations.
 //!
-//! Every method dispatches through the
-//! [`crate::intrinsics`] table so primitive string receivers reach
-//! these implementations without allocating a wrapper object
-//! (foundation plan rule #2).
+//! Primitive string receivers reach these methods through the
+//! JS-visible `String.prototype` native functions installed by the
+//! `String` `couch!` surface.
 //!
 //! # Contents
-//! - [`STRING_PROTOTYPE_TABLE`] — declarative table built with the
-//!   [`crate::intrinsics!`] macro.
+//! - [`STRING_PROTOTYPE_METHODS`] — native method specs installed on
+//!   the global `String.prototype`.
 //! - One private `impl_*` function per method.
 //!
 //! # Invariants
 //! - Every method validates the receiver as a primitive string or a
 //!   String wrapper with `[[StringData]]`; a non-string raises
-//!   [`crate::intrinsics::IntrinsicError::BadReceiver`].
+//!   `TypeError`.
 //! - Numeric arguments accept `Value::Number` and (for foundation-era
 //!   ergonomics on a few methods) string-encoded indices.
 //! - `indexOf` polls the runtime interrupt flag every
@@ -30,7 +29,6 @@
 use smallvec::SmallVec;
 
 use crate::Value;
-use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::number::NumberValue;
@@ -38,6 +36,20 @@ use crate::regexp::JsRegExp;
 use crate::string::Interrupted;
 use crate::string::JsString;
 use crate::{NativeCtx, NativeError};
+
+fn type_error(name: &'static str, reason: impl Into<String>) -> NativeError {
+    NativeError::TypeError {
+        name,
+        reason: reason.into(),
+    }
+}
+
+fn range_error(name: &'static str, reason: impl Into<String>) -> NativeError {
+    NativeError::RangeError {
+        name,
+        reason: reason.into(),
+    }
+}
 
 /// §22.1.3.1 thisStringValue / §7.1.17 ToString glue for
 /// `String.prototype.*` receivers.
@@ -60,48 +72,48 @@ use crate::{NativeCtx, NativeError};
 ///   TypeError in every String.prototype.* method).
 /// - `Value::Null` / `Value::Undefined` reject per
 ///   `RequireObjectCoercible`.
-fn receiver_string(args: &mut IntrinsicArgs<'_>) -> Result<JsString, IntrinsicError> {
-    let recv = args.receiver;
-    if let Some(s) = recv.as_string(args.gc_heap) {
+fn receiver_string(ctx: &mut NativeCtx<'_>, receiver: &Value) -> Result<JsString, NativeError> {
+    let recv = receiver;
+    if let Some(s) = recv.as_string(ctx.heap_mut()) {
         return Ok(s);
     }
     if let Some(obj) = recv.as_object() {
-        let gc = &*args.gc_heap;
+        let gc = ctx.heap();
         if let Some(s) = crate::object::string_data(obj, gc) {
             return Ok(s);
         }
         if let Some(b) = crate::object::boolean_data(obj, gc) {
             let text = if b { "true" } else { "false" };
-            return Ok(JsString::from_str(text, args.gc_heap)?);
+            return Ok(JsString::from_str(text, ctx.heap_mut())?);
         }
         if let Some(n) = crate::object::number_data(obj, gc) {
             let text = n.to_display_string();
-            return Ok(JsString::from_str(&text, args.gc_heap)?);
+            return Ok(JsString::from_str(&text, ctx.heap_mut())?);
         }
-        return Ok(JsString::from_str("[object Object]", args.gc_heap)?);
+        return Ok(JsString::from_str("[object Object]", ctx.heap_mut())?);
     }
     if let Some(b) = recv.as_boolean() {
         let text = if b { "true" } else { "false" };
-        return Ok(JsString::from_str(text, args.gc_heap)?);
+        return Ok(JsString::from_str(text, ctx.heap_mut())?);
     }
     if let Some(n) = recv.as_number() {
         let text = n.to_display_string();
-        return Ok(JsString::from_str(&text, args.gc_heap)?);
+        return Ok(JsString::from_str(&text, ctx.heap_mut())?);
     }
     if let Some(b) = recv.as_big_int() {
-        let text = b.to_decimal_string(&*args.gc_heap);
-        return Ok(JsString::from_str(&text, args.gc_heap)?);
+        let text = b.to_decimal_string(ctx.heap());
+        return Ok(JsString::from_str(&text, ctx.heap_mut())?);
     }
     if let Some(arr) = recv.as_array() {
         // §22.1.3.32 Array.prototype.toString → Array.prototype.join(",").
-        let gc = &*args.gc_heap;
+        let gc = ctx.heap();
         let items: Vec<String> = crate::array::with_elements(arr, gc, |els| {
             els.iter()
                 .map(|v| {
                     if v.is_null() || v.is_undefined() || v.is_hole() {
                         String::new()
-                    } else if let Some(s) = v.as_string(args.gc_heap) {
-                        s.to_lossy_string(args.gc_heap)
+                    } else if let Some(s) = v.as_string(gc) {
+                        s.to_lossy_string(gc)
                     } else if let Some(n) = v.as_number() {
                         n.to_display_string()
                     } else if let Some(b) = v.as_boolean() {
@@ -112,11 +124,11 @@ fn receiver_string(args: &mut IntrinsicArgs<'_>) -> Result<JsString, IntrinsicEr
                 })
                 .collect()
         });
-        return Ok(JsString::from_str(&items.join(","), args.gc_heap)?);
+        return Ok(JsString::from_str(&items.join(","), ctx.heap_mut())?);
     }
     if let Some(re) = recv.as_regexp() {
         // §22.2.6.13 RegExp.prototype.toString — `/source/flags`.
-        let gc = &*args.gc_heap;
+        let gc = ctx.heap();
         let pattern = re.source(gc);
         let flags = re.flags(gc);
         let pattern_str = if pattern.is_empty() {
@@ -125,9 +137,9 @@ fn receiver_string(args: &mut IntrinsicArgs<'_>) -> Result<JsString, IntrinsicEr
             pattern
         };
         let text = format!("/{}/{}", pattern_str, flags.to_js_string());
-        return Ok(JsString::from_str(&text, args.gc_heap)?);
+        return Ok(JsString::from_str(&text, ctx.heap_mut())?);
     }
-    Err(IntrinsicError::BadReceiver { expected: "string" })
+    Err(type_error("String.prototype", "expected string"))
 }
 
 /// §7.1.17 ToString applied to argument `index`.
@@ -140,48 +152,47 @@ fn receiver_string(args: &mut IntrinsicArgs<'_>) -> Result<JsString, IntrinsicEr
 ///
 /// Missing arguments coerce to `"undefined"` per §7.1.17 step 1
 /// (`ToString(undefined) = "undefined"`).
-fn arg_to_string(args: &mut IntrinsicArgs<'_>, index: u16) -> Result<JsString, IntrinsicError> {
-    let Some(arg) = args.args.get(index as usize) else {
-        return Ok(JsString::undefined_str(args.gc_heap)?);
+fn arg_to_string(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    index: u16,
+) -> Result<JsString, NativeError> {
+    let Some(arg) = args.get(index as usize) else {
+        return Ok(JsString::undefined_str(ctx.heap_mut())?);
     };
     if arg.is_undefined() {
-        return Ok(JsString::undefined_str(args.gc_heap)?);
+        return Ok(JsString::undefined_str(ctx.heap_mut())?);
     }
     if arg.is_null() {
-        return Ok(JsString::null_str(args.gc_heap)?);
+        return Ok(JsString::null_str(ctx.heap_mut())?);
     }
-    if let Some(s) = arg.as_string(args.gc_heap) {
+    if let Some(s) = arg.as_string(ctx.heap_mut()) {
         return Ok(s);
     }
     if let Some(b) = arg.as_boolean() {
         let text = if b { "true" } else { "false" };
-        return Ok(JsString::from_str(text, args.gc_heap)?);
+        return Ok(JsString::from_str(text, ctx.heap_mut())?);
     }
     if let Some(n) = arg.as_number() {
         let text = n.to_display_string();
-        return Ok(JsString::from_str(&text, args.gc_heap)?);
+        return Ok(JsString::from_str(&text, ctx.heap_mut())?);
     }
     if let Some(b) = arg.as_big_int() {
-        let text = b.to_decimal_string(&*args.gc_heap);
-        return Ok(JsString::from_str(&text, args.gc_heap)?);
+        let text = b.to_decimal_string(ctx.heap());
+        return Ok(JsString::from_str(&text, ctx.heap_mut())?);
     }
     if let Some(obj) = arg.as_object() {
-        let gc = &*args.gc_heap;
-        return crate::object::string_data(obj, gc).ok_or(IntrinsicError::BadArgument {
-            index,
-            reason: "must be a string",
-        });
+        let gc = ctx.heap();
+        return crate::object::string_data(obj, gc)
+            .ok_or_else(|| type_error("String.prototype", "must be a string"));
     }
     if arg.is_symbol() {
-        return Err(IntrinsicError::BadArgument {
-            index,
-            reason: "Symbol values cannot be converted to a string",
-        });
+        return Err(type_error(
+            "String.prototype",
+            "Symbol values cannot be converted to a string",
+        ));
     }
-    Err(IntrinsicError::BadArgument {
-        index,
-        reason: "must be a string",
-    })
+    Err(type_error("String.prototype", "must be a string"))
 }
 
 /// Pull a u32 index from arg `index`. §7.1.5 ToUint32 coerces every
@@ -190,8 +201,13 @@ fn arg_to_string(args: &mut IntrinsicArgs<'_>, index: u16) -> Result<JsString, I
 /// `Value::String` parses as decimal (NaN-on-failure clamps to 0
 /// per ToUint32 modulo), `Value::Undefined` and missing arguments
 /// collapse to `default`.
-fn arg_u32_or(args: &IntrinsicArgs<'_>, index: u16, default: u32) -> Result<u32, IntrinsicError> {
-    let Some(arg) = args.args.get(index as usize) else {
+fn arg_u32_or(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    index: u16,
+    default: u32,
+) -> Result<u32, NativeError> {
+    let Some(arg) = args.get(index as usize) else {
         return Ok(default);
     };
     if arg.is_undefined() {
@@ -206,13 +222,13 @@ fn arg_u32_or(args: &IntrinsicArgs<'_>, index: u16, default: u32) -> Result<u32,
     if arg.is_null() {
         return Ok(0);
     }
-    if let Some(s) = arg.as_string(args.gc_heap) {
-        return Ok(parse_index(s, args.gc_heap).unwrap_or(0));
+    if let Some(s) = arg.as_string(ctx.heap_mut()) {
+        return Ok(parse_index(s, ctx.heap_mut()).unwrap_or(0));
     }
-    Err(IntrinsicError::BadArgument {
-        index,
-        reason: "must be a non-negative integer",
-    })
+    Err(type_error(
+        "String.prototype",
+        "must be a non-negative integer",
+    ))
 }
 
 fn number_to_u32(n: NumberValue) -> u32 {
@@ -242,11 +258,16 @@ fn parse_index(s: JsString, heap: &otter_gc::GcHeap) -> Option<u32> {
 /// `NaN`/missing/`undefined` → `default`; non-finite values clamp
 /// to [`i64::MIN`] / [`i64::MAX`]; finite floats truncate toward
 /// zero.
-fn arg_int_or(args: &IntrinsicArgs<'_>, index: u16, default: i64) -> Result<i64, IntrinsicError> {
+fn arg_int_or(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    index: u16,
+    default: i64,
+) -> Result<i64, NativeError> {
     // §7.1.5 ToIntegerOrInfinity — coerce the spec-relevant operand
     // set (Number / Boolean / Null / String) before treating
     // non-finite / NaN as the default.
-    let Some(arg) = args.args.get(index as usize) else {
+    let Some(arg) = args.get(index as usize) else {
         return Ok(default);
     };
     if arg.is_undefined() {
@@ -261,18 +282,15 @@ fn arg_int_or(args: &IntrinsicArgs<'_>, index: u16, default: i64) -> Result<i64,
     if arg.is_null() {
         return Ok(0);
     }
-    if let Some(s) = arg.as_string(args.gc_heap) {
-        let text = s.to_lossy_string(args.gc_heap);
+    if let Some(s) = arg.as_string(ctx.heap_mut()) {
+        let text = s.to_lossy_string(ctx.heap_mut());
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Ok(0);
         }
         return Ok(trimmed.parse::<i64>().unwrap_or(0));
     }
-    Err(IntrinsicError::BadArgument {
-        index,
-        reason: "must be a number",
-    })
+    Err(type_error("String.prototype", "must be a number"))
 }
 
 fn number_to_int(n: NumberValue) -> i64 {
@@ -410,53 +428,73 @@ fn find_substr(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
     None
 }
 
-fn impl_length(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
+fn impl_length(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
     Ok(Value::number(NumberValue::from_i32(recv.len() as i32)))
 }
 
-fn impl_char_code_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    let idx = arg_u32_or(args, 0, 0)?;
-    let value = match recv.char_code_at(idx, args.gc_heap) {
+fn impl_char_code_at(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    let idx = arg_u32_or(ctx, args, 0, 0)?;
+    let value = match recv.char_code_at(idx, ctx.heap_mut()) {
         Some(unit) => NumberValue::from_i32(i32::from(unit)),
         None => NumberValue::Double(f64::NAN),
     };
     Ok(Value::number(value))
 }
 
-fn impl_char_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    let idx = arg_u32_or(args, 0, 0)?;
-    let unit = recv.char_code_at(idx, args.gc_heap);
+fn impl_char_at(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    let idx = arg_u32_or(ctx, args, 0, 0)?;
+    let unit = recv.char_code_at(idx, ctx.heap_mut());
     match unit {
         Some(u) => {
-            let s = JsString::from_utf16_units(&[u], args.gc_heap)?;
+            let s = JsString::from_utf16_units(&[u], ctx.heap_mut())?;
             Ok(Value::string(s))
         }
-        None => Ok(Value::string(JsString::empty(args.gc_heap)?)),
+        None => Ok(Value::string(JsString::empty(ctx.heap_mut())?)),
     }
 }
 
-fn impl_slice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
+fn impl_slice(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
     let total = recv.len();
-    let start = arg_u32_or(args, 0, 0)?.min(total);
-    let end = match args.args.get(1) {
-        Some(_) => arg_u32_or(args, 1, total)?.min(total),
+    let start = arg_u32_or(ctx, args, 0, 0)?.min(total);
+    let end = match args.get(1) {
+        Some(_) => arg_u32_or(ctx, args, 1, total)?.min(total),
         None => total,
     };
     let length = end.saturating_sub(start);
-    let out = recv.slice(start, length, args.gc_heap)?;
+    let out = recv.slice(start, length, ctx.heap_mut())?;
     Ok(Value::string(out))
 }
 
-fn impl_substring(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
+fn impl_substring(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
     let total = recv.len();
-    let mut start = arg_u32_or(args, 0, 0)?.min(total);
-    let mut end = match args.args.get(1) {
-        Some(_) => arg_u32_or(args, 1, total)?.min(total),
+    let mut start = arg_u32_or(ctx, args, 0, 0)?.min(total);
+    let mut end = match args.get(1) {
+        Some(_) => arg_u32_or(ctx, args, 1, total)?.min(total),
         None => total,
     };
     // Spec: if start > end, swap.
@@ -464,20 +502,21 @@ fn impl_substring(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
         std::mem::swap(&mut start, &mut end);
     }
     let length = end - start;
-    let out = recv.slice(start, length, args.gc_heap)?;
+    let out = recv.slice(start, length, ctx.heap_mut())?;
     Ok(Value::string(out))
 }
 
-fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    let needle = arg_to_string(args, 0)?;
-    let from = arg_u32_or(args, 1, 0)?;
+fn impl_index_of(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    let needle = arg_to_string(ctx, args, 0)?;
+    let from = arg_u32_or(ctx, args, 1, 0)?;
     let pos = recv
-        .index_of(needle, from, None, args.gc_heap)
-        .map_err(|Interrupted| IntrinsicError::BadArgument {
-            index: 0,
-            reason: "interrupted",
-        })?;
+        .index_of(needle, from, None, ctx.heap_mut())
+        .map_err(|Interrupted| type_error("String.prototype", "interrupted"))?;
     let value = match pos {
         Some(p) => NumberValue::from_i32(p as i32),
         None => NumberValue::from_i32(-1),
@@ -485,71 +524,89 @@ fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     Ok(Value::number(value))
 }
 
-fn impl_starts_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    let needle = arg_to_string(args, 0)?;
-    let from = arg_u32_or(args, 1, 0)?;
-    Ok(Value::boolean(recv.starts_with(needle, from, args.gc_heap)))
-}
-
-fn impl_ends_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    let needle = arg_to_string(args, 0)?;
-    let end_pos = arg_u32_or(args, 1, recv.len())?;
-    Ok(Value::boolean(recv.ends_with(
+fn impl_starts_with(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    let needle = arg_to_string(ctx, args, 0)?;
+    let from = arg_u32_or(ctx, args, 1, 0)?;
+    Ok(Value::boolean(recv.starts_with(
         needle,
-        end_pos,
-        args.gc_heap,
+        from,
+        ctx.heap_mut(),
     )))
 }
 
-fn impl_includes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    let needle = arg_to_string(args, 0)?;
-    let from = arg_u32_or(args, 1, 0)?;
+fn impl_ends_with(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    let needle = arg_to_string(ctx, args, 0)?;
+    let end_pos = arg_u32_or(ctx, args, 1, recv.len())?;
+    Ok(Value::boolean(recv.ends_with(
+        needle,
+        end_pos,
+        ctx.heap_mut(),
+    )))
+}
+
+fn impl_includes(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    let needle = arg_to_string(ctx, args, 0)?;
+    let from = arg_u32_or(ctx, args, 1, 0)?;
     let pos = recv
-        .index_of(needle, from, None, args.gc_heap)
-        .map_err(|Interrupted| IntrinsicError::BadArgument {
-            index: 0,
-            reason: "interrupted",
-        })?;
+        .index_of(needle, from, None, ctx.heap_mut())
+        .map_err(|Interrupted| type_error("String.prototype", "interrupted"))?;
     Ok(Value::boolean(pos.is_some()))
 }
 
-fn impl_concat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_concat(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
     // §22.1.3.5 — `for each next of arguments: nextString = ?
     // ToString(next)`. Coerce every operand via the shared
     // `arg_to_string` helper (primitives + wrapper objects with
     // `[[StringData]]`); plain objects without an inherited
     // `toString` still reject.
-    let recv = receiver_string(args)?;
+    let recv = receiver_string(ctx, receiver)?;
     let mut result = recv;
-    for i in 0..args.args.len() {
-        let piece = arg_to_string(args, i as u16)?;
-        result = JsString::concat(result, piece, args.gc_heap)?;
+    for i in 0..args.len() {
+        let piece = arg_to_string(ctx, args, i as u16)?;
+        result = JsString::concat(result, piece, ctx.heap_mut())?;
     }
     Ok(Value::string(result))
 }
 
-fn impl_repeat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    let count = arg_int_or(args, 0, 0)?;
+fn impl_repeat(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    let count = arg_int_or(ctx, args, 0, 0)?;
     if count < 0 {
-        return Err(IntrinsicError::BadArgument {
-            index: 0,
-            reason: "must be non-negative",
-        });
+        return Err(type_error("String.prototype", "must be non-negative"));
     }
     if count == 0 || recv.is_empty() {
-        return Ok(Value::string(JsString::empty(args.gc_heap)?));
+        return Ok(Value::string(JsString::empty(ctx.heap_mut())?));
     }
-    let units = recv.to_utf16_vec(args.gc_heap);
+    let units = recv.to_utf16_vec(ctx.heap_mut());
     let total = (units.len() as u64).saturating_mul(count as u64);
     if total > u32::MAX as u64 {
-        return Err(IntrinsicError::BadArgument {
-            index: 0,
-            reason: "result would exceed maximum string length",
-        });
+        return Err(range_error(
+            "String.prototype",
+            "result would exceed maximum string length",
+        ));
     }
     let mut buf = Vec::with_capacity(total as usize);
     for _ in 0..count {
@@ -557,7 +614,7 @@ fn impl_repeat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     }
     Ok(Value::string(JsString::from_utf16_units(
         &buf,
-        args.gc_heap,
+        ctx.heap_mut(),
     )?))
 }
 
@@ -568,9 +625,14 @@ enum PadSide {
     End,
 }
 
-fn pad_impl(args: &mut IntrinsicArgs<'_>, side: PadSide) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    let target = arg_int_or(args, 0, 0)?;
+fn pad_impl(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+    side: PadSide,
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    let target = arg_int_or(ctx, args, 0, 0)?;
     let recv_len = recv.len() as i64;
     if target <= recv_len {
         return Ok(Value::string(recv));
@@ -580,16 +642,16 @@ fn pad_impl(args: &mut IntrinsicArgs<'_>, side: PadSide) -> Result<Value, Intrin
     // `ToString(fillString)`. Coerce every spec-relevant operand
     // shape through `arg_to_string` so primitive fill strings
     // round-trip without bailing.
-    let pad_units: Vec<u16> = match args.args.get(1) {
+    let pad_units: Vec<u16> = match args.get(1) {
         None => vec![0x0020],
         Some(v) if v.is_undefined() => vec![0x0020],
-        _ => arg_to_string(args, 1)?.to_utf16_vec(args.gc_heap),
+        _ => arg_to_string(ctx, args, 1)?.to_utf16_vec(ctx.heap_mut()),
     };
     if pad_units.is_empty() {
         return Ok(Value::string(recv));
     }
     let pad_count = (target - recv_len) as usize;
-    let recv_units = recv.to_utf16_vec(args.gc_heap);
+    let recv_units = recv.to_utf16_vec(ctx.heap_mut());
     let mut buf: Vec<u16> = Vec::with_capacity(target as usize);
     let mut filled = 0;
     if matches!(side, PadSide::End) {
@@ -605,16 +667,24 @@ fn pad_impl(args: &mut IntrinsicArgs<'_>, side: PadSide) -> Result<Value, Intrin
     }
     Ok(Value::string(JsString::from_utf16_units(
         &buf,
-        args.gc_heap,
+        ctx.heap_mut(),
     )?))
 }
 
-fn impl_pad_start(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    pad_impl(args, PadSide::Start)
+fn impl_pad_start(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    pad_impl(ctx, receiver, args, PadSide::Start)
 }
 
-fn impl_pad_end(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    pad_impl(args, PadSide::End)
+fn impl_pad_end(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    pad_impl(ctx, receiver, args, PadSide::End)
 }
 
 /// Trim-direction selector for [`trim_impl`].
@@ -625,9 +695,14 @@ enum TrimSide {
     End,
 }
 
-fn trim_impl(args: &mut IntrinsicArgs<'_>, side: TrimSide) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    let units = recv.to_utf16_vec(args.gc_heap);
+fn trim_impl(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    _args: &[Value],
+    side: TrimSide,
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    let units = recv.to_utf16_vec(ctx.heap_mut());
     let start = match side {
         TrimSide::Both | TrimSide::Start => units
             .iter()
@@ -649,12 +724,16 @@ fn trim_impl(args: &mut IntrinsicArgs<'_>, side: TrimSide) -> Result<Value, Intr
     };
     Ok(Value::string(JsString::from_utf16_units(
         slice,
-        args.gc_heap,
+        ctx.heap_mut(),
     )?))
 }
 
-fn impl_trim(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    trim_impl(args, TrimSide::Both)
+fn impl_trim(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    trim_impl(ctx, receiver, args, TrimSide::Both)
 }
 
 /// §B.2.3.1 `CreateHTML(string, tag, attribute, value)`.
@@ -665,23 +744,25 @@ fn impl_trim(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// `String.prototype.{anchor, big, blink, bold, fixed, fontcolor,
 /// fontsize, italics, link, small, strike, sub, sup}` AnnexB shims.
 fn create_html(
-    args: &mut IntrinsicArgs<'_>,
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
     tag: &str,
     attribute: Option<&str>,
-) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    let body = recv.to_lossy_string(args.gc_heap);
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    let body = recv.to_lossy_string(ctx.heap_mut());
     let mut out = String::with_capacity(body.len() + tag.len() * 2 + 5);
     out.push('<');
     out.push_str(tag);
     if let Some(attr) = attribute {
-        let raw = if let Some(arg) = args.args.first() {
+        let raw = if let Some(arg) = args.first() {
             if arg.is_undefined() {
                 "undefined".to_string()
-            } else if let Some(s) = arg.as_string(args.gc_heap) {
-                s.to_lossy_string(args.gc_heap)
+            } else if let Some(s) = arg.as_string(ctx.heap_mut()) {
+                s.to_lossy_string(ctx.heap_mut())
             } else {
-                arg.display_string(&*args.gc_heap)
+                arg.display_string(ctx.heap())
             }
         } else {
             "undefined".to_string()
@@ -699,7 +780,7 @@ fn create_html(
     out.push_str("</");
     out.push_str(tag);
     out.push('>');
-    Ok(Value::string(JsString::from_str(&out, args.gc_heap)?))
+    Ok(Value::string(JsString::from_str(&out, ctx.heap_mut())?))
 }
 
 /// §B.2.3.1 `String.prototype.substr(start, length)`.
@@ -721,9 +802,13 @@ fn create_html(
 ///
 /// §22.1.3.10 `String.prototype.isWellFormed()`. Returns `true` if
 /// every surrogate code unit is part of a valid pair.
-fn impl_is_well_formed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    let units = recv.to_utf16_vec(args.gc_heap);
+fn impl_is_well_formed(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    let units = recv.to_utf16_vec(ctx.heap_mut());
     let mut i = 0;
     while i < units.len() {
         let u = units[i];
@@ -743,9 +828,13 @@ fn impl_is_well_formed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
 
 /// §22.1.3.11 `String.prototype.toWellFormed()`. Replaces every
 /// unpaired surrogate with `U+FFFD` (REPLACEMENT CHARACTER).
-fn impl_to_well_formed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    let units = recv.to_utf16_vec(args.gc_heap);
+fn impl_to_well_formed(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    let units = recv.to_utf16_vec(ctx.heap_mut());
     let mut out: Vec<u16> = Vec::with_capacity(units.len());
     let mut i = 0;
     while i < units.len() {
@@ -767,14 +856,18 @@ fn impl_to_well_formed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
     }
     Ok(Value::string(JsString::from_utf16_units(
         &out,
-        args.gc_heap,
+        ctx.heap_mut(),
     )?))
 }
 
-fn impl_substr(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
+fn impl_substr(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
     let size = recv.len() as i64;
-    let raw_start = arg_int_or(args, 0, 0)?;
+    let raw_start = arg_int_or(ctx, args, 0, 0)?;
     let int_start = if raw_start == i64::MIN {
         0
     } else if raw_start < 0 {
@@ -782,75 +875,139 @@ fn impl_substr(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     } else {
         std::cmp::min(raw_start, size)
     };
-    let int_length = match args.args.get(1) {
+    let int_length = match args.get(1) {
         None => size,
         Some(v) if v.is_undefined() => size,
         Some(_) => {
-            let raw = arg_int_or(args, 1, 0)?;
+            let raw = arg_int_or(ctx, args, 1, 0)?;
             std::cmp::min(std::cmp::max(raw, 0), size - int_start)
         }
     };
     if int_length <= 0 {
-        return Ok(Value::string(JsString::empty(args.gc_heap)?));
+        return Ok(Value::string(JsString::empty(ctx.heap_mut())?));
     }
     Ok(Value::string(recv.slice(
         int_start as u32,
         int_length as u32,
-        args.gc_heap,
+        ctx.heap_mut(),
     )?))
 }
 
-fn impl_anchor(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    create_html(args, "a", Some("name"))
+fn impl_anchor(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    create_html(ctx, receiver, args, "a", Some("name"))
 }
-fn impl_big(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    create_html(args, "big", None)
+fn impl_big(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    create_html(ctx, receiver, args, "big", None)
 }
-fn impl_blink(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    create_html(args, "blink", None)
+fn impl_blink(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    create_html(ctx, receiver, args, "blink", None)
 }
-fn impl_bold(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    create_html(args, "b", None)
+fn impl_bold(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    create_html(ctx, receiver, args, "b", None)
 }
-fn impl_fixed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    create_html(args, "tt", None)
+fn impl_fixed(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    create_html(ctx, receiver, args, "tt", None)
 }
-fn impl_fontcolor(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    create_html(args, "font", Some("color"))
+fn impl_fontcolor(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    create_html(ctx, receiver, args, "font", Some("color"))
 }
-fn impl_fontsize(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    create_html(args, "font", Some("size"))
+fn impl_fontsize(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    create_html(ctx, receiver, args, "font", Some("size"))
 }
-fn impl_italics(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    create_html(args, "i", None)
+fn impl_italics(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    create_html(ctx, receiver, args, "i", None)
 }
-fn impl_link(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    create_html(args, "a", Some("href"))
+fn impl_link(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    create_html(ctx, receiver, args, "a", Some("href"))
 }
-fn impl_small(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    create_html(args, "small", None)
+fn impl_small(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    create_html(ctx, receiver, args, "small", None)
 }
-fn impl_strike(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    create_html(args, "strike", None)
+fn impl_strike(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    create_html(ctx, receiver, args, "strike", None)
 }
-fn impl_sub(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    create_html(args, "sub", None)
+fn impl_sub(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    create_html(ctx, receiver, args, "sub", None)
 }
-fn impl_sup(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    create_html(args, "sup", None)
+fn impl_sup(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    create_html(ctx, receiver, args, "sup", None)
 }
 
-fn impl_trim_start(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    trim_impl(args, TrimSide::Start)
+fn impl_trim_start(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    trim_impl(ctx, receiver, args, TrimSide::Start)
 }
 
-fn impl_trim_end(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    trim_impl(args, TrimSide::End)
+fn impl_trim_end(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    trim_impl(ctx, receiver, args, TrimSide::End)
 }
 
-fn impl_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    let raw = arg_int_or(args, 0, 0)?;
+fn impl_at(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    let raw = arg_int_or(ctx, args, 0, 0)?;
     let len = recv.len() as i64;
     let idx = if raw < 0 {
         raw.saturating_add(len)
@@ -861,28 +1018,32 @@ fn impl_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         return Ok(Value::undefined());
     }
     let unit = recv
-        .char_code_at(idx as u32, args.gc_heap)
+        .char_code_at(idx as u32, ctx.heap_mut())
         .expect("index in range yields a code unit");
     Ok(Value::string(JsString::from_utf16_units(
         &[unit],
-        args.gc_heap,
+        ctx.heap_mut(),
     )?))
 }
 
-fn impl_code_point_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    let raw = arg_int_or(args, 0, 0)?;
+fn impl_code_point_at(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    let raw = arg_int_or(ctx, args, 0, 0)?;
     let len = recv.len() as i64;
     if raw < 0 || raw >= len {
         return Ok(Value::undefined());
     }
     let idx = raw as u32;
     let cu1 = recv
-        .char_code_at(idx, args.gc_heap)
+        .char_code_at(idx, ctx.heap_mut())
         .expect("index in range");
     if (0xD800..=0xDBFF).contains(&cu1) && (idx + 1) < len as u32 {
         let cu2 = recv
-            .char_code_at(idx + 1, args.gc_heap)
+            .char_code_at(idx + 1, ctx.heap_mut())
             .expect("idx+1 in range");
         if (0xDC00..=0xDFFF).contains(&cu2) {
             let cp = 0x10000u32 + ((u32::from(cu1) - 0xD800) << 10) + (u32::from(cu2) - 0xDC00);
@@ -896,9 +1057,13 @@ fn map_ascii<F: Fn(u16) -> u16>(units: &[u16], f: F) -> Vec<u16> {
     units.iter().map(|&u| f(u)).collect()
 }
 
-fn impl_to_lower_case(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    let units = recv.to_utf16_vec(args.gc_heap);
+fn impl_to_lower_case(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    let units = recv.to_utf16_vec(ctx.heap_mut());
     let lowered = map_ascii(&units, |u| {
         if (u16::from(b'A')..=u16::from(b'Z')).contains(&u) {
             u + 32
@@ -908,13 +1073,17 @@ fn impl_to_lower_case(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
     });
     Ok(Value::string(JsString::from_utf16_units(
         &lowered,
-        args.gc_heap,
+        ctx.heap_mut(),
     )?))
 }
 
-fn impl_to_upper_case(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    let units = recv.to_utf16_vec(args.gc_heap);
+fn impl_to_upper_case(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    let units = recv.to_utf16_vec(ctx.heap_mut());
     let upper = map_ascii(&units, |u| {
         if (u16::from(b'a')..=u16::from(b'z')).contains(&u) {
             u - 32
@@ -924,26 +1093,26 @@ fn impl_to_upper_case(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
     });
     Ok(Value::string(JsString::from_utf16_units(
         &upper,
-        args.gc_heap,
+        ctx.heap_mut(),
     )?))
 }
 
-fn impl_replace(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    if let Some(re) = args.args.first().and_then(|v| v.as_regexp()) {
-        let replacement = arg_to_string(args, 1)?;
-        return regex_replace(
-            recv,
-            &re,
-            args.gc_heap,
-            &replacement.to_utf16_vec(args.gc_heap),
-        );
+fn impl_replace(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    if let Some(re) = args.first().and_then(|v| v.as_regexp()) {
+        let replacement = arg_to_string(ctx, args, 1)?;
+        let replacement_units = replacement.to_utf16_vec(ctx.heap_mut());
+        return regex_replace(recv, &re, ctx.heap_mut(), &replacement_units);
     }
-    let needle = arg_to_string(args, 0)?;
-    let replacement = arg_to_string(args, 1)?;
-    let recv_units = recv.to_utf16_vec(args.gc_heap);
-    let needle_units = needle.to_utf16_vec(args.gc_heap);
-    let replacement_units = replacement.to_utf16_vec(args.gc_heap);
+    let needle = arg_to_string(ctx, args, 0)?;
+    let replacement = arg_to_string(ctx, args, 1)?;
+    let recv_units = recv.to_utf16_vec(ctx.heap_mut());
+    let needle_units = needle.to_utf16_vec(ctx.heap_mut());
+    let replacement_units = replacement.to_utf16_vec(ctx.heap_mut());
 
     if needle_units.is_empty() {
         let mut buf = Vec::with_capacity(recv_units.len() + replacement_units.len());
@@ -951,7 +1120,7 @@ fn impl_replace(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         buf.extend_from_slice(&recv_units);
         return Ok(Value::string(JsString::from_utf16_units(
             &buf,
-            args.gc_heap,
+            ctx.heap_mut(),
         )?));
     }
     let pos = match find_substr(&recv_units, &needle_units, 0) {
@@ -965,34 +1134,34 @@ fn impl_replace(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     buf.extend_from_slice(&recv_units[pos + needle_units.len()..]);
     Ok(Value::string(JsString::from_utf16_units(
         &buf,
-        args.gc_heap,
+        ctx.heap_mut(),
     )?))
 }
 
-fn impl_replace_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    if let Some(re) = args.args.first().and_then(|v| v.as_regexp()) {
+fn impl_replace_all(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    if let Some(re) = args.first().and_then(|v| v.as_regexp()) {
         // Spec: `replaceAll` requires the `g` flag for regex args.
-        let heap = &*args.gc_heap;
+        let heap = ctx.heap();
         if !re.flags(heap).global {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "must be a global regular expression",
-            });
+            return Err(type_error(
+                "String.prototype",
+                "must be a global regular expression",
+            ));
         }
-        let replacement = arg_to_string(args, 1)?;
-        return regex_replace(
-            recv,
-            &re,
-            args.gc_heap,
-            &replacement.to_utf16_vec(args.gc_heap),
-        );
+        let replacement = arg_to_string(ctx, args, 1)?;
+        let replacement_units = replacement.to_utf16_vec(ctx.heap_mut());
+        return regex_replace(recv, &re, ctx.heap_mut(), &replacement_units);
     }
-    let needle = arg_to_string(args, 0)?;
-    let replacement = arg_to_string(args, 1)?;
-    let recv_units = recv.to_utf16_vec(args.gc_heap);
-    let needle_units = needle.to_utf16_vec(args.gc_heap);
-    let replacement_units = replacement.to_utf16_vec(args.gc_heap);
+    let needle = arg_to_string(ctx, args, 0)?;
+    let replacement = arg_to_string(ctx, args, 1)?;
+    let recv_units = recv.to_utf16_vec(ctx.heap_mut());
+    let needle_units = needle.to_utf16_vec(ctx.heap_mut());
+    let replacement_units = replacement.to_utf16_vec(ctx.heap_mut());
 
     if needle_units.is_empty() {
         // Spec: insert replacement before each unit and at the end.
@@ -1005,7 +1174,7 @@ fn impl_replace_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
         buf.extend_from_slice(&replacement_units);
         return Ok(Value::string(JsString::from_utf16_units(
             &buf,
-            args.gc_heap,
+            ctx.heap_mut(),
         )?));
     }
     if recv_units.len() < needle_units.len() {
@@ -1026,27 +1195,31 @@ fn impl_replace_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
     buf.extend_from_slice(&recv_units[i..]);
     Ok(Value::string(JsString::from_utf16_units(
         &buf,
-        args.gc_heap,
+        ctx.heap_mut(),
     )?))
 }
 
-fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
+fn impl_split(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
 
     // Regex separator → defer to the dedicated walker.
-    if let Some(re) = args.args.first().and_then(|v| v.as_regexp()) {
-        let limit = parse_split_limit(args)?;
-        return regex_split(recv, &re, limit, args);
+    if let Some(re) = args.first().and_then(|v| v.as_regexp()) {
+        let limit = parse_split_limit(ctx, args)?;
+        return regex_split(ctx, recv, &re, limit);
     }
 
     // Resolve separator: missing or `undefined` → caller-as-only-element.
     // §7.1.17 ToString coerces every other operand (Boolean / Number /
     // BigInt / Null / wrapper objects) before the search.
     let separator_owned: JsString;
-    let separator = match args.args.first() {
+    let separator = match args.first() {
         None => {
             let singleton = [Value::string(recv)];
-            return Ok(Value::array(args.array_from_elements_rooted(
+            return Ok(Value::array(ctx.array_from_elements_with_roots(
                 singleton.iter().cloned(),
                 &[],
                 &[singleton.as_slice()],
@@ -1054,33 +1227,33 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
         Some(v) if v.is_undefined() => {
             let singleton = [Value::string(recv)];
-            return Ok(Value::array(args.array_from_elements_rooted(
+            return Ok(Value::array(ctx.array_from_elements_with_roots(
                 singleton.iter().cloned(),
                 &[],
                 &[singleton.as_slice()],
             )?));
         }
         Some(v) => {
-            if let Some(s) = v.as_string(args.gc_heap) {
+            if let Some(s) = v.as_string(ctx.heap_mut()) {
                 s
             } else {
-                separator_owned = arg_to_string(args, 0)?;
+                separator_owned = arg_to_string(ctx, args, 0)?;
                 separator_owned
             }
         }
     };
 
-    let limit = parse_split_limit(args)?;
+    let limit = parse_split_limit(ctx, args)?;
     if limit == 0 {
-        return Ok(Value::array(args.array_from_elements_rooted(
+        return Ok(Value::array(ctx.array_from_elements_with_roots(
             std::iter::empty(),
             &[],
             &[],
         )?));
     }
 
-    let recv_units = recv.to_utf16_vec(args.gc_heap);
-    let sep_units = separator.to_utf16_vec(args.gc_heap);
+    let recv_units = recv.to_utf16_vec(ctx.heap_mut());
+    let sep_units = separator.to_utf16_vec(ctx.heap_mut());
 
     // Empty separator: split into individual code units (capped).
     if sep_units.is_empty() {
@@ -1088,10 +1261,10 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         for &u in recv_units.iter().take(limit as usize) {
             out.push(Value::string(JsString::from_utf16_units(
                 &[u],
-                args.gc_heap,
+                ctx.heap_mut(),
             )?));
         }
-        return Ok(Value::array(args.array_from_elements_rooted(
+        return Ok(Value::array(ctx.array_from_elements_with_roots(
             out.iter().cloned(),
             &[],
             &[out.as_slice()],
@@ -1103,7 +1276,7 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     while (out.len() as u32) < limit {
         match find_substr(&recv_units, &sep_units, start) {
             Some(pos) => {
-                let part = JsString::from_utf16_units(&recv_units[start..pos], args.gc_heap)?;
+                let part = JsString::from_utf16_units(&recv_units[start..pos], ctx.heap_mut())?;
                 out.push(Value::string(part));
                 start = pos + sep_units.len();
             }
@@ -1111,10 +1284,10 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
     }
     if (out.len() as u32) < limit {
-        let part = JsString::from_utf16_units(&recv_units[start..], args.gc_heap)?;
+        let part = JsString::from_utf16_units(&recv_units[start..], ctx.heap_mut())?;
         out.push(Value::string(part));
     }
-    Ok(Value::array(args.array_from_elements_rooted(
+    Ok(Value::array(ctx.array_from_elements_with_roots(
         out.iter().cloned(),
         &[],
         &[out.as_slice()],
@@ -1123,13 +1296,13 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 
 /// Common limit-arg parser shared by string-separator and
 /// regex-separator `split` paths.
-fn parse_split_limit(args: &IntrinsicArgs<'_>) -> Result<u32, IntrinsicError> {
+fn parse_split_limit(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<u32, NativeError> {
     // §22.1.3.23 step 6: `limit` defaults to 2^32 - 1 and is
     // ToUint32-coerced. Foundation accepts the spec set
     // (`Number` / `Boolean` / `null` / `String` — strings parsed as
     // decimal integers). Non-integer / negative coerce to 0 per
     // ToUint32 modulo.
-    let Some(arg) = args.args.get(1) else {
+    let Some(arg) = args.get(1) else {
         return Ok(u32::MAX);
     };
     if arg.is_undefined() {
@@ -1151,8 +1324,8 @@ fn parse_split_limit(args: &IntrinsicArgs<'_>) -> Result<u32, IntrinsicError> {
     if arg.is_null() {
         return Ok(0);
     }
-    if let Some(s) = arg.as_string(args.gc_heap) {
-        let text = s.to_lossy_string(args.gc_heap);
+    if let Some(s) = arg.as_string(ctx.heap_mut()) {
+        let text = s.to_lossy_string(ctx.heap_mut());
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Ok(0);
@@ -1167,10 +1340,7 @@ fn parse_split_limit(args: &IntrinsicArgs<'_>) -> Result<u32, IntrinsicError> {
             }
         }));
     }
-    Err(IntrinsicError::BadArgument {
-        index: 1,
-        reason: "must be a number",
-    })
+    Err(type_error("String.prototype", "must be a number"))
 }
 
 fn regex_replace(
@@ -1178,7 +1348,7 @@ fn regex_replace(
     re: &JsRegExp,
     gc_heap: &mut otter_gc::GcHeap,
     replacement_template: &[u16],
-) -> Result<Value, IntrinsicError> {
+) -> Result<Value, NativeError> {
     let recv_units = recv.to_utf16_vec(gc_heap);
     let matches = collect_regex_matches(re, gc_heap, &recv_units);
     if matches.is_empty() {
@@ -1197,24 +1367,22 @@ fn regex_replace(
 }
 
 fn regex_split(
+    ctx: &mut NativeCtx<'_>,
     recv: JsString,
     re: &JsRegExp,
     limit: u32,
-    args: &mut IntrinsicArgs<'_>,
-) -> Result<Value, IntrinsicError> {
+) -> Result<Value, NativeError> {
     if limit == 0 {
-        return Ok(Value::array(args.array_from_elements_rooted(
+        return Ok(Value::array(ctx.array_from_elements_with_roots(
             std::iter::empty(),
             &[],
             &[],
         )?));
     }
-    let recv_units = recv.to_utf16_vec(args.gc_heap);
+    let recv_units = recv.to_utf16_vec(ctx.heap_mut());
     let mut out: Vec<Value> = Vec::new();
     let mut cursor: usize = 0;
-    let mut iter = re
-        .find_from_utf16(&*args.gc_heap, &recv_units, 0)
-        .into_iter();
+    let mut iter = re.find_from_utf16(ctx.heap(), &recv_units, 0).into_iter();
     while (out.len() as u32) < limit {
         let m = match iter.next() {
             Some(m) => m,
@@ -1231,19 +1399,19 @@ fn regex_split(
             drop(iter);
             cursor += 1;
             iter = re
-                .find_from_utf16(&*args.gc_heap, &recv_units, cursor)
+                .find_from_utf16(ctx.heap(), &recv_units, cursor)
                 .into_iter();
             continue;
         }
-        let part = JsString::from_utf16_units(&recv_units[cursor..m.range.start], args.gc_heap)?;
+        let part = JsString::from_utf16_units(&recv_units[cursor..m.range.start], ctx.heap_mut())?;
         out.push(Value::string(part));
         cursor = m.range.end;
     }
     if (out.len() as u32) < limit {
-        let part = JsString::from_utf16_units(&recv_units[cursor..], args.gc_heap)?;
+        let part = JsString::from_utf16_units(&recv_units[cursor..], ctx.heap_mut())?;
         out.push(Value::string(part));
     }
-    Ok(Value::array(args.array_from_elements_rooted(
+    Ok(Value::array(ctx.array_from_elements_with_roots(
         out.iter().cloned(),
         &[],
         &[out.as_slice()],
@@ -1258,7 +1426,7 @@ fn coerce_pattern_to_regexp(
     value: &Value,
     flags: &str,
     gc_heap: &mut otter_gc::GcHeap,
-) -> Result<JsRegExp, IntrinsicError> {
+) -> Result<JsRegExp, NativeError> {
     // §22.1.3.{13,14,15} step 6 — `pattern = ? ToString(arg)`.
     // Coerce every spec-relevant operand before compiling.
     let pattern_units: Vec<u16> = if value.is_undefined() {
@@ -1285,40 +1453,46 @@ fn coerce_pattern_to_regexp(
             "[object Object]".encode_utf16().collect()
         }
     } else {
-        return Err(IntrinsicError::BadArgument {
-            index: 0,
-            reason: "must be a regular expression or string",
-        });
+        return Err(type_error(
+            "String.prototype",
+            "must be a regular expression or string",
+        ));
     };
-    JsRegExp::compile(gc_heap, &pattern_units, flags).map_err(|_| IntrinsicError::BadArgument {
-        index: 0,
-        reason: "is not a valid regular expression pattern",
+    JsRegExp::compile(gc_heap, &pattern_units, flags).map_err(|_| {
+        type_error(
+            "String.prototype",
+            "is not a valid regular expression pattern",
+        )
     })
 }
 
-fn impl_match(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
+fn impl_match(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
     let undef = Value::undefined();
-    let re = if let Some(r) = args.args.first().and_then(|v| v.as_regexp()) {
+    let re = if let Some(r) = args.first().and_then(|v| v.as_regexp()) {
         r
     } else {
-        let arg0 = args.args.first().unwrap_or(&undef);
-        coerce_pattern_to_regexp(arg0, "", args.gc_heap)?
+        let arg0 = args.first().unwrap_or(&undef);
+        coerce_pattern_to_regexp(arg0, "", ctx.heap_mut())?
     };
     let re = &re;
-    let recv_units = recv.to_utf16_vec(args.gc_heap);
-    if re.flags(&*args.gc_heap).global {
+    let recv_units = recv.to_utf16_vec(ctx.heap_mut());
+    if re.flags(ctx.heap()).global {
         // `g` flag → return array of full matches only (no captures).
-        let matches = collect_regex_matches(re, &*args.gc_heap, &recv_units);
+        let matches = collect_regex_matches(re, ctx.heap(), &recv_units);
         if matches.is_empty() {
             return Ok(Value::null());
         }
         let mut out: Vec<Value> = Vec::with_capacity(matches.len());
         for m in &matches {
-            let s = JsString::from_utf16_units(&recv_units[m.range.clone()], args.gc_heap)?;
+            let s = JsString::from_utf16_units(&recv_units[m.range.clone()], ctx.heap_mut())?;
             out.push(Value::string(s));
         }
-        return Ok(Value::array(args.array_from_elements_rooted(
+        return Ok(Value::array(ctx.array_from_elements_with_roots(
             out.iter().cloned(),
             &[],
             &[out.as_slice()],
@@ -1327,7 +1501,7 @@ fn impl_match(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     // Non-global → mirror `RegExp.prototype.exec` (carries
     // `index` / `input` / `groups` per §22.2.7.2).
     let m = match re
-        .find_from_utf16(&*args.gc_heap, &recv_units, 0)
+        .find_from_utf16(ctx.heap(), &recv_units, 0)
         .into_iter()
         .next()
     {
@@ -1335,94 +1509,100 @@ fn impl_match(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         None => return Ok(Value::null()),
     };
     let recv_clone = recv;
-    let has_indices = re.flags(&*args.gc_heap).has_indices;
-    let arr = crate::regexp_prototype::build_match_result(
+    let has_indices = re.flags(ctx.heap()).has_indices;
+    let arr = crate::regexp_prototype::build_match_result_native(
         &m,
         &recv_units,
         recv_clone,
         has_indices,
-        args,
+        ctx,
         &[],
         &[],
-    )?;
+    )
+    .map_err(|err| type_error("String.prototype", err.to_string()))?;
     Ok(Value::array(arr))
 }
 
-fn impl_match_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
+fn impl_match_all(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
     let undef = Value::undefined();
-    let re = if let Some(r) = args.args.first().and_then(|v| v.as_regexp()) {
+    let re = if let Some(r) = args.first().and_then(|v| v.as_regexp()) {
         // §22.1.3.14 step 5.b: matchAll requires the global flag on
         // a RegExp arg; non-global is a TypeError.
-        let heap = &*args.gc_heap;
+        let heap = ctx.heap();
         if !r.flags(heap).global {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "must be a global regular expression",
-            });
+            return Err(type_error(
+                "String.prototype",
+                "must be a global regular expression",
+            ));
         }
         r
     } else {
         // §22.1.3.14 step 6.b: when the arg is not a RegExp, the
         // synthesised regex always has `g` set so the iteration
         // sweep visits every match.
-        let arg0 = args.args.first().unwrap_or(&undef);
-        coerce_pattern_to_regexp(arg0, "g", args.gc_heap)?
+        let arg0 = args.first().unwrap_or(&undef);
+        coerce_pattern_to_regexp(arg0, "g", ctx.heap_mut())?
     };
     let re = &re;
-    let recv_units = recv.to_utf16_vec(args.gc_heap);
-    let matches = collect_regex_matches(re, &*args.gc_heap, &recv_units);
-    let has_indices = re.flags(&*args.gc_heap).has_indices;
+    let recv_units = recv.to_utf16_vec(ctx.heap_mut());
+    let matches = collect_regex_matches(re, ctx.heap(), &recv_units);
+    let has_indices = re.flags(ctx.heap()).has_indices;
     let recv_clone = recv;
     let mut out: Vec<Value> = Vec::with_capacity(matches.len());
     for m in &matches {
-        let arr = crate::regexp_prototype::build_match_result(
+        let arr = crate::regexp_prototype::build_match_result_native(
             m,
             &recv_units,
             recv_clone,
             has_indices,
-            args,
+            ctx,
             &[],
             &[out.as_slice()],
-        )?;
+        )
+        .map_err(|err| type_error("String.prototype", err.to_string()))?;
         out.push(Value::array(arr));
     }
     // §22.1.3.14 step 7 — `Invoke(rx, @@matchAll, « S »)` returns a
     // `RegExp String Iterator`. The foundation lowers it to a
     // pre-computed Array wrapped in an `IteratorState::Array` so
     // each `next()` step yields one match in iteration order.
-    let arr = args.array_from_elements_rooted(out.iter().cloned(), &[], &[out.as_slice()])?;
+    let arr = ctx.array_from_elements_with_roots(out.iter().cloned(), &[], &[out.as_slice()])?;
     let arr_value = Value::array(arr);
     let state = crate::IteratorState::Array {
         array: arr,
         index: 0,
         origin: crate::BuiltinIteratorOrigin::Array,
     };
-    let handle = args
-        .gc_heap
+    let handle = ctx
         .alloc_old(state)
-        .map_err(|_| IntrinsicError::OutOfRange {
-            index: 0,
-            reason: "iterator allocation failed",
-        })?;
+        .map_err(|_| range_error("String.prototype", "iterator allocation failed"))?;
     let _ = arr_value;
     Ok(Value::iterator(handle))
 }
 
-fn impl_search(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
+fn impl_search(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
     let undef = Value::undefined();
-    let re = if let Some(r) = args.args.first().and_then(|v| v.as_regexp()) {
+    let re = if let Some(r) = args.first().and_then(|v| v.as_regexp()) {
         r
     } else {
-        let arg0 = args.args.first().unwrap_or(&undef);
-        coerce_pattern_to_regexp(arg0, "", args.gc_heap)?
+        let arg0 = args.first().unwrap_or(&undef);
+        coerce_pattern_to_regexp(arg0, "", ctx.heap_mut())?
     };
     let re = &re;
-    let recv_units = recv.to_utf16_vec(args.gc_heap);
+    let recv_units = recv.to_utf16_vec(ctx.heap_mut());
     // `search` always starts at index 0 — `lastIndex` is ignored
     // and not mutated per spec §22.1.3.13.
-    let heap = &*args.gc_heap;
+    let heap = ctx.heap();
     let pos = re
         .find_from_utf16(heap, &recv_units, 0)
         .into_iter()
@@ -1431,103 +1611,75 @@ fn impl_search(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::number(NumberValue::from_i32(pos)))
 }
 
-/// Declarative `String.prototype` table.
-///
-/// Task 30 brought the foundation-complete state for non-regex
-/// methods; task 31 layers in the regex-arg overloads of `replace`
-/// / `replaceAll` / `split` plus the new `match` / `matchAll` /
-/// `search` entries.
-pub static STRING_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
-    std::sync::LazyLock::new(|| {
-        crate::intrinsics!(
-            String,
-            "length"        / 0 => impl_length,
-            "charCodeAt"    / 1 => impl_char_code_at,
-            "charAt"        / 1 => impl_char_at,
-            "codePointAt"   / 1 => impl_code_point_at,
-            "at"            / 1 => impl_at,
-            "slice"         / 2 => impl_slice,
-            "substring"     / 2 => impl_substring,
-            // §22.1.3.{6,7,9,10,14,15,24} — these spec headings list
-            // the second argument in `[ , … ]` brackets, so per
-            // §17 the function-object `length` reflects only the
-            // first required parameter (== 1).
-            "indexOf"       / 1 => impl_index_of,
-            "lastIndexOf"   / 1 => impl_last_index_of,
-            "includes"      / 1 => impl_includes,
-            "startsWith"    / 1 => impl_starts_with,
-            "endsWith"      / 1 => impl_ends_with,
-            "concat"        / 1 => impl_concat,
-            "repeat"        / 1 => impl_repeat,
-            "padStart"      / 1 => impl_pad_start,
-            "padEnd"        / 1 => impl_pad_end,
-            "trim"          / 0 => impl_trim,
-            "trimStart"     / 0 => impl_trim_start,
-            "trimEnd"       / 0 => impl_trim_end,
-            // §B.2.3.2 / §B.2.3.3 — `trimLeft` is the AnnexB alias
-            // for `trimStart`; `trimRight` is the alias for
-            // `trimEnd`. Spec carries the same algorithm body, so
-            // route both through the same intrinsic impls.
-            "trimLeft"      / 0 => impl_trim_start,
-            "trimRight"     / 0 => impl_trim_end,
-            // §22.1.3.10 / .11 — Well-Formed Unicode Strings.
-            "isWellFormed"  / 0 => impl_is_well_formed,
-            "toWellFormed"  / 0 => impl_to_well_formed,
-            // §B.2.3.1 AnnexB legacy substr(start, length).
-            "substr"        / 2 => impl_substr,
-            // §B.2.3 AnnexB HTML wrappers.
-            "anchor"        / 1 => impl_anchor,
-            "big"           / 0 => impl_big,
-            "blink"         / 0 => impl_blink,
-            "bold"          / 0 => impl_bold,
-            "fixed"         / 0 => impl_fixed,
-            "fontcolor"     / 1 => impl_fontcolor,
-            "fontsize"      / 1 => impl_fontsize,
-            "italics"       / 0 => impl_italics,
-            "link"          / 1 => impl_link,
-            "small"         / 0 => impl_small,
-            "strike"        / 0 => impl_strike,
-            "sub"           / 0 => impl_sub,
-            "sup"           / 0 => impl_sup,
-            "toLowerCase"   / 0 => impl_to_lower_case,
-            "toUpperCase"   / 0 => impl_to_upper_case,
-            // §22.1.3.21 / §22.1.3.23 — `toLocaleLowerCase` /
-            // `toLocaleUpperCase` accept an optional `locales`
-            // argument but their default behaviour matches their
-            // locale-insensitive counterparts in the absence of an
-            // Intl Locale impl. Until Intl lands, alias to the
-            // generic case folders so the property exists and the
-            // spec result-shape (a string of the same length plus
-            // case mapping) holds for the ASCII fast path.
-            "toLocaleLowerCase" / 0 => impl_to_lower_case,
-            "toLocaleUpperCase" / 0 => impl_to_upper_case,
-            "replace"       / 2 => impl_replace,
-            "replaceAll"    / 2 => impl_replace_all,
-            "split"         / 2 => impl_split,
-            "match"         / 1 => impl_match,
-            "matchAll"      / 1 => impl_match_all,
-            "search"        / 1 => impl_search,
-            "localeCompare" / 1 => impl_locale_compare,
-            "normalize"     / 1 => impl_normalize,
-            "toString"      / 0 => impl_to_string,
-            "valueOf"       / 0 => impl_to_string,
-        )
-    });
+type StringNativeFn = fn(&mut NativeCtx<'_>, &Value, &[Value]) -> Result<Value, NativeError>;
+
+fn intrinsic_impl(name: &str) -> Option<StringNativeFn> {
+    Some(match name {
+        "length" => impl_length,
+        "charCodeAt" => impl_char_code_at,
+        "charAt" => impl_char_at,
+        "codePointAt" => impl_code_point_at,
+        "at" => impl_at,
+        "slice" => impl_slice,
+        "substring" => impl_substring,
+        "indexOf" => impl_index_of,
+        "lastIndexOf" => impl_last_index_of,
+        "includes" => impl_includes,
+        "startsWith" => impl_starts_with,
+        "endsWith" => impl_ends_with,
+        "concat" => impl_concat,
+        "repeat" => impl_repeat,
+        "padStart" => impl_pad_start,
+        "padEnd" => impl_pad_end,
+        "trim" => impl_trim,
+        "trimStart" | "trimLeft" => impl_trim_start,
+        "trimEnd" | "trimRight" => impl_trim_end,
+        "isWellFormed" => impl_is_well_formed,
+        "toWellFormed" => impl_to_well_formed,
+        "substr" => impl_substr,
+        "anchor" => impl_anchor,
+        "big" => impl_big,
+        "blink" => impl_blink,
+        "bold" => impl_bold,
+        "fixed" => impl_fixed,
+        "fontcolor" => impl_fontcolor,
+        "fontsize" => impl_fontsize,
+        "italics" => impl_italics,
+        "link" => impl_link,
+        "small" => impl_small,
+        "strike" => impl_strike,
+        "sub" => impl_sub,
+        "sup" => impl_sup,
+        "toLowerCase" | "toLocaleLowerCase" => impl_to_lower_case,
+        "toUpperCase" | "toLocaleUpperCase" => impl_to_upper_case,
+        "replace" => impl_replace,
+        "replaceAll" => impl_replace_all,
+        "split" => impl_split,
+        "match" => impl_match,
+        "matchAll" => impl_match_all,
+        "search" => impl_search,
+        "localeCompare" => impl_locale_compare,
+        "normalize" => impl_normalize,
+        "toString" | "valueOf" => impl_to_string,
+        _ => return None,
+    })
+}
 
 /// §22.1.3.10 String.prototype.lastIndexOf(search, fromIndex?).
-fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    let needle = arg_to_string(args, 0)?;
+fn impl_last_index_of(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    let needle = arg_to_string(ctx, args, 0)?;
     // ECMA-262 §22.1.3.11: `position` defaults to +∞, then
     // ToInteger, then min(pos, len). NaN clamps to 0. Foundation
     // takes the simpler accessor and clamps to `recv.len()`.
-    let position = arg_u32_or(args, 1, recv.len())?.min(recv.len());
+    let position = arg_u32_or(ctx, args, 1, recv.len())?.min(recv.len());
     let pos = recv
-        .last_index_of(needle, position, None, args.gc_heap)
-        .map_err(|Interrupted| IntrinsicError::BadArgument {
-            index: 0,
-            reason: "interrupted",
-        })?;
+        .last_index_of(needle, position, None, ctx.heap_mut())
+        .map_err(|Interrupted| type_error("String.prototype", "interrupted"))?;
     let value = match pos {
         Some(p) => NumberValue::from_i32(p as i32),
         None => NumberValue::from_i32(-1),
@@ -1538,14 +1690,18 @@ fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
 /// §22.1.3.12 String.prototype.localeCompare. Foundation falls
 /// back to spec-default Unicode code-point comparison; locale-
 /// aware ordering ships through `Intl.Collator`.
-fn impl_locale_compare(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?.to_lossy_string(args.gc_heap);
-    let other = match args.args.first() {
+fn impl_locale_compare(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?.to_lossy_string(ctx.heap_mut());
+    let other = match args.first() {
         Some(v) => {
-            if let Some(s) = v.as_string(args.gc_heap) {
-                s.to_lossy_string(args.gc_heap)
+            if let Some(s) = v.as_string(ctx.heap_mut()) {
+                s.to_lossy_string(ctx.heap_mut())
             } else {
-                v.display_string(&*args.gc_heap)
+                v.display_string(ctx.heap())
             }
         }
         None => "undefined".to_string(),
@@ -1565,41 +1721,46 @@ fn impl_locale_compare(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
 /// surface so call sites that depend on the method existing keep
 /// working. Real normalisation lands alongside the ICU integration
 /// follow-up.
-fn impl_normalize(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    let form = match args.args.first() {
+fn impl_normalize(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    let form = match args.first() {
         None => "NFC".to_string(),
         Some(v) if v.is_undefined() => "NFC".to_string(),
         Some(v) => {
-            if let Some(s) = v.as_string(args.gc_heap) {
-                s.to_lossy_string(args.gc_heap)
+            if let Some(s) = v.as_string(ctx.heap_mut()) {
+                s.to_lossy_string(ctx.heap_mut())
             } else {
-                return Err(IntrinsicError::BadArgument {
-                    index: 0,
-                    reason: "must be a string",
-                });
+                return Err(type_error("String.prototype", "must be a string"));
             }
         }
     };
     if !matches!(form.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
-        return Err(IntrinsicError::BadArgument {
-            index: 0,
-            reason: "must be one of NFC / NFD / NFKC / NFKD",
-        });
+        return Err(type_error(
+            "String.prototype",
+            "must be one of NFC / NFD / NFKC / NFKD",
+        ));
     }
     Ok(Value::string(recv))
 }
 
 /// §22.1.3.27 String.prototype.toString — returns the primitive.
-fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
+fn impl_to_string(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
     Ok(Value::string(recv))
 }
 
-/// Convenience accessor used by the dispatcher.
+/// Whether `name` is installed on `String.prototype`.
 #[must_use]
-pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
-    STRING_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::String, name)
+pub fn is_builtin_method(name: &str) -> bool {
+    STRING_PROTOTYPE_METHODS.iter().any(|m| m.name == name)
 }
 
 /// Generic bridge that exposes a `String.prototype.<name>` intrinsic
@@ -1611,16 +1772,16 @@ pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> 
 ///
 /// The function captures the method name via a per-method
 /// trampoline (see [`string_prototype_methods!`] below) and then
-/// looks up the implementation in [`STRING_PROTOTYPE_TABLE`].
+/// looks up the shared implementation by name.
 fn native_string_method(
     name: &'static str,
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
     // §22.1.3.18 `replace` / §22.1.3.19 `replaceAll` — when the
-    // replaceValue argument is callable, the intrinsic-table path
-    // can't drive the replacement (no interpreter context). Intercept
-    // here so `'abc'.replace('b', fn)` and `'abc'.replaceAll('b', fn)`
+    // replaceValue argument is callable, the shared direct native
+    // method path needs the interpreter context. Intercept here so
+    // `'abc'.replace('b', fn)` and `'abc'.replaceAll('b', fn)`
     // dispatch the callback with `(matched, position, string)` and
     // splice the result string.
     if (name == "replace" || name == "replaceAll")
@@ -1634,9 +1795,9 @@ fn native_string_method(
     // §22.1.3 — every `String.prototype` method (other than
     // `toString` / `valueOf`, which use `thisStringValue`) opens with
     // `RequireObjectCoercible(this)` then `S = ? ToString(this)`. The
-    // intrinsic path's `receiver_string` only inspects internal slots,
-    // so a non-wrapper Object receiver with a user `toString` (or one
-    // that throws / returns a Symbol) silently fell back to
+    // old receiver-only helper inspected internal slots, so a
+    // non-wrapper Object receiver with a user `toString` (or one that
+    // throws / returns a Symbol) silently fell back to
     // `"[object Object]"`. Coerce the receiver here, uniformly, so the
     // spec `ToString` ladder fires for `.call` / `.apply` on any
     // receiver and user `toString` / `@@toPrimitive` / abrupt
@@ -1705,27 +1866,11 @@ fn native_string_method(
             .coerce_string_method_args(&exec, name, &mut coerced_args)
             .map_err(|e| crate::native_function::vm_to_native_error(e, name))?;
     }
-    let allocation_roots = ctx.collect_native_roots();
-    let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
+    let impl_fn = intrinsic_impl(name).ok_or_else(|| NativeError::TypeError {
         name,
         reason: "unknown String.prototype method".to_string(),
     })?;
-    (entry.impl_fn)(&mut IntrinsicArgs {
-        receiver: &receiver,
-        args: &coerced_args,
-        gc_heap: ctx.heap_mut(),
-        allocation_roots: allocation_roots.as_slice(),
-    })
-    .map_err(|err| match err {
-        IntrinsicError::OutOfRange { .. } => NativeError::RangeError {
-            name,
-            reason: err.to_string(),
-        },
-        _ => NativeError::TypeError {
-            name,
-            reason: err.to_string(),
-        },
-    })
+    impl_fn(ctx, &receiver, &coerced_args)
 }
 
 /// Drive `String.prototype.replace` / `replaceAll` when
@@ -1741,16 +1886,7 @@ fn native_string_replace_callable(
 ) -> Result<Value, NativeError> {
     let receiver = *ctx.this_value();
 
-    let mut intrinsic_args = IntrinsicArgs {
-        receiver: &receiver,
-        args,
-        gc_heap: ctx.heap_mut(),
-        allocation_roots: &[],
-    };
-    let recv = receiver_string(&mut intrinsic_args).map_err(|err| NativeError::TypeError {
-        name: if replace_all { "replaceAll" } else { "replace" },
-        reason: err.to_string(),
-    })?;
+    let recv = receiver_string(ctx, &receiver)?;
     let needle = args
         .first()
         .and_then(|v| v.as_string(ctx.heap()))
@@ -1884,8 +2020,8 @@ macro_rules! string_prototype_methods {
         ///
         /// Property-access surfaces (`"".split`, `Reflect.get`,
         /// `Object.getOwnPropertyNames(String.prototype)`) resolve
-        /// through this table; the compile-time `CallString` fast
-        /// path keeps using [`STRING_PROTOTYPE_TABLE`] directly.
+        /// through this table; direct calls resolve through the same
+        /// native functions via `GetMethod + Call`.
         pub static STRING_PROTOTYPE_METHODS: &[MethodSpec] = &[
             $(MethodSpec {
                 name: $name,
@@ -1953,30 +2089,39 @@ string_prototype_methods!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Interpreter, NativeCallInfo};
 
-    /// Drive an intrinsic with a string receiver. Argument inputs
+    /// Drive a builtin string method with a string receiver. Argument inputs
     /// can be either decimal-integer strings (turned into
     /// `Value::Number`) or quoted forms — the helper auto-detects
     /// to keep the existing test cases readable.
     fn call(method: &str, recv: &str, args: &[&str]) -> String {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let recv_v = Value::string(JsString::from_str(recv, &mut gc_heap).unwrap());
+        let mut interp = Interpreter::new();
+        let recv_v = Value::string(JsString::from_str(recv, interp.gc_heap_mut()).unwrap());
         let arg_vs: Vec<Value> = args
             .iter()
             .map(|s| match s.parse::<i32>() {
                 Ok(n) => Value::number(NumberValue::from_i32(n)),
-                Err(_) => Value::string(JsString::from_str(s, &mut gc_heap).unwrap()),
+                Err(_) => Value::string(JsString::from_str(s, interp.gc_heap_mut()).unwrap()),
             })
             .collect();
-        let entry = lookup(method).unwrap();
-        let result = (entry.impl_fn)(&mut IntrinsicArgs {
-            receiver: &recv_v,
-            args: &arg_vs,
-            gc_heap: &mut gc_heap,
-            allocation_roots: &[],
-        })
-        .unwrap();
-        result.display_string(&gc_heap)
+        let impl_fn = intrinsic_impl(method).unwrap();
+        let result = {
+            let mut ctx = NativeCtx::new_with_call_info(&mut interp, NativeCallInfo::call(recv_v));
+            impl_fn(&mut ctx, &recv_v, &arg_vs).unwrap()
+        };
+        result.display_string(interp.gc_heap())
+    }
+
+    fn invoke_raw(
+        method: &str,
+        receiver: &Value,
+        args: &[Value],
+        interp: &mut Interpreter,
+    ) -> Result<Value, NativeError> {
+        let impl_fn = intrinsic_impl(method).unwrap();
+        let mut ctx = NativeCtx::new_with_call_info(interp, NativeCallInfo::call(*receiver));
+        impl_fn(&mut ctx, receiver, args)
     }
 
     #[test]
@@ -2024,16 +2169,9 @@ mod tests {
 
     #[test]
     fn bad_receiver_rejects() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let entry = lookup("length").unwrap();
-        let err = (entry.impl_fn)(&mut IntrinsicArgs {
-            receiver: &Value::undefined(),
-            args: &[],
-            gc_heap: &mut gc_heap,
-            allocation_roots: &[],
-        })
-        .unwrap_err();
-        assert!(matches!(err, IntrinsicError::BadReceiver { .. }));
+        let mut interp = Interpreter::new();
+        let err = invoke_raw("length", &Value::undefined(), &[], &mut interp).unwrap_err();
+        assert!(matches!(err, NativeError::TypeError { .. }));
     }
 
     /// Argument shorthand for [`call_v`].
@@ -2046,37 +2184,25 @@ mod tests {
     /// the raw [`Value`] so the caller can inspect non-string
     /// outputs (booleans, numbers, arrays).
     fn call_v(method: &str, recv: &str, args: &[A]) -> Value {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        call_v_with_heap(method, recv, args, &mut gc_heap)
+        let mut interp = Interpreter::new();
+        call_v_with_interp(method, recv, args, &mut interp)
     }
 
-    fn call_v_with_heap(
-        method: &str,
-        recv: &str,
-        args: &[A],
-        gc_heap: &mut otter_gc::GcHeap,
-    ) -> Value {
-        let recv_v = Value::string(JsString::from_str(recv, gc_heap).unwrap());
+    fn call_v_with_interp(method: &str, recv: &str, args: &[A], interp: &mut Interpreter) -> Value {
+        let recv_v = Value::string(JsString::from_str(recv, interp.gc_heap_mut()).unwrap());
         let arg_vs: Vec<Value> = args
             .iter()
             .map(|a| match a {
                 A::N(n) => Value::number(NumberValue::from_i32(*n)),
-                A::S(s) => Value::string(JsString::from_str(s, gc_heap).unwrap()),
+                A::S(s) => Value::string(JsString::from_str(s, interp.gc_heap_mut()).unwrap()),
             })
             .collect();
-        let entry = lookup(method).unwrap();
-        (entry.impl_fn)(&mut IntrinsicArgs {
-            receiver: &recv_v,
-            args: &arg_vs,
-            gc_heap,
-            allocation_roots: &[],
-        })
-        .unwrap()
+        invoke_raw(method, &recv_v, &arg_vs, interp).unwrap()
     }
 
     fn call_s(method: &str, recv: &str, args: &[A]) -> String {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        call_v_with_heap(method, recv, args, &mut gc_heap).display_string(&gc_heap)
+        let mut interp = Interpreter::new();
+        call_v_with_interp(method, recv, args, &mut interp).display_string(interp.gc_heap())
     }
 
     #[test]
@@ -2107,20 +2233,19 @@ mod tests {
         // §22.1.3.5 — `for each next of arguments: nextString = ?
         // ToString(next)`. Numbers, Booleans, etc. coerce instead
         // of rejecting.
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let recv = Value::string(JsString::from_str("a", &mut gc_heap).unwrap());
-        let entry = lookup("concat").unwrap();
-        let result = (entry.impl_fn)(&mut IntrinsicArgs {
-            receiver: &recv,
-            args: &[Value::number(NumberValue::from_i32(3))],
-            gc_heap: &mut gc_heap,
-            allocation_roots: &[],
-        })
+        let mut interp = Interpreter::new();
+        let recv = Value::string(JsString::from_str("a", interp.gc_heap_mut()).unwrap());
+        let result = invoke_raw(
+            "concat",
+            &recv,
+            &[Value::number(NumberValue::from_i32(3))],
+            &mut interp,
+        )
         .unwrap();
-        let Some(s) = result.as_string(&gc_heap) else {
+        let Some(s) = result.as_string(interp.gc_heap()) else {
             panic!("expected string result, got {result:?}");
         };
-        assert_eq!(s.to_lossy_string(&gc_heap), "a3");
+        assert_eq!(s.to_lossy_string(interp.gc_heap()), "a3");
     }
 
     #[test]
@@ -2132,17 +2257,19 @@ mod tests {
 
     #[test]
     fn repeat_rejects_negative() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let recv = Value::string(JsString::from_str("abc", &mut gc_heap).unwrap());
-        let entry = lookup("repeat").unwrap();
-        let err = (entry.impl_fn)(&mut IntrinsicArgs {
-            receiver: &recv,
-            args: &[Value::number(NumberValue::from_i32(-1))],
-            gc_heap: &mut gc_heap,
-            allocation_roots: &[],
-        })
+        let mut interp = Interpreter::new();
+        let recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
+        let err = invoke_raw(
+            "repeat",
+            &recv,
+            &[Value::number(NumberValue::from_i32(-1))],
+            &mut interp,
+        )
         .unwrap_err();
-        assert!(matches!(err, IntrinsicError::BadArgument { .. }));
+        assert!(matches!(
+            err,
+            NativeError::TypeError { .. } | NativeError::RangeError { .. }
+        ));
     }
 
     #[test]
@@ -2196,27 +2323,26 @@ mod tests {
     #[test]
     fn code_point_at_combines_surrogates() {
         // U+10000 = '𐀀' = 0xD800 0xDC00
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let mut interp = Interpreter::new();
         let units: [u16; 3] = [0xD800, 0xDC00, b'a' as u16];
-        let recv = Value::string(JsString::from_utf16_units(&units, &mut gc_heap).unwrap());
-        let entry = lookup("codePointAt").unwrap();
-        let r = (entry.impl_fn)(&mut IntrinsicArgs {
-            receiver: &recv,
-            args: &[Value::number(NumberValue::from_i32(0))],
-            gc_heap: &mut gc_heap,
-            allocation_roots: &[],
-        })
+        let recv = Value::string(JsString::from_utf16_units(&units, interp.gc_heap_mut()).unwrap());
+        let r = invoke_raw(
+            "codePointAt",
+            &recv,
+            &[Value::number(NumberValue::from_i32(0))],
+            &mut interp,
+        )
         .unwrap();
-        assert_eq!(r.display_string(&gc_heap), "65536");
+        assert_eq!(r.display_string(interp.gc_heap()), "65536");
         // Index 1 is the trailing surrogate alone.
-        let r2 = (entry.impl_fn)(&mut IntrinsicArgs {
-            receiver: &recv,
-            args: &[Value::number(NumberValue::from_i32(1))],
-            gc_heap: &mut gc_heap,
-            allocation_roots: &[],
-        })
+        let r2 = invoke_raw(
+            "codePointAt",
+            &recv,
+            &[Value::number(NumberValue::from_i32(1))],
+            &mut interp,
+        )
         .unwrap();
-        assert_eq!(r2.display_string(&gc_heap), "56320");
+        assert_eq!(r2.display_string(interp.gc_heap()), "56320");
     }
 
     #[test]
@@ -2227,21 +2353,14 @@ mod tests {
         assert_eq!(call_s("toLowerCase", "Hello, World!", &[]), "hello, world!");
         // Non-ASCII passes through unchanged.
         let units: [u16; 3] = [0x00C9, b'a' as u16, b'b' as u16]; // 'É' + "ab"
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let recv = Value::string(JsString::from_utf16_units(&units, &mut gc_heap).unwrap());
-        let entry = lookup("toLowerCase").unwrap();
-        let r = (entry.impl_fn)(&mut IntrinsicArgs {
-            receiver: &recv,
-            args: &[],
-            gc_heap: &mut gc_heap,
-            allocation_roots: &[],
-        })
-        .unwrap();
+        let mut interp = Interpreter::new();
+        let recv = Value::string(JsString::from_utf16_units(&units, interp.gc_heap_mut()).unwrap());
+        let r = invoke_raw("toLowerCase", &recv, &[], &mut interp).unwrap();
         // 'É' should stay (ASCII-only fold), 'a','b' lowercase.
-        let Some(s) = r.as_string(&gc_heap) else {
+        let Some(s) = r.as_string(interp.gc_heap()) else {
             panic!("expected string");
         };
-        let v = s.to_utf16_vec(&gc_heap);
+        let v = s.to_utf16_vec(interp.gc_heap());
         assert_eq!(v, vec![0x00C9, b'a' as u16, b'b' as u16]);
     }
 
@@ -2276,98 +2395,98 @@ mod tests {
 
     #[test]
     fn split_basic() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let v = call_v_with_heap("split", "a,b,c", &[A::S(",")], &mut gc_heap);
+        let mut interp = Interpreter::new();
+        let v = call_v_with_interp("split", "a,b,c", &[A::S(",")], &mut interp);
         let Some(a) = v.as_array() else {
             panic!("expected array");
         };
-        assert_eq!(crate::array::len(a, &gc_heap), 3);
+        assert_eq!(crate::array::len(a, interp.gc_heap()), 3);
         assert_eq!(
-            crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+            crate::array::get(a, interp.gc_heap(), 0).display_string(interp.gc_heap()),
             "a"
         );
         assert_eq!(
-            crate::array::get(a, &gc_heap, 1).display_string(&gc_heap),
+            crate::array::get(a, interp.gc_heap(), 1).display_string(interp.gc_heap()),
             "b"
         );
         assert_eq!(
-            crate::array::get(a, &gc_heap, 2).display_string(&gc_heap),
+            crate::array::get(a, interp.gc_heap(), 2).display_string(interp.gc_heap()),
             "c"
         );
     }
 
     #[test]
     fn split_consecutive_separators_yield_empty_chunks() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let v = call_v_with_heap("split", "a,,b", &[A::S(",")], &mut gc_heap);
+        let mut interp = Interpreter::new();
+        let v = call_v_with_interp("split", "a,,b", &[A::S(",")], &mut interp);
         let Some(a) = v.as_array() else {
             panic!("expected array");
         };
-        assert_eq!(crate::array::len(a, &gc_heap), 3);
+        assert_eq!(crate::array::len(a, interp.gc_heap()), 3);
         assert_eq!(
-            crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+            crate::array::get(a, interp.gc_heap(), 0).display_string(interp.gc_heap()),
             "a"
         );
         assert_eq!(
-            crate::array::get(a, &gc_heap, 1).display_string(&gc_heap),
+            crate::array::get(a, interp.gc_heap(), 1).display_string(interp.gc_heap()),
             ""
         );
         assert_eq!(
-            crate::array::get(a, &gc_heap, 2).display_string(&gc_heap),
+            crate::array::get(a, interp.gc_heap(), 2).display_string(interp.gc_heap()),
             "b"
         );
     }
 
     #[test]
     fn split_empty_separator_yields_code_units() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let v = call_v_with_heap("split", "abc", &[A::S("")], &mut gc_heap);
+        let mut interp = Interpreter::new();
+        let v = call_v_with_interp("split", "abc", &[A::S("")], &mut interp);
         let Some(a) = v.as_array() else {
             panic!("expected array");
         };
-        assert_eq!(crate::array::len(a, &gc_heap), 3);
+        assert_eq!(crate::array::len(a, interp.gc_heap()), 3);
         assert_eq!(
-            crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+            crate::array::get(a, interp.gc_heap(), 0).display_string(interp.gc_heap()),
             "a"
         );
         assert_eq!(
-            crate::array::get(a, &gc_heap, 1).display_string(&gc_heap),
+            crate::array::get(a, interp.gc_heap(), 1).display_string(interp.gc_heap()),
             "b"
         );
         assert_eq!(
-            crate::array::get(a, &gc_heap, 2).display_string(&gc_heap),
+            crate::array::get(a, interp.gc_heap(), 2).display_string(interp.gc_heap()),
             "c"
         );
     }
 
     #[test]
     fn split_with_limit() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let v = call_v_with_heap("split", "a,b,c,d", &[A::S(","), A::N(2)], &mut gc_heap);
+        let mut interp = Interpreter::new();
+        let v = call_v_with_interp("split", "a,b,c,d", &[A::S(","), A::N(2)], &mut interp);
         let Some(a) = v.as_array() else {
             panic!("expected array");
         };
-        assert_eq!(crate::array::len(a, &gc_heap), 2);
+        assert_eq!(crate::array::len(a, interp.gc_heap()), 2);
         assert_eq!(
-            crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+            crate::array::get(a, interp.gc_heap(), 0).display_string(interp.gc_heap()),
             "a"
         );
         assert_eq!(
-            crate::array::get(a, &gc_heap, 1).display_string(&gc_heap),
+            crate::array::get(a, interp.gc_heap(), 1).display_string(interp.gc_heap()),
             "b"
         );
     }
 
     #[test]
     fn split_no_match_returns_singleton() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let v = call_v_with_heap("split", "abc", &[A::S(",")], &mut gc_heap);
+        let mut interp = Interpreter::new();
+        let v = call_v_with_interp("split", "abc", &[A::S(",")], &mut interp);
         let Some(a) = v.as_array() else {
             panic!("expected array");
         };
-        assert_eq!(crate::array::len(a, &gc_heap), 1);
+        assert_eq!(crate::array::len(a, interp.gc_heap()), 1);
         assert_eq!(
-            crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+            crate::array::get(a, interp.gc_heap(), 0).display_string(interp.gc_heap()),
             "abc"
         );
     }
@@ -2375,46 +2494,39 @@ mod tests {
     #[test]
     fn split_empty_receiver() {
         // "".split(",") === [""]
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let v = call_v_with_heap("split", "", &[A::S(",")], &mut gc_heap);
+        let mut interp = Interpreter::new();
+        let v = call_v_with_interp("split", "", &[A::S(",")], &mut interp);
         let Some(a) = v.as_array() else {
             panic!("expected array");
         };
-        assert_eq!(crate::array::len(a, &gc_heap), 1);
+        assert_eq!(crate::array::len(a, interp.gc_heap()), 1);
         assert_eq!(
-            crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+            crate::array::get(a, interp.gc_heap(), 0).display_string(interp.gc_heap()),
             ""
         );
 
         // "".split("") === []
-        let v2 = call_v_with_heap("split", "", &[A::S("")], &mut gc_heap);
+        let v2 = call_v_with_interp("split", "", &[A::S("")], &mut interp);
         {
             let Some(a) = v2.as_array() else {
                 panic!("expected array");
             };
-            assert_eq!(crate::array::len(a, &gc_heap), 0);
+            assert_eq!(crate::array::len(a, interp.gc_heap()), 0);
         }
     }
 
     #[test]
     fn split_undefined_separator_returns_singleton() {
         // "abc".split() === ["abc"]
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let recv = Value::string(JsString::from_str("abc", &mut gc_heap).unwrap());
-        let entry = lookup("split").unwrap();
-        let r = (entry.impl_fn)(&mut IntrinsicArgs {
-            receiver: &recv,
-            args: &[],
-            gc_heap: &mut gc_heap,
-            allocation_roots: &[],
-        })
-        .unwrap();
+        let mut interp = Interpreter::new();
+        let recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
+        let r = invoke_raw("split", &recv, &[], &mut interp).unwrap();
         let Some(a) = r.as_array() else {
             panic!("expected array");
         };
-        assert_eq!(crate::array::len(a, &gc_heap), 1);
+        assert_eq!(crate::array::len(a, interp.gc_heap()), 1);
         assert_eq!(
-            crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+            crate::array::get(a, interp.gc_heap(), 0).display_string(interp.gc_heap()),
             "abc"
         );
     }

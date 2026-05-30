@@ -1,14 +1,16 @@
-//! `Number.prototype.*` intrinsic implementations.
+//! `Number.prototype.*` native implementations.
 //!
-//! Wired through the same [`crate::intrinsics`] table the string and
-//! array prototypes use, so `Op::CallMethodValue` reaches them via
-//! the existing primitive-receiver dispatch path.
+//! Each method is a `fn(&mut NativeCtx, &[Value]) -> Result<Value,
+//! NativeError>` installed on `Number.prototype` via the `Number`
+//! `couch!` surface, so `Op::CallMethodValue` and the
+//! `Number.prototype.toString.call(...)` property path reach the same
+//! implementation with a re-entrant handle.
 //!
 //! # Contents
-//! - [`NUMBER_PROTOTYPE_TABLE`] — declarative table built with the
-//!   [`crate::intrinsics!`] macro.
-//! - [`lookup`] — convenience accessor used by the dispatcher.
-//! - One private `impl_*` function per method.
+//! - [`NUMBER_PROTOTYPE_METHODS`] — native method specs installed on
+//!   the global `Number.prototype`.
+//! - One native per method, plus the `thisNumberValue` /
+//!   digit-coercion helpers they share.
 //!
 //! # Foundation subset
 //! - [`Number.prototype.toString(radix?)`](
@@ -18,24 +20,96 @@
 //! - [`Number.prototype.toFixed(digits)`](
 //!     https://tc39.es/ecma262/#sec-number.prototype.tofixed
 //!   ) — `digits` clamped to `0..=20`.
+//!
+//! # See also
+//! - <https://tc39.es/ecma262/#sec-properties-of-the-number-prototype-object>
 
 use super::NumberValue;
 use crate::Value;
-use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::js_surface::{Attr, MethodSpec};
 use crate::string::JsString;
 use crate::{NativeCall, NativeCtx, NativeError};
 
-/// Coerce a digit-count argument (`fractionDigits` / `precision`)
-/// per `ToIntegerOrInfinity` (§7.1.5). Surfaces the `Symbol` and
-/// `BigInt` arms as `TypeError` (which the wrapper translates to
-/// `IntrinsicError::BadArgument`); the rest go through the loose
-/// numeric coercion.
+/// §21.1.3 `thisNumberValue(value)` — unwrap a primitive number or a
+/// Number wrapper's `[[NumberData]]`; otherwise `TypeError`.
+fn this_number_value(ctx: &NativeCtx<'_>, name: &'static str) -> Result<NumberValue, NativeError> {
+    let this = *ctx.this_value();
+    if let Some(n) = this.as_number() {
+        return Ok(n);
+    }
+    if let Some(obj) = this.as_object()
+        && let Some(n) = crate::object::number_data(obj, ctx.heap())
+    {
+        return Ok(n);
+    }
+    Err(NativeError::TypeError {
+        name,
+        reason: "Number.prototype method called on incompatible receiver".to_string(),
+    })
+}
+
+/// §21.1.3.{3,4,5} — pre-coerce object-like arguments through
+/// `ToPrimitive(Number)` so a `@@toPrimitive` / `valueOf` / `toString`
+/// on a `fractionDigits` / `precision` argument runs before the
+/// numeric ladder. Primitive arguments pass through unchanged.
+fn coerce_numeric_args(
+    ctx: &mut NativeCtx<'_>,
+    name: &'static str,
+    args: &[Value],
+) -> Result<smallvec::SmallVec<[Value; 4]>, NativeError> {
+    let exec = ctx.execution_context().cloned();
+    let mut out: smallvec::SmallVec<[Value; 4]> = smallvec::SmallVec::with_capacity(args.len());
+    for arg in args {
+        let object_like = arg.is_object()
+            || arg.is_array()
+            || arg.is_function()
+            || arg.is_closure()
+            || arg.is_native_function()
+            || arg.is_bound_function()
+            || arg.is_class_constructor()
+            || arg.is_proxy()
+            || arg.is_regexp();
+        if object_like {
+            let Some(exec) = &exec else {
+                out.push(*arg);
+                continue;
+            };
+            let interp = ctx.interp_mut();
+            match interp.evaluate_to_primitive(
+                exec,
+                arg,
+                crate::abstract_ops::ToPrimitiveHint::Number,
+            ) {
+                Ok(primitive) => out.push(primitive),
+                Err(crate::VmError::Uncaught { value }) => {
+                    return Err(NativeError::Thrown {
+                        name,
+                        message: value,
+                    });
+                }
+                Err(err) => {
+                    return Err(NativeError::TypeError {
+                        name,
+                        reason: err.to_string(),
+                    });
+                }
+            }
+        } else {
+            out.push(*arg);
+        }
+    }
+    Ok(out)
+}
+
+/// Coerce a digit-count argument (`fractionDigits` / `precision`) per
+/// `ToIntegerOrInfinity` (§7.1.5). `Symbol` / `BigInt` arms surface as
+/// `TypeError`; the rest go through the loose numeric coercion.
 fn coerce_digits_arg(
     arg: Option<&Value>,
     default_undefined: f64,
     heap: &otter_gc::GcHeap,
-) -> Result<f64, IntrinsicError> {
+    name: &'static str,
+) -> Result<f64, NativeError> {
     use super::parse::IntegerCoercion;
     let Some(v) = arg else {
         return Ok(default_undefined);
@@ -45,48 +119,41 @@ fn coerce_digits_arg(
     }
     match super::parse::to_integer_or_infinity_strict(v, heap) {
         IntegerCoercion::Ok(n) => Ok(n),
-        IntegerCoercion::SymbolNotConvertible => Err(IntrinsicError::BadArgument {
-            index: 0,
-            reason: "cannot convert a Symbol to a number",
+        IntegerCoercion::SymbolNotConvertible => Err(NativeError::TypeError {
+            name,
+            reason: "cannot convert a Symbol to a number".to_string(),
         }),
-        IntegerCoercion::BigIntNotConvertible => Err(IntrinsicError::BadArgument {
-            index: 0,
-            reason: "cannot convert a BigInt to a number",
+        IntegerCoercion::BigIntNotConvertible => Err(NativeError::TypeError {
+            name,
+            reason: "cannot convert a BigInt to a number".to_string(),
         }),
     }
 }
 
-fn receiver_number(args: &IntrinsicArgs<'_>) -> Result<NumberValue, IntrinsicError> {
-    if let Some(n) = args.receiver.as_number() {
-        return Ok(n);
-    }
-    if let Some(obj) = args.receiver.as_object() {
-        let gc = &*args.gc_heap;
-        return crate::object::number_data(obj, gc)
-            .ok_or(IntrinsicError::BadReceiver { expected: "number" });
-    }
-    Err(IntrinsicError::BadReceiver { expected: "number" })
-}
-
-/// `Number.prototype.toString(radix = 10)`.
-fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_number(args)?;
+/// §21.1.3.6 `Number.prototype.toString(radix = 10)` and
+/// `Number.prototype.toLocaleString` (locale-agnostic) share this body.
+fn to_string_radix(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let recv = this_number_value(ctx, name)?;
     // §21.1.3.6 step 2 — `radix` defaults to 10 when `undefined`,
     // otherwise routes through `ToIntegerOrInfinity`. Out-of-range
     // (`< 2` or `> 36`) raises RangeError. Symbol / BigInt raise
-    // TypeError (mapped at the intrinsic error layer).
-    let radix: u32 = if let Some(v) = args.args.first() {
+    // TypeError.
+    let radix: u32 = if let Some(v) = args.first() {
         if v.is_undefined() {
             10
         } else if v.is_symbol() {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "Cannot convert a Symbol value to a number",
+            return Err(NativeError::TypeError {
+                name,
+                reason: "Cannot convert a Symbol value to a number".to_string(),
             });
         } else if v.is_big_int() {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "Cannot convert a BigInt value to a number",
+            return Err(NativeError::TypeError {
+                name,
+                reason: "Cannot convert a BigInt value to a number".to_string(),
             });
         } else {
             let f = if let Some(n) = v.as_number() {
@@ -95,17 +162,16 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
                 if b { 1.0 } else { 0.0 }
             } else if v.is_null() {
                 0.0
-            } else if let Some(s) = v.as_string(args.gc_heap) {
-                crate::number::parse::to_number_from_string(&s.to_lossy_string(args.gc_heap))
-                    .as_f64()
+            } else if let Some(s) = v.as_string(ctx.heap()) {
+                crate::number::parse::to_number_from_string(&s.to_lossy_string(ctx.heap())).as_f64()
             } else {
                 f64::NAN
             };
             let trunc = if f.is_nan() { 0.0 } else { f.trunc() };
             if !trunc.is_finite() || !(2.0..=36.0).contains(&trunc) {
-                return Err(IntrinsicError::OutOfRange {
-                    index: 0,
-                    reason: "must be an integer in 2..=36",
+                return Err(NativeError::RangeError {
+                    name,
+                    reason: "must be an integer in 2..=36".to_string(),
                 });
             }
             trunc as u32
@@ -116,61 +182,69 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     if radix == 10 {
         return Ok(Value::string(super::ecma::number_to_string(
             recv.as_f64(),
-            args.gc_heap,
+            ctx.heap_mut(),
         )?));
     }
     let rendered = super::dragon4::number_to_string_radix(recv.as_f64(), radix);
-    Ok(Value::string(JsString::from_str(&rendered, args.gc_heap)?))
+    Ok(Value::string(JsString::from_str(&rendered, ctx.heap_mut())?))
 }
 
-/// `Number.prototype.toFixed(digits = 0)`.
-fn impl_to_fixed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_number(args)?;
+fn number_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    to_string_radix(ctx, args, "Number.prototype.toString")
+}
+
+fn number_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    to_string_radix(ctx, args, "Number.prototype.toLocaleString")
+}
+
+/// §21.1.3.3 `Number.prototype.toFixed(digits = 0)`.
+fn number_to_fixed(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    const NAME: &str = "Number.prototype.toFixed";
+    let coerced = coerce_numeric_args(ctx, NAME, args)?;
+    let recv = this_number_value(ctx, NAME)?;
     // §21.1.3.3 step 2: `f = ToIntegerOrInfinity(fractionDigits)`.
-    let f_arg = coerce_digits_arg(args.args.first(), 0.0, args.gc_heap)?;
+    let f_arg = coerce_digits_arg(coerced.first(), 0.0, ctx.heap(), NAME)?;
     // §21.1.3.3 step 3: `f` outside `[0, 100]` (or `±Infinity`)
     // raises `RangeError`.
     if !f_arg.is_finite() || !(0.0..=100.0).contains(&f_arg) {
-        return Err(IntrinsicError::OutOfRange {
-            index: 0,
-            reason: "must be an integer in 0..=100",
+        return Err(NativeError::RangeError {
+            name: NAME,
+            reason: "must be an integer in 0..=100".to_string(),
         });
     }
     let digits = f_arg as u32;
     let rendered = super::ecma_fixed::number_to_fixed(recv.as_f64(), digits);
     Ok(Value::string(JsString::from_latin1(
         rendered.as_bytes(),
-        args.gc_heap,
+        ctx.heap_mut(),
     )?))
 }
 
 /// §21.1.3.2 `Number.prototype.toExponential(fractionDigits?)`.
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#sec-number.prototype.toexponential>
-fn impl_to_exponential(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_number(args)?;
+fn number_to_exponential(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    const NAME: &str = "Number.prototype.toExponential";
+    let coerced = coerce_numeric_args(ctx, NAME, args)?;
+    let recv = this_number_value(ctx, NAME)?;
     let value = recv.as_f64();
-    // §21.1.3.2 step 3: non-finite returns ToString(x) regardless
-    // of `fractionDigits` validity. Run the cold path BEFORE the
-    // range check so `(Infinity).toExponential(101)` returns
-    // `"Infinity"` (matching V8 / Test262 `infinity.js`).
+    // §21.1.3.2 step 3: non-finite returns ToString(x) regardless of
+    // `fractionDigits` validity, so `(Infinity).toExponential(101)`
+    // returns `"Infinity"`.
     if !value.is_finite() {
         return Ok(Value::string(super::ecma::number_to_string(
             value,
-            args.gc_heap,
+            ctx.heap_mut(),
         )?));
     }
     // §21.1.3.2 step 2: `f = undefined ? undefined :
     //   ToIntegerOrInfinity(fractionDigits)`.
-    let digits: Option<u32> = if args.args.first().is_none_or(|v| v.is_undefined()) {
+    let digits: Option<u32> = if coerced.first().is_none_or(|v| v.is_undefined()) {
         None
     } else {
-        let f = coerce_digits_arg(args.args.first(), 0.0, args.gc_heap)?;
+        let f = coerce_digits_arg(coerced.first(), 0.0, ctx.heap(), NAME)?;
         if !f.is_finite() || !(0.0..=100.0).contains(&f) {
-            return Err(IntrinsicError::OutOfRange {
-                index: 0,
-                reason: "must be an integer in 0..=100",
+            return Err(NativeError::RangeError {
+                name: NAME,
+                reason: "must be an integer in 0..=100".to_string(),
             });
         }
         Some(f as u32)
@@ -178,93 +252,66 @@ fn impl_to_exponential(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
     let rendered = super::ecma_fixed::number_to_exponential(value, digits);
     Ok(Value::string(JsString::from_latin1(
         rendered.as_bytes(),
-        args.gc_heap,
+        ctx.heap_mut(),
     )?))
 }
 
 /// §21.1.3.5 `Number.prototype.toPrecision(precision?)`.
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#sec-number.prototype.toprecision>
-fn impl_to_precision(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_number(args)?;
+fn number_to_precision(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    const NAME: &str = "Number.prototype.toPrecision";
+    let coerced = coerce_numeric_args(ctx, NAME, args)?;
+    let recv = this_number_value(ctx, NAME)?;
     let value = recv.as_f64();
     // §21.1.3.5 step 2: undefined precision is plain ToString.
-    if args.args.first().is_none_or(|v| v.is_undefined()) {
+    if coerced.first().is_none_or(|v| v.is_undefined()) {
         return Ok(Value::string(super::ecma::number_to_string(
             value,
-            args.gc_heap,
+            ctx.heap_mut(),
         )?));
     }
-    // §21.1.3.5 step 3: `p = ToIntegerOrInfinity(precision)`. We
-    // run this BEFORE the non-finite check so that a `Symbol` /
-    // `BigInt` arg surfaces a `TypeError` and a throwing `valueOf`
-    // propagates per §21.1.3.5 step 3 (matching test262
-    // `nan.js` / `return-abrupt-tointeger-precision*` cases).
-    let p = coerce_digits_arg(args.args.first(), 0.0, args.gc_heap)?;
+    // §21.1.3.5 step 3: `p = ToIntegerOrInfinity(precision)`, run
+    // BEFORE the non-finite check so a `Symbol` / `BigInt` arg surfaces
+    // a `TypeError` and a throwing `valueOf` propagates.
+    let p = coerce_digits_arg(coerced.first(), 0.0, ctx.heap(), NAME)?;
     // §21.1.3.5 step 4: NaN/Infinity short-circuit AFTER coercion.
     if !value.is_finite() {
         return Ok(Value::string(super::ecma::number_to_string(
             value,
-            args.gc_heap,
+            ctx.heap_mut(),
         )?));
     }
     // §21.1.3.5 step 5: out-of-range raises `RangeError`.
     if !p.is_finite() || !(1.0..=100.0).contains(&p) {
-        return Err(IntrinsicError::OutOfRange {
-            index: 0,
-            reason: "must be an integer in 1..=100",
+        return Err(NativeError::RangeError {
+            name: NAME,
+            reason: "must be an integer in 1..=100".to_string(),
         });
     }
     let precision = p as u32;
     let rendered = super::ecma_fixed::number_to_precision(value, Some(precision));
     Ok(Value::string(JsString::from_latin1(
         rendered.as_bytes(),
-        args.gc_heap,
+        ctx.heap_mut(),
     )?))
 }
 
 /// §21.1.3.7 `Number.prototype.valueOf()` — returns the receiver.
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#sec-number.prototype.valueof>
-fn impl_value_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(Value::number(receiver_number(args)?))
+fn number_value_of(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    Ok(Value::number(this_number_value(
+        ctx,
+        "Number.prototype.valueOf",
+    )?))
 }
 
-/// Declarative `Number.prototype` table.
-pub static NUMBER_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
-    std::sync::LazyLock::new(|| {
-        crate::intrinsics!(
-            Number,
-            "toString"      / 1 => impl_to_string,
-            "toFixed"       / 1 => impl_to_fixed,
-            "toExponential" / 1 => impl_to_exponential,
-            "toPrecision"   / 1 => impl_to_precision,
-            "toLocaleString"/ 0 => impl_to_string,
-            "valueOf"       / 0 => impl_value_of,
-        )
-    });
-
-/// Convenience accessor used by the dispatcher.
-#[must_use]
-pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
-    NUMBER_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Number, name)
-}
-
-/// `MethodSpec` list installed on `Number.prototype` by
-/// `bootstrap::install_number`. Each entry routes through the
-/// shared [`NUMBER_PROTOTYPE_TABLE`] via a native callback so the
-/// primitive-receiver fast path (`Op::CallMethodValue`) and the
-/// object-property path (`Number.prototype.toString.call(...)`) end
-/// up at the same implementation.
+/// `MethodSpec` list installed on `Number.prototype` by the `Number`
+/// `couch!` surface.
 pub static NUMBER_PROTOTYPE_METHODS: &[MethodSpec] = &[
-    method("toString", 1, native_to_string),
-    method("toFixed", 1, native_to_fixed),
-    method("toExponential", 1, native_to_exponential),
-    method("toPrecision", 1, native_to_precision),
-    method("toLocaleString", 0, native_to_locale_string),
-    method("valueOf", 0, native_value_of),
+    method("toString", 1, number_to_string),
+    method("toFixed", 1, number_to_fixed),
+    method("toExponential", 1, number_to_exponential),
+    method("toPrecision", 1, number_to_precision),
+    method("toLocaleString", 0, number_to_locale_string),
+    method("valueOf", 0, number_value_of),
 ];
 
 const fn method(
@@ -280,165 +327,25 @@ const fn method(
     }
 }
 
-fn native_number_method(
-    name: &'static str,
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-) -> Result<Value, NativeError> {
-    let receiver = *ctx.this_value();
-    // §21.1.3.{3,4,5} — `toFixed` / `toExponential` / `toPrecision`
-    // route their fractional-digits / precision argument through
-    // `ToIntegerOrInfinity`, which itself starts with `ToNumber`.
-    // For non-primitive args (`(123).toPrecision([2])`,
-    // `(0).toFixed(new Number(3))`) ToNumber observes
-    // `@@toPrimitive` / `valueOf` / `toString` via §7.1.1
-    // ToPrimitive(number). Pre-coerce here so the intrinsic table
-    // sees a primitive and surfaces RangeError / OK in line with
-    // the spec ladder.
-    let coerced: smallvec::SmallVec<[Value; 4]> =
-        if matches!(name, "toFixed" | "toExponential" | "toPrecision") {
-            let exec = ctx.execution_context().cloned();
-            let mut out: smallvec::SmallVec<[Value; 4]> =
-                smallvec::SmallVec::with_capacity(args.len());
-            for arg in args {
-                let object_like = arg.is_object()
-                    || arg.is_array()
-                    || arg.is_function()
-                    || arg.is_closure()
-                    || arg.is_native_function()
-                    || arg.is_bound_function()
-                    || arg.is_class_constructor()
-                    || arg.is_proxy()
-                    || arg.is_regexp();
-                if object_like {
-                    let Some(exec) = &exec else {
-                        out.push(*arg);
-                        continue;
-                    };
-                    let interp = ctx.interp_mut();
-                    match interp.evaluate_to_primitive(
-                        exec,
-                        arg,
-                        crate::abstract_ops::ToPrimitiveHint::Number,
-                    ) {
-                        Ok(primitive) => out.push(primitive),
-                        Err(crate::VmError::Uncaught { value }) => {
-                            return Err(NativeError::Thrown {
-                                name,
-                                message: value,
-                            });
-                        }
-                        Err(err) => {
-                            return Err(NativeError::TypeError {
-                                name,
-                                reason: err.to_string(),
-                            });
-                        }
-                    }
-                } else {
-                    out.push(*arg);
-                }
-            }
-            out
-        } else {
-            args.iter().cloned().collect()
-        };
-    let allocation_roots = ctx.collect_native_roots();
-    let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
-        name,
-        reason: "unknown Number.prototype method".to_string(),
-    })?;
-    (entry.impl_fn)(&mut IntrinsicArgs {
-        receiver: &receiver,
-        args: &coerced,
-        gc_heap: ctx.heap_mut(),
-        allocation_roots: allocation_roots.as_slice(),
-    })
-    .map_err(|err| match err {
-        // Preserve the spec error class when the intrinsic surfaces
-        // an out-of-range argument so the JS-visible exception is a
-        // `RangeError` (per ECMA-262 for the toFixed / toExponential
-        // / toPrecision wrappers).
-        IntrinsicError::OutOfRange { .. } => NativeError::RangeError {
-            name,
-            reason: err.to_string(),
-        },
-        _ => NativeError::TypeError {
-            name,
-            reason: err.to_string(),
-        },
-    })
-}
-
-fn native_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    native_number_method("toString", ctx, args)
-}
-
-fn native_to_fixed(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    native_number_method("toFixed", ctx, args)
-}
-
-fn native_to_exponential(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    native_number_method("toExponential", ctx, args)
-}
-
-fn native_to_precision(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    native_number_method("toPrecision", ctx, args)
-}
-
-fn native_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    native_number_method("toLocaleString", ctx, args)
-}
-
-fn native_value_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    native_number_method("valueOf", ctx, args)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    fn args<'a>(
-        recv: &'a Value,
-        args: &'a [Value],
-        gc_heap: &'a mut otter_gc::GcHeap,
-    ) -> IntrinsicArgs<'a> {
-        IntrinsicArgs {
-            receiver: recv,
-            args,
-            gc_heap,
-            allocation_roots: &[],
-        }
-    }
-
     #[test]
     fn to_string_default_radix_is_10() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let recv = Value::number(NumberValue::Smi(255));
-        let entry = lookup("toString").unwrap();
-        let out = (entry.impl_fn)(&mut args(&recv, &[], &mut gc_heap)).unwrap();
-        assert_eq!(out.display_string(&gc_heap), "255");
+        let out = super::super::ecma::number_to_string(255.0, &mut gc_heap).unwrap();
+        assert_eq!(out.to_lossy_string(&gc_heap), "255");
     }
 
     #[test]
     fn to_string_hex_radix() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let recv = Value::number(NumberValue::Smi(255));
-        let radix = Value::number(NumberValue::Smi(16));
-        let entry = lookup("toString").unwrap();
-        let out =
-            (entry.impl_fn)(&mut args(&recv, std::slice::from_ref(&radix), &mut gc_heap)).unwrap();
-        assert_eq!(out.display_string(&gc_heap), "ff");
+        assert_eq!(
+            super::super::dragon4::number_to_string_radix(255.0, 16),
+            "ff"
+        );
     }
 
     #[test]
     fn to_fixed_two_decimals() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let recv = Value::number(NumberValue::Double(1.75));
-        let two = Value::number(NumberValue::Smi(2));
-        let entry = lookup("toFixed").unwrap();
-        let out =
-            (entry.impl_fn)(&mut args(&recv, std::slice::from_ref(&two), &mut gc_heap)).unwrap();
-        assert_eq!(out.display_string(&gc_heap), "1.75");
+        assert_eq!(super::super::ecma_fixed::number_to_fixed(1.75, 2), "1.75");
     }
 }

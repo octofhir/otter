@@ -623,10 +623,14 @@ impl Interpreter {
             return string_prototype::lookup(name).is_some();
         }
         if recv_value.is_number() {
-            return number::prototype_lookup(name).is_some();
+            return number::prototype::NUMBER_PROTOTYPE_METHODS
+                .iter()
+                .any(|m| m.name == name);
         }
         if recv_value.is_boolean() {
-            return boolean_prototype::lookup(name).is_some();
+            return boolean_prototype::BOOLEAN_PROTOTYPE_METHODS
+                .iter()
+                .any(|m| m.name == name);
         }
         if recv_value.is_big_int() {
             return bigint::prototype::lookup(name).is_some();

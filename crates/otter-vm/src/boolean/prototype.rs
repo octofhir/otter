@@ -1,76 +1,64 @@
-//! `Boolean.prototype.*` intrinsic implementations.
+//! `Boolean.prototype.*` native implementations.
 //!
-//! Boolean methods support both primitive booleans and Boolean
+//! Boolean methods accept both primitive booleans and Boolean
 //! wrapper objects. Wrapper objects carry their `[[BooleanData]]`
 //! internal slot inside the object payload, not as a JS-visible own
 //! property.
 //!
 //! # Contents
-//! - [`BOOLEAN_PROTOTYPE_TABLE`] — declarative table built with
-//!   the [`crate::intrinsics!`] macro.
 //! - [`BOOLEAN_PROTOTYPE_METHODS`] — native method specs installed
 //!   on the global `Boolean.prototype`.
-//! - [`lookup`] — convenience accessor used by the dispatcher.
+//! - One `fn(&mut NativeCtx, &[Value]) -> Result<Value, NativeError>`
+//!   per method.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-boolean-prototype-object>
 use crate::Value;
-use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::js_surface::{Attr, MethodSpec};
 use crate::string::JsString;
 use crate::{NativeCall, NativeCtx, NativeError};
 
-fn receiver_bool(args: &IntrinsicArgs<'_>) -> Result<bool, IntrinsicError> {
-    if let Some(b) = args.receiver.as_boolean() {
+/// §20.3.3 `thisBooleanValue(value)` — unwrap a primitive boolean or
+/// a Boolean wrapper's `[[BooleanData]]`; otherwise `TypeError`.
+fn this_boolean_value(ctx: &NativeCtx<'_>, name: &'static str) -> Result<bool, NativeError> {
+    let this = *ctx.this_value();
+    if let Some(b) = this.as_boolean() {
         return Ok(b);
     }
-    if let Some(obj) = args.receiver.as_object() {
-        return crate::object::boolean_data(obj, args.gc_heap).ok_or(IntrinsicError::BadReceiver {
-            expected: "boolean",
-        });
+    if let Some(obj) = this.as_object()
+        && let Some(b) = crate::object::boolean_data(obj, ctx.heap())
+    {
+        return Ok(b);
     }
-    Err(IntrinsicError::BadReceiver {
-        expected: "boolean",
+    Err(NativeError::TypeError {
+        name,
+        reason: "Boolean.prototype method called on incompatible receiver".to_string(),
     })
 }
 
-/// §20.3.3.2 Boolean.prototype.toString — `"true"` / `"false"`.
-fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let s = if receiver_bool(args)? {
+/// §20.3.3.2 `Boolean.prototype.toString()` — `"true"` / `"false"`.
+fn boolean_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let s = if this_boolean_value(ctx, "Boolean.prototype.toString")? {
         "true"
     } else {
         "false"
     };
-    Ok(Value::string(JsString::from_str(s, args.gc_heap)?))
+    Ok(Value::string(JsString::from_str(s, ctx.heap_mut())?))
 }
 
-/// §20.3.3.3 Boolean.prototype.valueOf — returns the receiver.
-fn impl_value_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(Value::boolean(receiver_bool(args)?))
+/// §20.3.3.3 `Boolean.prototype.valueOf()` — the unwrapped boolean.
+fn boolean_value_of(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    Ok(Value::boolean(this_boolean_value(
+        ctx,
+        "Boolean.prototype.valueOf",
+    )?))
 }
 
-/// Declarative `Boolean.prototype` table.
-pub static BOOLEAN_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
-    std::sync::LazyLock::new(|| {
-        crate::intrinsics!(
-            Boolean,
-            "toString" / 0 => impl_to_string,
-            "valueOf"  / 0 => impl_value_of,
-        )
-    });
-
-/// Convenience accessor used by the dispatcher.
-#[must_use]
-pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
-    BOOLEAN_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Boolean, name)
-}
-
-/// `MethodSpec` list installed on `Boolean.prototype` by
-/// `bootstrap::install_boolean`. Both primitive dispatch and
-/// object-property calls route through [`BOOLEAN_PROTOTYPE_TABLE`].
+/// `MethodSpec` list installed on `Boolean.prototype` by the
+/// `Boolean` `couch!` surface.
 pub static BOOLEAN_PROTOTYPE_METHODS: &[MethodSpec] = &[
-    method("toString", 0, native_to_string),
-    method("valueOf", 0, native_value_of),
+    method("toString", 0, boolean_to_string),
+    method("valueOf", 0, boolean_value_of),
 ];
 
 const fn method(
@@ -84,35 +72,4 @@ const fn method(
         attrs: Attr::builtin_function(),
         call: NativeCall::Static(call),
     }
-}
-
-fn native_boolean_method(
-    name: &'static str,
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-) -> Result<Value, NativeError> {
-    let receiver = *ctx.this_value();
-    let allocation_roots = ctx.collect_native_roots();
-    let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
-        name,
-        reason: "unknown Boolean.prototype method".to_string(),
-    })?;
-    (entry.impl_fn)(&mut IntrinsicArgs {
-        receiver: &receiver,
-        args,
-        gc_heap: ctx.heap_mut(),
-        allocation_roots: allocation_roots.as_slice(),
-    })
-    .map_err(|err| NativeError::TypeError {
-        name,
-        reason: err.to_string(),
-    })
-}
-
-fn native_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    native_boolean_method("toString", ctx, args)
-}
-
-fn native_value_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    native_boolean_method("valueOf", ctx, args)
 }

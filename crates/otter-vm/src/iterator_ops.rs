@@ -1189,6 +1189,7 @@ impl Interpreter {
         // Apply the resume operation to the frame before re-entering
         // dispatch.
         let mut throw_value: Option<Value> = None;
+        let mut return_value: Option<Value> = None;
         match &kind {
             GeneratorResumeKind::Next(arg) => {
                 if frame.pc != 0
@@ -1205,8 +1206,19 @@ impl Interpreter {
                 for iterator in closers.iter().rev() {
                     self.iterator_close_value_sync(context, *iterator)?;
                 }
-                handle.mark_done(&mut self.gc_heap);
-                return self.make_runtime_rooted_iter_result(*arg, true, &[], &[]);
+                // §27.5.3.4 GeneratorResumeAbrupt(return) — if the body
+                // is suspended inside a `try` with a `finally`, resume
+                // it so those blocks run (a finally may even override
+                // the completion). With no active finally, complete
+                // immediately.
+                let has_finally = self
+                    .frame_cold(&frame)
+                    .is_some_and(|c| c.handlers.iter().any(|h| h.finally_pc.is_some()));
+                if !has_finally {
+                    handle.mark_done(&mut self.gc_heap);
+                    return self.make_runtime_rooted_iter_result(*arg, true, &[], &[]);
+                }
+                return_value = Some(*arg);
             }
             GeneratorResumeKind::Throw(reason) => {
                 throw_value = Some(*reason);
@@ -1214,6 +1226,21 @@ impl Interpreter {
         }
         let mut sub_stack: SmallVec<[Frame; 8]> = SmallVec::new();
         sub_stack.push(*frame);
+        if let Some(arg) = return_value {
+            // Drive the parked frame's `finally` blocks via the abrupt
+            // `return` path; `EndFinally` resumes the completion.
+            match self.return_running_finally(&mut sub_stack, arg) {
+                Ok(Some(v)) => {
+                    handle.mark_done(&mut self.gc_heap);
+                    return self.make_runtime_rooted_iter_result(v, true, &[], &[]);
+                }
+                Ok(None) => { /* finally parked; dispatch below runs it */ }
+                Err(err) => {
+                    handle.mark_done(&mut self.gc_heap);
+                    return Err(err);
+                }
+            }
+        }
         if let Some(reason) = throw_value {
             // Preserve the original throw value so the caller can
             // re-raise it on the outer stack when the gen body

@@ -35,16 +35,44 @@ pub fn install_date_well_knowns_post_bootstrap(
     global: JsObject,
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
-    let Some(date_ctor) = object::get(global, heap, "Date").and_then(|v| v.as_object()) else {
+    let Some(date_ctor_value) = object::get(global, heap, "Date") else {
         return Ok(());
     };
-    let Some(prototype) = object::get(date_ctor, heap, "prototype").and_then(|v| v.as_object())
-    else {
+    let prototype = if let Some(date_ctor) = date_ctor_value.as_native_function() {
+        date_ctor
+            .own_property_descriptor(heap, "prototype")
+            .ok()
+            .flatten()
+            .and_then(|desc| match desc.kind {
+                object::DescriptorKind::Data { value } => value.as_object(),
+                _ => None,
+            })
+    } else if let Some(date_ctor) = date_ctor_value.as_object() {
+        object::get(date_ctor, heap, "prototype").and_then(|v| v.as_object())
+    } else {
+        None
+    };
+    let Some(prototype) = prototype else {
         return Ok(());
     };
 
+    if let Some(to_utc_string) = object::get(prototype, heap, "toUTCString") {
+        object::define_own_property_partial(
+            prototype,
+            heap,
+            "toGMTString",
+            PartialPropertyDescriptor {
+                value: Some(to_utc_string),
+                writable: Some(true),
+                enumerable: Some(false),
+                configurable: Some(true),
+                ..Default::default()
+            },
+        );
+    }
+
     let global_root = Value::object(global);
-    let date_ctor_root = Value::object(date_ctor);
+    let date_ctor_root = date_ctor_value;
     let prototype_root = Value::object(prototype);
     let to_prim_fn = native_static_with_value_roots(
         heap,

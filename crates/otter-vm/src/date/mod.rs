@@ -7,14 +7,17 @@
 //! reuses the standard property machinery (V8 `JSDate` and JSC
 //! `DateInstance` follow the same model).
 //!
-//! All broken-down accessors (year / month / hours / …) lower
-//! through self-contained proleptic Gregorian arithmetic in
-//! [`broken_down`] / [`make_date`] — temporal_rs's full timezone
-//! provider isn't needed for the foundation surface.
+//! UTC operations use self-contained proleptic Gregorian arithmetic in
+//! [`broken_down`] / [`make_date`]. Local operations use the same
+//! `temporal_rs` host time-zone hook and compiled tzdb that power the
+//! engine's Temporal objects.
 //!
 //! # Contents
 //! - [`broken_down`] — convert epoch ms to UTC components.
-//! - [`make_date`] — convert wall-clock components back to ms.
+//! - [`local_broken_down`] — convert epoch ms to host-local components.
+//! - [`make_date`] — convert UTC wall-clock components back to ms.
+//! - [`make_local_date`] — convert host-local wall-clock components
+//!   back to ms.
 //! - [`to_iso_string`] — `Date.prototype.toISOString` body.
 //! - [`now_ms`] — host clock epoch milliseconds for `Date.now` /
 //!   the 0-argument constructor.
@@ -28,6 +31,19 @@ pub mod dispatch;
 pub mod prototype;
 pub mod well_known;
 
+pub(crate) const WEEKDAY_ABBREVIATIONS: [&str; 7] =
+    ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+pub(crate) const MONTH_ABBREVIATIONS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+pub(crate) fn month_abbreviation_index(s: &str) -> Option<u8> {
+    MONTH_ABBREVIATIONS
+        .iter()
+        .position(|name| *name == s)
+        .map(|idx| idx as u8)
+}
+
 /// Host wall-clock epoch milliseconds. Used by `Date.now` and the
 /// 0-argument `new Date()` form. Falls back to `NaN` if the host
 /// clock is misbehaving.
@@ -37,6 +53,46 @@ pub fn now_ms() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64() * 1000.0)
         .unwrap_or(f64::NAN)
+}
+
+/// Host local UTC offset in minutes (`local time - UTC`) for `time_ms`.
+/// Uses the same `temporal_rs` host time-zone hook and compiled tzdb
+/// that power `Temporal.Now` / `Temporal.ZonedDateTime`.
+#[must_use]
+pub fn local_utc_offset_minutes(time_ms: f64) -> f64 {
+    if !time_ms.is_finite() {
+        return f64::NAN;
+    }
+    let Ok(time_zone) = temporal_rs::Temporal::local_now().time_zone() else {
+        return 0.0;
+    };
+    let lookup_ms = time_ms
+        .trunc()
+        .clamp(-DATE_TIME_LIMIT_MS, DATE_TIME_LIMIT_MS) as i64;
+    let Ok(instant) = temporal_rs::Instant::from_epoch_milliseconds(lookup_ms) else {
+        return 0.0;
+    };
+    let Ok(zdt) = instant.to_zoned_date_time_iso(time_zone) else {
+        return 0.0;
+    };
+    zdt.offset_nanoseconds() as f64 / 60_000_000_000.0
+}
+
+/// ECMA-262 TimeZoneString shape (`GMT+HHMM` / `GMT-HHMM`) for the
+/// host local time zone at `time_ms`.
+#[must_use]
+pub fn local_timezone_string(time_ms: f64) -> String {
+    let offset = local_utc_offset_minutes(time_ms).trunc() as i32;
+    let sign = if offset >= 0 { '+' } else { '-' };
+    let abs = offset.abs();
+    format!("GMT{sign}{:02}{:02}", abs / 60, abs % 60)
+}
+
+/// Convert an epoch millisecond value to host-local broken-down time.
+#[must_use]
+pub fn local_broken_down(time_ms: f64) -> Option<BrokenDown> {
+    let offset_ms = local_utc_offset_minutes(time_ms) * 60_000.0;
+    broken_down(time_ms + offset_ms)
 }
 
 /// Broken-down UTC components of a Date's time value. All ranges
@@ -69,6 +125,7 @@ const MS_PER_MINUTE: i64 = 60 * MS_PER_SEC;
 const MS_PER_HOUR: i64 = 60 * MS_PER_MINUTE;
 /// Milliseconds in one day.
 const MS_PER_DAY: i64 = 24 * MS_PER_HOUR;
+const DATE_TIME_LIMIT_MS: f64 = 8.64e15;
 
 /// Days from the epoch to start of `year` (proleptic Gregorian).
 fn days_from_year(year: i32) -> i64 {
@@ -168,6 +225,20 @@ pub fn make_date(
     seconds: f64,
     ms: f64,
 ) -> f64 {
+    time_clip(make_date_unclipped(
+        year, month, day, hours, minutes, seconds, ms,
+    ))
+}
+
+fn make_date_unclipped(
+    year: f64,
+    month: f64,
+    day: f64,
+    hours: f64,
+    minutes: f64,
+    seconds: f64,
+    ms: f64,
+) -> f64 {
     if [year, month, day, hours, minutes, seconds, ms]
         .iter()
         .any(|v| !v.is_finite())
@@ -183,6 +254,14 @@ pub fn make_date(
     // Normalise month overflow into the year (spec lets month
     // overflow shift the year — `new Date(2024, 13, 1)` ===
     // `new Date(2025, 1, 1)`).
+    let year = year.trunc();
+    let month = month.trunc();
+    let day = day.trunc();
+    let hours = hours.trunc();
+    let minutes = minutes.trunc();
+    let seconds = seconds.trunc();
+    let ms = ms.trunc();
+
     let total_months = year as i64 * 12 + month as i64;
     let final_year = total_months.div_euclid(12) as i32;
     let final_month = total_months.rem_euclid(12) as u8;
@@ -193,16 +272,52 @@ pub fn make_date(
     }
     total_days += day as i64 - 1;
 
-    let total_ms = total_days * MS_PER_DAY
-        + hours as i64 * MS_PER_HOUR
-        + minutes as i64 * MS_PER_MINUTE
-        + seconds as i64 * MS_PER_SEC
-        + ms as i64;
-    let result = total_ms as f64;
-    if !result.is_finite() || result.abs() > 8.64e15 {
+    let result = (total_days as f64 * MS_PER_DAY as f64)
+        + (hours * MS_PER_HOUR as f64)
+        + (minutes * MS_PER_MINUTE as f64)
+        + (seconds * MS_PER_SEC as f64)
+        + ms;
+    result
+}
+
+fn time_clip(ms: f64) -> f64 {
+    if !ms.is_finite() || ms.abs() > DATE_TIME_LIMIT_MS {
         return f64::NAN;
     }
-    result
+    let clipped = ms.trunc();
+    if clipped == 0.0 { 0.0 } else { clipped }
+}
+
+/// Build an epoch millisecond value by interpreting the provided
+/// components in the host local time zone.
+#[must_use]
+pub fn make_local_date(
+    year: f64,
+    month: f64,
+    day: f64,
+    hours: f64,
+    minutes: f64,
+    seconds: f64,
+    ms: f64,
+) -> f64 {
+    let local_ms = make_date_unclipped(year, month, day, hours, minutes, seconds, ms);
+    if !local_ms.is_finite() {
+        return f64::NAN;
+    }
+    let mut utc_ms = local_ms;
+    for _ in 0..3 {
+        let offset_ms = local_utc_offset_minutes(utc_ms) * 60_000.0;
+        if !offset_ms.is_finite() {
+            return f64::NAN;
+        }
+        let next = local_ms - offset_ms;
+        if (next - utc_ms).abs() < 1.0 {
+            utc_ms = next;
+            break;
+        }
+        utc_ms = next;
+    }
+    time_clip(utc_ms)
 }
 
 /// §21.4.4.41 Date.prototype.toISOString format. Renders an
@@ -210,9 +325,16 @@ pub fn make_date(
 #[must_use]
 pub fn to_iso_string(ms: f64) -> Option<String> {
     let bd = broken_down(ms)?;
+    let year = if (0..=9999).contains(&bd.year) {
+        format!("{:04}", bd.year)
+    } else if bd.year < 0 {
+        format!("-{:06}", bd.year.abs())
+    } else {
+        format!("+{:06}", bd.year)
+    };
     Some(format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        bd.year,
+        "{}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        year,
         bd.month + 1,
         bd.day,
         bd.hour,

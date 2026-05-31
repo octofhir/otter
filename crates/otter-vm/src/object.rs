@@ -1391,7 +1391,8 @@ pub fn clip_date_value(ms: f64) -> f64 {
     if !ms.is_finite() || ms.abs() > 8.64e15 {
         f64::NAN
     } else {
-        ms.trunc()
+        let clipped = ms.trunc();
+        if clipped == 0.0 { 0.0 } else { clipped }
     }
 }
 

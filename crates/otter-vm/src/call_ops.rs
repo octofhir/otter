@@ -1603,12 +1603,19 @@ impl Interpreter {
             );
         }
 
-        let proto = self.construct_prototype_for_callee_runtime_rooted(
+        let mut proto = self.construct_prototype_for_callee_runtime_rooted(
             context,
             &effective_new_target,
             &[&current, &effective_new_target],
             &[effective_args.as_slice()],
         )?;
+        if proto.is_none()
+            && current
+                .as_native_function()
+                .is_some_and(|native| native.name(&self.gc_heap) == "Date")
+        {
+            proto = Some(self.constructor_prototype_value("Date")?);
+        }
         let receiver = {
             let mut value_roots: SmallVec<[&Value; 4]> =
                 smallvec::smallvec![&current, &effective_new_target];

@@ -159,7 +159,7 @@ pub fn construct_time_value(args: &[Value], heap: &GcHeap) -> f64 {
             let minutes = number_or(args, 4, 0.0);
             let seconds = number_or(args, 5, 0.0);
             let ms = number_or(args, 6, 0.0);
-            make_date(year, month, day, hours, minutes, seconds, ms)
+            super::make_local_date(year, month, day, hours, minutes, seconds, ms)
         }
     }
 }
@@ -173,7 +173,7 @@ fn year_with_two_digit_rule(year: f64) -> f64 {
         return year;
     }
     let int = year.trunc();
-    if int == year && (0.0..=99.0).contains(&int) {
+    if (0.0..=99.0).contains(&int) {
         int + 1900.0
     } else {
         year
@@ -207,6 +207,9 @@ fn parse_date(input: &str) -> f64 {
     let s = input.trim();
     if s.is_empty() {
         return f64::NAN;
+    }
+    if let Some(ms) = parse_legacy_date_string(s) {
+        return ms;
     }
     // Date portion: YYYY-MM-DD (year may be ±YYYYYY).
     let (date_part, rest) = split_at_first(s, &['T', ' ']);
@@ -247,11 +250,58 @@ fn parse_date(input: &str) -> f64 {
             };
         }
     }
-    let utc_ms = make_date(year, month - 1.0, day, hour, minute, second, ms);
+    let utc_ms = if rest.is_some() && offset_minutes == 0 && !has_explicit_zero_offset(rest) {
+        super::make_local_date(year, month - 1.0, day, hour, minute, second, ms)
+    } else {
+        make_date(year, month - 1.0, day, hour, minute, second, ms)
+    };
     if !utc_ms.is_finite() {
         return f64::NAN;
     }
     utc_ms - (offset_minutes as f64) * 60_000.0
+}
+
+fn parse_legacy_date_string(s: &str) -> Option<f64> {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() == 6 && parts[0].ends_with(',') && parts[5] == "GMT" {
+        let day = parts[1].parse::<f64>().ok()?;
+        let month = super::month_abbreviation_index(parts[2])? as f64;
+        let year = parts[3].parse::<f64>().ok()?;
+        let (hour, minute, second) = parse_hms(parts[4])?;
+        return Some(make_date(year, month, day, hour, minute, second, 0.0));
+    }
+    if parts.len() == 6 && parts[5].starts_with("GMT") {
+        let month = super::month_abbreviation_index(parts[1])? as f64;
+        let day = parts[2].parse::<f64>().ok()?;
+        let year = parts[3].parse::<f64>().ok()?;
+        let (hour, minute, second) = parse_hms(parts[4])?;
+        let offset = parse_gmt_offset(parts[5])?;
+        let utc = make_date(year, month, day, hour, minute, second, 0.0);
+        if !utc.is_finite() {
+            return Some(f64::NAN);
+        }
+        return Some(utc - offset as f64 * 60_000.0);
+    }
+    None
+}
+
+fn parse_hms(s: &str) -> Option<(f64, f64, f64)> {
+    let mut fields = s.split(':');
+    let hour = fields.next()?.parse::<f64>().ok()?;
+    let minute = fields.next()?.parse::<f64>().ok()?;
+    let second = fields.next()?.parse::<f64>().ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    Some((hour, minute, second))
+}
+
+fn parse_gmt_offset(s: &str) -> Option<i64> {
+    let body = s.strip_prefix("GMT")?;
+    if body.is_empty() {
+        return Some(0);
+    }
+    parse_offset(body)
 }
 
 fn split_at_first<'a>(s: &'a str, seps: &[char]) -> (&'a str, Option<&'a str>) {
@@ -298,11 +348,37 @@ fn parse_offset(s: &str) -> Option<i64> {
     Some(sign * (hours * 60 + minutes))
 }
 
+fn has_explicit_zero_offset(rest: Option<&str>) -> bool {
+    let Some(time) = rest else {
+        return false;
+    };
+    time.ends_with('Z') || time.ends_with("+00:00") || time.ends_with("-00:00")
+}
+
 fn parse_date_components(input: &str) -> Option<(f64, f64, f64)> {
     // `YYYY-MM-DD`, `YYYY-MM`, or `YYYY`.
-    let parts: Vec<&str> = input.splitn(3, '-').collect();
-    let year: f64 = parts.first()?.parse().ok()?;
-    let month: f64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(1.0);
-    let day: f64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let (year_part, rest) = if input.starts_with(['+', '-']) {
+        if input.len() < 7 {
+            return None;
+        }
+        input.split_at(7)
+    } else {
+        match input.find('-') {
+            Some(idx) => input.split_at(idx),
+            None => (input, ""),
+        }
+    };
+    if year_part == "-000000" {
+        return None;
+    }
+    let year: f64 = year_part.parse().ok()?;
+    let rest = rest.strip_prefix('-').unwrap_or(rest);
+    let parts: Vec<&str> = rest.splitn(2, '-').collect();
+    let month: f64 = parts
+        .first()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
+    let day: f64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(1.0);
     Some((year, month, day))
 }

@@ -610,6 +610,21 @@ now has the constructor-branded `[[Construct]]` slot required by
 then string/number branch so deleting `Symbol.prototype[@@toPrimitive]`
 falls back to observable ordinary `valueOf` / `toString`.
 
+### Date (built-ins/Date)
+
+| stage | total | passed | failed | skipped | crashed | pass rate |
+|---|---:|---:|---:|---:|---:|---:|
+| slice 9c (Temporal-backed local time + Date edge cases) | 618 | 615 | 0 | 3 | 0 | 100.00% |
+
+Slice 9c closes the non-skipped `built-ins/Date` suite. Local Date
+accessors, string rendering, setters, constructor multi-arg form, and
+offsetless date-time parsing now use the engine's Temporal-backed host
+time-zone provider instead of a UTC placeholder. The same slice fixes
+`Date.UTC` floating-point `MakeTime` precision, two-digit year
+truncation, expanded-year ISO strings, `Date.parse` of engine-produced
+legacy strings, negative-zero expanded years, and
+`Reflect.construct(Date, ..., newTarget)` default prototype fallback.
+
 ### Iterator protocol §7.4 — slice 8
 
 `Interpreter::get_iterator_sync` / `iterator_step_sync` /

@@ -83,6 +83,66 @@ pub(crate) fn compile_super_method_call(
     Ok(dst)
 }
 
+/// `super[expr](args...)` — invoke a parent-prototype method resolved
+/// through a computed key, with `this` bound to the current receiver
+/// (§13.3.7.1 / §13.3.5 MakeSuperPropertyReference). Mirrors
+/// [`compile_super_method_call`] but loads the method via
+/// `GetPrototype(home)` + `LoadElement`.
+pub(crate) fn compile_super_computed_method_call(
+    cx: &mut Compiler,
+    key_expr: &oxc_ast::ast::Expression<'_>,
+    arguments: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    let home_reg = load_synthetic_capture(cx, SUPER_HOME_NAME, span)?;
+    let parent_reg = cx.alloc_scratch();
+    cx.emit(
+        Op::GetPrototype,
+        [Operand::Register(parent_reg), Operand::Register(home_reg)],
+        span,
+    );
+    let idx = compile_expr(cx, key_expr, span)?;
+    let method_reg = cx.alloc_scratch();
+    cx.emit(
+        Op::LoadElement,
+        vec![
+            Operand::Register(method_reg),
+            Operand::Register(parent_reg),
+            Operand::Register(idx),
+        ],
+        span,
+    );
+    let this_reg = cx.alloc_scratch();
+    cx.emit(Op::LoadThis, [Operand::Register(this_reg)], span);
+    let has_spread = arguments
+        .iter()
+        .any(|arg| matches!(arg, oxc_ast::ast::Argument::SpreadElement(_)));
+    let dst = cx.alloc_scratch();
+    if has_spread {
+        let args_reg = compile_spread_call_args(cx, arguments, span)?;
+        cx.emit(
+            Op::CallSpread,
+            vec![
+                Operand::Register(dst),
+                Operand::Register(method_reg),
+                Operand::Register(this_reg),
+                Operand::Register(args_reg),
+            ],
+            span,
+        );
+    } else {
+        let arg_regs = compile_call_args(cx, arguments, span)?;
+        let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::Register(method_reg));
+        operands.push(Operand::Register(this_reg));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::CallWithThis, operands, span);
+    }
+    Ok(dst)
+}
+
 /// load. Resolves to a register holding the looked-up value.
 pub(crate) fn compile_super_member_load(
     cx: &mut Compiler,

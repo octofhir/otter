@@ -84,6 +84,12 @@ pub(crate) fn compile_method_call(
     {
         return compile_super_method_call(cx, member.property.name.as_str(), &call.arguments, span);
     }
+    // `super[expr](args...)` — computed-key parent-method invocation.
+    if let Expression::ComputedMemberExpression(member) = callee
+        && matches!(member.object, Expression::Super(_))
+    {
+        return compile_super_computed_method_call(cx, &member.expression, &call.arguments, span);
+    }
     // `import.meta.resolve(specifier)` — sync URL join against the
     // active module's URL. HTML spec returns a string; foundation
     // matches that shape via `Op::ImportMetaResolve`.

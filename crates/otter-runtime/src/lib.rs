@@ -4153,6 +4153,44 @@ mod tests {
     }
 
     #[test]
+    fn regexp_subclass_overrides_and_super_computed_call() {
+        let otter = Otter::new();
+        otter
+            .blocking_run_typescript(
+                r#"
+                function eq(a, b, m) { if (a !== b) throw new Error(m + ": " + a); }
+
+                // A RegExp subclass's own method shadows the base
+                // prototype via the instance's real [[Prototype]].
+                class RE extends RegExp {
+                    exec() { return "OWN"; }
+                    [Symbol.replace]() { return "SYM"; }
+                }
+                const r = new RE("b", "g");
+                eq(r.exec("xb"), "OWN", "subclass-exec-override");
+                eq(r[Symbol.replace]("ab", "z"), "SYM", "subclass-symbol-override");
+                // Plain RegExp keeps intrinsic behaviour.
+                eq(/b/.exec("ab")[0], "b", "plain-exec");
+                eq(/a/gi.flags, "gi", "plain-flags");
+
+                // super[computed](...) resolves the parent method with
+                // `this` bound to the receiver (spread + non-spread).
+                let called = 0;
+                class RE2 extends RegExp {
+                    [Symbol.replace](...args) {
+                        const out = super[Symbol.replace](...args);
+                        called += 1;
+                        return out;
+                    }
+                }
+                eq("a b a".replaceAll(new RE2(" ", "g"), "_"), "a_b_a", "super-computed-spread");
+                eq(called, 1, "super-computed-called-once");
+                "#,
+            )
+            .expect("RegExp subclass overrides + super[computed] call");
+    }
+
+    #[test]
     fn string_replace_split_match_spec_dispatch() {
         let otter = Otter::new();
         otter

@@ -3007,7 +3007,15 @@ impl Interpreter {
                 }
             };
             return if direct.is_undefined() {
-                let proto = self.constructor_prototype_value("RegExp")?;
+                // Walk the instance's actual `[[Prototype]]` so a
+                // `class X extends RegExp` override (e.g. `exec`,
+                // `@@replace`) on `X.prototype` shadows the base
+                // `%RegExp.prototype%` method, instead of jumping
+                // straight to the intrinsic.
+                let proto = match re.prototype_override(&self.gc_heap) {
+                    Some(p) => p,
+                    None => self.constructor_prototype_value("RegExp")?,
+                };
                 if proto.is_nullish() {
                     return Ok(VmGetOutcome::Value(Value::undefined()));
                 }

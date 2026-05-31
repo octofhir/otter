@@ -2180,14 +2180,32 @@ After:
 |---:|---:|---:|---:|---:|
 | 752 | 693 | 44 | 15 | 94.03% |
 
-Delta: +47 passing tests.
+A third pass landed the §14.15.3 finally-completion subsystem and
+related iterator fixes:
 
-Remaining failures (deferred — each a distinct subsystem): `finally`
-not running on `return`/`break` abrupt completion (blocks
-generator-close and throw-based IteratorClose, ~10), throw-unwind
-IteratorClose during destructuring (~10, needs handler-scoped close +
-re-entrant `return()` outside the unwind), fresh-per-iteration `let`
-bindings + head/RHS scope separation (~7), class `name` own-property +
-`var C = class{}` NamedEvaluation (3), `break`-carries-V completion
-(`*-abrupt-empty`, ~4), IteratorRecord `[[NextMethod]]` caching (proxy
-/ next-reference, 2-3), and global-scope `let` TDZ through a closure.
+- `return` / `break` / `continue` now run the `finally` blocks they
+  cross before reaching their target (runtime completion-token parked
+  on the frame + `Op::JumpViaFinally`; a finally's own abrupt
+  completion overrides). This also lifted **language/statements/try
+  83.25% → 91.13% (+16)** and **language/statements/for +8**.
+- A generator closed via `.return()` / `for…of` `break` resumes its
+  suspended body so the generator's own `finally` runs.
+- `for…of` drives a Proxy/accessor `next` through the ordinary
+  `[[Get]]` ladder.
+
+After:
+
+| total | passed | failed | skipped | pass rate |
+|---:|---:|---:|---:|---:|
+| 752 | 697 | 40 | 15 | 94.57% |
+
+Delta: +51 passing tests.
+
+Remaining failures (deferred — each a distinct subsystem): throw-unwind
+IteratorClose during destructuring + `for…of` `throw` (~12, needs
+`ExecutionContext` threaded into `unwind_throw` so the iterator's
+`return` can run as frames are popped), fresh-per-iteration `let`
+bindings + head/RHS scope separation (~7), `let` TDZ through a closure
+/ at global scope (~9), class `name` own-property + `var C = class{}`
+NamedEvaluation (3), `break`-carries-V completion (`*-abrupt-empty`,
+~2), and `arguments`-object mapping edge cases (3).

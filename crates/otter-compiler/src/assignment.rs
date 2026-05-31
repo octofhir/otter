@@ -45,8 +45,17 @@ pub(crate) fn compile_assignment(
         // lowers the store as a plain `this.X = V` write. Reads
         // still walk the parent chain via `compile_super_member_load`.
         if matches!(member.object, Expression::Super(_)) {
-            let this_reg = cx.alloc_scratch();
-            cx.emit(Op::LoadThis, [Operand::Register(this_reg)], span);
+            // §13.3.5.3 MakeSuperPropertyReference + §6.2.5.5 PutValue
+            // step 6.b — `super.X = V` resolves any accessor setter on
+            // the parent prototype and invokes it with `this` as the
+            // receiver; absent a setter it writes an own property onto
+            // `this`. `Op::SetSuperProperty` performs both.
+            let home_reg = load_synthetic_capture(cx, SUPER_HOME_NAME, span)?;
+            // §13.3.7.1 step 2 — `GetThisBinding` precedes RHS
+            // evaluation so a derived-constructor TDZ ReferenceError
+            // fires first.
+            let this_guard = cx.alloc_scratch();
+            cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
             let name_idx = cx.intern_string_constant(member.property.name.as_str());
             let new_value = match compound_op {
                 None => compile_expr(cx, &a.right, span)?,
@@ -68,14 +77,12 @@ pub(crate) fn compile_assignment(
                     dst
                 }
             };
-            let store_scratch = cx.alloc_scratch();
             cx.emit(
-                Op::StoreProperty,
+                Op::SetSuperProperty,
                 vec![
-                    Operand::Register(this_reg),
+                    Operand::Register(home_reg),
                     Operand::ConstIndex(name_idx),
                     Operand::Register(new_value),
-                    Operand::Register(store_scratch),
                 ],
                 span,
             );
@@ -164,25 +171,27 @@ pub(crate) fn compile_assignment(
         // `super[idx] = V` shares the receiver-targeted store with
         // its dotted counterpart per §13.3.5.3 + §6.2.4.5 step 6.b.
         if matches!(member.object, Expression::Super(_)) {
-            let this_reg = cx.alloc_scratch();
-            cx.emit(Op::LoadThis, [Operand::Register(this_reg)], span);
+            // §13.3.5.3 + §6.2.5.5 PutValue step 6.b — `super[K] = V`
+            // resolves an accessor setter on the parent prototype and
+            // invokes it with `this`; absent a setter it writes an own
+            // property onto `this`. `Op::SetSuperElement` performs both
+            // and runs `GetSuperBase` before the key's `ToPropertyKey`.
+            let home_reg = load_synthetic_capture(cx, SUPER_HOME_NAME, span)?;
+            // §13.3.7.1 step 2 — `GetThisBinding` precedes evaluation
+            // of the key expression, so a derived-constructor TDZ
+            // ReferenceError fires before any key/RHS side effects.
+            let this_guard = cx.alloc_scratch();
+            cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
             let idx_reg = compile_expr(cx, &member.expression, span)?;
             let new_value = match compound_op {
                 None => compile_expr(cx, &a.right, span)?,
                 Some(op) => {
                     let current = cx.alloc_scratch();
-                    let home_reg = load_synthetic_capture(cx, SUPER_HOME_NAME, span)?;
-                    let parent_reg = cx.alloc_scratch();
                     cx.emit(
-                        Op::GetPrototype,
-                        [Operand::Register(parent_reg), Operand::Register(home_reg)],
-                        span,
-                    );
-                    cx.emit(
-                        Op::LoadElement,
+                        Op::LoadSuperElement,
                         vec![
                             Operand::Register(current),
-                            Operand::Register(parent_reg),
+                            Operand::Register(home_reg),
                             Operand::Register(idx_reg),
                         ],
                         span,
@@ -202,7 +211,15 @@ pub(crate) fn compile_assignment(
                     dst
                 }
             };
-            cx.emit_store_element(this_reg, idx_reg, new_value, span);
+            cx.emit(
+                Op::SetSuperElement,
+                vec![
+                    Operand::Register(home_reg),
+                    Operand::Register(idx_reg),
+                    Operand::Register(new_value),
+                ],
+                span,
+            );
             return Ok(new_value);
         }
         let arr_reg = compile_expr(cx, &member.object, span)?;

@@ -153,20 +153,23 @@ pub(crate) fn compile_computed_member(
     // so the read picks up the parent prototype's slot per
     // §13.3.5 MakeSuperPropertyReference.
     if matches!(m.object, Expression::Super(_)) {
+        // §13.3.5 MakeSuperPropertyReference — `super[key]` resolves
+        // against `Object.getPrototypeOf(home)` but runs accessor
+        // getters with the current frame's `this` as the receiver.
         let home_reg = load_synthetic_capture(cx, SUPER_HOME_NAME, span)?;
-        let parent_reg = cx.alloc_scratch();
-        cx.emit(
-            Op::GetPrototype,
-            [Operand::Register(parent_reg), Operand::Register(home_reg)],
-            span,
-        );
+        // §13.3.7.1 step 2 — `GetThisBinding` runs before the key
+        // expression is evaluated. A `LoadThis` here surfaces the
+        // derived-constructor TDZ ReferenceError before any side
+        // effects in the key expression (e.g. `super[super()]`).
+        let this_guard = cx.alloc_scratch();
+        cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
         let idx = compile_expr(cx, &m.expression, span)?;
         let dst = cx.alloc_scratch();
         cx.emit(
-            Op::LoadElement,
+            Op::LoadSuperElement,
             vec![
                 Operand::Register(dst),
-                Operand::Register(parent_reg),
+                Operand::Register(home_reg),
                 Operand::Register(idx),
             ],
             span,

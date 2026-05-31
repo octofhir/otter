@@ -208,6 +208,13 @@ impl Interpreter {
                 error_classes::ErrorKind::ReferenceError,
                 "cannot access binding before initialization",
             ),
+            VmError::ThisUninitialized { message } => {
+                dynamic_message = message.clone();
+                (
+                    error_classes::ErrorKind::ReferenceError,
+                    dynamic_message.as_str(),
+                )
+            }
             VmError::UndefinedIdentifier { name } => {
                 dynamic_message = format!("{name} is not defined");
                 (

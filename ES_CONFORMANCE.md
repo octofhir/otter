@@ -2065,3 +2065,62 @@ contributes its value to the script / `eval` completion value.
 
 Remaining `toLowerCase`/`toUpperCase` failure is the unrelated
 `eval('"BJ"')`-style A1_T3 cases (other eval-code gaps deferred).
+
+### language/expressions/super (derived `this` binding + super references)
+
+Command:
+
+```sh
+cargo run -p otter-test262 --bin otter-test262 -- run \
+  --filter language/expressions/super \
+  --timeout 5000 \
+  --output test262_results/super.json
+```
+
+Before:
+
+| total | passed | failed | skipped | pass rate |
+|---:|---:|---:|---:|---:|
+| 94 | 67 | 26 | 1 | 72.04% |
+
+Fixes landed this slice:
+
+- **Derived-constructor `this` binding (§10.2.2).** A derived
+  constructor now enters with `this` in the TDZ (`Value::hole()`); the
+  new `Op::BindThisValue` installs the `super(...)` result as `this`
+  and the construct target. Reading `this` (or any `super.x`) before
+  `super()` is a `ReferenceError`, a second `super(...)` is a
+  `ReferenceError`, an object return overrides `this`, and an undefined
+  return with `this` still in the TDZ is a `ReferenceError`. Added the
+  `Function.is_derived_constructor` flag end-to-end.
+- **`class C extends <fn>` static side.** `[[SetPrototypeOf]]` now
+  accepts a plain ECMAScript function / closure / bound function as the
+  static-side prototype (§15.7.14 step 6.b), so a class can extend an
+  ordinary function constructor.
+- **Super property reads (`Op::LoadSuperProperty` /
+  `LoadSuperElement`).** `super.x` / `super[k]` resolve against
+  `Object.getPrototypeOf(home)` but invoke accessor getters with the
+  active `this` as receiver, run `GetSuperBase` before `ToPropertyKey`,
+  surface the `this`-TDZ `ReferenceError`, and throw `TypeError` on a
+  null super base.
+- **Super property writes (`Op::SetSuperProperty` / `SetSuperElement`).**
+  `super.x = v` / `super[k] = v` invoke a parent-prototype setter with
+  `this` as receiver, else write an own data property onto `this`
+  (replacing the old incorrect `this.x = v` lowering that ignored
+  inherited setters). `++super[k]` / compound assignments now compile.
+- **`class C extends null`.** Class lowering branches on a null
+  superclass value: `C.prototype.[[Prototype]]` is null and the
+  parent's `prototype` slot is never read.
+
+After:
+
+| total | passed | failed | skipped | pass rate |
+|---:|---:|---:|---:|---:|
+| 94 | 86 | 7 | 1 | 92.47% |
+
+Delta: +19 passing tests.
+
+Remaining failures (deferred): `super` inside `eval` within a method
+(4, eval-code cluster), spread-argument iterator-getter error
+propagation (2, shared with the for-of iterator path), and dynamic
+`GetSuperConstructor` reading the constructor's current prototype (1).

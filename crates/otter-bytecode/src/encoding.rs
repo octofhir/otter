@@ -557,6 +557,11 @@ pub const OP_BYTE_TABLE: &[(Op, u8)] = &[
     (Op::IteratorCloseEnd, 0x7E),
     (Op::GeneratorStart, 0x7F),
     (Op::GetAsyncIterator, 0x80),
+    (Op::BindThisValue, 0x81),
+    (Op::LoadSuperProperty, 0x82),
+    (Op::LoadSuperElement, 0x83),
+    (Op::SetSuperProperty, 0x84),
+    (Op::SetSuperElement, 0x85),
 ];
 
 #[cfg(test)]
@@ -920,7 +925,7 @@ mod tests {
         // Catches accidental opcode additions that forget to wire
         // through OP_BYTE_TABLE. If this fires, append the missing
         // opcode at the next unused byte.
-        const EXPECTED_OPCODE_COUNT: usize = 129;
+        const EXPECTED_OPCODE_COUNT: usize = 134;
         assert_eq!(
             OP_BYTE_TABLE.len(),
             EXPECTED_OPCODE_COUNT,

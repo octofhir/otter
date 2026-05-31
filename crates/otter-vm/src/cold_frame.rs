@@ -103,6 +103,16 @@ pub struct ColdFrame {
     /// Iterators that must be closed if a generator is parked inside
     /// destructuring and later resumed with `.return()`.
     pub active_iterator_closers: SmallVec<[Value; 2]>,
+    /// `true` when this frame runs a *derived* class constructor.
+    /// Its `this` starts in the TDZ (a `Value::hole()` in
+    /// `Frame::this_value`) until `super(...)` runs
+    /// [`otter_bytecode::Op::BindThisValue`]. The return path
+    /// (`pop_frame`) consults this to apply §10.2.2 derived
+    /// constructor return semantics: an object return is honoured
+    /// verbatim, an undefined return yields the bound `this`, and an
+    /// undefined return with `this` still in the TDZ is a
+    /// `ReferenceError`.
+    pub is_derived_constructor: bool,
 }
 
 impl ColdFrame {
@@ -121,6 +131,7 @@ impl ColdFrame {
             && self.incoming_args.is_empty()
             && self.handlers.is_empty()
             && self.active_iterator_closers.is_empty()
+            && !self.is_derived_constructor
     }
 
     /// Trace GC slots reachable through cold protocol state.

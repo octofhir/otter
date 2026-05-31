@@ -29,7 +29,38 @@ use crate::{
 impl Interpreter {
     pub(crate) fn run_load_this_reg(&self, frame: &mut Frame, dst: u16) -> Result<(), VmError> {
         let value = frame.this_value;
+        // §13.3.7.3 — a derived constructor's `this` is in the TDZ
+        // until `super(...)` binds it (sentinel: `Value::hole()`).
+        // Reading it early, including via `super.prop`, is a
+        // ReferenceError.
+        if value.is_hole() {
+            return Err(VmError::ThisUninitialized {
+                message: "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string(),
+            });
+        }
         write_register(frame, dst, value)?;
+        frame.advance_pc(self.current_byte_len)?;
+        Ok(())
+    }
+
+    /// §13.3.7.3 SuperCall steps 7–9 — bind the derived-constructor
+    /// `this` to the object `super(...)` produced. The result is also
+    /// recorded as the construct target so an implicit `return` from
+    /// the constructor yields the bound object (§10.2.2). A second
+    /// `super(...)` (i.e. `this` already initialized) is a
+    /// ReferenceError.
+    pub(crate) fn run_bind_this_value(&mut self, frame: &mut Frame, src: u16) -> Result<(), VmError> {
+        if !frame.this_value.is_hole() {
+            return Err(VmError::ThisUninitialized {
+                message: "super constructor may only be called once".to_string(),
+            });
+        }
+        let value = *read_register(frame, src)?;
+        frame.this_value = value;
+        if let Some(obj) = value.as_object() {
+            let cold = self.frame_ensure_cold(frame);
+            cold.construct_target = Some(obj);
+        }
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }

@@ -262,6 +262,15 @@ pub(crate) enum VmGetOutcome {
     InvokeGetter { getter: Value },
 }
 
+/// Key form for a `super.name` / `super[expr]` read. `Resolved`
+/// carries an already-interned named key; `Computed` carries the raw
+/// key value so `ToPropertyKey` runs *after* `GetSuperBase` per
+/// §13.3.7.1.
+pub(crate) enum SuperReadKey<'a> {
+    Resolved(VmPropertyKey<'a>),
+    Computed(Value),
+}
+
 /// Map an [`otter_gc::OutOfMemory`] from a GC body allocation into the
 /// runtime-shaped [`VmError::OutOfMemory`]. Used by every value-model
 /// helper that surfaces an allocation failure to the dispatcher.
@@ -2940,6 +2949,12 @@ impl Interpreter {
                     self.do_super_construct_spread(stack, context, operands)?;
                     continue;
                 }
+                Op::BindThisValue => {
+                    let src = register_operand(context.exec_operand(instr, 0))?;
+                    let frame = &mut stack[top_idx];
+                    self.run_bind_this_value(frame, src)?;
+                    continue;
+                }
                 Op::Throw => {
                     let src = register_operand(context.exec_operand(instr, 0))?;
                     let value = stack[top_idx]
@@ -3186,6 +3201,94 @@ impl Interpreter {
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_load_element_regs(context, frame, dst, recv_reg, idx_reg)?;
+                    continue;
+                }
+                Op::LoadSuperProperty => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let home_reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 2)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name = context
+                        .property_atom(name_idx)
+                        .ok_or(VmError::InvalidOperand)?
+                        .name();
+                    let home = *read_register(&stack[top_idx], home_reg)?;
+                    self.run_load_super_property(
+                        context,
+                        stack,
+                        top_idx,
+                        dst,
+                        home,
+                        SuperReadKey::Resolved(VmPropertyKey::String(name)),
+                    )?;
+                    continue;
+                }
+                Op::LoadSuperElement => {
+                    let (dst, home_reg, key_reg) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let home = *read_register(&stack[top_idx], home_reg)?;
+                    let key_raw = *read_register(&stack[top_idx], key_reg)?;
+                    self.run_load_super_property(
+                        context,
+                        stack,
+                        top_idx,
+                        dst,
+                        home,
+                        SuperReadKey::Computed(key_raw),
+                    )?;
+                    continue;
+                }
+                Op::SetSuperProperty => {
+                    let home_reg = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let value_reg = context
+                        .exec_register(instr, 2)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name = context
+                        .property_atom(name_idx)
+                        .ok_or(VmError::InvalidOperand)?
+                        .name();
+                    let home = *read_register(&stack[top_idx], home_reg)?;
+                    let value = *read_register(&stack[top_idx], value_reg)?;
+                    let strict = context.function_is_strict(stack[top_idx].function_id);
+                    self.run_store_super_property(
+                        context,
+                        stack,
+                        top_idx,
+                        home,
+                        SuperReadKey::Resolved(VmPropertyKey::String(name)),
+                        value,
+                        strict,
+                    )?;
+                    continue;
+                }
+                Op::SetSuperElement => {
+                    let (home_reg, key_reg, value_reg) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let home = *read_register(&stack[top_idx], home_reg)?;
+                    let key_raw = *read_register(&stack[top_idx], key_reg)?;
+                    let value = *read_register(&stack[top_idx], value_reg)?;
+                    let strict = context.function_is_strict(stack[top_idx].function_id);
+                    self.run_store_super_property(
+                        context,
+                        stack,
+                        top_idx,
+                        home,
+                        SuperReadKey::Computed(key_raw),
+                        value,
+                        strict,
+                    )?;
                     continue;
                 }
                 // §10.1.9 [[Set]] — accessor setter dispatch follows
@@ -4369,13 +4472,39 @@ impl Interpreter {
     ) -> Result<Option<Value>, VmError> {
         let mut popped = stack.pop().ok_or(VmError::InvalidOperand)?;
         let construct_target = self.frame_cold(&popped).and_then(|c| c.construct_target);
+        let is_derived_ctor = self
+            .frame_cold(&popped)
+            .is_some_and(|c| c.is_derived_constructor);
+        let derived_this = popped.this_value;
         // Release the cold slot now so the pool can reuse it; the
         // remaining cold-record reads above already happened.
         self.frame_release_cold(&mut popped);
-        let resolved = match construct_target {
-            Some(_) if value.is_object_type() => value,
-            Some(target) => Value::object(target),
-            None => value,
+        let resolved = if is_derived_ctor {
+            // §10.2.2 derived-constructor return semantics. An object
+            // return overrides the bound `this`; `undefined` yields
+            // the `super(...)`-bound `this` (ReferenceError if
+            // `super` never ran); any other primitive is a TypeError.
+            if value.is_object_type() {
+                value
+            } else if value.is_undefined() {
+                if derived_this.is_hole() {
+                    return Err(VmError::ThisUninitialized {
+                        message: "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string(),
+                    });
+                }
+                derived_this
+            } else {
+                return Err(VmError::TypeError {
+                    message: "derived constructors may only return an object or undefined"
+                        .to_string(),
+                });
+            }
+        } else {
+            match construct_target {
+                Some(_) if value.is_object_type() => value,
+                Some(target) => Value::object(target),
+                None => value,
+            }
         };
         if let Some(state) = popped.async_state {
             let jobs = state.result_promise.fulfill(&mut self.gc_heap, resolved);
@@ -5237,6 +5366,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             is_async_generator: false,
+            is_derived_constructor: false,
             is_module: false,
             needs_arguments: false,
             arguments_object_kind: ArgumentsObjectKind::Unmapped,
@@ -9051,6 +9181,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             is_async_generator: false,
+            is_derived_constructor: false,
             is_module: false,
             needs_arguments: false,
             arguments_object_kind: ArgumentsObjectKind::Unmapped,
@@ -9099,6 +9230,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             is_async_generator: false,
+            is_derived_constructor: false,
             is_module: false,
             needs_arguments: false,
             arguments_object_kind: ArgumentsObjectKind::Unmapped,
@@ -9540,6 +9672,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             is_async_generator: false,
+            is_derived_constructor: false,
             is_module: false,
             needs_arguments: false,
             arguments_object_kind: ArgumentsObjectKind::Unmapped,
@@ -9570,6 +9703,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             is_async_generator: false,
+            is_derived_constructor: false,
             is_module: false,
             needs_arguments: false,
             arguments_object_kind: ArgumentsObjectKind::Unmapped,

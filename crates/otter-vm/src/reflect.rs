@@ -668,6 +668,7 @@ mod tests {
                 is_async: false,
                 is_generator: false,
                 is_async_generator: false,
+                is_derived_constructor: false,
                 is_module: false,
                 needs_arguments: false,
                 arguments_object_kind: crate::ArgumentsObjectKind::Unmapped,

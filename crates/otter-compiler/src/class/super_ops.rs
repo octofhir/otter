@@ -41,6 +41,10 @@ pub(crate) fn compile_super_call(
         ],
         span,
     );
+    // §13.3.7.3 steps 7–9 — bind the derived constructor's `this` to
+    // the constructed value. The result of the `super(...)`
+    // expression is this same bound `this`.
+    cx.emit(Op::BindThisValue, [Operand::Register(dst)], span);
     Ok(dst)
 }
 
@@ -144,12 +148,31 @@ pub(crate) fn compile_super_computed_method_call(
 }
 
 /// load. Resolves to a register holding the looked-up value.
+///
+/// Unlike [`load_super_method`] (used by the call path, where `this`
+/// is supplied separately at the call site), a bare `super.name`
+/// value read must invoke any accessor getter with the current
+/// frame's `this` as the receiver per §13.3.5
+/// MakeSuperPropertyReference. `Op::LoadSuperProperty` performs the
+/// `Object.getPrototypeOf(home)`-based lookup with that receiver.
 pub(crate) fn compile_super_member_load(
     cx: &mut Compiler,
     name: &str,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
-    load_super_method(cx, name, span)
+    let home_reg = load_synthetic_capture(cx, SUPER_HOME_NAME, span)?;
+    let name_idx = cx.intern_string_constant(name);
+    let dst = cx.alloc_scratch();
+    cx.emit(
+        Op::LoadSuperProperty,
+        vec![
+            Operand::Register(dst),
+            Operand::Register(home_reg),
+            Operand::ConstIndex(name_idx),
+        ],
+        span,
+    );
+    Ok(dst)
 }
 
 /// the `super` shape stays bytecode-readable.

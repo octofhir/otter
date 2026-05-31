@@ -25,7 +25,7 @@ use otter_gc::raw::RawGc;
 
 use crate::{
     ClassConstructor, ExecutionContext, Frame, Interpreter, JsObject, JsString, NumberValue, Value,
-    VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
+    SuperReadKey, VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
     array::JsArray,
     binary, collections_prototype, descriptor_value, function_metadata,
     is_restricted_function_property, object,
@@ -113,7 +113,7 @@ impl Interpreter {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-topropertykey>
     /// - <https://tc39.es/ecma262/#sec-toprimitive>
-    fn coerce_property_key_value(
+    pub(crate) fn coerce_property_key_value(
         &mut self,
         context: &ExecutionContext,
         value: Value,
@@ -599,6 +599,147 @@ impl Interpreter {
         Ok(())
     }
 
+    /// §13.3.5 MakeSuperPropertyReference + §13.3.4 GetValue for a
+    /// `super.name` / `super[key]` read. The lookup base is the home
+    /// object's prototype, but accessor getters run with the active
+    /// frame's `this` as the receiver. The `this` binding must be
+    /// initialized (else ReferenceError) and the super-base must be
+    /// object-coercible (else TypeError).
+    pub(crate) fn run_load_super_property(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut SmallVec<[Frame; 8]>,
+        top_idx: usize,
+        dst: u16,
+        home: Value,
+        key: SuperReadKey<'_>,
+    ) -> Result<(), VmError> {
+        // §13.3.7.1 — `GetThisBinding` then `GetSuperBase`, both
+        // before any `ToPropertyKey` coercion on a computed key (a
+        // key's `toString` must observe the pre-coercion super base).
+        let actual_this = stack[top_idx].this_value;
+        if actual_this.is_hole() {
+            return Err(VmError::ThisUninitialized {
+                message: "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string(),
+            });
+        }
+        let base = self.get_prototype_for_op(&home)?;
+        if base.is_null() || base.is_undefined() {
+            return Err(VmError::TypeError {
+                message: "cannot read property of null or undefined super reference".to_string(),
+            });
+        }
+        let key = match key {
+            SuperReadKey::Resolved(k) => k,
+            SuperReadKey::Computed(raw) => {
+                let coerced = self.coerce_property_key_value(context, raw)?;
+                if let Some(sym) = coerced.as_symbol(&self.gc_heap) {
+                    VmPropertyKey::Symbol(sym)
+                } else if let Some(s) = coerced.as_string(&self.gc_heap) {
+                    VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
+                } else if let Some(n) = coerced.as_number() {
+                    VmPropertyKey::OwnedString(n.to_display_string())
+                } else {
+                    return Err(VmError::TypeMismatch);
+                }
+            }
+        };
+        let value = match self.ordinary_get_value(context, base, actual_this, &key, 0)? {
+            VmGetOutcome::Value(v) => v,
+            VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(context, &getter, actual_this, SmallVec::new())?
+            }
+        };
+        write_register(&mut stack[top_idx], dst, value)?;
+        stack[top_idx].advance_pc(self.current_byte_len)?;
+        Ok(())
+    }
+
+    /// §13.3.5 MakeSuperPropertyReference + §6.2.5.5 PutValue
+    /// step 6.b for a `super.name = v` / `super[key] = v` write. The
+    /// lookup base for a setter is the home object's prototype, but
+    /// the setter (or own-data write) targets the active frame's
+    /// `this`. `GetSuperBase` happens before any `ToPropertyKey`
+    /// coercion of a computed key.
+    pub(crate) fn run_store_super_property(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut SmallVec<[Frame; 8]>,
+        top_idx: usize,
+        home: Value,
+        key: SuperReadKey<'_>,
+        value: Value,
+        strict: bool,
+    ) -> Result<(), VmError> {
+        let actual_this = stack[top_idx].this_value;
+        if actual_this.is_hole() {
+            return Err(VmError::ThisUninitialized {
+                message: "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string(),
+            });
+        }
+        let base = self.get_prototype_for_op(&home)?;
+        if base.is_null() || base.is_undefined() {
+            return Err(VmError::TypeError {
+                message: "cannot write property of null or undefined super reference".to_string(),
+            });
+        }
+        let key = match key {
+            SuperReadKey::Resolved(VmPropertyKey::String(s)) => s.to_string(),
+            SuperReadKey::Resolved(k) => match k.string_name() {
+                Some(s) => s.to_string(),
+                None => return Err(VmError::TypeMismatch),
+            },
+            SuperReadKey::Computed(raw) => {
+                let coerced = self.coerce_property_key_value(context, raw)?;
+                if coerced.as_symbol(&self.gc_heap).is_some() {
+                    // Symbol-keyed super writes are not yet exercised
+                    // by the conformance subset; reject explicitly.
+                    return Err(VmError::TypeMismatch);
+                } else if let Some(s) = coerced.as_string(&self.gc_heap) {
+                    s.to_lossy_string(&self.gc_heap)
+                } else if let Some(n) = coerced.as_number() {
+                    n.to_display_string()
+                } else {
+                    return Err(VmError::TypeMismatch);
+                }
+            }
+        };
+        let base_obj = base.as_object();
+        let outcome = match base_obj {
+            Some(obj) => crate::object::resolve_set(obj, &self.gc_heap, &key),
+            None => object::SetOutcome::AssignData,
+        };
+        match outcome {
+            object::SetOutcome::InvokeSetter { setter } => {
+                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                args.push(value);
+                self.run_callable_sync(context, &setter, actual_this, args)?;
+            }
+            object::SetOutcome::Reject { .. } => {
+                Self::failed_set_result(
+                    strict,
+                    format!("Cannot assign to read-only property '{key}'"),
+                )?;
+            }
+            object::SetOutcome::AssignData => {
+                // No setter on the super base — write an own data
+                // property on the receiver (`this`).
+                if let Some(this_obj) = actual_this.as_object() {
+                    if !self.ordinary_set_data_property(this_obj, &key, value)? {
+                        Self::failed_set_result(
+                            strict,
+                            format!("Cannot assign to read-only property '{key}'"),
+                        )?;
+                    }
+                } else {
+                    return Err(VmError::TypeMismatch);
+                }
+            }
+        }
+        stack[top_idx].advance_pc(self.current_byte_len)?;
+        Ok(())
+    }
+
     pub(crate) fn run_set_prototype_regs(
         &mut self,
         context: &ExecutionContext,
@@ -615,15 +756,21 @@ impl Interpreter {
             raw_proto
         } else if let Some(c) = raw_proto.as_class_constructor() {
             Value::object(c.statics(&self.gc_heap))
-        } else if raw_proto.is_native_function() {
+        } else if raw_proto.is_native_function()
+            || raw_proto.is_function()
+            || raw_proto.is_closure()
+            || raw_proto.is_bound_function()
+        {
             // §15.7.14 ClassDefinitionEvaluation step 6.b — `class D
             // extends C` sets D.[[Prototype]] (the static side) to
             // the parent constructor C verbatim, so static methods on
-            // a native parent (`Promise.reject`, `Map[@@species]`, …)
-            // resolve through the ordinary [[Get]] ladder. Carry the
-            // native callable through as an `ObjectPrototype::Value`
-            // — the prototype walker in `ordinary_get_value` knows
-            // how to walk into a NativeFunction receiver.
+            // the parent resolve through the ordinary [[Get]] ladder.
+            // This holds whether C is a native constructor
+            // (`Promise.reject`, `Map[@@species]`, …) or a plain
+            // ECMAScript function used as a base class. Carry the
+            // callable through — the prototype walker in
+            // `ordinary_get_value` knows how to walk a callable
+            // receiver.
             raw_proto
         } else {
             return Err(VmError::TypeMismatch);

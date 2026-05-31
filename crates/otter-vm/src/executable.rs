@@ -186,6 +186,10 @@ pub(crate) struct ExecutableFunction {
     pub(crate) is_generator: bool,
     /// `true` when this function is an async generator.
     pub(crate) is_async_generator: bool,
+    /// `true` when this function is a derived-class constructor whose
+    /// `this` is bound by `super(...)` (§10.2.2). Frame setup starts
+    /// it in the TDZ.
+    pub(crate) is_derived_constructor: bool,
     /// `true` when this function body needs an `arguments` object.
     pub(crate) needs_arguments: bool,
     /// Arguments object shape requested by the compiler.
@@ -279,6 +283,7 @@ impl ExecutableFunction {
             is_strict: function.is_strict,
             is_arrow: function.is_arrow,
             has_rest: function.has_rest,
+            is_derived_constructor: function.is_derived_constructor,
             is_async: function.is_async,
             is_generator: function.is_generator,
             is_async_generator: function.is_async_generator,

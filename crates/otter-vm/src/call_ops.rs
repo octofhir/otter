@@ -130,15 +130,29 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
+        // §10.2.2 — a derived constructor enters with `this` in the
+        // TDZ; `super(...)` binds it via `Op::BindThisValue`. A base
+        // constructor receives the freshly-allocated receiver as
+        // `this` immediately.
+        let is_derived = function.is_derived_constructor;
+        let this_value = if is_derived {
+            Value::hole()
+        } else {
+            Value::object(receiver)
+        };
         let mut frame = Frame::with_exec_return_upvalues_and_this(
             function,
             return_register,
             upvalues,
-            Value::object(receiver),
+            this_value,
         );
         {
             let cold = self.frame_ensure_cold(&mut frame);
-            cold.construct_target = Some(receiver);
+            if is_derived {
+                cold.is_derived_constructor = true;
+            } else {
+                cold.construct_target = Some(receiver);
+            }
             cold.new_target = Some(new_target);
         }
         self.bind_bytecode_call_arguments(function, &mut frame, args)?;
@@ -161,16 +175,26 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
+        let is_derived = function.is_derived_constructor;
+        let this_value = if is_derived {
+            Value::hole()
+        } else {
+            Value::object(receiver)
+        };
         let mut frame = Frame::with_exec_return_upvalues_and_this(
             function,
             return_register,
             upvalues,
-            Value::object(receiver),
+            this_value,
         );
         let extras = args.bind_into(function, &mut frame)?;
         {
             let cold = self.frame_ensure_cold(&mut frame);
-            cold.construct_target = Some(receiver);
+            if is_derived {
+                cold.is_derived_constructor = true;
+            } else {
+                cold.construct_target = Some(receiver);
+            }
             cold.new_target = Some(new_target);
             if !extras.is_empty() {
                 cold.rest_args = extras.rest_args;

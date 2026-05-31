@@ -3321,6 +3321,9 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
             DiagnosticCode::Tdz,
             format!("cannot access local {local_index} before initialization"),
         ),
+        VmError::ThisUninitialized { message } => {
+            runtime_diagnostic(DiagnosticKind::Reference, DiagnosticCode::Tdz, message)
+        }
         VmError::StackOverflow { limit } => runtime_diagnostic(
             DiagnosticKind::Range,
             DiagnosticCode::StackOverflow,

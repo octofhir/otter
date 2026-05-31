@@ -362,6 +362,38 @@ pub enum Op {
     /// forwards the current frame's `new.target` instead of using
     /// the superclass callee as `new.target`.
     SuperConstructSpread,
+    /// Bind the derived-constructor `this` to the value produced by
+    /// a `super(...)` call (§13.3.7.3 SuperCall, steps 7–9 —
+    /// `BindThisValue`). Operand: `Register(src)`. Reads the super
+    /// result from `src`, installs it as the frame's `this`, marks
+    /// `this` initialized, and records it as the construct target so
+    /// an implicit `return` yields the bound object. Throws a
+    /// `ReferenceError` if `this` was already initialized (i.e.
+    /// `super()` ran twice).
+    BindThisValue,
+    /// `super.name` read (§13.3.5 MakeSuperPropertyReference +
+    /// GetValue). Operands: `Register(dst), Register(home),
+    /// ConstIndex(name)`. Resolves against
+    /// `Object.getPrototypeOf(home)` but invokes any accessor getter
+    /// with the *current* frame's `this` as the receiver. Throws a
+    /// ReferenceError if `this` is in the TDZ and a TypeError if the
+    /// resolved super-base is `null`/`undefined`.
+    LoadSuperProperty,
+    /// `super[key]` read — computed-key form of
+    /// [`Self::LoadSuperProperty`]. Operands: `Register(dst),
+    /// Register(home), Register(key)`.
+    LoadSuperElement,
+    /// `super.name = value` write (§13.3.5 + §6.2.5.5 PutValue
+    /// step 6.b). Operands: `Register(home), ConstIndex(name),
+    /// Register(value)`. Resolves any accessor setter against
+    /// `Object.getPrototypeOf(home)` and invokes it with the current
+    /// `this` as receiver; otherwise writes an own data property onto
+    /// `this`. TDZ / null-base errors match [`Self::LoadSuperProperty`].
+    SetSuperProperty,
+    /// `super[key] = value` write — computed-key form of
+    /// [`Self::SetSuperProperty`]. Operands: `Register(home),
+    /// Register(key), Register(value)`.
+    SetSuperElement,
     /// `r<dst> = ClassConstructor { ctor, prototype, statics }`.
     /// Operands: `Register(dst), Register(ctor), Register(prototype),
     /// Register(statics)`. Used by class lowering to package the
@@ -959,6 +991,11 @@ impl Op {
             Op::New => "NEW",
             Op::NewSpread => "NEW_SPREAD",
             Op::SuperConstructSpread => "SUPER_CONSTRUCT_SPREAD",
+            Op::BindThisValue => "BIND_THIS_VALUE",
+            Op::LoadSuperProperty => "LOAD_SUPER_PROPERTY",
+            Op::LoadSuperElement => "LOAD_SUPER_ELEMENT",
+            Op::SetSuperProperty => "SET_SUPER_PROPERTY",
+            Op::SetSuperElement => "SET_SUPER_ELEMENT",
             Op::MakeClass => "MAKE_CLASS",
             Op::CollectRest => "COLLECT_REST",
             Op::MathLoad => "MATH_LOAD",
@@ -1158,6 +1195,9 @@ impl Op {
             Op::NewCollection => 3,
             Op::CallSpread => 4,
             Op::NewSpread | Op::SuperConstructSpread => 3,
+            Op::BindThisValue => 1,
+            Op::LoadSuperProperty | Op::LoadSuperElement => 3,
+            Op::SetSuperProperty | Op::SetSuperElement => 3,
             // dst, name_const, src, scratch_dst.
             Op::StoreProperty => 4,
             // `NewArray` is variadic: `dst, count, elems...`. The
@@ -1601,6 +1641,18 @@ pub struct Function {
     /// have a stable hook.
     #[serde(default)]
     pub is_module: bool,
+    /// `true` when this function is the constructor of a *derived*
+    /// class (`class C extends B { … }`). Derived constructors start
+    /// with `this` in the TDZ: reading `this` (or `super.foo`) before
+    /// the `super(...)` call is a `ReferenceError`, and `this` is only
+    /// bound once [`Op::BindThisValue`] runs with the `super()`
+    /// result. Base-class constructors and ordinary functions leave
+    /// this `false` and receive `this` pre-bound at call entry.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+    #[serde(default)]
+    pub is_derived_constructor: bool,
     /// `true` when the function body references the `arguments`
     /// identifier and the function is not an arrow (arrows
     /// inherit `arguments` lexically per §10.2.1.4 — the foundation

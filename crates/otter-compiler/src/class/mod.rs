@@ -135,10 +135,20 @@ pub(crate) fn compile_class(
 
     // Build the prototype object up-front so methods can be
     // installed on it as we walk the class body. For `extends`,
-    // chain `C.prototype` from the parent's prototype.
+    // chain `C.prototype` from the parent's prototype. Statics
+    // object — own static methods live here and chain to the
+    // parent's statics for `extends`.
     let prototype_reg = cx.alloc_scratch();
     cx.emit(Op::NewObject, [Operand::Register(prototype_reg)], span);
+    let statics_reg = cx.alloc_scratch();
+    cx.emit(Op::NewObject, [Operand::Register(statics_reg)], span);
     if let Some(parent_reg) = super_reg {
+        // §15.7.14 ClassDefinitionEvaluation step 6 — `extends null`
+        // (or any superclass value that is null) gives protoParent =
+        // null: `C.prototype.[[Prototype]]` is null and the parent's
+        // `prototype` slot is never read. Branch on the runtime value
+        // so a literal `extends null` and a dynamic null both work.
+        let to_null = cx.emit_branch_placeholder(Op::JumpIfNullish, Some(parent_reg), span);
         let parent_proto = cx.alloc_scratch();
         let proto_const = cx.intern_string_constant("prototype");
         cx.emit(
@@ -158,13 +168,6 @@ pub(crate) fn compile_class(
             ],
             span,
         );
-    }
-
-    // Statics object — own static methods live here and chain to
-    // the parent's statics for `extends`.
-    let statics_reg = cx.alloc_scratch();
-    cx.emit(Op::NewObject, [Operand::Register(statics_reg)], span);
-    if let Some(parent_reg) = super_reg {
         cx.emit(
             Op::SetPrototype,
             vec![
@@ -173,6 +176,19 @@ pub(crate) fn compile_class(
             ],
             span,
         );
+        let done = cx.emit_branch_placeholder(Op::Jump, None, span);
+        cx.patch_branch_to_here(to_null);
+        let null_reg = cx.alloc_scratch();
+        cx.emit(Op::LoadNull, [Operand::Register(null_reg)], span);
+        cx.emit(
+            Op::SetPrototype,
+            vec![
+                Operand::Register(prototype_reg),
+                Operand::Register(null_reg),
+            ],
+            span,
+        );
+        cx.patch_branch_to_here(done);
     }
 
     // Install the synthetic `__class_home` / `__class_super`

@@ -136,6 +136,14 @@ pub enum VmError {
         /// Compiler-assigned local index.
         local_index: u32,
     },
+    /// The `this` binding of a derived-class constructor was used
+    /// (read, written, or implicitly returned) before the
+    /// `super(...)` call that initializes it, or `super(...)` ran
+    /// more than once. §13.3.7.3 / §10.2.2 — a `ReferenceError`.
+    ThisUninitialized {
+        /// Human-readable detail for the thrown `ReferenceError`.
+        message: String,
+    },
     /// JS call-stack depth exceeded the configured limit. Catchable
     /// per foundation plan §M7 ("stack-depth limit returns a
     /// catchable JS error").
@@ -219,6 +227,7 @@ impl std::fmt::Display for VmError {
             VmError::TemporalDeadZone { local_index } => {
                 write!(f, "cannot access local {local_index} before initialization")
             }
+            VmError::ThisUninitialized { message } => write!(f, "{message}"),
             VmError::StackOverflow { limit } => {
                 write!(f, "maximum call stack size exceeded (limit {limit})")
             }

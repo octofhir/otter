@@ -173,6 +173,15 @@ pub(crate) fn compile_update(
             key_reg: u16,
             _phantom: std::marker::PhantomData<&'c ()>,
         },
+        SuperStatic {
+            home_reg: u16,
+            name: &'b str,
+        },
+        SuperComputed {
+            home_reg: u16,
+            key_reg: u16,
+            _phantom: std::marker::PhantomData<&'c ()>,
+        },
     }
     let target = match &u.argument {
         SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
@@ -214,6 +223,50 @@ pub(crate) fn compile_update(
                 name,
                 storage,
                 with_ref,
+            }
+        }
+        SimpleAssignmentTarget::StaticMemberExpression(member)
+            if matches!(member.object, Expression::Super(_)) =>
+        {
+            // §13.4 update on `super.name` — read and write both go
+            // through the super reference (parent-prototype lookup,
+            // `this` receiver).
+            let home_reg = load_synthetic_capture(cx, SUPER_HOME_NAME, span)?;
+            let name = member.property.name.as_str();
+            let name_idx = cx.intern_string_constant(name);
+            cx.emit(
+                Op::LoadSuperProperty,
+                vec![
+                    Operand::Register(old),
+                    Operand::Register(home_reg),
+                    Operand::ConstIndex(name_idx),
+                ],
+                span,
+            );
+            UpdateTarget::SuperStatic { home_reg, name }
+        }
+        SimpleAssignmentTarget::ComputedMemberExpression(member)
+            if matches!(member.object, Expression::Super(_)) =>
+        {
+            let home_reg = load_synthetic_capture(cx, SUPER_HOME_NAME, span)?;
+            // §13.3.7.1 step 2 — `GetThisBinding` precedes key
+            // evaluation (derived-constructor TDZ fires first).
+            let this_guard = cx.alloc_scratch();
+            cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+            let key_reg = compile_expr(cx, &member.expression, span)?;
+            cx.emit(
+                Op::LoadSuperElement,
+                vec![
+                    Operand::Register(old),
+                    Operand::Register(home_reg),
+                    Operand::Register(key_reg),
+                ],
+                span,
+            );
+            UpdateTarget::SuperComputed {
+                home_reg,
+                key_reg,
+                _phantom: std::marker::PhantomData,
             }
         }
         SimpleAssignmentTarget::StaticMemberExpression(member) => {
@@ -343,6 +396,31 @@ pub(crate) fn compile_update(
             obj_reg, key_reg, ..
         } => {
             cx.emit_store_element(obj_reg, key_reg, next, span);
+        }
+        UpdateTarget::SuperStatic { home_reg, name } => {
+            let name_idx = cx.intern_string_constant(name);
+            cx.emit(
+                Op::SetSuperProperty,
+                vec![
+                    Operand::Register(home_reg),
+                    Operand::ConstIndex(name_idx),
+                    Operand::Register(next),
+                ],
+                span,
+            );
+        }
+        UpdateTarget::SuperComputed {
+            home_reg, key_reg, ..
+        } => {
+            cx.emit(
+                Op::SetSuperElement,
+                vec![
+                    Operand::Register(home_reg),
+                    Operand::Register(key_reg),
+                    Operand::Register(next),
+                ],
+                span,
+            );
         }
     }
     // §13.4.2.1 / 13.4.3.1 — postfix returns the pre-

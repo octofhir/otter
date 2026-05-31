@@ -61,6 +61,9 @@ pub(crate) fn compile_synthetic_constructor(
             ],
             span,
         );
+        // §13.3.7.3 steps 7–9 — bind `this` so the field initializers
+        // below (and the implicit return) see the constructed value.
+        parent.emit(Op::BindThisValue, [Operand::Register(dst)], span);
         if instance_fields.is_empty() {
             parent.emit(Op::Return, [Operand::Register(dst)], span);
         }
@@ -86,6 +89,7 @@ pub(crate) fn compile_synthetic_constructor(
     slot.param_count = 0;
     slot.length = 0;
     slot.has_rest = is_derived;
+    slot.is_derived_constructor = is_derived;
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.code = child.code;
     slot.spans = child.spans;
@@ -105,7 +109,18 @@ pub(crate) fn compile_class_constructor(
     is_derived: bool,
 ) -> Result<(u32, Vec<u32>), CompileError> {
     if instance_fields.is_empty() {
-        return compile_function_full(parent, name, params, body, span, is_async, false, true);
+        let module = Rc::clone(&parent.top_mut().module);
+        let (function_id, captures) =
+            compile_function_full(parent, name, params, body, span, is_async, false, true)?;
+        if is_derived {
+            module
+                .borrow_mut()
+                .functions
+                .get_mut(function_id as usize)
+                .expect("compiled constructor slot")
+                .is_derived_constructor = true;
+        }
+        return Ok((function_id, captures));
     }
     // Compile the function with field-init injection. We mirror
     // `compile_function` but inject the field stores after the
@@ -214,6 +229,7 @@ pub(crate) fn compile_class_constructor(
     slot.length = length;
     slot.has_rest = has_rest;
     slot.is_async = is_async;
+    slot.is_derived_constructor = is_derived;
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.code = child.code;
     slot.spans = child.spans;

@@ -2209,3 +2209,32 @@ bindings + head/RHS scope separation (~7), `let` TDZ through a closure
 / at global scope (~9), class `name` own-property + `var C = class{}`
 NamedEvaluation (3), `break`-carries-V completion (`*-abrupt-empty`,
 ~2), and `arguments`-object mapping edge cases (3).
+
+A fourth pass landed throw-unwind IteratorClose (§7.4.9) on a single
+closer registry shared by destructuring and `for…of`.
+`ColdFrame.active_iterator_closers` entries now carry the try-handler
+depth recorded at `Op::IteratorCloseStart`; `unwind_throw` (now taking
+`&ExecutionContext`) closes the crossed iterators innermost-first. A
+`try`/`catch` nested *inside* the region has a deeper depth and is not
+crossed, so its iterator stays open and iteration resumes. An iterator
+is dropped from the registry — making IteratorClose the spec no-op —
+when `next` returns `done: true`, when the in-frame step returns an
+error, and when an explicit `Op::IteratorClose` runs, so `[[return]]`
+is not invoked twice. `for…of` now registers its iterator via
+`IteratorCloseStart`/`End` (a body `throw` closes it); `break` /
+`continue` / `return` keep their inline close. Secondary throws from a
+`return` invoked during unwind are swallowed per spec.
+
+After:
+
+| total | passed | failed | skipped | pass rate |
+|---:|---:|---:|---:|---:|
+| 752 | 702 | 35 | 15 | 95.25% |
+
+Delta: +5 passing tests (`iterator`/`generator`-`close-via-throw`,
+`body-*-error`, `array-rest-lref-err`, `*-nrml-close-err`,
+`array-empty-iter-close-err`). Still open in this family: the
+destructuring `*-thrw-close-skip` / `*-iter-abpt` cases, where a user
+iterator's `next` throws through a separately parked call frame (not an
+in-frame error), so the iterator is not marked `[[done]]` before unwind
+and `return` runs once too often.

@@ -358,7 +358,7 @@ impl Interpreter {
                         // surrounding `try { gen.throw(x) } catch`
                         // observes the right payload.
                         if let Some(thrown) = self.pending_generator_throw.take() {
-                            self.unwind_throw(stack, thrown)?;
+                            self.unwind_throw(context, stack, thrown)?;
                             return Ok(());
                         }
                         return Err(err);

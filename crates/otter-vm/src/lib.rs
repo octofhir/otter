@@ -2789,7 +2789,7 @@ impl Interpreter {
                             && let Some(thrown) = self.pending_uncaught_throw.take()
                         {
                             self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
-                            let unwind = self.unwind_throw(stack, thrown);
+                            let unwind = self.unwind_throw(context, stack, thrown);
                             if unwind.is_ok() {
                                 self.pending_uncaught_frames = None;
                             }
@@ -2811,7 +2811,8 @@ impl Interpreter {
                                 None
                             };
                             self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
-                            let unwind = self.unwind_throw_with_uncaught(stack, thrown, uncaught);
+                            let unwind =
+                                self.unwind_throw_with_uncaught(context, stack, thrown, uncaught);
                             if unwind.is_ok() {
                                 self.pending_uncaught_frames = None;
                             }
@@ -2968,7 +2969,7 @@ impl Interpreter {
                     // unwind path clears `pending_uncaught_frames`
                     // through [`Self::clear_pending_uncaught_frames`].
                     self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
-                    let unwind = self.unwind_throw(stack, value);
+                    let unwind = self.unwind_throw(context, stack, value);
                     if unwind.is_ok() {
                         self.pending_uncaught_frames = None;
                     }
@@ -2984,7 +2985,7 @@ impl Interpreter {
                         .and_then(|c| c.pending_abrupt.take());
                     if let Some(value) = pending {
                         self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
-                        let unwind = self.unwind_throw(stack, value);
+                        let unwind = self.unwind_throw(context, stack, value);
                         if unwind.is_ok() {
                             self.pending_uncaught_frames = None;
                         }
@@ -3121,9 +3122,23 @@ impl Interpreter {
                 // `done`.
                 // <https://tc39.es/ecma262/#sec-iteratornext>
                 Op::IteratorNext => {
+                    // §7.4.8 IteratorStep — if `next` throws, the
+                    // iterator record is set `[[done]]` and IteratorClose
+                    // is *not* run for it. Deregister the iterator from
+                    // the §7.4.9 closer set before propagating so the
+                    // throw-unwind does not invoke `[[return]]`.
+                    let iter_reg = context
+                        .exec_register(instr, 2)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let iterator = *read_register(&stack[top_idx], iter_reg)?;
                     let operands = context.exec_operands(instr);
-                    if self.drive_iterator_next(stack, context, operands)? {
-                        continue;
+                    match self.drive_iterator_next(stack, context, operands) {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(e) => {
+                            self.deregister_frame_iterator_closer(&mut stack[top_idx], iterator);
+                            return Err(e);
+                        }
                     }
                     let value_dst = context
                         .exec_register(instr, 0)
@@ -3131,11 +3146,13 @@ impl Interpreter {
                     let done_dst = context
                         .exec_register(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
-                    let iter_reg = context
-                        .exec_register(instr, 2)
-                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_iterator_next_regs(frame, value_dst, done_dst, iter_reg)?;
+                    if let Err(e) =
+                        self.run_iterator_next_regs(frame, value_dst, done_dst, iter_reg)
+                    {
+                        self.deregister_frame_iterator_closer(&mut stack[top_idx], iterator);
+                        return Err(e);
+                    }
                     continue;
                 }
                 Op::IteratorClose => {
@@ -3143,6 +3160,10 @@ impl Interpreter {
                         .exec_register(instr, 0)
                         .ok_or(VmError::InvalidOperand)?;
                     let iterator = *read_register(&stack[top_idx], iter_reg)?;
+                    // §7.4.9 — mark the iterator done *before* running its
+                    // `[[return]]`: if `return` throws, the unwind must
+                    // not close it again (it is already closing).
+                    self.deregister_frame_iterator_closer(&mut stack[top_idx], iterator);
                     self.iterator_close_value_sync(context, iterator)?;
                     stack[top_idx].advance_pc(self.current_byte_len)?;
                     continue;
@@ -3152,9 +3173,15 @@ impl Interpreter {
                         .exec_register(instr, 0)
                         .ok_or(VmError::InvalidOperand)?;
                     let iterator = *read_register(&stack[top_idx], iter_reg)?;
+                    // §7.4.9 — record the handler depth so throw-unwind
+                    // can tell whether a catching handler sits inside or
+                    // outside this iterator's region.
+                    let handler_depth = self
+                        .frame_cold(&stack[top_idx])
+                        .map_or(0, |c| c.handlers.len() as u32);
                     self.frame_ensure_cold(&mut stack[top_idx])
                         .active_iterator_closers
-                        .push(iterator);
+                        .push((iterator, handler_depth));
                     stack[top_idx].advance_pc(self.current_byte_len)?;
                     continue;
                 }
@@ -3167,7 +3194,7 @@ impl Interpreter {
                         && let Some(pos) = cold
                             .active_iterator_closers
                             .iter()
-                            .rposition(|value| *value == iterator)
+                            .rposition(|(value, _)| *value == iterator)
                     {
                         cold.active_iterator_closers.remove(pos);
                     }
@@ -9369,9 +9396,17 @@ mod tests {
         // Push a second frame on top — should be popped during
         // unwinding and not absorb the throw.
         stack.push(Frame::for_function(&main));
+        let context = ExecutionContext::from_module(module_with(
+            vec![Instruction {
+                pc: 0,
+                op: Op::ReturnUndefined,
+                operands: vec![].into(),
+            }],
+            1,
+        ));
         let mut interp = Interpreter::new();
         let err = interp
-            .unwind_throw(&mut stack, Value::boolean(true))
+            .unwind_throw(&context, &mut stack, Value::boolean(true))
             .unwrap_err();
         match err {
             VmError::Uncaught { value } => assert_eq!(value, "true"),
@@ -9425,8 +9460,16 @@ mod tests {
                 exc_register: 1,
             });
         stack.push(frame);
+        let context = ExecutionContext::from_module(module_with(
+            vec![Instruction {
+                pc: 0,
+                op: Op::ReturnUndefined,
+                operands: vec![].into(),
+            }],
+            2,
+        ));
         interp
-            .unwind_throw(&mut stack, Value::boolean(true))
+            .unwind_throw(&context, &mut stack, Value::boolean(true))
             .unwrap();
         assert_eq!(stack[0].pc, 42);
         assert_eq!(stack[0].registers[1], Value::boolean(true));

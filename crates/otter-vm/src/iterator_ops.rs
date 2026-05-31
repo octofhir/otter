@@ -217,6 +217,14 @@ impl Interpreter {
         let (value, done) = step_iterator(iter, &mut self.gc_heap)?;
         write_register(frame, value_dst, value)?;
         write_register(frame, done_dst, Value::boolean(done))?;
+        if done {
+            // §7.4.9 — an exhausted iterator is `[[Done]]`; drop it from
+            // the closer registry so a later throw-unwind treats
+            // IteratorClose as the spec no-op rather than re-running
+            // `[[return]]`.
+            let iterator = *read_register(frame, iter_reg)?;
+            self.deregister_frame_iterator_closer(frame, iterator);
+        }
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
@@ -1203,7 +1211,7 @@ impl Interpreter {
                     .frame_cold(&frame)
                     .map(|cold| cold.active_iterator_closers.clone())
                     .unwrap_or_default();
-                for iterator in closers.iter().rev() {
+                for (iterator, _) in closers.iter().rev() {
                     self.iterator_close_value_sync(context, *iterator)?;
                 }
                 // §27.5.3.4 GeneratorResumeAbrupt(return) — if the body
@@ -1248,7 +1256,7 @@ impl Interpreter {
             // converts the value to a string when it surfaces as
             // VmError::Uncaught, losing the payload).
             self.pending_generator_throw = Some(reason);
-            match self.unwind_throw(&mut sub_stack, reason) {
+            match self.unwind_throw(context, &mut sub_stack, reason) {
                 Ok(_) => {}
                 Err(err) => {
                     handle.mark_done(&mut self.gc_heap);
@@ -1557,6 +1565,13 @@ impl Interpreter {
             if done && let Some(rc) = state.iterator.as_iterator() {
                 self.gc_heap
                     .with_payload(rc, |state| *state = IteratorState::Exhausted);
+            }
+            if !done {
+                // §7.4.9 — `next` produced a value without throwing, so
+                // the iterator is live again: re-arm its closer (cleared
+                // before the call) so a body abrupt completion runs
+                // `[[return]]`.
+                self.register_frame_iterator_closer(&mut stack[top_idx], state.iterator);
             }
             write_register(&mut stack[top_idx], value_dst, value)?;
             write_register(&mut stack[top_idx], done_dst, Value::boolean(done))?;

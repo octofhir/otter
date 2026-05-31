@@ -78,6 +78,15 @@ pub(crate) fn compile_for_of_statement(
     {
         frame.iterator_close_reg = Some(iter_reg);
     }
+    // §7.4.9 — open the iterator's close region so a throw inside the
+    // body runs its `[[return]]` during unwind (`IteratorCloseEnd` at
+    // the loop exit closes the region on normal / `break` completion;
+    // an exhausted iterator is already done and must not be re-closed).
+    // `break` / `continue` / `return` close inline at the jump site, so
+    // this region only covers the dynamic throw-unwind path.
+    if !is_for_await {
+        cx.emit(Op::IteratorCloseStart, [Operand::Register(iter_reg)], span);
+    }
     let loop_top = cx.next_pc;
     if is_for_await {
         let result_reg = cx.alloc_scratch();
@@ -166,6 +175,13 @@ pub(crate) fn compile_for_of_statement(
         cx.emit(Op::IteratorClose, [Operand::Register(iter_reg)], span);
     }
     cx.patch_branch_to_here(exit_jmp);
+    // Close the throw-unwind region: both the exhausted-iterator exit
+    // and a `break` reach here. Removing the registration prevents an
+    // already-finished (or inline-closed) iterator from being closed a
+    // second time by a later throw further up the same frame.
+    if !is_for_await {
+        cx.emit(Op::IteratorCloseEnd, [Operand::Register(iter_reg)], span);
+    }
     Ok(Some(completion_reg))
 }
 

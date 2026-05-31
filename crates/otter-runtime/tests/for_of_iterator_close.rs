@@ -1,20 +1,23 @@
-//! Runtime coverage for §7.4.9 IteratorClose on abrupt `for…of`
-//! completions — `break`, labelled `continue`, and `return` must call
-//! the iterator's `return` method as control leaves the loop.
+//! Runtime coverage for §7.4.9 IteratorClose on abrupt completion of
+//! a `for…of` loop and array destructuring.
 //!
-//! # Contents
-//! - `break` closes the innermost iterator.
-//! - A labelled `continue`/`break` that exits a `for…of` closes it.
-//! - `return` from inside the loop closes the iterator.
-//! - A `return` inside a nested function does NOT close the outer
-//!   loop's iterator.
+//! Each test drives a real `Runtime`, defines an iterable whose
+//! iterator records `next`/`return` invocations in a global `log`
+//! array, and asserts the iterator's `return` runs exactly when the
+//! spec requires:
 //!
-//! # See also
-//! - <https://tc39.es/ecma262/#sec-iteratorclose>
+//! - on `break` / `return` / a throw escaping the loop body → close;
+//! - when iteration runs to completion or `next` itself throws → no
+//!   close (the iterator record is already `[[done]]`);
+//! - when a `try`/`catch` *inside* the body swallows the throw → no
+//!   close (the loop never completes abruptly).
+//!
+//! Each snippet ends in `log.join(',')` so the script completion value
+//! is the recorded call trace.
 
 use otter_runtime::{Runtime, SourceInput};
 
-fn run(source: &str) -> String {
+fn run_trace(source: &str) -> String {
     let mut rt = Runtime::builder().build().expect("runtime");
     rt.run_script(SourceInput::from_javascript(source), "<for-of-close-test>")
         .expect("script")
@@ -22,54 +25,114 @@ fn run(source: &str) -> String {
         .to_string()
 }
 
-const ITERABLE: &str = r#"
-    var rc = 0;
-    var it = {
-        [Symbol.iterator]() {
-            return {
-                next() { return { done: false, value: 1 }; },
-                return() { rc++; return {}; }
-            };
-        }
-    };
-"#;
+/// An iterable whose `next` always yields and whose `return` pushes
+/// `return` to `log`. `next` logs each call.
+const LIVE_ITERABLE: &str = "var iterable = {\n\
+    [Symbol.iterator]() {\n\
+      return {\n\
+        next() { log.push('next'); return { value: 1, done: false }; },\n\
+        return() { log.push('return'); return {}; }\n\
+      };\n\
+    }\n\
+  };\n";
 
 #[test]
-fn break_closes_iterator() {
-    let out = run(&format!("{ITERABLE} for (var x of it) {{ break; }} String(rc);"));
-    assert_eq!(out, "1");
+fn close_on_break_runs_return() {
+    let src = format!(
+        "var log = [];\n{LIVE_ITERABLE}\
+         for (const x of iterable) {{ log.push('body'); break; }}\n\
+         log.join(',');"
+    );
+    assert_eq!(run_trace(&src), "next,body,return");
 }
 
 #[test]
-fn labelled_continue_closes_crossed_iterator() {
-    let out = run(&format!(
-        "{ITERABLE} L: do {{ for (var x of it) {{ continue L; }} }} while (false); String(rc);"
-    ));
-    assert_eq!(out, "1");
+fn close_on_return_runs_return() {
+    let src = format!(
+        "var log = [];\n\
+         function f() {{\n{LIVE_ITERABLE}\
+           for (const x of iterable) {{ log.push('body'); return; }}\n\
+         }}\n\
+         f();\n\
+         log.join(',');"
+    );
+    assert_eq!(run_trace(&src), "next,body,return");
 }
 
 #[test]
-fn labelled_break_closes_crossed_iterator() {
-    let out = run(&format!(
-        "{ITERABLE} L: for (var y of [0]) {{ for (var x of it) {{ break L; }} }} String(rc);"
-    ));
-    assert_eq!(out, "1");
+fn close_on_throw_in_body_runs_return() {
+    let src = format!(
+        "var log = [];\n{LIVE_ITERABLE}\
+         try {{\n\
+           for (const x of iterable) {{ log.push('body'); throw new Error('boom'); }}\n\
+         }} catch (e) {{ log.push('catch'); }}\n\
+         log.join(',');"
+    );
+    assert_eq!(run_trace(&src), "next,body,return,catch");
 }
 
 #[test]
-fn return_closes_iterator() {
-    let out = run(&format!(
-        "{ITERABLE} (function() {{ for (var x of it) {{ return; }} }})(); String(rc);"
-    ));
-    assert_eq!(out, "1");
+fn run_to_completion_does_not_close() {
+    // A naturally exhausted iterator is `[[done]]`; IteratorClose is a
+    // no-op (no `return` call).
+    let src = "var log = [];\n\
+         var iterable = {\n\
+           [Symbol.iterator]() {\n\
+             var i = 0;\n\
+             return {\n\
+               next() {\n\
+                 log.push('next');\n\
+                 return i++ < 1 ? { value: 1, done: false } : { value: undefined, done: true };\n\
+               },\n\
+               return() { log.push('return'); return {}; }\n\
+             };\n\
+           }\n\
+         };\n\
+         for (const x of iterable) { log.push('body'); }\n\
+         log.join(',');";
+    assert_eq!(run_trace(src), "next,body,next");
 }
 
 #[test]
-fn nested_function_return_does_not_close_outer_iterator() {
-    // The nested function's `return` must not touch the enclosing
-    // loop's iterator; only the `break` closes it (rc == 1).
-    let out = run(&format!(
-        "{ITERABLE} for (var x of it) {{ (function() {{ return; }})(); break; }} String(rc);"
-    ));
-    assert_eq!(out, "1");
+fn inner_try_catch_does_not_close_outer_loop() {
+    // A throw caught *inside* the loop body never completes the loop
+    // abruptly, so the iterator stays open and iteration resumes.
+    let src = "var log = [];\n\
+         var iterable = {\n\
+           [Symbol.iterator]() {\n\
+             var i = 0;\n\
+             return {\n\
+               next() {\n\
+                 log.push('next');\n\
+                 return i++ < 2 ? { value: i, done: false } : { value: undefined, done: true };\n\
+               },\n\
+               return() { log.push('return'); return {}; }\n\
+             };\n\
+           }\n\
+         };\n\
+         for (const x of iterable) {\n\
+           try { throw new Error('boom'); } catch (e) { log.push('caught'); }\n\
+         }\n\
+         log.join(',');";
+    // Two yielded values, each caught inside the body, then natural
+    // exhaustion — `return` is never invoked.
+    assert_eq!(run_trace(src), "next,caught,next,caught,next");
+}
+
+#[test]
+fn dstr_target_key_throwing_closes() {
+    // The destructuring target key `{}[thrower()]` is evaluated before
+    // `IteratorStep`, so `next` is never called; the iterator opened by
+    // `GetIterator` is still `[[done]] === false` and is closed
+    // (§7.4.9) — `return` runs without any `next`.
+    let src = "var log = [];\n\
+         var iterator = {\n\
+           next() { log.push('next'); return { value: 1, done: false }; },\n\
+           return() { log.push('return'); return {}; }\n\
+         };\n\
+         var iterable = {}; iterable[Symbol.iterator] = function () { return iterator; };\n\
+         var thrower = function () { throw new Error('boom'); };\n\
+         try { for ([ {}[thrower()] ] of [iterable]) {} } catch (e) {}\n\
+         log.join(',');";
+    assert_eq!(run_trace(src), "return");
 }

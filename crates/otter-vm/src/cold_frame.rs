@@ -123,9 +123,16 @@ pub struct ColdFrame {
     /// `Op::LeaveTry` or by exception unwind landing on a matching
     /// catch / finally. Innermost handler on top.
     pub handlers: SmallVec<[TryHandler; 4]>,
-    /// Iterators that must be closed if a generator is parked inside
-    /// destructuring and later resumed with `.return()`.
-    pub active_iterator_closers: SmallVec<[Value; 2]>,
+    /// Iterators whose `[[return]]` must run on an abrupt completion
+    /// that exits their region (§7.4.9 IteratorClose). Each entry pairs
+    /// the iterator with the `handlers` stack depth recorded when its
+    /// region opened (`Op::IteratorCloseStart`). On throw-unwind a
+    /// closer is run only when the catching handler sits *below* that
+    /// depth (the throw genuinely leaves the region); a `try`/`catch`
+    /// nested *inside* the region leaves the iterator open. Also drained
+    /// innermost-first when a parked generator is resumed with
+    /// `.return()`.
+    pub active_iterator_closers: SmallVec<[(Value, u32); 2]>,
     /// `true` when this frame runs a *derived* class constructor.
     /// Its `this` starts in the TDZ (a `Value::hole()` in
     /// `Frame::this_value`) until `super(...)` runs
@@ -200,7 +207,7 @@ impl ColdFrame {
         for v in &self.incoming_args {
             v.trace_value_slots(visitor);
         }
-        for v in &self.active_iterator_closers {
+        for (v, _) in &self.active_iterator_closers {
             v.trace_value_slots(visitor);
         }
     }

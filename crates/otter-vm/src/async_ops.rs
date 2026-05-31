@@ -199,7 +199,7 @@ impl Interpreter {
             crate::generator::AsyncGeneratorState::Executing,
         );
         if !fulfilled {
-            if let Err(error) = self.unwind_throw(&mut stack, value) {
+            if let Err(error) = self.unwind_throw(context, &mut stack, value) {
                 let frames = snapshot_frames(context, &stack);
                 return Err(RunError { error, frames });
             }
@@ -309,7 +309,7 @@ impl Interpreter {
             // Inject the rejection as a throw so the parked frame
             // observes it through its `try`/`catch`/`finally`
             // structure exactly as a synchronous throw would.
-            if let Err(error) = self.unwind_throw(&mut stack, value) {
+            if let Err(error) = self.unwind_throw(context, &mut stack, value) {
                 let frames = snapshot_frames(context, &stack);
                 return Err(RunError { error, frames });
             }
@@ -355,10 +355,11 @@ impl Interpreter {
     ///   a handler and no async-frame absorbed the throw.
     pub(crate) fn unwind_throw(
         &mut self,
+        context: &ExecutionContext,
         stack: &mut SmallVec<[Frame; 8]>,
         value: Value,
     ) -> Result<(), VmError> {
-        self.unwind_throw_with_uncaught(stack, value, None)
+        self.unwind_throw_with_uncaught(context, stack, value, None)
     }
 
     /// Same as [`Self::unwind_throw`], but returns
@@ -369,6 +370,7 @@ impl Interpreter {
     /// unhandled.
     pub(crate) fn unwind_throw_with_uncaught(
         &mut self,
+        context: &ExecutionContext,
         stack: &mut SmallVec<[Frame; 8]>,
         value: Value,
         mut uncaught_error: Option<VmError>,
@@ -376,22 +378,30 @@ impl Interpreter {
         let display = render_thrown_value(&value, &self.gc_heap);
         let payload = value;
         loop {
-            let Some(frame) = stack.last_mut() else {
+            if stack.last().is_none() {
                 if uncaught_error.is_none() {
                     self.pending_uncaught_throw = Some(payload);
                 }
                 return Err(uncaught_error
                     .take()
                     .unwrap_or(VmError::Uncaught { value: display }));
+            }
+            let popped_handler = {
+                let frame = stack.last_mut().expect("frame present");
+                self.frame_cold_mut(frame).and_then(|c| c.handlers.pop())
             };
-            let popped_handler = self.frame_cold_mut(frame).and_then(|c| c.handlers.pop());
-            // Re-borrow `frame` after the helper's `&mut self` borrow.
-            let frame = stack.last_mut().expect("frame still present");
             let Some(handler) = popped_handler else {
-                // No in-frame try-handler. Async frames absorb
-                // their own unhandled throws into the result
-                // promise as a rejection — synthesised in spec
-                // §27.7.5.3 step 1.h.iii.
+                // No in-frame try-handler: this frame's entire body is
+                // exited, so §7.4.9 IteratorClose runs for every
+                // iterator it left open (floor `-1` takes all depths)
+                // before the frame is discarded.
+                let closers =
+                    self.take_frame_closers_above(stack.last_mut().expect("frame"), -1);
+                self.close_unwind_iterators(context, closers);
+                let frame = stack.last_mut().expect("frame still present");
+                // Async frames absorb their own unhandled throws into the
+                // result promise as a rejection — spec §27.7.5.3
+                // step 1.h.iii.
                 if frame.async_state.is_some() {
                     let popped = stack.pop().expect("frame existed at last_mut");
                     let result_promise = popped
@@ -407,6 +417,19 @@ impl Interpreter {
                 stack.pop();
                 continue;
             };
+            // Landing in this frame's catch / finally: §7.4.9 closes the
+            // iterators whose region sits inside the handler just popped
+            // (registered at a deeper handler depth than the remaining
+            // floor). An iterator opened *outside* the matched handler —
+            // e.g. a `try`/`catch` nested inside the loop body — stays
+            // open so iteration can resume.
+            let floor = self
+                .frame_cold(stack.last().expect("frame"))
+                .map_or(0, |c| c.handlers.len() as i64);
+            let closers =
+                self.take_frame_closers_above(stack.last_mut().expect("frame"), floor);
+            self.close_unwind_iterators(context, closers);
+            let frame = stack.last_mut().expect("frame still present");
             if let Some(catch_pc) = handler.catch_pc {
                 frame.pc = catch_pc;
                 let slot = frame
@@ -420,6 +443,86 @@ impl Interpreter {
             frame.pc = finally_pc;
             self.frame_ensure_cold(frame).pending_throw = Some(payload);
             return Ok(());
+        }
+    }
+
+    /// Drain the top frame's iterator closers whose recorded handler
+    /// depth is strictly greater than `floor`, returning them
+    /// innermost-first (last registered runs first). Used by
+    /// [`Self::unwind_throw_with_uncaught`] to decide which §7.4.9
+    /// IteratorClose hooks the in-flight throw crosses.
+    fn take_frame_closers_above(
+        &mut self,
+        frame: &mut Frame,
+        floor: i64,
+    ) -> SmallVec<[Value; 2]> {
+        let mut out: SmallVec<[Value; 2]> = SmallVec::new();
+        if let Some(cold) = self.frame_cold_mut(frame) {
+            let mut i = 0;
+            while i < cold.active_iterator_closers.len() {
+                if i64::from(cold.active_iterator_closers[i].1) > floor {
+                    out.push(cold.active_iterator_closers.remove(i).0);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        out.reverse();
+        out
+    }
+
+    /// Run `[[return]]` on each iterator crossed by an in-flight throw.
+    /// A secondary throw from `return` is swallowed — §7.4.9 keeps the
+    /// original (throw) completion.
+    fn close_unwind_iterators(
+        &mut self,
+        context: &ExecutionContext,
+        closers: SmallVec<[Value; 2]>,
+    ) {
+        for iterator in closers {
+            let _ = self.iterator_close_value_sync(context, iterator);
+        }
+    }
+
+    /// Drop `iterator` from the top frame's §7.4.9 closer registry.
+    /// Called when the iterator becomes `[[Done]]` — its `next`
+    /// returned `done: true`, or an explicit `Op::IteratorClose`
+    /// already ran — so a later throw-unwind does not invoke
+    /// `[[return]]` a second time (IteratorClose is a no-op on a done
+    /// iterator).
+    pub(crate) fn deregister_frame_iterator_closer(
+        &mut self,
+        frame: &mut Frame,
+        iterator: Value,
+    ) {
+        if let Some(cold) = self.frame_cold_mut(frame)
+            && let Some(pos) = cold
+                .active_iterator_closers
+                .iter()
+                .rposition(|(v, _)| *v == iterator)
+        {
+            cold.active_iterator_closers.remove(pos);
+        }
+    }
+
+    /// Re-arm `iterator` in the top frame's §7.4.9 closer registry at
+    /// the current handler depth. Called after a user `next` returns
+    /// `done: false` (the closer was dropped for the span of the call
+    /// so a throwing `next` would not trigger IteratorClose). A no-op
+    /// when the iterator is already registered.
+    pub(crate) fn register_frame_iterator_closer(
+        &mut self,
+        frame: &mut Frame,
+        iterator: Value,
+    ) {
+        let depth = self.frame_cold(frame).map_or(0, |c| c.handlers.len() as u32);
+        let cold = self.frame_ensure_cold(frame);
+        if !cold
+            .active_iterator_closers
+            .iter()
+            .any(|(v, _)| *v == iterator)
+        {
+            cold.active_iterator_closers.push((iterator, depth));
         }
     }
 }

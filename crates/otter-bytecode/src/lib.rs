@@ -244,6 +244,16 @@ pub enum Op {
     /// `idx` in the current frame's upvalue table.
     /// Operands: `Register(src), Imm32(upvalue_idx)`.
     StoreUpvalue,
+    /// Replace own-upvalue cell `idx` with a freshly allocated cell
+    /// holding a hole (Temporal Dead Zone). Operands: `Imm32(idx)`.
+    /// Closures created *before* this op keep the previous cell, so a
+    /// `for (let x of …)` body materialises a distinct `x` per
+    /// iteration (§14.7.5.6 CreatePerIterationEnvironment) and a head
+    /// `let` name spends RHS evaluation in the TDZ (§14.7.5.12
+    /// ForIn/OfHeadEvaluation). A subsequent [`Op::StoreUpvalue`]
+    /// writes the iteration's value into the new cell; reading the hole
+    /// through [`Op::LoadUpvalue`] throws a `ReferenceError`.
+    FreshUpvalue,
     /// Variadic call. Operands: `dst, callee, argc, args...`. The
     /// callee must be a function value at this slice. The callee
     /// receives `this = undefined` (foundation default).
@@ -1041,6 +1051,7 @@ impl Op {
             Op::MakeClosure => "MAKE_CLOSURE",
             Op::LoadUpvalue => "LOAD_UPVALUE",
             Op::StoreUpvalue => "STORE_UPVALUE",
+            Op::FreshUpvalue => "FRESH_UPVALUE",
             Op::Call => "CALL",
             Op::ReturnValue => "RETURN_VALUE",
             Op::ReturnUndefined => "RETURN_UNDEFINED",
@@ -1126,6 +1137,7 @@ impl Op {
             | Op::IteratorCloseStart
             | Op::IteratorCloseEnd
             | Op::CollectArguments
+            | Op::FreshUpvalue
             | Op::LoadGlobalThis => 1,
             Op::LoadString
             | Op::LoadNumber

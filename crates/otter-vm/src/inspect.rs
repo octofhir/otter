@@ -851,6 +851,7 @@ mod tests {
         Op::MakeClosure,
         Op::LoadUpvalue,
         Op::StoreUpvalue,
+        Op::FreshUpvalue,
         Op::Call,
         Op::CallWithThis,
         Op::BindFunction,

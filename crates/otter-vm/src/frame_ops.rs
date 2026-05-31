@@ -93,7 +93,39 @@ impl Interpreter {
             .get(idx as usize)
             .ok_or(VmError::InvalidOperand)?;
         let value = read_upvalue(&self.gc_heap, cell);
+        // §13.3.1 — a hole in an upvalue cell marks the Temporal Dead
+        // Zone (`Op::FreshUpvalue` installs it for a per-iteration /
+        // head-TDZ `let`). Reading it before the initializer's
+        // `Op::StoreUpvalue` runs is a `ReferenceError`.
+        if value.is_hole() {
+            return Err(VmError::TemporalDeadZone {
+                local_index: idx as u32,
+            });
+        }
         write_register(frame, dst, value)?;
+        frame.advance_pc(self.current_byte_len)?;
+        Ok(())
+    }
+
+    /// `Op::FreshUpvalue idx` — install a freshly allocated hole cell at
+    /// own-upvalue index `idx`. Closures created before this op keep the
+    /// prior cell handle, so `for (let x of …)` materialises a distinct
+    /// `x` per iteration and a head `let` spends RHS evaluation in the
+    /// TDZ. The hole is cleared by the iteration's `Op::StoreUpvalue`.
+    pub(crate) fn run_fresh_upvalue_reg(
+        &mut self,
+        frame: &mut Frame,
+        idx: i32,
+    ) -> Result<(), VmError> {
+        if idx < 0 {
+            return Err(VmError::InvalidOperand);
+        }
+        let fresh = crate::alloc_upvalue(&mut self.gc_heap, Value::hole())?;
+        let slot = frame
+            .upvalues
+            .get_mut(idx as usize)
+            .ok_or(VmError::InvalidOperand)?;
+        *slot = fresh;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }

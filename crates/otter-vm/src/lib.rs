@@ -3824,6 +3824,14 @@ impl Interpreter {
                     self.run_load_upvalue_reg(frame, dst, idx)?;
                     continue;
                 }
+                Op::FreshUpvalue => {
+                    let idx = context
+                        .exec_imm32(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_fresh_upvalue_reg(frame, idx)?;
+                    continue;
+                }
                 Op::StoreUpvalue => {
                     let src = context
                         .exec_register(instr, 0)

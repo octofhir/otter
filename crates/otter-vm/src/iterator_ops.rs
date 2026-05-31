@@ -1637,13 +1637,21 @@ impl Interpreter {
             // path drive it.
             return Ok(false);
         };
-        // Already-exhausted user iterators short-circuit per
-        // §7.4.2 step 6.
-        let Some(iter_obj) = user_iter_value.as_object() else {
-            return Err(VmError::TypeMismatch);
+        // Resolve `next` through the ordinary [[Get]] ladder so a
+        // Proxy iterator (or one exposing `next` via an accessor) is
+        // handled, not just plain objects.
+        let next_fn = match self.ordinary_get_value(
+            context,
+            user_iter_value,
+            user_iter_value,
+            &VmPropertyKey::String("next"),
+            0,
+        )? {
+            VmGetOutcome::Value(v) => v,
+            VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(context, &getter, user_iter_value, SmallVec::new())?
+            }
         };
-        let next_fn =
-            crate::object::get(iter_obj, &self.gc_heap, "next").ok_or(VmError::TypeMismatch)?;
         if !is_callable(&next_fn) {
             return Err(VmError::TypeMismatch);
         }

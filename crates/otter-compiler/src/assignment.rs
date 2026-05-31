@@ -934,8 +934,13 @@ pub(crate) fn assign_object_pattern(
                 let name = p.binding.name.as_str().to_string();
                 let val = cx.alloc_scratch();
                 cx.emit_load_property(val, value_reg, &name, pspan);
+                // §13.15.5.5 — `{ x = anonymousFn }` applies
+                // NamedEvaluation so the default function/class is named
+                // after the bound identifier.
                 let final_val = match p.init.as_ref() {
-                    Some(default) => apply_default(cx, val, default, pspan)?,
+                    Some(default) => {
+                        apply_default_with_name(cx, val, default, Some(&name), pspan)?
+                    }
                     None => val,
                 };
                 store_identifier(cx, &name, final_val, pspan)?;

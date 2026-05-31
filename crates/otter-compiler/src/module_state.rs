@@ -61,6 +61,14 @@ pub(crate) struct ModuleState {
     /// pre-resolved (referrer, specifier, target) triple into the
     /// produced fragment's `module_resolutions` table.
     pub(crate) pre_resolved_imports: HashMap<String, String>,
+    /// Specifiers imported via `import defer * as ns from "x"` →
+    /// dedicated upvalue index of the *deferred* namespace cell. Kept
+    /// separate from `import_records` so an eager `import * as a` and a
+    /// deferred `import defer * as b` of the same module bind to
+    /// distinct objects (§16.2.1 deferred namespaces are distinct from
+    /// eager ones). Two deferred imports of the same module share one
+    /// cell, so their namespaces are identical.
+    pub(crate) deferred_import_records: HashMap<String, u16>,
 }
 
 /// Pre-resolved import / export information passed by the host

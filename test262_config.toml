@@ -26,14 +26,14 @@ skip_features = [
     "import-assertions",
     "import-attributes",
     "import-bytes",
-    "import-defer",
+    # import-defer (static `import defer * as`) is implemented; dynamic
+    # `import.defer()` tests stay gated behind the dynamic-import skip.
     "dynamic-import",
     "import.meta",
     "json-modules",
     "source-phase-imports",
     "source-phase-imports-module-source",
     "export-star-as-namespace-from-module",
-    "top-level-await",
 
     # FinalizationRegistry / WeakRef: host-gc-required tests need $262.gc()
     # to reliably trigger collection + cleanup callbacks
@@ -76,7 +76,6 @@ skip_features = [
     "upsert",
     "uint8array-base64",
     "import-bytes",
-    "import-defer",
 ]
 
 # Test flags to skip. Strictness is controlled by each test's

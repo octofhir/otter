@@ -503,6 +503,11 @@ impl Interpreter {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(None);
         }
+        self.ensure_deferred_namespace_ready(
+            context,
+            &target,
+            !Self::deferred_key_is_symbol_like(key),
+        )?;
         if let Some(proxy) = target.as_proxy() {
             let key_value = self.vm_property_key_to_value(key)?;
             let trap_args: SmallVec<[Value; 8]> =
@@ -858,6 +863,14 @@ impl Interpreter {
         context: &ExecutionContext,
         value: &Value,
     ) -> Result<bool, VmError> {
+        // Deferred namespaces report non-extensible (§28.3 [[IsExtensible]]
+        // → false) even before population, when the backing object is
+        // still internally extensible so export properties can be added.
+        if let Some(obj) = value.as_object() {
+            if object::deferred_namespace_target(obj, &self.gc_heap).is_some() {
+                return Ok(false);
+            }
+        }
         if let Some(proxy) = value.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {
@@ -919,6 +932,11 @@ impl Interpreter {
         key: &VmPropertyKey,
         descriptor: object::PartialPropertyDescriptor,
     ) -> Result<bool, VmError> {
+        self.ensure_deferred_namespace_ready(
+            context,
+            target,
+            !Self::deferred_key_is_symbol_like(key),
+        )?;
         if let Some(proxy) = target.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {
@@ -1958,6 +1976,7 @@ impl Interpreter {
         context: &ExecutionContext,
         target: &Value,
     ) -> Result<Vec<Value>, VmError> {
+        self.ensure_deferred_namespace_ready(context, target, true)?;
         if let Some(proxy) = target.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {
@@ -2310,6 +2329,14 @@ impl Interpreter {
         target: &Value,
         proto: &Value,
     ) -> Result<bool, VmError> {
+        // Deferred namespaces have an immutable null [[Prototype]]
+        // (§28.3 [[SetPrototypeOf]] = SetImmutablePrototype): succeed
+        // only when the requested prototype is also null.
+        if let Some(obj) = target.as_object() {
+            if object::deferred_namespace_target(obj, &self.gc_heap).is_some() {
+                return Ok(proto.is_null());
+            }
+        }
         if let Some(proxy) = target.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {
@@ -2434,6 +2461,16 @@ impl Interpreter {
         context: &ExecutionContext,
         value: &Value,
     ) -> Result<bool, VmError> {
+        // A deferred namespace already reports non-extensible; succeed
+        // without freezing the backing object so pending export
+        // properties can still be installed on first access.
+        if let Some(obj) = value.as_object() {
+            if object::deferred_namespace_target(obj, &self.gc_heap).is_some()
+                && !object::deferred_namespace_is_populated(obj, &self.gc_heap)
+            {
+                return Ok(true);
+            }
+        }
         if let Some(proxy) = value.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {
@@ -2669,6 +2706,13 @@ impl Interpreter {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(VmGetOutcome::Value(Value::undefined()));
         }
+        // TC39 import defer — accessing a deferred namespace evaluates
+        // its module, then reads delegate to the module environment.
+        self.ensure_deferred_namespace_ready(
+            context,
+            &base,
+            !Self::deferred_key_is_symbol_like(key),
+        )?;
         if let Some(obj) = base.as_object() {
             if let Some(value) = self.string_object_exotic_get(obj, key)? {
                 return Ok(VmGetOutcome::Value(value));
@@ -3327,6 +3371,11 @@ impl Interpreter {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(false);
         }
+        self.ensure_deferred_namespace_ready(
+            context,
+            &base,
+            !Self::deferred_key_is_symbol_like(key),
+        )?;
         if let Some(obj) = base.as_object() {
             if !matches!(
                 self.lookup_own_vm_property_key(obj, key),
@@ -3690,6 +3739,7 @@ impl Interpreter {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(Vec::new());
         }
+        self.ensure_deferred_namespace_ready(context, &target, true)?;
         if let Some(proxy) = target.as_proxy() {
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
             let trap_result = self.invoke_proxy_trap(context, &proxy, "ownKeys", trap_args)?;
@@ -3816,6 +3866,7 @@ impl Interpreter {
         if target.is_nullish() {
             return Ok(Vec::new());
         }
+        self.ensure_deferred_namespace_ready(context, &target, true)?;
 
         let mut current = target;
         let mut visited = BTreeSet::new();
@@ -3869,6 +3920,11 @@ impl Interpreter {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(true);
         }
+        self.ensure_deferred_namespace_ready(
+            context,
+            &target,
+            !Self::deferred_key_is_symbol_like(key),
+        )?;
         if let Some(proxy) = target.as_proxy() {
             let key_value = self.vm_property_key_to_value(key)?;
             let trap_args: SmallVec<[Value; 8]> =
@@ -3989,6 +4045,11 @@ impl Interpreter {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(false);
         }
+        self.ensure_deferred_namespace_ready(
+            context,
+            &target,
+            !Self::deferred_key_is_symbol_like(key),
+        )?;
         if let Some(proxy) = target.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {

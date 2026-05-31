@@ -2391,6 +2391,7 @@ impl Runtime {
                         referrer: entry_url.clone(),
                         specifier: url.to_string(),
                         target: url.to_string(),
+                        deferred: false,
                     });
                 module
                     .module_resolutions
@@ -2398,6 +2399,7 @@ impl Runtime {
                         referrer: String::new(),
                         specifier: url.to_string(),
                         target: url.to_string(),
+                        deferred: false,
                     });
             });
 

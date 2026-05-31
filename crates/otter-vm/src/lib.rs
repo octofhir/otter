@@ -330,6 +330,17 @@ pub struct Interpreter {
     /// alongside `module_environments`.
     module_resolution_cache:
         std::collections::HashMap<(std::sync::Arc<str>, String), std::sync::Arc<str>>,
+    /// Canonical URLs of modules whose `<module-init>` body has begun
+    /// running. Guards [`Op::EvaluateModule`] / deferred force-eval
+    /// against double evaluation and breaks import cycles (a module
+    /// being evaluated is treated as already evaluated). Cleared with
+    /// `module_environments`.
+    evaluated_modules: std::collections::HashSet<std::sync::Arc<str>>,
+    /// Cache of deferred module namespace exotic objects, keyed by
+    /// target module URL, so two `import defer * as` of the same module
+    /// yield the identical object (§16.2.1). Cleared with
+    /// `module_environments`.
+    deferred_namespaces: std::collections::HashMap<std::sync::Arc<str>, JsObject>,
     /// Monomorphic `LoadProperty` inline caches keyed by
     /// dense executable IC site id. These are interpreter-local
     /// hints and never affect bytecode dumps or JS-visible semantics.
@@ -693,6 +704,8 @@ impl Interpreter {
             microtasks: MicrotaskQueue::new(),
             module_environments: std::collections::HashMap::new(),
             module_resolution_cache: std::collections::HashMap::new(),
+            evaluated_modules: std::collections::HashSet::new(),
+            deferred_namespaces: std::collections::HashMap::new(),
             load_property_ics: Vec::new(),
             store_property_ics: Vec::new(),
             has_property_ics: Vec::new(),
@@ -1342,6 +1355,8 @@ impl Interpreter {
     pub fn reset_module_state(&mut self) {
         self.module_environments.clear();
         self.module_resolution_cache.clear();
+        self.evaluated_modules.clear();
+        self.deferred_namespaces.clear();
     }
 
     /// Resolve a specifier seen by the running module to the
@@ -3421,6 +3436,20 @@ impl Interpreter {
                         .property_atom(name_idx)
                         .ok_or(VmError::InvalidOperand)?;
                     let strict = context.function_is_strict(stack[top_idx].function_id);
+                    // `delete` has an object fast path that bypasses the
+                    // §28.3 MOP funnel; trigger deferred-namespace
+                    // evaluation here (named delete is never symbol-like
+                    // unless the key is "then").
+                    let receiver = *read_register(&stack[top_idx], obj_reg)?;
+                    if receiver.as_object().is_some_and(|o| {
+                        crate::object::deferred_namespace_target(o, &self.gc_heap).is_some()
+                    }) {
+                        self.ensure_deferred_namespace_ready(
+                            context,
+                            &receiver,
+                            key.name() != "then",
+                        )?;
+                    }
                     let frame = &mut stack[top_idx];
                     self.run_delete_property_reg(frame, dst, obj_reg, key, strict)?;
                     continue;
@@ -3434,6 +3463,17 @@ impl Interpreter {
                         .exec_register3(instr)
                         .ok_or(VmError::InvalidOperand)?;
                     let strict = context.function_is_strict(stack[top_idx].function_id);
+                    let receiver = *read_register(&stack[top_idx], obj_reg)?;
+                    if receiver.as_object().is_some_and(|o| {
+                        crate::object::deferred_namespace_target(o, &self.gc_heap).is_some()
+                    }) {
+                        let key_val = *read_register(&stack[top_idx], idx_reg)?;
+                        let symbol_like = key_val.as_symbol(&self.gc_heap).is_some()
+                            || key_val
+                                .as_string(&self.gc_heap)
+                                .is_some_and(|s| s.to_lossy_string(&self.gc_heap) == "then");
+                        self.ensure_deferred_namespace_ready(context, &receiver, !symbol_like)?;
+                    }
                     let frame = &mut stack[top_idx];
                     self.run_delete_element_regs(frame, dst, obj_reg, idx_reg, strict)?;
                     continue;
@@ -3975,6 +4015,36 @@ impl Interpreter {
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_import_namespace_reg(context, frame, dst, spec_idx)?;
+                    continue;
+                }
+                Op::ImportNamespaceDeferred => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let spec_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_import_namespace_deferred_reg(context, frame, dst, spec_idx)?;
+                    continue;
+                }
+                Op::EvaluateModule => {
+                    let url_idx = context
+                        .exec_const_index(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_evaluate_module_const(context, frame, url_idx)?;
+                    continue;
+                }
+                Op::MarkModuleEvaluated => {
+                    let url_idx = context
+                        .exec_const_index(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    if let Some(url) = context.string_constant_str(url_idx) {
+                        let url_arc: std::sync::Arc<str> = std::sync::Arc::from(url);
+                        self.evaluated_modules.insert(url_arc);
+                    }
+                    stack[top_idx].advance_pc(self.current_byte_len)?;
                     continue;
                 }
                 Op::ImportMetaResolve => {

@@ -20,8 +20,12 @@
 //! - `toLowerCase` / `toUpperCase` are **ASCII-only**. Full Unicode
 //!   case folding is deferred until ICU integration; non-ASCII code
 //!   units pass through unchanged.
-//! - `replace` / `replaceAll` perform **literal** substitution — the
-//!   spec's `$&` / `$<n>` substitution patterns are not honoured.
+//! - `replace` / `replaceAll` / `split` / `match` / `matchAll` /
+//!   `search` run the full §22.1.3 ladder: an Object argument
+//!   delegates to its `@@replace` / `@@split` / `@@match` /
+//!   `@@matchAll` / `@@search` method; the string-search paths honour
+//!   functional replacers and the `$$` / `$&` / `` $` `` / `$'`
+//!   substitution patterns.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-string-prototype-object>
@@ -35,7 +39,8 @@ use crate::number::NumberValue;
 use crate::regexp::JsRegExp;
 use crate::string::Interrupted;
 use crate::string::JsString;
-use crate::{NativeCtx, NativeError};
+use crate::symbol::WellKnown;
+use crate::{NativeCtx, NativeError, VmGetOutcome, VmPropertyKey};
 
 fn type_error(name: &'static str, reason: impl Into<String>) -> NativeError {
     NativeError::TypeError {
@@ -1097,6 +1102,256 @@ fn impl_to_upper_case(
     )?))
 }
 
+/// Map a [`crate::VmError`] from an interpreter re-entry onto the
+/// native error surface, preserving thrown user values.
+fn vm_err(err: crate::VmError, name: &'static str) -> NativeError {
+    match err {
+        crate::VmError::Uncaught { value } => NativeError::Thrown { name, message: value },
+        crate::VmError::TypeError { message } => NativeError::TypeError { name, reason: message },
+        crate::VmError::RangeError { message } => NativeError::RangeError { name, reason: message },
+        other => NativeError::TypeError {
+            name,
+            reason: other.to_string(),
+        },
+    }
+}
+
+/// `? Get(value, key)` honouring accessor getters; used for the
+/// `@@`-symbol method probe and `flags` read.
+fn get_value(
+    ctx: &mut NativeCtx<'_>,
+    value: Value,
+    key: &VmPropertyKey,
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| type_error(name, "missing execution context"))?;
+    let interp = ctx.interp_mut();
+    match interp
+        .ordinary_get_value(&exec, value, value, key, 0)
+        .map_err(|e| vm_err(e, name))?
+    {
+        VmGetOutcome::Value(v) => Ok(v),
+        VmGetOutcome::InvokeGetter { getter } => interp
+            .run_callable_sync(&exec, &getter, value, SmallVec::new())
+            .map_err(|e| vm_err(e, name)),
+    }
+}
+
+/// §7.3.11 GetMethod for a well-known symbol: returns `None` when the
+/// property is `undefined`/`null`, errors when present but not
+/// callable.
+fn get_symbol_method(
+    ctx: &mut NativeCtx<'_>,
+    value: Value,
+    wk: WellKnown,
+    name: &'static str,
+) -> Result<Option<Value>, NativeError> {
+    let sym = ctx.interp_mut().well_known_symbols().get(wk);
+    let method = get_value(ctx, value, &VmPropertyKey::Symbol(sym), name)?;
+    if method.is_nullish() {
+        return Ok(None);
+    }
+    if !method.is_callable() {
+        return Err(type_error(name, "method is not callable"));
+    }
+    Ok(Some(method))
+}
+
+/// §7.2.8 IsRegExp — `@@match` (if defined) decides; otherwise the
+/// native `[[RegExpMatcher]]` brand.
+fn is_reg_exp(ctx: &mut NativeCtx<'_>, value: Value, name: &'static str) -> Result<bool, NativeError> {
+    if !value.is_object_type() {
+        return Ok(false);
+    }
+    let sym = ctx.interp_mut().well_known_symbols().get(WellKnown::Match);
+    let matcher = get_value(ctx, value, &VmPropertyKey::Symbol(sym), name)?;
+    if !matcher.is_undefined() {
+        return Ok(matcher.to_boolean(ctx.heap()));
+    }
+    Ok(value.as_regexp().is_some())
+}
+
+/// Coerce a single value with the §7.1.17 `ToString` ladder (user
+/// `toString` / `valueOf` / `@@toPrimitive` observable; objects route
+/// through ToPrimitive). User exceptions propagate verbatim.
+fn value_to_string(
+    ctx: &mut NativeCtx<'_>,
+    value: Value,
+    name: &'static str,
+) -> Result<JsString, NativeError> {
+    if let Some(s) = value.as_string(ctx.heap()) {
+        return Ok(s);
+    }
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| type_error(name, "missing execution context"))?;
+    let text = ctx
+        .interp_mut()
+        .coerce_to_string(&exec, &value)
+        .map_err(|e| vm_err(e, name))?;
+    JsString::from_str(&text, ctx.heap_mut()).map_err(NativeError::from)
+}
+
+/// §22.1.3.17.1 GetSubstitution over UTF-16 units for a string-search
+/// replace (no capture groups, so `$n` / `$<name>` stay literal).
+/// Honours `$$`, `$&`, `` $` ``, and `$'`.
+fn get_substitution(matched: &[u16], string: &[u16], position: usize, template: &[u16]) -> Vec<u16> {
+    let mut out: Vec<u16> = Vec::with_capacity(template.len());
+    let mut i = 0;
+    while i < template.len() {
+        let c = template[i];
+        if c != b'$' as u16 || i + 1 >= template.len() {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        match template[i + 1] {
+            0x24 => {
+                out.push(0x24);
+                i += 2;
+            } // $$
+            0x26 => {
+                out.extend_from_slice(matched);
+                i += 2;
+            } // $&
+            0x60 => {
+                out.extend_from_slice(&string[..position.min(string.len())]);
+                i += 2;
+            } // $`
+            0x27 => {
+                let tail = (position + matched.len()).min(string.len());
+                out.extend_from_slice(&string[tail..]);
+                i += 2;
+            } // $'
+            _ => {
+                out.push(c);
+                i += 1;
+            } // literal `$`
+        }
+    }
+    out
+}
+
+/// §22.1.3.19 `String.prototype.replace` / §22.1.3.20 `replaceAll`,
+/// full spec ladder: `@@replace` dispatch, `ToString` coercion of
+/// receiver / searchValue, functional and `$`-template substitution.
+fn string_replace_spec(
+    replace_all: bool,
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let name: &'static str = if replace_all { "replaceAll" } else { "replace" };
+    let this = *ctx.this_value();
+    if this.is_nullish() {
+        return Err(type_error(name, "called on null or undefined"));
+    }
+    let search = args.first().copied().unwrap_or_else(Value::undefined);
+    let replace_value = args.get(1).copied().unwrap_or_else(Value::undefined);
+
+    // §22.1.3.19 step 2 — only an Object searchValue is probed for
+    // `@@replace`; a primitive never has its `@@replace` accessed.
+    if search.is_object_type() {
+        if replace_all && is_reg_exp(ctx, search, name)? {
+            let flags = get_value(ctx, search, &VmPropertyKey::String("flags"), name)?;
+            if flags.is_nullish() {
+                return Err(type_error(name, "flags is null or undefined"));
+            }
+            let flags_str = value_to_string(ctx, flags, name)?;
+            if !flags_str.to_lossy_string(ctx.heap()).contains('g') {
+                return Err(type_error(
+                    name,
+                    "replaceAll must be called with a global RegExp",
+                ));
+            }
+        }
+        if let Some(method) = get_symbol_method(ctx, search, WellKnown::Replace, name)? {
+            let exec = ctx
+                .execution_context()
+                .cloned()
+                .ok_or_else(|| type_error(name, "missing execution context"))?;
+            let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![this, replace_value];
+            return ctx
+                .interp_mut()
+                .run_callable_sync(&exec, &method, search, cb_args)
+                .map_err(|e| vm_err(e, name));
+        }
+    }
+
+    // String search path.
+    let string = value_to_string(ctx, this, name)?;
+    let search_str = value_to_string(ctx, search, name)?;
+    let functional = replace_value.is_callable();
+    let replace_template = if functional {
+        None
+    } else {
+        Some(value_to_string(ctx, replace_value, name)?)
+    };
+
+    let string_units = string.to_utf16_vec(ctx.heap());
+    let search_units = search_str.to_utf16_vec(ctx.heap());
+    let template_units = replace_template
+        .as_ref()
+        .map(|s| s.to_utf16_vec(ctx.heap()));
+
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| type_error(name, "missing execution context"))?;
+
+    let search_len = search_units.len();
+    let mut out: Vec<u16> = Vec::with_capacity(string_units.len());
+    let mut cursor = 0usize;
+    let mut position = find_substr(&string_units, &search_units, 0);
+    while let Some(pos) = position {
+        out.extend_from_slice(&string_units[cursor..pos]);
+        let replacement = if functional {
+            let matched = JsString::from_utf16_units(&search_units, ctx.heap_mut())?;
+            let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                Value::string(matched),
+                Value::number_f64(pos as f64),
+                Value::string(string),
+            ];
+            let raw = ctx
+                .interp_mut()
+                .run_callable_sync(&exec, &replace_value, Value::undefined(), cb_args)
+                .map_err(|e| vm_err(e, name))?;
+            value_to_string(ctx, raw, name)?.to_utf16_vec(ctx.heap())
+        } else {
+            get_substitution(
+                &search_units,
+                &string_units,
+                pos,
+                template_units.as_ref().expect("non-functional has template"),
+            )
+        };
+        out.extend_from_slice(&replacement);
+        cursor = pos + search_len;
+        if !replace_all {
+            break;
+        }
+        // Advance by at least one unit for an empty search string so an
+        // empty match cannot loop forever.
+        let next_from = if search_len == 0 { pos + 1 } else { cursor };
+        if next_from > string_units.len() {
+            break;
+        }
+        if search_len == 0 && pos < string_units.len() {
+            out.push(string_units[pos]);
+            cursor = next_from;
+        }
+        position = find_substr(&string_units, &search_units, next_from);
+    }
+    out.extend_from_slice(&string_units[cursor.min(string_units.len())..]);
+    Ok(Value::string(JsString::from_utf16_units(
+        &out,
+        ctx.heap_mut(),
+    )?))
+}
+
 fn impl_replace(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
@@ -1778,18 +2033,72 @@ fn native_string_method(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    // §22.1.3.18 `replace` / §22.1.3.19 `replaceAll` — when the
-    // replaceValue argument is callable, the shared direct native
-    // method path needs the interpreter context. Intercept here so
-    // `'abc'.replace('b', fn)` and `'abc'.replaceAll('b', fn)`
-    // dispatch the callback with `(matched, position, string)` and
-    // splice the result string.
-    if (name == "replace" || name == "replaceAll")
-        && args.len() >= 2
-        && ctx.cx.interp.is_callable_runtime(args.get(1).unwrap())
-        && args.first().is_some_and(|v| v.is_string())
-    {
-        return native_string_replace_callable(name == "replaceAll", ctx, args);
+    // §22.1.3.19 `replace` / §22.1.3.20 `replaceAll` run the full spec
+    // ladder (`@@replace` dispatch, `ToString` coercion, functional and
+    // `$`-template substitution), which needs the interpreter context.
+    if name == "replace" || name == "replaceAll" {
+        return string_replace_spec(name == "replaceAll", ctx, args);
+    }
+    // §22.1.3.23 `split` — an Object separator delegates to `@@split`
+    // (RegExp and user objects) with the un-stringified receiver.
+    if name == "split" {
+        let this = *ctx.this_value();
+        if this.is_nullish() {
+            return Err(type_error("split", "called on null or undefined"));
+        }
+        let separator = args.first().copied().unwrap_or_else(Value::undefined);
+        if separator.is_object_type()
+            && let Some(splitter) = get_symbol_method(ctx, separator, WellKnown::Split, "split")?
+        {
+            let exec = ctx
+                .execution_context()
+                .cloned()
+                .ok_or_else(|| type_error("split", "missing execution context"))?;
+            let limit = args.get(1).copied().unwrap_or_else(Value::undefined);
+            let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![this, limit];
+            return ctx
+                .interp_mut()
+                .run_callable_sync(&exec, &splitter, separator, cb_args)
+                .map_err(|e| vm_err(e, "split"));
+        }
+    }
+    // §22.1.3.{11,13,14} `match` / `search` / `matchAll` — an Object
+    // argument delegates to `@@match` / `@@search` / `@@matchAll`.
+    if let Some(wk) = match name {
+        "match" => Some(WellKnown::Match),
+        "search" => Some(WellKnown::Search),
+        "matchAll" => Some(WellKnown::MatchAll),
+        _ => None,
+    } {
+        let this = *ctx.this_value();
+        if this.is_nullish() {
+            return Err(type_error(name, "called on null or undefined"));
+        }
+        let arg = args.first().copied().unwrap_or_else(Value::undefined);
+        if arg.is_object_type() {
+            // §22.1.3.14 step 5.b — `matchAll` requires a global RegExp.
+            if name == "matchAll" && is_reg_exp(ctx, arg, name)? {
+                let flags = get_value(ctx, arg, &VmPropertyKey::String("flags"), name)?;
+                if flags.is_nullish() {
+                    return Err(type_error(name, "flags is null or undefined"));
+                }
+                let flags_str = value_to_string(ctx, flags, name)?;
+                if !flags_str.to_lossy_string(ctx.heap()).contains('g') {
+                    return Err(type_error(name, "matchAll must use a global RegExp"));
+                }
+            }
+            if let Some(method) = get_symbol_method(ctx, arg, wk, name)? {
+                let exec = ctx
+                    .execution_context()
+                    .cloned()
+                    .ok_or_else(|| type_error(name, "missing execution context"))?;
+                let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![this];
+                return ctx
+                    .interp_mut()
+                    .run_callable_sync(&exec, &method, arg, cb_args)
+                    .map_err(|e| vm_err(e, name));
+            }
+        }
     }
     let receiver = *ctx.this_value();
     // §22.1.3 — every `String.prototype` method (other than
@@ -1871,137 +2180,6 @@ fn native_string_method(
         reason: "unknown String.prototype method".to_string(),
     })?;
     impl_fn(ctx, &receiver, &coerced_args)
-}
-
-/// Drive `String.prototype.replace` / `replaceAll` when
-/// `replaceValue` is callable. Walks the receiver's UTF-16 units in
-/// place, locates each non-overlapping match of the
-/// string-coerced needle, invokes the callback with
-/// `(matched, position, fullString)` per §22.1.3.{18,19} step 6.h,
-/// and splices the returned string back in.
-fn native_string_replace_callable(
-    replace_all: bool,
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-) -> Result<Value, NativeError> {
-    let receiver = *ctx.this_value();
-
-    let recv = receiver_string(ctx, &receiver)?;
-    let needle = args
-        .first()
-        .and_then(|v| v.as_string(ctx.heap()))
-        .expect("guarded by caller — args[0] is a string");
-    let callback = args.get(1).cloned().unwrap_or(Value::undefined());
-    let recv_units = recv.to_utf16_vec(ctx.heap());
-    let needle_units = needle.to_utf16_vec(ctx.heap());
-    let needle_len = needle_units.len();
-    let recv_str = recv;
-    let recv_value = Value::string(recv_str);
-    let context = ctx.execution_context().cloned();
-    let context = match context {
-        Some(c) => c,
-        None => {
-            return Err(NativeError::TypeError {
-                name: if replace_all { "replaceAll" } else { "replace" },
-                reason: "missing execution context".to_string(),
-            });
-        }
-    };
-    let interp = ctx.interp_mut();
-    let mut out: Vec<u16> = Vec::with_capacity(recv_units.len());
-    let mut cursor: usize = 0;
-    // Edge case: empty needle splices the callback result at every
-    // unit boundary plus the end (matches §22.1.3.19 step 12.b /
-    // §22.1.3.18 step 12.b).
-    if needle_len == 0 {
-        let positions: Vec<usize> = if replace_all {
-            (0..=recv_units.len()).collect()
-        } else {
-            vec![0]
-        };
-        for pos in positions {
-            let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                Value::string(needle),
-                Value::number_f64(pos as f64),
-                recv_value,
-            ];
-            let raw = interp
-                .run_callable_sync(&context, &callback, Value::undefined(), cb_args)
-                .map_err(|err| NativeError::TypeError {
-                    name: if replace_all { "replaceAll" } else { "replace" },
-                    reason: err.to_string(),
-                })?;
-            let raw_string = if let Some(s) = raw.as_string(interp.gc_heap()) {
-                s
-            } else {
-                let text = raw.display_string(interp.gc_heap());
-                JsString::from_str(&text, interp.gc_heap_mut()).map_err(|err| {
-                    NativeError::TypeError {
-                        name: if replace_all { "replaceAll" } else { "replace" },
-                        reason: err.to_string(),
-                    }
-                })?
-            };
-            out.extend_from_slice(&raw_string.to_utf16_vec(interp.gc_heap()));
-            if pos < recv_units.len() {
-                out.push(recv_units[pos]);
-            }
-        }
-        return Ok(Value::string(
-            JsString::from_utf16_units(&out, interp.gc_heap_mut()).map_err(|err| {
-                NativeError::TypeError {
-                    name: if replace_all { "replaceAll" } else { "replace" },
-                    reason: err.to_string(),
-                }
-            })?,
-        ));
-    }
-    // Guard `cursor + needle_len <= len` (not `cursor <= len - needle_len`)
-    // so a needle longer than the receiver — `"a".replaceAll("aa", fn)` —
-    // never slices out of bounds; the loop body simply never runs.
-    while cursor + needle_len <= recv_units.len() {
-        if recv_units[cursor..cursor + needle_len] == needle_units[..] {
-            let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                Value::string(needle),
-                Value::number_f64(cursor as f64),
-                recv_value,
-            ];
-            let raw = interp
-                .run_callable_sync(&context, &callback, Value::undefined(), cb_args)
-                .map_err(|err| NativeError::TypeError {
-                    name: if replace_all { "replaceAll" } else { "replace" },
-                    reason: err.to_string(),
-                })?;
-            let raw_string = if let Some(s) = raw.as_string(interp.gc_heap()) {
-                s
-            } else {
-                let text = raw.display_string(interp.gc_heap());
-                JsString::from_str(&text, interp.gc_heap_mut()).map_err(|err| {
-                    NativeError::TypeError {
-                        name: if replace_all { "replaceAll" } else { "replace" },
-                        reason: err.to_string(),
-                    }
-                })?
-            };
-            out.extend_from_slice(&raw_string.to_utf16_vec(interp.gc_heap()));
-            cursor += needle_len;
-            if !replace_all {
-                break;
-            }
-        } else {
-            out.push(recv_units[cursor]);
-            cursor += 1;
-        }
-    }
-    out.extend_from_slice(&recv_units[cursor..]);
-    Ok(Value::string(
-        JsString::from_utf16_units(&out, interp.gc_heap_mut()).map_err(|err| {
-            NativeError::TypeError {
-                name: if replace_all { "replaceAll" } else { "replace" },
-                reason: err.to_string(),
-            }
-        })?,
-    ))
 }
 
 /// Generate a per-method trampoline + spec-table entry. The

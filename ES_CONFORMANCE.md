@@ -2021,3 +2021,29 @@ Subsequent slices closed the rest of `built-ins/JSON`:
 | 165 | 163 | 0 | 2 | 100.00% (non-skip) |
 
 Delta from the 80-pass baseline: +83 passing tests.
+
+### built-ins/String/prototype (regexp-symbol dispatch)
+
+`replace` / `replaceAll` / `split` / `match` / `matchAll` / `search`
+now run the §22.1.3 ladder: an Object argument delegates to its
+`@@replace` / `@@split` / `@@match` / `@@matchAll` / `@@search` method
+(RegExp + user objects), and the string-search paths coerce
+receiver / searchValue via `ToString`, honour functional replacers, and
+implement `$$` / `$&` / `` $` `` / `$'` substitution. Also wired
+`IteratorState::RegExpString` into the VM `IteratorNext` (`for…of` /
+spread / `Array.from` over `str.matchAll(re)` and `re[@@matchAll](s)`).
+
+```sh
+cargo run -p otter-test262 --bin otter-test262 -- run \
+  --filter built-ins/String/prototype --timeout 5000
+```
+
+| stage | total | passed | failed | skipped | pass rate |
+|---|---:|---:|---:|---:|---:|
+| before | 1184 | 1018 | 162 | 4 | 86.27% |
+| after  | 1184 | 1114 | 66  | 4 | 94.41% |
+
+Delta: +96 passing tests. `replace` 100%, `split` 96.7%. Remaining are
+the Unicode case-mapping cluster (`toLowerCase`/`toUpperCase`/locale,
+needs ICU), `normalize`, and a class computed-symbol-method `[[Get]]`
+gap blocking RegExp-subclass `@@replace` overrides.

@@ -1555,8 +1555,10 @@ impl Interpreter {
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return Ok(true);
         }
-        // Helper-wrapper iterator states drive through the
-        // interpreter-aware step path so callbacks can run.
+        // Helper-wrapper and RegExp-String iterator states drive
+        // through the interpreter-aware step path: the former need to
+        // run user callbacks, the latter re-enters `RegExpExec` (a JS
+        // `exec` that the synchronous `step_iterator` cannot call).
         let needs_full_step = self.gc_heap.read_payload(*iter_rc, |state| {
             matches!(
                 state,
@@ -1565,6 +1567,7 @@ impl Interpreter {
                     | IteratorState::Take { .. }
                     | IteratorState::Drop { .. }
                     | IteratorState::FlatMap { .. }
+                    | IteratorState::RegExpString { .. }
             )
         });
         if needs_full_step {

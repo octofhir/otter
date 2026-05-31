@@ -4153,6 +4153,44 @@ mod tests {
     }
 
     #[test]
+    fn string_replace_split_match_spec_dispatch() {
+        let otter = Otter::new();
+        otter
+            .blocking_run_typescript(
+                r#"
+                function eq(a, b, m) { if (a !== b) throw new Error(m + ": " + a); }
+
+                // searchValue coerces via ToString; function replacer fires.
+                eq("gnulluna".replace(null, (m, p) => p + ""), "g1una", "replace-null-fn");
+                // $-substitution patterns.
+                eq("abc".replace("b", "[$&]"), "a[b]c", "replace-dollar-amp");
+                eq("abc".replace("b", "$`|$'"), "aa|cc", "replace-dollar-ctx");
+                eq("a$b".replace("$", "$$"), "a$b", "replace-dollar-dollar");
+                // replaceAll over all occurrences.
+                eq("a.b.c".replaceAll(".", "-"), "a-b-c", "replaceAll");
+
+                // split delegates to RegExp @@split (captures included).
+                eq("a1b2c".split(/(\d)/).join(","), "a,1,b,2,c", "split-regexp");
+                eq("a,b,c".split(",").length, 3, "split-string");
+
+                // match / search delegate to RegExp @@match / @@search.
+                eq("a1b2".match(/\d/g).join(""), "12", "match-global");
+                eq("xxabc".search(/abc/), 2, "search");
+                eq([..."a1b2".matchAll(/\d/g)].length, 2, "matchAll");
+
+                // Primitive searchValue never probes @@replace.
+                Object.defineProperty(String.prototype, Symbol.replace, {
+                    configurable: true,
+                    get() { throw new Error("@@replace probed on primitive"); },
+                });
+                eq("a,b,c".replace(",", "X"), "aXb,c", "replace-primitive-no-symbol");
+                delete String.prototype[Symbol.replace];
+                "#,
+            )
+            .expect("String replace/split/match spec dispatch");
+    }
+
+    #[test]
     fn json_parse_reviver_raw_json_and_source() {
         let otter = Otter::new();
         otter

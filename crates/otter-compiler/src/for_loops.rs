@@ -59,6 +59,13 @@ pub(crate) fn compile_for_of_statement(
     let value_reg = cx.alloc_scratch();
     let done_reg = cx.alloc_scratch();
 
+    // §14.7.5.6 ForIn/OfBodyEvaluation maintains a running completion
+    // value `V`, updated to each non-empty body completion and
+    // returned as the statement's value. Initialise to `undefined`
+    // (the result when the body runs zero times or produces no value).
+    let completion_reg = cx.alloc_scratch();
+    cx.emit(Op::LoadUndefined, [Operand::Register(completion_reg)], span);
+
     cx.push_loop_frame(LoopFrame::iteration());
     let loop_top = cx.next_pc;
     if is_for_await {
@@ -111,7 +118,16 @@ pub(crate) fn compile_for_of_statement(
     // step (no per-iteration binding to materialize).
     cx.enter_scope();
     bind_for_in_of_head(cx, &s.left, bind_source, span)?;
-    compile_statement(cx, &s.body)?;
+    if let Some(body_reg) = compile_statement(cx, &s.body)? {
+        // Record this iteration's non-empty completion as `V`. A
+        // `break` / `continue` jumps out of the body before reaching
+        // here, so `V` keeps the prior iteration's value per spec.
+        cx.emit(
+            Op::StoreLocal,
+            [Operand::Register(body_reg), Operand::Imm32(completion_reg as i32)],
+            span,
+        );
+    }
     cx.exit_scope();
 
     let back_jmp = cx.emit_branch_placeholder(Op::Jump, None, span);
@@ -140,7 +156,7 @@ pub(crate) fn compile_for_of_statement(
         }
     }
     cx.patch_branch_to_here(exit_jmp);
-    Ok(None)
+    Ok(Some(completion_reg))
 }
 
 /// Lower `for (k in obj) { … }` per ECMA-262 §14.7.5.6

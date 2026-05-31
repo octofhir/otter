@@ -33,7 +33,7 @@
 //! - <https://tc39.es/ecma262/#sec-InnerModuleEvaluation>
 
 use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use otter_bytecode::ModuleInit;
 use otter_vm::{Interpreter, JsObject};
@@ -129,7 +129,7 @@ impl RuntimeModuleRecords {
             } else {
                 interp.alloc_host_object_with_roots(&[], &[])?
             };
-            interp.register_module_env(Rc::from(init.url.as_str()), env);
+            interp.register_module_env(Arc::from(init.url.as_str()), env);
             // The graph load + linker pipeline has already done
             // resolve + compile + linking by the time we get
             // here, so each record advances directly into

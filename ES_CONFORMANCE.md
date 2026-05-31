@@ -1561,14 +1561,14 @@ What landed:
   - Process-wide `static AGENTS: LazyLock<Mutex<AgentRegistry>>`
     owns one `mpsc::Sender<BroadcastMessage>` per running agent
     and a `VecDeque<String>` for `report` / `getReport`.
-  - `thread_local! AGENT_INBOX` holds the receiver end of each
-    agent's broadcast channel; the parent thread leaves it
-    `None` so a stray `receiveBroadcast` outside an agent fails
-    deterministically with `TypeError`.
+  - `AGENT_INBOXES` keys each agent's broadcast receiver by
+    `ThreadId`; the parent thread never registers one, so a stray
+    `receiveBroadcast` outside an agent fails deterministically
+    with `TypeError`.
   - Eight native fast-fn bindings:
     - `__otter_agent_start(source)` — spawns a real OS thread
-      via `std::thread::Builder`, sets up the thread-local
-      inbox, builds a fresh `Runtime`, installs the same
+      via `std::thread::Builder`, registers the agent inbox in
+      `AGENT_INBOXES`, builds a fresh `Runtime`, installs the same
       `__otter_agent_*` natives, prepends `D262_HOST_PREAMBLE`,
       and runs the user source.
     - `__otter_agent_broadcast(sab, num?)` — pulls the
@@ -1577,7 +1577,7 @@ What landed:
       list under lock, releases the lock, then fans out the
       message. Non-shared backings raise `TypeError`.
     - `__otter_agent_receive_broadcast(handler)` — temporarily
-      moves the receiver out of `AGENT_INBOX`, blocks on
+      moves the receiver out of `AGENT_INBOXES`, blocks on
       `Receiver::recv`, restores the receiver, rewraps the
       received `Arc<SharedBody>` via
       `JsArrayBuffer::from_shared_arc` on the agent's heap, and
@@ -1589,10 +1589,9 @@ What landed:
       first call into the process.
     - `__otter_agent_report(s)` / `__otter_agent_get_report()`
       — FIFO queue on `AGENTS.reports`.
-    - `__otter_agent_leaving()` — sets a thread-local flag (no
-      observable side effect; reserved for future
-      `getReport` polling).
-  - `reset_for_next_test()` clears senders + reports so the
+    - `__otter_agent_leaving()` — no observable side effect;
+      reserved for future `getReport` polling.
+  - `reset_for_next_test()` clears senders + reports + inboxes so the
     runner can drop residual state between tests.
 - `crates/otter-test262/src/harness.rs` — `D262_HOST_PREAMBLE`
   drops the throwing stubs; each `$262.agent.*` method now

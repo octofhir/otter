@@ -1391,7 +1391,7 @@ impl Runtime {
         // The closure is reusable across calls; each invocation
         // builds a fresh `BytecodeModule`.
         let hook: otter_vm::EvalHook =
-            std::rc::Rc::new(|source: &str, options: EvalCompileOptions| {
+            std::sync::Arc::new(|source: &str, options: EvalCompileOptions| {
                 otter_compiler::compile_script_source_with_forced_strict(
                     source,
                     SourceKind::JavaScript,
@@ -1667,7 +1667,7 @@ impl Runtime {
                     DynLoadError::Diagnostic(format!("dynamic import: alloc env failed: {e}"))
                 })?;
             self.interp
-                .register_module_env(std::rc::Rc::from(init.url.as_str()), env);
+                .register_module_env(std::sync::Arc::from(init.url.as_str()), env);
         }
         let inits: Vec<(String, u32, otter_vm::JsObject)> = context
             .module_inits()
@@ -1780,7 +1780,7 @@ impl Runtime {
                 DynLoadError::Diagnostic(format!("dynamic import: alloc env failed: {e}"))
             })?;
         self.interp
-            .register_module_env(std::rc::Rc::from(target_url), env);
+            .register_module_env(std::sync::Arc::from(target_url), env);
         otter_vm_init_marker_install(&mut self.interp, env);
         let import_meta = alloc_dynamic_import_meta(&mut self.interp, env, target_url)?;
         let callee = otter_vm::Value::function_id(0);

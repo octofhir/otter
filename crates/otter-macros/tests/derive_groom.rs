@@ -11,7 +11,7 @@
 //! `crates/otter-gc/tests/sweep_finalize.rs`; these tests pin the
 //! macro expansion shape.
 
-use std::cell::Cell;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use otter_gc::raw::SlotVisitor;
 use otter_gc::{SafeFinalize, SafeTraceable};
@@ -21,12 +21,10 @@ const GROOM_NAMED_TAG: u8 = 0xD1;
 const GROOM_TUPLE_TAG: u8 = 0xD2;
 const GROOM_EMPTY_TAG: u8 = 0xD3;
 
-thread_local! {
-    static GROOM_COUNTER: Cell<u32> = const { Cell::new(0) };
-}
+static GROOM_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 fn bump_counter() {
-    GROOM_COUNTER.with(|c| c.set(c.get() + 1));
+    GROOM_COUNTER.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Custom `GroomField`-compatible cell that increments the global
@@ -86,26 +84,26 @@ struct EmptyBody {
 
 #[test]
 fn derive_emits_safe_finalize_with_groom_field_calls() {
-    GROOM_COUNTER.with(|c| c.set(0));
+    GROOM_COUNTER.store(0, Ordering::Relaxed);
     let mut body = NamedBody::default();
     body.finalize_safe();
-    assert_eq!(GROOM_COUNTER.with(Cell::get), 1);
+    assert_eq!(GROOM_COUNTER.load(Ordering::Relaxed), 1);
 }
 
 #[test]
 fn tuple_field_via_hook_runs() {
-    GROOM_COUNTER.with(|c| c.set(0));
+    GROOM_COUNTER.store(0, Ordering::Relaxed);
     let mut body = TupleBody::new(7);
     body.finalize_safe();
-    assert_eq!(GROOM_COUNTER.with(Cell::get), 1);
+    assert_eq!(GROOM_COUNTER.load(Ordering::Relaxed), 1);
 }
 
 #[test]
 fn empty_body_finalize_compiles_and_is_a_noop() {
-    GROOM_COUNTER.with(|c| c.set(0));
+    GROOM_COUNTER.store(0, Ordering::Relaxed);
     let mut body = EmptyBody { only: 99 };
     body.finalize_safe();
-    assert_eq!(GROOM_COUNTER.with(Cell::get), 0);
+    assert_eq!(GROOM_COUNTER.load(Ordering::Relaxed), 0);
 }
 
 #[test]

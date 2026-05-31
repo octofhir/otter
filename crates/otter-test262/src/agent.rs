@@ -14,9 +14,9 @@
 //!     every running agent;
 //!   * a FIFO `VecDeque<String>` for `$262.agent.report` /
 //!     `$262.agent.getReport`.
-//! - Each agent thread holds its [`mpsc::Receiver<BroadcastMessage>`]
-//!   in [`AGENT_INBOX`] (`thread_local!`) so `receiveBroadcast`
-//!   blocks on the right channel without searching the registry.
+//! - Agent inboxes are keyed by [`thread::ThreadId`] in
+//!   [`AGENT_INBOXES`] so `receiveBroadcast` blocks on the right
+//!   channel without thread-local state.
 //! - The shared buffer rides through the channel as an
 //!   `Arc<SharedBody>`. The receiving agent rewraps it via
 //!   [`JsArrayBuffer::from_shared_arc`] before handing it to the
@@ -29,9 +29,8 @@
 //!   registry lock **before** sending — agents may block on recv,
 //!   and holding the registry lock across a blocking send would
 //!   serialise broadcast dispatch.
-//! - `parent_thread_id` filters the parent out of broadcast
-//!   distribution so the parent (which also has `AGENT_INBOX`
-//!   default = None) never receives its own messages.
+//! - The parent never registers an inbox, so it never receives its
+//!   own broadcast messages.
 //! - Each agent thread builds its own [`otter_runtime::Runtime`]
 //!   with a private heap; the only state shared with the parent
 //!   is the SAB's `Arc<SharedBody>`.
@@ -41,9 +40,7 @@
 //! - <https://github.com/tc39/test262/blob/main/INTERPRETING.md#host-defined-functions>
 //! - `docs/workers-262-plan.md` — slice 19c plan.
 
-use std::cell::RefCell;
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -57,7 +54,7 @@ use otter_vm::{NativeCtx, NativeError, NativeFastFn, Value};
 use crate::harness::D262_HOST_PREAMBLE;
 
 /// One broadcast message handed from the parent thread to every
-/// running agent through its [`AGENT_INBOX`] channel.
+/// running agent through its [`AGENT_INBOXES`] channel.
 #[derive(Clone)]
 struct BroadcastMessage {
     /// Shared backing for the cross-thread `SharedArrayBuffer`.
@@ -81,17 +78,11 @@ static AGENTS: LazyLock<Mutex<AgentRegistry>> = LazyLock::new(|| {
     })
 });
 
-thread_local! {
-    /// Receiver end of this agent's broadcast channel. The parent
-    /// thread leaves this `None` so a stray `receiveBroadcast` call
-    /// outside an agent fails deterministically with `TypeError`.
-    static AGENT_INBOX: RefCell<Option<mpsc::Receiver<BroadcastMessage>>> = const { RefCell::new(None) };
-    /// `true` once `$262.agent.leaving()` runs. Currently
-    /// informational — the agent thread still terminates when its
-    /// source body returns — but reserved for future
-    /// `$262.agent.getReport` polling.
-    static AGENT_LEAVING: AtomicBool = const { AtomicBool::new(false) };
-}
+/// Receiver end for each live agent thread. The parent thread never
+/// inserts an inbox, so a stray `receiveBroadcast` call outside an
+/// agent fails deterministically with `TypeError`.
+static AGENT_INBOXES: LazyLock<Mutex<HashMap<thread::ThreadId, mpsc::Receiver<BroadcastMessage>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Monotonic clock anchor — `monotonicNow()` returns
 /// milliseconds since the first call inside the process.
@@ -104,6 +95,10 @@ pub fn reset_for_next_test() {
     let mut reg = AGENTS.lock().expect("agent registry poisoned");
     reg.senders.clear();
     reg.reports.clear();
+    AGENT_INBOXES
+        .lock()
+        .expect("agent inbox registry poisoned")
+        .clear();
 }
 
 /// Install every `__otter_agent_*` native global on the given
@@ -190,10 +185,16 @@ fn agent_start(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
     thread::Builder::new()
         .name("test262-agent".to_string())
         .spawn(move || {
-            AGENT_INBOX.with(|cell| {
-                *cell.borrow_mut() = Some(rx);
-            });
+            let thread_id = thread::current().id();
+            AGENT_INBOXES
+                .lock()
+                .expect("agent inbox registry poisoned")
+                .insert(thread_id, rx);
             run_agent_source(source);
+            AGENT_INBOXES
+                .lock()
+                .expect("agent inbox registry poisoned")
+                .remove(&thread_id);
         })
         .map_err(|e| type_err(format!("agent thread spawn failed: {e}")))?;
 
@@ -264,19 +265,24 @@ fn agent_receive_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
         return Err(type_err("receiveBroadcast handler must be a function"));
     }
 
-    // Take the receiver out of the thread local while we block on
-    // recv. `rx.recv()` takes `&self` so the receiver remains
-    // valid for the next call; we put it back after recv returns.
-    let rx = AGENT_INBOX.with(|cell| cell.borrow_mut().take());
+    // Take the receiver out of the registry while we block on recv.
+    // `rx.recv()` takes `&self` so the receiver remains valid for
+    // the next call; we put it back after recv returns.
+    let thread_id = thread::current().id();
+    let rx = AGENT_INBOXES
+        .lock()
+        .expect("agent inbox registry poisoned")
+        .remove(&thread_id);
     let Some(rx) = rx else {
         return Err(type_err("receiveBroadcast called outside an agent thread"));
     };
     let result = rx.recv();
     // Always put the receiver back. If it's closed, the next
     // recv() returns `Disconnected` and the caller handles it.
-    AGENT_INBOX.with(|cell| {
-        *cell.borrow_mut() = Some(rx);
-    });
+    AGENT_INBOXES
+        .lock()
+        .expect("agent inbox registry poisoned")
+        .insert(thread_id, rx);
     let msg = match result {
         Ok(m) => m,
         Err(_) => {
@@ -369,6 +375,5 @@ fn agent_get_report(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 // =====================================================================
 
 fn agent_leaving(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    AGENT_LEAVING.with(|f| f.store(true, Ordering::Release));
     Ok(Value::undefined())
 }

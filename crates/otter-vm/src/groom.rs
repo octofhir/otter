@@ -158,12 +158,6 @@ impl<T: ?Sized> GroomField for std::sync::Arc<T> {
     fn groom(&mut self) {}
 }
 
-impl<T: ?Sized> GroomField for std::rc::Rc<T> {
-    /// Same rationale as the `Arc<T>` no-op.
-    #[inline]
-    fn groom(&mut self) {}
-}
-
 impl<T> GroomField for otter_gc::Gc<T> {
     /// `Gc<T>` payloads have their own finalize / drop chain — the
     /// outer body does not own that storage.

@@ -226,9 +226,8 @@ pub enum Op {
     /// Operands: `dst, function_const, upvalue_count, src0, src1, ...`.
     /// Each `srcN` is `Imm32(parent_upvalue_idx)` — a non-negative
     /// index into the **enclosing** frame's `upvalues` array. The
-    /// runtime clones each cell handle into the new closure's
-    /// `upvalues: Rc<[UpvalueCell]>`, so writes through one are
-    /// visible through all.
+    /// runtime clones each GC cell handle into the new closure's
+    /// upvalue spine, so writes through one are visible through all.
     ///
     /// Captured locals always live in the declaring frame's own
     /// upvalue cells (see [`Function::own_upvalue_count`]); a fresh

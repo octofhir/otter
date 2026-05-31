@@ -21,7 +21,7 @@
 //!
 //! # Invariants
 //! - Native `resolve` / `reject` closures capture the promise via
-//!   `JsPromiseHandle::clone()` (Rc-shared body). They are
+//!   `JsPromiseHandle::clone()` (shared body). They are
 //!   idempotent — once a promise settles, subsequent resolve /
 //!   reject calls are no-ops per spec §27.2.1.4 / §27.2.1.7.
 //! - Settlement enqueues all pending reactions onto
@@ -46,7 +46,7 @@ use crate::{Frame, Interpreter, NativeCtx, Value};
 use otter_gc::raw::{RawGc, SlotVisitor};
 use smallvec::{SmallVec, smallvec};
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::sync::Arc;
 
 struct PromiseSlots {
     values: crate::array::JsArray,
@@ -60,8 +60,8 @@ struct CapabilityExecutorState {
 }
 
 impl CapabilityExecutorState {
-    fn new() -> Rc<Self> {
-        Rc::new(Self {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
             resolve: RefCell::new(None),
             reject: RefCell::new(None),
         })
@@ -106,7 +106,7 @@ impl PromiseSlots {
         interp: &mut Interpreter,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
-    ) -> Result<Rc<Self>, NativeError> {
+    ) -> Result<Arc<Self>, NativeError> {
         let values = interp
             .alloc_runtime_rooted_array_from_values(
                 std::iter::empty::<Value>(),
@@ -114,7 +114,7 @@ impl PromiseSlots {
                 slice_roots,
             )
             .map_err(|_| oom_native("Promise combinator"))?;
-        Ok(Rc::new(Self {
+        Ok(Arc::new(Self {
             values,
             keys: None,
             remaining: Cell::new(1),
@@ -125,7 +125,7 @@ impl PromiseSlots {
         interp: &mut Interpreter,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
-    ) -> Result<Rc<Self>, NativeError> {
+    ) -> Result<Arc<Self>, NativeError> {
         let values = interp
             .alloc_runtime_rooted_array_from_values(
                 std::iter::empty::<Value>(),
@@ -144,7 +144,7 @@ impl PromiseSlots {
                 slice_roots,
             )
             .map_err(|_| oom_native("Promise keyed combinator"))?;
-        Ok(Rc::new(Self {
+        Ok(Arc::new(Self {
             values,
             keys: Some(keys),
             remaining: Cell::new(1),
@@ -592,9 +592,9 @@ where
 
 fn trace_captures(
     captures: &smallvec::SmallVec<[Value; 4]>,
-) -> Rc<crate::native_function::NativeTraceFn> {
+) -> Arc<crate::native_function::NativeTraceFn> {
     let captures = captures.clone();
-    Rc::new(move |visitor: &mut SlotVisitor<'_>| {
+    Arc::new(move |visitor: &mut SlotVisitor<'_>| {
         for capture in captures.iter() {
             capture.trace_value_slots(visitor);
         }
@@ -700,7 +700,7 @@ fn promise_element_function<F>(
     name: &'static str,
     length: u8,
     captures: smallvec::SmallVec<[Value; 4]>,
-    trace: Rc<crate::native_function::NativeTraceFn>,
+    trace: Arc<crate::native_function::NativeTraceFn>,
     value_roots: &[&Value],
     slice_roots: &[&[Value]],
     call: F,
@@ -1117,7 +1117,7 @@ fn new_generic_promise_capability(
     let state = CapabilityExecutorState::new();
     let trace_state = {
         let state = state.clone();
-        Rc::new(move |visitor: &mut SlotVisitor<'_>| state.trace(visitor))
+        Arc::new(move |visitor: &mut SlotVisitor<'_>| state.trace(visitor))
     };
     let state_for_call = state.clone();
     let mut roots = Vec::with_capacity(value_roots.len() + 1);
@@ -1725,7 +1725,7 @@ fn keyed_get(
 
 fn keyed_element_function(
     interp: &mut Interpreter,
-    slots: Rc<PromiseSlots>,
+    slots: Arc<PromiseSlots>,
     cap: PromiseCapability,
     variant: KeyedVariant,
     fulfilled: bool,
@@ -1737,7 +1737,7 @@ fn keyed_element_function(
     let trace_slots = {
         let slots = slots.clone();
         let cap = cap.clone();
-        Rc::new(move |visitor: &mut SlotVisitor<'_>| {
+        Arc::new(move |visitor: &mut SlotVisitor<'_>| {
             slots.trace(visitor);
             cap.promise.trace_value_slots(visitor);
             cap.resolve.trace_value_slots(visitor);
@@ -1937,7 +1937,7 @@ fn static_all_generic(
             let entry_anchor_base = interp.push_iteration_anchor(entry_promise) - 1;
             let cap_for_fulfill = cap.clone();
             let slots_for_trace = slots.clone();
-            let trace_slots = Rc::new(move |visitor: &mut SlotVisitor<'_>| {
+            let trace_slots = Arc::new(move |visitor: &mut SlotVisitor<'_>| {
                 slots_for_trace.trace(visitor);
                 cap_for_fulfill.promise.trace_value_slots(visitor);
                 cap_for_fulfill.resolve.trace_value_slots(visitor);
@@ -2175,7 +2175,7 @@ fn static_all_settled_generic(
                 let trace_slots = {
                     let slots = slots.clone();
                     let cap = cap.clone();
-                    Rc::new(move |visitor: &mut SlotVisitor<'_>| {
+                    Arc::new(move |visitor: &mut SlotVisitor<'_>| {
                         slots.trace(visitor);
                         cap.promise.trace_value_slots(visitor);
                         cap.resolve.trace_value_slots(visitor);
@@ -2224,7 +2224,7 @@ fn static_all_settled_generic(
                 let trace_slots = {
                     let slots = slots.clone();
                     let cap = cap.clone();
-                    Rc::new(move |visitor: &mut SlotVisitor<'_>| {
+                    Arc::new(move |visitor: &mut SlotVisitor<'_>| {
                         slots.trace(visitor);
                         cap.promise.trace_value_slots(visitor);
                         cap.resolve.trace_value_slots(visitor);
@@ -2542,7 +2542,7 @@ fn static_any_generic(
                 let trace_errors = {
                     let errors = errors.clone();
                     let cap = cap.clone();
-                    Rc::new(move |visitor: &mut SlotVisitor<'_>| {
+                    Arc::new(move |visitor: &mut SlotVisitor<'_>| {
                         errors.trace(visitor);
                         cap.promise.trace_value_slots(visitor);
                         cap.resolve.trace_value_slots(visitor);

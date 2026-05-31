@@ -80,7 +80,7 @@ pub enum MapKey {
     BigInt(crate::bigint::BigIntValue),
     /// Strings compare by code-unit content.
     String(JsString),
-    /// Symbols compare by `Rc::ptr_eq` identity.
+    /// Symbols compare by handle identity.
     Symbol(JsSymbol),
     /// The original [`Value`] for the object key — kept so iteration
     /// can hand back the live key reference and the moving collector can

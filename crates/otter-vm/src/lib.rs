@@ -314,13 +314,13 @@ pub struct Interpreter {
     /// Cleared between top-level `run` invocations on the same
     /// interpreter so a fresh script doesn't observe stale
     /// modules.
-    module_environments: std::collections::HashMap<std::rc::Rc<str>, JsObject>,
+    module_environments: std::collections::HashMap<std::sync::Arc<str>, JsObject>,
     /// Cached `(referrer, specifier) → target` lookup, built
     /// lazily from [`otter_bytecode::BytecodeModule::module_resolutions`]
     /// the first time the running module is observed. Cleared
     /// alongside `module_environments`.
     module_resolution_cache:
-        std::collections::HashMap<(std::rc::Rc<str>, String), std::rc::Rc<str>>,
+        std::collections::HashMap<(std::sync::Arc<str>, String), std::sync::Arc<str>>,
     /// Monomorphic `LoadProperty` inline caches keyed by
     /// dense executable IC site id. These are interpreter-local
     /// hints and never affect bytecode dumps or JS-visible semantics.
@@ -543,7 +543,9 @@ pub struct EvalCompileOptions {
 /// [`Op::Eval`] / [`Op::NewFunction`]. Returns a freshly linked
 /// [`BytecodeModule`] whose `<main>` completion value becomes the
 /// dispatch result.
-pub type EvalHook = std::rc::Rc<dyn Fn(&str, EvalCompileOptions) -> Result<BytecodeModule, String>>;
+pub type EvalHook = std::sync::Arc<
+    dyn Fn(&str, EvalCompileOptions) -> Result<BytecodeModule, String> + Send + Sync,
+>;
 
 struct StartupPhaseTimer {
     enabled: bool,
@@ -1311,7 +1313,7 @@ impl Interpreter {
     /// the topological order — once a module's `<module-init>`
     /// has run and populated its env, the driver records it
     /// here keyed by canonical URL.
-    pub fn register_module_env(&mut self, url: std::rc::Rc<str>, env: JsObject) {
+    pub fn register_module_env(&mut self, url: std::sync::Arc<str>, env: JsObject) {
         self.module_environments.insert(url, env);
     }
 
@@ -1362,13 +1364,13 @@ impl Interpreter {
         referrer: &str,
         specifier: &str,
     ) -> Option<JsObject> {
-        let referrer_rc: std::rc::Rc<str> = std::rc::Rc::from(referrer);
+        let referrer_rc: std::sync::Arc<str> = std::sync::Arc::from(referrer);
         let key = (referrer_rc.clone(), specifier.to_string());
         let target_url = if let Some(hit) = self.module_resolution_cache.get(&key) {
             hit.clone()
         } else {
             let target = context.module_resolution_target(referrer, specifier)?;
-            let target_rc: std::rc::Rc<str> = std::rc::Rc::from(target);
+            let target_rc: std::sync::Arc<str> = std::sync::Arc::from(target);
             self.module_resolution_cache.insert(key, target_rc.clone());
             target_rc
         };
@@ -5753,7 +5755,7 @@ mod tests {
         let outer = module_with(Vec::new(), 4);
         let context = ExecutionContext::from_module(outer.clone());
         let mut interp = Interpreter::new();
-        interp.set_eval_hook(Some(std::rc::Rc::new(move |_, _| Ok(compiled.clone()))));
+        interp.set_eval_hook(Some(std::sync::Arc::new(move |_, _| Ok(compiled.clone()))));
         let arg = Value::string(JsString::from_str("", interp.gc_heap_mut()).unwrap());
         let args = [arg];
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();

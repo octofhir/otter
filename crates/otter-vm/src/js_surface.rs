@@ -19,7 +19,7 @@
 //!   targets. They never contain `Gc<T>`, `Local<'gc, T>`, VM
 //!   frames, or borrowed contexts.
 //! - Builders are lifetime-bound to a mutable heap borrow and carry
-//!   an `Rc` marker so they remain `!Send + !Sync`.
+//!   a raw-pointer marker so they remain `!Send + !Sync`.
 //! - Every object store goes through [`crate::object`] descriptor
 //!   APIs so write barriers fire.
 //! - Static builtins use [`crate::NativeCall::Static`] by default;
@@ -31,7 +31,6 @@
 //! - [JS surface builders](../../../docs/book/src/extensions/js-surface-builders.md)
 
 use std::marker::PhantomData;
-use std::rc::Rc;
 
 use crate::native_function::{NativeCall, NativeFunction};
 use crate::number::NumberValue;
@@ -270,7 +269,7 @@ pub struct ObjectBuilder<'rt> {
     object: JsObject,
     raw_roots: Vec<*mut otter_gc::raw::RawGc>,
     value_roots: Vec<Value>,
-    _not_send_sync: PhantomData<Rc<()>>,
+    _not_send_sync: PhantomData<*mut ()>,
 }
 
 impl<'rt> ObjectBuilder<'rt> {
@@ -499,7 +498,7 @@ pub struct ConstructorBuilder<'rt> {
     spec: &'static ConstructorSpec,
     raw_roots: Vec<*mut otter_gc::raw::RawGc>,
     value_roots: Vec<Value>,
-    _not_send_sync: PhantomData<Rc<()>>,
+    _not_send_sync: PhantomData<*mut ()>,
 }
 
 impl<'rt> ConstructorBuilder<'rt> {
@@ -614,7 +613,7 @@ pub struct ClassBuilder<'rt> {
     spec: &'static ClassSpec,
     raw_roots: Vec<*mut otter_gc::raw::RawGc>,
     value_roots: Vec<Value>,
-    _not_send_sync: PhantomData<Rc<()>>,
+    _not_send_sync: PhantomData<*mut ()>,
 }
 
 impl<'rt> ClassBuilder<'rt> {
@@ -748,7 +747,7 @@ pub struct NamespaceBuilder<'rt> {
     object: JsObject,
     raw_roots: Vec<*mut otter_gc::raw::RawGc>,
     value_roots: Vec<Value>,
-    _not_send_sync: PhantomData<Rc<()>>,
+    _not_send_sync: PhantomData<*mut ()>,
 }
 
 impl<'rt> NamespaceBuilder<'rt> {

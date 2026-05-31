@@ -1027,23 +1027,22 @@ fn cli_otter_builder(caps: &CapabilitySet) -> otter_runtime::OtterBuilder {
     builder
 }
 
-std::thread_local! {
-    /// Top-level `--trace[=<path>]` target installed by [`main`].
-    /// `None` disables tracing. `Some("-")` writes to stderr.
-    /// Lives in a thread-local so the many `run_*` helpers do not
-    /// need to thread an extra parameter through every signature.
-    /// The CLI uses `#[tokio::main(flavor = "current_thread")]`, so
-    /// every dispatch stays on the same thread that set the cell.
-    static CLI_TRACE_TARGET: std::cell::RefCell<Option<String>> =
-        const { std::cell::RefCell::new(None) };
-}
+/// Top-level `--trace[=<path>]` target installed by [`main`].
+/// `None` disables tracing. `Some("-")` writes to stderr.
+static CLI_TRACE_TARGET: std::sync::LazyLock<std::sync::Mutex<Option<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 fn install_cli_trace_target(target: Option<String>) {
-    CLI_TRACE_TARGET.with(|cell| *cell.borrow_mut() = target);
+    *CLI_TRACE_TARGET
+        .lock()
+        .expect("CLI trace target mutex poisoned") = target;
 }
 
 fn cli_trace_target() -> Option<String> {
-    CLI_TRACE_TARGET.with(|cell| cell.borrow().clone())
+    CLI_TRACE_TARGET
+        .lock()
+        .expect("CLI trace target mutex poisoned")
+        .clone()
 }
 
 /// Build a [`otter_runtime::TracerFactory`] that emits the

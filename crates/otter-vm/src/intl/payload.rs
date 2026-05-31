@@ -273,8 +273,7 @@ pub fn alloc_intl(
 
 /// Heap handle for [`crate::Value::Intl`].
 ///
-/// Backed by a GC body ([`IntlBody`]) — the legacy `Rc<IntlPayload>`
-/// storage has been retired. The wrapper carries a cached
+/// Backed by a GC body ([`IntlBody`]); the wrapper carries a cached
 /// [`IntlKind`] discriminator so prototype routing and `typeof`
 /// display can avoid a heap read; the full payload still lives in
 /// the GC body.

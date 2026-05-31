@@ -162,8 +162,8 @@ fn module_env_keeps_object_alive() {
         interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
     let module_env =
         crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("alloc_object");
-    let url: std::rc::Rc<str> = std::rc::Rc::from("file:///gc_roots_test.js");
-    interp.register_module_env(std::rc::Rc::clone(&url), module_env);
+    let url: std::sync::Arc<str> = std::sync::Arc::from("file:///gc_roots_test.js");
+    interp.register_module_env(std::sync::Arc::clone(&url), module_env);
 
     let stashed =
         crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("alloc_object");

@@ -38,7 +38,6 @@
 //! - [GC API](../../../docs/book/src/engine/gc-api.md)
 //! - [Native bindings](../../../docs/book/src/extensions/native-bindings.md)
 
-use std::rc::Rc;
 use std::sync::Arc;
 
 use smallvec::SmallVec;
@@ -160,7 +159,7 @@ enum NativeCallStorage {
     Static(NativeFastFn),
     VmIntrinsic(VmIntrinsicFunction),
     Dynamic(Arc<NativeFn>),
-    LocalDynamic(Rc<LocalNativeFn>),
+    LocalDynamic(Arc<LocalNativeFn>),
 }
 
 impl From<NativeCall> for NativeCallStorage {
@@ -212,7 +211,7 @@ pub struct NativeFunctionBody {
     /// payload's GC slots itself; the derive dispatches to a
     /// per-field helper rather than the generic `PeltField` path.
     #[pelt(via = trace_native_trace_hook)]
-    trace: Option<Rc<NativeTraceFn>>,
+    trace: Option<Arc<NativeTraceFn>>,
     /// Own property state for the built-in `name` property.
     name_property: NativeOwnProperty,
     /// Own property state for the built-in `length` property.
@@ -232,7 +231,7 @@ pub struct NativeFunctionBody {
     prototype_override: Option<Value>,
 }
 
-fn trace_native_trace_hook(trace: &Option<Rc<NativeTraceFn>>, visitor: &mut SlotVisitor<'_>) {
+fn trace_native_trace_hook(trace: &Option<Arc<NativeTraceFn>>, visitor: &mut SlotVisitor<'_>) {
     if let Some(t) = trace {
         t(visitor);
     }
@@ -270,7 +269,7 @@ impl NativeFunction {
         length: u8,
         call: NativeCallStorage,
         captures: SmallVec<[Value; 4]>,
-        trace: Option<Rc<NativeTraceFn>>,
+        trace: Option<Arc<NativeTraceFn>>,
         metadata: NativeFunctionMetadata,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<Self, otter_gc::OutOfMemory> {
@@ -875,7 +874,7 @@ pub(crate) enum NativeCallTarget {
     /// Local VM-only closure path.
     LocalDynamic {
         /// Closure payload.
-        call: Rc<LocalNativeFn>,
+        call: Arc<LocalNativeFn>,
         /// Traced JS captures.
         captures: SmallVec<[Value; 4]>,
     },
@@ -976,7 +975,7 @@ where
         heap,
         name,
         0,
-        NativeCallStorage::LocalDynamic(Rc::new(call)),
+        NativeCallStorage::LocalDynamic(Arc::new(call)),
         captures,
         None,
         NativeFunctionMetadata::CONSTRUCTOR,
@@ -998,7 +997,7 @@ where
         heap,
         name,
         0,
-        NativeCallStorage::LocalDynamic(Rc::new(call)),
+        NativeCallStorage::LocalDynamic(Arc::new(call)),
         captures,
         None,
         NativeFunctionMetadata::BUILTIN,
@@ -1011,7 +1010,7 @@ pub(crate) fn traced_native_value_with_length<F>(
     name: &'static str,
     length: u8,
     captures: SmallVec<[Value; 4]>,
-    trace: Rc<NativeTraceFn>,
+    trace: Arc<NativeTraceFn>,
     external_visit: &mut RootSlotVisitor<'_>,
     call: F,
 ) -> Result<Value, otter_gc::OutOfMemory>
@@ -1022,7 +1021,7 @@ where
         heap,
         name,
         length,
-        NativeCallStorage::LocalDynamic(Rc::new(call)),
+        NativeCallStorage::LocalDynamic(Arc::new(call)),
         captures,
         Some(trace),
         NativeFunctionMetadata::BUILTIN,

@@ -26,10 +26,10 @@ use smallvec::SmallVec;
 
 use crate::{
     AsyncFrameState, ExecutableFunction, ExecutionContext, Frame, Interpreter, JsObject,
-    NativeCallInfo, NativeCtx, NativeFunction, UpvalueCell, Value, VmError, VmGetOutcome,
-    VmPropertyKey, abstract_ops, argument_window::BytecodeArgumentWindow, is_constructor_runtime,
-    native_to_vm_error, operand_decode::register_operand, promise_dispatch, read_register,
-    write_register,
+    NativeCallInfo, NativeCtx, NativeFunction, Value, VmError, VmGetOutcome, VmPropertyKey,
+    abstract_ops, argument_window::BytecodeArgumentWindow, frame_state::UpvalueSpine,
+    is_constructor_runtime, native_to_vm_error, operand_decode::register_operand, promise_dispatch,
+    read_register, write_register,
 };
 
 struct PreparedBytecodeFrame {
@@ -81,14 +81,15 @@ impl Interpreter {
         current: Value,
         effective_this: Value,
         heap: &otter_gc::GcHeap,
-    ) -> Result<(u32, std::rc::Rc<[UpvalueCell]>, Value, Option<Value>), VmError> {
+    ) -> Result<(u32, crate::frame_state::UpvalueSpine, Value, Option<Value>), VmError> {
         if let Some(function_id) = current.as_function() {
             return Ok((function_id, Frame::empty_upvalues(), effective_this, None));
         }
         if let Some(c) = current.as_closure(heap) {
             let function_id = c.function_id();
             let (upvalues, bound_this, bound_new_target) = heap.read_payload(c.handle, |body| {
-                let ups: std::rc::Rc<[UpvalueCell]> = std::rc::Rc::from(&body.upvalues[..]);
+                let ups: crate::frame_state::UpvalueSpine =
+                    body.upvalues.clone().into_boxed_slice();
                 (ups, body.bound_this, body.bound_new_target)
             });
             let this_value = bound_this.unwrap_or(effective_this);
@@ -100,15 +101,14 @@ impl Interpreter {
     fn bytecode_construct_target_parts(
         current: Value,
         heap: &otter_gc::GcHeap,
-    ) -> Result<(u32, std::rc::Rc<[UpvalueCell]>), VmError> {
+    ) -> Result<(u32, crate::frame_state::UpvalueSpine), VmError> {
         if let Some(function_id) = current.as_function() {
             return Ok((function_id, Frame::empty_upvalues()));
         }
         if let Some(c) = current.as_closure(heap) {
             let function_id = c.function_id();
-            let upvalues = heap.read_payload(c.handle, |body| {
-                std::rc::Rc::<[UpvalueCell]>::from(&body.upvalues[..])
-            });
+            let upvalues =
+                heap.read_payload(c.handle, |body| body.upvalues.clone().into_boxed_slice());
             return Ok((function_id, upvalues));
         }
         Err(VmError::NotCallable)
@@ -206,7 +206,7 @@ impl Interpreter {
         stack: &mut SmallVec<[Frame; 8]>,
         context: &ExecutionContext,
         function_id: u32,
-        parent_upvalues: std::rc::Rc<[UpvalueCell]>,
+        parent_upvalues: UpvalueSpine,
         this_for_callee: Value,
         new_target_for_callee: Option<Value>,
         effective_args: SmallVec<[Value; 8]>,
@@ -311,7 +311,7 @@ impl Interpreter {
         context: &ExecutionContext,
         stack: &SmallVec<[Frame; 8]>,
         function_id: u32,
-        parent_upvalues: std::rc::Rc<[UpvalueCell]>,
+        parent_upvalues: UpvalueSpine,
         this_for_callee: Value,
         new_target_for_callee: Option<Value>,
         args: &BytecodeArgumentWindow<'_>,

@@ -26,6 +26,7 @@
 //! - [`crate::dynamic_import`]
 
 use otter_bytecode::{BytecodeModule, Constant, Function, ModuleInit, Operand};
+use std::sync::Arc;
 
 use crate::executable::{ExecInstr, ExecutableFunction, ExecutableModule};
 use crate::property_atom::{AtomTable, AtomizedPropertyKey};
@@ -33,9 +34,9 @@ use crate::property_atom::{AtomTable, AtomizedPropertyKey};
 /// Cloneable dispatch context for VM-owned JS jobs.
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {
-    module: std::rc::Rc<BytecodeModule>,
-    executable: std::rc::Rc<ExecutableModule>,
-    atoms: std::rc::Rc<AtomTable>,
+    module: Arc<BytecodeModule>,
+    executable: Arc<ExecutableModule>,
+    atoms: Arc<AtomTable>,
 }
 
 impl ExecutionContext {
@@ -45,9 +46,9 @@ impl ExecutionContext {
         let executable = ExecutableModule::from_bytecode(&module);
         let atoms = AtomTable::from_constants(&module.constants);
         Self {
-            module: std::rc::Rc::new(module),
-            executable: std::rc::Rc::new(executable),
-            atoms: std::rc::Rc::new(atoms),
+            module: Arc::new(module),
+            executable: Arc::new(executable),
+            atoms: Arc::new(atoms),
         }
     }
 

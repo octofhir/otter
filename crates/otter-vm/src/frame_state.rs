@@ -28,6 +28,8 @@ use crate::{
     cold_frame::ColdFrameIdx,
 };
 
+pub(crate) type UpvalueSpine = Box<[UpvalueCell]>;
+
 // Hot frame fits in two 64 B cache lines. Cold protocol state (try
 // handlers, async parking, pending ToPrimitive/bind/iterator ladders,
 // rest/incoming args, …) lives in `cold_frame::ColdFramePool` and is
@@ -57,7 +59,7 @@ pub struct Frame {
     /// Captured upvalues for this call. Empty for non-closure
     /// frames. Indexed by `Op::LoadUpvalue` / `Op::StoreUpvalue`
     /// operands.
-    pub upvalues: std::rc::Rc<[UpvalueCell]>,
+    pub upvalues: UpvalueSpine,
     /// `this` value visible inside the body. `<main>` and free
     /// `Op::Call` invocations both bind `Value::Undefined`
     /// (foundation strict default). Method calls set the receiver,
@@ -261,13 +263,8 @@ impl Frame {
 
     /// Shared empty upvalue slice for plain functions without captured
     /// parent cells.
-    pub(crate) fn empty_upvalues() -> std::rc::Rc<[UpvalueCell]> {
-        thread_local! {
-            static EMPTY_UPVALUES: std::rc::Rc<[UpvalueCell]> =
-                std::rc::Rc::from(Vec::<UpvalueCell>::new());
-        }
-
-        EMPTY_UPVALUES.with(std::clone::Clone::clone)
+    pub(crate) fn empty_upvalues() -> UpvalueSpine {
+        Vec::<UpvalueCell>::new().into_boxed_slice()
     }
 
     /// Allocate a frame for `function`. Registers are pre-filled
@@ -333,24 +330,24 @@ impl Frame {
     pub fn build_upvalues(
         heap: &mut otter_gc::GcHeap,
         function: &Function,
-        parent_upvalues: std::rc::Rc<[UpvalueCell]>,
-    ) -> Result<std::rc::Rc<[UpvalueCell]>, otter_gc::OutOfMemory> {
+        parent_upvalues: UpvalueSpine,
+    ) -> Result<UpvalueSpine, otter_gc::OutOfMemory> {
         Self::build_upvalues_for_count(heap, function.own_upvalue_count, parent_upvalues)
     }
 
     pub(crate) fn build_upvalues_for_exec(
         heap: &mut otter_gc::GcHeap,
         function: &ExecutableFunction,
-        parent_upvalues: std::rc::Rc<[UpvalueCell]>,
-    ) -> Result<std::rc::Rc<[UpvalueCell]>, otter_gc::OutOfMemory> {
+        parent_upvalues: UpvalueSpine,
+    ) -> Result<UpvalueSpine, otter_gc::OutOfMemory> {
         Self::build_upvalues_for_count(heap, function.own_upvalue_count, parent_upvalues)
     }
 
     fn build_upvalues_for_count(
         heap: &mut otter_gc::GcHeap,
         own_upvalue_count: u16,
-        parent_upvalues: std::rc::Rc<[UpvalueCell]>,
-    ) -> Result<std::rc::Rc<[UpvalueCell]>, otter_gc::OutOfMemory> {
+        parent_upvalues: UpvalueSpine,
+    ) -> Result<UpvalueSpine, otter_gc::OutOfMemory> {
         let own = own_upvalue_count as usize;
         if own == 0 {
             return Ok(parent_upvalues);
@@ -360,7 +357,7 @@ impl Frame {
             cells.push(alloc_upvalue(heap, Value::undefined())?);
         }
         cells.extend(parent_upvalues.iter().copied());
-        Ok(std::rc::Rc::from(cells))
+        Ok(cells.into_boxed_slice())
     }
 
     /// Full constructor used by call sites that need to bind a
@@ -373,7 +370,7 @@ impl Frame {
     pub fn with_return_upvalues_and_this(
         function: &Function,
         return_register: Option<u16>,
-        upvalues: std::rc::Rc<[UpvalueCell]>,
+        upvalues: UpvalueSpine,
         this_value: Value,
     ) -> Self {
         let total = function
@@ -403,7 +400,7 @@ impl Frame {
     pub(crate) fn with_exec_return_upvalues_and_this(
         function: &ExecutableFunction,
         return_register: Option<u16>,
-        upvalues: std::rc::Rc<[UpvalueCell]>,
+        upvalues: UpvalueSpine,
         this_value: Value,
     ) -> Self {
         let mut registers: SmallVec<[Value; 8]> =

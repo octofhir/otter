@@ -573,33 +573,50 @@ fn impl_imul(args: &[NumberValue]) -> NumberValue {
 }
 
 /// §21.3.2.27 Math.random() — non-cryptographic pseudo-random.
-/// Uses a thread-local linear-congruential generator seeded from
-/// the system clock so foundation runs are reproducible inside a
-/// single VM but vary across processes.
+/// Uses a process-local SplitMix64 stream seeded from the system
+/// clock. This is intentionally not cryptographic.
 fn impl_random(_args: &[NumberValue]) -> NumberValue {
-    use std::cell::Cell;
-    thread_local! {
-        static SEED: Cell<u64> = Cell::new({
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0xDEADBEEFu64);
-            now | 1
-        });
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEED: AtomicU64 = AtomicU64::new(0);
+
+    fn initial_seed() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0xDEADBEEFu64)
+            | 1
     }
-    SEED.with(|cell| {
-        let mut s = cell.get();
-        // SplitMix64 step.
-        s = s.wrapping_add(0x9E3779B97F4A7C15);
-        let mut z = s;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-        z ^= z >> 31;
-        cell.set(s);
-        // Map upper 53 bits into `[0, 1)`.
-        let bits = (z >> 11) as f64 / (1u64 << 53) as f64;
-        NumberValue::Double(bits)
-    })
+
+    let mut s = SEED.load(Ordering::Relaxed);
+    if s == 0 {
+        let init = initial_seed();
+        s = SEED
+            .compare_exchange(0, init, Ordering::AcqRel, Ordering::Acquire)
+            .unwrap_or_else(|actual| actual);
+    }
+
+    loop {
+        let next = s.wrapping_add(0x9E3779B97F4A7C15);
+        match SEED.compare_exchange_weak(s, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                let mut z = next;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                z ^= z >> 31;
+                // Map upper 53 bits into `[0, 1)`.
+                let bits = (z >> 11) as f64 / (1u64 << 53) as f64;
+                return NumberValue::Double(bits);
+            }
+            Err(actual) if actual == 0 => {
+                let init = initial_seed();
+                s = SEED
+                    .compare_exchange(0, init, Ordering::AcqRel, Ordering::Acquire)
+                    .unwrap_or_else(|current| current);
+            }
+            Err(actual) => s = actual,
+        }
+    }
 }
 
 fn first_or_nan(args: &[NumberValue]) -> NumberValue {

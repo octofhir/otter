@@ -157,14 +157,6 @@ impl<T: ?Sized> PeltField for std::sync::Arc<T> {
     fn pelt_trace(&self, _visitor: &mut SlotVisitor<'_>) {}
 }
 
-impl<T: ?Sized> PeltField for std::rc::Rc<T> {
-    /// Same rationale as the `Arc<T>` no-op — Rc payloads in GC bodies
-    /// today wrap foreign data (closures, dyn trait objects) and any
-    /// embedded GC slot must be traced explicitly.
-    #[inline]
-    fn pelt_trace(&self, _visitor: &mut SlotVisitor<'_>) {}
-}
-
 impl<T: PeltField + ?Sized> PeltField for Box<T> {
     #[inline]
     fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {

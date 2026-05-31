@@ -306,8 +306,7 @@ pub const OBJECT_BODY_TYPE_TAG: u8 = 0x11;
 /// Per ECMA-262 §10.1, ordinary objects carry a hidden-class
 /// [`Shape`], an aligned slot table, an optional `[[Prototype]]`,
 /// a list of symbol-keyed own properties, and an `[[Extensible]]`
-/// flag. All of those fields live here directly — task 77 retired
-/// the pre-77 `Rc<RefCell<…>>` envelope. Mutation flows through
+/// flag. All of those fields live here directly. Mutation flows through
 /// [`otter_gc::GcHeap::with_payload`] (writers) and reads through
 /// [`otter_gc::GcHeap::read_payload`] (readers). Every store of a
 /// `Gc<…>`-bearing field is recorded through

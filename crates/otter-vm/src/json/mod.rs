@@ -20,9 +20,8 @@
 //! - **No recursion.** Both serializer and parser walk an explicit
 //!   stack capped at `MAX_NESTING_DEPTH` (1024) so adversarial
 //!   nested input cannot blow the host stack.
-//! - **Cycle detection.** Stringify carries an
-//!   `Rc::ptr_eq`-comparing visit set; revisiting an active node
-//!   raises `JsonError::Cyclic`.
+//! - **Cycle detection.** Stringify carries an identity visit set;
+//!   revisiting an active node raises `JsonError::Cyclic`.
 //! - **Deterministic key order.** Object properties enumerate in
 //!   shape insertion order (`JsObject::borrow_props`).
 //! - **NaN / ±Infinity / -0 → `null`** per spec §25.5.2.4.

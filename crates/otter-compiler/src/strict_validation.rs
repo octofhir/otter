@@ -323,6 +323,27 @@ impl StrictValidator {
             ),
         });
     }
+
+    /// Flag a `FunctionDeclaration` (possibly labelled) appearing as the
+    /// body of an *iteration* statement. Per §13.7.x.1 this is a Syntax
+    /// Error in both strict and sloppy modes — unlike the `IfStatement`
+    /// arm, Annex B does not relax it for iteration statements.
+    fn flag_iteration_function_body(&mut self, body: &Statement<'_>, context_label: &str) {
+        let Some(span) = labelled_function_body_span(body) else {
+            return;
+        };
+        self.diagnostics.push(SyntaxDiagnostic {
+            code: "ITERATION_FUNCTION_AS_STATEMENT_BODY".to_string(),
+            message: format!(
+                "SyntaxError: a function declaration cannot be the body of `{context_label}` \
+                 (§13.7.x.1 IsLabelledFunction early error)"
+            ),
+            range: Some((span.start, span.end)),
+            help: Some(
+                "wrap the function declaration in a block `{ … }`".to_string(),
+            ),
+        });
+    }
 }
 
 /// Scanner that detects free `arguments` references inside a class
@@ -616,6 +637,20 @@ impl<'a> Visit<'a> for ContainsAwaitScanner {
 fn function_declaration_body_span(body: &Statement<'_>) -> Option<Span> {
     match body {
         Statement::FunctionDeclaration(func) => Some(func.span),
+        _ => None,
+    }
+}
+
+/// §8.5.2 IsLabelledFunction — return the offending function span when
+/// `body` is a `FunctionDeclaration` reached through zero or more
+/// `LabeledStatement` wrappers (`L: M: function f(){}`). Used by the
+/// iteration-statement controllers, where a labelled function body is a
+/// Syntax Error in *both* strict and sloppy modes (Annex B relaxes only
+/// the `IfStatement` arm).
+fn labelled_function_body_span(body: &Statement<'_>) -> Option<Span> {
+    match body {
+        Statement::FunctionDeclaration(func) => Some(func.span),
+        Statement::LabeledStatement(labelled) => labelled_function_body_span(&labelled.body),
         _ => None,
     }
 }
@@ -962,22 +997,22 @@ impl<'a> Visit<'a> for StrictValidator {
     }
 
     fn visit_while_statement(&mut self, it: &WhileStatement<'a>) {
-        self.flag_function_declaration_body(&it.body, "while");
+        self.flag_iteration_function_body(&it.body, "while");
         walk::walk_while_statement(self, it);
     }
 
     fn visit_do_while_statement(&mut self, it: &DoWhileStatement<'a>) {
-        self.flag_function_declaration_body(&it.body, "do-while");
+        self.flag_iteration_function_body(&it.body, "do-while");
         walk::walk_do_while_statement(self, it);
     }
 
     fn visit_for_statement(&mut self, it: &ForStatement<'a>) {
-        self.flag_function_declaration_body(&it.body, "for");
+        self.flag_iteration_function_body(&it.body, "for");
         walk::walk_for_statement(self, it);
     }
 
     fn visit_for_in_statement(&mut self, it: &ForInStatement<'a>) {
-        self.flag_function_declaration_body(&it.body, "for-in");
+        self.flag_iteration_function_body(&it.body, "for-in");
         // §13.7.5.1 ForIn/OfHeadEvaluation early error: ForBinding
         // declarators in a `for-in` head must not carry an
         // Initializer. Annex B §B.3.5 relaxes this for `for (var x =
@@ -989,7 +1024,7 @@ impl<'a> Visit<'a> for StrictValidator {
     }
 
     fn visit_for_of_statement(&mut self, it: &ForOfStatement<'a>) {
-        self.flag_function_declaration_body(&it.body, "for-of");
+        self.flag_iteration_function_body(&it.body, "for-of");
         // §13.7.5.1 — `for-of` heads never permit Initializer on
         // any variant of ForBinding, regardless of strict mode.
         self.flag_for_head_initializer(&it.left, "for-of");

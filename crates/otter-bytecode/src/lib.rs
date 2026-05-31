@@ -669,6 +669,12 @@ pub enum Op {
     /// module-init call so eager evaluation and deferred force-eval
     /// share one guarded primitive.
     EvaluateModule,
+    /// Mark the module with the canonical URL in the constant operand as
+    /// evaluated, without running it. Operand: `ConstIndex(url)`. Emitted
+    /// by the async `<entry>` driver around an explicit module-init call
+    /// so deferred force-eval treats the module as already evaluated and
+    /// does not re-run it.
+    MarkModuleEvaluated,
     /// Wrap the value in `r<src>` as a fulfilled `Promise` and
     /// write to `r<dst>`. Operands:
     /// `Register(dst), Register(src)`.
@@ -1084,6 +1090,7 @@ impl Op {
             Op::ImportNamespace => "IMPORT_NAMESPACE",
             Op::ImportNamespaceDeferred => "IMPORT_NAMESPACE_DEFERRED",
             Op::EvaluateModule => "EVALUATE_MODULE",
+            Op::MarkModuleEvaluated => "MARK_MODULE_EVALUATED",
             Op::PromiseFulfilledOf => "PROMISE_FULFILLED_OF",
             Op::Await => "AWAIT",
             Op::SymbolLoad => "SYMBOL_LOAD",
@@ -1156,6 +1163,7 @@ impl Op {
             | Op::CollectArguments
             | Op::FreshUpvalue
             | Op::EvaluateModule
+            | Op::MarkModuleEvaluated
             | Op::LoadGlobalThis => 1,
             Op::LoadString
             | Op::LoadNumber
@@ -1321,7 +1329,7 @@ impl Op {
             // [name_const, value_reg]
             Op::DefineGlobalVar => pos == 0,
             // [url_const]
-            Op::EvaluateModule => pos == 0,
+            Op::EvaluateModule | Op::MarkModuleEvaluated => pos == 0,
             // [reg, reg, const]
             Op::LoadProperty | Op::DeleteProperty | Op::ToPrimitive => pos == 2,
             // [reg, kind_const, reg]

@@ -34,7 +34,6 @@ skip_features = [
     "source-phase-imports",
     "source-phase-imports-module-source",
     "export-star-as-namespace-from-module",
-    "top-level-await",
 
     # FinalizationRegistry / WeakRef: host-gc-required tests need $262.gc()
     # to reliably trigger collection + cleanup callbacks

@@ -566,6 +566,7 @@ pub const OP_BYTE_TABLE: &[(Op, u8)] = &[
     (Op::FreshUpvalue, 0x87),
     (Op::ImportNamespaceDeferred, 0x88),
     (Op::EvaluateModule, 0x89),
+    (Op::MarkModuleEvaluated, 0x8A),
 ];
 
 #[cfg(test)]

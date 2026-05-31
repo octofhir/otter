@@ -908,6 +908,7 @@ mod tests {
         Op::ImportNamespace,
         Op::ImportNamespaceDeferred,
         Op::EvaluateModule,
+        Op::MarkModuleEvaluated,
         Op::PromiseFulfilledOf,
         Op::NewIntl,
         Op::TemporalLoad,

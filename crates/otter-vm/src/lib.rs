@@ -4036,6 +4036,17 @@ impl Interpreter {
                     self.run_evaluate_module_const(context, frame, url_idx)?;
                     continue;
                 }
+                Op::MarkModuleEvaluated => {
+                    let url_idx = context
+                        .exec_const_index(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    if let Some(url) = context.string_constant_str(url_idx) {
+                        let url_arc: std::sync::Arc<str> = std::sync::Arc::from(url);
+                        self.evaluated_modules.insert(url_arc);
+                    }
+                    stack[top_idx].advance_pc(self.current_byte_len)?;
+                    continue;
+                }
                 Op::ImportMetaResolve => {
                     let dst = context
                         .exec_register(instr, 0)

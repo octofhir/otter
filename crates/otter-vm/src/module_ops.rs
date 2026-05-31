@@ -112,6 +112,20 @@ impl Interpreter {
         if self.evaluated_modules.contains(&url_arc) {
             return Ok(());
         }
+        // §28.3 ReadyForSyncExecution — a module with top-level await
+        // cannot be force-evaluated synchronously from a deferred
+        // namespace access; that is a TypeError, not a silent suspension.
+        if context
+            .module_init_function_id(url)
+            .and_then(|fid| context.function(fid))
+            .is_some_and(|f| f.is_async)
+        {
+            return Err(VmError::TypeError {
+                message:
+                    "Cannot synchronously evaluate a deferred module that uses top-level await"
+                        .to_string(),
+            });
+        }
         // Mark before running so an import cycle treats this module as
         // already evaluating (no re-entry).
         self.evaluated_modules.insert(url_arc.clone());

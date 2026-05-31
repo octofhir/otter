@@ -548,13 +548,23 @@ fn link(nodes: &BTreeMap<String, ModuleNode>, order: &[String], entry_url: &str)
 
     // Synthesise <entry>'s body. Ordering: for each module, build
     // module_env + import_meta, register, then call its <module-init>.
-    let entry_body = build_entry_body(nodes, order, entry_url, &mut constants);
+    let entry_body = build_entry_body(
+        nodes,
+        order,
+        entry_url,
+        &module_function_offset,
+        &mut constants,
+    );
     functions[0].code = entry_body.code;
     functions[0].spans = entry_body.spans;
     functions[0].locals = 0;
     functions[0].scratch = entry_body.scratch;
     functions[0].param_count = 0;
     functions[0].own_upvalue_count = 0;
+    // A graph that contains a top-level-await module evaluates through an
+    // async `<entry>` that awaits each module-init; mark it async so the
+    // dispatch loop parks/resumes it via the microtask queue.
+    functions[0].is_async = entry_body.is_async;
 
     BytecodeModule {
         module: entry_url.to_string(),
@@ -602,6 +612,9 @@ struct EntryBody {
     code: Vec<Instruction>,
     spans: Vec<SpanEntry>,
     scratch: u16,
+    /// `true` when the graph contains a top-level-await module, so the
+    /// `<entry>` driver must be async and await each module-init.
+    is_async: bool,
 }
 
 /// Build the synthesised `<entry>` driver. Pseudocode:
@@ -644,20 +657,61 @@ fn build_entry_body(
     nodes: &BTreeMap<String, ModuleNode>,
     order: &[String],
     entry_url: &str,
+    module_function_offset: &HashMap<String, u32>,
     constants: &mut Vec<Constant>,
 ) -> EntryBody {
     let mut code: Vec<Instruction> = Vec::new();
     let mut spans: Vec<SpanEntry> = Vec::new();
     let mut next_pc: u32 = 0;
 
+    // A module-init has its own top-level await iff its `<main>`
+    // (fragment function 0) is async.
+    let module_has_tla = |url: &str| -> bool {
+        nodes
+            .get(url)
+            .and_then(|n| n.fragment.functions.first())
+            .is_some_and(|f| f.is_async)
+    };
+
+    // [[AsyncEvaluation]] set (§16.2.1.5): a module is async-evaluated if
+    // it has top-level await or any of its non-deferred dependencies is
+    // async-evaluated. Computed as a fixpoint over non-deferred edges
+    // (deferred edges evaluate their target as a separate root).
+    let mut async_eval: HashSet<&str> = order
+        .iter()
+        .map(String::as_str)
+        .filter(|u| module_has_tla(u))
+        .collect();
+    loop {
+        let mut changed = false;
+        for node in nodes.values() {
+            for edge in &node.fragment.module_resolutions {
+                if !edge.deferred
+                    && async_eval.contains(edge.target.as_str())
+                    && async_eval.insert(edge.referrer.as_str())
+                {
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let module_is_async = |url: &str| async_eval.contains(url);
+
     // Eagerly-reachable module set: BFS from the entry module over
     // non-deferred resolution edges. Modules reachable only through
     // `import defer` edges are evaluated lazily on first namespace
-    // access (TC39 import defer), so the eager driver skips them.
+    // access (TC39 import defer), so the eager driver skips them — except
+    // when the deferred target is async-evaluated: it cannot be
+    // force-evaluated synchronously, so per the proposal it is evaluated
+    // eagerly and the deferred namespace wraps the already-evaluated
+    // module.
     let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
     for node in nodes.values() {
         for edge in &node.fragment.module_resolutions {
-            if !edge.deferred {
+            if !edge.deferred || module_is_async(edge.target.as_str()) {
                 adjacency
                     .entry(edge.referrer.as_str())
                     .or_default()
@@ -676,21 +730,157 @@ fn build_entry_body(
         }
     }
 
-    // Emit one EvaluateModule per eagerly-reachable module in
-    // topological post-order. The VM primitive is idempotent and
-    // recurses into each module's non-deferred dependency closure;
-    // iterating `order` preserves the established evaluation order.
+    let has_async = order
+        .iter()
+        .any(|url| reachable.contains(url.as_str()) && module_is_async(url));
+
+    if !has_async {
+        // Sync graph: one idempotent EvaluateModule per eagerly-reachable
+        // module in topological post-order. Unchanged fast path.
+        for url in order {
+            if !reachable.contains(url.as_str()) {
+                continue;
+            }
+            let url_const_idx = intern_string_const(constants, url);
+            emit_op(
+                &mut code,
+                &mut spans,
+                &mut next_pc,
+                Op::EvaluateModule,
+                [Operand::ConstIndex(url_const_idx)],
+            );
+        }
+        emit_op(&mut code, &mut spans, &mut next_pc, Op::ReturnUndefined, []);
+        return EntryBody {
+            code,
+            spans,
+            scratch: 0,
+            is_async: false,
+        };
+    }
+
+    // Async graph (§16.2.1.5): the `<entry>` is an async function that,
+    // for each eagerly-reachable module in post-order, builds its env +
+    // import_meta, marks it evaluated, calls its `<module-init>`, then
+    // awaits the result. A synchronous init runs to completion inline
+    // (await of `undefined` is a microtask no-op); an async (top-level
+    // await) init parks the entry until its body settles, so a module's
+    // dependencies — which precede it in `order` — are fully evaluated
+    // before it runs.
+    let url_name_idx = intern_string_const(constants, "url");
+    let mut next_reg: u16 = 0;
     for url in order {
         if !reachable.contains(url.as_str()) {
             continue;
         }
+        let Some(&init_fn_id) = module_function_offset.get(url) else {
+            continue;
+        };
         let url_const_idx = intern_string_const(constants, url);
+
+        let r_env = next_reg;
+        next_reg += 1;
         emit_op(
             &mut code,
             &mut spans,
             &mut next_pc,
-            Op::EvaluateModule,
+            Op::ImportNamespace,
+            [Operand::Register(r_env), Operand::ConstIndex(url_const_idx)],
+        );
+
+        let r_meta = next_reg;
+        next_reg += 1;
+        emit_op(
+            &mut code,
+            &mut spans,
+            &mut next_pc,
+            Op::NewObject,
+            [Operand::Register(r_meta)],
+        );
+        let r_url_str = next_reg;
+        next_reg += 1;
+        emit_op(
+            &mut code,
+            &mut spans,
+            &mut next_pc,
+            Op::LoadString,
+            [
+                Operand::Register(r_url_str),
+                Operand::ConstIndex(url_const_idx),
+            ],
+        );
+        let r_store_scratch = next_reg;
+        next_reg += 1;
+        emit_op(
+            &mut code,
+            &mut spans,
+            &mut next_pc,
+            Op::StoreProperty,
+            vec![
+                Operand::Register(r_meta),
+                Operand::ConstIndex(url_name_idx),
+                Operand::Register(r_url_str),
+                Operand::Register(r_store_scratch),
+            ],
+        );
+
+        // Mark evaluated before the call so a deferred force-eval of this
+        // module during its own evaluation does not re-enter it.
+        emit_op(
+            &mut code,
+            &mut spans,
+            &mut next_pc,
+            Op::MarkModuleEvaluated,
             [Operand::ConstIndex(url_const_idx)],
+        );
+
+        let r_init = next_reg;
+        next_reg += 1;
+        let init_const_idx = intern_function_id_const(constants, init_fn_id);
+        emit_op(
+            &mut code,
+            &mut spans,
+            &mut next_pc,
+            Op::MakeFunction,
+            [
+                Operand::Register(r_init),
+                Operand::ConstIndex(init_const_idx),
+            ],
+        );
+
+        let r_undef = next_reg;
+        next_reg += 1;
+        emit_op(
+            &mut code,
+            &mut spans,
+            &mut next_pc,
+            Op::LoadUndefined,
+            [Operand::Register(r_undef)],
+        );
+        let r_res = next_reg;
+        next_reg += 1;
+        emit_op(
+            &mut code,
+            &mut spans,
+            &mut next_pc,
+            Op::CallWithThis,
+            vec![
+                Operand::Register(r_res),
+                Operand::Register(r_init),
+                Operand::Register(r_undef),
+                Operand::ConstIndex(2),
+                Operand::Register(r_env),
+                Operand::Register(r_meta),
+            ],
+        );
+        let r_awaited = next_reg;
+        next_reg += 1;
+        emit_op(
+            &mut code,
+            &mut spans,
+            &mut next_pc,
+            Op::Await,
+            [Operand::Register(r_awaited), Operand::Register(r_res)],
         );
     }
 
@@ -698,8 +888,22 @@ fn build_entry_body(
     EntryBody {
         code,
         spans,
-        scratch: 0,
+        scratch: next_reg,
+        is_async: true,
     }
+}
+
+/// Intern a `Constant::FunctionId` and return its constant-pool index.
+fn intern_function_id_const(constants: &mut Vec<Constant>, function_id: u32) -> u32 {
+    for (i, c) in constants.iter().enumerate() {
+        if let Constant::FunctionId { index } = c
+            && *index == function_id
+        {
+            return i as u32;
+        }
+    }
+    constants.push(Constant::FunctionId { index: function_id });
+    (constants.len() - 1) as u32
 }
 
 fn emit_op(

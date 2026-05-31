@@ -957,16 +957,39 @@ impl Interpreter {
         context: &ExecutionContext,
         iterator: Value,
     ) -> Result<(), VmError> {
-        let close_target = if let Some(handle) = iterator.as_iterator() {
+        enum CloseAction {
+            User(Value),
+            Generator(crate::generator::JsGenerator),
+            Builtin,
+            None,
+        }
+        let action = if let Some(handle) = iterator.as_iterator() {
             self.gc_heap.read_payload(handle, |state| match state {
-                IteratorState::User { iterator } => Some(*iterator),
-                _ => None,
+                IteratorState::User { iterator } => CloseAction::User(*iterator),
+                // §7.4.9 — a generator's `return` resumes the suspended
+                // body with a return completion so its `finally` blocks
+                // run and `[[GeneratorState]]` becomes completed.
+                IteratorState::Generator { handle } => CloseAction::Generator(*handle),
+                // Array / TypedArray / String / Map / Set iterators
+                // expose no `return`, so IteratorClose is a no-op.
+                IteratorState::Exhausted => CloseAction::None,
+                _ => CloseAction::Builtin,
             })
         } else {
-            Some(iterator)
+            CloseAction::User(iterator)
         };
-        if let Some(close_target) = close_target {
-            self.iterator_close_sync(context, &close_target)?;
+        match action {
+            CloseAction::User(close_target) => {
+                self.iterator_close_sync(context, &close_target)?;
+            }
+            CloseAction::Generator(handle) => {
+                self.resume_generator(
+                    context,
+                    &handle,
+                    GeneratorResumeKind::Return(Value::undefined()),
+                )?;
+            }
+            CloseAction::Builtin | CloseAction::None => {}
         }
         Ok(())
     }

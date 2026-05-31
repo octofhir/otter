@@ -89,6 +89,11 @@ pub(crate) struct LoopFrame {
     /// `false` for a `switch` body, where `continue` must skip the
     /// frame and target the enclosing loop instead.
     pub(crate) is_real_loop: bool,
+    /// For a `for…of` frame, the register holding the iterator that
+    /// must be closed (§7.4.9 IteratorClose) when an abrupt
+    /// completion (`break` / labelled `continue` / `return`) exits the
+    /// loop. `None` for every other loop / switch frame.
+    pub(crate) iterator_close_reg: Option<u16>,
 }
 
 impl LoopFrame {
@@ -98,6 +103,7 @@ impl LoopFrame {
             break_patches: Vec::new(),
             label: None,
             is_real_loop: true,
+            iterator_close_reg: None,
         }
     }
 
@@ -107,6 +113,7 @@ impl LoopFrame {
             break_patches: Vec::new(),
             label: None,
             is_real_loop: false,
+            iterator_close_reg: None,
         }
     }
 }

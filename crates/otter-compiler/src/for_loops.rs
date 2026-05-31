@@ -67,6 +67,17 @@ pub(crate) fn compile_for_of_statement(
     cx.emit(Op::LoadUndefined, [Operand::Register(completion_reg)], span);
 
     cx.push_loop_frame(LoopFrame::iteration());
+    // §7.4.9 — register this iterator so abrupt completions (`break`,
+    // labelled `continue`, `return`) that exit the loop emit
+    // IteratorClose at the jump site. Async iterators need
+    // AsyncIteratorClose (await on the result) which the synchronous
+    // close path cannot perform, so leave `for await` to the existing
+    // break-only handling below.
+    if !is_for_await
+        && let Some(frame) = cx.loops.last_mut()
+    {
+        frame.iterator_close_reg = Some(iter_reg);
+    }
     let loop_top = cx.next_pc;
     if is_for_await {
         let result_reg = cx.alloc_scratch();
@@ -140,20 +151,19 @@ pub(crate) fn compile_for_of_statement(
         cx.patch_branch(pc, loop_top);
     }
     // §14.7.5.6 ForIn/OfBodyEvaluation — a `break` is an abrupt
-    // completion that must run IteratorClose (calling the iterator's
-    // `return`). The exhausted-iterator exit (`done` true) must NOT,
-    // so breaks land before the close op and the `done` jump lands
-    // after it. (`for await` would need AsyncIteratorClose; left to a
-    // follow-up so the sync close doesn't skip its await.)
-    if !is_for_await && !frame.break_patches.is_empty() {
-        for pc in frame.break_patches {
-            cx.patch_branch_to_here(pc);
-        }
+    // completion that must run IteratorClose. For synchronous `for…of`
+    // the close is emitted at the `break` / labelled-`continue` /
+    // `return` site (see `compile_break_with_iterator_close` and
+    // friends), so the break target here just lands at the exit. The
+    // exhausted-iterator exit (`done` true) must NOT close. `for await`
+    // still closes at the target (its sites are not annotated, pending
+    // AsyncIteratorClose support).
+    let had_breaks = !frame.break_patches.is_empty();
+    for pc in frame.break_patches {
+        cx.patch_branch_to_here(pc);
+    }
+    if is_for_await && had_breaks {
         cx.emit(Op::IteratorClose, [Operand::Register(iter_reg)], span);
-    } else {
-        for pc in frame.break_patches {
-            cx.patch_branch_to_here(pc);
-        }
     }
     cx.patch_branch_to_here(exit_jmp);
     Ok(Some(completion_reg))

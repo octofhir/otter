@@ -328,6 +328,17 @@ pub(crate) fn compile_statement(
                         span,
                     })?,
             };
+            // §7.4.9 — `break` exits every frame from the innermost up
+            // to and including the target, so close each crossed
+            // `for…of` iterator innermost-first before jumping.
+            let close_regs: Vec<u16> = cx.loops[target_idx..]
+                .iter()
+                .rev()
+                .filter_map(|f| f.iterator_close_reg)
+                .collect();
+            for reg in close_regs {
+                cx.emit(Op::IteratorClose, [Operand::Register(reg)], span);
+            }
             let pc = cx.emit_branch_placeholder(Op::Jump, None, span);
             cx.loops[target_idx].break_patches.push(pc);
             Ok(None)
@@ -388,10 +399,31 @@ pub(crate) fn compile_statement(
             let span = (r.span.start, r.span.end);
             match &r.argument {
                 Some(arg) => {
+                    // Evaluate the return value first, then close every
+                    // enclosing `for…of` iterator (§7.4.9) innermost-
+                    // first before the abrupt return propagates.
                     let reg = compile_expr(cx, arg, span)?;
+                    let close_regs: Vec<u16> = cx
+                        .loops
+                        .iter()
+                        .rev()
+                        .filter_map(|f| f.iterator_close_reg)
+                        .collect();
+                    for creg in close_regs {
+                        cx.emit(Op::IteratorClose, [Operand::Register(creg)], span);
+                    }
                     cx.emit(Op::ReturnValue, [Operand::Register(reg)], span);
                 }
                 None => {
+                    let close_regs: Vec<u16> = cx
+                        .loops
+                        .iter()
+                        .rev()
+                        .filter_map(|f| f.iterator_close_reg)
+                        .collect();
+                    for creg in close_regs {
+                        cx.emit(Op::IteratorClose, [Operand::Register(creg)], span);
+                    }
                     cx.emit(Op::ReturnUndefined, [], span);
                 }
             }
@@ -710,6 +742,17 @@ pub(crate) fn compile_statement(
                     idx
                 }
             };
+            // §7.4.9 — `continue` exits the frames inside the target
+            // (the target loop itself re-iterates and is not closed),
+            // so close each crossed `for…of` iterator innermost-first.
+            let close_regs: Vec<u16> = cx.loops[target_idx + 1..]
+                .iter()
+                .rev()
+                .filter_map(|f| f.iterator_close_reg)
+                .collect();
+            for reg in close_regs {
+                cx.emit(Op::IteratorClose, [Operand::Register(reg)], span);
+            }
             let pc = cx.emit_branch_placeholder(Op::Jump, None, span);
             cx.loops[target_idx].continue_patches.push(pc);
             Ok(None)

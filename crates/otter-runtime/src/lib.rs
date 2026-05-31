@@ -4153,6 +4153,85 @@ mod tests {
     }
 
     #[test]
+    fn json_parse_reviver_raw_json_and_source() {
+        let otter = Otter::new();
+        otter
+            .blocking_run_typescript(
+                r#"
+                function eq(a, b, m) { if (a !== b) throw new Error(m + ": " + a); }
+
+                // Reviver transforms values bottom-up; parsed objects
+                // inherit Object.prototype.
+                var parsed = JSON.parse('{"a":1,"b":2}', (k, v) =>
+                    typeof v === "number" ? v + 1 : v);
+                eq(parsed.a, 2, "reviver-a");
+                eq(parsed.b, 3, "reviver-b");
+                eq(Object.getPrototypeOf(JSON.parse("{}")), Object.prototype, "parse-proto");
+                eq(JSON.parse('{"__proto__":1}').__proto__, 1, "parse-proto-own");
+                eq(Object.is(JSON.parse("-0"), -0), true, "parse-neg-zero");
+
+                // rawJSON / isRawJSON round-trip.
+                var raw = JSON.rawJSON("1.50");
+                eq(JSON.isRawJSON(raw), true, "isRawJSON");
+                eq(JSON.isRawJSON({}), false, "isRawJSON-plain");
+                eq(raw.rawJSON, "1.50", "raw-text");
+                eq(Object.isFrozen(raw), true, "raw-frozen");
+                eq(JSON.stringify({ x: raw }), '{"x":1.50}', "stringify-raw");
+
+                // Reviver context.source carries the verbatim leaf text.
+                var src = JSON.parse("1.50", (k, v, ctx) => ctx.source);
+                eq(src, "1.50", "context-source");
+                "#,
+            )
+            .expect("JSON.parse reviver / rawJSON / context.source");
+    }
+
+    #[test]
+    fn json_stringify_runs_spec_observable_hooks() {
+        // toJSON, replacer function, array-replacer PropertyList,
+        // wrapper-object ToNumber/ToString unwrap, and verbatim
+        // propagation of a user exception thrown from a getter.
+        let otter = Otter::new();
+        otter
+            .blocking_run_typescript(
+                r#"
+                function eq(a, b, m) { if (a !== b) throw new Error(m + ": " + a); }
+
+                eq(JSON.stringify({ d: { toJSON() { return "X"; } } }),
+                   '{"d":"X"}', "toJSON");
+
+                eq(JSON.stringify({ a: 1, b: 2 }, (k, v) => typeof v === "number" ? v * 10 : v),
+                   '{"a":10,"b":20}', "replacer-fn");
+
+                eq(JSON.stringify({ a: 1, b: 2, c: 3 }, ["b", "a", "b"]),
+                   '{"b":2,"a":1}', "replacer-array");
+
+                eq(JSON.stringify(new Number(8.5)), "8.5", "number-wrapper");
+                eq(JSON.stringify(new String("s")), '"s"', "string-wrapper");
+
+                var sw = new String("raw");
+                sw.toString = function () { return "cooked"; };
+                eq(JSON.stringify(sw), '"cooked"', "string-wrapper-tostring");
+                "#,
+            )
+            .expect("spec-observable JSON.stringify hooks");
+
+        // A user exception thrown from a getter propagates verbatim,
+        // not as a wrapped TypeError — the caught value is the exact
+        // object that was thrown.
+        let err = otter.blocking_run_typescript(
+            "var sentinel = { marker: 42 }; \
+             try { JSON.stringify({ get k() { throw sentinel; } }); \
+             throw new Error('no throw'); } \
+             catch (e) { if (e !== sentinel) throw new Error('not verbatim'); }",
+        );
+        assert!(
+            err.is_ok(),
+            "user exception should propagate verbatim: {err:?}"
+        );
+    }
+
+    #[test]
     fn json_bigint_throws_type_error() {
         let otter = Otter::new();
         let err = otter

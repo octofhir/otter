@@ -74,6 +74,300 @@ enum Builder {
 
 /// Strict `JSON.parse`. `gc_heap` allocates both `JsString` values
 /// and `JsObject`s for parsed JSON objects.
+/// Install `object_proto` as the `[[Prototype]]` of every ordinary
+/// object reachable from a freshly parsed value.
+///
+/// The hot parser allocates objects with a null prototype because it
+/// runs without a realm handle; `JSON.parse` must instead expose
+/// results whose prototype is the realm `%Object.prototype%` (so
+/// inherited methods like `hasOwnProperty` resolve, and an own
+/// `"__proto__"` key stays an ordinary data property — §25.5.1).
+/// Parsed arrays already carry `%Array.prototype%`. The parse result
+/// is an acyclic tree, so an explicit work-stack suffices.
+pub(crate) fn install_object_prototype(
+    root: Value,
+    object_proto: Value,
+    gc_heap: &mut otter_gc::GcHeap,
+) {
+    let mut stack = vec![root];
+    while let Some(value) = stack.pop() {
+        if let Some(obj) = value.as_object() {
+            crate::object::set_prototype_value(obj, gc_heap, Some(object_proto));
+            let children: Vec<Value> = crate::object::with_properties(obj, gc_heap, |p| {
+                p.enumerable_data_iter().map(|(_, v)| v).collect()
+            });
+            stack.extend(children.into_iter().filter(|v| v.is_object() || v.as_array().is_some()));
+        } else if let Some(arr) = value.as_array() {
+            let len = crate::array::len(arr, gc_heap);
+            for idx in 0..len {
+                let elem = crate::array::get(arr, gc_heap, idx);
+                if elem.is_object() || elem.as_array().is_some() {
+                    stack.push(elem);
+                }
+            }
+        }
+    }
+}
+
+/// Source-span mirror of a parsed JSON value, used to feed the
+/// reviver `context.source` argument (ECMA-262 §25.5.1, the
+/// `json-parse-with-source` proposal). Only primitive leaves carry a
+/// source string; containers exist purely for navigation.
+#[derive(Debug, Clone)]
+pub(crate) enum SourceNode {
+    /// Verbatim, whitespace-trimmed source text of a primitive token.
+    Primitive(String),
+    Array(Vec<SourceNode>),
+    Object(Vec<(String, SourceNode)>),
+}
+
+impl SourceNode {
+    /// The `source` text for this node, present only for primitives.
+    pub(crate) fn source(&self) -> Option<&str> {
+        match self {
+            SourceNode::Primitive(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Child node for array index `idx`, if this is an array node.
+    pub(crate) fn array_child(&self, idx: usize) -> Option<&SourceNode> {
+        match self {
+            SourceNode::Array(items) => items.get(idx),
+            _ => None,
+        }
+    }
+
+    /// Child node for object key `key` (last occurrence wins, mirroring
+    /// `JSON.parse`'s last-key-wins materialisation).
+    pub(crate) fn object_child(&self, key: &str) -> Option<&SourceNode> {
+        match self {
+            SourceNode::Object(pairs) => pairs.iter().rev().find(|(k, _)| k == key).map(|(_, n)| n),
+            _ => None,
+        }
+    }
+}
+
+/// Build the [`SourceNode`] tree for already-validated JSON `text`.
+/// Returns `None` only if the text is unexpectedly malformed or
+/// nesting exceeds [`MAX_NESTING_DEPTH`]; callers fall back to a
+/// source-less reviver walk in that case.
+pub(crate) fn parse_source_tree(text: &str) -> Option<SourceNode> {
+    let mut sc = SourceScanner {
+        bytes: text.as_bytes(),
+        pos: 0,
+    };
+    sc.skip_ws();
+    let node = sc.scan_value(0)?;
+    sc.skip_ws();
+    if sc.pos == sc.bytes.len() { Some(node) } else { None }
+}
+
+struct SourceScanner<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl SourceScanner<'_> {
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+            self.pos += 1;
+        }
+    }
+
+    fn scan_value(&mut self, depth: usize) -> Option<SourceNode> {
+        if depth >= MAX_NESTING_DEPTH {
+            return None;
+        }
+        self.skip_ws();
+        match self.peek()? {
+            b'{' => self.scan_object(depth),
+            b'[' => self.scan_array(depth),
+            b'"' => {
+                let start = self.pos;
+                self.skip_string()?;
+                let span = std::str::from_utf8(&self.bytes[start..self.pos]).ok()?;
+                Some(SourceNode::Primitive(span.to_string()))
+            }
+            _ => {
+                let start = self.pos;
+                // Number / true / false / null — read until a
+                // structural / whitespace delimiter.
+                while let Some(b) = self.peek() {
+                    if matches!(b, b',' | b']' | b'}' | b' ' | b'\n' | b'\r' | b'\t') {
+                        break;
+                    }
+                    self.pos += 1;
+                }
+                if self.pos == start {
+                    return None;
+                }
+                let span = std::str::from_utf8(&self.bytes[start..self.pos]).ok()?;
+                Some(SourceNode::Primitive(span.to_string()))
+            }
+        }
+    }
+
+    fn scan_array(&mut self, depth: usize) -> Option<SourceNode> {
+        self.pos += 1; // consume '['
+        let mut items = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            return Some(SourceNode::Array(items));
+        }
+        loop {
+            let node = self.scan_value(depth + 1)?;
+            items.push(node);
+            self.skip_ws();
+            match self.peek()? {
+                b',' => {
+                    self.pos += 1;
+                    self.skip_ws();
+                }
+                b']' => {
+                    self.pos += 1;
+                    return Some(SourceNode::Array(items));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn scan_object(&mut self, depth: usize) -> Option<SourceNode> {
+        self.pos += 1; // consume '{'
+        let mut pairs = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return Some(SourceNode::Object(pairs));
+        }
+        loop {
+            self.skip_ws();
+            if self.peek()? != b'"' {
+                return None;
+            }
+            let key = self.scan_key()?;
+            self.skip_ws();
+            if self.peek()? != b':' {
+                return None;
+            }
+            self.pos += 1; // consume ':'
+            let node = self.scan_value(depth + 1)?;
+            pairs.push((key, node));
+            self.skip_ws();
+            match self.peek()? {
+                b',' => self.pos += 1,
+                b'}' => {
+                    self.pos += 1;
+                    return Some(SourceNode::Object(pairs));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Read and decode an object key string (positioned on the opening
+    /// quote) for use as a property-name lookup key.
+    fn scan_key(&mut self) -> Option<String> {
+        let start = self.pos;
+        self.skip_string()?;
+        let raw = std::str::from_utf8(&self.bytes[start + 1..self.pos - 1]).ok()?;
+        Some(decode_json_string(raw))
+    }
+
+    /// Advance past a string literal (positioned on the opening quote),
+    /// honouring backslash escapes. Leaves `pos` just after the
+    /// closing quote.
+    fn skip_string(&mut self) -> Option<()> {
+        self.pos += 1; // opening quote
+        while let Some(b) = self.peek() {
+            self.pos += 1;
+            match b {
+                b'"' => return Some(()),
+                b'\\' => {
+                    // Skip the escaped unit; `\uXXXX` advances 4 more.
+                    match self.peek()? {
+                        b'u' => self.pos += 5,
+                        _ => self.pos += 1,
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+}
+
+/// Minimal JSON string unescape for object-key matching. Covers the
+/// standard short escapes plus BMP `\uXXXX`; surrogate pairs combine.
+fn decode_json_string(raw: &str) -> String {
+    if !raw.contains('\\') {
+        return raw.to_string();
+    }
+    let units: Vec<u16> = raw.encode_utf16().collect();
+    let mut out: Vec<u16> = Vec::with_capacity(units.len());
+    let mut i = 0;
+    while i < units.len() {
+        let c = units[i];
+        if c != b'\\' as u16 {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let Some(&esc) = units.get(i) else { break };
+        match esc {
+            0x75 => {
+                // \uXXXX
+                let hex: String = units[i + 1..(i + 5).min(units.len())]
+                    .iter()
+                    .filter_map(|&u| char::from_u32(u as u32))
+                    .collect();
+                if let Ok(cp) = u16::from_str_radix(&hex, 16) {
+                    out.push(cp);
+                    i += 5;
+                } else {
+                    out.push(esc);
+                    i += 1;
+                }
+            }
+            0x62 => {
+                out.push(0x08);
+                i += 1;
+            } // \b
+            0x66 => {
+                out.push(0x0C);
+                i += 1;
+            } // \f
+            0x6E => {
+                out.push(0x0A);
+                i += 1;
+            } // \n
+            0x72 => {
+                out.push(0x0D);
+                i += 1;
+            } // \r
+            0x74 => {
+                out.push(0x09);
+                i += 1;
+            } // \t
+            _ => {
+                out.push(esc);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf16_lossy(&out)
+}
+
+/// Strict `JSON.parse` over `text`, with no caller-owned GC roots.
+/// Objects come back with a null prototype; the native entry point
+/// applies [`install_object_prototype`] afterwards.
 pub fn parse(text: &str, gc_heap: &mut otter_gc::GcHeap) -> Result<Value, ParseError> {
     let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
     parse_with_roots(text, gc_heap, &mut external_visit)
@@ -474,9 +768,12 @@ fn read_number(cursor: &mut Cursor<'_>) -> Result<NumberValue, ParseError> {
     let text = std::str::from_utf8(&cursor.bytes[start..cursor.pos])
         .map_err(|_| ParseError::at(start, "invalid utf-8 in number"))?;
 
-    // Smi fast path: integer-only literal that fits i32.
+    // Smi fast path: integer-only literal that fits i32. `-0` is
+    // excluded so it round-trips as IEEE negative zero rather than
+    // collapsing to the `+0` Smi.
     if !has_fraction
         && !has_exponent
+        && text != "-0"
         && let Ok(n) = text.parse::<i32>()
     {
         return Ok(NumberValue::from_i32(n));

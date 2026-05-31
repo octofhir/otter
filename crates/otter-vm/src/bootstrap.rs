@@ -605,9 +605,10 @@ mod tests {
         // `ARRAY_PROTOTYPE_METHODS.len()`, which grew by 3 with the
         // `copyWithin` / `toReversed` / `with` additions. Number
         // contributes `toLocaleString` as an own prototype builtin.
+        // +2 for JSON `rawJSON` / `isRawJSON` (json-parse-with-source).
         assert_eq!(
             telemetry.native_functions_installed(),
-            129 + reflect::REFLECT_SPEC.methods.len(),
+            131 + reflect::REFLECT_SPEC.methods.len(),
         );
         assert!(
             telemetry.gc_allocations() <= MAX_DEFAULT_GC_ALLOCATIONS,

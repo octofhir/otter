@@ -36,6 +36,7 @@
 
 mod parse;
 pub mod scan;
+mod serialize;
 mod stringify;
 
 pub use parse::{ParseError, parse};
@@ -43,7 +44,7 @@ pub use stringify::{StringifyOptions, stringify, stringify_with_options};
 
 use crate::runtime_cx::visit_native_roots;
 use crate::string::JsString;
-use crate::{NativeCtx, NativeError, Value};
+use crate::{NativeCtx, NativeError, Value, VmError};
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::RawGc;
 
@@ -60,6 +61,8 @@ otter_macros::holt! {
     methods = {
         "parse"     / 2 => native_parse,
         "stringify" / 3 => native_stringify,
+        "rawJSON"   / 1 => native_raw_json,
+        "isRawJSON" / 1 => native_is_raw_json,
     },
 }
 
@@ -166,7 +169,60 @@ pub(crate) fn call_with_roots(
 
 fn native_parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let coerced = coerce_json_parse_args(ctx, args)?;
-    native_json_call(ctx, otter_bytecode::method_id::JsonMethod::Parse, &coerced)
+    let unfiltered = native_json_call(ctx, otter_bytecode::method_id::JsonMethod::Parse, &coerced)?;
+
+    // The hot parser leaves objects with a null prototype; §25.5.1
+    // results expose the realm `%Object.prototype%`.
+    if let Some(object_proto) = ctx.interp_mut().object_prototype_object_opt() {
+        parse::install_object_prototype(unfiltered, Value::object(object_proto), ctx.heap_mut());
+    }
+
+    // §25.5.1 steps 7–9 — a callable reviver drives InternalizeJSONProperty.
+    let reviver = args.get(1).copied().unwrap_or_else(Value::undefined);
+    if !reviver.is_callable() {
+        return Ok(unfiltered);
+    }
+    let context = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "parse",
+            reason: "missing execution context".to_string(),
+        })?;
+    // §25.5.1 `json-parse-with-source` — record the source-span tree so
+    // the reviver's `context.source` argument is populated for leaves.
+    let source_tree = coerced
+        .first()
+        .and_then(|v| v.as_string(ctx.heap()))
+        .map(|s| s.to_lossy_string(ctx.heap()))
+        .and_then(|text| parse::parse_source_tree(&text));
+    ctx.interp_mut()
+        .json_internalize_root(&context, unfiltered, reviver, source_tree.as_ref())
+        .map_err(vm_to_native_parse)
+}
+
+/// Map a reviver-path [`VmError`] onto the native surface, preserving
+/// user exceptions (`Uncaught` → `Thrown`).
+fn vm_to_native_parse(err: VmError) -> NativeError {
+    match err {
+        VmError::Uncaught { value } => NativeError::Thrown {
+            name: "parse",
+            message: value,
+        },
+        VmError::RangeError { message } => NativeError::RangeError {
+            name: "parse",
+            reason: message,
+        },
+        VmError::Exit { code } => NativeError::Exit { code },
+        VmError::TypeError { message } => NativeError::TypeError {
+            name: "parse",
+            reason: message,
+        },
+        other => NativeError::TypeError {
+            name: "parse",
+            reason: other.to_string(),
+        },
+    }
 }
 
 /// §25.5.1 step 1 — `JText = ? ToString(text)`. Non-string `text`
@@ -178,59 +234,181 @@ fn coerce_json_parse_args(
     args: &[Value],
 ) -> Result<smallvec::SmallVec<[Value; 4]>, NativeError> {
     let mut out: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
+    // §25.5.1 step 1 runs `ToString(text)` even for a missing argument:
+    // `JSON.parse()` coerces `undefined` → `"undefined"` and parses it
+    // (yielding a SyntaxError), rather than a TypeError on a bad arg.
+    if out.is_empty() {
+        out.push(Value::undefined());
+    }
     if let Some(slot) = out.first_mut() {
-        let current = *slot;
-        let s = if let Some(s) = current.as_string(ctx.heap()) {
-            s
-        } else if current.is_symbol() {
-            return Err(NativeError::TypeError {
-                name: "parse",
-                reason: "cannot convert a Symbol to a string".to_string(),
-            });
-        } else if crate::abstract_ops::is_primitive(&current) {
-            let text = current.display_string(ctx.heap());
-            JsString::from_str(&text, ctx.heap_mut()).map_err(|_| NativeError::TypeError {
-                name: "parse",
-                reason: "out of memory".to_string(),
-            })?
-        } else {
-            let (interp, exec) = ctx.interp_mut_and_context();
-            let exec = exec.ok_or_else(|| NativeError::TypeError {
-                name: "parse",
-                reason: "missing execution context".to_string(),
-            })?;
-            let primitive = interp
-                .evaluate_to_primitive(
-                    &exec,
-                    &current,
-                    crate::abstract_ops::ToPrimitiveHint::String,
-                )
-                .map_err(|e| NativeError::TypeError {
-                    name: "parse",
-                    reason: e.to_string(),
-                })?;
-            if let Some(s) = primitive.as_string(ctx.heap()) {
-                s
-            } else if primitive.is_symbol() {
-                return Err(NativeError::TypeError {
-                    name: "parse",
-                    reason: "cannot convert a Symbol to a string".to_string(),
-                });
-            } else {
-                let text = primitive.display_string(ctx.heap());
-                JsString::from_str(&text, ctx.heap_mut()).map_err(|_| NativeError::TypeError {
-                    name: "parse",
-                    reason: "out of memory".to_string(),
-                })?
-            }
-        };
+        let s = coerce_text_to_string(ctx, *slot, "parse")?;
         *slot = Value::string(s);
     }
     Ok(out)
 }
 
+/// §7.1.17 `ToString(text)` for JSON text inputs. Strings pass
+/// through; other primitives use their display form; objects run the
+/// ToPrimitive(hint:string) + ToString ladder so a user `toString` /
+/// `valueOf` is observable. Symbols throw a `TypeError`. User
+/// exceptions propagate verbatim.
+fn coerce_text_to_string(
+    ctx: &mut NativeCtx<'_>,
+    value: Value,
+    name: &'static str,
+) -> Result<JsString, NativeError> {
+    if let Some(s) = value.as_string(ctx.heap()) {
+        return Ok(s);
+    }
+    if value.is_symbol() {
+        return Err(NativeError::TypeError {
+            name,
+            reason: "cannot convert a Symbol to a string".to_string(),
+        });
+    }
+    let primitive = if crate::abstract_ops::is_primitive(&value) {
+        value
+    } else {
+        let (interp, exec) = ctx.interp_mut_and_context();
+        let exec = exec.ok_or_else(|| NativeError::TypeError {
+            name,
+            reason: "missing execution context".to_string(),
+        })?;
+        let primitive = interp
+            .evaluate_to_primitive(&exec, &value, crate::abstract_ops::ToPrimitiveHint::String)
+            .map_err(|err| match err {
+                VmError::Uncaught { value } => NativeError::Thrown { name, message: value },
+                other => NativeError::TypeError {
+                    name,
+                    reason: other.to_string(),
+                },
+            })?;
+        if primitive.is_symbol() {
+            return Err(NativeError::TypeError {
+                name,
+                reason: "cannot convert a Symbol to a string".to_string(),
+            });
+        }
+        primitive
+    };
+    if let Some(s) = primitive.as_string(ctx.heap()) {
+        return Ok(s);
+    }
+    let text = primitive.display_string(ctx.heap());
+    JsString::from_str(&text, ctx.heap_mut()).map_err(|_| NativeError::TypeError {
+        name,
+        reason: "out of memory".to_string(),
+    })
+}
+
+/// §25.5.3 `JSON.rawJSON(text)`.
+fn native_raw_json(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let value = args.first().copied().unwrap_or_else(Value::undefined);
+    let json_string = coerce_text_to_string(ctx, value, "rawJSON")?;
+    let text = json_string.to_lossy_string(ctx.heap());
+
+    // §25.5.3 step 2 — reject empty input or leading/trailing JSON
+    // whitespace.
+    let bytes = text.as_bytes();
+    let bad_edge = bytes.is_empty()
+        || matches!(bytes.first(), Some(0x09 | 0x0A | 0x0D | 0x20))
+        || matches!(bytes.last(), Some(0x09 | 0x0A | 0x0D | 0x20));
+    if bad_edge {
+        return Err(NativeError::SyntaxError {
+            name: "rawJSON",
+            reason: "invalid rawJSON text".to_string(),
+        });
+    }
+
+    // §25.5.3 steps 3–4 — must be a valid JSON primitive (not an
+    // object or array).
+    match parse::parse(&text, ctx.heap_mut()) {
+        Ok(parsed) if parsed.as_object().is_some() || parsed.as_array().is_some() => {
+            return Err(NativeError::SyntaxError {
+                name: "rawJSON",
+                reason: "rawJSON text must be a primitive JSON value".to_string(),
+            });
+        }
+        Ok(_) => {}
+        Err(err) => {
+            return Err(NativeError::SyntaxError {
+                name: "rawJSON",
+                reason: format!("JSON Parse error: {} at byte {}", err.message, err.position),
+            });
+        }
+    }
+
+    // §25.5.3 steps 5–7 — null-proto object, own "rawJSON" data
+    // property, [[IsRawJSON]] slot, then frozen.
+    let raw_value = Value::string(json_string);
+    let mut roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        raw_value.trace_value_slots(visitor);
+    };
+    let obj = crate::object::alloc_object_with_roots(ctx.heap_mut(), &mut roots).map_err(|_| {
+        NativeError::TypeError {
+            name: "rawJSON",
+            reason: "out of memory".to_string(),
+        }
+    })?;
+    crate::object::set(obj, ctx.heap_mut(), "rawJSON", raw_value);
+    crate::object::set_is_raw_json(obj, ctx.heap_mut(), true);
+    crate::object::freeze(obj, ctx.heap_mut());
+    Ok(Value::object(obj))
+}
+
+/// §25.5.4 `JSON.isRawJSON(O)`.
+fn native_is_raw_json(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let is_raw = args
+        .first()
+        .and_then(|v| v.as_object())
+        .is_some_and(|obj| crate::object::is_raw_json(obj, ctx.heap()));
+    Ok(Value::boolean(is_raw))
+}
+
 fn native_stringify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    native_json_call(ctx, otter_bytecode::method_id::JsonMethod::Stringify, args)
+    // §25.5.2.1 — the full algorithm needs a live execution context so
+    // `toJSON`, the replacer, and accessor `[[Get]]` are observable.
+    let context = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "stringify",
+            reason: "missing execution context".to_string(),
+        })?;
+    ctx.interp_mut()
+        .json_stringify_spec(&context, args)
+        .map_err(vm_to_native_stringify)
+}
+
+/// Map a serializer [`VmError`] to the native error surface. A user
+/// exception thrown from a getter / `toJSON` / replacer must surface
+/// verbatim (`VmError::Uncaught` → `NativeError::Thrown`) so its
+/// original constructor is observable; only the serializer's own
+/// synthetic failures (cyclic, BigInt, depth) become `TypeError`s.
+fn vm_to_native_stringify(err: VmError) -> NativeError {
+    match err {
+        VmError::Uncaught { value } => NativeError::Thrown {
+            name: "stringify",
+            message: value,
+        },
+        VmError::SyntaxError { message } => NativeError::SyntaxError {
+            name: "stringify",
+            reason: message,
+        },
+        VmError::RangeError { message } => NativeError::RangeError {
+            name: "stringify",
+            reason: message,
+        },
+        VmError::Exit { code } => NativeError::Exit { code },
+        VmError::TypeError { message } => NativeError::TypeError {
+            name: "stringify",
+            reason: message,
+        },
+        other => NativeError::TypeError {
+            name: "stringify",
+            reason: other.to_string(),
+        },
+    }
 }
 
 fn native_json_call(

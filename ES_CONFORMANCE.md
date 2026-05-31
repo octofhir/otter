@@ -1966,3 +1966,58 @@ method path instead of the old no-context fast path:
 Delta: +11 passing tests. Focused check:
 
 - `annexB/built-ins/RegExp/prototype/compile`: 21 pass / 0 fail / 2 skip
+
+### built-ins/JSON (spec-driven SerializeJSONProperty)
+
+Command:
+
+```sh
+cargo run -p otter-test262 --bin otter-test262 -- run \
+  --filter built-ins/JSON \
+  --timeout 5000 \
+  --output test262_results/json_after.json
+```
+
+Before (heap-only `JSON.stringify` walker — no execution context, so
+`toJSON`, the replacer, and wrapper-object coercion were unobservable):
+
+| total | passed | failed | skipped | timeout | OOM | crash | pass rate |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 165 | 80 | 83 | 2 | 0 | 0 | 0 | 49.08% |
+
+After routing native `JSON.stringify` through a §25.5.2 serializer
+driven by the interpreter (`toJSON` invocation, `ReplacerFunction` /
+`PropertyList`, `ToNumber`/`ToString` wrapper unwrap, accessor-aware
+`[[Get]]`, proxy-aware `IsArray`, well-formed `QuoteJSONString`, and
+verbatim propagation of user-thrown exceptions):
+
+| total | passed | failed | skipped | timeout | OOM | crash | pass rate |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 165 | 125 | 38 | 2 | 0 | 0 | 0 | 76.69% |
+
+Delta: +45 passing tests. The `stringify/` subset alone moved
+35/68 → 64/64 (100% non-skip). Remaining `built-ins/JSON` failures are
+unrelated families: `parse/` (22), and the `rawJSON` / `isRawJSON`
+proposal (16), which are not yet implemented.
+
+#### Follow-up: reviver, source proposal, and `JSON.rawJSON`
+
+Subsequent slices closed the rest of `built-ins/JSON`:
+
+- **Reviver** — native `JSON.parse` now drives §25.5.1
+  InternalizeJSONProperty (recurse + Delete/CreateDataProperty,
+  snapshotted enumerable keys), and parsed objects expose
+  `%Object.prototype%` (the hot parser left them null-proto).
+- **`json-parse-with-source`** (ES2025) — `JSON.rawJSON` /
+  `JSON.isRawJSON` (`[[IsRawJSON]]` slot, frozen null-proto holder,
+  raw text emitted verbatim by stringify) and the reviver
+  `context.source` argument (a source-span tree, source surfaced only
+  while the leaf still SameValue-equals its parsed token).
+- Misc parse fixes: `ToString(text)` propagates user exceptions and
+  defaults a missing argument to `"undefined"`; `-0` round-trips.
+
+| total | passed | failed | skipped | pass rate |
+|---:|---:|---:|---:|---:|
+| 165 | 163 | 0 | 2 | 100.00% (non-skip) |
+
+Delta from the 80-pass baseline: +83 passing tests.

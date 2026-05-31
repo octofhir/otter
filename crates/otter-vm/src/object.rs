@@ -372,6 +372,11 @@ pub struct ObjectBody {
     symbol_data: Option<crate::symbol::JsSymbol>,
     /// `[[BigIntData]]` internal slot for BigInt wrapper objects.
     bigint_data: Option<BigIntValue>,
+    /// `[[IsRawJSON]]` internal slot for objects produced by
+    /// `JSON.rawJSON` (ECMA-262 §25.5.3). The raw text lives in the
+    /// object's own `"rawJSON"` data property; this flag tags the
+    /// object so `JSON.isRawJSON` / `JSON.stringify` recognise it.
+    is_raw_json: bool,
     /// `[[DateValue]]` internal slot for Date instances per
     /// ECMA-262 §21.4.5. Holds the time value as UTC epoch
     /// milliseconds (or `NaN` for an Invalid Date). Mutation goes
@@ -533,6 +538,7 @@ fn empty_object_body() -> ObjectBody {
         string_data: None,
         symbol_data: None,
         bigint_data: None,
+        is_raw_json: false,
         date_data: None,
         extensible: true,
         is_arguments_object: false,
@@ -629,6 +635,7 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
             string_data: None,
             symbol_data: None,
             bigint_data: None,
+            is_raw_json: false,
             date_data: None,
             extensible: true,
             is_arguments_object: false,
@@ -662,6 +669,7 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
             string_data: None,
             symbol_data: None,
             bigint_data: None,
+            is_raw_json: false,
             date_data: None,
             extensible: true,
             is_arguments_object: false,
@@ -1402,6 +1410,20 @@ pub fn set_date_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: f64) {
 #[must_use]
 pub fn date_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<f64> {
     heap.read_payload(obj, |body| body.date_data)
+}
+
+/// Tag an object as carrying the `[[IsRawJSON]]` internal slot
+/// (§25.5.3 `JSON.rawJSON`).
+pub fn set_is_raw_json(obj: JsObject, heap: &mut otter_gc::GcHeap, value: bool) {
+    heap.with_payload(obj, |body| {
+        body.is_raw_json = value;
+    });
+}
+
+/// `true` when `obj` carries the `[[IsRawJSON]]` internal slot.
+#[must_use]
+pub fn is_raw_json(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
+    heap.read_payload(obj, |body| body.is_raw_json)
 }
 
 /// Borrow typed host data attached to `obj`.

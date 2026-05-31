@@ -23,7 +23,7 @@
 
 use crate::{
     ExecutionContext, Interpreter, JsObject, JsString, Value, gc_trace::GcTrace,
-    js_surface::JsSurfaceError, object, symbol::WellKnown,
+    js_surface::JsSurfaceError, native_function::NativeFunction, object, symbol::WellKnown,
 };
 use otter_gc::raw::{RawGc, SlotVisitor};
 
@@ -101,6 +101,24 @@ impl FunctionKindPrototypes {
                 "constructor",
                 object::PropertyDescriptor::data(Value::object(ctor), true, false, true),
             );
+            let ctor_root = Value::object(ctor);
+            let proto_root = Value::object(proto);
+            let native = {
+                let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                    function_proto_value.trace_value_slots(visitor);
+                    ctor_root.trace_value_slots(visitor);
+                    proto_root.trace_value_slots(visitor);
+                };
+                NativeFunction::new_constructor_static_with_roots(
+                    heap,
+                    tag,
+                    1,
+                    crate::intrinsics::function::function_ctor_call,
+                    &mut visit,
+                )
+                .map_err(|_| JsSurfaceError::OutOfMemory)?
+            };
+            object::set_constructor_native(ctor, heap, Value::native_function(native));
             Ok((ctor, proto))
         };
 

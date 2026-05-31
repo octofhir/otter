@@ -1,10 +1,11 @@
 //! `%Symbol%` constructor installer + post-bootstrap well-known wiring.
 //!
-//! Routes through `couch!` with `callable_only = true` (§20.4.1 —
-//! `new Symbol(x)` throws "is not a constructor"). Static `for` /
-//! `keyFor`, prototype `toString` / `valueOf`, and the
-//! `Symbol.prototype.description` getter ride the declarative rows.
-//! All well-known symbol own properties (`Symbol.iterator`,
+//! Routes through `couch!` with a real `[[Construct]]` slot because
+//! §20.4.1 keeps `Symbol` constructor-branded while making construct
+//! calls throw. Static `for` / `keyFor`, prototype `toString` /
+//! `valueOf`, and the `Symbol.prototype.description` getter ride the
+//! declarative rows. All well-known symbol own properties
+//! (`Symbol.iterator`,
 //! `Symbol.toPrimitive`, …), the `Symbol.prototype[@@toPrimitive]`
 //! method, and the cross-class `@@toStringTag` / `@@iterator` / species
 //! fixups that depend on the per-realm `WellKnownSymbols` singleton
@@ -24,7 +25,7 @@ use crate::{NativeCtx, NativeError};
 otter_macros::couch! {
     name = "Symbol",
     feature = CORE,
-    constructor = (length = 0, call = symbol_ctor_call, callable_only = true),
+    constructor = (length = 0, call = symbol_ctor_call),
     statics = {
         "for"    / 1 => symbol_for_call,
         "keyFor" / 1 => symbol_key_for_call,

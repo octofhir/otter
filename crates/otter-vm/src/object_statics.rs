@@ -442,6 +442,12 @@ fn native_is(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
 /// respective `%X.prototype%` per §7.1.18.
 fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let target = args.first().cloned().unwrap_or(Value::undefined());
+    if target.is_nullish() {
+        return Err(NativeError::TypeError {
+            name: "Object.getPrototypeOf",
+            reason: "Object.getPrototypeOf called on null or undefined".to_string(),
+        });
+    }
     let exec_ctx = ctx
         .execution_context()
         .cloned()
@@ -451,6 +457,24 @@ fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
         })?;
     let closure_id = target.as_closure(ctx.heap()).map(|c| c.cached_function_id);
     let interp = ctx.interp_mut();
+    let primitive_proto_name = if target.is_boolean() {
+        Some("Boolean")
+    } else if target.is_number() {
+        Some("Number")
+    } else if target.is_string() {
+        Some("String")
+    } else if target.is_symbol() {
+        Some("Symbol")
+    } else if target.is_big_int() {
+        Some("BigInt")
+    } else {
+        None
+    };
+    if let Some(name) = primitive_proto_name {
+        return interp
+            .constructor_prototype_value(name)
+            .map_err(|err| object_native_error("Object.getPrototypeOf", err));
+    }
     let function_id = target.as_function().or(closure_id);
     if let Some(function_id) = function_id
         && let Some(proto) = interp.function_kind_prototype_for(&exec_ctx, function_id)
@@ -893,7 +917,7 @@ pub fn native_prototype_proto_set(
         return Ok(Value::undefined());
     }
     // §B.2.2.1.2 step 3 — non-object receivers silently no-op.
-    if !this_value.is_object() || this_value.is_proxy() {
+    if !this_value.is_object_type() {
         return Ok(Value::undefined());
     }
     // §20.1.3 — `Object.prototype` is an immutable-prototype
@@ -1860,6 +1884,8 @@ pub fn call(
                 crate::object::prevent_extensions(o, gc_heap);
             } else if let Some(a) = arg.as_array() {
                 crate::array::prevent_extensions(a, gc_heap);
+            } else if let Some(native) = arg.as_native_function() {
+                native.prevent_extensions(gc_heap);
             } else if let Some(r) = arg.as_regexp() {
                 r.prevent_extensions(gc_heap);
             }
@@ -1874,6 +1900,8 @@ pub fn call(
             // their `[[Extensible]]` slot.
             let result = if let Some(o) = arg.as_object() {
                 crate::object::is_frozen(o, gc_heap)
+            } else if let Some(native) = arg.as_native_function() {
+                native.is_frozen(gc_heap)
             } else {
                 // §20.1.2.15 step 2 — non-Object returns true. Spec
                 // Object covers callables/exotics (`is_object_type`),
@@ -1896,6 +1924,8 @@ pub fn call(
             // applied through the foundation surface.
             let result = if let Some(o) = arg.as_object() {
                 crate::object::is_sealed(o, gc_heap)
+            } else if let Some(native) = arg.as_native_function() {
+                native.is_sealed(gc_heap)
             } else {
                 // §20.1.2.16 step 2 — non-Object returns true. Same
                 // spec-Object widening as `isFrozen` above.
@@ -1915,6 +1945,8 @@ pub fn call(
                 crate::object::is_extensible(o, gc_heap)
             } else if let Some(arr) = arg.as_array() {
                 crate::array::is_extensible(arr, gc_heap)
+            } else if let Some(native) = arg.as_native_function() {
+                native.is_extensible(gc_heap)
             } else if let Some(r) = arg.as_regexp() {
                 r.is_extensible(gc_heap)
             } else {

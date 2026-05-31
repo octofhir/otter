@@ -889,6 +889,9 @@ impl Interpreter {
         if let Some(arr) = value.as_array() {
             return Ok(array::is_extensible(arr, &self.gc_heap));
         }
+        if let Some(native) = value.as_native_function() {
+            return Ok(native.is_extensible(&self.gc_heap));
+        }
         let fid = value.as_function().or_else(|| {
             value
                 .as_closure(&self.gc_heap)
@@ -2462,6 +2465,10 @@ impl Interpreter {
             array::prevent_extensions(arr, &mut self.gc_heap);
             return Ok(true);
         }
+        if let Some(native) = value.as_native_function() {
+            native.prevent_extensions(&mut self.gc_heap);
+            return Ok(true);
+        }
         let fid = value.as_function().or_else(|| {
             value
                 .as_closure(&self.gc_heap)
@@ -3290,8 +3297,8 @@ impl Interpreter {
     /// `globalThis.Intl.<class_name>.prototype`. Returns `null` when
     /// the namespace or constructor is missing.
     fn intl_kind_prototype_value(&mut self, class_name: &str) -> Value {
-        let Some(intl_ns) = object::get(self.global_this, &self.gc_heap, "Intl")
-            .and_then(|v| v.as_object())
+        let Some(intl_ns) =
+            object::get(self.global_this, &self.gc_heap, "Intl").and_then(|v| v.as_object())
         else {
             return Value::null();
         };

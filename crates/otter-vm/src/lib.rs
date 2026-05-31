@@ -5042,13 +5042,24 @@ pub(crate) fn install_string_iterator_post_bootstrap(
     global: crate::object::JsObject,
     well_known: &symbol::WellKnownSymbols,
 ) -> Result<(), crate::js_surface::JsSurfaceError> {
-    let Some(string_ctor) = crate::object::get(global, heap, "String").and_then(|v| v.as_object())
-    else {
+    let Some(string_ctor) = crate::object::get(global, heap, "String") else {
         return Ok(());
     };
-    let Some(prototype) =
+    let prototype = if let Some(string_ctor) = string_ctor.as_object() {
         crate::object::get(string_ctor, heap, "prototype").and_then(|v| v.as_object())
-    else {
+    } else if let Some(string_ctor) = string_ctor.as_native_function() {
+        string_ctor
+            .own_property_descriptor(heap, "prototype")
+            .ok()
+            .flatten()
+            .and_then(|desc| match desc.kind {
+                crate::object::DescriptorKind::Data { value } => value.as_object(),
+                crate::object::DescriptorKind::Accessor { .. } => None,
+            })
+    } else {
+        None
+    };
+    let Some(prototype) = prototype else {
         return Ok(());
     };
     let global_root = Value::object(global);
@@ -5302,11 +5313,10 @@ fn step_iterator(
                         let index_val =
                             Value::number(crate::number::NumberValue::from_f64(index as f64));
                         let pair = {
-                            let mut visitor =
-                                |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                                    index_val.trace_value_slots(visit);
-                                    element.trace_value_slots(visit);
-                                };
+                            let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                                index_val.trace_value_slots(visit);
+                                element.trace_value_slots(visit);
+                            };
                             crate::array::alloc_array_with_roots(gc_heap, &mut visitor)
                                 .map_err(|_| VmError::TypeMismatch)?
                         };

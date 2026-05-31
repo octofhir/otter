@@ -410,11 +410,24 @@ fn build_global_this_impl(
             t.record_skipped_entry();
         }
     }
-    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
-        && let Some(object_proto) =
+    if let Some(object_ctor) = object::get(global, heap, "Object") {
+        let object_proto = if let Some(object_ctor) = object_ctor.as_object() {
             object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
-    {
-        object::set_prototype(global, heap, Some(object_proto));
+        } else if let Some(object_ctor) = object_ctor.as_native_function() {
+            object_ctor
+                .own_property_descriptor(heap, "prototype")
+                .ok()
+                .flatten()
+                .and_then(|desc| match desc.kind {
+                    crate::object::DescriptorKind::Data { value } => value.as_object(),
+                    crate::object::DescriptorKind::Accessor { .. } => None,
+                })
+        } else {
+            None
+        };
+        if let Some(object_proto) = object_proto {
+            object::set_prototype(global, heap, Some(object_proto));
+        }
     }
     if let (Some(t), Some(before)) = (telemetry, before) {
         let after = allocation_snapshot(heap);

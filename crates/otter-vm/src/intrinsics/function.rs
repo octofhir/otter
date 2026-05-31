@@ -32,7 +32,10 @@ otter_macros::couch! {
 }
 
 /// `Function(...)` / `new Function(...)` — ECMA-262 §20.2.1.1.
-fn function_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn function_ctor_call(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
     let new_target_proto = crate::bootstrap::native_new_target_prototype(ctx, "Function")?;
     let (interp, context) = ctx.interp_mut_and_context();
     let Some(context) = context else {

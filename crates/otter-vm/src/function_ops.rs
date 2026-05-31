@@ -1535,8 +1535,12 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[Value],
     ) -> Result<JsObject, VmError> {
-        let mut roots = Vec::with_capacity(value_roots.len() + 2);
+        let object_proto = self.constructor_prototype_value("Object").ok();
+        let mut roots = Vec::with_capacity(value_roots.len() + 3);
         roots.extend_from_slice(value_roots);
+        if let Some(proto) = object_proto.as_ref() {
+            roots.push(proto);
+        }
         match &desc.kind {
             object::DescriptorKind::Data { value } => roots.push(value),
             object::DescriptorKind::Accessor { getter, setter } => {
@@ -1558,6 +1562,9 @@ impl Interpreter {
                 self.alloc_runtime_rooted_object_with_roots(roots.as_slice(), &[slice_roots])?
             }
         };
+        if let Some(proto_obj) = object_proto.and_then(|v| v.as_object()) {
+            object::set_prototype(result, &mut self.gc_heap, Some(proto_obj));
+        }
         match &desc.kind {
             object::DescriptorKind::Data { value } => {
                 self.set_property(result, "value", *value)?;

@@ -216,12 +216,7 @@ impl Interpreter {
         negate: bool,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
-        // §7.2.12 `IsStrictlyEqual`: the `Value::PartialEq` impl
-        // matches the spec for every primitive except BigInt-BigInt
-        // (which uses handle equality there), so route through
-        // `abstract_ops::same_value` for the spec-correct numeric
-        // BigInt comparison.
-        let eq = abstract_ops::same_value(&lhs, &rhs, &self.gc_heap);
+        let eq = abstract_ops::is_strictly_equal(&lhs, &rhs, &self.gc_heap);
         write_register(frame, dst, Value::boolean(eq ^ negate))?;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())

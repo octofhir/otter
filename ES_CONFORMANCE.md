@@ -491,17 +491,19 @@ Command:
 cargo run -p otter-test262 --bin otter-test262 -- run \
   --filter built-ins/Object/getOwnPropertyNames \
   --timeout 5000 \
-  --output test262_results/batch_object_gopn_after_primitives.json
+  --output test262_results/object_gopn_next_baseline.json
 ```
 
 Current:
 
 | total | passed | failed | skipped | timeout | OOM | crash | pass rate |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 45 | 29 | 16 | 0 | 0 | 0 | 0 | 64.44% |
+| 45 | 45 | 0 | 0 | 0 | 0 | 0 | 100.00% |
 
-Most remaining failures cluster around array/prototype identity,
-richer object descriptor behavior, and ordinary object edge cases.
+Native/function/exotic descriptor objects now inherit from
+`%Object.prototype%`, so `desc.hasOwnProperty(...)` works for
+descriptors returned from Array, Function, NativeFunction, and related
+Object statics paths.
 
 ### Reflect (slice: real namespace + Value-level internal-method dispatch)
 
@@ -573,6 +575,23 @@ Delta Reflect: **+88 passing tests (+57.51 points)** across seven slices.
 | slice 3                                            | 3414 | 2037 | 1372 | 59.71% |
 | slice 4 (PartialPropertyDescriptor)                | 3414 | 2169 | 1240 | 63.70% |
 | slice 6 (observable ToPropertyDescriptor + ToPropertyKey) | 3414 | 2273 | 1132 | 66.75% |
+| slice 9 (descriptor prototypes + global/primitive proto + strict equality + function-kind constructors) | 3414 | 3406 | 0 | 100.00% |
+
+Slice 9 closes the non-skipped `built-ins/Object` suite:
+
+- descriptor objects returned through function/native/exotic paths now
+  inherit `%Object.prototype%`;
+- `globalThis.[[Prototype]]` is wired when `Object` is installed as a
+  `NativeFunction` constructor;
+- `Object.getPrototypeOf` performs ToObject prototype lookup for
+  Boolean, Number, String, Symbol, and BigInt primitives;
+- strict equality uses `IsStrictlyEqual`, so `NaN !== NaN` works;
+- function-kind constructor placeholders are constructible via the
+  existing Function constructor native path;
+- `Object.prototype.__proto__` setter drives Proxy
+  `[[SetPrototypeOf]]` instead of silently no-oping;
+- `String.prototype[Symbol.iterator]` installs when `String` is a
+  native constructor.
 
 ### Symbol (built-ins/Symbol)
 
@@ -580,8 +599,16 @@ Delta Reflect: **+88 passing tests (+57.51 points)** across seven slices.
 |---|---:|---:|---:|---:|---:|---:|
 | before (placeholder)                          | 98 | 6  | 71 | 21 | 0 | 7.79% |
 | slice 7 (real Symbol ctor + post-bootstrap)   | 98 | 57 | 20 | 21 |  0 | 74.03% |
+| slice 9b (constructable Symbol + Date ToPrimitive) | 98 | 77 | 0 | 21 | 0 | 100.00% |
 
-Delta Symbol: **+51 passing tests (+66.24 points)** in slice 7.
+Delta Symbol: **+51 passing tests (+66.24 points)** in slice 7;
+**+20 passing tests** in slice 9b, closing all non-skipped cases.
+Slice 9b closes the non-skipped `built-ins/Symbol` suite: `%Symbol%`
+now has the constructor-branded `[[Construct]]` slot required by
+`IsConstructor(Symbol)` while `new Symbol()` still throws, and
+`new Date(object)` performs the one-argument `ToPrimitive(default)`
+then string/number branch so deleting `Symbol.prototype[@@toPrimitive]`
+falls back to observable ordinary `valueOf` / `toString`.
 
 ### Iterator protocol §7.4 — slice 8
 
@@ -769,7 +796,7 @@ Regression spot-checks (no movement vs. published baselines):
 |---|---:|
 | `built-ins/Reflect`     | 148 / 154 (96.73%) |
 | `built-ins/Proxy`       | 226 / 311 (82.48%) |
-| `built-ins/Symbol`      | 57 / 98 (74.03%)  |
+| `built-ins/Symbol`      | 77 / 98 (100.00% non-skip; 21 skip) |
 | `built-ins/Array/from`  | 26 / 47 (55.32%)  |
 
 Remaining gaps for the four suites cluster in: `Map.groupBy` /
@@ -847,7 +874,7 @@ Regression spot-checks (no movement vs. slice 9 baselines):
 | `built-ins/Set`         | 216 / 394 (54.96%) |
 | `built-ins/Reflect`     | 148 / 154 (96.73%) |
 | `built-ins/Proxy`       | 226 / 311 (82.48%) |
-| `built-ins/Symbol`      | 57 / 98 (74.03%)  |
+| `built-ins/Symbol`      | 77 / 98 (100.00% non-skip; 21 skip) |
 | `built-ins/Array/from`  | 26 / 47 (55.32%)  |
 | `built-ins/Function`    | 365 / 461 (79.18%) (+1 from prior) |
 

@@ -90,6 +90,7 @@ struct NativeFunctionMetadata {
     name_configurable: bool,
     length_configurable: bool,
     constructable: bool,
+    extensible: bool,
 }
 
 impl NativeFunctionMetadata {
@@ -97,18 +98,21 @@ impl NativeFunctionMetadata {
         name_configurable: true,
         length_configurable: true,
         constructable: false,
+        extensible: true,
     };
 
     const CONSTRUCTOR: Self = Self {
         name_configurable: true,
         length_configurable: true,
         constructable: true,
+        extensible: true,
     };
 
     const THROW_TYPE_ERROR: Self = Self {
         name_configurable: false,
         length_configurable: false,
         constructable: false,
+        extensible: false,
     };
 }
 
@@ -222,6 +226,10 @@ pub struct NativeFunctionBody {
     /// Ordinary own properties installed on native callables, such
     /// as `%Proxy%.revocable`.
     own_properties: JsObject,
+    /// Native callable `[[Extensible]]` slot. `%ThrowTypeError%`
+    /// starts non-extensible per §10.2.4 / §20.2.4.1.
+    #[pelt(skip)]
+    extensible: bool,
     /// Override for `[[Prototype]]`. Defaults to `None` so
     /// `Object.getPrototypeOf` falls back to `%Function.prototype%`.
     /// Spec-mandated overrides (e.g. each concrete TypedArray ctor
@@ -285,6 +293,9 @@ impl NativeFunction {
             };
             crate::object::alloc_object_with_roots(heap, &mut visit)?
         };
+        if !metadata.extensible {
+            crate::object::prevent_extensions(own_properties, heap);
+        }
         let own_properties_root = Value::object(own_properties);
         let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
@@ -308,6 +319,7 @@ impl NativeFunction {
                     length_property: default_length_property(),
                     metadata,
                     own_properties,
+                    extensible: metadata.extensible,
                     prototype_override: None,
                 },
                 &mut visit,
@@ -585,6 +597,53 @@ impl NativeFunction {
         heap.read_payload(self.inner, |body| body.metadata.constructable)
     }
 
+    /// Native callable `[[IsExtensible]]`.
+    #[must_use]
+    pub(crate) fn is_extensible(&self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.inner, |body| body.extensible)
+    }
+
+    /// Native callable `[[PreventExtensions]]`.
+    pub(crate) fn prevent_extensions(&self, heap: &mut otter_gc::GcHeap) {
+        let own_properties = heap.read_payload(self.inner, |body| body.own_properties);
+        crate::object::prevent_extensions(own_properties, heap);
+        heap.with_payload(self.inner, |body| body.extensible = false);
+    }
+
+    /// `Object.isSealed` for native callable values.
+    #[must_use]
+    pub(crate) fn is_sealed(&self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.inner, |body| {
+            !body.extensible
+                && native_own_property_is_sealed(
+                    &body.name_property,
+                    body.metadata.name_configurable,
+                )
+                && native_own_property_is_sealed(
+                    &body.length_property,
+                    body.metadata.length_configurable,
+                )
+                && crate::object::is_sealed(body.own_properties, heap)
+        })
+    }
+
+    /// `Object.isFrozen` for native callable values.
+    #[must_use]
+    pub(crate) fn is_frozen(&self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.inner, |body| {
+            !body.extensible
+                && native_own_property_is_frozen(
+                    &body.name_property,
+                    body.metadata.name_configurable,
+                )
+                && native_own_property_is_frozen(
+                    &body.length_property,
+                    body.metadata.length_configurable,
+                )
+                && crate::object::is_frozen(body.own_properties, heap)
+        })
+    }
+
     /// Return an own property descriptor for native function object
     /// metadata. Built-in `name` / `length` are non-writable,
     /// non-enumerable, configurable data properties.
@@ -725,6 +784,7 @@ impl NativeFunction {
                     None => return false,
                 }
             }
+            None if !self.is_extensible(heap) => return false,
             None if key == "name" || key == "length" => descriptor,
             None => {
                 let obj = heap.read_payload(self.inner, |body| body.own_properties);
@@ -1058,6 +1118,24 @@ fn native_own_property_is_enumerable(property: &NativeOwnProperty, builtin_defau
         NativeOwnProperty::Builtin => builtin_default,
         NativeOwnProperty::Deleted => false,
         NativeOwnProperty::Overridden(desc) => desc.flags.enumerable(),
+    }
+}
+
+fn native_own_property_is_sealed(property: &NativeOwnProperty, builtin_configurable: bool) -> bool {
+    match property {
+        NativeOwnProperty::Builtin => !builtin_configurable,
+        NativeOwnProperty::Deleted => true,
+        NativeOwnProperty::Overridden(desc) => !desc.flags.configurable(),
+    }
+}
+
+fn native_own_property_is_frozen(property: &NativeOwnProperty, builtin_configurable: bool) -> bool {
+    match property {
+        NativeOwnProperty::Builtin => !builtin_configurable,
+        NativeOwnProperty::Deleted => true,
+        NativeOwnProperty::Overridden(desc) => {
+            !desc.flags.configurable() && (!desc.is_data() || !desc.flags.writable())
+        }
     }
 }
 

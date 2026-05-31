@@ -277,7 +277,10 @@ fn coerce_text_to_string(
         let primitive = interp
             .evaluate_to_primitive(&exec, &value, crate::abstract_ops::ToPrimitiveHint::String)
             .map_err(|err| match err {
-                VmError::Uncaught { value } => NativeError::Thrown { name, message: value },
+                VmError::Uncaught { value } => NativeError::Thrown {
+                    name,
+                    message: value,
+                },
                 other => NativeError::TypeError {
                     name,
                     reason: other.to_string(),

@@ -938,9 +938,7 @@ pub(crate) fn assign_object_pattern(
                 // NamedEvaluation so the default function/class is named
                 // after the bound identifier.
                 let final_val = match p.init.as_ref() {
-                    Some(default) => {
-                        apply_default_with_name(cx, val, default, Some(&name), pspan)?
-                    }
+                    Some(default) => apply_default_with_name(cx, val, default, Some(&name), pspan)?,
                     None => val,
                 };
                 store_identifier(cx, &name, final_val, pspan)?;

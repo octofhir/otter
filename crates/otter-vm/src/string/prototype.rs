@@ -1141,7 +1141,11 @@ fn unicode_case_map(units: &[u16], upper: bool) -> Vec<u16> {
             continue;
         };
         if !upper && cp == 0x03A3 {
-            out.push(if sigma_is_final(&cps, i) { 0x03C2 } else { 0x03C3 });
+            out.push(if sigma_is_final(&cps, i) {
+                0x03C2
+            } else {
+                0x03C3
+            });
             continue;
         }
         if upper {
@@ -1185,9 +1189,18 @@ fn impl_to_upper_case(
 /// native error surface, preserving thrown user values.
 fn vm_err(err: crate::VmError, name: &'static str) -> NativeError {
     match err {
-        crate::VmError::Uncaught { value } => NativeError::Thrown { name, message: value },
-        crate::VmError::TypeError { message } => NativeError::TypeError { name, reason: message },
-        crate::VmError::RangeError { message } => NativeError::RangeError { name, reason: message },
+        crate::VmError::Uncaught { value } => NativeError::Thrown {
+            name,
+            message: value,
+        },
+        crate::VmError::TypeError { message } => NativeError::TypeError {
+            name,
+            reason: message,
+        },
+        crate::VmError::RangeError { message } => NativeError::RangeError {
+            name,
+            reason: message,
+        },
         other => NativeError::TypeError {
             name,
             reason: other.to_string(),
@@ -1241,7 +1254,11 @@ fn get_symbol_method(
 
 /// §7.2.8 IsRegExp — `@@match` (if defined) decides; otherwise the
 /// native `[[RegExpMatcher]]` brand.
-fn is_reg_exp(ctx: &mut NativeCtx<'_>, value: Value, name: &'static str) -> Result<bool, NativeError> {
+fn is_reg_exp(
+    ctx: &mut NativeCtx<'_>,
+    value: Value,
+    name: &'static str,
+) -> Result<bool, NativeError> {
     if !value.is_object_type() {
         return Ok(false);
     }
@@ -1278,7 +1295,12 @@ fn value_to_string(
 /// §22.1.3.17.1 GetSubstitution over UTF-16 units for a string-search
 /// replace (no capture groups, so `$n` / `$<name>` stay literal).
 /// Honours `$$`, `$&`, `` $` ``, and `$'`.
-fn get_substitution(matched: &[u16], string: &[u16], position: usize, template: &[u16]) -> Vec<u16> {
+fn get_substitution(
+    matched: &[u16],
+    string: &[u16],
+    position: usize,
+    template: &[u16],
+) -> Vec<u16> {
     let mut out: Vec<u16> = Vec::with_capacity(template.len());
     let mut i = 0;
     while i < template.len() {
@@ -1404,7 +1426,9 @@ fn string_replace_spec(
                 &search_units,
                 &string_units,
                 pos,
-                template_units.as_ref().expect("non-functional has template"),
+                template_units
+                    .as_ref()
+                    .expect("non-functional has template"),
             )
         };
         out.extend_from_slice(&replacement);

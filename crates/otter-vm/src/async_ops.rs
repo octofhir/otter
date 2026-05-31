@@ -395,8 +395,7 @@ impl Interpreter {
                 // exited, so §7.4.9 IteratorClose runs for every
                 // iterator it left open (floor `-1` takes all depths)
                 // before the frame is discarded.
-                let closers =
-                    self.take_frame_closers_above(stack.last_mut().expect("frame"), -1);
+                let closers = self.take_frame_closers_above(stack.last_mut().expect("frame"), -1);
                 self.close_unwind_iterators(context, closers);
                 let frame = stack.last_mut().expect("frame still present");
                 // Async frames absorb their own unhandled throws into the
@@ -426,8 +425,7 @@ impl Interpreter {
             let floor = self
                 .frame_cold(stack.last().expect("frame"))
                 .map_or(0, |c| c.handlers.len() as i64);
-            let closers =
-                self.take_frame_closers_above(stack.last_mut().expect("frame"), floor);
+            let closers = self.take_frame_closers_above(stack.last_mut().expect("frame"), floor);
             self.close_unwind_iterators(context, closers);
             let frame = stack.last_mut().expect("frame still present");
             if let Some(catch_pc) = handler.catch_pc {
@@ -451,11 +449,7 @@ impl Interpreter {
     /// innermost-first (last registered runs first). Used by
     /// [`Self::unwind_throw_with_uncaught`] to decide which §7.4.9
     /// IteratorClose hooks the in-flight throw crosses.
-    fn take_frame_closers_above(
-        &mut self,
-        frame: &mut Frame,
-        floor: i64,
-    ) -> SmallVec<[Value; 2]> {
+    fn take_frame_closers_above(&mut self, frame: &mut Frame, floor: i64) -> SmallVec<[Value; 2]> {
         let mut out: SmallVec<[Value; 2]> = SmallVec::new();
         if let Some(cold) = self.frame_cold_mut(frame) {
             let mut i = 0;
@@ -490,11 +484,7 @@ impl Interpreter {
     /// already ran — so a later throw-unwind does not invoke
     /// `[[return]]` a second time (IteratorClose is a no-op on a done
     /// iterator).
-    pub(crate) fn deregister_frame_iterator_closer(
-        &mut self,
-        frame: &mut Frame,
-        iterator: Value,
-    ) {
+    pub(crate) fn deregister_frame_iterator_closer(&mut self, frame: &mut Frame, iterator: Value) {
         if let Some(cold) = self.frame_cold_mut(frame)
             && let Some(pos) = cold
                 .active_iterator_closers
@@ -510,12 +500,10 @@ impl Interpreter {
     /// `done: false` (the closer was dropped for the span of the call
     /// so a throwing `next` would not trigger IteratorClose). A no-op
     /// when the iterator is already registered.
-    pub(crate) fn register_frame_iterator_closer(
-        &mut self,
-        frame: &mut Frame,
-        iterator: Value,
-    ) {
-        let depth = self.frame_cold(frame).map_or(0, |c| c.handlers.len() as u32);
+    pub(crate) fn register_frame_iterator_closer(&mut self, frame: &mut Frame, iterator: Value) {
+        let depth = self
+            .frame_cold(frame)
+            .map_or(0, |c| c.handlers.len() as u32);
         let cold = self.frame_ensure_cold(frame);
         if !cold
             .active_iterator_closers

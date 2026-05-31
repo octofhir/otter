@@ -30,14 +30,14 @@ use std::collections::BTreeMap;
 use otter_syntax::SyntaxDiagnostic;
 use oxc_ast::ast::{
     ArrowFunctionExpression, AssignmentExpression, AssignmentTarget,
-    AssignmentTargetPropertyIdentifier, AwaitExpression,
-    BindingIdentifier, BindingPattern, Class, ClassElement, DoWhileStatement, Expression,
-    ForInStatement, ForOfStatement, ForStatement, ForStatementLeft, FormalParameters, Function,
-    IdentifierReference, IfStatement, LabeledStatement, MethodDefinition, MethodDefinitionKind,
-    NumericLiteral, ObjectProperty, Program, PropertyDefinition, PropertyKey, PropertyKind,
-    SimpleAssignmentTarget, Statement, StaticBlock, StringLiteral, Super, SwitchStatement,
-    UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclaration,
-    VariableDeclarationKind, WhileStatement, YieldExpression,
+    AssignmentTargetPropertyIdentifier, AwaitExpression, BindingIdentifier, BindingPattern, Class,
+    ClassElement, DoWhileStatement, Expression, ForInStatement, ForOfStatement, ForStatement,
+    ForStatementLeft, FormalParameters, Function, IdentifierReference, IfStatement,
+    LabeledStatement, MethodDefinition, MethodDefinitionKind, NumericLiteral, ObjectProperty,
+    Program, PropertyDefinition, PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement,
+    StaticBlock, StringLiteral, Super, SwitchStatement, UnaryExpression, UnaryOperator,
+    UpdateExpression, UpdateOperator, VariableDeclaration, VariableDeclarationKind, WhileStatement,
+    YieldExpression,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_span::Span;
@@ -385,9 +385,7 @@ impl StrictValidator {
                  (§13.7.x.1 IsLabelledFunction early error)"
             ),
             range: Some((span.start, span.end)),
-            help: Some(
-                "wrap the function declaration in a block `{ … }`".to_string(),
-            ),
+            help: Some("wrap the function declaration in a block `{ … }`".to_string()),
         });
     }
 }
@@ -1153,8 +1151,10 @@ impl<'a> Visit<'a> for StrictValidator {
                               binding (§13.3.1.1)"
                         .to_string(),
                     range: Some((span.start, span.end)),
-                    help: Some("rename the binding; `let` is reserved as a lexical binding name"
-                        .to_string()),
+                    help: Some(
+                        "rename the binding; `let` is reserved as a lexical binding name"
+                            .to_string(),
+                    ),
                 });
             }
         }

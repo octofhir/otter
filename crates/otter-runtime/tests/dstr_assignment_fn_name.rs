@@ -47,5 +47,8 @@ fn object_property_default_names_anonymous_function() {
 
 #[test]
 fn array_element_default_names_anonymous_function() {
-    assert_eq!(run("var a; for ([ a = function(){} ] of [[]]) {} a.name;"), "a");
+    assert_eq!(
+        run("var a; for ([ a = function(){} ] of [[]]) {} a.name;"),
+        "a"
+    );
 }

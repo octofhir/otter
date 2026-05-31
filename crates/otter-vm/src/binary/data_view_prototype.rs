@@ -120,8 +120,9 @@ where
     let little_endian = to_little_endian_flag(coerced.get(le_arg), ctx.heap());
     let abs_offset = view.byte_offset(ctx.heap()) + offset;
     let buffer = view.buffer(ctx.heap());
-    let snapshot: Vec<u8> =
-        buffer.with_bytes(ctx.heap(), |b| b[abs_offset..abs_offset + byte_count].to_vec());
+    let snapshot: Vec<u8> = buffer.with_bytes(ctx.heap(), |b| {
+        b[abs_offset..abs_offset + byte_count].to_vec()
+    });
     f(&snapshot, little_endian, ctx.heap_mut())
 }
 
@@ -154,7 +155,9 @@ where
 // ---- getX --------------------------------------------------------------
 
 pub(crate) fn dv_get_int8(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    read_view(ctx, args, 1, 1, |s, _, _| Ok(smi(i8::from_le_bytes([s[0]]) as i32)))
+    read_view(ctx, args, 1, 1, |s, _, _| {
+        Ok(smi(i8::from_le_bytes([s[0]]) as i32))
+    })
 }
 
 pub(crate) fn dv_get_uint8(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -207,7 +210,10 @@ pub(crate) fn dv_get_uint32(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
     })
 }
 
-pub(crate) fn dv_get_float32(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn dv_get_float32(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
     read_view(ctx, args, 4, 1, |s, le, _| {
         let buf = [s[0], s[1], s[2], s[3]];
         let v = if le {
@@ -219,7 +225,10 @@ pub(crate) fn dv_get_float32(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<
     })
 }
 
-pub(crate) fn dv_get_float64(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn dv_get_float64(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
     read_view(ctx, args, 8, 1, |s, le, _| {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(s);

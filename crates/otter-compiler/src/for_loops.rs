@@ -96,9 +96,7 @@ pub(crate) fn compile_for_of_statement(
     // AsyncIteratorClose (await on the result) which the synchronous
     // close path cannot perform, so leave `for await` to the existing
     // break-only handling below.
-    if !is_for_await
-        && let Some(frame) = cx.loops.last_mut()
-    {
+    if !is_for_await && let Some(frame) = cx.loops.last_mut() {
         frame.iterator_close_reg = Some(iter_reg);
     }
     // §7.4.9 — open the iterator's close region so a throw inside the
@@ -173,7 +171,10 @@ pub(crate) fn compile_for_of_statement(
         // here, so `V` keeps the prior iteration's value per spec.
         cx.emit(
             Op::StoreLocal,
-            [Operand::Register(body_reg), Operand::Imm32(completion_reg as i32)],
+            [
+                Operand::Register(body_reg),
+                Operand::Imm32(completion_reg as i32),
+            ],
             span,
         );
     }
@@ -219,9 +220,7 @@ pub(crate) fn compile_for_of_statement(
 /// through a per-iteration upvalue cell (§14.7.5.6) that also provides
 /// the head Temporal Dead Zone (§14.7.5.12). `var`, destructuring, and
 /// AssignmentTarget heads return `None` and keep the register path.
-fn per_iteration_head_name(
-    head: &oxc_ast::ast::ForStatementLeft<'_>,
-) -> Option<(String, bool)> {
+fn per_iteration_head_name(head: &oxc_ast::ast::ForStatementLeft<'_>) -> Option<(String, bool)> {
     use oxc_ast::ast::{BindingPattern, ForStatementLeft, VariableDeclarationKind};
     let ForStatementLeft::VariableDeclaration(decl) = head else {
         return None;

@@ -14,10 +14,13 @@ use otter_runtime::{Runtime, SourceInput};
 
 fn eval(source: &str) -> String {
     let mut rt = Runtime::builder().build().expect("runtime");
-    rt.run_script(SourceInput::from_javascript(source), "<per-iter-scope-test>")
-        .expect("script")
-        .completion_string()
-        .to_string()
+    rt.run_script(
+        SourceInput::from_javascript(source),
+        "<per-iter-scope-test>",
+    )
+    .expect("script")
+    .completion_string()
+    .to_string()
 }
 
 #[test]

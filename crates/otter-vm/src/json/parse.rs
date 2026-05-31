@@ -96,7 +96,11 @@ pub(crate) fn install_object_prototype(
             let children: Vec<Value> = crate::object::with_properties(obj, gc_heap, |p| {
                 p.enumerable_data_iter().map(|(_, v)| v).collect()
             });
-            stack.extend(children.into_iter().filter(|v| v.is_object() || v.as_array().is_some()));
+            stack.extend(
+                children
+                    .into_iter()
+                    .filter(|v| v.is_object() || v.as_array().is_some()),
+            );
         } else if let Some(arr) = value.as_array() {
             let len = crate::array::len(arr, gc_heap);
             for idx in 0..len {
@@ -160,7 +164,11 @@ pub(crate) fn parse_source_tree(text: &str) -> Option<SourceNode> {
     sc.skip_ws();
     let node = sc.scan_value(0)?;
     sc.skip_ws();
-    if sc.pos == sc.bytes.len() { Some(node) } else { None }
+    if sc.pos == sc.bytes.len() {
+        Some(node)
+    } else {
+        None
+    }
 }
 
 struct SourceScanner<'a> {

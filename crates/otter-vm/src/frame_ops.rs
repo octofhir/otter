@@ -49,7 +49,11 @@ impl Interpreter {
     /// the constructor yields the bound object (§10.2.2). A second
     /// `super(...)` (i.e. `this` already initialized) is a
     /// ReferenceError.
-    pub(crate) fn run_bind_this_value(&mut self, frame: &mut Frame, src: u16) -> Result<(), VmError> {
+    pub(crate) fn run_bind_this_value(
+        &mut self,
+        frame: &mut Frame,
+        src: u16,
+    ) -> Result<(), VmError> {
         if !frame.this_value.is_hole() {
             return Err(VmError::ThisUninitialized {
                 message: "super constructor may only be called once".to_string(),

@@ -28,7 +28,9 @@ fn for_of_over_proxy_iterator() {
 #[test]
 fn plain_user_iterator_still_works() {
     assert_eq!(
-        run("var it={[Symbol.iterator](){var i=0;return{next(){return i<3?{value:i++,done:false}:{done:true};}};}}; var s=0; for(var x of it)s+=x; String(s);"),
+        run(
+            "var it={[Symbol.iterator](){var i=0;return{next(){return i<3?{value:i++,done:false}:{done:true};}};}}; var s=0; for(var x of it)s+=x; String(s);"
+        ),
         "3"
     );
 }

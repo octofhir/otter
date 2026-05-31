@@ -398,7 +398,6 @@ pub(crate) fn vm_err_to_value(err: &VmError, heap: &mut otter_gc::GcHeap) -> Val
     )
 }
 
-
 /// Render an uncaught JS value for diagnostic output. Routes
 /// Error-shaped objects through [`error_classes::render_error_to_string`]
 /// so the unwind printout matches what `e.toString()` returns at

@@ -24,8 +24,8 @@ use otter_bytecode::Operand;
 use otter_gc::raw::RawGc;
 
 use crate::{
-    ClassConstructor, ExecutionContext, Frame, Interpreter, JsObject, JsString, NumberValue, Value,
-    SuperReadKey, VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
+    ClassConstructor, ExecutionContext, Frame, Interpreter, JsObject, JsString, NumberValue,
+    SuperReadKey, Value, VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
     array::JsArray,
     binary, collections_prototype, descriptor_value, function_metadata,
     is_restricted_function_property, object,

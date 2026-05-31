@@ -63,5 +63,8 @@ fn set_for_of_observes_addition() {
 
 #[test]
 fn set_for_of_yields_values() {
-    assert_eq!(run("var t = 0; for (var x of new Set([1, 2, 3])) t += x; String(t);"), "6");
+    assert_eq!(
+        run("var t = 0; for (var x of new Set([1, 2, 3])) t += x; String(t);"),
+        "6"
+    );
 }

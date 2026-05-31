@@ -186,7 +186,10 @@ pub(crate) fn compile_statement(
             if let Some(cons_reg) = compile_statement(cx, &s.consequent)? {
                 cx.emit(
                     Op::StoreLocal,
-                    [Operand::Register(cons_reg), Operand::Imm32(completion_reg as i32)],
+                    [
+                        Operand::Register(cons_reg),
+                        Operand::Imm32(completion_reg as i32),
+                    ],
                     span,
                 );
             }
@@ -198,7 +201,10 @@ pub(crate) fn compile_statement(
                 if let Some(alt_reg) = compile_statement(cx, alt)? {
                     cx.emit(
                         Op::StoreLocal,
-                        [Operand::Register(alt_reg), Operand::Imm32(completion_reg as i32)],
+                        [
+                            Operand::Register(alt_reg),
+                            Operand::Imm32(completion_reg as i32),
+                        ],
                         span,
                     );
                 }
@@ -222,7 +228,10 @@ pub(crate) fn compile_statement(
             if let Some(body_reg) = compile_statement(cx, &s.body)? {
                 cx.emit(
                     Op::StoreLocal,
-                    [Operand::Register(body_reg), Operand::Imm32(completion_reg as i32)],
+                    [
+                        Operand::Register(body_reg),
+                        Operand::Imm32(completion_reg as i32),
+                    ],
                     span,
                 );
             }
@@ -249,7 +258,10 @@ pub(crate) fn compile_statement(
             if let Some(body_reg) = compile_statement(cx, &s.body)? {
                 cx.emit(
                     Op::StoreLocal,
-                    [Operand::Register(body_reg), Operand::Imm32(completion_reg as i32)],
+                    [
+                        Operand::Register(body_reg),
+                        Operand::Imm32(completion_reg as i32),
+                    ],
                     span,
                 );
             }
@@ -300,7 +312,10 @@ pub(crate) fn compile_statement(
             if let Some(body_reg) = compile_statement(cx, &s.body)? {
                 cx.emit(
                     Op::StoreLocal,
-                    [Operand::Register(body_reg), Operand::Imm32(completion_reg as i32)],
+                    [
+                        Operand::Register(body_reg),
+                        Operand::Imm32(completion_reg as i32),
+                    ],
                     span,
                 );
             }

@@ -121,18 +121,16 @@ fn sab_grow(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
             reason: "receiver is not a growable shared arraybuffer".to_string(),
         });
     }
-    let new_len = match crate::binary::to_index(
-        args.first().unwrap_or(&Value::undefined()),
-        ctx.heap(),
-    ) {
-        Some(n) => n as usize,
-        None => {
-            return Err(NativeError::TypeError {
-                name: NAME,
-                reason: "newByteLength must be a non-negative integer".to_string(),
-            });
-        }
-    };
+    let new_len =
+        match crate::binary::to_index(args.first().unwrap_or(&Value::undefined()), ctx.heap()) {
+            Some(n) => n as usize,
+            None => {
+                return Err(NativeError::TypeError {
+                    name: NAME,
+                    reason: "newByteLength must be a non-negative integer".to_string(),
+                });
+            }
+        };
     if !buf.grow(ctx.heap_mut(), new_len) {
         return Err(NativeError::TypeError {
             name: NAME,
@@ -312,18 +310,16 @@ fn ab_resize(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             reason: "buffer is not resizable or is detached".to_string(),
         });
     }
-    let new_len = match crate::binary::to_index(
-        args.first().unwrap_or(&Value::undefined()),
-        ctx.heap(),
-    ) {
-        Some(n) => n as usize,
-        None => {
-            return Err(NativeError::TypeError {
-                name: NAME,
-                reason: "newByteLength must be a non-negative integer".to_string(),
-            });
-        }
-    };
+    let new_len =
+        match crate::binary::to_index(args.first().unwrap_or(&Value::undefined()), ctx.heap()) {
+            Some(n) => n as usize,
+            None => {
+                return Err(NativeError::TypeError {
+                    name: NAME,
+                    reason: "newByteLength must be a non-negative integer".to_string(),
+                });
+            }
+        };
     if !buf.resize(ctx.heap_mut(), new_len) {
         return Err(NativeError::TypeError {
             name: NAME,
@@ -345,7 +341,12 @@ fn ab_transfer_to_fixed_length(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    ab_transfer_inner(ctx, args, true, "ArrayBuffer.prototype.transferToFixedLength")
+    ab_transfer_inner(
+        ctx,
+        args,
+        true,
+        "ArrayBuffer.prototype.transferToFixedLength",
+    )
 }
 
 fn ab_transfer_inner(

@@ -94,10 +94,11 @@ impl Interpreter {
 
         match self.serialize_json_property(context, &mut state, "", Value::object(wrapper))? {
             Some(text) => {
-                let s = JsString::from_str(&text, self.gc_heap_mut())
-                    .map_err(|_| VmError::TypeError {
+                let s = JsString::from_str(&text, self.gc_heap_mut()).map_err(|_| {
+                    VmError::TypeError {
                         message: "out of memory".to_string(),
-                    })?;
+                    }
+                })?;
                 Ok(Value::string(s))
             }
             None => Ok(Value::undefined()),
@@ -181,10 +182,11 @@ impl Interpreter {
                     crate::abstract_ops::same_value(&value, &parsed, self.gc_heap())
                 });
             if still_original {
-                let js =
-                    JsString::from_str(src, self.gc_heap_mut()).map_err(|_| VmError::TypeError {
+                let js = JsString::from_str(src, self.gc_heap_mut()).map_err(|_| {
+                    VmError::TypeError {
                         message: "out of memory".to_string(),
-                    })?;
+                    }
+                })?;
                 object::set(obj, self.gc_heap_mut(), "source", Value::string(js));
             }
         }
@@ -193,13 +195,13 @@ impl Interpreter {
 
     /// Allocate an empty `%Object.prototype%`-backed object.
     fn json_make_plain_object(&mut self) -> Result<object::JsObject, VmError> {
-        let obj =
-            object::alloc_object_with_roots(self.gc_heap_mut(), &mut |_: &mut dyn FnMut(
-                *mut otter_gc::raw::RawGc,
-            )| {})
-            .map_err(|_| VmError::TypeError {
-                message: "out of memory".to_string(),
-            })?;
+        let obj = object::alloc_object_with_roots(
+            self.gc_heap_mut(),
+            &mut |_: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {},
+        )
+        .map_err(|_| VmError::TypeError {
+            message: "out of memory".to_string(),
+        })?;
         let object_proto = self.object_prototype_object_opt();
         object::set_prototype_value(obj, self.gc_heap_mut(), object_proto.map(Value::object));
         Ok(obj)
@@ -275,12 +277,13 @@ impl Interpreter {
                 } else if let Some(b) = object::boolean_data(obj, heap) {
                     WrapperKind::Boolean(b)
                 } else {
-                    object::bigint_data(obj, heap)
-                        .map_or(WrapperKind::None, WrapperKind::BigInt)
+                    object::bigint_data(obj, heap).map_or(WrapperKind::None, WrapperKind::BigInt)
                 }
             };
             match kind {
-                WrapperKind::Number => value = Value::number(self.coerce_to_number(context, &value)?),
+                WrapperKind::Number => {
+                    value = Value::number(self.coerce_to_number(context, &value)?)
+                }
                 WrapperKind::String => {
                     let s = self.coerce_to_string(context, &value)?;
                     let js = JsString::from_str(&s, self.gc_heap_mut()).map_err(|_| {
@@ -599,11 +602,12 @@ impl Interpreter {
         let mut roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
             value.trace_value_slots(visitor);
         };
-        let obj = object::alloc_object_with_roots(self.gc_heap_mut(), &mut roots).map_err(|_| {
-            VmError::TypeError {
-                message: "out of memory".to_string(),
-            }
-        })?;
+        let obj =
+            object::alloc_object_with_roots(self.gc_heap_mut(), &mut roots).map_err(|_| {
+                VmError::TypeError {
+                    message: "out of memory".to_string(),
+                }
+            })?;
         let object_proto = self.object_prototype_object_opt();
         object::set_prototype_value(obj, self.gc_heap_mut(), object_proto.map(Value::object));
         object::set(obj, self.gc_heap_mut(), "", value);
@@ -655,8 +659,7 @@ fn quote_units(units: &[u16]) -> String {
                 if let Some(&low) = units.get(i + 1)
                     && (0xDC00..=0xDFFF).contains(&low)
                 {
-                    let cp =
-                        0x10000 + (((c as u32) - 0xD800) << 10) + ((low as u32) - 0xDC00);
+                    let cp = 0x10000 + (((c as u32) - 0xD800) << 10) + ((low as u32) - 0xDC00);
                     if let Some(ch) = char::from_u32(cp) {
                         out.push(ch);
                     }

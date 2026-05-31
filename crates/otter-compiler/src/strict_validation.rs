@@ -29,7 +29,8 @@ use std::collections::BTreeMap;
 
 use otter_syntax::SyntaxDiagnostic;
 use oxc_ast::ast::{
-    ArrowFunctionExpression, AssignmentExpression, AssignmentTarget, AwaitExpression,
+    ArrowFunctionExpression, AssignmentExpression, AssignmentTarget,
+    AssignmentTargetPropertyIdentifier, AwaitExpression,
     BindingIdentifier, BindingPattern, Class, ClassElement, DoWhileStatement, Expression,
     ForInStatement, ForOfStatement, ForStatement, ForStatementLeft, FormalParameters, Function,
     IdentifierReference, IfStatement, LabeledStatement, MethodDefinition, MethodDefinitionKind,
@@ -1190,6 +1191,58 @@ impl<'a> Visit<'a> for StrictValidator {
                 ),
             });
         }
+    }
+
+    fn visit_assignment_target_property_identifier(
+        &mut self,
+        it: &AssignmentTargetPropertyIdentifier<'a>,
+    ) {
+        // §12.7.1 — object-shorthand assignment target `{ eval }` /
+        // `{ arguments = 0 }` binds `eval`/`arguments`, which is an
+        // invalid assignment target in strict code.
+        if self.is_strict() && is_reserved_strict_assignment_target(it.binding.name.as_str()) {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "STRICT_RESERVED_ASSIGNMENT_TARGET".to_string(),
+                message: format!(
+                    "SyntaxError: `{}` is not a valid assignment target in strict mode \
+                     (§12.7.1 IsValidSimpleAssignmentTarget reserves `eval` and `arguments`)",
+                    it.binding.name.as_str()
+                ),
+                range: Some((it.binding.span.start, it.binding.span.end)),
+                help: Some(
+                    "rename the target; `eval` and `arguments` cannot be assigned in strict code"
+                        .to_string(),
+                ),
+            });
+        }
+        walk::walk_assignment_target_property_identifier(self, it);
+    }
+
+    fn visit_simple_assignment_target(&mut self, it: &SimpleAssignmentTarget<'a>) {
+        // §12.7.1 / §13.7.5.1 — `eval` and `arguments` are not valid
+        // simple assignment targets in strict code. Covers
+        // destructuring-assignment targets and `for`-head targets
+        // (`for ({ eval } of …)`, `for ([arguments] of …)`), which are
+        // not `AssignmentExpression` nodes.
+        if self.is_strict()
+            && let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = it
+            && is_reserved_strict_assignment_target(id.name.as_str())
+        {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "STRICT_RESERVED_ASSIGNMENT_TARGET".to_string(),
+                message: format!(
+                    "SyntaxError: `{}` is not a valid assignment target in strict mode \
+                     (§12.7.1 IsValidSimpleAssignmentTarget reserves `eval` and `arguments`)",
+                    id.name.as_str()
+                ),
+                range: Some((id.span.start, id.span.end)),
+                help: Some(
+                    "rename the target; `eval` and `arguments` cannot be assigned in strict code"
+                        .to_string(),
+                ),
+            });
+        }
+        walk::walk_simple_assignment_target(self, it);
     }
 
     fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {

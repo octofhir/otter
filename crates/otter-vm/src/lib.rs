@@ -5028,6 +5028,11 @@ fn step_iterator(
         Array(JsArray, usize),
         ArrayKey(JsArray, usize),
         ArrayEntry(JsArray, usize),
+        TypedArray(
+            crate::binary::typed_array::JsTypedArray,
+            usize,
+            crate::iterator_state::ArrayIterKind,
+        ),
         String(JsString, u32),
         MapCollection(JsMap, usize, MapIteratorKind),
         SetCollection(JsSet, usize, SetIteratorKind),
@@ -5041,6 +5046,11 @@ fn step_iterator(
         IteratorState::ArrayEntry { array, index } => {
             FastIteratorSnapshot::ArrayEntry(*array, *index)
         }
+        IteratorState::TypedArray {
+            typed_array,
+            index,
+            kind,
+        } => FastIteratorSnapshot::TypedArray(*typed_array, *index, *kind),
         IteratorState::String { string, index } => FastIteratorSnapshot::String(*string, *index),
         IteratorState::MapCollection { map, index, kind } => {
             FastIteratorSnapshot::MapCollection(*map, *index, *kind)
@@ -5116,6 +5126,56 @@ fn step_iterator(
                     }
                 });
                 Some(Value::array(pair))
+            }
+        }
+        FastIteratorSnapshot::TypedArray(typed_array, index, kind) => {
+            // §23.2.5.1 CreateArrayIterator step — read live each
+            // step; a detached buffer terminates iteration.
+            let detached = typed_array.buffer(gc_heap).is_detached(gc_heap);
+            if detached || index >= typed_array.length(gc_heap) {
+                None
+            } else {
+                let element = typed_array
+                    .get(gc_heap, index)
+                    .map_err(|_| VmError::TypeMismatch)?;
+                let advance = |gc_heap: &mut otter_gc::GcHeap| {
+                    gc_heap.with_payload(iter, |state| {
+                        if let IteratorState::TypedArray { index, .. } = state {
+                            *index += 1;
+                        }
+                    });
+                };
+                match kind {
+                    ArrayIterKind::Key => {
+                        advance(gc_heap);
+                        Some(Value::number(crate::number::NumberValue::from_f64(
+                            index as f64,
+                        )))
+                    }
+                    ArrayIterKind::Value => {
+                        advance(gc_heap);
+                        Some(element)
+                    }
+                    ArrayIterKind::Entry => {
+                        let index_val =
+                            Value::number(crate::number::NumberValue::from_f64(index as f64));
+                        let pair = {
+                            let mut visitor =
+                                |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                                    index_val.trace_value_slots(visit);
+                                    element.trace_value_slots(visit);
+                                };
+                            crate::array::alloc_array_with_roots(gc_heap, &mut visitor)
+                                .map_err(|_| VmError::TypeMismatch)?
+                        };
+                        crate::array::with_elements_mut(pair, gc_heap, |elements| {
+                            elements.push(index_val);
+                            elements.push(element);
+                        });
+                        advance(gc_heap);
+                        Some(Value::array(pair))
+                    }
+                }
             }
         }
         FastIteratorSnapshot::String(string, index) => {

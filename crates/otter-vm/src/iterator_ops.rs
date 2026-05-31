@@ -1435,6 +1435,31 @@ impl Interpreter {
             }
             return Err(VmError::TypeMismatch);
         }
+        // §23.2.3.32 %TypedArray%.prototype[@@iterator] — a TypedArray
+        // is not an ordinary object, so route it through its
+        // prototype's `@@iterator` (which returns a *live* array
+        // iterator that observes element mutations during `for…of`).
+        if value.as_typed_array(&self.gc_heap).is_some() {
+            let callee = match self.ordinary_get_value(
+                context,
+                value,
+                value,
+                &VmPropertyKey::Symbol(iter_sym),
+                0,
+            )? {
+                VmGetOutcome::Value(v) => v,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, value, SmallVec::new())?
+                }
+            };
+            if !is_callable(&callee) {
+                return Err(VmError::TypeMismatch);
+            }
+            self.frame_ensure_cold(&mut stack[top_idx])
+                .pending_get_iterator = Some(PendingGetIterator { pc, dst });
+            self.invoke(stack, context, &callee, value, SmallVec::new(), dst)?;
+            return Ok(true);
+        }
         let Some(obj) = value.as_object() else {
             return Ok(false);
         };

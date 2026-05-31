@@ -542,56 +542,43 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
     build_new_typed_array(ctx, t.kind(), &snapshot)
 }
 
-/// Wrap a snapshot of values in an iterator value. Mirrors the
-/// pattern Map / Set iterators use so callers see a real `next()`
-/// surface instead of a plain Array.
-///
-/// Spec: §22.2.5.6 `CreateArrayIterator(O, kind)` — the abstract
-/// op produces an Iterator over the typed array's index range.
-/// <https://tc39.es/ecma262/#sec-createarrayiterator>
-fn wrap_iterator(
+/// §23.2.5.1 CreateArrayIterator — a *live* TypedArray iterator whose
+/// `next()` reads the element at the current index on each step
+/// (observing mutations and buffer detachment), unlike a one-shot
+/// snapshot.
+fn live_typed_array_iterator(
     ctx: &mut NativeCtx<'_>,
-    snapshot: impl IntoIterator<Item = Value>,
-) -> Result<Value, otter_gc::OutOfMemory> {
-    let arr = ctx.array_from_elements_with_roots(snapshot, &[], &[])?;
-    let arr_value = Value::array(arr);
-    let state = crate::IteratorState::Array {
-        array: arr,
+    t: crate::binary::typed_array::JsTypedArray,
+    kind: crate::iterator_state::ArrayIterKind,
+) -> Result<Value, NativeError> {
+    let state = crate::IteratorState::TypedArray {
+        typed_array: t,
         index: 0,
-        origin: crate::BuiltinIteratorOrigin::Array,
+        kind,
     };
-    Ok(Value::iterator(ctx.alloc_iterator_state(
-        state,
-        &[&arr_value],
-        &[],
-    )?))
+    let root = *ctx.this_value();
+    Ok(Value::iterator(
+        ctx.alloc_iterator_state(state, &[&root], &[])
+            .map_err(native_oom)?,
+    ))
 }
 
 fn impl_keys(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     check_not_detached(&t, ctx.heap())?;
-    let len = t.length(ctx.heap_mut());
-    Ok(wrap_iterator(ctx, (0..len).map(|i| smi(i as i32)))?)
+    live_typed_array_iterator(ctx, t, crate::iterator_state::ArrayIterKind::Key)
 }
 
 fn impl_values(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     check_not_detached(&t, ctx.heap())?;
-    let values = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
-    wrap_iterator(ctx, values).map_err(native_oom)
+    live_typed_array_iterator(ctx, t, crate::iterator_state::ArrayIterKind::Value)
 }
 
 fn impl_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     check_not_detached(&t, ctx.heap())?;
-    let len = t.length(ctx.heap_mut());
-    let mut pairs: Vec<Value> = Vec::with_capacity(len);
-    for i in 0..len {
-        let element = t.get(ctx.heap_mut(), i).map_err(native_oom)?;
-        let pair = ctx.array_from_elements_with_roots([smi(i as i32), element], &[], &[&pairs])?;
-        pairs.push(Value::array(pair));
-    }
-    wrap_iterator(ctx, pairs).map_err(native_oom)
+    live_typed_array_iterator(ctx, t, crate::iterator_state::ArrayIterKind::Entry)
 }
 
 // ---- comparison helpers -------------------------------------------------

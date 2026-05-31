@@ -25,6 +25,7 @@
 
 use crate::Value;
 use crate::array::JsArray;
+use crate::binary::typed_array::JsTypedArray;
 use crate::collections::{JsMap, JsSet};
 use crate::string::JsString;
 
@@ -133,6 +134,22 @@ pub enum IteratorState {
         /// Next index to yield.
         #[pelt(skip)]
         index: usize,
+    },
+    /// Live walk over a TypedArray's elements per §23.2.5.1
+    /// `CreateArrayIterator(O, kind)`. Unlike the Array snapshot
+    /// states, this reads `typed_array[index]` on every step so
+    /// element mutations during iteration are observed, and reports
+    /// `done` when the backing buffer is detached.
+    TypedArray {
+        /// Backing typed array (traced live).
+        #[pelt(via = crate::binary::typed_array::JsTypedArray::trace_value_slots)]
+        typed_array: JsTypedArray,
+        /// Next element index to read.
+        #[pelt(skip)]
+        index: usize,
+        /// Yield shape (values / keys / entries).
+        #[pelt(skip)]
+        kind: ArrayIterKind,
     },
     /// Walks `string`'s WTF-16 code units while yielding full
     /// code-point strings; surrogate pairs advance as one item.
@@ -248,7 +265,11 @@ impl IteratorState {
     pub fn builtin_origin(&self) -> Option<BuiltinIteratorOrigin> {
         match self {
             IteratorState::Array { origin, .. } => Some(*origin),
-            IteratorState::ArrayKey { .. } | IteratorState::ArrayEntry { .. } => {
+            IteratorState::ArrayKey { .. }
+            | IteratorState::ArrayEntry { .. }
+            | IteratorState::TypedArray { .. } => {
+                // §23.2.5.1 — TypedArray iterators inherit
+                // %ArrayIteratorPrototype% just like Array iterators.
                 Some(BuiltinIteratorOrigin::Array)
             }
             IteratorState::String { .. } => Some(BuiltinIteratorOrigin::String),

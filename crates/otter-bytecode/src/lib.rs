@@ -394,6 +394,12 @@ pub enum Op {
     /// [`Self::SetSuperProperty`]. Operands: `Register(home),
     /// Register(key), Register(value)`.
     SetSuperElement,
+    /// `break` / `continue` that crosses one or more `finally` blocks
+    /// (§14.15.3). Operands: `Imm32(offset), Imm32(floor)`. Runs the
+    /// crossed `finally` blocks (popping the frame's try-handlers down
+    /// to `floor`), then jumps to `pc + 1 + offset`. `offset` is
+    /// patched like an ordinary branch target.
+    JumpViaFinally,
     /// `r<dst> = ClassConstructor { ctor, prototype, statics }`.
     /// Operands: `Register(dst), Register(ctor), Register(prototype),
     /// Register(statics)`. Used by class lowering to package the
@@ -996,6 +1002,7 @@ impl Op {
             Op::LoadSuperElement => "LOAD_SUPER_ELEMENT",
             Op::SetSuperProperty => "SET_SUPER_PROPERTY",
             Op::SetSuperElement => "SET_SUPER_ELEMENT",
+            Op::JumpViaFinally => "JUMP_VIA_FINALLY",
             Op::MakeClass => "MAKE_CLASS",
             Op::CollectRest => "COLLECT_REST",
             Op::MathLoad => "MATH_LOAD",
@@ -1198,6 +1205,7 @@ impl Op {
             Op::BindThisValue => 1,
             Op::LoadSuperProperty | Op::LoadSuperElement => 3,
             Op::SetSuperProperty | Op::SetSuperElement => 3,
+            Op::JumpViaFinally => 2,
             // dst, name_const, src, scratch_dst.
             Op::StoreProperty => 4,
             // `NewArray` is variadic: `dst, count, elems...`. The

@@ -2903,13 +2903,13 @@ impl Interpreter {
                         .get(src as usize)
                         .cloned()
                         .ok_or(VmError::InvalidOperand)?;
-                    if let Some(popped) = self.pop_frame(stack, value)? {
+                    if let Some(popped) = self.return_running_finally(stack, value)? {
                         return Ok(popped);
                     }
                     continue;
                 }
                 Op::ReturnUndefined => {
-                    if let Some(popped) = self.pop_frame(stack, Value::undefined())? {
+                    if let Some(popped) = self.return_running_finally(stack, Value::undefined())? {
                         return Ok(popped);
                     }
                     continue;
@@ -2979,6 +2979,9 @@ impl Interpreter {
                     let pending = self
                         .frame_cold_mut(&mut stack[top_idx])
                         .and_then(|c| c.pending_throw.take());
+                    let pending_abrupt = self
+                        .frame_cold_mut(&mut stack[top_idx])
+                        .and_then(|c| c.pending_abrupt.take());
                     if let Some(value) = pending {
                         self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
                         let unwind = self.unwind_throw(stack, value);
@@ -2986,6 +2989,13 @@ impl Interpreter {
                             self.pending_uncaught_frames = None;
                         }
                         unwind?;
+                    } else if let Some((completion, floor)) = pending_abrupt {
+                        // Resume the parked `return`/`break`/`continue`:
+                        // run the next enclosing `finally`, or perform
+                        // the completion when none remain.
+                        if let Some(popped) = self.unwind_abrupt(stack, completion, floor)? {
+                            return Ok(popped);
+                        }
                     } else {
                         stack[top_idx].advance_pc(self.current_byte_len)?;
                     }
@@ -4085,6 +4095,28 @@ impl Interpreter {
                     self.run_leave_try(frame)?;
                     continue;
                 }
+                Op::JumpViaFinally => {
+                    // §14.15.3 — `break`/`continue` crossing `finally`
+                    // blocks: run them (down to `floor`), then jump.
+                    let offset = context
+                        .exec_imm32(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let floor = context
+                        .exec_imm32(instr, 1)
+                        .ok_or(VmError::InvalidOperand)? as u32;
+                    let next_pc = (stack[top_idx].pc as i64 + 1).saturating_add(offset as i64);
+                    if !(0..=u32::MAX as i64).contains(&next_pc) {
+                        return Err(VmError::InvalidOperand);
+                    }
+                    if let Some(popped) = self.unwind_abrupt(
+                        stack,
+                        crate::cold_frame::AbruptKind::Jump(next_pc as u32),
+                        floor,
+                    )? {
+                        return Ok(popped);
+                    }
+                    continue;
+                }
                 Op::Jump => {
                     let offset = context
                         .exec_imm32(instr, 0)
@@ -4524,6 +4556,81 @@ impl Interpreter {
         // Caller's pc was set to the next instruction at call time;
         // nothing to advance here.
         Ok(None)
+    }
+
+    /// §14.15.3 — run the `finally` blocks between an abrupt `return` /
+    /// `break` / `continue` and its target, then perform the
+    /// completion. Pops handlers off the top frame until the handler
+    /// stack reaches `floor`; the first `finally` found parks the
+    /// completion (`pending_abrupt`) and jumps to the finally body —
+    /// `Op::EndFinally` resumes this walk. With no remaining `finally`,
+    /// a `Jump` sets the target pc and a `Return` pops the frame.
+    fn unwind_abrupt(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        completion: crate::cold_frame::AbruptKind,
+        floor: u32,
+    ) -> Result<Option<Value>, VmError> {
+        use crate::cold_frame::AbruptKind;
+        loop {
+            let top_idx = stack.len() - 1;
+            let handler_count = self
+                .frame_cold(&stack[top_idx])
+                .map(|c| c.handlers.len() as u32)
+                .unwrap_or(0);
+            if handler_count <= floor {
+                return match completion {
+                    AbruptKind::Jump(pc) => {
+                        stack[top_idx].pc = pc;
+                        Ok(None)
+                    }
+                    AbruptKind::Return(v) => self.pop_frame(stack, v),
+                };
+            }
+            let handler = self
+                .frame_cold_mut(&mut stack[top_idx])
+                .and_then(|c| c.handlers.pop());
+            match handler {
+                Some(h) if h.finally_pc.is_some() => {
+                    let finally_pc = h.finally_pc.expect("finally_pc checked");
+                    let cold = self.frame_ensure_cold(&mut stack[top_idx]);
+                    cold.pending_abrupt = Some((completion, floor));
+                    stack[top_idx].pc = finally_pc;
+                    return Ok(None);
+                }
+                // Catch-only handler crossed by the abrupt completion:
+                // pop it (cleanup) and keep walking.
+                Some(_) => continue,
+                None => {
+                    return match completion {
+                        AbruptKind::Jump(pc) => {
+                            stack[top_idx].pc = pc;
+                            Ok(None)
+                        }
+                        AbruptKind::Return(v) => self.pop_frame(stack, v),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Return `value` from the top frame, first running any enclosing
+    /// `finally` blocks (§14.15.3). Equivalent to [`Self::pop_frame`]
+    /// when no `finally` handler is active.
+    fn return_running_finally(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        value: Value,
+    ) -> Result<Option<Value>, VmError> {
+        let top_idx = stack.len() - 1;
+        let has_finally = self
+            .frame_cold(&stack[top_idx])
+            .is_some_and(|c| c.handlers.iter().any(|h| h.finally_pc.is_some()));
+        if has_finally {
+            self.unwind_abrupt(stack, crate::cold_frame::AbruptKind::Return(value), 0)
+        } else {
+            self.pop_frame(stack, value)
+        }
     }
 }
 

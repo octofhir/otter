@@ -35,6 +35,23 @@ use crate::frame_state::{
 use crate::{JsObject, Value};
 use smallvec::SmallVec;
 
+/// A non-throw abrupt completion (`return` / `break` / `continue`)
+/// that must run intervening `finally` blocks before reaching its
+/// target. Parked on the frame while a `finally` block executes; the
+/// `EndFinally` opcode resumes the completion afterwards.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-try-statement-runtime-semantics-evaluation>
+#[derive(Debug, Clone, Copy)]
+pub enum AbruptKind {
+    /// `return value;` — pop the frame yielding `value` once all
+    /// enclosing `finally` blocks have run.
+    Return(Value),
+    /// `break` / `continue` — jump to `target` pc (intra-frame loop
+    /// label) once the crossed `finally` blocks have run.
+    Jump(u32),
+}
+
 /// Niche-encoded handle into a [`ColdFramePool`]. Stored as
 /// `Option<ColdFrameIdx>` (4 bytes) on the hot frame; `None` means no
 /// cold record has been acquired yet.
@@ -80,6 +97,12 @@ pub struct ColdFrame {
     /// block. [`otter_bytecode::Op::EndFinally`] consumes it: `Some`
     /// re-throws, `None` falls through.
     pub pending_throw: Option<Value>,
+    /// A `return`/`break`/`continue` parked while a `finally` block
+    /// runs. The `u32` is the target handler-stack depth (`floor`):
+    /// `unwind_abrupt` runs `finally` blocks until the handler stack
+    /// shrinks to this depth, then performs the completion. Consumed
+    /// by `Op::EndFinally`.
+    pub pending_abrupt: Option<(AbruptKind, u32)>,
     /// Newly-allocated receiver when this frame was entered via
     /// `Op::New`. On return, the dispatcher substitutes this object
     /// for any non-object return value so constructors that don't
@@ -125,6 +148,7 @@ impl ColdFrame {
             && self.pending_get_iterator.is_none()
             && self.pending_iterator_next.is_none()
             && self.pending_throw.is_none()
+            && self.pending_abrupt.is_none()
             && self.construct_target.is_none()
             && self.new_target.is_none()
             && self.rest_args.is_empty()
@@ -158,6 +182,9 @@ impl ColdFrame {
         }
         // `pending_get_iterator` carries only pc + dst, no values.
         if let Some(v) = &self.pending_throw {
+            v.trace_value_slots(visitor);
+        }
+        if let Some((AbruptKind::Return(v), _)) = &self.pending_abrupt {
             v.trace_value_slots(visitor);
         }
         if let Some(obj) = &self.construct_target {

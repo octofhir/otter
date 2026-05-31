@@ -1078,15 +1078,6 @@ pub(crate) fn assign_maybe_default(
 /// `value_reg === undefined ? init : value_reg`. Foundation
 /// emits the conditional load via JumpIfFalse on
 /// `typeof value_reg === "undefined"`.
-pub(crate) fn apply_default(
-    cx: &mut Compiler,
-    value_reg: u16,
-    init: &oxc_ast::ast::Expression<'_>,
-    span: (u32, u32),
-) -> Result<u16, CompileError> {
-    apply_default_with_name(cx, value_reg, init, None, span)
-}
-
 pub(crate) fn apply_default_with_name(
     cx: &mut Compiler,
     value_reg: u16,

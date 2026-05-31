@@ -17,6 +17,30 @@ use crate::*;
 /// Compile one statement. Returns `Some(reg)` when the statement is
 /// an `ExpressionStatement` whose value should propagate as the
 /// program's completion value; `None` otherwise.
+/// Emit the jump for a `break`/`continue` targeting `cx.loops[target_idx]`.
+/// When one or more `finally` blocks sit between the jump site and the
+/// target, emit [`Op::JumpViaFinally`] (which runs those blocks before
+/// jumping, popping the frame's try-handlers down to the target's
+/// `handler_floor`); otherwise a plain [`Op::Jump`]. Returns the
+/// instruction pc so the caller can register it for back-patching.
+fn emit_loop_exit_jump(cx: &mut Compiler, target_idx: usize, span: (u32, u32)) -> u32 {
+    let crossed_finally = cx
+        .active_finally
+        .saturating_sub(cx.loops[target_idx].finally_floor);
+    if crossed_finally > 0 {
+        let floor = cx.loops[target_idx].handler_floor as i32;
+        let pc = cx.next_pc;
+        cx.emit(
+            Op::JumpViaFinally,
+            vec![Operand::Imm32(0), Operand::Imm32(floor)],
+            span,
+        );
+        pc
+    } else {
+        cx.emit_branch_placeholder(Op::Jump, None, span)
+    }
+}
+
 pub(crate) fn compile_statement(
     cx: &mut Compiler,
     stmt: &Statement<'_>,
@@ -339,7 +363,7 @@ pub(crate) fn compile_statement(
             for reg in close_regs {
                 cx.emit(Op::IteratorClose, [Operand::Register(reg)], span);
             }
-            let pc = cx.emit_branch_placeholder(Op::Jump, None, span);
+            let pc = emit_loop_exit_jump(cx, target_idx, span);
             cx.loops[target_idx].break_patches.push(pc);
             Ok(None)
         }
@@ -753,7 +777,7 @@ pub(crate) fn compile_statement(
             for reg in close_regs {
                 cx.emit(Op::IteratorClose, [Operand::Register(reg)], span);
             }
-            let pc = cx.emit_branch_placeholder(Op::Jump, None, span);
+            let pc = emit_loop_exit_jump(cx, target_idx, span);
             cx.loops[target_idx].continue_patches.push(pc);
             Ok(None)
         }

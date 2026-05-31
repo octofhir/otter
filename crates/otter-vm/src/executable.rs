@@ -312,6 +312,9 @@ fn rewrite_branch_operands(
 ) -> Vec<Operand> {
     let branch_slots: &[usize] = match op {
         Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfNullish => &[0],
+        // `JumpViaFinally` operand 0 is the branch delta; operand 1 is
+        // the handler-stack floor (not a branch target).
+        Op::JumpViaFinally => &[0],
         Op::EnterTry => &[0, 1],
         _ => return operands.to_vec(),
     };

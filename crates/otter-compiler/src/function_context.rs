@@ -32,6 +32,15 @@ pub(crate) struct FunctionContext {
     pub(crate) is_async_generator: bool,
     /// Stack of enclosing loops; the innermost is on top.
     pub(crate) loops: Vec<LoopFrame>,
+    /// Count of active `try` handlers (`EnterTry` not yet `LeaveTry`'d)
+    /// at the current compile point. Mirrors the runtime frame
+    /// handler-stack depth so `break`/`continue` can pass a `floor` to
+    /// [`otter_bytecode::Op::JumpViaFinally`].
+    pub(crate) active_handlers: u32,
+    /// Subset of [`Self::active_handlers`] that carry a `finally`
+    /// block. `break`/`continue` only need the finally-routing opcode
+    /// when this exceeds the target loop's recorded floor.
+    pub(crate) active_finally: u32,
     /// Label deposited by the immediately-enclosing
     /// `LabeledStatement` waiting to be consumed by the next pushed
     /// loop / switch frame. See [`compile_labeled_statement`].
@@ -100,6 +109,8 @@ impl FunctionContext {
             is_strict: false,
             is_async_generator: false,
             loops: Vec::new(),
+            active_handlers: 0,
+            active_finally: 0,
             pending_label: None,
             hoisted_function_names: HashSet::new(),
             captured_names: HashSet::new(),
@@ -164,6 +175,8 @@ impl FunctionContext {
     /// inside the body resolves to this frame.
     pub(crate) fn push_loop_frame(&mut self, mut frame: LoopFrame) {
         frame.label = self.pending_label.take();
+        frame.handler_floor = self.active_handlers;
+        frame.finally_floor = self.active_finally;
         self.loops.push(frame);
     }
 

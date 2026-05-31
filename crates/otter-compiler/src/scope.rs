@@ -94,6 +94,14 @@ pub(crate) struct LoopFrame {
     /// completion (`break` / labelled `continue` / `return`) exits the
     /// loop. `None` for every other loop / switch frame.
     pub(crate) iterator_close_reg: Option<u16>,
+    /// Runtime try-handler-stack depth in effect when this frame was
+    /// entered. A `break`/`continue` targeting this frame must run
+    /// every `finally` pushed since (handlers above this floor).
+    pub(crate) handler_floor: u32,
+    /// `finally`-handler count in effect at entry; a target whose
+    /// `active_finally` exceeds this needs the finally-routing
+    /// `break`/`continue` opcode.
+    pub(crate) finally_floor: u32,
 }
 
 impl LoopFrame {
@@ -104,6 +112,8 @@ impl LoopFrame {
             label: None,
             is_real_loop: true,
             iterator_close_reg: None,
+            handler_floor: 0,
+            finally_floor: 0,
         }
     }
 
@@ -114,6 +124,8 @@ impl LoopFrame {
             label: None,
             is_real_loop: false,
             iterator_close_reg: None,
+            handler_floor: 0,
+            finally_floor: 0,
         }
     }
 }

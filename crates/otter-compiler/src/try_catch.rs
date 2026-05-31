@@ -61,7 +61,13 @@ pub(crate) fn compile_try_statement(
 
     if has_catch && has_finally {
         let outer = cx.emit_enter_try(NO_HANDLER_OFFSET, 0, exc_reg, span);
+        // The outer handler carries the `finally`; track both depths so
+        // `break`/`continue` inside the body or catch can route through
+        // it (§14.15.3).
+        cx.active_handlers += 1;
+        cx.active_finally += 1;
         let inner = cx.emit_enter_try(0, NO_HANDLER_OFFSET, exc_reg, span);
+        cx.active_handlers += 1;
 
         cx.enter_scope();
         for inner_stmt in &s.block.body {
@@ -69,6 +75,7 @@ pub(crate) fn compile_try_statement(
         }
         cx.exit_scope();
         cx.emit(Op::LeaveTry, vec![], span);
+        cx.active_handlers -= 1; // inner catch handler left
         let success_jump = cx.emit_branch_placeholder(Op::Jump, None, span);
 
         cx.patch_enter_try_offset(inner, /* catch */ true);
@@ -77,6 +84,8 @@ pub(crate) fn compile_try_statement(
         cx.patch_branch_to_here(success_jump);
 
         cx.emit(Op::LeaveTry, vec![], span);
+        cx.active_handlers -= 1; // outer finally handler left
+        cx.active_finally -= 1;
         cx.patch_enter_try_offset(outer, /* finally */ false);
         compile_finalizer(cx, s.finalizer.as_ref().unwrap())?;
         cx.emit(Op::EndFinally, vec![], span);
@@ -85,12 +94,14 @@ pub(crate) fn compile_try_statement(
 
     if has_catch {
         let handler_pc = cx.emit_enter_try(0, NO_HANDLER_OFFSET, exc_reg, span);
+        cx.active_handlers += 1;
         cx.enter_scope();
         for inner_stmt in &s.block.body {
             compile_statement(cx, inner_stmt)?;
         }
         cx.exit_scope();
         cx.emit(Op::LeaveTry, vec![], span);
+        cx.active_handlers -= 1;
         let skip_catch = cx.emit_branch_placeholder(Op::Jump, None, span);
 
         cx.patch_enter_try_offset(handler_pc, true);
@@ -102,12 +113,16 @@ pub(crate) fn compile_try_statement(
 
     // try / finally only.
     let handler_pc = cx.emit_enter_try(NO_HANDLER_OFFSET, 0, exc_reg, span);
+    cx.active_handlers += 1;
+    cx.active_finally += 1;
     cx.enter_scope();
     for inner_stmt in &s.block.body {
         compile_statement(cx, inner_stmt)?;
     }
     cx.exit_scope();
     cx.emit(Op::LeaveTry, vec![], span);
+    cx.active_handlers -= 1;
+    cx.active_finally -= 1;
     cx.patch_enter_try_offset(handler_pc, false);
     compile_finalizer(cx, s.finalizer.as_ref().unwrap())?;
     cx.emit(Op::EndFinally, vec![], span);

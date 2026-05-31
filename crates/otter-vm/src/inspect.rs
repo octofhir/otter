@@ -878,6 +878,7 @@ mod tests {
         Op::LoadSuperElement,
         Op::SetSuperProperty,
         Op::SetSuperElement,
+        Op::JumpViaFinally,
         Op::MakeClass,
         Op::MathLoad,
         Op::CollectRest,

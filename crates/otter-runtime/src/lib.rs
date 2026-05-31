@@ -4153,6 +4153,44 @@ mod tests {
     }
 
     #[test]
+    fn string_unicode_case_mapping() {
+        let otter = Otter::new();
+        otter
+            .blocking_run_typescript(
+                r#"
+                function eq(a, b, m) { if (a !== b) throw new Error(m + ": " + JSON.stringify(a)); }
+                eq("Éab".toLowerCase(), "éab", "latin-1");
+                eq("ß".toUpperCase(), "SS", "sharp-s-upper");
+                eq("İ".toLowerCase(), "i̇", "dotted-I");
+                eq("𐐀".toLowerCase(), "𐐨", "supplementary-deseret");
+                // Final Sigma: cased before, end-of-word -> final form.
+                eq("AΣ".toLowerCase(), "aς", "final-sigma");
+                eq("ΣA".toLowerCase(), "σa", "non-final-sigma");
+                // toLocale* default to the locale-insensitive mapping.
+                eq("ABC".toLocaleLowerCase(), "abc", "locale-lower");
+                "#,
+            )
+            .expect("Unicode case mapping");
+    }
+
+    #[test]
+    fn eval_directive_prologue_completion_value() {
+        let otter = Otter::new();
+        otter
+            .blocking_run_typescript(
+                r#"
+                function eq(a, b, m) { if (a !== b) throw new Error(m + ": " + JSON.stringify(a)); }
+                // A directive-prologue string is an expression statement;
+                // its value is the eval completion value.
+                eq(eval('"hello"'), "hello", "bare-directive");
+                eq(eval('"use strict"'), "use strict", "use-strict-value");
+                eq(eval('"a"; 1'), 1, "directive-then-stmt");
+                "#,
+            )
+            .expect("eval directive completion value");
+    }
+
+    #[test]
     fn regexp_subclass_overrides_and_super_computed_call() {
         let otter = Otter::new();
         otter

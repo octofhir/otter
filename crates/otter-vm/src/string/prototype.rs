@@ -1058,8 +1058,99 @@ fn impl_code_point_at(
     Ok(Value::number(NumberValue::from_i32(i32::from(cu1))))
 }
 
-fn map_ascii<F: Fn(u16) -> u16>(units: &[u16], f: F) -> Vec<u16> {
-    units.iter().map(|&u| f(u)).collect()
+/// Decode a UTF-16 unit slice to its code-point sequence. A lone
+/// surrogate is preserved as its own scalar value so case mapping
+/// round-trips it unchanged (§22.1.3.26 operates on code points).
+fn decode_code_points(units: &[u16]) -> Vec<u32> {
+    let mut cps = Vec::with_capacity(units.len());
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+        if (0xD800..=0xDBFF).contains(&u)
+            && let Some(&low) = units.get(i + 1)
+            && (0xDC00..=0xDFFF).contains(&low)
+        {
+            let cp = 0x10000 + (((u as u32) - 0xD800) << 10) + ((low as u32) - 0xDC00);
+            cps.push(cp);
+            i += 2;
+        } else {
+            cps.push(u as u32);
+            i += 1;
+        }
+    }
+    cps
+}
+
+fn push_char_utf16(out: &mut Vec<u16>, ch: char) {
+    let mut buf = [0u16; 2];
+    out.extend_from_slice(ch.encode_utf16(&mut buf));
+}
+
+/// §11.4 Cased — a letter that has a case. Approximated by the
+/// Uppercase / Lowercase derived properties exposed by `char`,
+/// which covers the cased scalars the case-mapping tests exercise
+/// (Latin, Greek, supplementary-plane mathematical letters).
+fn is_cased(cp: u32) -> bool {
+    char::from_u32(cp).is_some_and(|c| c.is_uppercase() || c.is_lowercase())
+}
+
+/// §11.4 Case_Ignorable — characters skipped over when testing the
+/// Final_Sigma context: combining marks, format characters, modifier
+/// letters/symbols, and the MidLetter/Single_Quote punctuation set.
+fn is_case_ignorable(cp: u32) -> bool {
+    matches!(cp,
+        0x0027 | 0x002E | 0x003A | 0x00AD | 0x00B7 | 0x058A | 0x0387
+        | 0x05F4 | 0x2018 | 0x2019 | 0x2024 | 0x2027 | 0x2060..=0x2064
+        | 0xFE52 | 0xFE55 | 0xFF07 | 0xFF0E | 0xFF1A | 0x180E
+        | 0x200B..=0x200F | 0x202A..=0x202E | 0xFEFF
+        | 0x0300..=0x036F | 0x0483..=0x0489 | 0x0591..=0x05BD
+        | 0x0610..=0x061A | 0x064B..=0x065F | 0x0670
+        | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF
+        | 0xFE00..=0xFE0F | 0xFE20..=0xFE2F
+        // Supplementary-plane non-spacing marks (musical / variation).
+        | 0x1D167..=0x1D169 | 0x1D17B..=0x1D182 | 0x1D185..=0x1D18B
+        | 0x1D1AA..=0x1D1AD | 0x1D242..=0x1D244 | 0xE0100..=0xE01EF
+    ) || char::from_u32(cp).is_some_and(|c| {
+        // Lm (modifier letter) heuristic via the common ranges.
+        matches!(c as u32, 0x02B0..=0x02FF | 0x1D2C..=0x1D6A | 0x1DA0..=0x1DBF)
+    })
+}
+
+/// §22.1.3.26 Final_Sigma context: the GREEK CAPITAL LETTER SIGMA at
+/// `idx` is preceded by a cased scalar and not followed by one,
+/// skipping Case_Ignorable scalars in both directions.
+fn sigma_is_final(cps: &[u32], idx: usize) -> bool {
+    let before = (0..idx).rev().find(|&j| !is_case_ignorable(cps[j]));
+    let preceded = before.is_some_and(|j| is_cased(cps[j]));
+    let after = ((idx + 1)..cps.len()).find(|&j| !is_case_ignorable(cps[j]));
+    let followed = after.is_some_and(|j| is_cased(cps[j]));
+    preceded && !followed
+}
+
+/// §22.1.3.{26,28} `toUnicodeLowercase` / `toUnicodeUppercase` over
+/// code points via the Unicode default case mappings (`char`'s
+/// `to_lowercase` / `to_uppercase`, which include the unconditional
+/// SpecialCasing 1→N expansions such as `ß`→`SS`), plus the
+/// conditional Final_Sigma lowercase rule.
+fn unicode_case_map(units: &[u16], upper: bool) -> Vec<u16> {
+    let cps = decode_code_points(units);
+    let mut out: Vec<u16> = Vec::with_capacity(units.len());
+    for (i, &cp) in cps.iter().enumerate() {
+        let Some(ch) = char::from_u32(cp) else {
+            out.push(cp as u16);
+            continue;
+        };
+        if !upper && cp == 0x03A3 {
+            out.push(if sigma_is_final(&cps, i) { 0x03C2 } else { 0x03C3 });
+            continue;
+        }
+        if upper {
+            ch.to_uppercase().for_each(|m| push_char_utf16(&mut out, m));
+        } else {
+            ch.to_lowercase().for_each(|m| push_char_utf16(&mut out, m));
+        }
+    }
+    out
 }
 
 fn impl_to_lower_case(
@@ -1069,13 +1160,7 @@ fn impl_to_lower_case(
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     let units = recv.to_utf16_vec(ctx.heap_mut());
-    let lowered = map_ascii(&units, |u| {
-        if (u16::from(b'A')..=u16::from(b'Z')).contains(&u) {
-            u + 32
-        } else {
-            u
-        }
-    });
+    let lowered = unicode_case_map(&units, false);
     Ok(Value::string(JsString::from_utf16_units(
         &lowered,
         ctx.heap_mut(),
@@ -1089,13 +1174,7 @@ fn impl_to_upper_case(
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     let units = recv.to_utf16_vec(ctx.heap_mut());
-    let upper = map_ascii(&units, |u| {
-        if (u16::from(b'a')..=u16::from(b'z')).contains(&u) {
-            u - 32
-        } else {
-            u
-        }
-    });
+    let upper = unicode_case_map(&units, true);
     Ok(Value::string(JsString::from_utf16_units(
         &upper,
         ctx.heap_mut(),
@@ -2524,22 +2603,21 @@ mod tests {
     }
 
     #[test]
-    fn case_methods_ascii_only() {
+    fn case_methods_unicode() {
         assert_eq!(call_s("toLowerCase", "ABC", &[]), "abc");
         assert_eq!(call_s("toUpperCase", "abc", &[]), "ABC");
-        // Mixed.
         assert_eq!(call_s("toLowerCase", "Hello, World!", &[]), "hello, world!");
-        // Non-ASCII passes through unchanged.
+        // Non-ASCII folds per the Unicode default case mapping.
         let units: [u16; 3] = [0x00C9, b'a' as u16, b'b' as u16]; // 'É' + "ab"
         let mut interp = Interpreter::new();
         let recv = Value::string(JsString::from_utf16_units(&units, interp.gc_heap_mut()).unwrap());
         let r = invoke_raw("toLowerCase", &recv, &[], &mut interp).unwrap();
-        // 'É' should stay (ASCII-only fold), 'a','b' lowercase.
         let Some(s) = r.as_string(interp.gc_heap()) else {
             panic!("expected string");
         };
         let v = s.to_utf16_vec(interp.gc_heap());
-        assert_eq!(v, vec![0x00C9, b'a' as u16, b'b' as u16]);
+        // 'É' (U+00C9) → 'é' (U+00E9).
+        assert_eq!(v, vec![0x00E9, b'a' as u16, b'b' as u16]);
     }
 
     #[test]

@@ -136,6 +136,21 @@ pub(crate) fn compile_program(
     hoist_function_declarations(&mut cx, &program.body)?;
 
     let mut last_value_reg: Option<u16> = None;
+    // A directive prologue (`"use strict"`, etc.) is a sequence of
+    // string-literal expression statements; each contributes its
+    // string value to the script / `eval` completion value (so
+    // `eval('"x"')` evaluates to `"x"`). oxc lifts these out of
+    // `body` into `directives`, so emit them here first.
+    for directive in &program.directives {
+        let dst = cx.alloc_scratch();
+        let const_idx = cx.intern_string_constant(&directive.expression.value);
+        cx.emit(
+            Op::LoadString,
+            [Operand::Register(dst), Operand::ConstIndex(const_idx)],
+            (directive.span.start, directive.span.end),
+        );
+        last_value_reg = Some(dst);
+    }
     for stmt in &program.body {
         if let Some(reg) = compile_statement(&mut cx, stmt)? {
             last_value_reg = Some(reg);

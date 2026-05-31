@@ -2047,3 +2047,21 @@ Delta: +96 passing tests. `replace` 100%, `split` 96.7%. Remaining are
 the Unicode case-mapping cluster (`toLowerCase`/`toUpperCase`/locale,
 needs ICU), `normalize`, and a class computed-symbol-method `[[Get]]`
 gap blocking RegExp-subclass `@@replace` overrides.
+
+### String case mapping + eval directive completion
+
+`toLowerCase` / `toUpperCase` / `toLocaleLowerCase` / `toLocaleUpperCase`
+now apply the Unicode default case mappings over code points (BMP +
+supplementary, unconditional SpecialCasing 1→N such as `ß`→`SS`, plus
+the conditional Final_Sigma lowercase rule) instead of an ASCII-only
+fold. Separately, a directive-prologue string (`eval('"x"')`) now
+contributes its value to the script / `eval` completion value.
+
+| subset | before | after |
+|---|---:|---:|
+| `String/prototype/toLowerCase` | 25/30 | 29/30 |
+| `String/prototype/toUpperCase` | 23/26 | 25/26 |
+| `String/prototype` (cumulative) | 1018 | 1135 |
+
+Remaining `toLowerCase`/`toUpperCase` failure is the unrelated
+`eval('"BJ"')`-style A1_T3 cases (other eval-code gaps deferred).

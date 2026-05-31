@@ -2164,19 +2164,30 @@ Fixes landed this slice:
   `for ({ fn = function(){} } of …)` names the default after the bound
   identifier (§13.15.5.5).
 
+Plus a second pass of early-error rules:
+
+- function-declaration iteration body (`for(…) function f(){}`,
+  labelled too) is a SyntaxError in both modes (§13.7.x.1);
+- `let` is not a valid `let`/`const` BoundName (§13.3.1.1);
+- a `for`-head lexical binding may not collide with a body `var`
+  (§14.7.5.1);
+- `eval`/`arguments` are invalid strict assignment targets in
+  destructuring / `for`-head positions (§12.7.1).
+
 After:
 
 | total | passed | failed | skipped | pass rate |
 |---:|---:|---:|---:|---:|
-| 752 | 681 | 56 | 15 | 92.40% |
+| 752 | 693 | 44 | 15 | 94.03% |
 
-Delta: +35 passing tests.
+Delta: +47 passing tests.
 
 Remaining failures (deferred — each a distinct subsystem): `finally`
 not running on `return`/`break` abrupt completion (blocks
-generator-close and throw-based IteratorClose, ~15), parser early
-errors (`for (let let …)`, labelled function declarations, ~12),
-throw-unwind IteratorClose during destructuring (~10), class `name`
-own-property + `var C = class{}` NamedEvaluation (3), `break`-carries-V
-completion (`*-abrupt-empty`, ~4), global-scope `let` TDZ through a
-closure (~7), and fresh-per-iteration `let` bindings (2).
+generator-close and throw-based IteratorClose, ~10), throw-unwind
+IteratorClose during destructuring (~10, needs handler-scoped close +
+re-entrant `return()` outside the unwind), fresh-per-iteration `let`
+bindings + head/RHS scope separation (~7), class `name` own-property +
+`var C = class{}` NamedEvaluation (3), `break`-carries-V completion
+(`*-abrupt-empty`, ~4), IteratorRecord `[[NextMethod]]` caching (proxy
+/ next-reference, 2-3), and global-scope `let` TDZ through a closure.

@@ -35,8 +35,8 @@ use oxc_ast::ast::{
     IdentifierReference, IfStatement, LabeledStatement, MethodDefinition, MethodDefinitionKind,
     NumericLiteral, ObjectProperty, Program, PropertyDefinition, PropertyKey, PropertyKind,
     SimpleAssignmentTarget, Statement, StaticBlock, StringLiteral, Super, SwitchStatement,
-    UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclarationKind,
-    WhileStatement, YieldExpression,
+    UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclaration,
+    VariableDeclarationKind, WhileStatement, YieldExpression,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_span::Span;
@@ -328,6 +328,51 @@ impl StrictValidator {
     /// body of an *iteration* statement. Per §13.7.x.1 this is a Syntax
     /// Error in both strict and sloppy modes — unlike the `IfStatement`
     /// arm, Annex B does not relax it for iteration statements.
+    /// §14.7.5.1 ForIn/OfHeadEvaluation early error — when the head
+    /// declares `let`/`const` bindings, it is a Syntax Error if any of
+    /// their BoundNames also appears in the VarDeclaredNames of the
+    /// loop body (e.g. `for (let x of []) { var x; }`).
+    fn flag_for_head_lexical_var_conflict(
+        &mut self,
+        left: &ForStatementLeft<'_>,
+        body: &Statement<'_>,
+        context_label: &str,
+    ) {
+        let ForStatementLeft::VariableDeclaration(decl) = left else {
+            return;
+        };
+        if !matches!(
+            decl.kind,
+            VariableDeclarationKind::Let | VariableDeclarationKind::Const
+        ) {
+            return;
+        }
+        let mut lex_names: Vec<&str> = Vec::new();
+        for declarator in &decl.declarations {
+            for_each_bound_identifier(&declarator.id, &mut |name, _| lex_names.push(name));
+        }
+        if lex_names.is_empty() {
+            return;
+        }
+        let mut conflicts: Vec<(String, oxc_span::Span)> = Vec::new();
+        collect_var_decl_names_in_stmt(body, &mut |name, span| {
+            if lex_names.contains(&name) {
+                conflicts.push((name.to_string(), span));
+            }
+        });
+        for (name, span) in conflicts {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "FOR_HEAD_LEXICAL_VAR_CONFLICT".to_string(),
+                message: format!(
+                    "SyntaxError: `{name}` is declared both as a `{context_label}` lexical \
+                     binding and as a `var` in the loop body (§14.7.5.1)"
+                ),
+                range: Some((span.start, span.end)),
+                help: Some(format!("rename one of the two `{name}` declarations")),
+            });
+        }
+    }
+
     fn flag_iteration_function_body(&mut self, body: &Statement<'_>, context_label: &str) {
         let Some(span) = labelled_function_body_span(body) else {
             return;
@@ -1013,6 +1058,7 @@ impl<'a> Visit<'a> for StrictValidator {
 
     fn visit_for_in_statement(&mut self, it: &ForInStatement<'a>) {
         self.flag_iteration_function_body(&it.body, "for-in");
+        self.flag_for_head_lexical_var_conflict(&it.left, &it.body, "for-in");
         // §13.7.5.1 ForIn/OfHeadEvaluation early error: ForBinding
         // declarators in a `for-in` head must not carry an
         // Initializer. Annex B §B.3.5 relaxes this for `for (var x =
@@ -1025,6 +1071,7 @@ impl<'a> Visit<'a> for StrictValidator {
 
     fn visit_for_of_statement(&mut self, it: &ForOfStatement<'a>) {
         self.flag_iteration_function_body(&it.body, "for-of");
+        self.flag_for_head_lexical_var_conflict(&it.left, &it.body, "for-of");
         // §13.7.5.1 — `for-of` heads never permit Initializer on
         // any variant of ForBinding, regardless of strict mode.
         self.flag_for_head_initializer(&it.left, "for-of");
@@ -1080,6 +1127,37 @@ impl<'a> Visit<'a> for StrictValidator {
                 });
             }
         }
+    }
+
+    fn visit_variable_declaration(&mut self, it: &VariableDeclaration<'a>) {
+        // §13.3.1.1 LexicalDeclaration early error — `let` is not a
+        // legal BoundName of a `let` / `const` declaration in any mode
+        // (`var let` stays legal in sloppy code).
+        if matches!(
+            it.kind,
+            VariableDeclarationKind::Let | VariableDeclarationKind::Const
+        ) {
+            let mut offenders: Vec<oxc_span::Span> = Vec::new();
+            for declarator in &it.declarations {
+                for_each_bound_identifier(&declarator.id, &mut |name, span| {
+                    if name == "let" {
+                        offenders.push(span);
+                    }
+                });
+            }
+            for span in offenders {
+                self.diagnostics.push(SyntaxDiagnostic {
+                    code: "LEXICAL_BINDING_NAMED_LET".to_string(),
+                    message: "SyntaxError: `let` is not a valid name for a `let` / `const` \
+                              binding (§13.3.1.1)"
+                        .to_string(),
+                    range: Some((span.start, span.end)),
+                    help: Some("rename the binding; `let` is reserved as a lexical binding name"
+                        .to_string()),
+                });
+            }
+        }
+        walk::walk_variable_declaration(self, it);
     }
 
     fn visit_binding_identifier(&mut self, it: &BindingIdentifier<'a>) {

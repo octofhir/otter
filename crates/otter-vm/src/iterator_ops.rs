@@ -107,49 +107,22 @@ impl Interpreter {
             IteratorState::String { string, index: 0 }
         } else if let Some(m) = value.as_map() {
             // `for…of` over a `Map` yields `[key, value]` pairs (Spec
-            // §24.1.3.12 — `@@iterator` aliases `entries`); over a `Set`
-            // yields values (Spec §24.2.3.11). Snapshot at iteration start by
-            // building a synthetic backing array.
-            let entries = crate::collections::map_entries(m, &self.gc_heap);
-            let entries_len = entries.len();
-            let mut entry_values: Vec<Value> = Vec::with_capacity(entries_len * 2);
-            for (k, v) in entries {
-                entry_values.push(k);
-                entry_values.push(v);
-            }
-            let mut snap: SmallVec<[Value; 4]> = SmallVec::with_capacity(entries_len);
-            for pair in entry_values.chunks_exact(2) {
-                let pair_array = self.alloc_stack_rooted_array_from_values_with_root_slices(
-                    stack,
-                    pair.iter().cloned(),
-                    &[&value],
-                    &[entry_values.as_slice(), snap.as_slice()],
-                )?;
-                snap.push(Value::array(pair_array));
-            }
-            IteratorState::Array {
-                array: self.alloc_stack_rooted_array_from_values_with_root_slices(
-                    stack,
-                    snap.iter().cloned(),
-                    &[&value],
-                    &[entry_values.as_slice(), snap.as_slice()],
-                )?,
+            // §24.1.3.12 — `@@iterator` aliases `entries`). A live
+            // `MapCollection` iterator walks the backing entry table by
+            // index so additions / deletions during iteration are
+            // observed per §24.1.5.1 CreateMapIterator.
+            IteratorState::MapCollection {
+                map: m,
                 index: 0,
-                origin: crate::BuiltinIteratorOrigin::Map,
+                kind: crate::MapIteratorKind::Entry,
             }
         } else if let Some(s) = value.as_set() {
-            let snap: SmallVec<[Value; 4]> = crate::collections::set_values(s, &self.gc_heap)
-                .into_iter()
-                .collect();
-            IteratorState::Array {
-                array: self.alloc_stack_rooted_array_from_values(
-                    stack,
-                    snap.iter().cloned(),
-                    &[&value],
-                    snap.as_slice(),
-                )?,
+            // §24.2.3.11 — `for…of` over a `Set` yields values via a
+            // live `SetCollection` iterator (§24.2.5.1).
+            IteratorState::SetCollection {
+                set: s,
                 index: 0,
-                origin: crate::BuiltinIteratorOrigin::Set,
+                kind: crate::SetIteratorKind::Value,
             }
         } else if let Some(handle) = value.as_generator() {
             // §27.5 — generator objects are iterable; `[@@iterator]()` returns

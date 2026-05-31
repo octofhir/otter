@@ -2124,3 +2124,59 @@ Remaining failures (deferred): `super` inside `eval` within a method
 (4, eval-code cluster), spread-argument iterator-getter error
 propagation (2, shared with the for-of iterator path), and dynamic
 `GetSuperConstructor` reading the constructor's current prototype (1).
+
+### language/statements/for-of (iterator protocol, completion, IteratorClose)
+
+Command:
+
+```sh
+cargo run -p otter-test262 --bin otter-test262 -- run \
+  --filter language/statements/for-of \
+  --timeout 5000 \
+  --output test262_results/for-of.json
+```
+
+Before:
+
+| total | passed | failed | skipped | pass rate |
+|---:|---:|---:|---:|---:|
+| 752 | 646 | 91 | 15 | 87.65% |
+
+Fixes landed this slice:
+
+- **Live TypedArray `for…of`** (`Op` GetIterator path + new live
+  `IteratorState::TypedArray`): `for (x of int8arr)` no longer throws a
+  type mismatch, and reads `ta[index]` per step so mutations and buffer
+  detachment are observed (§23.2.5.1). `values`/`keys`/`entries` build
+  the live iterator and keep `%ArrayIteratorPrototype%`.
+- **Live Map / Set `for…of`**: build the live
+  `IteratorState::MapCollection` / `SetCollection` instead of an Array
+  snapshot, so additions/deletions during iteration are observed
+  (§24.1.5.1 / §24.2.5.1).
+- **Statement completion values**: `if` / `while` / `do-while` / `for`
+  / `for-of` now maintain and return the running completion value `V`
+  (§13/§14 Runtime Semantics) instead of discarding it.
+- **IteratorClose on abrupt completion**: `break`, labelled `continue`,
+  and `return` out of a `for…of` now run §7.4.9 IteratorClose for each
+  crossed loop; closing a generator iterator resumes it with a return
+  completion.
+- **NamedEvaluation in destructuring-assignment defaults**:
+  `for ({ fn = function(){} } of …)` names the default after the bound
+  identifier (§13.15.5.5).
+
+After:
+
+| total | passed | failed | skipped | pass rate |
+|---:|---:|---:|---:|---:|
+| 752 | 681 | 56 | 15 | 92.40% |
+
+Delta: +35 passing tests.
+
+Remaining failures (deferred — each a distinct subsystem): `finally`
+not running on `return`/`break` abrupt completion (blocks
+generator-close and throw-based IteratorClose, ~15), parser early
+errors (`for (let let …)`, labelled function declarations, ~12),
+throw-unwind IteratorClose during destructuring (~10), class `name`
+own-property + `var C = class{}` NamedEvaluation (3), `break`-carries-V
+completion (`*-abrupt-empty`, ~4), global-scope `let` TDZ through a
+closure (~7), and fresh-per-iteration `let` bindings (2).

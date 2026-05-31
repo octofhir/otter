@@ -654,6 +654,21 @@ pub enum Op {
     ///   time so this is the only dynamic-import path the runtime
     ///   needs to support today.
     ImportNamespace,
+    /// Resolve the *deferred* namespace object for a module imported
+    /// via `import defer * as ns from "x"` and write it to `r<dst>`.
+    /// Operands: `Register(dst), ConstIndex(specifier)`. Unlike
+    /// [`Op::ImportNamespace`], the target module's body is **not**
+    /// evaluated here; the returned exotic object triggers evaluation
+    /// on first access (TC39 import defer).
+    ImportNamespaceDeferred,
+    /// Evaluate the module with the canonical URL in the constant
+    /// operand (and its not-yet-evaluated, non-deferred dependency
+    /// closure, in post-order). Idempotent: a module whose body has
+    /// already run is skipped. Operand: `ConstIndex(url)`. Emitted by
+    /// the synthesised `<entry>` driver in place of an inline
+    /// module-init call so eager evaluation and deferred force-eval
+    /// share one guarded primitive.
+    EvaluateModule,
     /// Wrap the value in `r<src>` as a fulfilled `Promise` and
     /// write to `r<dst>`. Operands:
     /// `Register(dst), Register(src)`.
@@ -1067,6 +1082,8 @@ impl Op {
             Op::ArrayLength => "ARRAY_LENGTH",
             Op::Instanceof => "INSTANCEOF",
             Op::ImportNamespace => "IMPORT_NAMESPACE",
+            Op::ImportNamespaceDeferred => "IMPORT_NAMESPACE_DEFERRED",
+            Op::EvaluateModule => "EVALUATE_MODULE",
             Op::PromiseFulfilledOf => "PROMISE_FULFILLED_OF",
             Op::Await => "AWAIT",
             Op::SymbolLoad => "SYMBOL_LOAD",
@@ -1138,6 +1155,7 @@ impl Op {
             | Op::IteratorCloseEnd
             | Op::CollectArguments
             | Op::FreshUpvalue
+            | Op::EvaluateModule
             | Op::LoadGlobalThis => 1,
             Op::LoadString
             | Op::LoadNumber
@@ -1161,6 +1179,7 @@ impl Op {
             | Op::MathLoad
             | Op::Await
             | Op::ImportNamespace
+            | Op::ImportNamespaceDeferred
             | Op::ImportNamespaceDynamic
             | Op::ImportMetaResolve
             | Op::Eval
@@ -1293,6 +1312,7 @@ impl Op {
             | Op::MakeFunction
             | Op::MathLoad
             | Op::ImportNamespace
+            | Op::ImportNamespaceDeferred
             | Op::SymbolLoad
             | Op::TemporalLoad
             | Op::LoadBuiltinError
@@ -1300,6 +1320,8 @@ impl Op {
             | Op::LoadGlobalOrUndefined => pos == 1,
             // [name_const, value_reg]
             Op::DefineGlobalVar => pos == 0,
+            // [url_const]
+            Op::EvaluateModule => pos == 0,
             // [reg, reg, const]
             Op::LoadProperty | Op::DeleteProperty | Op::ToPrimitive => pos == 2,
             // [reg, kind_const, reg]
@@ -1855,6 +1877,12 @@ pub struct ModuleResolution {
     pub specifier: String,
     /// Resolved target module URL.
     pub target: String,
+    /// `true` when this edge is a `import defer * as ns from "x"`
+    /// deferred import. Eager module evaluation does **not** traverse
+    /// deferred edges; the target is evaluated only when its deferred
+    /// namespace is first accessed (TC39 import defer).
+    #[serde(default)]
+    pub deferred: bool,
 }
 
 /// One module's `<module-init>` entry record: `URL → function ID`.

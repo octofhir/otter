@@ -564,6 +564,8 @@ pub const OP_BYTE_TABLE: &[(Op, u8)] = &[
     (Op::SetSuperElement, 0x85),
     (Op::JumpViaFinally, 0x86),
     (Op::FreshUpvalue, 0x87),
+    (Op::ImportNamespaceDeferred, 0x88),
+    (Op::EvaluateModule, 0x89),
 ];
 
 #[cfg(test)]

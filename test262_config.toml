@@ -26,7 +26,8 @@ skip_features = [
     "import-assertions",
     "import-attributes",
     "import-bytes",
-    "import-defer",
+    # import-defer (static `import defer * as`) is implemented; dynamic
+    # `import.defer()` tests stay gated behind the dynamic-import skip.
     "dynamic-import",
     "import.meta",
     "json-modules",
@@ -76,7 +77,6 @@ skip_features = [
     "upsert",
     "uint8array-base64",
     "import-bytes",
-    "import-defer",
 ]
 
 # Test flags to skip. Strictness is controlled by each test's

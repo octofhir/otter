@@ -548,7 +548,7 @@ fn link(nodes: &BTreeMap<String, ModuleNode>, order: &[String], entry_url: &str)
 
     // Synthesise <entry>'s body. Ordering: for each module, build
     // module_env + import_meta, register, then call its <module-init>.
-    let entry_body = build_entry_body(nodes, order, &module_function_offset, &mut constants);
+    let entry_body = build_entry_body(nodes, order, entry_url, &mut constants);
     functions[0].code = entry_body.code;
     functions[0].spans = entry_body.spans;
     functions[0].locals = 0;
@@ -643,117 +643,54 @@ struct EntryBody {
 fn build_entry_body(
     nodes: &BTreeMap<String, ModuleNode>,
     order: &[String],
-    module_function_offset: &HashMap<String, u32>,
+    entry_url: &str,
     constants: &mut Vec<Constant>,
 ) -> EntryBody {
     let mut code: Vec<Instruction> = Vec::new();
     let mut spans: Vec<SpanEntry> = Vec::new();
     let mut next_pc: u32 = 0;
-    let mut next_reg: u16 = 0;
 
-    let url_name_idx = intern_string_const(constants, "url");
-
-    for url in order {
-        let Some(_node) = nodes.get(url) else {
+    // Eagerly-reachable module set: BFS from the entry module over
+    // non-deferred resolution edges. Modules reachable only through
+    // `import defer` edges are evaluated lazily on first namespace
+    // access (TC39 import defer), so the eager driver skips them.
+    let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
+    for node in nodes.values() {
+        for edge in &node.fragment.module_resolutions {
+            if !edge.deferred {
+                adjacency
+                    .entry(edge.referrer.as_str())
+                    .or_default()
+                    .push(edge.target.as_str());
+            }
+        }
+    }
+    let mut reachable: HashSet<&str> = HashSet::new();
+    let mut work = vec![entry_url];
+    while let Some(url) = work.pop() {
+        if !reachable.insert(url) {
             continue;
-        };
-        let init_fn_id = match module_function_offset.get(url) {
-            Some(&id) => id,
-            None => continue,
-        };
+        }
+        if let Some(deps) = adjacency.get(url) {
+            work.extend(deps.iter().copied());
+        }
+    }
 
-        // r_env: the module's env JsObject (resolved via the
-        // pre-populated registry against the <entry> referrer
-        // through the self-loop module_resolutions edge).
-        let r_env = next_reg;
-        next_reg += 1;
+    // Emit one EvaluateModule per eagerly-reachable module in
+    // topological post-order. The VM primitive is idempotent and
+    // recurses into each module's non-deferred dependency closure;
+    // iterating `order` preserves the established evaluation order.
+    for url in order {
+        if !reachable.contains(url.as_str()) {
+            continue;
+        }
         let url_const_idx = intern_string_const(constants, url);
         emit_op(
             &mut code,
             &mut spans,
             &mut next_pc,
-            Op::ImportNamespace,
-            [Operand::Register(r_env), Operand::ConstIndex(url_const_idx)],
-        );
-
-        // r_meta = new JsObject; r_meta.url = url.
-        let r_meta = next_reg;
-        next_reg += 1;
-        emit_op(
-            &mut code,
-            &mut spans,
-            &mut next_pc,
-            Op::NewObject,
-            [Operand::Register(r_meta)],
-        );
-
-        let r_url_str = next_reg;
-        next_reg += 1;
-        emit_op(
-            &mut code,
-            &mut spans,
-            &mut next_pc,
-            Op::LoadString,
-            [
-                Operand::Register(r_url_str),
-                Operand::ConstIndex(url_const_idx),
-            ],
-        );
-        let r_store_scratch = next_reg;
-        next_reg += 1;
-        emit_op(
-            &mut code,
-            &mut spans,
-            &mut next_pc,
-            Op::StoreProperty,
-            vec![
-                Operand::Register(r_meta),
-                Operand::ConstIndex(url_name_idx),
-                Operand::Register(r_url_str),
-                Operand::Register(r_store_scratch),
-            ],
-        );
-
-        // r_init = MakeFunction k[init_fn_id]
-        let r_init = next_reg;
-        next_reg += 1;
-        let init_const_idx = intern_function_id_const(constants, init_fn_id);
-        emit_op(
-            &mut code,
-            &mut spans,
-            &mut next_pc,
-            Op::MakeFunction,
-            [
-                Operand::Register(r_init),
-                Operand::ConstIndex(init_const_idx),
-            ],
-        );
-
-        // r_dummy = CallWithThis r_init, undefined, [r_env, r_meta]
-        let r_dummy = next_reg;
-        next_reg += 1;
-        let r_undef = next_reg;
-        next_reg += 1;
-        emit_op(
-            &mut code,
-            &mut spans,
-            &mut next_pc,
-            Op::LoadUndefined,
-            [Operand::Register(r_undef)],
-        );
-        emit_op(
-            &mut code,
-            &mut spans,
-            &mut next_pc,
-            Op::CallWithThis,
-            vec![
-                Operand::Register(r_dummy),
-                Operand::Register(r_init),
-                Operand::Register(r_undef),
-                Operand::ConstIndex(2),
-                Operand::Register(r_env),
-                Operand::Register(r_meta),
-            ],
+            Op::EvaluateModule,
+            [Operand::ConstIndex(url_const_idx)],
         );
     }
 
@@ -761,7 +698,7 @@ fn build_entry_body(
     EntryBody {
         code,
         spans,
-        scratch: next_reg,
+        scratch: 0,
     }
 }
 
@@ -792,18 +729,6 @@ fn intern_string_const(constants: &mut Vec<Constant>, s: &str) -> u32 {
         }
     }
     constants.push(Constant::String { utf16: target });
-    (constants.len() - 1) as u32
-}
-
-fn intern_function_id_const(constants: &mut Vec<Constant>, function_id: u32) -> u32 {
-    for (i, c) in constants.iter().enumerate() {
-        if let Constant::FunctionId { index } = c
-            && *index == function_id
-        {
-            return i as u32;
-        }
-    }
-    constants.push(Constant::FunctionId { index: function_id });
     (constants.len() - 1) as u32
 }
 

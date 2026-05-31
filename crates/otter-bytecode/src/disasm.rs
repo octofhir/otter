@@ -262,6 +262,8 @@ mod tests {
             Op::ImportMetaResolve,
             Op::ImportNamespaceDynamic,
             Op::ImportNamespace,
+            Op::ImportNamespaceDeferred,
+            Op::EvaluateModule,
             Op::PromiseFulfilledOf,
             Op::NewIntl,
             Op::TemporalLoad,
@@ -313,6 +315,7 @@ mod tests {
             | Op::CollectArguments
             | Op::BindThisValue
             | Op::LoadGlobalThis => vec![reg(0)],
+            Op::EvaluateModule => vec![konst(0)],
             Op::Jump | Op::TdzError | Op::FreshUpvalue => vec![imm(-1)],
             Op::JumpViaFinally => vec![imm(-1), imm(1)],
             Op::LoadString
@@ -329,6 +332,7 @@ mod tests {
             | Op::MakeFunction
             | Op::MathLoad
             | Op::ImportNamespace
+            | Op::ImportNamespaceDeferred
             | Op::PromiseFulfilledOf
             | Op::NewWeakRef
             | Op::NewFinalizationRegistry

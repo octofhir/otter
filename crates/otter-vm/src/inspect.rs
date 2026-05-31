@@ -906,6 +906,8 @@ mod tests {
         Op::ImportMetaResolve,
         Op::ImportNamespaceDynamic,
         Op::ImportNamespace,
+        Op::ImportNamespaceDeferred,
+        Op::EvaluateModule,
         Op::PromiseFulfilledOf,
         Op::NewIntl,
         Op::TemporalLoad,

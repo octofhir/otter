@@ -1474,6 +1474,60 @@ where
     })
 }
 
+/// Side data marking a *deferred* module namespace exotic object
+/// (TC39 import defer). The object carries `@@toStringTag` from
+/// creation; its export data properties are installed lazily by
+/// "populating" it the first time a triggering access evaluates the
+/// wrapped module identified by `target_url`.
+#[derive(Debug)]
+pub(crate) struct DeferredNamespaceData {
+    pub(crate) target_url: std::sync::Arc<str>,
+    /// `true` once the module has been evaluated and export properties
+    /// installed; the object then behaves as an ordinary frozen-shaped
+    /// namespace.
+    pub(crate) populated: std::cell::Cell<bool>,
+}
+
+/// Target module URL when `obj` is a deferred module namespace, else
+/// `None`.
+#[must_use]
+pub(crate) fn deferred_namespace_target(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+) -> Option<std::sync::Arc<str>> {
+    heap.read_payload(obj, |body| {
+        body.host_data
+            .as_ref()
+            .and_then(|d| d.downcast_ref::<DeferredNamespaceData>())
+            .map(|d| d.target_url.clone())
+    })
+}
+
+/// `true` when `obj` is a deferred namespace whose module has been
+/// evaluated and export properties installed.
+#[must_use]
+pub(crate) fn deferred_namespace_is_populated(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
+    heap.read_payload(obj, |body| {
+        body.host_data
+            .as_ref()
+            .and_then(|d| d.downcast_ref::<DeferredNamespaceData>())
+            .is_some_and(|d| d.populated.get())
+    })
+}
+
+/// Mark a deferred namespace as populated.
+pub(crate) fn set_deferred_namespace_populated(obj: JsObject, heap: &otter_gc::GcHeap) {
+    heap.read_payload(obj, |body| {
+        if let Some(d) = body
+            .host_data
+            .as_ref()
+            .and_then(|d| d.downcast_ref::<DeferredNamespaceData>())
+        {
+            d.populated.set(true);
+        }
+    });
+}
+
 /// Borrow the GC-managed hidden class, if installed.
 #[must_use]
 pub(crate) fn shape(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeHandle {

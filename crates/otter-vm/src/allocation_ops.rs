@@ -125,6 +125,49 @@ impl Interpreter {
         )
     }
 
+    /// Allocate a deferred module namespace exotic object (TC39 import
+    /// defer): a null-proto object tagged with the target module URL and
+    /// carrying `@@toStringTag` = "Module". It stays extensible until the
+    /// module is evaluated and export properties are installed, after
+    /// which it is made non-extensible.
+    pub(crate) fn alloc_deferred_namespace_object(
+        &mut self,
+        target_url: std::sync::Arc<str>,
+    ) -> Result<crate::object::JsObject, otter_gc::OutOfMemory> {
+        let roots = self.collect_runtime_roots();
+        let shape_root = self.shape_root();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+        };
+        let obj = crate::object::alloc_host_object_with_shape_roots(
+            &mut self.gc_heap,
+            shape_root,
+            crate::object::DeferredNamespaceData {
+                target_url,
+                populated: std::cell::Cell::new(false),
+            },
+            &mut external_visit,
+        )?;
+        let tag_sym = self
+            .well_known_symbols
+            .get(crate::symbol::WellKnown::ToStringTag);
+        let module_str = crate::JsString::from_str("Deferred Module", &mut self.gc_heap)?;
+        crate::object::define_own_symbol_property(
+            obj,
+            &mut self.gc_heap,
+            tag_sym,
+            crate::object::PropertyDescriptor::data(
+                crate::Value::string(module_str),
+                false,
+                false,
+                false,
+            ),
+        );
+        Ok(obj)
+    }
+
     pub(crate) fn alloc_runtime_rooted_object_with_proto(
         &mut self,
         proto: crate::object::JsObject,

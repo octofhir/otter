@@ -230,6 +230,30 @@ impl ExecutionContext {
             .find(|r| r.referrer == referrer && r.specifier == specifier)
             .map(|r| r.target.as_str())
     }
+
+    /// Function id of a module's `<module-init>` by canonical URL.
+    #[must_use]
+    pub fn module_init_function_id(&self, url: &str) -> Option<u32> {
+        self.module
+            .module_inits
+            .iter()
+            .find(|m| m.url == url)
+            .map(|m| m.function_id)
+    }
+
+    /// Canonical URLs of a module's non-deferred dependency targets.
+    /// Self-loop edges (`specifier == target`, added by the runtime so
+    /// `<entry>` can resolve envs) and deferred edges are excluded, so
+    /// the result is exactly the modules to evaluate before `url`.
+    #[must_use]
+    pub fn eager_dep_targets(&self, url: &str) -> Vec<&str> {
+        self.module
+            .module_resolutions
+            .iter()
+            .filter(|r| r.referrer == url && !r.deferred && r.specifier != r.target)
+            .map(|r| r.target.as_str())
+            .collect()
+    }
 }
 
 #[cfg(test)]

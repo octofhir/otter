@@ -313,18 +313,63 @@ pub fn compile_module_program(
     // Pre-pass: collect import sources + record per-source upvalue
     // slots; collect exported names + import bindings.
     let mut import_sources_in_order: Vec<String> = Vec::new();
+    let mut deferred_sources_in_order: Vec<String> = Vec::new();
     for stmt in &program.body {
         match stmt {
             Statement::ImportDeclaration(decl) if !decl.import_kind.is_type() => {
                 let specifier = decl.source.value.as_str().to_string();
-                if !state.import_records.contains_key(&specifier) {
-                    let uv = top.own_upvalue_count;
-                    top.own_upvalue_count =
-                        top.own_upvalue_count.checked_add(1).expect("uv overflow");
-                    state.import_records.insert(specifier.clone(), uv);
-                    import_sources_in_order.push(specifier.clone());
+                // TC39 import defer — `import defer * as ns from "x"`
+                // defers evaluation until the namespace is accessed.
+                // The grammar permits the namespace form only; named,
+                // default, and bare `import defer "x"` are early
+                // SyntaxErrors.
+                let is_defer_phase = matches!(decl.phase, Some(oxc_ast::ast::ImportPhase::Defer));
+                if is_defer_phase {
+                    let is_namespace_only = decl
+                        .specifiers
+                        .as_ref()
+                        .map(|specs| {
+                            specs.len() == 1
+                                && matches!(
+                                    specs[0],
+                                    oxc_ast::ast::ImportDeclarationSpecifier::ImportNamespaceSpecifier(_)
+                                )
+                        })
+                        .unwrap_or(false);
+                    if !is_namespace_only {
+                        return Err(CompileError::Syntax {
+                            messages: vec![
+                                "SyntaxError: `import defer` may only be used with a namespace import (`import defer * as ns from \"...\"`)"
+                                    .to_string(),
+                            ],
+                            diagnostics: Vec::new(),
+                        });
+                    }
                 }
-                let record_uv = state.import_records[&specifier];
+                // Deferred imports bind to a dedicated cell so they are
+                // not pulled into the eager-evaluation set and stay
+                // distinct from any eager namespace of the same module.
+                let record_uv = if is_defer_phase {
+                    if let Some(&uv) = state.deferred_import_records.get(&specifier) {
+                        uv
+                    } else {
+                        let uv = top.own_upvalue_count;
+                        top.own_upvalue_count =
+                            top.own_upvalue_count.checked_add(1).expect("uv overflow");
+                        state.deferred_import_records.insert(specifier.clone(), uv);
+                        deferred_sources_in_order.push(specifier.clone());
+                        uv
+                    }
+                } else {
+                    if !state.import_records.contains_key(&specifier) {
+                        let uv = top.own_upvalue_count;
+                        top.own_upvalue_count =
+                            top.own_upvalue_count.checked_add(1).expect("uv overflow");
+                        state.import_records.insert(specifier.clone(), uv);
+                        import_sources_in_order.push(specifier.clone());
+                    }
+                    state.import_records[&specifier]
+                };
                 if let Some(specifiers) = &decl.specifiers {
                     for spec in specifiers.iter() {
                         match spec {
@@ -466,14 +511,14 @@ pub fn compile_module_program(
     {
         let env_uv_sb = cx.module_state.as_ref().unwrap().module_env_uv;
         let meta_uv_sb = cx.module_state.as_ref().unwrap().import_meta_uv;
-        let record_uvs: Vec<u16> = cx
-            .module_state
-            .as_ref()
-            .unwrap()
-            .import_records
-            .values()
-            .copied()
-            .collect();
+        let record_uvs: Vec<u16> = {
+            let ms = cx.module_state.as_ref().unwrap();
+            ms.import_records
+                .values()
+                .chain(ms.deferred_import_records.values())
+                .copied()
+                .collect()
+        };
         cx.scopes[0].bindings.insert(
             module_env_synthetic_name(),
             BindingInfo {
@@ -538,6 +583,25 @@ pub fn compile_module_program(
         );
     }
 
+    // For each `import defer` source, emit Op::ImportNamespaceDeferred
+    // (resolves a deferred namespace object without evaluating the
+    // module) then StoreUpvalue into the deferred record cell.
+    for specifier in &deferred_sources_in_order {
+        let record_uv = cx.module_state.as_ref().unwrap().deferred_import_records[specifier];
+        let scratch = cx.alloc_scratch();
+        let spec_const = cx.intern_string_constant(specifier);
+        cx.emit(
+            Op::ImportNamespaceDeferred,
+            [Operand::Register(scratch), Operand::ConstIndex(spec_const)],
+            span0,
+        );
+        cx.emit(
+            Op::StoreUpvalue,
+            [Operand::Register(scratch), Operand::Imm32(record_uv as i32)],
+            span0,
+        );
+    }
+
     // §16.2.1.7 ModuleDeclarationInstantiation step 11 — hoist
     // every `var`-declared name in the module body to the
     // module-init function's variable scope, pre-bound to
@@ -569,6 +633,24 @@ pub fn compile_module_program(
         m.functions[0].code = std::mem::take(&mut cx.code);
         m.functions[0].spans = std::mem::take(&mut cx.spans);
     }
+    // Capture deferred import specifiers before dropping the compiler
+    // so resolution edges can be flagged. A specifier imported both
+    // eagerly and via `import defer` counts as eager for reachability
+    // (the module evaluates eagerly regardless), so it is excluded.
+    let deferred_only_specs: HashSet<String> = {
+        let ms = cx.module_state.as_ref();
+        let eager: HashSet<&String> = ms
+            .map(|s| s.import_records.keys().collect())
+            .unwrap_or_default();
+        ms.map(|s| {
+            s.deferred_import_records
+                .keys()
+                .filter(|k| !eager.contains(*k))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+    };
     drop(cx);
 
     let kind = bytecode_source_kind(source_kind);
@@ -582,7 +664,9 @@ pub fn compile_module_program(
         .into_inner();
 
     // Populate module_resolutions from host info: every specifier
-    // → (referrer, specifier, target) triple.
+    // → (referrer, specifier, target) triple. Edges whose specifier is
+    // imported only via `import defer` are flagged so eager evaluation
+    // skips them.
     let module_resolutions: Vec<otter_bytecode::ModuleResolution> = host
         .resolved_imports
         .iter()
@@ -590,6 +674,7 @@ pub fn compile_module_program(
             referrer: host.module_url.clone(),
             specifier: specifier.clone(),
             target: target.clone(),
+            deferred: deferred_only_specs.contains(specifier),
         })
         .collect();
 

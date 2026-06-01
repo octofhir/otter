@@ -1216,6 +1216,21 @@ impl Interpreter {
                 self.define_own_property_partial(bag, k, descriptor)?
             });
         }
+        if let Some(promise) = target.as_promise() {
+            // Promise instances are ordinary objects whose user-defined
+            // properties (e.g. a shadowing `then` accessor the combinator
+            // resolve path observes) live on a lazily-allocated expando.
+            let bag =
+                crate::property_dispatch::promise_ensure_expando_pub(&mut self.gc_heap, &promise)?;
+            return Ok(if let VmPropertyKey::Symbol(sym) = key {
+                object::define_own_symbol_property_partial(bag, &mut self.gc_heap, *sym, descriptor)
+            } else {
+                let k = key
+                    .string_name()
+                    .expect("non-symbol key has string spelling");
+                self.define_own_property_partial(bag, k, descriptor)?
+            });
+        }
         if let Some(arr) = target.as_array() {
             if let VmPropertyKey::Symbol(sym) = key {
                 let value = descriptor.value.unwrap_or(Value::undefined());

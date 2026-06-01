@@ -1039,6 +1039,25 @@ but driving it through user-written wrappers still hits the
 foundation iterator interception path), and `Symbol.toStringTag`
 on the iterator prototypes.
 
+### §27.2 Promise — `[[DefineOwnProperty]]` on promise instances (2026-06-02)
+
+`built-ins/Promise` 663 → 676 / 677 (100% of non-skipped). The
+accessor-aware `define_own_property_value` path (used whenever an
+execution context is present, i.e. the normal runtime) had branches
+for ordinary objects, functions, classes, regexps, arrays, and typed
+arrays, but not promises — so `Object.defineProperty(aPromise, …)`
+fell through to a blanket failure and threw `TypeError: Cannot
+define property`. Promise instances are ordinary objects whose
+user-defined properties live on a lazily-allocated expando; the path
+now routes them through `promise_ensure_expando_pub` like the
+no-context fast path already did. This unblocked the combinator
+`invoke-then-{get-}error-{close,reject}` tests (which install a
+poisoned `then` accessor on a promise) plus `prototype/then`
+ctor-poisoned / ctor-access-count and `finally/this-value-then-poisoned`.
+Note: the same gap remains for `Map` / `Set` / `WeakMap` / `WeakSet` /
+`ArrayBuffer` / `DataView` / `WeakRef`, which lack any expando store
+(even assignment throws); wiring those is a separate slice.
+
 ### §27.2 Promise — slice 10 (real Promise constructor + statics + prototype)
 
 Command:

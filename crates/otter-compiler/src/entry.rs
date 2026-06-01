@@ -333,6 +333,12 @@ pub fn compile_module_program(
     // (`export … from`) names are resolved elsewhere and excluded.
     let mut tdz_inline: Vec<(String, bool)> = Vec::new();
     let mut local_export_specs: Vec<(String, String)> = Vec::new();
+    // Statically-known re-export names (`export { x } from m`,
+    // `export * as ns from m`) — pre-declared as TDZ holes so the
+    // namespace reports them and an access before the re-export
+    // statement copies the value is a ReferenceError. (Bare `export *`
+    // names are not statically known and are filled by StarReexport.)
+    let mut reexport_tdz: Vec<String> = Vec::new();
     for stmt in &program.body {
         match stmt {
             Statement::ImportDeclaration(decl) if !decl.import_kind.is_type() => {
@@ -510,7 +516,9 @@ pub fn compile_module_program(
                     // local binding onto the env; its slot must be
                     // pre-declared. Re-export specs (`export … from`) are
                     // resolved separately.
-                    if !has_source {
+                    if has_source {
+                        reexport_tdz.push(exported_name);
+                    } else {
                         let local_name = module_export_name_to_str(&spec.local);
                         local_export_specs.push((exported_name, local_name));
                     }
@@ -529,9 +537,9 @@ pub fn compile_module_program(
                     import_sources_in_order.push(specifier);
                 }
                 if let Some(exported) = decl.exported.as_ref() {
-                    state
-                        .exported_names
-                        .insert(module_export_name_to_str(exported));
+                    let name = module_export_name_to_str(exported);
+                    state.exported_names.insert(name.clone());
+                    reexport_tdz.push(name);
                 }
             }
             Statement::ExportDefaultDeclaration(_) => {
@@ -662,6 +670,9 @@ pub fn compile_module_program(
         let mut slots: Vec<(String, bool)> = tdz_inline.clone();
         for (exported, local) in &local_export_specs {
             slots.push((exported.clone(), var_name_set.contains(local)));
+        }
+        for exported in &reexport_tdz {
+            slots.push((exported.clone(), false));
         }
         if !slots.is_empty() {
             let env_uv = cx

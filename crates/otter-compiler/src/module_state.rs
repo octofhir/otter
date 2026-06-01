@@ -64,6 +64,13 @@ pub(crate) struct ModuleState {
     /// `StoreProperty module_env, name, value` after the regular
     /// store so live-binding writes propagate.
     pub(crate) exported_names: HashSet<String>,
+    /// Local binding name → exported names it backs via a renamed local
+    /// re-export (`export { local as exported }`, no `from`). Every
+    /// assignment to `local` re-mirrors each `exported` slot on
+    /// `module_env`, so an aliased export reflects later writes to its
+    /// source binding (live binding, §16.2.1.7) rather than a one-time
+    /// snapshot at the export statement.
+    pub(crate) reexport_local_targets: HashMap<String, Vec<String>>,
     /// Per-specifier resolved target URL — populated by the host
     /// before module compilation begins. The compiler emits the
     /// pre-resolved (referrer, specifier, target) triple into the

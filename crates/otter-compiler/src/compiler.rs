@@ -146,7 +146,18 @@ impl Compiler {
                 .as_ref()
                 .is_some_and(|state| state.exported_names.contains(name))
         });
-        if !exported {
+        // Renamed local re-export targets (`export { name as alias }`)
+        // are mirrored under their *alias* on every write to `name`, so
+        // the aliased export tracks later assignments (live binding).
+        let aliases: Vec<String> = self
+            .stack
+            .iter()
+            .filter_map(|ctx| ctx.module_state.as_ref())
+            .filter_map(|state| state.reexport_local_targets.get(name))
+            .flatten()
+            .cloned()
+            .collect();
+        if !exported && aliases.is_empty() {
             return;
         }
         let env_uv = match self.stack.last().and_then(|ctx| ctx.module_state.as_ref()) {
@@ -162,7 +173,12 @@ impl Compiler {
             [Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
             span,
         );
-        self.emit_store_property(env_reg, name, value_reg, span);
+        if exported {
+            self.emit_store_property(env_reg, name, value_reg, span);
+        }
+        for alias in &aliases {
+            self.emit_store_property(env_reg, alias, value_reg, span);
+        }
     }
 }
 

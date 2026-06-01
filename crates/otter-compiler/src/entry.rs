@@ -508,6 +508,17 @@ pub fn compile_module_program(
                         import_sources_in_order.push(specifier);
                     }
                 }
+                // A re-export whose source resolves to this very module
+                // (`export { x } from "./self"`) is an indirect binding
+                // to our own local `x` — treat it like a local re-export
+                // so it tracks later writes (live binding) rather than
+                // snapshotting at the export statement.
+                let self_source = decl
+                    .source
+                    .as_ref()
+                    .map(|s| s.value.as_str())
+                    .and_then(|spec| host.resolved_imports.get(spec))
+                    .is_some_and(|target| *target == host.module_url);
                 let has_source = decl.source.is_some();
                 for spec in &decl.specifiers {
                     let exported_name = module_export_name_to_str(&spec.exported);
@@ -517,9 +528,25 @@ pub fn compile_module_program(
                     // pre-declared. Re-export specs (`export … from`) are
                     // resolved separately.
                     if has_source {
+                        if self_source {
+                            // imported name === our local binding name.
+                            let local_name = module_export_name_to_str(&spec.local);
+                            state
+                                .reexport_local_targets
+                                .entry(local_name)
+                                .or_default()
+                                .push(exported_name.clone());
+                        }
                         reexport_tdz.push(exported_name);
                     } else {
                         let local_name = module_export_name_to_str(&spec.local);
+                        if local_name != exported_name {
+                            state
+                                .reexport_local_targets
+                                .entry(local_name.clone())
+                                .or_default()
+                                .push(exported_name.clone());
+                        }
                         local_export_specs.push((exported_name, local_name));
                     }
                 }

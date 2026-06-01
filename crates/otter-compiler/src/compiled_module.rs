@@ -90,15 +90,22 @@ pub struct CompiledModuleMetadata {
     pub named_imports: Vec<NamedImport>,
 }
 
-/// A single named import binding request, used by the linker to
-/// validate that the imported name resolves in the target module
-/// (§16.2.1.6 ResolveExport).
+/// A single import binding, used by the linker to validate named
+/// imports (§16.2.1.6 ResolveExport) and to resolve local re-exports
+/// (`export { x }` where `x` is itself imported) through their source.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NamedImport {
     /// Raw source specifier of the importing declaration.
     pub specifier: String,
-    /// Imported export name (`"default"` for a default import).
+    /// Imported export name (`"default"` for a default import, empty
+    /// for a namespace import).
     pub name: String,
+    /// Local binding alias introduced by this import.
+    #[serde(default)]
+    pub local: String,
+    /// `true` for `import * as ns` (binds the module namespace object).
+    #[serde(default)]
+    pub is_namespace: bool,
 }
 
 impl Default for CompiledModuleMetadata {
@@ -297,14 +304,24 @@ impl<'a> Visit<'a> for ModuleMetadataVisitor<'_> {
         if let Some(specifiers) = &decl.specifiers {
             for spec in specifiers {
                 use oxc_ast::ast::ImportDeclarationSpecifier as Spec;
-                let name = match spec {
-                    Spec::ImportSpecifier(s) => module_export_name_to_str(&s.imported),
-                    Spec::ImportDefaultSpecifier(_) => "default".to_string(),
-                    Spec::ImportNamespaceSpecifier(_) => continue,
+                let (name, local, is_namespace) = match spec {
+                    Spec::ImportSpecifier(s) => (
+                        module_export_name_to_str(&s.imported),
+                        s.local.name.as_str().to_string(),
+                        false,
+                    ),
+                    Spec::ImportDefaultSpecifier(s) => {
+                        ("default".to_string(), s.local.name.as_str().to_string(), false)
+                    }
+                    Spec::ImportNamespaceSpecifier(s) => {
+                        (String::new(), s.local.name.as_str().to_string(), true)
+                    }
                 };
                 self.named_imports.push(NamedImport {
                     specifier: specifier.to_string(),
                     name,
+                    local,
+                    is_namespace,
                 });
             }
         }

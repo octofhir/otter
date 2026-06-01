@@ -545,19 +545,58 @@ fn resolve_export(
             continue;
         }
         match (export.local.as_deref(), export.from.as_deref()) {
-            // `export { local as name } from "from"` — indirect.
+            // `export { local as name } from "from"` — indirect named
+            // re-export; resolve through the source module.
             (Some(local), Some(from)) => {
                 result = match resolve_specifier(nodes, url, from) {
                     Some(target) => resolve_export(nodes, target, local, path),
                     None => Resolution::Null,
                 };
             }
-            // Local binding, `export default …`, or `export * as name`
-            // namespace re-export — all terminal resolved bindings.
+            // `export * as name from "from"` — namespace re-export.
+            // §15.2.1.16.3 step 6.a.iii resolves to the *source*
+            // module's namespace binding, so two modules re-exporting
+            // the same namespace match (unambiguous).
+            (None, Some(from)) => {
+                result = match resolve_specifier(nodes, url, from) {
+                    Some(target) => Resolution::Resolved {
+                        module: target.to_string(),
+                        binding: "*namespace*".to_string(),
+                    },
+                    None => Resolution::Null,
+                };
+            }
+            // `export { local }` / `export default …`. If `local` is
+            // itself an imported binding, the export is indirect and
+            // resolves through that import (§16.2.1.7.1 step 10.1.ii);
+            // otherwise it is a terminal local binding.
             _ => {
-                result = Resolution::Resolved {
-                    module: url.to_string(),
-                    binding: export.local.clone().unwrap_or_else(|| name.to_string()),
+                let local_name = export.local.as_deref().unwrap_or(name);
+                let via_import = nodes
+                    .get(url)
+                    .and_then(|node| {
+                        node.metadata
+                            .named_imports
+                            .iter()
+                            .find(|imp| imp.local == local_name)
+                    })
+                    .cloned();
+                result = match via_import {
+                    Some(imp) if imp.is_namespace => match resolve_specifier(nodes, url, &imp.specifier) {
+                        Some(target) => Resolution::Resolved {
+                            module: target.to_string(),
+                            binding: "*namespace*".to_string(),
+                        },
+                        None => Resolution::Null,
+                    },
+                    Some(imp) => match resolve_specifier(nodes, url, &imp.specifier) {
+                        Some(target) => resolve_export(nodes, target, &imp.name, path),
+                        None => Resolution::Null,
+                    },
+                    None => Resolution::Resolved {
+                        module: url.to_string(),
+                        binding: local_name.to_string(),
+                    },
                 };
             }
         }
@@ -612,13 +651,12 @@ fn validate_resolution(nodes: &BTreeMap<String, ModuleNode>) -> Result<(), Graph
             continue;
         }
         for import in &node.metadata.named_imports {
-            check_binding(
-                nodes,
-                url,
-                &import.specifier,
-                &import.name,
-                "import",
-            )?;
+            // Namespace imports (`import * as ns`) bind the module
+            // namespace object directly and need no export lookup.
+            if import.is_namespace {
+                continue;
+            }
+            check_binding(nodes, url, &import.specifier, &import.name, "import")?;
         }
         for export in &node.metadata.exports {
             // Only named re-exports (`export { local as name } from`)

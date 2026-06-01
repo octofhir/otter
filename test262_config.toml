@@ -22,18 +22,15 @@ max_heap_bytes_per_test = 536870912
 # Features to skip (tests requiring these features will be skipped).
 # Only skip features we truly cannot support (infra gaps or active proposals).
 skip_features = [
-    # Module system (requires module loader in test262 harness)
+    # Module proposals / host module kinds not yet wired in Otter.
     "import-assertions",
-    "import-attributes",
     "import-bytes",
     # import-defer (static `import defer * as`) is implemented; dynamic
     # `import.defer()` expression coverage is now exposed by the
     # dynamic-import suite.
-    "import.meta",
     "json-modules",
     "source-phase-imports",
     "source-phase-imports-module-source",
-    "export-star-as-namespace-from-module",
 
     # FinalizationRegistry / WeakRef: host-gc-required tests need $262.gc()
     # to reliably trigger collection + cleanup callbacks

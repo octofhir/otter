@@ -56,6 +56,10 @@ pub(crate) struct FunctionContext {
     /// recompiled and its closure isn't re-stored.
     /// <https://tc39.es/ecma262/#sec-functiondeclarationinstantiation>
     pub(crate) hoisted_function_names: HashSet<String>,
+    /// `true` when an anonymous `export default function/function*` was
+    /// already hoisted (compiled + mirrored to `module_env.default`) at
+    /// instantiation, so its source-position arm must be a no-op.
+    pub(crate) default_function_hoisted: bool,
     /// Names of this function's own bindings that some nested
     /// function references — populated by
     /// [`capture::analyze_function`] before code gen starts. Each
@@ -118,6 +122,7 @@ impl FunctionContext {
             active_finally: 0,
             pending_label: None,
             hoisted_function_names: HashSet::new(),
+            default_function_hoisted: false,
             captured_names: HashSet::new(),
             mapped_argument_names: HashSet::new(),
             reserved_own_upvalues: HashMap::new(),

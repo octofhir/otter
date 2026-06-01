@@ -683,6 +683,11 @@ pub(crate) fn compile_statement(
                     if hoisted_name.is_some() {
                         return Ok(None);
                     }
+                    // Anonymous default function/generator was hoisted +
+                    // mirrored at instantiation (§15.2.1.7); skip here.
+                    if f.id.is_none() && !f.declare && cx.top_mut().default_function_hoisted {
+                        return Ok(None);
+                    }
                     let name =
                         f.id.as_ref()
                             .map(|id| id.name.as_str().to_string())

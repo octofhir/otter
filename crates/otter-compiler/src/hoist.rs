@@ -494,6 +494,40 @@ pub(crate) fn hoist_function_declarations(
             cx.emit_module_export_default_mirror(tmp, span);
         }
     }
+    // §15.2.1.7 / §16.2.1.7.1 — an *anonymous* `export default
+    // function/function*` is a HoistableDeclaration named "default":
+    // it is initialized at instantiation, so `module_env.default` must
+    // hold the closure before any body statement (incl. a self-import
+    // observing it). Compile + mirror it here; the source-position arm
+    // then skips it.
+    for stmt in stmts.iter() {
+        let Statement::ExportDefaultDeclaration(decl) = stmt else {
+            continue;
+        };
+        let oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(f) = &decl.declaration
+        else {
+            continue;
+        };
+        if f.declare || f.id.is_some() {
+            continue;
+        }
+        let span = (f.span.start, f.span.end);
+        let (function_id, captures) = compile_function_full(
+            cx,
+            "default",
+            &f.params,
+            &f.body,
+            span,
+            f.r#async,
+            f.generator,
+            false,
+        )?;
+        let const_idx = cx.intern_function_id(function_id);
+        let tmp = cx.alloc_scratch();
+        emit_make_callable(cx, tmp, const_idx, &captures, false, span)?;
+        cx.emit_module_export_default_mirror(tmp, span);
+        cx.top_mut().default_function_hoisted = true;
+    }
     Ok(())
 }
 

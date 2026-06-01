@@ -149,6 +149,14 @@ mod tests {
         .unwrap()
     }
 
+    fn compile_module_src_err(src: &str, host: &ModuleHostInfo) -> CompileError {
+        with_program(src, SyntaxSourceKind::TypeScript, |program| {
+            compile_module_program(program, SyntaxSourceKind::TypeScript, host)
+        })
+        .unwrap()
+        .unwrap_err()
+    }
+
     fn compile_script_src(src: &str) -> BytecodeModule {
         compile_script_source(src, SyntaxSourceKind::TypeScript, "test.ts").unwrap()
     }
@@ -234,6 +242,42 @@ mod tests {
     }
 
     #[test]
+    fn script_import_defer_literal_uses_dynamic_import_path() {
+        let module = compile_script_src("import.defer(\"./empty.js\");");
+        let main = &module.functions[0];
+        assert!(
+            main.code.iter().any(|i| i.op == Op::ImportNamespaceDynamic),
+            "script-mode import.defer should return a dynamic-import promise"
+        );
+        assert!(
+            !main
+                .code
+                .iter()
+                .any(|i| i.op == Op::ImportNamespaceDeferred),
+            "script-mode import.defer must not use module-only deferred namespace lookup"
+        );
+    }
+
+    #[test]
+    fn module_import_defer_literal_uses_deferred_namespace_path() {
+        let module = compile_module_src(
+            "import.defer(\"./empty.js\");",
+            &host_info(&[("./empty.js", "file:///test/empty.js")]),
+        );
+        let init = &module.functions[0];
+        assert!(
+            init.code
+                .iter()
+                .any(|i| i.op == Op::ImportNamespaceDeferred),
+            "module-mode import.defer should resolve a deferred namespace"
+        );
+        assert!(
+            init.code.iter().any(|i| i.op == Op::PromiseFulfilledOf),
+            "module-mode import.defer should return a fulfilled promise for the deferred namespace"
+        );
+    }
+
+    #[test]
     fn class_heritage_await_marks_module_init_async() {
         let src = "let foo = 1; function fn() { return function() {}; } export class C extends fn(await foo) {}";
         let module = compile_module_src(src, &host_info(&[]));
@@ -251,6 +295,41 @@ mod tests {
             module.functions[0].is_async,
             "await in export var destructuring is module top-level await"
         );
+    }
+
+    #[test]
+    fn module_top_level_declaration_early_errors_are_syntax_errors() {
+        for src in [
+            "let x; const x = 0;",
+            "let x; var x;",
+            "var f; function f() {}",
+            "label: { label: 0; }",
+            "new.target;",
+        ] {
+            assert!(
+                matches!(
+                    compile_module_src_err(src, &host_info(&[])),
+                    CompileError::Syntax { .. }
+                ),
+                "expected module early SyntaxError for {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn export_default_anonymous_defs_infer_default_name() {
+        for src in [
+            "export default (function() { return 1; });",
+            "export default (function*() { yield 1; });",
+            "export default class {};",
+            "export default (class {});",
+        ] {
+            let module = compile_module_src(src, &host_info(&[]));
+            assert!(
+                module.functions.iter().any(|f| f.name == "default"),
+                "expected default function/class name in {src}"
+            );
+        }
     }
 
     #[test]

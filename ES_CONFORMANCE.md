@@ -491,13 +491,31 @@ target/debug/otter-test262 run \
 
 The previous config skipped 936 of 941 `dynamic-import` tests
 (`test262_results/dynamic_import_baseline_next.json`: 5 pass, 936
-skip). The remaining non-skipped blockers are now visible:
-script-side on-demand fixture loading through the local synchronous
-runner, dynamic `import.defer()` expression lowering, and
-async-generator rejection propagation. `returns-promise.js` now passes
-after promise property lookup was switched to the cached
-`%Promise.prototype%` intrinsic instead of the mutable global
-`Promise.prototype`.
+skip). After dynamic-import loading fixes and mode-specific
+`import.defer()` lowering:
+
+```sh
+target/debug/otter-test262 run \
+  --filter language/expressions/dynamic-import \
+  --timeout 20000 \
+  --output test262_results/dynamic_import_after_dynamic_failure_and_import_defer_modes.json
+```
+
+| total | passed | failed | skipped | timeout | OOM | crash | pass rate |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 941 | 618 | 35 | 288 | 0 | 0 | 0 | 94.64% |
+
+The delta from `dynamic_import_after_promise_intrinsic.json` is +18
+passing tests. Literal dynamic-import targets that fail parse/compile
+now stay represented in the module graph as rejecting synthetic module
+records instead of surfacing as `UnknownIntrinsic`, so
+`script-code_FIXTURE.js` rejects with `SyntaxError` as expected.
+`import.defer()` now lowers by source mode: module code resolves the
+deferred namespace and returns a fulfilled promise, while script code
+uses the host dynamic-import promise path instead of the module-only
+deferred namespace opcode. `returns-promise.js` continues to pass after
+promise property lookup was switched to the cached `%Promise.prototype%`
+intrinsic instead of the mutable global `Promise.prototype`.
 
 Updated module-code regression after the same unskip:
 
@@ -505,24 +523,29 @@ Updated module-code regression after the same unskip:
 target/debug/otter-test262 run \
   --filter language/module-code \
   --timeout 20000 \
-  --output test262_results/module_code_after_tla_syntax_fixes.json
+  --output test262_results/module_code_after_default_name_and_early_errors.json
 ```
 
 | total | passed | failed | skipped | timeout | OOM | crash | pass rate |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 596 | 466 | 103 | 27 | 0 | 0 | 0 | 81.90% |
+| 596 | 484 | 85 | 27 | 0 | 0 | 0 | 85.06% |
 
 Delta from `module_code_after_import_defer.json`: +6 passing tests,
 -9 skips, +3 surfaced failures after dynamic-import unskip; then +37
-passing tests and -24 crashes after top-level-await syntax fixes.
+passing tests and -24 crashes after top-level-await syntax fixes; then
++18 passing tests after module early-error validation and `export
+default` anonymous function/class name inference.
 The fixed slice covers `await` in class heritage inside exported class
 declarations, `await` in export-var destructuring initializers, and
 catchable bare-specifier dynamic imports (`await import("foo")`) that
-must not fail graph loading. `language/import/import-defer` remains
-101/101 after the changes
-(`test262_results/import_defer_after_tla_syntax_fixes.json`), and
-`language/expressions/dynamic-import` remains 600/941 with 0 crashes
-(`test262_results/dynamic_import_after_tla_syntax_fixes.json`).
+must not fail graph loading. The follow-up module-code slice covers
+top-level duplicate lexical declarations, lexical/`var` conflicts,
+duplicate labels, top-level `new.target`, and `SetFunctionName(...,
+"default")` for anonymous default exports. `language/import/import-defer`
+remains 101/101 after the changes
+(`test262_results/import_defer_after_dynamic_import_modes.json`), and
+`language/expressions/dynamic-import` is now 618/941 with 0 crashes
+(`test262_results/dynamic_import_after_dynamic_failure_and_import_defer_modes.json`).
 
 ### Native error / Function suite checkpoint (P1.2 / P1.3 close)
 

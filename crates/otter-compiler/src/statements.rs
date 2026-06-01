@@ -687,15 +687,18 @@ pub(crate) fn compile_statement(
                     dst
                 }
                 oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(c) => {
-                    let name = c.id.as_ref().map(|id| id.name.as_str().to_string());
-                    compile_class(cx, c, name.as_deref())?
+                    let name =
+                        c.id.as_ref()
+                            .map(|id| id.name.as_str().to_string())
+                            .unwrap_or_else(|| "default".to_string());
+                    compile_class(cx, c, Some(name.as_str()))?
                 }
                 other => {
                     let expr = other.as_expression().ok_or(CompileError::Unsupported {
                         node: "ExportDefaultDeclaration: unsupported declaration kind".to_string(),
                         span,
                     })?;
-                    compile_expr(cx, expr, span)?
+                    compile_expr_with_inferred_name(cx, expr, "default", span)?
                 }
             };
             let env_uv = cx

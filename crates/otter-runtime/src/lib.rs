@@ -1526,8 +1526,8 @@ impl Runtime {
             Ok(DynamicModuleLoad::FetchHttps { target_url }) => {
                 Ok(DynamicImportBegin::FetchHttps { target_url })
             }
-            Err(DynLoadError::Diagnostic(message)) => self
-                .alloc_dynamic_import_error(message)
+            Err(DynLoadError::Diagnostic { kind, message }) => self
+                .alloc_dynamic_import_error(kind, message)
                 .and_then(|value| self.settle_dynamic_import_result(token, Err(value)))
                 .map(|_| DynamicImportBegin::Settled),
             Err(DynLoadError::Thrown(value)) => self
@@ -1545,12 +1545,12 @@ impl Runtime {
         source: Result<String, String>,
     ) -> Result<bool, OtterError> {
         let reaction_outcome: Result<otter_vm::Value, otter_vm::Value> = match source
-            .map_err(DynLoadError::Diagnostic)
+            .map_err(DynLoadError::type_error)
             .and_then(|source| self.evaluate_dynamic_module_https_source(target_url, source))
         {
             Ok(namespace) => Ok(namespace),
-            Err(DynLoadError::Diagnostic(message)) => {
-                Err(self.alloc_dynamic_import_error(message)?)
+            Err(DynLoadError::Diagnostic { kind, message }) => {
+                Err(self.alloc_dynamic_import_error(kind, message)?)
             }
             Err(DynLoadError::Thrown(value)) => Err(value),
         };
@@ -1577,12 +1577,10 @@ impl Runtime {
 
     fn alloc_dynamic_import_error(
         &mut self,
+        kind: otter_vm::ErrorKind,
         message: String,
     ) -> Result<otter_vm::Value, OtterError> {
-        let proto = self
-            .interp
-            .error_classes_for_trace()
-            .prototype(otter_vm::ErrorKind::TypeError);
+        let proto = self.interp.error_classes_for_trace().prototype(kind);
         let proto_root = otter_vm::Value::object(proto);
         let obj = self
             .interp
@@ -1615,17 +1613,17 @@ impl Runtime {
         };
         let entry_for_loader: PathBuf = match referrer_opt {
             Some(url) => url_to_path(url).ok_or_else(|| {
-                DynLoadError::Diagnostic(format!(
+                DynLoadError::type_error(format!(
                     "dynamic import: referrer is not a file:// URL: \"{url}\""
                 ))
             })?,
             None => std::env::current_dir().map_err(|e| {
-                DynLoadError::Diagnostic(format!("dynamic import: cwd lookup failed: {e}"))
+                DynLoadError::type_error(format!("dynamic import: cwd lookup failed: {e}"))
             })?,
         };
         let loader = self.module_loader_for_entry(&entry_for_loader);
         let target_url = loader.resolve(specifier, referrer_opt).map_err(|e| {
-            DynLoadError::Diagnostic(format!(
+            DynLoadError::type_error(format!(
                 "dynamic import: cannot resolve \"{specifier}\": {e:?}"
             ))
         })?;
@@ -1640,7 +1638,7 @@ impl Runtime {
             return Ok(DynamicModuleLoad::FetchHttps { target_url });
         }
         let target_path: PathBuf = url_to_path(&target_url).ok_or_else(|| {
-            DynLoadError::Diagnostic(format!(
+            DynLoadError::type_error(format!(
                 "dynamic import: target is not a file:// URL: \"{target_url}\""
             ))
         })?;
@@ -1648,9 +1646,10 @@ impl Runtime {
             .module_graph
             .load_program(&loader, &target_path)
             .map_err(|e| {
-                DynLoadError::Diagnostic(format!(
-                    "dynamic import: load failed for \"{target_url}\": {e:?}"
-                ))
+                DynLoadError::from_graph_error(
+                    &e,
+                    format!("dynamic import: load failed for \"{target_url}\": {e:?}"),
+                )
             })?;
         for metadata in &linked.metadata {
             self.source_maps.record_compiled_metadata(metadata);
@@ -1664,7 +1663,7 @@ impl Runtime {
                 .interp
                 .alloc_host_object_with_roots(&[], &[])
                 .map_err(|e| {
-                    DynLoadError::Diagnostic(format!("dynamic import: alloc env failed: {e}"))
+                    DynLoadError::type_error(format!("dynamic import: alloc env failed: {e}"))
                 })?;
             self.interp
                 .register_module_env(std::sync::Arc::from(init.url.as_str()), env);
@@ -1707,13 +1706,13 @@ impl Runtime {
                 {
                     return Err(DynLoadError::Thrown(thrown));
                 }
-                return Err(DynLoadError::Diagnostic(format!(
+                return Err(DynLoadError::type_error(format!(
                     "dynamic import: evaluation failed for \"{url}\": {err}"
                 )));
             }
         }
         let namespace = self.interp.module_env(&target_url).ok_or_else(|| {
-            DynLoadError::Diagnostic(format!(
+            DynLoadError::type_error(format!(
                 "dynamic import: namespace missing after load: \"{target_url}\""
             ))
         })?;
@@ -1758,17 +1757,18 @@ impl Runtime {
             },
         )
         .map_err(|e| {
-            DynLoadError::Diagnostic(format!(
+            DynLoadError::syntax_error(format!(
                 "dynamic import: parse failed for \"{target_url}\": {e:?}"
             ))
         })?
         .map_err(|e| {
-            DynLoadError::Diagnostic(format!(
-                "dynamic import: compile failed for \"{target_url}\": {e:?}"
-            ))
+            DynLoadError::from_compile_error(
+                &e,
+                format!("dynamic import: compile failed for \"{target_url}\": {e:?}"),
+            )
         })?;
         if fragment_has_import_namespace_ops(&fragment) {
-            return Err(DynLoadError::Diagnostic(format!(
+            return Err(DynLoadError::type_error(format!(
                 "dynamic import: HTTPS module \"{target_url}\" has own static imports — not yet supported"
             )));
         }
@@ -1777,7 +1777,7 @@ impl Runtime {
             .interp
             .alloc_host_object_with_roots(&[], &[])
             .map_err(|e| {
-                DynLoadError::Diagnostic(format!("dynamic import: alloc env failed: {e}"))
+                DynLoadError::type_error(format!("dynamic import: alloc env failed: {e}"))
             })?;
         self.interp
             .register_module_env(std::sync::Arc::from(target_url), env);
@@ -1797,7 +1797,7 @@ impl Runtime {
             {
                 return Err(DynLoadError::Thrown(thrown));
             }
-            return Err(DynLoadError::Diagnostic(format!(
+            return Err(DynLoadError::type_error(format!(
                 "dynamic import: HTTPS evaluation failed for \"{target_url}\": {err}"
             )));
         }
@@ -3085,14 +3085,55 @@ fn url_to_path(url: &str) -> Option<std::path::PathBuf> {
 ///
 /// - [`DynLoadError::Diagnostic`] — host-side resolve / load /
 ///   compile / link / alloc failure. The settler synthesises a
-///   fresh `TypeError` from the message.
+///   fresh JS error of the carried kind from the message.
 /// - [`DynLoadError::Thrown`] — the dynamically-loaded module's
 ///   `<module-init>` threw a JS value. The settler uses that
 ///   value directly as the promise's rejection reason per
 ///   §16.2.1.7 step 7.b.i + §27.2.1.7.
 enum DynLoadError {
-    Diagnostic(String),
+    Diagnostic {
+        kind: otter_vm::ErrorKind,
+        message: String,
+    },
     Thrown(otter_vm::Value),
+}
+
+impl DynLoadError {
+    fn diagnostic(kind: otter_vm::ErrorKind, message: impl Into<String>) -> Self {
+        Self::Diagnostic {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    fn type_error(message: impl Into<String>) -> Self {
+        Self::diagnostic(otter_vm::ErrorKind::TypeError, message)
+    }
+
+    fn syntax_error(message: impl Into<String>) -> Self {
+        Self::diagnostic(otter_vm::ErrorKind::SyntaxError, message)
+    }
+
+    fn from_compile_error(err: &otter_compiler::CompileError, message: impl Into<String>) -> Self {
+        let kind = match err {
+            otter_compiler::CompileError::Syntax { .. } => otter_vm::ErrorKind::SyntaxError,
+            _ => otter_vm::ErrorKind::TypeError,
+        };
+        Self::diagnostic(kind, message)
+    }
+
+    fn from_graph_error(err: &module_graph::GraphError, message: impl Into<String>) -> Self {
+        let kind = match err {
+            module_graph::GraphError::Parse { .. } => otter_vm::ErrorKind::SyntaxError,
+            module_graph::GraphError::Compile { error, .. } => match error {
+                otter_compiler::CompileError::Syntax { .. } => otter_vm::ErrorKind::SyntaxError,
+                _ => otter_vm::ErrorKind::TypeError,
+            },
+            module_graph::GraphError::Cycle { .. } => otter_vm::ErrorKind::RangeError,
+            module_graph::GraphError::Loader(_) => otter_vm::ErrorKind::TypeError,
+        };
+        Self::diagnostic(kind, message)
+    }
 }
 
 /// Sentinel property used to flag a `module_env` as already
@@ -3127,10 +3168,10 @@ fn alloc_dynamic_import_meta(
     let import_meta = interp
         .alloc_host_object_with_roots(&[&env_root], &[])
         .map_err(|e| {
-            DynLoadError::Diagnostic(format!("dynamic import: alloc import_meta failed: {e}"))
+            DynLoadError::type_error(format!("dynamic import: alloc import_meta failed: {e}"))
         })?;
     let url_string = otter_vm::JsString::from_str(url, interp.gc_heap_mut()).map_err(|err| {
-        DynLoadError::Diagnostic(format!(
+        DynLoadError::type_error(format!(
             "dynamic import: alloc import_meta.url failed: {err}"
         ))
     })?;
@@ -4084,6 +4125,27 @@ mod tests {
         otter
             .blocking_run_file(dir.path().join("entry.ts"))
             .unwrap();
+    }
+
+    #[test]
+    fn module_program_dynamic_import_invalid_target_rejects_syntax_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("bad.js"),
+            "var smoosh; function smoosh() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("entry.mjs"),
+            "function fail() { return undefined.x; }\n\
+             import(\"./bad.js\")\n\
+               .catch((error) => { if (error.name !== \"SyntaxError\") fail(); })\n\
+               .then(() => {}, fail);\n",
+        )
+        .unwrap();
+
+        let mut runtime = Runtime::builder().build().unwrap();
+        runtime.run_module(dir.path().join("entry.mjs")).unwrap();
     }
 
     #[test]

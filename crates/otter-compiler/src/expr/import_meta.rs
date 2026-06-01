@@ -80,12 +80,15 @@ pub(crate) fn compile_import(
     let is_defer_phase = matches!(imp.phase, Some(oxc_ast::ast::ImportPhase::Defer));
     match unwrap_ts_expr(&imp.source) {
         Expression::StringLiteral(lit) => {
-            // Literal import.defer: linker resolves it during
-            // fragment merge, opcode reads the deferred namespace +
-            // wraps in a fulfilled promise.
+            // Literal import.defer in module code: linker resolves
+            // it during fragment merge, opcode reads the deferred
+            // namespace and wraps it in a fulfilled promise. In
+            // script code there is no module graph/upvalue state, so
+            // it uses the same host dynamic-import promise path as
+            // import().
             let specifier = lit.value.as_str().to_string();
             let spec_const = cx.intern_string_constant(&specifier);
-            if is_defer_phase {
+            if is_defer_phase && cx.module_state.is_some() {
                 let ns_dst = cx.alloc_scratch();
                 cx.emit(
                     Op::ImportNamespaceDeferred,

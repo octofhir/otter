@@ -33,9 +33,9 @@ use oxc_ast::ast::{
     AssignmentTargetPropertyIdentifier, AwaitExpression, BindingIdentifier, BindingPattern, Class,
     ClassElement, DoWhileStatement, Expression, ForInStatement, ForOfStatement, ForStatement,
     ForStatementLeft, FormalParameters, Function, IdentifierReference, IfStatement,
-    LabeledStatement, MethodDefinition, MethodDefinitionKind, NumericLiteral, ObjectProperty,
-    Program, PropertyDefinition, PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement,
-    StaticBlock, StringLiteral, Super, SwitchStatement, UnaryExpression, UnaryOperator,
+    LabeledStatement, MetaProperty, MethodDefinition, MethodDefinitionKind, NumericLiteral,
+    ObjectProperty, Program, PropertyDefinition, PropertyKey, PropertyKind, SimpleAssignmentTarget,
+    Statement, StaticBlock, StringLiteral, Super, SwitchStatement, UnaryExpression, UnaryOperator,
     UpdateExpression, UpdateOperator, VariableDeclaration, VariableDeclarationKind, WhileStatement,
     YieldExpression,
 };
@@ -83,6 +83,40 @@ pub fn validate_strict_mode_early_errors(
     Err(CompileError::Syntax {
         messages,
         diagnostics: visitor.diagnostics,
+    })
+}
+
+/// Validate module-body early errors that are stricter than ordinary
+/// strict-mode script validation.
+///
+/// ECMA-262 §16.2.1 rejects duplicate module lexical declarations,
+/// module lexical names that also appear in `var` declarations,
+/// duplicate labels, and `new.target` directly contained by the
+/// module body. OXC does not currently report all of these for the
+/// TypeScript-flavoured parse path Otter uses, so the compiler
+/// rejects them before lowering.
+pub fn validate_module_early_errors(program: &Program<'_>) -> Result<(), CompileError> {
+    let mut diagnostics = Vec::new();
+    flag_module_declaration_name_errors(program, &mut diagnostics);
+
+    let mut labels = ModuleLabelValidator {
+        labels: Vec::new(),
+        diagnostics: &mut diagnostics,
+    };
+    labels.visit_program(program);
+
+    let mut new_target = ModuleNewTargetValidator {
+        diagnostics: &mut diagnostics,
+    };
+    new_target.visit_program(program);
+
+    if diagnostics.is_empty() {
+        return Ok(());
+    }
+    let messages = diagnostics.iter().map(|d| d.message.clone()).collect();
+    Err(CompileError::Syntax {
+        messages,
+        diagnostics,
     })
 }
 
@@ -387,6 +421,210 @@ impl StrictValidator {
             range: Some((span.start, span.end)),
             help: Some("wrap the function declaration in a block `{ … }`".to_string()),
         });
+    }
+}
+
+fn flag_module_declaration_name_errors(
+    program: &Program<'_>,
+    diagnostics: &mut Vec<SyntaxDiagnostic>,
+) {
+    let mut lex_seen: BTreeMap<&str, Span> = BTreeMap::new();
+    let mut duplicate_lex: Vec<(String, Span)> = Vec::new();
+    let mut var_seen: BTreeMap<&str, Span> = BTreeMap::new();
+    let mut lex_var_conflicts: Vec<(String, Span)> = Vec::new();
+
+    for stmt in &program.body {
+        collect_module_item_lex_decl_names(stmt, &mut |name, span| {
+            if lex_seen.insert(name, span).is_some() {
+                duplicate_lex.push((name.to_string(), span));
+            }
+        });
+        collect_module_item_var_decl_names(stmt, &mut |name, span| {
+            var_seen.entry(name).or_insert(span);
+        });
+    }
+
+    for stmt in &program.body {
+        collect_module_item_lex_decl_names(stmt, &mut |name, span| {
+            if var_seen.contains_key(name) {
+                lex_var_conflicts.push((name.to_string(), span));
+            }
+        });
+    }
+
+    for (name, span) in duplicate_lex {
+        diagnostics.push(SyntaxDiagnostic {
+            code: "MODULE_DUPLICATE_LEXICAL_DECL".to_string(),
+            message: format!(
+                "SyntaxError: duplicate module lexical declaration `{name}` (§16.2.1)"
+            ),
+            range: Some((span.start, span.end)),
+            help: Some(
+                "module top-level lexical declarations, including function declarations, \
+                 must have unique names"
+                    .to_string(),
+            ),
+        });
+    }
+    for (name, span) in lex_var_conflicts {
+        diagnostics.push(SyntaxDiagnostic {
+            code: "MODULE_LEXICAL_VAR_CONFLICT".to_string(),
+            message: format!(
+                "SyntaxError: module lexical declaration `{name}` conflicts with a `var` \
+                 declaration (§16.2.1)"
+            ),
+            range: Some((span.start, span.end)),
+            help: Some(
+                "rename either the lexical declaration or the `var` declaration".to_string(),
+            ),
+        });
+    }
+}
+
+fn collect_module_item_lex_decl_names<'a, F>(stmt: &'a Statement<'a>, emit: &mut F)
+where
+    F: FnMut(&'a str, Span),
+{
+    match stmt {
+        Statement::VariableDeclaration(decl)
+            if matches!(
+                decl.kind,
+                VariableDeclarationKind::Let
+                    | VariableDeclarationKind::Const
+                    | VariableDeclarationKind::Using
+                    | VariableDeclarationKind::AwaitUsing
+            ) =>
+        {
+            for declarator in &decl.declarations {
+                for_each_bound_identifier(&declarator.id, emit);
+            }
+        }
+        Statement::FunctionDeclaration(func) => {
+            if let Some(id) = &func.id {
+                emit(id.name.as_str(), id.span);
+            }
+        }
+        Statement::ClassDeclaration(cls) => {
+            if let Some(id) = &cls.id {
+                emit(id.name.as_str(), id.span);
+            }
+        }
+        Statement::ExportNamedDeclaration(decl) => {
+            if let Some(inner) = &decl.declaration {
+                collect_module_decl_lex_names(inner, emit);
+            }
+        }
+        Statement::ExportDefaultDeclaration(decl) => match &decl.declaration {
+            oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
+                if let Some(id) = &func.id {
+                    emit(id.name.as_str(), id.span);
+                }
+            }
+            oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(cls) => {
+                if let Some(id) = &cls.id {
+                    emit(id.name.as_str(), id.span);
+                }
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+fn collect_module_decl_lex_names<'a, F>(decl: &'a oxc_ast::ast::Declaration<'a>, emit: &mut F)
+where
+    F: FnMut(&'a str, Span),
+{
+    match decl {
+        oxc_ast::ast::Declaration::VariableDeclaration(var)
+            if matches!(
+                var.kind,
+                VariableDeclarationKind::Let
+                    | VariableDeclarationKind::Const
+                    | VariableDeclarationKind::Using
+                    | VariableDeclarationKind::AwaitUsing
+            ) =>
+        {
+            for declarator in &var.declarations {
+                for_each_bound_identifier(&declarator.id, emit);
+            }
+        }
+        oxc_ast::ast::Declaration::FunctionDeclaration(func) => {
+            if let Some(id) = &func.id {
+                emit(id.name.as_str(), id.span);
+            }
+        }
+        oxc_ast::ast::Declaration::ClassDeclaration(cls) => {
+            if let Some(id) = &cls.id {
+                emit(id.name.as_str(), id.span);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_module_item_var_decl_names<'a, F>(stmt: &'a Statement<'a>, emit: &mut F)
+where
+    F: FnMut(&'a str, Span),
+{
+    match stmt {
+        Statement::ExportNamedDeclaration(decl) => {
+            if let Some(oxc_ast::ast::Declaration::VariableDeclaration(var)) = &decl.declaration
+                && matches!(var.kind, VariableDeclarationKind::Var)
+            {
+                for declarator in &var.declarations {
+                    for_each_bound_identifier(&declarator.id, emit);
+                }
+            }
+        }
+        _ => collect_var_decl_names_in_stmt(stmt, emit),
+    }
+}
+
+struct ModuleLabelValidator<'d> {
+    labels: Vec<String>,
+    diagnostics: &'d mut Vec<SyntaxDiagnostic>,
+}
+
+impl<'a> Visit<'a> for ModuleLabelValidator<'_> {
+    fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
+    fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
+    fn visit_class(&mut self, _: &Class<'a>) {}
+
+    fn visit_labeled_statement(&mut self, it: &LabeledStatement<'a>) {
+        let label = it.label.name.as_str();
+        if self.labels.iter().any(|seen| seen == label) {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "MODULE_DUPLICATE_LABEL".to_string(),
+                message: format!("SyntaxError: duplicate label `{label}` in module body (§16.2.1)"),
+                range: Some((it.label.span.start, it.label.span.end)),
+                help: Some("rename one of the nested labels".to_string()),
+            });
+        }
+        self.labels.push(label.to_string());
+        self.visit_statement(&it.body);
+        self.labels.pop();
+    }
+}
+
+struct ModuleNewTargetValidator<'d> {
+    diagnostics: &'d mut Vec<SyntaxDiagnostic>,
+}
+
+impl<'a> Visit<'a> for ModuleNewTargetValidator<'_> {
+    fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
+    fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
+
+    fn visit_meta_property(&mut self, it: &MetaProperty<'a>) {
+        if it.meta.name.as_str() == "new" && it.property.name.as_str() == "target" {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "MODULE_NEW_TARGET".to_string(),
+                message: "SyntaxError: `new.target` is not valid directly in module code (§16.2.1)"
+                    .to_string(),
+                range: Some((it.span.start, it.span.end)),
+                help: Some("use `new.target` inside a function or class constructor".to_string()),
+            });
+        }
     }
 }
 

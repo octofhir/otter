@@ -33,6 +33,9 @@
 //! - Module URLs are canonical `file://` strings (the loader
 //!   guarantees this).
 //! - Each module is parsed and compiled exactly once per run.
+//! - Literal dynamic-import target failures are deferred into a synthetic
+//!   module init so the eventual `import()` rejects instead of failing the
+//!   entry graph.
 //! - Linking is deterministic — modules visit in the order their
 //!   imports first appear so the merged function table reflects
 //!   source-graph topology.
@@ -173,8 +176,10 @@ impl<'a> ModuleGraphBuilder<'a> {
 
     fn build(mut self) -> Result<ModuleGraph, GraphError> {
         while let Some((url, kind, text, dynamic)) = self.queue.pop() {
+            let url_for_error = url.clone();
             if let Err(err) = self.load_one(url, kind, text, dynamic) {
                 if dynamic {
+                    self.insert_dynamic_failure_node(url_for_error, &err)?;
                     continue;
                 }
                 return Err(err);
@@ -276,6 +281,63 @@ impl<'a> ModuleGraphBuilder<'a> {
             },
         );
         Ok(())
+    }
+
+    fn insert_dynamic_failure_node(
+        &mut self,
+        url: String,
+        err: &GraphError,
+    ) -> Result<(), GraphError> {
+        if self.nodes.contains_key(&url) {
+            return Ok(());
+        }
+        let fragment = dynamic_failure_fragment(&url, err)?;
+        self.nodes.insert(
+            url,
+            ModuleNode {
+                fragment,
+                metadata: CompiledModuleMetadata::default(),
+                deps: Vec::new(),
+            },
+        );
+        Ok(())
+    }
+}
+
+fn dynamic_failure_fragment(url: &str, err: &GraphError) -> Result<BytecodeModule, GraphError> {
+    let ctor = dynamic_failure_constructor(err);
+    let message = format!("dynamic import: load failed for \"{url}\": {err:?}");
+    let message_literal =
+        serde_json::to_string(&message).unwrap_or_else(|_| "\"dynamic import failed\"".to_string());
+    let source = format!("throw new {ctor}({message_literal});");
+    with_program(source, SourceKind::JavaScript, |program| {
+        let host = ModuleHostInfo {
+            module_url: url.to_string(),
+            resolved_imports: HashMap::new(),
+        };
+        compile_module_program_to_module(program, SourceKind::JavaScript, &host).map_err(|error| {
+            GraphError::Compile {
+                url: url.to_string(),
+                error,
+            }
+        })
+    })
+    .map_err(|error| GraphError::Parse {
+        url: url.to_string(),
+        error,
+    })?
+    .map(|compiled| compiled.bytecode)
+}
+
+fn dynamic_failure_constructor(err: &GraphError) -> &'static str {
+    match err {
+        GraphError::Parse { .. } => "SyntaxError",
+        GraphError::Compile { error, .. } => match error {
+            CompileError::Syntax { .. } => "SyntaxError",
+            _ => "TypeError",
+        },
+        GraphError::Cycle { .. } => "RangeError",
+        GraphError::Loader(_) => "TypeError",
     }
 }
 

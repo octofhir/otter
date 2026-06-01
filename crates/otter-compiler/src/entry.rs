@@ -275,6 +275,7 @@ pub fn compile_module_program(
     // §12.9.3.1 + §15.7 strict-mode early errors. Module bodies are
     // always strict mode code (§10.2.10).
     strict_validation::validate_strict_mode_early_errors(program, true)?;
+    strict_validation::validate_module_early_errors(program)?;
     // §16.2.1 Static Semantics: Early Errors — `ImportDeclaration`
     // and `ExportDeclaration` are `ModuleItem` productions, not
     // statements; they may appear only directly under `ModuleBody`.

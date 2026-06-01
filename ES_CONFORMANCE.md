@@ -561,14 +561,20 @@ Spec-faithful (JSC/V8-style) module-binding work on
 | named-import TDZ + immutable imports | 545 | `Op::LoadImportBinding` (ReferenceError on hole); assignment to an import → TypeError |
 | resolver: namespace re-export + import-aliased export | 548 | `export * as ns from` and `export { x }` (x imported) resolved through their source |
 | namespace `[[Delete]]` | 549 | exported names non-deletable → strict TypeError |
+| hoist anonymous `export default function/function*` | 554 | §15.2.1.7 HoistableDeclaration named "default" |
+| live aliased + self re-export bindings | 555 | `export { a as b }` / `export { x } from "./self"` track later writes |
 
 `language/import/import-defer` stays 101/101 and `language/import`
 105/127 throughout; 0 regressions at each stage.
 
-Remaining (`language/module-code` 549/599): live resolved-binding
-tables for the namespace (indirect `export { x } from m` and `export *`
-must read the *source* binding live, incl. TDZ + later updates),
-plus the top-level-await ordering cluster.
+Remaining (`language/module-code` 555/599):
+- nested-closure TDZ: a function that captures a module-top `let`
+  declared later in source reads it as a free global instead of a TDZ
+  binding (capture analysis forward-reference gap).
+- cross-module live `export *` / `export { x } from m` (the self case
+  is live; cross-module still snapshots — needs the resolved-binding
+  table forwarding to the source env).
+- top-level-await evaluation-order cluster (§16.2.1.5).
 
 ### Native error / Function suite checkpoint (P1.2 / P1.3 close)
 

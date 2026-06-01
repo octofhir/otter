@@ -464,6 +464,21 @@ canonical `vm_to_native_error`. Fixes
 object-keys-binding-uninit, object-hasOwnProperty-binding-uninit,
 object-propertyIsEnumerable-binding-uninit}`.
 
+Cyclic module evaluation order (2026-06-02):
+`language/module-code` 575 → 581 / 599 (96.64% → 96.99%).
+The entry body drove `Op::EvaluateModule` once per module in
+topological order, which started the DFS at a non-entry module in a
+cycle — a back-edge `export … from` then ran the ancestor's body
+before its own dependency. Rooted the synchronous evaluation at the
+entry (§16.2.1.5 InnerModuleEvaluation), so each module's
+dependencies run first and a back-edge into an on-stack ancestor is
+skipped. The linker also emitted `module_resolutions` in hash-map
+order; restored source order from the request list so
+`eager_dep_targets` recurses dependencies in `[[RequestedModules]]`
+order. Fixes `instn-iee-bndng-{cls,const,fun,gen,let,var}`; the
+runtime cycle-lifecycle tests were updated to the spec-correct TDZ
+ReferenceError for uninitialized cross-module `const` reads.
+
 ### Import defer + module top-level await
 
 Command:

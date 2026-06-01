@@ -9,9 +9,12 @@
 //!
 //! 1. The graph driver must accept a two-file cycle without
 //!    raising `MODULE_GRAPH_CYCLE`.
-//! 2. The not-yet-evaluated side of the cycle must read as
-//!    `undefined` from the partially-populated `module_env`,
-//!    rather than crashing or rebinding to a stale value.
+//! 2. The not-yet-evaluated side of the cycle holds its `const` /
+//!    `let` exports as uninitialized bindings, so reading one across
+//!    the cyclic edge is a Temporal Dead Zone `ReferenceError`
+//!    (§16.2.1.7 InitializeEnvironment + GetBindingValue), not a
+//!    silent `undefined`. Function and `var` exports stay observable
+//!    through live-binding indirection.
 //!
 //! See: <https://tc39.es/ecma262/#sec-cyclic-module-records>
 //!      <https://tc39.es/ecma262/#sec-InnerModuleEvaluation>
@@ -26,11 +29,11 @@ fn write_pair(dir: &Path, a_src: &str, b_src: &str) {
 }
 
 /// Two-file ESM cycle, entry = a.ts. Post-order DFS rooted at
-/// `a.ts` runs `b.ts`'s body first; b's read of `fromA` must
-/// observe `undefined` (a hasn't run yet) without throwing. Then
-/// `a.ts` runs and reads `fromB` which is now populated.
+/// `a.ts` runs `b.ts`'s body first; b's read of the uninitialized
+/// `const fromA` is a TDZ `ReferenceError` (a hasn't run yet). Then
+/// `a.ts` runs and reads `fromB`, which is now initialized.
 #[test]
-fn two_file_cycle_reads_partial_env_without_throwing() {
+fn two_file_cycle_reads_uninitialized_export_as_tdz() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_pair(
         dir.path(),
@@ -39,8 +42,7 @@ fn two_file_cycle_reads_partial_env_without_throwing() {
             import { fromB } from "./b.ts";
             export const fromA = "A";
             // b.ts evaluates first per post-order DFS rooted at a;
-            // by the time a's body runs, fromB has been mirrored
-            // through to b's module_env.
+            // by the time a's body runs, fromB is initialized.
             if (fromB !== "B") {
                 throw new Error("a.ts saw fromB=" + fromB);
             }
@@ -50,12 +52,14 @@ fn two_file_cycle_reads_partial_env_without_throwing() {
             import { fromA } from "./a.ts";
             export const fromB = "B";
             // The cyclic edge is short-circuited at link time —
-            // a's <module-init> hasn't run yet so a's module_env
-            // is still empty for `fromA`. Spec live-binding
-            // semantics surface that as `undefined` rather than
-            // a TDZ ReferenceError.
-            if (fromA !== undefined) {
-                throw new Error("b.ts saw fromA=" + fromA);
+            // a's <module-init> hasn't run yet, so a's `fromA`
+            // binding is still uninitialized and reading it is a
+            // TDZ ReferenceError.
+            let observed;
+            try { fromA; observed = "no-throw"; }
+            catch (e) { observed = e.constructor.name; }
+            if (observed !== "ReferenceError") {
+                throw new Error("b.ts saw fromA=" + observed);
             }
         "#,
     );
@@ -66,9 +70,9 @@ fn two_file_cycle_reads_partial_env_without_throwing() {
 }
 
 /// Symmetric run: entry = b.ts. The post-order flips so a.ts
-/// evaluates first; a sees `fromB === undefined`, then b sees
-/// `fromA === "A"`. Verifies the cycle handler is symmetric and
-/// not entry-biased.
+/// evaluates first; a's read of the uninitialized `const fromB` is
+/// a TDZ `ReferenceError`, then b sees `fromA === "A"`. Verifies the
+/// cycle handler is symmetric and not entry-biased.
 #[test]
 fn two_file_cycle_symmetric_when_entry_flips() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -78,8 +82,11 @@ fn two_file_cycle_symmetric_when_entry_flips() {
         r#"
             import { fromB } from "./b.ts";
             export const fromA = "A";
-            if (fromB !== undefined) {
-                throw new Error("a.ts saw fromB=" + fromB);
+            let observed;
+            try { fromB; observed = "no-throw"; }
+            catch (e) { observed = e.constructor.name; }
+            if (observed !== "ReferenceError") {
+                throw new Error("a.ts saw fromB=" + observed);
             }
         "#,
         // b.ts
@@ -117,12 +124,16 @@ fn cycle_with_late_function_call_observes_full_bindings() {
         r#"
             import { greet, fromA } from "./a.ts";
             export const fromB = "B";
-            // a hasn't run when b's body executes, so fromA reads
-            // as undefined here. greet() is a live binding —
+            // a hasn't run when b's body executes, so `fromA` is an
+            // uninitialized binding and reading it is a TDZ
+            // ReferenceError. `greet` is a hoisted function binding —
             // calling it after both modules finish observes the
-            // populated values.
-            if (fromA !== undefined) {
-                throw new Error("b.ts saw fromA=" + fromA);
+            // populated values through live-binding indirection.
+            let observed;
+            try { fromA; observed = "no-throw"; }
+            catch (e) { observed = e.constructor.name; }
+            if (observed !== "ReferenceError") {
+                throw new Error("b.ts saw fromA=" + observed);
             }
         "#,
     );
@@ -160,6 +171,11 @@ fn three_module_cycle_post_order_evaluation() {
         "#,
     )
     .unwrap();
+    // §16.2.1.7 — `fromA` is an imported `const` whose binding is
+    // created uninitialized during instantiation. Because the cycle
+    // evaluates c, then b, then a (post-order rooted at the entry a),
+    // both b and c run before a's body initializes `fromA`, so reading
+    // it is a Temporal Dead Zone `ReferenceError`, not `undefined`.
     std::fs::write(
         dir.path().join("b.ts"),
         r#"
@@ -167,7 +183,10 @@ fn three_module_cycle_post_order_evaluation() {
             import { fromA } from "./a.ts";
             export const fromB = "B";
             if (fromC !== "C") throw new Error("b saw fromC=" + fromC);
-            if (fromA !== undefined) throw new Error("b saw fromA=" + fromA);
+            let observed;
+            try { fromA; observed = "no-throw"; }
+            catch (e) { observed = e.constructor.name; }
+            if (observed !== "ReferenceError") throw new Error("b saw fromA=" + observed);
         "#,
     )
     .unwrap();
@@ -176,7 +195,10 @@ fn three_module_cycle_post_order_evaluation() {
         r#"
             import { fromA } from "./a.ts";
             export const fromC = "C";
-            if (fromA !== undefined) throw new Error("c saw fromA=" + fromA);
+            let observed;
+            try { fromA; observed = "no-throw"; }
+            catch (e) { observed = e.constructor.name; }
+            if (observed !== "ReferenceError") throw new Error("c saw fromA=" + observed);
         "#,
     )
     .unwrap();

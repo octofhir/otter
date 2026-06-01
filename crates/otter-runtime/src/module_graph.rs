@@ -282,6 +282,23 @@ impl<'a> ModuleGraphBuilder<'a> {
                     edge.deferred = true;
                 }
             }
+            // §16.2.1.5 InnerModuleEvaluation walks `[[RequestedModules]]`
+            // in source order. The compiler assembles `module_resolutions`
+            // from a hash map, losing that order; restore it from the
+            // source-ordered request list so eager evaluation (which roots
+            // its DFS at the entry and recurses dependencies in this order)
+            // matches the spec's deterministic evaluation order.
+            let request_order: HashMap<&str, usize> = requests
+                .iter()
+                .enumerate()
+                .map(|(idx, request)| (request.specifier.as_str(), idx))
+                .collect();
+            compiled.bytecode.module_resolutions.sort_by_key(|edge| {
+                request_order
+                    .get(edge.specifier.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            });
             Ok::<_, GraphError>((compiled, deps, queued))
         })
         .map_err(|e| GraphError::Parse {
@@ -1282,10 +1299,27 @@ fn build_entry_body(
         .any(|url| reachable.contains(url) && module_is_async(url));
 
     if !has_async {
-        // Sync graph: one idempotent EvaluateModule per eagerly-reachable
-        // module in topological post-order. Unchanged fast path.
+        // Sync graph (§16.2.1.5 Evaluate → InnerModuleEvaluation). The
+        // DFS is rooted at the entry: `Op::EvaluateModule` recurses into
+        // each module's dependencies before running its own body, so
+        // evaluating the entry alone visits the whole eagerly-reachable
+        // graph in post-order. Rooting at the entry is what makes cyclic
+        // graphs correct — a back-edge (`export … from` that points back
+        // at an ancestor) finds the ancestor already on the evaluating
+        // stack and is skipped, instead of running the ancestor's body
+        // first. The remaining modules are emitted afterwards as
+        // idempotent no-ops to cover any module not reachable through the
+        // entry's eager edges.
+        let entry_const_idx = intern_string_const(constants, entry_url);
+        emit_op(
+            &mut code,
+            &mut spans,
+            &mut next_pc,
+            Op::EvaluateModule,
+            [Operand::ConstIndex(entry_const_idx)],
+        );
         for url in order {
-            if !reachable.contains(url) {
+            if url == entry_url || !reachable.contains(url) {
                 continue;
             }
             let url_const_idx = intern_string_const(constants, url);

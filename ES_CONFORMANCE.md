@@ -505,17 +505,24 @@ Updated module-code regression after the same unskip:
 target/debug/otter-test262 run \
   --filter language/module-code \
   --timeout 20000 \
-  --output test262_results/module_code_after_promise_intrinsic.json
+  --output test262_results/module_code_after_tla_syntax_fixes.json
 ```
 
 | total | passed | failed | skipped | timeout | OOM | crash | pass rate |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 596 | 429 | 116 | 27 | 0 | 0 | 24 | 75.40% |
+| 596 | 466 | 103 | 27 | 0 | 0 | 0 | 81.90% |
 
 Delta from `module_code_after_import_defer.json`: +6 passing tests,
--9 skips, +3 surfaced failures. `language/import/import-defer` remains
-101/101 after the unskip
-(`test262_results/import_defer_after_promise_intrinsic.json`).
+-9 skips, +3 surfaced failures after dynamic-import unskip; then +37
+passing tests and -24 crashes after top-level-await syntax fixes.
+The fixed slice covers `await` in class heritage inside exported class
+declarations, `await` in export-var destructuring initializers, and
+catchable bare-specifier dynamic imports (`await import("foo")`) that
+must not fail graph loading. `language/import/import-defer` remains
+101/101 after the changes
+(`test262_results/import_defer_after_tla_syntax_fixes.json`), and
+`language/expressions/dynamic-import` remains 600/941 with 0 crashes
+(`test262_results/dynamic_import_after_tla_syntax_fixes.json`).
 
 ### Native error / Function suite checkpoint (P1.2 / P1.3 close)
 

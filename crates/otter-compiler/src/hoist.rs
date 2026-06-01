@@ -594,9 +594,34 @@ pub(crate) fn module_body_uses_top_level_await(stmts: &[Statement<'_>]) -> bool 
             self.depth -= 1;
         }
         fn visit_class(&mut self, it: &oxc_ast::ast::Class<'a>) {
-            self.depth += 1;
-            oxc_ast_visit::walk::walk_class(self, it);
-            self.depth -= 1;
+            // Class heritage and computed property names are evaluated in the
+            // surrounding scope, so `class C extends f(await x) {}` is a
+            // top-level await when the class is a module item. Class element
+            // bodies and field/static initializers run in class-created
+            // function-like contexts, so await there is not module TLA.
+            if let Some(super_class) = &it.super_class {
+                self.visit_expression(super_class);
+            }
+            for element in &it.body.body {
+                match element {
+                    oxc_ast::ast::ClassElement::MethodDefinition(method) => {
+                        if method.computed {
+                            self.visit_property_key(&method.key);
+                        }
+                    }
+                    oxc_ast::ast::ClassElement::PropertyDefinition(prop) => {
+                        if prop.computed {
+                            self.visit_property_key(&prop.key);
+                        }
+                    }
+                    oxc_ast::ast::ClassElement::AccessorProperty(accessor) => {
+                        if accessor.computed {
+                            self.visit_property_key(&accessor.key);
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         fn visit_await_expression(&mut self, it: &oxc_ast::ast::AwaitExpression<'a>) {
             if self.depth == 0 {

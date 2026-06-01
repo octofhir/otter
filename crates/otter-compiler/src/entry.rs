@@ -822,10 +822,17 @@ pub(crate) fn compile_export_inner_declaration(
             for declarator in &v.declarations {
                 let dspan = (declarator.span.start, declarator.span.end);
                 let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id else {
-                    return Err(CompileError::Unsupported {
-                        node: "export with destructuring not yet supported".to_string(),
+                    let init = declarator.init.as_ref().ok_or(CompileError::Unsupported {
+                        node: "export destructuring requires an initializer".to_string(),
                         span: dspan,
-                    });
+                    })?;
+                    let init_reg = compile_expr(cx, init, dspan)?;
+                    if is_var {
+                        destructure_assign(cx, init_reg, &declarator.id, dspan)?;
+                    } else {
+                        destructure_into(cx, init_reg, &declarator.id, dspan)?;
+                    }
+                    continue;
                 };
                 let name = id.name.as_str().to_string();
                 // §16.2.3.7 ExportEntry: `export var x` reuses the

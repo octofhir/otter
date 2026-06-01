@@ -358,10 +358,22 @@ impl<'a> Visit<'a> for ModuleRequestVisitor {
 
     fn visit_import_expression(&mut self, imp: &oxc_ast::ast::ImportExpression<'a>) {
         if let Expression::StringLiteral(lit) = &imp.source {
-            self.record(lit.value.as_str(), true, true);
+            let specifier = lit.value.as_str();
+            if dynamic_literal_should_preload(specifier) {
+                self.record(specifier, true, true);
+            }
         }
         oxc_ast_visit::walk::walk_import_expression(self, imp);
     }
+}
+
+fn dynamic_literal_should_preload(specifier: &str) -> bool {
+    specifier.starts_with("./")
+        || specifier.starts_with("../")
+        || specifier.starts_with('/')
+        || specifier.starts_with("file://")
+        || specifier.starts_with("http://")
+        || specifier.starts_with("https://")
 }
 
 fn hosted_module_fragment(url: &str) -> BytecodeModule {

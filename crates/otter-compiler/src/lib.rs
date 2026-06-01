@@ -234,6 +234,26 @@ mod tests {
     }
 
     #[test]
+    fn class_heritage_await_marks_module_init_async() {
+        let src = "let foo = 1; function fn() { return function() {}; } export class C extends fn(await foo) {}";
+        let module = compile_module_src(src, &host_info(&[]));
+        assert!(
+            module.functions[0].is_async,
+            "await in class heritage is module top-level await"
+        );
+    }
+
+    #[test]
+    fn export_var_destructuring_with_await_compiles() {
+        let src = "let foo = 1; export var name1 = await foo; export var { x = await foo } = {};";
+        let module = compile_module_src(src, &host_info(&[]));
+        assert!(
+            module.functions[0].is_async,
+            "await in export var destructuring is module top-level await"
+        );
+    }
+
+    #[test]
     fn import_meta_lowers_to_load_upvalue() {
         let src = "let u = import.meta.url;";
         let module = compile_module_src(src, &host_info(&[]));

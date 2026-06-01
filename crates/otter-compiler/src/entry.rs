@@ -324,6 +324,15 @@ pub fn compile_module_program(
     // slots; collect exported names + import bindings.
     let mut import_sources_in_order: Vec<String> = Vec::new();
     let mut deferred_sources_in_order: Vec<String> = Vec::new();
+    // §16.2.1.7 InitializeEnvironment — exported binding slots that
+    // must exist on the module environment from instantiation so the
+    // namespace reports them (`'x' in ns`) and an access before the
+    // declaration runs is a TDZ `ReferenceError`. `(exported_name,
+    // local_name, is_var)`: `var` slots initialize to `undefined`,
+    // lexical / function / class slots to the TDZ hole. Re-export
+    // (`export … from`) names are resolved elsewhere and excluded.
+    let mut tdz_inline: Vec<(String, bool)> = Vec::new();
+    let mut local_export_specs: Vec<(String, String)> = Vec::new();
     for stmt in &program.body {
         match stmt {
             Statement::ImportDeclaration(decl) if !decl.import_kind.is_type() => {
@@ -443,22 +452,32 @@ pub fn compile_module_program(
                 if let Some(inner) = &decl.declaration {
                     match inner {
                         oxc_ast::ast::Declaration::VariableDeclaration(var_decl) => {
+                            let is_var = matches!(
+                                var_decl.kind,
+                                oxc_ast::ast::VariableDeclarationKind::Var
+                            );
                             for declarator in &var_decl.declarations {
                                 if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) =
                                     &declarator.id
                                 {
-                                    state.exported_names.insert(id.name.as_str().to_string());
+                                    let name = id.name.as_str().to_string();
+                                    state.exported_names.insert(name.clone());
+                                    tdz_inline.push((name, is_var));
                                 }
                             }
                         }
                         oxc_ast::ast::Declaration::FunctionDeclaration(f) => {
                             if let Some(id) = &f.id {
-                                state.exported_names.insert(id.name.as_str().to_string());
+                                let name = id.name.as_str().to_string();
+                                state.exported_names.insert(name.clone());
+                                tdz_inline.push((name, false));
                             }
                         }
                         oxc_ast::ast::Declaration::ClassDeclaration(c) => {
                             if let Some(id) = &c.id {
-                                state.exported_names.insert(id.name.as_str().to_string());
+                                let name = id.name.as_str().to_string();
+                                state.exported_names.insert(name.clone());
+                                tdz_inline.push((name, false));
                             }
                         }
                         _ => {}
@@ -483,9 +502,18 @@ pub fn compile_module_program(
                         import_sources_in_order.push(specifier);
                     }
                 }
+                let has_source = decl.source.is_some();
                 for spec in &decl.specifiers {
                     let exported_name = module_export_name_to_str(&spec.exported);
-                    state.exported_names.insert(exported_name);
+                    state.exported_names.insert(exported_name.clone());
+                    // `export { local as exported }` (no `from`) mirrors a
+                    // local binding onto the env; its slot must be
+                    // pre-declared. Re-export specs (`export … from`) are
+                    // resolved separately.
+                    if !has_source {
+                        let local_name = module_export_name_to_str(&spec.local);
+                        local_export_specs.push((exported_name, local_name));
+                    }
                 }
             }
             Statement::ExportAllDeclaration(decl) if !decl.export_kind.is_type() => {
@@ -508,6 +536,7 @@ pub fn compile_module_program(
             }
             Statement::ExportDefaultDeclaration(_) => {
                 state.exported_names.insert("default".to_string());
+                tdz_inline.push(("default".to_string(), false));
             }
             _ => {}
         }
@@ -616,6 +645,50 @@ pub fn compile_module_program(
             [Operand::Register(scratch), Operand::Imm32(record_uv as i32)],
             span0,
         );
+    }
+
+    // §16.2.1.7 InitializeEnvironment — pre-declare exported binding
+    // slots on the module environment before hoisting, so the
+    // namespace reports every export from instantiation and a read
+    // before initialization is a TDZ `ReferenceError`. `var` slots
+    // start `undefined`; lexical / function / class / default slots
+    // start as the hole and are filled when their declaration runs
+    // (function hoisting below overwrites its hole with the closure).
+    {
+        let mut var_name_set = std::collections::HashSet::new();
+        let mut tmp = Vec::new();
+        hoist_var_names(&program.body, &mut tmp);
+        var_name_set.extend(tmp);
+        let mut slots: Vec<(String, bool)> = tdz_inline.clone();
+        for (exported, local) in &local_export_specs {
+            slots.push((exported.clone(), var_name_set.contains(local)));
+        }
+        if !slots.is_empty() {
+            let env_uv = cx
+                .module_state
+                .as_ref()
+                .map(|s| s.module_env_uv)
+                .expect("module_state present for module fragment");
+            let env_reg = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadUpvalue,
+                [Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
+                span0,
+            );
+            let mut seen = std::collections::HashSet::new();
+            for (name, is_var) in slots {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                let val_reg = cx.alloc_scratch();
+                cx.emit(
+                    if is_var { Op::LoadUndefined } else { Op::LoadHole },
+                    [Operand::Register(val_reg)],
+                    span0,
+                );
+                cx.emit_store_property(env_reg, &name, val_reg, span0);
+            }
+        }
     }
 
     // §16.2.1.7 ModuleDeclarationInstantiation step 11 — hoist

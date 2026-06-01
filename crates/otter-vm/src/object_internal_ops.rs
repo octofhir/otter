@@ -517,8 +517,15 @@ impl Interpreter {
             && let Some(env) = object::module_namespace_env(obj, &self.gc_heap)
             && let Some(name) = key.string_name()
         {
-            return Ok(object::get(env, &self.gc_heap, name)
-                .map(|v| object::PropertyDescriptor::data(v, true, true, false)));
+            return match object::get(env, &self.gc_heap, name) {
+                // §10.4.6.5 step 7 — an uninitialized binding's
+                // descriptor query is a ReferenceError (TDZ).
+                Some(v) if v.is_hole() => Err(VmError::ThisUninitialized {
+                    message: format!("Cannot access '{name}' before initialization"),
+                }),
+                Some(v) => Ok(Some(object::PropertyDescriptor::data(v, true, true, false))),
+                None => Ok(None),
+            };
         }
         if let Some(proxy) = target.as_proxy() {
             let key_value = self.vm_property_key_to_value(key)?;
@@ -2789,6 +2796,13 @@ impl Interpreter {
                 && let Some(name) = key.string_name()
             {
                 let value = object::get(env, &self.gc_heap, name).unwrap_or_else(Value::undefined);
+                // §10.4.6.8 step 9 — reading an export still in its TDZ
+                // (uninitialized binding slot) is a ReferenceError.
+                if value.is_hole() {
+                    return Err(VmError::ThisUninitialized {
+                        message: format!("Cannot access '{name}' before initialization"),
+                    });
+                }
                 return Ok(VmGetOutcome::Value(value));
             }
             if let Some(value) = self.string_object_exotic_get(obj, key)? {

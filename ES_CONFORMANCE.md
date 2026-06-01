@@ -547,6 +547,29 @@ remains 101/101 after the changes
 `language/expressions/dynamic-import` is now 618/941 with 0 crashes
 (`test262_results/dynamic_import_after_dynamic_failure_and_import_defer_modes.json`).
 
+### Module bindings + Module Namespace Exotic Object rework
+
+Spec-faithful (JSC/V8-style) module-binding work on
+`language/module-code`, landed incrementally:
+
+| stage | module-code passed | notes |
+|---|---:|---|
+| baseline | 503 / 599 | start of session |
+| `export *` + link-time ResolveExport | 521 | bare `export *`; resolution-phase SyntaxError for unresolved/ambiguous named imports + re-exports |
+| Module Namespace Exotic Object | 531 | distinct §10.4.6 object (null proto, non-extensible, sorted keys, fail-set MOPs) via `Op::ModuleNamespaceObject`, cached per module for identity; reads live through the env |
+| export-slot pre-declaration + namespace TDZ | 532 | `var`→undefined / lexical→hole slots at instantiation; namespace `[[Get]]`/`[[GetOwnProperty]]` throw ReferenceError on the hole |
+| named-import TDZ + immutable imports | 545 | `Op::LoadImportBinding` (ReferenceError on hole); assignment to an import → TypeError |
+| resolver: namespace re-export + import-aliased export | 548 | `export * as ns from` and `export { x }` (x imported) resolved through their source |
+| namespace `[[Delete]]` | 549 | exported names non-deletable → strict TypeError |
+
+`language/import/import-defer` stays 101/101 and `language/import`
+105/127 throughout; 0 regressions at each stage.
+
+Remaining (`language/module-code` 549/599): live resolved-binding
+tables for the namespace (indirect `export { x } from m` and `export *`
+must read the *source* binding live, incl. TDZ + later updates),
+plus the top-level-await ordering cluster.
+
 ### Native error / Function suite checkpoint (P1.2 / P1.3 close)
 
 After tightening native error class metadata (descriptors on

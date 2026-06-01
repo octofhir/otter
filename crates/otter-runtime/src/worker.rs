@@ -27,15 +27,27 @@
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 //! - [Runtime architecture](../../../docs/book/src/engine/architecture.md)
 
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::Duration;
+
+use otter_gc::raw::RawGc;
+use otter_vm::bigint::BigIntValue;
+use otter_vm::binary::JsArrayBuffer;
+use otter_vm::binary::array_buffer::SharedBody;
+use otter_vm::number::NumberValue;
+use otter_vm::string::JsString;
+use otter_vm::{NativeCall, NativeCtx, NativeError, NativeFn, Value, array, collections, object};
+use smallvec::smallvec;
 
 use crate::module_loader;
 use crate::{
-    CapabilitySet, ExecutionResult, OtterError, RuntimeActivityStats, RuntimeBuilder,
-    RuntimeHandle, SourceInput, StructuredCloneTransferList, StructuredCloneValue,
+    CapabilitySet, ExecutionResult, OtterError, Runtime, RuntimeActivityStats, RuntimeBuilder,
+    RuntimeConfig, RuntimeHandle, SourceInput, StructuredCloneNumber, StructuredCloneTransferList,
+    StructuredCloneValue,
 };
 
 static NEXT_WORKER_ID: AtomicU64 = AtomicU64::new(1);
@@ -50,6 +62,1178 @@ impl WorkerId {
     pub const fn get(self) -> u64 {
         self.0
     }
+}
+
+#[derive(Clone)]
+enum WorkerPayload {
+    Undefined,
+    Null,
+    Boolean(bool),
+    Number(StructuredCloneNumber),
+    BigInt(String),
+    String(String),
+    Array(Vec<WorkerPayload>),
+    Object(Vec<(String, WorkerPayload)>),
+    Map(Vec<(WorkerPayload, WorkerPayload)>),
+    Set(Vec<WorkerPayload>),
+    ArrayBuffer(Vec<u8>),
+    SharedArrayBuffer(Arc<SharedBody>),
+}
+
+#[derive(Default)]
+struct WorkerTransferList {
+    buffers: Vec<JsArrayBuffer>,
+    set: HashSet<JsArrayBuffer>,
+}
+
+enum WorkerCommand {
+    Message(WorkerPayload),
+    Shutdown,
+}
+
+enum WorkerEvent {
+    Message(WorkerPayload),
+    Error(String),
+    MessageError(String),
+    Closed,
+}
+
+struct WorkerRecord {
+    id: WorkerId,
+    tx: mpsc::Sender<WorkerCommand>,
+    events: Mutex<mpsc::Receiver<WorkerEvent>>,
+    interrupt: crate::InterruptHandle,
+    join: Mutex<Option<thread::JoinHandle<()>>>,
+    terminated: std::sync::atomic::AtomicBool,
+}
+
+impl WorkerRecord {
+    fn terminate(&self) {
+        if self
+            .terminated
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let _ = self.tx.send(WorkerCommand::Shutdown);
+        self.interrupt.interrupt();
+        otter_vm::atomics_wait::cancel_all_waiters();
+    }
+
+    fn join(&self) {
+        if let Some(join) = self.join.lock().expect("worker join mutex poisoned").take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for WorkerRecord {
+    fn drop(&mut self) {
+        self.terminate();
+        if let Some(join) = self
+            .join
+            .get_mut()
+            .expect("worker join mutex poisoned")
+            .take()
+        {
+            let _ = join.join();
+        }
+    }
+}
+
+#[derive(Default)]
+struct WorkerHostState {
+    config: RuntimeConfig,
+    workers: Mutex<HashMap<u64, Arc<WorkerRecord>>>,
+}
+
+impl WorkerHostState {
+    fn new(config: RuntimeConfig) -> Self {
+        Self {
+            config,
+            workers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn insert(&self, record: Arc<WorkerRecord>) {
+        self.workers
+            .lock()
+            .expect("worker registry poisoned")
+            .insert(record.id.get(), record);
+    }
+
+    fn get(&self, id: u64) -> Option<Arc<WorkerRecord>> {
+        self.workers
+            .lock()
+            .expect("worker registry poisoned")
+            .get(&id)
+            .cloned()
+    }
+
+    fn remove(&self, id: u64) -> Option<Arc<WorkerRecord>> {
+        self.workers
+            .lock()
+            .expect("worker registry poisoned")
+            .remove(&id)
+    }
+}
+
+impl Drop for WorkerHostState {
+    fn drop(&mut self) {
+        let workers: Vec<_> = self
+            .workers
+            .lock()
+            .expect("worker registry poisoned")
+            .drain()
+            .map(|(_, worker)| worker)
+            .collect();
+        for worker in &workers {
+            worker.terminate();
+        }
+        for worker in workers {
+            worker.join();
+        }
+    }
+}
+
+pub(crate) fn install_main_worker_globals(runtime: &mut Runtime) -> Result<(), OtterError> {
+    let host = Arc::new(WorkerHostState::new(runtime.config.clone()));
+    install_worker_host_natives(runtime, Arc::clone(&host))?;
+    runtime.install_native_constructor_global_call("Worker", 2, worker_constructor_call(host))?;
+    Ok(())
+}
+
+fn install_worker_host_natives(
+    runtime: &mut Runtime,
+    host: Arc<WorkerHostState>,
+) -> Result<(), OtterError> {
+    runtime.install_native_global_call(
+        "__otter_worker_spawn",
+        2,
+        worker_spawn_call(host.clone()),
+    )?;
+    runtime.install_native_global_call(
+        "__otter_worker_post_message",
+        3,
+        worker_post_message_call(host.clone()),
+    )?;
+    runtime.install_native_global_call(
+        "__otter_worker_terminate",
+        1,
+        worker_terminate_call(host.clone()),
+    )?;
+    runtime.install_native_global_call("__otter_worker_drain", 1, worker_drain_call(host))?;
+    Ok(())
+}
+
+fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
+    let call: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
+        let specifier = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
+        let id = spawn_worker_record(&host, specifier)?;
+        let worker = ctx.alloc_object()?;
+        let worker_value = Value::object(worker);
+        object::set(
+            worker,
+            ctx.heap_mut(),
+            "__otterWorkerId",
+            Value::number_f64(id as f64),
+        );
+        object::set(worker, ctx.heap_mut(), "onmessage", Value::null());
+        object::set(worker, ctx.heap_mut(), "onerror", Value::null());
+        object::set(worker, ctx.heap_mut(), "onmessageerror", Value::null());
+        let listeners = ctx.alloc_object()?;
+        object::set(
+            worker,
+            ctx.heap_mut(),
+            "__otterListeners",
+            Value::object(listeners),
+        );
+
+        let post_host = host.clone();
+        let post = ctx.native_value_with_captures(
+            "postMessage",
+            smallvec![],
+            &[&worker_value],
+            &[],
+            move |ctx, args, _captures| {
+                let id = worker_id_from_this(ctx, "Worker.postMessage")?;
+                let Some(record) = post_host.get(id) else {
+                    return Err(type_err(
+                        "Worker.postMessage",
+                        "worker is not running".to_string(),
+                    ));
+                };
+                if record.terminated.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(type_err(
+                        "Worker.postMessage",
+                        "worker has been terminated".to_string(),
+                    ));
+                }
+                let transfers = parse_worker_transfer_list(args.get(1), ctx)?;
+                let payload = clone_worker_value(
+                    args.first().unwrap_or(&Value::undefined()),
+                    ctx.heap(),
+                    &transfers,
+                )?;
+                detach_worker_transfers(&transfers, ctx.heap_mut());
+                record
+                    .tx
+                    .send(WorkerCommand::Message(payload))
+                    .map_err(|_| {
+                        type_err("Worker.postMessage", "worker channel is closed".to_string())
+                    })?;
+                Ok(Value::undefined())
+            },
+        )?;
+        object::set(worker, ctx.heap_mut(), "postMessage", post);
+
+        let terminate_host = host.clone();
+        let terminate = ctx.native_value_with_captures(
+            "terminate",
+            smallvec![],
+            &[&worker_value, &post],
+            &[],
+            move |ctx, _args, _captures| {
+                let worker = ctx
+                    .this_value()
+                    .as_object()
+                    .ok_or_else(|| type_err("Worker.terminate", "invalid receiver".to_string()))?;
+                clear_worker_poll_timer(ctx, worker)?;
+                let id = worker_id_from_object(ctx, worker, "Worker.terminate")?;
+                if let Some(record) = terminate_host.remove(id) {
+                    record.terminate();
+                }
+                Ok(Value::undefined())
+            },
+        )?;
+        object::set(worker, ctx.heap_mut(), "terminate", terminate);
+
+        let dispatch = ctx.native_value_with_captures(
+            "dispatchEvent",
+            smallvec![],
+            &[&worker_value, &post, &terminate],
+            &[],
+            move |ctx, args, _captures| {
+                let worker = ctx.this_value().as_object().ok_or_else(|| {
+                    type_err("Worker.dispatchEvent", "invalid receiver".to_string())
+                })?;
+                let event = args.first().copied().unwrap_or(Value::undefined());
+                let event_obj = event.as_object().ok_or_else(|| {
+                    type_err(
+                        "Worker.dispatchEvent",
+                        "event must be an object".to_string(),
+                    )
+                })?;
+                dispatch_event_object(ctx, worker, event_obj)?;
+                Ok(Value::boolean(true))
+            },
+        )?;
+        object::set(worker, ctx.heap_mut(), "dispatchEvent", dispatch);
+        let add = ctx.native_value_with_captures(
+            "addEventListener",
+            smallvec![],
+            &[&worker_value, &post, &terminate, &dispatch],
+            &[],
+            move |ctx, args, _captures| {
+                let worker = ctx.this_value().as_object().ok_or_else(|| {
+                    type_err("Worker.addEventListener", "invalid receiver".to_string())
+                })?;
+                let ty = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
+                if let Some(listener) = args.get(1)
+                    && listener.is_callable()
+                {
+                    add_worker_event_listener(ctx, worker, &ty, *listener)?;
+                }
+                Ok(Value::undefined())
+            },
+        )?;
+        object::set(worker, ctx.heap_mut(), "addEventListener", add);
+        let remove = ctx.native_value_with_captures(
+            "removeEventListener",
+            smallvec![],
+            &[&worker_value, &post, &terminate, &dispatch, &add],
+            &[],
+            move |ctx, args, _captures| {
+                let worker = ctx.this_value().as_object().ok_or_else(|| {
+                    type_err("Worker.removeEventListener", "invalid receiver".to_string())
+                })?;
+                let ty = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
+                if let Some(listener) = args.get(1) {
+                    remove_worker_event_listener(ctx, worker, &ty, *listener)?;
+                }
+                Ok(Value::undefined())
+            },
+        )?;
+        object::set(worker, ctx.heap_mut(), "removeEventListener", remove);
+
+        install_worker_poll_timer(ctx, host.clone(), worker)?;
+        Ok(worker_value)
+    });
+    NativeCall::Dynamic(call)
+}
+
+fn spawn_worker_record(host: &Arc<WorkerHostState>, specifier: String) -> Result<u64, NativeError> {
+    let id = WorkerId(NEXT_WORKER_ID.fetch_add(1, Ordering::Relaxed));
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (event_tx, event_rx) = mpsc::channel();
+    let child_config = host.config.clone();
+    let (interrupt_tx, interrupt_rx) = mpsc::sync_channel(1);
+    let thread_name = format!("otter-worker-{}", id.get());
+    let join = thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            run_js_worker(id, specifier, child_config, cmd_rx, event_tx, interrupt_tx);
+        })
+        .map_err(|err| type_err("Worker", format!("worker spawn failed: {err}")))?;
+    let interrupt = interrupt_rx.recv().map_err(|_| {
+        type_err(
+            "Worker",
+            "worker runtime stopped before exposing interrupt handle".to_string(),
+        )
+    })?;
+    let record = Arc::new(WorkerRecord {
+        id,
+        tx: cmd_tx,
+        events: Mutex::new(event_rx),
+        interrupt,
+        join: Mutex::new(Some(join)),
+        terminated: std::sync::atomic::AtomicBool::new(false),
+    });
+    host.insert(record);
+    Ok(id.get())
+}
+
+fn worker_spawn_call(host: Arc<WorkerHostState>) -> NativeCall {
+    let call: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
+        let specifier = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
+        let id = WorkerId(NEXT_WORKER_ID.fetch_add(1, Ordering::Relaxed));
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let child_config = host.config.clone();
+        let (interrupt_tx, interrupt_rx) = mpsc::sync_channel(1);
+        let thread_name = format!("otter-worker-{}", id.get());
+        let join = thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                run_js_worker(id, specifier, child_config, cmd_rx, event_tx, interrupt_tx);
+            })
+            .map_err(|err| type_err("Worker", format!("worker spawn failed: {err}")))?;
+        let interrupt = interrupt_rx.recv().map_err(|_| {
+            type_err(
+                "Worker",
+                "worker runtime stopped before exposing interrupt handle".to_string(),
+            )
+        })?;
+        let record = Arc::new(WorkerRecord {
+            id,
+            tx: cmd_tx,
+            events: Mutex::new(event_rx),
+            interrupt,
+            join: Mutex::new(Some(join)),
+            terminated: std::sync::atomic::AtomicBool::new(false),
+        });
+        host.insert(record);
+        Ok(Value::number_f64(id.get() as f64))
+    });
+    NativeCall::Dynamic(call)
+}
+
+fn worker_post_message_call(host: Arc<WorkerHostState>) -> NativeCall {
+    let call: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
+        let id = numeric_worker_id(args.first().unwrap_or(&Value::undefined()))?;
+        let Some(record) = host.get(id) else {
+            return Err(type_err(
+                "Worker.postMessage",
+                "worker is not running".to_string(),
+            ));
+        };
+        if record.terminated.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(type_err(
+                "Worker.postMessage",
+                "worker has been terminated".to_string(),
+            ));
+        }
+        let undefined = Value::undefined();
+        let value = args.get(1).unwrap_or(&undefined);
+        let transfers = parse_worker_transfer_list(args.get(2), ctx)?;
+        let payload = clone_worker_value(value, ctx.heap(), &transfers)?;
+        detach_worker_transfers(&transfers, ctx.heap_mut());
+        record
+            .tx
+            .send(WorkerCommand::Message(payload))
+            .map_err(|_| type_err("Worker.postMessage", "worker channel is closed".to_string()))?;
+        Ok(Value::undefined())
+    });
+    NativeCall::Dynamic(call)
+}
+
+fn worker_terminate_call(host: Arc<WorkerHostState>) -> NativeCall {
+    let call: Arc<NativeFn> = Arc::new(move |_ctx, args, _captures| {
+        let id = numeric_worker_id(args.first().unwrap_or(&Value::undefined()))?;
+        if let Some(record) = host.remove(id) {
+            record.terminate();
+        }
+        Ok(Value::undefined())
+    });
+    NativeCall::Dynamic(call)
+}
+
+fn worker_drain_call(host: Arc<WorkerHostState>) -> NativeCall {
+    let call: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
+        let id = numeric_worker_id(args.first().unwrap_or(&Value::undefined()))?;
+        let Some(record) = host.get(id) else {
+            return Ok(Value::undefined());
+        };
+        let mut drained = Vec::new();
+        {
+            let events = record
+                .events
+                .lock()
+                .expect("worker event receiver poisoned");
+            while let Ok(event) = events.try_recv() {
+                match worker_event_to_value(ctx, event) {
+                    Ok(value) => drained.push(value),
+                    Err(err) => drained.push(worker_event_to_value(
+                        ctx,
+                        WorkerEvent::MessageError(err.to_string()),
+                    )?),
+                }
+            }
+        }
+        if drained.is_empty() {
+            return Ok(Value::undefined());
+        }
+        let array = ctx.array_from_elements(drained)?;
+        Ok(Value::array(array))
+    });
+    NativeCall::Dynamic(call)
+}
+
+fn install_worker_poll_timer(
+    ctx: &mut NativeCtx<'_>,
+    host: Arc<WorkerHostState>,
+    worker: object::JsObject,
+) -> Result<(), NativeError> {
+    let worker_value = Value::object(worker);
+    let poll = ctx.native_value_with_captures(
+        "__otter_worker_poll",
+        smallvec![worker_value],
+        &[&worker_value],
+        &[],
+        move |ctx, _args, captures| {
+            let Some(worker) = captures.first().and_then(|value| value.as_object()) else {
+                return Ok(Value::undefined());
+            };
+            let id = worker_id_from_object(ctx, worker, "Worker")?;
+            let Some(record) = host.get(id) else {
+                return Ok(Value::undefined());
+            };
+            let mut events = Vec::new();
+            {
+                let rx = record
+                    .events
+                    .lock()
+                    .expect("worker event receiver poisoned");
+                while let Ok(event) = rx.try_recv() {
+                    events.push(event);
+                }
+            }
+            for event in events {
+                let event_obj = match worker_event_to_value(ctx, event) {
+                    Ok(value) => value.as_object().expect("event materializes to object"),
+                    Err(err) => {
+                        worker_event_to_value(ctx, WorkerEvent::MessageError(err.to_string()))?
+                            .as_object()
+                            .expect("messageerror materializes to object")
+                    }
+                };
+                let ty = object::get(event_obj, ctx.heap(), "type")
+                    .and_then(|value| value.as_string(ctx.heap()))
+                    .map(|s| s.to_lossy_string(ctx.heap()))
+                    .unwrap_or_default();
+                if ty == "close" {
+                    return Ok(Value::undefined());
+                }
+                dispatch_event_object(ctx, worker, event_obj)?;
+            }
+            Ok(Value::undefined())
+        },
+    )?;
+    let set_interval = {
+        let (interp, _exec) = ctx.interp_mut_and_context();
+        object::get(*interp.global_this(), interp.gc_heap(), "setInterval")
+    }
+    .ok_or_else(|| type_err("Worker", "setInterval is not installed".to_string()))?;
+    let exec = ctx
+        .interp_mut_and_context()
+        .1
+        .ok_or_else(|| type_err("Worker", "missing execution context".to_string()))?;
+    let (interp, _) = ctx.interp_mut_and_context();
+    let token = interp
+        .run_callable_sync(
+            &exec,
+            &set_interval,
+            Value::undefined(),
+            smallvec![poll, Value::number_f64(1.0)],
+        )
+        .map_err(vm_error_to_native)?;
+    object::set(worker, ctx.heap_mut(), "__otterPoll", token);
+    Ok(())
+}
+
+fn dispatch_event_object(
+    ctx: &mut NativeCtx<'_>,
+    worker: object::JsObject,
+    event: object::JsObject,
+) -> Result<(), NativeError> {
+    let ty = object::get(event, ctx.heap(), "type")
+        .and_then(|value| value.as_string(ctx.heap()))
+        .map(|s| s.to_lossy_string(ctx.heap()))
+        .unwrap_or_default();
+    let handler_key = format!("on{ty}");
+    let handler = object::get(worker, ctx.heap(), &handler_key).unwrap_or(Value::undefined());
+    let listeners = worker_event_listeners(ctx, worker, &ty);
+    let exec = ctx
+        .interp_mut_and_context()
+        .1
+        .ok_or_else(|| type_err("Worker", "missing execution context".to_string()))?;
+    if handler.is_callable() {
+        let (interp, _) = ctx.interp_mut_and_context();
+        interp
+            .run_callable_sync(
+                &exec,
+                &handler,
+                Value::object(worker),
+                smallvec![Value::object(event)],
+            )
+            .map_err(vm_error_to_native)?;
+    }
+    for listener in listeners {
+        if listener.is_callable() {
+            let (interp, _) = ctx.interp_mut_and_context();
+            interp
+                .run_callable_sync(
+                    &exec,
+                    &listener,
+                    Value::object(worker),
+                    smallvec![Value::object(event)],
+                )
+                .map_err(vm_error_to_native)?;
+        }
+    }
+    Ok(())
+}
+
+fn worker_listener_store(
+    ctx: &mut NativeCtx<'_>,
+    worker: object::JsObject,
+) -> Result<object::JsObject, NativeError> {
+    if let Some(store) =
+        object::get(worker, ctx.heap(), "__otterListeners").and_then(|value| value.as_object())
+    {
+        return Ok(store);
+    }
+    let store = ctx.alloc_object()?;
+    object::set(
+        worker,
+        ctx.heap_mut(),
+        "__otterListeners",
+        Value::object(store),
+    );
+    Ok(store)
+}
+
+fn add_worker_event_listener(
+    ctx: &mut NativeCtx<'_>,
+    worker: object::JsObject,
+    ty: &str,
+    listener: Value,
+) -> Result<(), NativeError> {
+    let store = worker_listener_store(ctx, worker)?;
+    let list = match object::get(store, ctx.heap(), ty).and_then(|value| value.as_array()) {
+        Some(list) => list,
+        None => {
+            let list = ctx.array_from_elements(Vec::new())?;
+            object::set(store, ctx.heap_mut(), ty, Value::array(list));
+            list
+        }
+    };
+    let len = array::len(list, ctx.heap());
+    for idx in 0..len {
+        if array::get(list, ctx.heap(), idx) == listener {
+            return Ok(());
+        }
+    }
+    array::set(list, ctx.heap_mut(), len, listener).map_err(|err| {
+        type_err(
+            "Worker.addEventListener",
+            format!(
+                "listener allocation failed: requested {}, limit {}",
+                err.requested_bytes(),
+                err.heap_limit_bytes()
+            ),
+        )
+    })
+}
+
+fn remove_worker_event_listener(
+    ctx: &mut NativeCtx<'_>,
+    worker: object::JsObject,
+    ty: &str,
+    listener: Value,
+) -> Result<(), NativeError> {
+    let store = worker_listener_store(ctx, worker)?;
+    let Some(list) = object::get(store, ctx.heap(), ty).and_then(|value| value.as_array()) else {
+        return Ok(());
+    };
+    let len = array::len(list, ctx.heap());
+    let kept: Vec<Value> = (0..len)
+        .map(|idx| array::get(list, ctx.heap(), idx))
+        .filter(|value| *value != listener)
+        .collect();
+    let next = ctx.array_from_elements(kept)?;
+    object::set(store, ctx.heap_mut(), ty, Value::array(next));
+    Ok(())
+}
+
+fn worker_event_listeners(ctx: &NativeCtx<'_>, worker: object::JsObject, ty: &str) -> Vec<Value> {
+    let Some(store) =
+        object::get(worker, ctx.heap(), "__otterListeners").and_then(|value| value.as_object())
+    else {
+        return Vec::new();
+    };
+    let Some(list) = object::get(store, ctx.heap(), ty).and_then(|value| value.as_array()) else {
+        return Vec::new();
+    };
+    let len = array::len(list, ctx.heap());
+    (0..len)
+        .map(|idx| array::get(list, ctx.heap(), idx))
+        .collect()
+}
+
+fn clear_worker_poll_timer(
+    ctx: &mut NativeCtx<'_>,
+    worker: object::JsObject,
+) -> Result<(), NativeError> {
+    let Some(token) = object::get(worker, ctx.heap(), "__otterPoll") else {
+        return Ok(());
+    };
+    let clear_interval = {
+        let (interp, _exec) = ctx.interp_mut_and_context();
+        object::get(*interp.global_this(), interp.gc_heap(), "clearInterval")
+    }
+    .ok_or_else(|| {
+        type_err(
+            "Worker.terminate",
+            "clearInterval is not installed".to_string(),
+        )
+    })?;
+    let exec = ctx
+        .interp_mut_and_context()
+        .1
+        .ok_or_else(|| type_err("Worker.terminate", "missing execution context".to_string()))?;
+    let (interp, _) = ctx.interp_mut_and_context();
+    interp
+        .run_callable_sync(&exec, &clear_interval, Value::undefined(), smallvec![token])
+        .map(|_| ())
+        .map_err(vm_error_to_native)
+}
+
+fn worker_id_from_this(ctx: &NativeCtx<'_>, name: &'static str) -> Result<u64, NativeError> {
+    let worker = ctx
+        .this_value()
+        .as_object()
+        .ok_or_else(|| type_err(name, "invalid receiver".to_string()))?;
+    worker_id_from_object(ctx, worker, name)
+}
+
+fn worker_id_from_object(
+    ctx: &NativeCtx<'_>,
+    worker: object::JsObject,
+    name: &'static str,
+) -> Result<u64, NativeError> {
+    let value = object::get(worker, ctx.heap(), "__otterWorkerId")
+        .ok_or_else(|| type_err(name, "missing worker id".to_string()))?;
+    numeric_worker_id(&value)
+}
+
+fn vm_error_to_native(err: otter_vm::VmError) -> NativeError {
+    match err {
+        otter_vm::VmError::Uncaught { value } => NativeError::Thrown {
+            name: "Worker",
+            message: value,
+        },
+        other => type_err("Worker", other.to_string()),
+    }
+}
+
+fn run_js_worker(
+    _id: WorkerId,
+    specifier: String,
+    config: RuntimeConfig,
+    rx: mpsc::Receiver<WorkerCommand>,
+    tx: mpsc::Sender<WorkerEvent>,
+    interrupt_tx: mpsc::SyncSender<crate::InterruptHandle>,
+) {
+    let mut runtime = match Runtime::from_config(config) {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            let _ = tx.send(WorkerEvent::Error(err.to_string()));
+            return;
+        }
+    };
+    runtime.set_allow_blocking_atomics_wait(true);
+    let interrupt = runtime.interrupt_handle();
+    let _ = interrupt_tx.send(interrupt);
+    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Err(err) = install_worker_scope_natives(&mut runtime, tx.clone(), closed.clone()) {
+        let _ = tx.send(WorkerEvent::Error(err.to_string()));
+        return;
+    }
+    let context = match run_worker_entry(&mut runtime, &specifier) {
+        Ok((_result, context)) => context,
+        Err(err) => {
+            let _ = tx.send(WorkerEvent::Error(err.to_string()));
+            let _ = tx.send(WorkerEvent::Closed);
+            return;
+        }
+    };
+    while !closed.load(std::sync::atomic::Ordering::SeqCst) {
+        match rx.recv() {
+            Ok(WorkerCommand::Message(payload)) => {
+                if let Err(err) = runtime.dispatch_worker_message_event(&context, |ctx| {
+                    materialize_worker_payload(ctx, &payload)
+                }) {
+                    match err {
+                        crate::MessageEventDispatchError::Materialize(err) => {
+                            let _ = tx.send(WorkerEvent::MessageError(err.to_string()));
+                        }
+                        crate::MessageEventDispatchError::Handler(err) => {
+                            let _ = tx.send(WorkerEvent::Error(err.to_string()));
+                        }
+                    }
+                }
+            }
+            Ok(WorkerCommand::Shutdown) | Err(_) => break,
+        }
+    }
+    let _ = tx.send(WorkerEvent::Closed);
+}
+
+fn run_worker_entry(
+    runtime: &mut Runtime,
+    specifier: &str,
+) -> Result<(ExecutionResult, otter_vm::ExecutionContext), OtterError> {
+    let path = PathBuf::from(specifier);
+    if path.exists() {
+        runtime.run_file_with_context(path)
+    } else {
+        runtime.run_module_with_context(path)
+    }
+}
+
+fn install_worker_scope_natives(
+    runtime: &mut Runtime,
+    tx: mpsc::Sender<WorkerEvent>,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), OtterError> {
+    let post_tx = tx.clone();
+    let post: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
+        let transfers = parse_worker_transfer_list(args.get(1), ctx)?;
+        let payload = clone_worker_value(
+            args.first().unwrap_or(&Value::undefined()),
+            ctx.heap(),
+            &transfers,
+        )?;
+        detach_worker_transfers(&transfers, ctx.heap_mut());
+        post_tx
+            .send(WorkerEvent::Message(payload))
+            .map_err(|_| type_err("postMessage", "parent channel is closed".to_string()))?;
+        Ok(Value::undefined())
+    });
+    runtime.install_native_global_call("postMessage", 2, NativeCall::Dynamic(post))?;
+
+    let close_flag = closed;
+    let close: Arc<NativeFn> = Arc::new(move |_ctx, _args, _captures| {
+        close_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(Value::undefined())
+    });
+    runtime.install_native_global_call("close", 0, NativeCall::Dynamic(close))?;
+    runtime.set_global("self", runtime.global_this_value());
+    runtime.set_global("onmessage", Value::null());
+    runtime.set_global("onerror", Value::null());
+    Ok(())
+}
+
+fn worker_event_to_value(
+    ctx: &mut NativeCtx<'_>,
+    event: WorkerEvent,
+) -> Result<Value, NativeError> {
+    let object = ctx.alloc_object()?;
+    match event {
+        WorkerEvent::Message(payload) => {
+            let data = materialize_worker_payload(ctx, &payload)?;
+            let ty = string_value(ctx, "message")?;
+            object::set(object, ctx.heap_mut(), "type", ty);
+            object::set(object, ctx.heap_mut(), "data", data);
+        }
+        WorkerEvent::Error(message) => {
+            let ty = string_value(ctx, "error")?;
+            let message = string_value(ctx, &message)?;
+            object::set(object, ctx.heap_mut(), "type", ty);
+            object::set(object, ctx.heap_mut(), "message", message);
+        }
+        WorkerEvent::MessageError(message) => {
+            let ty = string_value(ctx, "messageerror")?;
+            let message = string_value(ctx, &message)?;
+            object::set(object, ctx.heap_mut(), "type", ty);
+            object::set(object, ctx.heap_mut(), "message", message);
+        }
+        WorkerEvent::Closed => {
+            let ty = string_value(ctx, "close")?;
+            object::set(object, ctx.heap_mut(), "type", ty);
+        }
+    }
+    Ok(Value::object(object))
+}
+
+fn parse_worker_transfer_list(
+    value: Option<&Value>,
+    ctx: &mut NativeCtx<'_>,
+) -> Result<WorkerTransferList, NativeError> {
+    let Some(value) = value else {
+        return Ok(WorkerTransferList::default());
+    };
+    if value.is_undefined() || value.is_null() {
+        return Ok(WorkerTransferList::default());
+    }
+    let array = value.as_array().ok_or_else(|| {
+        type_err(
+            "Worker.postMessage",
+            "transferList must be an Array".to_string(),
+        )
+    })?;
+    let mut out = WorkerTransferList::default();
+    let len = array::len(array, ctx.heap());
+    for idx in 0..len {
+        let item = array::get(array, ctx.heap(), idx);
+        let buffer = item.as_array_buffer().ok_or_else(|| {
+            type_err(
+                "Worker.postMessage",
+                format!("transferList[{idx}] is not an ArrayBuffer"),
+            )
+        })?;
+        if buffer.is_shared() {
+            return Err(type_err(
+                "Worker.postMessage",
+                format!("transferList[{idx}] is a SharedArrayBuffer"),
+            ));
+        }
+        if buffer.is_detached(ctx.heap()) {
+            return Err(type_err(
+                "Worker.postMessage",
+                format!("transferList[{idx}] is detached"),
+            ));
+        }
+        if !out.set.insert(buffer) {
+            return Err(type_err(
+                "Worker.postMessage",
+                format!("duplicate transferable ArrayBuffer at transferList[{idx}]"),
+            ));
+        }
+        out.buffers.push(buffer);
+    }
+    Ok(out)
+}
+
+fn detach_worker_transfers(transfers: &WorkerTransferList, heap: &mut otter_gc::GcHeap) {
+    for buffer in &transfers.buffers {
+        buffer.detach(heap);
+    }
+}
+
+fn clone_worker_value(
+    value: &Value,
+    heap: &otter_gc::GcHeap,
+    transfers: &WorkerTransferList,
+) -> Result<WorkerPayload, NativeError> {
+    let mut active = HashSet::new();
+    clone_worker_value_inner(value, heap, transfers, "$".to_string(), 0, &mut active)
+}
+
+fn clone_worker_value_inner(
+    value: &Value,
+    heap: &otter_gc::GcHeap,
+    transfers: &WorkerTransferList,
+    path: String,
+    depth: usize,
+    active: &mut HashSet<RawGc>,
+) -> Result<WorkerPayload, NativeError> {
+    if depth > crate::structured_clone::DEFAULT_STRUCTURED_CLONE_MAX_DEPTH {
+        return Err(type_err(
+            "structuredClone",
+            format!("depth limit exceeded at {path}"),
+        ));
+    }
+    if value.is_undefined() {
+        return Ok(WorkerPayload::Undefined);
+    }
+    if value.is_null() {
+        return Ok(WorkerPayload::Null);
+    }
+    if let Some(b) = value.as_boolean() {
+        return Ok(WorkerPayload::Boolean(b));
+    }
+    if let Some(n) = value.as_number() {
+        return Ok(WorkerPayload::Number(n.into()));
+    }
+    if let Some(b) = value.as_big_int() {
+        return Ok(WorkerPayload::BigInt(b.to_decimal_string(heap)));
+    }
+    if let Some(s) = value.as_string(heap) {
+        return Ok(WorkerPayload::String(s.to_lossy_string(heap)));
+    }
+    if let Some(buf) = value.as_array_buffer() {
+        if let Some(shared) = buf.as_shared_arc(heap) {
+            return Ok(WorkerPayload::SharedArrayBuffer(shared));
+        }
+        if transfers.set.contains(&buf) && buf.is_detached(heap) {
+            return Err(type_err(
+                "structuredClone",
+                format!("cannot transfer detached ArrayBuffer at {path}"),
+            ));
+        }
+        return Ok(WorkerPayload::ArrayBuffer(
+            buf.with_bytes(heap, |bytes| bytes.to_vec()),
+        ));
+    }
+    if let Some(arr) = value.as_array() {
+        if !active.insert(arr.raw()) {
+            return Err(type_err(
+                "structuredClone",
+                format!("cycle detected at {path}"),
+            ));
+        }
+        let len = array::len(arr, heap);
+        let values: Vec<Value> = (0..len).map(|idx| array::get(arr, heap, idx)).collect();
+        let mut cloned = Vec::with_capacity(values.len());
+        for (idx, value) in values.iter().enumerate() {
+            cloned.push(clone_worker_value_inner(
+                value,
+                heap,
+                transfers,
+                format!("{path}[{idx}]"),
+                depth + 1,
+                active,
+            )?);
+        }
+        active.remove(&arr.raw());
+        return Ok(WorkerPayload::Array(cloned));
+    }
+    if let Some(map) = value.as_map() {
+        if !active.insert(map.raw()) {
+            return Err(type_err(
+                "structuredClone",
+                format!("cycle detected at {path}"),
+            ));
+        }
+        let entries = collections::map_entries(map, heap);
+        let mut cloned = Vec::with_capacity(entries.len());
+        for (idx, (key, value)) in entries.iter().enumerate() {
+            cloned.push((
+                clone_worker_value_inner(
+                    key,
+                    heap,
+                    transfers,
+                    format!("{path}<map-key:{idx}>"),
+                    depth + 1,
+                    active,
+                )?,
+                clone_worker_value_inner(
+                    value,
+                    heap,
+                    transfers,
+                    format!("{path}<map-value:{idx}>"),
+                    depth + 1,
+                    active,
+                )?,
+            ));
+        }
+        active.remove(&map.raw());
+        return Ok(WorkerPayload::Map(cloned));
+    }
+    if let Some(set) = value.as_set() {
+        if !active.insert(set.raw()) {
+            return Err(type_err(
+                "structuredClone",
+                format!("cycle detected at {path}"),
+            ));
+        }
+        let values = collections::set_values(set, heap);
+        let mut cloned = Vec::with_capacity(values.len());
+        for (idx, value) in values.iter().enumerate() {
+            cloned.push(clone_worker_value_inner(
+                value,
+                heap,
+                transfers,
+                format!("{path}<set-value:{idx}>"),
+                depth + 1,
+                active,
+            )?);
+        }
+        active.remove(&set.raw());
+        return Ok(WorkerPayload::Set(cloned));
+    }
+    if let Some(obj) = value.as_object() {
+        if !active.insert(obj.raw()) {
+            return Err(type_err(
+                "structuredClone",
+                format!("cycle detected at {path}"),
+            ));
+        }
+        let properties: Vec<(String, Value)> = object::with_properties(obj, heap, |properties| {
+            properties
+                .enumerable_data_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect()
+        });
+        let mut cloned = Vec::with_capacity(properties.len());
+        for (key, value) in properties {
+            cloned.push((
+                key.clone(),
+                clone_worker_value_inner(
+                    &value,
+                    heap,
+                    transfers,
+                    format!("{path}.{key}"),
+                    depth + 1,
+                    active,
+                )?,
+            ));
+        }
+        active.remove(&obj.raw());
+        return Ok(WorkerPayload::Object(cloned));
+    }
+    Err(type_err(
+        "structuredClone",
+        format!("unsupported value at {path}: {:?}", value.kind()),
+    ))
+}
+
+fn materialize_worker_payload(
+    ctx: &mut NativeCtx<'_>,
+    payload: &WorkerPayload,
+) -> Result<Value, NativeError> {
+    match payload {
+        WorkerPayload::Undefined => Ok(Value::undefined()),
+        WorkerPayload::Null => Ok(Value::null()),
+        WorkerPayload::Boolean(value) => Ok(Value::boolean(*value)),
+        WorkerPayload::Number(value) => Ok(Value::number(NumberValue::from_f64(value.as_f64()))),
+        WorkerPayload::BigInt(value) => {
+            let bigint = BigIntValue::from_decimal(ctx.heap_mut(), value)
+                .ok_or_else(|| type_err("structuredClone", "invalid BigInt payload".to_string()))?
+                .map_err(|err| {
+                    type_err(
+                        "structuredClone",
+                        format!(
+                            "BigInt allocation failed: requested {}, limit {}",
+                            err.requested_bytes(),
+                            err.heap_limit_bytes()
+                        ),
+                    )
+                })?;
+            Ok(Value::big_int(bigint))
+        }
+        WorkerPayload::String(value) => string_value(ctx, value),
+        WorkerPayload::Array(values) => {
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                out.push(materialize_worker_payload(ctx, value)?);
+            }
+            let array = ctx.array_from_elements(out)?;
+            Ok(Value::array(array))
+        }
+        WorkerPayload::Object(properties) => {
+            let object = ctx.alloc_object()?;
+            for (key, value) in properties {
+                let value = materialize_worker_payload(ctx, value)?;
+                object::set(object, ctx.heap_mut(), key, value);
+            }
+            Ok(Value::object(object))
+        }
+        WorkerPayload::Map(entries) => {
+            let mut map = ctx.alloc_map()?;
+            for (key, value) in entries {
+                let key = materialize_worker_payload(ctx, key)?;
+                let value = materialize_worker_payload(ctx, value)?;
+                ctx.map_set(&mut map, key, value)?;
+            }
+            Ok(Value::map(map))
+        }
+        WorkerPayload::Set(values) => {
+            let mut set = ctx.alloc_set()?;
+            for value in values {
+                let value = materialize_worker_payload(ctx, value)?;
+                ctx.set_add(&mut set, value)?;
+            }
+            Ok(Value::set(set))
+        }
+        WorkerPayload::ArrayBuffer(bytes) => {
+            let Some(buffer) = ctx.alloc_array_buffer_zeroed(bytes.len(), &[], &[])? else {
+                return Err(type_err(
+                    "structuredClone",
+                    "ArrayBuffer allocation failed".to_string(),
+                ));
+            };
+            buffer.with_bytes_mut(ctx.heap_mut(), |target| {
+                target.clear();
+                target.extend_from_slice(bytes);
+            });
+            Ok(Value::array_buffer(buffer))
+        }
+        WorkerPayload::SharedArrayBuffer(body) => {
+            let buffer =
+                JsArrayBuffer::from_shared_arc(ctx.heap_mut(), body.clone()).map_err(|err| {
+                    type_err(
+                        "structuredClone",
+                        format!(
+                            "SharedArrayBuffer allocation failed: requested {}, limit {}",
+                            err.requested_bytes(),
+                            err.heap_limit_bytes()
+                        ),
+                    )
+                })?;
+            Ok(Value::array_buffer(buffer))
+        }
+    }
+}
+
+fn value_to_string(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<String, NativeError> {
+    if let Some(s) = value.as_string(ctx.heap()) {
+        Ok(s.to_lossy_string(ctx.heap()))
+    } else if value.is_undefined() {
+        Ok("undefined".to_string())
+    } else {
+        Ok(value.display_string(ctx.heap()))
+    }
+}
+
+fn string_value(ctx: &mut NativeCtx<'_>, value: &str) -> Result<Value, NativeError> {
+    Ok(Value::string(
+        JsString::from_str(value, ctx.heap_mut())
+            .map_err(|err| type_err("Worker", err.to_string()))?,
+    ))
+}
+
+fn numeric_worker_id(value: &Value) -> Result<u64, NativeError> {
+    match value.as_number() {
+        Some(n) if n.as_f64().is_finite() && n.as_f64() >= 1.0 => Ok(n.as_f64() as u64),
+        _ => Err(type_err("Worker", "invalid worker id".to_string())),
+    }
+}
+
+fn type_err(name: &'static str, reason: String) -> NativeError {
+    NativeError::TypeError { name, reason }
 }
 
 /// Sendable handle to one worker isolate.
@@ -435,6 +1619,8 @@ fn worker_specifier(id: WorkerId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Otter;
+    use std::fs;
 
     fn assert_send_sync_static<T: Send + Sync + 'static>() {}
 
@@ -529,5 +1715,329 @@ mod tests {
         assert_eq!(report.live_runtime_handles, 2);
         assert!(report.has_leaks());
         drop(cloned);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn global_worker_receives_worker_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_path = dir.path().join("worker.js");
+        fs::write(&worker_path, "postMessage('ready');").unwrap();
+        let entry = dir.path().join("entry.js");
+        fs::write(
+            &entry,
+            format!(
+                r#"
+                let got = "pending";
+                const w = new Worker({:?});
+                w.onerror = (event) => {{
+                  got = "ERR:" + event.message;
+                  w.terminate();
+                }};
+                w.onmessage = (event) => {{
+                  got = event.data;
+                  w.terminate();
+                }};
+                setTimeout(() => {{
+                  if (got !== "ready") throw "bad worker message: " + got;
+                }}, 20);
+                "#,
+                worker_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let otter = Otter::builder()
+            .capabilities(CapabilitySet::allow_all())
+            .build()
+            .unwrap();
+        otter.run_file(&entry).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn global_worker_event_listener_surface_dispatches_and_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_path = dir.path().join("worker.js");
+        fs::write(&worker_path, "postMessage('ready');").unwrap();
+        let entry = dir.path().join("entry.js");
+        fs::write(
+            &entry,
+            format!(
+                r#"
+                let count = 0;
+                let got = "pending";
+                const w = new Worker({:?});
+                const removed = () => {{ count += 100; }};
+                w.addEventListener("message", removed);
+                w.removeEventListener("message", removed);
+                w.onmessage = () => {{ count += 10; }};
+                w.addEventListener("message", (event) => {{
+                  count += 1;
+                  got = event.data;
+                  w.terminate();
+                }});
+                setTimeout(() => {{
+                  if (got !== "ready") throw "listener did not receive message";
+                  if (count !== 11) throw "bad listener count: " + count;
+                }}, 20);
+                "#,
+                worker_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let otter = Otter::builder()
+            .capabilities(CapabilitySet::allow_all())
+            .build()
+            .unwrap();
+        otter.run_file(&entry).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn global_worker_parent_to_worker_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_path = dir.path().join("worker.js");
+        fs::write(
+            &worker_path,
+            "globalThis.onmessage = (event) => postMessage(event.data.answer + 1);",
+        )
+        .unwrap();
+        let entry = dir.path().join("entry.js");
+        fs::write(
+            &entry,
+            format!(
+                r#"
+                let got = 0;
+                const w = new Worker({:?});
+                w.onerror = (event) => {{
+                  got = -1;
+                  w.terminate();
+                }};
+                w.onmessage = (event) => {{
+                  got = event.data;
+                  w.terminate();
+                }};
+                w.postMessage({{ answer: 41 }});
+                setTimeout(() => {{
+                  if (got !== 42) throw "bad response: " + got;
+                }}, 20);
+                "#,
+                worker_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let otter = Otter::builder()
+            .capabilities(CapabilitySet::allow_all())
+            .build()
+            .unwrap();
+        otter.run_file(&entry).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn global_worker_terminate_interrupts_infinite_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_path = dir.path().join("worker.js");
+        fs::write(&worker_path, "while (true) {}").unwrap();
+        let entry = dir.path().join("entry.js");
+        fs::write(
+            &entry,
+            format!(
+                r#"
+                const w = new Worker({:?});
+                w.terminate();
+                "terminated";
+                "#,
+                worker_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let otter = Otter::builder()
+            .capabilities(CapabilitySet::allow_all())
+            .build()
+            .unwrap();
+        otter.run_file(&entry).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn global_worker_terminate_interrupts_atomics_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_path = dir.path().join("worker.js");
+        fs::write(
+            &worker_path,
+            r#"
+            globalThis.onmessage = (event) => {
+              const view = new Int32Array(event.data);
+              Atomics.wait(view, 0, 0);
+              postMessage("after-wait");
+            };
+            "#,
+        )
+        .unwrap();
+        let entry = dir.path().join("entry.js");
+        fs::write(
+            &entry,
+            format!(
+                r#"
+                const sab = new SharedArrayBuffer(4);
+                let got = "pending";
+                const w = new Worker({:?});
+                w.onmessage = (event) => {{
+                  got = event.data;
+                }};
+                w.onerror = () => {{
+                  got = "interrupted";
+                }};
+                w.postMessage(sab);
+                setTimeout(() => w.terminate(), 5);
+                setTimeout(() => {{
+                  if (got === "after-wait") throw "Atomics.wait was not cancelled";
+                }}, 20);
+                "#,
+                worker_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let otter = Otter::builder()
+            .capabilities(CapabilitySet::allow_all())
+            .build()
+            .unwrap();
+        otter.run_file(&entry).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn global_worker_shares_shared_array_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_path = dir.path().join("worker.js");
+        fs::write(
+            &worker_path,
+            r#"
+            globalThis.onmessage = (event) => {
+              const view = new Int32Array(event.data);
+              Atomics.store(view, 0, 7);
+              Atomics.notify(view, 0, 1);
+              postMessage("stored");
+            };
+            "#,
+        )
+        .unwrap();
+        let entry = dir.path().join("entry.js");
+        fs::write(
+            &entry,
+            format!(
+                r#"
+                const sab = new SharedArrayBuffer(4);
+                const view = new Int32Array(sab);
+                let got = "pending";
+                const w = new Worker({:?});
+                w.onerror = (event) => {{
+                  got = "ERR:" + event.message;
+                  w.terminate();
+                }};
+                w.onmessage = (event) => {{
+                  got = event.data;
+                  w.terminate();
+                }};
+                w.postMessage(sab);
+                setTimeout(() => {{
+                  if (got !== "stored") throw "bad response: " + got;
+                  if (Atomics.load(view, 0) !== 7) throw "shared write missing";
+                }}, 20);
+                "#,
+                worker_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let otter = Otter::builder()
+            .capabilities(CapabilitySet::allow_all())
+            .build()
+            .unwrap();
+        otter.run_file(&entry).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn global_worker_transfers_array_buffer_and_detaches_sender() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_path = dir.path().join("worker.js");
+        fs::write(
+            &worker_path,
+            r#"
+            globalThis.onmessage = (event) => {
+              const view = new Uint8Array(event.data);
+              postMessage([event.data.byteLength, view[0], view[1], view[2]]);
+            };
+            "#,
+        )
+        .unwrap();
+        let entry = dir.path().join("entry.js");
+        fs::write(
+            &entry,
+            format!(
+                r#"
+                const buffer = new ArrayBuffer(3);
+                const view = new Uint8Array(buffer);
+                view[0] = 4;
+                view[1] = 5;
+                view[2] = 6;
+                let got = null;
+                const w = new Worker({:?});
+                w.onerror = (event) => {{
+                  got = "ERR:" + event.message;
+                  w.terminate();
+                }};
+                w.onmessage = (event) => {{
+                  got = event.data.join(",");
+                  w.terminate();
+                }};
+                w.postMessage(buffer, [buffer]);
+                if (buffer.byteLength !== 0) throw "sender buffer was not detached";
+                setTimeout(() => {{
+                  if (got !== "3,4,5,6") throw "bad transfer result: " + got;
+                }}, 20);
+                "#,
+                worker_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let otter = Otter::builder()
+            .capabilities(CapabilitySet::allow_all())
+            .build()
+            .unwrap();
+        otter.run_file(&entry).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn global_worker_post_message_rejects_unsupported_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_path = dir.path().join("worker.js");
+        fs::write(&worker_path, "globalThis.onmessage = () => {};").unwrap();
+        let entry = dir.path().join("entry.js");
+        fs::write(
+            &entry,
+            format!(
+                r#"
+                const w = new Worker({:?});
+                let threw = false;
+                try {{
+                  w.postMessage(() => 1);
+                }} catch (err) {{
+                  threw = String(err).includes("structuredClone");
+                }}
+                w.terminate();
+                if (!threw) throw "unsupported value did not throw";
+                "#,
+                worker_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let otter = Otter::builder()
+            .capabilities(CapabilitySet::allow_all())
+            .build()
+            .unwrap();
+        otter.run_file(&entry).await.unwrap();
     }
 }

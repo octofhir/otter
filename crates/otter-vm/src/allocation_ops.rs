@@ -332,6 +332,41 @@ impl Interpreter {
         ))
     }
 
+    /// Allocate a host-created native constructor while exposing runtime roots
+    /// and caller-owned pending values.
+    pub fn native_constructor_from_call_host_rooted(
+        &mut self,
+        name: &'static str,
+        length: u8,
+        call: NativeCall,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<Value, otter_gc::OutOfMemory> {
+        let roots = self.collect_runtime_roots();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            for value in value_roots {
+                value.trace_value_slots(visitor);
+            }
+            for slice in slice_roots {
+                for value in *slice {
+                    value.trace_value_slots(visitor);
+                }
+            }
+        };
+        Ok(Value::native_function(
+            NativeFunction::from_constructor_call_with_roots(
+                &mut self.gc_heap,
+                name,
+                length,
+                call,
+                &mut external_visit,
+            )?,
+        ))
+    }
+
     pub(crate) fn alloc_runtime_rooted_iterator_state(
         &mut self,
         state: IteratorState,

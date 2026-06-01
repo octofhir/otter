@@ -17,6 +17,9 @@
 //! # Invariants
 //! - String bytes/code units live on the GC heap (Vec inside body).
 //!   No `Rc` / `Arc` / `Box` / `Cell` / `RefCell` inside the body.
+//! - Bodies are allocated in old-space. `JsString` is a copied handle
+//!   wrapper used heavily by native builtins; keeping string bodies
+//!   non-moving preserves those local handles across GC.
 //! - `len` is precomputed at construction and is O(1) heap-free at
 //!   the body level (callers read it via `heap.read_payload`).
 //! - `hash` is the FNV-1a hash over the materialised UTF-16 code
@@ -188,7 +191,7 @@ pub fn alloc_flat_string_body_with_roots(
     // usage keeps doubling.
     let bytes = (units.len() as u64).saturating_mul(2);
     heap.reserve_bytes_with_roots(bytes, external_visit)?;
-    heap.alloc_with_roots(
+    heap.alloc_old_with_roots(
         JsStringBody {
             id,
             len,
@@ -212,7 +215,7 @@ pub fn alloc_latin1_string_body_with_roots(
     let len = bytes.len() as u32;
     let hash = hash_latin1(bytes);
     heap.reserve_bytes_with_roots(bytes.len() as u64, external_visit)?;
-    heap.alloc_with_roots(
+    heap.alloc_old_with_roots(
         JsStringBody {
             id,
             len,
@@ -272,7 +275,7 @@ pub fn concat_string_bodies(
     // right)` because FNV-1a is a streaming hash.
     let combined_hash = fnv_combine(left_hash, right_hash, right_len as usize);
 
-    heap.alloc_with_roots(
+    heap.alloc_old_with_roots(
         JsStringBody {
             id: JsStringId::new(0),
             len: new_len,
@@ -344,7 +347,7 @@ pub fn slice_string_body(
                 }
                 _ => 0,
             });
-            heap.alloc_with_roots(
+            heap.alloc_old_with_roots(
                 JsStringBody {
                     id: JsStringId::new(0),
                     len: length,
@@ -386,7 +389,7 @@ pub fn slice_string_body(
                 let units = to_utf16_vec_slice(heap, parent, abs_start, length);
                 hash_utf16(&units)
             };
-            heap.alloc_with_roots(
+            heap.alloc_old_with_roots(
                 JsStringBody {
                     id: JsStringId::new(0),
                     len: length,

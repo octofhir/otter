@@ -34,7 +34,7 @@ use crate::config::Test262Config;
 use crate::feature_map::FeatureMap;
 use crate::harness::HarnessCache;
 use crate::isolation::{WatchdogOutcome, fresh_runtime, run_with_watchdog};
-use crate::metadata::{Frontmatter, FrontmatterError, NegativePhase};
+use crate::metadata::{Frontmatter, FrontmatterError, NegativePhase, TestFlag};
 
 /// Resolved on-disk paths for a test262 checkout.
 #[derive(Debug, Clone)]
@@ -369,7 +369,14 @@ pub fn run_one(
     };
 
     // 9. Allocate fresh runtime + run.
-    let mut runtime = match fresh_runtime(exec.timeout, exec.max_heap_bytes) {
+    let allow_blocking_atomics_wait = !frontmatter
+        .test_flags()
+        .contains(&TestFlag::CanBlockIsFalse);
+    let mut runtime = match fresh_runtime(
+        exec.timeout,
+        exec.max_heap_bytes,
+        allow_blocking_atomics_wait,
+    ) {
         Ok(rt) => rt,
         Err(err) => {
             return result_with(
@@ -389,18 +396,6 @@ pub fn run_one(
     // the cross-test agent registry first so leftover senders /
     // reports from the previous test do not bleed in.
     crate::agent::reset_for_next_test();
-    if let Err(err) = crate::agent::install_natives(&mut runtime) {
-        return result_with(
-            rel_path,
-            esid,
-            features,
-            Outcome::Crash {
-                panic: format!("agent native install failed: {err}"),
-            },
-            start,
-        );
-    }
-
     let outcome = if frontmatter.is_module() {
         run_module_test(&mut runtime, &combined, test_path, exec.timeout)
     } else {

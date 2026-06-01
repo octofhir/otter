@@ -22,6 +22,7 @@
 //! - [`crate::executable`]
 
 use otter_bytecode::Operand;
+use otter_gc::raw::RawGc;
 use smallvec::SmallVec;
 
 use crate::{
@@ -31,6 +32,54 @@ use crate::{
     is_constructor_runtime, native_to_vm_error, operand_decode::register_operand, promise_dispatch,
     read_register, write_register,
 };
+
+struct SyncNativeCallRoots<'a> {
+    runtime_roots: Vec<*mut RawGc>,
+    value_roots: SmallVec<[&'a Value; 4]>,
+    slice_roots: SmallVec<[&'a [Value]; 2]>,
+}
+
+impl otter_gc::ExtraRootSource for SyncNativeCallRoots<'_> {
+    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        for &slot in &self.runtime_roots {
+            visitor(slot);
+        }
+        for value in &self.value_roots {
+            value.trace_value_slots(visitor);
+        }
+        for slice in &self.slice_roots {
+            for value in *slice {
+                value.trace_value_slots(visitor);
+            }
+        }
+    }
+}
+
+fn invoke_native_call_with_roots(
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
+    call: crate::native_function::NativeCallTarget,
+    this_value: Value,
+    value_roots: &[&Value],
+    args: &[Value],
+) -> Result<Value, VmError> {
+    let this_root = this_value;
+    let mut roots = SyncNativeCallRoots {
+        runtime_roots: interp.collect_runtime_roots(),
+        value_roots: smallvec::smallvec![&this_root],
+        slice_roots: smallvec::smallvec![args],
+    };
+    roots.value_roots.extend_from_slice(value_roots);
+    let previous = interp
+        .gc_heap
+        .install_extra_roots(Some(otter_gc::ExtraRoots::new(&roots)));
+    let call_info = NativeCallInfo::call(this_root);
+    let mut ctx =
+        NativeCtx::new_with_call_info_and_context(interp, call_info, Some(context.clone()));
+    let result = call.invoke(&mut ctx, args).map_err(native_to_vm_error);
+    let _ = interp.gc_heap.install_extra_roots(previous);
+    result
+}
 
 struct PreparedBytecodeFrame {
     frame: Frame,
@@ -526,11 +575,9 @@ impl Interpreter {
             if let crate::native_function::NativeCallTarget::VmIntrinsic(_) = call {
                 return Ok(false);
             }
-            let call_info = NativeCallInfo::call(this_value);
             self.record_runtime_native_call();
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            let result = call.invoke(&mut ctx, args).map_err(native_to_vm_error)?;
+            let result =
+                invoke_native_call_with_roots(self, context, call, this_value, &[callee], args)?;
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(true);
         }
@@ -540,11 +587,9 @@ impl Interpreter {
             if let crate::native_function::NativeCallTarget::VmIntrinsic(_) = call {
                 return Ok(false);
             }
-            let call_info = NativeCallInfo::call(this_value);
             self.record_runtime_native_call();
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            let result = call.invoke(&mut ctx, args).map_err(native_to_vm_error)?;
+            let result =
+                invoke_native_call_with_roots(self, context, call, this_value, &[callee], args)?;
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(true);
         }
@@ -677,13 +722,15 @@ impl Interpreter {
                 crate::object::call_native(obj, &self.gc_heap).and_then(|v| v.as_native_function())
         {
             let call = native.call_target(&self.gc_heap);
-            let call_info = NativeCallInfo::call(effective_this);
             self.record_runtime_native_call();
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            let result = call
-                .invoke(&mut ctx, effective_args.as_slice())
-                .map_err(native_to_vm_error)?;
+            let result = invoke_native_call_with_roots(
+                self,
+                context,
+                call,
+                effective_this,
+                &[&current],
+                effective_args.as_slice(),
+            )?;
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(());
@@ -697,13 +744,15 @@ impl Interpreter {
                 write_register(&mut stack[top_idx], dst, result)?;
                 return Ok(());
             }
-            let call_info = NativeCallInfo::call(effective_this);
             self.record_runtime_native_call();
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            let result = call
-                .invoke(&mut ctx, effective_args.as_slice())
-                .map_err(native_to_vm_error)?;
+            let result = invoke_native_call_with_roots(
+                self,
+                context,
+                call,
+                effective_this,
+                &[&current],
+                effective_args.as_slice(),
+            )?;
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(());
@@ -1406,13 +1455,15 @@ impl Interpreter {
                 crate::object::call_native(obj, &self.gc_heap).and_then(|v| v.as_native_function())
         {
             let call = native.call_target(&self.gc_heap);
-            let call_info = NativeCallInfo::call(effective_this);
             self.record_runtime_native_call();
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            return call
-                .invoke(&mut ctx, effective_args.as_slice())
-                .map_err(native_to_vm_error);
+            return invoke_native_call_with_roots(
+                self,
+                context,
+                call,
+                effective_this,
+                &[&current],
+                effective_args.as_slice(),
+            );
         }
         if let Some(native) = current.as_native_function() {
             let native = &native;
@@ -1425,13 +1476,15 @@ impl Interpreter {
                     effective_args,
                 );
             }
-            let call_info = NativeCallInfo::call(effective_this);
             self.record_runtime_native_call();
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            return call
-                .invoke(&mut ctx, effective_args.as_slice())
-                .map_err(native_to_vm_error);
+            return invoke_native_call_with_roots(
+                self,
+                context,
+                call,
+                effective_this,
+                &[&current],
+                effective_args.as_slice(),
+            );
         }
         let (function_id, parent_upvalues, this_for_callee, new_target_for_callee) =
             Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;

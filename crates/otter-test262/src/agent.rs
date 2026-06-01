@@ -1,9 +1,10 @@
 //! `$262.agent.*` host harness (slice 19c).
 //!
-//! Test262 cross-worker tests require a host-defined agent model
-//! (start agent threads, broadcast a `SharedArrayBuffer`, wake up
-//! `Atomics.wait` waiters from another thread, etc.). This module
-//! plugs that surface into the test262 runner.
+//! Test262 cross-agent tests require a host-defined agent model
+//! (start agents, broadcast a `SharedArrayBuffer`, wake up
+//! `Atomics.wait` waiters from another isolate, etc.). This module
+//! plugs that surface into the test262 runner by routing
+//! `$262.agent.start` through the real runtime Worker backend.
 //!
 //! Architecture:
 //!
@@ -31,9 +32,9 @@
 //!   serialise broadcast dispatch.
 //! - The parent never registers an inbox, so it never receives its
 //!   own broadcast messages.
-//! - Each agent thread builds its own [`otter_runtime::Runtime`]
-//!   with a private heap; the only state shared with the parent
-//!   is the SAB's `Arc<SharedBody>`.
+//! - Each agent is a real Worker runtime with a private heap; the
+//!   only state shared with the parent is the SAB's
+//!   `Arc<SharedBody>`.
 //!
 //! # See also
 //!
@@ -41,11 +42,14 @@
 //! - `docs/workers-262-plan.md` — slice 19c plan.
 
 use std::collections::{HashMap, VecDeque};
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use otter_runtime::{OtterError, Runtime, SourceInput};
+use otter_runtime::{InterruptHandle, OtterError, Runtime};
 use otter_vm::binary::JsArrayBuffer;
 use otter_vm::binary::array_buffer::SharedBody;
 use otter_vm::string::JsString;
@@ -67,6 +71,15 @@ struct BroadcastMessage {
 struct AgentRegistry {
     /// One sender per running agent.
     senders: Vec<mpsc::Sender<BroadcastMessage>>,
+    /// Join handles for started agents. Reset joins previous-test agents
+    /// after closing their broadcast channels so their private heaps return
+    /// pages to the process-global GC cage before the next test starts.
+    handles: Vec<thread::JoinHandle<()>>,
+    /// Cooperative interrupt handles for agent runtimes. Reset trips these
+    /// before joining so agents spinning in JS code can leave their VM loops.
+    interrupts: Vec<InterruptHandle>,
+    /// Worker ids returned by the runtime Worker backend.
+    worker_ids: Vec<u64>,
     /// `$262.agent.report` / `$262.agent.getReport` FIFO.
     reports: VecDeque<String>,
 }
@@ -74,6 +87,9 @@ struct AgentRegistry {
 static AGENTS: LazyLock<Mutex<AgentRegistry>> = LazyLock::new(|| {
     Mutex::new(AgentRegistry {
         senders: Vec::new(),
+        handles: Vec::new(),
+        interrupts: Vec::new(),
+        worker_ids: Vec::new(),
         reports: VecDeque::new(),
     })
 });
@@ -83,6 +99,10 @@ static AGENTS: LazyLock<Mutex<AgentRegistry>> = LazyLock::new(|| {
 /// agent fails deterministically with `TypeError`.
 static AGENT_INBOXES: LazyLock<Mutex<HashMap<thread::ThreadId, mpsc::Receiver<BroadcastMessage>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static PENDING_WORKER_INBOXES: LazyLock<Mutex<VecDeque<mpsc::Receiver<BroadcastMessage>>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::new()));
+static AGENT_TEMP_FILES: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static NEXT_AGENT_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Monotonic clock anchor — `monotonicNow()` returns
 /// milliseconds since the first call inside the process.
@@ -92,13 +112,39 @@ static MONOTONIC_BASE: LazyLock<Instant> = LazyLock::new(Instant::now);
 /// driver between tests so a previous test's leftover agents /
 /// reports do not bleed into the next.
 pub fn reset_for_next_test() {
-    let mut reg = AGENTS.lock().expect("agent registry poisoned");
-    reg.senders.clear();
-    reg.reports.clear();
+    let (handles, interrupts) = {
+        let mut reg = AGENTS.lock().expect("agent registry poisoned");
+        reg.senders.clear();
+        reg.reports.clear();
+        reg.worker_ids.clear();
+        (
+            std::mem::take(&mut reg.handles),
+            std::mem::take(&mut reg.interrupts),
+        )
+    };
     AGENT_INBOXES
         .lock()
         .expect("agent inbox registry poisoned")
         .clear();
+    PENDING_WORKER_INBOXES
+        .lock()
+        .expect("agent pending inbox registry poisoned")
+        .clear();
+    for interrupt in interrupts {
+        interrupt.interrupt();
+    }
+    otter_vm::atomics_wait::cancel_all_waiters();
+    for handle in handles {
+        let _ = handle.join();
+    }
+    let paths = AGENT_TEMP_FILES
+        .lock()
+        .expect("agent temp-file registry poisoned")
+        .drain(..)
+        .collect::<Vec<_>>();
+    for path in paths {
+        let _ = fs::remove_file(path);
+    }
 }
 
 /// Install every `__otter_agent_*` native global on the given
@@ -106,6 +152,7 @@ pub fn reset_for_next_test() {
 /// the harness preamble runs so the JS-side `$262.agent` object
 /// in [`D262_HOST_PREAMBLE`] resolves to live bindings.
 pub fn install_natives(runtime: &mut Runtime) -> Result<(), OtterError> {
+    claim_pending_worker_inbox();
     for (name, length, call) in NATIVES {
         runtime.install_native_global(name, *length, *call)?;
     }
@@ -144,6 +191,19 @@ fn is_html_dda(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
     Ok(Value::null())
 }
 
+fn claim_pending_worker_inbox() {
+    let rx = PENDING_WORKER_INBOXES
+        .lock()
+        .expect("agent pending inbox registry poisoned")
+        .pop_front();
+    if let Some(rx) = rx {
+        AGENT_INBOXES
+            .lock()
+            .expect("agent inbox registry poisoned")
+            .insert(thread::current().id(), rx);
+    }
+}
+
 fn arg_to_string(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<String, NativeError> {
     if let Some(s) = value.as_string(ctx.heap()) {
         return Ok(s.to_lossy_string(ctx.heap()));
@@ -174,52 +234,75 @@ fn agent_start(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
     let source = arg_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
     let (tx, rx) = mpsc::channel::<BroadcastMessage>();
 
+    let entry = write_agent_entry(source)?;
+    PENDING_WORKER_INBOXES
+        .lock()
+        .expect("agent pending inbox registry poisoned")
+        .push_back(rx);
+    let worker_id = spawn_worker_agent(ctx, &entry)?;
     {
         let mut reg = AGENTS.lock().expect("agent registry poisoned");
         reg.senders.push(tx);
+        reg.worker_ids.push(worker_id);
     }
-
-    // Spawn the agent on a real OS thread. The thread builds its
-    // own runtime; the only Rust state shared with the parent is
-    // the `Arc<SharedBody>` that rides through the channel.
-    thread::Builder::new()
-        .name("test262-agent".to_string())
-        .spawn(move || {
-            let thread_id = thread::current().id();
-            AGENT_INBOXES
-                .lock()
-                .expect("agent inbox registry poisoned")
-                .insert(thread_id, rx);
-            run_agent_source(source);
-            AGENT_INBOXES
-                .lock()
-                .expect("agent inbox registry poisoned")
-                .remove(&thread_id);
-        })
-        .map_err(|e| type_err(format!("agent thread spawn failed: {e}")))?;
 
     Ok(Value::undefined())
 }
 
-fn run_agent_source(source: String) {
-    // Build the same preamble the runner uses for the main thread
-    // so the agent observes a full `$262` global.
+fn write_agent_entry(source: String) -> Result<PathBuf, NativeError> {
     let mut combined = String::with_capacity(D262_HOST_PREAMBLE.len() + source.len() + 16);
     combined.push_str(D262_HOST_PREAMBLE);
     combined.push('\n');
     combined.push_str(&source);
 
-    let Ok(mut runtime) = Runtime::builder()
-        .timeout(Duration::from_secs(30))
-        .max_heap_bytes(256 * 1024 * 1024)
-        .build()
-    else {
-        return;
+    let id = NEXT_AGENT_FILE_ID.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("otter-test262-agent-{id}.js"));
+    fs::write(&path, combined)
+        .map_err(|err| type_err(format!("agent entry write failed: {err}")))?;
+    AGENT_TEMP_FILES
+        .lock()
+        .expect("agent temp-file registry poisoned")
+        .push(path.clone());
+    Ok(path)
+}
+
+fn spawn_worker_agent(ctx: &mut NativeCtx<'_>, entry: &PathBuf) -> Result<u64, NativeError> {
+    let path = entry.to_string_lossy().to_string();
+    let path_value = {
+        let js = JsString::from_str(&path, ctx.heap_mut())
+            .map_err(|err| type_err(format!("agent path string allocation failed: {err}")))?;
+        Value::string(js)
     };
-    if install_natives(&mut runtime).is_err() {
-        return;
-    }
-    let _ = runtime.run_script(SourceInput::from_javascript(combined), "test262-agent");
+    let (interp, exec) = ctx.interp_mut_and_context();
+    let exec = exec.ok_or_else(|| type_err("missing execution context"))?;
+    let spawn = otter_vm::object::get(
+        *interp.global_this(),
+        interp.gc_heap(),
+        "__otter_worker_spawn",
+    )
+    .ok_or_else(|| type_err("Worker backend is not installed"))?;
+    interp
+        .run_callable_sync(
+            &exec,
+            &spawn,
+            Value::undefined(),
+            smallvec::smallvec![path_value],
+        )
+        .and_then(|value| {
+            value
+                .as_number()
+                .map(|number| number.as_f64() as u64)
+                .ok_or(otter_vm::VmError::TypeError {
+                    message: "Worker backend returned a non-numeric id".to_string(),
+                })
+        })
+        .map_err(|err| match err {
+            otter_vm::VmError::Uncaught { value } => NativeError::Thrown {
+                name: "$262.agent.start",
+                message: value,
+            },
+            other => type_err(other.to_string()),
+        })
 }
 
 // =====================================================================
@@ -356,6 +439,7 @@ fn agent_report(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
 }
 
 fn agent_get_report(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    drain_worker_agent_events(ctx)?;
     let mut reg = AGENTS.lock().expect("agent registry poisoned");
     let msg = reg.reports.pop_front();
     drop(reg);
@@ -368,6 +452,68 @@ fn agent_get_report(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
             Ok(Value::string(js))
         }
     }
+}
+
+fn drain_worker_agent_events(ctx: &mut NativeCtx<'_>) -> Result<(), NativeError> {
+    let worker_ids = {
+        let reg = AGENTS.lock().expect("agent registry poisoned");
+        reg.worker_ids.clone()
+    };
+    if worker_ids.is_empty() {
+        return Ok(());
+    }
+    let (interp, exec) = ctx.interp_mut_and_context();
+    let exec = exec.ok_or_else(|| type_err("missing execution context"))?;
+    let Some(drain) = otter_vm::object::get(
+        *interp.global_this(),
+        interp.gc_heap(),
+        "__otter_worker_drain",
+    ) else {
+        return Ok(());
+    };
+    let mut surfaced = Vec::new();
+    for id in worker_ids {
+        let events = interp
+            .run_callable_sync(
+                &exec,
+                &drain,
+                Value::undefined(),
+                smallvec::smallvec![Value::number_f64(id as f64)],
+            )
+            .map_err(|err| match err {
+                otter_vm::VmError::Uncaught { value } => NativeError::Thrown {
+                    name: "$262.agent.getReport",
+                    message: value,
+                },
+                other => type_err(other.to_string()),
+            })?;
+        let Some(events) = events.as_array() else {
+            continue;
+        };
+        let len = otter_vm::array::len(events, interp.gc_heap());
+        for idx in 0..len {
+            let event = otter_vm::array::get(events, interp.gc_heap(), idx);
+            let Some(event) = event.as_object() else {
+                continue;
+            };
+            let ty = otter_vm::object::get(event, interp.gc_heap(), "type")
+                .and_then(|value| value.as_string(interp.gc_heap()))
+                .map(|value| value.to_lossy_string(interp.gc_heap()))
+                .unwrap_or_default();
+            if ty == "error" || ty == "messageerror" {
+                let message = otter_vm::object::get(event, interp.gc_heap(), "message")
+                    .and_then(|value| value.as_string(interp.gc_heap()))
+                    .map(|value| value.to_lossy_string(interp.gc_heap()))
+                    .unwrap_or_else(|| ty.clone());
+                surfaced.push(format!("agent {ty}: {message}"));
+            }
+        }
+    }
+    if !surfaced.is_empty() {
+        let mut reg = AGENTS.lock().expect("agent registry poisoned");
+        reg.reports.extend(surfaced);
+    }
+    Ok(())
 }
 
 // =====================================================================

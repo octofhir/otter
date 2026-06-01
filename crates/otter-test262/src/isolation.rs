@@ -28,16 +28,24 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use otter_runtime::{ExecutionResult, InterruptHandle, OtterError, Runtime, SourceInput};
+use otter_runtime::{
+    ExecutionResult, InterruptHandle, OtterError, Runtime, RuntimeGlobalInstaller, SourceInput,
+};
 
 /// Build a fresh runtime with the configured per-test caps.
 ///
 /// `max_heap_bytes = 0` disables the cap (matches
 /// `RuntimeBuilder::max_heap_bytes`'s contract).
-pub fn fresh_runtime(timeout: Duration, max_heap_bytes: u64) -> Result<Runtime, OtterError> {
+pub fn fresh_runtime(
+    timeout: Duration,
+    max_heap_bytes: u64,
+    allow_blocking_atomics_wait: bool,
+) -> Result<Runtime, OtterError> {
     Runtime::builder()
         .timeout(timeout)
         .max_heap_bytes(max_heap_bytes)
+        .allow_blocking_atomics_wait(allow_blocking_atomics_wait)
+        .global_installer(RuntimeGlobalInstaller::new(crate::agent::install_natives))
         .build()
 }
 
@@ -146,6 +154,7 @@ fn spawn_watchdog(handle: InterruptHandle, timeout: Duration) -> WatchdogHandle 
             }
             if outcome.is_err() {
                 handle.interrupt();
+                otter_vm::atomics_wait::cancel_all_waiters();
             }
         })
         .expect("test262-watchdog thread should spawn");
@@ -172,7 +181,7 @@ mod tests {
 
     #[test]
     fn watchdog_returns_ok_when_body_finishes_quickly() {
-        let mut rt = fresh_runtime(Duration::from_secs(5), 64 * 1024 * 1024).unwrap();
+        let mut rt = fresh_runtime(Duration::from_secs(5), 64 * 1024 * 1024, false).unwrap();
         let outcome = run_with_watchdog(&mut rt, Duration::from_secs(5), |rt| {
             rt.run_script(SourceInput::from_javascript("1 + 1;"), "<test>")
         });
@@ -181,7 +190,7 @@ mod tests {
 
     #[test]
     fn watchdog_classifies_panic_as_panic() {
-        let mut rt = fresh_runtime(Duration::ZERO, 64 * 1024 * 1024).unwrap();
+        let mut rt = fresh_runtime(Duration::ZERO, 64 * 1024 * 1024, false).unwrap();
         let outcome = run_with_watchdog(&mut rt, Duration::ZERO, |_| {
             panic!("synthetic engine panic for test")
         });
@@ -195,7 +204,7 @@ mod tests {
     fn watchdog_with_zero_timeout_does_not_spawn_thread() {
         // Zero timeout disables the watchdog; this regresses on the
         // "watchdog always spawns" implementation if we ever flip it.
-        let mut rt = fresh_runtime(Duration::ZERO, 64 * 1024 * 1024).unwrap();
+        let mut rt = fresh_runtime(Duration::ZERO, 64 * 1024 * 1024, false).unwrap();
         let outcome = run_with_watchdog(&mut rt, Duration::ZERO, |rt| {
             rt.run_script(SourceInput::from_javascript("var x = 1;"), "<test>")
         });

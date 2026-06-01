@@ -2,6 +2,42 @@
 // Only includes Otter-specific globals, Web APIs come from @types/node
 
 declare global {
+    type WorkerMessageHandler = (event: WorkerMessageEvent) => void;
+
+    interface WorkerOptions {
+        type?: "classic" | "module";
+        name?: string;
+        credentials?: "omit" | "same-origin" | "include";
+    }
+
+    interface WorkerMessageEvent<T = any> {
+        readonly type: "message" | "messageerror" | "error";
+        readonly data: T;
+        readonly message?: string;
+    }
+
+    interface WorkerGlobalScope {
+        readonly self: WorkerGlobalScope;
+        onmessage: WorkerMessageHandler | null;
+        onerror: WorkerMessageHandler | null;
+        postMessage(value: any, transferList?: any[]): void;
+        close(): void;
+    }
+
+    class Worker {
+        constructor(specifier: string | URL, options?: WorkerOptions);
+        onmessage: WorkerMessageHandler | null;
+        onerror: WorkerMessageHandler | null;
+        onmessageerror: WorkerMessageHandler | null;
+        postMessage(value: any, transferList?: any[]): void;
+        terminate(): void;
+        addEventListener(type: "message" | "messageerror" | "error", listener: WorkerMessageHandler): void;
+        removeEventListener(type: "message" | "messageerror" | "error", listener: WorkerMessageHandler): void;
+        dispatchEvent(event: WorkerMessageEvent): boolean;
+    }
+
+    var self: WorkerGlobalScope & typeof globalThis;
+
     // ============================================================================
     // CommonJS Support
     // ============================================================================

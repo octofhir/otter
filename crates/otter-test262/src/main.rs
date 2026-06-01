@@ -41,6 +41,10 @@ const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 const MAX_TIMEOUT_MS: u64 = 30_000;
 /// Default per-test heap cap (512 MiB).
 const DEFAULT_MAX_HEAP_BYTES: u64 = 512 * 1024 * 1024;
+/// Test262 can run several `$262.agent` runtimes at once. Use a larger
+/// process-global pointer-compression cage than the VM default before the
+/// first per-test runtime is constructed.
+const TEST262_CAGE_BYTES: usize = 1024 * 1024 * 1024;
 /// How often to flush the cursor file mid-shard.
 const CURSOR_FLUSH_EVERY: u64 = 100;
 /// Default location for generated baselines.
@@ -237,6 +241,11 @@ fn run(repo_root: &Path, args: RunArgs) -> Result<ExitCode> {
     if args.dry_run {
         println!("total: {}", tests.len());
         return Ok(ExitCode::SUCCESS);
+    }
+
+    if otter_runtime::otter_gc::cage_size() == 0 {
+        otter_runtime::otter_gc::init_cage_with_size(TEST262_CAGE_BYTES)
+            .context("failed to initialise Test262 GC cage")?;
     }
 
     if args.resume > 0 {

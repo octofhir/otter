@@ -22,6 +22,8 @@
 //! # Invariants
 //! - `Uint8ClampedArray`, `Float32Array`, `Float64Array` are never
 //!   accepted as a `typedArray` argument to any atomic op.
+//! - Detached TypedArray buffers are rejected before `index` or
+//!   value coercion.
 //! - `wait` / `waitAsync` require a `SharedArrayBuffer`-backed view
 //!   of `Int32Array` or `BigInt64Array`.
 //! - Out-of-range indices surface as `RangeError`, **not**
@@ -104,20 +106,27 @@ fn validate_integer_typed_array(
             ),
         ));
     }
+    if ta.buffer(heap).is_detached(heap) {
+        return Err(type_err(
+            method_name,
+            "TypedArray buffer is detached".to_string(),
+        ));
+    }
     Ok(ta)
 }
 
 /// §25.4.3.4 ValidateAtomicAccess ( typedArray, requestIndex ).
-/// Coerces `request_index` through ToIndex, then bounds-checks it
-/// against `typedArray.length`. Out-of-range → `RangeError`.
+/// Captures `typedArray.length`, coerces `request_index` through
+/// ToIndex, then bounds-checks against the captured length.
+/// Out-of-range → `RangeError`.
 fn validate_atomic_access(
     ctx: &mut NativeCtx<'_>,
     ta: &JsTypedArray,
     request_index: &Value,
     method_name: &'static str,
 ) -> Result<usize, NativeError> {
-    let idx = coerce_to_index(ctx, request_index, method_name)?;
     let len = ta.length(ctx.heap());
+    let idx = coerce_to_index(ctx, request_index, method_name)?;
     if idx >= len {
         return Err(range_err(
             method_name,
@@ -655,6 +664,12 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
             }
         }
     };
+    if !is_async && !ctx.interp_mut().allow_blocking_atomics_wait() {
+        return Err(type_err(
+            method_name,
+            "Atomics.wait cannot block on this runtime".to_string(),
+        ));
+    }
     let heap = ctx.interp_mut().gc_heap_mut();
     let current = ta.get(heap, idx).map_err(|e| {
         type_err(
@@ -684,9 +699,13 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
             let ms = timeout.min(u64::MAX as f64) as u64;
             Some(Duration::from_millis(ms))
         };
-        match atomics_wait::park_until_notified(buf_id, idx, dur) {
+        let interrupt = ctx.interp_mut().interrupt_handle();
+        match atomics_wait::park_until_notified(buf_id, idx, dur, Some(&interrupt)) {
             WaitOutcome::Ok => "ok",
             WaitOutcome::TimedOut => "timed-out",
+            WaitOutcome::Interrupted | WaitOutcome::Cancelled => {
+                return Err(NativeError::Interrupted);
+            }
         }
     };
     let string_heap = ctx.cx.interp.gc_heap_mut();

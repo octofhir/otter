@@ -305,6 +305,7 @@ pub struct Interpreter {
     shape_runtime: object::ShapeRuntime,
     max_stack_depth: u32,
     sync_reentry_depth: u32,
+    allow_blocking_atomics_wait: bool,
     /// Per-interpreter microtask queue. Plain field — accessed
     /// only through `&mut self`. The dispatch loop threads
     /// `&mut self.microtasks` alongside `&mut stack` (split-borrow)
@@ -707,6 +708,7 @@ impl Interpreter {
             shape_runtime,
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
             sync_reentry_depth: 0,
+            allow_blocking_atomics_wait: false,
             microtasks: MicrotaskQueue::new(),
             module_environments: std::collections::HashMap::new(),
             module_resolution_cache: std::collections::HashMap::new(),
@@ -1564,6 +1566,21 @@ impl Interpreter {
     #[must_use]
     pub fn interrupt_handle(&self) -> InterruptFlag {
         self.interrupt.clone()
+    }
+
+    /// Configure whether this isolate may block in `Atomics.wait`.
+    ///
+    /// Main/direct runtimes keep this disabled so an infinite wait cannot
+    /// stall the host thread. Worker runtimes enable it because their owning
+    /// host can interrupt and terminate the isolate thread.
+    pub fn set_allow_blocking_atomics_wait(&mut self, allow: bool) {
+        self.allow_blocking_atomics_wait = allow;
+    }
+
+    /// Whether this isolate may block in `Atomics.wait`.
+    #[must_use]
+    pub fn allow_blocking_atomics_wait(&self) -> bool {
+        self.allow_blocking_atomics_wait
     }
 
     /// Clone-out the error-class registry. Used by native closures

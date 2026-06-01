@@ -488,6 +488,27 @@ impl NativeFunction {
         )
     }
 
+    /// Build a native constructor from an already-classified call target while
+    /// exposing caller-owned roots across metadata allocation.
+    pub fn from_constructor_call_with_roots(
+        heap: &mut otter_gc::GcHeap,
+        name: &'static str,
+        length: u8,
+        call: NativeCall,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        Self::allocate_with_roots(
+            heap,
+            name,
+            length,
+            call.into(),
+            SmallVec::new(),
+            None,
+            NativeFunctionMetadata::CONSTRUCTOR,
+            external_visit,
+        )
+    }
+
     /// Build the realm's `%ThrowTypeError%` intrinsic function while
     /// exposing caller-owned roots across metadata allocation.
     pub(crate) fn throw_type_error_with_roots(
@@ -1193,6 +1214,11 @@ pub enum NativeError {
         /// Process-style exit status, already normalized to one byte.
         code: u8,
     },
+    /// Host-visible runtime interruption observed inside a blocking
+    /// native operation. This is not a JS throw and must not be
+    /// catchable by user code.
+    #[error("native function interrupted")]
+    Interrupted,
 }
 
 impl From<otter_gc::OutOfMemory> for NativeError {
@@ -1228,6 +1254,7 @@ pub(crate) fn vm_to_native_error(err: crate::VmError, name: &'static str) -> Nat
             name,
             reason: message,
         },
+        crate::VmError::Interrupted => NativeError::Interrupted,
         other => NativeError::TypeError {
             name,
             reason: other.to_string(),

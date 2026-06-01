@@ -381,6 +381,7 @@ pub(crate) fn native_to_vm_error(err: NativeError) -> VmError {
             message: format!("{name}: {reason}"),
         },
         NativeError::Exit { code } => VmError::Exit { code },
+        NativeError::Interrupted => VmError::Interrupted,
     }
 }
 

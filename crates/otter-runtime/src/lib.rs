@@ -315,6 +315,40 @@ impl HostedModule {
     }
 }
 
+/// Cloneable callback that installs embedder globals on every runtime isolate.
+///
+/// Runtime workers clone [`RuntimeConfig`], so installers registered on a
+/// parent runtime also run inside child worker isolates before user code
+/// starts. Installers must copy owned data into the runtime and must not expose
+/// isolate-local VM handles across runtime boundaries.
+#[derive(Clone)]
+pub struct RuntimeGlobalInstaller {
+    install: Arc<dyn Fn(&mut Runtime) -> Result<(), OtterError> + Send + Sync>,
+}
+
+impl RuntimeGlobalInstaller {
+    /// Build a global installer from a sendable callback.
+    #[must_use]
+    pub fn new(
+        install: impl Fn(&mut Runtime) -> Result<(), OtterError> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            install: Arc::new(install),
+        }
+    }
+
+    fn install(&self, runtime: &mut Runtime) -> Result<(), OtterError> {
+        (self.install)(runtime)
+    }
+}
+
+impl std::fmt::Debug for RuntimeGlobalInstaller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeGlobalInstaller")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Runtime-owned class-shaped global surface.
 ///
 /// Product crates expose this opaque handle to embedders instead of exposing VM
@@ -946,6 +980,8 @@ pub(crate) struct RuntimeConfig {
     loader: Option<module_loader::LoaderConfig>,
     hosted_modules: Vec<HostedModule>,
     global_classes: Vec<GlobalClass>,
+    global_installers: Vec<RuntimeGlobalInstaller>,
+    allow_blocking_atomics_wait: bool,
     console_sink: ConsoleSinkHandle,
     hooks: RuntimeHooks,
     process_argv: Vec<String>,
@@ -1126,6 +1162,8 @@ impl Default for RuntimeConfig {
             loader: None,
             hosted_modules: Vec::new(),
             global_classes: Vec::new(),
+            global_installers: Vec::new(),
+            allow_blocking_atomics_wait: false,
             console_sink: otter_vm::console::default_console_sink(),
             hooks: RuntimeHooks::default(),
             process_argv: process::default_argv(),
@@ -1228,6 +1266,25 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn global_classes(mut self, specs: impl IntoIterator<Item = GlobalClass>) -> Self {
         self.config.global_classes.extend(specs);
+        self
+    }
+
+    /// Register a callback that installs embedder globals on this runtime and
+    /// on worker runtimes spawned from it.
+    #[must_use]
+    pub fn global_installer(mut self, installer: RuntimeGlobalInstaller) -> Self {
+        self.config.global_installers.push(installer);
+        self
+    }
+
+    /// Allow blocking `Atomics.wait` on the main runtime.
+    ///
+    /// The default is `false`, so direct embedders cannot accidentally park
+    /// their host thread forever. Enable this only when the embedder has a
+    /// watchdog or another reliable cancellation path.
+    #[must_use]
+    pub fn allow_blocking_atomics_wait(mut self, allow: bool) -> Self {
+        self.config.allow_blocking_atomics_wait = allow;
         self
     }
 
@@ -1360,6 +1417,7 @@ impl Runtime {
         // the configured cap.
         let mut interp = Interpreter::with_string_heap_cap(config.max_heap_bytes);
         interp.set_max_stack_depth(config.max_stack_depth);
+        interp.set_allow_blocking_atomics_wait(config.allow_blocking_atomics_wait);
         interp.set_console_sink(config.console_sink.clone());
         for spec in &config.global_classes {
             match spec.inner {
@@ -1404,7 +1462,7 @@ impl Runtime {
         if let Some(factory) = &config.tracer_factory {
             interp.set_tracer(Some(factory.build()));
         }
-        Ok(Runtime {
+        let mut runtime = Runtime {
             interp,
             config,
             module_loader,
@@ -1414,7 +1472,13 @@ impl Runtime {
             diagnostics: RuntimeDiagnosticsSink::default(),
             package_manager,
             promise_registry: promise_registry::PromiseRegistry::new(),
-        })
+        };
+        worker::install_main_worker_globals(&mut runtime)?;
+        let global_installers = runtime.config.global_installers.clone();
+        for installer in global_installers {
+            installer.install(&mut runtime)?;
+        }
+        Ok(runtime)
     }
 }
 
@@ -1439,6 +1503,11 @@ pub struct Runtime {
     /// resolves / rejects it through the standard promise
     /// dispatch path so reactions land on the microtask queue.
     promise_registry: promise_registry::PromiseRegistry,
+}
+
+pub(crate) enum MessageEventDispatchError {
+    Materialize(OtterError),
+    Handler(OtterError),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1474,6 +1543,10 @@ impl Runtime {
     #[must_use]
     pub fn interrupt_handle(&self) -> InterruptHandle {
         InterruptHandle(self.interp.interrupt_handle())
+    }
+
+    pub(crate) fn set_allow_blocking_atomics_wait(&mut self, allow: bool) {
+        self.interp.set_allow_blocking_atomics_wait(allow);
     }
 
     /// Configured per-`run_*` timeout (currently informational; the
@@ -1816,6 +1889,10 @@ impl Runtime {
         self.interp.set_global(name, value);
     }
 
+    pub(crate) fn global_this_value(&self) -> otter_vm::Value {
+        otter_vm::Value::object(*self.interp.global_this())
+    }
+
     /// Install a host-defined native function as a global binding.
     ///
     /// The function is allocated on the runtime's GC heap as a
@@ -1847,6 +1924,106 @@ impl Runtime {
             })?;
         self.interp.set_global(name, value);
         Ok(())
+    }
+
+    pub(crate) fn install_native_global_call(
+        &mut self,
+        name: &'static str,
+        length: u8,
+        call: RuntimeNativeCall,
+    ) -> Result<(), OtterError> {
+        let value = self
+            .interp
+            .native_function_from_call_host_rooted(name, length, call, &[], &[])
+            .map_err(|oom| OtterError::OutOfMemory {
+                requested_bytes: oom.requested_bytes(),
+                heap_limit_bytes: oom.heap_limit_bytes(),
+            })?;
+        self.interp.set_global(name, value);
+        Ok(())
+    }
+
+    pub(crate) fn install_native_constructor_global_call(
+        &mut self,
+        name: &'static str,
+        length: u8,
+        call: RuntimeNativeCall,
+    ) -> Result<(), OtterError> {
+        let value = self
+            .interp
+            .native_constructor_from_call_host_rooted(name, length, call, &[], &[])
+            .map_err(|oom| OtterError::OutOfMemory {
+                requested_bytes: oom.requested_bytes(),
+                heap_limit_bytes: oom.heap_limit_bytes(),
+            })?;
+        self.interp.set_global(name, value);
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_worker_message_event<F>(
+        &mut self,
+        context: &ExecutionContext,
+        materialize_data: F,
+    ) -> Result<(), MessageEventDispatchError>
+    where
+        F: FnOnce(&mut otter_vm::NativeCtx<'_>) -> Result<otter_vm::Value, otter_vm::NativeError>,
+    {
+        let global = *self.interp.global_this();
+        let handler = otter_vm::object::get(global, self.interp.gc_heap(), "onmessage")
+            .unwrap_or_else(otter_vm::Value::undefined);
+        if !handler.is_callable() {
+            return Ok(());
+        }
+
+        let global_value = otter_vm::Value::object(global);
+        let event_value = {
+            let mut ctx = otter_vm::NativeCtx::new_with_call_info_and_context(
+                &mut self.interp,
+                otter_vm::NativeCallInfo::call(global_value),
+                Some(context.clone()),
+            );
+            let data = materialize_data(&mut ctx)
+                .map_err(map_native_error)
+                .map_err(MessageEventDispatchError::Materialize)?;
+            let event = ctx
+                .alloc_object()
+                .map_err(|err| OtterError::OutOfMemory {
+                    requested_bytes: err.requested_bytes(),
+                    heap_limit_bytes: err.heap_limit_bytes(),
+                })
+                .map_err(MessageEventDispatchError::Materialize)?;
+            let ty = otter_vm::Value::string(
+                otter_vm::JsString::from_str("message", ctx.heap_mut())
+                    .map_err(|err| OtterError::OutOfMemory {
+                        requested_bytes: err.requested_bytes(),
+                        heap_limit_bytes: err.heap_limit_bytes(),
+                    })
+                    .map_err(MessageEventDispatchError::Materialize)?,
+            );
+            otter_vm::object::set(event, ctx.heap_mut(), "type", ty);
+            otter_vm::object::set(event, ctx.heap_mut(), "data", data);
+            otter_vm::Value::object(event)
+        };
+
+        self.interp
+            .run_callable_sync(
+                context,
+                &handler,
+                global_value,
+                smallvec::smallvec![event_value],
+            )
+            .map_err(|err| MessageEventDispatchError::Handler(self.map_reentry_error(err)))?;
+        self.interp.drain_microtasks(context).map_err(|err| {
+            MessageEventDispatchError::Handler(enrich_runtime_diagnostic_with_cause(
+                &mut self.interp,
+                map_vm_error(err),
+            ))
+        })
+    }
+
+    fn map_reentry_error(&mut self, err: otter_vm::VmError) -> OtterError {
+        let mapped = map_vm_error(otter_vm::RunError::bare(err));
+        enrich_runtime_diagnostic_with_cause(&mut self.interp, mapped)
     }
 
     /// `true` when the per-isolate `TimerCallbacks` table has any
@@ -2215,16 +2392,25 @@ impl Runtime {
         source: SourceInput,
         specifier: &str,
     ) -> Result<ExecutionResult, OtterError> {
-        let start = std::time::Instant::now();
-        let compiled = self.compile_source(&source, specifier)?;
-        self.run_compiled_script_since(compiled.bytecode, start)
+        self.run_script_with_context(source, specifier)
+            .map(|(result, _)| result)
     }
 
-    fn run_compiled_script_since(
+    fn run_script_with_context(
+        &mut self,
+        source: SourceInput,
+        specifier: &str,
+    ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
+        let start = std::time::Instant::now();
+        let compiled = self.compile_source(&source, specifier)?;
+        self.run_compiled_script_with_context_since(compiled.bytecode, start)
+    }
+
+    fn run_compiled_script_with_context_since(
         &mut self,
         module: BytecodeModule,
         start: std::time::Instant,
-    ) -> Result<ExecutionResult, OtterError> {
+    ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
         let context = ExecutionContext::from_module(module);
         // Run the script first; the script error wins if both the
         // script and the drain fail. On script success we still
@@ -2247,7 +2433,8 @@ impl Runtime {
                     ..
                 }),
             ) => {
-                return Ok(ExecutionResult::from_exit_code(code, start.elapsed()));
+                let result = ExecutionResult::from_exit_code(code, start.elapsed());
+                return Ok((result, context));
             }
             (Err(script_err), _) => {
                 return Err(enrich_runtime_diagnostic_with_cause(
@@ -2263,10 +2450,10 @@ impl Runtime {
             }
             (Ok(v), Ok(())) => v,
         };
-        Ok(
+        let result =
             ExecutionResult::from_vm_value(value, start.elapsed(), self.interp.gc_heap_mut())
-                .with_exit_code(process::exit_code(&self.interp)),
-        )
+                .with_exit_code(process::exit_code(&self.interp));
+        Ok((result, context))
     }
 
     /// Drain the microtask queue manually. Embedders that want to
@@ -2360,6 +2547,14 @@ impl Runtime {
         &mut self,
         entry_path: impl AsRef<Path>,
     ) -> Result<ExecutionResult, OtterError> {
+        self.run_module_with_context(entry_path)
+            .map(|(result, _)| result)
+    }
+
+    pub(crate) fn run_module_with_context(
+        &mut self,
+        entry_path: impl AsRef<Path>,
+    ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
         let start = std::time::Instant::now();
         let entry_path = entry_path.as_ref();
         let loader = self.module_loader_for_entry(entry_path);
@@ -2423,7 +2618,8 @@ impl Runtime {
                 }),
             ) => {
                 self.module_records.mark_evaluated();
-                return Ok(ExecutionResult::from_exit_code(code, start.elapsed()));
+                let result = ExecutionResult::from_exit_code(code, start.elapsed());
+                return Ok((result, context));
             }
             (Err(script_err), _) => {
                 self.module_records.mark_errored();
@@ -2442,10 +2638,10 @@ impl Runtime {
             (Ok(v), Ok(())) => v,
         };
         self.module_records.mark_evaluated();
-        Ok(
+        let result =
             ExecutionResult::from_vm_value(value, start.elapsed(), self.interp.gc_heap_mut())
-                .with_exit_code(process::exit_code(&self.interp)),
-        )
+                .with_exit_code(process::exit_code(&self.interp));
+        Ok((result, context))
     }
 
     fn module_loader_for_entry(&self, entry_path: &Path) -> module_loader::ModuleLoader {
@@ -2521,21 +2717,28 @@ impl Runtime {
     /// # Errors
     /// See [`OtterError`] variants.
     pub fn run_file(&mut self, path: impl AsRef<Path>) -> Result<ExecutionResult, OtterError> {
+        self.run_file_with_context(path).map(|(result, _)| result)
+    }
+
+    pub(crate) fn run_file_with_context(
+        &mut self,
+        path: impl AsRef<Path>,
+    ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
         let path = path.as_ref();
         let source = SourceInput::from_path(path)?;
         if source_path_has_module_extension(path) {
-            return self.run_module(path);
+            return self.run_module_with_context(path);
         }
         let package_type = {
             let loader = self.module_loader_for_entry(path);
             source_path_package_type(path, &loader)
         };
         if package_type == Some(module_loader::LoaderPackageType::Module) {
-            return self.run_module(path);
+            return self.run_module_with_context(path);
         }
         let specifier = path.to_string_lossy().to_string();
         if package_type == Some(module_loader::LoaderPackageType::CommonJs) {
-            return self.run_script(source, &specifier);
+            return self.run_script_with_context(source, &specifier);
         }
         if !source_path_has_script_extension(path) {
             let start = std::time::Instant::now();
@@ -2549,12 +2752,12 @@ impl Runtime {
             })
             .map_err(|err| map_syntax_error(err, &specifier))??;
             if let Some(module) = module {
-                return self.run_compiled_script_since(module, start);
+                return self.run_compiled_script_with_context_since(module, start);
             }
-            return self.run_module(path);
+            return self.run_module_with_context(path);
         }
         let specifier = path.to_string_lossy().to_string();
-        self.run_script(source, &specifier)
+        self.run_script_with_context(source, &specifier)
     }
 }
 
@@ -3403,6 +3606,40 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
         _ => OtterError::Internal {
             code: DiagnosticCode::VmUnknown.as_str().to_string(),
             message: display,
+        },
+    }
+}
+
+fn map_native_error(err: otter_vm::NativeError) -> OtterError {
+    match err {
+        otter_vm::NativeError::Interrupted => OtterError::Interrupted,
+        otter_vm::NativeError::Exit { code } => OtterError::Runtime {
+            diagnostic: Diagnostic {
+                kind: DiagnosticKind::Type,
+                code: DiagnosticCode::Uncaught.as_str().to_string(),
+                message: format!("native function requested process exit with code {code}"),
+                source_url: None,
+                range: None,
+                span: None,
+                help: None,
+                frames: Vec::new(),
+                cause: None,
+                aggregated_errors: Vec::new(),
+            },
+        },
+        other => OtterError::Runtime {
+            diagnostic: Diagnostic {
+                kind: DiagnosticKind::Type,
+                code: DiagnosticCode::TypeError.as_str().to_string(),
+                message: other.to_string(),
+                source_url: None,
+                range: None,
+                span: None,
+                help: None,
+                frames: Vec::new(),
+                cause: None,
+                aggregated_errors: Vec::new(),
+            },
         },
     }
 }

@@ -176,7 +176,7 @@ impl<'rt> NativeCtx<'rt> {
     /// context to invoke callbacks with the same function table as
     /// the caller.
     #[must_use]
-    pub(crate) fn new_with_call_info_and_context(
+    pub fn new_with_call_info_and_context(
         interp: &'rt mut Interpreter,
         call_info: NativeCallInfo,
         context: Option<ExecutionContext>,

@@ -788,7 +788,26 @@ impl GcHeap {
     ///   a fresh page request.
     #[inline]
     pub fn alloc_old<T: Traceable>(&mut self, value: T) -> Result<Gc<T>, OutOfMemory> {
-        self.alloc_old_inner(value, true)
+        let mut empty = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+        self.alloc_old_with_roots_inner(value, true, &mut empty)
+    }
+
+    /// Allocate a `T` directly in old-space while keeping caller-supplied
+    /// roots and the pending payload live across any cap-triggered full GC.
+    ///
+    /// This mirrors [`Self::alloc_with_roots`] for non-moving old-space
+    /// allocations used by VM handles that are copied into Rust locals.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::alloc_old`].
+    #[inline]
+    pub fn alloc_old_with_roots<T: Traceable>(
+        &mut self,
+        value: T,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<Gc<T>, OutOfMemory> {
+        self.alloc_old_with_roots_inner(value, true, external_visit)
     }
 
     /// Allocate a diagnostic object directly in old-space without
@@ -806,7 +825,8 @@ impl GcHeap {
     /// the allocation.
     #[inline]
     pub fn alloc_old_diagnostic<T: Traceable>(&mut self, value: T) -> Result<Gc<T>, OutOfMemory> {
-        let out = self.alloc_old_inner(value, false)?;
+        let mut empty = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+        let out = self.alloc_old_with_roots_inner(value, false, &mut empty)?;
         if self.max_heap_bytes != 0 {
             self.drain_shared_external_releases();
             self.tracked_bytes = self.live_bytes_total().saturating_add(self.reserved_bytes);
@@ -816,10 +836,11 @@ impl GcHeap {
     }
 
     #[inline]
-    fn alloc_old_inner<T: Traceable>(
+    fn alloc_old_with_roots_inner<T: Traceable>(
         &mut self,
-        value: T,
+        mut value: T,
         enforce_cap: bool,
+        external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<Gc<T>, OutOfMemory> {
         // See `alloc_with_roots`: payloads are at most
         // `OBJECT_ALIGNMENT`-aligned, so over-aligned bodies must box.
@@ -838,8 +859,17 @@ impl GcHeap {
             aligned <= u32::MAX as usize,
             "object size exceeds u32 limit"
         );
+        let pending_value = std::ptr::addr_of_mut!(value);
+        let mut allocation_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            // SAFETY: `pending_value` points at the stack-owned payload that
+            // will be copied into old-space after any cap-triggered full GC.
+            unsafe {
+                T::trace_slots(pending_value, visitor);
+            }
+        };
         if enforce_cap && self.max_heap_bytes != 0 {
-            self.account_or_collect(aligned as u64)?;
+            self.account_or_collect_with_roots(aligned as u64, &mut allocation_roots)?;
         }
         let is_marking = self.marking.is_marking();
         let offset = if aligned > LARGE_OBJECT_THRESHOLD {

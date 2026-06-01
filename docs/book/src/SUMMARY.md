@@ -14,6 +14,7 @@
 - [Architecture](engine/architecture.md)
 - [Runtime Principles](engine/runtime-principles.md)
 - [Event Loop](engine/event-loop.md)
+- [Workers](engine/workers.md)
 - [Frontend And Compilation](engine/frontend.md)
 - [GC API](engine/gc-api.md)
 - [Native Call ABI](engine/native-call-abi.md)

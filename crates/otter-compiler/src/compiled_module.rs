@@ -82,6 +82,23 @@ pub struct CompiledModuleMetadata {
     pub exports: Vec<CompiledExport>,
     /// Deterministic live-binding slot labels for module exports.
     pub live_binding_slots: Vec<LiveBindingSlot>,
+    /// Named import requests (`import { x as y } from "m"` and
+    /// `import d from "m"`) used for link-time ResolveExport
+    /// validation. Namespace (`import * as ns`) and bare side-effect
+    /// imports carry no binding name and are not recorded here.
+    #[serde(default)]
+    pub named_imports: Vec<NamedImport>,
+}
+
+/// A single named import binding request, used by the linker to
+/// validate that the imported name resolves in the target module
+/// (§16.2.1.6 ResolveExport).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NamedImport {
+    /// Raw source specifier of the importing declaration.
+    pub specifier: String,
+    /// Imported export name (`"default"` for a default import).
+    pub name: String,
 }
 
 impl Default for CompiledModuleMetadata {
@@ -93,6 +110,7 @@ impl Default for CompiledModuleMetadata {
             imports: Vec::new(),
             exports: Vec::new(),
             live_binding_slots: Vec::new(),
+            named_imports: Vec::new(),
         }
     }
 }
@@ -110,6 +128,7 @@ impl CompiledModuleMetadata {
             imports: Vec::new(),
             exports: Vec::new(),
             live_binding_slots: Vec::new(),
+            named_imports: Vec::new(),
         }
     }
 }
@@ -182,6 +201,8 @@ pub(crate) struct ModuleMetadataParts {
     pub(crate) exports: Vec<CompiledExport>,
     /// Live-binding slot metadata.
     pub(crate) live_binding_slots: Vec<LiveBindingSlot>,
+    /// Named import requests for link-time resolution validation.
+    pub(crate) named_imports: Vec<NamedImport>,
 }
 
 pub(crate) fn collect_module_metadata(
@@ -192,6 +213,7 @@ pub(crate) fn collect_module_metadata(
         resolved_imports: &host.resolved_imports,
         imports: Vec::new(),
         exports: Vec::new(),
+        named_imports: Vec::new(),
         live_binding_names: BTreeSet::new(),
         seen_imports: HashSet::new(),
     };
@@ -211,6 +233,7 @@ pub(crate) fn collect_module_metadata(
         imports: visitor.imports,
         exports: visitor.exports,
         live_binding_slots,
+        named_imports: visitor.named_imports,
     }
 }
 
@@ -237,6 +260,7 @@ struct ModuleMetadataVisitor<'a> {
     resolved_imports: &'a HashMap<String, String>,
     imports: Vec<CompiledImport>,
     exports: Vec<CompiledExport>,
+    named_imports: Vec<NamedImport>,
     live_binding_names: BTreeSet<String>,
     seen_imports: HashSet<(String, CompiledImportKind)>,
 }
@@ -262,8 +286,27 @@ impl ModuleMetadataVisitor<'_> {
 
 impl<'a> Visit<'a> for ModuleMetadataVisitor<'_> {
     fn visit_import_declaration(&mut self, decl: &oxc_ast::ast::ImportDeclaration<'a>) {
-        if !decl.import_kind.is_type() {
-            self.record_import(decl.source.value.as_str(), CompiledImportKind::Static);
+        if decl.import_kind.is_type() {
+            return;
+        }
+        let specifier = decl.source.value.as_str();
+        self.record_import(specifier, CompiledImportKind::Static);
+        // Record each *named* binding request (`import { x as y }`
+        // and `import d`) for link-time ResolveExport validation.
+        // Namespace (`import * as ns`) carries no single export name.
+        if let Some(specifiers) = &decl.specifiers {
+            for spec in specifiers {
+                use oxc_ast::ast::ImportDeclarationSpecifier as Spec;
+                let name = match spec {
+                    Spec::ImportSpecifier(s) => module_export_name_to_str(&s.imported),
+                    Spec::ImportDefaultSpecifier(_) => "default".to_string(),
+                    Spec::ImportNamespaceSpecifier(_) => continue,
+                };
+                self.named_imports.push(NamedImport {
+                    specifier: specifier.to_string(),
+                    name,
+                });
+            }
         }
     }
 

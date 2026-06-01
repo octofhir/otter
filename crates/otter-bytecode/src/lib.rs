@@ -675,6 +675,16 @@ pub enum Op {
     /// so deferred force-eval treats the module as already evaluated and
     /// does not re-run it.
     MarkModuleEvaluated,
+    /// Star re-export: copy each enumerable own **string** key of the
+    /// source module environment `r<src>` onto the target module
+    /// environment `r<target>`, excluding `"default"` and any key the
+    /// target already owns. Operands: `Register(target), Register(src)`.
+    ///
+    /// Lowers `export * from "mod"` (§16.2.3.7 GetExportedNames star
+    /// expansion) in the copy-at-evaluation module model: explicit
+    /// local exports take precedence (skip-if-present), and `default`
+    /// is never propagated through a star re-export.
+    StarReexport,
     /// Wrap the value in `r<src>` as a fulfilled `Promise` and
     /// write to `r<dst>`. Operands:
     /// `Register(dst), Register(src)`.
@@ -1091,6 +1101,7 @@ impl Op {
             Op::ImportNamespaceDeferred => "IMPORT_NAMESPACE_DEFERRED",
             Op::EvaluateModule => "EVALUATE_MODULE",
             Op::MarkModuleEvaluated => "MARK_MODULE_EVALUATED",
+            Op::StarReexport => "STAR_REEXPORT",
             Op::PromiseFulfilledOf => "PROMISE_FULFILLED_OF",
             Op::Await => "AWAIT",
             Op::SymbolLoad => "SYMBOL_LOAD",
@@ -1257,6 +1268,7 @@ impl Op {
             Op::CallMethodValue => 4,    // dst, recv, name_const, argc
             Op::ForInKeys => 2,          // dst, obj
             Op::CopyDataProperties => 2, // target, src
+            Op::StarReexport => 2,       // target_env, src_env
             Op::DefineOwnProperty => 3,  // target, key, desc
             // dst, argc — args follow as `Register(arg0)…`.
             Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf => 2,

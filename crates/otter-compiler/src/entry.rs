@@ -799,6 +799,7 @@ pub fn compile_module_program_to_module(
     metadata.imports = module_metadata.imports;
     metadata.exports = module_metadata.exports;
     metadata.live_binding_slots = module_metadata.live_binding_slots;
+    metadata.named_imports = module_metadata.named_imports;
     Ok(CompiledModule::new(bytecode, metadata))
 }
 

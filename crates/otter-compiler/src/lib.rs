@@ -69,7 +69,7 @@ mod with_statement;
 use compiled_module::collect_module_metadata;
 pub use compiled_module::{
     CompiledExport, CompiledImport, CompiledImportKind, CompiledModule, CompiledModuleMetadata,
-    CompiledSourceSpan, LiveBindingSlot,
+    CompiledSourceSpan, LiveBindingSlot, NamedImport,
 };
 pub use entry::{
     compile_module_program, compile_module_program_to_module, compile_script_program,

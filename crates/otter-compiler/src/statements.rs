@@ -745,14 +745,6 @@ pub(crate) fn compile_statement(
                     node: format!("ExportAllDeclaration: unresolved source `{source}`"),
                     span,
                 })?;
-            let exported_alias = decl
-                .exported
-                .as_ref()
-                .map(module_export_name_to_str)
-                .ok_or(CompileError::Unsupported {
-                    node: "ExportAllDeclaration: bare `export *` not yet supported".to_string(),
-                    span,
-                })?;
             let record_reg = cx.alloc_scratch();
             cx.emit(
                 Op::LoadUpvalue,
@@ -773,7 +765,25 @@ pub(crate) fn compile_statement(
                 [Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
                 span,
             );
-            cx.emit_store_property(env_reg, &exported_alias, record_reg, span);
+            match decl.exported.as_ref().map(module_export_name_to_str) {
+                // `export * as ns from "mod"` — the source namespace
+                // object becomes a single named export on module_env.
+                Some(exported_alias) => {
+                    cx.emit_store_property(env_reg, &exported_alias, record_reg, span);
+                }
+                // Bare `export * from "mod"` — copy the source's
+                // exported names onto module_env (excluding `default`,
+                // local exports take precedence). The source module is
+                // evaluated before this body by dependency order, so
+                // its module_env is already populated.
+                None => {
+                    cx.emit(
+                        Op::StarReexport,
+                        [Operand::Register(env_reg), Operand::Register(record_reg)],
+                        span,
+                    );
+                }
+            }
             Ok(None)
         }
 

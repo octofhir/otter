@@ -3194,6 +3194,13 @@ pub(crate) fn map_graph_error(err: module_graph::GraphError) -> OtterError {
                 .with_help("break the import cycle or reduce module graph depth"),
             ],
         },
+        module_graph::GraphError::Resolution { url, message } => OtterError::Compile {
+            diagnostics: vec![
+                Diagnostic::syntax(message)
+                    .with_source_url(url)
+                    .with_help("export the imported binding from the target module"),
+            ],
+        },
     }
 }
 
@@ -3333,6 +3340,7 @@ impl DynLoadError {
                 _ => otter_vm::ErrorKind::TypeError,
             },
             module_graph::GraphError::Cycle { .. } => otter_vm::ErrorKind::RangeError,
+            module_graph::GraphError::Resolution { .. } => otter_vm::ErrorKind::SyntaxError,
             module_graph::GraphError::Loader(_) => otter_vm::ErrorKind::TypeError,
         };
         Self::diagnostic(kind, message)

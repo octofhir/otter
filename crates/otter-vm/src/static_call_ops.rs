@@ -242,6 +242,50 @@ impl Interpreter {
         Ok(())
     }
 
+    /// `Op::StarReexport` — copy each enumerable own string key of the
+    /// source module environment onto the target module environment,
+    /// excluding `"default"` and any name the target already owns.
+    ///
+    /// Lowers `export * from "mod"` in the copy-at-evaluation module
+    /// model: explicit local exports (mirrored onto the target before
+    /// or after this op) take precedence, and `default` is never
+    /// propagated through a star re-export (§16.2.3.7 GetExportedNames).
+    pub(crate) fn run_star_reexport_operands(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut SmallVec<[Frame; 8]>,
+        operands: &[Operand],
+    ) -> Result<(), VmError> {
+        let top_idx = stack.len() - 1;
+        let (target, src) = {
+            let frame = &stack[top_idx];
+            let target_reg = register_operand(operands.first())?;
+            let src_reg = register_operand(operands.get(1))?;
+            (
+                *read_register(frame, target_reg)?,
+                *read_register(frame, src_reg)?,
+            )
+        };
+        if let (Some(target_obj), Some(src_obj)) = (target.as_object(), src.as_object()) {
+            let existing: std::collections::HashSet<String> = self
+                .enumerable_own_string_keys_for_value(context, target, 0)?
+                .into_iter()
+                .collect();
+            let names = self.enumerable_own_string_keys_for_value(context, src, 0)?;
+            for name in names {
+                if name == "default" || existing.contains(&name) {
+                    continue;
+                }
+                if let Some(value) = crate::object::get(src_obj, &self.gc_heap, &name) {
+                    crate::object::set(target_obj, &mut self.gc_heap, &name, value);
+                }
+            }
+        }
+        let frame = &mut stack[top_idx];
+        frame.advance_pc(self.current_byte_len)?;
+        Ok(())
+    }
+
     /// `Op::DefineOwnProperty` — §10.1.6.1 OrdinaryDefineOwnProperty
     /// on `target` using `key` and the property-descriptor object
     /// `desc` (read through accessor-aware ToPropertyDescriptor).

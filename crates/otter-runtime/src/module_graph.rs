@@ -53,7 +53,8 @@ use otter_bytecode::{
     OperandList, SourceKind as BytecodeSourceKind, SpanEntry,
 };
 use otter_compiler::{
-    CompileError, CompiledModuleMetadata, ModuleHostInfo, compile_module_program_to_module,
+    CompileError, CompiledExport, CompiledModuleMetadata, ModuleHostInfo,
+    compile_module_program_to_module,
 };
 use otter_syntax::{SourceKind, SyntaxError, with_program};
 use oxc_ast::ast::{Expression, Program};
@@ -95,6 +96,17 @@ pub enum GraphError {
         /// URL where the cycle was detected.
         url: String,
     },
+    /// §16.2.1.6 ResolveExport failure: a named import or named
+    /// re-export references a binding the target module does not
+    /// unambiguously export. Surfaces as a resolution-phase
+    /// `SyntaxError`.
+    #[error("SyntaxError: {message}")]
+    Resolution {
+        /// URL of the module whose import/re-export failed to resolve.
+        url: String,
+        /// Human-readable description of the unresolved binding.
+        message: String,
+    },
 }
 
 /// One loaded + compiled module fragment, plus its resolved
@@ -125,6 +137,7 @@ struct ModuleGraph {
 
 impl ModuleGraph {
     fn link(self) -> Result<LinkedProgram, GraphError> {
+        validate_resolution(&self.nodes)?;
         let order = topological_order(&self.nodes, &self.entry_url)?;
         let module = link(&self.nodes, &order, &self.entry_url);
         let metadata = order
@@ -337,6 +350,7 @@ fn dynamic_failure_constructor(err: &GraphError) -> &'static str {
             _ => "TypeError",
         },
         GraphError::Cycle { .. } => "RangeError",
+        GraphError::Resolution { .. } => "SyntaxError",
         GraphError::Loader(_) => "TypeError",
     }
 }
@@ -459,6 +473,189 @@ fn hosted_module_fragment(url: &str) -> BytecodeModule {
         constants: Vec::new(),
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+    }
+}
+
+/// §16.2.1.6 ResolveExport result for one binding lookup.
+#[derive(Clone, PartialEq, Eq)]
+enum Resolution {
+    /// No export by this name is reachable.
+    Null,
+    /// Distinct star re-exports resolve the name to different bindings.
+    Ambiguous,
+    /// Resolved to a concrete `(module_url, binding_name)`.
+    Resolved { module: String, binding: String },
+}
+
+/// Whether `url` names a real parsed source module whose export
+/// surface we model. Host/builtin fragments carry an empty
+/// `source_url` and are treated as always-resolvable so we never
+/// reject `node:`/hosted imports we do not analyse.
+fn is_resolvable_module(nodes: &BTreeMap<String, ModuleNode>, url: &str) -> bool {
+    nodes
+        .get(url)
+        .is_some_and(|node| !node.metadata.source_url.is_empty())
+}
+
+/// Resolve `specifier` against `from_url`'s recorded import edges to
+/// the canonical target URL, if statically known.
+fn resolve_specifier<'a>(
+    nodes: &'a BTreeMap<String, ModuleNode>,
+    from_url: &str,
+    specifier: &str,
+) -> Option<&'a str> {
+    let meta = &nodes.get(from_url)?.metadata;
+    meta.imports
+        .iter()
+        .find(|import| import.specifier == specifier)
+        .and_then(|import| import.target.as_deref())
+}
+
+/// §16.2.1.6 ResolveExport(module, exportName, resolveSet). `path`
+/// is the active `(module, name)` lookup chain used to short-circuit
+/// import cycles (returns [`Resolution::Null`] on revisit).
+fn resolve_export(
+    nodes: &BTreeMap<String, ModuleNode>,
+    url: &str,
+    name: &str,
+    path: &mut Vec<(String, String)>,
+) -> Resolution {
+    // Unmodelled (host/builtin) target: any imported name is assumed
+    // to resolve.
+    if !is_resolvable_module(nodes, url) {
+        return Resolution::Resolved {
+            module: url.to_string(),
+            binding: name.to_string(),
+        };
+    }
+    let key = (url.to_string(), name.to_string());
+    if path.iter().any(|entry| entry == &key) {
+        return Resolution::Null;
+    }
+    path.push(key);
+
+    let exports: &[CompiledExport] = &nodes.get(url).expect("checked above").metadata.exports;
+    let mut result = Resolution::Null;
+
+    // 1. Direct export entries (local, default, named re-export, or
+    //    `export * as ns`) matching `name`.
+    let mut found_direct = false;
+    for export in exports {
+        if export.name != name {
+            continue;
+        }
+        match (export.local.as_deref(), export.from.as_deref()) {
+            // `export { local as name } from "from"` — indirect.
+            (Some(local), Some(from)) => {
+                result = match resolve_specifier(nodes, url, from) {
+                    Some(target) => resolve_export(nodes, target, local, path),
+                    None => Resolution::Null,
+                };
+            }
+            // Local binding, `export default …`, or `export * as name`
+            // namespace re-export — all terminal resolved bindings.
+            _ => {
+                result = Resolution::Resolved {
+                    module: url.to_string(),
+                    binding: export.local.clone().unwrap_or_else(|| name.to_string()),
+                };
+            }
+        }
+        found_direct = true;
+        break;
+    }
+
+    // 2. Star re-exports (`export * from "m"`), excluding `default`.
+    if !found_direct && name != "default" {
+        let mut star = Resolution::Null;
+        for export in exports {
+            if export.name != "*" {
+                continue;
+            }
+            let Some(from) = export.from.as_deref() else {
+                continue;
+            };
+            let Some(target) = resolve_specifier(nodes, url, from) else {
+                continue;
+            };
+            match resolve_export(nodes, target, name, path) {
+                Resolution::Ambiguous => {
+                    star = Resolution::Ambiguous;
+                    break;
+                }
+                candidate @ Resolution::Resolved { .. } => match &star {
+                    Resolution::Null => star = candidate,
+                    Resolution::Resolved { .. } => {
+                        if star != candidate {
+                            star = Resolution::Ambiguous;
+                            break;
+                        }
+                    }
+                    Resolution::Ambiguous => {}
+                },
+                Resolution::Null => {}
+            }
+        }
+        result = star;
+    }
+
+    path.pop();
+    result
+}
+
+/// Validate every named import and named re-export across the graph
+/// (§16.2.1.6). A name that resolves to nothing or ambiguously is a
+/// resolution-phase `SyntaxError`.
+fn validate_resolution(nodes: &BTreeMap<String, ModuleNode>) -> Result<(), GraphError> {
+    for (url, node) in nodes {
+        if node.metadata.source_url.is_empty() {
+            continue;
+        }
+        for import in &node.metadata.named_imports {
+            check_binding(
+                nodes,
+                url,
+                &import.specifier,
+                &import.name,
+                "import",
+            )?;
+        }
+        for export in &node.metadata.exports {
+            // Only named re-exports (`export { local as name } from`)
+            // require a binding lookup; star and namespace re-exports
+            // do not.
+            if let (Some(local), Some(from)) = (export.local.as_deref(), export.from.as_deref()) {
+                check_binding(nodes, url, from, local, "re-export")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve `name` against the module reached through `specifier` from
+/// `url`; error if the binding is missing or ambiguous.
+fn check_binding(
+    nodes: &BTreeMap<String, ModuleNode>,
+    url: &str,
+    specifier: &str,
+    name: &str,
+    kind: &str,
+) -> Result<(), GraphError> {
+    let Some(target) = resolve_specifier(nodes, url, specifier) else {
+        return Ok(());
+    };
+    if !is_resolvable_module(nodes, target) {
+        return Ok(());
+    }
+    let mut path = Vec::new();
+    match resolve_export(nodes, target, name, &mut path) {
+        Resolution::Resolved { .. } => Ok(()),
+        _ => Err(GraphError::Resolution {
+            url: url.to_string(),
+            message: format!(
+                "{kind} of `{name}` from `{specifier}` does not resolve to an exported binding"
+            ),
+        }),
     }
 }
 

@@ -4574,6 +4574,11 @@ impl Interpreter {
                     self.run_copy_data_properties_operands(context, stack, operands)?;
                     continue;
                 }
+                Op::StarReexport => {
+                    let operands = context.exec_operands(instr);
+                    self.run_star_reexport_operands(context, stack, operands)?;
+                    continue;
+                }
                 Op::DefineOwnProperty => {
                     let operands = context.exec_operands(instr);
                     self.run_define_own_property_operands(context, stack, operands)?;

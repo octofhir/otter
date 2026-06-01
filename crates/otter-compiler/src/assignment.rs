@@ -292,6 +292,18 @@ pub(crate) fn compile_assignment(
             });
         }
     };
+    // §16.2.1.7 CreateImportBinding — import bindings are immutable
+    // indirect bindings. Module code is strict, so assigning to one
+    // throws TypeError at runtime (after evaluating the RHS for its
+    // side effects), not a compile error.
+    if crate::module_state::find_module_import_binding(cx, &name).is_some() {
+        let _ = compile_expr(cx, &a.right, span)?;
+        return Ok(emit_assignment_type_error(
+            cx,
+            &format!("Assignment to constant variable '{name}'."),
+            span,
+        ));
+    }
     let storage = match cx.lookup_binding(&name) {
         Some(info) if info.is_const => {
             return Err(CompileError::Unsupported {

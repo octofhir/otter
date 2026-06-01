@@ -693,6 +693,12 @@ pub enum Op {
     /// yields the exotic object bound by `import * as ns` /
     /// `export * as ns`.
     ModuleNamespaceObject,
+    /// Read named import binding `name` from the module environment in
+    /// `r<record>` and write it to `r<dst>`. Operands:
+    /// `Register(dst), Register(record), ConstIndex(name)`. Unlike
+    /// [`Op::LoadProperty`], a binding still in its TDZ (the slot holds
+    /// the hole) raises a `ReferenceError` (§9.1.1.5 GetBindingValue).
+    LoadImportBinding,
     /// Wrap the value in `r<src>` as a fulfilled `Promise` and
     /// write to `r<dst>`. Operands:
     /// `Register(dst), Register(src)`.
@@ -1111,6 +1117,7 @@ impl Op {
             Op::MarkModuleEvaluated => "MARK_MODULE_EVALUATED",
             Op::StarReexport => "STAR_REEXPORT",
             Op::ModuleNamespaceObject => "MODULE_NAMESPACE_OBJECT",
+            Op::LoadImportBinding => "LOAD_IMPORT_BINDING",
             Op::PromiseFulfilledOf => "PROMISE_FULFILLED_OF",
             Op::Await => "AWAIT",
             Op::SymbolLoad => "SYMBOL_LOAD",
@@ -1248,6 +1255,7 @@ impl Op {
             | Op::ToPrimitive
             | Op::LooseEqual
             | Op::LooseNotEqual
+            | Op::LoadImportBinding
             | Op::NewBuiltinError => 3,
             Op::GetPrototype
             | Op::SetPrototype
@@ -1355,6 +1363,8 @@ impl Op {
             Op::EvaluateModule | Op::MarkModuleEvaluated => pos == 0,
             // [reg, reg, const]
             Op::LoadProperty | Op::DeleteProperty | Op::ToPrimitive => pos == 2,
+            // [dst, record_reg, name_const]
+            Op::LoadImportBinding => pos == 2,
             // [reg, kind_const, reg]
             Op::NewCollection | Op::NewBuiltinError => pos == 1,
             // [reg, class_const, reg, reg]

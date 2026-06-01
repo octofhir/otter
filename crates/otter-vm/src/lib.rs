@@ -4126,6 +4126,20 @@ impl Interpreter {
                     self.run_module_namespace_object_reg(context, frame, dst, spec_idx)?;
                     continue;
                 }
+                Op::LoadImportBinding => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let record_reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 2)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_load_import_binding_reg(context, frame, dst, record_reg, name_idx)?;
+                    continue;
+                }
                 Op::EvaluateModule => {
                     let url_idx = context
                         .exec_const_index(instr, 0)

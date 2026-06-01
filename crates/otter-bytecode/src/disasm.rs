@@ -267,6 +267,7 @@ mod tests {
             Op::MarkModuleEvaluated,
             Op::StarReexport,
             Op::ModuleNamespaceObject,
+            Op::LoadImportBinding,
             Op::PromiseFulfilledOf,
             Op::NewIntl,
             Op::TemporalLoad,
@@ -409,6 +410,7 @@ mod tests {
             | Op::NewBuiltinError
             | Op::ToPrimitive
             | Op::PromiseCall
+            | Op::LoadImportBinding
             | Op::DefineOwnProperty => vec![reg(0), reg(1), reg(2)],
             Op::IteratorNext => vec![reg(0), reg(1), reg(2)],
             Op::GetAsyncIterator => vec![reg(0), reg(1)],

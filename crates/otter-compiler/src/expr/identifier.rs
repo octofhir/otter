@@ -155,8 +155,19 @@ fn compile_identifier_without_with(
         if binding.is_namespace {
             return Ok(record_dst);
         }
+        // §9.1.1.5 GetBindingValue — read the named import through the
+        // env record, raising ReferenceError if it is still in its TDZ.
         let dst = cx.alloc_scratch();
-        cx.emit_load_property(dst, record_dst, &binding.source_name, span);
+        let name_const = cx.intern_string_constant(&binding.source_name);
+        cx.emit(
+            Op::LoadImportBinding,
+            vec![
+                Operand::Register(dst),
+                Operand::Register(record_dst),
+                Operand::ConstIndex(name_const),
+            ],
+            span,
+        );
         return Ok(dst);
     }
     if let Some(info) = cx.lookup_binding(name) {

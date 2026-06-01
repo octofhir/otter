@@ -79,6 +79,38 @@ impl Interpreter {
         Ok(())
     }
 
+    /// `Op::LoadImportBinding` — read named import `name` from the
+    /// module environment in `record_reg`. A slot still in its TDZ
+    /// (holding the hole) raises a `ReferenceError` (§9.1.1.5
+    /// GetBindingValue); otherwise the current binding value is written
+    /// to `dst`.
+    pub(crate) fn run_load_import_binding_reg(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut Frame,
+        dst: u16,
+        record_reg: u16,
+        name_idx: u32,
+    ) -> Result<(), VmError> {
+        let name = context
+            .string_constant_str(name_idx)
+            .ok_or(VmError::InvalidOperand)?
+            .to_string();
+        let record = *read_register(frame, record_reg)?;
+        let value = record
+            .as_object()
+            .and_then(|env| crate::object::get(env, &self.gc_heap, &name))
+            .unwrap_or_else(Value::undefined);
+        if value.is_hole() {
+            return Err(VmError::ThisUninitialized {
+                message: format!("Cannot access '{name}' before initialization"),
+            });
+        }
+        write_register(frame, dst, value)?;
+        frame.advance_pc(self.current_byte_len)?;
+        Ok(())
+    }
+
     /// `Op::ImportNamespaceDeferred` — resolve (or lazily create) the
     /// deferred namespace object for `specifier` and write it to `dst`.
     /// The target module is **not** evaluated here (TC39 import defer).

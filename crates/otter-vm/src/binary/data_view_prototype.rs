@@ -30,6 +30,13 @@ fn bad(reason: &str) -> NativeError {
     }
 }
 
+fn range_bad(reason: &str) -> NativeError {
+    NativeError::RangeError {
+        name: NAME,
+        reason: reason.to_string(),
+    }
+}
+
 fn receiver(ctx: &NativeCtx<'_>) -> Result<JsDataView, NativeError> {
     ctx.this_value()
         .as_data_view()
@@ -45,9 +52,20 @@ fn check_not_detached(view: &JsDataView, heap: &otter_gc::GcHeap) -> Result<(), 
 }
 
 fn read_byte_offset(args: &[Value], heap: &otter_gc::GcHeap) -> Result<usize, NativeError> {
-    match to_index(args.first().unwrap_or(&Value::undefined()), heap) {
+    // §25.3.1.1 step 1 — `getIndex = ToIndex(requestIndex)`. ToIndex
+    // runs ToNumber first (a Symbol / BigInt request is a TypeError),
+    // then rejects a negative or too-large integer with a RangeError.
+    let undefined = Value::undefined();
+    let value = args.first().unwrap_or(&undefined);
+    if value.as_symbol(heap).is_some() {
+        return Err(bad("Cannot convert a Symbol value to a number"));
+    }
+    if value.is_big_int() {
+        return Err(bad("Cannot convert a BigInt value to a number"));
+    }
+    match to_index(value, heap) {
         Some(n) => Ok(n as usize),
-        None => Err(bad("byteOffset must be a non-negative integer")),
+        None => Err(range_bad("Invalid DataView byteOffset")),
     }
 }
 
@@ -57,8 +75,10 @@ fn ensure_within(
     offset: usize,
     byte_count: usize,
 ) -> Result<(), NativeError> {
+    // §25.3.1.1 step 13 / §25.3.1.2 step 15 — an access past the view's
+    // byte length is a RangeError, not a TypeError.
     if offset + byte_count > view.byte_length(heap) {
-        return Err(bad("out of bounds"));
+        return Err(range_bad("Offset is outside the bounds of the DataView"));
     }
     Ok(())
 }

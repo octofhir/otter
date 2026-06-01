@@ -1326,6 +1326,18 @@ typed-array constructors (`BigInt64Array` / `BigUint64Array`
 both still bootstrap placeholders), and BigInt boxing
 (`Object(1n)` → BigInt wrapper object).
 
+### §25.3 DataView — RangeError for out-of-range access (2026-06-02)
+
+`built-ins/DataView` 318 → 360 / 561. `GetViewValue` (§25.3.1.1
+step 13) and `SetViewValue` (§25.3.1.2 step 15) require a
+`RangeError` when `getIndex + elementSize` exceeds the view size,
+and `ToIndex` (step 1) rejects a negative or too-large byteOffset
+with a `RangeError`; the prototype get/set methods raised a
+`TypeError` in both cases. A Symbol / BigInt byteOffset still throws
+the `TypeError` that `ToNumber` would. Remaining DataView failures
+are operation-ordering cases (ToIndex / value conversion / detached
+check sequence) — a separate slice.
+
 ### §25.3 DataView — slice 14
 
 Real callable + constructible `NativeFunction` for `DataView`

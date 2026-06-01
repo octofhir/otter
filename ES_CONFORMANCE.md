@@ -432,6 +432,20 @@ Remaining gaps for `language/module-code`:
 - ~70 `MODULE_RESOLUTION_ERROR` failures are runner-infrastructure
   (`_FIXTURE.js` helper modules), not engine.
 
+Phase B — captured top-level lexical TDZ (2026-06-02):
+`language/module-code` 565 → 571 / 599 (94.32% → 95.33%).
+A nested function reading a module-top `let` / `const` / `class`
+declared later in source observed the binding's own-upvalue cell
+holding its default `undefined` instead of the Temporal Dead Zone
+hole, so `typeof x` / a forward read returned `undefined` rather
+than throwing `ReferenceError`. `pre_declare_lexical_bindings` now
+emits `Op::FreshUpvalue` for each captured lexical so the cell
+starts as the TDZ hole (§10.2.11 step 33). The matching
+`compile_assignment` arm now mirrors `store_identifier` and throws
+`TypeError` when a closure assigns to a captured `const`
+(§13.15.2). Fixes `instn-local-bndng-{let,const,cls}` and
+`instn-local-bndng-export-{let,const,cls}`.
+
 ### Import defer + module top-level await
 
 Command:

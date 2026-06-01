@@ -336,7 +336,17 @@ pub(crate) fn pre_declare_lexical_bindings(
             // diagnostic at declaration time rather than here.
             continue;
         }
-        cx.declare_binding(name, *is_const, span)?;
+        // §10.2.11 step 33 — a captured top-level lexical lives in an
+        // own-upvalue cell so closures can observe it. The cell starts
+        // life holding `undefined`, which a closure that runs before
+        // the source-level declaration would misread as an initialized
+        // value. Install the TDZ hole now so such a forward read is a
+        // `ReferenceError` until the declaration's store clears it.
+        if let crate::scope::BindingStorage::Upvalue { idx } =
+            cx.declare_binding(name, *is_const, span)?
+        {
+            cx.emit(Op::FreshUpvalue, [Operand::Imm32(idx as i32)], span);
+        }
     }
     Ok(())
 }

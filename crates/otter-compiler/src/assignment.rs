@@ -319,9 +319,30 @@ pub(crate) fn compile_assignment(
         // populates globals (e.g. `assert.sameValue = function …`
         // before the first reference) keeps working.
         // <https://tc39.es/ecma262/#sec-putvalue>
-        None => cx
-            .resolve_capture(&name)
-            .map(|idx| BindingStorage::Upvalue { idx }),
+        None => {
+            // A `const` captured from an enclosing function is not in
+            // this frame's scopes, so `lookup_binding` misses it. §13.15.2
+            // PutValue on an immutable binding throws TypeError at
+            // runtime after the RHS is evaluated for its side effects.
+            let captured_const = cx.stack.iter().rev().skip(1).any(|frame| {
+                frame
+                    .scopes
+                    .iter()
+                    .rev()
+                    .find_map(|scope| scope.bindings.get(&name))
+                    .is_some_and(|info| info.is_const)
+            });
+            if captured_const {
+                let _ = compile_expr(cx, &a.right, span)?;
+                return Ok(emit_assignment_type_error(
+                    cx,
+                    &format!("Assignment to constant variable '{name}'."),
+                    span,
+                ));
+            }
+            cx.resolve_capture(&name)
+                .map(|idx| BindingStorage::Upvalue { idx })
+        }
     };
     let active_with_envs = cx.active_with_envs.clone();
     let with_ref = emit_with_binding_probe(cx, &name, &active_with_envs, span)?;

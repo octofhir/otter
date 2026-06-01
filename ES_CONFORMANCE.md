@@ -1346,10 +1346,16 @@ setters) `ToNumber` / `ToBigInt` of the value, `ToBoolean`, the
 detached-buffer guard, and finally the range guard — reusing
 `to_number_or_throw` / `to_big_int_or_throw` so a poisoned `valueOf`
 propagates its thrown value and a Symbol / cross-numeric-type value
-throws `TypeError`. Remaining DataView failures are constructor
-argument validation (`new DataView(buffer, offset, length)`) and
-accessor `name` / detached-buffer descriptor cases — a separate
-slice.
+throws `TypeError`. The `DataView` constructor was then rewritten
+to the §25.3.2.1 sequence — require an ArrayBuffer, `ToIndex` the
+byteOffset (its coercion may detach the buffer), detached guard,
+offset bound, then `ToIndex` the byteLength — raising `RangeError`
+for an out-of-range offset/length and propagating a poisoned
+`valueOf`; and the `byteLength` / `byteOffset` getters now throw a
+`TypeError` on a detached buffer (§25.3.4.1/.2) instead of
+reporting zero. `built-ins/DataView` 447 → 470 / 561. Remaining
+failures are the accessor `name` descriptor ("get byteLength") and
+DataView-instance expando `defineProperty` — separate slices.
 
 ### §25.3 DataView — slice 14
 

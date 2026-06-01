@@ -318,20 +318,6 @@ impl PromiseBuilder {
         JsPromiseHandle::pending_with_roots(interp.gc_heap_mut(), &mut external_visit)
     }
 
-    pub(crate) fn fulfilled_runtime_rooted(
-        &self,
-        interp: &mut Interpreter,
-        value: Value,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
-    ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
-        let roots = interp.collect_runtime_roots();
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
-        };
-        JsPromiseHandle::fulfilled_with_roots(interp.gc_heap_mut(), value, &mut external_visit)
-    }
-
     pub(crate) fn pending_stack_rooted(
         &self,
         interp: &mut Interpreter,
@@ -1398,9 +1384,17 @@ fn static_resolve(
             return Ok(Value::promise(p));
         }
     }
-    Ok(Value::promise(
-        PromiseBuilder::new().fulfilled_runtime_rooted(interp, value, &[], &[args])?,
-    ))
+    // §27.2.4.7 PromiseResolve — settle a fresh promise through its
+    // resolve function rather than fulfilling directly, so a thenable
+    // value is adopted (§27.2.1.3.2) instead of becoming the
+    // fulfillment value verbatim.
+    let cap = PromiseBuilder::with_optional_context(context).capability_runtime_rooted(
+        interp,
+        &[&value],
+        &[args],
+    )?;
+    call_capability_resolve(interp, &cap, value)?;
+    Ok(cap.promise)
 }
 
 fn static_reject(interp: &mut Interpreter, args: &[Value]) -> Result<JsPromiseHandle, NativeError> {
@@ -2938,10 +2932,105 @@ fn resolve_native_body(
         return Ok(Value::undefined());
     }
 
+    // §27.2.1.3.2 Promise Resolve Functions steps 8-13 — any object
+    // with a callable `then` is a thenable: read `then` (firing an
+    // accessor and rejecting on its throw), then schedule a
+    // PromiseResolveThenableJob that calls `then(resolve, reject)`
+    // with this promise's resolving functions. A native promise
+    // takes the faster `attach_then` path above; this branch covers
+    // user-defined thenables (`Promise.resolve(obj)`, `await obj`).
+    if value.is_object_type()
+        && let Some(exec) = context.clone()
+    {
+        let then = {
+            let interp = ctx.interp_mut();
+            match get_property_runtime(interp, &exec, value, "then", "Promise resolve") {
+                Ok(then) => then,
+                Err(err) => {
+                    let reason = native_error_rejection_value_preserving_throw(interp, err);
+                    let jobs = promise.reject(interp.gc_heap_mut(), reason);
+                    drain_jobs(interp, jobs);
+                    return Ok(Value::undefined());
+                }
+            }
+        };
+        if crate::is_callable_value(&then) {
+            let value_root = value;
+            let then_root = then;
+            let (on_fulfill, on_reject) = make_resolve_adoption_handlers_native_rooted(
+                ctx,
+                promise,
+                &[&value_root, &then_root],
+                &[args],
+            )?;
+            let job =
+                make_resolve_thenable_job(ctx, value, then, on_fulfill, on_reject, exec.clone())?;
+            ctx.interp_mut().microtasks_mut().enqueue(crate::Microtask {
+                callee: job,
+                this_value: Value::undefined(),
+                args: SmallVec::new(),
+                context: Some(exec),
+                result_capability: None,
+                kind: crate::microtask::MicrotaskKind::Call,
+            });
+            return Ok(Value::undefined());
+        }
+    }
+
     let interp = ctx.interp_mut();
     let jobs = promise.fulfill(interp.gc_heap_mut(), value);
     drain_jobs(interp, jobs);
     Ok(Value::undefined())
+}
+
+/// §27.2.1.3.2 PromiseResolveThenableJob — a native that calls
+/// `then.call(thenable, resolve, reject)` and, if that call throws,
+/// rejects the promise with the abrupt completion's value. Enqueued
+/// as a microtask so the thenable's `then` runs on a later tick, per
+/// spec, rather than synchronously during resolution.
+fn make_resolve_thenable_job(
+    ctx: &mut NativeCtx<'_>,
+    thenable: Value,
+    then: Value,
+    on_fulfill: Value,
+    on_reject: Value,
+    exec: ExecutionContext,
+) -> Result<Value, NativeError> {
+    let captures: SmallVec<[Value; 4]> = smallvec![thenable, then, on_fulfill, on_reject];
+    native_value_with_captures_native_rooted(
+        ctx,
+        "PromiseResolveThenableJob",
+        captures,
+        &[&thenable, &then, &on_fulfill, &on_reject],
+        &[],
+        move |ctx, _args, captures| {
+            let thenable = captures[0];
+            let then = captures[1];
+            let on_fulfill = captures[2];
+            let on_reject = captures[3];
+            let interp = ctx.interp_mut();
+            match interp.run_callable_sync(&exec, &then, thenable, smallvec![on_fulfill, on_reject])
+            {
+                Ok(_) => Ok(Value::undefined()),
+                Err(err) => {
+                    // §27.2.1.3.2 — an abrupt `then` call rejects the
+                    // promise with the thrown value, preserving its
+                    // identity (a user `throw obj` keeps `obj`).
+                    let reason = interp.take_pending_uncaught_throw().unwrap_or_else(|| {
+                        crate::error_ops::vm_err_to_value(&err, interp.gc_heap_mut())
+                    });
+                    let _ = interp.run_callable_sync(
+                        &exec,
+                        &on_reject,
+                        Value::undefined(),
+                        smallvec![reason],
+                    );
+                    Ok(Value::undefined())
+                }
+            }
+        },
+    )
+    .map_err(|_| oom_native("PromiseResolveThenableJob"))
 }
 
 fn make_resolve_adoption_handlers_native_rooted(

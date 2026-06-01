@@ -29,14 +29,44 @@ use crate::{
 };
 
 impl Interpreter {
+    /// §27.7.5.3 Await step 2 — `PromiseResolve(%Promise%, value)`.
+    ///
+    /// A native promise is returned as-is; any other value (including
+    /// a user-defined thenable) is settled through a fresh promise's
+    /// resolve function so thenables are adopted (§27.2.1.3.2) rather
+    /// than awaited as opaque values.
+    fn await_promise_resolve(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &SmallVec<[Frame; 8]>,
+        value: Value,
+    ) -> Result<crate::promise::JsPromiseHandle, VmError> {
+        if let Some(p) = value.as_promise() {
+            return Ok(p);
+        }
+        let cap = promise_dispatch::PromiseBuilder::with_context(context.clone())
+            .capability_stack_rooted(self, stack, &[&value], &[])?;
+        let resolve = cap.resolve;
+        self.run_callable_sync(
+            context,
+            &resolve,
+            Value::undefined(),
+            smallvec::smallvec![value],
+        )?;
+        Ok(cap
+            .promise
+            .as_promise()
+            .expect("promise capability holds a promise"))
+    }
+
     /// Handle [`otter_bytecode::Op::Await`]: park the current
     /// async frame off the active stack and attach resume / reject
     /// reactions to the awaited promise.
     ///
     /// # Algorithm
-    /// 1. Wrap a non-promise value with `Promise.resolve(v)` per
-    ///    spec §27.7.5.3 step 1.b (an `Await` of a non-thenable
-    ///    settles immediately on the next microtask tick).
+    /// 1. Resolve the awaited value through [`Self::await_promise_resolve`]
+    ///    (`PromiseResolve(%Promise%, v)`) so a thenable is adopted and a
+    ///    plain value settles on the next microtask tick.
     /// 2. Advance the parked frame's pc past the `Await`
     ///    instruction so resumption continues with the next op.
     /// 3. Pop the frame off the active stack and box it; share the
@@ -90,13 +120,7 @@ impl Interpreter {
         // Advance past the Await before parking so resumption
         // continues at the next instruction.
         stack[top_idx].advance_pc(self.current_byte_len)?;
-        let promise =
-            if let Some(p) = awaited.as_promise() {
-                p
-            } else {
-                promise_dispatch::PromiseBuilder::with_context(context.clone())
-                    .fulfilled_stack_rooted(self, stack, awaited, &[], &[])?
-            };
+        let promise = self.await_promise_resolve(context, stack, awaited)?;
         let promise_value = Value::promise(promise);
         let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
             .capability_stack_rooted(self, stack, &[&promise_value], &[])?;
@@ -133,13 +157,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
         stack[top_idx].advance_pc(self.current_byte_len)?;
-        let promise =
-            if let Some(p) = awaited.as_promise() {
-                p
-            } else {
-                promise_dispatch::PromiseBuilder::with_context(context.clone())
-                    .fulfilled_stack_rooted(self, stack, awaited, &[], &[])?
-            };
+        let promise = self.await_promise_resolve(context, stack, awaited)?;
         let promise_value = Value::promise(promise);
         let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
             .capability_stack_rooted(self, stack, &[&promise_value], &[])?;

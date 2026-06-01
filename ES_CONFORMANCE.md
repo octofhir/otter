@@ -489,6 +489,19 @@ path and rejected `foo` as a read-only property, skipping the
 which must surface before the non-writable rejection. Fixes
 `namespace/internals/super-access-to-tdz-binding`.
 
+Thenable adoption in PromiseResolve (2026-06-02):
+`language/module-code` 582 → 584 / 599. `Promise.resolve(thenable)`
+and `await thenable` treated any non-native-promise value as an
+opaque fulfillment value, so a user thenable resolved to itself
+instead of being adopted. The promise resolve function
+(§27.2.1.3.2) now reads `then` and, when callable, schedules a
+PromiseResolveThenableJob that calls `then(resolve, reject)` with
+the promise's resolving functions (rejecting on an abrupt `then`).
+`Promise.resolve` and `Await` (§27.7.5.3) route non-promise values
+through that resolve function instead of fulfilling directly. Fixes
+`top-level-await/await-awaits-thenables{,-that-throw}`; built-ins/
+Promise + async suites unchanged.
+
 ### Import defer + module top-level await
 
 Command:

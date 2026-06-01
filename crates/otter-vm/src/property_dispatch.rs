@@ -742,6 +742,22 @@ impl Interpreter {
                     !Self::deferred_key_is_symbol_like(&VmPropertyKey::String(&key)),
                 )?;
                 if let Some(this_obj) = actual_this.as_object() {
+                    // §10.1.9.2 OrdinarySetWithOwnDescriptor step 2.c —
+                    // the data write consults `Receiver.[[GetOwnProperty]]`.
+                    // For a module namespace receiver that lookup throws a
+                    // TDZ ReferenceError when the target binding is still
+                    // uninitialized (§10.4.6.5 step 7), which must surface
+                    // before the namespace's non-writable rejection.
+                    if object::module_namespace_env(this_obj, &self.gc_heap).is_some() {
+                        self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                            context,
+                            actual_this,
+                            &VmPropertyKey::String(&key),
+                            0,
+                            &[&actual_this],
+                            &[],
+                        )?;
+                    }
                     if !self.ordinary_set_data_property(this_obj, &key, value)? {
                         Self::failed_set_result(
                             strict,

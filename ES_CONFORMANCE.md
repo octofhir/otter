@@ -479,6 +479,16 @@ order. Fixes `instn-iee-bndng-{cls,const,fun,gen,let,var}`; the
 runtime cycle-lifecycle tests were updated to the spec-correct TDZ
 ReferenceError for uninitialized cross-module `const` reads.
 
+Super-property write to a namespace TDZ binding (2026-06-02):
+`language/module-code` 581 → 582 / 599. A `super.foo = V` whose
+receiver is a module namespace fell straight into the data-write
+path and rejected `foo` as a read-only property, skipping the
+`Receiver.[[GetOwnProperty]]` that OrdinarySetWithOwnDescriptor
+(§10.1.9.2 step 2.c) performs. The namespace lookup throws a TDZ
+`ReferenceError` for an uninitialized binding (§10.4.6.5 step 7),
+which must surface before the non-writable rejection. Fixes
+`namespace/internals/super-access-to-tdz-binding`.
+
 ### Import defer + module top-level await
 
 Command:

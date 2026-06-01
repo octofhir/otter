@@ -509,6 +509,17 @@ impl Interpreter {
             &target,
             !Self::deferred_key_is_symbol_like(key),
         )?;
+        // §10.4.6.5 [[GetOwnProperty]] — namespace string keys report
+        // `{writable:true, enumerable:true, configurable:false}` data
+        // descriptors resolved through the environment; symbol keys
+        // fall through to the namespace's own properties.
+        if let Some(obj) = target.as_object()
+            && let Some(env) = object::module_namespace_env(obj, &self.gc_heap)
+            && let Some(name) = key.string_name()
+        {
+            return Ok(object::get(env, &self.gc_heap, name)
+                .map(|v| object::PropertyDescriptor::data(v, true, true, false)));
+        }
         if let Some(proxy) = target.as_proxy() {
             let key_value = self.vm_property_key_to_value(key)?;
             let trap_args: SmallVec<[Value; 8]> =
@@ -938,6 +949,31 @@ impl Interpreter {
             target,
             !Self::deferred_key_is_symbol_like(key),
         )?;
+        // §10.4.6.6 [[DefineOwnProperty]] — a namespace export is a fixed
+        // `{writable:true, enumerable:true, configurable:false}` data
+        // property; a define on a string export succeeds only if it
+        // requests no change to those attributes or the value. Adding a
+        // new name fails. Symbol keys fall through to the ordinary
+        // (non-extensible) define on the namespace's own properties.
+        if let Some(obj) = target.as_object()
+            && let Some(env) = object::module_namespace_env(obj, &self.gc_heap)
+            && let Some(name) = key.string_name()
+        {
+            let Some(current) = object::get(env, &self.gc_heap, name) else {
+                return Ok(false);
+            };
+            let value_ok = match descriptor.value {
+                Some(v) => abstract_ops::same_value(&v, &current, &self.gc_heap),
+                None => true,
+            };
+            let ok = descriptor.get.is_none()
+                && descriptor.set.is_none()
+                && descriptor.configurable != Some(true)
+                && descriptor.enumerable != Some(false)
+                && descriptor.writable != Some(false)
+                && value_ok;
+            return Ok(ok);
+        }
         if let Some(proxy) = target.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {
@@ -1988,6 +2024,24 @@ impl Interpreter {
         target: &Value,
     ) -> Result<Vec<Value>, VmError> {
         self.ensure_deferred_namespace_ready(context, target, true)?;
+        // §10.4.6.13 [[OwnPropertyKeys]] — exported string names in
+        // ascending code-unit order, followed by the namespace's own
+        // symbol keys (`@@toStringTag`).
+        if let Some(obj) = target.as_object()
+            && let Some(env) = object::module_namespace_env(obj, &self.gc_heap)
+        {
+            let mut keys: Vec<Value> = Vec::new();
+            for name in object::module_namespace_sorted_string_keys(env, &self.gc_heap) {
+                keys.push(Value::string(
+                    string::JsString::from_str(&name, &mut self.gc_heap).map_err(VmError::from)?,
+                ));
+            }
+            let symbols: Vec<Value> = object::with_properties(obj, &self.gc_heap, |p| {
+                p.symbol_keys().map(Value::symbol).collect()
+            });
+            keys.extend(symbols);
+            return Ok(keys);
+        }
         if let Some(proxy) = target.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {
@@ -2344,7 +2398,9 @@ impl Interpreter {
         // (§28.3 [[SetPrototypeOf]] = SetImmutablePrototype): succeed
         // only when the requested prototype is also null.
         if let Some(obj) = target.as_object() {
-            if object::deferred_namespace_target(obj, &self.gc_heap).is_some() {
+            if object::deferred_namespace_target(obj, &self.gc_heap).is_some()
+                || object::module_namespace_env(obj, &self.gc_heap).is_some()
+            {
                 return Ok(proto.is_null());
             }
         }
@@ -2725,6 +2781,16 @@ impl Interpreter {
             !Self::deferred_key_is_symbol_like(key),
         )?;
         if let Some(obj) = base.as_object() {
+            // §10.4.6.8 [[Get]] — a Module Namespace Exotic Object
+            // resolves string keys through the wrapped environment;
+            // symbol keys (e.g. @@toStringTag) fall through to its own
+            // properties.
+            if let Some(env) = object::module_namespace_env(obj, &self.gc_heap)
+                && let Some(name) = key.string_name()
+            {
+                let value = object::get(env, &self.gc_heap, name).unwrap_or_else(Value::undefined);
+                return Ok(VmGetOutcome::Value(value));
+            }
             if let Some(value) = self.string_object_exotic_get(obj, key)? {
                 return Ok(VmGetOutcome::Value(value));
             }
@@ -3388,6 +3454,13 @@ impl Interpreter {
             !Self::deferred_key_is_symbol_like(key),
         )?;
         if let Some(obj) = base.as_object() {
+            // §10.4.6.7 [[HasProperty]] — namespace string keys exist iff
+            // the environment exports them; symbol keys check own props.
+            if let Some(env) = object::module_namespace_env(obj, &self.gc_heap)
+                && let Some(name) = key.string_name()
+            {
+                return Ok(object::get(env, &self.gc_heap, name).is_some());
+            }
             if !matches!(
                 self.lookup_own_vm_property_key(obj, key),
                 object::PropertyLookup::Absent
@@ -3936,6 +4009,15 @@ impl Interpreter {
             &target,
             !Self::deferred_key_is_symbol_like(key),
         )?;
+        // §10.4.6.11 [[Delete]] — an exported string name cannot be
+        // deleted (returns false); a non-export string succeeds. Symbol
+        // keys fall through to the ordinary delete on own properties.
+        if let Some(obj) = target.as_object()
+            && let Some(env) = object::module_namespace_env(obj, &self.gc_heap)
+            && let Some(name) = key.string_name()
+        {
+            return Ok(object::get(env, &self.gc_heap, name).is_none());
+        }
         if let Some(proxy) = target.as_proxy() {
             let key_value = self.vm_property_key_to_value(key)?;
             let trap_args: SmallVec<[Value; 8]> =
@@ -4061,6 +4143,13 @@ impl Interpreter {
             &target,
             !Self::deferred_key_is_symbol_like(key),
         )?;
+        // §10.4.6.9 [[Set]] — a Module Namespace Exotic Object never
+        // accepts assignment.
+        if let Some(obj) = target.as_object()
+            && object::module_namespace_env(obj, &self.gc_heap).is_some()
+        {
+            return Ok(false);
+        }
         if let Some(proxy) = target.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {

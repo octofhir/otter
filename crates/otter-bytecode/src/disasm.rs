@@ -266,6 +266,7 @@ mod tests {
             Op::EvaluateModule,
             Op::MarkModuleEvaluated,
             Op::StarReexport,
+            Op::ModuleNamespaceObject,
             Op::PromiseFulfilledOf,
             Op::NewIntl,
             Op::TemporalLoad,
@@ -335,6 +336,7 @@ mod tests {
             | Op::MathLoad
             | Op::ImportNamespace
             | Op::ImportNamespaceDeferred
+            | Op::ModuleNamespaceObject
             | Op::PromiseFulfilledOf
             | Op::NewWeakRef
             | Op::NewFinalizationRegistry

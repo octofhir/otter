@@ -685,6 +685,14 @@ pub enum Op {
     /// local exports take precedence (skip-if-present), and `default`
     /// is never propagated through a star re-export.
     StarReexport,
+    /// Resolve the Module Namespace Exotic Object (ECMA-262 §10.4.6)
+    /// for the module imported via `specifier` and write it to
+    /// `r<dst>`. Operands: `Register(dst), ConstIndex(specifier)`.
+    /// Distinct from [`Op::ImportNamespace`], which yields the raw
+    /// module environment used for named-import indirection; this
+    /// yields the exotic object bound by `import * as ns` /
+    /// `export * as ns`.
+    ModuleNamespaceObject,
     /// Wrap the value in `r<src>` as a fulfilled `Promise` and
     /// write to `r<dst>`. Operands:
     /// `Register(dst), Register(src)`.
@@ -1102,6 +1110,7 @@ impl Op {
             Op::EvaluateModule => "EVALUATE_MODULE",
             Op::MarkModuleEvaluated => "MARK_MODULE_EVALUATED",
             Op::StarReexport => "STAR_REEXPORT",
+            Op::ModuleNamespaceObject => "MODULE_NAMESPACE_OBJECT",
             Op::PromiseFulfilledOf => "PROMISE_FULFILLED_OF",
             Op::Await => "AWAIT",
             Op::SymbolLoad => "SYMBOL_LOAD",
@@ -1199,6 +1208,7 @@ impl Op {
             | Op::Await
             | Op::ImportNamespace
             | Op::ImportNamespaceDeferred
+            | Op::ModuleNamespaceObject
             | Op::ImportNamespaceDynamic
             | Op::ImportMetaResolve
             | Op::Eval
@@ -1333,6 +1343,7 @@ impl Op {
             | Op::MathLoad
             | Op::ImportNamespace
             | Op::ImportNamespaceDeferred
+            | Op::ModuleNamespaceObject
             | Op::SymbolLoad
             | Op::TemporalLoad
             | Op::LoadBuiltinError

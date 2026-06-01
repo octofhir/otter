@@ -30,9 +30,17 @@ pub(crate) struct ImportBinding {
     /// empty string here as the sentinel.
     pub(crate) source_name: String,
     /// `true` for `import * as ns from "./..."` — the alias binds
-    /// to the namespace JsObject directly, so reads return the
-    /// record without an extra `LoadProperty`.
+    /// to the Module Namespace Exotic Object, resolved from
+    /// `specifier` at read time (distinct from the raw env record).
     pub(crate) is_namespace: bool,
+    /// Raw source specifier of the import (e.g. `"./other.ts"`), used
+    /// to resolve the namespace exotic object for `is_namespace`
+    /// bindings.
+    pub(crate) specifier: String,
+    /// `true` for `import defer * as ns` — the alias binds to the
+    /// *deferred* namespace cell (lazy evaluation) rather than the
+    /// eager Module Namespace Exotic Object.
+    pub(crate) is_deferred: bool,
 }
 
 /// Module-mode state attached to a [`FunctionContext`] when the

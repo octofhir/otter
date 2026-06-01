@@ -402,6 +402,8 @@ pub fn compile_module_program(
                                         record_uv_idx: record_uv,
                                         source_name,
                                         is_namespace: false,
+                                        specifier: specifier.clone(),
+                                        is_deferred: is_defer_phase,
                                     },
                                 );
                             }
@@ -413,6 +415,8 @@ pub fn compile_module_program(
                                         record_uv_idx: record_uv,
                                         source_name: "default".to_string(),
                                         is_namespace: false,
+                                        specifier: specifier.clone(),
+                                        is_deferred: is_defer_phase,
                                     },
                                 );
                             }
@@ -426,6 +430,8 @@ pub fn compile_module_program(
                                         record_uv_idx: record_uv,
                                         source_name: String::new(),
                                         is_namespace: true,
+                                        specifier: specifier.clone(),
+                                        is_deferred: is_defer_phase,
                                     },
                                 );
                             }

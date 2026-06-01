@@ -590,27 +590,43 @@ pub(crate) fn compile_statement(
                     // `export { name }` — read from the local
                     // binding or from an imported alias.
                     if let Some((binding, synthetic)) = find_module_import_binding(cx, &local) {
-                        let resolved_uv = if cx.module_state.is_some() {
-                            binding.record_uv_idx
-                        } else {
-                            cx.resolve_capture(&synthetic)
-                                .expect("synthetic import-record binding must resolve")
-                        };
-                        let record_dst = cx.alloc_scratch();
-                        cx.emit(
-                            Op::LoadUpvalue,
-                            vec![
-                                Operand::Register(record_dst),
-                                Operand::Imm32(resolved_uv as i32),
-                            ],
-                            span,
-                        );
-                        if binding.is_namespace {
-                            record_dst
-                        } else {
+                        if binding.is_namespace && !binding.is_deferred {
+                            // Re-exporting an eager `import * as ns`
+                            // binding forwards the Module Namespace
+                            // Exotic Object (§10.4.6).
                             let dst = cx.alloc_scratch();
-                            cx.emit_load_property(dst, record_dst, &binding.source_name, span);
+                            let spec_const = cx.intern_string_constant(&binding.specifier);
+                            cx.emit(
+                                Op::ModuleNamespaceObject,
+                                vec![Operand::Register(dst), Operand::ConstIndex(spec_const)],
+                                span,
+                            );
                             dst
+                        } else {
+                            let resolved_uv = if cx.module_state.is_some() {
+                                binding.record_uv_idx
+                            } else {
+                                cx.resolve_capture(&synthetic)
+                                    .expect("synthetic import-record binding must resolve")
+                            };
+                            let record_dst = cx.alloc_scratch();
+                            cx.emit(
+                                Op::LoadUpvalue,
+                                vec![
+                                    Operand::Register(record_dst),
+                                    Operand::Imm32(resolved_uv as i32),
+                                ],
+                                span,
+                            );
+                            // A deferred namespace binding's cell already
+                            // holds the namespace object; forward it.
+                            if binding.is_namespace {
+                                record_dst
+                            } else {
+                                let dst = cx.alloc_scratch();
+                                cx.emit_load_property(dst, record_dst, &binding.source_name, span);
+                                dst
+                            }
                         }
                     } else {
                         let info = cx.lookup_binding(&local).ok_or(CompileError::Unsupported {
@@ -745,15 +761,6 @@ pub(crate) fn compile_statement(
                     node: format!("ExportAllDeclaration: unresolved source `{source}`"),
                     span,
                 })?;
-            let record_reg = cx.alloc_scratch();
-            cx.emit(
-                Op::LoadUpvalue,
-                vec![
-                    Operand::Register(record_reg),
-                    Operand::Imm32(record_uv as i32),
-                ],
-                span,
-            );
             let env_uv = cx
                 .module_state
                 .as_ref()
@@ -766,17 +773,33 @@ pub(crate) fn compile_statement(
                 span,
             );
             match decl.exported.as_ref().map(module_export_name_to_str) {
-                // `export * as ns from "mod"` — the source namespace
-                // object becomes a single named export on module_env.
+                // `export * as ns from "mod"` — the source's Module
+                // Namespace Exotic Object becomes a named export.
                 Some(exported_alias) => {
-                    cx.emit_store_property(env_reg, &exported_alias, record_reg, span);
+                    let ns_reg = cx.alloc_scratch();
+                    let spec_const = cx.intern_string_constant(&source);
+                    cx.emit(
+                        Op::ModuleNamespaceObject,
+                        vec![Operand::Register(ns_reg), Operand::ConstIndex(spec_const)],
+                        span,
+                    );
+                    cx.emit_store_property(env_reg, &exported_alias, ns_reg, span);
                 }
                 // Bare `export * from "mod"` — copy the source's
                 // exported names onto module_env (excluding `default`,
                 // local exports take precedence). The source module is
                 // evaluated before this body by dependency order, so
-                // its module_env is already populated.
+                // its env is already populated.
                 None => {
+                    let record_reg = cx.alloc_scratch();
+                    cx.emit(
+                        Op::LoadUpvalue,
+                        vec![
+                            Operand::Register(record_reg),
+                            Operand::Imm32(record_uv as i32),
+                        ],
+                        span,
+                    );
                     cx.emit(
                         Op::StarReexport,
                         [Operand::Register(env_reg), Operand::Register(record_reg)],

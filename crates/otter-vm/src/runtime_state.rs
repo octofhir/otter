@@ -91,6 +91,9 @@ impl<'a> RuntimeState<'a> {
         for env in interp.module_environments_for_trace() {
             env.trace_gc_roots(visitor);
         }
+        for ns in interp.module_namespaces_for_trace() {
+            ns.trace_gc_roots(visitor);
+        }
         for value in interp.module_errors_for_trace() {
             value.trace_value_slots(visitor);
         }

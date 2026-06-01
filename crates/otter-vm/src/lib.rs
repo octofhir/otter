@@ -348,6 +348,11 @@ pub struct Interpreter {
     /// yield the identical object (§16.2.1). Cleared with
     /// `module_environments`.
     deferred_namespaces: std::collections::HashMap<std::sync::Arc<str>, JsObject>,
+    /// Cache of eager Module Namespace Exotic Objects (§10.4.6), keyed
+    /// by target module URL, so every `import * as ns` / `export * as
+    /// ns` of the same module yields the identical object. Cleared with
+    /// `module_environments`.
+    module_namespaces: std::collections::HashMap<std::sync::Arc<str>, JsObject>,
     /// Monomorphic `LoadProperty` inline caches keyed by
     /// dense executable IC site id. These are interpreter-local
     /// hints and never affect bytecode dumps or JS-visible semantics.
@@ -716,6 +721,7 @@ impl Interpreter {
             evaluated_modules: std::collections::HashSet::new(),
             module_errors: std::collections::HashMap::new(),
             deferred_namespaces: std::collections::HashMap::new(),
+            module_namespaces: std::collections::HashMap::new(),
             load_property_ics: Vec::new(),
             store_property_ics: Vec::new(),
             has_property_ics: Vec::new(),
@@ -1369,6 +1375,7 @@ impl Interpreter {
         self.evaluated_modules.clear();
         self.module_errors.clear();
         self.deferred_namespaces.clear();
+        self.module_namespaces.clear();
     }
 
     /// Resolve a specifier seen by the running module to the
@@ -1411,6 +1418,44 @@ impl Interpreter {
             target_rc
         };
         self.module_environments.get(target_url.as_ref()).cloned()
+    }
+
+    /// Resolve `(referrer, specifier)` to the eager Module Namespace
+    /// Exotic Object (§10.4.6) — used by the user-visible `import * as
+    /// ns` binding and `export * as ns`, distinct from the raw module
+    /// environment used for named-import indirection.
+    pub(crate) fn resolve_module_namespace_object(
+        &mut self,
+        context: &ExecutionContext,
+        referrer: &str,
+        specifier: &str,
+    ) -> Option<JsObject> {
+        let referrer_rc: std::sync::Arc<str> = std::sync::Arc::from(referrer);
+        let key = (referrer_rc, specifier.to_string());
+        let target_url = if let Some(hit) = self.module_resolution_cache.get(&key) {
+            hit.clone()
+        } else {
+            let target = context.module_resolution_target(referrer, specifier)?;
+            let target_rc: std::sync::Arc<str> = std::sync::Arc::from(target);
+            self.module_resolution_cache.insert(key, target_rc.clone());
+            target_rc
+        };
+        self.get_or_create_module_namespace(target_url.as_ref())
+    }
+
+    /// Eager Module Namespace Exotic Object (§10.4.6) wrapping the
+    /// environment of `target_url`, created on first use and cached so
+    /// every `import * as ns` / re-export of the same module yields the
+    /// identical object.
+    fn get_or_create_module_namespace(&mut self, target_url: &str) -> Option<JsObject> {
+        let target_rc: std::sync::Arc<str> = std::sync::Arc::from(target_url);
+        if let Some(ns) = self.module_namespaces.get(&target_rc) {
+            return Some(*ns);
+        }
+        let env = *self.module_environments.get(&target_rc)?;
+        let ns = self.alloc_module_namespace_object(env).ok()?;
+        self.module_namespaces.insert(target_rc, ns);
+        Some(ns)
     }
 
     /// Mutable handle to the isolate-local microtask queue.
@@ -1843,6 +1888,16 @@ impl Interpreter {
     /// live module bindings.
     pub fn module_environments_for_trace(&self) -> impl Iterator<Item = &JsObject> {
         self.module_environments.values()
+    }
+
+    /// Borrow cached eager + deferred module namespace exotic objects
+    /// for GC root tracing. They are reachable from JS via `import * as
+    /// ns`, so they must survive collection even when no live register
+    /// currently holds them.
+    pub fn module_namespaces_for_trace(&self) -> impl Iterator<Item = &JsObject> {
+        self.module_namespaces
+            .values()
+            .chain(self.deferred_namespaces.values())
     }
 
     /// Borrow cached module-evaluation thrown values for GC root tracing.
@@ -4058,6 +4113,17 @@ impl Interpreter {
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_import_namespace_deferred_reg(context, frame, dst, spec_idx)?;
+                    continue;
+                }
+                Op::ModuleNamespaceObject => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let spec_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_module_namespace_object_reg(context, frame, dst, spec_idx)?;
                     continue;
                 }
                 Op::EvaluateModule => {

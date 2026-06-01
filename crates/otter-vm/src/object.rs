@@ -1488,6 +1488,43 @@ pub(crate) struct DeferredNamespaceData {
     pub(crate) populated: std::cell::Cell<bool>,
 }
 
+/// Side data marking a Module Namespace Exotic Object (ECMA-262
+/// §10.4.6). The object is a thin exotic view over the wrapped module
+/// environment `env` (an ordinary object that holds the live export
+/// values): property reads resolve through `env` so the namespace
+/// reflects late and cyclic writes, while writes / defines / deletes
+/// fail and the key set is the env's exported names (sorted) plus the
+/// namespace's own symbol keys (`@@toStringTag`).
+#[derive(Debug)]
+pub(crate) struct ModuleNamespaceData {
+    pub(crate) env: JsObject,
+}
+
+/// Wrapped module environment when `obj` is a Module Namespace Exotic
+/// Object, else `None`.
+#[must_use]
+pub(crate) fn module_namespace_env(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<JsObject> {
+    heap.read_payload(obj, |body| {
+        body.host_data
+            .as_ref()
+            .and_then(|d| d.downcast_ref::<ModuleNamespaceData>())
+            .map(|d| d.env)
+    })
+}
+
+/// Exported string keys of a module namespace's environment, sorted in
+/// ascending code-unit order per §10.4.6.13 \[\[OwnPropertyKeys]].
+#[must_use]
+pub(crate) fn module_namespace_sorted_string_keys(
+    env: JsObject,
+    heap: &otter_gc::GcHeap,
+) -> Vec<String> {
+    let mut names: Vec<String> =
+        with_properties(env, heap, |p| p.enumerable_keys().map(str::to_string).collect());
+    names.sort_unstable();
+    names
+}
+
 /// Target module URL when `obj` is a deferred module namespace, else
 /// `None`.
 #[must_use]

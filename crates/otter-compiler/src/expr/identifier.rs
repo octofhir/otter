@@ -119,6 +119,22 @@ fn compile_identifier_without_with(
     // Spec: <https://tc39.es/ecma262/#sec-getidentifierreference>
     //       <https://tc39.es/ecma262/#sec-module-environment-records-getbindingvalue-n-s>
     if let Some((binding, synthetic)) = find_module_import_binding(cx, name) {
+        // `import * as ns` binds to the Module Namespace Exotic Object
+        // (§10.4.6), resolved from the specifier — distinct from the
+        // raw env record used for named-import indirection. A `import
+        // defer * as ns` binding instead reads its dedicated deferred
+        // namespace cell (lazy evaluation), handled by the generic
+        // record path below.
+        if binding.is_namespace && !binding.is_deferred {
+            let dst = cx.alloc_scratch();
+            let spec_const = cx.intern_string_constant(&binding.specifier);
+            cx.emit(
+                Op::ModuleNamespaceObject,
+                vec![Operand::Register(dst), Operand::ConstIndex(spec_const)],
+                span,
+            );
+            return Ok(dst);
+        }
         let resolved_uv = if cx.module_state.is_some() {
             binding.record_uv_idx
         } else {
@@ -134,6 +150,8 @@ fn compile_identifier_without_with(
             ],
             span,
         );
+        // `import defer * as ns` — the deferred cell already holds the
+        // deferred namespace object; read it directly.
         if binding.is_namespace {
             return Ok(record_dst);
         }

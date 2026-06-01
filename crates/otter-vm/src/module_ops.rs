@@ -50,6 +50,35 @@ impl Interpreter {
         Ok(())
     }
 
+    /// `Op::ModuleNamespaceObject` — resolve the Module Namespace
+    /// Exotic Object (§10.4.6) for `specifier` and write it to `dst`.
+    /// Used by `import * as ns` / `export * as ns`; distinct from the
+    /// raw module environment yielded by [`Op::ImportNamespace`].
+    pub(crate) fn run_module_namespace_object_reg(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut Frame,
+        dst: u16,
+        spec_idx: u32,
+    ) -> Result<(), VmError> {
+        let specifier = context
+            .string_constant_str(spec_idx)
+            .ok_or(VmError::InvalidOperand)?
+            .to_string();
+        let referrer: String = context
+            .exec_function(frame.function_id)
+            .map(|f| f.module_url.as_ref().to_string())
+            .unwrap_or_default();
+        let namespace = self
+            .resolve_module_namespace_object(context, referrer.as_str(), specifier.as_str())
+            .ok_or_else(|| VmError::UnknownIntrinsic {
+                name: format!("import * as \"{specifier}\""),
+            })?;
+        write_register(frame, dst, Value::object(namespace))?;
+        frame.advance_pc(self.current_byte_len)?;
+        Ok(())
+    }
+
     /// `Op::ImportNamespaceDeferred` — resolve (or lazily create) the
     /// deferred namespace object for `specifier` and write it to `dst`.
     /// The target module is **not** evaluated here (TC39 import defer).

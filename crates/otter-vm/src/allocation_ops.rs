@@ -168,6 +168,51 @@ impl Interpreter {
         Ok(obj)
     }
 
+    /// Allocate a Module Namespace Exotic Object (ECMA-262 §10.4.6): a
+    /// null-proto, non-extensible object carrying `@@toStringTag` =
+    /// "Module" and a [`crate::object::ModuleNamespaceData`] pointing at
+    /// the wrapped module environment `env`. Property reads resolve live
+    /// through `env`; writes/defines/deletes fail (enforced by the
+    /// namespace MOP forks in `object_internal_ops`).
+    pub(crate) fn alloc_module_namespace_object(
+        &mut self,
+        env: crate::object::JsObject,
+    ) -> Result<crate::object::JsObject, otter_gc::OutOfMemory> {
+        let roots = self.collect_runtime_roots();
+        let shape_root = self.shape_root();
+        let env_value = Value::object(env);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            env_value.trace_value_slots(visitor);
+        };
+        let obj = crate::object::alloc_host_object_with_shape_roots(
+            &mut self.gc_heap,
+            shape_root,
+            crate::object::ModuleNamespaceData { env },
+            &mut external_visit,
+        )?;
+        let tag_sym = self
+            .well_known_symbols
+            .get(crate::symbol::WellKnown::ToStringTag);
+        let module_str = crate::JsString::from_str("Module", &mut self.gc_heap)?;
+        crate::object::define_own_symbol_property(
+            obj,
+            &mut self.gc_heap,
+            tag_sym,
+            crate::object::PropertyDescriptor::data(
+                crate::Value::string(module_str),
+                false,
+                false,
+                false,
+            ),
+        );
+        // §10.4.6 namespaces are non-extensible from creation.
+        crate::object::prevent_extensions(obj, &mut self.gc_heap);
+        Ok(obj)
+    }
+
     pub(crate) fn alloc_runtime_rooted_object_with_proto(
         &mut self,
         proto: crate::object::JsObject,

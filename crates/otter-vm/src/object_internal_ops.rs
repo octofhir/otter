@@ -3895,10 +3895,27 @@ impl Interpreter {
         }
         if let Some(obj) = target.as_object() {
             // §10.4.6 namespace enumerable string keys are its resolved
-            // exported names (all enumerable), resolved through the table
-            // rather than the namespace object's own (empty) string slots.
+            // exported names (all enumerable). EnumerableOwnProperties
+            // (§7.3.23) calls [[GetOwnProperty]] per key, so a name whose
+            // binding is still uninitialized surfaces a TDZ ReferenceError
+            // here (§10.4.6.5 step 7) rather than being silently listed.
             if object::module_namespace_env(obj, &self.gc_heap).is_some() {
-                return Ok(self.module_namespace_export_names(obj));
+                let names = self.module_namespace_export_names(obj);
+                let mut out = Vec::with_capacity(names.len());
+                for name in names {
+                    let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                        context,
+                        target,
+                        &VmPropertyKey::OwnedString(name.clone()),
+                        hops + 1,
+                        &[&target],
+                        &[],
+                    )?;
+                    if desc.is_some_and(|d| d.enumerable()) {
+                        out.push(name);
+                    }
+                }
+                return Ok(out);
             }
             let mut keys = Vec::new();
             if let Some(value) = object::string_data(obj, &self.gc_heap) {

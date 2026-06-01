@@ -365,28 +365,7 @@ fn class_constructor_own_property_keys_without_context(
 }
 
 fn object_native_error(name: &'static str, err: VmError) -> NativeError {
-    match err {
-        VmError::Uncaught { value } => NativeError::Thrown {
-            name,
-            message: value,
-        },
-        VmError::TypeError { message } => NativeError::TypeError {
-            name,
-            reason: message,
-        },
-        VmError::RangeError { message } => NativeError::RangeError {
-            name,
-            reason: message,
-        },
-        VmError::SyntaxError { message } => NativeError::SyntaxError {
-            name,
-            reason: message,
-        },
-        other => NativeError::TypeError {
-            name,
-            reason: other.to_string(),
-        },
-    }
+    crate::native_function::vm_to_native_error(err, name)
 }
 
 macro_rules! native_object_static {

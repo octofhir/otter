@@ -380,6 +380,11 @@ pub(crate) fn native_to_vm_error(err: NativeError) -> VmError {
         NativeError::RangeError { name, reason } => VmError::RangeError {
             message: format!("{name}: {reason}"),
         },
+        // Round-trips back to a ReferenceError-classed VmError so a TDZ
+        // error raised behind a native boundary keeps its class.
+        NativeError::ReferenceError { name, reason } => VmError::ThisUninitialized {
+            message: format!("{name}: {reason}"),
+        },
         NativeError::Exit { code } => VmError::Exit { code },
         NativeError::Interrupted => VmError::Interrupted,
     }

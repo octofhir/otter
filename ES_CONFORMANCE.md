@@ -446,6 +446,24 @@ starts as the TDZ hole (§10.2.11 step 33). The matching
 (§13.15.2). Fixes `instn-local-bndng-{let,const,cls}` and
 `instn-local-bndng-export-{let,const,cls}`.
 
+Namespace MOP TDZ via native boundary (2026-06-02):
+`language/module-code` 571 → 575 / 599 (95.33% → 96.64%).
+`Object.keys` on a module namespace took a shortcut that listed
+export names without the per-key `[[GetOwnProperty]]` call
+EnumerableOwnProperties (§7.3.23) mandates, so an uninitialized
+binding was silently listed instead of throwing. Separately, the
+`VmError` → `NativeError` conversion collapsed every non-`TypeError`
+variant — including the TDZ `ThisUninitialized` / `TemporalDeadZone`
+/ `UndefinedIdentifier` — into `TypeError`, so a `ReferenceError`
+raised behind a native (`Object.keys`, `Object.getOwnPropertyDescriptor`,
+`hasOwnProperty`, `propertyIsEnumerable`) surfaced with the wrong
+class. Added a `NativeError::ReferenceError` variant with a faithful
+round-trip and folded the duplicate `object_native_error` into the
+canonical `vm_to_native_error`. Fixes
+`namespace/internals/{get-own-property-str-found-uninit,
+object-keys-binding-uninit, object-hasOwnProperty-binding-uninit,
+object-propertyIsEnumerable-binding-uninit}`.
+
 ### Import defer + module top-level await
 
 Command:

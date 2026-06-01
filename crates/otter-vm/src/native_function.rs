@@ -1206,6 +1206,19 @@ pub enum NativeError {
         /// Short reason.
         reason: String,
     },
+    /// Access to an uninitialized binding (Temporal Dead Zone) or an
+    /// unresolved reference surfaced from inside a native. §13.3.7.3 /
+    /// §10.2.2 — a JS `ReferenceError`. Without this variant a TDZ
+    /// error raised behind a native boundary (e.g. a module namespace
+    /// MOP reached through `Object.keys`) would be misreported as a
+    /// `TypeError`.
+    #[error("native function {name}: {reason}")]
+    ReferenceError {
+        /// Display name of the native.
+        name: &'static str,
+        /// Short reason.
+        reason: String,
+    },
     /// Host-visible runtime termination requested by a native such
     /// as `process.exit(code)`. This is not a JS throw and must not
     /// be catchable by user code.
@@ -1254,6 +1267,19 @@ pub(crate) fn vm_to_native_error(err: crate::VmError, name: &'static str) -> Nat
             name,
             reason: message,
         },
+        // §10.2.2 / §13.3.7.3 — TDZ and unresolved-reference errors are
+        // ReferenceErrors and must keep that class across the native
+        // boundary rather than collapsing to the TypeError fallback.
+        crate::VmError::ThisUninitialized { ref message } => NativeError::ReferenceError {
+            name,
+            reason: message.clone(),
+        },
+        crate::VmError::TemporalDeadZone { .. } | crate::VmError::UndefinedIdentifier { .. } => {
+            NativeError::ReferenceError {
+                name,
+                reason: err.to_string(),
+            }
+        }
         crate::VmError::Interrupted => NativeError::Interrupted,
         other => NativeError::TypeError {
             name,

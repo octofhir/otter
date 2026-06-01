@@ -149,6 +149,12 @@ pub struct MethodSpec {
 pub struct AccessorSpec {
     /// Exported JavaScript property name.
     pub name: &'static str,
+    /// Getter function name — `"get " + name` per §10.2.2 / §15.x so
+    /// `Object.getOwnPropertyDescriptor(O, name).get.name` matches the
+    /// spec-mandated `"get <name>"`.
+    pub get_name: &'static str,
+    /// Setter function name — `"set " + name`.
+    pub set_name: &'static str,
     /// Getter call target, when present.
     pub get: Option<NativeCall>,
     /// Setter call target, when present.
@@ -446,7 +452,7 @@ impl<'rt> ObjectBuilder<'rt> {
         let getter = match &spec.get {
             Some(call) => Some(Value::native_function(native_from_call_with_raw_roots(
                 self.heap,
-                spec.name,
+                spec.get_name,
                 0,
                 call.clone(),
                 self.raw_roots.as_slice(),
@@ -463,7 +469,7 @@ impl<'rt> ObjectBuilder<'rt> {
         let setter = match &spec.set {
             Some(call) => Some(Value::native_function(native_from_call_with_raw_roots(
                 self.heap,
-                spec.name,
+                spec.set_name,
                 1,
                 call.clone(),
                 self.raw_roots.as_slice(),
@@ -916,6 +922,8 @@ mod tests {
 
     static CLASS_PROTOTYPE_ACCESSORS: &[AccessorSpec] = &[AccessorSpec {
         name: "answer",
+        get_name: "get answer",
+        set_name: "set answer",
         get: Some(NativeCall::Static(one)),
         set: None,
         attrs: Attr::new(false, false, true),

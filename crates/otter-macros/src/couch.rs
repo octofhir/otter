@@ -683,6 +683,8 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         quote! {
             ::otter_vm::AccessorSpec {
                 name: #js_name,
+                get_name: ::core::concat!("get ", #js_name),
+                set_name: ::core::concat!("set ", #js_name),
                 get: #get_tokens,
                 set: #set_tokens,
                 attrs: #attrs_path,

@@ -1326,6 +1326,20 @@ typed-array constructors (`BigInt64Array` / `BigUint64Array`
 both still bootstrap placeholders), and BigInt boxing
 (`Object(1n)` → BigInt wrapper object).
 
+### Builtin accessor function names — `get`/`set` prefix (2026-06-02)
+
+A builtin accessor's getter / setter `NativeFunction` was named with
+the bare property key, so
+`Object.getOwnPropertyDescriptor(O, name).get.name` reported
+`"byteLength"` / `"size"` instead of the spec-mandated
+`"get byteLength"` / `"get size"` (§10.2.9 SetFunctionName with the
+`"get"` / `"set"` prefix). `AccessorSpec` now carries `get_name` /
+`set_name`, which the `couch!` and `raft!`/`holt` macros emit as
+`concat!("get ", key)` / `concat!("set ", key)`; `accessor_from_spec`
+names each function accordingly. Verified deltas with zero
+regressions: DataView +3, RegExp +10, Map +1, Set +1, ArrayBuffer
++1 (more accessor `name.js` tests across other builtins also flip).
+
 ### §25.3 DataView — RangeError for out-of-range access (2026-06-02)
 
 `built-ins/DataView` 318 → 360 / 561. `GetViewValue` (§25.3.1.1

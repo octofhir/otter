@@ -209,6 +209,13 @@ pub const fn runtime_accessor(
 ) -> RuntimeAccessorSpec {
     RuntimeAccessorSpec {
         name,
+        // A `const fn` cannot concatenate `"get "`/`"set "` onto a
+        // runtime `&'static str`; runtime-built accessors fall back to
+        // the bare name. The `couch!` / `raft!` macros, which own the
+        // builtin accessor surface, emit the spec-correct
+        // `"get <name>"` / `"set <name>"` from string literals.
+        get_name: name,
+        set_name: name,
         get,
         set,
         attrs,

@@ -355,7 +355,14 @@ impl Interpreter {
         let name = key.name();
         let receiver = *read_register(frame, obj_reg)?;
         let removed = if let Some(o) = receiver.as_object() {
-            crate::object::delete(o, &mut self.gc_heap, name)
+            // §10.4.6.10 [[Delete]] — a Module Namespace Exotic Object
+            // refuses to delete an exported string name (strict module
+            // code then throws TypeError below).
+            if let Some(env) = crate::object::module_namespace_env(o, &self.gc_heap) {
+                crate::object::get(env, &self.gc_heap, name).is_none()
+            } else {
+                crate::object::delete(o, &mut self.gc_heap, name)
+            }
         } else if let Some(arr) = receiver.as_array() {
             crate::array::delete_named_property(arr, &mut self.gc_heap, name)
         } else if let Some(class) = receiver.as_class_constructor() {

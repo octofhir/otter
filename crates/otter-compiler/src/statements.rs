@@ -588,14 +588,39 @@ pub(crate) fn compile_statement(
                     continue;
                 } else {
                     // `export { name }` — read from the local
-                    // binding (the body must have declared it).
-                    let info = cx.lookup_binding(&local).ok_or(CompileError::Unsupported {
-                        node: format!("export of undeclared `{local}`"),
-                        span,
-                    })?;
-                    let dst = cx.alloc_scratch();
-                    cx.emit_load_storage(dst, info.storage, span);
-                    dst
+                    // binding or from an imported alias.
+                    if let Some((binding, synthetic)) = find_module_import_binding(cx, &local) {
+                        let resolved_uv = if cx.module_state.is_some() {
+                            binding.record_uv_idx
+                        } else {
+                            cx.resolve_capture(&synthetic)
+                                .expect("synthetic import-record binding must resolve")
+                        };
+                        let record_dst = cx.alloc_scratch();
+                        cx.emit(
+                            Op::LoadUpvalue,
+                            vec![
+                                Operand::Register(record_dst),
+                                Operand::Imm32(resolved_uv as i32),
+                            ],
+                            span,
+                        );
+                        if binding.is_namespace {
+                            record_dst
+                        } else {
+                            let dst = cx.alloc_scratch();
+                            cx.emit_load_property(dst, record_dst, &binding.source_name, span);
+                            dst
+                        }
+                    } else {
+                        let info = cx.lookup_binding(&local).ok_or(CompileError::Unsupported {
+                            node: format!("export of undeclared `{local}`"),
+                            span,
+                        })?;
+                        let dst = cx.alloc_scratch();
+                        cx.emit_load_storage(dst, info.storage, span);
+                        dst
+                    }
                 };
                 let env_uv = cx
                     .module_state

@@ -130,6 +130,40 @@ impl Compiler {
         }
         Some(current)
     }
+
+    /// Mirror an assignment to an exported module binding through to
+    /// `module_env`, including assignments emitted inside nested
+    /// functions. Nested functions capture the synthetic module-env
+    /// binding through the normal upvalue cascade.
+    pub(crate) fn emit_module_export_mirror(
+        &mut self,
+        name: &str,
+        value_reg: u16,
+        span: (u32, u32),
+    ) {
+        let exported = self.stack.iter().any(|ctx| {
+            ctx.module_state
+                .as_ref()
+                .is_some_and(|state| state.exported_names.contains(name))
+        });
+        if !exported {
+            return;
+        }
+        let env_uv = match self.stack.last().and_then(|ctx| ctx.module_state.as_ref()) {
+            Some(state) => state.module_env_uv,
+            None => match self.resolve_capture(&module_env_synthetic_name()) {
+                Some(idx) => idx,
+                None => return,
+            },
+        };
+        let env_reg = self.alloc_scratch();
+        self.emit(
+            Op::LoadUpvalue,
+            [Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
+            span,
+        );
+        self.emit_store_property(env_reg, name, value_reg, span);
+    }
 }
 
 impl std::ops::Deref for Compiler {

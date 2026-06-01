@@ -102,10 +102,15 @@ struct ModuleNode {
     fragment: BytecodeModule,
     /// Compiler-owned metadata for this unlinked source module.
     metadata: CompiledModuleMetadata,
-    /// `(specifier_text → target_url)` pairs, mirroring
-    /// `fragment.module_resolutions` — used by the topological
-    /// sort to walk to dependencies.
-    deps: Vec<(String, String)>,
+    /// Source-ordered module requests, preserving `defer` phase
+    /// records even when the same specifier also appears eagerly.
+    deps: Vec<ModuleEdge>,
+}
+
+#[derive(Debug)]
+struct ModuleEdge {
+    target: String,
+    deferred: bool,
 }
 
 /// Frozen module graph assembled by [`ModuleGraphBuilder`].
@@ -146,7 +151,7 @@ struct ModuleGraphBuilder<'a> {
     loader: &'a ModuleLoader,
     entry_url: String,
     nodes: BTreeMap<String, ModuleNode>,
-    queue: Vec<(String, SourceKind, String)>,
+    queue: Vec<(String, SourceKind, String, bool)>,
     load_count: usize,
 }
 
@@ -161,14 +166,19 @@ impl<'a> ModuleGraphBuilder<'a> {
             loader,
             entry_url: entry_url.clone(),
             nodes: BTreeMap::new(),
-            queue: vec![(entry_url, entry_kind, entry_text)],
+            queue: vec![(entry_url, entry_kind, entry_text, false)],
             load_count: 0,
         }
     }
 
     fn build(mut self) -> Result<ModuleGraph, GraphError> {
-        while let Some((url, kind, text)) = self.queue.pop() {
-            self.load_one(url, kind, text)?;
+        while let Some((url, kind, text, dynamic)) = self.queue.pop() {
+            if let Err(err) = self.load_one(url, kind, text, dynamic) {
+                if dynamic {
+                    continue;
+                }
+                return Err(err);
+            }
         }
         Ok(ModuleGraph {
             entry_url: self.entry_url,
@@ -176,7 +186,13 @@ impl<'a> ModuleGraphBuilder<'a> {
         })
     }
 
-    fn load_one(&mut self, url: String, kind: SourceKind, text: String) -> Result<(), GraphError> {
+    fn load_one(
+        &mut self,
+        url: String,
+        kind: SourceKind,
+        text: String,
+        optional_dynamic: bool,
+    ) -> Result<(), GraphError> {
         if self.nodes.contains_key(&url) {
             return Ok(());
         }
@@ -197,29 +213,52 @@ impl<'a> ModuleGraphBuilder<'a> {
         }
 
         let (compiled, deps, queued) = with_program(text, kind, |program| {
-            let specifiers = collect_specifiers(program);
+            let requests = collect_module_requests(program);
             let mut resolved_imports: HashMap<String, String> = HashMap::new();
-            let mut deps: Vec<(String, String)> = Vec::with_capacity(specifiers.len());
-            let mut queued: Vec<(String, SourceKind, String)> = Vec::new();
-            for spec in &specifiers {
-                let target = self.loader.resolve(spec, Some(&url))?;
-                resolved_imports.insert(spec.clone(), target.clone());
-                deps.push((spec.clone(), target.clone()));
+            let mut deps: Vec<ModuleEdge> = Vec::with_capacity(requests.len());
+            let mut queued: Vec<(String, SourceKind, String, bool)> = Vec::new();
+            let mut eager_static_specs: HashSet<String> = HashSet::new();
+            let mut dynamic_specs: HashSet<String> = HashSet::new();
+            for request in &requests {
+                let target = self.loader.resolve(&request.specifier, Some(&url))?;
+                resolved_imports.insert(request.specifier.clone(), target.clone());
+                if request.dynamic {
+                    dynamic_specs.insert(request.specifier.clone());
+                } else if !request.deferred {
+                    eager_static_specs.insert(request.specifier.clone());
+                }
+                deps.push(ModuleEdge {
+                    target: target.clone(),
+                    deferred: request.deferred,
+                });
                 if !self.nodes.contains_key(&target) {
-                    let loaded = self.loader.load(spec, Some(&url))?;
-                    queued.push((loaded.url, loaded.kind, loaded.text));
+                    let loaded = self.loader.load(&request.specifier, Some(&url))?;
+                    queued.push((
+                        loaded.url,
+                        loaded.kind,
+                        loaded.text,
+                        optional_dynamic || request.dynamic,
+                    ));
                 }
             }
             let host = ModuleHostInfo {
                 module_url: url.clone(),
                 resolved_imports,
             };
-            let compiled = compile_module_program_to_module(program, kind, &host).map_err(|e| {
-                GraphError::Compile {
-                    url: url.clone(),
-                    error: e,
+            let mut compiled =
+                compile_module_program_to_module(program, kind, &host).map_err(|e| {
+                    GraphError::Compile {
+                        url: url.clone(),
+                        error: e,
+                    }
+                })?;
+            for edge in &mut compiled.bytecode.module_resolutions {
+                if dynamic_specs.contains(&edge.specifier)
+                    && !eager_static_specs.contains(&edge.specifier)
+                {
+                    edge.deferred = true;
                 }
-            })?;
+            }
             Ok::<_, GraphError>((compiled, deps, queued))
         })
         .map_err(|e| GraphError::Parse {
@@ -248,15 +287,14 @@ fn nodes_key_for(fragment: &BytecodeModule) -> String {
 
 /// Parse `text` as a module and walk its AST gathering every
 /// static-import / re-export source plus every literal-string
-/// `import("./x")` specifier. Uses [`oxc_ast_visit::Visit`] so we
-/// don't hand-roll match arms per AST node kind — adding new
-/// expression / statement variants in OXC won't silently miss
-/// dynamic-import calls hidden inside them.
+/// `import("./x")` specifier. Static imports preserve phase in source
+/// order so `import defer "x"` and later eager `import "x"` remain
+/// distinct module requests for evaluation ordering.
 ///
 /// Spec: <https://tc39.es/ecma262/#sec-imports>,
 ///       <https://tc39.es/ecma262/#sec-import-call-runtime-semantics-evaluation>.
-fn collect_specifiers(program: &Program<'_>) -> Vec<String> {
-    let mut visitor = SpecifierVisitor::default();
+fn collect_module_requests(program: &Program<'_>) -> Vec<ModuleRequest> {
+    let mut visitor = ModuleRequestVisitor::default();
     for stmt in &program.body {
         visitor.visit_statement(stmt);
     }
@@ -264,23 +302,39 @@ fn collect_specifiers(program: &Program<'_>) -> Vec<String> {
 }
 
 #[derive(Default)]
-struct SpecifierVisitor {
-    out: Vec<String>,
-    seen: HashSet<String>,
+struct ModuleRequestVisitor {
+    out: Vec<ModuleRequest>,
+    seen: HashSet<(String, bool)>,
 }
 
-impl SpecifierVisitor {
-    fn record(&mut self, specifier: &str) {
-        if self.seen.insert(specifier.to_string()) {
-            self.out.push(specifier.to_string());
+#[derive(Clone)]
+struct ModuleRequest {
+    specifier: String,
+    deferred: bool,
+    dynamic: bool,
+}
+
+impl ModuleRequestVisitor {
+    fn record(&mut self, specifier: &str, deferred: bool, dynamic: bool) {
+        let key = (specifier.to_string(), deferred);
+        if self.seen.insert(key) {
+            self.out.push(ModuleRequest {
+                specifier: specifier.to_string(),
+                deferred,
+                dynamic,
+            });
         }
     }
 }
 
-impl<'a> Visit<'a> for SpecifierVisitor {
+impl<'a> Visit<'a> for ModuleRequestVisitor {
     fn visit_import_declaration(&mut self, decl: &oxc_ast::ast::ImportDeclaration<'a>) {
         if !decl.import_kind.is_type() {
-            self.record(decl.source.value.as_str());
+            self.record(
+                decl.source.value.as_str(),
+                matches!(decl.phase, Some(oxc_ast::ast::ImportPhase::Defer)),
+                false,
+            );
         }
     }
 
@@ -288,7 +342,7 @@ impl<'a> Visit<'a> for SpecifierVisitor {
         if !decl.export_kind.is_type()
             && let Some(src) = &decl.source
         {
-            self.record(src.value.as_str());
+            self.record(src.value.as_str(), false, false);
         }
         // Walk into nested declarations / expressions so they
         // contribute their own dynamic imports (e.g. an exported
@@ -298,13 +352,13 @@ impl<'a> Visit<'a> for SpecifierVisitor {
 
     fn visit_export_all_declaration(&mut self, decl: &oxc_ast::ast::ExportAllDeclaration<'a>) {
         if !decl.export_kind.is_type() {
-            self.record(decl.source.value.as_str());
+            self.record(decl.source.value.as_str(), false, false);
         }
     }
 
     fn visit_import_expression(&mut self, imp: &oxc_ast::ast::ImportExpression<'a>) {
         if let Expression::StringLiteral(lit) = &imp.source {
-            self.record(lit.value.as_str());
+            self.record(lit.value.as_str(), true, true);
         }
         oxc_ast_visit::walk::walk_import_expression(self, imp);
     }
@@ -363,49 +417,89 @@ fn topological_order(
     }
     let mut marks: HashMap<String, Mark> = HashMap::new();
     let mut order: Vec<String> = Vec::with_capacity(nodes.len());
-    // Each stack entry: (url, next-child-index).
-    let mut stack: Vec<(String, usize)> = vec![(entry.to_string(), 0)];
-    marks.insert(entry.to_string(), Mark::InProgress);
 
-    while let Some((url, child_idx)) = stack.last().cloned() {
-        if stack.len() > MODULE_DEPTH_LIMIT {
-            return Err(GraphError::Cycle { url });
+    let mut async_eval: HashSet<&str> = nodes
+        .iter()
+        .filter_map(|(url, node)| {
+            node.fragment
+                .functions
+                .first()
+                .is_some_and(|f| f.is_async)
+                .then_some(url.as_str())
+        })
+        .collect();
+    loop {
+        let mut changed = false;
+        for node in nodes.values() {
+            for edge in &node.fragment.module_resolutions {
+                if !edge.deferred
+                    && async_eval.contains(edge.target.as_str())
+                    && async_eval.insert(edge.referrer.as_str())
+                {
+                    changed = true;
+                }
+            }
         }
-        let node = match nodes.get(&url) {
-            Some(n) => n,
-            None => {
+        if !changed {
+            break;
+        }
+    }
+    let mut roots = Vec::with_capacity(nodes.len() + 1);
+    roots.push(entry.to_string());
+    roots.extend(nodes.keys().filter(|url| url.as_str() != entry).cloned());
+
+    for root in roots {
+        if marks.contains_key(&root) {
+            continue;
+        }
+        // Each stack entry: (url, next-child-index).
+        let mut stack: Vec<(String, usize)> = vec![(root.clone(), 0)];
+        marks.insert(root, Mark::InProgress);
+
+        while let Some((url, child_idx)) = stack.last().cloned() {
+            if stack.len() > MODULE_DEPTH_LIMIT {
+                return Err(GraphError::Cycle { url });
+            }
+            let node = match nodes.get(&url) {
+                Some(n) => n,
+                None => {
+                    stack.pop();
+                    marks.insert(url.clone(), Mark::Done);
+                    order.push(url);
+                    continue;
+                }
+            };
+            if child_idx >= node.deps.len() {
                 stack.pop();
                 marks.insert(url.clone(), Mark::Done);
                 order.push(url);
                 continue;
             }
-        };
-        if child_idx >= node.deps.len() {
-            stack.pop();
-            marks.insert(url.clone(), Mark::Done);
-            order.push(url);
-            continue;
-        }
-        // Advance the parent's child index for the next iteration.
-        if let Some(top) = stack.last_mut() {
-            top.1 = child_idx + 1;
-        }
-        let (_, target) = &node.deps[child_idx];
-        match marks.get(target).copied() {
-            // Already emitted — the dependency's <module-init>
-            // runs before the parent's, so nothing to do here.
-            Some(Mark::Done) => continue,
-            // Back-edge into a module that is still on the
-            // DFS in-progress stack: the cyclic edge is skipped.
-            // The dependency record is already allocated and its
-            // env is reachable through `Op::ImportNamespace`, so
-            // reads from the parent's body resolve through live-
-            // binding indirection (a not-yet-populated export
-            // simply reads as `undefined`, exactly per spec).
-            Some(Mark::InProgress) => continue,
-            None => {
-                marks.insert(target.clone(), Mark::InProgress);
-                stack.push((target.clone(), 0));
+            // Advance the parent's child index for the next iteration.
+            if let Some(top) = stack.last_mut() {
+                top.1 = child_idx + 1;
+            }
+            let edge = &node.deps[child_idx];
+            if edge.deferred && !async_eval.contains(edge.target.as_str()) {
+                continue;
+            }
+            let target = &edge.target;
+            match marks.get(target).copied() {
+                // Already emitted — the dependency's <module-init>
+                // runs before the parent's, so nothing to do here.
+                Some(Mark::Done) => continue,
+                // Back-edge into a module that is still on the
+                // DFS in-progress stack: the cyclic edge is skipped.
+                // The dependency record is already allocated and its
+                // env is reachable through `Op::ImportNamespace`, so
+                // reads from the parent's body resolve through live-
+                // binding indirection (a not-yet-populated export
+                // simply reads as `undefined`, exactly per spec).
+                Some(Mark::InProgress) => continue,
+                None => {
+                    marks.insert(target.clone(), Mark::InProgress);
+                    stack.push((target.clone(), 0));
+                }
             }
         }
     }
@@ -528,6 +622,9 @@ fn link(nodes: &BTreeMap<String, ModuleNode>, order: &[String], entry_url: &str)
         for f in &node.fragment.functions {
             let mut new_fn = f.clone();
             new_fn.id = fn_offset + f.id;
+            if new_fn.module_url.is_empty() {
+                new_fn.module_url = url.clone();
+            }
             new_fn.code = rewrite_const_indices(&f.code, const_offset);
             functions.push(new_fn);
         }
@@ -708,37 +805,77 @@ fn build_entry_body(
     // force-evaluated synchronously, so per the proposal it is evaluated
     // eagerly and the deferred namespace wraps the already-evaluated
     // module.
-    let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
+    let non_deferred_children = |url: &str| -> Vec<String> {
+        nodes
+            .get(url)
+            .map(|node| {
+                node.fragment
+                    .module_resolutions
+                    .iter()
+                    .filter(|edge| !edge.deferred)
+                    .map(|edge| edge.target.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let collect_tla_descendants = |root: &str| -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stack = vec![root.to_string()];
+        while let Some(url) = stack.pop() {
+            if !seen.insert(url.clone()) {
+                continue;
+            }
+            if module_has_tla(&url) {
+                out.push(url);
+                continue;
+            }
+            stack.extend(non_deferred_children(&url));
+        }
+        out
+    };
+
+    let mut adjacency: HashMap<&str, Vec<String>> = HashMap::new();
+    let mut deferred_async_modules: HashSet<String> = HashSet::new();
     for node in nodes.values() {
         for edge in &node.fragment.module_resolutions {
-            if !edge.deferred || module_is_async(edge.target.as_str()) {
+            if !edge.deferred {
                 adjacency
                     .entry(edge.referrer.as_str())
                     .or_default()
-                    .push(edge.target.as_str());
+                    .push(edge.target.clone());
+            } else {
+                let async_roots = collect_tla_descendants(edge.target.as_str());
+                if !async_roots.is_empty() {
+                    deferred_async_modules.extend(async_roots.iter().cloned());
+                    adjacency
+                        .entry(edge.referrer.as_str())
+                        .or_default()
+                        .extend(async_roots);
+                }
             }
         }
     }
-    let mut reachable: HashSet<&str> = HashSet::new();
-    let mut work = vec![entry_url];
+    let mut reachable: HashSet<String> = HashSet::new();
+    let mut work = vec![entry_url.to_string()];
     while let Some(url) = work.pop() {
-        if !reachable.insert(url) {
+        if !reachable.insert(url.clone()) {
             continue;
         }
-        if let Some(deps) = adjacency.get(url) {
-            work.extend(deps.iter().copied());
+        if let Some(deps) = adjacency.get(url.as_str()) {
+            work.extend(deps.iter().cloned());
         }
     }
 
     let has_async = order
         .iter()
-        .any(|url| reachable.contains(url.as_str()) && module_is_async(url));
+        .any(|url| reachable.contains(url) && module_is_async(url));
 
     if !has_async {
         // Sync graph: one idempotent EvaluateModule per eagerly-reachable
         // module in topological post-order. Unchanged fast path.
         for url in order {
-            if !reachable.contains(url.as_str()) {
+            if !reachable.contains(url) {
                 continue;
             }
             let url_const_idx = intern_string_const(constants, url);
@@ -769,118 +906,125 @@ fn build_entry_body(
     // before it runs.
     let url_name_idx = intern_string_const(constants, "url");
     let mut next_reg: u16 = 0;
+    let mut deferred_pending: Vec<(u32, u16)> = Vec::new();
+    let mut deferred_postponed: Vec<String> = Vec::new();
     for url in order {
-        if !reachable.contains(url.as_str()) {
+        if !reachable.contains(url) {
+            continue;
+        }
+        if url == entry_url {
+            for (pending_url_const_idx, pending_reg) in deferred_pending.drain(..) {
+                emit_await_module_result(
+                    &mut code,
+                    &mut spans,
+                    &mut next_pc,
+                    &mut next_reg,
+                    pending_url_const_idx,
+                    pending_reg,
+                );
+            }
+            for postponed_url in deferred_postponed.drain(..) {
+                let Some(&postponed_init_fn_id) = module_function_offset.get(&postponed_url) else {
+                    continue;
+                };
+                let (postponed_url_const_idx, postponed_result_reg) = emit_module_init_call(
+                    &mut code,
+                    &mut spans,
+                    &mut next_pc,
+                    &mut next_reg,
+                    constants,
+                    url_name_idx,
+                    &postponed_url,
+                    postponed_init_fn_id,
+                );
+                emit_await_module_result(
+                    &mut code,
+                    &mut spans,
+                    &mut next_pc,
+                    &mut next_reg,
+                    postponed_url_const_idx,
+                    postponed_result_reg,
+                );
+            }
+        }
+        if module_is_async(url)
+            && deferred_async_modules.contains(url)
+            && url != entry_url
+            && nodes.get(url).is_some_and(|node| {
+                node.fragment
+                    .module_resolutions
+                    .iter()
+                    .any(|edge| !edge.deferred && deferred_async_modules.contains(&edge.target))
+            })
+        {
+            deferred_postponed.push(url.clone());
             continue;
         }
         let Some(&init_fn_id) = module_function_offset.get(url) else {
             continue;
         };
-        let url_const_idx = intern_string_const(constants, url);
-
-        let r_env = next_reg;
-        next_reg += 1;
-        emit_op(
+        let (url_const_idx, result_reg) = emit_module_init_call(
             &mut code,
             &mut spans,
             &mut next_pc,
-            Op::ImportNamespace,
-            [Operand::Register(r_env), Operand::ConstIndex(url_const_idx)],
+            &mut next_reg,
+            constants,
+            url_name_idx,
+            url,
+            init_fn_id,
         );
-
-        let r_meta = next_reg;
-        next_reg += 1;
-        emit_op(
+        if module_is_async(url) && deferred_async_modules.contains(url) && url != entry_url {
+            deferred_pending.push((url_const_idx, result_reg));
+        } else if module_is_async(url) {
+            emit_await_module_result(
+                &mut code,
+                &mut spans,
+                &mut next_pc,
+                &mut next_reg,
+                url_const_idx,
+                result_reg,
+            );
+        } else {
+            emit_op(
+                &mut code,
+                &mut spans,
+                &mut next_pc,
+                Op::MarkModuleEvaluated,
+                [Operand::ConstIndex(url_const_idx)],
+            );
+        }
+    }
+    for (pending_url_const_idx, pending_reg) in deferred_pending {
+        emit_await_module_result(
             &mut code,
             &mut spans,
             &mut next_pc,
-            Op::NewObject,
-            [Operand::Register(r_meta)],
+            &mut next_reg,
+            pending_url_const_idx,
+            pending_reg,
         );
-        let r_url_str = next_reg;
-        next_reg += 1;
-        emit_op(
+    }
+    for postponed_url in deferred_postponed {
+        let Some(&postponed_init_fn_id) = module_function_offset.get(&postponed_url) else {
+            continue;
+        };
+        let (postponed_url_const_idx, postponed_result_reg) = emit_module_init_call(
             &mut code,
             &mut spans,
             &mut next_pc,
-            Op::LoadString,
-            [
-                Operand::Register(r_url_str),
-                Operand::ConstIndex(url_const_idx),
-            ],
+            &mut next_reg,
+            constants,
+            url_name_idx,
+            &postponed_url,
+            postponed_init_fn_id,
         );
-        let r_store_scratch = next_reg;
-        next_reg += 1;
-        emit_op(
+        emit_await_module_result(
             &mut code,
             &mut spans,
             &mut next_pc,
-            Op::StoreProperty,
-            vec![
-                Operand::Register(r_meta),
-                Operand::ConstIndex(url_name_idx),
-                Operand::Register(r_url_str),
-                Operand::Register(r_store_scratch),
-            ],
-        );
-
-        // Mark evaluated before the call so a deferred force-eval of this
-        // module during its own evaluation does not re-enter it.
-        emit_op(
-            &mut code,
-            &mut spans,
-            &mut next_pc,
-            Op::MarkModuleEvaluated,
-            [Operand::ConstIndex(url_const_idx)],
-        );
-
-        let r_init = next_reg;
-        next_reg += 1;
-        let init_const_idx = intern_function_id_const(constants, init_fn_id);
-        emit_op(
-            &mut code,
-            &mut spans,
-            &mut next_pc,
-            Op::MakeFunction,
-            [
-                Operand::Register(r_init),
-                Operand::ConstIndex(init_const_idx),
-            ],
-        );
-
-        let r_undef = next_reg;
-        next_reg += 1;
-        emit_op(
-            &mut code,
-            &mut spans,
-            &mut next_pc,
-            Op::LoadUndefined,
-            [Operand::Register(r_undef)],
-        );
-        let r_res = next_reg;
-        next_reg += 1;
-        emit_op(
-            &mut code,
-            &mut spans,
-            &mut next_pc,
-            Op::CallWithThis,
-            vec![
-                Operand::Register(r_res),
-                Operand::Register(r_init),
-                Operand::Register(r_undef),
-                Operand::ConstIndex(2),
-                Operand::Register(r_env),
-                Operand::Register(r_meta),
-            ],
-        );
-        let r_awaited = next_reg;
-        next_reg += 1;
-        emit_op(
-            &mut code,
-            &mut spans,
-            &mut next_pc,
-            Op::Await,
-            [Operand::Register(r_awaited), Operand::Register(r_res)],
+            &mut next_reg,
+            postponed_url_const_idx,
+            postponed_result_reg,
         );
     }
 
@@ -891,6 +1035,132 @@ fn build_entry_body(
         scratch: next_reg,
         is_async: true,
     }
+}
+
+fn emit_module_init_call(
+    code: &mut Vec<Instruction>,
+    spans: &mut Vec<SpanEntry>,
+    next_pc: &mut u32,
+    next_reg: &mut u16,
+    constants: &mut Vec<Constant>,
+    url_name_idx: u32,
+    url: &str,
+    init_fn_id: u32,
+) -> (u32, u16) {
+    let url_const_idx = intern_string_const(constants, url);
+
+    let r_env = *next_reg;
+    *next_reg += 1;
+    emit_op(
+        code,
+        spans,
+        next_pc,
+        Op::ImportNamespace,
+        [Operand::Register(r_env), Operand::ConstIndex(url_const_idx)],
+    );
+
+    let r_meta = *next_reg;
+    *next_reg += 1;
+    emit_op(
+        code,
+        spans,
+        next_pc,
+        Op::NewObject,
+        [Operand::Register(r_meta)],
+    );
+    let r_url_str = *next_reg;
+    *next_reg += 1;
+    emit_op(
+        code,
+        spans,
+        next_pc,
+        Op::LoadString,
+        [
+            Operand::Register(r_url_str),
+            Operand::ConstIndex(url_const_idx),
+        ],
+    );
+    let r_store_scratch = *next_reg;
+    *next_reg += 1;
+    emit_op(
+        code,
+        spans,
+        next_pc,
+        Op::StoreProperty,
+        vec![
+            Operand::Register(r_meta),
+            Operand::ConstIndex(url_name_idx),
+            Operand::Register(r_url_str),
+            Operand::Register(r_store_scratch),
+        ],
+    );
+
+    let r_init = *next_reg;
+    *next_reg += 1;
+    let init_const_idx = intern_function_id_const(constants, init_fn_id);
+    emit_op(
+        code,
+        spans,
+        next_pc,
+        Op::MakeFunction,
+        [
+            Operand::Register(r_init),
+            Operand::ConstIndex(init_const_idx),
+        ],
+    );
+
+    let r_undef = *next_reg;
+    *next_reg += 1;
+    emit_op(
+        code,
+        spans,
+        next_pc,
+        Op::LoadUndefined,
+        [Operand::Register(r_undef)],
+    );
+    let r_res = *next_reg;
+    *next_reg += 1;
+    emit_op(
+        code,
+        spans,
+        next_pc,
+        Op::CallWithThis,
+        vec![
+            Operand::Register(r_res),
+            Operand::Register(r_init),
+            Operand::Register(r_undef),
+            Operand::ConstIndex(2),
+            Operand::Register(r_env),
+            Operand::Register(r_meta),
+        ],
+    );
+    (url_const_idx, r_res)
+}
+
+fn emit_await_module_result(
+    code: &mut Vec<Instruction>,
+    spans: &mut Vec<SpanEntry>,
+    next_pc: &mut u32,
+    next_reg: &mut u16,
+    url_const_idx: u32,
+    result_reg: u16,
+) {
+    let r_awaited = *next_reg;
+    *next_reg += 1;
+    emit_op(
+        code,
+        spans,
+        next_pc,
+        Op::Await,
+        [Operand::Register(r_awaited), Operand::Register(result_reg)],
+    );
+    emit_op(
+        code,
+        spans,
+        next_pc,
+        Op::MarkModuleEvaluated,
+        [Operand::ConstIndex(url_const_idx)],
+    );
 }
 
 /// Intern a `Constant::FunctionId` and return its constant-pool index.

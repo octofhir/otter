@@ -27,8 +27,9 @@
 //! - The walker visits every root listed in §4.2 of the GC
 //!   architecture plan: globals, intrinsics, module envs,
 //!   active call frames, parked async / generator frames,
-//!   microtask queue, dynamic-import host (deferred), symbol
-//!   registry, error-class registry, function-user-prop bag.
+//!   microtask queue, dynamic-import registry, module error
+//!   cache, symbol registry, error-class registry,
+//!   function-user-prop bag.
 //!
 //! # See also
 //!
@@ -67,9 +68,7 @@ impl<'a> RuntimeState<'a> {
     /// - parked async / generator frames in promise reactions
     ///   (Phase 1: covered by the per-frame stub);
     /// - microtask queue;
-    /// - dynamic-import host (filed as a runtime-side TODO,
-    ///   `module_loader::DYNAMIC_IMPORT_HOST` does not yet
-    ///   exist);
+    /// - dynamic-import registry and module evaluation error cache;
     /// - symbol registry + well-known symbols;
     /// - error-class registry;
     /// - function-user-prop bag;
@@ -91,6 +90,9 @@ impl<'a> RuntimeState<'a> {
         // 2) Module environments.
         for env in interp.module_environments_for_trace() {
             env.trace_gc_roots(visitor);
+        }
+        for value in interp.module_errors_for_trace() {
+            value.trace_value_slots(visitor);
         }
         // 3) Microtask queue.
         interp.microtasks().trace_gc_roots(visitor);

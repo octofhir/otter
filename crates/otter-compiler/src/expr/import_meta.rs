@@ -77,32 +77,43 @@ pub(crate) fn compile_import(
     //
     // Spec: <https://tc39.es/ecma262/#sec-import-call-runtime-semantics-evaluation>
     let span = (imp.span.start, imp.span.end);
-    if cx.module_state.is_none() {
-        return Err(CompileError::Unsupported {
-            node: "dynamic `import()` outside an ES-module fragment".to_string(),
-            span,
-        });
-    }
+    let is_defer_phase = matches!(imp.phase, Some(oxc_ast::ast::ImportPhase::Defer));
     match unwrap_ts_expr(&imp.source) {
         Expression::StringLiteral(lit) => {
-            // Literal: linker resolves it during fragment merge,
-            // opcode reads namespace + wraps in a fulfilled
-            // promise.
+            // Literal import.defer: linker resolves it during
+            // fragment merge, opcode reads the deferred namespace +
+            // wraps in a fulfilled promise.
             let specifier = lit.value.as_str().to_string();
             let spec_const = cx.intern_string_constant(&specifier);
-            let ns_dst = cx.alloc_scratch();
-            cx.emit(
-                Op::ImportNamespace,
-                [Operand::Register(ns_dst), Operand::ConstIndex(spec_const)],
-                span,
-            );
-            let promise_dst = cx.alloc_scratch();
-            cx.emit(
-                Op::PromiseFulfilledOf,
-                [Operand::Register(promise_dst), Operand::Register(ns_dst)],
-                span,
-            );
-            Ok(promise_dst)
+            if is_defer_phase {
+                let ns_dst = cx.alloc_scratch();
+                cx.emit(
+                    Op::ImportNamespaceDeferred,
+                    [Operand::Register(ns_dst), Operand::ConstIndex(spec_const)],
+                    span,
+                );
+                let promise_dst = cx.alloc_scratch();
+                cx.emit(
+                    Op::PromiseFulfilledOf,
+                    [Operand::Register(promise_dst), Operand::Register(ns_dst)],
+                    span,
+                );
+                Ok(promise_dst)
+            } else {
+                let spec_reg = cx.alloc_scratch();
+                cx.emit(
+                    Op::LoadString,
+                    [Operand::Register(spec_reg), Operand::ConstIndex(spec_const)],
+                    span,
+                );
+                let promise_dst = cx.alloc_scratch();
+                cx.emit(
+                    Op::ImportNamespaceDynamic,
+                    [Operand::Register(promise_dst), Operand::Register(spec_reg)],
+                    span,
+                );
+                Ok(promise_dst)
+            }
         }
         other => {
             // Non-literal: opcode returns a Promise<namespace>

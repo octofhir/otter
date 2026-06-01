@@ -330,12 +330,18 @@ pub struct Interpreter {
     /// alongside `module_environments`.
     module_resolution_cache:
         std::collections::HashMap<(std::sync::Arc<str>, String), std::sync::Arc<str>>,
-    /// Canonical URLs of modules whose `<module-init>` body has begun
-    /// running. Guards [`Op::EvaluateModule`] / deferred force-eval
-    /// against double evaluation and breaks import cycles (a module
-    /// being evaluated is treated as already evaluated). Cleared with
-    /// `module_environments`.
+    /// Canonical URLs of modules currently running their `<module-init>`.
+    /// Used to detect deferred namespace force-evaluation of a module
+    /// that is still evaluating in the same cycle.
+    module_evaluating: std::collections::HashSet<std::sync::Arc<str>>,
+    /// Canonical URLs of modules whose `<module-init>` body completed.
+    /// Guards [`Op::EvaluateModule`] / deferred force-eval against
+    /// double evaluation. Cleared with `module_environments`.
     evaluated_modules: std::collections::HashSet<std::sync::Arc<str>>,
+    /// Cached thrown completion for modules whose synchronous evaluation
+    /// failed. Re-reading a deferred namespace rethrows the identical JS
+    /// value instead of synthesizing a fresh error.
+    module_errors: std::collections::HashMap<std::sync::Arc<str>, Value>,
     /// Cache of deferred module namespace exotic objects, keyed by
     /// target module URL, so two `import defer * as` of the same module
     /// yield the identical object (§16.2.1). Cleared with
@@ -704,7 +710,9 @@ impl Interpreter {
             microtasks: MicrotaskQueue::new(),
             module_environments: std::collections::HashMap::new(),
             module_resolution_cache: std::collections::HashMap::new(),
+            module_evaluating: std::collections::HashSet::new(),
             evaluated_modules: std::collections::HashSet::new(),
+            module_errors: std::collections::HashMap::new(),
             deferred_namespaces: std::collections::HashMap::new(),
             load_property_ics: Vec::new(),
             store_property_ics: Vec::new(),
@@ -1355,7 +1363,9 @@ impl Interpreter {
     pub fn reset_module_state(&mut self) {
         self.module_environments.clear();
         self.module_resolution_cache.clear();
+        self.module_evaluating.clear();
         self.evaluated_modules.clear();
+        self.module_errors.clear();
         self.deferred_namespaces.clear();
     }
 
@@ -1816,6 +1826,11 @@ impl Interpreter {
     /// live module bindings.
     pub fn module_environments_for_trace(&self) -> impl Iterator<Item = &JsObject> {
         self.module_environments.values()
+    }
+
+    /// Borrow cached module-evaluation thrown values for GC root tracing.
+    pub fn module_errors_for_trace(&self) -> impl Iterator<Item = &Value> {
+        self.module_errors.values()
     }
 
     /// Borrow the well-known symbol singleton table. Used by
@@ -4042,6 +4057,7 @@ impl Interpreter {
                         .ok_or(VmError::InvalidOperand)?;
                     if let Some(url) = context.string_constant_str(url_idx) {
                         let url_arc: std::sync::Arc<str> = std::sync::Arc::from(url);
+                        self.module_evaluating.remove(&url_arc);
                         self.evaluated_modules.insert(url_arc);
                     }
                     stack[top_idx].advance_pc(self.current_byte_len)?;

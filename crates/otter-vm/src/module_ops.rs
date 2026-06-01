@@ -19,8 +19,8 @@
 
 use crate::{
     ExecutionContext, Frame, Interpreter, JsString, Value, VmError,
-    operand_decode::register_operand, promise_dispatch, read_register, resolve_relative_url,
-    write_register,
+    operand_decode::register_operand, promise_dispatch, read_register, render_thrown_value,
+    resolve_relative_url, write_register,
 };
 use otter_bytecode::Operand;
 use smallvec::SmallVec;
@@ -112,6 +112,15 @@ impl Interpreter {
         if self.evaluated_modules.contains(&url_arc) {
             return Ok(());
         }
+        if let Some(thrown) = self.module_errors.get(&url_arc).copied() {
+            self.set_pending_uncaught_throw(thrown);
+            return Err(VmError::Uncaught {
+                value: render_thrown_value(&thrown, &self.gc_heap),
+            });
+        }
+        if self.module_evaluating.contains(&url_arc) {
+            return Ok(());
+        }
         // §28.3 ReadyForSyncExecution — a module with top-level await
         // cannot be force-evaluated synchronously from a deferred
         // namespace access; that is a TypeError, not a silent suspension.
@@ -127,29 +136,52 @@ impl Interpreter {
             });
         }
         // Mark before running so an import cycle treats this module as
-        // already evaluating (no re-entry).
-        self.evaluated_modules.insert(url_arc.clone());
+        // already evaluating (no re-entry), while deferred namespace
+        // access can still detect that it is not fully evaluated.
+        self.module_evaluating.insert(url_arc.clone());
 
-        let deps: Vec<String> = context
-            .eager_dep_targets(url)
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        for dep in deps {
-            self.evaluate_module_rec(context, &dep)?;
+        let result = (|| -> Result<(), VmError> {
+            let deps: Vec<String> = context
+                .eager_dep_targets(url)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            for dep in deps {
+                self.evaluate_module_rec(context, &dep)?;
+            }
+
+            let Some(function_id) = context.module_init_function_id(url) else {
+                return Ok(());
+            };
+            let Some(env) = self.module_environments.get(&url_arc).copied() else {
+                return Ok(());
+            };
+            let meta = self.build_import_meta(url)?;
+            let init = Value::function(function_id);
+            let args: SmallVec<[Value; 8]> = smallvec::smallvec![Value::object(env), meta];
+            self.run_callable_sync(context, &init, Value::undefined(), args)?;
+            Ok(())
+        })();
+
+        self.module_evaluating.remove(&url_arc);
+        match result {
+            Ok(()) => {
+                self.evaluated_modules.insert(url_arc);
+                Ok(())
+            }
+            Err(err) => {
+                if matches!(err, VmError::Uncaught { .. })
+                    && let Some(thrown) = self.take_pending_uncaught_throw()
+                {
+                    self.module_errors.insert(url_arc, thrown);
+                    self.set_pending_uncaught_throw(thrown);
+                    return Err(VmError::Uncaught {
+                        value: render_thrown_value(&thrown, &self.gc_heap),
+                    });
+                }
+                Err(err)
+            }
         }
-
-        let Some(function_id) = context.module_init_function_id(url) else {
-            return Ok(());
-        };
-        let Some(env) = self.module_environments.get(&url_arc).copied() else {
-            return Ok(());
-        };
-        let meta = self.build_import_meta(url)?;
-        let init = Value::function(function_id);
-        let args: SmallVec<[Value; 8]> = smallvec::smallvec![Value::object(env), meta];
-        self.run_callable_sync(context, &init, Value::undefined(), args)?;
-        Ok(())
     }
 
     /// Build a module's `import.meta` object with its `url` property.
@@ -199,6 +231,12 @@ impl Interpreter {
         if !trigger || crate::object::deferred_namespace_is_populated(obj, &self.gc_heap) {
             return Ok(());
         }
+        if !self.module_ready_for_sync_execution(context, target_url.as_ref(), &mut Vec::new()) {
+            return Err(VmError::TypeError {
+                message: "Cannot synchronously evaluate a deferred module while it is evaluating"
+                    .to_string(),
+            });
+        }
         self.evaluate_module_rec(context, &target_url)?;
         if let Some(env) = self.module_environments.get(&target_url).copied() {
             let env_value = Value::object(env);
@@ -225,6 +263,38 @@ impl Interpreter {
         }
         crate::object::set_deferred_namespace_populated(obj, &self.gc_heap);
         Ok(())
+    }
+
+    /// Conservative §28.3 ReadyForSyncExecution over the active
+    /// non-deferred dependency graph.
+    fn module_ready_for_sync_execution(
+        &self,
+        context: &ExecutionContext,
+        url: &str,
+        seen: &mut Vec<std::sync::Arc<str>>,
+    ) -> bool {
+        let url_arc: std::sync::Arc<str> = std::sync::Arc::from(url);
+        if seen.iter().any(|seen| seen.as_ref() == url) {
+            return true;
+        }
+        seen.push(url_arc.clone());
+        if self.evaluated_modules.contains(&url_arc) {
+            return true;
+        }
+        if self.module_evaluating.contains(&url_arc) {
+            return false;
+        }
+        if context
+            .module_init_function_id(url)
+            .and_then(|fid| context.function(fid))
+            .is_some_and(|f| f.is_async)
+        {
+            return false;
+        }
+        context
+            .eager_dep_targets(url)
+            .into_iter()
+            .all(|dep| self.module_ready_for_sync_execution(context, dep, seen))
     }
 
     /// `true` when `key` is symbol-like for a deferred namespace: a
@@ -278,12 +348,37 @@ impl Interpreter {
         let promise =
             if let Some(s) = spec_value.as_string(&self.gc_heap) {
                 let specifier = s.to_lossy_string(&self.gc_heap);
-                if let Some(ns) =
-                    self.resolve_module_namespace(context, referrer.as_str(), &specifier)
+                if let Some(target) =
+                    context.module_resolution_target(referrer.as_str(), &specifier)
                 {
-                    let namespace_value = Value::object(ns);
-                    promise_dispatch::PromiseBuilder::with_context(import_context.clone())
-                        .fulfilled_stack_rooted(self, stack, namespace_value, &[], &[])?
+                    let target = target.to_string();
+                    match self.evaluate_module_rec(context, &target) {
+                        Ok(()) => {
+                            let ns = self
+                                .resolve_module_namespace(context, referrer.as_str(), &specifier)
+                                .ok_or_else(|| VmError::UnknownIntrinsic {
+                                    name: format!("import \"{specifier}\""),
+                                })?;
+                            let namespace_value = Value::object(ns);
+                            promise_dispatch::PromiseBuilder::with_context(import_context.clone())
+                                .fulfilled_stack_rooted(self, stack, namespace_value, &[], &[])?
+                        }
+                        Err(VmError::Uncaught { .. }) => {
+                            let reason = self
+                                .take_pending_uncaught_throw()
+                                .unwrap_or_else(|| Value::undefined());
+                            promise_dispatch::PromiseBuilder::with_context(import_context.clone())
+                                .rejected_stack_rooted(self, stack, reason, &[], &[])?
+                        }
+                        Err(err) => {
+                            let reason = self.make_type_error_with_stack_roots(
+                                stack,
+                                &format!("dynamic import: evaluation failed: {err}"),
+                            )?;
+                            promise_dispatch::PromiseBuilder::with_context(import_context.clone())
+                                .rejected_stack_rooted(self, stack, reason, &[], &[])?
+                        }
+                    }
                 } else if let Some(loader) = self.dynamic_import_loader.clone() {
                     let pending =
                         promise_dispatch::PromiseBuilder::with_context(import_context.clone())

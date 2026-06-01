@@ -705,6 +705,11 @@ impl Interpreter {
             }
         };
         let base_obj = base.as_object();
+        self.ensure_deferred_namespace_ready(
+            context,
+            &base,
+            !Self::deferred_key_is_symbol_like(&VmPropertyKey::String(&key)),
+        )?;
         let outcome = match base_obj {
             Some(obj) => crate::object::resolve_set(obj, &self.gc_heap, &key),
             None => object::SetOutcome::AssignData,
@@ -724,6 +729,11 @@ impl Interpreter {
             object::SetOutcome::AssignData => {
                 // No setter on the super base — write an own data
                 // property on the receiver (`this`).
+                self.ensure_deferred_namespace_ready(
+                    context,
+                    &actual_this,
+                    !Self::deferred_key_is_symbol_like(&VmPropertyKey::String(&key)),
+                )?;
                 if let Some(this_obj) = actual_this.as_object() {
                     if !self.ordinary_set_data_property(this_obj, &key, value)? {
                         Self::failed_set_result(
@@ -1145,6 +1155,19 @@ impl Interpreter {
         let value = *read_register(frame, src)?;
         let strict = context.function_is_strict(frame.function_id);
         let receiver = *read_register(frame, obj_reg)?;
+        if let Some(o) = receiver.as_object()
+            && object::deferred_namespace_target(o, &self.gc_heap).is_some()
+        {
+            self.ensure_deferred_namespace_ready(context, &receiver, true)?;
+            if !self.ordinary_set_data_property(o, name, value)? {
+                Self::failed_set_result(
+                    strict,
+                    format!("Cannot assign to read-only property '{name}'"),
+                )?;
+            }
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return Ok(());
+        }
         let target = if let Some(o) = receiver.as_object() {
             Some(o)
         } else if let Some(c) = receiver.as_class_constructor() {
@@ -1832,12 +1855,41 @@ impl Interpreter {
         let idx_value = self.coerce_property_key_value(context, idx_value_raw)?;
         if let Some(obj) = recv.as_object() {
             if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
-                self.ordinary_set_symbol_with_callable_setter(context, obj, sym, value, strict)?;
+                if object::deferred_namespace_target(obj, &self.gc_heap).is_some() {
+                    self.ensure_deferred_namespace_ready(context, &recv, false)?;
+                    if !object::deferred_namespace_is_populated(obj, &self.gc_heap)
+                        && object::get_own_symbol_descriptor(obj, &self.gc_heap, sym).is_none()
+                    {
+                        return Err(VmError::TypeError {
+                            message:
+                                "Cannot add symbol property to non-extensible module namespace"
+                                    .to_string(),
+                        });
+                    } else {
+                        self.ordinary_set_symbol_with_callable_setter(
+                            context, obj, sym, value, strict,
+                        )?;
+                    }
+                } else {
+                    self.ordinary_set_symbol_with_callable_setter(
+                        context, obj, sym, value, strict,
+                    )?;
+                }
             } else if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let key = key.to_lossy_string(&self.gc_heap);
+                self.ensure_deferred_namespace_ready(
+                    context,
+                    &recv,
+                    !Self::deferred_key_is_symbol_like(&VmPropertyKey::String(&key)),
+                )?;
                 self.store_computed_ordinary_property(obj, &key, value, strict)?;
             } else if let Some(n) = idx_value.as_number() {
                 let key = n.to_display_string();
+                self.ensure_deferred_namespace_ready(
+                    context,
+                    &recv,
+                    !Self::deferred_key_is_symbol_like(&VmPropertyKey::String(&key)),
+                )?;
                 self.store_computed_ordinary_property(obj, &key, value, strict)?;
             } else {
                 return Err(VmError::TypeMismatch);

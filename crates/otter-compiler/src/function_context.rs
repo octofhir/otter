@@ -521,32 +521,6 @@ impl FunctionContext {
         }
     }
 
-    /// In module mode, mirror an assignment to an exported name
-    /// through to the captured `module_env` JsObject so importers'
-    /// later reads observe the new value (live bindings).
-    /// No-op when `name` is not in the export set or when not in
-    /// module mode.
-    ///
-    /// Spec: <https://tc39.es/ecma262/#sec-module-environment-records-setmutablebinding-n-v-s>
-    pub(crate) fn emit_module_export_mirror(
-        &mut self,
-        name: &str,
-        value_reg: u16,
-        span: (u32, u32),
-    ) {
-        let env_uv = match &self.module_state {
-            Some(state) if state.exported_names.contains(name) => state.module_env_uv,
-            _ => return,
-        };
-        let env_reg = self.alloc_scratch();
-        self.emit(
-            Op::LoadUpvalue,
-            [Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
-            span,
-        );
-        self.emit_store_property(env_reg, name, value_reg, span);
-    }
-
     /// Mirror `value_reg` through to `module_env.default`. Used by
     /// `export default function f(){}` from the hoist pass: the
     /// default export entry was registered by the module pre-pass

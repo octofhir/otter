@@ -432,6 +432,48 @@ Remaining gaps for `language/module-code`:
 - ~70 `MODULE_RESOLUTION_ERROR` failures are runner-infrastructure
   (`_FIXTURE.js` helper modules), not engine.
 
+### Import defer + module top-level await
+
+Command:
+
+```sh
+target/debug/otter-test262 run \
+  --filter language/import/import-defer \
+  --timeout 20000 \
+  --output test262_results/import_defer_after_fmt.json
+```
+
+Before:
+
+| total | passed | failed | skipped | timeout | OOM | crash | pass rate |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 101 | 80 | 21 | 0 | 0 | 0 | 0 | 79.21% |
+
+After:
+
+| total | passed | failed | skipped | timeout | OOM | crash | pass rate |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 101 | 101 | 0 | 0 | 0 | 0 | 0 | 100.00% |
+
+Delta: +21 passing tests. The slice closes the non-skipped
+`language/import/import-defer` suite by wiring deferred namespace
+trigger edge cases, cached module-evaluation errors, dynamic
+`import.defer()`, literal dynamic `import()`, nested module export
+mirrors, and the import-defer/TLA async evaluation order.
+
+Regression spot-check:
+
+```sh
+target/debug/otter-test262 run \
+  --filter language/module-code \
+  --timeout 20000 \
+  --output test262_results/module_code_after_import_defer.json
+```
+
+| total | passed | failed | skipped | timeout | OOM | crash | pass rate |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 596 | 423 | 113 | 36 | 0 | 0 | 24 | 75.54% |
+
 ### Native error / Function suite checkpoint (P1.2 / P1.3 close)
 
 After tightening native error class metadata (descriptors on

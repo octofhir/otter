@@ -15,6 +15,57 @@
 use super::{SUPER_CTOR_NAME, is_top_level_super_call, load_synthetic_capture};
 use crate::*;
 
+fn emit_public_field_define(
+    cx: &mut Compiler,
+    receiver_reg: u16,
+    key_reg: u16,
+    value_reg: u16,
+    span: (u32, u32),
+) {
+    let desc_reg = cx.alloc_scratch();
+    cx.emit(Op::NewObject, [Operand::Register(desc_reg)], span);
+
+    let value_const = cx.intern_string_constant("value");
+    let value_scratch = cx.alloc_scratch();
+    cx.emit(
+        Op::StoreProperty,
+        vec![
+            Operand::Register(desc_reg),
+            Operand::ConstIndex(value_const),
+            Operand::Register(value_reg),
+            Operand::Register(value_scratch),
+        ],
+        span,
+    );
+
+    let true_reg = cx.alloc_scratch();
+    cx.emit(Op::LoadTrue, [Operand::Register(true_reg)], span);
+    for attr in ["writable", "enumerable", "configurable"] {
+        let attr_const = cx.intern_string_constant(attr);
+        let attr_scratch = cx.alloc_scratch();
+        cx.emit(
+            Op::StoreProperty,
+            vec![
+                Operand::Register(desc_reg),
+                Operand::ConstIndex(attr_const),
+                Operand::Register(true_reg),
+                Operand::Register(attr_scratch),
+            ],
+            span,
+        );
+    }
+
+    cx.emit(
+        Op::DefineOwnProperty,
+        [
+            Operand::Register(receiver_reg),
+            Operand::Register(key_reg),
+            Operand::Register(desc_reg),
+        ],
+        span,
+    );
+}
+
 ///   capture as user-written constructors.
 pub(crate) fn compile_synthetic_constructor(
     parent: &mut Compiler,
@@ -255,8 +306,8 @@ pub(crate) fn emit_instance_field_inits(
         cx.emit(Op::LoadThis, [Operand::Register(this_reg)], pspan);
         if p.computed {
             // §15.7.10 — computed-key field. Evaluate the key
-            // expression at constructor-run time and write via
-            // `Op::StoreElement`.
+            // expression at constructor-run time and define a data
+            // property via DefineField / CreateDataPropertyOrThrow.
             let key_expr = p
                 .key
                 .as_expression()
@@ -266,7 +317,7 @@ pub(crate) fn emit_instance_field_inits(
                     span: pspan,
                 })?;
             let key_reg = compile_expr(cx, key_expr, pspan)?;
-            cx.emit_store_element(this_reg, key_reg, value_reg, pspan);
+            emit_public_field_define(cx, this_reg, key_reg, value_reg, pspan);
             continue;
         }
         let key_str = match &p.key {
@@ -275,7 +326,7 @@ pub(crate) fn emit_instance_field_inits(
             oxc_ast::ast::PropertyKey::NumericLiteral(lit) => lit.value.to_string(),
             oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) => {
                 let key_reg = crate::class::load_private_key(cx, pid.name.as_str(), pspan)?;
-                cx.emit_store_element(this_reg, key_reg, value_reg, pspan);
+                emit_public_field_define(cx, this_reg, key_reg, value_reg, pspan);
                 continue;
             }
             _ => {
@@ -285,7 +336,14 @@ pub(crate) fn emit_instance_field_inits(
                 });
             }
         };
-        cx.emit_store_property(this_reg, &key_str, value_reg, pspan);
+        let key_reg = cx.alloc_scratch();
+        let key_const = cx.intern_string_constant(&key_str);
+        cx.emit(
+            Op::LoadString,
+            [Operand::Register(key_reg), Operand::ConstIndex(key_const)],
+            pspan,
+        );
+        emit_public_field_define(cx, this_reg, key_reg, value_reg, pspan);
     }
     Ok(())
 }

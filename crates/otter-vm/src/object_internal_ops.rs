@@ -1050,6 +1050,16 @@ impl Interpreter {
             };
         }
         if let Some(obj) = target.as_object() {
+            if object::deferred_namespace_target(obj, &self.gc_heap).is_some()
+                && !object::deferred_namespace_is_populated(obj, &self.gc_heap)
+                && Self::deferred_key_is_symbol_like(key)
+                && matches!(
+                    self.lookup_own_vm_property_key(obj, key),
+                    object::PropertyLookup::Absent
+                )
+            {
+                return Ok(false);
+            }
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
                 object::define_own_symbol_property_partial(obj, &mut self.gc_heap, *sym, descriptor)
             } else {

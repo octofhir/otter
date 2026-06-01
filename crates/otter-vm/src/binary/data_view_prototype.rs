@@ -10,16 +10,14 @@
 //! - <https://tc39.es/ecma262/#sec-setviewvalue>
 
 use num_bigint::BigInt;
-use smallvec::SmallVec;
 
 use crate::Value;
-use crate::abstract_ops::ToPrimitiveHint;
 use crate::bigint::BigIntValue;
 use crate::number::NumberValue;
 use crate::{NativeCtx, NativeError};
 
 use super::data_view::JsDataView;
-use super::{number_value, smi, to_index, to_little_endian_flag};
+use super::{number_value, smi, to_little_endian_flag};
 
 const NAME: &str = "DataView.prototype";
 
@@ -51,24 +49,6 @@ fn check_not_detached(view: &JsDataView, heap: &otter_gc::GcHeap) -> Result<(), 
     Ok(())
 }
 
-fn read_byte_offset(args: &[Value], heap: &otter_gc::GcHeap) -> Result<usize, NativeError> {
-    // §25.3.1.1 step 1 — `getIndex = ToIndex(requestIndex)`. ToIndex
-    // runs ToNumber first (a Symbol / BigInt request is a TypeError),
-    // then rejects a negative or too-large integer with a RangeError.
-    let undefined = Value::undefined();
-    let value = args.first().unwrap_or(&undefined);
-    if value.as_symbol(heap).is_some() {
-        return Err(bad("Cannot convert a Symbol value to a number"));
-    }
-    if value.is_big_int() {
-        return Err(bad("Cannot convert a BigInt value to a number"));
-    }
-    match to_index(value, heap) {
-        Some(n) => Ok(n as usize),
-        None => Err(range_bad("Invalid DataView byteOffset")),
-    }
-}
-
 fn ensure_within(
     view: &JsDataView,
     heap: &otter_gc::GcHeap,
@@ -83,43 +63,50 @@ fn ensure_within(
     Ok(())
 }
 
-/// §25.3.4 `GetViewValue` / `SetViewValue` start with `ToIndex` on the
-/// `byteOffset` (and, for setters, `ToNumber` / `ToBigInt` on the
-/// value), each of which runs `ToPrimitive(Number)`. Pre-coerce the
-/// object-like argument slots so user `@@toPrimitive` / `valueOf` /
-/// `toString` hooks fire before the strict numeric guards.
-fn precoerce(
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-    indices: &[usize],
-) -> Result<SmallVec<[Value; 4]>, NativeError> {
-    let mut out: SmallVec<[Value; 4]> = args.iter().cloned().collect();
-    let Some(exec) = ctx.execution_context().cloned() else {
-        return Ok(out);
-    };
-    for &idx in indices {
-        let Some(slot) = out.get(idx).copied() else {
-            continue;
-        };
-        let is_object_like = slot.is_object()
-            || slot.is_array()
-            || slot.is_function()
-            || slot.is_closure()
-            || slot.is_native_function()
-            || slot.is_bound_function()
-            || slot.is_class_constructor()
-            || slot.is_proxy()
-            || slot.is_regexp();
-        if !is_object_like {
-            continue;
-        }
-        let primitive = ctx
-            .interp_mut()
-            .evaluate_to_primitive(&exec, &slot, ToPrimitiveHint::Number)
-            .map_err(|e| bad(&e.to_string()))?;
-        out[idx] = primitive;
+/// §25.3.1.1 step 2 / §25.3.1.2 step 2 — `getIndex = ToIndex(requestIndex)`.
+/// `ToIndex` runs `ToNumber` (firing `@@toPrimitive` / `valueOf` /
+/// `toString`, and throwing for a Symbol / BigInt request), truncates
+/// toward zero, then rejects a negative or `> 2**53 - 1` result with a
+/// `RangeError`. Returning the abrupt completion verbatim preserves a
+/// user `throw` (e.g. a `Test262Error` from a poisoned `valueOf`).
+fn to_index_or_throw(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<usize, NativeError> {
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| bad("missing execution context"))?;
+    let number = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, value)
+        .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+    let n = number.as_f64();
+    let integer = if n.is_nan() { 0.0 } else { n.trunc() };
+    if !(0.0..=9_007_199_254_740_991.0).contains(&integer) {
+        return Err(range_bad("Invalid DataView access index"));
     }
-    Ok(out)
+    Ok(integer as usize)
+}
+
+/// §25.3.1.2 step 3 — `SetViewValue` converts the value with `ToBigInt`
+/// for the BigInt element types and `ToNumber` otherwise, before the
+/// detached-buffer and range checks. The conversion fires its operand's
+/// observable coercion and throws (Symbol / cross-numeric-type), with
+/// the abrupt completion propagated verbatim.
+fn convert_set_value(
+    ctx: &mut NativeCtx<'_>,
+    is_bigint: bool,
+    value: &Value,
+) -> Result<Value, NativeError> {
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| bad("missing execution context"))?;
+    if is_bigint {
+        let big = crate::coerce::to_big_int_or_throw(ctx.interp_mut(), &exec, value)
+            .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+        Ok(Value::big_int(big))
+    } else {
+        let number = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, value)
+            .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+        Ok(number_value(number.as_f64()))
+    }
 }
 
 fn read_view<F>(
@@ -132,12 +119,14 @@ fn read_view<F>(
 where
     F: FnOnce(&[u8], bool, &mut otter_gc::GcHeap) -> Result<Value, NativeError>,
 {
-    let coerced = precoerce(ctx, args, &[0])?;
+    // §25.3.1.1 GetViewValue order: RequireInternalSlot, ToIndex(index),
+    // ToBoolean(littleEndian), detached-buffer guard, range guard.
     let view = receiver(ctx)?;
+    let request = args.first().cloned().unwrap_or_default();
+    let offset = to_index_or_throw(ctx, &request)?;
+    let little_endian = to_little_endian_flag(args.get(le_arg), ctx.heap());
     check_not_detached(&view, ctx.heap())?;
-    let offset = read_byte_offset(&coerced, ctx.heap())?;
     ensure_within(&view, ctx.heap(), offset, byte_count)?;
-    let little_endian = to_little_endian_flag(coerced.get(le_arg), ctx.heap());
     let abs_offset = view.byte_offset(ctx.heap()) + offset;
     let buffer = view.buffer(ctx.heap());
     let snapshot: Vec<u8> = buffer.with_bytes(ctx.heap(), |b| {
@@ -150,18 +139,23 @@ fn write_view<F>(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
     byte_count: usize,
+    is_bigint: bool,
     f: F,
 ) -> Result<Value, NativeError>
 where
     F: FnOnce(&mut [u8], &Value, bool, &otter_gc::GcHeap),
 {
-    let coerced = precoerce(ctx, args, &[0, 1])?;
+    // §25.3.1.2 SetViewValue order: RequireInternalSlot, ToIndex(index),
+    // numeric conversion of the value, ToBoolean(littleEndian),
+    // detached-buffer guard, range guard, then the store.
     let view = receiver(ctx)?;
+    let request = args.first().cloned().unwrap_or_default();
+    let offset = to_index_or_throw(ctx, &request)?;
+    let raw_value = args.get(1).cloned().unwrap_or_default();
+    let value = convert_set_value(ctx, is_bigint, &raw_value)?;
+    let little_endian = to_little_endian_flag(args.get(2), ctx.heap());
     check_not_detached(&view, ctx.heap())?;
-    let offset = read_byte_offset(&coerced, ctx.heap())?;
     ensure_within(&view, ctx.heap(), offset, byte_count)?;
-    let value = coerced.get(1).cloned().unwrap_or(Value::undefined());
-    let little_endian = to_little_endian_flag(coerced.get(2), ctx.heap());
     let mut staging = vec![0u8; byte_count];
     f(&mut staging, &value, little_endian, ctx.heap());
     let abs_offset = view.byte_offset(ctx.heap()) + offset;
@@ -357,19 +351,19 @@ fn coerce_biguint64(value: &Value, heap: &otter_gc::GcHeap) -> u64 {
 }
 
 pub(crate) fn dv_set_int8(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    write_view(ctx, args, 1, |b, v, _, heap| {
+    write_view(ctx, args, 1, false, |b, v, _, heap| {
         b[0] = coerce_int(v, heap) as i8 as u8;
     })
 }
 
 pub(crate) fn dv_set_uint8(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    write_view(ctx, args, 1, |b, v, _, heap| {
+    write_view(ctx, args, 1, false, |b, v, _, heap| {
         b[0] = coerce_int(v, heap) as u8;
     })
 }
 
 pub(crate) fn dv_set_int16(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    write_view(ctx, args, 2, |b, v, le, heap| {
+    write_view(ctx, args, 2, false, |b, v, le, heap| {
         let n = coerce_int(v, heap) as i16;
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
         b.copy_from_slice(&bytes);
@@ -377,7 +371,7 @@ pub(crate) fn dv_set_int16(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
 }
 
 pub(crate) fn dv_set_uint16(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    write_view(ctx, args, 2, |b, v, le, heap| {
+    write_view(ctx, args, 2, false, |b, v, le, heap| {
         let n = coerce_int(v, heap) as u16;
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
         b.copy_from_slice(&bytes);
@@ -385,7 +379,7 @@ pub(crate) fn dv_set_uint16(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
 }
 
 pub(crate) fn dv_set_int32(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    write_view(ctx, args, 4, |b, v, le, heap| {
+    write_view(ctx, args, 4, false, |b, v, le, heap| {
         let n = crate::number::bitwise::to_int32(coerce_number(v, heap));
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
         b.copy_from_slice(&bytes);
@@ -393,7 +387,7 @@ pub(crate) fn dv_set_int32(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
 }
 
 pub(crate) fn dv_set_uint32(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    write_view(ctx, args, 4, |b, v, le, heap| {
+    write_view(ctx, args, 4, false, |b, v, le, heap| {
         let n = crate::number::bitwise::to_uint32(coerce_number(v, heap));
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
         b.copy_from_slice(&bytes);
@@ -404,7 +398,7 @@ pub(crate) fn dv_set_float32(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    write_view(ctx, args, 4, |b, v, le, heap| {
+    write_view(ctx, args, 4, false, |b, v, le, heap| {
         let n = coerce_number(v, heap).as_f64() as f32;
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
         b.copy_from_slice(&bytes);
@@ -415,7 +409,7 @@ pub(crate) fn dv_set_float64(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    write_view(ctx, args, 8, |b, v, le, heap| {
+    write_view(ctx, args, 8, false, |b, v, le, heap| {
         let n = coerce_number(v, heap).as_f64();
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
         b.copy_from_slice(&bytes);
@@ -426,7 +420,7 @@ pub(crate) fn dv_set_bigint64(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    write_view(ctx, args, 8, |b, v, le, heap| {
+    write_view(ctx, args, 8, true, |b, v, le, heap| {
         let n = coerce_bigint64(v, heap);
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
         b.copy_from_slice(&bytes);
@@ -437,7 +431,7 @@ pub(crate) fn dv_set_biguint64(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    write_view(ctx, args, 8, |b, v, le, heap| {
+    write_view(ctx, args, 8, true, |b, v, le, heap| {
         let n = coerce_biguint64(v, heap);
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
         b.copy_from_slice(&bytes);

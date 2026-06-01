@@ -1334,9 +1334,22 @@ step 13) and `SetViewValue` (§25.3.1.2 step 15) require a
 and `ToIndex` (step 1) rejects a negative or too-large byteOffset
 with a `RangeError`; the prototype get/set methods raised a
 `TypeError` in both cases. A Symbol / BigInt byteOffset still throws
-the `TypeError` that `ToNumber` would. Remaining DataView failures
-are operation-ordering cases (ToIndex / value conversion / detached
-check sequence) — a separate slice.
+the `TypeError` that `ToNumber` would.
+
+Then the get/set operation ordering was aligned with `GetViewValue`
+/ `SetViewValue`: `built-ins/DataView` 360 → 447 / 561. Previously
+the methods ran a detached-buffer guard before `ToIndex`, coerced
+the byteOffset and value together up front, and used lenient numeric
+coercion (a Symbol value became `NaN`). The methods now follow the
+spec sequence — RequireInternalSlot, `ToIndex(byteOffset)`, then (for
+setters) `ToNumber` / `ToBigInt` of the value, `ToBoolean`, the
+detached-buffer guard, and finally the range guard — reusing
+`to_number_or_throw` / `to_big_int_or_throw` so a poisoned `valueOf`
+propagates its thrown value and a Symbol / cross-numeric-type value
+throws `TypeError`. Remaining DataView failures are constructor
+argument validation (`new DataView(buffer, offset, length)`) and
+accessor `name` / detached-buffer descriptor cases — a separate
+slice.
 
 ### §25.3 DataView — slice 14
 

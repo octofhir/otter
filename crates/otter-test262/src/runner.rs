@@ -13,8 +13,9 @@
 //! 5. Build a fresh `Runtime` with the configured heap cap.
 //! 6. Compile + run the harness preamble (cached per-worker).
 //! 7. Compile + run the test body. `flags: [module]` routes through
-//!    [`otter_runtime::Runtime::run_module`]; everything else
-//!    through [`otter_runtime::Runtime::run_script`].
+//!    [`otter_runtime::Runtime::run_module`]; dynamic-import scripts
+//!    are staged on disk so sibling `_FIXTURE.js` imports resolve;
+//!    other scripts route through [`otter_runtime::Runtime::run_script`].
 //! 8. Map the engine outcome onto [`Outcome`] per ECMA-262 +
 //!    test262 INTERPRETING.md negative-test rules.
 //!
@@ -25,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ignore::WalkBuilder;
-use otter_runtime::{Diagnostic, DiagnosticKind, OtterError, Runtime, SourceInput};
+use otter_runtime::{Diagnostic, DiagnosticKind, IoErrorKind, OtterError, Runtime, SourceInput};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -403,7 +404,15 @@ pub fn run_one(
     let outcome = if frontmatter.is_module() {
         run_module_test(&mut runtime, &combined, test_path, exec.timeout)
     } else {
-        run_script_test(&mut runtime, &combined, &rel_path, exec.timeout)
+        let stage_script = features.iter().any(|feature| feature == "dynamic-import");
+        run_script_test(
+            &mut runtime,
+            &combined,
+            &rel_path,
+            test_path,
+            stage_script,
+            exec.timeout,
+        )
     };
 
     // 10. Apply negative-test inversion if the frontmatter expects
@@ -417,8 +426,29 @@ fn run_script_test(
     runtime: &mut Runtime,
     source: &str,
     rel_path: &str,
+    test_path: &Path,
+    stage_on_disk: bool,
     timeout: Duration,
 ) -> Outcome {
+    if stage_on_disk {
+        let (dir, entry) = match stage_test_entry(source, test_path, "entry.js") {
+            Ok(staged) => staged,
+            Err(reason) => {
+                return Outcome::Fail {
+                    reason,
+                    stack: None,
+                };
+            }
+        };
+        let outcome = run_with_watchdog(runtime, timeout, |rt| {
+            let source = SourceInput::from_path(&entry)?;
+            let specifier = file_url_for_path(&entry)?;
+            rt.run_script(source, &specifier)
+        });
+        let mapped = map_watchdog_outcome(outcome);
+        drop(dir);
+        return mapped;
+    }
     let outcome = run_with_watchdog(runtime, timeout, |rt| {
         rt.run_script(SourceInput::from_javascript(source.to_string()), rel_path)
     });
@@ -432,32 +462,38 @@ fn run_module_test(
     timeout: Duration,
 ) -> Outcome {
     // Module entry must live on disk (the loader uses the parent
-    // directory as the resolution base). Stage the combined source
-    // in a tempfile under the system temp dir. Use the test file's
-    // basename so self-referential imports (`import C from
-    // './<this-test>.js'`, a common pattern in `language/module-code/`
-    // for ResolveExport / instantiation tests per
-    // <https://tc39.es/ecma262/#sec-moduledeclarationinstantiation>)
-    // resolve back to the staged entry file inside the same temp dir.
-    let dir = match tempfile_dir() {
-        Ok(dir) => dir,
-        Err(err) => {
+    // directory as the resolution base).
+    let (dir, entry) = match stage_test_entry(source, test_path, "entry.mjs") {
+        Ok(staged) => staged,
+        Err(reason) => {
             return Outcome::Fail {
-                reason: format!("tempdir creation failed: {err}"),
+                reason,
                 stack: None,
             };
         }
     };
+    let outcome = run_with_watchdog(runtime, timeout, |rt| rt.run_module(&entry));
+    let mapped = map_watchdog_outcome(outcome);
+    drop(dir); // explicit; the temp dir auto-cleans on drop anyway
+    mapped
+}
+
+fn stage_test_entry(
+    source: &str,
+    test_path: &Path,
+    fallback_basename: &str,
+) -> Result<(tempfile::TempDir, PathBuf), String> {
+    let dir = match tempfile_dir() {
+        Ok(dir) => dir,
+        Err(err) => return Err(format!("tempdir creation failed: {err}")),
+    };
     let basename = test_path
         .file_name()
         .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_else(|| std::ffi::OsString::from("entry.mjs"));
+        .unwrap_or_else(|| std::ffi::OsString::from(fallback_basename));
     let entry = dir.path().join(&basename);
     if let Err(err) = std::fs::write(&entry, source) {
-        return Outcome::Fail {
-            reason: format!("tempfile write failed: {err}"),
-            stack: None,
-        };
+        return Err(format!("tempfile write failed: {err}"));
     }
     // Hard-link every sibling `.js` file from the test's source
     // directory into the temp dir so corpus-convention sibling
@@ -488,14 +524,20 @@ fn run_module_test(
                 .or_else(|_| std::fs::copy(&sibling_path, &dest).map(|_| ()));
         }
     }
-    let outcome = run_with_watchdog(runtime, timeout, |rt| rt.run_module(&entry));
-    let mapped = map_watchdog_outcome(outcome);
-    drop(dir); // explicit; the temp dir auto-cleans on drop anyway
-    mapped
+    Ok((dir, entry))
 }
 
 fn tempfile_dir() -> std::io::Result<tempfile::TempDir> {
     tempfile::Builder::new().prefix("otter-test262-").tempdir()
+}
+
+fn file_url_for_path(path: &Path) -> Result<String, OtterError> {
+    let canonical = std::fs::canonicalize(path).map_err(|err| OtterError::Io {
+        path: path.to_path_buf(),
+        kind: IoErrorKind::from_std(err.kind()),
+        message: err.to_string(),
+    })?;
+    Ok(format!("file://{}", canonical.display()))
 }
 
 fn map_watchdog_outcome(outcome: WatchdogOutcome) -> Outcome {

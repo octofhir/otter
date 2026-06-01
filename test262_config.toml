@@ -27,8 +27,8 @@ skip_features = [
     "import-attributes",
     "import-bytes",
     # import-defer (static `import defer * as`) is implemented; dynamic
-    # `import.defer()` tests stay gated behind the dynamic-import skip.
-    "dynamic-import",
+    # `import.defer()` expression coverage is now exposed by the
+    # dynamic-import suite.
     "import.meta",
     "json-modules",
     "source-phase-imports",

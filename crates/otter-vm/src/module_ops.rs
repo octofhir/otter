@@ -345,9 +345,8 @@ impl Interpreter {
             .map(|f| f.module_url.as_ref().to_string())
             .unwrap_or_default();
         let import_context = context.clone();
-        let promise =
-            if let Some(s) = spec_value.as_string(&self.gc_heap) {
-                let specifier = s.to_lossy_string(&self.gc_heap);
+        let promise = match self.coerce_to_string(context, &spec_value) {
+            Ok(specifier) => {
                 if let Some(target) =
                     context.module_resolution_target(referrer.as_str(), &specifier)
                 {
@@ -397,14 +396,31 @@ impl Interpreter {
                     promise_dispatch::PromiseBuilder::with_context(import_context.clone())
                         .rejected_stack_rooted(self, stack, reason, &[], &[])?
                 }
-            } else {
+            }
+            Err(VmError::Uncaught { value }) => {
+                let reason = if let Some(thrown) = self.take_pending_uncaught_throw() {
+                    thrown
+                } else {
+                    let fallback = JsString::from_str(&value, &mut self.gc_heap).map_err(|_| {
+                        VmError::TypeError {
+                            message: "dynamic import: failed to allocate rejection reason"
+                                .to_string(),
+                        }
+                    })?;
+                    Value::string(fallback)
+                };
+                promise_dispatch::PromiseBuilder::with_context(import_context)
+                    .rejected_stack_rooted(self, stack, reason, &[], &[])?
+            }
+            Err(err) => {
                 let reason = self.make_type_error_with_stack_roots(
                     stack,
-                    "dynamic import: specifier must be a string",
+                    &format!("dynamic import: specifier ToString failed: {err}"),
                 )?;
                 promise_dispatch::PromiseBuilder::with_context(import_context)
                     .rejected_stack_rooted(self, stack, reason, &[], &[])?
-            };
+            }
+        };
         write_register(&mut stack[top_idx], dst, Value::promise(promise))?;
         stack[top_idx].advance_pc(self.current_byte_len)?;
         Ok(())

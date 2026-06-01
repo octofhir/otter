@@ -8,10 +8,10 @@
 //!
 //! # Contents
 //! - [`RealmIntrinsics`] — typed slots for `%Object.prototype%`,
-//!   `%Function.prototype%`, `%Array.prototype%`. Native-function-shaped
-//!   constructors (`Promise`, `RegExp`, `Date`, `Iterator`, …) take
-//!   a different resolution path; their prototypes are looked up
-//!   through `NativeFunction::own_property_descriptor`.
+//!   `%Function.prototype%`, `%Array.prototype%`, and
+//!   `%Promise.prototype%`. Native-function-shaped constructors that
+//!   are not on hot object-dispatch paths still resolve through
+//!   `NativeFunction::own_property_descriptor`.
 //!
 //! # Invariants
 //! - Slots are populated by reading the `globalThis` graph **after**
@@ -60,6 +60,8 @@ pub(crate) struct RealmIntrinsics {
     pub function_prototype: Option<JsObject>,
     /// `%Array.prototype%`.
     pub array_prototype: Option<JsObject>,
+    /// `%Promise.prototype%`.
+    pub promise_prototype: Option<JsObject>,
 }
 
 impl RealmIntrinsics {
@@ -70,6 +72,7 @@ impl RealmIntrinsics {
         self.object_prototype = resolve_prototype(global, heap, "Object");
         self.function_prototype = resolve_prototype(global, heap, "Function");
         self.array_prototype = resolve_prototype(global, heap, "Array");
+        self.promise_prototype = resolve_prototype(global, heap, "Promise");
     }
 
     /// Trace cached prototype handles as root slots.
@@ -78,6 +81,7 @@ impl RealmIntrinsics {
             &self.object_prototype,
             &self.function_prototype,
             &self.array_prototype,
+            &self.promise_prototype,
         ]
         .into_iter()
         .filter_map(Option::as_ref)
@@ -92,6 +96,7 @@ impl RealmIntrinsics {
         self.object_prototype.is_none()
             && self.function_prototype.is_none()
             && self.array_prototype.is_none()
+            && self.promise_prototype.is_none()
     }
 }
 
@@ -123,6 +128,10 @@ mod tests {
             "Function.prototype cached"
         );
         assert!(slots.array_prototype.is_some(), "Array.prototype cached");
+        assert!(
+            slots.promise_prototype.is_some(),
+            "Promise.prototype cached"
+        );
     }
 
     #[test]
@@ -161,6 +170,7 @@ mod tests {
         let object_slot = interp.realm_intrinsics().object_prototype.unwrap();
         let function_slot = interp.realm_intrinsics().function_prototype.unwrap();
         let array_slot = interp.realm_intrinsics().array_prototype.unwrap();
+        let promise_slot = interp.realm_intrinsics().promise_prototype.unwrap();
         assert_eq!(
             object_slot,
             resolve_prototype(global, &mut interp.gc_heap, "Object").unwrap(),
@@ -175,6 +185,11 @@ mod tests {
             array_slot,
             resolve_prototype(global, &mut interp.gc_heap, "Array").unwrap(),
             "Array.prototype cache must be forwarded with globalThis"
+        );
+        assert_eq!(
+            promise_slot,
+            resolve_prototype(global, &mut interp.gc_heap, "Promise").unwrap(),
+            "Promise.prototype cache must be forwarded with globalThis"
         );
 
         let obj = interp

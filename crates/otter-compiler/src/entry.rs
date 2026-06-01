@@ -88,6 +88,10 @@ pub(crate) fn compile_program(
     force_strict: bool,
 ) -> Result<BytecodeModule, CompileError> {
     let module = Rc::new(RefCell::new(ModuleBuilder::default()));
+    let script_module_url = module_specifier
+        .starts_with("file://")
+        .then(|| module_specifier.to_string())
+        .unwrap_or_default();
     // §16.2.1.7 — top-level `await` upgrades `<main>` to async so
     // the dispatch loop's async machinery parks / resumes the
     // entry frame on suspension points.
@@ -107,9 +111,12 @@ pub(crate) fn compile_program(
         span: (program.span.start, program.span.end),
         is_async: main_is_async,
         is_strict: main_is_strict,
+        module_url: script_module_url.clone(),
         ..Default::default()
     });
-    let mut top = FunctionContext::new(Rc::clone(&module)).with_strict(main_is_strict);
+    let mut top = FunctionContext::new(Rc::clone(&module))
+        .with_strict(main_is_strict)
+        .with_module_url(script_module_url);
     top.captured_names = capture::analyze_module(&program.body);
     let mut cx = Compiler::new(top);
     cx.enter_scope();
@@ -289,7 +296,9 @@ pub fn compile_module_program(
         ..Default::default()
     });
 
-    let mut top = FunctionContext::new(Rc::clone(&module)).with_strict(true);
+    let mut top = FunctionContext::new(Rc::clone(&module))
+        .with_strict(true)
+        .with_module_url(host.module_url.clone());
     top.captured_names = capture::analyze_module(&program.body);
     // Also capture names that any inner function references whose
     // bindings live as `module_env` / `import_meta` / `import_record_*`

@@ -29,6 +29,10 @@ pub(crate) struct FunctionContext {
     /// lowered. This is compile-time metadata stored on the
     /// resulting bytecode function and also drives early errors.
     pub(crate) is_strict: bool,
+    /// Canonical source URL inherited by nested functions. Dynamic
+    /// import uses this as the referrer when it runs inside a
+    /// function body rather than at top level.
+    pub(crate) module_url: String,
     pub(crate) is_async_generator: bool,
     /// Stack of enclosing loops; the innermost is on top.
     pub(crate) loops: Vec<LoopFrame>,
@@ -107,6 +111,7 @@ impl FunctionContext {
             scratch: 0,
             scopes: Vec::new(),
             is_strict: false,
+            module_url: String::new(),
             is_async_generator: false,
             loops: Vec::new(),
             active_handlers: 0,
@@ -127,6 +132,11 @@ impl FunctionContext {
 
     pub(crate) fn with_strict(mut self, is_strict: bool) -> Self {
         self.is_strict = is_strict;
+        self
+    }
+
+    pub(crate) fn with_module_url(mut self, module_url: impl Into<String>) -> Self {
+        self.module_url = module_url.into();
         self
     }
 

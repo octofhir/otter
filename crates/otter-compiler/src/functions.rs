@@ -36,7 +36,9 @@ pub(crate) fn compile_function_full(
     let uses_mapped_arguments = needs_arguments && !function_is_strict && simple_params;
     validate_formal_parameter_names(params, function_is_strict, allow_duplicate_formals, span)?;
     let active_with_envs = parent.active_with_envs.clone();
-    let mut child = FunctionContext::new(Rc::clone(&module)).with_strict(function_is_strict);
+    let mut child = FunctionContext::new(Rc::clone(&module))
+        .with_strict(function_is_strict)
+        .with_module_url(parent.module_url.clone());
     child.active_with_envs = active_with_envs;
     child.is_async_generator = is_async_generator;
     if let Some(b) = body {
@@ -65,6 +67,7 @@ pub(crate) fn compile_function_full(
         name: name.to_string(),
         span,
         is_strict: function_is_strict,
+        module_url: parent.module_url.clone(),
         ..Default::default()
     });
 
@@ -205,7 +208,9 @@ pub(crate) fn compile_arrow_function(
     let function_is_strict = parent.is_strict || arrow.body.has_use_strict_directive();
     validate_formal_parameter_names(&arrow.params, function_is_strict, false, span)?;
     let active_with_envs = parent.active_with_envs.clone();
-    let mut child = FunctionContext::new(Rc::clone(&module)).with_strict(function_is_strict);
+    let mut child = FunctionContext::new(Rc::clone(&module))
+        .with_strict(function_is_strict)
+        .with_module_url(parent.module_url.clone());
     child.active_with_envs = active_with_envs;
     child.captured_names = capture::analyze_arrow(arrow);
     child.reserve_known_own_upvalues();
@@ -225,6 +230,7 @@ pub(crate) fn compile_arrow_function(
         name: "<arrow>".to_string(),
         span,
         is_strict: function_is_strict,
+        module_url: parent.module_url.clone(),
         ..Default::default()
     });
 

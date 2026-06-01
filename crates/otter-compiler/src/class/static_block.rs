@@ -20,7 +20,9 @@ pub(crate) fn compile_static_block(
     span: (u32, u32),
 ) -> Result<(u32, Vec<u32>), CompileError> {
     let module = Rc::clone(&parent.top_mut().module);
-    let mut child = FunctionContext::new(Rc::clone(&module)).with_strict(true);
+    let mut child = FunctionContext::new(Rc::clone(&module))
+        .with_strict(true)
+        .with_module_url(parent.module_url.clone());
     // §15.7.4 — `var` / `let` / `function` declarations inside a
     // static block live in the block's own scope. Compute the
     // capture-name set so identifier references to outer locals
@@ -35,6 +37,7 @@ pub(crate) fn compile_static_block(
         name: format!("{class_name}.<static-init>"),
         span,
         is_strict: true,
+        module_url: parent.module_url.clone(),
         ..Default::default()
     });
 

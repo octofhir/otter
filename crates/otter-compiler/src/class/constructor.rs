@@ -75,7 +75,9 @@ pub(crate) fn compile_synthetic_constructor(
     instance_fields: &[&oxc_ast::ast::PropertyDefinition<'_>],
 ) -> Result<(u32, Vec<u32>), CompileError> {
     let module = Rc::clone(&parent.top_mut().module);
-    let child = FunctionContext::new(Rc::clone(&module)).with_strict(true);
+    let child = FunctionContext::new(Rc::clone(&module))
+        .with_strict(true)
+        .with_module_url(parent.module_url.clone());
     // No body to pre-pass; only the synthesised super call needs
     // outer captures.
     parent.push(child);
@@ -89,6 +91,7 @@ pub(crate) fn compile_synthetic_constructor(
         name: name.to_string(),
         span,
         is_strict: true,
+        module_url: parent.module_url.clone(),
         ..Default::default()
     });
 
@@ -180,7 +183,9 @@ pub(crate) fn compile_class_constructor(
     // setup here.
     let module = Rc::clone(&parent.top_mut().module);
     validate_formal_parameter_names(params, true, false, span)?;
-    let mut child = FunctionContext::new(Rc::clone(&module)).with_strict(true);
+    let mut child = FunctionContext::new(Rc::clone(&module))
+        .with_strict(true)
+        .with_module_url(parent.module_url.clone());
     if let Some(b) = body {
         child.captured_names = capture::analyze_function(Some(params), b);
     }
@@ -198,6 +203,7 @@ pub(crate) fn compile_class_constructor(
         name: name.to_string(),
         span,
         is_strict: true,
+        module_url: parent.module_url.clone(),
         ..Default::default()
     });
 

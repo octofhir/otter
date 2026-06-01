@@ -474,6 +474,49 @@ target/debug/otter-test262 run \
 |---:|---:|---:|---:|---:|---:|---:|---:|
 | 596 | 423 | 113 | 36 | 0 | 0 | 24 | 75.54% |
 
+After exposing the `dynamic-import` feature in `test262_config.toml`
+and preserving file-backed script referrers for nested dynamic import
+sites:
+
+```sh
+target/debug/otter-test262 run \
+  --filter language/expressions/dynamic-import \
+  --timeout 20000 \
+  --output test262_results/dynamic_import_after_promise_intrinsic.json
+```
+
+| total | passed | failed | skipped | timeout | OOM | crash | pass rate |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 941 | 600 | 53 | 288 | 0 | 0 | 0 | 91.88% |
+
+The previous config skipped 936 of 941 `dynamic-import` tests
+(`test262_results/dynamic_import_baseline_next.json`: 5 pass, 936
+skip). The remaining non-skipped blockers are now visible:
+script-side on-demand fixture loading through the local synchronous
+runner, dynamic `import.defer()` expression lowering, and
+async-generator rejection propagation. `returns-promise.js` now passes
+after promise property lookup was switched to the cached
+`%Promise.prototype%` intrinsic instead of the mutable global
+`Promise.prototype`.
+
+Updated module-code regression after the same unskip:
+
+```sh
+target/debug/otter-test262 run \
+  --filter language/module-code \
+  --timeout 20000 \
+  --output test262_results/module_code_after_promise_intrinsic.json
+```
+
+| total | passed | failed | skipped | timeout | OOM | crash | pass rate |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 596 | 429 | 116 | 27 | 0 | 0 | 24 | 75.40% |
+
+Delta from `module_code_after_import_defer.json`: +6 passing tests,
+-9 skips, +3 surfaced failures. `language/import/import-defer` remains
+101/101 after the unskip
+(`test262_results/import_defer_after_promise_intrinsic.json`).
+
 ### Native error / Function suite checkpoint (P1.2 / P1.3 close)
 
 After tightening native error class metadata (descriptors on

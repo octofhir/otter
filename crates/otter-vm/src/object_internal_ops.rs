@@ -429,6 +429,7 @@ impl Interpreter {
             "Object" => self.realm_intrinsics.object_prototype,
             "Function" => self.realm_intrinsics.function_prototype,
             "Array" => self.realm_intrinsics.array_prototype,
+            "Promise" => self.realm_intrinsics.promise_prototype,
             _ => None,
         };
         if let Some(proto) = cached {

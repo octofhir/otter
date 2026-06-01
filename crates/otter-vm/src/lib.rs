@@ -353,6 +353,20 @@ pub struct Interpreter {
     /// ns` of the same module yields the identical object. Cleared with
     /// `module_environments`.
     module_namespaces: std::collections::HashMap<std::sync::Arc<str>, JsObject>,
+    /// Per-run §16.2.1.6 ResolveExport tables: importing module URL →
+    /// (exported name → `(defining_module, binding)`). Populated by the
+    /// runtime from each module's
+    /// [`otter_compiler::CompiledModuleMetadata::resolved_exports`].
+    /// The Module Namespace Exotic Object reads
+    /// ([`Op::LoadImportBinding`], `[[Get]]`, `[[OwnPropertyKeys]]`, …)
+    /// consult this so re-exported and star-exported names read the
+    /// defining module's live environment. `binding == "*namespace*"`
+    /// resolves to `defining_module`'s namespace object. Cleared with
+    /// `module_environments`.
+    module_resolved_exports: std::collections::HashMap<
+        std::sync::Arc<str>,
+        std::collections::BTreeMap<String, (std::sync::Arc<str>, String)>,
+    >,
     /// Monomorphic `LoadProperty` inline caches keyed by
     /// dense executable IC site id. These are interpreter-local
     /// hints and never affect bytecode dumps or JS-visible semantics.
@@ -722,6 +736,7 @@ impl Interpreter {
             module_errors: std::collections::HashMap::new(),
             deferred_namespaces: std::collections::HashMap::new(),
             module_namespaces: std::collections::HashMap::new(),
+            module_resolved_exports: std::collections::HashMap::new(),
             load_property_ics: Vec::new(),
             store_property_ics: Vec::new(),
             has_property_ics: Vec::new(),
@@ -1355,6 +1370,20 @@ impl Interpreter {
         self.module_environments.insert(url, env);
     }
 
+    /// Register a module's §16.2.1.6 ResolveExport table (exported name
+    /// → `(defining_module, binding)`), computed by the linker. Read by
+    /// the Module Namespace Exotic Object MOP forks and
+    /// [`Op::LoadImportBinding`] so re-exported / star-exported names
+    /// resolve to the defining module's live binding. Overwrites any
+    /// prior table for `url`; cleared by [`Self::reset_module_state`].
+    pub fn register_module_resolved_exports(
+        &mut self,
+        url: std::sync::Arc<str>,
+        table: std::collections::BTreeMap<String, (std::sync::Arc<str>, String)>,
+    ) {
+        self.module_resolved_exports.insert(url, table);
+    }
+
     /// Borrow a module's `module_env` JsObject by URL. Returns
     /// `None` when the URL is unknown — the runtime surfaces
     /// that as a catchable diagnostic upstream rather than
@@ -1376,6 +1405,7 @@ impl Interpreter {
         self.module_errors.clear();
         self.deferred_namespaces.clear();
         self.module_namespaces.clear();
+        self.module_resolved_exports.clear();
     }
 
     /// Resolve a specifier seen by the running module to the
@@ -1453,9 +1483,77 @@ impl Interpreter {
             return Some(*ns);
         }
         let env = *self.module_environments.get(&target_rc)?;
-        let ns = self.alloc_module_namespace_object(env).ok()?;
+        let ns = self
+            .alloc_module_namespace_object(env, target_rc.clone())
+            .ok()?;
         self.module_namespaces.insert(target_rc, ns);
         Some(ns)
+    }
+
+    /// §10.4.6 namespace string-key resolution. Resolves `name` through
+    /// `ns_obj`'s module §16.2.1.6 ResolveExport table to the live
+    /// binding value. Returns `Some(value)` when `name` is an exported
+    /// binding — the value may be the TDZ hole, which the caller maps to
+    /// a `ReferenceError` (§10.4.6.8 step 9). Returns `None` when `name`
+    /// is not exported. A re-exported / star-exported name resolves to
+    /// the *defining* module's live environment, not a snapshot. The
+    /// `"*namespace*"` binding (`export * as ns`) resolves to the
+    /// defining module's namespace object. Unmodeled (host) modules with
+    /// no table fall back to reading the wrapped environment directly.
+    pub(crate) fn module_namespace_get_binding(
+        &mut self,
+        ns_obj: JsObject,
+        name: &str,
+    ) -> Option<Value> {
+        let url = crate::object::module_namespace_url(ns_obj, &self.gc_heap)?;
+        self.resolve_module_binding(&url, name)
+    }
+
+    /// §16.2.1.6 ResolveExport + §9.1.1.5 GetBindingValue for one
+    /// `(module_url, exported name)` pair. Returns the defining module's
+    /// live binding value (possibly the TDZ hole), the defining module's
+    /// namespace object for the `"*namespace*"` sentinel, or `None` when
+    /// the name is not exported. Backs both the namespace MOP forks and
+    /// [`Op::LoadImportBinding`]. Unmodeled (host) modules with no table
+    /// read their environment directly by name.
+    pub(crate) fn resolve_module_binding(&mut self, module_url: &str, name: &str) -> Option<Value> {
+        if let Some(table) = self.module_resolved_exports.get(module_url) {
+            let (defmod, binding) = table.get(name)?.clone();
+            if binding == "*namespace*" {
+                return self
+                    .get_or_create_module_namespace(&defmod)
+                    .map(Value::object);
+            }
+            if binding == "*deferred-namespace*" {
+                return self
+                    .get_or_create_deferred_namespace(defmod)
+                    .ok()
+                    .map(Value::object);
+            }
+            let env = *self.module_environments.get(&defmod)?;
+            return Some(
+                crate::object::get(env, &self.gc_heap, &binding).unwrap_or_else(Value::hole),
+            );
+        }
+        let env = *self.module_environments.get(module_url)?;
+        crate::object::get(env, &self.gc_heap, name)
+    }
+
+    /// Exported string names a namespace exposes — its ResolveExport
+    /// table keys (already ascending), or the wrapped env keys for
+    /// unmodeled (host) modules. Used by the namespace `[[HasProperty]]`
+    /// and `[[OwnPropertyKeys]]` MOP forks.
+    pub(crate) fn module_namespace_export_names(&self, ns_obj: JsObject) -> Vec<String> {
+        let Some(url) = crate::object::module_namespace_url(ns_obj, &self.gc_heap) else {
+            return Vec::new();
+        };
+        if let Some(table) = self.module_resolved_exports.get(&url) {
+            return table.keys().cloned().collect();
+        }
+        match crate::object::module_namespace_env(ns_obj, &self.gc_heap) {
+            Some(env) => crate::object::module_namespace_sorted_string_keys(env, &self.gc_heap),
+            None => Vec::new(),
+        }
     }
 
     /// Mutable handle to the isolate-local microtask queue.
@@ -4130,14 +4228,14 @@ impl Interpreter {
                     let dst = context
                         .exec_register(instr, 0)
                         .ok_or(VmError::InvalidOperand)?;
-                    let record_reg = context
-                        .exec_register(instr, 1)
+                    let url_idx = context
+                        .exec_const_index(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
                     let name_idx = context
                         .exec_const_index(instr, 2)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_load_import_binding_reg(context, frame, dst, record_reg, name_idx)?;
+                    self.run_load_import_binding_reg(context, frame, dst, url_idx, name_idx)?;
                     continue;
                 }
                 Op::EvaluateModule => {

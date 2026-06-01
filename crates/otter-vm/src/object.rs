@@ -1497,7 +1497,14 @@ pub(crate) struct DeferredNamespaceData {
 /// namespace's own symbol keys (`@@toStringTag`).
 #[derive(Debug)]
 pub(crate) struct ModuleNamespaceData {
+    /// The module's own environment object. Kept for GC reachability
+    /// and as the fallback key source for unmodeled (host/builtin)
+    /// modules that carry no ResolveExport table.
     pub(crate) env: JsObject,
+    /// Canonical URL of the module this namespace exposes. Used to look
+    /// up the module's §16.2.1.6 ResolveExport table so re-exported and
+    /// star-exported names resolve to the defining module's live env.
+    pub(crate) module_url: std::sync::Arc<str>,
 }
 
 /// Wrapped module environment when `obj` is a Module Namespace Exotic
@@ -1512,6 +1519,21 @@ pub(crate) fn module_namespace_env(obj: JsObject, heap: &otter_gc::GcHeap) -> Op
     })
 }
 
+/// Canonical module URL when `obj` is a Module Namespace Exotic Object,
+/// else `None`.
+#[must_use]
+pub(crate) fn module_namespace_url(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+) -> Option<std::sync::Arc<str>> {
+    heap.read_payload(obj, |body| {
+        body.host_data
+            .as_ref()
+            .and_then(|d| d.downcast_ref::<ModuleNamespaceData>())
+            .map(|d| d.module_url.clone())
+    })
+}
+
 /// Exported string keys of a module namespace's environment, sorted in
 /// ascending code-unit order per §10.4.6.13 \[\[OwnPropertyKeys]].
 #[must_use]
@@ -1519,8 +1541,9 @@ pub(crate) fn module_namespace_sorted_string_keys(
     env: JsObject,
     heap: &otter_gc::GcHeap,
 ) -> Vec<String> {
-    let mut names: Vec<String> =
-        with_properties(env, heap, |p| p.enumerable_keys().map(str::to_string).collect());
+    let mut names: Vec<String> = with_properties(env, heap, |p| {
+        p.enumerable_keys().map(str::to_string).collect()
+    });
     names.sort_unstable();
     names
 }

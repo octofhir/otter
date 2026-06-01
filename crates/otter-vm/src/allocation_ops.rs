@@ -177,6 +177,7 @@ impl Interpreter {
     pub(crate) fn alloc_module_namespace_object(
         &mut self,
         env: crate::object::JsObject,
+        module_url: std::sync::Arc<str>,
     ) -> Result<crate::object::JsObject, otter_gc::OutOfMemory> {
         let roots = self.collect_runtime_roots();
         let shape_root = self.shape_root();
@@ -190,7 +191,7 @@ impl Interpreter {
         let obj = crate::object::alloc_host_object_with_shape_roots(
             &mut self.gc_heap,
             shape_root,
-            crate::object::ModuleNamespaceData { env },
+            crate::object::ModuleNamespaceData { env, module_url },
             &mut external_visit,
         )?;
         let tag_sym = self

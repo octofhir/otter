@@ -266,7 +266,10 @@ fn write_agent_entry(source: String) -> Result<PathBuf, NativeError> {
     Ok(path)
 }
 
-fn spawn_worker_agent(ctx: &mut NativeCtx<'_>, entry: &PathBuf) -> Result<u64, NativeError> {
+fn spawn_worker_agent(
+    ctx: &mut NativeCtx<'_>,
+    entry: &std::path::Path,
+) -> Result<u64, NativeError> {
     let path = entry.to_string_lossy().to_string();
     let path_value = {
         let js = JsString::from_str(&path, ctx.heap_mut())

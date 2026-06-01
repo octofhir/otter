@@ -53,7 +53,7 @@ use otter_bytecode::{
     OperandList, SourceKind as BytecodeSourceKind, SpanEntry,
 };
 use otter_compiler::{
-    CompileError, CompiledExport, CompiledModuleMetadata, ModuleHostInfo,
+    CompileError, CompiledExport, CompiledModuleMetadata, ModuleHostInfo, ResolvedBinding,
     compile_module_program_to_module,
 };
 use otter_syntax::{SourceKind, SyntaxError, with_program};
@@ -140,14 +140,19 @@ impl ModuleGraph {
         validate_resolution(&self.nodes)?;
         let order = topological_order(&self.nodes, &self.entry_url)?;
         let module = link(&self.nodes, &order, &self.entry_url);
+        let mut resolved = compute_resolved_exports(&self.nodes);
         let metadata = order
             .iter()
             .filter_map(|url| {
-                self.nodes
-                    .get(url)
-                    .map(|node| node.metadata.clone())
-                    .filter(|metadata| !metadata.source_url.is_empty())
+                self.nodes.get(url).map(|node| {
+                    let mut metadata = node.metadata.clone();
+                    if let Some(table) = resolved.remove(url) {
+                        metadata.resolved_exports = table;
+                    }
+                    metadata
+                })
             })
+            .filter(|metadata| !metadata.source_url.is_empty())
             .collect();
 
         Ok(LinkedProgram {
@@ -582,20 +587,34 @@ fn resolve_export(
                     })
                     .cloned();
                 result = match via_import {
-                    Some(imp) if imp.is_namespace => match resolve_specifier(nodes, url, &imp.specifier) {
-                        Some(target) => Resolution::Resolved {
-                            module: target.to_string(),
-                            binding: "*namespace*".to_string(),
-                        },
-                        None => Resolution::Null,
-                    },
+                    Some(imp) if imp.is_namespace => {
+                        match resolve_specifier(nodes, url, &imp.specifier) {
+                            Some(target) => Resolution::Resolved {
+                                module: target.to_string(),
+                                // §16.2.1.6: re-exporting an `import defer * as`
+                                // binding preserves deferred namespace semantics.
+                                binding: if imp.is_deferred {
+                                    "*deferred-namespace*".to_string()
+                                } else {
+                                    "*namespace*".to_string()
+                                },
+                            },
+                            None => Resolution::Null,
+                        }
+                    }
                     Some(imp) => match resolve_specifier(nodes, url, &imp.specifier) {
                         Some(target) => resolve_export(nodes, target, &imp.name, path),
                         None => Resolution::Null,
                     },
+                    // Terminal local binding. The defining module holds
+                    // it live on its environment under the *exported*
+                    // name (`name`), not the local — `export { local as
+                    // name }` mirrors writes to `local` onto env[name].
+                    // Returning `name` keeps the resolution aligned with
+                    // the env key the runtime actually reads.
                     None => Resolution::Resolved {
                         module: url.to_string(),
-                        binding: local_name.to_string(),
+                        binding: name.to_string(),
                     },
                 };
             }
@@ -695,6 +714,88 @@ fn check_binding(
             ),
         }),
     }
+}
+
+/// Append `name` to `names` if not already present.
+fn push_unique(names: &mut Vec<String>, name: &str) {
+    if !names.iter().any(|existing| existing == name) {
+        names.push(name.to_string());
+    }
+}
+
+/// §16.2.1.7 GetExportedNames(module, exportStarSet) — the set of names
+/// a module's namespace can expose. Local and indirect export entries
+/// (named exports, named re-exports, `export * as ns`) contribute their
+/// exported name; bare `export *` entries contribute every non-`default`
+/// name of the starred module, recursively. `default` is included for a
+/// module's own entries (it is importable directly) but is never pulled
+/// in through a star. `seen` is the `exportStarSet` that breaks
+/// `export *` cycles.
+fn module_exported_names(
+    nodes: &BTreeMap<String, ModuleNode>,
+    url: &str,
+    seen: &mut Vec<String>,
+) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    if seen.iter().any(|visited| visited == url) {
+        return names;
+    }
+    seen.push(url.to_string());
+    let Some(node) = nodes.get(url) else {
+        return names;
+    };
+    for export in &node.metadata.exports {
+        if export.name == "*" {
+            let Some(from) = export.from.as_deref() else {
+                continue;
+            };
+            let Some(target) = resolve_specifier(nodes, url, from) else {
+                continue;
+            };
+            for name in module_exported_names(nodes, target, seen) {
+                if name != "default" {
+                    push_unique(&mut names, &name);
+                }
+            }
+        } else {
+            push_unique(&mut names, &export.name);
+        }
+    }
+    names
+}
+
+/// Build every modeled module's §16.2.1.6 ResolveExport table:
+/// exported name → resolved live binding. Names that resolve to nothing
+/// or ambiguously are omitted so the namespace never exposes them
+/// (§10.4.6 / §16.2.1.10 unambiguousNames). Computed once at link time
+/// and threaded to the runtime through each module's
+/// [`CompiledModuleMetadata::resolved_exports`].
+fn compute_resolved_exports(
+    nodes: &BTreeMap<String, ModuleNode>,
+) -> HashMap<String, BTreeMap<String, ResolvedBinding>> {
+    let mut out: HashMap<String, BTreeMap<String, ResolvedBinding>> = HashMap::new();
+    for (url, node) in nodes {
+        if node.metadata.source_url.is_empty() {
+            continue;
+        }
+        let mut table: BTreeMap<String, ResolvedBinding> = BTreeMap::new();
+        for name in module_exported_names(nodes, url, &mut Vec::new()) {
+            let mut path = Vec::new();
+            if let Resolution::Resolved { module, binding } =
+                resolve_export(nodes, url, &name, &mut path)
+            {
+                table.insert(
+                    name,
+                    ResolvedBinding {
+                        defining_module: module,
+                        binding,
+                    },
+                );
+            }
+        }
+        out.insert(url.clone(), table);
+    }
+    out
 }
 
 /// Topological sort of `nodes`, post-order DFS rooted at `entry`.

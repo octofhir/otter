@@ -88,6 +88,29 @@ pub struct CompiledModuleMetadata {
     /// imports carry no binding name and are not recorded here.
     #[serde(default)]
     pub named_imports: Vec<NamedImport>,
+    /// §16.2.1.6 ResolveExport result table for this module, computed
+    /// at link time over the whole graph. Maps each exported name in
+    /// the module's §16.2.1.7 GetExportedNames set (the unambiguous
+    /// ones) to the live binding it resolves to. The runtime's Module
+    /// Namespace Exotic Object reads and `Op::LoadImportBinding`
+    /// consult this so re-exported / star-exported names read the
+    /// *defining* module's live environment instead of a snapshot.
+    /// Empty for unlinked single-module compiler output.
+    #[serde(default)]
+    pub resolved_exports: std::collections::BTreeMap<String, ResolvedBinding>,
+}
+
+/// One §16.2.1.6 ResolveExport result: an exported name resolves to
+/// the binding `binding` in module `defining_module`. The sentinel
+/// `binding == "*namespace*"` (used by `export * as ns from "m"`)
+/// means the resolved value is `defining_module`'s namespace object.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedBinding {
+    /// Canonical URL of the module that owns the live binding.
+    pub defining_module: String,
+    /// Exported name under which `defining_module` holds the binding
+    /// live on its environment, or `"*namespace*"`.
+    pub binding: String,
 }
 
 /// A single import binding, used by the linker to validate named
@@ -106,6 +129,12 @@ pub struct NamedImport {
     /// `true` for `import * as ns` (binds the module namespace object).
     #[serde(default)]
     pub is_namespace: bool,
+    /// `true` for `import defer * as ns` — re-exporting this binding
+    /// (`export { ns }`) preserves deferred namespace semantics
+    /// (§16.2.1.6 ResolveExport: `[[BindingName]]` is
+    /// `deferred-namespace`, not `namespace`).
+    #[serde(default)]
+    pub is_deferred: bool,
 }
 
 impl Default for CompiledModuleMetadata {
@@ -118,6 +147,7 @@ impl Default for CompiledModuleMetadata {
             exports: Vec::new(),
             live_binding_slots: Vec::new(),
             named_imports: Vec::new(),
+            resolved_exports: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -136,6 +166,7 @@ impl CompiledModuleMetadata {
             exports: Vec::new(),
             live_binding_slots: Vec::new(),
             named_imports: Vec::new(),
+            resolved_exports: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -301,6 +332,7 @@ impl<'a> Visit<'a> for ModuleMetadataVisitor<'_> {
         // Record each *named* binding request (`import { x as y }`
         // and `import d`) for link-time ResolveExport validation.
         // Namespace (`import * as ns`) carries no single export name.
+        let is_deferred = matches!(decl.phase, Some(oxc_ast::ast::ImportPhase::Defer));
         if let Some(specifiers) = &decl.specifiers {
             for spec in specifiers {
                 use oxc_ast::ast::ImportDeclarationSpecifier as Spec;
@@ -310,9 +342,11 @@ impl<'a> Visit<'a> for ModuleMetadataVisitor<'_> {
                         s.local.name.as_str().to_string(),
                         false,
                     ),
-                    Spec::ImportDefaultSpecifier(s) => {
-                        ("default".to_string(), s.local.name.as_str().to_string(), false)
-                    }
+                    Spec::ImportDefaultSpecifier(s) => (
+                        "default".to_string(),
+                        s.local.name.as_str().to_string(),
+                        false,
+                    ),
                     Spec::ImportNamespaceSpecifier(s) => {
                         (String::new(), s.local.name.as_str().to_string(), true)
                     }
@@ -322,6 +356,7 @@ impl<'a> Visit<'a> for ModuleMetadataVisitor<'_> {
                     name,
                     local,
                     is_namespace,
+                    is_deferred,
                 });
             }
         }

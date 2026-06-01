@@ -83,7 +83,7 @@ fn date_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
 }
 
 fn date_construct_time_value(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<f64, NativeError> {
-    if args.len() == 0 {
+    if args.is_empty() {
         return Ok(crate::date::dispatch::construct_time_value(
             args,
             ctx.heap(),

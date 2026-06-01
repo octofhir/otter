@@ -88,10 +88,11 @@ pub(crate) fn compile_program(
     force_strict: bool,
 ) -> Result<BytecodeModule, CompileError> {
     let module = Rc::new(RefCell::new(ModuleBuilder::default()));
-    let script_module_url = module_specifier
-        .starts_with("file://")
-        .then(|| module_specifier.to_string())
-        .unwrap_or_default();
+    let script_module_url = if module_specifier.starts_with("file://") {
+        module_specifier.to_string()
+    } else {
+        Default::default()
+    };
     // §16.2.1.7 — top-level `await` upgrades `<main>` to async so
     // the dispatch loop's async machinery parks / resumes the
     // entry frame on suspension points.
@@ -458,10 +459,8 @@ pub fn compile_module_program(
                 if let Some(inner) = &decl.declaration {
                     match inner {
                         oxc_ast::ast::Declaration::VariableDeclaration(var_decl) => {
-                            let is_var = matches!(
-                                var_decl.kind,
-                                oxc_ast::ast::VariableDeclarationKind::Var
-                            );
+                            let is_var =
+                                matches!(var_decl.kind, oxc_ast::ast::VariableDeclarationKind::Var);
                             for declarator in &var_decl.declarations {
                                 if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) =
                                     &declarator.id
@@ -720,7 +719,11 @@ pub fn compile_module_program(
                 }
                 let val_reg = cx.alloc_scratch();
                 cx.emit(
-                    if is_var { Op::LoadUndefined } else { Op::LoadHole },
+                    if is_var {
+                        Op::LoadUndefined
+                    } else {
+                        Op::LoadHole
+                    },
                     [Operand::Register(val_reg)],
                     span0,
                 );

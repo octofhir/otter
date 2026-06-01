@@ -120,6 +120,11 @@ all                 = { level = "deny", priority = -1 }
 result_large_err    = "allow"
 too_many_arguments  = "allow"
 type_complexity     = "allow"
+# The engine is single-threaded by design (one isolate per thread,
+# NaN-boxed non-Send `Value`). `Arc` is used purely for cheap shared
+# refcounting within that thread; the Send+Sync bound the lint wants
+# is neither achievable nor needed here.
+arc_with_non_send_sync = "allow"
 
 # Optimized release profile for the new foundation engine.
 [profile.release]

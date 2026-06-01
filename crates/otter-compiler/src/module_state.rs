@@ -139,6 +139,22 @@ pub(crate) fn find_module_import_binding(
     None
 }
 
+/// Resolve a raw import `specifier` to its canonical target URL via the
+/// host-provided `pre_resolved_imports`, walking the context stack so a
+/// nested function (whose own `module_state` is `None`) still finds the
+/// enclosing module's resolution table. Returns `None` when no enclosing
+/// module recorded the specifier (e.g. script-mode compilation).
+pub(crate) fn module_specifier_target(cx: &Compiler, specifier: &str) -> Option<String> {
+    for frame in cx.stack.iter().rev() {
+        if let Some(state) = &frame.module_state
+            && let Some(target) = state.pre_resolved_imports.get(specifier)
+        {
+            return Some(target.clone());
+        }
+    }
+    None
+}
+
 pub(crate) fn bytecode_source_kind(kind: SyntaxSourceKind) -> BytecodeSourceKind {
     if kind.is_typescript() {
         BytecodeSourceKind::TypeScript

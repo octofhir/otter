@@ -272,12 +272,11 @@ fn make_date_unclipped(
     }
     total_days += day as i64 - 1;
 
-    let result = (total_days as f64 * MS_PER_DAY as f64)
+    (total_days as f64 * MS_PER_DAY as f64)
         + (hours * MS_PER_HOUR as f64)
         + (minutes * MS_PER_MINUTE as f64)
         + (seconds * MS_PER_SEC as f64)
-        + ms;
-    result
+        + ms
 }
 
 fn time_clip(ms: f64) -> f64 {

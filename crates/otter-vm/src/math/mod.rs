@@ -608,7 +608,7 @@ fn impl_random(_args: &[NumberValue]) -> NumberValue {
                 let bits = (z >> 11) as f64 / (1u64 << 53) as f64;
                 return NumberValue::Double(bits);
             }
-            Err(actual) if actual == 0 => {
+            Err(0) => {
                 let init = initial_seed();
                 s = SEED
                     .compare_exchange(0, init, Ordering::AcqRel, Ordering::Acquire)

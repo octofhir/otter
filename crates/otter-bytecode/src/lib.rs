@@ -1364,7 +1364,7 @@ impl Op {
             // [reg, reg, const]
             Op::LoadProperty | Op::DeleteProperty | Op::ToPrimitive => pos == 2,
             // [dst, record_reg, name_const]
-            Op::LoadImportBinding => pos == 2,
+            Op::LoadImportBinding => pos == 1 || pos == 2,
             // [reg, kind_const, reg]
             Op::NewCollection | Op::NewBuiltinError => pos == 1,
             // [reg, class_const, reg, reg]

@@ -1727,6 +1727,7 @@ impl Runtime {
         for metadata in &linked.metadata {
             self.source_maps.record_compiled_metadata(metadata);
         }
+        self.register_resolved_exports(&linked.metadata);
         let context = ExecutionContext::from_module(linked.module);
         for init in context.module_inits() {
             if self.interp.module_env(&init.url).is_some() {
@@ -2551,6 +2552,36 @@ impl Runtime {
             .map(|(result, _)| result)
     }
 
+    /// Register every linked module's §16.2.1.6 ResolveExport table with
+    /// the interpreter so the Module Namespace Exotic Object reads and
+    /// `Op::LoadImportBinding` resolve re-exported / star-exported names
+    /// to the defining module's live binding. Called once per graph load,
+    /// before evaluation begins.
+    fn register_resolved_exports(&mut self, metadata: &[CompiledModuleMetadata]) {
+        for module in metadata {
+            if module.source_url.is_empty() || module.resolved_exports.is_empty() {
+                continue;
+            }
+            let table = module
+                .resolved_exports
+                .iter()
+                .map(|(name, resolved)| {
+                    (
+                        name.clone(),
+                        (
+                            std::sync::Arc::from(resolved.defining_module.as_str()),
+                            resolved.binding.clone(),
+                        ),
+                    )
+                })
+                .collect();
+            self.interp.register_module_resolved_exports(
+                std::sync::Arc::from(module.source_url.as_str()),
+                table,
+            );
+        }
+    }
+
     pub(crate) fn run_module_with_context(
         &mut self,
         entry_path: impl AsRef<Path>,
@@ -2574,6 +2605,9 @@ impl Runtime {
             &self.config.hosted_modules,
             &self.config.capabilities,
         )?;
+        // After `allocate_for_module_inits` (which resets per-run module
+        // state); registering earlier would be wiped by that reset.
+        self.register_resolved_exports(&linked.metadata);
         self.module_records
             .for_each_record(|url, _function_id, _env| {
                 // Self-loop edge: <entry>'s referrer is the entry's URL
@@ -2709,6 +2743,7 @@ impl Runtime {
         for metadata in &linked.metadata {
             self.source_maps.record_compiled_metadata(metadata);
         }
+        self.register_resolved_exports(&linked.metadata);
         Ok(())
     }
 

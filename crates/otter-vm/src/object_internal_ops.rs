@@ -514,10 +514,10 @@ impl Interpreter {
         // descriptors resolved through the environment; symbol keys
         // fall through to the namespace's own properties.
         if let Some(obj) = target.as_object()
-            && let Some(env) = object::module_namespace_env(obj, &self.gc_heap)
+            && object::module_namespace_env(obj, &self.gc_heap).is_some()
             && let Some(name) = key.string_name()
         {
-            return match object::get(env, &self.gc_heap, name) {
+            return match self.module_namespace_get_binding(obj, name) {
                 // §10.4.6.5 step 7 — an uninitialized binding's
                 // descriptor query is a ReferenceError (TDZ).
                 Some(v) if v.is_hole() => Err(VmError::ThisUninitialized {
@@ -885,10 +885,10 @@ impl Interpreter {
         // Deferred namespaces report non-extensible (§28.3 [[IsExtensible]]
         // → false) even before population, when the backing object is
         // still internally extensible so export properties can be added.
-        if let Some(obj) = value.as_object() {
-            if object::deferred_namespace_target(obj, &self.gc_heap).is_some() {
-                return Ok(false);
-            }
+        if let Some(obj) = value.as_object()
+            && object::deferred_namespace_target(obj, &self.gc_heap).is_some()
+        {
+            return Ok(false);
         }
         if let Some(proxy) = value.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
@@ -2035,10 +2035,10 @@ impl Interpreter {
         // ascending code-unit order, followed by the namespace's own
         // symbol keys (`@@toStringTag`).
         if let Some(obj) = target.as_object()
-            && let Some(env) = object::module_namespace_env(obj, &self.gc_heap)
+            && object::module_namespace_env(obj, &self.gc_heap).is_some()
         {
             let mut keys: Vec<Value> = Vec::new();
-            for name in object::module_namespace_sorted_string_keys(env, &self.gc_heap) {
+            for name in self.module_namespace_export_names(obj) {
                 keys.push(Value::string(
                     string::JsString::from_str(&name, &mut self.gc_heap).map_err(VmError::from)?,
                 ));
@@ -2404,12 +2404,11 @@ impl Interpreter {
         // Deferred namespaces have an immutable null [[Prototype]]
         // (§28.3 [[SetPrototypeOf]] = SetImmutablePrototype): succeed
         // only when the requested prototype is also null.
-        if let Some(obj) = target.as_object() {
-            if object::deferred_namespace_target(obj, &self.gc_heap).is_some()
-                || object::module_namespace_env(obj, &self.gc_heap).is_some()
-            {
-                return Ok(proto.is_null());
-            }
+        if let Some(obj) = target.as_object()
+            && (object::deferred_namespace_target(obj, &self.gc_heap).is_some()
+                || object::module_namespace_env(obj, &self.gc_heap).is_some())
+        {
+            return Ok(proto.is_null());
         }
         if let Some(proxy) = target.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
@@ -2538,12 +2537,11 @@ impl Interpreter {
         // A deferred namespace already reports non-extensible; succeed
         // without freezing the backing object so pending export
         // properties can still be installed on first access.
-        if let Some(obj) = value.as_object() {
-            if object::deferred_namespace_target(obj, &self.gc_heap).is_some()
-                && !object::deferred_namespace_is_populated(obj, &self.gc_heap)
-            {
-                return Ok(true);
-            }
+        if let Some(obj) = value.as_object()
+            && object::deferred_namespace_target(obj, &self.gc_heap).is_some()
+            && !object::deferred_namespace_is_populated(obj, &self.gc_heap)
+        {
+            return Ok(true);
         }
         if let Some(proxy) = value.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
@@ -2792,18 +2790,22 @@ impl Interpreter {
             // resolves string keys through the wrapped environment;
             // symbol keys (e.g. @@toStringTag) fall through to its own
             // properties.
-            if let Some(env) = object::module_namespace_env(obj, &self.gc_heap)
+            if object::module_namespace_env(obj, &self.gc_heap).is_some()
                 && let Some(name) = key.string_name()
             {
-                let value = object::get(env, &self.gc_heap, name).unwrap_or_else(Value::undefined);
-                // §10.4.6.8 step 9 — reading an export still in its TDZ
-                // (uninitialized binding slot) is a ReferenceError.
-                if value.is_hole() {
-                    return Err(VmError::ThisUninitialized {
+                // §10.4.6.8 [[Get]] — resolve the export through the
+                // module's ResolveExport table to the defining module's
+                // live binding. A re-exported / star-exported name reads
+                // the source env, not a snapshot.
+                return match self.module_namespace_get_binding(obj, name) {
+                    // step 9 — reading an export still in its TDZ
+                    // (uninitialized binding slot) is a ReferenceError.
+                    Some(value) if value.is_hole() => Err(VmError::ThisUninitialized {
                         message: format!("Cannot access '{name}' before initialization"),
-                    });
-                }
-                return Ok(VmGetOutcome::Value(value));
+                    }),
+                    Some(value) => Ok(VmGetOutcome::Value(value)),
+                    None => Ok(VmGetOutcome::Value(Value::undefined())),
+                };
             }
             if let Some(value) = self.string_object_exotic_get(obj, key)? {
                 return Ok(VmGetOutcome::Value(value));
@@ -3470,10 +3472,15 @@ impl Interpreter {
         if let Some(obj) = base.as_object() {
             // §10.4.6.7 [[HasProperty]] — namespace string keys exist iff
             // the environment exports them; symbol keys check own props.
-            if let Some(env) = object::module_namespace_env(obj, &self.gc_heap)
+            if object::module_namespace_env(obj, &self.gc_heap).is_some()
                 && let Some(name) = key.string_name()
             {
-                return Ok(object::get(env, &self.gc_heap, name).is_some());
+                // §10.4.6.7 — a string key exists iff it is one of the
+                // module's resolved exported names (TDZ-independent).
+                return Ok(self
+                    .module_namespace_export_names(obj)
+                    .iter()
+                    .any(|exported| exported == name));
             }
             if !matches!(
                 self.lookup_own_vm_property_key(obj, key),
@@ -3887,6 +3894,12 @@ impl Interpreter {
             return Ok(enumerable);
         }
         if let Some(obj) = target.as_object() {
+            // §10.4.6 namespace enumerable string keys are its resolved
+            // exported names (all enumerable), resolved through the table
+            // rather than the namespace object's own (empty) string slots.
+            if object::module_namespace_env(obj, &self.gc_heap).is_some() {
+                return Ok(self.module_namespace_export_names(obj));
+            }
             let mut keys = Vec::new();
             if let Some(value) = object::string_data(obj, &self.gc_heap) {
                 keys.extend((0..value.len()).map(|idx| idx.to_string()));

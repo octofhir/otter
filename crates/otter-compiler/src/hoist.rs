@@ -638,20 +638,14 @@ pub(crate) fn module_body_uses_top_level_await(stmts: &[Statement<'_>]) -> bool 
             }
             for element in &it.body.body {
                 match element {
-                    oxc_ast::ast::ClassElement::MethodDefinition(method) => {
-                        if method.computed {
-                            self.visit_property_key(&method.key);
-                        }
+                    oxc_ast::ast::ClassElement::MethodDefinition(method) if method.computed => {
+                        self.visit_property_key(&method.key);
                     }
-                    oxc_ast::ast::ClassElement::PropertyDefinition(prop) => {
-                        if prop.computed {
-                            self.visit_property_key(&prop.key);
-                        }
+                    oxc_ast::ast::ClassElement::PropertyDefinition(prop) if prop.computed => {
+                        self.visit_property_key(&prop.key);
                     }
-                    oxc_ast::ast::ClassElement::AccessorProperty(accessor) => {
-                        if accessor.computed {
-                            self.visit_property_key(&accessor.key);
-                        }
+                    oxc_ast::ast::ClassElement::AccessorProperty(accessor) if accessor.computed => {
+                        self.visit_property_key(&accessor.key);
                     }
                     _ => {}
                 }

@@ -80,26 +80,29 @@ impl Interpreter {
     }
 
     /// `Op::LoadImportBinding` — read named import `name` from the
-    /// module environment in `record_reg`. A slot still in its TDZ
-    /// (holding the hole) raises a `ReferenceError` (§9.1.1.5
-    /// GetBindingValue); otherwise the current binding value is written
-    /// to `dst`.
+    /// source module `url` via its §16.2.1.6 ResolveExport table, so a
+    /// re-exported / star-exported name reads the *defining* module's
+    /// live binding. A slot still in its TDZ (the hole) raises a
+    /// `ReferenceError` (§9.1.1.5 GetBindingValue); otherwise the
+    /// current binding value is written to `dst`.
     pub(crate) fn run_load_import_binding_reg(
         &mut self,
         context: &ExecutionContext,
         frame: &mut Frame,
         dst: u16,
-        record_reg: u16,
+        url_idx: u32,
         name_idx: u32,
     ) -> Result<(), VmError> {
+        let url = context
+            .string_constant_str(url_idx)
+            .ok_or(VmError::InvalidOperand)?
+            .to_string();
         let name = context
             .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?
             .to_string();
-        let record = *read_register(frame, record_reg)?;
-        let value = record
-            .as_object()
-            .and_then(|env| crate::object::get(env, &self.gc_heap, &name))
+        let value = self
+            .resolve_module_binding(&url, &name)
             .unwrap_or_else(Value::undefined);
         if value.is_hole() {
             return Err(VmError::ThisUninitialized {
@@ -257,7 +260,7 @@ impl Interpreter {
     /// Deferred namespace object for `target_url`, created on first use
     /// and cached so repeated `import defer` of the same module yield
     /// the identical object.
-    fn get_or_create_deferred_namespace(
+    pub(crate) fn get_or_create_deferred_namespace(
         &mut self,
         target_url: std::sync::Arc<str>,
     ) -> Result<crate::object::JsObject, VmError> {
@@ -426,7 +429,7 @@ impl Interpreter {
                         Err(VmError::Uncaught { .. }) => {
                             let reason = self
                                 .take_pending_uncaught_throw()
-                                .unwrap_or_else(|| Value::undefined());
+                                .unwrap_or_else(Value::undefined);
                             promise_dispatch::PromiseBuilder::with_context(import_context.clone())
                                 .rejected_stack_rooted(self, stack, reason, &[], &[])?
                         }

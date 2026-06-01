@@ -69,7 +69,7 @@ mod with_statement;
 use compiled_module::collect_module_metadata;
 pub use compiled_module::{
     CompiledExport, CompiledImport, CompiledImportKind, CompiledModule, CompiledModuleMetadata,
-    CompiledSourceSpan, LiveBindingSlot, NamedImport,
+    CompiledSourceSpan, LiveBindingSlot, NamedImport, ResolvedBinding,
 };
 pub use entry::{
     compile_module_program, compile_module_program_to_module, compile_script_program,
@@ -100,7 +100,7 @@ pub(crate) use functions::*;
 pub(crate) use hoist::*;
 pub(crate) use module_state::{
     ImportBinding, ModuleBuilder, ModuleState, bytecode_source_kind, find_module_import_binding,
-    module_export_name_to_str,
+    module_export_name_to_str, module_specifier_target,
 };
 pub(crate) use params::*;
 pub(crate) use scope::{BindingInfo, BindingStorage, LoopFrame, Scope};
@@ -199,15 +199,16 @@ mod tests {
     }
 
     #[test]
-    fn module_import_lowers_to_load_property_chain() {
+    fn module_import_lowers_to_load_import_binding() {
         let src = "import { value } from \"./other.ts\"; let y = value;";
         let host = host_info(&[("./other.ts", "file:///test/other.ts")]);
         let module = compile_module_src(src, &host);
         let init = &module.functions[0];
-        // ImportNamespace at the top of the body.
+        // ImportNamespace at the top of the body (source record cell).
         assert!(init.code.iter().any(|i| i.op == Op::ImportNamespace));
-        // LoadProperty for the read of `value`.
-        assert!(init.code.iter().any(|i| i.op == Op::LoadProperty));
+        // §9.1.1.5 GetBindingValue — the read of `value` resolves through
+        // the source module's ResolveExport table via LoadImportBinding.
+        assert!(init.code.iter().any(|i| i.op == Op::LoadImportBinding));
         // module_resolutions populated from host info.
         assert_eq!(module.module_resolutions.len(), 1);
         assert_eq!(module.module_resolutions[0].specifier, "./other.ts");

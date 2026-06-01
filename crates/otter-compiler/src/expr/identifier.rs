@@ -135,35 +135,42 @@ fn compile_identifier_without_with(
             );
             return Ok(dst);
         }
-        let resolved_uv = if cx.module_state.is_some() {
-            binding.record_uv_idx
-        } else {
-            cx.resolve_capture(&synthetic)
-                .expect("synthetic import-record binding must resolve")
-        };
-        let record_dst = cx.alloc_scratch();
-        cx.emit(
-            Op::LoadUpvalue,
-            vec![
-                Operand::Register(record_dst),
-                Operand::Imm32(resolved_uv as i32),
-            ],
-            span,
-        );
         // `import defer * as ns` — the deferred cell already holds the
         // deferred namespace object; read it directly.
         if binding.is_namespace {
+            let resolved_uv = if cx.module_state.is_some() {
+                binding.record_uv_idx
+            } else {
+                cx.resolve_capture(&synthetic)
+                    .expect("synthetic import-record binding must resolve")
+            };
+            let record_dst = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadUpvalue,
+                vec![
+                    Operand::Register(record_dst),
+                    Operand::Imm32(resolved_uv as i32),
+                ],
+                span,
+            );
             return Ok(record_dst);
         }
         // §9.1.1.5 GetBindingValue — read the named import through the
-        // env record, raising ReferenceError if it is still in its TDZ.
-        let dst = cx.alloc_scratch();
+        // source module's §16.2.1.6 ResolveExport table so a re-exported
+        // / star-exported name observes the *defining* module's live
+        // binding (raising ReferenceError if it is still in its TDZ).
+        // The source URL is statically known from the host resolution
+        // table, so the read needs no per-import record cell.
+        let source_url = module_specifier_target(cx, &binding.specifier)
+            .unwrap_or_else(|| binding.specifier.clone());
+        let url_const = cx.intern_string_constant(&source_url);
         let name_const = cx.intern_string_constant(&binding.source_name);
+        let dst = cx.alloc_scratch();
         cx.emit(
             Op::LoadImportBinding,
             vec![
                 Operand::Register(dst),
-                Operand::Register(record_dst),
+                Operand::ConstIndex(url_const),
                 Operand::ConstIndex(name_const),
             ],
             span,

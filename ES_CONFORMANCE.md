@@ -1326,6 +1326,15 @@ typed-array constructors (`BigInt64Array` / `BigUint64Array`
 both still bootstrap placeholders), and BigInt boxing
 (`Object(1n)` → BigInt wrapper object).
 
+### §23.2.3.32 %TypedArray%.prototype.toLocaleString (2026-06-02)
+
+`built-ins/TypedArray` +16. `toLocaleString` fell through to
+`toString`, rendering each element with a raw numeric conversion. It
+now invokes `element.toLocaleString()` per element and `ToString`s
+the result before joining with ",", so a user-overridden
+`Number.prototype.toLocaleString` runs (and its abrupt completion
+propagates) as the conformance tests require.
+
 ### §23.2.2.1 %TypedArray%.from + iterator result Get (2026-06-02)
 
 `built-ins/TypedArray` +16. The per-kind `from` ignored the `mapfn`

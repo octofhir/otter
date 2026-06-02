@@ -421,10 +421,36 @@ fn impl_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
     join_into_string(&t, ",", ctx.heap_mut())
 }
 
-fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    // Foundation simplification: locale-aware rendering deferred to
-    // Intl integration. Falls through to `toString`.
-    impl_to_string(ctx, args)
+fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    // §23.2.3.32 — join each element's `Invoke(element,
+    // "toLocaleString")` (not a raw numeric render) with "," so a
+    // user-overridden `Number.prototype.toLocaleString` runs and its
+    // abrupt completion propagates.
+    let t = receiver(ctx)?;
+    check_not_detached(&t, ctx.heap())?;
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| type_error("missing execution context"))?;
+    let len = t.length(ctx.heap_mut());
+    let mut parts: Vec<String> = Vec::new();
+    for i in 0..len {
+        let element = t.get(ctx.heap_mut(), i).map_err(native_oom)?;
+        let method = ta_get(ctx, element, crate::VmPropertyKey::String("toLocaleString"))?;
+        if !ctx.cx.interp.is_callable_runtime(&method) {
+            return Err(type_error("element toLocaleString is not callable"));
+        }
+        let rendered = ctx
+            .cx
+            .interp
+            .run_callable_sync(&exec, &method, element, smallvec::smallvec![])
+            .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+        let s = crate::coerce::to_string_or_throw(ctx.cx.interp, &exec, &rendered)
+            .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+        parts.push(s);
+    }
+    let joined = parts.join(",");
+    Ok(Value::string(JsString::from_str(&joined, ctx.heap_mut())?))
 }
 
 fn impl_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

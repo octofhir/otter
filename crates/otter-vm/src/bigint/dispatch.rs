@@ -43,7 +43,7 @@ pub fn call(
         M::AsIntN => {
             let bits = expect_bits(args.first(), heap)?;
             let value = args.get(1).cloned().unwrap_or(Value::undefined());
-            let n = to_bigint(heap, &value)?;
+            let n = to_bigint_strict(heap, &value)?;
             let clipped = as_int_n(bits, &n);
             let handle = BigIntValue::from_inner(heap, clipped).map_err(oom_to_vm)?;
             Ok(Value::big_int(handle))
@@ -52,7 +52,7 @@ pub fn call(
         M::AsUintN => {
             let bits = expect_bits(args.first(), heap)?;
             let value = args.get(1).cloned().unwrap_or(Value::undefined());
-            let n = to_bigint(heap, &value)?;
+            let n = to_bigint_strict(heap, &value)?;
             let clipped = as_uint_n(bits, &n);
             let handle = BigIntValue::from_inner(heap, clipped).map_err(oom_to_vm)?;
             Ok(Value::big_int(handle))
@@ -108,6 +108,21 @@ fn to_bigint(heap: &GcHeap, value: &Value) -> Result<BigInt, VmError> {
     Err(VmError::TypeError {
         message: "Cannot convert value to a BigInt".to_string(),
     })
+}
+
+/// §7.1.13 ToBigInt — the strict conversion used by `BigInt.asIntN` /
+/// `asUintN`. Unlike the `BigInt()` constructor's `NumberToBigInt`
+/// (shared `to_bigint`), a Number operand is a `TypeError` here, not a
+/// silent integer conversion. The operand is already ToPrimitive'd by
+/// `coerce_bigint_call_args`, so a Number reaching this point came from
+/// a numeric primitive or a `valueOf` / `@@toPrimitive` result.
+fn to_bigint_strict(heap: &GcHeap, value: &Value) -> Result<BigInt, VmError> {
+    if value.is_number() {
+        return Err(VmError::TypeError {
+            message: "Cannot convert a Number to a BigInt".to_string(),
+        });
+    }
+    to_bigint(heap, value)
 }
 
 fn string_to_bigint(text: &str) -> Result<BigInt, VmError> {

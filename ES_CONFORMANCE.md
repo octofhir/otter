@@ -1572,6 +1572,17 @@ before `powf`. (2) `Math.round` — for `x` in `[-0.5, 0)` (and `-0`) the
 result is `-0`; `(x + 0.5).floor()` produced `+0`, so the sign of a
 zero result is restored when the input is negative.
 
+### §21.2.2.1 BigInt.asIntN / asUintN strict ToBigInt (2026-06-03)
+
+`built-ins/BigInt` +2 (`asIntN`/`asUintN` `bigint-tobigint-errors`).
+Both statics converted their value argument through the `BigInt()`
+constructor's `NumberToBigInt` (which accepts an integer Number), but
+§21.2.2.1/.2 use `ToBigInt` (§7.1.13), under which a Number operand is
+a `TypeError`. A new `to_bigint_strict` rejects a Number before
+delegating to the shared conversion, so `asIntN(0, 5)` / `asUintN(0,
+undefined)` / a `valueOf` returning a Number now throw. The `BigInt()`
+constructor keeps the lenient `NumberToBigInt` path.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

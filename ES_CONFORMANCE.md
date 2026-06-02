@@ -1186,7 +1186,10 @@ instead of throwing when invoked with `%RegExp.prototype%` as `this`
 regexp `[[Set]]`/`[[Delete]]` through `OrdinarySet`/`OrdinaryDelete`
 (an inherited getter-only accessor rejects the write; `delete` on a
 regexp no longer throws) added +3 — total +12, `built-ins/RegExp`
-1244 → 1256 across the cluster.
+1244 → 1256 across the cluster. A further +7 (1256 → 1263) fixed
+`SpeciesConstructor` (§7.3.20 step 6) to fall back to the default
+constructor on a nullish `@@species` instead of returning the resolved
+`constructor` — unblocking `@@split`/`@@matchAll` species + IsRegExp tests.
 
 CLI smoke verifies:
 

@@ -1050,8 +1050,10 @@ pub(crate) fn species_constructor_runtime(
         .well_known_symbols()
         .get(crate::symbol::WellKnown::Species);
     let s = get_symbol_property_runtime(ctx, &c, species_sym, name)?;
+    // §7.3.20 step 6 — `undefined`/`null` @@species falls back to the
+    // default constructor, not the resolved `constructor` value.
     if s.is_nullish() {
-        return Ok(c);
+        return Ok(*default_ctor);
     }
     let (interp, exec) = ctx.interp_mut_and_context();
     let exec = exec.ok_or_else(|| crate::NativeError::TypeError {

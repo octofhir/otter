@@ -1406,6 +1406,17 @@ String wrapper object (`new String("123")`) rendered as
 `to_string_or_throw`, running the operand's `toString` / `valueOf`
 and throwing for a Symbol.
 
+### §22.1.3.7 String includes/startsWith/endsWith RegExp guard (2026-06-02)
+
+`built-ins/String/prototype/{includes,startsWith,endsWith}` all 100%;
+`built-ins/String/prototype` 1149→1155. These must run
+IsRegExp(searchString) and throw before ToString (steps 4-6). The shared
+arg pre-coercion was ToPrimitive-coercing argument 0 up front, so a
+RegExp searchString was stringified before the impl saw it; argument 0
+now stays raw, `is_reg_exp` runs (observing its @@match getter), then
+`value_to_string` coerces — also restoring the abrupt completion from a
+non-RegExp searchString's `toString`.
+
 ### §22.1.3.20 String.prototype.slice negative indices (2026-06-02)
 
 `built-ins/String/prototype/slice` +2; `built-ins/String/prototype`

@@ -1326,6 +1326,16 @@ typed-array constructors (`BigInt64Array` / `BigUint64Array`
 both still bootstrap placeholders), and BigInt boxing
 (`Object(1n)` → BigInt wrapper object).
 
+### §22.2.7.2 RegExp.prototype.exec — ToString(input) (2026-06-02)
+
+`built-ins/RegExp` +12. `RegExp.prototype.exec` (and `test`,
+`Symbol.match` / `Symbol.search` built on it) coerced the input
+argument with a debug `display_string` rather than `ToString`, so a
+String wrapper object (`new String("123")`) rendered as
+`"[object String]"` and never matched. The input is now coerced with
+`to_string_or_throw`, running the operand's `toString` / `valueOf`
+and throwing for a Symbol.
+
 ### §10.4.5.3 TypedArray [[DefineOwnProperty]] value coercion (2026-06-02)
 
 `built-ins/TypedArray` +4. `Object.defineProperty(ta, i, {value})`

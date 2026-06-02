@@ -727,8 +727,11 @@ fn coerce_to_string(
     if let Some(s) = v.as_string(ctx.heap()) {
         return Ok(s);
     }
-    let s = v.display_string(ctx.heap());
-
+    // §7.1.17 ToString — a wrapper object / coercible primitive must run
+    // its `toString` / `valueOf` (a Symbol throws), not a debug render.
+    let exec = ctx.execution_context().cloned().ok_or_else(|| oom(name))?;
+    let s = crate::coerce::to_string_or_throw(ctx.interp_mut(), &exec, v)
+        .map_err(|e| crate::native_function::vm_to_native_error(e, name))?;
     JsString::from_str(&s, ctx.heap_mut()).map_err(|_| oom(name))
 }
 

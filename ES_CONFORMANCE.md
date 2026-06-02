@@ -1420,6 +1420,19 @@ on the slow path) also routed `length` through `set_named_property`,
 storing the raw object and falsely reporting success; it now delegates
 to the same `[[DefineOwnProperty]]` / ArraySetLength path.
 
+### §23.1.3.32 Array.prototype.toLocaleString per-element Invoke (2026-06-03)
+
+`built-ins/Array` +4. `toLocaleString` was aliased to `toString`'s
+join path, so it stringified each element with `ToString` instead of
+`ToString(? Invoke(element, "toLocaleString"))`. It now visits every
+index in order, skips `null` / `undefined` elements (still emitting the
+list separator between positions), and invokes each element's own
+`toLocaleString` with the element as `this` — a primitive element stays
+primitive under a strict callee (the `onlyStrict` `primitive_this`
+tests), and the method is resolved through `GetV` so a getter-backed
+inherited method fires. A non-callable resolved method throws a
+`TypeError`.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

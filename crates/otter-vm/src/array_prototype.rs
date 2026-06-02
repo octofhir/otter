@@ -538,7 +538,8 @@ impl Interpreter {
                 let separator_arg = args.first().copied();
                 Some(self.array_join(context, receiver, separator_arg, roots))
             }
-            "toString" | "toLocaleString" => Some(self.array_join(context, receiver, None, roots)),
+            "toString" => Some(self.array_join(context, receiver, None, roots)),
+            "toLocaleString" => Some(self.array_to_locale_string(context, receiver, roots)),
             "concat" => Some(self.array_concat(context, receiver, args, roots)),
             "sort" => {
                 let comparefn = args.first().copied().unwrap_or_else(Value::undefined);
@@ -964,6 +965,68 @@ impl Interpreter {
             &joined,
             self.gc_heap_mut(),
         )?))
+    }
+
+    /// §23.1.3.32 `Array.prototype.toLocaleString`. Unlike `toString`
+    /// (which joins via `ToString`), each present element is stringified
+    /// through `ToString(? Invoke(element, "toLocaleString"))`, so the
+    /// element's own `toLocaleString` runs with the element as `this`
+    /// (primitive elements stay primitive under a strict callee). A
+    /// `null` / `undefined` element contributes nothing but the
+    /// separator is still emitted between every position.
+    pub(crate) fn array_to_locale_string(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        // step 1 — array = ? ToObject(this value).
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        // step 2 — len = ? LengthOfArrayLike(array).
+        let len = length_of_array_like(self, context, &o)?;
+        // The list separator is implementation-defined; ECMA-402 absent,
+        // use "," so `["",""].toLocaleString()` reports it consistently.
+        const SEPARATOR: &str = ",";
+        let cap = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
+        let mut r = String::new();
+        for k in 0..cap {
+            if k > 0 {
+                r.push_str(SEPARATOR);
+            }
+            // step 12.b — element = ? Get(array, ToString(k)).
+            let element = self.get_property_value_for_call(context, o, &k.to_string())?;
+            if element.is_undefined() || element.is_null() {
+                continue;
+            }
+            // step 12.e — Invoke(element, "toLocaleString"): GetV resolves
+            // the method (boxing a primitive only for the lookup), then
+            // Call passes the original element as `this`.
+            let method = match self.ordinary_get_value(
+                context,
+                element,
+                element,
+                &crate::VmPropertyKey::String("toLocaleString"),
+                0,
+            )? {
+                crate::VmGetOutcome::Value(v) => v,
+                crate::VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, element, SmallVec::new())?
+                }
+            };
+            if !crate::abstract_ops::is_callable(&method) {
+                return Err(VmError::TypeError {
+                    message: "element's toLocaleString is not callable".to_string(),
+                });
+            }
+            let result = self.run_callable_sync(context, &method, element, SmallVec::new())?;
+            let s = self.coerce_to_string(context, &result)?;
+            r.push_str(&s);
+        }
+        Ok(Value::string(JsString::from_str(&r, self.gc_heap_mut())?))
     }
 
     /// §22.1.3.10.1 IsConcatSpreadable(O): a non-object is never spread;

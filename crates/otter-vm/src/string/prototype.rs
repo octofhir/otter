@@ -1833,6 +1833,11 @@ fn coerce_pattern_to_regexp(
         n.to_display_string().encode_utf16().collect()
     } else if let Some(b) = value.as_big_int() {
         b.to_decimal_string(&*gc_heap).encode_utf16().collect()
+    } else if let Some(r) = value.as_regexp() {
+        // RegExpCreate(R, flags) with a RegExp source reuses its pattern
+        // (the requested flags win), so `matchAll`'s synthesised matcher
+        // sweeps the same pattern with `g` set.
+        r.pattern_utf16(gc_heap)
     } else if let Some(obj) = value.as_object() {
         let gc = &*gc_heap;
         if let Some(s) = crate::object::string_data(obj, gc) {
@@ -1920,61 +1925,29 @@ fn impl_match_all(
     receiver: &Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let recv = receiver_string(ctx, receiver)?;
-    let undef = Value::undefined();
-    let re = if let Some(r) = args.first().and_then(|v| v.as_regexp()) {
-        // §22.1.3.14 step 5.b: matchAll requires the global flag on
-        // a RegExp arg; non-global is a TypeError.
-        let heap = ctx.heap();
-        if !r.flags(heap).global {
-            return Err(type_error(
-                "String.prototype",
-                "must be a global regular expression",
-            ));
-        }
-        r
-    } else {
-        // §22.1.3.14 step 6.b: when the arg is not a RegExp, the
-        // synthesised regex always has `g` set so the iteration
-        // sweep visits every match.
-        let arg0 = args.first().unwrap_or(&undef);
-        coerce_pattern_to_regexp(arg0, "g", ctx.heap_mut())?
-    };
-    let re = &re;
-    let recv_units = recv.to_utf16_vec(ctx.heap_mut());
-    let matches = collect_regex_matches(re, ctx.heap(), &recv_units);
-    let has_indices = re.flags(ctx.heap()).has_indices;
-    let recv_clone = recv;
-    let mut out: Vec<Value> = Vec::with_capacity(matches.len());
-    for m in &matches {
-        let arr = crate::regexp_prototype::build_match_result_native(
-            m,
-            &recv_units,
-            recv_clone,
-            has_indices,
-            ctx,
-            &[],
-            &[out.as_slice()],
-        )
-        .map_err(|err| type_error("String.prototype", err.to_string()))?;
-        out.push(Value::array(arr));
-    }
-    // §22.1.3.14 step 7 — `Invoke(rx, @@matchAll, « S »)` returns a
-    // `RegExp String Iterator`. The foundation lowers it to a
-    // pre-computed Array wrapped in an `IteratorState::Array` so
-    // each `next()` step yields one match in iteration order.
-    let arr = ctx.array_from_elements_with_roots(out.iter().cloned(), &[], &[out.as_slice()])?;
-    let arr_value = Value::array(arr);
-    let state = crate::IteratorState::Array {
-        array: arr,
-        index: 0,
-        origin: crate::BuiltinIteratorOrigin::Array,
-    };
-    let handle = ctx
-        .alloc_old(state)
-        .map_err(|_| range_error("String.prototype", "iterator allocation failed"))?;
-    let _ = arr_value;
-    Ok(Value::iterator(handle))
+    // The receiver is already `S = ToString(O)` (coerced uniformly by
+    // `native_string_method`), and `native_string_method`'s symbol-method
+    // block has already handled §22.1.3.14 steps 2.a-d — the `@@matchAll`
+    // delegation and the global-flag check for a non-nullish RegExp arg.
+    // What reaches here is the fallback: steps 4-5 build a fresh global
+    // matcher and `Invoke(rx, @@matchAll, « S »)`, so a user-overridden
+    // `RegExp.prototype[@@matchAll]` is observed instead of an inlined
+    // iterator.
+    const NAME: &str = "String.prototype.matchAll";
+    let s = receiver_string(ctx, receiver)?;
+    let arg = args.first().copied().unwrap_or_else(Value::undefined);
+    let rx = coerce_pattern_to_regexp(&arg, "g", ctx.heap_mut())?;
+    let rx_value = Value::regexp(rx);
+    let method = get_symbol_method(ctx, rx_value, WellKnown::MatchAll, NAME)?
+        .ok_or_else(|| type_error(NAME, "RegExp has no @@matchAll method"))?;
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| type_error(NAME, "missing execution context"))?;
+    let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![Value::string(s)];
+    ctx.interp_mut()
+        .run_callable_sync(&exec, &method, rx_value, cb_args)
+        .map_err(|e| vm_err(e, NAME))
 }
 
 fn impl_search(

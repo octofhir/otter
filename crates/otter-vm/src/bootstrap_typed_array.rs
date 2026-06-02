@@ -209,10 +209,7 @@ fn drain_iterable_into_values(
         .cx
         .interp
         .run_callable_sync(exec_ctx, &iter_method, src_value, no_args)
-        .map_err(|e| NativeError::TypeError {
-            name: "TypedArray",
-            reason: e.to_string(),
-        })?;
+        .map_err(|e| vm_to_native(e, "TypedArray"))?;
     let handle = if let Some(h) = iter_obj.as_iterator() {
         h
     } else if let Some(g) = iter_obj.as_generator() {
@@ -238,10 +235,7 @@ fn drain_iterable_into_values(
             .cx
             .interp
             .iterator_next_full(exec_ctx, &handle)
-            .map_err(|e| NativeError::TypeError {
-                name: "TypedArray",
-                reason: e.to_string(),
-            })?;
+            .map_err(|e| vm_to_native(e, "TypedArray"))?;
         if done {
             break;
         }
@@ -1084,14 +1078,17 @@ fn ta_ctor_dispatch(
     // the per-kind dispatcher's array-like path collects the
     // yielded values rather than reading the (probably-undefined)
     // `length` own slot.
-    // §23.2.5.1 — an ordinary Object *or* an Array source initializes
-    // from `@@iterator` / array-like reads. An Array is its own Value
-    // kind (not `as_object`), so it must be matched explicitly or
-    // `new TA([…])` would skip the observable element coercion entirely.
+    // §23.2.5.1 — any Object source other than an ArrayBuffer or a
+    // TypedArray (which have dedicated initializers) initializes from
+    // `@@iterator` / array-like reads. Arrays, functions, generators and
+    // proxies are each their own Value kind, so the check is "Type is
+    // Object" minus the two specialized sources — otherwise e.g.
+    // `new TA(functionWithIteratorGetter)` or `new TA(generator)` would
+    // skip the observable `@@iterator` read entirely.
     let src_value_opt = args
         .first()
         .copied()
-        .filter(|v| v.is_object() || v.is_array());
+        .filter(|v| v.is_object_type() && !v.is_array_buffer() && !v.is_typed_array());
     let iter_pre: Option<SmallVec<[Value; 4]>> =
         if let (Some(src_value), Some(exec)) = (src_value_opt, exec.as_ref()) {
             let iter_sym = ctx

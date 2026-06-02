@@ -361,7 +361,15 @@ fn impl_round(args: &[NumberValue]) -> NumberValue {
     } else if f.is_infinite() {
         f
     } else {
-        (f + 0.5).floor()
+        // §21.3.2.28 — for x in [-0.5, 0) (and -0) the result is -0:
+        // `(f + 0.5).floor()` yields +0 there, so restore the sign of a
+        // zero result whose input was negative.
+        let r = (f + 0.5).floor();
+        if r == 0.0 && f.is_sign_negative() {
+            -0.0
+        } else {
+            r
+        }
     };
     NumberValue::Double(rounded).canonicalize()
 }

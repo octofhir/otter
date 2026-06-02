@@ -1561,6 +1561,17 @@ RegExp, where `(new Proxy(re, {})).lastIndex` should read the target's
 `lastIndex` — fell through to `undefined`. The branch now matches on the
 resolved name via `string_name()`.
 
+### §21.3.2 Math.pow / Math.round spec edge cases (2026-06-03)
+
+`built-ins/Math` +4, `language/expressions/exponentiation` +2.
+(1) `Number::exponentiate` — IEEE `powf` disagrees with ECMAScript in
+two cases: a NaN exponent is always NaN even for `1 ** NaN` (IEEE
+returns 1), and `(±1) ** ±∞` is NaN (IEEE returns 1). `bitwise::pow`
+(shared by `Math.pow` and the `**` operator) now special-cases both
+before `powf`. (2) `Math.round` — for `x` in `[-0.5, 0)` (and `-0`) the
+result is `-0`; `(x + 0.5).floor()` produced `+0`, so the sign of a
+zero result is restored when the input is negative.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

@@ -111,7 +111,15 @@ pub fn shr_logical(lhs: NumberValue, rhs: NumberValue) -> NumberValue {
 /// back to the double path (canonicalized into `Smi` when exact).
 #[must_use]
 pub fn pow(base: NumberValue, exponent: NumberValue) -> NumberValue {
-    NumberValue::Double(base.as_f64().powf(exponent.as_f64())).canonicalize()
+    let b = base.as_f64();
+    let e = exponent.as_f64();
+    // §6.1.6.1.3 Number::exponentiate — two cases where IEEE `powf`
+    // disagrees with ECMAScript: a NaN exponent is always NaN (even
+    // `1 ** NaN`), and `(±1) ** ±∞` is NaN (IEEE returns 1).
+    if e.is_nan() || (b.abs() == 1.0 && e.is_infinite()) {
+        return NumberValue::Double(f64::NAN);
+    }
+    NumberValue::Double(b.powf(e)).canonicalize()
 }
 
 #[cfg(test)]

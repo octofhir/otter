@@ -1388,6 +1388,19 @@ the search is visited" tests returned `-1`. `HasProperty` now also
 consults `array::get_accessor`, fixing those methods and the `in`
 operator on arrays with own indexed/named accessors.
 
+### §23.1.3.34 Array.prototype[@@unscopables] (2026-06-03)
+
+`built-ins/Array` +4. `Array.prototype[Symbol.unscopables]` was
+absent, so `Object.getPrototypeOf(unscopables)` threw and the `with`
+exclusion list was unreadable. It is now installed post-bootstrap as a
+`null`-prototype object carrying own enumerable / writable /
+configurable `true` data properties for the post-ES5 methods (`at`,
+`copyWithin`, `entries`, `fill`, `find`, `findIndex`, `findLast`,
+`findLastIndex`, `flat`, `flatMap`, `includes`, `keys`, `toReversed`,
+`toSorted`, `toSpliced`, `values` — `with` excluded), with the
+`@@unscopables` property itself non-writable / non-enumerable /
+configurable.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

@@ -151,6 +151,70 @@ pub(crate) fn install_array_well_knowns_post_bootstrap(
             ..Default::default()
         },
     );
+    install_array_unscopables(heap, prototype, well_known)?;
+    Ok(())
+}
+
+/// §23.1.3.34 `Array.prototype[@@unscopables]` — a `null`-prototype
+/// object whose own enumerable data properties (all `true`) name the
+/// post-ES5 methods that a `with` statement must not bind. The list is
+/// fixed by the spec; `with` itself is deliberately excluded. The
+/// `@@unscopables` property is non-writable / non-enumerable /
+/// configurable.
+fn install_array_unscopables(
+    heap: &mut otter_gc::GcHeap,
+    prototype: object::JsObject,
+    well_known: &WellKnownSymbols,
+) -> Result<(), JsSurfaceError> {
+    const UNSCOPABLES: &[&str] = &[
+        "at",
+        "copyWithin",
+        "entries",
+        "fill",
+        "find",
+        "findIndex",
+        "findLast",
+        "findLastIndex",
+        "flat",
+        "flatMap",
+        "includes",
+        "keys",
+        "toReversed",
+        "toSorted",
+        "toSpliced",
+        "values",
+    ];
+    let prototype_root = Value::object(prototype);
+    let list =
+        crate::intrinsics::shared::alloc_object_with_value_roots_pub(heap, &[&prototype_root])
+            .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    object::set_prototype(list, heap, None);
+    for name in UNSCOPABLES {
+        object::define_own_property_partial(
+            list,
+            heap,
+            name,
+            PartialPropertyDescriptor {
+                value: Some(Value::boolean(true)),
+                writable: Some(true),
+                enumerable: Some(true),
+                configurable: Some(true),
+                ..Default::default()
+            },
+        );
+    }
+    object::define_own_symbol_property_partial(
+        prototype,
+        heap,
+        well_known.get(WellKnown::Unscopables),
+        PartialPropertyDescriptor {
+            value: Some(Value::object(list)),
+            writable: Some(false),
+            enumerable: Some(false),
+            configurable: Some(true),
+            ..Default::default()
+        },
+    );
     Ok(())
 }
 

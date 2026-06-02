@@ -875,7 +875,13 @@ impl Interpreter {
             // §10.1.8 OrdinaryGet on a callable receiver — user
             // properties resolve via the function-properties side table.
             return Ok(Some(
-                self.function_property_get_stack_rooted(context, stack, fid, name)?,
+                self.function_property_get_stack_rooted_with_receiver(
+                    context,
+                    stack,
+                    fid,
+                    Some(recv_value),
+                    name,
+                )?,
             ));
         }
         if let Some(native) = recv_value.as_native_function() {

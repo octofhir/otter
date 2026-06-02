@@ -1648,6 +1648,29 @@ impl Interpreter {
         function_id: u32,
         name: &str,
     ) -> Result<Value, VmError> {
+        self.function_property_get_stack_rooted_with_receiver(
+            context,
+            stack,
+            function_id,
+            None,
+            name,
+        )
+    }
+
+    /// As [`Self::function_property_get_stack_rooted`], but `receiver`
+    /// supplies the value written to a freshly materialized
+    /// `prototype.constructor`. For a closure the canonical callable is
+    /// the closure value itself, not `Value::function(function_id)`, so
+    /// callers that hold the closure pass it through to keep
+    /// `C.prototype.constructor === C`.
+    pub(crate) fn function_property_get_stack_rooted_with_receiver(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &SmallVec<[Frame; 8]>,
+        function_id: u32,
+        receiver: Option<Value>,
+        name: &str,
+    ) -> Result<Value, VmError> {
         if name != "prototype" {
             return self.function_property_get_non_prototype(context, function_id, name);
         }
@@ -1658,14 +1681,21 @@ impl Interpreter {
         }
 
         let function_root = Value::function(function_id);
-        let bag = self.function_user_bag_stack_rooted(stack, function_id, &[&function_root])?;
+        let constructor_value = receiver.unwrap_or(function_root);
+        let bag = self.function_user_bag_stack_rooted(
+            stack,
+            function_id,
+            &[&function_root, &constructor_value],
+        )?;
         if let Some(existing) = crate::object::get(bag, &self.gc_heap, "prototype") {
             return Ok(existing);
         }
 
         let bag_root = Value::object(bag);
-        let proto =
-            self.alloc_stack_rooted_object_with_extra_roots(stack, &[&function_root, &bag_root])?;
+        let proto = self.alloc_stack_rooted_object_with_extra_roots(
+            stack,
+            &[&function_root, &constructor_value, &bag_root],
+        )?;
         if let Some(object_proto) = self.realm_intrinsics.object_prototype.or_else(|| {
             crate::object::get(self.global_this, &self.gc_heap, "Object")
                 .and_then(|v| v.as_object())
@@ -1688,7 +1718,7 @@ impl Interpreter {
             self.finish_generator_function_prototype(context, function_id, proto, parent)?;
         }
         let proto_value = Value::object(proto);
-        let constructor = object::PropertyDescriptor::data(function_root, true, false, true);
+        let constructor = object::PropertyDescriptor::data(constructor_value, true, false, true);
         let _ = object::define_own_property(proto, &mut self.gc_heap, "constructor", constructor);
         let prototype_desc = object::PropertyDescriptor::data(proto_value, true, false, false);
         let _ = object::define_own_property(bag, &mut self.gc_heap, "prototype", prototype_desc);
@@ -1703,6 +1733,29 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {
+        self.function_property_get_runtime_rooted_with_receiver(
+            context,
+            function_id,
+            None,
+            name,
+            value_roots,
+            slice_roots,
+        )
+    }
+
+    /// As [`Self::function_property_get_runtime_rooted`], but `receiver`
+    /// supplies the value written to a freshly materialized
+    /// `prototype.constructor` (the closure value for a closure; see
+    /// [`Self::function_property_get_stack_rooted_with_receiver`]).
+    pub(crate) fn function_property_get_runtime_rooted_with_receiver(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        receiver: Option<Value>,
+        name: &str,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
         if name != "prototype" {
             return self.function_property_get_non_prototype(context, function_id, name);
         }
@@ -1713,8 +1766,10 @@ impl Interpreter {
         }
 
         let function_root = Value::function(function_id);
-        let mut bag_roots = Vec::with_capacity(value_roots.len() + 1);
+        let constructor_value = receiver.unwrap_or(function_root);
+        let mut bag_roots = Vec::with_capacity(value_roots.len() + 2);
         bag_roots.push(&function_root);
+        bag_roots.push(&constructor_value);
         bag_roots.extend_from_slice(value_roots);
         let bag = self.function_user_bag_runtime_rooted(function_id, &bag_roots, slice_roots)?;
         if let Some(existing) = crate::object::get(bag, &self.gc_heap, "prototype") {
@@ -1722,8 +1777,9 @@ impl Interpreter {
         }
 
         let bag_root = Value::object(bag);
-        let mut proto_roots = Vec::with_capacity(value_roots.len() + 2);
+        let mut proto_roots = Vec::with_capacity(value_roots.len() + 3);
         proto_roots.push(&function_root);
+        proto_roots.push(&constructor_value);
         proto_roots.push(&bag_root);
         proto_roots.extend_from_slice(value_roots);
         let proto = self.alloc_runtime_rooted_object_with_roots(&proto_roots, slice_roots)?;
@@ -1751,7 +1807,7 @@ impl Interpreter {
             self.finish_generator_function_prototype(context, function_id, proto, parent)?;
         }
         let proto_value = Value::object(proto);
-        let constructor = object::PropertyDescriptor::data(function_root, true, false, true);
+        let constructor = object::PropertyDescriptor::data(constructor_value, true, false, true);
         let _ = object::define_own_property(proto, &mut self.gc_heap, "constructor", constructor);
         let prototype_desc = object::PropertyDescriptor::data(proto_value, true, false, false);
         let _ = object::define_own_property(bag, &mut self.gc_heap, "prototype", prototype_desc);

@@ -1154,10 +1154,11 @@ impl Interpreter {
                 .map(|c| c.cached_function_id)
         });
         if let Some(function_id) = function_id {
-            return match self.function_property_get_stack_rooted(
+            return match self.function_property_get_stack_rooted_with_receiver(
                 context,
                 stack,
                 function_id,
+                Some(*callee),
                 "prototype",
             )? {
                 proto if proto.is_object_type() => Ok(Some(proto)),
@@ -1205,9 +1206,10 @@ impl Interpreter {
                 .map(|c| c.cached_function_id)
         });
         if let Some(function_id) = function_id {
-            return match self.function_property_get_runtime_rooted(
+            return match self.function_property_get_runtime_rooted_with_receiver(
                 context,
                 function_id,
+                Some(*callee),
                 "prototype",
                 value_roots,
                 slice_roots,

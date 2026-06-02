@@ -226,15 +226,17 @@ impl Interpreter {
             roots.push(&value);
             roots.extend_from_slice(value_roots);
             match stack_roots {
-                Some(stack) => self.function_property_get_stack_rooted(
+                Some(stack) => self.function_property_get_stack_rooted_with_receiver(
                     &function_context,
                     stack,
                     function_id,
+                    Some(value),
                     "prototype",
                 )?,
-                None => self.function_property_get_runtime_rooted(
+                None => self.function_property_get_runtime_rooted_with_receiver(
                     &function_context,
                     function_id,
+                    Some(value),
                     "prototype",
                     &roots,
                     slice_roots,

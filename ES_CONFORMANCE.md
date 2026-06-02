@@ -2734,3 +2734,32 @@ Fixed: `forwards-length-for-array-likes`, `elements-deleted-after`,
 `built-ins/Array`. Still open: `iter-cstm-ctor`, blocked by an
 unrelated root — a closure's `.prototype.constructor` resolves to the
 bare function rather than the closure value (tracked separately).
+
+## Closure `.prototype.constructor` is the closure value (§10.2.5 / §20.2)
+
+When a function's `prototype` object was lazily materialized, its
+`constructor` data property was wired to `Value::function(function_id)`
+— the bare function for that id. For a non-capturing function that is
+the canonical callable, so `C.prototype.constructor === C` held. A
+**closure** (a function that captures upvalues) is a distinct value, so
+`Value::function(function_id)` was a different object and
+`C.prototype.constructor` resolved to the bare function instead of `C`.
+`prototype` identity was unaffected (it is cached per function id), so
+only `.constructor` was wrong and `instanceof` still worked.
+
+`function_property_get_{stack,runtime}_rooted` now take an optional
+`receiver`; callers that hold the actual callable (property get on a
+callable, method get, `[[Get]]` on a function, construct-prototype
+lookup, dynamic-function build) pass it through and it becomes the
+`constructor` value. The `None` path is unchanged
+(`Value::function(function_id)`), so non-closure callables are
+byte-identical.
+
+| section | before | after | delta |
+|---|---:|---:|---:|
+| `built-ins/Array/from` | 46/47 | 47/47 | +1 |
+
+Fixed: `iter-cstm-ctor` (`Array.from.call(C, iterable)` with a closure
+`C`). 0 regressions across `built-ins/Array`,
+`language/statements/class`, `language/expressions`, and
+`built-ins/Function`.

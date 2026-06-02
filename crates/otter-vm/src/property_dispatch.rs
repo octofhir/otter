@@ -956,7 +956,13 @@ impl Interpreter {
                 .as_closure(&self.gc_heap)
                 .map(|c| c.cached_function_id)
         }) {
-            self.function_property_get_stack_rooted(context, stack, fid, name)?
+            self.function_property_get_stack_rooted_with_receiver(
+                context,
+                stack,
+                fid,
+                Some(receiver),
+                name,
+            )?
         } else if let Some(native) = receiver.as_native_function() {
             match native.own_property_descriptor(&mut self.gc_heap, name)? {
                 Some(desc) => match &desc.kind {

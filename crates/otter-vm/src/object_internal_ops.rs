@@ -711,18 +711,20 @@ impl Interpreter {
                     DescriptorAllocationRoots::Runtime {
                         value_roots,
                         slice_roots,
-                    } => self.function_property_get_runtime_rooted(
+                    } => self.function_property_get_runtime_rooted_with_receiver(
                         context,
                         function_id,
+                        Some(target),
                         "prototype",
                         value_roots,
                         slice_roots,
                     )?,
                     DescriptorAllocationRoots::Stack(stack) => self
-                        .function_property_get_stack_rooted(
+                        .function_property_get_stack_rooted_with_receiver(
                             context,
                             stack,
                             function_id,
+                            Some(target),
                             "prototype",
                         )?,
                 };

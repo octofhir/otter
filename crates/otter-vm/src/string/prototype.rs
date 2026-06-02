@@ -478,15 +478,25 @@ fn impl_slice(
     receiver: &Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
+    // §22.1.3.20 — `intStart` / `intEnd` are ToIntegerOrInfinity, so a
+    // negative index counts from the end (`max(len + n, 0)`) rather than
+    // clamping to zero; only then is the span taken.
     let recv = receiver_string(ctx, receiver)?;
-    let total = recv.len();
-    let start = arg_u32_or(ctx, args, 0, 0)?.min(total);
-    let end = match args.get(1) {
-        Some(_) => arg_u32_or(ctx, args, 1, total)?.min(total),
-        None => total,
+    let total = recv.len() as i64;
+    let int_start = arg_int_or(ctx, args, 0, 0)?;
+    let from = if int_start < 0 {
+        (total + int_start).max(0)
+    } else {
+        int_start.min(total)
     };
-    let length = end.saturating_sub(start);
-    let out = recv.slice(start, length, ctx.heap_mut())?;
+    let int_end = arg_int_or(ctx, args, 1, total)?;
+    let to = if int_end < 0 {
+        (total + int_end).max(0)
+    } else {
+        int_end.min(total)
+    };
+    let length = (to - from).max(0);
+    let out = recv.slice(from as u32, length as u32, ctx.heap_mut())?;
     Ok(Value::string(out))
 }
 

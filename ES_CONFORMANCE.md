@@ -1406,6 +1406,18 @@ String wrapper object (`new String("123")`) rendered as
 `to_string_or_throw`, running the operand's `toString` / `valueOf`
 and throwing for a Symbol.
 
+### §23.2.5.1 TypedArray(object) constructor coercion (2026-06-02)
+
+`TypedArrayConstructors/ctors/object-arg` 13→22, `ctors-bigint/object-arg`
+likewise. Two defects: (1) the local `vm_to_native` collapsed a thrown JS
+exception (`VmError::Uncaught`) into a generic TypeError, so a `length`
+getter / element `valueOf` that threw kept the wrong error class — it now
+delegates to `vm_to_native_error` (preserves Thrown / ReferenceError /
+SyntaxError). (2) an Array argument (its own Value kind, not `as_object`)
+skipped the iterator/array-like branch and was copied without the
+per-element `ToNumber` / `ToBigInt`; `new TA([…])` now drains `@@iterator`
+and coerces each value, so element coercion hooks fire.
+
 ### §23.2.3.16 %TypedArray%.prototype.indexOf/includes/lastIndexOf (2026-06-02)
 
 `built-ins/TypedArray` +9. `ToIntegerOrInfinity(fromIndex)` was applied

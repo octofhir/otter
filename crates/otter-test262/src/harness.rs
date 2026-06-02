@@ -117,6 +117,11 @@ var $262 = (function () {
         }
     };
 })();
+// `print` host function (INTERPRETING.md). Async completion is detected
+// via the `$DONE` polyfill stub (appended after every include, so it wins
+// over `doneprintHandle.js`), so `print` only needs to exist as a callable
+// host binding for the non-async tests that reference it.
+globalThis.print = function print() {};
 "#;
 
 /// Errors raised by the harness loader.

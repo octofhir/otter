@@ -318,59 +318,69 @@ pub fn native_regexp_symbol_match(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
+    let name = "RegExp.prototype[@@match]";
     let receiver = *ctx.this_value();
-    let Some(re) = receiver.as_regexp() else {
+    // §22.2.6.8 step 1 — the receiver need only be an Object; the
+    // matching itself flows through the observable `exec` protocol.
+    if !receiver.is_object_type() {
         return Err(crate::NativeError::TypeError {
-            name: "RegExp.prototype[@@match]",
-            reason: "called on a non-RegExp receiver".to_string(),
+            name,
+            reason: "called on a non-object receiver".to_string(),
         });
-    };
-
-    let text = string_arg_to_jsstring(ctx, args, 0, "RegExp.prototype[@@match]")?;
-    let flags = re.flags(ctx.heap());
-    let units = text.to_utf16_vec(ctx.heap());
-    if !flags.global {
-        return exec_once_native(&re, text, ctx, &[]);
     }
-    let full_unicode = flags.unicode || flags.unicode_sets;
-    re.set_last_index(ctx.heap_mut(), 0);
-    let mut cursor: usize = 0;
+    // Step 3 — S = ? ToString(string).
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
+    let text = coerce_to_jsstring_runtime(ctx, &arg, name)?;
+    // Step 4-5 — flags = ? ToString(? Get(rx, "flags")); global = "g".
+    let flags_val = get_property_runtime(ctx, &receiver, "flags", name)?;
+    let flags_str = coerce_to_jsstring_runtime(ctx, &flags_val, name)?.to_lossy_string(ctx.heap());
+    let global = flags_str.contains('g');
+    if !global {
+        // Step 6 — RegExpExec(rx, S).
+        return regexp_exec_runtime(ctx, &receiver, text, name);
+    }
+    // Step 7 — global: reset lastIndex, then loop RegExpExec.
+    let full_unicode = flags_str.contains('u') || flags_str.contains('v');
+    set_property_runtime(ctx, &receiver, "lastIndex", Value::number_i32(0), name)?;
+    let text_units = text.to_utf16_vec(ctx.heap());
     let mut matches_out: Vec<Value> = Vec::new();
     loop {
-        let mut iter = re.find_from_utf16(ctx.heap(), &units, cursor).into_iter();
-        let m = match iter.next() {
-            Some(m) => m,
-            None => break,
-        };
-        let match_str = JsString::from_utf16_units(&units[m.range.clone()], ctx.heap_mut())
-            .map_err(|_| crate::NativeError::TypeError {
-                name: "RegExp.prototype[@@match]",
-                reason: "out of memory".to_string(),
-            })?;
-        matches_out.push(Value::string(match_str));
-        if m.range.start == m.range.end {
-            cursor = advance_string_index(&units, m.range.end, full_unicode);
-        } else {
-            cursor = m.range.end;
-        }
-        if cursor > units.len() {
+        let result = regexp_exec_runtime(ctx, &receiver, text, name)?;
+        if result.is_null() {
             break;
         }
+        // matchStr = ? ToString(? Get(result, "0")).
+        let match_val = get_property_runtime(ctx, &result, "0", name)?;
+        let match_str = coerce_to_jsstring_runtime(ctx, &match_val, name)?;
+        let is_empty = match_str.is_empty();
+        matches_out.push(Value::string(match_str));
+        if is_empty {
+            // Empty match — AdvanceStringIndex via the observable
+            // lastIndex so a custom `exec` / accessor sees the write.
+            let last_index_val = get_property_runtime(ctx, &receiver, "lastIndex", name)?;
+            let this_index = to_length_runtime(ctx, &last_index_val, name)? as usize;
+            let next_index = advance_string_index(&text_units, this_index, full_unicode);
+            set_property_runtime(
+                ctx,
+                &receiver,
+                "lastIndex",
+                Value::number_f64(next_index as f64),
+                name,
+            )?;
+        }
     }
-    re.set_last_index(ctx.heap_mut(), 0);
     if matches_out.is_empty() {
         return Ok(Value::null());
     }
-    let receiver_value = Value::regexp(re);
     let text_value = Value::string(text);
     let arr = ctx
         .array_from_elements_with_roots(
             matches_out.iter().cloned(),
-            &[&receiver_value, &text_value],
+            &[&receiver, &text_value],
             &[matches_out.as_slice()],
         )
         .map_err(|_| crate::NativeError::TypeError {
-            name: "RegExp.prototype[@@match]",
+            name,
             reason: "array allocation failed".to_string(),
         })?;
     Ok(Value::array(arr))

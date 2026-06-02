@@ -1326,6 +1326,18 @@ typed-array constructors (`BigInt64Array` / `BigUint64Array`
 both still bootstrap placeholders), and BigInt boxing
 (`Object(1n)` → BigInt wrapper object).
 
+### §22.2.6.8 RegExp.prototype[@@match] observable protocol (2026-06-02)
+
+`built-ins/RegExp` +15. `@@match` was a hardcoded fast path that
+required a real RegExp receiver and drove the engine directly,
+bypassing the spec's observable operations. It now follows
+§22.2.6.8: any Object receiver, `S = ToString(string)`, `flags =
+ToString(Get(rx, "flags"))`, and the match itself through
+`RegExpExec` (`Get(rx, "exec")` + call, falling back to the builtin
+exec) with `Set(rx, "lastIndex", …)` / AdvanceStringIndex on empty
+matches — so a monkey-patched `exec`, a `flags` accessor, a
+`lastIndex` setter, and a poisoned argument are all honoured.
+
 ### §22.2.7.2 RegExp.prototype.exec — ToString(input) (2026-06-02)
 
 `built-ins/RegExp` +12. `RegExp.prototype.exec` (and `test`,

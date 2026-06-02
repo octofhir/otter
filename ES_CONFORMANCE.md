@@ -2763,3 +2763,25 @@ Fixed: `iter-cstm-ctor` (`Array.from.call(C, iterable)` with a closure
 `C`). 0 regressions across `built-ins/Array`,
 `language/statements/class`, `language/expressions`, and
 `built-ins/Function`.
+
+## Array.of honours the `this` constructor and uses CreateDataProperty (§23.1.2.2)
+
+`Array.of` built the result with `Set` for both element indices and
+`length`. The spec uses `CreateDataPropertyOrThrow` for each element
+(so a pre-defined non-enumerable index on a custom-constructed instance
+is redefined to the data shape, and an abrupt define propagates) and a
+single observable `Set(A, "length", len, true)`. `native_of` now routes
+through `Interpreter::array_of_sync`: `Construct(C, «len»)` when `C` is
+a constructor (else a fresh ordinary Array), each item via
+`CreateDataPropertyOrThrow`, then the throwing length `Set`. The
+`Op::ArrayOf` fast path still builds a plain Array for direct
+`Array.of(...)` callsites.
+
+| section | before | after | delta |
+|---|---:|---:|---:|
+| `built-ins/Array/of` | 9/16 | 15/16 | +6 |
+
+Fixed: `does-not-use-set-for-indices`, `return-a-new-array-object`,
+`return-abrupt-from-data-property{,-using-proxy}`,
+`return-abrupt-from-setting-length`, `sets-length`. 0 regressions
+across `built-ins/Array`.

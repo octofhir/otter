@@ -310,6 +310,41 @@ impl Interpreter {
             )?))
         }
     }
+
+    /// §23.1.2.2 `Array.of(...items)` honouring the `this` constructor
+    /// `C`: when `C` is a constructor the result is `Construct(C,
+    /// «len»)`, else a fresh ordinary Array. Each item is installed via
+    /// `CreateDataPropertyOrThrow` and the length written through the
+    /// observable `Set(A, "length", len, true)`.
+    ///
+    /// The `Op::ArrayOf` fast path keeps building a plain Array for
+    /// direct `Array.of(...)` callsites; this is the reflective
+    /// (`Array.of.call(C, …)`) entry that must observe `C`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-array.of>
+    pub(crate) fn array_of_sync(
+        &mut self,
+        context: &ExecutionContext,
+        constructor: Value,
+        items: &[Value],
+    ) -> Result<Value, VmError> {
+        let use_ctor = !constructor.is_undefined()
+            && crate::abstract_ops::is_constructor(&constructor, context, &self.gc_heap);
+        let len = items.len();
+        let target = self.array_from_make_target(context, use_ctor, &constructor, Some(len))?;
+        let anchor_base = self.push_iteration_anchor(target) - 1;
+        let result = (|interp: &mut Self| -> Result<(), VmError> {
+            for (k, value) in items.iter().enumerate() {
+                interp.create_data_property_or_throw(context, target, &k.to_string(), *value)?;
+            }
+            Ok(())
+        })(self);
+        self.pop_iteration_anchors_to(anchor_base);
+        result?;
+        self.array_set_property_throwing(context, target, "length", Value::number_f64(len as f64))?;
+        Ok(target)
+    }
 }
 
 fn collect_array_args(

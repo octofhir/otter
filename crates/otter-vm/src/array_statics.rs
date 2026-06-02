@@ -26,8 +26,6 @@
 //! - <https://tc39.es/ecma262/#sec-array.from>
 //! - <https://tc39.es/ecma262/#sec-array.of>
 
-use smallvec::SmallVec;
-
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::{NativeCtx, NativeError, Value, VmError};
@@ -58,20 +56,20 @@ fn native_is_array(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     Ok(Value::boolean(args.first().is_some_and(|v| v.is_array())))
 }
 
-/// §23.1.2.3 `Array.of(...items)` JS-visible NativeFunction.
+/// §23.1.2.2 `Array.of(...items)` JS-visible NativeFunction. Routes
+/// through `Interpreter::array_of_sync` so `Array.of.call(C, …)`
+/// observes the `this` constructor `C` (`Construct(C, «len»)` plus the
+/// spec `CreateDataPropertyOrThrow` / `Set(A, "length", …)` protocol).
 fn native_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
-    if is_constructor(&this_value) {
-        return construct_and_fill(ctx, &this_value, args)
-            .map_err(|e| vm_to_native_array_static("Array.of", e));
-    }
-    let arr = ctx
-        .array_from_elements_with_roots(args.iter().cloned(), &[], &[args])
-        .map_err(|_| NativeError::TypeError {
-            name: "Array.of",
-            reason: "out of memory while allocating array".to_string(),
-        })?;
-    Ok(Value::array(arr))
+    let (interp, exec) = ctx.interp_mut_and_context();
+    let exec = exec.ok_or_else(|| NativeError::TypeError {
+        name: "Array.of",
+        reason: "missing execution context".to_string(),
+    })?;
+    interp
+        .array_of_sync(&exec, this_value, args)
+        .map_err(|e| vm_to_native_array_static("Array.of", e))
 }
 
 /// §23.1.2.1 `Array.from(items, mapFn?, thisArg?)` JS-visible
@@ -88,46 +86,6 @@ fn native_from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
     interp
         .array_from_sync(&exec, this_value, args)
         .map_err(|e| vm_to_native_array_static("Array.from", e))
-}
-
-fn is_constructor(value: &Value) -> bool {
-    value.is_function()
-        || value.is_closure()
-        || value.is_native_function()
-        || value.is_bound_function()
-        || value.is_class_constructor()
-}
-
-/// §23.1.2.3 step 4–7: `Construct(C, «len»)` then write each item
-/// via `CreateDataPropertyOrThrow`.
-fn construct_and_fill(
-    ctx: &mut NativeCtx<'_>,
-    target: &Value,
-    args: &[Value],
-) -> Result<Value, VmError> {
-    let len = args.len();
-    let mut ctor_args: SmallVec<[Value; 8]> = SmallVec::with_capacity(1);
-    ctor_args.push(Value::number_i32(len as i32));
-    let receiver = {
-        let (interp, exec) = ctx.interp_mut_and_context();
-        let exec = exec.ok_or(VmError::InvalidOperand)?;
-        interp.run_construct_sync(&exec, target, *target, ctor_args)?
-    };
-    let receiver_obj = if let Some(obj) = receiver.as_object() {
-        obj
-    } else if receiver.is_array() {
-        return Ok(receiver);
-    } else {
-        return Err(VmError::TypeError {
-            message: "Array.of constructor returned a non-object".to_string(),
-        });
-    };
-    for (idx, value) in args.iter().enumerate() {
-        let key = idx.to_string();
-        ctx.set_property(receiver_obj, &key, *value)?;
-    }
-    ctx.set_property(receiver_obj, "length", Value::number_i32(len as i32))?;
-    Ok(receiver)
 }
 
 fn vm_to_native_array_static(name: &'static str, err: VmError) -> NativeError {

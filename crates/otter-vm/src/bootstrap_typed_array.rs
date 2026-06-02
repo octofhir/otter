@@ -1084,49 +1084,55 @@ fn ta_ctor_dispatch(
     // the per-kind dispatcher's array-like path collects the
     // yielded values rather than reading the (probably-undefined)
     // `length` own slot.
-    let iter_pre: Option<SmallVec<[Value; 4]>> = if let (Some(src_obj), Some(exec)) =
-        (args.first().and_then(|v| v.as_object()), exec.as_ref())
-    {
-        let iter_sym = ctx
-            .cx
-            .interp
-            .well_known_symbols()
-            .get(crate::symbol::WellKnown::Iterator);
-        let src_value = Value::object(src_obj);
-        // §23.2.5.1 — GetMethod(source, @@iterator): an Object source
-        // with a callable `@@iterator` initializes from the drained
-        // iterator; otherwise it is an array-like read with observable
-        // `[[Get]]` + `ToNumber` / `ToBigInt`. Either way the values are
-        // coerced up-front so the per-kind dispatcher only narrows.
-        let iter_method = ta_get_via(
-            ctx,
-            exec,
-            src_value,
-            &crate::VmPropertyKey::Symbol(iter_sym),
-        )?;
-        let drained = if ctx.cx.interp.is_callable_runtime(&iter_method) {
-            // §22.2.4.4 — IterableToList collects raw values, then each
-            // is converted (ToNumber / ToBigInt) when stored.
-            let raw = drain_iterable_into_values(ctx, exec, &src_value, iter_method)?;
-            coerce_values_for_kind(ctx, exec, raw, kind)?
+    // §23.2.5.1 — an ordinary Object *or* an Array source initializes
+    // from `@@iterator` / array-like reads. An Array is its own Value
+    // kind (not `as_object`), so it must be matched explicitly or
+    // `new TA([…])` would skip the observable element coercion entirely.
+    let src_value_opt = args
+        .first()
+        .copied()
+        .filter(|v| v.is_object() || v.is_array());
+    let iter_pre: Option<SmallVec<[Value; 4]>> =
+        if let (Some(src_value), Some(exec)) = (src_value_opt, exec.as_ref()) {
+            let iter_sym = ctx
+                .cx
+                .interp
+                .well_known_symbols()
+                .get(crate::symbol::WellKnown::Iterator);
+            // §23.2.5.1 — GetMethod(source, @@iterator): an Object source
+            // with a callable `@@iterator` initializes from the drained
+            // iterator; otherwise it is an array-like read with observable
+            // `[[Get]]` + `ToNumber` / `ToBigInt`. Either way the values are
+            // coerced up-front so the per-kind dispatcher only narrows.
+            let iter_method = ta_get_via(
+                ctx,
+                exec,
+                src_value,
+                &crate::VmPropertyKey::Symbol(iter_sym),
+            )?;
+            let drained = if ctx.cx.interp.is_callable_runtime(&iter_method) {
+                // §22.2.4.4 — IterableToList collects raw values, then each
+                // is converted (ToNumber / ToBigInt) when stored.
+                let raw = drain_iterable_into_values(ctx, exec, &src_value, iter_method)?;
+                coerce_values_for_kind(ctx, exec, raw, kind)?
+            } else {
+                read_array_like_coerced(ctx, exec, src_value, kind)?
+            };
+            let arr = ctx
+                .array_from_elements(drained)
+                .map_err(|_| NativeError::TypeError {
+                    name: typed_array_name(kind),
+                    reason: "out of memory while allocating array".to_string(),
+                })?;
+            let mut out: SmallVec<[Value; 4]> = SmallVec::new();
+            out.push(Value::array(arr));
+            for v in args.iter().skip(1) {
+                out.push(*v);
+            }
+            Some(out)
         } else {
-            read_array_like_coerced(ctx, exec, src_value, kind)?
+            None
         };
-        let arr = ctx
-            .array_from_elements(drained)
-            .map_err(|_| NativeError::TypeError {
-                name: typed_array_name(kind),
-                reason: "out of memory while allocating array".to_string(),
-            })?;
-        let mut out: SmallVec<[Value; 4]> = SmallVec::new();
-        out.push(Value::array(arr));
-        for v in args.iter().skip(1) {
-            out.push(*v);
-        }
-        Some(out)
-    } else {
-        None
-    };
     let coerced: SmallVec<[Value; 4]> = if let Some(pre) = iter_pre {
         pre
     } else if args.first().is_some_and(|v| v.is_array_buffer()) {
@@ -1401,24 +1407,12 @@ fn ta_callback_dispatch(
 // ---------------------------------------------------------------
 
 fn vm_to_native(err: VmError, name: &'static str) -> NativeError {
-    match err {
-        VmError::TypeError { message } => NativeError::TypeError {
-            name,
-            reason: message,
-        },
-        VmError::TypeMismatch => NativeError::TypeError {
-            name,
-            reason: "type mismatch".to_string(),
-        },
-        VmError::RangeError { message } => NativeError::RangeError {
-            name,
-            reason: message,
-        },
-        other => NativeError::TypeError {
-            name,
-            reason: other.to_string(),
-        },
-    }
+    // Delegate to the canonical mapping so a thrown JS exception
+    // (`VmError::Uncaught`) keeps its identity as `NativeError::Thrown`
+    // rather than collapsing into a generic TypeError — array-like
+    // `length` getters / element `valueOf` hooks re-throw user errors
+    // (Test262Error, RangeError, …) that must propagate unchanged.
+    crate::native_function::vm_to_native_error(err, name)
 }
 
 // ---------------------------------------------------------------

@@ -1866,7 +1866,7 @@ impl Interpreter {
     /// otherwise (firing the operand's coercion and throwing for a
     /// Symbol / cross-numeric type), then narrow it to the element
     /// representation. The conversion runs before the index check.
-    fn typed_array_coerce_element(
+    pub(crate) fn typed_array_coerce_element(
         &mut self,
         context: &ExecutionContext,
         kind: crate::binary::TypedArrayKind,

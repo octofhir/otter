@@ -1326,6 +1326,17 @@ typed-array constructors (`BigInt64Array` / `BigUint64Array`
 both still bootstrap placeholders), and BigInt boxing
 (`Object(1n)` → BigInt wrapper object).
 
+### §10.4.5.3 TypedArray [[DefineOwnProperty]] value coercion (2026-06-02)
+
+`built-ins/TypedArray` +4. `Object.defineProperty(ta, i, {value})`
+on an in-bounds integer index narrowed the descriptor value with a
+lenient coercion, so an object value's `valueOf` never ran (it stored
+`0`). After the index / attribute validity checks (§10.4.5.3 steps
+a-e), the descriptor value is now converted with `ToNumber` /
+`ToBigInt` (step f, via the shared `typed_array_coerce_element`)
+before the store, so its coercion runs and a Symbol / cross-type
+value throws.
+
 ### §10.4.5.16 TypedArray integer-indexed [[Set]] value coercion (2026-06-02)
 
 `built-ins/TypedArray` +7. Storing into an integer-indexed element

@@ -1326,11 +1326,11 @@ impl Interpreter {
                     return Ok(false);
                 }
                 if let Some(value) = descriptor.value {
-                    let coerced = crate::binary::dispatch::coerce_element_for_store(
-                        &mut self.gc_heap,
-                        t.kind(),
-                        &value,
-                    )?;
+                    // §10.4.5.3 step f — SetTypedArrayElement converts the
+                    // descriptor value with ToNumber / ToBigInt (firing
+                    // its coercion and throwing for a Symbol / cross-type)
+                    // before storing it.
+                    let coerced = self.typed_array_coerce_element(context, t.kind(), value)?;
                     t.set(&mut self.gc_heap, n as usize, &coerced);
                 }
                 return Ok(true);

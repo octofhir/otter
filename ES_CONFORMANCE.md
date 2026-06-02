@@ -1326,6 +1326,17 @@ typed-array constructors (`BigInt64Array` / `BigUint64Array`
 both still bootstrap placeholders), and BigInt boxing
 (`Object(1n)` → BigInt wrapper object).
 
+### §10.4.2.4 Array `length` setter (ArraySetLength) (2026-06-02)
+
+`built-ins/Array` +7. `arr.length = v` went through a lenient named
+store that silently clamped the value, so `length = 2**32 / -1 / 2.5`
+set 0 instead of throwing `RangeError`, and an object value's
+`valueOf` never ran. The assignment is a `[[DefineOwnProperty]]` of
+"length", so it now routes through the shared define path: `ToUint32`
+must equal `ToNumber` (else RangeError), the value's `valueOf` runs,
+and a shrink deletes from the top down honoring non-configurable
+elements.
+
 ### §23.1.3.1 Array.prototype.concat ArraySpeciesCreate (2026-06-02)
 
 `built-ins/Array` +11. `concat` collected its elements into a plain

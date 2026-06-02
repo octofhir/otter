@@ -1228,6 +1228,31 @@ impl Interpreter {
                 }
             }
         } else if let Some(a) = receiver.as_array() {
+            // §10.4.2.4 ArraySetLength — `arr.length = v` is a
+            // [[DefineOwnProperty]] of "length", so ToUint32(v) must
+            // equal ToNumber(v) (else RangeError) and the value's
+            // `valueOf` runs. Route it through the shared define path
+            // rather than the lenient named-property store.
+            if name == "length" {
+                let descriptor = object::PartialPropertyDescriptor {
+                    value: Some(value),
+                    ..Default::default()
+                };
+                let ok = self.define_own_property_value(
+                    context,
+                    &receiver,
+                    &crate::VmPropertyKey::String("length"),
+                    descriptor,
+                )?;
+                if !ok {
+                    Self::failed_set_result(
+                        strict,
+                        "Cannot assign to read only property 'length' of array".to_string(),
+                    )?;
+                }
+                stack[top_idx].advance_pc(self.current_byte_len)?;
+                return Ok(());
+            }
             if !self.store_array_accessor_property(context, a, name, &value, strict)? {
                 let has_own_named =
                     crate::array::get_named_property(a, &self.gc_heap, name).is_some();

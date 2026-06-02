@@ -1499,6 +1499,20 @@ failure. The gather phase already used `HasProperty` + `Get`, so an
 index getter that mutates the array mid-sort was observed — the
 precise getter / setter / length / append / delete tests now pass.
 
+### §23.1.3.36 Array.prototype.toString reads "join" + Object fallback (2026-06-03)
+
+`built-ins/Array` +2. `toString` was aliased straight to the `join`
+path. Per §23.1.3.36 it must `Get(O, "join")` and, when that is not
+callable, fall back to `%Object.prototype.toString%`. It now invokes
+the resolved `join` when callable, else computes the
+`%Object.prototype.toString%` result directly — so a non-callable own
+`join` (e.g. `{ join: null }`) yields `"[object Object]"`, a boolean
+receiver yields `"[object Boolean]"`, and the fallback works even after
+`Object.prototype.toString` is deleted (it does not route through a
+property lookup). The builtin-tag classifier is now shared between
+`Object.prototype.toString` and this fallback via
+`builtin_to_string_tag_value`.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

@@ -1176,7 +1176,16 @@ fn property_key_to_vm_key(key: &PropertyKey) -> crate::VmPropertyKey<'static> {
 /// `"Object"` and relies on a prototype-installed `@@toStringTag`
 /// for its kind-specific string.
 fn builtin_to_string_tag(ctx: &NativeCtx<'_>) -> String {
-    let v = ctx.this_value();
+    builtin_to_string_tag_value(*ctx.this_value(), ctx.cx.interp)
+}
+
+/// §20.1.3.6 builtinTag classification for an arbitrary value, shared
+/// by `Object.prototype.toString` and `Array.prototype.toString`'s
+/// `%Object.prototype.toString%` fallback (which must work even after
+/// the `toString` property is deleted, so it cannot route through a
+/// property lookup).
+pub(crate) fn builtin_to_string_tag_value(v: Value, interp: &crate::Interpreter) -> String {
+    let v = &v;
     if v.is_undefined() || v.is_hole() {
         return "Undefined".to_string();
     }
@@ -1227,28 +1236,28 @@ fn builtin_to_string_tag(ctx: &NativeCtx<'_>) -> String {
         return "Object".to_string();
     }
     if v.is_proxy() {
-        return proxy_builtin_tag(v, ctx.heap());
+        return proxy_builtin_tag(v, interp.gc_heap());
     }
     if let Some(obj) = v.as_object() {
-        if crate::object::is_arguments_object(obj, ctx.heap()) {
+        if crate::object::is_arguments_object(obj, interp.gc_heap()) {
             return "Arguments".to_string();
         }
-        if crate::object::date_data(obj, ctx.heap()).is_some() {
+        if crate::object::date_data(obj, interp.gc_heap()).is_some() {
             return "Date".to_string();
         }
-        if crate::object::call_native(obj, ctx.heap()).is_some() {
+        if crate::object::call_native(obj, interp.gc_heap()).is_some() {
             return "Function".to_string();
         }
-        if crate::object::boolean_data(obj, ctx.heap()).is_some() {
+        if crate::object::boolean_data(obj, interp.gc_heap()).is_some() {
             return "Boolean".to_string();
         }
-        if crate::object::number_data(obj, ctx.heap()).is_some() {
+        if crate::object::number_data(obj, interp.gc_heap()).is_some() {
             return "Number".to_string();
         }
-        if crate::object::string_data(obj, ctx.heap()).is_some() {
+        if crate::object::string_data(obj, interp.gc_heap()).is_some() {
             return "String".to_string();
         }
-        if object_has_error_data(ctx, obj) {
+        if object_has_error_data_value(obj, interp) {
             return "Error".to_string();
         }
         return "Object".to_string();
@@ -1293,10 +1302,10 @@ fn proxy_builtin_tag(value: &Value, heap: &otter_gc::GcHeap) -> String {
 /// realm error prototype is reached. Used as a substitute for the
 /// spec's `[[ErrorData]]` internal slot, which Otter does not carry
 /// on ordinary object instances.
-fn object_has_error_data(ctx: &NativeCtx<'_>, obj: crate::object::JsObject) -> bool {
+fn object_has_error_data_value(obj: crate::object::JsObject, interp: &crate::Interpreter) -> bool {
     use crate::ErrorKind;
-    let heap = ctx.heap();
-    let registry = &ctx.cx.interp.error_classes;
+    let heap = interp.gc_heap();
+    let registry = &interp.error_classes;
     // §20.5.3 "The Error prototype object does not have an
     // `[[ErrorData]]` internal slot." Treat any of the realm error
     // prototypes as ordinary objects when probed directly — only

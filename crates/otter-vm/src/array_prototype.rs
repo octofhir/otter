@@ -538,7 +538,7 @@ impl Interpreter {
                 let separator_arg = args.first().copied();
                 Some(self.array_join(context, receiver, separator_arg, roots))
             }
-            "toString" => Some(self.array_join(context, receiver, None, roots)),
+            "toString" => Some(self.array_to_string(context, receiver, roots)),
             "toLocaleString" => Some(self.array_to_locale_string(context, receiver, roots)),
             "concat" => Some(self.array_concat(context, receiver, args, roots)),
             "sort" => {
@@ -959,6 +959,61 @@ impl Interpreter {
         let joined = parts.join(&separator);
         Ok(Value::string(JsString::from_str(
             &joined,
+            self.gc_heap_mut(),
+        )?))
+    }
+
+    /// §23.1.3.36 `Array.prototype.toString`. Reads `Get(O, "join")`
+    /// and calls it when callable; otherwise falls back to the
+    /// `%Object.prototype.toString%` intrinsic — which must work even
+    /// when the `toString` property has been deleted, so the result is
+    /// computed directly rather than through a property lookup.
+    pub(crate) fn array_to_string(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        let func = self.get_property_value_for_call(context, o, "join")?;
+        if self.is_callable_runtime(&func) {
+            return self.run_callable_sync(context, &func, o, SmallVec::new());
+        }
+        self.ordinary_object_to_string(context, o)
+    }
+
+    /// §20.1.3.6 `%Object.prototype.toString%` applied to `o`: a string
+    /// `@@toStringTag` overrides the builtin tag, yielding
+    /// `"[object <tag>]"`. Shared fallback for `Array.prototype.toString`.
+    fn ordinary_object_to_string(
+        &mut self,
+        context: &ExecutionContext,
+        o: Value,
+    ) -> Result<Value, VmError> {
+        let tag_sym = self.well_known_symbols().get(WellKnown::ToStringTag);
+        let explicit = match self.ordinary_get_value(
+            context,
+            o,
+            o,
+            &crate::VmPropertyKey::Symbol(tag_sym),
+            0,
+        )? {
+            crate::VmGetOutcome::Value(v) => v,
+            crate::VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(context, &getter, o, SmallVec::new())?
+            }
+        };
+        let tag = explicit
+            .as_string(self.gc_heap())
+            .map(|s| s.to_lossy_string(self.gc_heap()))
+            .unwrap_or_else(|| crate::object_statics::builtin_to_string_tag_value(o, self));
+        let display = format!("[object {tag}]");
+        Ok(Value::string(JsString::from_str(
+            &display,
             self.gc_heap_mut(),
         )?))
     }

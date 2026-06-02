@@ -1513,6 +1513,13 @@ property lookup). The builtin-tag classifier is now shared between
 `Object.prototype.toString` and this fallback via
 `builtin_to_string_tag_value`.
 
+### §23.1.1.1 new Array(len) invalid length is RangeError (2026-06-03)
+
+`built-ins/Array` +3 (`length/S15.4.2.2_A2.2_*`). `new Array(n)` with a
+single Number argument threw a `TypeError` when `n` was not a valid
+array length (`-1`, `2**32`, `2.5`). Per §23.1.1.1 step 8.b the
+`ToUint32(len) ≠ len` case is a `RangeError`. Changed the error class.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

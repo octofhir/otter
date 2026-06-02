@@ -60,8 +60,11 @@ impl Interpreter {
         {
             let raw = n.as_f64();
             let len = raw as u32;
+            // §23.1.1.1 step 8.b — a single Number argument whose
+            // ToUint32 round-trip differs from the value is not a valid
+            // array length and raises a RangeError (not a TypeError).
             if !raw.is_finite() || raw < 0.0 || raw != f64::from(len) {
-                return Err(VmError::TypeError {
+                return Err(VmError::RangeError {
                     message: "Invalid array length".to_string(),
                 });
             }

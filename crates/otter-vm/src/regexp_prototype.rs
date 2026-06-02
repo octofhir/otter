@@ -645,19 +645,20 @@ fn to_length_runtime(
     value: &Value,
     name: &'static str,
 ) -> Result<u64, crate::NativeError> {
-    let primitive = if crate::abstract_ops::is_primitive(value) {
-        *value
-    } else {
-        let (interp, exec) = ctx.interp_mut_and_context();
-        let exec = exec.ok_or_else(|| crate::NativeError::TypeError {
+    // §7.1.20 ToLength = ToIntegerOrInfinity(? ToNumber(arg)) clamped to
+    // [0, 2^53-1]. ToNumber throws for a Symbol / BigInt and runs (and so
+    // can re-throw from) a `valueOf`, so the fallible coercion is required —
+    // an infallible NaN cast would silently swallow those abrupt completions.
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| crate::NativeError::TypeError {
             name,
             reason: "missing execution context".to_string(),
         })?;
-        interp
-            .evaluate_to_primitive(&exec, value, crate::abstract_ops::ToPrimitiveHint::Number)
-            .map_err(vm_err_to_native(name))?
-    };
-    let n = crate::number::to_number_value(&primitive, ctx.heap());
+    let n = crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, value)
+        .map_err(vm_err_to_native(name))?
+        .as_f64();
     if n.is_nan() || n <= 0.0 {
         return Ok(0);
     }
@@ -950,6 +951,20 @@ pub fn native_regexp_symbol_replace(
             let raw_str = coerce_to_jsstring_runtime(ctx, &raw, name)?;
             raw_str.to_utf16_vec(ctx.heap())
         } else {
+            // §22.2.6.11 step 14.n.i — the non-functional path coerces a
+            // present `groups` with ToObject before GetSubstitution. `null`
+            // (from a monkey-patched `exec`) throws; a primitive is passed
+            // through, since the `$<name>` lookups read it via the full
+            // [[Get]], which boxes primitives the same way ToObject would.
+            let named_captures_coerced = match named_captures_obj {
+                Some(nc) if nc.is_nullish() => {
+                    return Err(crate::NativeError::TypeError {
+                        name,
+                        reason: "named capture groups is not coercible to an Object".to_string(),
+                    });
+                }
+                other => other,
+            };
             let template = replacement_template
                 .as_ref()
                 .expect("non-functional path has a template")
@@ -960,7 +975,7 @@ pub fn native_regexp_symbol_replace(
                 &s_units,
                 position,
                 &captures,
-                named_captures_obj.as_ref(),
+                named_captures_coerced.as_ref(),
                 &template,
                 name,
             )?

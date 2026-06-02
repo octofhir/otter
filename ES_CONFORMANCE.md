@@ -1406,7 +1406,27 @@ String wrapper object (`new String("123")`) rendered as
 `to_string_or_throw`, running the operand's `toString` / `valueOf`
 and throwing for a Symbol.
 
+### §22.1.3.20 String.prototype.slice negative indices (2026-06-02)
+
+`built-ins/String/prototype/slice` +2; `built-ins/String/prototype`
+1140→1149. `slice` read start/end with the unsigned arg helper, so a
+negative index clamped to 0 instead of counting from the end
+(`"hello".slice(0,-1)` → `""`). It now applies ToIntegerOrInfinity with
+the spec from/to computation. The fix also unblocked the TypedArray
+`object-arg/conversion-operation` test (the harness keys on
+`TA.name.slice(0, -5)`).
+
 ### §23.2.5.1 TypedArray(object) constructor coercion (2026-06-02)
+
+`TypedArrayConstructors/ctors/object-arg` 13→25 across the session. After
+the array-coercion + thrown-error fix, the source detection was broadened
+from object-or-array to any Object (minus ArrayBuffer / TypedArray) so a
+function / generator / proxy source has its `@@iterator` read, and
+`drain_iterable_into_values` now routes iterator throws through
+`vm_to_native` so a generator throwing mid-iteration propagates its
+original error class.
+
+
 
 `TypedArrayConstructors/ctors/object-arg` 13→22, `ctors-bigint/object-arg`
 likewise. Two defects: (1) the local `vm_to_native` collapsed a thrown JS

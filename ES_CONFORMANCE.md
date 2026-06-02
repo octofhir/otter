@@ -1472,6 +1472,20 @@ throws a `TypeError` for a revoked proxy). A `Proxy` wrapping an array
 was therefore concatenated as a single element instead of spread, and a
 revoked proxy did not throw. The fallback now calls `is_array_spec`.
 
+### §10.4.2.1 Array symbol-keyed accessor descriptors (2026-06-03)
+
+`built-ins/Array` +1 (concat `is-concat-spreadable-get-order`).
+`Object.defineProperty(arr, sym, { get, set })` stored only the
+`[[Value]]`, discarding the getter/setter, because arrays kept a
+data-only symbol table. So a symbol accessor on an array (e.g. an own
+`@@isConcatSpreadable` / `@@toPrimitive` getter) never fired. A
+dedicated `symbol_accessors` side table now holds the getter/setter
+pair (a symbol lives in exactly one of the data / accessor tables), and
+the array `[[Get]]`, `[[HasProperty]]`, `[[GetOwnProperty]]`,
+`[[Delete]]`, and own-symbol-key enumeration all consult it — so the
+getter is invoked, `getOwnPropertyDescriptor` reports the accessor
+shape, and `getOwnPropertySymbols` lists the key.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

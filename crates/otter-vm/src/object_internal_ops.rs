@@ -605,6 +605,12 @@ impl Interpreter {
             // `Object.getOwnPropertyDescriptor(arr, sym)` and
             // `hasOwnProperty(sym)` observe the spec shape.
             if let VmPropertyKey::Symbol(sym) = key {
+                if let Some((getter, setter)) = array::get_symbol_accessor(arr, &self.gc_heap, *sym)
+                {
+                    return Ok(Some(object::PropertyDescriptor::accessor(
+                        getter, setter, true, true,
+                    )));
+                }
                 if let Some(value) = array::get_symbol_property(arr, &self.gc_heap, *sym) {
                     return Ok(Some(object::PropertyDescriptor::data(
                         value, true, true, true,
@@ -1235,8 +1241,20 @@ impl Interpreter {
         }
         if let Some(arr) = target.as_array() {
             if let VmPropertyKey::Symbol(sym) = key {
-                let value = descriptor.value.unwrap_or(Value::undefined());
-                array::set_symbol_property(arr, &mut self.gc_heap, *sym, value);
+                // §10.4.2.1 — a symbol accessor descriptor installs a
+                // getter/setter pair; a data descriptor stores the value.
+                if descriptor.is_accessor() {
+                    array::set_symbol_accessor(
+                        arr,
+                        &mut self.gc_heap,
+                        *sym,
+                        descriptor.get,
+                        descriptor.set,
+                    );
+                } else {
+                    let value = descriptor.value.unwrap_or(Value::undefined());
+                    array::set_symbol_property(arr, &mut self.gc_heap, *sym, value);
+                }
                 return Ok(true);
             }
             let Some(k) = key.string_name() else {
@@ -2885,6 +2903,16 @@ impl Interpreter {
         if let Some(arr) = base.as_array() {
             let value = match key {
                 VmPropertyKey::Symbol(sym) => {
+                    if let Some((getter, _)) =
+                        crate::array::get_symbol_accessor(arr, &self.gc_heap, *sym)
+                    {
+                        match getter {
+                            Some(callable) if abstract_ops::is_callable(&callable) => {
+                                return Ok(VmGetOutcome::InvokeGetter { getter: callable });
+                            }
+                            _ => return Ok(VmGetOutcome::Value(Value::undefined())),
+                        }
+                    }
                     if let Some(v) = crate::array::get_symbol_property(arr, &self.gc_heap, *sym) {
                         v
                     } else if let Some(p) = self
@@ -3592,7 +3620,9 @@ impl Interpreter {
                     Ok(true)
                 }
                 VmPropertyKey::Symbol(sym) => {
-                    if array::get_symbol_property(arr, &self.gc_heap, *sym).is_some() {
+                    if array::get_symbol_property(arr, &self.gc_heap, *sym).is_some()
+                        || array::get_symbol_accessor(arr, &self.gc_heap, *sym).is_some()
+                    {
                         return Ok(true);
                     }
                     let proto = self.constructor_prototype_value("Array")?;

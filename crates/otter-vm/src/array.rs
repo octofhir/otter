@@ -82,6 +82,14 @@ pub struct ArrayBody {
     /// so the `Option` keeps the inline footprint at one word.
     #[pelt(via = trace_array_symbol_properties)]
     pub(crate) symbol_properties: Option<Vec<(crate::symbol::JsSymbol, Value)>>,
+    /// Symbol-keyed accessor descriptors installed via
+    /// `Object.defineProperty(arr, sym, { get, set })`. Kept separate
+    /// from `symbol_properties` (which is data-only); a given symbol is
+    /// in exactly one table. `(getter, setter)` — either may be `None`.
+    /// Spec: §10.4.2.1 ArrayExoticObject [[DefineOwnProperty]].
+    #[pelt(via = trace_array_symbol_accessors)]
+    pub(crate) symbol_accessors:
+        Option<Vec<(crate::symbol::JsSymbol, (Option<Value>, Option<Value>))>>,
     /// Verbatim slice of input text captured by `JSON.parse` for the
     /// lazy stringify memcpy fast-path. `Some` only when the array
     /// originated from `JSON.parse`; the slice spans the closing
@@ -119,6 +127,24 @@ fn trace_array_symbol_properties(
     if let Some(entries) = field {
         for (_sym, value) in entries {
             value.trace_value_slots(visitor);
+        }
+    }
+}
+
+/// Trace helper for symbol-keyed accessor descriptors: only the
+/// getter / setter `Value` slots carry GC references.
+fn trace_array_symbol_accessors(
+    field: &Option<Vec<(crate::symbol::JsSymbol, (Option<Value>, Option<Value>))>>,
+    visitor: &mut SlotVisitor<'_>,
+) {
+    if let Some(entries) = field {
+        for (_sym, (getter, setter)) in entries {
+            if let Some(g) = getter {
+                g.trace_value_slots(visitor);
+            }
+            if let Some(s) = setter {
+                s.trace_value_slots(visitor);
+            }
         }
     }
 }
@@ -789,6 +815,14 @@ pub fn set_symbol_property(
 ) {
     let barrier_value = value;
     heap.with_payload(arr, |body| {
+        // A symbol is in exactly one table — installing a data value
+        // removes any accessor previously held for the same key.
+        if let Some(accessors) = body.symbol_accessors.as_mut() {
+            accessors.retain(|(k, _)| !k.ptr_eq(key));
+            if accessors.is_empty() {
+                body.symbol_accessors = None;
+            }
+        }
         let table = body.symbol_properties.get_or_insert_with(Vec::new);
         if let Some(slot) = table.iter_mut().find(|(k, _)| k.ptr_eq(key)) {
             slot.1 = value;
@@ -798,6 +832,53 @@ pub fn set_symbol_property(
         body.dirty = true;
     });
     heap.record_write(arr, &barrier_value);
+}
+
+/// Install a symbol-keyed accessor descriptor, removing any data slot
+/// previously held for the same key (a symbol is in one table only).
+pub fn set_symbol_accessor(
+    arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    key: crate::symbol::JsSymbol,
+    getter: Option<Value>,
+    setter: Option<Value>,
+) {
+    heap.with_payload(arr, |body| {
+        if let Some(table) = body.symbol_properties.as_mut() {
+            table.retain(|(k, _)| !k.ptr_eq(key));
+            if table.is_empty() {
+                body.symbol_properties = None;
+            }
+        }
+        let accessors = body.symbol_accessors.get_or_insert_with(Vec::new);
+        if let Some(slot) = accessors.iter_mut().find(|(k, _)| k.ptr_eq(key)) {
+            slot.1 = (getter, setter);
+        } else {
+            accessors.push((key, (getter, setter)));
+        }
+        body.dirty = true;
+    });
+    if let Some(g) = &getter {
+        heap.record_write(arr, g);
+    }
+    if let Some(s) = &setter {
+        heap.record_write(arr, s);
+    }
+}
+
+/// Read a symbol-keyed accessor descriptor. Returns `None` when no
+/// accessor is installed for `key`.
+#[must_use]
+pub fn get_symbol_accessor(
+    arr: JsArray,
+    heap: &otter_gc::GcHeap,
+    key: crate::symbol::JsSymbol,
+) -> Option<(Option<Value>, Option<Value>)> {
+    heap.read_payload(arr, |body| {
+        body.symbol_accessors
+            .as_ref()
+            .and_then(|table| table.iter().find(|(k, _)| k.ptr_eq(key)).map(|(_, v)| *v))
+    })
 }
 
 /// Read a symbol-keyed own property. Returns `None` when the slot
@@ -834,6 +915,15 @@ pub fn delete_symbol_property(
             }
             body.dirty = true;
         }
+        if let Some(table) = body.symbol_accessors.as_mut()
+            && let Some(pos) = table.iter().position(|(k, _)| k.ptr_eq(key))
+        {
+            table.remove(pos);
+            if table.is_empty() {
+                body.symbol_accessors = None;
+            }
+            body.dirty = true;
+        }
         true
     })
 }
@@ -843,9 +933,14 @@ pub fn delete_symbol_property(
 #[must_use]
 pub fn own_symbol_keys(arr: JsArray, heap: &otter_gc::GcHeap) -> Vec<crate::symbol::JsSymbol> {
     heap.read_payload(arr, |body| {
-        body.symbol_properties
+        let mut keys: Vec<crate::symbol::JsSymbol> = body
+            .symbol_properties
             .as_ref()
-            .map_or_else(Vec::new, |t| t.iter().map(|(k, _)| *k).collect())
+            .map_or_else(Vec::new, |t| t.iter().map(|(k, _)| *k).collect());
+        if let Some(accessors) = body.symbol_accessors.as_ref() {
+            keys.extend(accessors.iter().map(|(k, _)| *k));
+        }
+        keys
     })
 }
 

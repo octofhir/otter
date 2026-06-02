@@ -506,6 +506,177 @@ impl ErrorClassRegistry {
             "toString",
             PropertyDescriptor::data(to_string_root, true, false, true),
         );
+        // `get`/`set Error.prototype.stack` — the Error Stacks proposal
+        // (`sec-get-error.prototype.stack`). `stack` is an accessor on
+        // `%Error.prototype%` (non-enumerable, configurable). The getter
+        // returns an implementation-defined string for objects with an
+        // `[[ErrorData]]` internal slot (modelled by an error prototype
+        // in the chain) and `undefined` otherwise; the setter installs an
+        // own data property on the receiver via
+        // SetterThatIgnoresPrototypeProperties.
+        fn error_stack_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+            let receiver = *ctx.this_value();
+            // step 2 — E is not an Object → TypeError. A Proxy is an
+            // Object even though it is not an ordinary `JsObject`.
+            if !receiver.is_object_type() {
+                return Err(NativeError::TypeError {
+                    name: "get Error.prototype.stack",
+                    reason: "receiver must be an Object".to_string(),
+                });
+            }
+            // step 3 — no [[ErrorData]] → undefined. Only ordinary
+            // objects whose prototype chain reaches an error prototype
+            // model the internal slot; a Proxy / other exotic never does.
+            let has_error_data = receiver.as_object().is_some_and(|obj| {
+                crate::object_statics::object_has_error_data_value(obj, ctx.interp_mut())
+            });
+            if !has_error_data {
+                return Ok(Value::undefined());
+            }
+            // step 4 — implementation-defined stack string. Otter does
+            // not capture frames, so report the error's string form.
+            let rendered = render_error_to_string(&receiver, ctx.heap());
+            let s = JsString::from_str(&rendered, ctx.heap_mut()).map_err(|err| {
+                NativeError::TypeError {
+                    name: "get Error.prototype.stack",
+                    reason: err.to_string(),
+                }
+            })?;
+            Ok(Value::string(s))
+        }
+        fn error_stack_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            let receiver = *ctx.this_value();
+            let value = args.first().copied().unwrap_or_else(Value::undefined);
+            // step 2 — E is not an Object → TypeError.
+            if !receiver.is_object_type() {
+                return Err(NativeError::TypeError {
+                    name: "set Error.prototype.stack",
+                    reason: "receiver must be an Object".to_string(),
+                });
+            }
+            // step 3 — v is not a String → TypeError.
+            if !value.is_string() {
+                return Err(NativeError::TypeError {
+                    name: "set Error.prototype.stack",
+                    reason: "stack value must be a String".to_string(),
+                });
+            }
+            let context =
+                ctx.execution_context()
+                    .cloned()
+                    .ok_or_else(|| NativeError::TypeError {
+                        name: "set Error.prototype.stack",
+                        reason: "missing execution context".to_string(),
+                    })?;
+            let interp = ctx.interp_mut();
+            // SetterThatIgnoresPrototypeProperties step 2 — setting on
+            // %Error.prototype% itself throws.
+            let home = interp.constructor_prototype_value("Error").ok();
+            if let Some(home) = home
+                && crate::abstract_ops::same_value(&home, &receiver, interp.gc_heap())
+            {
+                return Err(NativeError::TypeError {
+                    name: "set Error.prototype.stack",
+                    reason: "cannot set stack on Error.prototype".to_string(),
+                });
+            }
+            let map_err = |err: crate::VmError| match err {
+                crate::VmError::Uncaught { value } => NativeError::Thrown {
+                    name: "set Error.prototype.stack",
+                    message: value,
+                },
+                other => NativeError::TypeError {
+                    name: "set Error.prototype.stack",
+                    reason: other.to_string(),
+                },
+            };
+            // SetterThatIgnoresPrototypeProperties steps 3-5.
+            let existing = interp
+                .ordinary_get_own_property_descriptor_value_runtime_rooted(
+                    &context,
+                    receiver,
+                    &crate::VmPropertyKey::String("stack"),
+                    0,
+                    &[&receiver, &value],
+                    &[],
+                )
+                .map_err(map_err)?;
+            let throw = || NativeError::TypeError {
+                name: "set Error.prototype.stack",
+                reason: "cannot set stack".to_string(),
+            };
+            match existing {
+                // step 4 — no own "stack": CreateDataPropertyOrThrow.
+                None => {
+                    interp
+                        .create_data_property_or_throw(&context, receiver, "stack", value)
+                        .map_err(map_err)?;
+                }
+                // step 5 — own "stack" exists: Set(this, p, v, true).
+                Some(desc) => match desc.kind {
+                    crate::object::DescriptorKind::Accessor { setter, .. } => match setter {
+                        Some(s) if crate::abstract_ops::is_callable(&s) => {
+                            let mut a: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                            a.push(value);
+                            interp
+                                .run_callable_sync(&context, &s, receiver, a)
+                                .map_err(map_err)?;
+                        }
+                        // Set with Throw=true on an accessor without a
+                        // setter raises a TypeError.
+                        _ => return Err(throw()),
+                    },
+                    crate::object::DescriptorKind::Data { .. } => {
+                        // A non-writable own data property rejects the write.
+                        if !desc.flags.writable() {
+                            return Err(throw());
+                        }
+                        let descriptor = crate::object::PartialPropertyDescriptor {
+                            value: Some(value),
+                            ..Default::default()
+                        };
+                        let ok = interp
+                            .define_own_property_value(
+                                &context,
+                                &receiver,
+                                &crate::VmPropertyKey::String("stack"),
+                                descriptor,
+                            )
+                            .map_err(map_err)?;
+                        if !ok {
+                            return Err(throw());
+                        }
+                    }
+                },
+            }
+            Ok(Value::undefined())
+        }
+        let stack_get = native_static_with_roots(
+            gc_heap,
+            "get stack",
+            0,
+            error_stack_get,
+            &[&error_proto_root],
+        )?;
+        let stack_set = native_static_with_roots(
+            gc_heap,
+            "set stack",
+            1,
+            error_stack_set,
+            &[&error_proto_root],
+        )?;
+        let _ = object::define_own_property(
+            error_proto,
+            gc_heap,
+            "stack",
+            PropertyDescriptor::accessor(
+                Some(Value::native_function(stack_get)),
+                Some(Value::native_function(stack_set)),
+                false,
+                true,
+            ),
+        );
+
         // §20.5.3.4 Error.prototype.toString is intercepted by
         // `object_prototype_intercept` in the dispatcher when the
         // receiver's prototype chain includes any error prototype.

@@ -1302,7 +1302,10 @@ fn proxy_builtin_tag(value: &Value, heap: &otter_gc::GcHeap) -> String {
 /// realm error prototype is reached. Used as a substitute for the
 /// spec's `[[ErrorData]]` internal slot, which Otter does not carry
 /// on ordinary object instances.
-fn object_has_error_data_value(obj: crate::object::JsObject, interp: &crate::Interpreter) -> bool {
+pub(crate) fn object_has_error_data_value(
+    obj: crate::object::JsObject,
+    interp: &crate::Interpreter,
+) -> bool {
     use crate::ErrorKind;
     let heap = interp.gc_heap();
     let registry = &interp.error_classes;

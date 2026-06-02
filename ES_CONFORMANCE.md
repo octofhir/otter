@@ -1534,6 +1534,23 @@ omitted (`function () { [native code] }`), which the grammar permits.
 (Class / constructor source-text cases still pending real source
 retention.)
 
+### Error.prototype.stack accessor (Error Stacks proposal) (2026-06-03)
+
+`built-ins/Error` +25 (`prototype/stack/*`). `Error.prototype` had no
+`stack` accessor at all. Installed the proposal's accessor (non-
+enumerable, configurable). The getter throws a `TypeError` for a
+non-object receiver, returns `undefined` for a receiver without an
+`[[ErrorData]]` slot (a `Proxy` / non-error object), and otherwise
+returns an implementation-defined string (Otter retains no frames, so
+the error's string form). The setter throws for a non-object receiver
+or a non-String value, throws when the receiver is `%Error.prototype%`
+itself, and otherwise runs `SetterThatIgnoresPrototypeProperties`:
+`CreateDataPropertyOrThrow` when there is no own `stack`, else
+`Set(this, "stack", v, true)` — invoking an own accessor's setter and
+rejecting a non-writable / setter-less property. (Remaining: a true
+`[[ErrorData]]` instance marker — the chain heuristic over-approximates
+`Object.create(Error.prototype)` — and Proxy-receiver trap routing.)
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

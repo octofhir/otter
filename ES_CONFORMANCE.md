@@ -1326,6 +1326,17 @@ typed-array constructors (`BigInt64Array` / `BigUint64Array`
 both still bootstrap placeholders), and BigInt boxing
 (`Object(1n)` → BigInt wrapper object).
 
+### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
+
+`built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded
+fast path bound to a real RegExp. It now follows §22.2.6.10 over any
+Object receiver: `S = ToString(string)`; save `Get(rx, "lastIndex")`,
+reset to 0 only when it differs (SameValue); `RegExpExec(rx, S)`;
+restore `lastIndex` when the exec changed it; return -1 for a null
+result, else `Get(result, "index")` — so a monkey-patched `exec` and
+a `lastIndex` accessor are observed. Removed the now-unused lenient
+`string_arg_to_jsstring` helper.
+
 ### §22.2.6.8 RegExp.prototype[@@match] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +15. `@@match` was a hardcoded fast path that

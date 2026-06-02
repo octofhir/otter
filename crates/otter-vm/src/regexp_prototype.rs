@@ -396,24 +396,36 @@ pub fn native_regexp_symbol_search(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
+    let name = "RegExp.prototype[@@search]";
     let receiver = *ctx.this_value();
-    let Some(re) = receiver.as_regexp() else {
+    // §22.2.6.10 step 1 — any Object receiver; matching flows through
+    // the observable `exec` protocol and preserves `lastIndex`.
+    if !receiver.is_object_type() {
         return Err(crate::NativeError::TypeError {
-            name: "RegExp.prototype[@@search]",
-            reason: "called on a non-RegExp receiver".to_string(),
+            name,
+            reason: "called on a non-object receiver".to_string(),
         });
-    };
-
-    let text = string_arg_to_jsstring(ctx, args, 0, "RegExp.prototype[@@search]")?;
-    let previous = re.last_index_value(ctx.heap());
-    re.set_last_index(ctx.heap_mut(), 0);
-    let units = text.to_utf16_vec(ctx.heap());
-    let result = re.find_from_utf16(ctx.heap(), &units, 0).into_iter().next();
-    re.set_last_index_value(ctx.heap_mut(), previous);
-    Ok(match result {
-        Some(m) => Value::number_i32(m.range.start as i32),
-        None => Value::number_i32(-1),
-    })
+    }
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
+    let text = coerce_to_jsstring_runtime(ctx, &arg, name)?;
+    // Steps 4-5 — save `lastIndex`, reset to 0 only if it differs.
+    let previous = get_property_runtime(ctx, &receiver, "lastIndex", name)?;
+    let zero = Value::number_i32(0);
+    if !crate::abstract_ops::same_value(&previous, &zero, ctx.heap()) {
+        set_property_runtime(ctx, &receiver, "lastIndex", zero, name)?;
+    }
+    // Step 6 — RegExpExec(rx, S).
+    let result = regexp_exec_runtime(ctx, &receiver, text, name)?;
+    // Steps 7-8 — restore `lastIndex` if the exec changed it.
+    let current = get_property_runtime(ctx, &receiver, "lastIndex", name)?;
+    if !crate::abstract_ops::same_value(&current, &previous, ctx.heap()) {
+        set_property_runtime(ctx, &receiver, "lastIndex", previous, name)?;
+    }
+    // Steps 9-10 — null → -1, else Get(result, "index").
+    if result.is_null() {
+        return Ok(Value::number_i32(-1));
+    }
+    get_property_runtime(ctx, &result, "index", name)
 }
 
 /// §22.2.7.3 `AdvanceStringIndex(S, index, unicode)`. When `unicode`
@@ -431,53 +443,6 @@ fn advance_string_index(units: &[u16], index: usize, unicode: bool) -> usize {
         }
     }
     index + 1
-}
-
-fn string_arg_to_jsstring(
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-    index: usize,
-    method_name: &'static str,
-) -> Result<JsString, crate::NativeError> {
-    let raw = args.get(index).cloned().unwrap_or(Value::undefined());
-    if let Some(s) = raw.as_string(ctx.heap()) {
-        return Ok(s);
-    }
-    if raw.is_symbol() {
-        return Err(crate::NativeError::TypeError {
-            name: method_name,
-            reason: "cannot convert a Symbol to a string".to_string(),
-        });
-    }
-    let text: String = if raw.is_undefined() {
-        "undefined".to_string()
-    } else if raw.is_null() {
-        "null".to_string()
-    } else if let Some(b) = raw.as_boolean() {
-        if b { "true" } else { "false" }.to_string()
-    } else if let Some(n) = raw.as_number() {
-        n.to_display_string()
-    } else if let Some(bi) = raw.as_big_int() {
-        bi.to_decimal_string(ctx.heap())
-    } else if let Some(obj) = raw.as_object() {
-        let gc = ctx.heap();
-        if let Some(s) = crate::object::string_data(obj, gc) {
-            return Ok(s);
-        }
-        if let Some(n) = crate::object::number_data(obj, gc) {
-            n.to_display_string()
-        } else if let Some(b) = crate::object::boolean_data(obj, gc) {
-            if b { "true" } else { "false" }.to_string()
-        } else {
-            raw.display_string(gc)
-        }
-    } else {
-        raw.display_string(ctx.heap())
-    };
-    JsString::from_str(&text, ctx.heap_mut()).map_err(|_| crate::NativeError::TypeError {
-        name: method_name,
-        reason: "out of memory".to_string(),
-    })
 }
 
 fn vm_err_to_native(name: &'static str) -> impl Fn(crate::VmError) -> crate::NativeError {

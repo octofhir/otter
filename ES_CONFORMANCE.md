@@ -1520,6 +1520,20 @@ single Number argument threw a `TypeError` when `n` was not a valid
 array length (`-1`, `2**32`, `2.5`). Per §23.1.1.1 step 8.b the
 `ToUint32(len) ≠ len` case is a `RangeError`. Changed the error class.
 
+### §20.2.3.5 Function.prototype.toString emits valid NativeFunction (2026-06-03)
+
+`built-ins/Function` +37 (`prototype/toString/*`). Otter does not retain
+function source text, so `toString` uses the `NativeFunction` form
+(permitted by the spec when source is unavailable). It emitted the
+internal display name verbatim — `function <anonymous>() { [native
+code] }`, `function <arrow>() { … }`, computed `[Symbol.iterator]`
+names — none of which are valid `IdentifierName`s, so the conformance
+`nativeFunctionMatcher` rejected them as syntax errors. The name is now
+emitted only when it is a valid `IdentifierName`; otherwise it is
+omitted (`function () { [native code] }`), which the grammar permits.
+(Class / constructor source-text cases still pending real source
+retention.)
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

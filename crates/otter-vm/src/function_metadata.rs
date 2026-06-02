@@ -287,11 +287,35 @@ pub(crate) fn bound_delete_own_property(
     })
 }
 
-/// Render a callable through the current foundation `toString` placeholder.
+/// `true` when `name` is a syntactically valid `IdentifierName`
+/// (§12.7) usable in the `NativeFunction` grammar's optional name slot.
+/// Internal display placeholders (`<anonymous>`, `<arrow>`), computed /
+/// symbol method names (`[Symbol.iterator]`), and `bound `-prefixed
+/// names contain characters that are not `IdentifierPart`, so they must
+/// be omitted rather than emitted into an otherwise-parseable native
+/// function source.
+fn is_identifier_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c == '$' || c == '_' || c.is_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '$' || c == '_' || c.is_alphanumeric())
+}
+
+/// Render a callable's `Function.prototype.toString` value. Otter does
+/// not retain function source text, so every callable uses the
+/// `NativeFunction` form (§20.2.3.5 permits this when source is
+/// unavailable). The optional name is emitted only when it is a valid
+/// `IdentifierName`, keeping the result parseable by the spec grammar.
 #[must_use]
 pub(crate) fn callable_to_string(ctx: &mut FunctionMetadataContext<'_>, callee: &Value) -> String {
     let display = callable_name(ctx, callee).unwrap_or_default();
-    format!("function {display}() {{ [native code] }}")
+    if is_identifier_name(&display) {
+        format!("function {display}() {{ [native code] }}")
+    } else {
+        "function () { [native code] }".to_string()
+    }
 }
 
 /// Compute builtin metadata for a newly created bound function.

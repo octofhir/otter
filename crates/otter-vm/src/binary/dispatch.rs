@@ -529,6 +529,11 @@ fn coerce_for_kind(
         }
     } else if value.is_big_int() {
         Err(VmError::TypeMismatch)
+    } else if value.is_symbol() {
+        // §7.1.4 ToNumber(Symbol) is a TypeError; a Symbol element
+        // stored into a numeric TypedArray must throw rather than
+        // silently coercing to a number.
+        Err(VmError::TypeMismatch)
     } else {
         Ok(*value)
     }

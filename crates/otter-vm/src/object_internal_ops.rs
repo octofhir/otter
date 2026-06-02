@@ -3158,14 +3158,19 @@ impl Interpreter {
                     object::PropertyLookup::Absent => {}
                 }
             }
+            // `lastIndex` is the RegExp's only own data property;
+            // `source` / `flags` / `global` / … are accessors on
+            // `%RegExp.prototype%`. Resolving the latter here from the
+            // internal slots would skip the prototype getters, so an
+            // overridden / poisoned flag accessor (and the observable
+            // component reads `get flags` performs) would never run.
+            // Only `lastIndex` short-circuits; the rest fall to the
+            // prototype walk below.
             let direct = match key {
-                VmPropertyKey::Symbol(_) => Value::undefined(),
-                _ => {
-                    let key = key
-                        .string_name()
-                        .expect("non-symbol key has string spelling");
-                    regexp_prototype::load_property(&re, &mut self.gc_heap, key)
+                VmPropertyKey::String("lastIndex") => {
+                    regexp_prototype::load_property(&re, &mut self.gc_heap, "lastIndex")
                 }
+                _ => Value::undefined(),
             };
             return if direct.is_undefined() {
                 // Walk the instance's actual `[[Prototype]]` so a

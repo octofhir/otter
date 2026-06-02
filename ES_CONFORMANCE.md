@@ -2857,3 +2857,26 @@ Fixed across `exec`, `Symbol.match`, `Symbol.replace`, `Symbol.split`,
 and `Symbol.search` (lastIndex get/set/coerce error propagation, sticky
 / global reset). 0 regressions across `built-ins/RegExp` and
 `built-ins/String/prototype`.
+
+## RegExp flag reads resolve through the prototype accessors (§22.2.6.4)
+
+A RegExp's `[[Get]]` short-circuited `source` / `flags` / `global` /
+`unicode` / … to the internal flag slots, and the bytecode load path
+read its expando with a data-only lookup. Both skipped the
+`%RegExp.prototype%` accessor getters, so an overridden or poisoned flag
+accessor (`Object.defineProperty(re, "global", {get})`) never ran and
+`get flags`'s observable per-component reads were invisible. Now only
+`lastIndex` (the sole own data property) short-circuits; the flag /
+source names fall through to the prototype accessors, and the bytecode
+regexp load routes through the shared `[[Get]]` ladder so an own expando
+accessor fires its getter.
+
+| section | before | after | delta |
+|---|---:|---:|---:|
+| `built-ins/RegExp` (whole) | 1220 | 1227 | +7 |
+| `built-ins/String/prototype` | 1139 | 1140 | +1 |
+
+Fixed: `Symbol.match` / `Symbol.replace` `get-global-err` /
+`get-unicode-error` / `coerce-global` / `builtin-infer-unicode` and
+related flag-observability cases. 0 regressions across `built-ins/RegExp`
+and `built-ins/String/prototype`.

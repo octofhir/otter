@@ -998,22 +998,18 @@ impl Interpreter {
                     .or_else(|| self.load_object_prototype_method(name))
                     .unwrap_or(Value::undefined()),
             }
-        } else if let Some(r) = receiver.as_regexp() {
-            // Expando bag wins over the spec-mandated direct
-            // load so user-installed members
-            // (`re.exec = fn`, `re.global = false`) shadow the
-            // built-in accessors during test262 observability
-            // checks.
-            if let Some(bag) = r.expando(&self.gc_heap)
-                && let Some(value) = crate::object::get(bag, &self.gc_heap, name)
-            {
-                value
-            } else {
-                let direct = regexp_prototype::load_property(&r, &mut self.gc_heap, name);
-                if direct.is_undefined() {
-                    self.load_from_constructor_prototype(context, "RegExp", &receiver, name)?
-                } else {
-                    direct
+        } else if receiver.as_regexp().is_some() {
+            // §10.1.8 [[Get]] on a RegExp: route through the shared
+            // ladder so an own expando member installed with an
+            // accessor (`Object.defineProperty(re, "global", {get})`)
+            // fires its getter rather than reading as `undefined`. The
+            // ladder checks the expando, the struct flag fast path, and
+            // the prototype chain in spec order.
+            let key = VmPropertyKey::String(name);
+            match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
+                VmGetOutcome::Value(value) => value,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
                 }
             }
         } else if let Some(s) = receiver.as_symbol(&self.gc_heap) {

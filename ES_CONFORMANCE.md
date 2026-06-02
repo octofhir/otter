@@ -1373,6 +1373,21 @@ argument (§22.1.2.1 / §22.1.2.2) via `to_number_or_throw`, so
 `valueOf` fires and a Symbol / BigInt throws; `fromCodePoint` keeps
 its `RangeError` for a non-integer or out-of-range code point.
 
+### §10.4.2.1 Array [[HasProperty]] sees indexed/named accessors (2026-06-03)
+
+`built-ins/Array` +24 (indexOf 12, lastIndexOf 12). `defineProperty`
+installing a getter/setter on an array — at an index or a named key —
+holes the underlying dense / named data slot so reads resolve through
+the accessor table. But the array branch of `[[HasProperty]]` only
+probed `has_own_element` and `get_named_property`, never the accessor
+table, so `HasProperty(arr, k)` returned false for an accessor-only
+key. `Array.prototype.indexOf` / `lastIndexOf` test `HasProperty`
+before `Get` (§23.1.3.* steps), so they skipped the slot and never
+invoked the getter — the canonical "property added to prototype during
+the search is visited" tests returned `-1`. `HasProperty` now also
+consults `array::get_accessor`, fixing those methods and the `in`
+operator on arrays with own indexed/named accessors.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

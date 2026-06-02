@@ -3589,6 +3589,13 @@ impl Interpreter {
                     {
                         return Ok(true);
                     }
+                    // §10.4.2.1 [[HasProperty]] over own properties — an
+                    // indexed or named accessor installed via
+                    // `Object.defineProperty` holes its dense / named data
+                    // slot, so it is only visible through the accessor table.
+                    if array::get_accessor(arr, &self.gc_heap, k).is_some() {
+                        return Ok(true);
+                    }
                     if array::get_named_property(arr, &self.gc_heap, k).is_some() {
                         return Ok(true);
                     }

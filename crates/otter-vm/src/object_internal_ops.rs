@@ -4366,6 +4366,36 @@ impl Interpreter {
         }
         Ok(false)
     }
+
+    /// Walk `base`'s prototype chain and return the first `Proxy`
+    /// reached through ordinary objects, or `None` if the chain holds
+    /// no proxy. Used by `[[Set]]` to honour §10.1.9.2 step 2.b — when
+    /// no ordinary node carries the property, a proxy in the chain
+    /// still owns `[[Set]]` (its `set` trap must run). Pure ordinary
+    /// `[[GetPrototypeOf]]` links are followed; a proxy node stops the
+    /// walk (its own prototype is the proxy's concern).
+    pub(crate) fn first_proxy_in_prototype_chain(
+        &mut self,
+        base: Value,
+    ) -> Result<Option<Value>, VmError> {
+        let mut current = match base.as_object() {
+            Some(obj) => object::prototype_value(obj, &self.gc_heap).unwrap_or(Value::null()),
+            None => return Ok(None),
+        };
+        for _ in 0..object::PROTO_CHAIN_HARD_CAP {
+            if current.is_nullish() {
+                return Ok(None);
+            }
+            if current.is_proxy() {
+                return Ok(Some(current));
+            }
+            let Some(obj) = current.as_object() else {
+                return Ok(None);
+            };
+            current = object::prototype_value(obj, &self.gc_heap).unwrap_or(Value::null());
+        }
+        Ok(None)
+    }
 }
 
 /// §6.2.5.7 IsCompatiblePropertyDescriptor specialised to a target

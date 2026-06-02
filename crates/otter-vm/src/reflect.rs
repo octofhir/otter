@@ -273,6 +273,38 @@ pub fn call(
                         return Ok(Value::boolean(false));
                     }
                     crate::object::SetOutcome::AssignData => {
+                        // §10.1.9.2 step 2.b — `resolve_set` only walks
+                        // ordinary prototype links, so a Proxy in the
+                        // chain is invisible to it. When `target` has no
+                        // own property for `key` and a proxy sits in the
+                        // prototype chain, `[[Set]]` belongs to that
+                        // proxy (its `set` trap must run with the
+                        // original receiver), not a data write on the
+                        // receiver.
+                        let target_has_own = interp
+                            .ordinary_get_own_property_descriptor_value_runtime_rooted(
+                                context,
+                                target,
+                                &key,
+                                0,
+                                &[&target, &value, &receiver],
+                                &[],
+                            )?
+                            .is_some();
+                        if !target_has_own
+                            && let Some(proxy_proto) =
+                                interp.first_proxy_in_prototype_chain(target)?
+                        {
+                            let ok = interp.ordinary_set_data_value(
+                                context,
+                                proxy_proto,
+                                &key,
+                                value,
+                                receiver,
+                                0,
+                            )?;
+                            return Ok(Value::boolean(ok));
+                        }
                         // §10.1.9 step 4 — data path. Honour receiver:
                         // when target ≠ receiver, the data write lands
                         // on receiver, not target.

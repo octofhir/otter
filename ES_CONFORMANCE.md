@@ -2812,3 +2812,23 @@ separate root: `new.target` inside a Construct of a closure resolves to
 the bare function rather than the closure value (the same closure /
 bare-function duality fixed for `prototype.constructor`, now in the
 Construct `new.target` path).
+
+## Reflect.set delegates [[Set]] to a Proxy in the prototype chain (§10.1.9.2)
+
+`resolve_set` only walks ordinary prototype links, so a `Proxy` in the
+chain was invisible: `Reflect.set(Object.create(proxy), key, v)` wrote a
+data property on the receiver instead of invoking the proxy's `set`
+trap. `Reflect.set` now, on the `AssignData` outcome, checks whether the
+target has no own property for the key and a proxy sits in its prototype
+chain (`first_proxy_in_prototype_chain`); if so it delegates to that
+proxy's `[[Set]]` (`ordinary_set_data_value`, which dispatches the trap
+with the original receiver) per §10.1.9.2 step 2.b.
+
+| section | before | after | delta |
+|---|---:|---:|---:|
+| `built-ins/Proxy` | 245/274 | 246/274 | +1 |
+
+Fixed: `set/trap-is-undefined-target-is-proxy`. 0 regressions across
+`built-ins/Proxy` and `built-ins/Reflect`. The plain `obj.prop = v`
+store path needs the same delegation (tracked separately — it sits on
+the inline-cache hot path).

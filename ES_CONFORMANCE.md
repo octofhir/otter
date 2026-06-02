@@ -1486,6 +1486,19 @@ the array `[[Get]]`, `[[HasProperty]]`, `[[GetOwnProperty]]`,
 getter is invoked, `getOwnPropertyDescriptor` reports the accessor
 shape, and `getOwnPropertySymbols` lists the key.
 
+### §23.1.3.30 Array.prototype.sort write-back via Set/Delete (2026-06-03)
+
+`built-ins/Array` +15 (all `sort/precise-*`). After collecting and
+sorting the present elements, `sort` wrote the result back with the
+lenient internal data store and deleted holes without checking success.
+Per §23.1.3.30 steps 8-9 the write-back is `Set(O, j, v, true)` and the
+tail removal is `DeletePropertyOrThrow(O, j)`. The write-back now runs
+OrdinarySet (`array_ordinary_set_own`), so an own / inherited index
+accessor's setter fires and a rejected write throws; deletes throw on
+failure. The gather phase already used `HasProperty` + `Get`, so an
+index getter that mutates the array mid-sort was observed — the
+precise getter / setter / length / append / delete tests now pass.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

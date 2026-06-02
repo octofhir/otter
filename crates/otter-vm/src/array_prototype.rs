@@ -1246,21 +1246,33 @@ impl Interpreter {
         }
         let item_count = items.len();
         let sorted = self.sort_merge(context, items, comparefn)?;
-        // Write the sorted prefix back, then delete the trailing holes.
+        // §23.1.3.30 steps 8-9 — write the sorted prefix back with
+        // `Set(O, j, v, true)` (so an own / inherited accessor setter
+        // fires and a failed write throws), then `DeletePropertyOrThrow`
+        // the trailing holes.
         for (j, item) in sorted.into_iter().enumerate() {
             let key = j.to_string();
-            self.ordinary_set_data_value(
-                context,
-                o,
-                &crate::VmPropertyKey::String(&key),
-                item,
-                o,
-                0,
-            )?;
+            let ok = if let Some(arr) = o.as_array() {
+                self.array_ordinary_set_own(context, arr, &key, item)?
+            } else {
+                self.array_set_property_throwing(context, o, &key, item)?;
+                true
+            };
+            if !ok {
+                return Err(VmError::TypeError {
+                    message: format!("Cannot assign to read only property '{key}' during sort"),
+                });
+            }
         }
         for k in item_count..cap {
             let key = k.to_string();
-            self.ordinary_delete_value(context, o, &crate::VmPropertyKey::String(&key), 0)?;
+            let deleted =
+                self.ordinary_delete_value(context, o, &crate::VmPropertyKey::String(&key), 0)?;
+            if !deleted {
+                return Err(VmError::TypeError {
+                    message: format!("Cannot delete property '{key}' during sort"),
+                });
+            }
         }
         Ok(o)
     }

@@ -1326,6 +1326,20 @@ typed-array constructors (`BigInt64Array` / `BigUint64Array`
 both still bootstrap placeholders), and BigInt boxing
 (`Object(1n)` → BigInt wrapper object).
 
+### §23.2.5.1 TypedArray constructor from array-like (2026-06-02)
+
+`built-ins/TypedArray` +3. `new TA(object)` where the source is a
+plain array-like (no `@@iterator`) read `length` and the elements
+with non-observable accessors and a lenient element coercion, so
+getters never fired, an excessive `length` aborted instead of
+throwing `RangeError`, and a Symbol element was silently dropped.
+The constructor now reads the array-like through `Get` + `ToLength`
+and `Get` + `ToNumber` / `ToBigInt` (fallibly reserving the element
+buffer so a pathological `length` is a `RangeError`); the
+iterator-sourced path likewise converts each yielded value. The
+plain-`Array` and `%TypedArray%.from` paths still use lenient
+coercion — a separate slice.
+
 ### §23.2.3.26 %TypedArray%.prototype.set — array-like source (2026-06-02)
 
 `built-ins/TypedArray/prototype/set` 82 → 104 / 110 (full

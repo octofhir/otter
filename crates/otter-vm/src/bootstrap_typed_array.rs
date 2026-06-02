@@ -274,6 +274,107 @@ fn drain_iterable_into_values(
     Ok(collected)
 }
 
+/// §23.2.5.1 / §22.2.4.4 — convert each collected source value with
+/// `ToBigInt` for BigInt element types and `ToNumber` otherwise, so a
+/// Symbol / cross-numeric value throws and a `valueOf` / `toString`
+/// runs. The per-kind dispatcher narrows the result on store.
+fn coerce_values_for_kind(
+    ctx: &mut NativeCtx<'_>,
+    exec: &crate::ExecutionContext,
+    values: Vec<Value>,
+    kind: TypedArrayKind,
+) -> Result<Vec<Value>, NativeError> {
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let converted = if kind.is_bigint() {
+            let big = crate::coerce::to_big_int_or_throw(ctx.cx.interp, exec, &value)
+                .map_err(|e| vm_to_native(e, "TypedArray"))?;
+            Value::big_int(big)
+        } else {
+            let number = crate::coerce::to_number_or_throw(ctx.cx.interp, exec, &value)
+                .map_err(|e| vm_to_native(e, "TypedArray"))?;
+            Value::number(number)
+        };
+        out.push(converted);
+    }
+    Ok(out)
+}
+
+/// §7.3.3 Get + run an accessor, propagating an abrupt completion.
+fn ta_get_via(
+    ctx: &mut NativeCtx<'_>,
+    exec: &crate::ExecutionContext,
+    source: Value,
+    key: &crate::VmPropertyKey<'_>,
+) -> Result<Value, NativeError> {
+    let outcome = ctx
+        .cx
+        .interp
+        .ordinary_get_value(exec, source, source, key, 0)
+        .map_err(|e| vm_to_native(e, "TypedArray"))?;
+    match outcome {
+        crate::VmGetOutcome::Value(v) => Ok(v),
+        crate::VmGetOutcome::InvokeGetter { getter } => ctx
+            .cx
+            .interp
+            .run_callable_sync(exec, &getter, source, smallvec::SmallVec::new())
+            .map_err(|e| vm_to_native(e, "TypedArray")),
+    }
+}
+
+/// §23.2.5.1 InitializeTypedArrayFromArrayLike — read an array-like
+/// object's `length` (`Get` + `ToLength`) and each element (`Get`,
+/// running getters, then `ToNumber` / `ToBigInt`), so user side
+/// effects run and a Symbol / cross-numeric element throws. Returns
+/// the converted elements; the per-kind dispatcher narrows them to the
+/// destination representation on store.
+fn read_array_like_coerced(
+    ctx: &mut NativeCtx<'_>,
+    exec: &crate::ExecutionContext,
+    source: Value,
+    kind: TypedArrayKind,
+) -> Result<Vec<Value>, NativeError> {
+    let len_value = ta_get_via(ctx, exec, source, &crate::VmPropertyKey::String("length"))?;
+    let len_number = crate::coerce::to_number_or_throw(ctx.cx.interp, exec, &len_value)
+        .map_err(|e| vm_to_native(e, "TypedArray"))?;
+    let n = len_number.as_f64();
+    let len = if n.is_nan() || n <= 0.0 {
+        0
+    } else {
+        n.trunc().min(9_007_199_254_740_991.0) as usize
+    };
+    // §23.2.5.1.1 AllocateTypedArrayBuffer rejects a length the host
+    // cannot back with a RangeError; reserve up-front (fallibly) so a
+    // pathological `length` (e.g. 2**53) fails cleanly instead of
+    // aborting the process on the capacity request.
+    let mut out: Vec<Value> = Vec::new();
+    if out.try_reserve_exact(len).is_err() {
+        return Err(NativeError::RangeError {
+            name: "TypedArray",
+            reason: "Invalid typed array length".to_string(),
+        });
+    }
+    for i in 0..len {
+        let value = ta_get_via(
+            ctx,
+            exec,
+            source,
+            &crate::VmPropertyKey::OwnedString(i.to_string()),
+        )?;
+        let converted = if kind.is_bigint() {
+            let big = crate::coerce::to_big_int_or_throw(ctx.cx.interp, exec, &value)
+                .map_err(|e| vm_to_native(e, "TypedArray"))?;
+            Value::big_int(big)
+        } else {
+            let number = crate::coerce::to_number_or_throw(ctx.cx.interp, exec, &value)
+                .map_err(|e| vm_to_native(e, "TypedArray"))?;
+            Value::number(number)
+        };
+        out.push(converted);
+    }
+    Ok(out)
+}
+
 /// §22.2.3 TypedArray callback prototype method wrappers — used
 /// for reflective access and `Function.prototype.call` style
 /// re-entries; the method-call fast path bypasses these into
@@ -896,24 +997,32 @@ fn ta_ctor_dispatch(
             .well_known_symbols()
             .get(crate::symbol::WellKnown::Iterator);
         let has_iter = crate::object::get_symbol(src_obj, ctx.heap(), iter_sym).is_some();
-        if has_iter {
-            let src_value = Value::object(src_obj);
-            let drained = drain_iterable_into_values(ctx, exec, &src_value)?;
-            let arr = ctx
-                .array_from_elements(drained)
-                .map_err(|_| NativeError::TypeError {
-                    name: typed_array_name(kind),
-                    reason: "out of memory while allocating array".to_string(),
-                })?;
-            let mut out: SmallVec<[Value; 4]> = SmallVec::new();
-            out.push(Value::array(arr));
-            for v in args.iter().skip(1) {
-                out.push(*v);
-            }
-            Some(out)
+        let src_value = Value::object(src_obj);
+        // §23.2.5.1 — an Object source with `@@iterator` initializes
+        // from the drained iterator; otherwise it is an array-like and
+        // its `length` / elements are read with observable `[[Get]]` +
+        // `ToNumber` / `ToBigInt`. Either way the values are coerced
+        // up-front so the per-kind dispatcher only narrows and stores.
+        let drained = if has_iter {
+            // §22.2.4.4 — IterableToList collects raw values, then each
+            // is converted (ToNumber / ToBigInt) when stored.
+            let raw = drain_iterable_into_values(ctx, exec, &src_value)?;
+            coerce_values_for_kind(ctx, exec, raw, kind)?
         } else {
-            None
+            read_array_like_coerced(ctx, exec, src_value, kind)?
+        };
+        let arr = ctx
+            .array_from_elements(drained)
+            .map_err(|_| NativeError::TypeError {
+                name: typed_array_name(kind),
+                reason: "out of memory while allocating array".to_string(),
+            })?;
+        let mut out: SmallVec<[Value; 4]> = SmallVec::new();
+        out.push(Value::array(arr));
+        for v in args.iter().skip(1) {
+            out.push(*v);
         }
+        Some(out)
     } else {
         None
     };

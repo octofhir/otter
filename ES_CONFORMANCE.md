@@ -1406,6 +1406,15 @@ String wrapper object (`new String("123")`) rendered as
 `to_string_or_throw`, running the operand's `toString` / `valueOf`
 and throwing for a Symbol.
 
+### §22.1.3.14 String.prototype.matchAll @@matchAll dispatch (2026-06-02)
+
+`built-ins/String/prototype/matchAll` 100%; `built-ins/String/prototype`
+1161→1165. matchAll computed matches inline, so when its @@matchAll
+delegation did not fire (null/undefined regexp, or a RegExp whose
+@@matchAll was overridden to undefined) it skipped ToString(receiver) and
+ignored a user RegExp.prototype[@@matchAll]. It now runs steps 4-5:
+RegExpCreate(R, "g") then Invoke(rx, @@matchAll, « S »).
+
 ### §22.1.3.8/.9 String indexOf/lastIndexOf coercion order + NaN (2026-06-02)
 
 `built-ins/String/prototype/{indexOf,lastIndexOf}` both 100%;

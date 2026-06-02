@@ -135,6 +135,22 @@ pub enum IteratorState {
         #[pelt(skip)]
         index: usize,
     },
+    /// Live walk over a generic array-like object (e.g. an `arguments`
+    /// object) per §23.1.5.1 `CreateArrayIterator(O, kind)`. Reads
+    /// `LengthOfArrayLike(O)` and `Get(O, index)` on every step so a
+    /// `length` / element mutation during iteration is observed —
+    /// unlike the dense `Array` states, whose backing handle already
+    /// reflects mutation, this holds an arbitrary object.
+    ArrayLike {
+        /// Backing array-like object (traced live).
+        object: Value,
+        /// Next index to read.
+        #[pelt(skip)]
+        index: usize,
+        /// Yield shape (values / keys / entries).
+        #[pelt(skip)]
+        kind: ArrayIterKind,
+    },
     /// Live walk over a TypedArray's elements per §23.2.5.1
     /// `CreateArrayIterator(O, kind)`. Unlike the Array snapshot
     /// states, this reads `typed_array[index]` on every step so
@@ -267,6 +283,7 @@ impl IteratorState {
             IteratorState::Array { origin, .. } => Some(*origin),
             IteratorState::ArrayKey { .. }
             | IteratorState::ArrayEntry { .. }
+            | IteratorState::ArrayLike { .. }
             | IteratorState::TypedArray { .. } => {
                 // §23.2.5.1 — TypedArray iterators inherit
                 // %ArrayIteratorPrototype% just like Array iterators.

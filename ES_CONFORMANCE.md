@@ -1449,6 +1449,20 @@ extensibility. A rejected element Set raises the `TypeError` required by
 non-writable length, so a setter that freezes the array mid-push now
 surfaces the spec `TypeError` with no own element added.
 
+### §23.1.5.1 Array Iterator over a live array-like (2026-06-03)
+
+`built-ins/ArrayIteratorPrototype` +4, `language/statements/for-of`
++3, `built-ins/Array` +4. `Array.prototype.{values,keys,entries}` on a
+non-array array-like (e.g. an `arguments` object) snapshotted the
+elements into a fresh dense array at creation, so a `length` / element
+mutation between `next()` calls was invisible. A new live
+`IteratorState::ArrayLike { object, index, kind }` holds the array-like
+itself and re-reads `length` and the element on every step
+(§23.1.5.1 CreateArrayIterator), so growing or truncating the source
+mid-iteration is observed. It inherits `%ArrayIteratorPrototype%` and is
+driven by the same heap-only fast-iterator path used for dense arrays,
+so both explicit `.next()` and `for…of` / spread see the live view.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

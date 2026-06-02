@@ -5467,6 +5467,7 @@ fn step_iterator(
         Array(JsArray, usize),
         ArrayKey(JsArray, usize),
         ArrayEntry(JsArray, usize),
+        ArrayLike(Value, usize, crate::iterator_state::ArrayIterKind),
         TypedArray(
             crate::binary::typed_array::JsTypedArray,
             usize,
@@ -5497,6 +5498,11 @@ fn step_iterator(
         IteratorState::SetCollection { set, index, kind } => {
             FastIteratorSnapshot::SetCollection(*set, *index, *kind)
         }
+        IteratorState::ArrayLike {
+            object,
+            index,
+            kind,
+        } => FastIteratorSnapshot::ArrayLike(*object, *index, *kind),
         IteratorState::Exhausted => FastIteratorSnapshot::Exhausted,
         IteratorState::User { .. }
         | IteratorState::RegExpString { .. }
@@ -5565,6 +5571,69 @@ fn step_iterator(
                     }
                 });
                 Some(Value::array(pair))
+            }
+        }
+        FastIteratorSnapshot::ArrayLike(object, index, kind) => {
+            // §23.1.5.2.1 %ArrayIteratorPrototype%.next over a generic
+            // array-like object: re-read `length` and the element each
+            // step so a mutation between calls is observed. Reads go
+            // through the object's own data slots (`arguments`-style
+            // array-likes), matching the other heap-only fast iterators.
+            let len = match object
+                .as_object()
+                .and_then(|obj| crate::object::get(obj, gc_heap, "length"))
+            {
+                Some(v) => to_length(&v, gc_heap)?,
+                None => 0,
+            };
+            if index >= len {
+                None
+            } else {
+                let advance = |gc_heap: &mut otter_gc::GcHeap| {
+                    gc_heap.with_payload(iter, |state| {
+                        if let IteratorState::ArrayLike { index, .. } = state {
+                            *index += 1;
+                        }
+                    });
+                };
+                match kind {
+                    ArrayIterKind::Key => {
+                        advance(gc_heap);
+                        Some(Value::number(crate::number::NumberValue::from_f64(
+                            index as f64,
+                        )))
+                    }
+                    ArrayIterKind::Value => {
+                        let v = object
+                            .as_object()
+                            .and_then(|obj| crate::object::get(obj, gc_heap, &index.to_string()))
+                            .unwrap_or_else(Value::undefined);
+                        advance(gc_heap);
+                        Some(v)
+                    }
+                    ArrayIterKind::Entry => {
+                        let element = object
+                            .as_object()
+                            .and_then(|obj| crate::object::get(obj, gc_heap, &index.to_string()))
+                            .unwrap_or_else(Value::undefined);
+                        let index_val =
+                            Value::number(crate::number::NumberValue::from_f64(index as f64));
+                        let pair = {
+                            let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                                index_val.trace_value_slots(visit);
+                                element.trace_value_slots(visit);
+                            };
+                            crate::array::alloc_array_with_roots(gc_heap, &mut visitor)
+                                .map_err(|_| VmError::TypeMismatch)?
+                        };
+                        crate::array::with_elements_mut(pair, gc_heap, |elements| {
+                            elements.push(index_val);
+                            elements.push(element);
+                        });
+                        advance(gc_heap);
+                        Some(Value::array(pair))
+                    }
+                }
             }
         }
         FastIteratorSnapshot::TypedArray(typed_array, index, kind) => {

@@ -297,7 +297,7 @@ native_array!(native_values_iter, "values");
 native_array!(native_entries_iter, "entries");
 
 /// §7.3.18 `LengthOfArrayLike(O)` with live `Get(O, "length")` semantics.
-fn length_of_array_like(
+pub(crate) fn length_of_array_like(
     interp: &mut Interpreter,
     context: &ExecutionContext,
     o: &Value,
@@ -830,7 +830,7 @@ impl Interpreter {
     /// §23.1.3.6 / §23.1.3.20 / §23.1.3.32 live Array iterator creation.
     pub(crate) fn array_iterator_method(
         &mut self,
-        context: &ExecutionContext,
+        _context: &ExecutionContext,
         receiver: Value,
         kind: &str,
         roots: &[&[Value]],
@@ -840,44 +840,40 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
-        let arr = if let Some(arr) = o.as_array() {
-            arr
-        } else {
-            let len = length_of_array_like(self, context, &o)?.min(MAX_ARRAY_LIKE_PROBE_LEN);
-            let mut values = Vec::with_capacity(len);
-            for k in 0..len {
-                if kind == "keys" {
-                    values.push(Value::undefined());
-                } else {
-                    values.push(self.array_method_get_property(
-                        context,
-                        o,
-                        &format_index_key(k as f64),
-                    )?);
-                }
+        // §23.1.5.1 CreateArrayIterator(O, kind). A real array uses the
+        // dense `Array*` states (its own GC handle reflects mutation); a
+        // generic array-like (e.g. an `arguments` object) holds a live
+        // `ArrayLike` state so a `length` / element change between
+        // `next()` calls is observed rather than snapshot at creation.
+        let state = if let Some(arr) = o.as_array() {
+            match kind {
+                "keys" => crate::IteratorState::ArrayKey {
+                    array: arr,
+                    index: 0,
+                },
+                "entries" => crate::IteratorState::ArrayEntry {
+                    array: arr,
+                    index: 0,
+                },
+                _ => crate::IteratorState::Array {
+                    array: arr,
+                    index: 0,
+                    origin: crate::BuiltinIteratorOrigin::Array,
+                },
             }
-            self.array_create_from_dense_values(values)?
-                .as_array()
-                .ok_or_else(|| VmError::TypeError {
-                    message: "array allocation failed".to_string(),
-                })?
+        } else {
+            let iter_kind = match kind {
+                "keys" => crate::iterator_state::ArrayIterKind::Key,
+                "entries" => crate::iterator_state::ArrayIterKind::Entry,
+                _ => crate::iterator_state::ArrayIterKind::Value,
+            };
+            crate::IteratorState::ArrayLike {
+                object: o,
+                index: 0,
+                kind: iter_kind,
+            }
         };
-        let state = match kind {
-            "keys" => crate::IteratorState::ArrayKey {
-                array: arr,
-                index: 0,
-            },
-            "entries" => crate::IteratorState::ArrayEntry {
-                array: arr,
-                index: 0,
-            },
-            _ => crate::IteratorState::Array {
-                array: arr,
-                index: 0,
-                origin: crate::BuiltinIteratorOrigin::Array,
-            },
-        };
-        let arr_root = Value::array(arr);
+        let arr_root = o;
         let heap = self.gc_heap_mut();
         let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
             arr_root.trace_value_slots(visit);
@@ -2478,7 +2474,10 @@ impl Interpreter {
         Ok(actual as usize)
     }
 
-    fn array_create_from_dense_values(&mut self, values: Vec<Value>) -> Result<Value, VmError> {
+    pub(crate) fn array_create_from_dense_values(
+        &mut self,
+        values: Vec<Value>,
+    ) -> Result<Value, VmError> {
         if values.len() > u32::MAX as usize {
             return Err(VmError::RangeError {
                 message: "Invalid array length".to_string(),

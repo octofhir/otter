@@ -214,31 +214,25 @@ fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
     // otherwise routes through `ToIntegerOrInfinity`. The spec
     // raises RangeError for `< 2` / `> 36`; non-coercible operands
     // raise TypeError.
-    let radix = if let Some(v) = args.first() {
-        if v.is_undefined() {
-            10u32
-        } else if v.is_symbol() {
-            return Err(NativeError::TypeError {
-                name: "BigInt.prototype.toString",
-                reason: "Cannot convert a Symbol value to a number".to_string(),
-            });
-        } else if v.is_big_int() {
-            return Err(NativeError::TypeError {
-                name: "BigInt.prototype.toString",
-                reason: "Cannot convert a BigInt value to a number".to_string(),
-            });
-        } else {
-            let f = if let Some(n) = v.as_number() {
-                n.as_f64()
-            } else if let Some(b) = v.as_boolean() {
-                if b { 1.0 } else { 0.0 }
-            } else if v.is_null() {
-                0.0
-            } else if let Some(s) = v.as_string(ctx.heap()) {
-                crate::number::parse::to_number_from_string(&s.to_lossy_string(ctx.heap())).as_f64()
-            } else {
-                f64::NAN
+    let radix = match args.first() {
+        None => 10u32,
+        Some(v) if v.is_undefined() => 10u32,
+        Some(v) => {
+            // §21.2.3.3 step 4 — radixNumber = ToIntegerOrInfinity(radix),
+            // whose ToNumber runs a `valueOf` / `@@toPrimitive` (poisoned
+            // ones throw) and rejects Symbol / BigInt; an object operand
+            // must not be silently dropped to NaN.
+            let v = *v;
+            let number = {
+                let (interp, exec) = ctx.interp_mut_and_context();
+                let exec = exec.ok_or_else(|| NativeError::TypeError {
+                    name: "BigInt.prototype.toString",
+                    reason: "missing execution context".to_string(),
+                })?;
+                crate::coerce::to_number_or_throw(interp, &exec, &v)
+                    .map_err(|err| vm_to_native(err, "BigInt.prototype.toString"))?
             };
+            let f = number.as_f64();
             let trunc = if f.is_nan() { 0.0 } else { f.trunc() };
             if !trunc.is_finite() || !(2.0..=36.0).contains(&trunc) {
                 return Err(NativeError::RangeError {
@@ -248,8 +242,6 @@ fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
             }
             trunc as u32
         }
-    } else {
-        10u32
     };
     let rendered = b.with_inner(ctx.heap(), |bi| bi.to_str_radix(radix));
 

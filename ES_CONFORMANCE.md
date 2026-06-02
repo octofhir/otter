@@ -1583,6 +1583,16 @@ delegating to the shared conversion, so `asIntN(0, 5)` / `asUintN(0,
 undefined)` / a `valueOf` returning a Number now throw. The `BigInt()`
 constructor keeps the lenient `NumberToBigInt` path.
 
+### §21.1.3.6 / §21.2.3.3 Number/BigInt toString radix coercion (2026-06-03)
+
+`built-ins/Number` +1, `built-ins/BigInt` +1. `Number.prototype.toString`
+and `BigInt.prototype.toString` coerced an object `radix` argument
+through a lenient inline match that dropped any non-primitive to `NaN`
+— so a poisoned `valueOf` never ran and a coercible object (e.g.
+`{ valueOf() { return 16 } }`) produced a spurious `RangeError`. Both
+now run `ToIntegerOrInfinity` via `to_number_or_throw` (full ToPrimitive
+ladder, Symbol / BigInt → TypeError), then range-check `[2, 36]`.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

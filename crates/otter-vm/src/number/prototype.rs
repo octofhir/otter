@@ -142,31 +142,26 @@ fn to_string_radix(
     // otherwise routes through `ToIntegerOrInfinity`. Out-of-range
     // (`< 2` or `> 36`) raises RangeError. Symbol / BigInt raise
     // TypeError.
-    let radix: u32 = if let Some(v) = args.first() {
-        if v.is_undefined() {
-            10
-        } else if v.is_symbol() {
-            return Err(NativeError::TypeError {
-                name,
-                reason: "Cannot convert a Symbol value to a number".to_string(),
-            });
-        } else if v.is_big_int() {
-            return Err(NativeError::TypeError {
-                name,
-                reason: "Cannot convert a BigInt value to a number".to_string(),
-            });
-        } else {
-            let f = if let Some(n) = v.as_number() {
-                n.as_f64()
-            } else if let Some(b) = v.as_boolean() {
-                if b { 1.0 } else { 0.0 }
-            } else if v.is_null() {
-                0.0
-            } else if let Some(s) = v.as_string(ctx.heap()) {
-                crate::number::parse::to_number_from_string(&s.to_lossy_string(ctx.heap())).as_f64()
-            } else {
-                f64::NAN
+    let radix: u32 = match args.first() {
+        None => 10,
+        Some(v) if v.is_undefined() => 10,
+        Some(v) => {
+            // §21.1.3.6 step 4 — radixNumber = ToIntegerOrInfinity(radix),
+            // whose ToNumber runs the operand's `valueOf` / `@@toPrimitive`
+            // (a poisoned one throws) and rejects Symbol / BigInt. The
+            // earlier inline coercion dropped an object operand to NaN
+            // without ever observing its `valueOf`.
+            let v = *v;
+            let number = {
+                let (interp, exec) = ctx.interp_mut_and_context();
+                let exec = exec.ok_or_else(|| NativeError::TypeError {
+                    name,
+                    reason: "missing execution context".to_string(),
+                })?;
+                crate::coerce::to_number_or_throw(interp, &exec, &v)
+                    .map_err(|err| crate::native_function::vm_to_native_error(err, name))?
             };
+            let f = number.as_f64();
             let trunc = if f.is_nan() { 0.0 } else { f.trunc() };
             if !trunc.is_finite() || !(2.0..=36.0).contains(&trunc) {
                 return Err(NativeError::RangeError {
@@ -176,8 +171,6 @@ fn to_string_radix(
             }
             trunc as u32
         }
-    } else {
-        10
     };
     if radix == 10 {
         return Ok(Value::string(super::ecma::number_to_string(

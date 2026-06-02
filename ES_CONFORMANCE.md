@@ -1190,6 +1190,11 @@ regexp no longer throws) added +3 — total +12, `built-ins/RegExp`
 `SpeciesConstructor` (§7.3.20 step 6) to fall back to the default
 constructor on a nullish `@@species` instead of returning the resolved
 `constructor` — unblocking `@@split`/`@@matchAll` species + IsRegExp tests.
+Then +1 (host `print` global in the runner harness, for
+`Symbol.replace/coerce-global`) and +3 (observable coercions:
+`to_length_runtime` throws via ToNumber on a Symbol/BigInt lastIndex or
+result length; `@@replace` applies ToObject to a present `groups`).
+`built-ins/RegExp` 1244 → 1267 across the session, 0 regress.
 
 CLI smoke verifies:
 

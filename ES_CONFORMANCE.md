@@ -1326,6 +1326,16 @@ typed-array constructors (`BigInt64Array` / `BigUint64Array`
 both still bootstrap placeholders), and BigInt boxing
 (`Object(1n)` → BigInt wrapper object).
 
+### §23.1.3.1 Array.prototype.concat ArraySpeciesCreate (2026-06-02)
+
+`built-ins/Array` +11. `concat` collected its elements into a plain
+Array, ignoring `@@species`. It now creates the result with
+`ArraySpeciesCreate(O, 0)` first (so the observable `constructor` /
+`@@species` lookup and construction run before any element is read),
+appends each spread / single element via `CreateDataProperty`, and
+rejects a combined length above `2**53 - 1` with a `TypeError` up
+front per spread source. `@@isConcatSpreadable` was already honoured.
+
 ### §22.1.2 String.fromCharCode / fromCodePoint ToNumber (2026-06-02)
 
 `built-ins/String` +9. Both statics coerced their arguments with a

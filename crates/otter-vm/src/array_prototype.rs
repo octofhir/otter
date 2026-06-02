@@ -850,37 +850,50 @@ impl Interpreter {
         }
     }
 
-    /// Append element `e` to `out` per the §23.1.3.1 concat loop body:
-    /// a spreadable `e` contributes `Get(E, k)` for each present index
-    /// (absent indices stay holes), else `e` is appended as a single
-    /// value. Bounded by `MAX_ARRAY_LIKE_PROBE_LEN`.
-    fn concat_append(
+    /// §23.1.3.1 concat loop body, appending directly onto the
+    /// species-created result `a` starting at index `n`: a spreadable
+    /// `e` contributes `CreateDataProperty(a, n+k, Get(E, k))` for each
+    /// present index (absent indices advance `n` without a property),
+    /// else `e` is appended as one element. The combined length must
+    /// stay within `2**53 - 1` (TypeError otherwise). Returns the next
+    /// write index.
+    fn concat_append_to(
         &mut self,
         context: &ExecutionContext,
         e: Value,
-        out: &mut Vec<Value>,
-    ) -> Result<(), VmError> {
+        a: Value,
+        mut n: u64,
+    ) -> Result<u64, VmError> {
+        const MAX_SAFE: f64 = 9_007_199_254_740_991.0;
+        let too_long = || VmError::TypeError {
+            message: "concatenated array length exceeds the maximum safe integer".to_string(),
+        };
         if self.is_concat_spreadable(context, e)? {
-            let len = length_of_array_like(self, context, &e)?;
-            let cap = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
-            for k in 0..cap {
+            let len = length_of_array_like(self, context, &e)? as u64;
+            if (n as f64) + (len as f64) > MAX_SAFE {
+                return Err(too_long());
+            }
+            for k in 0..len {
                 let key = k.to_string();
-                let has = self.ordinary_has_property_value(
+                if self.ordinary_has_property_value(
                     context,
                     e,
                     &crate::VmPropertyKey::String(&key),
                     0,
-                )?;
-                if has {
-                    out.push(self.get_property_value_for_call(context, e, &key)?);
-                } else {
-                    out.push(Value::hole());
+                )? {
+                    let v = self.get_property_value_for_call(context, e, &key)?;
+                    self.create_data_property_or_throw(context, a, &n.to_string(), v)?;
                 }
+                n += 1;
             }
         } else {
-            out.push(e);
+            if n as f64 >= MAX_SAFE {
+                return Err(too_long());
+            }
+            self.create_data_property_or_throw(context, a, &n.to_string(), e)?;
+            n += 1;
         }
-        Ok(())
+        Ok(n)
     }
 
     /// §23.1.3.2 live `Array.prototype.concat` over a generic receiver.
@@ -896,26 +909,24 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
-        let mut combined: Vec<Value> = Vec::new();
-        self.concat_append(context, o, &mut combined)?;
-        for &a in args {
-            self.concat_append(context, a, &mut combined)?;
+        // §23.1.3.1 step 2 — A = ArraySpeciesCreate(O, 0) runs (and its
+        // observable `@@species` lookup / construction) before any
+        // element is read; elements are then appended via
+        // CreateDataProperty so a custom species object / proxy
+        // observes each define.
+        let a = self.array_species_create(context, o, 0, roots)?;
+        let mut n: u64 = self.concat_append_to(context, o, a, 0)?;
+        for &item in args {
+            n = self.concat_append_to(context, item, a, n)?;
         }
-        let heap = self.gc_heap_mut();
-        let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-            for value in &combined {
-                value.trace_value_slots(visit);
-            }
-        };
-        let arr = crate::array::alloc_array_with_roots(heap, &mut visitor).map_err(|_| {
-            VmError::TypeError {
-                message: "array allocation failed".to_string(),
-            }
-        })?;
-        crate::array::with_elements_mut(arr, heap, |elements| {
-            elements.extend(combined);
-        });
-        Ok(Value::array(arr))
+        // §23.1.3.1 step 4 — Set(A, "length", n).
+        self.array_set_property_throwing(
+            context,
+            a,
+            "length",
+            Value::number(NumberValue::from_f64(n as f64)),
+        )?;
+        Ok(a)
     }
 
     /// §23.1.3.30.1 SortCompare(x, y, comparefn). `undefined` sorts to

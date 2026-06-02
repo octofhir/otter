@@ -1406,6 +1406,19 @@ String wrapper object (`new String("123")`) rendered as
 `to_string_or_throw`, running the operand's `toString` / `valueOf`
 and throwing for a Symbol.
 
+### §23.2.3.16 %TypedArray%.prototype.indexOf/includes/lastIndexOf (2026-06-02)
+
+`built-ins/TypedArray` +9. `ToIntegerOrInfinity(fromIndex)` was applied
+in the prototype dispatcher before the impl's `ValidateTypedArray`, so a
+`fromIndex.valueOf` that detached the buffer threw a TypeError instead of
+the web-reality result. The coercion now runs inside the impl after the
+detached check and the length capture; the loop walks the pre-coercion
+length and reads each index with a detach-tolerant `[[Get]]` (undefined
+on a detached/shrunk view). `indexOf`/`lastIndexOf` skip the detached
+slot (strict compare) → -1; `includes` uses SameValueZero with
+`undefined === undefined` true → `includes(undefined)` returns true. Also
+corrects the three methods' `length` from 2 to 1.
+
 ### §10.4.5.3 TypedArray [[DefineOwnProperty]] value coercion (2026-06-02)
 
 `built-ins/TypedArray` +4. `Object.defineProperty(ta, i, {value})`

@@ -1551,6 +1551,16 @@ rejecting a non-writable / setter-less property. (Remaining: a true
 `[[ErrorData]]` instance marker — the chain heuristic over-approximates
 `Object.create(Error.prototype)` — and Proxy-receiver trap routing.)
 
+### §22.2.6 RegExp lastIndex [[Get]] for atomized keys (2026-06-03)
+
+`built-ins/Proxy` +2 (`get`/`has` `trap-is-missing-target-is-proxy`).
+The RegExp `[[Get]]` branch resolved `lastIndex` only when the key was
+the `String("lastIndex")` literal, so a key arriving as an atomized /
+owned string — e.g. forwarded through a trap-less `Proxy` wrapping a
+RegExp, where `(new Proxy(re, {})).lastIndex` should read the target's
+`lastIndex` — fell through to `undefined`. The branch now matches on the
+resolved name via `string_name()`.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

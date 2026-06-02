@@ -3216,11 +3216,14 @@ impl Interpreter {
             // component reads `get flags` performs) would never run.
             // Only `lastIndex` short-circuits; the rest fall to the
             // prototype walk below.
-            let direct = match key {
-                VmPropertyKey::String("lastIndex") => {
-                    regexp_prototype::load_property(&re, &mut self.gc_heap, "lastIndex")
-                }
-                _ => Value::undefined(),
+            // Match on the resolved name, not a single `String` literal:
+            // a key forwarded through a Proxy (or any atomized read)
+            // arrives as `Atom` / `OwnedString`, which must still resolve
+            // the RegExp's only own data property.
+            let direct = if key.string_name() == Some("lastIndex") {
+                regexp_prototype::load_property(&re, &mut self.gc_heap, "lastIndex")
+            } else {
+                Value::undefined()
             };
             return if direct.is_undefined() {
                 // Walk the instance's actual `[[Prototype]]` so a

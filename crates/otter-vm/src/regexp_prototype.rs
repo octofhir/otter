@@ -1183,30 +1183,22 @@ pub fn native_regexp_symbol_split(
     let lim: u32 = if limit_arg.is_undefined() {
         u32::MAX
     } else {
-        let primitive = if crate::abstract_ops::is_primitive(&limit_arg) {
-            limit_arg
-        } else {
-            let (interp, exec) = ctx.interp_mut_and_context();
-            let exec = exec.ok_or_else(|| crate::NativeError::TypeError {
-                name,
-                reason: "missing execution context".to_string(),
-            })?;
-            interp
-                .evaluate_to_primitive(
-                    &exec,
-                    &limit_arg,
-                    crate::abstract_ops::ToPrimitiveHint::Number,
-                )
-                .map_err(vm_err_to_native(name))?
-        };
-        let n = crate::number::to_number_value(&primitive, ctx.heap());
+        // ToUint32 runs ToNumber, which throws for a Symbol / BigInt
+        // limit rather than coercing it to zero.
+        let exec =
+            ctx.execution_context()
+                .cloned()
+                .ok_or_else(|| crate::NativeError::TypeError {
+                    name,
+                    reason: "missing execution context".to_string(),
+                })?;
+        let n = crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, &limit_arg)
+            .map_err(vm_err_to_native(name))?
+            .as_f64();
         if n.is_nan() {
             0
         } else {
-            // ToUint32 modulo 2^32.
-            let truncated = n.trunc();
-            let modulo = truncated.rem_euclid(4_294_967_296.0);
-            modulo as u32
+            n.trunc().rem_euclid(4_294_967_296.0) as u32
         }
     };
 

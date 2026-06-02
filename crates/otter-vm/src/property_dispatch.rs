@@ -418,6 +418,17 @@ impl Interpreter {
             } else {
                 true
             }
+        } else if let Some(r) = receiver.as_regexp() {
+            // §10.1.10 [[Delete]] — `lastIndex` is non-configurable; every
+            // other own name lives in the lazy expando bag, and a missing
+            // name deletes vacuously (returns `true`).
+            if name == "lastIndex" {
+                false
+            } else if let Some(bag) = r.expando(&self.gc_heap) {
+                crate::object::delete(bag, &mut self.gc_heap, name)
+            } else {
+                true
+            }
         } else {
             return Err(VmError::TypeError {
                 message: format!(
@@ -577,6 +588,30 @@ impl Interpreter {
                 } else {
                     true
                 }
+            } else {
+                return Err(VmError::TypeMismatch);
+            }
+        } else if let Some(r) = receiver.as_regexp() {
+            // §10.1.10 [[Delete]] — only `lastIndex` (non-configurable) and
+            // the lazy expando carry own names; any other key deletes
+            // vacuously.
+            if let Some(sym) = idx.as_symbol(&self.gc_heap) {
+                if let Some(bag) = r.expando(&self.gc_heap) {
+                    crate::object::delete_symbol(bag, &mut self.gc_heap, sym)
+                } else {
+                    true
+                }
+            } else if let Some(s) = idx.as_string(&self.gc_heap) {
+                let name = s.to_lossy_string(&self.gc_heap);
+                if name == "lastIndex" {
+                    false
+                } else if let Some(bag) = r.expando(&self.gc_heap) {
+                    crate::object::delete(bag, &mut self.gc_heap, &name)
+                } else {
+                    true
+                }
+            } else if idx.as_number().is_some() {
+                true
             } else {
                 return Err(VmError::TypeMismatch);
             }
@@ -1212,12 +1247,44 @@ impl Interpreter {
                         object::PropertyLookup::Absent
                     )
                 });
-                if absent && !r.is_extensible(&self.gc_heap) {
-                    Self::failed_set_result(
-                        strict,
-                        format!("Cannot add property '{name}' to non-extensible RegExp"),
-                    )?;
-                    None
+                if absent {
+                    // §10.1.9.2 OrdinarySet — `lastIndex` is the regexp's
+                    // only own data slot, so any other write that has no own
+                    // shadow must consult the prototype chain first: an
+                    // inherited getter-only accessor (`global`, `source`, …)
+                    // rejects the write rather than installing an own slot.
+                    let proto = self.get_prototype_for_op(&receiver)?;
+                    if let Some(proto_obj) = proto.as_object() {
+                        match object::resolve_set(proto_obj, &self.gc_heap, name) {
+                            object::SetOutcome::InvokeSetter { setter } => {
+                                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                                args.push(value);
+                                self.run_callable_sync(context, &setter, receiver, args)?;
+                                stack[top_idx].advance_pc(self.current_byte_len)?;
+                                return Ok(());
+                            }
+                            object::SetOutcome::Reject { .. } => {
+                                Self::failed_set_result(
+                                    strict,
+                                    format!("Cannot assign to read-only property '{name}'"),
+                                )?;
+                                stack[top_idx].advance_pc(self.current_byte_len)?;
+                                return Ok(());
+                            }
+                            object::SetOutcome::AssignData => {}
+                        }
+                    }
+                    if !r.is_extensible(&self.gc_heap) {
+                        Self::failed_set_result(
+                            strict,
+                            format!("Cannot add property '{name}' to non-extensible RegExp"),
+                        )?;
+                        None
+                    } else {
+                        let bag = regexp_ensure_expando(self, &r, &receiver)?;
+                        self.ordinary_set_data_property(bag, name, value)?;
+                        None
+                    }
                 } else {
                     let bag = regexp_ensure_expando(self, &r, &receiver)?;
                     if !self.ordinary_set_data_property(bag, name, value)? {
@@ -3399,13 +3466,55 @@ impl Interpreter {
                             object::PropertyLookup::Absent
                         )
                     });
-                    if absent && !r.is_extensible(&self.gc_heap) {
-                        return Self::finish_failed_set(
-                            stack,
-                            context,
-                            format!("Cannot add property '{key}' to non-extensible RegExp"),
-                            self.current_byte_len,
-                        );
+                    if absent {
+                        // §10.1.9.2 OrdinarySet — with no own shadow, the
+                        // prototype chain decides: an inherited getter-only
+                        // accessor (`global`, `source`, …) rejects the write
+                        // instead of installing an own slot on the regexp.
+                        let proto = self.get_prototype_for_op(&receiver)?;
+                        if let Some(proto_obj) = proto.as_object() {
+                            match object::resolve_set(proto_obj, &self.gc_heap, key) {
+                                object::SetOutcome::InvokeSetter { setter } => {
+                                    if !abstract_ops::is_callable(&setter) {
+                                        return Self::finish_failed_set(
+                                            stack,
+                                            context,
+                                            "Cannot assign to accessor property without a setter",
+                                            self.current_byte_len,
+                                        );
+                                    }
+                                    stack[top_idx].advance_pc(self.current_byte_len)?;
+                                    let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                                    args.push(value);
+                                    self.invoke(
+                                        stack,
+                                        context,
+                                        &setter,
+                                        receiver,
+                                        args,
+                                        scratch_reg,
+                                    )?;
+                                    return Ok(true);
+                                }
+                                object::SetOutcome::Reject { .. } => {
+                                    return Self::finish_failed_set(
+                                        stack,
+                                        context,
+                                        format!("Cannot assign to read-only property '{key}'"),
+                                        self.current_byte_len,
+                                    );
+                                }
+                                object::SetOutcome::AssignData => {}
+                            }
+                        }
+                        if !r.is_extensible(&self.gc_heap) {
+                            return Self::finish_failed_set(
+                                stack,
+                                context,
+                                format!("Cannot add property '{key}' to non-extensible RegExp"),
+                                self.current_byte_len,
+                            );
+                        }
                     }
                     let bag = regexp_ensure_expando(self, r, &receiver)?;
                     if !self.ordinary_set_data_property(bag, key, value)? {

@@ -1179,6 +1179,15 @@ target/release/otter-test262 run \
 | `built-ins/RegExp/unicodeSets`      | 114       | 100.0%         | |
 | `built-ins/RegExp/lookBehind`       | 17        | 100.0%         | |
 
+Update (2026-06-02): `built-ins/RegExp` 1244 → 1253 (97.72% → 98.43%),
++9 from the flag accessors (`global`/`source`/…) returning `undefined`
+instead of throwing when invoked with `%RegExp.prototype%` as `this`
+(§22.2.6.x step 3a; `flags` then reads `""`). A follow-up wiring the
+regexp `[[Set]]`/`[[Delete]]` through `OrdinarySet`/`OrdinaryDelete`
+(an inherited getter-only accessor rejects the write; `delete` on a
+regexp no longer throws) added +3 — total +12, `built-ins/RegExp`
+1244 → 1256 across the cluster.
+
 CLI smoke verifies:
 
 ```js

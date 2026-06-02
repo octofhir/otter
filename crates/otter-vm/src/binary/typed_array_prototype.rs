@@ -112,6 +112,55 @@ fn integer_arg(arg: Option<&Value>, default: i64) -> i64 {
     n.trunc() as i64
 }
 
+/// `ToIntegerOrInfinity(fromIndex)` for the `indexOf` / `lastIndexOf` /
+/// `includes` search methods. Unlike [`integer_arg`] this runs the full
+/// `ToNumber` so a `valueOf` / `@@toPrimitive` hook fires (and may detach
+/// the buffer) and a Symbol / BigInt argument throws. The detached / range
+/// checks that follow are the caller's responsibility, matching the spec
+/// order (`ValidateTypedArray` precedes `ToIntegerOrInfinity`).
+fn integer_index_arg(
+    ctx: &mut NativeCtx<'_>,
+    arg: Option<&Value>,
+    default: i64,
+) -> Result<i64, NativeError> {
+    let Some(v) = arg else {
+        return Ok(default);
+    };
+    if v.is_undefined() {
+        return Ok(default);
+    }
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| type_error("missing execution context"))?;
+    let n = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, v)
+        .map_err(|e| crate::native_function::vm_to_native_error(e, "TypedArray.prototype"))?
+        .as_f64();
+    if n.is_nan() {
+        return Ok(0);
+    }
+    if !n.is_finite() {
+        return Ok(if n.is_sign_positive() {
+            i64::MAX
+        } else {
+            i64::MIN
+        });
+    }
+    Ok(n.trunc() as i64)
+}
+
+/// Integer-indexed `[[Get]]` for a possibly-detached view. After a
+/// `fromIndex` coercion detaches (or a resizable buffer shrinks) the
+/// backing buffer, `align-detached-buffer-semantics-with-web-reality`
+/// makes the index read yield `undefined` rather than throwing, so the
+/// search loops keep running against the length captured before coercion.
+fn ta_element_or_undefined(t: &JsTypedArray, ctx: &mut NativeCtx<'_>, i: usize) -> Value {
+    if t.buffer(ctx.heap()).is_detached(ctx.heap()) || i >= t.length(ctx.heap_mut()) {
+        return Value::undefined();
+    }
+    t.get(ctx.heap_mut(), i).unwrap_or(Value::undefined())
+}
+
 /// §23.2.3.26 step 5 — `ToIntegerOrInfinity(offset)` for
 /// `%TypedArray%.prototype.set`. Runs `ToNumber` through the
 /// interpreter so a `valueOf` / `@@toPrimitive` hook fires (it may
@@ -313,20 +362,23 @@ fn impl_reverse(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
 
 fn impl_index_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
+    // §23.2.3.16 — ValidateTypedArray and the length read precede
+    // ToIntegerOrInfinity(fromIndex), so `len` is captured before the
+    // coercion's `valueOf` can detach the buffer.
     check_not_detached(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut()) as i64;
     if len == 0 {
         return Ok(smi(-1));
     }
     let target = args.first().cloned().unwrap_or(Value::undefined());
-    let start = integer_arg(args.get(1), 0);
+    let start = integer_index_arg(ctx, args.get(1), 0)?;
     let from = if start < 0 {
         (len + start).max(0)
     } else {
         start.min(len)
     } as usize;
     for i in from..(len as usize) {
-        if values_equal_strict(&t.get(ctx.heap_mut(), i).map_err(native_oom)?, &target) {
+        if values_equal_strict(&ta_element_or_undefined(&t, ctx, i), &target) {
             return Ok(smi(i as i32));
         }
     }
@@ -341,7 +393,7 @@ fn impl_last_index_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
         return Ok(smi(-1));
     }
     let target = args.first().cloned().unwrap_or(Value::undefined());
-    let start = integer_arg(args.get(1), len - 1);
+    let start = integer_index_arg(ctx, args.get(1), len - 1)?;
     let from = if start < 0 {
         (len + start).max(-1)
     } else {
@@ -349,10 +401,7 @@ fn impl_last_index_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     };
     let mut i = from;
     while i >= 0 {
-        if values_equal_strict(
-            &t.get(ctx.heap_mut(), i as usize).map_err(native_oom)?,
-            &target,
-        ) {
+        if values_equal_strict(&ta_element_or_undefined(&t, ctx, i as usize), &target) {
             return Ok(smi(i as i32));
         }
         i -= 1;
@@ -364,15 +413,18 @@ fn impl_includes(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     let t = receiver(ctx)?;
     check_not_detached(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut()) as i64;
+    if len == 0 {
+        return Ok(Value::boolean(false));
+    }
     let target = args.first().cloned().unwrap_or(Value::undefined());
-    let start = integer_arg(args.get(1), 0);
+    let start = integer_index_arg(ctx, args.get(1), 0)?;
     let from = if start < 0 {
         (len + start).max(0)
     } else {
         start.min(len)
     } as usize;
     for i in from..(len as usize) {
-        if values_equal_zero(&t.get(ctx.heap_mut(), i).map_err(native_oom)?, &target) {
+        if values_equal_zero(&ta_element_or_undefined(&t, ctx, i), &target) {
             return Ok(Value::boolean(true));
         }
     }
@@ -693,6 +745,12 @@ fn values_equal_strict(a: &Value, b: &Value) -> bool {
 
 /// SameValueZero — like strict equality but `NaN === NaN`.
 fn values_equal_zero(a: &Value, b: &Value) -> bool {
+    // SameValueZero(undefined, undefined) is true. `includes` reads each
+    // index with `[[Get]]`, which yields `undefined` on a detached view,
+    // so `includes(undefined, …)` after a mid-call detach matches.
+    if a.is_undefined() && b.is_undefined() {
+        return true;
+    }
     if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
         if x.is_nan() && y.is_nan() {
             return true;

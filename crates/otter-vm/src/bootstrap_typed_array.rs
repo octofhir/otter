@@ -1264,15 +1264,18 @@ fn ta_proto_dispatch(
     let receiver = *ctx.this_value();
     let mut small_args: SmallVec<[Value; 4]> = args.iter().cloned().collect();
 
-    // §23.2.3.{8,5,18,16,17} — `fill` / `copyWithin` / `includes` /
-    // `indexOf` / `lastIndexOf` open with `ToNumber` /
+    // §23.2.3.{8,5} — `fill` / `copyWithin` open with `ToNumber` /
     // `ToIntegerOrInfinity` on their operands (and `fill` coerces its
     // value first, as a BigInt for bigint element kinds). The intrinsic
     // impl reads raw `Value`s, so coerce here in spec order.
+    //
+    // `includes` / `indexOf` / `lastIndexOf` coerce their `fromIndex`
+    // inside the impl instead: §23.2.3.16 runs ToIntegerOrInfinity only
+    // after ValidateTypedArray + the length read, so a `valueOf` that
+    // detaches the buffer must not pre-empt that ordering.
     let int_coerce: &[usize] = match method_name {
         "fill" => &[1, 2],
         "copyWithin" => &[0, 1, 2],
-        "includes" | "indexOf" | "lastIndexOf" => &[1],
         _ => &[],
     };
     if method_name == "fill" || !int_coerce.is_empty() {
@@ -1456,9 +1459,9 @@ otter_macros::couch! {
             "fill"           / 3 => ta_fill,
             "copyWithin"     / 3 => ta_copy_within,
             "reverse"        / 0 => ta_reverse,
-            "indexOf"        / 2 => ta_index_of,
-            "lastIndexOf"    / 2 => ta_last_index_of,
-            "includes"       / 2 => ta_includes,
+            "indexOf"        / 1 => ta_index_of,
+            "lastIndexOf"    / 1 => ta_last_index_of,
+            "includes"       / 1 => ta_includes,
             "join"           / 1 => ta_join,
             "toString"       / 0 => ta_to_string,
             "toLocaleString" / 0 => ta_to_locale_string,

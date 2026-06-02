@@ -66,7 +66,7 @@ pub static ARRAY_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("at", 1, native_at),
     method("reverse", 0, native_reverse),
     method("fill", 3, native_fill),
-    method("flat", 1, native_flat),
+    method("flat", 0, native_flat),
     method("splice", 2, native_splice),
     method("sort", 1, native_sort),
     method("toString", 0, native_to_string),
@@ -628,6 +628,15 @@ impl Interpreter {
     }
 
     /// §23.1.3.11 live `Array.prototype.flat`.
+    /// §23.1.3.13 `Array.prototype.flat([depth])`.
+    ///
+    /// `A = ArraySpeciesCreate(O, 0)` then `FlattenIntoArray(A, O,
+    /// sourceLen, 0, depthNum)`. The result honours the receiver's
+    /// `@@species` constructor and installs each element via the
+    /// observable `CreateDataPropertyOrThrow`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-array.prototype.flat>
     pub(crate) fn array_flat(
         &mut self,
         context: &ExecutionContext,
@@ -640,6 +649,7 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
+        let source_len = length_of_array_like(self, context, &o)?.min(MAX_ARRAY_LIKE_PROBE_LEN);
         let depth = if depth_arg.is_undefined() {
             1
         } else {
@@ -652,36 +662,104 @@ impl Interpreter {
                 n.trunc() as i64
             }
         };
-        fn walk(out: &mut Vec<Value>, heap: &otter_gc::GcHeap, body: &[Value], depth: i64) {
-            for v in body {
-                if v.is_hole() {
-                    continue;
-                }
-                if let Some(a) = v.as_array()
-                    && depth > 0
-                {
-                    crate::array::with_elements(a, heap, |inner| walk(out, heap, inner, depth - 1));
-                } else {
-                    out.push(*v);
-                }
+        let a = self.array_species_create(context, o, 0, roots)?;
+        let anchor_base = self.push_iteration_anchor(a) - 1;
+        self.push_iteration_anchor(o);
+        let result = self.flatten_into_array(context, a, o, source_len, 0, depth, None);
+        self.pop_iteration_anchors_to(anchor_base);
+        result?;
+        Ok(a)
+    }
+
+    /// §7.2.2 `IsArray`: an Array exotic object, or a non-revoked
+    /// Proxy whose target chain bottoms out in one. A revoked Proxy is
+    /// an abrupt TypeError.
+    pub(crate) fn is_array_spec(&self, value: &Value) -> Result<bool, VmError> {
+        let mut current = *value;
+        for _ in 0..=object::PROTO_CHAIN_HARD_CAP {
+            if current.is_array() {
+                return Ok(true);
             }
+            let Some(proxy) = current.as_proxy() else {
+                return Ok(false);
+            };
+            if proxy.is_revoked(&self.gc_heap) {
+                return Err(VmError::TypeError {
+                    message: "Cannot perform 'IsArray' on a proxy that has been revoked"
+                        .to_string(),
+                });
+            }
+            current = proxy.target(&self.gc_heap);
         }
-        let len = length_of_array_like(self, context, &o)?.min(MAX_ARRAY_LIKE_PROBE_LEN);
-        let mut elements = Vec::with_capacity(len);
-        for k in 0..len {
-            if self.array_method_has_property(context, o, &format_index_key(k as f64))? {
-                elements.push(self.array_method_get_property(
+        Ok(false)
+    }
+
+    /// §23.1.3.13.1 FlattenIntoArray. Recurses into nested arrays while
+    /// `depth > 0`, applying `mapper` (the `flatMap` callback) only at
+    /// the top level. Reads each source index through the observable
+    /// `HasProperty` / `Get`, recurses on `IsArray` elements, and
+    /// installs leaves via `CreateDataPropertyOrThrow`. Returns the next
+    /// free target index.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-flattenintoarray>
+    pub(crate) fn flatten_into_array(
+        &mut self,
+        context: &ExecutionContext,
+        target: Value,
+        source: Value,
+        source_len: usize,
+        start: usize,
+        depth: i64,
+        mapper: Option<(Value, Value)>,
+    ) -> Result<usize, VmError> {
+        // 2^53 - 1: a CreateDataPropertyOrThrow target index past the
+        // safe-integer limit is a §23.1.3.13.1 step 4.c.ii TypeError.
+        const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+        let mut target_index = start;
+        for source_index in 0..source_len {
+            let key = format_index_key(source_index as f64);
+            if !self.array_method_has_property(context, source, &key)? {
+                continue;
+            }
+            let mut element = self.array_method_get_property(context, source, &key)?;
+            let anchor_base = self.push_iteration_anchor(element) - 1;
+            if let Some((mapper_fn, map_this)) = mapper {
+                let cb_args: SmallVec<[Value; 8]> =
+                    smallvec::smallvec![element, Value::number_f64(source_index as f64), source,];
+                element = self.run_callable_sync(context, &mapper_fn, map_this, cb_args)?;
+                self.push_iteration_anchor(element);
+            }
+            if depth > 0 && self.is_array_spec(&element)? {
+                let element_len =
+                    length_of_array_like(self, context, &element)?.min(MAX_ARRAY_LIKE_PROBE_LEN);
+                target_index = self.flatten_into_array(
                     context,
-                    o,
-                    &format_index_key(k as f64),
-                )?);
+                    target,
+                    element,
+                    element_len,
+                    target_index,
+                    depth - 1,
+                    None,
+                )?;
             } else {
-                elements.push(Value::hole());
+                if target_index as f64 >= MAX_SAFE_INTEGER {
+                    self.pop_iteration_anchors_to(anchor_base);
+                    return Err(VmError::TypeError {
+                        message: "flatten target index exceeds maximum safe integer".to_string(),
+                    });
+                }
+                self.create_data_property_or_throw(
+                    context,
+                    target,
+                    &format_index_key(target_index as f64),
+                    element,
+                )?;
+                target_index += 1;
             }
+            self.pop_iteration_anchors_to(anchor_base);
         }
-        let mut out = Vec::with_capacity(elements.len());
-        walk(&mut out, self.gc_heap(), &elements, depth);
-        self.array_create_from_dense_values(out)
+        Ok(target_index)
     }
 
     /// §23.1.3.6 / §23.1.3.20 / §23.1.3.32 live Array iterator creation.
@@ -2355,6 +2433,28 @@ pub(crate) fn array_callback_native_dispatch(
         ),
         _ => None,
     };
+    // §23.1.3.12 `flatMap` is FlattenIntoArray(A, O, len, 0, 1, mapper,
+    // T): each callback result that IsArray is spliced one level deep
+    // through the observable HasProperty / Get / CreateDataProperty
+    // protocol — not the raw element snapshot the generic loop uses.
+    if name == "flatMap" {
+        let target = output_target.expect("flatMap output target created above");
+        let anchor_base = interp.push_iteration_anchor(target) - 1;
+        interp.push_iteration_anchor(receiver);
+        let probe_len = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
+        let result = interp.flatten_into_array(
+            &context,
+            target,
+            receiver,
+            probe_len,
+            0,
+            1,
+            Some((callback, this_arg)),
+        );
+        interp.pop_iteration_anchors_to(anchor_base);
+        result.map_err(|err| crate::native_function::vm_to_native_error(err, "flatMap"))?;
+        return Ok(target);
+    }
     // `find` family visits every index `0..len` (an absent slot yields
     // `undefined` for the element); the rest skip absent indices.
     let visit_all = matches!(name, "find" | "findIndex" | "findLast" | "findLastIndex");
@@ -2549,43 +2649,6 @@ pub(crate) fn array_callback_native_dispatch(
             }
             "reduce" | "reduceRight" => {
                 acc = result;
-            }
-            "flatMap" => {
-                // §23.1.3.13 step 5 — FlattenIntoArray with depth=1.
-                // Each callback result, if an Array, has its
-                // elements spliced into the output; otherwise the
-                // raw value is appended.
-                if let Some(inner) = result.as_array() {
-                    let inner_vals: Vec<Value> =
-                        crate::array::with_elements(inner, interp.gc_heap(), |els| {
-                            els.iter().filter(|v| !v.is_hole()).cloned().collect()
-                        });
-                    for v in inner_vals {
-                        let target = output_target.ok_or(NativeError::TypeError {
-                            name: "flatMap",
-                            reason: "missing output target".to_string(),
-                        })?;
-                        let key = format_index_key(target_index as f64);
-                        interp
-                            .create_data_property_or_throw(&context, target, &key, v)
-                            .map_err(|err| {
-                                crate::native_function::vm_to_native_error(err, "flatMap")
-                            })?;
-                        target_index += 1;
-                    }
-                } else {
-                    let target = output_target.ok_or(NativeError::TypeError {
-                        name: "flatMap",
-                        reason: "missing output target".to_string(),
-                    })?;
-                    let key = format_index_key(target_index as f64);
-                    interp
-                        .create_data_property_or_throw(&context, target, &key, result)
-                        .map_err(|err| {
-                            crate::native_function::vm_to_native_error(err, "flatMap")
-                        })?;
-                    target_index += 1;
-                }
             }
             _ => {}
         }

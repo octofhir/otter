@@ -2785,3 +2785,30 @@ Fixed: `does-not-use-set-for-indices`, `return-a-new-array-object`,
 `return-abrupt-from-data-property{,-using-proxy}`,
 `return-abrupt-from-setting-length`, `sets-length`. 0 regressions
 across `built-ins/Array`.
+
+## flat / flatMap as spec FlattenIntoArray (§23.1.3.13 / §23.1.3.12)
+
+`Array.prototype.flat` built a plain dense Array and recursed through
+direct element reads, ignoring `@@species`, observable `HasProperty` /
+`Get`, and `CreateDataPropertyOrThrow`. `flatMap` flattened only literal
+arrays via a raw element snapshot. Both now run the shared
+`Interpreter::flatten_into_array` (§23.1.3.13.1): `ArraySpeciesCreate(O,
+0)` for the target, `HasProperty` + `Get` per source index, recursion
+into nested values while `depth > 0` using the proxy-aware
+`is_array_spec` (§7.2.2 IsArray unwraps the proxy target chain, throws
+on a revoked proxy), and `CreateDataPropertyOrThrow` for leaves with the
+2^53-1 target-index guard. `flat`'s declared `length` is now `0`.
+
+| section | before | after | delta |
+|---|---:|---:|---:|
+| `built-ins/Array/prototype/flat` | 14/19 | 19/19 | +5 |
+| `built-ins/Array/prototype/flatMap` | 22/25 | 23/25 | +1 |
+
+Fixed: flat `length`, `non-object-ctor-throws`, `proxy-access-count`,
+`target-array-non-extensible`, `target-array-with-non-configurable-property`,
+and flatMap `proxy-access-count`. 0 regressions across `built-ins/Array`.
+The two remaining flatMap `@@species` custom-constructor cases are a
+separate root: `new.target` inside a Construct of a closure resolves to
+the bare function rather than the closure value (the same closure /
+bare-function duality fixed for `prototype.constructor`, now in the
+Construct `new.target` path).

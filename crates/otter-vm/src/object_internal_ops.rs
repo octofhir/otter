@@ -1243,6 +1243,29 @@ impl Interpreter {
                 return Ok(false);
             };
             if k == "length" {
+                // §10.4.2.4 ArraySetLength. Steps 3-5 coerce the candidate
+                // length BEFORE any property validation: `newLen` runs
+                // `ToUint32` (whose inner `ToNumber` is the first observable
+                // coercion) and `numberLen` runs `ToNumber` again (the
+                // second), so an object value's `valueOf` / `@@toPrimitive`
+                // fires exactly twice and a non-integer / negative / overflow
+                // length raises `RangeError` ahead of the configurable /
+                // enumerable / writable checks.
+                let new_len = if let Some(v) = descriptor.value {
+                    let number_for_uint = crate::coerce::to_number_or_throw(self, context, &v)?;
+                    let new_len = crate::number::bitwise::to_uint32(number_for_uint);
+                    let number_len = crate::coerce::to_number_or_throw(self, context, &v)?;
+                    if (new_len as f64) != number_len.as_f64() {
+                        return Err(VmError::RangeError {
+                            message: "Invalid array length".to_string(),
+                        });
+                    }
+                    Some(new_len as usize)
+                } else {
+                    None
+                };
+                // OrdinaryDefineOwnProperty validation against length's fixed
+                // shape — a non-configurable, non-enumerable data property.
                 if descriptor.is_accessor()
                     || matches!(descriptor.configurable, Some(true))
                     || matches!(descriptor.enumerable, Some(true))
@@ -1251,43 +1274,42 @@ impl Interpreter {
                 }
                 let old_len = array::len(arr, &self.gc_heap);
                 let length_writable = array::length_writable(arr, &self.gc_heap);
-                if !length_writable {
-                    if matches!(descriptor.writable, Some(true)) {
-                        return Ok(false);
+                let want_writable_false = matches!(descriptor.writable, Some(false));
+                let want_writable_true = matches!(descriptor.writable, Some(true));
+                let Some(new_len) = new_len else {
+                    // No [[Value]]: only a writable transition is possible.
+                    if !length_writable {
+                        return Ok(!want_writable_true);
                     }
-                    if let Some(v) = descriptor.value {
-                        let number_len = crate::coerce::to_number_or_throw(self, context, &v)?;
-                        let new_len = crate::number::bitwise::to_uint32(number_len);
-                        if (new_len as f64) != number_len.as_f64() {
-                            return Err(VmError::RangeError {
-                                message: "Invalid array length".to_string(),
-                            });
-                        }
-                        return Ok(new_len as usize == old_len);
+                    if want_writable_false {
+                        array::set_length_writable(arr, &mut self.gc_heap, false);
+                    }
+                    return Ok(true);
+                };
+                if new_len >= old_len {
+                    // §10.4.2.4 step 9 — grow / no-op. A non-writable length
+                    // forbids a value change or a writable→true promotion
+                    // (the property is non-configurable).
+                    if !length_writable {
+                        return Ok(new_len == old_len && !want_writable_true);
+                    }
+                    array::set_length_checked(arr, &mut self.gc_heap, new_len)
+                        .map_err(|_| VmError::TypeMismatch)?;
+                    if want_writable_false {
+                        array::set_length_writable(arr, &mut self.gc_heap, false);
                     }
                     return Ok(true);
                 }
-                let new_writable = descriptor.writable.unwrap_or(true);
-                if let Some(v) = descriptor.value {
-                    let number_len = crate::coerce::to_number_or_throw(self, context, &v)?;
-                    let new_len = crate::number::bitwise::to_uint32(number_len);
-                    if (new_len as f64) != number_len.as_f64() {
-                        return Err(VmError::RangeError {
-                            message: "Invalid array length".to_string(),
-                        });
-                    }
-                    let delete_ok =
-                        array::set_length_checked(arr, &mut self.gc_heap, new_len as usize)
-                            .map_err(|_| VmError::TypeMismatch)?;
-                    if !new_writable {
-                        array::set_length_writable(arr, &mut self.gc_heap, false);
-                    }
-                    return Ok(delete_ok);
+                // §10.4.2.4 step 10 — shrink requires a writable length.
+                if !length_writable {
+                    return Ok(false);
                 }
-                if !new_writable {
+                let delete_ok = array::set_length_checked(arr, &mut self.gc_heap, new_len)
+                    .map_err(|_| VmError::TypeMismatch)?;
+                if want_writable_false {
                     array::set_length_writable(arr, &mut self.gc_heap, false);
                 }
-                return Ok(true);
+                return Ok(delete_ok);
             }
             if let Some(idx) = object::array_index_property_name(k) {
                 return self.define_array_index_property(arr, k, idx as usize, descriptor);
@@ -4289,8 +4311,20 @@ impl Interpreter {
             };
         }
         if let Some(arr) = target.as_array() {
-            if let Some(key) = key.string_name() {
-                array::set_named_property(arr, &mut self.gc_heap, key, value)
+            if let Some(name) = key.string_name() {
+                // §10.4.2 arrays inherit OrdinarySet but override
+                // [[DefineOwnProperty]]; assigning "length" is therefore an
+                // ArraySetLength that coerces the value (twice) and can
+                // reject — `set_named_property` would store the raw object
+                // and falsely report success.
+                if name == "length" {
+                    let descriptor = object::PartialPropertyDescriptor {
+                        value: Some(value),
+                        ..Default::default()
+                    };
+                    return self.define_own_property_value(context, &target, key, descriptor);
+                }
+                array::set_named_property(arr, &mut self.gc_heap, name, value)
                     .map_err(|_| VmError::TypeMismatch)?;
             }
             return Ok(true);

@@ -1401,6 +1401,25 @@ configurable `true` data properties for the post-ES5 methods (`at`,
 `@@unscopables` property itself non-writable / non-enumerable /
 configurable.
 
+### §10.4.2.4 ArraySetLength dual coercion + ordering (2026-06-03)
+
+`built-ins/Array` +5. Setting an array `length` coerced the candidate
+value once and validated the descriptor (accessor / configurable /
+enumerable rejection) before coercing, so two spec-observable steps
+were wrong: `ToUint32` (whose inner `ToNumber` is observable) and the
+separate `ToNumber` of step 4 now both run, firing an object value's
+`valueOf` / `@@toPrimitive` exactly twice; and the `RangeError` from
+`newLen ≠ numberLen` (step 5) now precedes the property validation, so
+`defineProperty([], "length", {value: -1, configurable: true})` throws
+`RangeError` rather than the configurable rejection's `TypeError`. The
+old-length read and writable check moved after coercion (a `valueOf`
+that flips `length` non-writable mid-coercion is honoured), and a
+non-writable length now rejects a value change or a writable→true
+promotion. The array `[[Set]]` path (`Reflect.set` / `arr.length = v`
+on the slow path) also routed `length` through `set_named_property`,
+storing the raw object and falsely reporting success; it now delegates
+to the same `[[DefineOwnProperty]]` / ArraySetLength path.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

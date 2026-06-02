@@ -1406,6 +1406,17 @@ String wrapper object (`new String("123")`) rendered as
 `to_string_or_throw`, running the operand's `toString` / `valueOf`
 and throwing for a Symbol.
 
+### §22.1.3.8/.9 String indexOf/lastIndexOf coercion order + NaN (2026-06-02)
+
+`built-ins/String/prototype/{indexOf,lastIndexOf}` both 100%;
+`built-ins/String/prototype` 1155→1161. The shared arg pre-coercion
+coerced all integer operands before all string operands, so
+`lastIndexOf(searchString, position)` ran ToNumber(position) before
+ToString(searchString); the table is now an ordered (index, is_int) list
+per method (split keeps limit-before-separator per §22.1.3.21). Also
+`lastIndexOf(s, NaN)` now maps NaN position to the string end (§22.1.3.9
+step 5) instead of 0.
+
 ### §22.1.3.7 String includes/startsWith/endsWith RegExp guard (2026-06-02)
 
 `built-ins/String/prototype/{includes,startsWith,endsWith}` all 100%;

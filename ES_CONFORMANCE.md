@@ -1326,6 +1326,15 @@ typed-array constructors (`BigInt64Array` / `BigUint64Array`
 both still bootstrap placeholders), and BigInt boxing
 (`Object(1n)` → BigInt wrapper object).
 
+### §22.1.2 String.fromCharCode / fromCodePoint ToNumber (2026-06-02)
+
+`built-ins/String` +9. Both statics coerced their arguments with a
+lenient numeric parse that ignored an object's `valueOf` and turned a
+Symbol / BigInt into NaN (then 0). They now run `? ToNumber(next)` per
+argument (§22.1.2.1 / §22.1.2.2) via `to_number_or_throw`, so
+`valueOf` fires and a Symbol / BigInt throws; `fromCodePoint` keeps
+its `RangeError` for a non-integer or out-of-range code point.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

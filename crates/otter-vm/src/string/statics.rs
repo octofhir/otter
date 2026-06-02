@@ -161,9 +161,21 @@ fn string_raw(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 /// for the exact contract), or a wrapper object via
 /// `@@toPrimitive` → `valueOf` → `toString`.
 fn string_from_char_code(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    // §22.1.2.1 — each argument is `ToUint16(? ToNumber(next))`, so an
+    // object's `valueOf` runs and a Symbol / BigInt argument throws,
+    // rather than being silently coerced to 0.
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or(NativeError::TypeError {
+            name: "String.fromCharCode",
+            reason: "no execution context available".to_string(),
+        })?;
     let mut units: Vec<u16> = Vec::with_capacity(args.len());
     for arg in args {
-        let n = crate::number::parse::to_number_value(arg, ctx.heap());
+        let n = crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, arg)
+            .map_err(|e| crate::native_function::vm_to_native_error(e, "String.fromCharCode"))?
+            .as_f64();
         units.push(to_uint16(n));
     }
     JsString::from_utf16_units(&units, ctx.heap_mut())
@@ -194,9 +206,21 @@ fn string_from_char_code(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
 /// - [`NativeError::TypeError`] — string heap exhausted while
 ///   materialising the final `JsString`.
 fn string_from_code_point(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    // §22.1.2.2 — each argument is `? ToNumber(next)` (an object's
+    // `valueOf` runs, a Symbol / BigInt throws), then validated as an
+    // integer code point in `[0, 0x10FFFF]` (otherwise RangeError).
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or(NativeError::TypeError {
+            name: "String.fromCodePoint",
+            reason: "no execution context available".to_string(),
+        })?;
     let mut units: Vec<u16> = Vec::with_capacity(args.len() * 2);
     for arg in args {
-        let n = crate::number::parse::to_number_value(arg, ctx.heap());
+        let n = crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, arg)
+            .map_err(|e| crate::native_function::vm_to_native_error(e, "String.fromCodePoint"))?
+            .as_f64();
         if !n.is_finite() || n < 0.0 || n > 0x10FFFF as f64 || n.fract() != 0.0 {
             return Err(NativeError::RangeError {
                 name: "String.fromCodePoint",

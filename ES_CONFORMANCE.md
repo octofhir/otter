@@ -1326,6 +1326,19 @@ typed-array constructors (`BigInt64Array` / `BigUint64Array`
 both still bootstrap placeholders), and BigInt boxing
 (`Object(1n)` → BigInt wrapper object).
 
+### §23.2.3.26 %TypedArray%.prototype.set — offset coercion (2026-06-02)
+
+`built-ins/TypedArray/prototype/set` 62 → 82 / 110 (and the full
+`built-ins/TypedArray` suite +20). The method read `offset` with a
+lenient integer coercion that skipped `valueOf`, never propagated an
+abrupt completion, and reported a negative offset as a `TypeError`.
+`set` now computes `targetOffset = ToIntegerOrInfinity(offset)`
+through `to_number_or_throw` before the detached / range checks, so a
+poisoned `valueOf` (which may detach the target) runs and propagates,
+and a negative or out-of-bounds offset is a `RangeError`
+(§23.2.3.26 step 5). The array-like source `length` / element reads
+still use lenient coercion — a separate slice.
+
 ### Builtin accessor function names — `get`/`set` prefix (2026-06-02)
 
 A builtin accessor's getter / setter `NativeFunction` was named with

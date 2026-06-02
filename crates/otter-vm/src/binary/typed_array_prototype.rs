@@ -112,6 +112,25 @@ fn integer_arg(arg: Option<&Value>, default: i64) -> i64 {
     n.trunc() as i64
 }
 
+/// §23.2.3.26 step 5 — `ToIntegerOrInfinity(offset)` for
+/// `%TypedArray%.prototype.set`. Runs `ToNumber` through the
+/// interpreter so a `valueOf` / `@@toPrimitive` hook fires (it may
+/// detach the target buffer) and its abrupt completion propagates,
+/// then truncates toward zero (`NaN` → 0, `±Infinity` preserved). The
+/// caller maps a negative or out-of-bounds result to a `RangeError`.
+fn ta_set_offset(ctx: &mut NativeCtx<'_>, arg: Option<&Value>) -> Result<f64, NativeError> {
+    let undefined = Value::undefined();
+    let value = arg.unwrap_or(&undefined);
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| type_error("missing execution context"))?;
+    let number = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, value)
+        .map_err(|e| crate::native_function::vm_to_native_error(e, "TypedArray.prototype.set"))?;
+    let n = number.as_f64();
+    Ok(if n.is_nan() { 0.0 } else { n.trunc() })
+}
+
 fn native_oom(_: otter_gc::OutOfMemory) -> NativeError {
     type_error("out of memory")
 }
@@ -410,12 +429,22 @@ fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
 
 fn impl_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
-    check_not_detached(&t, ctx.heap())?;
-    let offset = integer_arg(args.get(1), 0);
-    if offset < 0 {
-        return Err(type_error("must be non-negative"));
+    // §23.2.3.26 step 5 — `targetOffset = ToIntegerOrInfinity(offset)`
+    // runs before the detached / range checks, so its `valueOf` fires
+    // (and may detach the buffer), its abrupt completion propagates,
+    // and a negative result is a RangeError rather than a TypeError.
+    let offset_f = ta_set_offset(ctx, args.get(1))?;
+    if offset_f < 0.0 {
+        return Err(range_error("Start offset is out of bounds"));
     }
-    let off = offset as usize;
+    check_not_detached(&t, ctx.heap())?;
+    // A `+Infinity` or past-the-end offset overruns any source; reject
+    // before the `usize` cast so the per-source bound checks stay
+    // overflow-free.
+    if offset_f > t.length(ctx.heap_mut()) as f64 {
+        return Err(range_error("Start offset is out of bounds"));
+    }
+    let off = offset_f as usize;
     let source = args.first().cloned().unwrap_or(Value::undefined());
     let kind = t.kind();
     fn coerce(

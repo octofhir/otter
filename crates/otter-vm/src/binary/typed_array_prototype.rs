@@ -472,61 +472,104 @@ fn impl_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
             let coerced = coerce(kind, v, ctx.heap_mut())?;
             t.set(ctx.heap_mut(), off + i, &coerced);
         }
-    } else if let Some(arr) = source.as_array() {
-        let src_len = crate::array::len(arr, ctx.heap_mut());
-        if off + src_len > t.length(ctx.heap_mut()) {
-            return Err(range_error("source overruns destination"));
-        }
-        for i in 0..src_len {
-            let v = crate::array::get(arr, ctx.heap_mut(), i);
-            let coerced = coerce(kind, &v, ctx.heap_mut())?;
-            t.set(ctx.heap_mut(), off + i, &coerced);
-        }
-    } else if let Some(obj) = source.as_object() {
-        // §22.2.3.23.1 step 14 — array-like Object source.
-        let len_value =
-            crate::object::get(obj, ctx.heap_mut(), "length").unwrap_or(Value::undefined());
-        let len_n = crate::number::to_number_value(&len_value, ctx.heap_mut());
-        let src_len = if len_n.is_nan() || len_n <= 0.0 {
-            0
-        } else {
-            len_n.min(9_007_199_254_740_991.0) as usize
-        };
-        if off + src_len > t.length(ctx.heap_mut()) {
-            return Err(range_error("source overruns destination"));
-        }
-        for i in 0..src_len {
-            let key = i.to_string();
-            let v = crate::object::get(obj, ctx.heap_mut(), &key).unwrap_or(Value::undefined());
-            let coerced = coerce(kind, &v, ctx.heap_mut())?;
-            t.set(ctx.heap_mut(), off + i, &coerced);
-        }
-    } else if let Some(s) = source.as_string(ctx.heap_mut()) {
-        // §22.2.3.23.1 step 14 — String indexed-char wrapper.
-        let units = s.to_utf16_vec(ctx.heap_mut());
-        let src_len = units.len();
-        if off + src_len > t.length(ctx.heap_mut()) {
-            return Err(range_error("source overruns destination"));
-        }
-        for (i, unit) in units.iter().enumerate() {
-            let ch = char::from_u32(*unit as u32).unwrap_or('\u{FFFD}');
-            let s_one = ch.to_string();
-            let v = Value::string(JsString::from_str(&s_one, ctx.heap_mut())?);
-            let coerced = coerce(kind, &v, ctx.heap_mut())?;
-            t.set(ctx.heap_mut(), off + i, &coerced);
-        }
-    } else if source.is_number()
-        || source.is_boolean()
-        || source.is_symbol()
-        || source.is_big_int()
-        || source.is_null()
-        || source.is_undefined()
-    {
-        // Primitive wrappers have no own indexed properties — no-op.
     } else {
-        return Err(type_error("must be a TypedArray or array-like"));
+        // §23.2.3.26.2 SetTypedArrayFromArrayLike — every non-TypedArray
+        // source is coerced through ToObject, then `length` and each
+        // element are read with the ordinary `[[Get]]` (firing getters)
+        // and converted via ToNumber / ToBigInt, so user side effects
+        // run and abrupt completions propagate in spec order.
+        if source.is_null() || source.is_undefined() {
+            return Err(type_error("cannot set a TypedArray from null or undefined"));
+        }
+        let src_len = ta_array_like_length(ctx, source)?;
+        if off + src_len > t.length(ctx.heap_mut()) {
+            return Err(range_error("source overruns destination"));
+        }
+        for i in 0..src_len {
+            let v = ta_get(
+                ctx,
+                source,
+                crate::VmPropertyKey::OwnedString(i.to_string()),
+            )?;
+            let coerced = ta_coerce_value(ctx, kind, &v)?;
+            // A getter may have detached the target mid-loop; §23.2.3.26.2
+            // step 6 still converts every value but a store into a
+            // detached view is a no-op.
+            if !t.buffer(ctx.heap()).is_detached(ctx.heap()) {
+                t.set(ctx.heap_mut(), off + i, &coerced);
+            }
+        }
     }
     Ok(Value::undefined())
+}
+
+/// §7.3.3 Get + run an accessor — read `source[key]` through the
+/// ordinary `[[Get]]` so array / string indexing and user getters all
+/// fire, propagating an abrupt completion verbatim.
+fn ta_get(
+    ctx: &mut NativeCtx<'_>,
+    source: Value,
+    key: crate::VmPropertyKey<'_>,
+) -> Result<Value, NativeError> {
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| type_error("missing execution context"))?;
+    let outcome = ctx
+        .interp_mut()
+        .ordinary_get_value(&exec, source, source, &key, 0)
+        .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+    match outcome {
+        crate::VmGetOutcome::Value(v) => Ok(v),
+        crate::VmGetOutcome::InvokeGetter { getter } => ctx
+            .interp_mut()
+            .run_callable_sync(&exec, &getter, source, smallvec::smallvec![])
+            .map_err(|e| crate::native_function::vm_to_native_error(e, NAME)),
+    }
+}
+
+/// §7.3.20 LengthOfArrayLike — `ToLength(Get(source, "length"))`.
+fn ta_array_like_length(ctx: &mut NativeCtx<'_>, source: Value) -> Result<usize, NativeError> {
+    let len_value = ta_get(ctx, source, crate::VmPropertyKey::String("length"))?;
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| type_error("missing execution context"))?;
+    let number = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, &len_value)
+        .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+    let n = number.as_f64();
+    let len = if n.is_nan() || n <= 0.0 {
+        0.0
+    } else {
+        n.trunc().min(9_007_199_254_740_991.0)
+    };
+    Ok(len as usize)
+}
+
+/// §23.2.3.26.2 step 6.c — convert a source element with `ToBigInt`
+/// for BigInt element types and `ToNumber` otherwise (firing the
+/// operand's coercion and throwing for a Symbol / cross-numeric type),
+/// then narrow it to the destination element representation.
+fn ta_coerce_value(
+    ctx: &mut NativeCtx<'_>,
+    kind: TypedArrayKind,
+    value: &Value,
+) -> Result<Value, NativeError> {
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| type_error("missing execution context"))?;
+    let converted = if kind.is_bigint() {
+        let big = crate::coerce::to_big_int_or_throw(ctx.interp_mut(), &exec, value)
+            .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+        Value::big_int(big)
+    } else {
+        let number = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, value)
+            .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+        number_value(number.as_f64())
+    };
+    crate::binary::dispatch::coerce_element_for_store(ctx.heap_mut(), kind, &converted)
+        .map_err(|_| type_error("element type mismatch"))
 }
 
 fn impl_to_reversed(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {

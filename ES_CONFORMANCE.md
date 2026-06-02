@@ -1326,6 +1326,19 @@ typed-array constructors (`BigInt64Array` / `BigUint64Array`
 both still bootstrap placeholders), and BigInt boxing
 (`Object(1n)` → BigInt wrapper object).
 
+### §23.2.3.26 %TypedArray%.prototype.set — array-like source (2026-06-02)
+
+`built-ins/TypedArray/prototype/set` 82 → 104 / 110 (full
+`built-ins/TypedArray` +22). The array / object / string source paths
+read `length` and each element with non-observable accessors and a
+lenient element coercion, so getters never fired, abrupt completions
+were swallowed, and a Symbol element silently became `NaN`. The
+non-TypedArray branches are now one `SetTypedArrayFromArrayLike`
+(§23.2.3.26.2): `ToObject` (null / undefined throw `TypeError`),
+`length` via `Get` + `ToLength`, and each element via `Get` (running
+getters) + `ToNumber` / `ToBigInt`, with a store into a
+mid-loop-detached view a no-op.
+
 ### §23.2.3.26 %TypedArray%.prototype.set — offset coercion (2026-06-02)
 
 `built-ins/TypedArray/prototype/set` 62 → 82 / 110 (and the full

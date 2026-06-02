@@ -123,7 +123,12 @@ impl Interpreter {
         args: &mut [Value],
     ) -> Result<(), VmError> {
         let (int_coerce, str_coerce): (&[usize], &[usize]) = match name {
-            "indexOf" | "lastIndexOf" | "includes" | "startsWith" | "endsWith" => (&[1], &[0]),
+            "indexOf" | "lastIndexOf" => (&[1], &[0]),
+            // §22.1.3.7/.21/.22 — includes/startsWith/endsWith must run
+            // IsRegExp(searchString) (and throw) *before* ToString, so the
+            // raw search argument has to reach the impl uncoerced; only the
+            // position operand is pre-coerced here.
+            "includes" | "startsWith" | "endsWith" => (&[1], &[]),
             "slice" | "substring" | "substr" => (&[0, 1], &[]),
             "at" | "charAt" | "charCodeAt" | "codePointAt" => (&[0], &[]),
             "repeat" => (&[0], &[]),

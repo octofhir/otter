@@ -545,7 +545,15 @@ fn impl_starts_with(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
-    let needle = arg_to_string(ctx, args, 0)?;
+    let search = args.first().copied().unwrap_or(Value::undefined());
+    // §22.1.3.21 step 4-6 — a RegExp searchString throws before its ToString.
+    if is_reg_exp(ctx, search, "String.prototype.startsWith")? {
+        return Err(type_error(
+            "String.prototype.startsWith",
+            "searchString must not be a RegExp",
+        ));
+    }
+    let needle = value_to_string(ctx, search, "String.prototype.startsWith")?;
     let from = arg_u32_or(ctx, args, 1, 0)?;
     Ok(Value::boolean(recv.starts_with(
         needle,
@@ -560,7 +568,15 @@ fn impl_ends_with(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
-    let needle = arg_to_string(ctx, args, 0)?;
+    let search = args.first().copied().unwrap_or(Value::undefined());
+    // §22.1.3.7 step 4-6 — a RegExp searchString throws before its ToString.
+    if is_reg_exp(ctx, search, "String.prototype.endsWith")? {
+        return Err(type_error(
+            "String.prototype.endsWith",
+            "searchString must not be a RegExp",
+        ));
+    }
+    let needle = value_to_string(ctx, search, "String.prototype.endsWith")?;
     let end_pos = arg_u32_or(ctx, args, 1, recv.len())?;
     Ok(Value::boolean(recv.ends_with(
         needle,
@@ -575,7 +591,15 @@ fn impl_includes(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
-    let needle = arg_to_string(ctx, args, 0)?;
+    let search = args.first().copied().unwrap_or(Value::undefined());
+    // §22.1.3.7 step 4-6 — a RegExp searchString throws before its ToString.
+    if is_reg_exp(ctx, search, "String.prototype.includes")? {
+        return Err(type_error(
+            "String.prototype.includes",
+            "searchString must not be a RegExp",
+        ));
+    }
+    let needle = value_to_string(ctx, search, "String.prototype.includes")?;
     let from = arg_u32_or(ctx, args, 1, 0)?;
     let pos = recv
         .index_of(needle, from, None, ctx.heap_mut())

@@ -40,7 +40,7 @@ impl Interpreter {
         stack[top_idx].advance_pc(self.current_byte_len)?;
         let result = match op {
             Op::ArrayConstruct => self.array_construct_stack_rooted(stack, &args)?,
-            Op::ArrayFrom => self.array_from_sync(context, &args)?,
+            Op::ArrayFrom => self.array_from_sync(context, Value::undefined(), &args)?,
             Op::ArrayOf => self.array_of_stack_rooted(stack, &args)?,
             _ => return Err(VmError::InvalidOperand),
         };
@@ -107,21 +107,28 @@ impl Interpreter {
 
     /// §23.1.2.1 `Array.from(items, mapFn?, thisArg?)`.
     ///
-    /// Splits on `items`:
-    /// - Has `@@iterator` → walk via [`Self::iterator_to_list_sync`]
-    ///   (sync iterator protocol, §7.4).
-    /// - Otherwise → array-like read of `length` + indexed
-    ///   properties (§7.3.18 CreateListFromArrayLike with no element
-    ///   type filter).
+    /// `constructor` is the `this` value of the call (`C`). When it is
+    /// a constructor the result `A` is `Construct(C)` (iterator path)
+    /// or `Construct(C, «len»)` (array-like path); otherwise `A` is a
+    /// fresh ordinary Array. Elements are installed with
+    /// `CreateDataPropertyOrThrow` and the final length is written via
+    /// the observable `Set(A, "length", …, true)`. A thrown `mapfn` or
+    /// `CreateDataPropertyOrThrow` closes an open iterator (§7.4.11).
     ///
-    /// When `mapFn` is supplied (must be callable), each value is
-    /// passed through `mapFn(value, index)` with `this` = `thisArg`.
+    /// Splits on `items`:
+    /// - `@@iterator` present → drive the sync iterator protocol live
+    ///   so observable mutations during `mapfn` are honoured (§7.4).
+    /// - Otherwise → array-like read of `length` + indexed properties.
+    ///
+    /// When `mapFn` is supplied it must be callable; each value passes
+    /// through `mapFn(value, index)` with `this` = `thisArg`.
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-array.from>
     pub(crate) fn array_from_sync(
         &mut self,
         context: &ExecutionContext,
+        constructor: Value,
         args: &[Value],
     ) -> Result<Value, VmError> {
         let items = args.first().cloned().unwrap_or(Value::undefined());
@@ -133,10 +140,12 @@ impl Interpreter {
                 message: "Array.from mapFn must be callable".to_string(),
             });
         }
+        let use_ctor = !constructor.is_undefined()
+            && crate::abstract_ops::is_constructor(&constructor, context, &self.gc_heap);
 
-        // Step 1 — built-in iterable fast paths short-circuit the
-        // `@@iterator` round-trip; for everything else look up
-        // `@@iterator` to decide between iterable and array-like.
+        // `usingIterator = GetMethod(items, @@iterator)`. Built-in
+        // iterables short-circuit the property round-trip via a
+        // sentinel; everything else looks `@@iterator` up directly.
         let is_builtin_iterable = items.is_array()
             || items.is_string()
             || items.is_set()
@@ -146,9 +155,6 @@ impl Interpreter {
         let iterator_method = if items.is_undefined() || items.is_null() {
             Value::undefined()
         } else if is_builtin_iterable {
-            // Sentinel: any non-undefined value picks the iterator
-            // path below; `iterator_to_list_sync` handles built-ins
-            // via its fast-path branches.
             Value::boolean(true)
         } else {
             let iterator_sym = self.well_known_symbols.get(symbol::WellKnown::Iterator);
@@ -166,110 +172,143 @@ impl Interpreter {
             }
         };
 
-        let raw_values: Vec<Value> = if iterator_method.is_undefined() || iterator_method.is_null()
-        {
-            // Step 4 — ArrayLike path.
-            if items.is_undefined() || items.is_null() {
-                return Err(VmError::TypeError {
-                    message: "Array.from requires an iterable or array-like".to_string(),
-                });
-            }
-            let length_value = match self.ordinary_get_value(
-                context,
-                items,
-                items,
-                &VmPropertyKey::String("length"),
-                0,
-            )? {
-                VmGetOutcome::Value(v) => v,
-                VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, items, SmallVec::new())?
-                }
-            };
-            let len = to_length(&length_value, &self.gc_heap)?;
-            let mut out = Vec::with_capacity(len);
-            for index in 0..len {
-                let key = VmPropertyKey::OwnedString(index.to_string());
-                let value = match self.ordinary_get_value(context, items, items, &key, 0)? {
-                    VmGetOutcome::Value(v) => v,
-                    VmGetOutcome::InvokeGetter { getter } => {
-                        self.run_callable_sync(context, &getter, items, SmallVec::new())?
-                    }
-                };
-                out.push(value);
-            }
-            out
-        } else {
+        if !iterator_method.is_undefined() && !iterator_method.is_null() {
             if !is_builtin_iterable && !self.is_callable_runtime(&iterator_method) {
                 return Err(VmError::TypeError {
                     message: "iterator method is not callable".to_string(),
                 });
             }
-            if has_map && !is_builtin_iterable {
-                let (iterator, next_method) = self.get_iterator_sync(context, &items)?;
-                let anchor_base = self.push_iteration_anchor(iterator) - 1;
-                self.push_iteration_anchor(next_method);
-                self.push_iteration_anchor(items);
-                self.push_iteration_anchor(map_fn);
-                self.push_iteration_anchor(this_arg);
-                let mut mapped: Vec<Value> = Vec::new();
-                let mut index = 0usize;
-                let result = loop {
-                    match self.iterator_step_sync(context, &iterator, &next_method) {
-                        Ok(Some(value)) => {
-                            let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
-                            cb_args.push(value);
-                            cb_args.push(Value::number_i32(index as i32));
-                            match self.run_callable_sync(context, &map_fn, this_arg, cb_args) {
-                                Ok(mapped_value) => {
-                                    mapped.push(mapped_value);
-                                    self.push_iteration_anchor(mapped_value);
-                                    index = index.saturating_add(1);
-                                }
-                                Err(err) => {
-                                    let _ = self.iterator_close_sync(context, &iterator);
-                                    break Err(err);
-                                }
-                            }
-                        }
-                        Ok(None) => break Ok(mapped),
+            // Step 6 — iterator path. `A = Construct(C)` (no length
+            // forwarded; the count is unknown up front) or a fresh
+            // Array.
+            let target = self.array_from_make_target(context, use_ctor, &constructor, None)?;
+            let (iterator, next_method) = self.get_iterator_sync(context, &items)?;
+            let anchor_base = self.push_iteration_anchor(iterator) - 1;
+            self.push_iteration_anchor(next_method);
+            self.push_iteration_anchor(items);
+            self.push_iteration_anchor(map_fn);
+            self.push_iteration_anchor(this_arg);
+            self.push_iteration_anchor(target);
+            let mut k = 0usize;
+            let result = loop {
+                let value = match self.iterator_step_sync(context, &iterator, &next_method) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => break Ok(()),
+                    // `next` threw: the iterator is already done, no close.
+                    Err(err) => break Err(err),
+                };
+                let mapped = if has_map {
+                    let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
+                    cb_args.push(value);
+                    cb_args.push(Value::number_f64(k as f64));
+                    match self.run_callable_sync(context, &map_fn, this_arg, cb_args) {
+                        Ok(mapped) => mapped,
                         Err(err) => {
                             let _ = self.iterator_close_sync(context, &iterator);
                             break Err(err);
                         }
                     }
+                } else {
+                    value
                 };
-                self.pop_iteration_anchors_to(anchor_base);
-                let mapped = result?;
-                return Ok(Value::array(self.alloc_runtime_rooted_array_from_values(
-                    mapped,
-                    &[&items, &map_fn, &this_arg],
-                    &[],
-                )?));
-            }
-            // `iterator_to_list_sync` short-circuits built-ins and
-            // routes everything else through `GetIterator` /
-            // `IteratorStep`.
-            self.iterator_to_list_sync(context, &items)?
-        };
-
-        let mut mapped: Vec<Value> = Vec::with_capacity(raw_values.len());
-        for (index, value) in raw_values.into_iter().enumerate() {
-            if has_map {
-                let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
-                cb_args.push(value);
-                cb_args.push(Value::number_i32(index as i32));
-                let mapped_value = self.run_callable_sync(context, &map_fn, this_arg, cb_args)?;
-                mapped.push(mapped_value);
-            } else {
-                mapped.push(value);
-            }
+                if let Err(err) =
+                    self.create_data_property_or_throw(context, target, &k.to_string(), mapped)
+                {
+                    let _ = self.iterator_close_sync(context, &iterator);
+                    break Err(err);
+                }
+                k = k.saturating_add(1);
+            };
+            self.pop_iteration_anchors_to(anchor_base);
+            result?;
+            self.array_set_property_throwing(
+                context,
+                target,
+                "length",
+                Value::number_f64(k as f64),
+            )?;
+            return Ok(target);
         }
-        Ok(Value::array(self.alloc_runtime_rooted_array_from_values(
-            mapped,
-            &[&items, &map_fn, &this_arg],
-            &[],
-        )?))
+
+        // Step 4 — array-like path.
+        if items.is_undefined() || items.is_null() {
+            return Err(VmError::TypeError {
+                message: "Array.from requires an iterable or array-like".to_string(),
+            });
+        }
+        let length_value = match self.ordinary_get_value(
+            context,
+            items,
+            items,
+            &VmPropertyKey::String("length"),
+            0,
+        )? {
+            VmGetOutcome::Value(v) => v,
+            VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(context, &getter, items, SmallVec::new())?
+            }
+        };
+        let len = to_length(&length_value, &self.gc_heap)?;
+        let target = self.array_from_make_target(context, use_ctor, &constructor, Some(len))?;
+        let anchor_base = self.push_iteration_anchor(target) - 1;
+        self.push_iteration_anchor(items);
+        self.push_iteration_anchor(map_fn);
+        self.push_iteration_anchor(this_arg);
+        let result = (|interp: &mut Self| -> Result<(), VmError> {
+            for index in 0..len {
+                let key = VmPropertyKey::OwnedString(index.to_string());
+                let value = match interp.ordinary_get_value(context, items, items, &key, 0)? {
+                    VmGetOutcome::Value(v) => v,
+                    VmGetOutcome::InvokeGetter { getter } => {
+                        interp.run_callable_sync(context, &getter, items, SmallVec::new())?
+                    }
+                };
+                let mapped = if has_map {
+                    let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
+                    cb_args.push(value);
+                    cb_args.push(Value::number_f64(index as f64));
+                    interp.run_callable_sync(context, &map_fn, this_arg, cb_args)?
+                } else {
+                    value
+                };
+                interp.create_data_property_or_throw(
+                    context,
+                    target,
+                    &index.to_string(),
+                    mapped,
+                )?;
+            }
+            Ok(())
+        })(self);
+        self.pop_iteration_anchors_to(anchor_base);
+        result?;
+        self.array_set_property_throwing(context, target, "length", Value::number_f64(len as f64))?;
+        Ok(target)
+    }
+
+    /// Allocate the Array.from result object: `Construct(C)` (optionally
+    /// with a forwarded `len`) when `C` is a constructor, else a fresh
+    /// ordinary Array.
+    fn array_from_make_target(
+        &mut self,
+        context: &ExecutionContext,
+        use_ctor: bool,
+        constructor: &Value,
+        len: Option<usize>,
+    ) -> Result<Value, VmError> {
+        if use_ctor {
+            let mut ctor_args: SmallVec<[Value; 8]> = SmallVec::new();
+            if let Some(len) = len {
+                ctor_args.push(Value::number_f64(len as f64));
+            }
+            self.run_construct_sync(context, constructor, *constructor, ctor_args)
+        } else {
+            Ok(Value::array(self.alloc_runtime_rooted_array_from_values(
+                Vec::new(),
+                &[],
+                &[],
+            )?))
+        }
     }
 }
 
@@ -376,7 +415,7 @@ mod tests {
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let result = interp
-            .array_from_sync(&context, &[Value::array(source)])
+            .array_from_sync(&context, Value::undefined(), &[Value::array(source)])
             .expect("Array.from");
 
         let after = interp.gc_heap().stats().new_allocated_bytes;

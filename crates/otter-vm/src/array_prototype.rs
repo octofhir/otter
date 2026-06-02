@@ -1100,7 +1100,7 @@ impl Interpreter {
         }
     }
 
-    fn array_set_property_throwing(
+    pub(crate) fn array_set_property_throwing(
         &mut self,
         context: &ExecutionContext,
         o: Value,
@@ -1727,7 +1727,7 @@ impl Interpreter {
         }
     }
 
-    fn create_data_property_or_throw(
+    pub(crate) fn create_data_property_or_throw(
         &mut self,
         context: &ExecutionContext,
         target: Value,

@@ -2708,3 +2708,29 @@ destructuring `*-thrw-close-skip` / `*-iter-abpt` cases, where a user
 iterator's `next` throws through a separately parked call frame (not an
 in-frame error), so the iterator is not marked `[[done]]` before unwind
 and `return` runs once too often.
+
+## Array.from honours the `this` constructor (§23.1.2.1)
+
+`Array.from` (the NativeFunction and the `Op::ArrayFrom` fast path)
+built a plain Array and snapshotted built-in iterables before running
+`mapfn`. It now threads the call's `this` value as `C`: when `C` is a
+constructor the result `A` is `Construct(C)` (iterator path) or
+`Construct(C, «len»)` (array-like path), otherwise a fresh ordinary
+Array. Elements are installed with `CreateDataPropertyOrThrow` and the
+final length is written through the observable `Set(A, "length", …,
+true)`. The iterator path now drives the live sync-iterator protocol so
+mutations during `mapfn` are honoured, and a throwing `mapfn` or
+`CreateDataPropertyOrThrow` closes the iterator (§7.4.11).
+
+| section | before | after | delta |
+|---|---:|---:|---:|
+| `built-ins/Array/from` | 38/47 | 46/47 | +8 |
+| `built-ins/Array` (whole) | 2783 | 2791 | +8 |
+
+Fixed: `forwards-length-for-array-likes`, `elements-deleted-after`,
+`elements-updated-after`, `iter-cstm-ctor-err`, `iter-set-elem-prop-err`,
+`iter-set-length-err`, `source-object-constructor`,
+`source-object-length-set-elem-prop-err`. 0 regressions across
+`built-ins/Array`. Still open: `iter-cstm-ctor`, blocked by an
+unrelated root — a closure's `.prototype.constructor` resolves to the
+bare function rather than the closure value (tracked separately).

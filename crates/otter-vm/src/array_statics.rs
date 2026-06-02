@@ -79,13 +79,14 @@ fn native_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
 /// `Interpreter::array_from_sync` so the iterable / array-like
 /// ladder observes user `@@iterator` / `mapFn` / `thisArg`.
 fn native_from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let this_value = *ctx.this_value();
     let (interp, exec) = ctx.interp_mut_and_context();
     let exec = exec.ok_or_else(|| NativeError::TypeError {
         name: "Array.from",
         reason: "missing execution context".to_string(),
     })?;
     interp
-        .array_from_sync(&exec, args)
+        .array_from_sync(&exec, this_value, args)
         .map_err(|e| vm_to_native_array_static("Array.from", e))
 }
 

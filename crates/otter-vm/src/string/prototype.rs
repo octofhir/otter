@@ -2065,10 +2065,25 @@ fn impl_last_index_of(
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     let needle = arg_to_string(ctx, args, 0)?;
-    // ECMA-262 §22.1.3.11: `position` defaults to +∞, then
-    // ToInteger, then min(pos, len). NaN clamps to 0. Foundation
-    // takes the simpler accessor and clamps to `recv.len()`.
-    let position = arg_u32_or(ctx, args, 1, recv.len())?.min(recv.len());
+    // §22.1.3.9 step 5 — `numPos = ToNumber(position)`; if it is NaN the
+    // search position is +∞ (the whole string), otherwise
+    // ToIntegerOrInfinity clamped to `[0, len]`. `position` is already
+    // ToNumber-coerced by the shared arg pre-coercion, so a NaN here must
+    // map to the end, not to 0.
+    let len = recv.len();
+    let position = match args.get(1) {
+        Some(v) if !v.is_undefined() => {
+            let n = v.as_number().map(|x| x.as_f64()).unwrap_or(f64::NAN);
+            if n.is_nan() || n >= len as f64 {
+                len
+            } else if n <= 0.0 {
+                0
+            } else {
+                n as u32
+            }
+        }
+        _ => len,
+    };
     let pos = recv
         .last_index_of(needle, position, None, ctx.heap_mut())
         .map_err(|Interrupted| type_error("String.prototype", "interrupted"))?;

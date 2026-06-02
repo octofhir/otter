@@ -122,25 +122,30 @@ impl Interpreter {
         name: &str,
         args: &mut [Value],
     ) -> Result<(), VmError> {
-        let (int_coerce, str_coerce): (&[usize], &[usize]) = match name {
-            "indexOf" | "lastIndexOf" => (&[1], &[0]),
-            // §22.1.3.7/.21/.22 — includes/startsWith/endsWith must run
-            // IsRegExp(searchString) (and throw) *before* ToString, so the
-            // raw search argument has to reach the impl uncoerced; only the
-            // position operand is pre-coerced here.
-            "includes" | "startsWith" | "endsWith" => (&[1], &[]),
-            "slice" | "substring" | "substr" => (&[0, 1], &[]),
-            "at" | "charAt" | "charCodeAt" | "codePointAt" => (&[0], &[]),
-            "repeat" => (&[0], &[]),
-            "padStart" | "padEnd" => (&[0], &[1]),
-            "replace" | "replaceAll" => (&[], &[0]),
-            "split" => (&[1], &[0]),
-            "concat" => (&[], &[0, 1, 2, 3]),
-            "match" | "matchAll" | "search" | "normalize" => (&[], &[0]),
-            "anchor" | "fontcolor" | "fontsize" | "link" => (&[], &[0]),
-            _ => (&[], &[]),
+        // Each entry is `(arg index, is_int)` in the exact order the spec
+        // coerces the operands, so observable side effects (and abrupt
+        // completions) fire in spec order — e.g. `lastIndexOf` runs
+        // ToString(searchString=arg0) before ToNumber(position=arg1)
+        // (§22.1.3.9 steps 3-4), whereas `split` coerces ToUint32(limit=
+        // arg1) before ToString(separator=arg0) (§22.1.3.21 steps 6-7).
+        let order: &[(usize, bool)] = match name {
+            "indexOf" | "lastIndexOf" => &[(0, false), (1, true)],
+            // includes/startsWith/endsWith must run IsRegExp(searchString)
+            // (and throw) before ToString, so the raw search argument has
+            // to reach the impl uncoerced; only the position is pre-coerced.
+            "includes" | "startsWith" | "endsWith" => &[(1, true)],
+            "slice" | "substring" | "substr" => &[(0, true), (1, true)],
+            "at" | "charAt" | "charCodeAt" | "codePointAt" => &[(0, true)],
+            "repeat" => &[(0, true)],
+            "padStart" | "padEnd" => &[(0, true), (1, false)],
+            "replace" | "replaceAll" => &[(0, false)],
+            "split" => &[(1, true), (0, false)],
+            "concat" => &[(0, false), (1, false), (2, false), (3, false)],
+            "match" | "matchAll" | "search" | "normalize" => &[(0, false)],
+            "anchor" | "fontcolor" | "fontsize" | "link" => &[(0, false)],
+            _ => &[],
         };
-        if int_coerce.is_empty() && str_coerce.is_empty() {
+        if order.is_empty() {
             return Ok(());
         }
         let regexp_pass_through = matches!(name, "match" | "matchAll" | "search" | "normalize");
@@ -155,32 +160,30 @@ impl Interpreter {
                 || v.is_proxy()
                 || (!regexp_pass_through && v.is_regexp())
         };
-        for &idx in int_coerce {
+        for &(idx, is_int) in order {
             let Some(&v) = args.get(idx) else {
                 continue;
             };
-            // Skip primitives the native method body already recognises
-            // (`undefined` is the "absent" sentinel some §B.2.3.1
-            // substr-style methods key on).
-            if v.is_number() || v.is_boolean() || v.is_null() || v.is_undefined() {
-                continue;
+            if is_int {
+                // Skip primitives the native method body already
+                // recognises (`undefined` is the "absent" sentinel some
+                // §B.2.3.1 substr-style methods key on).
+                if v.is_number() || v.is_boolean() || v.is_null() || v.is_undefined() {
+                    continue;
+                }
+                let coerced = self.coerce_to_number(context, &v)?;
+                args[idx] = Value::number(coerced);
+            } else {
+                if !is_non_primitive(&v) {
+                    continue;
+                }
+                let primitive = self.evaluate_to_primitive(
+                    context,
+                    &v,
+                    crate::abstract_ops::ToPrimitiveHint::String,
+                )?;
+                args[idx] = primitive;
             }
-            let coerced = self.coerce_to_number(context, &v)?;
-            args[idx] = Value::number(coerced);
-        }
-        for &idx in str_coerce {
-            let Some(&v) = args.get(idx) else {
-                continue;
-            };
-            if !is_non_primitive(&v) {
-                continue;
-            }
-            let primitive = self.evaluate_to_primitive(
-                context,
-                &v,
-                crate::abstract_ops::ToPrimitiveHint::String,
-            )?;
-            args[idx] = primitive;
         }
         Ok(())
     }

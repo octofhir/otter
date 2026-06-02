@@ -1259,18 +1259,18 @@ impl Interpreter {
             None
         } else if let Some(t) = receiver.as_typed_array(&self.gc_heap) {
             if let Some(n) = canonical_numeric_index_string(name) {
+                // §10.4.5.16 step 2 — convert the value (firing its
+                // coercion, throwing for a Symbol / cross-type) before
+                // the index check, so side effects run even for an
+                // out-of-bounds write, which then discards the result.
+                let converted = self.typed_array_coerce_element(context, t.kind(), value)?;
                 if !t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
                     && n.is_finite()
                     && n.fract() == 0.0
                     && n >= 0.0
                     && (n as usize) < t.length(&self.gc_heap)
                 {
-                    let coerced = binary::dispatch::coerce_element_for_store(
-                        &mut self.gc_heap,
-                        t.kind(),
-                        &value,
-                    )?;
-                    t.set(&mut self.gc_heap, n as usize, &coerced);
+                    t.set(&mut self.gc_heap, n as usize, &converted);
                 }
             } else {
                 typed_array_set_expando(self, &t, name, value)?;
@@ -1861,6 +1861,25 @@ impl Interpreter {
         Ok(())
     }
 
+    /// §10.4.5.16 step 2 — convert a value being stored into a typed
+    /// array with `ToBigInt` for BigInt element kinds and `ToNumber`
+    /// otherwise (firing the operand's coercion and throwing for a
+    /// Symbol / cross-numeric type), then narrow it to the element
+    /// representation. The conversion runs before the index check.
+    fn typed_array_coerce_element(
+        &mut self,
+        context: &ExecutionContext,
+        kind: crate::binary::TypedArrayKind,
+        value: Value,
+    ) -> Result<Value, VmError> {
+        let converted = if kind.is_bigint() {
+            Value::big_int(crate::coerce::to_big_int_or_throw(self, context, &value)?)
+        } else {
+            Value::number(crate::coerce::to_number_or_throw(self, context, &value)?)
+        };
+        binary::dispatch::coerce_element_for_store(&mut self.gc_heap, kind, &converted)
+    }
+
     pub(crate) fn run_store_element_regs(
         &mut self,
         context: &ExecutionContext,
@@ -2133,39 +2152,37 @@ impl Interpreter {
                 return Err(VmError::TypeMismatch);
             }
         } else if let Some(t) = recv.as_typed_array(&self.gc_heap) {
-            if let Some(n) = idx_value.as_number() {
-                // §10.4.5.14 IntegerIndexedElementSet.
-                match n.as_smi() {
-                    Some(v) if v >= 0 => {
-                        let coerced = binary::dispatch::coerce_element_for_store(
-                            &mut self.gc_heap,
-                            t.kind(),
-                            &value,
-                        )?;
-                        t.set(&mut self.gc_heap, v as usize, &coerced);
-                    }
-                    _ => return Err(VmError::TypeMismatch),
-                }
+            // §10.4.5.16 TypedArraySetElement / §10.4.5.5 [[Set]] —
+            // determine the canonical numeric index, then convert the
+            // value with ToNumber / ToBigInt (firing `valueOf` and
+            // throwing for a Symbol / cross-type) **before** the index
+            // validity check, so the conversion side effects run even
+            // when the index is out of bounds; an invalid index then
+            // discards the converted value (§10.4.5.9 step 2).
+            let numeric_index: Option<f64> = if let Some(n) = idx_value.as_number() {
+                Some(n.as_f64())
             } else if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let name = key.to_lossy_string(&self.gc_heap);
-                if let Some(nf) = canonical_numeric_index_string(&name) {
-                    if t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
-                        || !nf.is_finite()
-                        || nf.fract() != 0.0
-                        || nf < 0.0
-                        || (nf as usize) >= t.length(&self.gc_heap)
-                    {
-                        // out-of-range / non-integer — silent no-op
-                    } else {
-                        let coerced = binary::dispatch::coerce_element_for_store(
-                            &mut self.gc_heap,
-                            t.kind(),
-                            &value,
-                        )?;
-                        t.set(&mut self.gc_heap, nf as usize, &coerced);
+                match canonical_numeric_index_string(&name) {
+                    Some(nf) => Some(nf),
+                    None => {
+                        typed_array_set_expando(self, &t, &name, value)?;
+                        stack[top_idx].advance_pc(self.current_byte_len)?;
+                        return Ok(());
                     }
-                } else {
-                    typed_array_set_expando(self, &t, &name, value)?;
+                }
+            } else {
+                None
+            };
+            if let Some(nf) = numeric_index {
+                let converted = self.typed_array_coerce_element(context, t.kind(), value)?;
+                let valid = !t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
+                    && nf.is_finite()
+                    && nf.fract() == 0.0
+                    && nf >= 0.0
+                    && (nf as usize) < t.length(&self.gc_heap);
+                if valid {
+                    t.set(&mut self.gc_heap, nf as usize, &converted);
                 }
             } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let bag = typed_array_ensure_expando(self, &t)?;

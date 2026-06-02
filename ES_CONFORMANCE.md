@@ -1326,6 +1326,19 @@ typed-array constructors (`BigInt64Array` / `BigUint64Array`
 both still bootstrap placeholders), and BigInt boxing
 (`Object(1n)` → BigInt wrapper object).
 
+### §10.4.5.16 TypedArray integer-indexed [[Set]] value coercion (2026-06-02)
+
+`built-ins/TypedArray` +7. Storing into an integer-indexed element
+(`ta[i] = v`) narrowed the value with a lenient coercion, so an
+object value's `valueOf` never ran (it stored `0`) and the
+conversion was skipped entirely for an out-of-bounds index. The
+store now converts the value with `ToNumber` / `ToBigInt` (firing the
+operand's coercion and throwing for a Symbol / cross-type) **before**
+the index validity check — matching TypedArraySetElement, where the
+conversion's side effects run even when an out-of-bounds index then
+discards the result. Both the element-store and property-store paths
+share the new `typed_array_coerce_element` helper.
+
 ### §23.2.3.32 %TypedArray%.prototype.toLocaleString (2026-06-02)
 
 `built-ins/TypedArray` +16. `toLocaleString` fell through to

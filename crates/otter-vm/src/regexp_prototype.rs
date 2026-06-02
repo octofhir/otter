@@ -62,6 +62,7 @@ fn vm_shape_error_to_native(err: VmError) -> NativeError {
 /// [`MakeMatchIndicesIndexPairArray`](https://tc39.es/ecma262/#sec-makematchindicesindexpairarray)).
 pub(crate) fn exec_once_native(
     re: &JsRegExp,
+    receiver: &Value,
     text: JsString,
     ctx: &mut NativeCtx<'_>,
     slice_roots: &[&[Value]],
@@ -69,13 +70,25 @@ pub(crate) fn exec_once_native(
     let units = text.to_utf16_vec(ctx.heap());
     let len = units.len();
     let flags = re.flags(ctx.heap());
-    let mut start = re.last_index(ctx.heap()) as usize;
-    if (flags.global || flags.sticky) && start > len {
-        re.set_last_index(ctx.heap_mut(), 0);
-        return Ok(Value::null());
-    }
+    // §22.2.7.2 step 4 — `lastIndex = ? ToLength(? Get(R, "lastIndex"))`.
+    // The read is observable (a user `lastIndex` getter fires) even
+    // when the regex is neither global nor sticky.
+    let last_index_val = get_property_runtime(ctx, receiver, "lastIndex", REGEXP_EXEC_NAME)?;
+    let mut start = to_length_runtime(ctx, &last_index_val, REGEXP_EXEC_NAME)? as usize;
+    // step 8 — a non-global, non-sticky match always starts at 0.
     if !flags.global && !flags.sticky {
         start = 0;
+    } else if start > len {
+        // step 12.a.i — out-of-range start resets `lastIndex` (the
+        // observable `Set` throws on a non-writable `lastIndex`).
+        set_property_runtime(
+            ctx,
+            receiver,
+            "lastIndex",
+            Value::number_i32(0),
+            REGEXP_EXEC_NAME,
+        )?;
+        return Ok(Value::null());
     }
     let m = re
         .find_from_utf16(ctx.heap(), &units, start)
@@ -85,17 +98,35 @@ pub(crate) fn exec_once_native(
         Some(m) => m,
         None => {
             if flags.global || flags.sticky {
-                re.set_last_index(ctx.heap_mut(), 0);
+                set_property_runtime(
+                    ctx,
+                    receiver,
+                    "lastIndex",
+                    Value::number_i32(0),
+                    REGEXP_EXEC_NAME,
+                )?;
             }
             return Ok(Value::null());
         }
     };
     if flags.sticky && m.range.start != start {
-        re.set_last_index(ctx.heap_mut(), 0);
+        set_property_runtime(
+            ctx,
+            receiver,
+            "lastIndex",
+            Value::number_i32(0),
+            REGEXP_EXEC_NAME,
+        )?;
         return Ok(Value::null());
     }
     if flags.global || flags.sticky {
-        re.set_last_index(ctx.heap_mut(), m.range.end as u32);
+        set_property_runtime(
+            ctx,
+            receiver,
+            "lastIndex",
+            Value::number_f64(m.range.end as f64),
+            REGEXP_EXEC_NAME,
+        )?;
     }
 
     Ok(Value::array(build_match_result_native(
@@ -519,7 +550,28 @@ fn set_property_runtime(
         name,
         reason: "missing execution context".to_string(),
     })?;
-    interp
+    // Resolve accessor setters along the prototype chain first so a
+    // custom `set lastIndex` (e.g. a `@@split` splitter) fires; only
+    // ordinary data targets fall through to the data write.
+    if let Some(obj) = receiver.as_object() {
+        match crate::object::resolve_set(obj, interp.gc_heap(), key) {
+            crate::object::SetOutcome::InvokeSetter { setter } => {
+                if !interp.is_callable_runtime(&setter) {
+                    return Err(read_only_set_error(name, key));
+                }
+                let args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![value];
+                interp
+                    .run_callable_sync(&exec, &setter, *receiver, args)
+                    .map_err(vm_err_to_native(name))?;
+                return Ok(());
+            }
+            crate::object::SetOutcome::Reject { .. } => {
+                return Err(read_only_set_error(name, key));
+            }
+            crate::object::SetOutcome::AssignData => {}
+        }
+    }
+    let ok = interp
         .ordinary_set_data_value(
             &exec,
             *receiver,
@@ -529,7 +581,21 @@ fn set_property_runtime(
             0,
         )
         .map_err(vm_err_to_native(name))?;
+    // `Set(O, P, V, true)` — a `[[Set]]` returning false (e.g. a
+    // non-writable `lastIndex`) is a TypeError, not a silent no-op.
+    if !ok {
+        return Err(read_only_set_error(name, key));
+    }
     Ok(())
+}
+
+/// The §10.1.9.2 / §7.3.4 `Set(O, P, V, true)` failure: a rejected
+/// write (non-writable data, accessor without a setter) is a TypeError.
+fn read_only_set_error(name: &'static str, key: &str) -> crate::NativeError {
+    crate::NativeError::TypeError {
+        name,
+        reason: format!("Cannot assign to read only property '{key}'"),
+    }
 }
 
 /// §7.1.17 `ToString` synchronous bridge. Primitives go through
@@ -668,7 +734,7 @@ fn regexp_exec_runtime(
     }
     // Fall back to builtin exec only when `rx` is actually a RegExp.
     if let Some(re) = rx.as_regexp() {
-        return exec_once_native(&re, s, ctx, &[]);
+        return exec_once_native(&re, rx, s, ctx, &[]);
     }
     Err(crate::NativeError::TypeError {
         name,
@@ -1573,14 +1639,56 @@ mod tests {
         Value::regexp(JsRegExp::compile(interp.gc_heap_mut(), &units, flags).unwrap())
     }
 
+    /// Minimal `<main>` context so `exec_once_native`'s observable
+    /// `Get`/`Set(lastIndex)` ladder has an execution context to run on.
+    fn empty_context() -> crate::ExecutionContext {
+        use otter_bytecode::{BytecodeModule, Function, Instruction, SourceKind, SpanEntry};
+        crate::ExecutionContext::from_module(BytecodeModule {
+            module: "regexp-proto-test.ts".to_string(),
+            source_kind: SourceKind::TypeScript,
+            functions: vec![Function {
+                id: 0,
+                name: "<main>".to_string(),
+                span: (0, 0),
+                locals: 0,
+                scratch: 0,
+                param_count: 0,
+                length: 0,
+                own_upvalue_count: 0,
+                is_strict: false,
+                is_arrow: false,
+                has_rest: false,
+                is_async: false,
+                is_generator: false,
+                is_async_generator: false,
+                is_derived_constructor: false,
+                is_module: false,
+                needs_arguments: false,
+                arguments_object_kind: crate::ArgumentsObjectKind::Unmapped,
+                mapped_argument_bindings: Vec::new(),
+                module_url: String::new(),
+                code: Vec::<Instruction>::new(),
+                spans: Vec::<SpanEntry>::new(),
+            }],
+            constants: Vec::new(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        })
+    }
+
     fn call(method: &str, recv: &Value, args: &[Value], interp: &mut Interpreter) -> Value {
         let re = recv.as_regexp().unwrap();
-        let mut ctx = NativeCtx::new_with_call_info(interp, NativeCallInfo::call(*recv));
+        let context = empty_context();
+        let mut ctx = NativeCtx::new_with_call_info_and_context(
+            interp,
+            NativeCallInfo::call(*recv),
+            Some(context),
+        );
         let text = string_arg_to_jsstring_for_test(args, 0, &mut ctx).unwrap();
         match method {
-            "exec" => exec_once_native(&re, text, &mut ctx, &[]).unwrap(),
+            "exec" => exec_once_native(&re, recv, text, &mut ctx, &[]).unwrap(),
             "test" => Value::boolean(
-                !exec_once_native(&re, text, &mut ctx, &[])
+                !exec_once_native(&re, recv, text, &mut ctx, &[])
                     .unwrap()
                     .is_null(),
             ),

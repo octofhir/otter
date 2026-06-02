@@ -4303,6 +4303,12 @@ impl Interpreter {
         if let Some(re) = target.as_regexp() {
             return match key {
                 VmPropertyKey::String(key) if *key == "lastIndex" => {
+                    // A non-writable `lastIndex` rejects the write
+                    // (returns false → `Set` with Throw=true raises a
+                    // TypeError); otherwise store the new value.
+                    if !re.last_index_writable(&self.gc_heap) {
+                        return Ok(false);
+                    }
                     regexp_prototype::store_property(&re, &mut self.gc_heap, key, value);
                     Ok(true)
                 }

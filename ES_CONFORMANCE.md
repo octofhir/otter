@@ -2832,3 +2832,28 @@ Fixed: `set/trap-is-undefined-target-is-proxy`. 0 regressions across
 `built-ins/Proxy` and `built-ins/Reflect`. The plain `obj.prop = v`
 store path needs the same delegation (tracked separately — it sits on
 the inline-cache hot path).
+
+## RegExpBuiltinExec observes lastIndex; Set(lastIndex) throws (§22.2.7.2)
+
+`RegExp.prototype.exec` (RegExpBuiltinExec) read and wrote `lastIndex`
+through the internal `JsRegExp` slot, so a user `lastIndex` getter never
+fired, a non-writable `lastIndex` was silently overwritten, and the
+spec's `ToLength(Get(R, "lastIndex"))` coercion was skipped.
+`exec_once_native` now threads the receiver and uses the observable
+`Get` (ToLength) at step 4 and `Set(R, "lastIndex", …, true)` at steps
+12/15. Two supporting fixes: `set_property_runtime` now performs a full
+`[[Set]]` (resolves accessor setters along the prototype chain, then the
+data path) and raises a TypeError when the write is rejected — a
+`Set(O, P, V, true)` returning false is not a silent no-op; and the
+`JsRegExp` `lastIndex` `[[Set]]` honours its writable bit (rejects
+instead of dropping the write, which had let the `@@match` / `@@replace`
+global loop spin forever on a frozen `lastIndex`).
+
+| section | before | after | delta |
+|---|---:|---:|---:|
+| `built-ins/RegExp` (whole) | 1194 | 1220 | +26 |
+
+Fixed across `exec`, `Symbol.match`, `Symbol.replace`, `Symbol.split`,
+and `Symbol.search` (lastIndex get/set/coerce error propagation, sticky
+/ global reset). 0 regressions across `built-ins/RegExp` and
+`built-ins/String/prototype`.

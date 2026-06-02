@@ -450,11 +450,12 @@ fn regexp_constructor_matches(
 // ---------------------------------------------------------------
 
 fn proto_exec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let receiver = *ctx.this_value();
     let re = receiver_regexp(ctx, "RegExp.prototype.exec")?;
     let text = args.first().cloned().unwrap_or(Value::undefined());
     let text_str = coerce_to_string(ctx, &text, "RegExp.prototype.exec")?;
 
-    crate::regexp_prototype::exec_once_native(&re, text_str, ctx, &[args])
+    crate::regexp_prototype::exec_once_native(&re, &receiver, text_str, ctx, &[args])
 }
 
 fn proto_test(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

@@ -189,39 +189,15 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
 /// `[Symbol.iterator]` method and pumping the resulting iterator
 /// until completion. Used by the §22.2.4.4 `new TA(iterable)`
 /// constructor path.
+/// §7.4.2 GetIterator + drain — call the already-fetched `@@iterator`
+/// method (one `GetMethod`, per spec) and collect every yielded value.
 fn drain_iterable_into_values(
     ctx: &mut NativeCtx<'_>,
     exec_ctx: &crate::ExecutionContext,
     src: &Value,
+    iter_method: Value,
 ) -> Result<Vec<Value>, NativeError> {
-    let iterator_sym = ctx
-        .cx
-        .interp
-        .well_known_symbols()
-        .get(crate::symbol::WellKnown::Iterator);
     let src_value = *src;
-    let key = crate::VmPropertyKey::Symbol(iterator_sym);
-    let outcome = ctx
-        .cx
-        .interp
-        .ordinary_get_value(exec_ctx, src_value, src_value, &key, 0)
-        .map_err(|e| NativeError::TypeError {
-            name: "TypedArray",
-            reason: e.to_string(),
-        })?;
-    let iter_method = match outcome {
-        crate::VmGetOutcome::Value(v) => v,
-        crate::VmGetOutcome::InvokeGetter { getter } => {
-            let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-            ctx.cx
-                .interp
-                .run_callable_sync(exec_ctx, &getter, src_value, args)
-                .map_err(|e| NativeError::TypeError {
-                    name: "TypedArray",
-                    reason: e.to_string(),
-                })?
-        }
-    };
     if !ctx.cx.interp.is_callable_runtime(&iter_method) {
         return Err(NativeError::TypeError {
             name: "TypedArray",
@@ -296,6 +272,42 @@ fn coerce_values_for_kind(
             Value::number(number)
         };
         out.push(converted);
+    }
+    Ok(out)
+}
+
+/// §7.3.20 LengthOfArrayLike + raw element reads — `Get(source, k)`
+/// for each `k < ToLength(Get(source, "length"))`, running getters but
+/// **not** numeric-coercing (the caller maps, then converts). Reserves
+/// fallibly so a pathological `length` throws `RangeError`.
+fn read_array_like_raw(
+    ctx: &mut NativeCtx<'_>,
+    exec: &crate::ExecutionContext,
+    source: Value,
+) -> Result<Vec<Value>, NativeError> {
+    let len_value = ta_get_via(ctx, exec, source, &crate::VmPropertyKey::String("length"))?;
+    let len_number = crate::coerce::to_number_or_throw(ctx.cx.interp, exec, &len_value)
+        .map_err(|e| vm_to_native(e, "TypedArray"))?;
+    let n = len_number.as_f64();
+    let len = if n.is_nan() || n <= 0.0 {
+        0
+    } else {
+        n.trunc().min(9_007_199_254_740_991.0) as usize
+    };
+    let mut out: Vec<Value> = Vec::new();
+    if out.try_reserve_exact(len).is_err() {
+        return Err(NativeError::RangeError {
+            name: "TypedArray.from",
+            reason: "Invalid typed array length".to_string(),
+        });
+    }
+    for i in 0..len {
+        out.push(ta_get_via(
+            ctx,
+            exec,
+            source,
+            &crate::VmPropertyKey::OwnedString(i.to_string()),
+        )?);
     }
     Ok(out)
 }
@@ -917,19 +929,103 @@ fn ta_from_dispatch(
     args: &[Value],
     kind: TypedArrayKind,
 ) -> Result<Value, NativeError> {
+    // §23.2.2.1 %TypedArray%.from(source, mapfn, thisArg).
+    let name = typed_array_name(kind);
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name,
+            reason: "missing execution context".to_string(),
+        })?;
+    let source = args.first().cloned().unwrap_or(Value::undefined());
+    let mapfn = args.get(1).cloned().unwrap_or(Value::undefined());
+    let mapping = !mapfn.is_undefined();
+    if mapping && !ctx.cx.interp.is_callable_runtime(&mapfn) {
+        return Err(NativeError::TypeError {
+            name,
+            reason: "mapfn is not a function".to_string(),
+        });
+    }
+    let this_arg = args.get(2).cloned().unwrap_or(Value::undefined());
+    // §23.2.2.1 step 4 — GetMethod(source, @@iterator). `GetV` on a
+    // null / undefined source throws a TypeError before that.
+    if source.is_null() || source.is_undefined() {
+        return Err(NativeError::TypeError {
+            name,
+            reason: "cannot create a TypedArray from null or undefined".to_string(),
+        });
+    }
+    let iter_sym = ctx
+        .cx
+        .interp
+        .well_known_symbols()
+        .get(crate::symbol::WellKnown::Iterator);
+    let iter_method = ta_get_via(ctx, &exec, source, &crate::VmPropertyKey::Symbol(iter_sym))?;
+    let raw = if ctx.cx.interp.is_callable_runtime(&iter_method) {
+        drain_iterable_into_values(ctx, &exec, &source, iter_method)?
+    } else {
+        read_array_like_raw(ctx, &exec, source)?
+    };
+    let mut out: Vec<Value> = Vec::new();
+    if out.try_reserve_exact(raw.len()).is_err() {
+        return Err(NativeError::RangeError {
+            name,
+            reason: "Invalid typed array length".to_string(),
+        });
+    }
+    for (k, value) in raw.into_iter().enumerate() {
+        // §23.2.2.1 step 6.e — map the source value (mapfn(value, k))
+        // before the numeric conversion, then convert with
+        // ToNumber / ToBigInt so a Symbol / cross-type element throws.
+        let mapped = if mapping {
+            let index = Value::number(crate::number::NumberValue::from_f64(k as f64));
+            ctx.cx
+                .interp
+                .run_callable_sync(&exec, &mapfn, this_arg, smallvec::smallvec![value, index])
+                .map_err(|e| vm_to_native(e, name))?
+        } else {
+            value
+        };
+        let converted = if kind.is_bigint() {
+            let big = crate::coerce::to_big_int_or_throw(ctx.cx.interp, &exec, &mapped)
+                .map_err(|e| vm_to_native(e, name))?;
+            Value::big_int(big)
+        } else {
+            let number = crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, &mapped)
+                .map_err(|e| vm_to_native(e, name))?;
+            Value::number(number)
+        };
+        out.push(converted);
+    }
+    let arr = ctx
+        .array_from_elements(out)
+        .map_err(|_| NativeError::TypeError {
+            name,
+            reason: "out of memory while allocating array".to_string(),
+        })?;
+    let arr_value = Value::array(arr);
     let roots = ctx.collect_native_roots();
     let this_value = *ctx.this_value();
+    let arr_slice = [arr_value];
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        crate::runtime_cx::visit_native_roots(visitor, &roots, &this_value, None, &[], &[args]);
+        crate::runtime_cx::visit_native_roots(
+            visitor,
+            &roots,
+            &this_value,
+            None,
+            &[],
+            &[&arr_slice],
+        );
     };
     dispatch::typed_array_call_with_roots(
         kind,
         TypedArrayMethod::From,
-        args,
+        std::slice::from_ref(&arr_value),
         ctx.heap_mut(),
         &mut external_visit,
     )
-    .map_err(|e| vm_to_native(e, typed_array_name(kind)))
+    .map_err(|e| vm_to_native(e, name))
 }
 
 fn ta_of_dispatch(
@@ -996,17 +1092,22 @@ fn ta_ctor_dispatch(
             .interp
             .well_known_symbols()
             .get(crate::symbol::WellKnown::Iterator);
-        let has_iter = crate::object::get_symbol(src_obj, ctx.heap(), iter_sym).is_some();
         let src_value = Value::object(src_obj);
-        // §23.2.5.1 — an Object source with `@@iterator` initializes
-        // from the drained iterator; otherwise it is an array-like and
-        // its `length` / elements are read with observable `[[Get]]` +
-        // `ToNumber` / `ToBigInt`. Either way the values are coerced
-        // up-front so the per-kind dispatcher only narrows and stores.
-        let drained = if has_iter {
+        // §23.2.5.1 — GetMethod(source, @@iterator): an Object source
+        // with a callable `@@iterator` initializes from the drained
+        // iterator; otherwise it is an array-like read with observable
+        // `[[Get]]` + `ToNumber` / `ToBigInt`. Either way the values are
+        // coerced up-front so the per-kind dispatcher only narrows.
+        let iter_method = ta_get_via(
+            ctx,
+            exec,
+            src_value,
+            &crate::VmPropertyKey::Symbol(iter_sym),
+        )?;
+        let drained = if ctx.cx.interp.is_callable_runtime(&iter_method) {
             // §22.2.4.4 — IterableToList collects raw values, then each
             // is converted (ToNumber / ToBigInt) when stored.
-            let raw = drain_iterable_into_values(ctx, exec, &src_value)?;
+            let raw = drain_iterable_into_values(ctx, exec, &src_value, iter_method)?;
             coerce_values_for_kind(ctx, exec, raw, kind)?
         } else {
             read_array_like_coerced(ctx, exec, src_value, kind)?

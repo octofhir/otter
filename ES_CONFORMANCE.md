@@ -1326,6 +1326,20 @@ typed-array constructors (`BigInt64Array` / `BigUint64Array`
 both still bootstrap placeholders), and BigInt boxing
 (`Object(1n)` → BigInt wrapper object).
 
+### §23.2.2.1 %TypedArray%.from + iterator result Get (2026-06-02)
+
+`built-ins/TypedArray` +16. The per-kind `from` ignored the `mapfn`
+argument entirely and read its source with lenient coercion. It now
+follows §23.2.2.1: reject a non-callable `mapfn`, `GetMethod(source,
+@@iterator)` to choose the iterator or array-like path, apply
+`mapfn(value, k)` before converting each element with
+`ToNumber` / `ToBigInt`, reserving the element buffer fallibly so a
+pathological `length` is a `RangeError`. Reading an iterator result's
+`done` / `value` now goes through the ordinary `[[Get]]`
+(IteratorComplete / IteratorValue) instead of a data-only read, so an
+accessor result object fires its getters and a `done`-less iterator
+whose `value` getter throws terminates instead of spinning forever.
+
 ### §23.2.5.1 TypedArray constructor from array-like (2026-06-02)
 
 `built-ins/TypedArray` +3. `new TA(object)` where the source is a

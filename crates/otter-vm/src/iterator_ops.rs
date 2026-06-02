@@ -229,6 +229,24 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Read a property off an iterator result record through the
+    /// ordinary `[[Get]]`, so an accessor getter runs and propagates
+    /// its abrupt completion. Spec: IteratorComplete / IteratorValue.
+    fn iter_result_get(
+        &mut self,
+        context: &ExecutionContext,
+        record: Value,
+        name: &'static str,
+    ) -> Result<Value, VmError> {
+        let key = crate::VmPropertyKey::String(name);
+        match self.ordinary_get_value(context, record, record, &key, 0)? {
+            crate::VmGetOutcome::Value(v) => Ok(v),
+            crate::VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(context, &getter, record, SmallVec::new())
+            }
+        }
+    }
+
     /// Synchronously advance an iterator one step, with full
     /// interpreter access so user-iterator `next()` calls and
     /// helper-wrapper callbacks can run inline. Mirrors the
@@ -337,19 +355,25 @@ impl Interpreter {
                 }
                 let result =
                     self.run_callable_sync(context, &next_fn, iter_value, SmallVec::new())?;
-                let Some(record) = result.as_object() else {
+                if result.as_object().is_none() {
                     return Err(VmError::TypeMismatch);
-                };
-                let value = crate::object::get(record, &self.gc_heap, "value")
-                    .unwrap_or(Value::undefined());
-                let done = crate::object::get(record, &self.gc_heap, "done")
-                    .unwrap_or(Value::undefined())
+                }
+                // §7.4.5 IteratorComplete / §7.4.6 IteratorValue read
+                // `done` then (when not done) `value` through the
+                // ordinary `[[Get]]`, so an accessor result object fires
+                // its getters and an abrupt completion propagates rather
+                // than silently reading `undefined` (which would never
+                // terminate a `done`-less iterator).
+                let done = self
+                    .iter_result_get(context, result, "done")?
                     .to_boolean(&self.gc_heap);
                 if done {
                     self.gc_heap
                         .with_payload(*iter, |state| *state = IteratorState::Exhausted);
+                    return Ok((Value::undefined(), true));
                 }
-                Ok((value, done))
+                let value = self.iter_result_get(context, result, "value")?;
+                Ok((value, false))
             }
             IteratorStateSnapshot::RegExpString {
                 matcher,

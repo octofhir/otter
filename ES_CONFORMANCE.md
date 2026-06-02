@@ -1433,6 +1433,22 @@ tests), and the method is resolved through `GetV` so a getter-backed
 inherited method fires. A non-callable resolved method throws a
 `TypeError`.
 
+### §23.1.3.23 Array.prototype.push Set with Throw=true (2026-06-03)
+
+`built-ins/Array` +3. `push` wrote each element through the lenient
+internal data set, which created an own index directly — skipping an
+inherited accessor setter on the prototype chain and never failing on a
+frozen / non-extensible array. It now performs OrdinarySet for a real
+array receiver (`array_ordinary_set_own`): an own accessor invokes its
+setter (or rejects when absent), an own non-writable property rejects,
+an absent index consults the prototype chain via `resolve_set` (firing
+an inherited setter, e.g. `Array.prototype["0"]`, or rejecting a
+non-writable / non-extensible shadow), and a fresh slot honours
+extensibility. A rejected element Set raises the `TypeError` required by
+`Set(O, P, V, true)`; the subsequent `length` Set already threw on a
+non-writable length, so a setter that freezes the array mid-push now
+surfaces the spec `TypeError` with no own element added.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

@@ -1430,6 +1430,72 @@ impl Interpreter {
     }
 
     /// §23.1.3.23 live `Array.prototype.push` over a generic array-like receiver.
+    /// §10.4.2 OrdinarySet for an array index / named own key with the
+    /// array itself as the receiver. Unlike the dense write fast path it
+    /// honours an inherited accessor setter on the prototype chain, an
+    /// own non-writable property, and a non-extensible array — returning
+    /// `false` so a `Set(..., Throw=true)` caller (e.g. `push`) can raise
+    /// the spec `TypeError`.
+    fn array_ordinary_set_own(
+        &mut self,
+        context: &ExecutionContext,
+        arr: crate::array::JsArray,
+        key: &str,
+        value: Value,
+    ) -> Result<bool, VmError> {
+        if let Some((_getter, setter)) = crate::array::get_accessor(arr, self.gc_heap(), key) {
+            return match setter {
+                Some(s) if crate::abstract_ops::is_callable(&s) => {
+                    let mut a: SmallVec<[Value; 8]> = SmallVec::new();
+                    a.push(value);
+                    self.run_callable_sync(context, &s, Value::array(arr), a)?;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            };
+        }
+        let idx = object::array_index_property_name(key).map(|i| i as usize);
+        let has_own = match idx {
+            Some(i) => crate::array::has_own_element(arr, self.gc_heap(), i),
+            None => crate::array::get_named_property(arr, self.gc_heap(), key).is_some(),
+        };
+        if has_own {
+            let writable = crate::array::get_property_flags(arr, self.gc_heap(), key)
+                .is_none_or(|f| f.writable());
+            if !writable {
+                return Ok(false);
+            }
+        } else {
+            // Absent own — consult the prototype chain for an inherited
+            // setter or non-writable shadow before installing a new slot.
+            let proto = self.constructor_prototype_value("Array")?;
+            if let Some(proto_obj) = proto.as_object() {
+                match crate::object::resolve_set(proto_obj, self.gc_heap(), key) {
+                    crate::object::SetOutcome::InvokeSetter { setter } => {
+                        let mut a: SmallVec<[Value; 8]> = SmallVec::new();
+                        a.push(value);
+                        self.run_callable_sync(context, &setter, Value::array(arr), a)?;
+                        return Ok(true);
+                    }
+                    crate::object::SetOutcome::Reject { .. } => return Ok(false),
+                    crate::object::SetOutcome::AssignData => {}
+                }
+            }
+            if !crate::array::is_extensible(arr, self.gc_heap()) {
+                return Ok(false);
+            }
+        }
+        match idx {
+            Some(i) => crate::array::define_index_value(arr, self.gc_heap_mut(), i, value)
+                .map_err(|_| VmError::TypeMismatch)?,
+            None => {
+                crate::array::set_named_property(arr, self.gc_heap_mut(), key, value)
+                    .map_err(|_| VmError::TypeMismatch)?;
+            }
+        }
+        Ok(true)
+    }
+
     pub(crate) fn array_push(
         &mut self,
         context: &ExecutionContext,
@@ -1453,14 +1519,19 @@ impl Interpreter {
         let mut n = len;
         for &arg in args {
             let key = format_index_key(n);
-            self.ordinary_set_data_value(
-                context,
-                o,
-                &crate::VmPropertyKey::String(&key),
-                arg,
-                o,
-                0,
-            )?;
+            // §23.1.3.23 step 6.c — Set(O, ToString(n), E, true): a real
+            // array honours inherited setters / writability and throws on
+            // failure; a generic array-like routes through the throwing
+            // property setter.
+            if let Some(arr) = o.as_array() {
+                if !self.array_ordinary_set_own(context, arr, &key, arg)? {
+                    return Err(VmError::TypeError {
+                        message: format!("Cannot assign to read only property '{key}'"),
+                    });
+                }
+            } else {
+                self.array_set_property_throwing(context, o, &key, arg)?;
+            }
             n += 1.0;
         }
         self.array_set_length_throwing(context, o, n)?;

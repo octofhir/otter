@@ -1463,6 +1463,15 @@ mid-iteration is observed. It inherits `%ArrayIteratorPrototype%` and is
 driven by the same heap-only fast-iterator path used for dense arrays,
 so both explicit `.next()` and `for…of` / spread see the live view.
 
+### §22.1.3.1.1 IsConcatSpreadable uses §7.2.2 IsArray (2026-06-03)
+
+`built-ins/Array` +3. When `Get(O, @@isConcatSpreadable)` is undefined,
+`concat` fell back to a bare "is this a real Array" check instead of
+`IsArray(O)`, which per §7.2.2 unwraps a Proxy to its target (and
+throws a `TypeError` for a revoked proxy). A `Proxy` wrapping an array
+was therefore concatenated as a single element instead of spread, and a
+revoked proxy did not throw. The fallback now calls `is_array_spec`.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

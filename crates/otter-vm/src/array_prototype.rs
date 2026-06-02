@@ -1045,7 +1045,10 @@ impl Interpreter {
                 }
             };
         if spread.is_undefined() {
-            Ok(e.is_array())
+            // §22.1.3.1.1 step 3 — fall back to IsArray(O), which per
+            // §7.2.2 unwraps a Proxy to its target (throwing for a
+            // revoked proxy) rather than only matching a bare Array.
+            self.is_array_spec(&e)
         } else {
             Ok(spread.to_boolean(self.gc_heap()))
         }

@@ -62,6 +62,10 @@ pub(crate) struct RealmIntrinsics {
     pub array_prototype: Option<JsObject>,
     /// `%Promise.prototype%`.
     pub promise_prototype: Option<JsObject>,
+    /// `%RegExp.prototype%`. Needed so the flag accessors (§22.2.6.x
+    /// step 3a) can return `undefined` instead of throwing when invoked
+    /// with the prototype itself as the `this` value.
+    pub regexp_prototype: Option<JsObject>,
 }
 
 impl RealmIntrinsics {
@@ -73,6 +77,7 @@ impl RealmIntrinsics {
         self.function_prototype = resolve_prototype(global, heap, "Function");
         self.array_prototype = resolve_prototype(global, heap, "Array");
         self.promise_prototype = resolve_prototype(global, heap, "Promise");
+        self.regexp_prototype = resolve_prototype(global, heap, "RegExp");
     }
 
     /// Trace cached prototype handles as root slots.
@@ -82,6 +87,7 @@ impl RealmIntrinsics {
             &self.function_prototype,
             &self.array_prototype,
             &self.promise_prototype,
+            &self.regexp_prototype,
         ]
         .into_iter()
         .filter_map(Option::as_ref)

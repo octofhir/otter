@@ -702,9 +702,32 @@ fn flag_bool(
     name: &'static str,
     f: impl FnOnce(&RegExpFlags) -> bool,
 ) -> Result<Value, NativeError> {
-    let re = receiver_regexp(ctx, name)?;
+    // §22.2.6.x step 3a: a non-RegExp `this` that is the prototype object
+    // itself yields `undefined` (so `RegExp.prototype.flags` reads ""), only
+    // any other object without an [[OriginalFlags]] slot throws.
+    let Some(re) = ctx.this_value().as_regexp() else {
+        if this_is_regexp_prototype(ctx) {
+            return Ok(Value::undefined());
+        }
+        return Err(NativeError::TypeError {
+            name,
+            reason: "this is not a RegExp".to_string(),
+        });
+    };
     let flags = re.flags(ctx.heap());
     Ok(Value::boolean(f(&flags)))
+}
+
+/// SameValue(this, %RegExp.prototype%) — used by the flag accessors to
+/// distinguish the prototype object from an arbitrary non-RegExp receiver.
+fn this_is_regexp_prototype(ctx: &mut NativeCtx<'_>) -> bool {
+    let Some(this_obj) = ctx.this_value().as_object() else {
+        return false;
+    };
+    matches!(
+        ctx.interp_mut().realm_intrinsics().regexp_prototype,
+        Some(proto) if proto == this_obj
+    )
 }
 
 // ---------------------------------------------------------------

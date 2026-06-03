@@ -77,8 +77,8 @@ fn pin_number_data_and_globals(
     let global_methods: &[(&'static str, u8, crate::native_function::NativeFastFn)] = &[
         ("parseInt", 2, number_parse_int_native),
         ("parseFloat", 1, number_parse_float_native),
-        ("isNaN", 1, number_is_nan_native),
-        ("isFinite", 1, number_is_finite_native),
+        ("isNaN", 1, global_is_nan),
+        ("isFinite", 1, global_is_finite),
         ("encodeURI", 1, global_encode_uri),
         ("encodeURIComponent", 1, global_encode_uri_component),
         ("decodeURI", 1, global_decode_uri),
@@ -99,11 +99,15 @@ fn pin_number_data_and_globals(
             )?;
         }
     }
-    for shared in ["parseInt", "parseFloat", "isNaN", "isFinite"] {
+    // §21.1.2.{12,13} / §19.2.{4,5}: `Number.parseInt === parseInt`
+    // and `Number.parseFloat === parseFloat` are the SAME callable.
+    // `Number.isNaN` / `Number.isFinite` are intentionally NOT aliased
+    // — they are strict (§21.1.2.{2,3}) while the global `isNaN` /
+    // `isFinite` coerce via ToNumber (§19.2.{2,3}).
+    for shared in ["parseInt", "parseFloat"] {
         if let Some(global_fn) = object::get(global, heap, shared) {
-            // §21.1.2.{12,13} / §19.2.{4,5}: overwrite the static
-            // with the global binding so identity holds. Configurable
-            // so the redefine succeeds.
+            // Overwrite the static with the global binding so identity
+            // holds. Configurable so the redefine succeeds.
             let desc = crate::object::PropertyDescriptor::data(global_fn, true, false, true);
             if !ctor.define_own_property(heap, shared, desc) {
                 return Err(JsSurfaceError::DefinePropertyFailed(shared));
@@ -199,21 +203,30 @@ fn number_is_safe_integer_native(
 }
 
 fn number_parse_int_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let s = if let Some(arg) = args.first() {
-        if let Some(s) = arg.as_string(ctx.heap()) {
-            s.to_lossy_string(ctx.heap())
-        } else {
-            arg.display_string(ctx.heap())
+    // §19.2.5 step 1: `inputString = ? ToString(string)` runs first
+    // and is observable through a user `toString`/`valueOf`/
+    // `@@toPrimitive` override.
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
+    let context = native_context(ctx, "parseInt")?;
+    let s = ctx
+        .cx
+        .interp
+        .coerce_to_string(&context, &arg)
+        .map_err(|e| crate::native_function::vm_to_native_error(e, "parseInt"))?;
+    // §19.2.5 step 4: `R = ? ToInt32(radix)` — coerce the radix after
+    // the string so a user `valueOf` on the radix fires in spec order.
+    let radix = match args.get(1) {
+        Some(radix) if !radix.is_undefined() => {
+            let context = native_context(ctx, "parseInt")?;
+            let num = ctx
+                .cx
+                .interp
+                .coerce_to_number(&context, radix)
+                .map_err(|e| crate::native_function::vm_to_native_error(e, "parseInt"))?;
+            crate::number::bitwise::to_int32(num)
         }
-    } else {
-        return Ok(Value::number(crate::number::NumberValue::from_f64(
-            f64::NAN,
-        )));
+        _ => 0,
     };
-    let radix = args
-        .get(1)
-        .and_then(|v| v.as_number())
-        .map_or(0, |n| n.as_f64() as i32);
     Ok(Value::number(crate::number::parse::parse_int(&s, radix)))
 }
 
@@ -221,17 +234,14 @@ fn number_parse_float_native(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let s = if let Some(arg) = args.first() {
-        if let Some(s) = arg.as_string(ctx.heap()) {
-            s.to_lossy_string(ctx.heap())
-        } else {
-            arg.display_string(ctx.heap())
-        }
-    } else {
-        return Ok(Value::number(crate::number::NumberValue::from_f64(
-            f64::NAN,
-        )));
-    };
+    // §19.2.4 step 1: `inputString = ? ToString(string)` — observable.
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
+    let context = native_context(ctx, "parseFloat")?;
+    let s = ctx
+        .cx
+        .interp
+        .coerce_to_string(&context, &arg)
+        .map_err(|e| crate::native_function::vm_to_native_error(e, "parseFloat"))?;
     Ok(Value::number(crate::number::parse::parse_float(&s)))
 }
 
@@ -239,10 +249,58 @@ fn number_parse_float_native(
 // Legacy global wrappers — §19.2 / §B.2.1.
 // ---------------------------------------------------------------
 
+/// Recover the active [`ExecutionContext`], or surface the spec
+/// `TypeError` that the contextless paths cannot raise. Coercion
+/// helpers below need it to re-enter the interpreter for user
+/// `toString`/`valueOf`/`@@toPrimitive` overrides.
+fn native_context(
+    ctx: &mut NativeCtx<'_>,
+    name: &'static str,
+) -> Result<crate::ExecutionContext, NativeError> {
+    ctx.execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name,
+            reason: "missing execution context".to_string(),
+        })
+}
+
+/// §7.1.1 `ToPrimitive(value, "string")` at the NativeCtx layer so a
+/// user `toString`/`valueOf`/`@@toPrimitive` override fires before the
+/// contextless §19.2.6 / §B.2.1 string algorithms run. Returns the
+/// coerced primitive `Value`: a String operand passes through
+/// unchanged so lone surrogates survive (those algorithms inspect raw
+/// UTF-16 units), while non-String primitives are rendered downstream.
+/// A Symbol operand raises the spec `TypeError`.
+fn coerce_first_to_string_value(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
+    if arg.is_string() {
+        return Ok(arg);
+    }
+    let context = native_context(ctx, name)?;
+    let prim = ctx
+        .cx
+        .interp
+        .coerce_to_primitive(&context, &arg, crate::abstract_ops::ToPrimitiveHint::String)
+        .map_err(|e| crate::native_function::vm_to_native_error(e, name))?;
+    if prim.is_symbol() {
+        return Err(NativeError::TypeError {
+            name,
+            reason: "Cannot convert a Symbol value to a string".to_string(),
+        });
+    }
+    Ok(prim)
+}
+
 fn global_encode_uri(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let coerced = coerce_first_to_string_value(ctx, args, "encodeURI")?;
     crate::global_functions::call(
         otter_bytecode::method_id::GlobalMethod::EncodeURI,
-        args,
+        &[coerced],
         ctx.heap_mut(),
     )
     .map_err(|err| match err {
@@ -261,9 +319,10 @@ fn global_encode_uri_component(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
+    let coerced = coerce_first_to_string_value(ctx, args, "encodeURIComponent")?;
     crate::global_functions::call(
         otter_bytecode::method_id::GlobalMethod::EncodeURIComponent,
-        args,
+        &[coerced],
         ctx.heap_mut(),
     )
     .map_err(|err| match err {
@@ -279,9 +338,10 @@ fn global_encode_uri_component(
 }
 
 fn global_decode_uri(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let coerced = coerce_first_to_string_value(ctx, args, "decodeURI")?;
     crate::global_functions::call(
         otter_bytecode::method_id::GlobalMethod::DecodeURI,
-        args,
+        &[coerced],
         ctx.heap_mut(),
     )
     .map_err(|err| match err {
@@ -304,9 +364,10 @@ fn global_decode_uri_component(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
+    let coerced = coerce_first_to_string_value(ctx, args, "decodeURIComponent")?;
     crate::global_functions::call(
         otter_bytecode::method_id::GlobalMethod::DecodeURIComponent,
-        args,
+        &[coerced],
         ctx.heap_mut(),
     )
     .map_err(|err| match err {
@@ -326,9 +387,10 @@ fn global_decode_uri_component(
 }
 
 fn global_escape(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let coerced = coerce_first_to_string_value(ctx, args, "escape")?;
     crate::global_functions::call(
         otter_bytecode::method_id::GlobalMethod::Escape,
-        args,
+        &[coerced],
         ctx.heap_mut(),
     )
     .map_err(|err| NativeError::TypeError {
@@ -338,15 +400,45 @@ fn global_escape(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn global_unescape(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let coerced = coerce_first_to_string_value(ctx, args, "unescape")?;
     crate::global_functions::call(
         otter_bytecode::method_id::GlobalMethod::Unescape,
-        args,
+        &[coerced],
         ctx.heap_mut(),
     )
     .map_err(|err| NativeError::TypeError {
         name: "unescape",
         reason: err.to_string(),
     })
+}
+
+/// §19.2.3 `isNaN(number)` — the **global** function coerces its
+/// argument via `? ToNumber(number)` (firing user `valueOf` /
+/// `@@toPrimitive`) before the strict NaN test, unlike the strict
+/// `Number.isNaN` (§21.1.2.3) which performs no coercion.
+fn global_is_nan(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
+    let context = native_context(ctx, "isNaN")?;
+    let num = ctx
+        .cx
+        .interp
+        .coerce_to_number(&context, &arg)
+        .map_err(|e| crate::native_function::vm_to_native_error(e, "isNaN"))?;
+    Ok(Value::boolean(num.as_f64().is_nan()))
+}
+
+/// §19.2.2 `isFinite(number)` — the **global** function coerces via
+/// `? ToNumber(number)` before the strict finiteness test, unlike the
+/// strict `Number.isFinite` (§21.1.2.2).
+fn global_is_finite(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
+    let context = native_context(ctx, "isFinite")?;
+    let num = ctx
+        .cx
+        .interp
+        .coerce_to_number(&context, &arg)
+        .map_err(|e| crate::native_function::vm_to_native_error(e, "isFinite"))?;
+    Ok(Value::boolean(num.as_f64().is_finite()))
 }
 
 fn global_eval(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

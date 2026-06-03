@@ -1551,6 +1551,32 @@ rejecting a non-writable / setter-less property. (Remaining: a true
 `[[ErrorData]]` instance marker — the chain heuristic over-approximates
 `Object.create(Error.prototype)` — and Proxy-receiver trap routing.)
 
+### §19.2 global functions fire user `toString`/`valueOf` coercion (2026-06-03)
+
+`isNaN` +9 (13→22, 100%), `isFinite` +9 (14→23, 100%), `parseInt` +11
+(49→60), `parseFloat` +3 (53→56), `encodeURI`/`encodeURIComponent` +2
+(→100%), `unescape` +5 (→100%), `escape` +10, `decodeURI*` +2, `Number`
+→100% (339/340); 0 regressions across `JSON`, `Object`, `String`.
+Every §19.2 global routed its argument straight into the contextless
+string/number algorithms (`global_functions::call` / lossy
+`display_string`), so an object argument coerced to `"[object Object]"`
+and a user `toString`/`valueOf`/`@@toPrimitive` never ran — `parseInt`'s
+radix was likewise read with no `ToInt32` coercion. Each native wrapper
+now coerces at the `NativeCtx` layer first: `parseInt`/`parseFloat` run
+`? ToString(string)` (and `parseInt` then `? ToInt32(radix)`, observable
+in spec order); `encodeURI*`/`decodeURI*`/`escape`/`unescape` run
+`ToPrimitive(arg, "string")` and pass the primitive down (a String
+operand passes through unchanged so lone surrogates survive the §19.2.6
+algorithms). Symbol operands raise the spec `TypeError`; user throws keep
+their class through `vm_to_native_error`. Separately, the global `isNaN` /
+`isFinite` were wrongly aliased to the strict `Number.isNaN` /
+`Number.isFinite`; split them into coercing global wrappers
+(`? ToNumber`, §19.2.{2,3}) while `Number.isNaN`/`isFinite` stay strict
+(§21.1.2.{2,3}) — only `Number.parseInt`/`parseFloat` remain SAME-callable
+aliases. (Remaining: `parseFloat("1ex")`, the SM staging octal edge, and
+the §19.2.6.1 code-unit decode cases are parse-algorithm gaps, not
+coercion.)
+
 ### §19.2.6.5 `encodeURI` throws `URIError` on an unpaired surrogate (2026-06-03)
 
 `built-ins/encodeURI` +10 (50→60), `encodeURIComponent` likewise,

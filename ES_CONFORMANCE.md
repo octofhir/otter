@@ -1551,6 +1551,26 @@ rejecting a non-writable / setter-less property. (Remaining: a true
 `[[ErrorData]]` instance marker — the chain heuristic over-approximates
 `Object.create(Error.prototype)` — and Proxy-receiver trap routing.)
 
+### §25.3 DataView instances hold ordinary own properties (2026-06-03)
+
+`built-ins/DataView` +2 (`instance-extensibility`,
+`instance-extensibility-sab`), 0 regressions. A `DataView` is an
+ordinary extensible object, so `dv.x = 1` and
+`Object.defineProperty(dv, …)` must install own properties — but the GC
+body had no storage for them, so every write was dropped and
+`defineProperty` threw. Added a lazy `expando: Option<JsObject>` bag to
+`DataViewBodyGc` (traced; mirrors the `TypedArray` / `Promise` pattern)
+and routed the `DataView` branch of every ordinary-object internal
+method through it: `[[Get]]` (fast-path + `ordinary_get_value`),
+`[[Set]]` (named + computed stores), `[[Delete]]` (named + computed),
+`[[DefineOwnProperty]]`, `[[GetOwnProperty]]`, `[[OwnPropertyKeys]]`,
+plus the `Object.getOwnPropertyDescriptor` / `getOwnPropertyNames` /
+`getOwnPropertySymbols` static guards. (Remaining `DataView` fail:
+`byteOffset-validated-against-initial-buffer-length` — the constructor's
+`offset > bufferByteLength` RangeError must precede
+`GetPrototypeFromConstructor`; deferred — needs native-construct
+prototype-read reordering.)
+
 ### §6.2.4.6 PutValue TDZ on assignment to a `let` / `const` (2026-06-03)
 
 `language/expressions/assignment` +5, `language/statements/let` +2,

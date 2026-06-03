@@ -697,6 +697,21 @@ impl Interpreter {
             }
             return Ok(None);
         }
+        if let Some(dv) = target.as_data_view() {
+            // §25.3 — ordinary own properties live in the lazy expando.
+            if let Some(bag) = dv.expando(&self.gc_heap) {
+                if let Some(key) = key.string_name() {
+                    if let Some(desc) = object::get_own_descriptor(bag, &self.gc_heap, key) {
+                        return Ok(Some(desc));
+                    }
+                } else if let VmPropertyKey::Symbol(sym) = key
+                    && let Some(desc) = object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym)
+                {
+                    return Ok(Some(desc));
+                }
+            }
+            return Ok(None);
+        }
         let function_id = target.as_function().or_else(|| {
             target
                 .as_closure(&self.gc_heap)
@@ -1230,6 +1245,20 @@ impl Interpreter {
             // resolve path observes) live on a lazily-allocated expando.
             let bag =
                 crate::property_dispatch::promise_ensure_expando_pub(&mut self.gc_heap, &promise)?;
+            return Ok(if let VmPropertyKey::Symbol(sym) = key {
+                object::define_own_symbol_property_partial(bag, &mut self.gc_heap, *sym, descriptor)
+            } else {
+                let k = key
+                    .string_name()
+                    .expect("non-symbol key has string spelling");
+                self.define_own_property_partial(bag, k, descriptor)?
+            });
+        }
+        if let Some(dv) = target.as_data_view() {
+            // §25.3 — a `DataView` is an ordinary extensible object;
+            // `Object.defineProperty(dv, …)` installs onto the expando.
+            let bag =
+                crate::property_dispatch::data_view_ensure_expando_pub(&mut self.gc_heap, &dv)?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
                 object::define_own_symbol_property_partial(bag, &mut self.gc_heap, *sym, descriptor)
             } else {
@@ -2286,6 +2315,28 @@ impl Interpreter {
                     .map_err(VmError::from)?,
             ));
             if let Some(expando) = regexp.expando(&self.gc_heap) {
+                let (strings, symbols): (Vec<String>, Vec<Value>) =
+                    object::with_properties(expando, &self.gc_heap, |p| {
+                        (
+                            p.keys().map(str::to_string).collect(),
+                            p.symbol_keys().map(Value::symbol).collect(),
+                        )
+                    });
+                for key in strings {
+                    keys.push(Value::string(
+                        string::JsString::from_str(&key, &mut self.gc_heap)
+                            .map_err(VmError::from)?,
+                    ));
+                }
+                keys.extend(symbols);
+            }
+            return Ok(keys);
+        }
+        if let Some(dv) = target.as_data_view() {
+            // §25.3 — own keys are exactly the ordinary expando entries
+            // (byteLength / byteOffset / buffer are prototype getters).
+            let mut keys = Vec::new();
+            if let Some(expando) = dv.expando(&self.gc_heap) {
                 let (strings, symbols): (Vec<String>, Vec<Value>) =
                     object::with_properties(expando, &self.gc_heap, |p| {
                         (
@@ -3433,7 +3484,43 @@ impl Interpreter {
             }
             return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
         }
-        if base.is_array_buffer() || base.is_data_view() {
+        if let Some(dv) = base.as_data_view() {
+            // §25.3 — ordinary own properties in the lazy expando win
+            // over the prototype walk.
+            if let Some(bag) = dv.expando(&self.gc_heap) {
+                let lookup = match key {
+                    VmPropertyKey::Symbol(sym) => {
+                        object::lookup_own_symbol(bag, &self.gc_heap, *sym)
+                    }
+                    _ => {
+                        let name = key
+                            .string_name()
+                            .expect("non-symbol key has string spelling");
+                        object::lookup_own(bag, &self.gc_heap, name)
+                    }
+                };
+                match lookup {
+                    object::PropertyLookup::Data { value, .. } => {
+                        return Ok(VmGetOutcome::Value(value));
+                    }
+                    object::PropertyLookup::Accessor { getter, .. } => {
+                        return Ok(match getter {
+                            Some(g) if abstract_ops::is_callable(&g) => {
+                                VmGetOutcome::InvokeGetter { getter: g }
+                            }
+                            _ => VmGetOutcome::Value(Value::undefined()),
+                        });
+                    }
+                    object::PropertyLookup::Absent => {}
+                }
+            }
+            let proto = self.get_prototype_for_op(&base)?;
+            if proto.is_nullish() {
+                return Ok(VmGetOutcome::Value(Value::undefined()));
+            }
+            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+        }
+        if base.is_array_buffer() {
             let proto = self.get_prototype_for_op(&base)?;
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));

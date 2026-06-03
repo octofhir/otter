@@ -418,6 +418,12 @@ impl Interpreter {
             } else {
                 true
             }
+        } else if let Some(dv) = receiver.as_data_view() {
+            if let Some(bag) = dv.expando(&self.gc_heap) {
+                crate::object::delete(bag, &mut self.gc_heap, name)
+            } else {
+                true
+            }
         } else if let Some(r) = receiver.as_regexp() {
             // §10.1.10 [[Delete]] — `lastIndex` is non-configurable; every
             // other own name lives in the lazy expando bag, and a missing
@@ -609,6 +615,25 @@ impl Interpreter {
                     crate::object::delete(bag, &mut self.gc_heap, &name)
                 } else {
                     true
+                }
+            } else if idx.as_number().is_some() {
+                true
+            } else {
+                return Err(VmError::TypeMismatch);
+            }
+        } else if let Some(dv) = receiver.as_data_view() {
+            // §25.3 — ordinary own properties live in the lazy expando;
+            // a missing name deletes vacuously.
+            if let Some(sym) = idx.as_symbol(&self.gc_heap) {
+                match dv.expando(&self.gc_heap) {
+                    Some(bag) => crate::object::delete_symbol(bag, &mut self.gc_heap, sym),
+                    None => true,
+                }
+            } else if let Some(s) = idx.as_string(&self.gc_heap) {
+                let name = s.to_lossy_string(&self.gc_heap);
+                match dv.expando(&self.gc_heap) {
+                    Some(bag) => crate::object::delete(bag, &mut self.gc_heap, &name),
+                    None => true,
                 }
             } else if idx.as_number().is_some() {
                 true
@@ -1131,11 +1156,20 @@ impl Interpreter {
                 direct
             }
         } else if let Some(dv) = receiver.as_data_view() {
-            let direct = binary::data_view_prototype::load_property(&dv, &self.gc_heap, name);
-            if direct.is_undefined() {
-                self.load_from_constructor_prototype(context, "DataView", &receiver, name)?
+            // §25.3 — a `DataView` is an ordinary object; user-installed
+            // own properties (`dv.x = 1`) live in the lazy expando bag
+            // and win over the prototype walk.
+            if let Some(bag) = dv.expando(&self.gc_heap)
+                && let Some(value) = crate::object::get(bag, &self.gc_heap, name)
+            {
+                value
             } else {
-                direct
+                let direct = binary::data_view_prototype::load_property(&dv, &self.gc_heap, name);
+                if direct.is_undefined() {
+                    self.load_from_constructor_prototype(context, "DataView", &receiver, name)?
+                } else {
+                    direct
+                }
             }
         } else if let Some(t) = receiver.as_typed_array(&self.gc_heap) {
             // §10.4.5.4 [[Get]] — check the expando bag before
@@ -1477,6 +1511,9 @@ impl Interpreter {
                 bag
             };
             Some(bag)
+        } else if let Some(dv) = receiver.as_data_view() {
+            // §25.3 — ordinary own properties land in the lazy expando.
+            Some(data_view_ensure_expando_pub(&mut self.gc_heap, &dv)?)
         } else if receiver.is_undefined() || receiver.is_null() || receiver.is_hole() {
             return Err(VmError::TypeError {
                 message: format!(
@@ -2319,6 +2356,22 @@ impl Interpreter {
                         message: "Cannot store symbol property on Promise".to_string(),
                     });
                 }
+            } else {
+                return Err(VmError::TypeMismatch);
+            }
+        } else if let Some(dv) = recv.as_data_view() {
+            // §25.3 — ordinary object: route both symbol- and
+            // string-keyed writes into the lazy expando bag.
+            let bag = data_view_ensure_expando_pub(&mut self.gc_heap, &dv)?;
+            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
+                if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
+                    return Err(VmError::TypeError {
+                        message: "Cannot store symbol property on DataView".to_string(),
+                    });
+                }
+            } else if let Some(s) = idx_value.as_string(&self.gc_heap) {
+                let name = s.to_lossy_string(&self.gc_heap);
+                self.set_property(bag, &name, value)?;
             } else {
                 return Err(VmError::TypeMismatch);
             }
@@ -4468,5 +4521,24 @@ pub(crate) fn promise_ensure_expando_pub(
     };
     let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
     p.set_expando(heap, bag);
+    Ok(bag)
+}
+
+/// Lazy-allocate (and cache) the `DataView` expando `JsObject` backing
+/// ordinary own properties (`dv.x = 1`). A `DataView` is an ordinary
+/// extensible object per §25.3, so it must hold arbitrary own props.
+pub(crate) fn data_view_ensure_expando_pub(
+    heap: &mut otter_gc::GcHeap,
+    dv: &crate::binary::JsDataView,
+) -> Result<JsObject, VmError> {
+    if let Some(existing) = dv.expando(heap) {
+        return Ok(existing);
+    }
+    let recv = Value::data_view(*dv);
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        recv.trace_value_slots(visitor);
+    };
+    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    dv.set_expando(heap, bag);
     Ok(bag)
 }

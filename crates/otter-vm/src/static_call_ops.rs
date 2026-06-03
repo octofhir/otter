@@ -856,7 +856,10 @@ impl Interpreter {
                             .to_string(),
                     });
                 }
-                let desc = if target.is_object() || target.is_string() {
+                let desc = if target.is_object() || target.is_string() || target.is_data_view() {
+                    // §25.3 — a `DataView` is an ordinary object; its
+                    // [[GetOwnProperty]] (expando-backed) is handled by
+                    // the ordinary descriptor path.
                     self.ordinary_get_own_property_descriptor_value_stack_rooted(
                         context, stack, *target, &key, 0,
                     )?
@@ -1506,6 +1509,7 @@ fn own_property_names_uses_internal_methods(target: &Value) -> bool {
         || target.is_native_function()
         || target.is_bound_function()
         || target.is_class_constructor()
+        || target.is_data_view()
 }
 
 fn own_property_descriptors_uses_internal_methods(target: &Value) -> bool {
@@ -1518,6 +1522,7 @@ fn own_property_descriptors_uses_internal_methods(target: &Value) -> bool {
         || target.is_bound_function()
         || target.is_class_constructor()
         || target.is_regexp()
+        || target.is_data_view()
 }
 
 pub(crate) fn enumerable_own_string_entries(

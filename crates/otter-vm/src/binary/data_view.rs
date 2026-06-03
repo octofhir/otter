@@ -38,6 +38,10 @@ pub struct DataViewBodyGc {
     pub byte_offset: usize,
     /// View byte length (construction-time).
     pub byte_length: usize,
+    /// Lazy expando bag for ordinary own properties (`dv.x = 1`,
+    /// `Object.defineProperty(dv, …)`). `None` until first write —
+    /// a `DataView` is an ordinary extensible object per §25.3.
+    pub expando: Option<crate::object::JsObject>,
 }
 
 impl otter_gc::SafeTraceable for DataViewBodyGc {
@@ -48,6 +52,12 @@ impl otter_gc::SafeTraceable for DataViewBodyGc {
         // (`LocalArrayBufferHandle` / `SharedArrayBufferHandle`);
         // forward the trace so its body survives the cycle.
         self.buffer.trace_value_slots(visitor);
+        if let Some(expando) = &self.expando
+            && !expando.is_null()
+        {
+            let p = expando as *const crate::object::JsObject as *mut otter_gc::raw::RawGc;
+            visitor(p);
+        }
     }
 }
 
@@ -70,6 +80,7 @@ pub fn alloc_data_view(
         buffer,
         byte_offset,
         byte_length,
+        expando: None,
     })
 }
 
@@ -127,6 +138,17 @@ impl JsDataView {
     #[must_use]
     pub fn byte_length(self, heap: &otter_gc::GcHeap) -> usize {
         heap.read_payload(self.handle, |body| body.byte_length)
+    }
+
+    /// Read the lazy expando bag, if one has been created.
+    #[must_use]
+    pub fn expando(self, heap: &otter_gc::GcHeap) -> Option<crate::object::JsObject> {
+        heap.read_payload(self.handle, |body| body.expando)
+    }
+
+    /// Install / replace the lazy expando bag.
+    pub fn set_expando(self, heap: &mut otter_gc::GcHeap, expando: crate::object::JsObject) {
+        heap.with_payload(self.handle, |body| body.expando = Some(expando));
     }
 
     /// Identity comparison via GC handle offset.

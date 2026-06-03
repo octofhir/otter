@@ -294,6 +294,12 @@ pub(crate) fn bound_delete_own_property(
 /// names contain characters that are not `IdentifierPart`, so they must
 /// be omitted rather than emitted into an otherwise-parseable native
 /// function source.
+/// `true` for the compiler's internal anonymous-callable display
+/// placeholders, whose observable `name` property is the empty string.
+fn is_anon_name_placeholder(name: &str) -> bool {
+    matches!(name, "<anonymous>" | "<arrow>" | "<class>")
+}
+
 fn is_identifier_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
@@ -389,7 +395,15 @@ fn callable_name(ctx: &mut FunctionMetadataContext<'_>, callee: &Value) -> Resul
             return Ok(String::new());
         }
         let function = ctx.context.function(fid).ok_or(VmError::InvalidOperand)?;
-        return Ok(function.name.clone());
+        // §15.2.5 / §15.4.5 — an anonymous function / arrow / class with
+        // no NamedEvaluation context has a `name` of `""`. The compiler
+        // records an internal `<…>` placeholder for diagnostics; surface
+        // it as the empty string for the observable `name` property.
+        return Ok(if is_anon_name_placeholder(&function.name) {
+            String::new()
+        } else {
+            function.name.clone()
+        });
     }
     if let Some(native) = callee.as_native_function() {
         return match native.own_property_descriptor(ctx.gc_heap, "name")? {

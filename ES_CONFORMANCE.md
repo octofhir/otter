@@ -1694,6 +1694,18 @@ arrow / class RHS through `compile_expr_with_inferred_name`. A named
 function / class RHS, and compound assignment, are unaffected (the
 helper's default arm compiles them normally).
 
+### §20.2.4.2 anonymous function `name` is the empty string (2026-06-03)
+
+`language/expressions/function` +1, `language/expressions/arrow-function`
++1. The compiler records an internal `<anonymous>` / `<arrow>` /
+`<class>` display placeholder as a callable's name (for diagnostics);
+the observable `name` property surfaced that placeholder instead of the
+spec-required `""` for an anonymous function / arrow / class with no
+NamedEvaluation context. `callable_name` now maps the placeholders to
+`""`. A NamedEvaluation-inferred name (`var f = function () {}`) and a
+declared name are real strings and pass through unchanged; the
+compiler-stored placeholder is untouched.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

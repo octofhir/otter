@@ -979,6 +979,14 @@ pub(crate) fn compile_switch_statement(
     let span = (s.span.start, s.span.end);
     let disc_reg = compile_expr(cx, &s.discriminant, span)?;
 
+    // §14.12.4 CaseBlockEvaluation completion: `V` starts empty
+    // (observable as `undefined` for `eval`) and each executed clause's
+    // non-empty statement-list value replaces it (`UpdateEmpty`). An
+    // empty clause leaves it unchanged. Initialised before the selector
+    // jumps so every entry path sees it.
+    let completion_reg = cx.alloc_scratch();
+    cx.emit(Op::LoadUndefined, [Operand::Register(completion_reg)], span);
+
     // Fresh lexical scope so per-case `let` bindings don't leak.
     cx.enter_scope();
     cx.push_loop_frame(LoopFrame::switch_body());
@@ -1029,7 +1037,19 @@ pub(crate) fn compile_switch_statement(
         let body_pc = cx.next_pc;
         case_body_pcs.push(body_pc);
         for inner in case.consequent.iter() {
-            compile_statement(cx, inner)?;
+            // UpdateEmpty — only a non-empty statement completion
+            // overwrites `V`; declarations / empty statements (which
+            // return `None`) leave the previous clause value in place.
+            if let Some(sub) = compile_statement(cx, inner)? {
+                cx.emit(
+                    Op::StoreLocal,
+                    [
+                        Operand::Register(sub),
+                        Operand::Imm32(completion_reg as i32),
+                    ],
+                    span,
+                );
+            }
         }
     }
     let switch_end_pc = cx.next_pc;
@@ -1054,7 +1074,7 @@ pub(crate) fn compile_switch_statement(
         "switch frames must not collect continue patches"
     );
     cx.exit_scope();
-    Ok(None)
+    Ok(Some(completion_reg))
 }
 
 /// Lower `label: stmt` per ECMA-262 §14.13.

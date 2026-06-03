@@ -1551,6 +1551,22 @@ rejecting a non-writable / setter-less property. (Remaining: a true
 `[[ErrorData]]` instance marker — the chain heuristic over-approximates
 `Object.create(Error.prototype)` — and Proxy-receiver trap routing.)
 
+### §14.12.4 SwitchStatement completion value (2026-06-03)
+
+`language/statements/switch` +11 (`cptn-*` completion tests),
+0 regressions across the whole `language` tree. `compile_switch_statement`
+returned no completion register, so `eval('1; switch (null) {}')` leaked
+the preceding statement's value (`1`) instead of the switch's own
+`undefined`. CaseBlockEvaluation starts `V` empty (observable as
+`undefined`) and each executed clause's non-empty statement-list value
+replaces it via `UpdateEmpty`; an empty clause leaves it unchanged.
+Lowered this with the existing completion idiom: a scratch register
+initialised to `undefined` before the selector jumps, into which each
+clause statement that yields a value (`compile_statement` → `Some`)
+stores. (Remaining `cptn-*-abrupt-empty`: a `break` / `continue` must
+carry the accumulated `V`; the per-statement-return completion model
+cannot thread it through an abrupt jump — deferred.)
+
 ### §10.2.4 `Object.getOwnPropertyDescriptor` on a class constructor (2026-06-03)
 
 `language/statements/class` +1 (`definition/prototype-property`),

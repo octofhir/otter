@@ -9163,10 +9163,13 @@ mod tests {
             .as_ref()
             .and_then(|v| v.as_string(heap_ref))
             .expect("message string");
+        // §13.3.10: the numeric specifier is coerced via ToString to
+        // "12", then rejected because no module resolves under that
+        // name (no loader is installed in this test).
         assert!(
             message
                 .to_lossy_string(heap_ref)
-                .contains("specifier must be a string")
+                .contains("module not resolvable")
         );
     }
 

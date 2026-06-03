@@ -1617,6 +1617,18 @@ short-circuit, and resolved the separator before the limit. Per
 huge limit to `u32::MAX` instead of taking it modulo `2^32`, so
 `split(sep, 2**32)` is now `[]`.
 
+### §22.1.3.13 / §22.1.3.15 String match / search invoke @@match / @@search (2026-06-03)
+
+`built-ins/String` +3. `String.prototype.match` / `search` inlined the
+matching logic over the internally-created RegExp instead of invoking
+its `@@match` / `@@search` method. Per §22.1.3.13/.15 the fallback is
+`rx = RegExpCreate(regexp, undefined); Return Invoke(rx, @@match/@@search,
+« S »)`, so a user-overridden `RegExp.prototype[@@match]` /
+`[@@search]` must run. Both now mirror `matchAll`'s dispatch:
+`coerce_pattern_to_regexp` then `GetMethod` + `Call` on the created
+RegExp (the upstream symbol-method block still delegates a regexp /
+object argument that already defines the well-known method).
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

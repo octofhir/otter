@@ -1885,56 +1885,27 @@ fn impl_match(
     receiver: &Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let recv = receiver_string(ctx, receiver)?;
-    let undef = Value::undefined();
-    let re = if let Some(r) = args.first().and_then(|v| v.as_regexp()) {
-        r
-    } else {
-        let arg0 = args.first().unwrap_or(&undef);
-        coerce_pattern_to_regexp(arg0, "", ctx.heap_mut())?
-    };
-    let re = &re;
-    let recv_units = recv.to_utf16_vec(ctx.heap_mut());
-    if re.flags(ctx.heap()).global {
-        // `g` flag → return array of full matches only (no captures).
-        let matches = collect_regex_matches(re, ctx.heap(), &recv_units);
-        if matches.is_empty() {
-            return Ok(Value::null());
-        }
-        let mut out: Vec<Value> = Vec::with_capacity(matches.len());
-        for m in &matches {
-            let s = JsString::from_utf16_units(&recv_units[m.range.clone()], ctx.heap_mut())?;
-            out.push(Value::string(s));
-        }
-        return Ok(Value::array(ctx.array_from_elements_with_roots(
-            out.iter().cloned(),
-            &[],
-            &[out.as_slice()],
-        )?));
-    }
-    // Non-global → mirror `RegExp.prototype.exec` (carries
-    // `index` / `input` / `groups` per §22.2.7.2).
-    let m = match re
-        .find_from_utf16(ctx.heap(), &recv_units, 0)
-        .into_iter()
-        .next()
-    {
-        Some(m) => m,
-        None => return Ok(Value::null()),
-    };
-    let recv_clone = recv;
-    let has_indices = re.flags(ctx.heap()).has_indices;
-    let arr = crate::regexp_prototype::build_match_result_native(
-        &m,
-        &recv_units,
-        recv_clone,
-        has_indices,
-        ctx,
-        &[],
-        &[],
-    )
-    .map_err(|err| type_error("String.prototype", err.to_string()))?;
-    Ok(Value::array(arr))
+    // §22.1.3.13 fallback (steps 4-7): a non-`@@match` argument (the
+    // upstream symbol-method block already delegated a regexp / object
+    // that defines `@@match`) becomes `RegExpCreate(regexp, undefined)`,
+    // then the result is `Invoke(rx, @@match, « S »)` — so a
+    // user-overridden `RegExp.prototype[@@match]` is observed instead of
+    // an inlined matcher.
+    const NAME: &str = "String.prototype.match";
+    let s = receiver_string(ctx, receiver)?;
+    let arg = args.first().copied().unwrap_or_else(Value::undefined);
+    let rx = coerce_pattern_to_regexp(&arg, "", ctx.heap_mut())?;
+    let rx_value = Value::regexp(rx);
+    let method = get_symbol_method(ctx, rx_value, WellKnown::Match, NAME)?
+        .ok_or_else(|| type_error(NAME, "RegExp has no @@match method"))?;
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| type_error(NAME, "missing execution context"))?;
+    let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![Value::string(s)];
+    ctx.interp_mut()
+        .run_callable_sync(&exec, &method, rx_value, cb_args)
+        .map_err(|e| vm_err(e, NAME))
 }
 
 fn impl_match_all(
@@ -1972,25 +1943,25 @@ fn impl_search(
     receiver: &Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let recv = receiver_string(ctx, receiver)?;
-    let undef = Value::undefined();
-    let re = if let Some(r) = args.first().and_then(|v| v.as_regexp()) {
-        r
-    } else {
-        let arg0 = args.first().unwrap_or(&undef);
-        coerce_pattern_to_regexp(arg0, "", ctx.heap_mut())?
-    };
-    let re = &re;
-    let recv_units = recv.to_utf16_vec(ctx.heap_mut());
-    // `search` always starts at index 0 — `lastIndex` is ignored
-    // and not mutated per spec §22.1.3.13.
-    let heap = ctx.heap();
-    let pos = re
-        .find_from_utf16(heap, &recv_units, 0)
-        .into_iter()
-        .next()
-        .map_or(-1, |m| m.range.start as i32);
-    Ok(Value::number(NumberValue::from_i32(pos)))
+    // §22.1.3.15 fallback (steps 4-7): a non-`@@search` argument becomes
+    // `RegExpCreate(regexp, undefined)`, then `Invoke(rx, @@search, « S »)`,
+    // so a user-overridden `RegExp.prototype[@@search]` runs rather than an
+    // inlined search.
+    const NAME: &str = "String.prototype.search";
+    let s = receiver_string(ctx, receiver)?;
+    let arg = args.first().copied().unwrap_or_else(Value::undefined);
+    let rx = coerce_pattern_to_regexp(&arg, "", ctx.heap_mut())?;
+    let rx_value = Value::regexp(rx);
+    let method = get_symbol_method(ctx, rx_value, WellKnown::Search, NAME)?
+        .ok_or_else(|| type_error(NAME, "RegExp has no @@search method"))?;
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| type_error(NAME, "missing execution context"))?;
+    let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![Value::string(s)];
+    ctx.interp_mut()
+        .run_callable_sync(&exec, &method, rx_value, cb_args)
+        .map_err(|e| vm_err(e, NAME))
 }
 
 type StringNativeFn = fn(&mut NativeCtx<'_>, &Value, &[Value]) -> Result<Value, NativeError>;

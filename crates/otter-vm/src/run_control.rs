@@ -109,6 +109,13 @@ pub enum VmError {
         /// Human-readable diagnostic.
         message: String,
     },
+    /// `URIError` — malformed input to `decodeURI*` / `encodeURI*`
+    /// (§19.2.6). Distinct from [`Self::TypeError`] so the spec-mandated
+    /// class survives to the thrown instance.
+    URIError {
+        /// Human-readable diagnostic.
+        message: String,
+    },
     /// String allocation failed because the heap cap was hit.
     OutOfMemory {
         /// Bytes the allocation requested.
@@ -214,6 +221,7 @@ impl std::fmt::Display for VmError {
             VmError::TypeError { message } => write!(f, "{message}"),
             VmError::RangeError { message } => write!(f, "{message}"),
             VmError::SyntaxError { message } => write!(f, "{message}"),
+            VmError::URIError { message } => write!(f, "{message}"),
             VmError::OutOfMemory {
                 requested_bytes,
                 heap_limit_bytes,

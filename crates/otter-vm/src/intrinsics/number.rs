@@ -273,6 +273,10 @@ fn global_decode_uri(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
         ctx.heap_mut(),
     )
     .map_err(|err| match err {
+        crate::VmError::URIError { message } => NativeError::URIError {
+            name: "decodeURI",
+            reason: message,
+        },
         crate::VmError::TypeError { message } => NativeError::TypeError {
             name: "decodeURI",
             reason: message,
@@ -294,6 +298,10 @@ fn global_decode_uri_component(
         ctx.heap_mut(),
     )
     .map_err(|err| match err {
+        crate::VmError::URIError { message } => NativeError::URIError {
+            name: "decodeURIComponent",
+            reason: message,
+        },
         crate::VmError::TypeError { message } => NativeError::TypeError {
             name: "decodeURIComponent",
             reason: message,

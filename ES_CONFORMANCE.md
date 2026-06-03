@@ -1551,6 +1551,22 @@ rejecting a non-writable / setter-less property. (Remaining: a true
 `[[ErrorData]]` instance marker — the chain heuristic over-approximates
 `Object.create(Error.prototype)` — and Proxy-receiver trap routing.)
 
+### §19.2.6.1 `decodeURI` throws `URIError` on malformed input (2026-06-03)
+
+`built-ins/decodeURI` +49 (34→83), `decodeURIComponent` likewise,
+0 regressions. Malformed percent-escapes (a `%` not followed by two hex
+digits, or a decoded octet stream that is not well-formed UTF-8 —
+overlong forms, lone surrogates, truncated sequences) were reported as
+`TypeError`: `uri_decode` returned `VmError::TypeMismatch` and the
+`decodeURI*` native wrappers funnelled every error into
+`NativeError::TypeError`. The spec mandates `URIError`. Added a `URIError`
+class end to end — `VmError::URIError`, `NativeError::URIError`, the
+`native_to_vm_error` round-trip, and the `ErrorKind::URIError` rendering
+in the make-error path — and routed the malformed-escape / bad-UTF-8
+returns through it. (Remaining: a handful of code-unit-level continuation
+validation + reserved-set cases need the full §19.2.6.1 Decode rewrite —
+deferred.)
+
 ### §14.12.4 SwitchStatement completion value (2026-06-03)
 
 `language/statements/switch` +11 (`cptn-*` completion tests),

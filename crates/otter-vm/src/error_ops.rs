@@ -202,6 +202,10 @@ impl Interpreter {
                     dynamic_message.as_str(),
                 )
             }
+            VmError::URIError { message } => {
+                dynamic_message = message.clone();
+                (error_classes::ErrorKind::URIError, dynamic_message.as_str())
+            }
             VmError::NotCallable => (
                 error_classes::ErrorKind::TypeError,
                 "value is not a function",
@@ -380,6 +384,9 @@ pub(crate) fn native_to_vm_error(err: NativeError) -> VmError {
             message: format!("{name}: {reason}"),
         },
         NativeError::RangeError { name, reason } => VmError::RangeError {
+            message: format!("{name}: {reason}"),
+        },
+        NativeError::URIError { name, reason } => VmError::URIError {
             message: format!("{name}: {reason}"),
         },
         // Round-trips back to a ReferenceError-classed VmError so a TDZ

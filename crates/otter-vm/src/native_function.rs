@@ -1206,6 +1206,15 @@ pub enum NativeError {
         /// Short reason.
         reason: String,
     },
+    /// Malformed input to `decodeURI*` / `encodeURI*`; surfaces as a JS
+    /// `URIError` (§19.2.6).
+    #[error("native function {name}: {reason}")]
+    URIError {
+        /// Display name of the native.
+        name: &'static str,
+        /// Short reason.
+        reason: String,
+    },
     /// Access to an uninitialized binding (Temporal Dead Zone) or an
     /// unresolved reference surfaced from inside a native. §13.3.7.3 /
     /// §10.2.2 — a JS `ReferenceError`. Without this variant a TDZ

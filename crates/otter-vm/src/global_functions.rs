@@ -280,8 +280,10 @@ fn uri_decode(input: &str, _component: bool) -> Result<String, VmError> {
     while i < bytes.len() {
         let b = bytes[i];
         if b == b'%' {
+            // §19.2.6.1 Decode step 4.b — a `%` must be followed by two
+            // hexadecimal digits or the input is malformed (`URIError`).
             if i + 2 >= bytes.len() {
-                return Err(VmError::TypeMismatch);
+                return Err(uri_error());
             }
             let hi = hex_digit(bytes[i + 1])?;
             let lo = hex_digit(bytes[i + 2])?;
@@ -292,7 +294,16 @@ fn uri_decode(input: &str, _component: bool) -> Result<String, VmError> {
             i += 1;
         }
     }
-    String::from_utf8(out).map_err(|_| VmError::TypeMismatch)
+    // §19.2.6.1 step 4.d — the decoded octet stream must be well-formed
+    // UTF-8 (rejecting overlong forms, lone surrogates, truncated multi-
+    // byte sequences); otherwise the URI is malformed.
+    String::from_utf8(out).map_err(|_| uri_error())
+}
+
+fn uri_error() -> VmError {
+    VmError::URIError {
+        message: "URI malformed".to_string(),
+    }
 }
 
 fn hex_digit(b: u8) -> Result<u8, VmError> {
@@ -300,6 +311,6 @@ fn hex_digit(b: u8) -> Result<u8, VmError> {
         b'0'..=b'9' => Ok(b - b'0'),
         b'a'..=b'f' => Ok(b - b'a' + 10),
         b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err(VmError::TypeMismatch),
+        _ => Err(uri_error()),
     }
 }

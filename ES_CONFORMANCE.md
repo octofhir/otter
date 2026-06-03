@@ -1603,6 +1603,20 @@ than throwing. Per §22.1.3.18 step 4, `n < 0` or `n = +∞` is a
 `RangeError` checked before the `n = 0` early return; the order is now
 correct and a saturating `+∞` is detected from the raw coerced value.
 
+### §22.1.3.1 / §22.1.3.21 String charAt + split ordering (2026-06-03)
+
+`built-ins/String` +4. (1) `charAt` coerced `pos` through `ToUint32`
+(clamping a negative index to 0, so `"abc".charAt(-1)` returned `"a"`).
+Per §22.1.3.1 the position is a signed `ToIntegerOrInfinity`; `pos < 0`
+or `pos ≥ length` now returns `""`. (2) `split` returned the
+whole-string `[S]` for an `undefined` separator before the `lim = 0`
+short-circuit, and resolved the separator before the limit. Per
+§22.1.3.21 the limit is `ToUint32`'d (step 6) before the separator's
+`ToString` (step 7), and `lim = 0` returns `[]` (step 8) before the
+`undefined`-separator case (step 9). `parse_split_limit` also clamped a
+huge limit to `u32::MAX` instead of taking it modulo `2^32`, so
+`split(sep, 2**32)` is now `[]`.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

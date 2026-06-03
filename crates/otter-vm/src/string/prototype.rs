@@ -462,9 +462,15 @@ fn impl_char_at(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
-    let idx = arg_u32_or(ctx, args, 0, 0)?;
-    let unit = recv.char_code_at(idx, ctx.heap_mut());
-    match unit {
+    // §22.1.3.1 — position is `ToIntegerOrInfinity(pos)` (signed): a
+    // negative or out-of-range index returns the empty string rather
+    // than clamping to index 0, so `"abc".charAt(-1)` is `""`.
+    let pos = arg_int_or(ctx, args, 0, 0)?;
+    let len = recv.len() as i64;
+    if pos < 0 || pos >= len {
+        return Ok(Value::string(JsString::empty(ctx.heap_mut())?));
+    }
+    match recv.char_code_at(pos as u32, ctx.heap_mut()) {
         Some(u) => {
             let s = JsString::from_utf16_units(&[u], ctx.heap_mut())?;
             Ok(Value::string(s))
@@ -1617,38 +1623,25 @@ fn impl_split(
         return regex_split(ctx, recv, &re, limit);
     }
 
-    // Resolve separator: missing or `undefined` → caller-as-only-element.
-    // §7.1.17 ToString coerces every other operand (Boolean / Number /
-    // BigInt / Null / wrapper objects) before the search.
-    let separator_owned: JsString;
-    let separator = match args.first() {
-        None => {
-            let singleton = [Value::string(recv)];
-            return Ok(Value::array(ctx.array_from_elements_with_roots(
-                singleton.iter().cloned(),
-                &[],
-                &[singleton.as_slice()],
-            )?));
-        }
-        Some(v) if v.is_undefined() => {
-            let singleton = [Value::string(recv)];
-            return Ok(Value::array(ctx.array_from_elements_with_roots(
-                singleton.iter().cloned(),
-                &[],
-                &[singleton.as_slice()],
-            )?));
-        }
-        Some(v) => {
-            if let Some(s) = v.as_string(ctx.heap_mut()) {
-                s
-            } else {
-                separator_owned = arg_to_string(ctx, args, 0)?;
-                separator_owned
-            }
-        }
-    };
-
+    // §22.1.3.21 step 6 — lim = ToUint32(limit), coerced BEFORE the
+    // separator's ToString (step 7) per spec operand order.
     let limit = parse_split_limit(ctx, args)?;
+    // step 7 — R = ToString(separator). A missing / `undefined`
+    // separator has no coercion side effect; every other operand runs
+    // the ToString ladder here.
+    let separator_owned: JsString;
+    let separator: Option<JsString> = match args.first() {
+        None => None,
+        Some(v) if v.is_undefined() => None,
+        Some(v) => Some(if let Some(s) = v.as_string(ctx.heap_mut()) {
+            s
+        } else {
+            separator_owned = arg_to_string(ctx, args, 0)?;
+            separator_owned
+        }),
+    };
+    // step 8 — `lim = 0` returns an empty array, ahead of the
+    // `undefined` separator whole-string case (step 9).
     if limit == 0 {
         return Ok(Value::array(ctx.array_from_elements_with_roots(
             std::iter::empty(),
@@ -1656,6 +1649,15 @@ fn impl_split(
             &[],
         )?));
     }
+    // step 9 — a `undefined` / missing separator yields `[S]`.
+    let Some(separator) = separator else {
+        let singleton = [Value::string(recv)];
+        return Ok(Value::array(ctx.array_from_elements_with_roots(
+            singleton.iter().cloned(),
+            &[],
+            &[singleton.as_slice()],
+        )?));
+    };
 
     let recv_units = recv.to_utf16_vec(ctx.heap_mut());
     let sep_units = separator.to_utf16_vec(ctx.heap_mut());
@@ -1714,14 +1716,16 @@ fn parse_split_limit(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<u32, Nat
         return Ok(u32::MAX);
     }
     if let Some(n) = arg.as_number() {
-        let v = number_to_int(n);
-        return Ok(if v < 0 {
+        // §7.1.6 ToUint32 — NaN / ±∞ → +0, otherwise the truncated
+        // magnitude taken modulo 2^32 (so `2**32` wraps to 0 rather
+        // than clamping to the maximum).
+        let f = n.as_f64();
+        let u = if !f.is_finite() {
             0
-        } else if v > u32::MAX as i64 {
-            u32::MAX
         } else {
-            v as u32
-        });
+            f.trunc().rem_euclid(4_294_967_296.0) as u32
+        };
+        return Ok(u);
     }
     if let Some(b) = arg.as_boolean() {
         return Ok(if b { 1 } else { 0 });

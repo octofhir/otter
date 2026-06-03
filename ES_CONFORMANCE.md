@@ -1640,6 +1640,17 @@ a `NaN` / `Infinity` receiver, while the step-5 `[0, 100]` `RangeError`
 still only applies to a finite receiver (`(Infinity).toExponential(101)`
 stays `"Infinity"`).
 
+### §21.2.1 BigInt is a constructor (2026-06-03)
+
+`built-ins/BigInt` +1 (`is-a-constructor`). BigInt was installed
+callable-only (no `[[Construct]]` slot), so `IsConstructor(BigInt)` was
+false and `Reflect.construct(fn, args, BigInt)` rejected it as a
+NewTarget. Per §21.2.1 BigInt has a `[[Construct]]` slot (it may be the
+target of an `extends` clause); `new BigInt(x)` still throws because the
+constructor rejects a defined NewTarget. Dropped `callable_only` so the
+constructor slot is installed; `bigint_ctor_call` already throws via
+`is_construct_call`.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

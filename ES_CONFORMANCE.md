@@ -1551,6 +1551,30 @@ rejecting a non-writable / setter-less property. (Remaining: a true
 `[[ErrorData]]` instance marker — the chain heuristic over-approximates
 `Object.create(Error.prototype)` — and Proxy-receiver trap routing.)
 
+### §6.2.4.6 PutValue TDZ on assignment to a `let` / `const` (2026-06-03)
+
+`language/expressions/assignment` +5, `language/statements/let` +2,
+`language/statements/for-of` +4 (0 regressions). Assigning to a lexical
+binding before its declaration's initializer ran must throw
+`ReferenceError` (§9.1.1.1.5 SetMutableBinding step 2 / §13.3.7.1). Two
+shapes were unhandled:
+
+- **Same-function** (`x = 1; let x;`). The lexical pre-pass records the
+  name as uninitialized at block entry, so `compile_assignment` /
+  `store_identifier` now emit `Op::TdzError` when the resolved binding's
+  `initialized` flag is clear — mirroring the read-side lowering in
+  `expr::identifier`. A compound assignment (`x += 1`) throws at the
+  GetValue read, before its RHS; a plain `=` throws at PutValue, after
+  the RHS side effects.
+- **Cross-function capture** (`function () { x = 1; } …; let x;`). The
+  capture's TDZ cannot be settled statically, so a new
+  `Op::StoreUpvalueChecked` raises `ReferenceError` when the upvalue cell
+  still holds the hole. It is emitted only for assignment stores routed
+  through `resolve_capture`; binding-initialization stores (declarations,
+  rest parameters, `var` / `for` destructuring heads, per-iteration
+  loop bindings) keep the plain `Op::StoreUpvalue`, which legitimately
+  clears the hole.
+
 ### §22.2.6 RegExp lastIndex [[Get]] for atomized keys (2026-06-03)
 
 `built-ins/Proxy` +2 (`get`/`has` `trap-is-missing-target-is-proxy`).

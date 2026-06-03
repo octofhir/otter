@@ -4068,6 +4068,17 @@ impl Interpreter {
                     self.run_store_upvalue_reg(frame, src, idx)?;
                     continue;
                 }
+                Op::StoreUpvalueChecked => {
+                    let src = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let idx = context
+                        .exec_imm32(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_store_upvalue_checked_reg(frame, src, idx)?;
+                    continue;
+                }
                 Op::CollectRest => {
                     let dst = context
                         .exec_register(instr, 0)

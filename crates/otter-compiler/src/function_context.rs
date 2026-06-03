@@ -630,7 +630,8 @@ impl FunctionContext {
     }
 
     /// Emit the "write `src` into this binding" op pair for the
-    /// storage kind.
+    /// storage kind. Used for *binding initialization* (declarations,
+    /// loop-head per-iteration bindings) — it clears any TDZ hole.
     pub(crate) fn emit_store_storage(
         &mut self,
         src: u16,
@@ -645,6 +646,31 @@ impl FunctionContext {
             ),
             BindingStorage::Upvalue { idx } => self.emit(
                 Op::StoreUpvalue,
+                [Operand::Register(src), Operand::Imm32(idx as i32)],
+                span,
+            ),
+        }
+    }
+
+    /// Emit a binding *assignment* store (PutValue, §6.2.4.6). Captured
+    /// upvalues use [`Op::StoreUpvalueChecked`] so a write to a `let`
+    /// still in its TDZ raises `ReferenceError`; a register binding has
+    /// no runtime hole (the read/write TDZ is detected statically at the
+    /// reference site), so a plain `StoreLocal` suffices.
+    pub(crate) fn emit_assign_storage(
+        &mut self,
+        src: u16,
+        storage: BindingStorage,
+        span: (u32, u32),
+    ) {
+        match storage {
+            BindingStorage::Register { reg } => self.emit(
+                Op::StoreLocal,
+                [Operand::Register(src), Operand::Imm32(reg as i32)],
+                span,
+            ),
+            BindingStorage::Upvalue { idx } => self.emit(
+                Op::StoreUpvalueChecked,
                 [Operand::Register(src), Operand::Imm32(idx as i32)],
                 span,
             ),

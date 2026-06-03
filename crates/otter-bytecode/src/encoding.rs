@@ -570,6 +570,7 @@ pub const OP_BYTE_TABLE: &[(Op, u8)] = &[
     (Op::StarReexport, 0x8B),
     (Op::ModuleNamespaceObject, 0x8C),
     (Op::LoadImportBinding, 0x8D),
+    (Op::StoreUpvalueChecked, 0x8E),
 ];
 
 #[cfg(test)]
@@ -933,7 +934,7 @@ mod tests {
         // Catches accidental opcode additions that forget to wire
         // through OP_BYTE_TABLE. If this fires, append the missing
         // opcode at the next unused byte.
-        const EXPECTED_OPCODE_COUNT: usize = 142;
+        const EXPECTED_OPCODE_COUNT: usize = 143;
         assert_eq!(
             OP_BYTE_TABLE.len(),
             EXPECTED_OPCODE_COUNT,

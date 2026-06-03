@@ -21,6 +21,17 @@ enum PreparedAssignmentTarget {
     PrivateField { obj_reg: u16, key_reg: u16 },
 }
 
+/// `Op::TdzError`'s operand carries the binding's slot index purely for
+/// the runtime diagnostic message — it mirrors the read-side TDZ lowering
+/// in `expr::identifier`.
+fn tdz_diag_index(storage: Option<BindingStorage>) -> i32 {
+    match storage {
+        Some(BindingStorage::Register { reg }) => reg as i32,
+        Some(BindingStorage::Upvalue { idx }) => idx as i32,
+        None => 0,
+    }
+}
+
 pub(crate) fn compile_assignment(
     cx: &mut Compiler,
     a: &oxc_ast::ast::AssignmentExpression<'_>,
@@ -304,6 +315,19 @@ pub(crate) fn compile_assignment(
             span,
         ));
     }
+    // §6.2.4.6 PutValue → §9.1.1.1.5 SetMutableBinding: assigning to a
+    // `let` binding before its declaration's initializer ran is a TDZ
+    // access. The lexical pre-pass declares the name (uninitialized) at
+    // block entry, so the miss is observable statically.
+    let binding_uninitialized = matches!(
+        cx.lookup_binding(&name),
+        Some(info) if !info.is_const && !info.initialized
+    );
+    // A cross-function capture has no local binding, so its TDZ cannot be
+    // settled statically: the assignment store must runtime-check the
+    // upvalue cell for the hole. Same-function stores never need this —
+    // the static `binding_uninitialized` path covers their TDZ.
+    let mut capture_store = false;
     let storage = match cx.lookup_binding(&name) {
         Some(info) if info.is_const => {
             return Err(CompileError::Unsupported {
@@ -340,8 +364,11 @@ pub(crate) fn compile_assignment(
                     span,
                 ));
             }
-            cx.resolve_capture(&name)
-                .map(|idx| BindingStorage::Upvalue { idx })
+            let captured = cx
+                .resolve_capture(&name)
+                .map(|idx| BindingStorage::Upvalue { idx });
+            capture_store = captured.is_some();
+            captured
         }
     };
     let active_with_envs = cx.active_with_envs.clone();
@@ -361,6 +388,13 @@ pub(crate) fn compile_assignment(
                 cx.patch_branch_to_here(fallback);
             }
             match storage {
+                // §13.15.2 compound assignment reads the target via
+                // GetValue first, so a TDZ access throws here — before
+                // the RHS is evaluated for its side effects.
+                Some(_) if binding_uninitialized => {
+                    let diag_idx = tdz_diag_index(storage);
+                    cx.emit(Op::TdzError, [Operand::Imm32(diag_idx)], span);
+                }
                 Some(s) => cx.emit_load_storage(current, s, span),
                 None => {
                     let name_idx = cx.intern_string_constant(&name);
@@ -430,8 +464,18 @@ pub(crate) fn compile_assignment(
         cx.patch_branch_to_here(fallback);
     }
     match storage {
+        // §6.2.4.6 PutValue on a `let` binding still in its TDZ throws
+        // ReferenceError — after the RHS evaluated for its side effects.
+        Some(_) if binding_uninitialized => {
+            let diag_idx = tdz_diag_index(storage);
+            cx.emit(Op::TdzError, [Operand::Imm32(diag_idx)], span);
+        }
         Some(s) => {
-            cx.emit_store_storage(value, s, span);
+            if capture_store {
+                cx.emit_assign_storage(value, s, span);
+            } else {
+                cx.emit_store_storage(value, s, span);
+            }
             cx.mark_initialized(&name);
             cx.emit_module_export_mirror(&name, value, span);
         }
@@ -1178,6 +1222,13 @@ pub(crate) fn store_identifier(
     value_reg: u16,
     span: (u32, u32),
 ) -> Result<(), CompileError> {
+    // `store_identifier` is shared between binding *initialization*
+    // (rest parameters, `var` / `for` destructuring heads — where the
+    // target is legitimately uninitialized at the store) and genuine
+    // assignment (destructuring-assignment leaves). Only a cross-function
+    // capture needs the runtime TDZ store check; the static TDZ for a
+    // same-function `let` is enforced at its reference site.
+    let mut capture_store = false;
     let storage = match cx.lookup_binding(name) {
         Some(info) if info.is_const => {
             emit_assignment_type_error(
@@ -1205,13 +1256,20 @@ pub(crate) fn store_identifier(
                 );
                 return Ok(());
             }
-            cx.resolve_capture(name)
-                .map(|idx| BindingStorage::Upvalue { idx })
+            let captured = cx
+                .resolve_capture(name)
+                .map(|idx| BindingStorage::Upvalue { idx });
+            capture_store = captured.is_some();
+            captured
         }
     };
     match storage {
         Some(s) => {
-            cx.emit_store_storage(value_reg, s, span);
+            if capture_store {
+                cx.emit_assign_storage(value_reg, s, span);
+            } else {
+                cx.emit_store_storage(value_reg, s, span);
+            }
             cx.mark_initialized(name);
             cx.emit_module_export_mirror(name, value_reg, span);
         }

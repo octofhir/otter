@@ -244,6 +244,14 @@ pub enum Op {
     /// `idx` in the current frame's upvalue table.
     /// Operands: `Register(src), Imm32(upvalue_idx)`.
     StoreUpvalue,
+    /// Like [`Op::StoreUpvalue`], but raises `ReferenceError` when the
+    /// target cell still holds the Temporal Dead Zone hole. Emitted for
+    /// an *assignment* (PutValue, §6.2.4.6) to a captured `let` / `const`
+    /// binding — a write before the declaration's initializer ran. The
+    /// binding-initialization stores keep using [`Op::StoreUpvalue`],
+    /// which legitimately clears the hole.
+    /// Operands: `Register(src), Imm32(upvalue_idx)`.
+    StoreUpvalueChecked,
     /// Replace own-upvalue cell `idx` with a freshly allocated cell
     /// holding a hole (Temporal Dead Zone). Operands: `Imm32(idx)`.
     /// Closures created *before* this op keep the previous cell, so a
@@ -1096,6 +1104,7 @@ impl Op {
             Op::MakeClosure => "MAKE_CLOSURE",
             Op::LoadUpvalue => "LOAD_UPVALUE",
             Op::StoreUpvalue => "STORE_UPVALUE",
+            Op::StoreUpvalueChecked => "STORE_UPVALUE_CHECKED",
             Op::FreshUpvalue => "FRESH_UPVALUE",
             Op::Call => "CALL",
             Op::ReturnValue => "RETURN_VALUE",
@@ -1210,6 +1219,7 @@ impl Op {
             | Op::StoreLocal
             | Op::LoadUpvalue
             | Op::StoreUpvalue
+            | Op::StoreUpvalueChecked
             | Op::MakeFunction
             | Op::MathLoad
             | Op::Await

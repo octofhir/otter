@@ -607,7 +607,9 @@ mod tests {
             .iter()
             .find(|f| f.is_arrow)
             .expect("arrow function record");
-        assert_eq!(arrow_fn.name, "<arrow>");
+        // §13.15.2 NamedEvaluation — `const f = () => …` infers the
+        // binding's name onto the otherwise-anonymous arrow.
+        assert_eq!(arrow_fn.name, "f");
     }
 
     #[test]
@@ -631,9 +633,11 @@ mod tests {
             "inner should LoadUpvalue: {:?}",
             inner.code
         );
+        // Assignment to a captured binding goes through the TDZ-checked
+        // upvalue store (§6.2.4.6 PutValue).
         assert!(
-            inner.code.iter().any(|i| i.op == Op::StoreUpvalue),
-            "inner should StoreUpvalue: {:?}",
+            inner.code.iter().any(|i| i.op == Op::StoreUpvalueChecked),
+            "inner should StoreUpvalueChecked: {:?}",
             inner.code
         );
     }

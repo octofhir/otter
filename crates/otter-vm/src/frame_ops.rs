@@ -153,6 +153,35 @@ impl Interpreter {
         Ok(())
     }
 
+    /// `Op::StoreUpvalueChecked` — assignment (PutValue, §6.2.4.6) to a
+    /// captured `let` / `const`. A cell still holding the Temporal Dead
+    /// Zone hole means the write precedes the declaration's initializer,
+    /// which is a `ReferenceError`. Binding initialization keeps using
+    /// [`Self::run_store_upvalue_reg`], which clears the hole.
+    pub(crate) fn run_store_upvalue_checked_reg(
+        &mut self,
+        frame: &mut Frame,
+        src: u16,
+        idx: i32,
+    ) -> Result<(), VmError> {
+        if idx < 0 {
+            return Err(VmError::InvalidOperand);
+        }
+        let value = *read_register(frame, src)?;
+        let cell = *frame
+            .upvalues
+            .get(idx as usize)
+            .ok_or(VmError::InvalidOperand)?;
+        if read_upvalue(&self.gc_heap, cell).is_hole() {
+            return Err(VmError::TemporalDeadZone {
+                local_index: idx as u32,
+            });
+        }
+        store_upvalue(&mut self.gc_heap, cell, value);
+        frame.advance_pc(self.current_byte_len)?;
+        Ok(())
+    }
+
     pub(crate) fn run_collect_rest_reg(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,

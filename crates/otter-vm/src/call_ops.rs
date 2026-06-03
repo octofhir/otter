@@ -1535,6 +1535,23 @@ impl Interpreter {
             )?;
             gen_handle.set_async(&mut self.gc_heap, async_gen);
             gen_handle.install_owner_on_frame(&mut self.gc_heap);
+            // §27.5 — run the generator prologue (mirroring the opcode
+            // `invoke` path) so the handle is primed to its
+            // suspended-start state. Without it a generator created
+            // through a builtin's synchronous re-entry (e.g. an
+            // `@@iterator` that is a generator function, driven by
+            // `Array.from` / `GetSetRecord` / the iterator helpers) is
+            // never started and reports `done` on its first `next`.
+            let (frame, cold) = gen_handle
+                .take_frame(&mut self.gc_heap)
+                .ok_or(VmError::InvalidOperand)?;
+            let mut frame = *frame;
+            if let Some(cold) = cold {
+                self.frame_attach_cold(&mut frame, cold);
+            }
+            let mut prologue_stack: SmallVec<[Frame; 8]> = SmallVec::new();
+            prologue_stack.push(frame);
+            self.dispatch_loop(context, &mut prologue_stack)?;
             return Ok(Value::generator(gen_handle));
         }
         inner.push(new_frame);

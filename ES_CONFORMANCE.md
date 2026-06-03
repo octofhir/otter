@@ -1665,6 +1665,20 @@ object that merely inherits an error prototype, and a `Proxy`, return
 `undefined`. (`Object.prototype.toString`'s "Error" tag still uses the
 prototype-chain heuristic.)
 
+### §27.5 Generator prologue on synchronous builtin re-entry (2026-06-03)
+
+`built-ins/Set` +5 (suite now 100%), plus `Array.from` / iterator
+helpers over a generator-function iterable. When a builtin synchronously
+calls a generator function — e.g. an `@@iterator` / set-like `keys`
+that is `function* () {…}`, driven by `Array.from`, `GetSetRecord`, or
+the iterator helpers — `run_callable_sync` created the generator handle
+but skipped the prologue the opcode `invoke` path runs, so the
+generator was never started and reported `done` on its first `next`.
+The synchronous path now runs the same prologue (`take_frame` +
+`dispatch_loop`) before returning the handle, priming it to its
+suspended-start state. Normal `g()` calls (opcode path) were already
+correct and are unaffected.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

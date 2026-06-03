@@ -222,28 +222,37 @@ fn number_to_exponential(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
     let coerced = coerce_numeric_args(ctx, NAME, args)?;
     let recv = this_number_value(ctx, NAME)?;
     let value = recv.as_f64();
-    // §21.1.3.2 step 3: non-finite returns ToString(x) regardless of
-    // `fractionDigits` validity, so `(Infinity).toExponential(101)`
-    // returns `"Infinity"`.
+    // §21.1.3.2 step 2: `f = ? ToIntegerOrInfinity(fractionDigits)` runs
+    // BEFORE the non-finite return (step 3), so a Symbol / BigInt
+    // `fractionDigits` raises a TypeError even for a NaN / Infinity
+    // receiver.
+    let f_value: Option<f64> = if coerced.first().is_none_or(|v| v.is_undefined()) {
+        None
+    } else {
+        Some(coerce_digits_arg(coerced.first(), 0.0, ctx.heap(), NAME)?)
+    };
+    // §21.1.3.2 step 3: a non-finite receiver returns ToString(x)
+    // regardless of `fractionDigits`'s range, so
+    // `(Infinity).toExponential(101)` returns `"Infinity"` (the range
+    // check below — step 5 — never runs).
     if !value.is_finite() {
         return Ok(Value::string(super::ecma::number_to_string(
             value,
             ctx.heap_mut(),
         )?));
     }
-    // §21.1.3.2 step 2: `f = undefined ? undefined :
-    //   ToIntegerOrInfinity(fractionDigits)`.
-    let digits: Option<u32> = if coerced.first().is_none_or(|v| v.is_undefined()) {
-        None
-    } else {
-        let f = coerce_digits_arg(coerced.first(), 0.0, ctx.heap(), NAME)?;
-        if !f.is_finite() || !(0.0..=100.0).contains(&f) {
-            return Err(NativeError::RangeError {
-                name: NAME,
-                reason: "must be an integer in 0..=100".to_string(),
-            });
+    // §21.1.3.2 step 5: `f` must be an integer in `[0, 100]`.
+    let digits: Option<u32> = match f_value {
+        None => None,
+        Some(f) => {
+            if !f.is_finite() || !(0.0..=100.0).contains(&f) {
+                return Err(NativeError::RangeError {
+                    name: NAME,
+                    reason: "must be an integer in 0..=100".to_string(),
+                });
+            }
+            Some(f as u32)
         }
-        Some(f as u32)
     };
     let rendered = super::ecma_fixed::number_to_exponential(value, digits);
     Ok(Value::string(JsString::from_latin1(

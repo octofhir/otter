@@ -1629,6 +1629,17 @@ its `@@match` / `@@search` method. Per §22.1.3.13/.15 the fallback is
 RegExp (the upstream symbol-method block still delegates a regexp /
 object argument that already defines the well-known method).
 
+### §21.1.3.2 Number.prototype.toExponential coercion order (2026-06-03)
+
+`built-ins/Number` +1 (suite now 100%). `toExponential` returned early
+for a non-finite receiver before coercing `fractionDigits`, so
+`NaN.toExponential(Symbol())` did not throw. Per §21.1.3.2 step 2,
+`f = ? ToIntegerOrInfinity(fractionDigits)` runs before the step-3
+non-finite return — a Symbol / BigInt now raises a `TypeError` even for
+a `NaN` / `Infinity` receiver, while the step-5 `[0, 100]` `RangeError`
+still only applies to a finite receiver (`(Infinity).toExponential(101)`
+stays `"Infinity"`).
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

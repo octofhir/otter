@@ -38,6 +38,15 @@ const MARK_COLOR_MASK: u8 = 0b0000_0011;
 const FLAG_YOUNG: u8 = 0b0000_0100;
 const FLAG_FORWARDED: u8 = 0b0000_1000;
 const FLAG_PINNED: u8 = 0b0001_0000;
+/// Set once the sweeper has finalized + dropped a dead old/large-space
+/// object. Old-space is non-moving and reaps memory only at whole-page
+/// granularity, so a dead corpse stays in its page's bump range and is
+/// re-walked by every later sweep. Without this flag a subsequent sweep
+/// would `drop_in_place` the same payload twice — a double free of any
+/// owned buffer (e.g. a string body's `Vec<u16>`). The bit survives
+/// `clear_mark` (which only touches the color bits) so the drop is
+/// idempotent across GC cycles.
+const FLAG_SWEPT: u8 = 0b0010_0000;
 
 /// Tri-color marker state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +203,20 @@ impl GcHeader {
     #[inline]
     pub fn set_forwarded(&self) {
         self.flags.fetch_or(FLAG_FORWARDED, Ordering::Release);
+    }
+
+    /// True iff the sweeper has already finalized + dropped this dead
+    /// object. Guards against a second `drop_in_place` on a later
+    /// sweep (see [`FLAG_SWEPT`]).
+    #[inline]
+    pub fn is_swept(&self) -> bool {
+        self.flags.load(Ordering::Acquire) & FLAG_SWEPT != 0
+    }
+
+    /// Record that the sweeper has finalized + dropped this object.
+    #[inline]
+    pub fn set_swept(&self) {
+        self.flags.fetch_or(FLAG_SWEPT, Ordering::Release);
     }
 
     /// Returns true iff the object is pinned (future compactor

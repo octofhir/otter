@@ -1289,14 +1289,23 @@ impl GcHeap {
                     let tag = (*h).type_tag() as usize;
                     let size = (*h).size_bytes() as usize;
                     if !(*h).is_marked() {
-                        let tag_u8 = (*h).type_tag();
-                        if let Some(finalize_fn) = self.trace_table.get_finalize(tag_u8) {
-                            finalize_fn(h);
+                        // Old/large space is non-moving and reaps only
+                        // whole dead pages, so a dropped corpse stays in
+                        // the bump range and is re-walked by later
+                        // sweeps. Drop exactly once — a second
+                        // `drop_in_place` would double-free any buffer
+                        // the payload owns (e.g. a string `Vec<u16>`).
+                        if !(*h).is_swept() {
+                            let tag_u8 = (*h).type_tag();
+                            if let Some(finalize_fn) = self.trace_table.get_finalize(tag_u8) {
+                                finalize_fn(h);
+                            }
+                            if let Some(drop_fn) = self.trace_table.get_drop(tag_u8) {
+                                drop_fn(h);
+                            }
+                            (*h).set_swept();
+                            reclaimed += size;
                         }
-                        if let Some(drop_fn) = self.trace_table.get_drop(tag_u8) {
-                            drop_fn(h);
-                        }
-                        reclaimed += size;
                     } else {
                         per_tag_live_count[tag] = per_tag_live_count[tag].wrapping_add(1);
                         per_tag_live_bytes[tag] = per_tag_live_bytes[tag].wrapping_add(size);
@@ -1308,14 +1317,23 @@ impl GcHeap {
                     let tag = (*h).type_tag() as usize;
                     let size = (*h).size_bytes() as usize;
                     if !(*h).is_marked() {
-                        let tag_u8 = (*h).type_tag();
-                        if let Some(finalize_fn) = self.trace_table.get_finalize(tag_u8) {
-                            finalize_fn(h);
+                        // Old/large space is non-moving and reaps only
+                        // whole dead pages, so a dropped corpse stays in
+                        // the bump range and is re-walked by later
+                        // sweeps. Drop exactly once — a second
+                        // `drop_in_place` would double-free any buffer
+                        // the payload owns (e.g. a string `Vec<u16>`).
+                        if !(*h).is_swept() {
+                            let tag_u8 = (*h).type_tag();
+                            if let Some(finalize_fn) = self.trace_table.get_finalize(tag_u8) {
+                                finalize_fn(h);
+                            }
+                            if let Some(drop_fn) = self.trace_table.get_drop(tag_u8) {
+                                drop_fn(h);
+                            }
+                            (*h).set_swept();
+                            reclaimed += size;
                         }
-                        if let Some(drop_fn) = self.trace_table.get_drop(tag_u8) {
-                            drop_fn(h);
-                        }
-                        reclaimed += size;
                     } else {
                         per_tag_live_count[tag] = per_tag_live_count[tag].wrapping_add(1);
                         per_tag_live_bytes[tag] = per_tag_live_bytes[tag].wrapping_add(size);

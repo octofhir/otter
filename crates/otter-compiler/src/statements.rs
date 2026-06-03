@@ -102,7 +102,10 @@ pub(crate) fn compile_statement(
                             node: format!("var `{name}` not pre-hoisted"),
                             span,
                         })?;
-                        let init_reg = compile_expr(cx, init, span)?;
+                        // §14.3.1.2 — `BindingIdentifier = AnonymousFunction`
+                        // infers the binding's name.
+                        let init_reg =
+                            crate::expr::compile_expr_with_inferred_name(cx, init, &name, span)?;
                         cx.emit_store_storage(init_reg, info.storage, span);
                         if cx.stack.len() == 1 && cx.module_state.is_none() {
                             let name_idx = cx.intern_string_constant(&name);
@@ -147,7 +150,11 @@ pub(crate) fn compile_statement(
                         None => cx.declare_binding(&name, is_const, span)?,
                     };
                     let init_reg = match &declarator.init {
-                        Some(init) => compile_expr(cx, init, span)?,
+                        // §14.3.1.2 — NamedEvaluation infers the binding name
+                        // for an anonymous function initializer.
+                        Some(init) => {
+                            crate::expr::compile_expr_with_inferred_name(cx, init, &name, span)?
+                        }
                         None => {
                             let dst = cx.alloc_scratch();
                             cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);

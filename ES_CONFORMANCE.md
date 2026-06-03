@@ -1679,6 +1679,21 @@ The synchronous path now runs the same prologue (`take_frame` +
 suspended-start state. Normal `g()` calls (opcode path) were already
 correct and are unaffected.
 
+### §13.15.2 / §14.3.1.2 NamedEvaluation for declarations & assignment (2026-06-03)
+
+`language/expressions/assignment` +4, `language/statements/let` +4,
+`language/expressions/object` +2. NamedEvaluation (inferring a function
+/ class name from its binding target) was wired only for destructuring
+defaults, so `var f = function () {}`, `let g = () => {}`, `c = class
+{}`, and `{ m: function () {} }` left the function with its internal
+`<anonymous>` / `<arrow>` / `<class>` placeholder instead of the
+inferred name. The simple-`=` identifier-target assignment, the
+`var` / `let` / `const` binding-identifier initializer, and the
+static-key object-property paths now route an anonymous function /
+arrow / class RHS through `compile_expr_with_inferred_name`. A named
+function / class RHS, and compound assignment, are unaffected (the
+helper's default arm compiles them normally).
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

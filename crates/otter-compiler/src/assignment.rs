@@ -347,7 +347,9 @@ pub(crate) fn compile_assignment(
     let active_with_envs = cx.active_with_envs.clone();
     let with_ref = emit_with_binding_probe(cx, &name, &active_with_envs, span)?;
     let value = match compound_op {
-        None => compile_expr(cx, &a.right, span)?,
+        // §13.15.2 — plain `IdentifierRef = AnonymousFunctionDefinition`
+        // performs NamedEvaluation, inferring the target's name.
+        None => crate::expr::compile_expr_with_inferred_name(cx, &a.right, &name, span)?,
         Some(op) => {
             let current = cx.alloc_scratch();
             let mut with_done = None;

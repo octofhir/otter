@@ -270,7 +270,10 @@ pub(crate) fn compile_object_literal(
                     continue;
                 }
                 let key_str = static_key_str.expect("non-computed key resolved above");
-                let value_reg = compile_expr(cx, &p.value, key_span)?;
+                // §13.2.5.5 step — `PropertyName: AnonymousFunctionDefinition`
+                // infers the function's name from the property key.
+                let value_reg =
+                    crate::expr::compile_expr_with_inferred_name(cx, &p.value, &key_str, key_span)?;
                 let const_idx = cx.intern_string_constant(&key_str);
                 let store_scratch = cx.alloc_scratch();
                 cx.emit(

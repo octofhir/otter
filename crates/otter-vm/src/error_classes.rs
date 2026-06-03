@@ -524,12 +524,13 @@ impl ErrorClassRegistry {
                     reason: "receiver must be an Object".to_string(),
                 });
             }
-            // step 3 — no [[ErrorData]] → undefined. Only ordinary
-            // objects whose prototype chain reaches an error prototype
-            // model the internal slot; a Proxy / other exotic never does.
-            let has_error_data = receiver.as_object().is_some_and(|obj| {
-                crate::object_statics::object_has_error_data_value(obj, ctx.interp_mut())
-            });
+            // step 3 — no [[ErrorData]] → undefined. The slot is an exact
+            // per-instance marker set by an error constructor, so a
+            // `Proxy` / non-error object and a plain
+            // `Object.create(Error.prototype)` all return undefined.
+            let has_error_data = receiver
+                .as_object()
+                .is_some_and(|obj| crate::object::has_error_data(obj, ctx.heap()));
             if !has_error_data {
                 return Ok(Value::undefined());
             }
@@ -1197,6 +1198,8 @@ impl ErrorClassRegistry {
                 heap_limit_bytes: ctx.heap().max_heap_bytes(),
             })?;
         crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto));
+        // §20.5.* — the instance carries the `[[ErrorData]]` internal slot.
+        crate::object::set_error_data(obj, ctx.heap_mut());
         if let Some(text) = message {
             let s = JsString::from_str(text, ctx.heap_mut())?;
             // §20.5.1.1 step 4.c — `msgDesc` is `{ [[Value]]: msg,

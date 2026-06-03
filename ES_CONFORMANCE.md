@@ -1651,6 +1651,20 @@ constructor rejects a defined NewTarget. Dropped `callable_only` so the
 constructor slot is installed; `bigint_ctor_call` already throws via
 `is_construct_call`.
 
+### §20.5 [[ErrorData]] internal-slot marker (2026-06-03)
+
+`built-ins/Error` +3 (`prototype/stack` `getter-no-error-data`,
+`getter-error-as-prototype`, `getter-foreign-new-target`).
+`get Error.prototype.stack`'s `[[ErrorData]]` check used a prototype-
+chain probe, which over-approximated: a plain `Object.create(Error.
+prototype)` (no slot) reported a stack. A real per-instance
+`error_data` flag is now set by every error constructor path (the
+native registry constructor and the bytecode `NewError` /
+`NewBuiltinError` opcodes), and the getter consults it exactly — so an
+object that merely inherits an error prototype, and a `Proxy`, return
+`undefined`. (`Object.prototype.toString`'s "Error" tag still uses the
+prototype-chain heuristic.)
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

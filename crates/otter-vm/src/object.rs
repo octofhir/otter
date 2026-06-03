@@ -383,6 +383,11 @@ pub struct ObjectBody {
     /// through [`set_date_data`] which applies TimeClip
     /// (§21.4.1.6).
     date_data: Option<f64>,
+    /// `[[ErrorData]]` internal slot presence marker (§20.5). Set only
+    /// on instances produced by an error constructor, so a plain
+    /// `Object.create(Error.prototype)` is correctly distinguished from
+    /// a real error (e.g. by `get Error.prototype.stack`).
+    error_data: bool,
     /// `[[Extensible]]` internal slot. New keys are rejected when
     /// this is `false`.
     extensible: bool,
@@ -540,6 +545,7 @@ fn empty_object_body() -> ObjectBody {
         bigint_data: None,
         is_raw_json: false,
         date_data: None,
+        error_data: false,
         extensible: true,
         is_arguments_object: false,
     }
@@ -637,6 +643,7 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
             bigint_data: None,
             is_raw_json: false,
             date_data: None,
+            error_data: false,
             extensible: true,
             is_arguments_object: false,
         },
@@ -671,6 +678,7 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
             bigint_data: None,
             is_raw_json: false,
             date_data: None,
+            error_data: false,
             extensible: true,
             is_arguments_object: false,
         },
@@ -1411,6 +1419,22 @@ pub fn set_date_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: f64) {
 #[must_use]
 pub fn date_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<f64> {
     heap.read_payload(obj, |body| body.date_data)
+}
+
+/// Mark an object as carrying the `[[ErrorData]]` internal slot
+/// (§20.5) — set when an error constructor produces the instance.
+pub fn set_error_data(obj: JsObject, heap: &mut otter_gc::GcHeap) {
+    heap.with_payload(obj, |body| {
+        body.error_data = true;
+    });
+}
+
+/// `true` when the object has the `[[ErrorData]]` internal slot. Unlike
+/// a prototype-chain probe this is exact: `Object.create(Error.prototype)`
+/// returns `false`.
+#[must_use]
+pub fn has_error_data(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
+    heap.read_payload(obj, |body| body.error_data)
 }
 
 /// Tag an object as carrying the `[[IsRawJSON]]` internal slot

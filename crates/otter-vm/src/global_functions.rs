@@ -97,11 +97,11 @@ pub fn call(
             &args.first().cloned().unwrap_or(Value::undefined()),
         ))),
         M::EncodeURI => js_string(
-            &uri_encode(&coerce_to_string(args.first(), gc_heap), false),
+            &uri_encode(&coerce_to_utf16(args.first(), gc_heap), false)?,
             gc_heap,
         ),
         M::EncodeURIComponent => js_string(
-            &uri_encode(&coerce_to_string(args.first(), gc_heap), true),
+            &uri_encode(&coerce_to_utf16(args.first(), gc_heap), true)?,
             gc_heap,
         ),
         M::DecodeURI => {
@@ -243,32 +243,64 @@ fn js_string(s: &str, heap: &mut otter_gc::GcHeap) -> Result<Value, VmError> {
 /// §19.2.6.5 Encode — percent-encode every byte that isn't in the
 /// "always-safe" set. `component = true` matches encodeURIComponent
 /// (smaller safe set); `false` matches encodeURI.
-fn uri_encode(input: &str, component: bool) -> String {
-    fn is_unreserved(b: u8) -> bool {
-        b.is_ascii_alphanumeric()
-            || matches!(
-                b,
-                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
+/// §19.2.6.5 Encode — walks the input's UTF-16 code units. A code unit
+/// in the unescaped set passes through; any other code point is UTF-8
+/// encoded and percent-escaped byte by byte. An unpaired surrogate is
+/// malformed (`URIError`).
+fn uri_encode(units: &[u16], component: bool) -> Result<String, VmError> {
+    fn is_unreserved(b: u16) -> bool {
+        b < 0x80
+            && (u8::try_from(b).unwrap().is_ascii_alphanumeric()
+                || matches!(
+                    b as u8,
+                    b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
+                ))
+    }
+    fn is_uri_reserved(b: u16) -> bool {
+        b < 0x80
+            && matches!(
+                b as u8,
+                b';' | b'/' | b'?' | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b',' | b'#'
             )
     }
-    fn is_uri_reserved(b: u8) -> bool {
-        matches!(
-            b,
-            b';' | b'/' | b'?' | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b',' | b'#'
-        )
-    }
-    let mut out = String::with_capacity(input.len());
-    for b in input.bytes() {
-        if is_unreserved(b) || (!component && is_uri_reserved(b)) {
-            out.push(b as char);
+    const HEX: &[u8] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(units.len());
+    let mut i = 0;
+    while i < units.len() {
+        let c = units[i];
+        if is_unreserved(c) || (!component && is_uri_reserved(c)) {
+            out.push(c as u8 as char);
+            i += 1;
+            continue;
+        }
+        // §11.1.3 CodePointAt — pair a high surrogate with the following
+        // low surrogate; an unpaired surrogate (either half) is malformed.
+        let code_point: u32 = if (0xD800..=0xDBFF).contains(&c) {
+            match units.get(i + 1) {
+                Some(&low) if (0xDC00..=0xDFFF).contains(&low) => {
+                    i += 1;
+                    0x10000 + (((c as u32 - 0xD800) << 10) | (low as u32 - 0xDC00))
+                }
+                _ => return Err(uri_error()),
+            }
+        } else if (0xDC00..=0xDFFF).contains(&c) {
+            return Err(uri_error());
         } else {
+            c as u32
+        };
+        i += 1;
+        // Encode the scalar value as UTF-8 and percent-escape each byte.
+        let mut buf = [0u8; 4];
+        let encoded = char::from_u32(code_point)
+            .ok_or_else(uri_error)?
+            .encode_utf8(&mut buf);
+        for b in encoded.bytes() {
             out.push('%');
-            const HEX: &[u8] = b"0123456789ABCDEF";
             out.push(HEX[(b >> 4) as usize] as char);
             out.push(HEX[(b & 0x0F) as usize] as char);
         }
     }
-    out
+    Ok(out)
 }
 
 /// §19.2.6.4 Decode — inverse of [`uri_encode`]. Raises

@@ -1551,6 +1551,20 @@ rejecting a non-writable / setter-less property. (Remaining: a true
 `[[ErrorData]]` instance marker — the chain heuristic over-approximates
 `Object.create(Error.prototype)` — and Proxy-receiver trap routing.)
 
+### §19.2.6.5 `encodeURI` throws `URIError` on an unpaired surrogate (2026-06-03)
+
+`built-ins/encodeURI` +10 (50→60), `encodeURIComponent` likewise,
+0 regressions. `uri_encode` consumed the already-`ToString`-coerced
+(lossy) `&str`, so a lone surrogate had been replaced with U+FFFD and was
+silently encoded as `%EF%BF%BD` instead of raising `URIError`. Rewrote it
+to walk the input's UTF-16 code units: a high surrogate pairs with the
+following low surrogate into a supplementary code point, and an unpaired
+surrogate (either half) is malformed; every non-unescaped code point is
+UTF-8 encoded and percent-escaped byte by byte. Reuses the `URIError`
+class added for `decodeURI`. (Remaining `A6_T1`: `encodeURI(object)` must
+run the argument's `toString` through `ToPrimitive` — the contextless
+coercion path can't invoke a user method; deferred.)
+
 ### §19.2.6.1 `decodeURI` throws `URIError` on malformed input (2026-06-03)
 
 `built-ins/decodeURI` +49 (34→83), `decodeURIComponent` likewise,

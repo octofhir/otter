@@ -245,9 +245,15 @@ fn global_encode_uri(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
         args,
         ctx.heap_mut(),
     )
-    .map_err(|err| NativeError::TypeError {
-        name: "encodeURI",
-        reason: err.to_string(),
+    .map_err(|err| match err {
+        crate::VmError::URIError { message } => NativeError::URIError {
+            name: "encodeURI",
+            reason: message,
+        },
+        other => NativeError::TypeError {
+            name: "encodeURI",
+            reason: other.to_string(),
+        },
     })
 }
 
@@ -260,9 +266,15 @@ fn global_encode_uri_component(
         args,
         ctx.heap_mut(),
     )
-    .map_err(|err| NativeError::TypeError {
-        name: "encodeURIComponent",
-        reason: err.to_string(),
+    .map_err(|err| match err {
+        crate::VmError::URIError { message } => NativeError::URIError {
+            name: "encodeURIComponent",
+            reason: message,
+        },
+        other => NativeError::TypeError {
+            name: "encodeURIComponent",
+            reason: other.to_string(),
+        },
     })
 }
 

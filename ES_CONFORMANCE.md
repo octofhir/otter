@@ -1593,6 +1593,16 @@ through a lenient inline match that dropped any non-primitive to `NaN`
 now run `ToIntegerOrInfinity` via `to_number_or_throw` (full ToPrimitive
 ladder, Symbol / BigInt → TypeError), then range-check `[2, 36]`.
 
+### §22.1.3.18 String.prototype.repeat count RangeError ordering (2026-06-03)
+
+`built-ins/String` +2 (`repeat/count-less-than-zero-throws`,
+`count-is-infinity-throws`). A negative count threw a `TypeError`
+instead of a `RangeError`, and the `n = 0` / empty-string shortcut ran
+before the range check, so `"".repeat(Infinity)` returned `""` rather
+than throwing. Per §22.1.3.18 step 4, `n < 0` or `n = +∞` is a
+`RangeError` checked before the `n = 0` early return; the order is now
+correct and a saturating `+∞` is detected from the raw coerced value.
+
 ### §22.2.6.10 RegExp.prototype[@@search] observable protocol (2026-06-02)
 
 `built-ins/RegExp` +10. `@@search`, like `@@match`, was a hardcoded

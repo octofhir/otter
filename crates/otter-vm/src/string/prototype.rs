@@ -632,10 +632,23 @@ fn impl_repeat(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
-    let count = arg_int_or(ctx, args, 0, 0)?;
-    if count < 0 {
-        return Err(type_error("String.prototype", "must be non-negative"));
+    // §22.1.3.18 steps 3-4 — n = ToIntegerOrInfinity(count); a negative
+    // or `+∞` count is a RangeError, checked BEFORE the `n = 0` /
+    // empty-string shortcuts so `"".repeat(Infinity)` and
+    // `"".repeat(-1)` throw rather than returning `""`. The argument is
+    // pre-coerced to a Number by the String method coercion pass.
+    let raw = match args.first() {
+        Some(v) if !v.is_undefined() => v.as_number().map_or(0.0, |n| n.as_f64()),
+        _ => 0.0,
+    };
+    let n = if raw.is_nan() { 0.0 } else { raw.trunc() };
+    if n < 0.0 || n == f64::INFINITY {
+        return Err(range_error(
+            "String.prototype.repeat",
+            "count must be a non-negative finite number",
+        ));
     }
+    let count = n as i64;
     if count == 0 || recv.is_empty() {
         return Ok(Value::string(JsString::empty(ctx.heap_mut())?));
     }

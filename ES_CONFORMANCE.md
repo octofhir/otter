@@ -1551,6 +1551,19 @@ rejecting a non-writable / setter-less property. (Remaining: a true
 `[[ErrorData]]` instance marker — the chain heuristic over-approximates
 `Object.create(Error.prototype)` — and Proxy-receiver trap routing.)
 
+### §10.2.4 `Object.getOwnPropertyDescriptor` on a class constructor (2026-06-03)
+
+`language/statements/class` +1 (`definition/prototype-property`),
+0 regressions. `Object.getOwnPropertyDescriptor(C, "prototype" | "name" |
+"length")` returned `undefined` even though the matching `[[Get]]`
+worked, because the static `Object.getOwnPropertyDescriptor` dispatch
+took a contextless class branch that only read the statics table — it
+never synthesised the constructor's `prototype` (non-writable,
+non-configurable per §10.2.4) / `name` / `length` (§15.7.4) own
+descriptors. Routed class constructors through the ordinary
+`[[GetOwnProperty]]` path, which already materialises those descriptors
+via the constructor function's metadata.
+
 ### §25.3 DataView instances hold ordinary own properties (2026-06-03)
 
 `built-ins/DataView` +2 (`instance-extensibility`,

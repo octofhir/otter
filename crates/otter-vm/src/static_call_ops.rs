@@ -856,27 +856,20 @@ impl Interpreter {
                             .to_string(),
                     });
                 }
-                let desc = if target.is_object() || target.is_string() || target.is_data_view() {
+                let desc = if target.is_object()
+                    || target.is_string()
+                    || target.is_data_view()
+                    || target.is_class_constructor()
+                {
                     // §25.3 — a `DataView` is an ordinary object; its
                     // [[GetOwnProperty]] (expando-backed) is handled by
-                    // the ordinary descriptor path.
+                    // the ordinary descriptor path. A class constructor's
+                    // [[GetOwnProperty]] there also surfaces the synthetic
+                    // `prototype` / `name` / `length` own properties
+                    // (§10.2.4 / §15.7) the statics table does not store.
                     self.ordinary_get_own_property_descriptor_value_stack_rooted(
                         context, stack, *target, &key, 0,
                     )?
-                } else if let Some(class) = target.as_class_constructor() {
-                    match &key {
-                        VmPropertyKey::Symbol(sym) => object::get_own_symbol_descriptor(
-                            class.statics(self.gc_heap()),
-                            self.gc_heap(),
-                            *sym,
-                        ),
-                        _ => object::get_own_descriptor(
-                            class.statics(self.gc_heap()),
-                            self.gc_heap(),
-                            key.string_name()
-                                .expect("non-symbol property key has string spelling"),
-                        ),
-                    }
                 } else if let Some(native) = target.as_native_function() {
                     match &key {
                         VmPropertyKey::Symbol(sym) => {

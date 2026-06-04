@@ -45,6 +45,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # trybuild compile-fail snapshots include `$RUST` source
+          # snippets, which rustc only renders when the std sources
+          # are present in the sysroot.
+          components: rust-src
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: cargo test --locked --workspace --all-features

@@ -1450,7 +1450,7 @@ impl Runtime {
         // builds a fresh `BytecodeModule`.
         let hook: otter_vm::EvalHook =
             std::sync::Arc::new(|source: &str, options: EvalCompileOptions| {
-                otter_compiler::compile_script_source_with_forced_strict(
+                otter_compiler::compile_eval_source(
                     source,
                     SourceKind::JavaScript,
                     "<eval>",

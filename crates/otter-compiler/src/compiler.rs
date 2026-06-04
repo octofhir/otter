@@ -32,6 +32,11 @@ pub(crate) struct Compiler {
     /// so peers across classes never collide.
     /// <https://tc39.es/ecma262/#sec-private-names>
     pub(crate) private_namespaces: Vec<u32>,
+    /// `true` when compiling a *strict* `eval` body: §19.2.1.1 gives
+    /// strict eval its own variable environment, so top-level `var` /
+    /// `function` declarations must NOT mirror onto the global object
+    /// (ordinary scripts mirror per §16.1.7 regardless of strictness).
+    pub(crate) suppress_global_mirror: bool,
 }
 
 impl Compiler {
@@ -39,6 +44,7 @@ impl Compiler {
         Self {
             stack: vec![top],
             private_namespaces: Vec::new(),
+            suppress_global_mirror: false,
         }
     }
 

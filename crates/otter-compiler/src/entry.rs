@@ -49,6 +49,25 @@ pub fn compile_script_source_with_forced_strict(
     .map_err(CompileError::from)?
 }
 
+/// Compile an `eval` / `new Function` body. Differs from script
+/// compilation in one §19.2.1.1 detail: a *strict* eval body gets its
+/// own variable environment, so top-level `var` / `function`
+/// declarations don't mirror onto the global object.
+///
+/// # Errors
+/// Returns [`CompileError`] when parsing fails or lowering rejects the AST.
+pub fn compile_eval_source(
+    source: &str,
+    kind: SyntaxSourceKind,
+    module_specifier: &str,
+    force_strict: bool,
+) -> Result<BytecodeModule, CompileError> {
+    with_program(source, kind, |program| {
+        compile_program_with_mode(program, kind, module_specifier, force_strict, true)
+    })
+    .map_err(CompileError::from)?
+}
+
 /// Compile source text into the frozen runtime boundary product.
 ///
 /// This is the preferred compiler/runtime contract for loaded script sources.
@@ -87,6 +106,16 @@ pub(crate) fn compile_program(
     module_specifier: &str,
     force_strict: bool,
 ) -> Result<BytecodeModule, CompileError> {
+    compile_program_with_mode(program, source_kind, module_specifier, force_strict, false)
+}
+
+pub(crate) fn compile_program_with_mode(
+    program: &Program<'_>,
+    source_kind: SyntaxSourceKind,
+    module_specifier: &str,
+    force_strict: bool,
+    eval_mode: bool,
+) -> Result<BytecodeModule, CompileError> {
     let module = Rc::new(RefCell::new(ModuleBuilder::default()));
     let script_module_url = if module_specifier.starts_with("file://") {
         module_specifier.to_string()
@@ -124,6 +153,7 @@ pub(crate) fn compile_program(
         .with_module_url(script_module_url);
     top.captured_names = capture::analyze_module(&program.body);
     let mut cx = Compiler::new(top);
+    cx.suppress_global_mirror = eval_mode && main_is_strict;
     cx.enter_scope();
 
     // §16.1.7 GlobalDeclarationInstantiation / §16.2.1.7

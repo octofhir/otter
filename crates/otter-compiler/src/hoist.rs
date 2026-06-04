@@ -493,6 +493,20 @@ pub(crate) fn hoist_function_declarations(
             .expect("pass 2 pre-declared the binding")
             .storage;
         cx.emit_store_storage(tmp, storage, span);
+        // §16.1.7 GlobalDeclarationInstantiation step 17 — a script
+        // top-level function declaration creates an own property on
+        // the global object, so sibling scripts and eval chunks can
+        // resolve it. Mirrors the `var` initializer path in
+        // `compile_statement`. Strict eval bodies keep their own
+        // variable environment (§19.2.1.1) and don't mirror.
+        if cx.stack.len() == 1 && cx.module_state.is_none() && !cx.suppress_global_mirror {
+            let name_idx = cx.intern_string_constant(&name);
+            cx.emit(
+                Op::DefineGlobalVar,
+                [Operand::ConstIndex(name_idx), Operand::Register(tmp)],
+                span,
+            );
+        }
         // Mirror through to `module_env` for `export function f`
         // (and `export default function f` — its export entry
         // landed under `default` from the pre-pass; the named

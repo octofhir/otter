@@ -72,8 +72,8 @@ pub use compiled_module::{
     CompiledSourceSpan, LiveBindingSlot, NamedImport, ResolvedBinding,
 };
 pub use entry::{
-    compile_module_program, compile_module_program_to_module, compile_script_program,
-    compile_script_source, compile_script_source_to_module,
+    compile_eval_source, compile_module_program, compile_module_program_to_module,
+    compile_script_program, compile_script_source, compile_script_source_to_module,
     compile_script_source_with_forced_strict,
 };
 pub use errors::CompileError;

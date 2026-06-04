@@ -107,7 +107,10 @@ pub(crate) fn compile_statement(
                         let init_reg =
                             crate::expr::compile_expr_with_inferred_name(cx, init, &name, span)?;
                         cx.emit_store_storage(init_reg, info.storage, span);
-                        if cx.stack.len() == 1 && cx.module_state.is_none() {
+                        if cx.stack.len() == 1
+                            && cx.module_state.is_none()
+                            && !cx.suppress_global_mirror
+                        {
                             let name_idx = cx.intern_string_constant(&name);
                             cx.emit(
                                 Op::DefineGlobalVar,

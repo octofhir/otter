@@ -1,5 +1,8 @@
 # Dependencies
 node_modules/
+# Hand-written fixture packages are test data, not installed deps —
+# CI checkouts must carry them for the development-loop CLI test.
+!tests/fixtures/pkg/development-loop/node_modules/
 
 target
 # Otter cache

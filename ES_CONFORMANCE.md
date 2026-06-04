@@ -1551,6 +1551,40 @@ rejecting a non-writable / setter-less property. (Remaining: a true
 `[[ErrorData]]` instance marker — the chain heuristic over-approximates
 `Object.create(Error.prototype)` — and Proxy-receiver trap routing.)
 
+### §22.1.3 String.prototype spec gaps: normalize, thisStringValue, method lookup on natives (2026-06-04)
+
+`built-ins/String` 1320→1331 (99.63%), 0 regressions across `Function`,
+`Object`, `Array/prototype`, `JSON`, `Number`, `Promise`,
+`language/expressions`. Six distinct gaps:
+- **`normalize`** validated the form but returned the receiver
+  unchanged; now runs real Unicode Normalization Forms over the UTF-16
+  code units via `icu_normalizer` (lone surrogates pass through). The
+  form coerces via `? ToString(form)` (so `["NFC"]` works and a RegExp
+  form stringifies), an unknown form raises the step-4 `RangeError`
+  (was `TypeError`), and `normalize.length` is 0 per the spec table.
+- **`toString` / `valueOf`** ran the generic receiver ladder, accepting
+  any object as `"[object Object]"`; now `thisStringValue` — only a
+  String primitive or `[[StringData]]` wrapper, else `TypeError`.
+- **`charCodeAt`** clamped its position through ToUint32, so
+  `"abc".charCodeAt(-1)` returned 91 (`'['` of a coerced receiver) /
+  the code unit at 0; now signed `ToIntegerOrInfinity` with NaN for
+  out-of-range, matching `charAt`.
+- **`localeCompare`** stringified its argument lossily (a String
+  wrapper compared as `"[object Object]"`); the argument now rides the
+  shared `coerce_string_method_args` ToString pre-coercion.
+- **`String.prototype[Symbol.iterator]`** rejected non-wrapper
+  receivers outright; it is generic (`? ToString(this)`), so a plain
+  object's own `toString` now runs and its abrupt completion
+  propagates.
+- **Method calls on native-function receivers** resolved only own
+  properties — `Function.prototype.slice = String.prototype.slice;
+  Function().slice(...)` threw `NotCallable` while the property READ
+  resolved fine. The lookup now falls back up `%Function.prototype%` /
+  `%Object.prototype%` like every other receiver.
+(Remaining: `match` `v`-flag unicode-sets case, `localeCompare`
+canonical-equivalence (needs collation-aware compare), and two legacy
+`String` statics — separate roots.)
+
 ### §19.2 global functions fire user `toString`/`valueOf` coercion (2026-06-03)
 
 `isNaN` +9 (13→22, 100%), `isFinite` +9 (14→23, 100%), `parseInt` +11

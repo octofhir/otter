@@ -76,6 +76,7 @@ num-traits  = "0.2"
 temporal_rs = { version = "0.2.3", features = ["sys-local", "compiled_data"] }
 
 icu_collator = { version = "2.1", features = ["compiled_data"] }
+icu_normalizer = { version = "2.1", features = ["compiled_data"] }
 icu_decimal  = { version = "2.1", features = ["compiled_data"] }
 icu_datetime = { version = "2.1", features = ["compiled_data"] }
 icu_locale   = { version = "2.1", features = ["compiled_data"] }

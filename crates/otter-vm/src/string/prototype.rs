@@ -448,8 +448,15 @@ fn impl_char_code_at(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
-    let idx = arg_u32_or(ctx, args, 0, 0)?;
-    let value = match recv.char_code_at(idx, ctx.heap_mut()) {
+    // §22.1.3.4 — position is `ToIntegerOrInfinity(pos)` (signed): a
+    // negative or out-of-range index returns NaN rather than clamping
+    // to index 0, so `"abc".charCodeAt(-1)` is NaN.
+    let pos = arg_int_or(ctx, args, 0, 0)?;
+    let len = i64::from(recv.len());
+    if pos < 0 || pos >= len {
+        return Ok(Value::number(NumberValue::Double(f64::NAN)));
+    }
+    let value = match recv.char_code_at(pos as u32, ctx.heap_mut()) {
         Some(unit) => NumberValue::from_i32(i32::from(unit)),
         None => NumberValue::Double(f64::NAN),
     };
@@ -2064,16 +2071,11 @@ fn impl_locale_compare(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?.to_lossy_string(ctx.heap_mut());
-    let other = match args.first() {
-        Some(v) => {
-            if let Some(s) = v.as_string(ctx.heap_mut()) {
-                s.to_lossy_string(ctx.heap_mut())
-            } else {
-                v.display_string(ctx.heap())
-            }
-        }
-        None => "undefined".to_string(),
-    };
+    // §22.1.3.10 step 3 — `That = ? ToString(that)`. Object operands
+    // arrive pre-coerced to primitives by `coerce_string_method_args`;
+    // `arg_to_string` finishes the primitive rendering (a String
+    // wrapper unwraps to its `[[StringData]]`, not "[object Object]").
+    let other = arg_to_string(ctx, args, 0)?.to_lossy_string(ctx.heap_mut());
     let cmp = match recv.cmp(&other) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
@@ -2095,34 +2097,67 @@ fn impl_normalize(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
+    // §22.1.3.13 step 3 — `f = ? ToString(form)` unless undefined.
+    // Object operands arrive pre-coerced to primitives by
+    // `coerce_string_method_args`; `arg_to_string` renders the rest.
     let form = match args.first() {
         None => "NFC".to_string(),
         Some(v) if v.is_undefined() => "NFC".to_string(),
-        Some(v) => {
-            if let Some(s) = v.as_string(ctx.heap_mut()) {
-                s.to_lossy_string(ctx.heap_mut())
-            } else {
-                return Err(type_error("String.prototype", "must be a string"));
-            }
-        }
+        Some(_) => arg_to_string(ctx, args, 0)?.to_lossy_string(ctx.heap_mut()),
     };
+    // §22.1.3.13 step 4 — an unknown form is a RangeError.
     if !matches!(form.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
-        return Err(type_error(
+        return Err(range_error(
             "String.prototype",
-            "must be one of NFC / NFD / NFKC / NFKD",
+            "The normalization form should be one of NFC, NFD, NFKC, NFKD",
         ));
     }
-    Ok(Value::string(recv))
+    // §22.1.3.13 step 5 — Unicode Normalization Forms over the UTF-16
+    // code units (lone surrogates pass through unchanged).
+    let units = recv.to_utf16_vec(ctx.heap());
+    let normalized: Vec<u16> = match form.as_str() {
+        "NFC" => icu_normalizer::ComposingNormalizerBorrowed::new_nfc()
+            .normalize_utf16(&units)
+            .into(),
+        "NFKC" => icu_normalizer::ComposingNormalizerBorrowed::new_nfkc()
+            .normalize_utf16(&units)
+            .into(),
+        "NFD" => icu_normalizer::DecomposingNormalizerBorrowed::new_nfd()
+            .normalize_utf16(&units)
+            .into(),
+        _ => icu_normalizer::DecomposingNormalizerBorrowed::new_nfkd()
+            .normalize_utf16(&units)
+            .into(),
+    };
+    Ok(Value::string(JsString::from_utf16_units(
+        &normalized,
+        ctx.heap_mut(),
+    )?))
 }
 
-/// §22.1.3.27 String.prototype.toString — returns the primitive.
+/// §22.1.3.28 / §22.1.3.35 `String.prototype.toString` / `valueOf` —
+/// `thisStringValue(this)`: only a String primitive or a String
+/// wrapper carrying `[[StringData]]` is acceptable; every other
+/// receiver raises `TypeError` (these two methods are intentionally
+/// non-generic, unlike the `ToString(this)` ladder the rest of
+/// `String.prototype` runs).
 fn impl_to_string(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
     _args: &[Value],
 ) -> Result<Value, NativeError> {
-    let recv = receiver_string(ctx, receiver)?;
-    Ok(Value::string(recv))
+    if let Some(s) = receiver.as_string(ctx.heap_mut()) {
+        return Ok(Value::string(s));
+    }
+    if let Some(obj) = receiver.as_object()
+        && let Some(s) = crate::object::string_data(obj, ctx.heap())
+    {
+        return Ok(Value::string(s));
+    }
+    Err(type_error(
+        "String.prototype",
+        "String.prototype.toString requires that 'this' be a String",
+    ))
 }
 
 /// Whether `name` is installed on `String.prototype`.
@@ -2372,7 +2407,7 @@ string_prototype_methods!(
     bridge_match_all       => "matchAll",       1;
     bridge_search          => "search",         1;
     bridge_locale_compare  => "localeCompare",  1;
-    bridge_normalize       => "normalize",      1;
+    bridge_normalize       => "normalize",      0;
     bridge_to_string       => "toString",       0;
     bridge_value_of        => "valueOf",        0;
 );

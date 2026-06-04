@@ -5312,7 +5312,18 @@ fn write_register(frame: &mut Frame, idx: u16, value: Value) -> Result<(), VmErr
 /// `this` value. Installed as the realm's iterator method per
 /// §22.1.3.34.
 fn string_proto_iterator(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    let this = ctx.this_value();
+    const NAME: &str = "String.prototype[Symbol.iterator]";
+    let this = *ctx.this_value();
+    // §22.1.3.34 — RequireObjectCoercible(this), then `S = ?
+    // ToString(this)`: the method is generic, so a plain-object
+    // receiver runs its own `toString` / `valueOf` / `@@toPrimitive`
+    // (and an abrupt completion from there propagates).
+    if this.is_nullish() {
+        return Err(NativeError::TypeError {
+            name: NAME,
+            reason: "called on null or undefined".to_string(),
+        });
+    }
     let string = if let Some(s) = this.as_string(ctx.heap()) {
         s
     } else if let Some(obj) = this.as_object()
@@ -5320,10 +5331,18 @@ fn string_proto_iterator(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
     {
         s
     } else {
-        return Err(NativeError::TypeError {
-            name: "String.prototype[Symbol.iterator]",
-            reason: "this is not a String".to_string(),
-        });
+        let (interp, exec) = ctx.interp_mut_and_context();
+        let exec = exec.ok_or_else(|| NativeError::TypeError {
+            name: NAME,
+            reason: "missing execution context".to_string(),
+        })?;
+        let text = interp
+            .coerce_to_string(&exec, &this)
+            .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+        JsString::from_str(&text, ctx.heap_mut()).map_err(|_| NativeError::TypeError {
+            name: NAME,
+            reason: "out of memory".to_string(),
+        })?
     };
     let state = IteratorState::String { string, index: 0 };
     Ok(Value::iterator(ctx.alloc_iterator_state(

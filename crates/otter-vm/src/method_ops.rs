@@ -142,13 +142,19 @@ impl Interpreter {
             "split" => &[(1, true), (0, false)],
             "concat" => &[(0, false), (1, false), (2, false), (3, false)],
             "match" | "matchAll" | "search" | "normalize" => &[(0, false)],
+            // §22.1.3.10 step 3 — `That = ? ToString(that)`.
+            "localeCompare" => &[(0, false)],
             "anchor" | "fontcolor" | "fontsize" | "link" => &[(0, false)],
             _ => &[],
         };
         if order.is_empty() {
             return Ok(());
         }
-        let regexp_pass_through = matches!(name, "match" | "matchAll" | "search" | "normalize");
+        // Only the `@@match` / `@@matchAll` / `@@search` dispatchers keep
+        // a RegExp argument un-stringified; `normalize` ToStrings every
+        // form operand (§22.1.3.13 step 3) and then rejects `"/re/"`
+        // with the step-4 RangeError.
+        let regexp_pass_through = matches!(name, "match" | "matchAll" | "search");
         let is_non_primitive = |v: &Value| {
             v.is_object()
                 || v.is_array()
@@ -893,12 +899,21 @@ impl Interpreter {
             ));
         }
         if let Some(native) = recv_value.as_native_function() {
-            // Native callable receiver — look up `name` on the function
-            // object's own-property table.
-            let value = native
+            // Native callable receiver — own properties first, then the
+            // §10.1.8 OrdinaryGet walk up `%Function.prototype%` /
+            // `%Object.prototype%` so a user-installed method (e.g.
+            // `Function.prototype.slice = String.prototype.slice`)
+            // resolves for calls exactly as it does for property reads.
+            let value = match native
                 .own_property_descriptor(&mut self.gc_heap, name)?
                 .map(|desc| descriptor_value(&desc))
-                .unwrap_or_else(Value::undefined);
+            {
+                Some(value) => value,
+                None => self
+                    .load_function_prototype_method(name)
+                    .or_else(|| self.load_object_prototype_method(name))
+                    .unwrap_or_else(Value::undefined),
+            };
             return Ok(Some(value));
         }
         if recv_value.is_boolean()

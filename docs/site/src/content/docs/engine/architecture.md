@@ -16,7 +16,7 @@ Async and worker APIs must preserve that boundary. Values move between
 workers through structured clone or transferables, not raw GC handles.
 
 Runtime design also follows the resource contract in
-[Runtime Principles](../runtime-principles/): VM turns must be measurable,
+[Runtime Principles](/otter/engine/runtime-principles/): VM turns must be measurable,
 budgetable, and yieldable so embedded scripts cannot monopolize CPU,
 heap, off-heap memory, host operations, or the event loop.
 

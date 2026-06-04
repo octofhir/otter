@@ -210,7 +210,7 @@ Runtime-resource work is incomplete until it has tests or benchmarks for:
 
 ## See Also
 
-- [Engine Architecture](../architecture/)
-- [Event Loop And Async Boundary](../event-loop/)
-- [GC API](../gc-api/)
-- [Startup Performance](../../performance/startup/)
+- [Engine Architecture](/otter/engine/architecture/)
+- [Event Loop And Async Boundary](/otter/engine/event-loop/)
+- [GC API](/otter/engine/gc-api/)
+- [Startup Performance](/otter/performance/startup/)

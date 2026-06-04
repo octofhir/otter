@@ -48,7 +48,7 @@ to the selected drive mode.
 
 Runtime turns are budgetable. A CPU-heavy script, promise reaction storm,
 or long host callback chain must be able to yield or fail according to the
-resource policy described in [Runtime Principles](../runtime-principles/).
+resource policy described in [Runtime Principles](/otter/engine/runtime-principles/).
 
 Microtask checkpointing is VM work. Promise reactions, `queueMicrotask`,
 and async-function resumes run only after the current JS execution context

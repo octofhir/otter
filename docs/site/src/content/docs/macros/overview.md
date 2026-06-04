@@ -234,7 +234,7 @@ burrow! {
 ```
 
 Burrow is the only macro that touches the embedder root contract;
-see [Native Bindings](../../extensions/native-bindings/) for the
+see [Native Bindings](/otter/extensions/native-bindings/) for the
 embedder side.
 
 ## `lodge!` — Hosted Module
@@ -286,7 +286,7 @@ fn open_kv(
 
 Optional fields `install = my_install_fn` and `module_static =
 MY_MODULE` override the derived identifiers. See
-[Hosted Modules](../../extensions/hosted-modules/) for the loader
+[Hosted Modules](/otter/extensions/hosted-modules/) for the loader
 contract.
 
 ## `#[derive(Pelt)]` — GC Body Tracing
@@ -381,15 +381,15 @@ decision in `bootstrap.rs`.
 - Expansion compiles under `#![forbid(unsafe_code)]`. Any macro
   that needs `unsafe` for the expansion is a design bug.
 - Every generated method call targets ABI v1 from
-  [Native Call ABI](../../engine/native-call-abi/). The macro
+  [Native Call ABI](/otter/engine/native-call-abi/). The macro
   expansion fails to compile if the referenced function does
   not match the v1 signature.
 
 ## See Also
 
-- [Otter Macros — Design Note](../design/) — rationale, full
+- [Otter Macros — Design Note](/otter/macros/design/) — rationale, full
   surface, migration sequence, open questions.
-- [Native Call ABI](../../engine/native-call-abi/) — the signature
+- [Native Call ABI](/otter/engine/native-call-abi/) — the signature
   every generated method targets.
-- [JS Surface Builders](../../extensions/js-surface-builders/) —
+- [JS Surface Builders](/otter/extensions/js-surface-builders/) —
   the runtime helpers the macro expansions call into.

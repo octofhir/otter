@@ -6,8 +6,8 @@ Otter's active engine and product crates live under `crates/`.
 
 Start with:
 
-- [Architecture](../../engine/architecture/) for active crate ownership;
-- [Frontend And Compilation](../../engine/frontend/) before changing
+- [Architecture](/otter/engine/architecture/) for active crate ownership;
+- [Frontend And Compilation](/otter/engine/frontend/) before changing
   parser, module detection, or TypeScript behavior;
 - [`ES_CONFORMANCE.md`](https://github.com/octofhir/otter/blob/main/ES_CONFORMANCE.md) before changing
   ECMAScript behavior;

@@ -1102,15 +1102,23 @@ impl IsolateRunner {
                 TickOutcome::Processed | TickOutcome::Idle => {}
                 TickOutcome::Shutdown => return,
             }
-            if matches!(self.poll_one_tick(), TickOutcome::Idle) {
-                match self.rx.recv() {
+            // Every poll consumes a message, so every outcome must be
+            // honoured here — discarding a `Shutdown` consumed by this
+            // poll would re-enter the blocking `recv()` while the
+            // handle's `Drop` is parked in `join()` holding its `tx`
+            // clone: the channel never disconnects and both threads
+            // deadlock.
+            match self.poll_one_tick() {
+                TickOutcome::Processed => {}
+                TickOutcome::Shutdown => return,
+                TickOutcome::Idle => match self.rx.recv() {
                     Ok(msg) => {
                         if matches!(self.process_message(msg), TickOutcome::Shutdown) {
                             return;
                         }
                     }
                     Err(_) => return,
-                }
+                },
             }
         }
     }

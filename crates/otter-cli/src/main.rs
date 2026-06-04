@@ -3212,7 +3212,41 @@ trust = "untrusted"
             .join("fixtures")
             .join("pkg")
             .join("development-loop");
-        let entry = fixture.join("entry.ts");
+        // `node_modules` is gitignored, so copy the committed fixture
+        // into a scratch root and materialize the installed registry
+        // package there — the test stays hermetic and runs identically
+        // on a fresh checkout.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("development-loop");
+        copy_fixture_tree(&fixture, &root);
+        let tool = root.join("node_modules/fixture-tool");
+        write_fixture(
+            &tool.join("package.json"),
+            r#"{
+  "name": "fixture-tool",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": {
+      "otter": "./otter.js",
+      "default": "./index.js"
+    }
+  },
+  "bin": {
+    "fixture-tool": "./bin.js"
+  }
+}
+"#,
+        );
+        write_fixture(&tool.join("bin.js"), "undefined;\n");
+        write_fixture(
+            &tool.join("index.js"),
+            "export const installedValue = 20;\n",
+        );
+        write_fixture(&tool.join("otter.js"), "export const installedValue = 2;\n");
+        write_fixture(&root.join("node_modules/.bin/fixture-tool"), "undefined;\n");
+        let entry = root.join("entry.ts");
 
         run_check(&entry, false, &CapabilitySet::default())
             .await
@@ -3224,7 +3258,7 @@ trust = "untrusted"
             bin: true,
             args: Vec::new(),
         };
-        let resolved = resolve_run_target(&fixture, &args).await.unwrap();
+        let resolved = resolve_run_target(&root, &args).await.unwrap();
         match resolved {
             RunTarget::Bin(bin) => assert!(bin.path.ends_with("node_modules/fixture-tool/bin.js")),
             other => panic!("expected fixture-tool bin, got {other:?}"),
@@ -3384,6 +3418,22 @@ trust = "untrusted"
             text.contains(expected_text) || json.contains(expected_text),
             "{label} diagnostic changed\ntext: {text}\njson: {json}"
         );
+    }
+
+    /// Recursively copy a committed fixture directory into a scratch
+    /// root so a test can materialize gitignored state (e.g.
+    /// `node_modules`) without touching the repository tree.
+    fn copy_fixture_tree(src: &Path, dst: &Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let target = dst.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_fixture_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
     }
 
     fn write_fixture(path: &Path, text: &str) {

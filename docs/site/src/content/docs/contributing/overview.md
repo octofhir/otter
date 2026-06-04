@@ -6,12 +6,12 @@ Otter's active engine and product crates live under `crates/`.
 
 Start with:
 
-- [Architecture](../engine/architecture.md) for active crate ownership;
-- [Frontend And Compilation](../engine/frontend.md) before changing
+- [Architecture](../../engine/architecture/) for active crate ownership;
+- [Frontend And Compilation](../../engine/frontend/) before changing
   parser, module detection, or TypeScript behavior;
-- [`ES_CONFORMANCE.md`](../../../../ES_CONFORMANCE.md) before changing
+- [`ES_CONFORMANCE.md`](https://github.com/octofhir/otter/blob/main/ES_CONFORMANCE.md) before changing
   ECMAScript behavior;
-- [`AGENTS.md`](../../../../AGENTS.md) for repository-specific workflow
+- [`AGENTS.md`](https://github.com/octofhir/otter/blob/main/AGENTS.md) for repository-specific workflow
   rules.
 
 This book is the contributor-facing source of truth for stable workflows.

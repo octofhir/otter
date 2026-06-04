@@ -8,7 +8,7 @@ built-in prototype — `Number.prototype.toFixed`, `Array.prototype.map`,
 same dispatch path as every other built-in.
 
 There is **one** shape for a built-in method: a native function with the
-[Native Call ABI](../engine/native-call-abi.md) signature, installed on
+[Native Call ABI](../../engine/native-call-abi/) signature, installed on
 the prototype through the `couch!` surface.
 
 ```rust
@@ -108,7 +108,7 @@ otter_macros::couch! {
 
 Small surfaces can inline the rows instead:
 `prototype = { methods = { "exec" / 1 => proto_exec, "test" / 1 => proto_test } }`.
-See the [`couch!` design notes](../macros/design.md) for the full field
+See the [`couch!` design notes](../../macros/design/) for the full field
 list (accessors, `parent`, constants, statics).
 
 ## 3. The dispatch gate

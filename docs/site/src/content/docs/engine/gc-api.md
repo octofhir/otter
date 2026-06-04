@@ -126,7 +126,7 @@ implementation detail. Large `ArrayBuffer` stores, string backing storage,
 retained source text, bytecode cache blobs, JSON source slices, and native
 buffers must be visible to runtime pressure so the engine can collect,
 yield, or reject work before resident memory grows without bound. See
-[Runtime Principles](runtime-principles.md).
+[Runtime Principles](../runtime-principles/).
 
 The runnable copy of this pattern is covered by
 `crates/otter-gc/tests/book_gc_api_examples.rs` and the

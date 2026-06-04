@@ -419,13 +419,13 @@ Task 4.1 is DONE when:
 
 ## Cross-references
 
-- [Native Call ABI](../engine/native-call-abi.md) — ABI v1 the
+- [Native Call ABI](../../engine/native-call-abi/) — ABI v1 the
   generated code targets.
-- [`crates/otter-macros/src/lib.rs`](../crates/otter-macros/src/lib.rs)
+- [`crates/otter-macros/src/lib.rs`](https://github.com/octofhir/otter/blob/main/crates/otter-macros/src/lib.rs)
   — current proc-macro implementations.
-- [`crates/otter-vm/src/intrinsics/`](../crates/otter-vm/src/intrinsics/)
+- [`crates/otter-vm/src/intrinsics/`](https://github.com/octofhir/otter/tree/main/crates/otter-vm/src/intrinsics)
   — current hand-written installers; each becomes a macro callsite
   during Phase 4.2.
-- [`crates/otter-vm/src/intrinsics/shared.rs`](../crates/otter-vm/src/intrinsics/shared.rs)
+- [`crates/otter-vm/src/intrinsics/shared.rs`](https://github.com/octofhir/otter/blob/main/crates/otter-vm/src/intrinsics/shared.rs)
   — runtime helpers the macro expansions call (no new runtime
   path).

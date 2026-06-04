@@ -4,7 +4,7 @@ import starlight from '@astrojs/starlight';
 
 // https://astro.build/config
 export default defineConfig({
-	site: 'https://octoshikari.github.io',
+	site: 'https://octofhir.github.io',
 	base: '/otter',
 	integrations: [
 		starlight({
@@ -15,11 +15,11 @@ export default defineConfig({
 				{
 					icon: 'github',
 					label: 'GitHub',
-					href: 'https://github.com/octoshikari/otter',
+					href: 'https://github.com/octofhir/otter',
 				},
 			],
 			editLink: {
-				baseUrl: 'https://github.com/octoshikari/otter/edit/main/docs/site/',
+				baseUrl: 'https://github.com/octofhir/otter/edit/main/docs/site/',
 			},
 			sidebar: [
 				{ label: 'Introduction', slug: 'introduction' },

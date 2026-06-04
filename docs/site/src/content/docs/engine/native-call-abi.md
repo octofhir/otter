@@ -178,9 +178,9 @@ the version.
 
 ## See also
 
-- [`crates/otter-vm/src/runtime_cx.rs`](../crates/otter-vm/src/runtime_cx.rs)
+- [`crates/otter-vm/src/runtime_cx.rs`](https://github.com/octofhir/otter/blob/main/crates/otter-vm/src/runtime_cx.rs)
   — `NativeCtx` / `NativeCallInfo` implementation.
-- [`crates/otter-vm/src/native_function.rs`](../crates/otter-vm/src/native_function.rs)
+- [`crates/otter-vm/src/native_function.rs`](https://github.com/octofhir/otter/blob/main/crates/otter-vm/src/native_function.rs)
   — `NativeFastFn`, `NativeCall`, `NativeError`, `NativeFunction`.
-- [`crates/otter-vm/tests/compile_fail/`](../crates/otter-vm/tests/compile_fail/)
+- [`crates/otter-vm/tests/compile_fail/`](https://github.com/octofhir/otter/tree/main/crates/otter-vm/tests/compile_fail)
   — every forbidden pattern enforced at compile time.

@@ -210,7 +210,7 @@ Runtime-resource work is incomplete until it has tests or benchmarks for:
 
 ## See Also
 
-- [Engine Architecture](architecture.md)
-- [Event Loop And Async Boundary](event-loop.md)
-- [GC API](gc-api.md)
-- [Startup Performance](../performance/startup.md)
+- [Engine Architecture](../architecture/)
+- [Event Loop And Async Boundary](../event-loop/)
+- [GC API](../gc-api/)
+- [Startup Performance](../../performance/startup/)

@@ -7,7 +7,7 @@ It explains how to extend the runtime without copying internals from task
 files, parked crates, or raw GC adapters.
 
 Use this book for stable contributor workflows and examples. Repository rules
-for coding agents live in [`AGENTS.md`](../../../AGENTS.md).
+for coding agents live in [`AGENTS.md`](https://github.com/octofhir/otter/blob/main/AGENTS.md).
 
 Historical task and ADR files are intentionally excluded from the living docs.
 When a contributor-facing API stabilizes, its workflow belongs here.

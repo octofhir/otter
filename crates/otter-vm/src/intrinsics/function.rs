@@ -45,7 +45,7 @@ pub(crate) fn function_ctor_call(
         });
     };
     let result = interp
-        .build_function_constructor_with_roots(&context, args, None, &[], &[args])
+        .build_function_constructor(&context, args)
         .map_err(|err| {
             let reason = format!("{err}");
             match err {

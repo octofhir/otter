@@ -1042,28 +1042,6 @@ where
     )?))
 }
 
-pub(crate) fn native_constructor_value_with_captures_unchecked_with_roots<F>(
-    heap: &mut otter_gc::GcHeap,
-    name: &'static str,
-    captures: SmallVec<[Value; 4]>,
-    external_visit: &mut RootSlotVisitor<'_>,
-    call: F,
-) -> Result<Value, otter_gc::OutOfMemory>
-where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
-{
-    Ok(Value::native_function(NativeFunction::allocate_with_roots(
-        heap,
-        name,
-        0,
-        NativeCallStorage::LocalDynamic(Arc::new(call)),
-        captures,
-        None,
-        NativeFunctionMetadata::CONSTRUCTOR,
-        external_visit,
-    )?))
-}
-
 pub(crate) fn native_value_with_captures_unchecked_with_roots<F>(
     heap: &mut otter_gc::GcHeap,
     name: &'static str,

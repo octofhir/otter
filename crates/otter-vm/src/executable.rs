@@ -50,11 +50,23 @@ pub(crate) struct ExecutableModuleBuilder {
 
 impl ExecutableModuleBuilder {
     /// Build a transient executable view from the compiler/debug module DTO.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn from_bytecode(module: &BytecodeModule) -> Self {
+        Self::from_bytecode_with_ic_base(module, 0)
+    }
+
+    /// Build a transient executable view whose dense property-IC site
+    /// ids start at `property_ic_base`, keeping sites globally unique
+    /// across chunks linked into one interpreter.
+    #[must_use]
+    pub(crate) fn from_bytecode_with_ic_base(
+        module: &BytecodeModule,
+        property_ic_base: u32,
+    ) -> Self {
         let mut builder = Self {
             functions: Vec::with_capacity(module.functions.len()),
-            next_property_ic_site: 0,
+            next_property_ic_site: property_ic_base,
         };
         for function in &module.functions {
             builder.push_function(function);
@@ -72,7 +84,7 @@ impl ExecutableModuleBuilder {
     pub(crate) fn freeze(self) -> ExecutableModule {
         ExecutableModule {
             functions: self.functions.into_boxed_slice(),
-            property_ic_site_count: self.next_property_ic_site,
+            property_ic_site_end: self.next_property_ic_site,
         }
     }
 }
@@ -81,20 +93,31 @@ impl ExecutableModuleBuilder {
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutableModule {
     functions: Box<[ExecutableFunction]>,
-    property_ic_site_count: u32,
+    property_ic_site_end: u32,
 }
 
 impl ExecutableModule {
     /// Build a frozen execution view from the compiler/debug module DTO.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn from_bytecode(module: &BytecodeModule) -> Self {
         ExecutableModuleBuilder::from_bytecode(module).freeze()
     }
 
-    /// Function-table lookup by VM function id.
+    /// Build a frozen execution view whose dense property-IC site ids
+    /// start at `property_ic_base`.
     #[must_use]
-    pub(crate) fn function(&self, function_id: u32) -> Option<&ExecutableFunction> {
-        self.functions.get(function_id as usize)
+    pub(crate) fn from_bytecode_with_ic_base(
+        module: &BytecodeModule,
+        property_ic_base: u32,
+    ) -> Self {
+        ExecutableModuleBuilder::from_bytecode_with_ic_base(module, property_ic_base).freeze()
+    }
+
+    /// Function-table lookup by chunk-local function index.
+    #[must_use]
+    pub(crate) fn function(&self, local_index: u32) -> Option<&ExecutableFunction> {
+        self.functions.get(local_index as usize)
     }
 
     /// Return an instruction's operands in declaration order.
@@ -128,10 +151,11 @@ impl ExecutableModule {
         instr.imm32(index)
     }
 
-    /// Number of dense named-property IC sites in this module.
+    /// One past the highest dense named-property IC site id in this
+    /// module (equals the site count when the IC base is zero).
     #[must_use]
-    pub(crate) const fn property_ic_site_count(&self) -> u32 {
-        self.property_ic_site_count
+    pub(crate) const fn property_ic_site_end(&self) -> u32 {
+        self.property_ic_site_end
     }
 }
 
@@ -166,7 +190,7 @@ impl ExecutableFunction {
 /// One executable function body.
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutableFunction {
-    /// Index into the executable function table.
+    /// Global VM function id (chunk base + local table index).
     pub(crate) id: u32,
     /// Number of parameter registers at the start of the frame.
     pub(crate) param_count: u16,
@@ -564,7 +588,7 @@ mod tests {
         let executable = ExecutableModule::from_bytecode(&module);
         let function = executable.function(0).unwrap();
 
-        assert_eq!(executable.property_ic_site_count(), 2);
+        assert_eq!(executable.property_ic_site_end(), 2);
         assert_eq!(function.code[0].property_ic_site(), Some(0));
         assert_eq!(function.code[1].property_ic_site(), Some(1));
     }
@@ -603,7 +627,7 @@ mod tests {
         let executable = builder.freeze();
         let exec_fn = executable.function(0).unwrap();
         assert_eq!(exec_fn.code.len(), 2);
-        assert_eq!(executable.property_ic_site_count(), 1);
+        assert_eq!(executable.property_ic_site_end(), 1);
         assert_eq!(
             executable.operands(&exec_fn.code[1]),
             &[

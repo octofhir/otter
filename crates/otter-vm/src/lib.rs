@@ -45,6 +45,7 @@ pub mod binary;
 pub mod boolean;
 mod call_ops;
 pub mod closure;
+mod code_space;
 mod coerce;
 pub mod cold_frame;
 mod collection_ops;
@@ -299,6 +300,13 @@ pub struct Interpreter {
     /// layer delegates `gc_heap` / `heap_stats` /
     /// `heap_snapshot` / `force_gc` accessors here.
     gc_heap: otter_gc::GcHeap,
+    /// Registry of every linked code chunk (entry scripts, module
+    /// graphs, `eval` / `new Function` bodies, dynamic-import
+    /// fragments). Function ids are global across chunks, so a
+    /// function value escaping its chunk stays callable from any
+    /// frame; every linked [`ExecutionContext`] resolves foreign ids
+    /// through this shared registry.
+    code_space: std::sync::Arc<code_space::CodeSpace>,
     /// Interpreter-owned hidden-class side tables for GC-managed shapes.
     /// Runtime object storage uses the root, interned shape keys, and
     /// transition/cache tables here.
@@ -724,6 +732,7 @@ impl Interpreter {
             interrupt: InterruptFlag::new(),
             current_byte_len: 1,
             gc_heap,
+            code_space: std::sync::Arc::new(code_space::CodeSpace::default()),
             shape_runtime,
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
             sync_reentry_depth: 0,
@@ -978,7 +987,7 @@ impl Interpreter {
     }
 
     fn ensure_property_ic_capacity(&mut self, context: &ExecutionContext) {
-        let site_count = context.property_ic_site_count();
+        let site_count = context.property_ic_site_end();
         if self.load_property_ics.len() < site_count {
             self.load_property_ics
                 .resize(site_count, property_ic::PropertyIcEntry::Empty);
@@ -2496,6 +2505,15 @@ impl Interpreter {
         let _ = self.gc_heap.install_extra_roots(previous);
     }
 
+    /// Link a freshly compiled module into this interpreter's code
+    /// space. Rebases the module's function ids onto the global id
+    /// space so function values created by this chunk stay callable
+    /// after they escape to frames executing other chunks (the
+    /// `eval` / `new Function` / dynamic-import escape paths).
+    pub fn link_module(&mut self, module: otter_bytecode::BytecodeModule) -> ExecutionContext {
+        code_space::CodeSpace::link(&self.code_space, module)
+    }
+
     /// Execute `<main>` of `module` and return its completion value.
     ///
     /// # Errors
@@ -2503,6 +2521,13 @@ impl Interpreter {
     /// snapshot) on bytecode malformation, type mismatch, OOM,
     /// interrupt, or stack overflow.
     pub fn run(&mut self, context: &ExecutionContext) -> Result<Value, RunError> {
+        // Adopt the entry chunk's code space so chunks linked during
+        // this run (eval / new Function bodies) land in the same
+        // function-id space as the running script. No-op for contexts
+        // produced by `link_module`.
+        if !std::sync::Arc::ptr_eq(&self.code_space, context.space()) {
+            self.code_space = std::sync::Arc::clone(context.space());
+        }
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
         let previous = self.gc_heap.install_extra_roots(Some(extra_roots));
         self.pending_uncaught_throw = None;
@@ -3035,9 +3060,17 @@ impl Interpreter {
 
     fn dispatch_loop_inner(
         &mut self,
-        context: &ExecutionContext,
+        entry_context: &ExecutionContext,
         stack: &mut SmallVec<[Frame; 8]>,
     ) -> Result<Value, VmError> {
+        // One stack can interleave frames from several code chunks
+        // (closures escaped from `eval` / `new Function` / sibling
+        // scripts), so each iteration dispatches against the chunk
+        // owning the *top frame*: constants, atoms, and module
+        // resolutions are chunk-local. The owned slot caches the last
+        // foreign chunk so repeated foreign-frame ticks don't re-lock
+        // the code-space registry.
+        let mut foreign_context: Option<ExecutionContext> = None;
         loop {
             if self.interrupt.is_set() {
                 return Err(VmError::Interrupted);
@@ -3057,6 +3090,26 @@ impl Interpreter {
             }
             let top_idx = stack.len() - 1;
             let function_id = stack[top_idx].function_id;
+            let context: &ExecutionContext = if entry_context.covers_function(function_id) {
+                entry_context
+            } else {
+                let cached_covers = foreign_context
+                    .as_ref()
+                    .is_some_and(|c| c.covers_function(function_id));
+                if !cached_covers {
+                    foreign_context = match entry_context.for_function(function_id) {
+                        Some(code_space::ResolvedCtx::Owned(owned)) => {
+                            // Foreign chunks linked after this loop
+                            // started (eval during this turn) carry
+                            // IC sites past the entry chunk's range.
+                            self.ensure_property_ic_capacity(&owned);
+                            Some(owned)
+                        }
+                        _ => None,
+                    };
+                }
+                foreign_context.as_ref().ok_or(VmError::InvalidOperand)?
+            };
             let function = context
                 .exec_function(function_id)
                 .ok_or(VmError::InvalidOperand)?;
@@ -6457,7 +6510,7 @@ mod tests {
     }
 
     #[test]
-    fn new_function_wrapper_uses_rooted_prototype_and_native_allocation() {
+    fn new_function_links_eval_chunk_into_shared_code_space() {
         let compiled_main = vec![
             Instruction {
                 pc: 0,
@@ -6480,46 +6533,25 @@ mod tests {
             module_inits: Vec::new(),
         };
         let outer = module_with(Vec::new(), 4);
-        let context = ExecutionContext::from_module(outer.clone());
         let mut interp = Interpreter::new();
+        let context = interp.link_module(outer);
         interp.set_eval_hook(Some(std::sync::Arc::new(move |_, _| Ok(compiled.clone()))));
         let arg = Value::string(JsString::from_str("", interp.gc_heap_mut()).unwrap());
         let args = [arg];
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
-        let mut frame = Frame::for_function(&outer.functions[0]);
-        frame.registers[0] = args[0];
-        stack.push(frame);
 
-        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-        let wrapper = interp
-            .build_function_constructor_with_roots(
-                &context,
-                args.as_slice(),
-                Some(&stack),
-                &[],
-                &[args.as_slice()],
-            )
+        let result = interp
+            .build_function_constructor(&context, args.as_slice())
             .expect("Function constructor");
-        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
-        assert!(
-            after > before,
-            "new Function wrapper should allocate prototype and native metadata through roots"
-        );
 
-        let Some(native) = (wrapper).as_native_function() else {
-            panic!("new Function should return a native wrapper");
-        };
-        let desc = native
-            .own_property_descriptor(interp.gc_heap_mut(), "prototype")
-            .unwrap()
-            .expect("prototype descriptor");
-        let Some(proto) = (descriptor_value(&desc)).as_object() else {
-            panic!("prototype should be an object");
-        };
+        let fid = result.as_function().expect("plain function value");
         assert_eq!(
-            object::get(proto, interp.gc_heap(), "constructor"),
-            Some(Value::native_function(native))
+            fid, 2,
+            "eval chunk ids rebase past the outer chunk's single function"
         );
+        let function = context
+            .function(fid)
+            .expect("foreign id resolves through the shared code space");
+        assert_eq!(function.name, "anonymous");
     }
 
     #[test]

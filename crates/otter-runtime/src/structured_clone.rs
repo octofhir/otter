@@ -642,7 +642,7 @@ fn value_type_name(value: &Value) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use otter_vm::{ExecutionContext, Interpreter};
+    use otter_vm::Interpreter;
 
     use super::*;
 
@@ -662,8 +662,8 @@ mod tests {
             "<structured-clone-test>",
         )
         .expect("compile fixture");
-        let context = ExecutionContext::from_module(compiled.bytecode);
         let mut interp = Interpreter::new();
+        let context = interp.link_module(compiled.bytecode);
         let value = interp.run(&context).expect("run fixture");
         clone_vm_value_with_options(&value, interp.gc_heap(), options)
     }

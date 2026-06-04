@@ -6,27 +6,30 @@
 //!
 //! # Contents
 //! - Indirect eval execution and writeback.
-//! - `Function` constructor argument collection.
+//! - `Function` constructor argument coercion and body synthesis.
 //!
 //! # Invariants
 //! - Helpers advance the current frame PC exactly once on success.
-//! - Arguments are read from executable operands.
+//! - Compiled eval / `new Function` modules link into the
+//!   interpreter's code space, so escaping closures and classes keep
+//!   resolvable global function ids.
+//! - Per-argument coercion re-reads each value from its GC-visited
+//!   slot (frame register / native argument storage) because user
+//!   `toString` can move the heap.
 //! - Strict-mode eval inherits the caller function strictness.
 //!
 //! # See also
-//! - [`crate::executable`]
+//! - [`crate::code_space`]
 //! - [`crate::ExecutionContext`]
 
 use otter_bytecode::{BytecodeModule, Operand};
-use otter_gc::raw::RawGc;
 use smallvec::SmallVec;
 
 use crate::promise::JsPromise;
 use crate::{
-    AsyncFrameState, ClassConstructor, EvalCompileOptions, ExecutionContext, Frame, Interpreter,
-    NativeCtx, Value, VmError, abstract_ops, function_metadata, native_function, object,
-    operand_decode::register_operand, promise_dispatch, read_register, render_thrown_value,
-    write_register,
+    AsyncFrameState, EvalCompileOptions, ExecutionContext, Frame, Interpreter, Value, VmError,
+    abstract_ops, operand_decode::register_operand, promise_dispatch, read_register,
+    render_thrown_value, write_register,
 };
 
 impl Interpreter {
@@ -55,15 +58,23 @@ impl Interpreter {
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
-        let top_idx = stack.len() - 1;
-        let args = collect_new_function_args(&stack[top_idx], operands)?;
-        let result = self.build_function_constructor_with_roots(
-            context,
-            &args,
-            Some(stack),
-            &[],
-            &[args.as_slice()],
-        )?;
+        let argc = match operands.get(1) {
+            Some(&Operand::ConstIndex(n)) => n as usize,
+            _ => return Err(VmError::InvalidOperand),
+        };
+        // Coerce one argument at a time, re-reading each value from
+        // its frame register right before coercion: user `toString`
+        // can trigger a moving collection, and registers are the
+        // GC-traced (and rewritten) home of these values — a Rust-side
+        // snapshot of the whole argument list would go stale.
+        let mut parts: Vec<String> = Vec::with_capacity(argc);
+        for i in 0..argc {
+            let r = register_operand(operands.get(2 + i))?;
+            let top_idx = stack.len() - 1;
+            let value = *read_register(&stack[top_idx], r)?;
+            parts.push(self.function_constructor_arg_to_string(context, &value)?);
+        }
+        let result = self.build_function_constructor_from_parts(parts)?;
         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
         write_register(frame, dst, result)?;
         frame.advance_pc(self.current_byte_len)?;
@@ -86,7 +97,10 @@ impl Interpreter {
         };
         let source = s.to_lossy_string(&self.gc_heap);
         let module = self.compile_eval_source(&source, EvalCompileOptions { force_strict })?;
-        let context = ExecutionContext::from_module(module);
+        // Linking (not a standalone context) keeps the eval chunk's
+        // function ids global, so closures and classes escaping the
+        // eval stay callable from any later frame.
+        let context = self.link_module(module);
         let main = context.exec_main();
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let upvalues =
@@ -131,26 +145,31 @@ impl Interpreter {
         Ok(value)
     }
 
-    /// Build a `Function(args, body)` callable per §20.2.1.1. The
-    /// result is a [`crate::NativeFunction`] that holds the freshly
-    /// compiled inner module and dispatches it on every call;
-    /// inner-module function IDs aren't valid against the outer
-    /// running module, so wrapping in a native rather than
-    /// returning the inner closure handle directly keeps the call
-    /// surface correct.
-    pub(crate) fn build_function_constructor_with_roots(
+    /// Build a `Function(args, body)` callable per §20.2.1.1. `args`
+    /// must live in GC-visited slots (native-call argument storage or
+    /// frame registers) because per-argument coercion can re-enter
+    /// user code and move the heap; each iteration re-reads its slot.
+    /// The synthesised module links into the interpreter's code space,
+    /// so the returned closure's function id resolves from any frame —
+    /// no wrapper indirection is needed.
+    pub(crate) fn build_function_constructor(
         &mut self,
         context: &ExecutionContext,
         args: &[Value],
-        stack_roots: Option<&SmallVec<[Frame; 8]>>,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {
         // Coerce every argument to a string per §20.2.1.1 step 1.
         let mut parts: Vec<String> = Vec::with_capacity(args.len());
         for arg in args {
             parts.push(self.function_constructor_arg_to_string(context, arg)?);
         }
+        self.build_function_constructor_from_parts(parts)
+    }
+
+    /// §20.2.1.1 steps 2+ over already-coerced argument strings.
+    pub(crate) fn build_function_constructor_from_parts(
+        &mut self,
+        parts: Vec<String>,
+    ) -> Result<Value, VmError> {
         let (params, body): (Vec<&str>, &str) = if parts.is_empty() {
             (Vec::new(), "")
         } else {
@@ -164,331 +183,16 @@ impl Interpreter {
         let params_joined = params.join(",");
         let source = format!("(function anonymous({params_joined}) {{\n{body}\n}})");
         let module = self.compile_eval_source(&source, EvalCompileOptions::default())?;
-        let context = ExecutionContext::from_module(module);
+        let context = self.link_module(module);
         // Running the synthesised module's `<main>` returns the
         // function value (the parenthesised expression is the
-        // program's completion). We capture that value's
-        // `function_id` together with the inner context so the
-        // returned native can replay calls against the right
-        // bytecode.
+        // program's completion).
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         stack.push(Frame::for_function_with_heap(
             context.main(),
             &mut self.gc_heap,
         )?);
-        let value = self.dispatch_loop(&context, &mut stack)?;
-        self.wrap_eval_function_value_with_roots(
-            context,
-            value,
-            stack_roots,
-            value_roots,
-            slice_roots,
-        )
-    }
-
-    fn wrap_eval_function_value_with_roots(
-        &mut self,
-        function_context: ExecutionContext,
-        value: Value,
-        stack_roots: Option<&SmallVec<[Frame; 8]>>,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
-        if let Some(class) = value.as_class_constructor() {
-            return self.wrap_eval_class_constructor_with_roots(
-                function_context,
-                class,
-                stack_roots,
-                value_roots,
-                slice_roots,
-            );
-        }
-        if !value.is_function() && !value.is_closure() {
-            return Ok(value);
-        }
-        let mut metadata_ctx = function_metadata::FunctionMetadataContext::new(
-            &function_context,
-            &mut self.gc_heap,
-            &self.function_user_props,
-            &self.function_deleted_metadata,
-        );
-        let name_value =
-            function_metadata::callable_intrinsic_property(&mut metadata_ctx, &value, "name")?;
-        let length_value =
-            function_metadata::callable_intrinsic_property(&mut metadata_ctx, &value, "length")?;
-        let function_id_opt = value.as_function().or_else(|| {
-            value
-                .as_closure(&self.gc_heap)
-                .map(|c| c.cached_function_id)
-        });
-        let prototype_value = if let Some(function_id) = function_id_opt {
-            let mut roots = Vec::with_capacity(value_roots.len() + 1);
-            roots.push(&value);
-            roots.extend_from_slice(value_roots);
-            match stack_roots {
-                Some(stack) => self.function_property_get_stack_rooted_with_receiver(
-                    &function_context,
-                    stack,
-                    function_id,
-                    Some(value),
-                    "prototype",
-                )?,
-                None => self.function_property_get_runtime_rooted_with_receiver(
-                    &function_context,
-                    function_id,
-                    Some(value),
-                    "prototype",
-                    &roots,
-                    slice_roots,
-                )?,
-            }
-        } else {
-            Value::undefined()
-        };
-        let target_capture = value;
-        let callback_context = function_context.clone();
-        let stack_slots = stack_roots
-            .map(|stack| self.collect_allocation_roots(stack))
-            .unwrap_or_default();
-        let native_value_root = value;
-        let name_root = name_value;
-        let length_root = length_value;
-        let prototype_root = prototype_value;
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &stack_slots {
-                visitor(slot);
-            }
-            native_value_root.trace_value_slots(visitor);
-            name_root.trace_value_slots(visitor);
-            length_root.trace_value_slots(visitor);
-            prototype_root.trace_value_slots(visitor);
-            for root in value_roots {
-                root.trace_value_slots(visitor);
-            }
-            for slice in slice_roots {
-                for value in *slice {
-                    value.trace_value_slots(visitor);
-                }
-            }
-        };
-        let wrapper = native_function::native_constructor_value_with_captures_unchecked_with_roots(
-            &mut self.gc_heap,
-            "anonymous",
-            smallvec::smallvec![target_capture],
-            &mut external_visit,
-            move |ctx: &mut NativeCtx<'_>, call_args: &[Value], captures: &[Value]| {
-                let Some(target) = captures.first().cloned() else {
-                    return Err(crate::native_function::NativeError::TypeError {
-                        name: "anonymous",
-                        reason: "missing wrapped function target".to_string(),
-                    });
-                };
-                let args: SmallVec<[Value; 8]> = call_args.iter().cloned().collect();
-                let is_construct_call = ctx.is_construct_call();
-                let this_value = *ctx.this_value();
-                let interp = ctx.interp_mut();
-                let result = if is_construct_call {
-                    interp.run_construct_sync(&callback_context, &target, target, args)
-                } else {
-                    interp.run_callable_sync(&callback_context, &target, this_value, args)
-                }
-                .map_err(|err| crate::native_function::NativeError::TypeError {
-                    name: "anonymous",
-                    reason: format!("{err}"),
-                })?;
-                interp
-                    .wrap_eval_function_value_with_roots(
-                        callback_context.clone(),
-                        result,
-                        None,
-                        &[&target, &this_value],
-                        &[call_args],
-                    )
-                    .map_err(|err| crate::native_function::NativeError::TypeError {
-                        name: "anonymous",
-                        reason: format!("{err}"),
-                    })
-            },
-        )
-        .map_err(VmError::from)?;
-
-        if let Some(native) = wrapper.as_native_function() {
-            let name = object::PropertyDescriptor::data(name_value, false, false, true);
-            let _ = native.define_own_property(&mut self.gc_heap, "name", name);
-            let length = object::PropertyDescriptor::data(length_value, false, false, true);
-            let _ = native.define_own_property(&mut self.gc_heap, "length", length);
-            let prototype = object::PropertyDescriptor::data(prototype_value, true, false, false);
-            let _ = native.define_own_property(&mut self.gc_heap, "prototype", prototype);
-            if let Some(proto) = prototype_value.as_object() {
-                let constructor = object::PropertyDescriptor::data(wrapper, true, false, true);
-                let _ = object::define_own_property(
-                    proto,
-                    &mut self.gc_heap,
-                    "constructor",
-                    constructor,
-                );
-            }
-        }
-
-        Ok(wrapper)
-    }
-
-    fn wrap_eval_class_constructor_with_roots(
-        &mut self,
-        function_context: ExecutionContext,
-        class: ClassConstructor,
-        stack_roots: Option<&SmallVec<[Frame; 8]>>,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
-        let target_capture = Value::class_constructor(class);
-        let prototype = class.prototype(&self.gc_heap);
-        let statics = class.statics(&self.gc_heap);
-        self.wrap_eval_object_callables(&function_context, prototype, target_capture)?;
-        self.wrap_eval_object_callables(&function_context, statics, target_capture)?;
-        let callback_context = function_context.clone();
-        let stack_slots = stack_roots
-            .map(|stack| self.collect_allocation_roots(stack))
-            .unwrap_or_default();
-        let native_value_root = target_capture;
-        let prototype_root = Value::object(prototype);
-        let statics_root = Value::object(statics);
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &stack_slots {
-                visitor(slot);
-            }
-            native_value_root.trace_value_slots(visitor);
-            prototype_root.trace_value_slots(visitor);
-            statics_root.trace_value_slots(visitor);
-            for root in value_roots {
-                root.trace_value_slots(visitor);
-            }
-            for slice in slice_roots {
-                for value in *slice {
-                    value.trace_value_slots(visitor);
-                }
-            }
-        };
-        let wrapper_ctor =
-            native_function::native_constructor_value_with_captures_unchecked_with_roots(
-                &mut self.gc_heap,
-                "anonymous",
-                smallvec::smallvec![target_capture],
-                &mut external_visit,
-                move |ctx: &mut NativeCtx<'_>, call_args: &[Value], captures: &[Value]| {
-                    if !ctx.is_construct_call() {
-                        return Err(crate::native_function::NativeError::TypeError {
-                            name: "anonymous",
-                            reason: "Class constructor cannot be invoked without 'new'".to_string(),
-                        });
-                    }
-                    let Some(target) = captures.first().cloned() else {
-                        return Err(crate::native_function::NativeError::TypeError {
-                            name: "anonymous",
-                            reason: "missing wrapped class target".to_string(),
-                        });
-                    };
-                    let args: SmallVec<[Value; 8]> = call_args.iter().cloned().collect();
-                    ctx.interp_mut()
-                        .run_construct_sync(&callback_context, &target, target, args)
-                        .map_err(|err| crate::native_function::NativeError::TypeError {
-                            name: "anonymous",
-                            reason: format!("{err}"),
-                        })
-                },
-            )
-            .map_err(VmError::from)?;
-        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            wrapper_ctor.trace_value_slots(visitor);
-            prototype_root.trace_value_slots(visitor);
-            statics_root.trace_value_slots(visitor);
-        };
-        let wrapped = ClassConstructor::new_with_roots(
-            &mut self.gc_heap,
-            wrapper_ctor,
-            prototype,
-            statics,
-            &mut roots,
-        )?;
-        Ok(Value::class_constructor(wrapped))
-    }
-
-    fn wrap_eval_object_callables(
-        &mut self,
-        function_context: &ExecutionContext,
-        obj: crate::object::JsObject,
-        owner_root: Value,
-    ) -> Result<(), VmError> {
-        let (string_keys, symbol_keys): (Vec<String>, Vec<_>) =
-            object::with_properties(obj, &self.gc_heap, |props| {
-                (
-                    props.keys().map(str::to_string).collect(),
-                    props.symbol_keys().collect(),
-                )
-            });
-        for key in string_keys {
-            if key == "constructor" {
-                continue;
-            }
-            let Some(desc) = object::get_own_descriptor(obj, &self.gc_heap, &key) else {
-                continue;
-            };
-            let wrapped =
-                self.wrap_eval_descriptor_callables(function_context, desc, owner_root)?;
-            object::define_own_property(obj, &mut self.gc_heap, &key, wrapped);
-        }
-        for sym in symbol_keys {
-            let Some(desc) = object::get_own_symbol_descriptor(obj, &self.gc_heap, sym) else {
-                continue;
-            };
-            object::define_own_symbol_property(obj, &mut self.gc_heap, sym, desc);
-        }
-        Ok(())
-    }
-
-    fn wrap_eval_descriptor_callables(
-        &mut self,
-        function_context: &ExecutionContext,
-        desc: object::PropertyDescriptor,
-        owner_root: Value,
-    ) -> Result<object::PropertyDescriptor, VmError> {
-        let flags = desc.flags;
-        let kind = match desc.kind {
-            object::DescriptorKind::Data { value } => {
-                let value = self.wrap_eval_function_value_with_roots(
-                    function_context.clone(),
-                    value,
-                    None,
-                    &[&owner_root],
-                    &[],
-                )?;
-                object::DescriptorKind::Data { value }
-            }
-            object::DescriptorKind::Accessor { getter, setter } => {
-                let getter = match getter {
-                    Some(value) => Some(self.wrap_eval_function_value_with_roots(
-                        function_context.clone(),
-                        value,
-                        None,
-                        &[&owner_root],
-                        &[],
-                    )?),
-                    None => None,
-                };
-                let setter = match setter {
-                    Some(value) => Some(self.wrap_eval_function_value_with_roots(
-                        function_context.clone(),
-                        value,
-                        None,
-                        &[&owner_root],
-                        &[],
-                    )?),
-                    None => None,
-                };
-                object::DescriptorKind::Accessor { getter, setter }
-            }
-        };
-        Ok(object::PropertyDescriptor { kind, flags })
+        self.dispatch_loop(&context, &mut stack)
     }
 
     fn function_constructor_arg_to_string(
@@ -553,20 +257,4 @@ impl Interpreter {
             })?;
         hook(source, options).map_err(|message| VmError::SyntaxError { message })
     }
-}
-
-fn collect_new_function_args(
-    frame: &Frame,
-    operands: &[Operand],
-) -> Result<SmallVec<[Value; 4]>, VmError> {
-    let argc = match operands.get(1) {
-        Some(&Operand::ConstIndex(n)) => n as usize,
-        _ => return Err(VmError::InvalidOperand),
-    };
-    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-    for i in 0..argc {
-        let r = register_operand(operands.get(2 + i))?;
-        args.push(*read_register(frame, r)?);
-    }
-    Ok(args)
 }

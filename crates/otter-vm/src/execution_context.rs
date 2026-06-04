@@ -18,9 +18,14 @@
 //! - The bytecode module is an implementation detail of the
 //!   context. Callers use narrow accessors for function-table,
 //!   constant-pool, and module-resolution reads.
+//! - One context owns one chunk of the interpreter's shared
+//!   [`crate::code_space::CodeSpace`]; function ids are global, and
+//!   fid-keyed reads resolve foreign ids through the registry while
+//!   constant-pool reads stay chunk-local.
 //!
 //! # See also
 //!
+//! - [`crate::code_space`]
 //! - [`crate::microtask`]
 //! - [`crate::timers`]
 //! - [`crate::dynamic_import`]
@@ -28,28 +33,133 @@
 use otter_bytecode::{BytecodeModule, Constant, Function, ModuleInit, Operand};
 use std::sync::Arc;
 
+use crate::code_space::{ChunkTables, CodeSpace, ResolvedCtx};
 use crate::executable::{ExecInstr, ExecutableFunction, ExecutableModule};
 use crate::property_atom::{AtomTable, AtomizedPropertyKey};
 
 /// Cloneable dispatch context for VM-owned JS jobs.
-#[derive(Debug, Clone)]
 pub struct ExecutionContext {
     module: Arc<BytecodeModule>,
     executable: Arc<ExecutableModule>,
     atoms: Arc<AtomTable>,
+    /// First global function id owned by this chunk. Function-table
+    /// lookups subtract this before indexing; ids below the base or
+    /// past the table belong to sibling chunks in `space`.
+    function_base: u32,
+    /// Shared registry of every chunk linked into the owning
+    /// interpreter. Foreign function ids (closures escaped from
+    /// `eval` / `new Function` / other scripts) resolve through it.
+    space: Arc<CodeSpace>,
+    /// Append-only memo of sibling chunks already resolved through
+    /// `space`, so fid-keyed reads (`function`, `exec_function`, …)
+    /// can hand out references without re-locking the registry.
+    /// Per-context; clones start empty.
+    siblings: elsa::sync::FrozenVec<Box<ChunkTables>>,
+}
+
+impl std::fmt::Debug for ExecutionContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionContext")
+            .field("module", &self.module.module)
+            .field("function_base", &self.function_base())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for ExecutionContext {
+    fn clone(&self) -> Self {
+        Self {
+            module: Arc::clone(&self.module),
+            executable: Arc::clone(&self.executable),
+            atoms: Arc::clone(&self.atoms),
+            function_base: self.function_base,
+            space: Arc::clone(&self.space),
+            siblings: elsa::sync::FrozenVec::new(),
+        }
+    }
 }
 
 impl ExecutionContext {
-    /// Build a context from an owned bytecode module.
+    /// Build a context from an owned bytecode module, linked into a
+    /// fresh single-chunk code space. Embedders that execute several
+    /// modules on one interpreter must use
+    /// [`crate::Interpreter::link_module`] instead so all chunks share
+    /// one function-id space.
     #[must_use]
     pub fn from_module(module: BytecodeModule) -> Self {
-        let executable = ExecutableModule::from_bytecode(&module);
-        let atoms = AtomTable::from_constants(&module.constants);
+        CodeSpace::link(&Arc::new(CodeSpace::default()), module)
+    }
+
+    /// Wrap one linked chunk's tables. Only [`CodeSpace::link`] and
+    /// [`Self::for_function`] construct contexts this way.
+    #[must_use]
+    pub(crate) fn from_chunk_tables(tables: ChunkTables, space: Arc<CodeSpace>) -> Self {
         Self {
-            module: Arc::new(module),
-            executable: Arc::new(executable),
-            atoms: Arc::new(atoms),
+            module: tables.module,
+            executable: tables.executable,
+            atoms: tables.atoms,
+            function_base: tables.function_base,
+            space,
+            siblings: elsa::sync::FrozenVec::new(),
         }
+    }
+
+    /// Resolve the sibling chunk owning a foreign `function_id`,
+    /// memoising the registry hit so returned references stay
+    /// borrowable from `self`.
+    fn sibling_tables(&self, function_id: u32) -> Option<&ChunkTables> {
+        let covers = |t: &ChunkTables| {
+            function_id
+                .checked_sub(t.function_base)
+                .is_some_and(|local| local < t.function_count)
+        };
+        if let Some(tables) = self.siblings.iter().find(|t| covers(t)) {
+            return Some(tables);
+        }
+        let tables = self.space.chunk_for(function_id)?;
+        Some(self.siblings.push_get(Box::new(tables)))
+    }
+
+    /// First global function id owned by this chunk.
+    #[must_use]
+    pub(crate) fn function_base(&self) -> u32 {
+        self.function_base
+    }
+
+    /// Shared code-space registry this chunk was linked into.
+    #[must_use]
+    pub(crate) fn space(&self) -> &Arc<CodeSpace> {
+        &self.space
+    }
+
+    /// `true` when `function_id` falls inside this chunk's table.
+    #[must_use]
+    pub(crate) fn covers_function(&self, function_id: u32) -> bool {
+        function_id
+            .checked_sub(self.function_base)
+            .is_some_and(|local| (local as usize) < self.module.functions.len())
+    }
+
+    /// Resolve the context owning `function_id`: this chunk on the hot
+    /// in-chunk path, otherwise the sibling chunk registered in the
+    /// shared code space. `None` means the id was never linked.
+    #[must_use]
+    pub(crate) fn for_function(&self, function_id: u32) -> Option<ResolvedCtx<'_>> {
+        if self.covers_function(function_id) {
+            return Some(ResolvedCtx::Ambient(self));
+        }
+        let tables = self.space.chunk_for(function_id)?;
+        Some(ResolvedCtx::Owned(Self::from_chunk_tables(
+            tables,
+            Arc::clone(&self.space),
+        )))
+    }
+
+    /// Translate a global function id to this chunk's local table
+    /// index.
+    fn local_function_index(&self, function_id: u32) -> Option<u32> {
+        let local = function_id.checked_sub(self.function_base)?;
+        ((local as usize) < self.module.functions.len()).then_some(local)
     }
 
     /// Synthetic bytecode module name.
@@ -78,16 +188,37 @@ impl ExecutionContext {
         &self.module.module_inits
     }
 
-    /// Function-table lookup by VM function id.
+    /// Function-table lookup by global VM function id. Foreign ids
+    /// resolve transparently through the shared code space, so
+    /// fid-keyed metadata reads (name, length, flags) work on any
+    /// linked function value regardless of which chunk it escaped
+    /// from.
     #[must_use]
     pub fn function(&self, function_id: u32) -> Option<&Function> {
-        self.module.functions.get(function_id as usize)
+        if let Some(local) = self.local_function_index(function_id) {
+            return self.module.functions.get(local as usize);
+        }
+        let tables = self.sibling_tables(function_id)?;
+        tables
+            .module
+            .functions
+            .get((function_id - tables.function_base) as usize)
     }
 
-    /// Executable function lookup by VM function id.
+    /// Executable function lookup by global VM function id. Foreign
+    /// ids resolve like [`Self::function`]. Dispatch must still swap
+    /// to the owning chunk's context (via [`Self::for_function`])
+    /// before decoding constant-pool operands — only the function
+    /// body itself is chunk-portable.
     #[must_use]
     pub(crate) fn exec_function(&self, function_id: u32) -> Option<&ExecutableFunction> {
-        self.executable.function(function_id)
+        if let Some(local) = self.local_function_index(function_id) {
+            return self.executable.function(local);
+        }
+        let tables = self.sibling_tables(function_id)?;
+        tables
+            .executable
+            .function(function_id - tables.function_base)
     }
 
     /// Return an executable instruction's operands in declaration order.
@@ -134,10 +265,12 @@ impl ExecutionContext {
         self.executable.imm32(instr, index)
     }
 
-    /// Number of dense named-property IC sites in this context.
+    /// One past the highest dense named-property IC site id used by
+    /// this chunk. Doubles as the interpreter IC-table capacity needed
+    /// to dispatch this chunk.
     #[must_use]
-    pub(crate) fn property_ic_site_count(&self) -> usize {
-        self.executable.property_ic_site_count() as usize
+    pub(crate) fn property_ic_site_end(&self) -> usize {
+        self.executable.property_ic_site_end() as usize
     }
 
     /// Dense property IC site for a named property instruction at the

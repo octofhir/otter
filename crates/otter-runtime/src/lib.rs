@@ -1728,7 +1728,7 @@ impl Runtime {
             self.source_maps.record_compiled_metadata(metadata);
         }
         self.register_resolved_exports(&linked.metadata);
-        let context = ExecutionContext::from_module(linked.module);
+        let context = self.interp.link_module(linked.module);
         for init in context.module_inits() {
             if self.interp.module_env(&init.url).is_some() {
                 continue;
@@ -1846,7 +1846,7 @@ impl Runtime {
                 "dynamic import: HTTPS module \"{target_url}\" has own static imports — not yet supported"
             )));
         }
-        let context = ExecutionContext::from_module(fragment);
+        let context = self.interp.link_module(fragment);
         let env = self
             .interp
             .alloc_host_object_with_roots(&[], &[])
@@ -1857,7 +1857,7 @@ impl Runtime {
             .register_module_env(std::sync::Arc::from(target_url), env);
         otter_vm_init_marker_install(&mut self.interp, env);
         let import_meta = alloc_dynamic_import_meta(&mut self.interp, env, target_url)?;
-        let callee = otter_vm::Value::function_id(0);
+        let callee = otter_vm::Value::function_id(context.main().id);
         let args: smallvec::SmallVec<[otter_vm::Value; 8]> = smallvec::smallvec![
             otter_vm::Value::object(env),
             otter_vm::Value::object(import_meta),
@@ -2412,7 +2412,7 @@ impl Runtime {
         module: BytecodeModule,
         start: std::time::Instant,
     ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
-        let context = ExecutionContext::from_module(module);
+        let context = self.interp.link_module(module);
         // Run the script first; the script error wins if both the
         // script and the drain fail. On script success we still
         // drain so any `queueMicrotask` registered during script
@@ -2633,7 +2633,7 @@ impl Runtime {
             });
 
         self.module_records.mark_evaluating();
-        let context = ExecutionContext::from_module(module);
+        let context = self.interp.link_module(module);
         let script_outcome = self.interp.run(&context);
         let drain_outcome = self.interp.drain_microtasks(&context);
         let value = match (script_outcome, drain_outcome) {

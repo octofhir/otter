@@ -63,6 +63,7 @@ tokio               = { version = "1", features = ["rt-multi-thread", "sync", "t
 # Collections / utilities.
 smallvec    = "1"
 indexmap    = "2"
+elsa        = "1.11"
 globset     = "0.4"
 sysinfo     = "0.39"
 proc-macro2 = "1"

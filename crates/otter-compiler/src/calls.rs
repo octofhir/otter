@@ -404,9 +404,21 @@ pub(crate) fn compile_method_call(
         }
         let src_reg = arg_regs[0];
         let dst = cx.alloc_scratch();
+        // §19.2.1.3 EvalDeclarationInstantiation — a sloppy direct
+        // eval run from a parameter initializer whose body
+        // var-declares `arguments` throws SyntaxError when the
+        // calling function binds the name (the binding exists but is
+        // still uninitialized during parameter instantiation). After
+        // the parameters are bound the same eval body is legal, so
+        // only the parameter-default window arms the flag.
+        let forbid_var_arguments = cx.in_param_init && cx.binds_arguments;
         cx.emit(
             Op::Eval,
-            [Operand::Register(dst), Operand::Register(src_reg)],
+            [
+                Operand::Register(dst),
+                Operand::Register(src_reg),
+                Operand::Imm32(i32::from(forbid_var_arguments)),
+            ],
             span,
         );
         return Ok(dst);

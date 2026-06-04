@@ -591,6 +591,11 @@ pub struct EvalCompileOptions {
     /// compiler stores the resulting strict bit on `<main>` so
     /// nested functions inherit it normally.
     pub force_strict: bool,
+    /// `true` for a direct eval whose calling variable environment
+    /// binds `arguments` (ordinary functions always; arrows only when
+    /// they bind the name themselves). §19.2.1.3 then makes a sloppy
+    /// body var-declaring `arguments` an early SyntaxError.
+    pub forbid_var_arguments: bool,
 }
 
 /// Embedder-supplied parse + compile callback used by

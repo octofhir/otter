@@ -443,8 +443,10 @@ fn global_is_finite(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
 
 fn global_eval(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let arg = args.first().cloned().unwrap_or(Value::undefined());
+    // §19.2.1.1 indirect eval: sloppy, global variable environment —
+    // no caller-scope restrictions apply.
     ctx.interp_mut()
-        .run_eval(&arg, false)
+        .run_eval(&arg, crate::EvalCompileOptions::default())
         .map_err(|err| match err {
             VmError::SyntaxError { message } => NativeError::SyntaxError {
                 name: "eval",

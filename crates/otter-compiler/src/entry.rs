@@ -50,9 +50,12 @@ pub fn compile_script_source_with_forced_strict(
 }
 
 /// Compile an `eval` / `new Function` body. Differs from script
-/// compilation in one §19.2.1.1 detail: a *strict* eval body gets its
-/// own variable environment, so top-level `var` / `function`
-/// declarations don't mirror onto the global object.
+/// compilation in two details: a *strict* eval body gets its own
+/// variable environment (§19.2.1.1), so top-level `var` / `function`
+/// declarations don't mirror onto the global object; and when the
+/// direct-eval call site's variable environment binds `arguments`
+/// (`forbid_var_arguments`), a sloppy body var-declaring `arguments`
+/// is an early SyntaxError (§19.2.1.3 EvalDeclarationInstantiation).
 ///
 /// # Errors
 /// Returns [`CompileError`] when parsing fails or lowering rejects the AST.
@@ -61,8 +64,19 @@ pub fn compile_eval_source(
     kind: SyntaxSourceKind,
     module_specifier: &str,
     force_strict: bool,
+    forbid_var_arguments: bool,
 ) -> Result<BytecodeModule, CompileError> {
     with_program(source, kind, |program| {
+        if forbid_var_arguments && !(force_strict || program.has_use_strict_directive()) {
+            let mut var_names: Vec<String> = Vec::new();
+            hoist_var_names(&program.body, &mut var_names);
+            if var_names.iter().any(|name| name == "arguments") {
+                return Err(CompileError::Unsupported {
+                    node: "SyntaxError: eval body may not var-declare 'arguments' here".to_string(),
+                    span: (program.span.start, program.span.end),
+                });
+            }
+        }
         compile_program_with_mode(program, kind, module_specifier, force_strict, true)
     })
     .map_err(CompileError::from)?

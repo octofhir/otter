@@ -41,10 +41,17 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let src_reg = register_operand(operands.get(1))?;
+        let forbid_var_arguments = matches!(operands.get(2), Some(&Operand::Imm32(1)));
         let top_idx = stack.len() - 1;
         let value = *read_register(&stack[top_idx], src_reg)?;
         let force_strict = context.function_is_strict(stack[top_idx].function_id);
-        let result = self.run_eval(&value, force_strict)?;
+        let result = self.run_eval(
+            &value,
+            EvalCompileOptions {
+                force_strict,
+                forbid_var_arguments,
+            },
+        )?;
         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
         write_register(frame, dst, result)?;
         frame.advance_pc(self.current_byte_len)?;
@@ -89,14 +96,18 @@ impl Interpreter {
     /// # Errors
     /// - [`VmError::SyntaxError`] when no eval hook is installed or
     ///   parsing / compilation fail.
-    pub(crate) fn run_eval(&mut self, value: &Value, force_strict: bool) -> Result<Value, VmError> {
+    pub(crate) fn run_eval(
+        &mut self,
+        value: &Value,
+        options: EvalCompileOptions,
+    ) -> Result<Value, VmError> {
         let Some(s) = value.as_string(&self.gc_heap) else {
             // Per §19.4.1.1 step 4, eval'd non-strings are returned
             // unchanged — `eval(42) === 42`.
             return Ok(*value);
         };
         let source = s.to_lossy_string(&self.gc_heap);
-        let module = self.compile_eval_source(&source, EvalCompileOptions { force_strict })?;
+        let module = self.compile_eval_source(&source, options)?;
         // Linking (not a standalone context) keeps the eval chunk's
         // function ids global, so closures and classes escaping the
         // eval stay callable from any later frame.

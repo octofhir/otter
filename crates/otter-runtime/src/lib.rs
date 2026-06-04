@@ -1455,6 +1455,7 @@ impl Runtime {
                     SourceKind::JavaScript,
                     "<eval>",
                     options.force_strict,
+                    options.forbid_var_arguments,
                 )
                 .map_err(|e| format!("compile error: {e:?}"))
             });

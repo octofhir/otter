@@ -41,6 +41,11 @@ pub(crate) fn compile_function_full(
         .with_module_url(parent.module_url.clone());
     child.active_with_envs = active_with_envs;
     child.is_async_generator = is_async_generator;
+    // §10.2.11 — every non-arrow function's variable environment
+    // binds `arguments` (as the arguments object, a parameter, or a
+    // body declaration), which arms the §19.2.1.3 direct-eval check
+    // during parameter initialization.
+    child.binds_arguments = true;
     if let Some(b) = body {
         child.captured_names = capture::analyze_function(Some(params), b);
     }
@@ -75,6 +80,7 @@ pub(crate) fn compile_function_full(
     // Bind every formal parameter, in source order. Side-effects
     // (default-value evaluation, iterator-protocol calls for array
     // patterns) follow the spec's per-call ordering.
+    parent.in_param_init = true;
     for (ordinal, param) in params.items.iter().enumerate() {
         compile_formal_parameter(
             parent,
@@ -88,6 +94,7 @@ pub(crate) fn compile_function_full(
     if let Some(rest) = &params.rest {
         compile_rest_parameter(parent, &rest.rest.argument, span)?;
     }
+    parent.in_param_init = false;
     let mapped_argument_bindings = if uses_mapped_arguments {
         mapped_formal_parameter_bindings(parent, params)
     } else {
@@ -187,6 +194,28 @@ pub(crate) fn compile_function_full(
     Ok((function_id, captures))
 }
 
+/// `true` when an arrow's variable environment will bind
+/// `arguments`: a parameter pattern, body `var` (incl. hoistable
+/// function declarations), or top-level lexical declaration
+/// introduces the name. §10.2.11 — arrows never synthesize an
+/// arguments object of their own.
+fn arrow_binds_arguments(arrow: &oxc_ast::ast::ArrowFunctionExpression<'_>) -> bool {
+    let mut names: Vec<String> = Vec::new();
+    for param in &arrow.params.items {
+        collect_pattern_var_names(&param.pattern, &mut names);
+    }
+    if let Some(rest) = &arrow.params.rest {
+        collect_pattern_var_names(&rest.rest.argument, &mut names);
+    }
+    hoist_var_names(&arrow.body.statements, &mut names);
+    if names.iter().any(|name| name == "arguments") {
+        return true;
+    }
+    let mut lex: Vec<(String, bool)> = Vec::new();
+    hoist_lexical_names(&arrow.body.statements, &mut lex);
+    lex.iter().any(|(name, _)| name == "arguments")
+}
+
 /// Compile an arrow function. Two body shapes share the same
 /// lowering:
 ///
@@ -210,8 +239,14 @@ pub(crate) fn compile_arrow_function(
     let active_with_envs = parent.active_with_envs.clone();
     let mut child = FunctionContext::new(Rc::clone(&module))
         .with_strict(function_is_strict)
+        .with_arrow()
         .with_module_url(parent.module_url.clone());
     child.active_with_envs = active_with_envs;
+    // Arrows have no implicit `arguments` object; the binding exists
+    // only when a parameter or a body var / lexical / function
+    // declaration introduces the name (drives the §19.2.1.3
+    // direct-eval-in-parameter-defaults check).
+    child.binds_arguments = arrow_binds_arguments(arrow);
     child.captured_names = capture::analyze_arrow(arrow);
     child.reserve_known_own_upvalues();
     parent.push(child);
@@ -235,6 +270,7 @@ pub(crate) fn compile_arrow_function(
     });
 
     predeclare_formal_parameters(parent, &arrow.params, false, span)?;
+    parent.in_param_init = true;
     for (ordinal, param) in arrow.params.items.iter().enumerate() {
         compile_formal_parameter(
             parent,
@@ -248,6 +284,7 @@ pub(crate) fn compile_arrow_function(
     if let Some(rest) = &arrow.params.rest {
         compile_rest_parameter(parent, &rest.rest.argument, span)?;
     }
+    parent.in_param_init = false;
 
     if arrow.expression {
         // `() => expr` — body is a single ExpressionStatement

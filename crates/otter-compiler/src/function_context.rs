@@ -29,6 +29,22 @@ pub(crate) struct FunctionContext {
     /// lowered. This is compile-time metadata stored on the
     /// resulting bytecode function and also drives early errors.
     pub(crate) is_strict: bool,
+    /// `true` when this context lowers an arrow function. Arrows have
+    /// no own `arguments` binding, which changes the
+    /// EvalDeclarationInstantiation `var arguments` early error
+    /// (§19.2.1.3) for direct eval call sites inside the body.
+    pub(crate) is_arrow: bool,
+    /// `true` while formal-parameter defaults of this function are
+    /// being lowered. A direct eval in that window var-declaring
+    /// `arguments` is an early SyntaxError when [`Self::binds_arguments`]
+    /// holds (§19.2.1.3); after parameter instantiation the binding is
+    /// initialized and the same eval body is legal.
+    pub(crate) in_param_init: bool,
+    /// `true` when this function will have an `arguments` binding in
+    /// its variable environment: every non-arrow function, and arrows
+    /// only when a parameter / body `var` / body lexical / body
+    /// function declaration introduces the name.
+    pub(crate) binds_arguments: bool,
     /// Canonical source URL inherited by nested functions. Dynamic
     /// import uses this as the referrer when it runs inside a
     /// function body rather than at top level.
@@ -115,6 +131,9 @@ impl FunctionContext {
             scratch: 0,
             scopes: Vec::new(),
             is_strict: false,
+            is_arrow: false,
+            in_param_init: false,
+            binds_arguments: false,
             module_url: String::new(),
             is_async_generator: false,
             loops: Vec::new(),
@@ -137,6 +156,11 @@ impl FunctionContext {
 
     pub(crate) fn with_strict(mut self, is_strict: bool) -> Self {
         self.is_strict = is_strict;
+        self
+    }
+
+    pub(crate) fn with_arrow(mut self) -> Self {
+        self.is_arrow = true;
         self
     }
 

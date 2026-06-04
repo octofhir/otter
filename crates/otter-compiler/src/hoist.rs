@@ -147,6 +147,10 @@ pub(crate) fn hoist_var_names_in_stmt<'a>(stmt: &Statement<'a>, out: &mut Vec<St
             }
         }
         Statement::LabeledStatement(s) => hoist_var_names_in_stmt(&s.body, out),
+        // §14.11 — `with (expr) stmt` does not open a var scope; its
+        // body's `var` declarations hoist to the enclosing function /
+        // script scope like any other nested statement.
+        Statement::WithStatement(s) => hoist_var_names_in_stmt(&s.body, out),
         // `function`, `class`, plain expressions, etc. — none
         // contribute var-declared names to this scope.
         _ => {}

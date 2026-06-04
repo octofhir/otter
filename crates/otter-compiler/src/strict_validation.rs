@@ -838,6 +838,9 @@ where
             }
         }
         Statement::LabeledStatement(s) => collect_var_decl_names_in_stmt(&s.body, emit),
+        // §14.11 — `with` bodies hoist their `var` names to the
+        // enclosing variable scope like any other nested statement.
+        Statement::WithStatement(s) => collect_var_decl_names_in_stmt(&s.body, emit),
         Statement::TryStatement(s) => {
             collect_var_decl_names(&s.block.body, emit);
             if let Some(handler) = &s.handler {

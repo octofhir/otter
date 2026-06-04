@@ -178,11 +178,11 @@ echo "=== Generating HTML dashboard ==="
 "$TEST262_BIN" site "$MERGED" --output "$RESULTS_DIR/site/index.html" || {
     echo "Site generation failed" >&2
 }
-# Keep the contributor-book copy in sync so the published doc site
-# always carries the latest dashboard (mdBook ships it verbatim).
-if [ -d docs/book/src/conformance ] && [ -f "$RESULTS_DIR/site/index.html" ]; then
-    cp "$RESULTS_DIR/site/index.html" docs/book/src/conformance/index.html
-    echo "Dashboard copied to docs/book/src/conformance/index.html"
+# Keep the doc-site dashboard data in sync so the published site
+# always renders the latest baseline.
+if [ -d docs/site/public/conformance ] && [ -f "$MERGED" ]; then
+    cp "$MERGED" docs/site/public/conformance/data.json
+    echo "Baseline copied to docs/site/public/conformance/data.json"
 fi
 
 echo ""

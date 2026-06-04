@@ -1,0 +1,29 @@
+---
+title: ECMAScript Conformance
+tableOfContents: false
+---
+
+import ConformanceDashboard from '../../../components/ConformanceDashboard.astro';
+
+Otter tracks its ECMAScript conformance against the official
+[tc39/test262](https://github.com/tc39/test262) suite. The dashboard
+below renders the latest merged full-corpus baseline: drill into any
+group to see per-section pass rates and the failing tests with their
+reasons. Each failing test links to its source in the pinned test262
+commit.
+
+<ConformanceDashboard />
+
+## Regenerating
+
+```sh
+# Run the full corpus in crash-safe batches; refreshes the merged
+# baseline and this page's data automatically.
+bash scripts/test262-full-run.sh
+
+# Re-render from an existing baseline only.
+just test262-site
+```
+
+See `ES_CONFORMANCE.md` at the repository root for the measured
+baseline history and per-fix deltas.

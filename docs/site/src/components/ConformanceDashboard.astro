@@ -1,0 +1,223 @@
+---
+// Interactive test262 conformance dashboard.
+//
+// Renders client-side from /conformance/data.json (the latest merged
+// baseline produced by `otter-test262 merge`; refreshed by
+// `just test262-site` / scripts/test262-full-run.sh). Drill-down group
+// tree with stacked pass/fail bars, lazy failing-test tables with
+// reasons, live path filter, and per-test links into the pinned
+// tc39/test262 commit.
+---
+
+<div class="conf-dash">
+  <div id="conf-hero"></div>
+  <input
+    id="conf-filter"
+    type="search"
+    placeholder="Filter sections… (e.g. built-ins/Array)"
+    autocomplete="off"
+  />
+  <div id="conf-tree"><p class="conf-loading">Loading baseline…</p></div>
+</div>
+
+<style is:global>
+  .conf-dash {
+    --pass: #2da44e;
+    --fail: #cf222e;
+    --broken: #bf8700;
+    --skip: #afb8c1;
+  }
+  .conf-dash .hero-row { display: flex; align-items: center; gap: 16px; margin: 8px 0; }
+  .conf-dash .rate { font-size: 34px; font-weight: 600; }
+  .conf-dash .hero-row .bar { height: 18px; flex: 1; }
+  .conf-dash .legend { margin: 6px 0 0; color: var(--sl-color-gray-3); font-size: 0.9em; }
+  .conf-dash .chip { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin: 0 4px 0 12px; }
+  .conf-dash .chip.c-pass { background: var(--pass); }
+  .conf-dash .chip.c-fail { background: var(--fail); }
+  .conf-dash .chip.c-broken { background: var(--broken); }
+  .conf-dash .chip.c-skip { background: var(--skip); }
+  .conf-dash #conf-filter {
+    width: 100%; max-width: 480px; margin: 16px 0; padding: 6px 10px;
+    font: inherit; border: 1px solid var(--sl-color-gray-5); border-radius: 6px;
+    background: var(--sl-color-bg); color: var(--sl-color-text);
+  }
+  .conf-dash .bar {
+    display: inline-flex; width: 200px; height: 10px; border-radius: 5px; overflow: hidden;
+    background: var(--sl-color-gray-6); border: 1px solid var(--sl-color-gray-5); flex: none;
+  }
+  .conf-dash .bar i { display: block; height: 100%; }
+  .conf-dash .bar .p { background: var(--pass); }
+  .conf-dash .bar .f { background: var(--fail); }
+  .conf-dash .bar .b { background: var(--broken); }
+  .conf-dash .bar .s { background: var(--skip); }
+  .conf-dash .row {
+    display: flex; align-items: center; gap: 12px; padding: 5px 8px;
+    border-radius: 6px; cursor: pointer; user-select: none;
+  }
+  .conf-dash .row:hover { background: var(--sl-color-gray-6); }
+  .conf-dash .row .tw { flex: none; width: 14px; color: var(--sl-color-gray-3); font-size: 11px; transition: transform 0.12s; }
+  .conf-dash .row.open .tw { transform: rotate(90deg); }
+  .conf-dash .row .name { flex: 0 0 auto; min-width: 220px; font-weight: 500; }
+  .conf-dash .row .pct { color: var(--sl-color-gray-3); width: 72px; text-align: right; font-variant-numeric: tabular-nums; }
+  .conf-dash .row .counts { color: var(--sl-color-gray-3); white-space: nowrap; font-variant-numeric: tabular-nums; font-size: 0.9em; }
+  .conf-dash .row.leafrow { cursor: default; }
+  .conf-dash .kids { margin-left: 22px; border-left: 1px solid var(--sl-color-gray-5); padding-left: 6px; display: none; }
+  .conf-dash .kids.open { display: block; }
+  .conf-dash table.fails { margin: 6px 0 14px; width: 100%; font-size: 0.85em; }
+  .conf-dash table.fails .reason { color: var(--sl-color-gray-3); word-break: break-word; }
+  .conf-dash .badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 12px; color: #fff; }
+  .conf-dash .badge.o-fail { background: var(--fail); }
+  .conf-dash .badge.o-crash { background: #8250df; }
+  .conf-dash .badge.o-timeout { background: var(--broken); }
+  .conf-dash .badge.o-oom { background: #0969da; }
+  .conf-dash .conf-meta { color: var(--sl-color-gray-3); margin: 0 0 8px; }
+  .conf-dash .empty, .conf-dash .conf-loading { color: var(--sl-color-gray-3); padding: 8px 0; }
+</style>
+
+<script>
+  const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+  const resp = await fetch(`${base}/conformance/data.json`);
+  const DATA = await resp.json();
+
+  function emptyTotals() {
+    return { total: 0, passed: 0, failed: 0, skipped: 0, crashed: 0, timed_out: 0, oom: 0 };
+  }
+  function addTotals(a: any, b: any) {
+    for (const k of Object.keys(a)) a[k] += b[k] || 0;
+  }
+  const root: any = { name: "", totals: emptyTotals(), kids: new Map() };
+  for (const [section, t] of Object.entries(DATA.by_section || {})) {
+    addTotals(root.totals, t);
+    let node = root;
+    for (const seg of section.split("/")) {
+      if (!node.kids.has(seg)) node.kids.set(seg, { name: seg, totals: emptyTotals(), kids: new Map() });
+      node = node.kids.get(seg);
+      addTotals(node.totals, t);
+    }
+  }
+  const fails = new Map<string, any[]>();
+  for (const f of DATA.failing_tests || []) {
+    const seg = f.path.split("/");
+    const key = seg.slice(0, Math.min(3, seg.length)).join("/");
+    if (!fails.has(key)) fails.set(key, []);
+    fails.get(key)!.push(f);
+  }
+  const passRate = (t: any) => {
+    const d = t.total - t.skipped;
+    return d > 0 ? (t.passed * 100) / d : 0;
+  };
+
+  function el(tag: string, cls?: string, text?: string) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+  function bar(t: any) {
+    const b = el("span", "bar");
+    const mk = (cls: string, n: number) => {
+      const i = el("i", cls);
+      (i as HTMLElement).style.width = (t.total ? (n * 100) / t.total : 0) + "%";
+      b.appendChild(i);
+    };
+    mk("p", t.passed); mk("f", t.failed); mk("b", t.crashed + t.timed_out + t.oom); mk("s", t.skipped);
+    return b;
+  }
+  function testUrl(path: string) {
+    const c = DATA.test262_commit && DATA.test262_commit !== "unknown" ? DATA.test262_commit : "main";
+    return `https://github.com/tc39/test262/blob/${c}/test/${path}`;
+  }
+  function failTable(rows: any[]) {
+    const tb = el("table", "fails");
+    tb.innerHTML = "<thead><tr><th>Outcome</th><th>Test</th><th>Reason</th></tr></thead>";
+    const body = el("tbody");
+    for (const f of rows) {
+      const tr = el("tr");
+      const td1 = el("td");
+      td1.appendChild(el("span", "badge o-" + f.outcome, f.outcome));
+      tr.appendChild(td1);
+      const td2 = el("td");
+      const a = el("a") as HTMLAnchorElement;
+      a.href = testUrl(f.path); a.target = "_blank"; a.rel = "noopener";
+      a.appendChild(el("code", undefined, f.path));
+      td2.appendChild(a); tr.appendChild(td2);
+      tr.appendChild(el("td", "reason", f.reason));
+      body.appendChild(tr);
+    }
+    tb.appendChild(body);
+    return tb;
+  }
+  function renderNode(node: any, path: string): HTMLElement {
+    const wrap = el("div", "node");
+    const leafFails = fails.get(path) || [];
+    const expandable = node.kids.size > 0 || leafFails.length > 0;
+    const row = el("div", "row" + (expandable ? "" : " leafrow"));
+    row.appendChild(el("span", "tw", expandable ? "▶" : ""));
+    row.appendChild(el("span", "name", node.name));
+    row.appendChild(bar(node.totals));
+    row.appendChild(el("span", "pct", passRate(node.totals).toFixed(1) + "%"));
+    row.appendChild(el("span", "counts",
+      node.totals.passed + " / " + node.totals.total +
+      (node.totals.failed ? "  ·  " + node.totals.failed + " fail" : "") +
+      (node.totals.skipped ? "  ·  " + node.totals.skipped + " skip" : "")));
+    wrap.appendChild(row);
+    if (expandable) {
+      const kids = el("div", "kids");
+      let built = false;
+      row.addEventListener("click", () => {
+        if (!built) {
+          for (const [name, child] of [...node.kids.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+            kids.appendChild(renderNode(child, path ? path + "/" + name : name));
+          }
+          if (leafFails.length) kids.appendChild(failTable(leafFails));
+          built = true;
+        }
+        const open = kids.classList.toggle("open");
+        row.classList.toggle("open", open);
+      });
+      wrap.appendChild(kids);
+    }
+    return wrap;
+  }
+  function renderTree(filter: string) {
+    const tree = document.getElementById("conf-tree")!;
+    tree.textContent = "";
+    let shown = 0;
+    for (const name of [...root.kids.keys()].sort()) {
+      if (filter) {
+        const any = Object.keys(DATA.by_section || {}).some((s) => s.startsWith(name) && s.includes(filter));
+        if (!any) continue;
+      }
+      tree.appendChild(renderNode(root.kids.get(name), name));
+      shown++;
+    }
+    if (!shown) tree.appendChild(el("div", "empty", "No sections match the filter."));
+  }
+
+  const t = DATA.totals || emptyTotals();
+  const hero = document.getElementById("conf-hero")!;
+  const meta = el("p", "conf-meta");
+  meta.innerHTML =
+    "Engine <code>" + String(DATA.engine_commit || "?").slice(0, 12) +
+    "</code> · test262 <code>" + String(DATA.test262_commit || "?").slice(0, 12) +
+    "</code> · " + (DATA.ran_at || "");
+  hero.appendChild(meta);
+  const heroRow = el("div", "hero-row");
+  heroRow.appendChild(el("span", "rate", passRate(t).toFixed(2) + "%"));
+  heroRow.appendChild(bar(t));
+  hero.appendChild(heroRow);
+  const legend = el("p", "legend");
+  legend.innerHTML =
+    '<span class="chip c-pass"></span>pass ' + t.passed +
+    ' <span class="chip c-fail"></span>fail ' + t.failed +
+    ' <span class="chip c-broken"></span>crash ' + t.crashed + " / timeout " + t.timed_out + " / oom " + t.oom +
+    ' <span class="chip c-skip"></span>skip ' + t.skipped + " · total " + t.total;
+  hero.appendChild(legend);
+
+  let debounce: ReturnType<typeof setTimeout>;
+  (document.getElementById("conf-filter") as HTMLInputElement).addEventListener("input", (e) => {
+    clearTimeout(debounce);
+    debounce = setTimeout(() => renderTree((e.target as HTMLInputElement).value.trim()), 120);
+  });
+  renderTree("");
+</script>

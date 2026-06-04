@@ -1,0 +1,36 @@
+---
+title: Otter Engine
+description: Contributor guide for the Otter JavaScript engine.
+template: splash
+hero:
+  tagline: A JavaScript engine in Rust — contributor guide, internals, and live ECMAScript conformance.
+  actions:
+    - text: Get started
+      link: ./introduction/
+      icon: right-arrow
+    - text: Conformance dashboard
+      link: ./conformance/
+      icon: rocket
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+<CardGrid stagger>
+	<Card title="Engine internals" icon="setting">
+		Architecture, the dispatch loop, GC API, and the native call ABI under
+		[Engine Internals](./engine/architecture/).
+	</Card>
+	<Card title="Contribute a built-in" icon="pencil">
+		The porting workflow from spec to passing tests:
+		[Adding a Built-in Method](./contributing/builtin-methods/).
+	</Card>
+	<Card title="Conformance" icon="approve-check">
+		Live test262 pass rates with per-group drill-down on the
+		[conformance dashboard](./conformance/).
+	</Card>
+	<Card title="Extensions" icon="puzzle">
+		Hosted modules, native bindings, and the plugin system under
+		[Extensions](./extensions/overview/).
+	</Card>
+</CardGrid>

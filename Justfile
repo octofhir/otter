@@ -125,7 +125,7 @@ test262-full *args:
 # baseline and refresh the copy shipped inside the contributor book.
 test262-site:
     cargo run --release -p otter-test262 --bin otter-test262 -- site test262_results/latest.json --output test262_results/site/index.html
-    cp test262_results/site/index.html docs/book/src/conformance/index.html
+    cp test262_results/latest.json docs/site/public/conformance/data.json
 
 # Generate ES_CONFORMANCE.md from latest test262 results
 test262-conformance:

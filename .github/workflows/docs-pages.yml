@@ -4,11 +4,11 @@ on:
   push:
     branches: [main]
     paths:
-      - docs/book/**
+      - docs/site/**
       - .github/workflows/docs-pages.yml
   pull_request:
     paths:
-      - docs/book/**
+      - docs/site/**
       - .github/workflows/docs-pages.yml
   workflow_dispatch:
 
@@ -19,36 +19,39 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-  MDBOOK_VERSION: 0.4.52
-
 jobs:
   build:
-    name: Build mdBook
+    name: Build docs site
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
 
-      - name: Install mdBook
-        run: |
-          if ! command -v mdbook >/dev/null 2>&1 || [ "$(mdbook --version)" != "mdbook v${MDBOOK_VERSION}" ]; then
-            cargo install mdbook --locked --version "${MDBOOK_VERSION}"
-          fi
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: docs/site/pnpm-lock.yaml
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
 
-      - name: Build contributor book
-        run: mdbook build docs/book
+      - name: Install dependencies
+        working-directory: docs/site
+        run: pnpm install --frozen-lockfile
+
+      - name: Build site
+        working-directory: docs/site
+        run: pnpm build
 
       - name: Upload GitHub Pages artifact
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: actions/upload-pages-artifact@v4
         with:
-          path: docs/book/book
+          path: docs/site/dist
 
   deploy:
     name: Deploy GitHub Pages

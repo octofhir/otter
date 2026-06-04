@@ -1,0 +1,88 @@
+// @ts-check
+import { defineConfig } from 'astro/config';
+import starlight from '@astrojs/starlight';
+
+// https://astro.build/config
+export default defineConfig({
+	site: 'https://octoshikari.github.io',
+	base: '/otter',
+	integrations: [
+		starlight({
+			title: 'Otter Engine',
+			description:
+				'Contributor guide and conformance dashboard for the Otter JavaScript engine.',
+			social: [
+				{
+					icon: 'github',
+					label: 'GitHub',
+					href: 'https://github.com/octoshikari/otter',
+				},
+			],
+			editLink: {
+				baseUrl: 'https://github.com/octoshikari/otter/edit/main/docs/site/',
+			},
+			sidebar: [
+				{ label: 'Introduction', slug: 'introduction' },
+				{
+					label: 'Contributing',
+					items: [
+						{ label: 'Overview', slug: 'contributing/overview' },
+						{ label: 'Porting Process', slug: 'contributing/porting' },
+						{ label: 'Adding a Built-in Method', slug: 'contributing/builtin-methods' },
+						{ label: 'Test Harness', slug: 'contributing/test-harness' },
+					],
+				},
+				{
+					label: 'Engine Internals',
+					items: [
+						{ label: 'Architecture', slug: 'engine/architecture' },
+						{ label: 'Runtime Principles', slug: 'engine/runtime-principles' },
+						{ label: 'Event Loop', slug: 'engine/event-loop' },
+						{ label: 'Workers', slug: 'engine/workers' },
+						{ label: 'Frontend And Compilation', slug: 'engine/frontend' },
+						{ label: 'GC API', slug: 'engine/gc-api' },
+						{ label: 'Native Call ABI', slug: 'engine/native-call-abi' },
+						{ label: 'Step Trace', slug: 'engine/step-trace' },
+					],
+				},
+				{
+					label: 'Conformance',
+					items: [{ label: 'ECMAScript Conformance', slug: 'conformance' }],
+				},
+				{
+					label: 'Package Manager',
+					items: [{ label: 'Development Loop', slug: 'package-manager/development-loop' }],
+				},
+				{
+					label: 'Extensions And Plugins',
+					items: [
+						{ label: 'Overview', slug: 'extensions/overview' },
+						{ label: 'Hosted Modules', slug: 'extensions/hosted-modules' },
+						{ label: 'Native Bindings', slug: 'extensions/native-bindings' },
+						{ label: 'JS Surface Builders', slug: 'extensions/js-surface-builders' },
+						{ label: 'Plugin System', slug: 'extensions/plugin-system' },
+					],
+				},
+				{
+					label: 'Web APIs',
+					items: [{ label: 'Contribution Workflow', slug: 'web/contributing' }],
+				},
+				{
+					label: 'Performance',
+					items: [{ label: 'Startup', slug: 'performance/startup' }],
+				},
+				{
+					label: 'Deployment',
+					items: [{ label: 'macOS', slug: 'deployment/macos' }],
+				},
+				{
+					label: 'Macros',
+					items: [
+						{ label: 'Overview', slug: 'macros/overview' },
+						{ label: 'Design Note', slug: 'macros/design' },
+					],
+				},
+			],
+		}),
+	],
+});

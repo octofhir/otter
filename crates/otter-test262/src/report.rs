@@ -239,10 +239,14 @@ impl Baseline {
     /// # Errors
     /// [`ReportError::Io`] / [`ReportError::Json`].
     pub fn from_path(path: &Path) -> Result<Self, ReportError> {
-        let text = std::fs::read_to_string(path).map_err(|e| ReportError::Io {
+        let bytes = std::fs::read(path).map_err(|e| ReportError::Io {
             path: path.to_path_buf(),
             message: e.to_string(),
         })?;
+        // Failure reasons can carry lone surrogates from JS string
+        // values (WTF-16 → invalid UTF-8 on disk); decode lossily so
+        // one bad reason byte can't sink a whole merge.
+        let text = String::from_utf8_lossy(&bytes);
         serde_json::from_str(&text).map_err(ReportError::Json)
     }
 }

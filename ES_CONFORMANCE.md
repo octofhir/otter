@@ -44,6 +44,24 @@ Guards re-measured against the same-day baseline — exact match, 0
 regressions: `built-ins/String` 1213, `built-ins/Promise` 676 (100%),
 `built-ins/Map` 170 (100%), `language/statements/for-of` 714.
 
+**End-of-session full re-run** (same day, post-fixes): 42481 / 51764
+passed (86.85% excl. skip), 6426 fail, 6 crash, 2 timeout — **+1193
+passing vs the morning baseline** (+1064 TypedArray/prototype subtree
+recovered from the crash, +92 block-scope early errors, +37 `with`
+var-hoisting). `staging/sm` remains excluded (host-level kill — the
+ported suite needs its own budget). Merge now reads batch reports
+lossily: failure reasons can carry lone surrogates (WTF-16 → invalid
+UTF-8) and previously sank the whole merge.
+
+**Block-level lexical early errors** (same day): new
+`validate_block_early_errors` compiler pass enforces §14.2.1/§14.12.1
+(duplicate `LexicallyDeclaredNames` incl. block-level
+function/generator/async declarations, lexical/`var` clashes; Annex B
+§B.3.3.1 sloppy plain-function exemption).
+`language/block-scope`: 47 → 139 of 145. Guards: annexB 472,
+`language/statements` 8655 (+2 vs baseline), `language/expressions`
+10254 — no regressions.
+
 Runner changes captured alongside: `--filter` now supports a leading
 `^` anchor (prefix match) so directory shards stay disjoint
 (`built-ins/RegExp/` no longer also matches

@@ -121,6 +121,12 @@ test262-dir dir:
 test262-full *args:
     bash scripts/test262-full-run.sh {{args}}
 
+# Render the interactive conformance dashboard from the latest merged
+# baseline and refresh the copy shipped inside the contributor book.
+test262-site:
+    cargo run --release -p otter-test262 --bin otter-test262 -- site test262_results/latest.json --output test262_results/site/index.html
+    cp test262_results/site/index.html docs/book/src/conformance/index.html
+
 # Generate ES_CONFORMANCE.md from latest test262 results
 test262-conformance:
     @echo "test262 conformance generation is not wired in the current otter-test262 runner; update ES_CONFORMANCE.md from the generated JSON/Markdown report."

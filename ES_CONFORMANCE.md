@@ -3,6 +3,84 @@
 This file tracks measured Test262 results for the active
 `crates/otter-test262` runner.
 
+## Shared code space + GlobalDeclarationInstantiation + eval `arguments` early error (2026-06-05)
+
+Three roots fixed this session (engine commits `f9c3abb6`, `2dd2389b`,
+`c229e25f`), all in the eval / cross-chunk linkage family:
+
+1. **Shared code space with global function ids** (`f9c3abb6`).
+   Closures / classes / plain function values escaping `eval` and
+   `new Function` crashed `VM_BYTECODE_INVARIANT invalid operand`:
+   closures store a bare `function_id`, and eval compiled an isolated
+   `BytecodeModule` whose ids meant nothing in the outer context.
+   Every compiled module now links into one interpreter-wide
+   `CodeSpace` (function ids, `Constant::FunctionId`, module inits,
+   and property-IC sites rebased by monotonic bases); the dispatch
+   loop swaps to the chunk owning the top frame each tick, and
+   fid-keyed metadata reads resolve foreign ids transparently. The
+   ~300-line `new Function` native-wrapper hack (which also laundered
+   every thrown error into TypeError) is deleted.
+   `language/expressions` 10254 → 10274, crashes 6 → 2 (remaining two
+   are the pre-existing await-computed-property-name compiler gap).
+
+2. **Script top-level `function` declarations mirror onto
+   `globalThis`** (`2dd2389b`, §16.1.7 step 17). Only `var`
+   initializers mirrored before, so eval chunks couldn't see harness
+   helpers (`assert is not defined` ×120). Strict *eval* bodies keep
+   their own variable environment (§19.2.1.1) via
+   `compile_eval_source` + `suppress_global_mirror` — this also fixes
+   the pre-existing sloppy-strict-eval `var` leak onto `globalThis`.
+   `annexB/language/eval-code` 89 → 153 pass.
+
+3. **`eval("var arguments")` in parameter defaults is an early
+   SyntaxError** (`c229e25f`, §19.2.1.3). Armed only while formal
+   parameter defaults are being lowered in a function that binds
+   `arguments` (every non-arrow; arrows only when a parameter / body
+   declaration introduces the name); a body-position eval stays legal
+   (12.2.1-11). Flag flows compiler → `Op::Eval` Imm32 →
+   `EvalCompileOptions::forbid_var_arguments`.
+   `language/eval-code` 157 → 293 pass (45% → 84.7%).
+
+| suite | before | after |
+|---|---:|---:|
+| `language/eval-code` | 152 / 347 | 293 / 347 |
+| `annexB/language/eval-code` | 89 / 469 | 153 / 469 |
+| `built-ins/Function` | 420 / 509 | 423 / 509 |
+| `language/expressions` | 10254 / 11038 | 10276 / 11038 |
+| `language/expressions/class` | 3914 / 4059 | 3929 / 4059 |
+
+Guards exact (0 regressions): `language/statements` 8690,
+`built-ins/Promise` 676, `built-ins/Object` 3402, `built-ins/String`
+1213, `language/global-code` 20, `language/statements/variable` 6
+fails (= baseline). otter-vm lib 569 pass.
+
+**End-of-session full run** (staging excluded this time — its batch
+ran >3.5 h before being cut; the 2026-06-04 baseline counted only 10
+staging passes): 42729 / 51688 passed, 6164 fail, 6 crash, 2 timeout —
+87.38% excl. skip. Common-section comparison vs the 2026-06-04
+baseline: **+258 passing, 0 net regressions**. The two
+`language/statements/class` subclass-Function fails and the
+eval `non-definable-function-with-function` pair are new known gaps
+(below); Atomics wait/notify deltas are timing flakes, and the
+`module-code/top-level-await` batch needed retries around the known
+pre-existing native heap-corruption flake (verified identical 4/15
+SIGBUS rate on the pre-session commit `87ca6704`).
+
+Remaining in this family:
+
+- `annexB/language/eval-code` 316 fails need direct-eval *caller
+  variable environment* plumbing (B.3.3.3 block function decls and
+  `var` hoisting into the calling function's scope — Otter has no
+  runtime env objects for function locals, so this is its own design).
+- `language/eval-code` 53 fails are mostly parser early-error cases.
+- §16.1.7.10 CreateGlobalFunctionBinding pre-validation: eval bodies
+  must check *every* function name's definability before defining any
+  (`non-definable-function-with-function`, 2 tests) and preserve
+  non-configurable-but-writable existing properties.
+- `class X extends Function` subclassing: the §20.2.1.1
+  CreateDynamicFunction path doesn't honour `new.target` prototypes
+  yet (2 tests, exposed by deleting the old wrapper).
+
 ## Full-Corpus Baseline + TypedArray/prototype crash fix (2026-06-04)
 
 First full-corpus run captured on this branch (engine commit

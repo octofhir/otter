@@ -883,7 +883,9 @@ impl Interpreter {
                 }
             }
         };
-        heap.alloc_with_roots(state, &mut visitor)
+        // Old-space: iterator handles cross native frames in Rust locals;
+        // a young-space scavenge moving the cell would leave them stale.
+        heap.alloc_old_with_roots(state, &mut visitor)
             .map(Value::iterator)
             .map_err(|_| VmError::TypeError {
                 message: "iterator allocation failed".to_string(),

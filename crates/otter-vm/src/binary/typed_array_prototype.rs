@@ -848,7 +848,7 @@ mod tests {
     use crate::{Interpreter, NativeCallInfo};
 
     #[test]
-    fn typed_array_entries_uses_native_rooted_young_allocation() {
+    fn typed_array_entries_uses_old_iterator_state_allocation() {
         let mut interp = Interpreter::new();
         let receiver = {
             let heap = interp.gc_heap_mut();
@@ -857,7 +857,7 @@ mod tests {
                 JsTypedArray::new(heap, buffer, TypedArrayKind::Int8, 0, 2).expect("typed array");
             Value::typed_array(view)
         };
-        let before = interp.gc_heap().stats().new_allocated_bytes;
+        let before = interp.gc_heap().stats().old_allocated_bytes;
 
         let result = {
             let mut ctx =
@@ -865,10 +865,10 @@ mod tests {
             impl_entries(&mut ctx, &[]).expect("entries")
         };
 
-        let after = interp.gc_heap().stats().new_allocated_bytes;
+        let after = interp.gc_heap().stats().old_allocated_bytes;
         assert!(
             after > before,
-            "TypedArray.prototype.entries should allocate pair arrays, snapshot array, and iterator state in young space"
+            "TypedArray.prototype.entries should allocate its iterator state in non-moving old space"
         );
         assert!(result.is_iterator());
     }

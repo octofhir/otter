@@ -1764,7 +1764,7 @@ mod tests {
         let mut interp = Interpreter::new();
         let set = collections::alloc_set(interp.gc_heap_mut()).expect("set");
         collections::set_add(set, interp.gc_heap_mut(), Value::number_i32(1)).expect("seed");
-        let before = interp.gc_heap().stats().new_allocated_bytes;
+        let before = interp.gc_heap().stats().old_allocated_bytes;
 
         let result = {
             let mut ctx =
@@ -1772,10 +1772,10 @@ mod tests {
             set_proto_values(&mut ctx, &[]).expect("set values")
         };
 
-        let after = interp.gc_heap().stats().new_allocated_bytes;
+        let after = interp.gc_heap().stats().old_allocated_bytes;
         assert!(
             after > before,
-            "Set iterator native path should allocate snapshot array and iterator state in young space"
+            "Set iterator native path should allocate its iterator state in non-moving old space"
         );
         assert!(result.is_iterator());
     }
@@ -1791,7 +1791,7 @@ mod tests {
             Value::number_i32(2),
         )
         .expect("seed");
-        let before = interp.gc_heap().stats().new_allocated_bytes;
+        let before = interp.gc_heap().stats().old_allocated_bytes;
 
         let result = {
             let mut ctx =
@@ -1799,10 +1799,10 @@ mod tests {
             make_map_iterator(&mut ctx, map, MapIterKind::Entries).expect("map entries")
         };
 
-        let after = interp.gc_heap().stats().new_allocated_bytes;
+        let after = interp.gc_heap().stats().old_allocated_bytes;
         assert!(
             after > before,
-            "Map iterator native path should allocate snapshot arrays and iterator state in young space"
+            "Map iterator native path should allocate its iterator state in non-moving old space"
         );
         assert!(result.is_iterator());
     }

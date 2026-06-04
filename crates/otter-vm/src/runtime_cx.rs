@@ -788,7 +788,11 @@ impl<'rt> NativeCtx<'rt> {
                 slice_roots,
             );
         };
-        self.heap_mut().alloc_with_roots(state, &mut external_visit)
+        // Old-space: native callers copy the returned handle into Rust
+        // locals across GC-bearing calls, so the cell must never move
+        // under a young-space scavenge.
+        self.heap_mut()
+            .alloc_old_with_roots(state, &mut external_visit)
     }
 
     /// Enter a branded GC session for root/weak operations.

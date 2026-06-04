@@ -894,6 +894,17 @@ impl GcHeap {
             };
             std::ptr::write(header_ptr, header);
             std::ptr::write(payload_ptr, value);
+            // The payload was installed with `ptr::write`, bypassing the
+            // mutator write barrier. Any young children it carries are
+            // old→young edges the next scavenge can only discover through
+            // the card table, so barrier every edge slot now.
+            let marking = &mut self.marking;
+            T::trace_slots(payload_ptr, &mut |slot| {
+                // SAFETY (inherited from the enclosing block): `slot`
+                // points into the just-written payload; `header_ptr` is
+                // the freshly initialised parent header.
+                crate::barrier::write_barrier(header_ptr, slot as *mut u8, *slot, marking);
+            });
         }
         let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
         row.live_bytes = row.live_bytes.wrapping_add(aligned);

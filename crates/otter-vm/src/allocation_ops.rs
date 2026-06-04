@@ -433,8 +433,11 @@ impl Interpreter {
                 }
             }
         };
+        // Old-space: iterator handles are copied into Rust locals across
+        // GC-bearing calls (IteratorStep drains, native `next` bodies), so
+        // the cell must never move under a young-space scavenge.
         self.gc_heap
-            .alloc_with_roots(state, &mut external_visit)
+            .alloc_old_with_roots(state, &mut external_visit)
             .map_err(VmError::from)
     }
 
@@ -637,8 +640,11 @@ impl Interpreter {
                 }
             }
         };
+        // Old-space for the same reason as
+        // `alloc_runtime_rooted_iterator_state`: the handle outlives this
+        // call inside Rust locals that a moving scavenge cannot rewrite.
         self.gc_heap
-            .alloc_with_roots(state, &mut external_visit)
+            .alloc_old_with_roots(state, &mut external_visit)
             .map_err(VmError::from)
     }
 

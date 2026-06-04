@@ -6523,7 +6523,7 @@ mod tests {
     }
 
     #[test]
-    fn get_iterator_map_snapshot_uses_young_allocation_with_frame_roots() {
+    fn get_iterator_map_snapshot_uses_old_iterator_state_allocation_with_frame_roots() {
         let module = module_with(Vec::new(), 5);
         let mut interp = Interpreter::new();
         let map = crate::collections::alloc_map(interp.gc_heap_mut()).unwrap();
@@ -6547,12 +6547,12 @@ mod tests {
         frame.registers[0] = Value::map(map);
         stack.push(frame);
 
-        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let before = interp.gc_heap_mut().stats().old_allocated_bytes;
         interp.run_get_iterator_regs(&mut stack, 0, 1, 0).unwrap();
-        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let after = interp.gc_heap_mut().stats().old_allocated_bytes;
         assert!(
             after > before,
-            "GetIterator over Map should allocate snapshot arrays and iterator state in young space"
+            "GetIterator over Map should allocate its iterator state in non-moving old space"
         );
 
         interp
@@ -6574,7 +6574,7 @@ mod tests {
     }
 
     #[test]
-    fn get_iterator_user_resume_uses_young_allocation_with_frame_roots() {
+    fn get_iterator_user_resume_uses_old_iterator_state_allocation_with_frame_roots() {
         let module = module_with(Vec::new(), 4);
         let mut interp = Interpreter::new();
         let iterator_obj = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
@@ -6589,17 +6589,17 @@ mod tests {
         let context = ExecutionContext::from_module(module);
         let operands = vec![Operand::Register(1), Operand::Register(0)];
 
-        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let before = interp.gc_heap_mut().stats().old_allocated_bytes;
         assert!(
             interp
                 .drive_get_iterator(&mut stack, &context, &operands)
                 .unwrap()
         );
-        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let after = interp.gc_heap_mut().stats().old_allocated_bytes;
 
         assert!(
             after > before,
-            "GetIterator resume should allocate user iterator state in young space"
+            "GetIterator resume should allocate user iterator state in non-moving old space"
         );
         assert!(stack[0].registers[1].is_iterator());
         assert!(
@@ -6658,7 +6658,7 @@ mod tests {
     }
 
     #[test]
-    fn iterator_helper_map_uses_young_allocation_with_frame_roots() {
+    fn iterator_helper_map_uses_old_iterator_state_allocation_with_frame_roots() {
         fn identity_mapper(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
             Ok(args.first().cloned().unwrap_or(Value::undefined()))
         }
@@ -6686,16 +6686,16 @@ mod tests {
             .expect("GetIterator should produce an iterator handle");
         let args: SmallVec<[Value; 8]> = smallvec::smallvec![mapper];
 
-        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let before = interp.gc_heap_mut().stats().old_allocated_bytes;
         assert!(
             interp
                 .iterator_helper_dispatch(&mut stack, &context, &iter, "map", &args, 2)
                 .unwrap()
         );
-        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let after = interp.gc_heap_mut().stats().old_allocated_bytes;
         assert!(
             after > before,
-            "Iterator helper map() should allocate its wrapper state in young space"
+            "Iterator helper map() should allocate its wrapper state in non-moving old space"
         );
         assert!(stack[0].registers[2].is_iterator());
     }
@@ -6741,16 +6741,16 @@ mod tests {
         let flat_iter = stack[0].registers[2]
             .as_iterator()
             .expect("flatMap should return an iterator");
-        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let before = interp.gc_heap_mut().stats().old_allocated_bytes;
 
         let (value, done) = interp
             .iterator_next_full(&context, &flat_iter)
             .expect("flatMap next");
 
-        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let after = interp.gc_heap_mut().stats().old_allocated_bytes;
         assert!(
             after > before,
-            "flatMap should allocate adopted inner array iterator state through runtime roots"
+            "flatMap should allocate adopted inner array iterator state in non-moving old space"
         );
         assert_eq!(value, Value::number(NumberValue::from_i32(99)));
         assert!(!done);
@@ -8476,17 +8476,17 @@ mod tests {
             panic!("Array iterator factory should be native");
         };
         let call = native.call_target(interp.gc_heap());
-        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let before = interp.gc_heap_mut().stats().old_allocated_bytes;
         let call_info = NativeCallInfo::call(Value::undefined());
         let mut ctx =
             NativeCtx::new_with_call_info_and_context(&mut interp, call_info, Some(context));
 
         let result = call.invoke(&mut ctx, &[]).expect("invoke iterator factory");
 
-        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let after = interp.gc_heap_mut().stats().old_allocated_bytes;
         assert!(
             after > before,
-            "Array[Symbol.iterator] factory should allocate iterator state through native roots"
+            "Array[Symbol.iterator] factory should allocate iterator state in non-moving old space"
         );
         let Some(iter) = (result).as_iterator() else {
             panic!("factory should return an iterator");

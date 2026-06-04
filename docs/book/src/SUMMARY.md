@@ -36,6 +36,10 @@
 
 - [Contribution Workflow](web/contributing.md)
 
+# Conformance
+
+- [ECMAScript Conformance](conformance/overview.md)
+
 # Performance
 
 - [Startup](performance/startup.md)

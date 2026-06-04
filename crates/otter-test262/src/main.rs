@@ -456,11 +456,22 @@ fn relative_to(base: &Path, p: &Path) -> String {
 }
 
 fn git_head(repo: &Path) -> Option<String> {
-    let head_path = repo.join(".git").join("HEAD");
-    let head = std::fs::read_to_string(&head_path).ok()?;
+    // Submodules store `.git` as a `gitdir: <path>` pointer file
+    // rather than a directory — follow it so the dashboard records
+    // the pinned vendor/test262 commit instead of "unknown".
+    let dot_git = repo.join(".git");
+    let git_dir = if dot_git.is_file() {
+        let pointer = std::fs::read_to_string(&dot_git).ok()?;
+        let rel = pointer.trim().strip_prefix("gitdir: ")?.to_string();
+        let resolved = repo.join(rel);
+        resolved.canonicalize().unwrap_or(resolved)
+    } else {
+        dot_git
+    };
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
     let head = head.trim();
     if let Some(rest) = head.strip_prefix("ref: ") {
-        let ref_path = repo.join(".git").join(rest);
+        let ref_path = git_dir.join(rest);
         return std::fs::read_to_string(&ref_path)
             .ok()
             .map(|s| s.trim().to_string());

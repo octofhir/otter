@@ -50,7 +50,12 @@ impl ExtraRoots {
         }
     }
 
-    pub(crate) fn visit(self, visitor: &mut dyn FnMut(*mut RawGc)) {
+    /// Visit the source's roots. Public so a composite
+    /// [`ExtraRootSource`] (e.g. a native-call scope that adds its own
+    /// argument roots on top of the interpreter's runtime roots) can
+    /// re-dispatch into an inner registration without the VM crate
+    /// needing raw-pointer dereference of its own.
+    pub fn visit(self, visitor: &mut dyn FnMut(*mut RawGc)) {
         // SAFETY: callers install `ExtraRoots` only for scopes where `data`
         // still points at the original `ExtraRootSource`.
         unsafe { (self.thunk)(self.data, visitor) };

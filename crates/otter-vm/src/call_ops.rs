@@ -34,16 +34,21 @@ use crate::{
 };
 
 struct SyncNativeCallRoots<'a> {
-    runtime_roots: Vec<*mut RawGc>,
+    /// Inner registration over the interpreter, re-dispatched so its
+    /// runtime roots are re-enumerated **live** at every trace. A
+    /// snapshot `Vec<*mut RawGc>` taken at call entry would miss
+    /// anything the native registers afterwards (fresh anchors, IC
+    /// entries, shape transitions), and a moving scavenge inside the
+    /// native would then sweep or relocate objects those late slots
+    /// still reference.
+    interp_roots: otter_gc::ExtraRoots,
     value_roots: SmallVec<[&'a Value; 4]>,
     slice_roots: SmallVec<[&'a [Value]; 2]>,
 }
 
 impl otter_gc::ExtraRootSource for SyncNativeCallRoots<'_> {
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
-        for &slot in &self.runtime_roots {
-            visitor(slot);
-        }
+        self.interp_roots.visit(visitor);
         for value in &self.value_roots {
             value.trace_value_slots(visitor);
         }
@@ -65,7 +70,7 @@ fn invoke_native_call_with_roots(
 ) -> Result<Value, VmError> {
     let this_root = this_value;
     let mut roots = SyncNativeCallRoots {
-        runtime_roots: interp.collect_runtime_roots(),
+        interp_roots: otter_gc::ExtraRoots::new::<Interpreter>(interp),
         value_roots: smallvec::smallvec![&this_root],
         slice_roots: smallvec::smallvec![args],
     };

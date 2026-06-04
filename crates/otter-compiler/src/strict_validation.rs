@@ -30,14 +30,14 @@ use std::collections::BTreeMap;
 use otter_syntax::SyntaxDiagnostic;
 use oxc_ast::ast::{
     ArrowFunctionExpression, AssignmentExpression, AssignmentTarget,
-    AssignmentTargetPropertyIdentifier, AwaitExpression, BindingIdentifier, BindingPattern, Class,
-    ClassElement, DoWhileStatement, Expression, ForInStatement, ForOfStatement, ForStatement,
-    ForStatementLeft, FormalParameters, Function, IdentifierReference, IfStatement,
-    LabeledStatement, MetaProperty, MethodDefinition, MethodDefinitionKind, NumericLiteral,
-    ObjectProperty, Program, PropertyDefinition, PropertyKey, PropertyKind, SimpleAssignmentTarget,
-    Statement, StaticBlock, StringLiteral, Super, SwitchStatement, UnaryExpression, UnaryOperator,
-    UpdateExpression, UpdateOperator, VariableDeclaration, VariableDeclarationKind, WhileStatement,
-    YieldExpression,
+    AssignmentTargetPropertyIdentifier, AwaitExpression, BindingIdentifier, BindingPattern,
+    BlockStatement, Class, ClassElement, DoWhileStatement, Expression, ForInStatement,
+    ForOfStatement, ForStatement, ForStatementLeft, FormalParameters, Function,
+    IdentifierReference, IfStatement, LabeledStatement, MetaProperty, MethodDefinition,
+    MethodDefinitionKind, NumericLiteral, ObjectProperty, Program, PropertyDefinition, PropertyKey,
+    PropertyKind, SimpleAssignmentTarget, Statement, StaticBlock, StringLiteral, Super,
+    SwitchStatement, UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator,
+    VariableDeclaration, VariableDeclarationKind, WhileStatement, YieldExpression,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_span::Span;
@@ -1781,6 +1781,194 @@ fn is_legacy_numeric_form(raw: &str) -> bool {
         return false;
     }
     bytes[1].is_ascii_digit()
+}
+
+/// Validate block-level lexical early errors (§14.2.1, §14.12.1).
+///
+/// For every `Block` and switch `CaseBlock`, the
+/// `LexicallyDeclaredNames` of its statement list (`let` / `const` /
+/// `using` / `class` plus block-level function, generator, and async
+/// function declarations) must be duplicate-free and disjoint from the
+/// statement list's `VarDeclaredNames`. Annex B §B.3.3.1 relaxes
+/// exactly one case: two plain (non-async, non-generator) function
+/// declarations may share a name in sloppy mode.
+pub fn validate_block_early_errors(
+    program: &Program<'_>,
+    force_strict: bool,
+) -> Result<(), CompileError> {
+    let source_strict = force_strict || program.has_use_strict_directive();
+    let mut visitor = BlockLexicalValidator {
+        strict_stack: vec![source_strict],
+        diagnostics: Vec::new(),
+    };
+    visitor.visit_program(program);
+    if visitor.diagnostics.is_empty() {
+        return Ok(());
+    }
+    let messages = visitor
+        .diagnostics
+        .iter()
+        .map(|d| d.message.clone())
+        .collect();
+    Err(CompileError::Syntax {
+        messages,
+        diagnostics: visitor.diagnostics,
+    })
+}
+
+struct BlockLexicalValidator {
+    strict_stack: Vec<bool>,
+    diagnostics: Vec<SyntaxDiagnostic>,
+}
+
+impl BlockLexicalValidator {
+    fn strict(&self) -> bool {
+        *self
+            .strict_stack
+            .last()
+            .expect("strict stack starts non-empty")
+    }
+
+    /// §14.2.1 checks over one statement list (a block body or the
+    /// union of a switch statement's case consequents).
+    fn check_statement_list<'a, 'b>(
+        &mut self,
+        stmts: impl Iterator<Item = &'b Statement<'a>> + Clone,
+    ) where
+        'a: 'b,
+    {
+        let strict = self.strict();
+        // name → is the first declaration a plain function declaration?
+        let mut lex_seen: BTreeMap<&str, bool> = BTreeMap::new();
+        for stmt in stmts.clone() {
+            collect_block_lex_decl_names(stmt, &mut |name, span, plain_fn| {
+                match lex_seen.entry(name) {
+                    std::collections::btree_map::Entry::Occupied(first) => {
+                        // Annex B §B.3.3.1 — duplicate *plain* function
+                        // declarations are tolerated in sloppy mode.
+                        if strict || !(*first.get() && plain_fn) {
+                            self.diagnostics.push(SyntaxDiagnostic {
+                                code: "BLOCK_DUPLICATE_LEXICAL_DECL".to_string(),
+                                message: format!(
+                                    "SyntaxError: duplicate lexical declaration `{name}` in \
+                                     block (§14.2.1)"
+                                ),
+                                range: Some((span.start, span.end)),
+                                help: Some(
+                                    "block-scoped declarations, including function \
+                                     declarations, must have unique names"
+                                        .to_string(),
+                                ),
+                            });
+                        }
+                    }
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert(plain_fn);
+                    }
+                }
+            });
+        }
+        if lex_seen.is_empty() {
+            return;
+        }
+        for stmt in stmts {
+            collect_var_decl_names_in_stmt(stmt, &mut |name, span| {
+                if lex_seen.contains_key(name) {
+                    self.diagnostics.push(SyntaxDiagnostic {
+                        code: "BLOCK_LEXICAL_VAR_CONFLICT".to_string(),
+                        message: format!(
+                            "SyntaxError: lexical declaration `{name}` conflicts with a \
+                             `var` declaration in the same block (§14.2.1)"
+                        ),
+                        range: Some((span.start, span.end)),
+                        help: Some(
+                            "rename either the lexical declaration or the `var` declaration"
+                                .to_string(),
+                        ),
+                    });
+                }
+            });
+        }
+    }
+}
+
+/// `LexicallyDeclaredNames` contribution of one block-level statement
+/// (§14.2.6): `let` / `const` / `using` declarators, `class` names,
+/// and hoistable declaration names. The closure also receives whether
+/// the declaration is a *plain* function declaration (the only shape
+/// Annex B §B.3.3.1 exempts from the duplicate rule).
+fn collect_block_lex_decl_names<'a, F>(stmt: &'a Statement<'a>, emit: &mut F)
+where
+    F: FnMut(&'a str, Span, bool),
+{
+    match stmt {
+        Statement::VariableDeclaration(decl)
+            if matches!(
+                decl.kind,
+                VariableDeclarationKind::Let
+                    | VariableDeclarationKind::Const
+                    | VariableDeclarationKind::Using
+                    | VariableDeclarationKind::AwaitUsing
+            ) =>
+        {
+            for declarator in &decl.declarations {
+                for_each_bound_identifier(&declarator.id, &mut |name, span| {
+                    emit(name, span, false);
+                });
+            }
+        }
+        Statement::FunctionDeclaration(func) => {
+            if let Some(id) = &func.id {
+                emit(id.name.as_str(), id.span, !func.r#async && !func.generator);
+            }
+        }
+        Statement::ClassDeclaration(cls) => {
+            if let Some(id) = &cls.id {
+                emit(id.name.as_str(), id.span, false);
+            }
+        }
+        _ => {}
+    }
+}
+
+impl<'a> Visit<'a> for BlockLexicalValidator {
+    fn visit_block_statement(&mut self, it: &BlockStatement<'a>) {
+        self.check_statement_list(it.body.iter());
+        walk::walk_block_statement(self, it);
+    }
+
+    fn visit_switch_statement(&mut self, it: &SwitchStatement<'a>) {
+        // §14.12.1 — the CaseBlock's LexicallyDeclaredNames are the
+        // union across every case consequent.
+        self.check_statement_list(it.cases.iter().flat_map(|case| case.consequent.iter()));
+        walk::walk_switch_statement(self, it);
+    }
+
+    fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
+        let body_strict = it
+            .body
+            .as_ref()
+            .is_some_and(|b| b.has_use_strict_directive());
+        let inner_strict = self.strict() || body_strict;
+        self.strict_stack.push(inner_strict);
+        walk::walk_function(self, it, flags);
+        self.strict_stack.pop();
+    }
+
+    fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+        let body_strict = !it.expression && it.body.has_use_strict_directive();
+        let inner_strict = self.strict() || body_strict;
+        self.strict_stack.push(inner_strict);
+        walk::walk_arrow_function_expression(self, it);
+        self.strict_stack.pop();
+    }
+
+    fn visit_class(&mut self, it: &Class<'a>) {
+        // §10.2.10 — class bodies are always strict mode code.
+        self.strict_stack.push(true);
+        walk::walk_class(self, it);
+        self.strict_stack.pop();
+    }
 }
 
 #[cfg(test)]

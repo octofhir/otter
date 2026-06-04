@@ -100,6 +100,10 @@ pub(crate) fn compile_program(
     // does not flag on its own (legacy octal / non-octal-decimal
     // integer literals, etc.).
     strict_validation::validate_strict_mode_early_errors(program, force_strict)?;
+    // §14.2.1 / §14.12.1 block-level lexical early errors (duplicate
+    // LexicallyDeclaredNames, lexical/var clashes) with the Annex B
+    // §B.3.3.1 sloppy-mode plain-function exemption.
+    strict_validation::validate_block_early_errors(program, force_strict)?;
     let main_is_async = module_body_uses_top_level_await(&program.body);
     let main_is_strict = force_strict || program.has_use_strict_directive();
     // Reserve slot 0 for `<main>` so nested function compilation
@@ -276,6 +280,9 @@ pub fn compile_module_program(
     // §12.9.3.1 + §15.7 strict-mode early errors. Module bodies are
     // always strict mode code (§10.2.10).
     strict_validation::validate_strict_mode_early_errors(program, true)?;
+    // §14.2.1 / §14.12.1 block-level lexical early errors; module
+    // code is always strict so no Annex B exemption applies.
+    strict_validation::validate_block_early_errors(program, true)?;
     strict_validation::validate_module_early_errors(program)?;
     // §16.2.1 Static Semantics: Early Errors — `ImportDeclaration`
     // and `ExportDeclaration` are `ModuleItem` productions, not

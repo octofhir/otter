@@ -593,6 +593,16 @@ impl GcHeap {
         std::mem::replace(&mut self.extra_roots, roots)
     }
 
+    /// Read the currently installed extra-roots registration without
+    /// replacing it. Composite sources use this to chain the outer
+    /// registration so nested native calls keep the outer call's
+    /// argument roots alive (the heap stores a single registration,
+    /// not a stack).
+    #[must_use]
+    pub fn current_extra_roots(&self) -> Option<ExtraRoots> {
+        self.extra_roots
+    }
+
     /// Reference to the marking state (Phase 2 / task 86 will
     /// drive it).
     pub fn marking(&self) -> &MarkingState {

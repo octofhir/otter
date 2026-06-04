@@ -42,12 +42,20 @@ struct SyncNativeCallRoots<'a> {
     /// native would then sweep or relocate objects those late slots
     /// still reference.
     interp_roots: otter_gc::ExtraRoots,
+    /// Outer registration chained through, because the heap holds a
+    /// single extra-roots slot: without this, a nested native call
+    /// would hide the outer call's `this`/argument roots from any
+    /// scavenge triggered inside it.
+    previous: Option<otter_gc::ExtraRoots>,
     value_roots: SmallVec<[&'a Value; 4]>,
     slice_roots: SmallVec<[&'a [Value]; 2]>,
 }
 
 impl otter_gc::ExtraRootSource for SyncNativeCallRoots<'_> {
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        if let Some(previous) = self.previous {
+            previous.visit(visitor);
+        }
         self.interp_roots.visit(visitor);
         for value in &self.value_roots {
             value.trace_value_slots(visitor);
@@ -71,6 +79,7 @@ fn invoke_native_call_with_roots(
     let this_root = this_value;
     let mut roots = SyncNativeCallRoots {
         interp_roots: otter_gc::ExtraRoots::new::<Interpreter>(interp),
+        previous: interp.gc_heap.current_extra_roots(),
         value_roots: smallvec::smallvec![&this_root],
         slice_roots: smallvec::smallvec![args],
     };

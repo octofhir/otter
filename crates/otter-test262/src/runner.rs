@@ -82,7 +82,10 @@ pub fn ensure_corpus_present(repo_root: &Path) -> Result<CorpusPaths, CorpusErro
 /// `_FIXTURE.js` files are excluded per
 /// [INTERPRETING.md](https://github.com/tc39/test262/blob/main/INTERPRETING.md#test-files).
 /// `filter` (when supplied) is a substring match on the path
-/// relative to `paths.test_dir`.
+/// relative to `paths.test_dir`; a leading `^` anchors it to the
+/// start of the path so batch runners can keep directory shards
+/// disjoint (`built-ins/RegExp/` would otherwise also match
+/// `annexB/built-ins/RegExp/...`).
 pub fn list_tests(paths: &CorpusPaths, filter: Option<&str>) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     let walker = WalkBuilder::new(&paths.test_dir)
@@ -112,7 +115,11 @@ pub fn list_tests(paths: &CorpusPaths, filter: Option<&str>) -> Vec<PathBuf> {
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            if !rel.contains(filter) {
+            let matched = match filter.strip_prefix('^') {
+                Some(prefix) => rel.starts_with(prefix),
+                None => rel.contains(filter),
+            };
+            if !matched {
                 continue;
             }
         }

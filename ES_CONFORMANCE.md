@@ -3,6 +3,57 @@
 This file tracks measured Test262 results for the active
 `crates/otter-test262` runner.
 
+## Full-Corpus Baseline + TypedArray/prototype crash fix (2026-06-04)
+
+First full-corpus run captured on this branch (engine commit
+`eee272de`, per-batch heap cap 512 MB, 10 s timeout):
+
+```sh
+bash scripts/test262-full-run.sh
+# merged report: test262_results/latest.json
+# HTML dashboard: test262_results/site/index.html
+```
+
+| total | passed | failed | skipped | timeout | OOM | crash | pass rate (excl. skip) |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 50360 | 41288 | 6422 | 2642 | 2 | 0 | 6 | 86.53% |
+
+Known gaps in that baseline: `built-ins/TypedArray/prototype/**`
+(runner process SIGSEGV — whole subtree uncounted) and `staging/sm`
+(host OOM kill).
+
+**TypedArray/prototype SIGSEGV root cause**: `IteratorState` cells
+were allocated in the young (copying) space. Iterator handles are
+copied into Rust locals across GC-bearing calls (`Array.from` drains,
+IteratorStep, native `next` bodies); a young-space scavenge moved the
+cell (`FLAG_FORWARDED`), the local handle went stale, and the next
+`read_payload` matched on a garbage enum discriminant — a wild jump.
+Fix: all four `IteratorState` allocation funnels now use non-moving
+old-space allocation (`alloc_old_with_roots`), and
+`alloc_old_with_roots_inner` barriers every edge slot of the freshly
+written payload so old→young edges land in the card table (the
+`ptr::write` install bypassed the mutator write barrier).
+
+After the fix:
+
+| suite | before | after |
+|---|---|---|
+| `built-ins/TypedArray/prototype` | crash (0 counted of 1404) | 1064 pass / 133 fail / 207 skip, 0 crash |
+
+Guards re-measured against the same-day baseline — exact match, 0
+regressions: `built-ins/String` 1213, `built-ins/Promise` 676 (100%),
+`built-ins/Map` 170 (100%), `language/statements/for-of` 714.
+
+Runner changes captured alongside: `--filter` now supports a leading
+`^` anchor (prefix match) so directory shards stay disjoint
+(`built-ins/RegExp/` no longer also matches
+`annexB/built-ins/RegExp/...`), `scripts/test262-full-run.sh` was
+rewritten against the current CLI (anchored per-directory batches,
+crash-split one level deep, merge via the `merge` subcommand), and a
+new `site` subcommand renders the merged JSON into a self-contained
+static HTML dashboard (per-group pass bars + failing tests with
+reasons) for publishing.
+
 ## Runner Status
 
 Captured on 2026-05-07 against engine commit

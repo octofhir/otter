@@ -17,6 +17,7 @@
 //! - [`config`]          — `test262_config.toml` loader (the
 //!   format the project has been on since the legacy runner).
 //! - [`report`]          — JSON + Markdown writers (slice 104).
+//! - [`site`]            — static HTML conformance dashboard.
 //! - [`diff`]            — baseline diff (slice 104).
 //! - [`shard`]           — `--shard N/M` traversal (slice 104).
 //! - [`isolation`]       — fresh-runtime factory (slice 103).
@@ -37,5 +38,6 @@ pub mod metadata;
 pub mod report;
 pub mod runner;
 pub mod shard;
+pub mod site;
 
 pub use runner::{CorpusError, CorpusPaths, count_tests, ensure_corpus_present, list_tests};

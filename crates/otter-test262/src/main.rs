@@ -78,6 +78,8 @@ enum Command {
     Diff(DiffArgs),
     /// Merge per-shard JSON outputs into one baseline.
     Merge(MergeArgs),
+    /// Render a baseline JSON into a static HTML dashboard.
+    Site(SiteArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -155,6 +157,15 @@ struct MergeArgs {
     output: PathBuf,
 }
 
+#[derive(Parser, Debug)]
+struct SiteArgs {
+    /// Path to a baseline / merged report (`*.json`).
+    input: PathBuf,
+    /// Where to write the self-contained HTML page.
+    #[arg(long, default_value = "test262_results/site/index.html")]
+    output: PathBuf,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match dispatch(cli) {
@@ -176,6 +187,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::Parse(args) => parse(args),
         Command::Diff(args) => diff_cmd(&repo_root, args),
         Command::Merge(args) => merge_cmd(args),
+        Command::Site(args) => site_cmd(args),
     }
 }
 
@@ -518,6 +530,20 @@ fn merge_cmd(args: MergeArgs) -> Result<ExitCode> {
         json.display(),
         md.display()
     );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn site_cmd(args: SiteArgs) -> Result<ExitCode> {
+    let baseline = Baseline::from_path(&args.input)
+        .with_context(|| format!("failed to read baseline {}", args.input.display()))?;
+    let html = otter_test262::site::render_html(&baseline);
+    if let Some(parent) = args.output.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    std::fs::write(&args.output, html)
+        .with_context(|| format!("failed to write {}", args.output.display()))?;
+    eprintln!("site written: {}", args.output.display());
     Ok(ExitCode::SUCCESS)
 }
 

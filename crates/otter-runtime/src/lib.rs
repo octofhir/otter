@@ -1482,6 +1482,10 @@ impl Runtime {
         if let Some(factory) = &config.tracer_factory {
             interp.set_tracer(Some(factory.build()));
         }
+        let layer_a_dynamic_imports = LayerADynamicImportQueue::default();
+        interp.set_dynamic_import_loader(std::sync::Arc::new(LayerADynamicImportLoader {
+            queue: layer_a_dynamic_imports.clone(),
+        }));
         let mut runtime = Runtime {
             interp,
             config,
@@ -1491,6 +1495,7 @@ impl Runtime {
             source_maps: RuntimeSourceMapTable::default(),
             diagnostics: RuntimeDiagnosticsSink::default(),
             package_manager,
+            layer_a_dynamic_imports,
             promise_registry: promise_registry::PromiseRegistry::new(),
         };
         worker::install_main_worker_globals(&mut runtime)?;
@@ -1513,6 +1518,13 @@ pub struct Runtime {
     source_maps: RuntimeSourceMapTable,
     diagnostics: RuntimeDiagnosticsSink,
     package_manager: RuntimePackageManagerHandle,
+    /// Direct-mode (Layer A) dynamic-import requests. The default
+    /// loader installed at construction queues `import()` calls whose
+    /// target the linked graph cannot resolve; `run_script` /
+    /// `run_module` pump the queue through [`Self::begin_dynamic_import`]
+    /// between microtask drains. The isolate runner replaces the
+    /// loader at spawn, so this queue stays empty under Layer B.
+    layer_a_dynamic_imports: LayerADynamicImportQueue,
     /// Per-isolate map from runtime-issued `PromiseId` to the
     /// pending [`otter_vm::JsPromiseHandle`] a host async op is
     /// expected to settle. Embedders register a fresh promise
@@ -1545,6 +1557,27 @@ pub(crate) enum TimerFireOutcome {
 pub(crate) enum DynamicImportBegin {
     Settled,
     FetchHttps { target_url: String },
+}
+
+/// Shared FIFO of `(token, specifier, referrer)` dynamic-import
+/// requests awaiting the Layer A pump.
+type LayerADynamicImportQueue =
+    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(u64, String, String)>>>;
+
+/// Default [`otter_vm::DynamicImportLoader`] for direct-mode runtimes:
+/// queues the request for [`Runtime::pump_layer_a_dynamic_imports`].
+/// Replaced by the isolate runner's inbox-backed loader under Layer B.
+struct LayerADynamicImportLoader {
+    queue: LayerADynamicImportQueue,
+}
+
+impl otter_vm::DynamicImportLoader for LayerADynamicImportLoader {
+    fn schedule(&self, token: u64, specifier: String, referrer: String) {
+        self.queue
+            .lock()
+            .expect("layer-a dynamic import queue poisoned")
+            .push_back((token, specifier, referrer));
+    }
 }
 
 enum DynamicModuleLoad {
@@ -2499,10 +2532,58 @@ impl Runtime {
             }
             (Ok(v), Ok(())) => v,
         };
+        self.pump_layer_a_dynamic_imports(&context)?;
         let result =
             ExecutionResult::from_vm_value(value, start.elapsed(), self.interp.gc_heap_mut())
                 .with_exit_code(process::exit_code(&self.interp));
         Ok((result, context))
+    }
+
+    /// Drive direct-mode dynamic imports to completion: pop every
+    /// queued `import()` request, load + evaluate it through
+    /// [`Self::begin_dynamic_import`], then drain microtasks — whose
+    /// reactions may queue further imports — until the queue is dry.
+    /// HTTPS targets need the isolate runner's fetcher and reject
+    /// with a `TypeError` here.
+    fn pump_layer_a_dynamic_imports(
+        &mut self,
+        context: &ExecutionContext,
+    ) -> Result<(), OtterError> {
+        loop {
+            let batch: Vec<(u64, String, String)> = {
+                let mut queue = self
+                    .layer_a_dynamic_imports
+                    .lock()
+                    .expect("layer-a dynamic import queue poisoned");
+                queue.drain(..).collect()
+            };
+            if batch.is_empty() {
+                return Ok(());
+            }
+            for (token, specifier, referrer) in batch {
+                match self.begin_dynamic_import(token, &specifier, &referrer)? {
+                    DynamicImportBegin::Settled => {}
+                    DynamicImportBegin::FetchHttps { target_url } => {
+                        let reason = self.alloc_dynamic_import_error(
+                            otter_vm::ErrorKind::TypeError,
+                            format!(
+                                "dynamic import: remote module \"{target_url}\" requires the isolate runner"
+                            ),
+                        )?;
+                        self.settle_dynamic_import_result(token, Err(reason))?;
+                    }
+                }
+            }
+            if let Err(err) = self
+                .interp
+                .drain_microtasks_with_default(Some(context.clone()))
+            {
+                return Err(enrich_runtime_diagnostic_with_cause(
+                    &mut self.interp,
+                    map_vm_error(err),
+                ));
+            }
+        }
     }
 
     /// Drain the microtask queue manually. Embedders that want to
@@ -2728,6 +2809,7 @@ impl Runtime {
             }
             (Ok(v), Ok(())) => v,
         };
+        self.pump_layer_a_dynamic_imports(&context)?;
         self.module_records.mark_evaluated();
         let result =
             ExecutionResult::from_vm_value(value, start.elapsed(), self.interp.gc_heap_mut())

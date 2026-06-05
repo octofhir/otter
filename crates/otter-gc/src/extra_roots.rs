@@ -8,14 +8,17 @@
 //! # Invariants
 //!
 //! - The source passed to [`ExtraRoots::new`] must outlive its heap registration.
-//!   Callers enforce this by installing/restoring the registration around the VM
+//!   Callers enforce this by pushing/popping the registration around the VM
 //!   turn or explicit GC scope.
+//! - The heap keeps registrations on a LIFO stack and traces **every** live
+//!   entry, so a nested registration never hides an outer scope's roots from
+//!   a collection triggered inside the inner scope.
 //! - The VM crate implements only the safe trait; the raw pointer dereference is
 //!   kept inside this crate's audited unsafe boundary.
 //!
 //! # See also
 //!
-//! - [`crate::heap::GcHeap::install_extra_roots`]
+//! - [`crate::heap::GcHeap::push_extra_roots`]
 
 use crate::compressed::RawGc;
 
@@ -59,5 +62,15 @@ impl ExtraRoots {
         // SAFETY: callers install `ExtraRoots` only for scopes where `data`
         // still points at the original `ExtraRootSource`.
         unsafe { (self.thunk)(self.data, visitor) };
+    }
+
+    /// `true` when both registrations dispatch to the same source
+    /// object through the same thunk. Used by the heap's root walk to
+    /// skip duplicate stack entries (re-entrant scopes registering the
+    /// same interpreter) — a missed match only costs an idempotent
+    /// re-visit, never a missed root.
+    #[must_use]
+    pub fn same_source(&self, other: &Self) -> bool {
+        std::ptr::eq(self.data, other.data) && std::ptr::fn_addr_eq(self.thunk, other.thunk)
     }
 }

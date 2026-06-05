@@ -126,7 +126,16 @@ pub struct GcHeap {
     marking: MarkingState,
     handle_stack: Box<HandleStack>,
     global_handles: Box<GlobalHandleTable>,
-    extra_roots: Option<ExtraRoots>,
+    /// LIFO stack of runtime-owned root sources. A stack — not a
+    /// single slot — because VM scopes nest (native call → re-entrant
+    /// dispatch → nested native): replacing a single registration
+    /// would hide the outer scope's roots from any collection
+    /// triggered inside the inner scope, leaving moved objects
+    /// unreachable through the outer scope's Rust-local handles.
+    /// Every live entry is traced; duplicates (the same interpreter
+    /// re-registered by a nested scope) are skipped via
+    /// [`ExtraRoots::same_source`].
+    extra_roots: Vec<ExtraRoots>,
     frame_root_providers: FrameRootProviders,
     ephemerons: EphemeronRegistry,
     weak_finalization: WeakFinalizationRegistry,
@@ -178,7 +187,7 @@ impl GcHeap {
             marking: MarkingState::new(),
             handle_stack: Box::new(HandleStack::new()),
             global_handles: Box::new(GlobalHandleTable::new()),
-            extra_roots: None,
+            extra_roots: Vec::new(),
             frame_root_providers: FrameRootProviders::new(),
             ephemerons: EphemeronRegistry::default(),
             weak_finalization: WeakFinalizationRegistry::default(),
@@ -586,21 +595,23 @@ impl GcHeap {
         &self.global_handles
     }
 
-    /// Install or clear the heap's extra runtime root source, returning the
-    /// previous registration so callers can restore nested scopes.
+    /// Push an extra runtime root source onto the heap's LIFO
+    /// registration stack.
+    ///
+    /// Returns the new stack depth; callers pass `depth - 1` to
+    /// [`Self::pop_extra_roots_to`] when the source goes out of scope.
+    /// Every live entry is traced during collection, so a nested
+    /// registration never hides an outer scope's roots.
     #[must_use]
-    pub fn install_extra_roots(&mut self, roots: Option<ExtraRoots>) -> Option<ExtraRoots> {
-        std::mem::replace(&mut self.extra_roots, roots)
+    pub fn push_extra_roots(&mut self, roots: ExtraRoots) -> usize {
+        self.extra_roots.push(roots);
+        self.extra_roots.len()
     }
 
-    /// Read the currently installed extra-roots registration without
-    /// replacing it. Composite sources use this to chain the outer
-    /// registration so nested native calls keep the outer call's
-    /// argument roots alive (the heap stores a single registration,
-    /// not a stack).
-    #[must_use]
-    pub fn current_extra_roots(&self) -> Option<ExtraRoots> {
-        self.extra_roots
+    /// Truncate the extra-roots stack back down to `depth`.
+    pub fn pop_extra_roots_to(&mut self, depth: usize) {
+        debug_assert!(depth <= self.extra_roots.len());
+        self.extra_roots.truncate(depth);
     }
 
     /// Reference to the marking state (Phase 2 / task 86 will
@@ -993,7 +1004,7 @@ impl GcHeap {
         // own handle-stack and global-handles walk.
         let handle_stack: *const HandleStack = &*self.handle_stack;
         let global_handles: *const GlobalHandleTable = &*self.global_handles;
-        let extra_roots = self.extra_roots;
+        let extra_roots: *const Vec<ExtraRoots> = &self.extra_roots;
         let frame_root_providers: *const FrameRootProviders = &self.frame_root_providers;
         let mut combined = move |visitor: &mut dyn FnMut(*mut RawGc)| {
             // SAFETY: STW pause; raw pointers reconstituted to
@@ -1003,9 +1014,9 @@ impl GcHeap {
                 (*global_handles).visit_slots(visitor);
             }
             external_visit(visitor);
-            if let Some(extra) = extra_roots {
-                extra.visit(visitor);
-            }
+            // SAFETY: STW pause; the heap owns the registration stack for the
+            // duration of this root walk.
+            visit_extra_roots_deduped(unsafe { &*extra_roots }, visitor);
             // SAFETY: STW pause; the heap owns the registry for the duration of
             // this root walk.
             unsafe { (*frame_root_providers).trace(visitor) };
@@ -1186,9 +1197,7 @@ impl GcHeap {
             (*global_handles).visit_slots(&mut shade);
         }
         external_visit(&mut shade);
-        if let Some(extra) = self.extra_roots {
-            extra.visit(&mut shade);
-        }
+        visit_extra_roots_deduped(&self.extra_roots, &mut shade);
         self.frame_root_providers.trace(&mut shade);
     }
 
@@ -1528,9 +1537,18 @@ impl GcHeap {
     }
 }
 
-fn parent_payload_slot<T: ?Sized>(parent: Gc<T>) -> *mut RawGc {
-    let body_base = parent.as_header_ptr() as *mut u8;
-    body_base.wrapping_add(std::mem::size_of::<GcHeader>()) as *mut RawGc
+/// Visit every registered extra-roots entry, skipping later entries
+/// that dispatch to the same source as an earlier one. Re-entrant VM
+/// scopes re-register the same interpreter; tracing it once per pause
+/// keeps the root walk linear in distinct sources. Visiting is
+/// idempotent, so a false-negative match only costs a redundant walk.
+fn visit_extra_roots_deduped(entries: &[ExtraRoots], visitor: &mut dyn FnMut(*mut RawGc)) {
+    for (i, entry) in entries.iter().enumerate() {
+        if entries[..i].iter().any(|prev| prev.same_source(entry)) {
+            continue;
+        }
+        entry.visit(visitor);
+    }
 }
 
 impl std::fmt::Debug for GcHeap {

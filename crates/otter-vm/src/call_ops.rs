@@ -42,20 +42,12 @@ struct SyncNativeCallRoots<'a> {
     /// native would then sweep or relocate objects those late slots
     /// still reference.
     interp_roots: otter_gc::ExtraRoots,
-    /// Outer registration chained through, because the heap holds a
-    /// single extra-roots slot: without this, a nested native call
-    /// would hide the outer call's `this`/argument roots from any
-    /// scavenge triggered inside it.
-    previous: Option<otter_gc::ExtraRoots>,
     value_roots: SmallVec<[&'a Value; 4]>,
     slice_roots: SmallVec<[&'a [Value]; 2]>,
 }
 
 impl otter_gc::ExtraRootSource for SyncNativeCallRoots<'_> {
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
-        if let Some(previous) = self.previous {
-            previous.visit(visitor);
-        }
         self.interp_roots.visit(visitor);
         for value in &self.value_roots {
             value.trace_value_slots(visitor);
@@ -79,19 +71,20 @@ fn invoke_native_call_with_roots(
     let this_root = this_value;
     let mut roots = SyncNativeCallRoots {
         interp_roots: otter_gc::ExtraRoots::new::<Interpreter>(interp),
-        previous: interp.gc_heap.current_extra_roots(),
         value_roots: smallvec::smallvec![&this_root],
         slice_roots: smallvec::smallvec![args],
     };
     roots.value_roots.extend_from_slice(value_roots);
-    let previous = interp
+    // Pushed (not installed) so any outer scope's value/slice roots
+    // stay visible to scavenges triggered inside this native.
+    let depth = interp
         .gc_heap
-        .install_extra_roots(Some(otter_gc::ExtraRoots::new(&roots)));
+        .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
     let call_info = NativeCallInfo::call(this_root);
     let mut ctx =
         NativeCtx::new_with_call_info_and_context(interp, call_info, Some(context.clone()));
     let result = call.invoke(&mut ctx, args).map_err(native_to_vm_error);
-    let _ = interp.gc_heap.install_extra_roots(previous);
+    interp.gc_heap.pop_extra_roots_to(depth - 1);
     result
 }
 

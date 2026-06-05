@@ -795,7 +795,7 @@ impl Interpreter {
             .realm_intrinsics
             .populate(&mut interp.gc_heap, global_this);
         let extra_roots = otter_gc::ExtraRoots::new(&interp);
-        let previous = interp.gc_heap.install_extra_roots(Some(extra_roots));
+        let extra_root_depth = interp.gc_heap.push_extra_roots(extra_roots);
         // §22.1.5 / §23.1.5 / §24.1.5 / §24.2.5 — build the per-kind
         // iterator prototypes once `%Iterator.prototype%` is wired
         // into the global. The bootstrap helper owns the install
@@ -821,7 +821,7 @@ impl Interpreter {
             interp.regexp_string_iterator_prototype = Some(protos.regexp_string);
         }
         interp.install_function_kind_prototypes_post_bootstrap();
-        let _ = interp.gc_heap.install_extra_roots(previous);
+        interp.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
         interp
     }
 
@@ -2488,7 +2488,7 @@ impl Interpreter {
     /// trigger itself.
     pub fn force_gc(&mut self) {
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
-        let previous = self.gc_heap.install_extra_roots(Some(extra_roots));
+        let extra_root_depth = self.gc_heap.push_extra_roots(extra_roots);
         let mut noop = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
         self.gc_heap.mark_phase(&mut noop);
         crate::collections::run_ephemeron_fixpoint(&mut self.gc_heap);
@@ -2507,7 +2507,7 @@ impl Interpreter {
             });
         }
         self.gc_heap.sweep_phase();
-        let _ = self.gc_heap.install_extra_roots(previous);
+        self.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
     }
 
     /// Link a freshly compiled module into this interpreter's code
@@ -2534,7 +2534,7 @@ impl Interpreter {
             self.code_space = std::sync::Arc::clone(context.space());
         }
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
-        let previous = self.gc_heap.install_extra_roots(Some(extra_roots));
+        let extra_root_depth = self.gc_heap.push_extra_roots(extra_roots);
         self.pending_uncaught_throw = None;
         self.pending_uncaught_frames = None;
         self.ensure_property_ic_capacity(context);
@@ -2542,7 +2542,7 @@ impl Interpreter {
             Ok(v) => Ok(v),
             Err((error, frames)) => Err(RunError { error, frames }),
         };
-        let _ = self.gc_heap.install_extra_roots(previous);
+        self.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
         result
     }
 

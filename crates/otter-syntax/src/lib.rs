@@ -50,15 +50,38 @@ pub enum SourceKind {
     TypeScriptJsx,
 }
 
+/// Parse goal — ECMA-262 §16.1 Script vs §16.2 Module.
+///
+/// The goal changes early-error rules at parse time: `await` is a
+/// plain identifier in script code, `import` / `export` declarations
+/// are script syntax errors, and modules are implicitly strict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceGoal {
+    /// §16.1 Script grammar.
+    Script,
+    /// §16.2 Module grammar.
+    Module,
+}
+
 impl SourceKind {
-    /// Translate to OXC's `SourceType`.
+    /// Translate to OXC's `SourceType` with the Module goal.
     #[must_use]
     pub fn to_oxc(self) -> SourceType {
+        self.to_oxc_with_goal(SourceGoal::Module)
+    }
+
+    /// Translate to OXC's `SourceType` under an explicit parse goal.
+    #[must_use]
+    pub fn to_oxc_with_goal(self, goal: SourceGoal) -> SourceType {
+        let base = match goal {
+            SourceGoal::Script => SourceType::default().with_script(true),
+            SourceGoal::Module => SourceType::default().with_module(true),
+        };
         match self {
-            SourceKind::JavaScript => SourceType::default(),
-            SourceKind::JavaScriptJsx => SourceType::default().with_jsx(true),
-            SourceKind::TypeScript => SourceType::default().with_typescript(true),
-            SourceKind::TypeScriptJsx => SourceType::default().with_typescript(true).with_jsx(true),
+            SourceKind::JavaScript => base,
+            SourceKind::JavaScriptJsx => base.with_jsx(true),
+            SourceKind::TypeScript => base.with_typescript(true),
+            SourceKind::TypeScriptJsx => base.with_typescript(true).with_jsx(true),
         }
     }
 
@@ -99,12 +122,33 @@ pub fn with_program<R>(
     kind: SourceKind,
     f: impl for<'a> FnOnce(&'a Program<'a>) -> R,
 ) -> Result<R, SyntaxError> {
+    with_program_goal(source, kind, SourceGoal::Module, f)
+}
+
+/// Parse `source` once under an explicit [`SourceGoal`] and pass the
+/// AST to `f`.
+///
+/// Script-goal compilation entry points (classic scripts, `eval` /
+/// `new Function` bodies per §19.2.1.1) use this so script-only
+/// grammar — `await` as an identifier, `import` / `export` as syntax
+/// errors — is enforced at parse time. Module pipelines keep
+/// [`with_program`].
+///
+/// # Errors
+/// Returns a [`SyntaxError`] when OXC reports parse diagnostics.
+pub fn with_program_goal<R>(
+    source: impl Into<String>,
+    kind: SourceKind,
+    goal: SourceGoal,
+    f: impl for<'a> FnOnce(&'a Program<'a>) -> R,
+) -> Result<R, SyntaxError> {
     let allocator = Allocator::default();
     let source = source.into();
-    let parser = Parser::new(&allocator, &source, kind.to_oxc()).with_options(ParseOptions {
-        parse_regular_expression: true,
-        ..Default::default()
-    });
+    let parser =
+        Parser::new(&allocator, &source, kind.to_oxc_with_goal(goal)).with_options(ParseOptions {
+            parse_regular_expression: true,
+            ..Default::default()
+        });
     let ret = parser.parse();
     if !ret.errors.is_empty() {
         return Err(SyntaxError::from_oxc(&ret.errors));

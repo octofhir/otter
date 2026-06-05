@@ -43,7 +43,9 @@ pub fn compile_script_source_with_forced_strict(
     module_specifier: &str,
     force_strict: bool,
 ) -> Result<BytecodeModule, CompileError> {
-    with_program(source, kind, |program| {
+    // §16.1 Script goal: `await` stays a plain identifier and
+    // `import` / `export` declarations are early syntax errors.
+    otter_syntax::with_program_goal(source, kind, otter_syntax::SourceGoal::Script, |program| {
         compile_program(program, kind, module_specifier, force_strict)
     })
     .map_err(CompileError::from)?
@@ -66,7 +68,8 @@ pub fn compile_eval_source(
     force_strict: bool,
     forbid_var_arguments: bool,
 ) -> Result<BytecodeModule, CompileError> {
-    with_program(source, kind, |program| {
+    // §19.2.1.1 PerformEval parses the body with the Script goal.
+    otter_syntax::with_program_goal(source, kind, otter_syntax::SourceGoal::Script, |program| {
         if forbid_var_arguments && !(force_strict || program.has_use_strict_directive()) {
             let mut var_names: Vec<String> = Vec::new();
             hoist_var_names(&program.body, &mut var_names);

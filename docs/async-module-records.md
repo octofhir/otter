@@ -209,3 +209,44 @@ commit with full module-code/statements/Promise guards.
 - Known out of scope: host-loader HTTPS dynamic imports keep the
   current approximation; `for_of_iterator_close.rs::
   close_on_return_runs_return` is a pre-existing unrelated failure.
+
+## Implementation session (2026-06-05)
+
+All five steps landed; acceptance met.
+
+1. **Export destructuring BoundNames** — pre-pass
+   (`entry.rs`), metadata (`compiled_module.rs`), and
+   `destructure_pattern` leaf mirror now walk binding patterns via
+   `collect_pattern_var_names`. `export const { check } = …` resolves.
+2. **`ModuleRecordState`** (`otter-vm/src/module_records.rs`) absorbed
+   `module_evaluating` / `evaluated_modules` / `module_errors` /
+   `module_async_init_promises`; gates + errors traced from
+   `RuntimeState::trace_roots`.
+3. **Evaluate / InnerModuleEvaluation** (`module_ops.rs`) — full spec
+   shape, including the DFS stack, `[[DFSIndex]]` /
+   `[[DFSAncestorIndex]]`, SCC pop with `[[CycleRoot]]`, per-module
+   gate promises, `[[PendingAsyncDependencies]]`, and §16.2.1.9
+   ExecuteAsyncModule + AsyncModuleExecutionFulfilled/Rejected with a
+   faithful GatherAvailableAncestors (gather-then-sort-then-execute —
+   nested-on-discovery execution reorders `dfs-invariant.js`).
+   Waiters on a cycle member register on its cycle root
+   (`pending-async-dep-from-cycle.js`). Dynamic import +
+   host loader (`load_dynamic_module`) call `evaluate_module`;
+   `evaluate_module_rec_dynamic` and the init-marker dedupe died.
+4. **Entry driver** — `<entry>` emits `Op::EvaluateModule dst, k[url]`
+   (operand layout changed to `[reg, const]`; gate promise or
+   `undefined` lands in `dst`) for the entry plus idempotent sweeps,
+   awaiting gates when the graph is async. Import-defer TLA roots are
+   no longer pre-evaluated by the driver: InnerModuleEvaluation
+   gathers them in request position
+   (GatherAsynchronousTransitiveDependencies), fixing the
+   `import-defer/evaluation-top-level-await` family (4 tests) that the
+   pre-entry approximation evaluated before earlier siblings.
+5. Docs + cleanup (this note).
+
+Results: `language/module-code` 584 → 587/599;
+`top-level-await` filter (incl. `import-defer`) 256/256, stable 5×;
+dynamic-import 689, statements 8714 (2 pre-existing crashes),
+Promise 676/676. Zero regressions; `otter-vm` 570 / `otter-runtime`
+138 lib tests green. `tokio_spawn_native_ctx_is_not_send` trybuild
+mismatch pre-exists on main.

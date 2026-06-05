@@ -235,6 +235,19 @@ impl Interpreter {
         let result = (|| -> Result<(), RunError> {
             if !fulfilled {
                 if let Err(error) = self.unwind_throw(context, &mut stack, value) {
+                    // Unhandled anywhere in the parked gen body —
+                    // §27.6.3 AsyncGenerator resumption settles the
+                    // front request as rejected instead of letting the
+                    // throw escape the dispatch tick.
+                    if matches!(error, VmError::Uncaught { .. }) {
+                        let reason = self.take_pending_uncaught_throw().unwrap_or(value);
+                        owner.mark_done(&mut self.gc_heap);
+                        self.async_generator_complete_step(context, &owner, Err(reason), true)
+                            .map_err(RunError::bare)?;
+                        self.async_generator_drain_done(context, &owner)
+                            .map_err(RunError::bare)?;
+                        return Ok(());
+                    }
                     let frames = snapshot_frames(context, &stack);
                     return Err(RunError { error, frames });
                 }

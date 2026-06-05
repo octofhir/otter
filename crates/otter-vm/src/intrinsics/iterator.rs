@@ -88,17 +88,11 @@ otter_macros::couch! {
             "some"    / 1 => iterator_proto_some,
             "every"   / 1 => iterator_proto_every,
             "find"    / 1 => iterator_proto_find,
-            // §27.1.5.1 / §22.1.5.1 / §23.1.5.1 / §24.1.5.1 /
-            // §24.2.5.1 — Otter exposes one `%IteratorPrototype%`
-            // carrying `next` / `return` / `throw`; the per-kind
-            // iterator sub-prototypes inherit from it. Each method
-            // routes back through `iterator_next_full` /
-            // `iterator_helper_dispatch` so the spec result record
-            // is identical whether the call comes from
-            // `Op::IteratorNext` or reflective `proto.next.call(it)`.
-            "next"    / 0 => iterator_proto_next,
-            "return"  / 1 => iterator_proto_return,
-            "throw"   / 1 => iterator_proto_throw,
+            // §27.1.2 — `%Iterator.prototype%` itself carries NO own
+            // `next` / `return` / `throw`; those live on the concrete
+            // iterator prototypes (`%IteratorHelperPrototype%`,
+            // `%WrapForValidIteratorPrototype%`, the per-kind built-in
+            // prototypes, `%GeneratorPrototype%`) built post-bootstrap.
         },
     },
 }
@@ -236,30 +230,123 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
     let set = make("Set Iterator")?;
     let string = make("String Iterator")?;
     let regexp_string = make("RegExp String Iterator")?;
-    let next_fn = native_static_with_value_roots(
+    let helper = make("Iterator Helper")?;
+    // §27.1.3.2 — `%WrapForValidIteratorPrototype%` carries no
+    // `@@toStringTag` of its own.
+    let wrap_for_valid_iterator = {
+        let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            parent_value.trace_value_slots(visitor);
+        };
+        let proto = object::alloc_object_with_shape_roots(heap, shape_root, &mut visit)
+            .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        object::set_prototype(proto, heap, Some(parent));
+        proto
+    };
+    let install_method = |heap: &mut otter_gc::GcHeap,
+                          proto: JsObject,
+                          name: &'static str,
+                          length: u8,
+                          call: crate::native_function::NativeFastFn,
+                          label: &'static str|
+     -> Result<(), JsSurfaceError> {
+        let proto_root = Value::object(proto);
+        let f = native_static_with_value_roots(heap, name, length, call, &[&proto_root])
+            .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        if !object::define_own_property(
+            proto,
+            heap,
+            name,
+            object::PropertyDescriptor::data(Value::native_function(f), true, false, true),
+        ) {
+            return Err(JsSurfaceError::DefinePropertyFailed(label));
+        }
+        Ok(())
+    };
+    install_method(
         heap,
+        regexp_string,
         "next",
         0,
         regexp_string_iterator_proto_next,
-        &[&parent_value],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    if !object::define_own_property(
-        regexp_string,
+        "RegExpStringIteratorPrototype.next",
+    )?;
+    // §22.1.5.1 / §23.1.5.1 / §24.1.5.1 / §24.2.5.1 — each per-kind
+    // built-in iterator prototype owns its `next`.
+    install_method(
         heap,
+        array,
         "next",
-        object::PropertyDescriptor::data(Value::native_function(next_fn), true, false, true),
-    ) {
-        return Err(JsSurfaceError::DefinePropertyFailed(
-            "RegExpStringIteratorPrototype.next",
-        ));
-    }
+        0,
+        iterator_proto_next,
+        "ArrayIteratorPrototype.next",
+    )?;
+    install_method(
+        heap,
+        map,
+        "next",
+        0,
+        iterator_proto_next,
+        "MapIteratorPrototype.next",
+    )?;
+    install_method(
+        heap,
+        set,
+        "next",
+        0,
+        iterator_proto_next,
+        "SetIteratorPrototype.next",
+    )?;
+    install_method(
+        heap,
+        string,
+        "next",
+        0,
+        iterator_proto_next,
+        "StringIteratorPrototype.next",
+    )?;
+    // §27.1.2.1 — `%IteratorHelperPrototype%` owns `next` and `return`.
+    install_method(
+        heap,
+        helper,
+        "next",
+        0,
+        iterator_proto_next,
+        "IteratorHelperPrototype.next",
+    )?;
+    install_method(
+        heap,
+        helper,
+        "return",
+        1,
+        iterator_proto_return,
+        "IteratorHelperPrototype.return",
+    )?;
+    // §27.1.3.2 — `%WrapForValidIteratorPrototype%` owns `next` and
+    // `return`, both forwarding to the wrapped iterator.
+    install_method(
+        heap,
+        wrap_for_valid_iterator,
+        "next",
+        0,
+        iterator_proto_next,
+        "WrapForValidIteratorPrototype.next",
+    )?;
+    install_method(
+        heap,
+        wrap_for_valid_iterator,
+        "return",
+        1,
+        iterator_proto_return,
+        "WrapForValidIteratorPrototype.return",
+    )?;
     Ok(crate::bootstrap::BuiltinIteratorPrototypes {
         array,
         map,
         set,
         string,
         regexp_string,
+        helper,
+        wrap_for_valid_iterator,
     })
 }
 
@@ -281,16 +368,11 @@ fn iterator_receiver(
                 reason: "iterator allocation failed".to_string(),
             });
     }
-    // §27.1.4.1.1 GetIteratorDirect — the `Iterator.prototype.X`
-    // helpers accept any receiver that implements the iterator
-    // protocol via a callable `next` method; they do NOT walk
-    // `@@iterator`. Probe `next` directly and wrap as `IteratorState::User`.
-    if this_value.is_object()
-        || this_value.is_map()
-        || this_value.is_set()
-        || this_value.is_array()
-        || this_value.is_string()
-    {
+    // §7.4.4 GetIteratorDirect — the `Iterator.prototype.X` helpers
+    // accept any Object receiver; `next` is read once here and NOT
+    // checked for callability (a non-callable `next` throws when the
+    // first step is driven, per IteratorNext).
+    if !crate::abstract_ops::is_primitive(&this_value) {
         let (interp, exec_ctx) = ctx.interp_mut_and_context();
         let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
             name,
@@ -309,12 +391,6 @@ fn iterator_receiver(
                     .map_err(|e| crate::native_function::vm_to_native_error(e, name))?
             }
         };
-        if !interp.is_callable_runtime(&next_method) {
-            return Err(crate::NativeError::TypeError {
-                name,
-                reason: "this is not an iterator".to_string(),
-            });
-        }
         let this_root = this_value;
         let state = crate::IteratorState::User {
             iterator: this_value,
@@ -329,8 +405,46 @@ fn iterator_receiver(
     }
     Err(crate::NativeError::TypeError {
         name,
-        reason: "this is not an iterator".to_string(),
+        reason: "this is not an object".to_string(),
     })
+}
+
+/// §27.1.4.x step 2 — every `Iterator.prototype.*` helper requires an
+/// Object receiver; primitives throw TypeError before any argument
+/// coercion or validation.
+fn require_object_receiver(
+    this_value: &Value,
+    name: &'static str,
+) -> Result<(), crate::NativeError> {
+    if crate::abstract_ops::is_primitive(this_value) {
+        return Err(crate::NativeError::TypeError {
+            name,
+            reason: "this is not an object".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// §27.1.4.x — argument validation failures close the receiver
+/// (IteratorClose with the validation error as completion) before the
+/// iterator record is built. The original abrupt completion wins over
+/// anything the close itself throws, per §7.4.9.
+fn close_receiver_on_validation_failure(
+    ctx: &mut crate::NativeCtx<'_>,
+    this_value: Value,
+    err: crate::NativeError,
+) -> crate::NativeError {
+    let (interp, exec_ctx) = ctx.interp_mut_and_context();
+    let Some(exec_ctx) = exec_ctx else {
+        return err;
+    };
+    let original_throw = interp.take_pending_uncaught_throw();
+    let _ = interp.iterator_close_value_sync(&exec_ctx, this_value);
+    let _ = interp.take_pending_uncaught_throw();
+    if let Some(value) = original_throw {
+        interp.set_pending_uncaught_throw(value);
+    }
+    err
 }
 
 /// Strict iterator receiver used by `%IteratorPrototype%.next/return/throw`.
@@ -386,10 +500,19 @@ fn iterator_proto_map(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
+    let this_value = *ctx.this_value();
+    require_object_receiver(&this_value, "Iterator.prototype.map")?;
+    let mapper = match require_callable_arg(ctx, args, "Iterator.prototype.map", 0) {
+        Ok(mapper) => mapper,
+        Err(err) => return Err(close_receiver_on_validation_failure(ctx, this_value, err)),
+    };
     let source = iterator_receiver(ctx, "Iterator.prototype.map")?;
-    let mapper = require_callable_arg(ctx, args, "Iterator.prototype.map", 0)?;
     let source_value = Value::iterator(source);
-    let state = crate::IteratorState::Map { source, mapper };
+    let state = crate::IteratorState::Map {
+        source,
+        mapper,
+        counter: 0,
+    };
     let handle = ctx
         .alloc_iterator_state(state, &[&source_value, &mapper], &[])
         .map_err(|_| crate::NativeError::TypeError {
@@ -403,10 +526,19 @@ fn iterator_proto_filter(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
+    let this_value = *ctx.this_value();
+    require_object_receiver(&this_value, "Iterator.prototype.filter")?;
+    let predicate = match require_callable_arg(ctx, args, "Iterator.prototype.filter", 0) {
+        Ok(predicate) => predicate,
+        Err(err) => return Err(close_receiver_on_validation_failure(ctx, this_value, err)),
+    };
     let source = iterator_receiver(ctx, "Iterator.prototype.filter")?;
-    let predicate = require_callable_arg(ctx, args, "Iterator.prototype.filter", 0)?;
     let source_value = Value::iterator(source);
-    let state = crate::IteratorState::Filter { source, predicate };
+    let state = crate::IteratorState::Filter {
+        source,
+        predicate,
+        counter: 0,
+    };
     let handle = ctx
         .alloc_iterator_state(state, &[&source_value, &predicate], &[])
         .map_err(|_| crate::NativeError::TypeError {
@@ -420,8 +552,13 @@ fn iterator_proto_take(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
+    let this_value = *ctx.this_value();
+    require_object_receiver(&this_value, "Iterator.prototype.take")?;
+    let n = match iterator_arg_count_native(ctx, args, "Iterator.prototype.take") {
+        Ok(n) => n,
+        Err(err) => return Err(close_receiver_on_validation_failure(ctx, this_value, err)),
+    };
     let source = iterator_receiver(ctx, "Iterator.prototype.take")?;
-    let n = iterator_arg_count_native(ctx, args, "Iterator.prototype.take")?;
     let source_value = Value::iterator(source);
     let state = crate::IteratorState::Take {
         source,
@@ -440,8 +577,13 @@ fn iterator_proto_drop(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
+    let this_value = *ctx.this_value();
+    require_object_receiver(&this_value, "Iterator.prototype.drop")?;
+    let n = match iterator_arg_count_native(ctx, args, "Iterator.prototype.drop") {
+        Ok(n) => n,
+        Err(err) => return Err(close_receiver_on_validation_failure(ctx, this_value, err)),
+    };
     let source = iterator_receiver(ctx, "Iterator.prototype.drop")?;
-    let n = iterator_arg_count_native(ctx, args, "Iterator.prototype.drop")?;
     let source_value = Value::iterator(source);
     let state = crate::IteratorState::Drop { source, to_drop: n };
     let handle = ctx
@@ -457,13 +599,19 @@ fn iterator_proto_flat_map(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
+    let this_value = *ctx.this_value();
+    require_object_receiver(&this_value, "Iterator.prototype.flatMap")?;
+    let mapper = match require_callable_arg(ctx, args, "Iterator.prototype.flatMap", 0) {
+        Ok(mapper) => mapper,
+        Err(err) => return Err(close_receiver_on_validation_failure(ctx, this_value, err)),
+    };
     let source = iterator_receiver(ctx, "Iterator.prototype.flatMap")?;
-    let mapper = require_callable_arg(ctx, args, "Iterator.prototype.flatMap", 0)?;
     let source_value = Value::iterator(source);
     let state = crate::IteratorState::FlatMap {
         source,
         mapper,
         inner: None,
+        counter: 0,
     };
     let handle = ctx
         .alloc_iterator_state(state, &[&source_value, &mapper], &[])
@@ -559,8 +707,13 @@ fn iterator_proto_for_each(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
+    let this_value = *ctx.this_value();
+    require_object_receiver(&this_value, "Iterator.prototype.forEach")?;
+    let callback = match require_callable_arg(ctx, args, "Iterator.prototype.forEach", 0) {
+        Ok(callback) => callback,
+        Err(err) => return Err(close_receiver_on_validation_failure(ctx, this_value, err)),
+    };
     let handle = iterator_receiver(ctx, "Iterator.prototype.forEach")?;
-    let callback = require_callable_arg(ctx, args, "Iterator.prototype.forEach", 0)?;
     let exec_ctx =
         ctx.execution_context()
             .cloned()
@@ -583,12 +736,19 @@ fn iterator_proto_for_each(
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
         cb_args.push(v);
         cb_args.push(Value::number(crate::number::NumberValue::from_f64(idx)));
-        ctx.cx
-            .interp
-            .run_callable_sync(&exec_ctx, &callback, Value::undefined(), cb_args)
-            .map_err(|e| {
-                crate::native_function::vm_to_native_error(e, "Iterator.prototype.forEach")
-            })?;
+        if let Err(err) =
+            ctx.cx
+                .interp
+                .run_callable_sync(&exec_ctx, &callback, Value::undefined(), cb_args)
+        {
+            ctx.cx
+                .interp
+                .close_iterator_preserving_throw(&exec_ctx, &handle);
+            return Err(crate::native_function::vm_to_native_error(
+                err,
+                "Iterator.prototype.forEach",
+            ));
+        }
         idx += 1.0;
     }
     Ok(Value::undefined())
@@ -598,8 +758,13 @@ fn iterator_proto_reduce(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
+    let this_value = *ctx.this_value();
+    require_object_receiver(&this_value, "Iterator.prototype.reduce")?;
+    let reducer = match require_callable_arg(ctx, args, "Iterator.prototype.reduce", 0) {
+        Ok(reducer) => reducer,
+        Err(err) => return Err(close_receiver_on_validation_failure(ctx, this_value, err)),
+    };
     let handle = iterator_receiver(ctx, "Iterator.prototype.reduce")?;
-    let reducer = require_callable_arg(ctx, args, "Iterator.prototype.reduce", 0)?;
     let exec_ctx =
         ctx.execution_context()
             .cloned()
@@ -639,13 +804,23 @@ fn iterator_proto_reduce(
         cb_args.push(acc);
         cb_args.push(v);
         cb_args.push(Value::number(crate::number::NumberValue::from_f64(idx)));
-        acc = ctx
-            .cx
-            .interp
-            .run_callable_sync(&exec_ctx, &reducer, Value::undefined(), cb_args)
-            .map_err(|e| {
-                crate::native_function::vm_to_native_error(e, "Iterator.prototype.reduce")
-            })?;
+        acc =
+            match ctx
+                .cx
+                .interp
+                .run_callable_sync(&exec_ctx, &reducer, Value::undefined(), cb_args)
+            {
+                Ok(acc) => acc,
+                Err(err) => {
+                    ctx.cx
+                        .interp
+                        .close_iterator_preserving_throw(&exec_ctx, &handle);
+                    return Err(crate::native_function::vm_to_native_error(
+                        err,
+                        "Iterator.prototype.reduce",
+                    ));
+                }
+            };
         idx += 1.0;
     }
     if !has_acc {
@@ -675,8 +850,13 @@ fn iterator_proto_find(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
+    let this_value = *ctx.this_value();
+    require_object_receiver(&this_value, "Iterator.prototype.find")?;
+    let predicate = match require_callable_arg(ctx, args, "Iterator.prototype.find", 0) {
+        Ok(predicate) => predicate,
+        Err(err) => return Err(close_receiver_on_validation_failure(ctx, this_value, err)),
+    };
     let handle = iterator_receiver(ctx, "Iterator.prototype.find")?;
-    let predicate = require_callable_arg(ctx, args, "Iterator.prototype.find", 0)?;
     let exec_ctx =
         ctx.execution_context()
             .cloned()
@@ -699,14 +879,30 @@ fn iterator_proto_find(
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
         cb_args.push(v);
         cb_args.push(Value::number(crate::number::NumberValue::from_f64(idx)));
-        let kept = ctx
-            .cx
-            .interp
-            .run_callable_sync(&exec_ctx, &predicate, Value::undefined(), cb_args)
-            .map_err(|e| {
-                crate::native_function::vm_to_native_error(e, "Iterator.prototype.find")
-            })?;
+        let kept = match ctx.cx.interp.run_callable_sync(
+            &exec_ctx,
+            &predicate,
+            Value::undefined(),
+            cb_args,
+        ) {
+            Ok(kept) => kept,
+            Err(err) => {
+                ctx.cx
+                    .interp
+                    .close_iterator_preserving_throw(&exec_ctx, &handle);
+                return Err(crate::native_function::vm_to_native_error(
+                    err,
+                    "Iterator.prototype.find",
+                ));
+            }
+        };
         if kept.to_boolean(ctx.heap()) {
+            ctx.cx
+                .interp
+                .iterator_close_value_sync(&exec_ctx, Value::iterator(handle))
+                .map_err(|e| {
+                    crate::native_function::vm_to_native_error(e, "Iterator.prototype.find")
+                })?;
             return Ok(v);
         }
         idx += 1.0;
@@ -818,14 +1014,37 @@ fn iterator_proto_return(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
+    let this_value = *ctx.this_value();
     let handle = iterator_receiver_builtin(ctx, "Iterator.prototype.return")?;
     let arg = args.first().cloned().unwrap_or(Value::undefined());
     let iter_value = Value::iterator(handle);
+    // §27.1.2.1.2 — `return` on a helper forwards IteratorClose to the
+    // underlying iterator chain (helper sources, user `return`
+    // methods, suspended generator bodies). Async generators keep the
+    // promise-shaped resumption path instead.
+    let receiver_is_async_generator = this_value
+        .as_generator()
+        .is_some_and(|g| g.is_async(ctx.interp_mut().gc_heap()));
+    if !receiver_is_async_generator {
+        let exec_ctx =
+            ctx.execution_context()
+                .cloned()
+                .ok_or_else(|| crate::NativeError::TypeError {
+                    name: "Iterator.prototype.return",
+                    reason: "missing execution context".to_string(),
+                })?;
+        ctx.cx
+            .interp
+            .iterator_close_value_sync(&exec_ctx, iter_value)
+            .map_err(|e| {
+                crate::native_function::vm_to_native_error(e, "Iterator.prototype.return")
+            })?;
+    }
     ctx.cx
         .interp
         .gc_heap_for_cx_mut()
         .with_payload(handle, |state| {
-            *state = crate::IteratorState::Exhausted;
+            state.exhaust();
         });
     let obj = ctx
         .alloc_object_with_roots(&[&iter_value, &arg], &[])
@@ -866,8 +1085,13 @@ fn iterator_predicate_drain(
     short_on_truthy: bool,
     initial: bool,
 ) -> Result<Value, crate::NativeError> {
+    let this_value = *ctx.this_value();
+    require_object_receiver(&this_value, name)?;
+    let predicate = match require_callable_arg(ctx, args, name, 0) {
+        Ok(predicate) => predicate,
+        Err(err) => return Err(close_receiver_on_validation_failure(ctx, this_value, err)),
+    };
     let handle = iterator_receiver(ctx, name)?;
-    let predicate = require_callable_arg(ctx, args, name, 0)?;
     let exec_ctx =
         ctx.execution_context()
             .cloned()
@@ -888,12 +1112,29 @@ fn iterator_predicate_drain(
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
         cb_args.push(v);
         cb_args.push(Value::number(crate::number::NumberValue::from_f64(idx)));
-        let kept = ctx
-            .cx
-            .interp
-            .run_callable_sync(&exec_ctx, &predicate, Value::undefined(), cb_args)
-            .map_err(|e| crate::native_function::vm_to_native_error(e, name))?;
+        // §27.1.4.x — IfAbruptCloseIterator: a throwing predicate
+        // closes the underlying iterator before propagating.
+        let kept = match ctx.cx.interp.run_callable_sync(
+            &exec_ctx,
+            &predicate,
+            Value::undefined(),
+            cb_args,
+        ) {
+            Ok(kept) => kept,
+            Err(err) => {
+                ctx.cx
+                    .interp
+                    .close_iterator_preserving_throw(&exec_ctx, &handle);
+                return Err(crate::native_function::vm_to_native_error(err, name));
+            }
+        };
         if kept.to_boolean(ctx.heap()) == short_on_truthy {
+            // Early exit closes the underlying iterator with a normal
+            // completion; a throwing `return` propagates.
+            ctx.cx
+                .interp
+                .iterator_close_value_sync(&exec_ctx, Value::iterator(handle))
+                .map_err(|e| crate::native_function::vm_to_native_error(e, name))?;
             return Ok(Value::boolean(short_on_truthy));
         }
         idx += 1.0;

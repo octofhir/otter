@@ -92,6 +92,10 @@ pub enum BuiltinIteratorOrigin {
     String,
     /// `%RegExpStringIteratorPrototype%`.
     RegExpString,
+    /// `%IteratorHelperPrototype%` — §27.1.2.1.
+    Helper,
+    /// `%WrapForValidIteratorPrototype%` — §27.1.3.2.
+    WrapForValidIterator,
 }
 
 /// Runtime state for iterator handles driven via `Op::IteratorNext`.
@@ -227,14 +231,24 @@ pub enum IteratorState {
         /// first step (for-of `GetIterator`).
         next_method: Option<Value>,
     },
-    /// Permanently exhausted iterator.
-    Exhausted,
+    /// Permanently exhausted iterator. Keeps the origin of the state
+    /// it replaced so `[[GetPrototypeOf]]` stays stable across
+    /// exhaustion.
+    Exhausted {
+        /// Prototype-routing origin of the pre-exhaustion state.
+        #[pelt(skip)]
+        origin: Option<BuiltinIteratorOrigin>,
+    },
     /// Lazy `Iterator.prototype.map(fn)` wrapper.
     Map {
         /// Underlying iterator handle.
         source: IteratorHandle,
         /// Per-element mapper. Must be callable.
         mapper: Value,
+        /// §27.1.4.7 — zero-based counter passed as the mapper's
+        /// second argument.
+        #[pelt(skip)]
+        counter: u64,
     },
     /// Lazy `Iterator.prototype.filter(predicate)` wrapper.
     Filter {
@@ -242,6 +256,10 @@ pub enum IteratorState {
         source: IteratorHandle,
         /// Per-element predicate. Must be callable.
         predicate: Value,
+        /// §27.1.4.6 — zero-based counter passed as the predicate's
+        /// second argument.
+        #[pelt(skip)]
+        counter: u64,
     },
     /// Lazy `Iterator.prototype.take(n)` wrapper.
     Take {
@@ -274,6 +292,10 @@ pub enum IteratorState {
         /// Inner iterator currently being drained, when the last
         /// `mapper` call produced an iterable.
         inner: Option<IteratorHandle>,
+        /// §27.1.4.5 — zero-based counter passed as the mapper's
+        /// second argument.
+        #[pelt(skip)]
+        counter: u64,
     },
 }
 
@@ -298,7 +320,27 @@ impl IteratorState {
             IteratorState::RegExpString { .. } => Some(BuiltinIteratorOrigin::RegExpString),
             IteratorState::MapCollection { .. } => Some(BuiltinIteratorOrigin::Map),
             IteratorState::SetCollection { .. } => Some(BuiltinIteratorOrigin::Set),
-            _ => None,
+            // §27.1.2.1 — the lazy helper wrappers expose
+            // `%IteratorHelperPrototype%` (own `next` / `return`).
+            IteratorState::Map { .. }
+            | IteratorState::Filter { .. }
+            | IteratorState::Take { .. }
+            | IteratorState::Drop { .. }
+            | IteratorState::FlatMap { .. } => Some(BuiltinIteratorOrigin::Helper),
+            // §27.1.3.2 — wrapped user / generator iterators expose
+            // `%WrapForValidIteratorPrototype%` (own `next` / `return`).
+            IteratorState::User { .. } | IteratorState::Generator { .. } => {
+                Some(BuiltinIteratorOrigin::WrapForValidIterator)
+            }
+            IteratorState::Exhausted { origin } => *origin,
         }
+    }
+
+    /// Fold the state to [`IteratorState::Exhausted`] while keeping
+    /// the prototype-routing origin stable.
+    pub fn exhaust(&mut self) {
+        *self = IteratorState::Exhausted {
+            origin: self.builtin_origin(),
+        };
     }
 }

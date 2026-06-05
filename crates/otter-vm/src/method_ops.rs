@@ -251,30 +251,37 @@ impl Interpreter {
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
 
+        // Iterator-helpers / generator resumption methods always
+        // dispatch through the resolved prototype method (native or
+        // user override) so one implementation — the §27.1 natives —
+        // owns the spec semantics (GetIteratorDirect caching,
+        // IteratorClose forwarding, argument-validation order).
+        // Generator `next` / `return` / `throw` carry a resumption
+        // argument the resume block below threads into the suspended
+        // frame; only user (non-native) overrides divert to `invoke`.
+        let generator_resumption =
+            recv_value.is_generator() && matches!(name, "next" | "return" | "throw");
         if (recv_value.is_iterator() || recv_value.is_generator())
             && iterator_dispatch_method_name(name)
         {
             let method = self
                 .get_method_value_for_call(context, stack, recv_value, name)?
                 .unwrap_or_else(Value::undefined);
-            if method.as_native_function().is_none() {
-                if !self.is_callable_runtime(&method) {
-                    return Err(VmError::NotCallable);
-                }
+            let route_to_invoke = if generator_resumption {
+                method.as_native_function().is_none() && self.is_callable_runtime(&method)
+            } else {
+                self.is_callable_runtime(&method)
+            };
+            if route_to_invoke {
                 stack[top_idx].advance_pc(self.current_byte_len)?;
                 return self.invoke(stack, context, &method, recv_value, arg_values, dst);
             }
-        }
-
-        // Iterator-helpers proposal — when receiver is an iterator
-        // value, route through the dedicated dispatcher that builds
-        // lazy wrappers / drains for terminals.
-        // <https://tc39.es/proposal-iterator-helpers/>
-        if let Some(rc) = recv_value.as_iterator() {
-            let iter_rc = rc;
-            if self.iterator_helper_dispatch(stack, context, &iter_rc, name, &arg_values, dst)? {
-                return Ok(());
+            if recv_value.is_iterator() {
+                return Err(VmError::NotCallable);
             }
+            // Generator natives fall through to the resume block,
+            // which threads the resumption argument and the async
+            // promise machinery.
         }
 
         // §27.5.3 Generator.prototype methods — `.next` / `.return`

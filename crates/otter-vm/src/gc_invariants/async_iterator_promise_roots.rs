@@ -241,13 +241,14 @@ fn promise_iterator_generator_cycles_reclaimed_when_unrooted() {
 
     let iter = interp
         .gc_heap_mut()
-        .alloc_old(IteratorState::Exhausted)
+        .alloc_old(IteratorState::Exhausted { origin: None })
         .expect("iterator");
     interp.gc_heap_mut().with_payload(iter, |state| {
         *state = IteratorState::FlatMap {
             source: iter,
             mapper: Value::undefined(),
             inner: Some(iter),
+            counter: 0,
         };
     });
 

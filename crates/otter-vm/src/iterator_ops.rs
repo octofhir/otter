@@ -28,8 +28,8 @@ use crate::{
     ExecutionContext, Frame, GeneratorResumeKind, Interpreter, IteratorHandle, IteratorState,
     JsPromise, JsString, PendingGetIterator, PendingIteratorNext, Value, VmError, VmGetOutcome,
     VmPropertyKey, array, generator::AsyncGeneratorState, is_callable,
-    operand_decode::register_operand, promise::PromiseCapability, read_register, require_callable,
-    step_iterator, symbol, take_drop_count, value_kind_name, write_register,
+    operand_decode::register_operand, promise::PromiseCapability, read_register, step_iterator,
+    symbol, write_register,
 };
 
 fn string_iterator_values(s: JsString, heap: &mut otter_gc::GcHeap) -> Result<Vec<Value>, VmError> {
@@ -67,10 +67,12 @@ enum IteratorStateSnapshot {
     Map {
         source: IteratorHandle,
         mapper: Value,
+        counter: u64,
     },
     Filter {
         source: IteratorHandle,
         predicate: Value,
+        counter: u64,
     },
     Take {
         source: IteratorHandle,
@@ -84,6 +86,7 @@ enum IteratorStateSnapshot {
         source: IteratorHandle,
         mapper: Value,
         inner: Option<IteratorHandle>,
+        counter: u64,
     },
 }
 
@@ -296,16 +299,24 @@ impl Interpreter {
                 IteratorState::Generator { handle } => {
                     Some(IteratorStateSnapshot::Generator(*handle))
                 }
-                IteratorState::Map { source, mapper } => Some(IteratorStateSnapshot::Map {
+                IteratorState::Map {
+                    source,
+                    mapper,
+                    counter,
+                } => Some(IteratorStateSnapshot::Map {
                     source: *source,
                     mapper: *mapper,
+                    counter: *counter,
                 }),
-                IteratorState::Filter { source, predicate } => {
-                    Some(IteratorStateSnapshot::Filter {
-                        source: *source,
-                        predicate: *predicate,
-                    })
-                }
+                IteratorState::Filter {
+                    source,
+                    predicate,
+                    counter,
+                } => Some(IteratorStateSnapshot::Filter {
+                    source: *source,
+                    predicate: *predicate,
+                    counter: *counter,
+                }),
                 IteratorState::Take { source, remaining } => Some(IteratorStateSnapshot::Take {
                     source: *source,
                     remaining: *remaining,
@@ -318,10 +329,12 @@ impl Interpreter {
                     source,
                     mapper,
                     inner,
+                    counter,
                 } => Some(IteratorStateSnapshot::FlatMap {
                     source: *source,
                     mapper: *mapper,
                     inner: *inner,
+                    counter: *counter,
                 }),
                 _ => None,
             });
@@ -342,8 +355,7 @@ impl Interpreter {
                     .unwrap_or(Value::undefined())
                     .to_boolean(&self.gc_heap);
                 if done {
-                    self.gc_heap
-                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
+                    self.gc_heap.with_payload(*iter, |state| state.exhaust());
                 }
                 Ok((value, done))
             }
@@ -381,8 +393,7 @@ impl Interpreter {
                     .iter_result_get(context, result, "done")?
                     .to_boolean(&self.gc_heap);
                 if done {
-                    self.gc_heap
-                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
+                    self.gc_heap.with_payload(*iter, |state| state.exhaust());
                     return Ok((Value::undefined(), true));
                 }
                 let value = self.iter_result_get(context, result, "value")?;
@@ -423,48 +434,93 @@ impl Interpreter {
                 }
                 Ok((match_value, false))
             }
-            IteratorStateSnapshot::Map { source, mapper } => {
+            IteratorStateSnapshot::Map {
+                source,
+                mapper,
+                counter,
+            } => {
                 let (v, done) = self.iterator_next_full(context, &source)?;
                 if done {
-                    self.gc_heap
-                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
+                    self.gc_heap.with_payload(*iter, |state| state.exhaust());
                     return Ok((Value::undefined(), true));
                 }
-                let mapped = self.run_callable_sync(
+                let counter_value =
+                    Value::number(crate::number::NumberValue::from_f64(counter as f64));
+                // §27.1.4.7 step 5.b.v — IfAbruptCloseIterator: a throw
+                // from the mapper closes the underlying iterator before
+                // propagating.
+                let mapped = match self.run_callable_sync(
                     context,
                     &mapper,
                     Value::undefined(),
-                    smallvec::smallvec![v],
-                )?;
+                    smallvec::smallvec![v, counter_value],
+                ) {
+                    Ok(mapped) => mapped,
+                    Err(err) => {
+                        self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                        self.close_iterator_preserving_throw(context, &source);
+                        return Err(err);
+                    }
+                };
+                self.gc_heap.with_payload(*iter, |state| {
+                    if let IteratorState::Map { counter, .. } = state {
+                        *counter += 1;
+                    }
+                });
                 Ok((mapped, false))
             }
-            IteratorStateSnapshot::Filter { source, predicate } => loop {
-                let (v, done) = self.iterator_next_full(context, &source)?;
-                if done {
-                    self.gc_heap
-                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
-                    return Ok((Value::undefined(), true));
+            IteratorStateSnapshot::Filter {
+                source,
+                predicate,
+                counter,
+            } => {
+                let mut counter = counter;
+                loop {
+                    let (v, done) = self.iterator_next_full(context, &source)?;
+                    if done {
+                        self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                        return Ok((Value::undefined(), true));
+                    }
+                    let counter_value =
+                        Value::number(crate::number::NumberValue::from_f64(counter as f64));
+                    // §27.1.4.6 step 5.b.v — IfAbruptCloseIterator on a
+                    // throwing predicate.
+                    let kept = match self.run_callable_sync(
+                        context,
+                        &predicate,
+                        Value::undefined(),
+                        smallvec::smallvec![v, counter_value],
+                    ) {
+                        Ok(kept) => kept,
+                        Err(err) => {
+                            self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                            self.close_iterator_preserving_throw(context, &source);
+                            return Err(err);
+                        }
+                    };
+                    counter += 1;
+                    self.gc_heap.with_payload(*iter, |state| {
+                        if let IteratorState::Filter { counter: slot, .. } = state {
+                            *slot = counter;
+                        }
+                    });
+                    if kept.to_boolean(&self.gc_heap) {
+                        return Ok((v, false));
+                    }
                 }
-                let kept = self.run_callable_sync(
-                    context,
-                    &predicate,
-                    Value::undefined(),
-                    smallvec::smallvec![v],
-                )?;
-                if kept.to_boolean(&self.gc_heap) {
-                    return Ok((v, false));
-                }
-            },
+            }
             IteratorStateSnapshot::Take { source, remaining } => {
                 if remaining == 0 {
-                    self.gc_heap
-                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
+                    self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                    // §27.1.4.9 step 5.b.ii — the limit being reached
+                    // closes the underlying iterator with a normal
+                    // completion.
+                    self.iterator_close_value_sync(context, Value::iterator(source))?;
                     return Ok((Value::undefined(), true));
                 }
                 let (v, done) = self.iterator_next_full(context, &source)?;
                 if done {
-                    self.gc_heap
-                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
+                    self.gc_heap.with_payload(*iter, |state| state.exhaust());
                     return Ok((Value::undefined(), true));
                 }
                 self.gc_heap.with_payload(*iter, |state| {
@@ -478,8 +534,7 @@ impl Interpreter {
                 for _ in 0..to_drop {
                     let (_, done) = self.iterator_next_full(context, &source)?;
                     if done {
-                        self.gc_heap
-                            .with_payload(*iter, |state| *state = IteratorState::Exhausted);
+                        self.gc_heap.with_payload(*iter, |state| state.exhaust());
                         return Ok((Value::undefined(), true));
                     }
                 }
@@ -490,8 +545,7 @@ impl Interpreter {
                 });
                 let (v, done) = self.iterator_next_full(context, &source)?;
                 if done {
-                    self.gc_heap
-                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
+                    self.gc_heap.with_payload(*iter, |state| state.exhaust());
                     return Ok((Value::undefined(), true));
                 }
                 Ok((v, false))
@@ -500,6 +554,7 @@ impl Interpreter {
                 source,
                 mapper,
                 mut inner,
+                mut counter,
             } => loop {
                 if let Some(inner_iter) = inner.take() {
                     let (v, done) = self.iterator_next_full(context, &inner_iter)?;
@@ -514,16 +569,32 @@ impl Interpreter {
                 }
                 let (v, done) = self.iterator_next_full(context, &source)?;
                 if done {
-                    self.gc_heap
-                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
+                    self.gc_heap.with_payload(*iter, |state| state.exhaust());
                     return Ok((Value::undefined(), true));
                 }
-                let mapped = self.run_callable_sync(
+                let counter_value =
+                    Value::number(crate::number::NumberValue::from_f64(counter as f64));
+                // §27.1.4.5 step 5.b.iv — IfAbruptCloseIterator on a
+                // throwing mapper.
+                let mapped = match self.run_callable_sync(
                     context,
                     &mapper,
                     Value::undefined(),
-                    smallvec::smallvec![v],
-                )?;
+                    smallvec::smallvec![v, counter_value],
+                ) {
+                    Ok(mapped) => mapped,
+                    Err(err) => {
+                        self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                        self.close_iterator_preserving_throw(context, &source);
+                        return Err(err);
+                    }
+                };
+                counter += 1;
+                self.gc_heap.with_payload(*iter, |state| {
+                    if let IteratorState::FlatMap { counter: slot, .. } = state {
+                        *slot = counter;
+                    }
+                });
                 // §27.5.1.10 step 7.b.iv — `GetIteratorFlattenable(mapped)`
                 // accepts any iterable (Array / Set / Map / String /
                 // Generator / Object with `@@iterator`) and any
@@ -636,216 +707,6 @@ impl Interpreter {
         }
     }
 
-    /// Dispatch one of the §27.5 / iterator-helper-proposal methods against a
-    /// [`Value::Iterator`] receiver. Returns `Ok(true)` when the call was
-    /// handled (`dst` written, pc advanced) and `Ok(false)` when the receiver
-    /// does not expose `name`.
-    ///
-    /// # See also
-    /// - <https://tc39.es/proposal-iterator-helpers/>
-    pub(crate) fn iterator_helper_dispatch(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        context: &ExecutionContext,
-        iter_rc: &IteratorHandle,
-        name: &str,
-        args: &SmallVec<[Value; 8]>,
-        dst: u16,
-    ) -> Result<bool, VmError> {
-        // Lazy helpers wrap the source in a new IteratorState; the
-        // eager terminals drain via `iterator_next_full`.
-        let iter_value = Value::iterator(*iter_rc);
-        let result = match name {
-            "map" => {
-                let mapper = require_callable(args.first())?;
-                let mapper_root = mapper;
-                let state = IteratorState::Map {
-                    source: *iter_rc,
-                    mapper,
-                };
-                Value::iterator(self.alloc_stack_rooted_iterator_state(
-                    stack,
-                    state,
-                    &[&iter_value, &mapper_root],
-                    &[],
-                )?)
-            }
-            "filter" => {
-                let predicate = require_callable(args.first())?;
-                let predicate_root = predicate;
-                let state = IteratorState::Filter {
-                    source: *iter_rc,
-                    predicate,
-                };
-                Value::iterator(self.alloc_stack_rooted_iterator_state(
-                    stack,
-                    state,
-                    &[&iter_value, &predicate_root],
-                    &[],
-                )?)
-            }
-            "take" => {
-                let n = take_drop_count(args.first())?;
-                let state = IteratorState::Take {
-                    source: *iter_rc,
-                    remaining: n,
-                };
-                Value::iterator(self.alloc_stack_rooted_iterator_state(
-                    stack,
-                    state,
-                    &[&iter_value],
-                    &[],
-                )?)
-            }
-            "drop" => {
-                let n = take_drop_count(args.first())?;
-                let state = IteratorState::Drop {
-                    source: *iter_rc,
-                    to_drop: n,
-                };
-                Value::iterator(self.alloc_stack_rooted_iterator_state(
-                    stack,
-                    state,
-                    &[&iter_value],
-                    &[],
-                )?)
-            }
-            "flatMap" => {
-                let mapper = require_callable(args.first())?;
-                let mapper_root = mapper;
-                let state = IteratorState::FlatMap {
-                    source: *iter_rc,
-                    mapper,
-                    inner: None,
-                };
-                Value::iterator(self.alloc_stack_rooted_iterator_state(
-                    stack,
-                    state,
-                    &[&iter_value, &mapper_root],
-                    &[],
-                )?)
-            }
-            "toArray" => {
-                let collected = self.drain_iterator(context, iter_rc)?;
-                let result = self.alloc_stack_rooted_array_from_values_with_root_slices(
-                    stack,
-                    collected.iter().cloned(),
-                    &[&iter_value],
-                    &[args.as_slice(), collected.as_slice()],
-                )?;
-                Value::array(result)
-            }
-            "forEach" => {
-                let callback = require_callable(args.first())?;
-                let collected = self.drain_iterator(context, iter_rc)?;
-                for v in collected {
-                    self.run_callable_sync(
-                        context,
-                        &callback,
-                        Value::undefined(),
-                        smallvec::smallvec![v],
-                    )?;
-                }
-                Value::undefined()
-            }
-            "reduce" => {
-                let reducer = require_callable(args.first())?;
-                let has_initial = args.len() >= 2;
-                let mut acc = if has_initial {
-                    args[1]
-                } else {
-                    Value::undefined()
-                };
-                let collected = self.drain_iterator(context, iter_rc)?;
-                let mut iter = collected.into_iter();
-                if !has_initial {
-                    acc = match iter.next() {
-                        Some(v) => v,
-                        None => {
-                            // Spec §27.5.x — empty + no initial → TypeError.
-                            return Err(VmError::TypeMismatch);
-                        }
-                    };
-                }
-                for v in iter {
-                    acc = self.run_callable_sync(
-                        context,
-                        &reducer,
-                        Value::undefined(),
-                        smallvec::smallvec![acc, v],
-                    )?;
-                }
-                acc
-            }
-            // §27.1.2 %IteratorPrototype%.next — pull one step from
-            // the wrapped state and surface the spec-shaped result
-            // object `{ value, done }`.
-            // <https://tc39.es/ecma262/#sec-iteratorprototype>
-            "next" => {
-                let (v, done) = self.iterator_next_full(context, iter_rc)?;
-                let obj =
-                    self.alloc_stack_rooted_object_with_extra_roots(stack, &[&iter_value, &v])?;
-                self.set_property(obj, "value", v)?;
-                self.set_property(obj, "done", Value::boolean(done))?;
-                Value::object(obj)
-            }
-            // §27.1.3 / §27.1.4 — `return` / `throw` on plain
-            // array-backed iterators are no-ops that fold the
-            // iterator to its completion state. Generator-style
-            // iterators are handled by the dedicated
-            // `Value::Generator` dispatch above.
-            "return" => {
-                let arg = args.first().cloned().unwrap_or(Value::undefined());
-                let obj =
-                    self.alloc_stack_rooted_object_with_extra_roots(stack, &[&iter_value, &arg])?;
-                self.set_property(obj, "value", arg)?;
-                self.set_property(obj, "done", Value::boolean(true))?;
-                Value::object(obj)
-            }
-            "throw" => {
-                let arg = args.first().cloned().unwrap_or(Value::undefined());
-                return Err(VmError::Uncaught {
-                    value: value_kind_name(&arg).to_string(),
-                });
-            }
-            _ => return Ok(false),
-        };
-        let top_idx = stack.len() - 1;
-        let frame = &mut stack[top_idx];
-        write_register(frame, dst, result)?;
-        frame.advance_pc(self.current_byte_len)?;
-        Ok(true)
-    }
-
-    fn drain_iterator(
-        &mut self,
-        context: &ExecutionContext,
-        iter_rc: &IteratorHandle,
-    ) -> Result<Vec<Value>, VmError> {
-        let mut out = Vec::new();
-        loop {
-            let (v, done) = self.iterator_next_full(context, iter_rc)?;
-            if done {
-                return Ok(out);
-            }
-            out.push(v);
-        }
-    }
-
-    /// §7.4.1 GetIterator(obj, hint=sync) sync helper.
-    ///
-    /// Returns the spec's `IteratorRecord` as `(iterator, nextMethod)`
-    /// — the `[[Done]]` slot lives on the caller side as a local
-    /// `bool` because step / close paths short-circuit through `?`.
-    ///
-    /// # Errors
-    /// - `TypeError` if `@@iterator` lookup or the result of calling
-    ///   it is not an Object.
-    /// - Any abrupt completion from the user `@@iterator` / `Get`
-    ///   ladder propagates verbatim.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-getiterator>
     pub(crate) fn get_iterator_sync(
         &mut self,
         context: &ExecutionContext,
@@ -989,6 +850,12 @@ impl Interpreter {
         enum CloseAction {
             User(Value),
             Generator(crate::generator::JsGenerator),
+            /// Iterator-helper wrapper — closing it forwards the close
+            /// to the (optional) inner iterator, then to the source.
+            Helper {
+                source: IteratorHandle,
+                inner: Option<IteratorHandle>,
+            },
             Builtin,
             None,
         }
@@ -999,9 +866,23 @@ impl Interpreter {
                 // body with a return completion so its `finally` blocks
                 // run and `[[GeneratorState]]` becomes completed.
                 IteratorState::Generator { handle } => CloseAction::Generator(*handle),
+                // §27.1.2.1 — the helper wrappers behave like the spec's
+                // implicit generators: a close runs their underlying
+                // IteratorClose before completing.
+                IteratorState::Map { source, .. }
+                | IteratorState::Filter { source, .. }
+                | IteratorState::Take { source, .. }
+                | IteratorState::Drop { source, .. } => CloseAction::Helper {
+                    source: *source,
+                    inner: None,
+                },
+                IteratorState::FlatMap { source, inner, .. } => CloseAction::Helper {
+                    source: *source,
+                    inner: *inner,
+                },
                 // Array / TypedArray / String / Map / Set iterators
                 // expose no `return`, so IteratorClose is a no-op.
-                IteratorState::Exhausted => CloseAction::None,
+                IteratorState::Exhausted { .. } => CloseAction::None,
                 _ => CloseAction::Builtin,
             })
         } else {
@@ -1018,9 +899,37 @@ impl Interpreter {
                     GeneratorResumeKind::Return(Value::undefined()),
                 )?;
             }
+            CloseAction::Helper { source, inner } => {
+                // Mark the wrapper exhausted FIRST so a re-entrant or
+                // repeated close does not forward twice.
+                if let Some(handle) = iterator.as_iterator() {
+                    self.gc_heap.with_payload(handle, |state| state.exhaust());
+                }
+                let inner_result = match inner {
+                    Some(inner) => self.iterator_close_value_sync(context, Value::iterator(inner)),
+                    None => Ok(()),
+                };
+                self.iterator_close_value_sync(context, Value::iterator(source))?;
+                inner_result?;
+            }
             CloseAction::Builtin | CloseAction::None => {}
         }
         Ok(())
+    }
+
+    /// §7.4.8 IfAbruptCloseIterator — close `handle` while preserving
+    /// the original pending thrown value; the close result (normal or
+    /// abrupt) is swallowed in favour of the original completion.
+    pub(crate) fn close_iterator_preserving_throw(
+        &mut self,
+        context: &ExecutionContext,
+        handle: &IteratorHandle,
+    ) {
+        let original_throw = self.take_pending_uncaught_throw();
+        let _ = self.iterator_close_value_sync(context, Value::iterator(*handle));
+        if let Some(value) = original_throw {
+            self.set_pending_uncaught_throw(value);
+        }
     }
 
     /// §7.4.13 IteratorToList synchronous helper.
@@ -1637,8 +1546,7 @@ impl Interpreter {
                 None => (Value::undefined(), true),
             };
             if done && let Some(rc) = state.iterator.as_iterator() {
-                self.gc_heap
-                    .with_payload(rc, |state| *state = IteratorState::Exhausted);
+                self.gc_heap.with_payload(rc, |state| state.exhaust());
             }
             if !done {
                 // §7.4.9 — `next` produced a value without throwing, so
@@ -1684,8 +1592,7 @@ impl Interpreter {
                 .unwrap_or(Value::undefined())
                 .to_boolean(&self.gc_heap);
             if done {
-                self.gc_heap
-                    .with_payload(*iter_rc, |state| *state = IteratorState::Exhausted);
+                self.gc_heap.with_payload(*iter_rc, |state| state.exhaust());
             }
             write_register(&mut stack[top_idx], value_dst, value)?;
             write_register(&mut stack[top_idx], done_dst, Value::boolean(done))?;

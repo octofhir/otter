@@ -451,6 +451,10 @@ pub struct BuiltinIteratorPrototypes {
     pub string: JsObject,
     /// `%RegExpStringIteratorPrototype%` — §22.2.7.2.
     pub regexp_string: JsObject,
+    /// `%IteratorHelperPrototype%` — §27.1.2.1.
+    pub helper: JsObject,
+    /// `%WrapForValidIteratorPrototype%` — §27.1.3.2.
+    pub wrap_for_valid_iterator: JsObject,
 }
 
 /// §22.1.5.2 / §23.1.5.2 / §24.1.5.2 / §24.2.5.2 — materialise the

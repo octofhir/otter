@@ -526,6 +526,8 @@ pub struct Interpreter {
     set_iterator_prototype: Option<JsObject>,
     string_iterator_prototype: Option<JsObject>,
     regexp_string_iterator_prototype: Option<JsObject>,
+    iterator_helper_prototype: Option<JsObject>,
+    wrap_for_valid_iterator_prototype: Option<JsObject>,
     function_kind_prototypes: function_kind::FunctionKindPrototypes,
     /// Pool of cold-frame side records (try handlers, async parking,
     /// in-flight ToPrimitive/bind/iterator ladders, module URL, …).
@@ -781,6 +783,8 @@ impl Interpreter {
             set_iterator_prototype: None,
             string_iterator_prototype: None,
             regexp_string_iterator_prototype: None,
+            iterator_helper_prototype: None,
+            wrap_for_valid_iterator_prototype: None,
             function_kind_prototypes: function_kind::FunctionKindPrototypes::default(),
             cold_frames: cold_frame::ColdFramePool::new(),
             realm_intrinsics: realm_intrinsics::RealmIntrinsics::default(),
@@ -817,6 +821,8 @@ impl Interpreter {
             interp.set_iterator_prototype = Some(protos.set);
             interp.string_iterator_prototype = Some(protos.string);
             interp.regexp_string_iterator_prototype = Some(protos.regexp_string);
+            interp.iterator_helper_prototype = Some(protos.helper);
+            interp.wrap_for_valid_iterator_prototype = Some(protos.wrap_for_valid_iterator);
         }
         interp.install_function_kind_prototypes_post_bootstrap();
         interp.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
@@ -835,6 +841,8 @@ impl Interpreter {
             BuiltinIteratorOrigin::Set => self.set_iterator_prototype,
             BuiltinIteratorOrigin::String => self.string_iterator_prototype,
             BuiltinIteratorOrigin::RegExpString => self.regexp_string_iterator_prototype,
+            BuiltinIteratorOrigin::Helper => self.iterator_helper_prototype,
+            BuiltinIteratorOrigin::WrapForValidIterator => self.wrap_for_valid_iterator_prototype,
         }
     }
 
@@ -2223,6 +2231,8 @@ impl Interpreter {
             self.set_iterator_prototype.as_ref(),
             self.string_iterator_prototype.as_ref(),
             self.regexp_string_iterator_prototype.as_ref(),
+            self.iterator_helper_prototype.as_ref(),
+            self.wrap_for_valid_iterator_prototype.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -5716,37 +5726,6 @@ pub enum GeneratorResumeKind {
     Throw(Value),
 }
 
-/// Coerce `take(n)` / `drop(n)` argument to a non-negative integer.
-/// Per the iterator-helpers proposal step 3, NaN / non-integer
-/// inputs raise a RangeError-equivalent (surfaced here as
-/// `TypeMismatch`).
-fn take_drop_count(arg: Option<&Value>) -> Result<u64, VmError> {
-    let Some(v) = arg else {
-        return Err(VmError::TypeMismatch);
-    };
-    let n = if v.is_undefined() {
-        return Err(VmError::TypeMismatch);
-    } else if let Some(num) = v.as_number() {
-        num.as_f64()
-    } else if let Some(b) = v.as_boolean() {
-        if b { 1.0 } else { 0.0 }
-    } else if v.is_null() {
-        0.0
-    } else {
-        return Err(VmError::TypeMismatch);
-    };
-    if n.is_nan() {
-        return Err(VmError::TypeMismatch);
-    }
-    if n.is_infinite() && n.is_sign_positive() {
-        return Ok(u64::MAX);
-    }
-    if n < 0.0 {
-        return Err(VmError::TypeMismatch);
-    }
-    Ok(n.trunc() as u64)
-}
-
 /// Drive an iterator one step. Returns `(value, done)`. Once an
 /// iterator hands back `done = true`, its state transitions to
 /// `Exhausted` so subsequent calls are stable no-ops (matches the
@@ -5796,7 +5775,7 @@ fn step_iterator(
             index,
             kind,
         } => FastIteratorSnapshot::ArrayLike(*object, *index, *kind),
-        IteratorState::Exhausted => FastIteratorSnapshot::Exhausted,
+        IteratorState::Exhausted { .. } => FastIteratorSnapshot::Exhausted,
         IteratorState::User { .. }
         | IteratorState::RegExpString { .. }
         | IteratorState::Generator { .. }
@@ -6090,7 +6069,7 @@ fn step_iterator(
     match outcome {
         Some(value) => Ok((value, false)),
         None => {
-            gc_heap.with_payload(iter, |state| *state = IteratorState::Exhausted);
+            gc_heap.with_payload(iter, |state| state.exhaust());
             Ok((Value::undefined(), true))
         }
     }
@@ -6854,152 +6833,6 @@ mod tests {
                 .is_none_or(|c| c.pending_get_iterator.is_none())
         );
         assert_eq!(stack[0].pc, 1);
-    }
-
-    #[test]
-    fn iterator_helper_next_uses_young_allocation_with_frame_roots() {
-        let module = module_with(Vec::new(), 4);
-        let mut interp = Interpreter::new();
-        let source = crate::array::from_elements_old_for_fixture(
-            interp.gc_heap_mut(),
-            [Value::number(NumberValue::from_i32(7))],
-        )
-        .unwrap();
-
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
-        let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[0] = Value::array(source);
-        stack.push(frame);
-        let context = ExecutionContext::from_module(module);
-
-        interp.run_get_iterator_regs(&mut stack, 0, 1, 0).unwrap();
-        let iter = stack[0].registers[1]
-            .as_iterator()
-            .expect("GetIterator should produce an iterator handle");
-        let args: SmallVec<[Value; 8]> = SmallVec::new();
-
-        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-        assert!(
-            interp
-                .iterator_helper_dispatch(&mut stack, &context, &iter, "next", &args, 2)
-                .unwrap()
-        );
-        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
-        assert!(
-            after > before,
-            "Iterator helper next() should allocate its result object in young space"
-        );
-
-        let Some(record) = (stack[0].registers[2]).as_object() else {
-            panic!("Iterator helper next() should write a result object");
-        };
-        assert_eq!(
-            object::get(record, interp.gc_heap(), "value"),
-            Some(Value::number(NumberValue::from_i32(7)))
-        );
-        assert_eq!(
-            object::get(record, interp.gc_heap(), "done"),
-            Some(Value::boolean(false))
-        );
-    }
-
-    #[test]
-    fn iterator_helper_map_uses_old_iterator_state_allocation_with_frame_roots() {
-        fn identity_mapper(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-            Ok(args.first().cloned().unwrap_or(Value::undefined()))
-        }
-
-        let module = module_with(Vec::new(), 4);
-        let mut interp = Interpreter::new();
-        let source = crate::array::from_elements_old_for_fixture(
-            interp.gc_heap_mut(),
-            [Value::number(NumberValue::from_i32(5))],
-        )
-        .unwrap();
-        let mapper =
-            native_value_static(interp.gc_heap_mut(), "identityMapper", 1, identity_mapper)
-                .unwrap();
-
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
-        let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[0] = Value::array(source);
-        stack.push(frame);
-        let context = ExecutionContext::from_module(module);
-
-        interp.run_get_iterator_regs(&mut stack, 0, 1, 0).unwrap();
-        let iter = stack[0].registers[1]
-            .as_iterator()
-            .expect("GetIterator should produce an iterator handle");
-        let args: SmallVec<[Value; 8]> = smallvec::smallvec![mapper];
-
-        let before = interp.gc_heap_mut().stats().old_allocated_bytes;
-        assert!(
-            interp
-                .iterator_helper_dispatch(&mut stack, &context, &iter, "map", &args, 2)
-                .unwrap()
-        );
-        let after = interp.gc_heap_mut().stats().old_allocated_bytes;
-        assert!(
-            after > before,
-            "Iterator helper map() should allocate its wrapper state in non-moving old space"
-        );
-        assert!(stack[0].registers[2].is_iterator());
-    }
-
-    #[test]
-    fn iterator_flat_map_inner_array_uses_runtime_rooted_iterator_allocation() {
-        let module = module_with(Vec::new(), 4);
-        let mut interp = Interpreter::new();
-        let source = crate::array::from_elements_old_for_fixture(
-            interp.gc_heap_mut(),
-            [Value::number(NumberValue::from_i32(1))],
-        )
-        .unwrap();
-        let mapped = crate::array::from_elements_old_for_fixture(
-            interp.gc_heap_mut(),
-            [Value::number(NumberValue::from_i32(99))],
-        )
-        .unwrap();
-        let mapper = native_value_with_captures(
-            interp.gc_heap_mut(),
-            "returnCapturedArray",
-            smallvec::smallvec![Value::array(mapped)],
-            |_ctx, _args, captures| Ok(captures.first().cloned().unwrap_or(Value::undefined())),
-        )
-        .unwrap();
-
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
-        let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[0] = Value::array(source);
-        stack.push(frame);
-        let context = ExecutionContext::from_module(module);
-
-        interp.run_get_iterator_regs(&mut stack, 0, 1, 0).unwrap();
-        let iter = stack[0].registers[1]
-            .as_iterator()
-            .expect("GetIterator should produce an iterator handle");
-        let args: SmallVec<[Value; 8]> = smallvec::smallvec![mapper];
-        assert!(
-            interp
-                .iterator_helper_dispatch(&mut stack, &context, &iter, "flatMap", &args, 2)
-                .unwrap()
-        );
-        let flat_iter = stack[0].registers[2]
-            .as_iterator()
-            .expect("flatMap should return an iterator");
-        let before = interp.gc_heap_mut().stats().old_allocated_bytes;
-
-        let (value, done) = interp
-            .iterator_next_full(&context, &flat_iter)
-            .expect("flatMap next");
-
-        let after = interp.gc_heap_mut().stats().old_allocated_bytes;
-        assert!(
-            after > before,
-            "flatMap should allocate adopted inner array iterator state in non-moving old space"
-        );
-        assert_eq!(value, Value::number(NumberValue::from_i32(99)));
-        assert!(!done);
     }
 
     #[test]
@@ -8662,49 +8495,6 @@ mod tests {
             .expect_err("non-callable own String wrapper replace should shadow builtin");
 
         assert!(matches!(err, VmError::NotCallable));
-    }
-
-    #[test]
-    fn iterator_helper_to_array_uses_stack_rooted_result_allocation() {
-        let module = module_with(Vec::new(), 4);
-        let mut interp = Interpreter::new();
-        let source = crate::array::from_elements_old_for_fixture(
-            interp.gc_heap_mut(),
-            [Value::number(NumberValue::from_i32(21))],
-        )
-        .unwrap();
-
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
-        let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[0] = Value::array(source);
-        stack.push(frame);
-        let context = ExecutionContext::from_module(module);
-
-        interp.run_get_iterator_regs(&mut stack, 0, 1, 0).unwrap();
-        let iter = stack[0].registers[1]
-            .as_iterator()
-            .expect("GetIterator should produce an iterator handle");
-        let args: SmallVec<[Value; 8]> = SmallVec::new();
-        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-
-        assert!(
-            interp
-                .iterator_helper_dispatch(&mut stack, &context, &iter, "toArray", &args, 2)
-                .unwrap()
-        );
-
-        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
-        assert!(
-            after > before,
-            "Iterator helper toArray() should allocate its result through stack roots"
-        );
-        let Some(result) = (stack[0].registers[2]).as_array() else {
-            panic!("toArray should return an array");
-        };
-        assert_eq!(
-            crate::array::get(result, interp.gc_heap(), 0),
-            Value::number(NumberValue::from_i32(21))
-        );
     }
 
     #[test]

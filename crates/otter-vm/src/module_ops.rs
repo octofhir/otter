@@ -31,8 +31,8 @@
 
 use crate::{
     ExecutionContext, Frame, Interpreter, JsString, Value, VmError, module_records::ModuleStatus,
-    operand_decode::register_operand, promise_dispatch, read_register, render_thrown_value,
-    resolve_relative_url, write_register,
+    operand_decode::register_operand, promise_dispatch, read_register, resolve_relative_url,
+    write_register,
 };
 use otter_bytecode::Operand;
 use smallvec::SmallVec;
@@ -255,7 +255,7 @@ impl Interpreter {
                     if let Some(thrown) = record.evaluation_error {
                         self.set_pending_uncaught_throw(thrown);
                         return Err(VmError::Uncaught {
-                            value: render_thrown_value(&thrown, &self.gc_heap),
+                            value: self.render_thrown(&thrown),
                         });
                     }
                     return Ok(record.evaluation_promise);
@@ -305,7 +305,7 @@ impl Interpreter {
                     if let Some(thrown) = record.evaluation_error {
                         self.set_pending_uncaught_throw(thrown);
                         return Err(VmError::Uncaught {
-                            value: render_thrown_value(&thrown, &self.gc_heap),
+                            value: self.render_thrown(&thrown),
                         });
                     }
                     return Ok(());
@@ -377,7 +377,7 @@ impl Interpreter {
                 {
                     self.set_pending_uncaught_throw(thrown);
                     return Err(VmError::Uncaught {
-                        value: render_thrown_value(&thrown, &self.gc_heap),
+                        value: self.render_thrown(&thrown),
                     });
                 }
                 root
@@ -477,7 +477,7 @@ impl Interpreter {
             }
             self.set_pending_uncaught_throw(thrown);
             return VmError::Uncaught {
-                value: render_thrown_value(&thrown, &self.gc_heap),
+                value: self.render_thrown(&thrown),
             };
         }
         // Infrastructure failure — reset so a later attempt can retry.

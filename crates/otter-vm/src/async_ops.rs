@@ -25,7 +25,7 @@ use smallvec::SmallVec;
 use crate::promise::JsPromise;
 use crate::{
     ExecutionContext, Frame, Interpreter, RunError, Value, VmError, promise_dispatch,
-    render_thrown_value, snapshot_frames,
+    snapshot_frames,
 };
 
 impl Interpreter {
@@ -434,7 +434,7 @@ impl Interpreter {
         value: Value,
         mut uncaught_error: Option<VmError>,
     ) -> Result<(), VmError> {
-        let display = render_thrown_value(&value, &self.gc_heap);
+        let display = self.render_thrown(&value);
         let payload = value;
         loop {
             if stack.last().is_none() {

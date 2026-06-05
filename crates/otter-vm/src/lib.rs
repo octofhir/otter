@@ -156,7 +156,7 @@ use arithmetic_dispatch::{
     bigint_and_op, bigint_mul_op, bigint_or_op, bigint_sub_op, bigint_xor_op,
 };
 pub(crate) use error_ops::{
-    native_to_vm_error, render_thrown_value, snapshot_frames, symbol_to_vm_error, vm_err_to_value,
+    native_to_vm_error, snapshot_frames, symbol_to_vm_error, vm_err_to_value,
 };
 use executable::ExecutableFunction;
 use operand_decode::{apply_branch, register_operand};
@@ -3127,7 +3127,7 @@ impl Interpreter {
                         crate::promise::PromiseState::Rejected(reason) => {
                             return Err((
                                 VmError::Uncaught {
-                                    value: render_thrown_value(&reason, &self.gc_heap),
+                                    value: self.render_thrown(&reason),
                                 },
                                 Vec::new(),
                             ));

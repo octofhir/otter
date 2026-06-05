@@ -29,7 +29,7 @@ use crate::promise::JsPromise;
 use crate::{
     AsyncFrameState, EvalCompileOptions, ExecutionContext, Frame, Interpreter, Value, VmError,
     abstract_ops, operand_decode::register_operand, promise_dispatch, read_register,
-    render_thrown_value, write_register,
+    write_register,
 };
 
 impl Interpreter {
@@ -147,7 +147,7 @@ impl Interpreter {
                 crate::promise::PromiseState::Fulfilled(v) => v,
                 crate::promise::PromiseState::Rejected(reason) => {
                     return Err(VmError::Uncaught {
-                        value: render_thrown_value(&reason, &self.gc_heap),
+                        value: self.render_thrown(&reason),
                     });
                 }
                 crate::promise::PromiseState::Pending => Value::undefined(),

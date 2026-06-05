@@ -413,6 +413,50 @@ pub(crate) fn vm_err_to_value(err: &VmError, heap: &mut otter_gc::GcHeap) -> Val
     )
 }
 
+impl crate::Interpreter {
+    /// Render a thrown JS value for diagnostics, with a
+    /// constructor-name fallback over the heap-only
+    /// [`render_thrown_value`]: an error-shaped object whose class
+    /// never set a `name` property (e.g. the test262 harness's
+    /// `Test262Error`) renders under its constructor function's name
+    /// instead of the generic `Error`.
+    pub(crate) fn render_thrown(&self, value: &Value) -> String {
+        let heap = &self.gc_heap;
+        if let Some(obj) = value.as_object() {
+            let has_real_name = crate::object::get(obj, heap, "name")
+                .is_some_and(|name| !name.is_undefined() && !name.is_null());
+            let message = crate::object::get(obj, heap, "message");
+            if !has_real_name && let Some(ctor_name) = self.thrown_constructor_name(obj) {
+                let message = message
+                    .filter(|v| !v.is_undefined())
+                    .map(|v| {
+                        v.as_string(heap)
+                            .map_or_else(|| v.display_string(heap), |s| s.to_lossy_string(heap))
+                    })
+                    .unwrap_or_default();
+                return if message.is_empty() {
+                    ctor_name
+                } else {
+                    format!("{ctor_name}: {message}")
+                };
+            }
+        }
+        render_thrown_value(value, heap)
+    }
+
+    /// Resolve the bytecode function name of an object's
+    /// `constructor`. `None` for missing/native/anonymous
+    /// constructors.
+    fn thrown_constructor_name(&self, obj: crate::object::JsObject) -> Option<String> {
+        let ctor = crate::object::get(obj, &self.gc_heap, "constructor")?;
+        let function_id = ctor.as_function()?;
+        let chunk = self.code_space.chunk_for(function_id)?;
+        let local = function_id.checked_sub(chunk.function_base)? as usize;
+        let name = chunk.module.functions.get(local)?.name.clone();
+        (!name.is_empty()).then_some(name)
+    }
+}
+
 /// Render an uncaught JS value for diagnostic output. Routes
 /// Error-shaped objects through [`error_classes::render_error_to_string`]
 /// so the unwind printout matches what `e.toString()` returns at

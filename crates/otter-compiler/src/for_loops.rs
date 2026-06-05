@@ -212,6 +212,12 @@ pub(crate) fn compile_for_of_statement(
     if !is_for_await {
         cx.emit(Op::IteratorCloseEnd, [Operand::Register(iter_reg)], span);
     }
+    // Close the head-binding scope opened for the per-iteration
+    // `let`/`const` cell — leaving it pushed would leak the head name
+    // into the enclosing scope's redeclaration checks.
+    if per_iter_upvalue.is_some() {
+        cx.exit_scope();
+    }
     Ok(Some(completion_reg))
 }
 

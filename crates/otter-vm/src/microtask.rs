@@ -16,10 +16,13 @@
 //!
 //! # Drain semantics
 //!
-//! - **Swap-and-drain** with `mem::take`: tasks enqueued *during* a
-//!   drain go on the next generation. Each generation runs to
-//!   completion before the next. This matches reused-buffer engine
-//!   patterns while skipping the interior-mutability cost.
+//! - **Swap-and-drain** into the queue-owned `in_flight` deque:
+//!   tasks enqueued *during* a drain go on the next generation, and
+//!   each generation runs to completion before the next. Waiting
+//!   tasks stay owned by the queue — never by a driver-local batch —
+//!   so the GC root walk sees them while their predecessors execute
+//!   (parked async frames in the queue carry raw register slots a
+//!   scavenge must rewrite).
 //! - **Reentrant `drain_depth`**: nested `drain_microtasks()` calls
 //!   from inside a microtask are no-ops — the outermost drain
 //!   absorbs all pending work.

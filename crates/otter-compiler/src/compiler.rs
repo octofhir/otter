@@ -32,6 +32,11 @@ pub(crate) struct Compiler {
     /// so peers across classes never collide.
     /// <https://tc39.es/ecma262/#sec-private-names>
     pub(crate) private_namespaces: Vec<u32>,
+    /// Private names declared by each enclosing class, parallel to
+    /// `private_namespaces`. Seeds §8.2.4 AllPrivateNamesValid when a
+    /// nested class body is compiled (its `#name` references may
+    /// resolve to an outer class).
+    pub(crate) class_private_names: Vec<std::collections::HashSet<String>>,
     /// `true` when compiling a *strict* `eval` body: §19.2.1.1 gives
     /// strict eval its own variable environment, so top-level `var` /
     /// `function` declarations must NOT mirror onto the global object
@@ -44,6 +49,7 @@ impl Compiler {
         Self {
             stack: vec![top],
             private_namespaces: Vec::new(),
+            class_private_names: Vec::new(),
             suppress_global_mirror: false,
         }
     }

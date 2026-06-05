@@ -92,8 +92,13 @@ pub(crate) fn compile_class(
     validate_no_direct_super_in_methods(&class.body)?;
     // §15.7.1 / §8.2.4 AllPrivateNamesValid — every `#name` must be
     // declared in an enclosing class. The heritage expression is
-    // evaluated in the outer private scope.
-    validate_class_private_names(class)?;
+    // evaluated in the outer private scope. Enclosing classes' names
+    // seed the scope stack: a nested class compiled inside a method
+    // body may legally reference the outer class's `#name`.
+    {
+        let mut scopes = cx.class_private_names.clone();
+        validate_class_private_names_inner(class, &mut scopes)?;
+    }
 
     cx.enter_scope();
 
@@ -113,6 +118,7 @@ pub(crate) fn compile_class(
     // class evaluation. Methods capture these bindings, so repeated
     // evaluation of the same class body gets distinct private keys.
     let private_bound = collect_class_private_bound(&class.body);
+    cx.class_private_names.push(private_bound.clone());
     for name in &private_bound {
         let binding = cx
             .private_key_binding_name(name)
@@ -633,6 +639,7 @@ pub(crate) fn compile_class(
     );
 
     cx.private_namespaces.pop();
+    cx.class_private_names.pop();
     cx.exit_scope();
     Ok(class_reg)
 }
@@ -719,25 +726,32 @@ pub(crate) fn load_private_key(
     name: &str,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
-    let binding = cx
-        .private_key_binding_name(name)
-        .ok_or(CompileError::Unsupported {
+    if cx.private_namespaces.is_empty() {
+        return Err(CompileError::Unsupported {
             node: "private name used outside a class body".to_string(),
             span,
-        })?;
-    if let Some(info) = cx.lookup_binding(&binding) {
-        let dst = cx.alloc_scratch();
-        cx.emit_load_storage(dst, info.storage, span);
-        return Ok(dst);
+        });
     }
-    if let Some(uv_idx) = cx.resolve_capture(&binding) {
-        let dst = cx.alloc_scratch();
-        cx.emit(
-            Op::LoadUpvalue,
-            [Operand::Register(dst), Operand::Imm32(uv_idx as i32)],
-            span,
-        );
-        return Ok(dst);
+    // §9.2 PrivateEnvironment chain — resolve through enclosing class
+    // scopes, innermost first, so an inner class reads an outer
+    // class's `#name` while its own declarations shadow.
+    let namespaces: Vec<u32> = cx.private_namespaces.iter().rev().copied().collect();
+    for ns in namespaces {
+        let binding = format!("__privsym_{ns}_{name}");
+        if let Some(info) = cx.lookup_binding(&binding) {
+            let dst = cx.alloc_scratch();
+            cx.emit_load_storage(dst, info.storage, span);
+            return Ok(dst);
+        }
+        if let Some(uv_idx) = cx.resolve_capture(&binding) {
+            let dst = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadUpvalue,
+                [Operand::Register(dst), Operand::Imm32(uv_idx as i32)],
+                span,
+            );
+            return Ok(dst);
+        }
     }
     Err(CompileError::Unsupported {
         node: format!("private name `#{name}` missing runtime key binding"),

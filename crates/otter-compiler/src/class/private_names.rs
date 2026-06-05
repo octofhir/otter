@@ -2,7 +2,6 @@
 //!
 //! # Contents
 //! - [`validate_no_direct_super_in_methods`] - reject direct `super(...)` outside derived constructors.
-//! - [`validate_class_private_names`] - validate class private-name references.
 //! - [`collect_class_private_bound`] - collect private names declared by a class body.
 //! - [`private_name_in_scope`] - test private-name visibility through nested class scopes.
 //! - [`validate_private_refs_in_expression`] - validate private references in expressions.
@@ -138,22 +137,6 @@ pub(crate) fn validate_no_direct_super_in_methods(
         }
     }
     Ok(())
-}
-
-/// §15.7.1 / §8.2.4 Static Semantics: AllPrivateNamesValid —
-/// every `#name` reference inside a class body must resolve to a
-/// `PrivateBoundIdentifier` of an enclosing class. The heritage
-/// expression is evaluated against the **outer** private
-/// environment (it cannot see the class's own private names).
-///
-/// Walks the class subtree, maintaining a stack of declared
-/// `#name` sets. Raises `CompileError::Syntax` on the first
-/// unresolved reference.
-pub(crate) fn validate_class_private_names(
-    class: &oxc_ast::ast::Class<'_>,
-) -> Result<(), CompileError> {
-    let mut scopes: Vec<std::collections::HashSet<String>> = Vec::new();
-    validate_class_private_names_inner(class, &mut scopes)
 }
 
 pub(crate) fn collect_class_private_bound(

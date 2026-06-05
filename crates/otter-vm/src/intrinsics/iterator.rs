@@ -40,23 +40,20 @@ fn iterator_ctor_call(
             name: "Iterator",
             reason: "out of memory".to_string(),
         })?;
-    let proto = if let Some(nf) = new_target.as_native_function() {
-        let heap = ctx.heap_mut();
-        nf.own_property_descriptor(heap, "prototype")
+    let proto = crate::intrinsics::shared::native_new_target_prototype(ctx, "Iterator")?;
+    let proto_obj = match proto.and_then(|v| v.as_object()) {
+        Some(p) => Some(p),
+        // OrdinaryCreateFromConstructor fallback — a non-object
+        // `prototype` resolves to the intrinsic default
+        // `%Iterator.prototype%`.
+        None => ctx
+            .cx
+            .interp
+            .constructor_prototype_value("Iterator")
             .ok()
-            .flatten()
-            .and_then(|d| match d.kind {
-                crate::object::DescriptorKind::Data { value } => Some(value),
-                _ => None,
-            })
-    } else if let Some(target_obj) = new_target.as_object() {
-        crate::object::get(target_obj, ctx.heap(), "prototype")
-    } else if let Some(c) = new_target.as_class_constructor() {
-        crate::object::get(c.statics(ctx.heap()), ctx.heap(), "prototype")
-    } else {
-        None
+            .and_then(|v| v.as_object()),
     };
-    if let Some(proto_obj) = proto.and_then(|v| v.as_object()) {
+    if let Some(proto_obj) = proto_obj {
         crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto_obj));
     }
     Ok(Value::object(obj))
@@ -302,20 +299,14 @@ fn iterator_receiver(
         let next_key = crate::VmPropertyKey::String("next");
         let outcome = interp
             .ordinary_get_value(&exec_ctx, this_value, this_value, &next_key, 0)
-            .map_err(|e| crate::NativeError::TypeError {
-                name,
-                reason: e.to_string(),
-            })?;
+            .map_err(|e| crate::native_function::vm_to_native_error(e, name))?;
         let next_method = match outcome {
             crate::VmGetOutcome::Value(v) => v,
             crate::VmGetOutcome::InvokeGetter { getter } => {
                 let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
                 interp
                     .run_callable_sync(&exec_ctx, &getter, this_value, args)
-                    .map_err(|e| crate::NativeError::TypeError {
-                        name,
-                        reason: e.to_string(),
-                    })?
+                    .map_err(|e| crate::native_function::vm_to_native_error(e, name))?
             }
         };
         if !interp.is_callable_runtime(&next_method) {
@@ -327,9 +318,10 @@ fn iterator_receiver(
         let this_root = this_value;
         let state = crate::IteratorState::User {
             iterator: this_value,
+            next_method: Some(next_method),
         };
         return ctx
-            .alloc_iterator_state(state, &[&this_root], &[])
+            .alloc_iterator_state(state, &[&this_root, &next_method], &[])
             .map_err(|_| crate::NativeError::TypeError {
                 name,
                 reason: "iterator allocation failed".to_string(),
@@ -501,10 +493,7 @@ fn iterator_arg_count_native(
         })?;
         interp
             .evaluate_to_primitive(&exec, &arg, crate::abstract_ops::ToPrimitiveHint::Number)
-            .map_err(|e| crate::NativeError::TypeError {
-                name,
-                reason: e.to_string(),
-            })?
+            .map_err(|e| crate::native_function::vm_to_native_error(e, name))?
     };
     let n = crate::number::to_number_value(&primitive, ctx.heap());
     if n.is_nan() {
@@ -544,9 +533,8 @@ fn iterator_proto_to_array(
             .cx
             .interp
             .iterator_next_full(&exec_ctx, &handle)
-            .map_err(|e| crate::NativeError::TypeError {
-                name: "Iterator.prototype.toArray",
-                reason: e.to_string(),
+            .map_err(|e| {
+                crate::native_function::vm_to_native_error(e, "Iterator.prototype.toArray")
             })?;
         if done {
             break;
@@ -586,9 +574,8 @@ fn iterator_proto_for_each(
             .cx
             .interp
             .iterator_next_full(&exec_ctx, &handle)
-            .map_err(|e| crate::NativeError::TypeError {
-                name: "Iterator.prototype.forEach",
-                reason: e.to_string(),
+            .map_err(|e| {
+                crate::native_function::vm_to_native_error(e, "Iterator.prototype.forEach")
             })?;
         if done {
             break;
@@ -599,9 +586,8 @@ fn iterator_proto_for_each(
         ctx.cx
             .interp
             .run_callable_sync(&exec_ctx, &callback, Value::undefined(), cb_args)
-            .map_err(|e| crate::NativeError::TypeError {
-                name: "Iterator.prototype.forEach",
-                reason: e.to_string(),
+            .map_err(|e| {
+                crate::native_function::vm_to_native_error(e, "Iterator.prototype.forEach")
             })?;
         idx += 1.0;
     }
@@ -637,9 +623,8 @@ fn iterator_proto_reduce(
             .cx
             .interp
             .iterator_next_full(&exec_ctx, &handle)
-            .map_err(|e| crate::NativeError::TypeError {
-                name: "Iterator.prototype.reduce",
-                reason: e.to_string(),
+            .map_err(|e| {
+                crate::native_function::vm_to_native_error(e, "Iterator.prototype.reduce")
             })?;
         if done {
             break;
@@ -658,9 +643,8 @@ fn iterator_proto_reduce(
             .cx
             .interp
             .run_callable_sync(&exec_ctx, &reducer, Value::undefined(), cb_args)
-            .map_err(|e| crate::NativeError::TypeError {
-                name: "Iterator.prototype.reduce",
-                reason: e.to_string(),
+            .map_err(|e| {
+                crate::native_function::vm_to_native_error(e, "Iterator.prototype.reduce")
             })?;
         idx += 1.0;
     }
@@ -706,9 +690,8 @@ fn iterator_proto_find(
             .cx
             .interp
             .iterator_next_full(&exec_ctx, &handle)
-            .map_err(|e| crate::NativeError::TypeError {
-                name: "Iterator.prototype.find",
-                reason: e.to_string(),
+            .map_err(|e| {
+                crate::native_function::vm_to_native_error(e, "Iterator.prototype.find")
             })?;
         if done {
             break;
@@ -720,9 +703,8 @@ fn iterator_proto_find(
             .cx
             .interp
             .run_callable_sync(&exec_ctx, &predicate, Value::undefined(), cb_args)
-            .map_err(|e| crate::NativeError::TypeError {
-                name: "Iterator.prototype.find",
-                reason: e.to_string(),
+            .map_err(|e| {
+                crate::native_function::vm_to_native_error(e, "Iterator.prototype.find")
             })?;
         if kept.to_boolean(ctx.heap()) {
             return Ok(v);
@@ -755,10 +737,7 @@ fn iterator_proto_next(
         .cx
         .interp
         .iterator_next_full(&exec_ctx, &handle)
-        .map_err(|e| crate::NativeError::TypeError {
-            name: "Iterator.prototype.next",
-            reason: e.to_string(),
-        })?;
+        .map_err(|e| crate::native_function::vm_to_native_error(e, "Iterator.prototype.next"))?;
     let obj = ctx
         .alloc_object_with_roots(&[&iter_value, &value], &[])
         .map_err(|_| crate::NativeError::TypeError {
@@ -766,15 +745,9 @@ fn iterator_proto_next(
             reason: "result allocation failed".to_string(),
         })?;
     ctx.set_property(obj, "value", value)
-        .map_err(|e| crate::NativeError::TypeError {
-            name: "Iterator.prototype.next",
-            reason: e.to_string(),
-        })?;
+        .map_err(|e| crate::native_function::vm_to_native_error(e, "Iterator.prototype.next"))?;
     ctx.set_property(obj, "done", Value::boolean(done))
-        .map_err(|e| crate::NativeError::TypeError {
-            name: "Iterator.prototype.next",
-            reason: e.to_string(),
-        })?;
+        .map_err(|e| crate::native_function::vm_to_native_error(e, "Iterator.prototype.next"))?;
     Ok(Value::object(obj))
 }
 
@@ -820,10 +793,7 @@ fn regexp_string_iterator_proto_next(
         .cx
         .interp
         .iterator_next_full(&exec_ctx, &handle)
-        .map_err(|e| crate::NativeError::TypeError {
-            name,
-            reason: e.to_string(),
-        })?;
+        .map_err(|e| crate::native_function::vm_to_native_error(e, name))?;
     let obj = ctx
         .alloc_object_with_roots(&[&iter_value, &value], &[])
         .map_err(|_| crate::NativeError::TypeError {
@@ -831,15 +801,9 @@ fn regexp_string_iterator_proto_next(
             reason: "result allocation failed".to_string(),
         })?;
     ctx.set_property(obj, "value", value)
-        .map_err(|e| crate::NativeError::TypeError {
-            name,
-            reason: e.to_string(),
-        })?;
+        .map_err(|e| crate::native_function::vm_to_native_error(e, name))?;
     ctx.set_property(obj, "done", Value::boolean(done))
-        .map_err(|e| crate::NativeError::TypeError {
-            name,
-            reason: e.to_string(),
-        })?;
+        .map_err(|e| crate::native_function::vm_to_native_error(e, name))?;
     Ok(Value::object(obj))
 }
 
@@ -870,15 +834,9 @@ fn iterator_proto_return(
             reason: "result allocation failed".to_string(),
         })?;
     ctx.set_property(obj, "value", arg)
-        .map_err(|e| crate::NativeError::TypeError {
-            name: "Iterator.prototype.return",
-            reason: e.to_string(),
-        })?;
+        .map_err(|e| crate::native_function::vm_to_native_error(e, "Iterator.prototype.return"))?;
     ctx.set_property(obj, "done", Value::boolean(true))
-        .map_err(|e| crate::NativeError::TypeError {
-            name: "Iterator.prototype.return",
-            reason: e.to_string(),
-        })?;
+        .map_err(|e| crate::native_function::vm_to_native_error(e, "Iterator.prototype.return"))?;
     Ok(Value::object(obj))
 }
 
@@ -923,10 +881,7 @@ fn iterator_predicate_drain(
             .cx
             .interp
             .iterator_next_full(&exec_ctx, &handle)
-            .map_err(|e| crate::NativeError::TypeError {
-                name,
-                reason: e.to_string(),
-            })?;
+            .map_err(|e| crate::native_function::vm_to_native_error(e, name))?;
         if done {
             return Ok(Value::boolean(initial));
         }
@@ -937,10 +892,7 @@ fn iterator_predicate_drain(
             .cx
             .interp
             .run_callable_sync(&exec_ctx, &predicate, Value::undefined(), cb_args)
-            .map_err(|e| crate::NativeError::TypeError {
-                name,
-                reason: e.to_string(),
-            })?;
+            .map_err(|e| crate::native_function::vm_to_native_error(e, name))?;
         if kept.to_boolean(ctx.heap()) == short_on_truthy {
             return Ok(Value::boolean(short_on_truthy));
         }
@@ -1028,20 +980,14 @@ fn iterator_from_native(
         let key = crate::VmPropertyKey::Symbol(iterator_sym);
         let outcome = interp
             .ordinary_get_value(&exec_ctx, input, input, &key, 0)
-            .map_err(|e| crate::NativeError::TypeError {
-                name: "Iterator.from",
-                reason: e.to_string(),
-            })?;
+            .map_err(|e| crate::native_function::vm_to_native_error(e, "Iterator.from"))?;
         let iter_method = match outcome {
             crate::VmGetOutcome::Value(v) => v,
             crate::VmGetOutcome::InvokeGetter { getter } => {
                 let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
                 interp
                     .run_callable_sync(&exec_ctx, &getter, input, args)
-                    .map_err(|e| crate::NativeError::TypeError {
-                        name: "Iterator.from",
-                        reason: e.to_string(),
-                    })?
+                    .map_err(|e| crate::native_function::vm_to_native_error(e, "Iterator.from"))?
             }
         };
         let iter_value = if iter_method.is_nullish() {
@@ -1050,10 +996,7 @@ fn iterator_from_native(
             let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
             interp
                 .run_callable_sync(&exec_ctx, &iter_method, input, args)
-                .map_err(|e| crate::NativeError::TypeError {
-                    name: "Iterator.from",
-                    reason: e.to_string(),
-                })?
+                .map_err(|e| crate::native_function::vm_to_native_error(e, "Iterator.from"))?
         } else {
             return Err(crate::NativeError::TypeError {
                 name: "Iterator.from",
@@ -1063,11 +1006,27 @@ fn iterator_from_native(
         if iter_value.is_iterator() {
             return Ok(iter_value);
         }
+        // §7.4.4 GetIteratorDirect — `next` is read once here, not
+        // per step.
+        let next_key = crate::VmPropertyKey::String("next");
+        let next_outcome = interp
+            .ordinary_get_value(&exec_ctx, iter_value, iter_value, &next_key, 0)
+            .map_err(|e| crate::native_function::vm_to_native_error(e, "Iterator.from"))?;
+        let next_method = match next_outcome {
+            crate::VmGetOutcome::Value(v) => v,
+            crate::VmGetOutcome::InvokeGetter { getter } => {
+                let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                interp
+                    .run_callable_sync(&exec_ctx, &getter, iter_value, args)
+                    .map_err(|e| crate::native_function::vm_to_native_error(e, "Iterator.from"))?
+            }
+        };
         let state = crate::IteratorState::User {
             iterator: iter_value,
+            next_method: Some(next_method),
         };
         let handle = ctx
-            .alloc_iterator_state(state, &[&iter_value], &[])
+            .alloc_iterator_state(state, &[&iter_value, &next_method], &[])
             .map_err(|_| crate::NativeError::TypeError {
                 name: "Iterator.from",
                 reason: "iterator allocation failed".to_string(),

@@ -222,7 +222,10 @@ fn drain_iterable_into_values(
             })?
     } else {
         let other_root = iter_obj;
-        let state = crate::IteratorState::User { iterator: iter_obj };
+        let state = crate::IteratorState::User {
+            iterator: iter_obj,
+            next_method: None,
+        };
         ctx.alloc_iterator_state(state, &[&other_root], &[])
             .map_err(|_| NativeError::TypeError {
                 name: "TypedArray",

@@ -221,6 +221,11 @@ pub enum IteratorState {
     User {
         /// Iterator object returned by `obj[@@iterator]()`.
         iterator: Value,
+        /// §7.4.4 GetIteratorDirect — `next` read once when the
+        /// iterator record is created (Iterator.from / iterator
+        /// helpers). `None` for paths that defer the lookup to the
+        /// first step (for-of `GetIterator`).
+        next_method: Option<Value>,
     },
     /// Permanently exhausted iterator.
     Exhausted,

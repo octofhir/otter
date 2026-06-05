@@ -55,7 +55,7 @@ fn string_iterator_values(s: JsString, heap: &mut otter_gc::GcHeap) -> Result<Ve
 /// Cloned snapshot of an [`IteratorState`] taken before driving a
 /// helper callback so the GC body borrow does not span dispatch.
 enum IteratorStateSnapshot {
-    User(Value),
+    User(Value, Option<Value>),
     RegExpString {
         matcher: Value,
         input: JsString,
@@ -276,7 +276,10 @@ impl Interpreter {
     ) -> Result<(Value, bool), VmError> {
         let snapshot: Option<IteratorStateSnapshot> =
             self.gc_heap.read_payload(*iter, |state| match state {
-                IteratorState::User { iterator } => Some(IteratorStateSnapshot::User(*iterator)),
+                IteratorState::User {
+                    iterator,
+                    next_method,
+                } => Some(IteratorStateSnapshot::User(*iterator, *next_method)),
                 IteratorState::RegExpString {
                     matcher,
                     input,
@@ -344,12 +347,22 @@ impl Interpreter {
                 }
                 Ok((value, done))
             }
-            IteratorStateSnapshot::User(iter_value) => {
-                let Some(iter_obj) = iter_value.as_object() else {
-                    return Err(VmError::TypeMismatch);
+            IteratorStateSnapshot::User(iter_value, next_method) => {
+                // §7.4.4 GetIteratorDirect — helpers cache `next` once
+                // at iterator-record creation. Paths that defer the
+                // lookup (for-of `GetIterator`) read it through the
+                // ordinary `[[Get]]` so accessor `next` fires.
+                let next_fn = match next_method {
+                    Some(next_fn) => next_fn,
+                    None => {
+                        let key = crate::VmPropertyKey::String("next");
+                        match self.ordinary_get_value(context, iter_value, iter_value, &key, 0)? {
+                            crate::VmGetOutcome::Value(v) => v,
+                            crate::VmGetOutcome::InvokeGetter { getter } => self
+                                .run_callable_sync(context, &getter, iter_value, SmallVec::new())?,
+                        }
+                    }
                 };
-                let next_fn = crate::object::get(iter_obj, &self.gc_heap, "next")
-                    .ok_or(VmError::TypeMismatch)?;
                 if !self.is_callable_runtime(&next_fn) {
                     return Err(VmError::TypeMismatch);
                 }
@@ -584,8 +597,19 @@ impl Interpreter {
                     if let Some(g) = iter_value.as_generator() {
                         IteratorState::Generator { handle: g }
                     } else {
+                        // §7.4.2 GetIteratorFlattenable step 3 —
+                        // GetIteratorDirect caches `next` once.
+                        let key = crate::VmPropertyKey::String("next");
+                        let next_method = match self
+                            .ordinary_get_value(context, iter_value, iter_value, &key, 0)?
+                        {
+                            crate::VmGetOutcome::Value(v) => v,
+                            crate::VmGetOutcome::InvokeGetter { getter } => self
+                                .run_callable_sync(context, &getter, iter_value, SmallVec::new())?,
+                        };
                         IteratorState::User {
                             iterator: iter_value,
+                            next_method: Some(next_method),
                         }
                     }
                 } else {
@@ -970,7 +994,7 @@ impl Interpreter {
         }
         let action = if let Some(handle) = iterator.as_iterator() {
             self.gc_heap.read_payload(handle, |state| match state {
-                IteratorState::User { iterator } => CloseAction::User(*iterator),
+                IteratorState::User { iterator, .. } => CloseAction::User(*iterator),
                 // §7.4.9 — a generator's `return` resumes the suspended
                 // body with a return completion so its `finally` blocks
                 // run and `[[GeneratorState]]` becomes completed.
@@ -1450,7 +1474,10 @@ impl Interpreter {
                     || produced.is_map()
                     || produced.is_set()
                 {
-                    IteratorState::User { iterator: produced }
+                    IteratorState::User {
+                        iterator: produced,
+                        next_method: None,
+                    }
                 } else {
                     if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                         cold.pending_get_iterator = None;
@@ -1691,7 +1718,7 @@ impl Interpreter {
         // state so the borrow does not span the `invoke` call
         // below.
         let user_iter = self.gc_heap.read_payload(*iter_rc, |state| match state {
-            IteratorState::User { iterator } => Some(*iterator),
+            IteratorState::User { iterator, .. } => Some(*iterator),
             _ => None,
         });
         let Some(user_iter_value) = user_iter else {

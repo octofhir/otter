@@ -644,9 +644,29 @@ pub fn compile_module_program(
                     reexport_tdz.push(name);
                 }
             }
-            Statement::ExportDefaultDeclaration(_) => {
+            Statement::ExportDefaultDeclaration(decl) => {
                 state.exported_names.insert("default".to_string());
                 tdz_inline.push(("default".to_string(), false));
+                // §16.2.3.7 — a *named* default function/class also
+                // creates a module-scope binding; later writes to it
+                // must mirror onto the `default` export slot (live
+                // binding).
+                let local_name = match &decl.declaration {
+                    oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
+                        f.id.as_ref().map(|id| id.name.as_str().to_string())
+                    }
+                    oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(c) => {
+                        c.id.as_ref().map(|id| id.name.as_str().to_string())
+                    }
+                    _ => None,
+                };
+                if let Some(local_name) = local_name {
+                    state
+                        .reexport_local_targets
+                        .entry(local_name)
+                        .or_default()
+                        .push("default".to_string());
+                }
             }
             _ => {}
         }

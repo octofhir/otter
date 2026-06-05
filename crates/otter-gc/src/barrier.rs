@@ -25,6 +25,15 @@
 //!   short-circuits to a couple of branches in the common case.
 //! - Card-table mark uses a single `(byte_offset / CARD_SIZE)`
 //!   index + atomic-or; zero allocation.
+//! - The dirty card is derived from the **parent header**, never
+//!   from the mutated slot. Traced slots routinely live outside
+//!   the parent's cell (boxed frames, `VecDeque` buffers, spilled
+//!   `SmallVec` storage are malloc-owned); masking such a slot
+//!   address to "its page" fabricates a page header in foreign
+//!   memory and the card-bit `|=` becomes a wild single-bit
+//!   write. The scavenger's dirty-card scan re-traces every
+//!   object intersecting a dirty card in full, so header-granular
+//!   marking loses no edges.
 //!
 //! # See also
 //!
@@ -37,18 +46,14 @@ use crate::page::Page;
 
 /// Single write-barrier entry point.
 ///
-/// Run after every pointer store `*slot_addr = child` performed
-/// inside an object whose [`GcHeader`] is `parent_header`.
-///
-/// `slot_addr` may be any address inside the parent object —
-/// the barrier locates the owning page via the address bitmask,
-/// not via the parent header.
+/// Run after every pointer store of `child` performed into an
+/// object whose [`GcHeader`] is `parent_header` — including
+/// stores into malloc-owned side storage reachable from the
+/// parent's payload (boxed frames, collection buffers).
 ///
 /// # Safety
 ///
-/// - `parent_header` must be a live `GcHeader`.
-/// - `slot_addr` must be inside the same page as `parent_header`
-///   (typically a field address inside the parent payload).
+/// - `parent_header` must be a live `GcHeader` inside a heap page.
 /// - `child` is the offset just stored into the slot. Zero is
 ///   accepted (no child = no-op).
 /// - `marking` is the [`MarkingState`] owned by the same
@@ -56,22 +61,26 @@ use crate::page::Page;
 #[inline]
 pub unsafe fn write_barrier(
     parent_header: *mut GcHeader,
-    slot_addr: *mut u8,
     child: RawGc,
     marking: &mut MarkingState,
 ) {
     // SAFETY: per docstring preconditions.
     unsafe {
-        // 1) Generational barrier — old → young pointer. Mark
-        // card dirty so the next scavenge picks up the young
-        // child.
+        // 1) Generational barrier — old → young pointer. Mark the
+        // card containing the parent's header dirty so the next
+        // scavenge re-traces the parent and evacuates the young
+        // child. The card is computed from the parent header — not
+        // the slot — because traced slots may live in malloc-owned
+        // side storage outside any heap page (see module
+        // invariants).
         if !child.is_null() && (*parent_header).is_old() {
             // SAFETY: child offset is valid in-cage.
             let child_header = cage_base().add(child.0 as usize) as *mut GcHeader;
             if (*child_header).is_young() {
-                let page_header = Page::header_of_mut(slot_addr);
-                let page_base = Page::page_base_of(slot_addr);
-                let byte_offset = (slot_addr as usize) - (page_base as usize);
+                let parent_addr = parent_header as *mut u8;
+                let page_header = Page::header_of_mut(parent_addr);
+                let page_base = Page::page_base_of(parent_addr);
+                let byte_offset = (parent_addr as usize) - (page_base as usize);
                 page_header.mark_card(byte_offset);
             }
         }

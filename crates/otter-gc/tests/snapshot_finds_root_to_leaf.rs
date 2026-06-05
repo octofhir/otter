@@ -37,7 +37,7 @@ fn link(heap: &mut GcHeap, parent: Gc<Node>, child: Gc<Node>) {
             (parent.as_header_ptr() as *mut u8).add(std::mem::size_of::<GcHeader>()) as *mut Node;
         let slot = std::ptr::addr_of_mut!((*payload).next);
         *slot = child;
-        heap.write_barrier(parent, slot, child);
+        heap.write_barrier(parent, child);
     }
 }
 

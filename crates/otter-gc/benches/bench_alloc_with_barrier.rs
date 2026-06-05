@@ -35,7 +35,7 @@ fn bench(c: &mut Criterion) {
                     as *mut Pair;
                 let slot = std::ptr::addr_of_mut!((*payload).next);
                 (*slot) = q;
-                heap.write_barrier(p, slot, q);
+                heap.write_barrier(p, q);
             }
         });
     });

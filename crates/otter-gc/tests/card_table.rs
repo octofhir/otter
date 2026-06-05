@@ -2,6 +2,13 @@
 //! scavenge via the dirty-card scan, even when no other root
 //! references the young object. The card returns to clean after
 //! the scavenge.
+//!
+//! Also covers the malloc-owned-slot shape: a traced slot living
+//! behind a `Box` (outside the parent's heap cell) must still
+//! produce a dirty card on the **parent's** page. Computing the
+//! card from the slot address would fabricate a page header in
+//! malloc memory — a wild single-bit write — and the young child
+//! would be reaped because the real parent page stays clean.
 
 use otter_gc::raw::RawGc;
 use otter_gc::trace::{SlotVisitor, Traceable};
@@ -16,6 +23,23 @@ impl Traceable for Box1 {
     unsafe fn trace_slots(this: *mut Self, v: &mut SlotVisitor<'_>) {
         unsafe {
             let slot = std::ptr::addr_of_mut!((*this).child) as *mut RawGc;
+            v(slot);
+        }
+    }
+}
+
+/// Parent whose traced slot lives in malloc memory (behind a
+/// `Box`), mirroring VM bodies like a parked frame's boxed
+/// register file.
+struct BoxedSlot {
+    child: Box<Gc<Box1>>,
+}
+
+impl Traceable for BoxedSlot {
+    const TYPE_TAG: u8 = 0x61;
+    unsafe fn trace_slots(this: *mut Self, v: &mut SlotVisitor<'_>) {
+        unsafe {
+            let slot = (&mut *(*this).child) as *mut Gc<Box1> as *mut RawGc;
             v(slot);
         }
     }
@@ -52,7 +76,7 @@ fn old_to_young_pointer_survives_via_dirty_card() {
             let slot_addr = std::ptr::addr_of_mut!((*parent_payload).child);
             (*slot_addr) = child;
             // Fire the barrier.
-            heap.write_barrier(promoted, slot_addr, child);
+            heap.write_barrier(promoted, child);
         }
         // The page containing the slot must now have a dirty
         // card.
@@ -110,4 +134,57 @@ fn old_to_young_pointer_survives_via_dirty_card() {
             "card still dirty after scavenge"
         );
     }
+}
+
+#[test]
+fn old_to_young_pointer_behind_boxed_slot_survives_scavenge() {
+    let mut heap = GcHeap::new().expect("heap");
+    heap.register_traceable::<Box1>();
+    heap.register_traceable::<BoxedSlot>();
+
+    let scope = unsafe { HandleScope::from_ptr(heap.handle_stack_ptr()) };
+    // Young child, then an old parent whose only reference to the
+    // child sits behind a Box (malloc memory). `alloc_old`'s payload
+    // edge barrier must mark the card of the *parent header* — the
+    // slot address is useless for card math.
+    let child = heap.alloc(Box1 { child: Gc::null() }).unwrap();
+    let child_local = scope.local(child);
+    assert!(unsafe { (*child.as_header_ptr()).is_young() });
+    let parent = heap
+        .alloc_old(BoxedSlot {
+            child: Box::new(child),
+        })
+        .unwrap();
+    assert!(unsafe { (*parent.as_header_ptr()).is_old() });
+    // The parent's page must carry the dirty card.
+    unsafe {
+        let parent_addr = parent.as_header_ptr() as *const u8;
+        let page_header = Page::header_of(parent_addr);
+        let page_base = Page::page_base_of(parent_addr);
+        let byte_offset = parent_addr as usize - page_base as usize;
+        assert!(
+            page_header.is_card_dirty(byte_offset),
+            "alloc_old edge barrier must dirty the parent's card for a boxed slot"
+        );
+    }
+    // Drop the direct root; the child stays reachable only through
+    // the old parent's boxed slot via the dirty card.
+    let _ = child_local;
+    drop(scope);
+    otter_gc::with_gc_session(&mut heap, |mut session| {
+        let root = session.root(parent);
+        std::mem::forget(root);
+    });
+    heap.collect_minor(otter_gc::EmptyRoots);
+    let child_after = heap.read_payload(parent, |body| *body.child);
+    assert!(
+        !child_after.is_null(),
+        "boxed-slot child reaped despite alloc_old edge barrier"
+    );
+    // The forwarded child must still carry its registered type tag.
+    assert_eq!(
+        unsafe { (*child_after.as_header_ptr()).type_tag() },
+        Box1::TYPE_TAG,
+        "boxed-slot child header clobbered after scavenge"
+    );
 }

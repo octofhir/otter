@@ -907,13 +907,17 @@ impl GcHeap {
             // The payload was installed with `ptr::write`, bypassing the
             // mutator write barrier. Any young children it carries are
             // old→young edges the next scavenge can only discover through
-            // the card table, so barrier every edge slot now.
+            // the card table, so barrier every edge now. The traced slots
+            // themselves may live in malloc-owned side storage (boxed
+            // frames, collection buffers); the barrier marks the card of
+            // `header_ptr`, never of the slot.
             let marking = &mut self.marking;
             T::trace_slots(payload_ptr, &mut |slot| {
                 // SAFETY (inherited from the enclosing block): `slot`
-                // points into the just-written payload; `header_ptr` is
-                // the freshly initialised parent header.
-                crate::barrier::write_barrier(header_ptr, slot as *mut u8, *slot, marking);
+                // points into the just-written payload's reachable
+                // storage; `header_ptr` is the freshly initialised
+                // parent header.
+                crate::barrier::write_barrier(header_ptr, *slot, marking);
             });
         }
         let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
@@ -1426,31 +1430,19 @@ impl GcHeap {
     /// Single hot-path write barrier for a pointer-field store.
     ///
     /// Caller must:
-    /// - have already performed the underlying store
-    ///   `(*slot_addr) = child.raw()`,
+    /// - have already performed the underlying store of `child`
+    ///   into the parent (inline field or malloc-owned side
+    ///   storage reachable from the payload),
     /// - pass the parent's `Gc<T>` (so the heap can locate the
-    ///   parent's header),
-    /// - pass the address of the slot inside the parent (so the
-    ///   barrier can compute the card-bit position).
-    pub fn write_barrier<T: ?Sized, U: ?Sized>(
-        &mut self,
-        parent: Gc<T>,
-        slot_addr: *mut Gc<U>,
-        child: Gc<U>,
-    ) {
+    ///   parent's header for card marking).
+    pub fn write_barrier<T: ?Sized, U: ?Sized>(&mut self, parent: Gc<T>, child: Gc<U>) {
         if parent.is_null() {
             return;
         }
         let parent_header = parent.as_header_ptr();
-        // SAFETY: parent is non-null; slot_addr is inside the
-        // parent payload as required by the barrier contract.
+        // SAFETY: parent is non-null and live.
         unsafe {
-            crate::barrier::write_barrier(
-                parent_header,
-                slot_addr as *mut u8,
-                child.raw(),
-                &mut self.marking,
-            );
+            crate::barrier::write_barrier(parent_header, child.raw(), &mut self.marking);
         }
     }
 
@@ -1460,15 +1452,15 @@ impl GcHeap {
     /// This is the safe contributor-facing mutation hook. Callers do
     /// not provide raw slot pointers and do not call barriers
     /// manually; they only pass the parent object and the value that
-    /// was just stored. The heap computes a conservative slot address
-    /// inside the parent payload for card-table marking.
+    /// was just stored. Card marking is header-granular, so the slot's
+    /// actual location (inline or malloc-owned side storage) is
+    /// irrelevant.
     pub fn record_write<T: ?Sized, V: GcStore + ?Sized>(&mut self, parent: Gc<T>, value: &V) {
         if parent.is_null() {
             return;
         }
-        let slot = parent_payload_slot(parent);
         let mut record = |edge: crate::GcEdge| {
-            self.write_barrier_raw(parent, slot, edge.raw());
+            self.write_barrier_raw(parent, edge.raw());
         };
         value.visit_gc_edges(&mut record);
     }
@@ -1476,25 +1468,14 @@ impl GcHeap {
     /// Type-erased write barrier for callers that hold the
     /// child as a [`RawGc`] rather than a typed `Gc<U>`.
     /// Equivalent to [`Self::write_barrier`] otherwise.
-    pub(crate) fn write_barrier_raw<T: ?Sized>(
-        &mut self,
-        parent: Gc<T>,
-        slot_addr: *mut RawGc,
-        child: RawGc,
-    ) {
+    pub(crate) fn write_barrier_raw<T: ?Sized>(&mut self, parent: Gc<T>, child: RawGc) {
         if parent.is_null() {
             return;
         }
         let parent_header = parent.as_header_ptr();
-        // SAFETY: parent is non-null; slot_addr is inside the
-        // parent payload as required by the barrier contract.
+        // SAFETY: parent is non-null and live.
         unsafe {
-            crate::barrier::write_barrier(
-                parent_header,
-                slot_addr as *mut u8,
-                child,
-                &mut self.marking,
-            );
+            crate::barrier::write_barrier(parent_header, child, &mut self.marking);
         }
     }
 

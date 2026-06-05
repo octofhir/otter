@@ -72,6 +72,12 @@ pub(crate) struct FunctionContext {
     /// recompiled and its closure isn't re-stored.
     /// <https://tc39.es/ecma262/#sec-functiondeclarationinstantiation>
     pub(crate) hoisted_function_names: HashSet<String>,
+    /// §B.3.3 — block-level function names receiving the sloppy-mode
+    /// var-scope extension, mapped to the variable-scope storage the
+    /// declaration's source position syncs into. The `bool` marks
+    /// global-script bindings that also mirror via `DefineGlobalVar`.
+    pub(crate) annex_b_var_storages:
+        std::collections::HashMap<String, (crate::scope::BindingStorage, bool)>,
     /// `true` when an anonymous `export default function/function*` was
     /// already hoisted (compiled + mirrored to `module_env.default`) at
     /// instantiation, so its source-position arm must be a no-op.
@@ -141,6 +147,7 @@ impl FunctionContext {
             active_finally: 0,
             pending_label: None,
             hoisted_function_names: HashSet::new(),
+            annex_b_var_storages: std::collections::HashMap::new(),
             default_function_hoisted: false,
             captured_names: HashSet::new(),
             mapped_argument_names: HashSet::new(),

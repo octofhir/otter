@@ -38,6 +38,7 @@
 //!   re-emit JS source and re-parse.
 //!
 
+mod annex_b;
 mod assignment;
 mod builtins_call;
 mod builtins_table;

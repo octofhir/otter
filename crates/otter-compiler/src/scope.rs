@@ -40,7 +40,7 @@ pub(crate) struct BindingInfo {
 }
 
 /// Where a binding lives in the running frame.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BindingStorage {
     /// Plain register. Read with `LoadLocal`, written with
     /// `StoreLocal`.

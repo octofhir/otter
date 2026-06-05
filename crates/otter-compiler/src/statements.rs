@@ -66,6 +66,12 @@ pub(crate) fn compile_statement(
         Statement::BlockStatement(b) => {
             let span = (b.span.start, b.span.end);
             cx.enter_scope();
+            // §14.2.3 BlockDeclarationInstantiation — function
+            // declarations instantiate on block entry, before any
+            // statement runs. The hoisted-name set is scoped to this
+            // block so the same name hoists independently elsewhere.
+            let saved_hoisted = cx.hoisted_function_names.clone();
+            hoist_function_declarations(cx, &b.body)?;
             let mut last = None;
             for inner in &b.body {
                 if let Some(r) = compile_statement(cx, inner)? {
@@ -73,6 +79,7 @@ pub(crate) fn compile_statement(
                 }
             }
             cx.exit_scope();
+            cx.hoisted_function_names = saved_hoisted;
             let _ = span;
             Ok(last)
         }
@@ -411,6 +418,26 @@ pub(crate) fn compile_statement(
             // block declaration in strict mode) fall through to the
             // ordinary block-scoped binding path.
             if cx.hoisted_function_names.contains(&name) {
+                // §B.3.3 — a sloppy block-level declaration's source
+                // position also updates the variable-scope binding
+                // (and the global own property for script bodies)
+                // with the block binding's current value.
+                if let Some(&(var_storage, global_mirror)) = cx.annex_b_var_storages.get(&name)
+                    && let Some(info) = cx.lookup_binding(&name)
+                    && info.storage != var_storage
+                {
+                    let tmp = cx.alloc_scratch();
+                    cx.emit_load_storage(tmp, info.storage, span);
+                    cx.emit_store_storage(tmp, var_storage, span);
+                    if global_mirror {
+                        let name_idx = cx.intern_string_constant(&name);
+                        cx.emit(
+                            Op::DefineGlobalVar,
+                            [Operand::ConstIndex(name_idx), Operand::Register(tmp)],
+                            span,
+                        );
+                    }
+                }
                 return Ok(None);
             }
             let (function_id, captures) = compile_function_full(
@@ -992,6 +1019,15 @@ pub(crate) fn compile_switch_statement(
 
     // Fresh lexical scope so per-case `let` bindings don't leak.
     cx.enter_scope();
+    // §14.12.3 / §14.2.3 — the CaseBlock instantiates its function
+    // declarations on entry, across every clause.
+    let saved_hoisted = cx.hoisted_function_names.clone();
+    let case_stmts: Vec<&oxc_ast::ast::Statement<'_>> = s
+        .cases
+        .iter()
+        .flat_map(|case| case.consequent.iter())
+        .collect();
+    hoist_function_declarations_from(cx, &case_stmts)?;
     cx.push_loop_frame(LoopFrame::switch_body());
 
     // Pass 1: emit selector comparisons for every non-default case.
@@ -1077,6 +1113,7 @@ pub(crate) fn compile_switch_statement(
         "switch frames must not collect continue patches"
     );
     cx.exit_scope();
+    cx.hoisted_function_names = saved_hoisted;
     Ok(Some(completion_reg))
 }
 

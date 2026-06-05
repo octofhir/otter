@@ -201,6 +201,14 @@ pub(crate) fn compile_program_with_mode(
     let mut top_level_vars: Vec<String> = Vec::new();
     hoist_var_names(&program.body, &mut top_level_vars);
     pre_declare_var_bindings(&mut cx, &top_level_vars, program_span)?;
+    // §B.3.3.2/3 — sloppy script / eval bodies extend the variable
+    // scope with block-level function declaration names.
+    pre_declare_annex_b_functions(
+        &mut cx,
+        &program.body,
+        &std::collections::HashSet::new(),
+        program_span,
+    )?;
     // §10.2.11 step 33 — pre-declare top-level `let` / `const` /
     // `class` names with TDZ so the function-hoist pass below can
     // see them when an inner function captures one of these

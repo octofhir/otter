@@ -133,6 +133,17 @@ pub(crate) fn compile_function_full(
     if let Some(body) = body {
         let mut var_names: Vec<String> = Vec::new();
         hoist_var_names(&body.statements, &mut var_names);
+        // §B.3.3.1 — parameter names (and the arguments object's
+        // implicit binding) block the sloppy block-level function
+        // var-scope extension; everything bound so far is a parameter
+        // or the function self-name.
+        let mut annex_blocked: std::collections::HashSet<String> = parent
+            .scopes
+            .iter()
+            .flat_map(|scope| scope.bindings.keys().cloned())
+            .collect();
+        annex_blocked.insert("arguments".to_string());
+        pre_declare_annex_b_functions(parent, &body.statements, &annex_blocked, span)?;
         pre_declare_var_bindings(parent, &var_names, span)?;
         // Pre-declare lexical bindings (TDZ) so hoisted nested
         // functions can capture forward references.
@@ -317,6 +328,13 @@ pub(crate) fn compile_arrow_function(
         // `Statement::VariableDeclaration` arm.
         let mut var_names: Vec<String> = Vec::new();
         hoist_var_names(&arrow.body.statements, &mut var_names);
+        let mut annex_blocked: std::collections::HashSet<String> = parent
+            .scopes
+            .iter()
+            .flat_map(|scope| scope.bindings.keys().cloned())
+            .collect();
+        annex_blocked.insert("arguments".to_string());
+        pre_declare_annex_b_functions(parent, &arrow.body.statements, &annex_blocked, span)?;
         pre_declare_var_bindings(parent, &var_names, span)?;
         let mut lex_names: Vec<(String, bool)> = Vec::new();
         hoist_lexical_names(&arrow.body.statements, &mut lex_names);

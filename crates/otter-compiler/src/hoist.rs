@@ -32,11 +32,21 @@ use crate::*;
 /// - <https://tc39.es/ecma262/#sec-static-semantics-varscopeddeclarations>
 pub(crate) fn hoist_var_names<'a>(stmts: &[Statement<'a>], out: &mut Vec<String>) {
     for stmt in stmts {
-        hoist_var_names_in_stmt(stmt, out);
+        hoist_var_names_in_stmt_at(stmt, out, true);
     }
 }
 
 pub(crate) fn hoist_var_names_in_stmt<'a>(stmt: &Statement<'a>, out: &mut Vec<String>) {
+    hoist_var_names_in_stmt_at(stmt, out, true);
+}
+
+fn hoist_var_names_nested<'a>(stmts: &[Statement<'a>], out: &mut Vec<String>) {
+    for stmt in stmts {
+        hoist_var_names_in_stmt_at(stmt, out, false);
+    }
+}
+
+fn hoist_var_names_in_stmt_at<'a>(stmt: &Statement<'a>, out: &mut Vec<String>, top: bool) {
     match stmt {
         Statement::VariableDeclaration(d)
             if matches!(d.kind, oxc_ast::ast::VariableDeclarationKind::Var) =>
@@ -45,36 +55,14 @@ pub(crate) fn hoist_var_names_in_stmt<'a>(stmt: &Statement<'a>, out: &mut Vec<St
                 collect_pattern_var_names(&declarator.id, out);
             }
         }
-        // §B.3.3 (web-compat) — in sloppy mode, a block-nested
-        // FunctionDeclaration must also surface as a `var` binding
-        // in the containing function / script / eval scope so the
-        // canonical shape
-        // `{ function f(){} } f()` resolves `f` after the block
-        // exits. The block-level lex binding is separately created
-        // by the inner BlockStatement scope.
-        // <https://tc39.es/ecma262/#sec-block-level-function-declarations-web-legacy-compatibility-semantics>
-        Statement::FunctionDeclaration(f) if !f.declare => {
+        // §8.2.5 VarScopedDeclarations — a *top-level* function
+        // declaration is var-scoped (§10.2.11 step 34). Block-nested
+        // declarations are lexical within their block; the sloppy-mode
+        // §B.3.3 var extension for them runs through
+        // [`pre_declare_annex_b_functions`], which applies the
+        // early-error blockers this indiscriminate walk cannot see.
+        Statement::FunctionDeclaration(f) if top && !f.declare => {
             if let Some(id) = &f.id {
-                out.push(id.name.as_str().to_string());
-            }
-        }
-        Statement::IfStatement(s)
-            if matches!(s.consequent, Statement::FunctionDeclaration(_))
-                || s.alternate
-                    .as_ref()
-                    .is_some_and(|a| matches!(a, Statement::FunctionDeclaration(_))) =>
-        {
-            if let Statement::FunctionDeclaration(f) = &s.consequent
-                && !f.declare
-                && let Some(id) = &f.id
-            {
-                out.push(id.name.as_str().to_string());
-            }
-            if let Some(alt) = &s.alternate
-                && let Statement::FunctionDeclaration(f) = alt
-                && !f.declare
-                && let Some(id) = &f.id
-            {
                 out.push(id.name.as_str().to_string());
             }
         }
@@ -93,15 +81,15 @@ pub(crate) fn hoist_var_names_in_stmt<'a>(stmt: &Statement<'a>, out: &mut Vec<St
                 }
             }
         }
-        Statement::BlockStatement(b) => hoist_var_names(&b.body, out),
+        Statement::BlockStatement(b) => hoist_var_names_nested(&b.body, out),
         Statement::IfStatement(s) => {
-            hoist_var_names_in_stmt(&s.consequent, out);
+            hoist_var_names_in_stmt_at(&s.consequent, out, false);
             if let Some(alt) = &s.alternate {
-                hoist_var_names_in_stmt(alt, out);
+                hoist_var_names_in_stmt_at(alt, out, false);
             }
         }
-        Statement::WhileStatement(s) => hoist_var_names_in_stmt(&s.body, out),
-        Statement::DoWhileStatement(s) => hoist_var_names_in_stmt(&s.body, out),
+        Statement::WhileStatement(s) => hoist_var_names_in_stmt_at(&s.body, out, false),
+        Statement::DoWhileStatement(s) => hoist_var_names_in_stmt_at(&s.body, out, false),
         Statement::ForStatement(s) => {
             if let Some(oxc_ast::ast::ForStatementInit::VariableDeclaration(d)) = &s.init
                 && matches!(d.kind, oxc_ast::ast::VariableDeclarationKind::Var)
@@ -110,7 +98,7 @@ pub(crate) fn hoist_var_names_in_stmt<'a>(stmt: &Statement<'a>, out: &mut Vec<St
                     collect_pattern_var_names(&declarator.id, out);
                 }
             }
-            hoist_var_names_in_stmt(&s.body, out);
+            hoist_var_names_in_stmt_at(&s.body, out, false);
         }
         Statement::ForInStatement(s) => {
             if let oxc_ast::ast::ForStatementLeft::VariableDeclaration(d) = &s.left
@@ -120,7 +108,7 @@ pub(crate) fn hoist_var_names_in_stmt<'a>(stmt: &Statement<'a>, out: &mut Vec<St
                     collect_pattern_var_names(&declarator.id, out);
                 }
             }
-            hoist_var_names_in_stmt(&s.body, out);
+            hoist_var_names_in_stmt_at(&s.body, out, false);
         }
         Statement::ForOfStatement(s) => {
             if let oxc_ast::ast::ForStatementLeft::VariableDeclaration(d) = &s.left
@@ -130,27 +118,27 @@ pub(crate) fn hoist_var_names_in_stmt<'a>(stmt: &Statement<'a>, out: &mut Vec<St
                     collect_pattern_var_names(&declarator.id, out);
                 }
             }
-            hoist_var_names_in_stmt(&s.body, out);
+            hoist_var_names_in_stmt_at(&s.body, out, false);
         }
         Statement::SwitchStatement(s) => {
             for case in s.cases.iter() {
-                hoist_var_names(&case.consequent, out);
+                hoist_var_names_nested(&case.consequent, out);
             }
         }
         Statement::TryStatement(s) => {
-            hoist_var_names(&s.block.body, out);
+            hoist_var_names_nested(&s.block.body, out);
             if let Some(handler) = &s.handler {
-                hoist_var_names(&handler.body.body, out);
+                hoist_var_names_nested(&handler.body.body, out);
             }
             if let Some(finalizer) = &s.finalizer {
-                hoist_var_names(&finalizer.body, out);
+                hoist_var_names_nested(&finalizer.body, out);
             }
         }
-        Statement::LabeledStatement(s) => hoist_var_names_in_stmt(&s.body, out),
+        Statement::LabeledStatement(s) => hoist_var_names_in_stmt_at(&s.body, out, false),
         // §14.11 — `with (expr) stmt` does not open a var scope; its
         // body's `var` declarations hoist to the enclosing function /
         // script scope like any other nested statement.
-        Statement::WithStatement(s) => hoist_var_names_in_stmt(&s.body, out),
+        Statement::WithStatement(s) => hoist_var_names_in_stmt_at(&s.body, out, false),
         // `function`, `class`, plain expressions, etc. — none
         // contribute var-declared names to this scope.
         _ => {}
@@ -393,6 +381,17 @@ pub(crate) fn hoist_function_declarations(
     cx: &mut Compiler,
     stmts: &[Statement<'_>],
 ) -> Result<(), CompileError> {
+    let refs: Vec<&Statement<'_>> = stmts.iter().collect();
+    hoist_function_declarations_from(cx, &refs)
+}
+
+/// Statement-reference variant of [`hoist_function_declarations`]
+/// for callers whose statement list spans several AST nodes (the
+/// switch CaseBlock).
+pub(crate) fn hoist_function_declarations_from(
+    cx: &mut Compiler,
+    stmts: &[&Statement<'_>],
+) -> Result<(), CompileError> {
     use std::collections::HashMap;
     // Resolve each statement to its hoistable `FunctionDeclaration`
     // payload, including the export-wrapped forms `export function`
@@ -460,7 +459,11 @@ pub(crate) fn hoist_function_declarations(
             continue;
         }
         let span = (f.span.start, f.span.end);
-        if cx.lookup_binding(&name).is_none() {
+        // Only a binding in the *current* scope (a parameter, a
+        // var-hoisted name, a sibling declaration) is reused; an
+        // outer-scope binding must not be captured by a block-level
+        // declaration's instantiation.
+        if cx.lookup_in_current_scope(&name).is_none() {
             let storage = cx.declare_binding(&name, false, span)?;
             let dst = cx.alloc_scratch();
             cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
@@ -499,7 +502,7 @@ pub(crate) fn hoist_function_declarations(
         let tmp = cx.alloc_scratch();
         emit_make_callable(cx, tmp, const_idx, &captures, false, span)?;
         let storage = cx
-            .lookup_binding(&name)
+            .lookup_in_current_scope(&name)
             .expect("pass 2 pre-declared the binding")
             .storage;
         cx.emit_store_storage(tmp, storage, span);
@@ -509,7 +512,11 @@ pub(crate) fn hoist_function_declarations(
         // resolve it. Mirrors the `var` initializer path in
         // `compile_statement`. Strict eval bodies keep their own
         // variable environment (§19.2.1.1) and don't mirror.
-        if cx.stack.len() == 1 && cx.module_state.is_none() && !cx.suppress_global_mirror {
+        if cx.stack.len() == 1
+            && cx.scopes.len() == 1
+            && cx.module_state.is_none()
+            && !cx.suppress_global_mirror
+        {
             let name_idx = cx.intern_string_constant(&name);
             cx.emit(
                 Op::DefineGlobalVar,
@@ -701,4 +708,55 @@ pub(crate) fn module_body_uses_top_level_await(stmts: &[Statement<'_>]) -> bool 
         finder.visit_statement(stmt);
     }
     finder.found
+}
+
+/// §B.3.3.1/2/3 — pre-declare the sloppy-mode var-scope extension for
+/// block-level function declarations. Candidates get an initialized
+/// (`undefined`) binding in the current variable scope at
+/// instantiation time; the declaration's source position later syncs
+/// the block binding's value into it. `extra_blocked` carries
+/// caller-scope blockers (parameter names, `"arguments"`).
+pub(crate) fn pre_declare_annex_b_functions(
+    cx: &mut Compiler,
+    stmts: &[Statement<'_>],
+    extra_blocked: &HashSet<String>,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    if cx.is_strict {
+        return Ok(());
+    }
+    let mut blocked = extra_blocked.clone();
+    let mut top_lex: Vec<(String, bool)> = Vec::new();
+    hoist_lexical_names(stmts, &mut top_lex);
+    blocked.extend(top_lex.into_iter().map(|(name, _)| name));
+    let candidates = crate::annex_b::collect_annex_b_candidates(stmts, &blocked);
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let global_mirror =
+        cx.stack.len() == 1 && cx.module_state.is_none() && !cx.suppress_global_mirror;
+    for name in candidates {
+        let storage = match cx.lookup_binding(&name) {
+            Some(info) => info.storage,
+            None => {
+                let storage = cx.declare_binding(&name, false, span)?;
+                let dst = cx.alloc_scratch();
+                cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
+                cx.emit_store_storage(dst, storage, span);
+                cx.mark_initialized(&name);
+                if global_mirror {
+                    let name_idx = cx.intern_string_constant(&name);
+                    cx.emit(
+                        Op::DefineGlobalVar,
+                        [Operand::ConstIndex(name_idx), Operand::Register(dst)],
+                        span,
+                    );
+                }
+                storage
+            }
+        };
+        cx.annex_b_var_storages
+            .insert(name, (storage, global_mirror));
+    }
+    Ok(())
 }

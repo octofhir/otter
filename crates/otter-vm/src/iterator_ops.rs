@@ -618,11 +618,6 @@ impl Interpreter {
                     continue;
                 } else if let Some(g) = mapped.as_generator() {
                     IteratorState::Generator { handle: g }
-                } else if let Some(s) = mapped.as_string(&self.gc_heap) {
-                    IteratorState::String {
-                        string: s,
-                        index: 0,
-                    }
                 } else if mapped.is_set() || mapped.is_map() || mapped.is_object() {
                     // §7.4.2 GetIteratorFlattenable — look up
                     // `@@iterator`. If present, call it to obtain

@@ -1079,3 +1079,132 @@ fn iterator_from_native(
         reason: "argument is not iterable".to_string(),
     })
 }
+
+/// §27.5.1 `%GeneratorPrototype%` brand check: the receiver must be a
+/// synchronous generator object.
+fn require_sync_generator(
+    ctx: &mut crate::NativeCtx<'_>,
+    name: &'static str,
+) -> Result<(), crate::NativeError> {
+    let this = *ctx.this_value();
+    let ok = this
+        .as_generator()
+        .is_some_and(|g| !g.is_async(ctx.interp_mut().gc_heap()));
+    if ok {
+        Ok(())
+    } else {
+        Err(crate::NativeError::TypeError {
+            name,
+            reason: "receiver is not a generator object".to_string(),
+        })
+    }
+}
+
+/// §27.5.1.2 `%GeneratorPrototype%.next(value)`.
+pub(crate) fn generator_proto_next(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    require_sync_generator(ctx, "Generator.prototype.next")?;
+    iterator_proto_next(ctx, args)
+}
+
+/// §27.5.1.4 `%GeneratorPrototype%.return(value)`.
+pub(crate) fn generator_proto_return(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    require_sync_generator(ctx, "Generator.prototype.return")?;
+    iterator_proto_return(ctx, args)
+}
+
+/// §27.5.1.5 `%GeneratorPrototype%.throw(exception)`.
+pub(crate) fn generator_proto_throw(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    require_sync_generator(ctx, "Generator.prototype.throw")?;
+    iterator_proto_throw(ctx, args)
+}
+
+/// §27.6.1 AsyncGeneratorValidate-shaped guard: a wrong receiver
+/// REJECTS the returned promise instead of throwing (§27.6.1.2 step
+/// 3 / AWAIT-shaped completions). `Ok(None)` means the receiver is a
+/// genuine async generator and the caller should proceed.
+fn async_generator_validate(
+    ctx: &mut crate::NativeCtx<'_>,
+    name: &'static str,
+) -> Result<Option<Value>, crate::NativeError> {
+    let this = *ctx.this_value();
+    let ok = this
+        .as_generator()
+        .is_some_and(|g| g.is_async(ctx.interp_mut().gc_heap()));
+    if ok {
+        return Ok(None);
+    }
+    let (interp, exec_ctx) = ctx.interp_mut_and_context();
+    let Some(exec_ctx) = exec_ctx else {
+        return Err(crate::NativeError::TypeError {
+            name,
+            reason: "missing execution context".to_string(),
+        });
+    };
+    let reason = interp
+        .make_type_error_with_stack_roots(
+            &smallvec::SmallVec::new(),
+            "receiver is not an async generator object",
+        )
+        .map_err(|_| crate::NativeError::TypeError {
+            name,
+            reason: "rejection allocation failed".to_string(),
+        })?;
+    let promise = crate::promise_dispatch::PromiseBuilder::with_context(exec_ctx)
+        .rejected_runtime_rooted(interp, reason, &[&reason], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name,
+            reason: "rejection allocation failed".to_string(),
+        })?;
+    Ok(Some(Value::promise(promise)))
+}
+
+/// §27.6.1.2 `%AsyncGeneratorPrototype%.next(value)`.
+pub(crate) fn async_generator_proto_next(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    if let Some(rejected) = async_generator_validate(ctx, "AsyncGenerator.prototype.next")? {
+        return Ok(rejected);
+    }
+    iterator_proto_next(ctx, args)
+}
+
+/// §27.6.1.3 `%AsyncGeneratorPrototype%.return(value)`.
+pub(crate) fn async_generator_proto_return(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    if let Some(rejected) = async_generator_validate(ctx, "AsyncGenerator.prototype.return")? {
+        return Ok(rejected);
+    }
+    iterator_proto_return(ctx, args)
+}
+
+/// §27.6.1.4 `%AsyncGeneratorPrototype%.throw(exception)`.
+pub(crate) fn async_generator_proto_throw(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    if let Some(rejected) = async_generator_validate(ctx, "AsyncGenerator.prototype.throw")? {
+        return Ok(rejected);
+    }
+    iterator_proto_throw(ctx, args)
+}
+
+/// §27.1.3.1 `%AsyncIteratorPrototype%[@@asyncIterator]` — returns
+/// the receiver unchanged.
+pub(crate) fn async_iterator_proto_symbol_async_iterator(
+    ctx: &mut crate::NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    Ok(*ctx.this_value())
+}

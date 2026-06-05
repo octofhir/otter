@@ -245,23 +245,43 @@ impl Interpreter {
     /// `constructor` and the kind's `@@toStringTag`. Every generator
     /// function's own `.prototype` object inherits from it.
     fn install_shared_generator_object_prototypes(&mut self) {
+        use crate::intrinsics::iterator as iter_natives;
         let iterator_proto = self
             .constructor_prototype_value("Iterator")
             .ok()
             .and_then(|v| v.as_object());
+        // §27.1.3 %AsyncIteratorPrototype% — `[[Prototype]]` is
+        // %Object.prototype%; carries `@@asyncIterator` returning the
+        // receiver. %AsyncGeneratorPrototype% inherits from it.
+        let async_iterator_proto = self.build_async_iterator_prototype();
+        type Methods = [(&'static str, crate::native_function::NativeFastFn); 3];
+        let sync_methods: Methods = [
+            ("next", iter_natives::generator_proto_next),
+            ("return", iter_natives::generator_proto_return),
+            ("throw", iter_natives::generator_proto_throw),
+        ];
+        let async_methods: Methods = [
+            ("next", iter_natives::async_generator_proto_next),
+            ("return", iter_natives::async_generator_proto_return),
+            ("throw", iter_natives::async_generator_proto_throw),
+        ];
         let pairs = [
             (
                 self.function_kind_prototypes.generator_prototype,
                 "Generator",
+                iterator_proto,
+                sync_methods,
             ),
             (
                 self.function_kind_prototypes.async_generator_prototype,
                 "AsyncGenerator",
+                async_iterator_proto,
+                async_methods,
             ),
         ];
         let tag_sym = self.well_known_symbols.get(WellKnown::ToStringTag);
         let mut built: [Option<JsObject>; 2] = [None, None];
-        for (slot, (kind_proto, tag)) in built.iter_mut().zip(pairs) {
+        for (slot, (kind_proto, tag, parent, methods)) in built.iter_mut().zip(pairs) {
             let Some(kind_proto) = kind_proto else {
                 continue;
             };
@@ -278,8 +298,34 @@ impl Interpreter {
             }) else {
                 continue;
             };
-            if let Some(iterator_proto) = iterator_proto {
-                object::set_prototype(shared, &mut self.gc_heap, Some(iterator_proto));
+            if let Some(parent) = parent {
+                object::set_prototype(shared, &mut self.gc_heap, Some(parent));
+            }
+            // §27.5.1.2-5 / §27.6.1.2-4 — own `next` / `return` /
+            // `throw`, each with `length = 1`, { [[Writable]]: true,
+            // [[Enumerable]]: false, [[Configurable]]: true }.
+            let shared_root = Value::object(shared);
+            for (name, call) in methods {
+                let Ok(native) = crate::intrinsics::shared::native_static_with_value_roots(
+                    &mut self.gc_heap,
+                    name,
+                    1,
+                    call,
+                    &[&kind_proto_value, &shared_root],
+                ) else {
+                    continue;
+                };
+                object::define_own_property(
+                    shared,
+                    &mut self.gc_heap,
+                    name,
+                    object::PropertyDescriptor::data(
+                        Value::native_function(native),
+                        true,
+                        false,
+                        true,
+                    ),
+                );
             }
             let Ok(tag_string) = JsString::from_str(tag, &mut self.gc_heap) else {
                 continue;
@@ -313,6 +359,47 @@ impl Interpreter {
         self.function_kind_prototypes.generator_object_prototype = built[0];
         self.function_kind_prototypes
             .async_generator_object_prototype = built[1];
+    }
+
+    /// §27.1.3 — allocate `%AsyncIteratorPrototype%` with its
+    /// `@@asyncIterator` self-returner.
+    fn build_async_iterator_prototype(&mut self) -> Option<JsObject> {
+        let object_proto = self.object_prototype_object_opt();
+        let proto = {
+            let mut visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+            object::alloc_object_with_shape_roots(
+                &mut self.gc_heap,
+                self.shape_runtime.root(),
+                &mut visit,
+            )
+            .ok()?
+        };
+        if let Some(object_proto) = object_proto {
+            object::set_prototype(proto, &mut self.gc_heap, Some(object_proto));
+        }
+        let proto_root = Value::object(proto);
+        let native = crate::intrinsics::shared::native_static_with_value_roots(
+            &mut self.gc_heap,
+            "[Symbol.asyncIterator]",
+            0,
+            crate::intrinsics::iterator::async_iterator_proto_symbol_async_iterator,
+            &[&proto_root],
+        )
+        .ok()?;
+        let async_iter_sym = self.well_known_symbols.get(WellKnown::AsyncIterator);
+        object::define_own_symbol_property_partial(
+            proto,
+            &mut self.gc_heap,
+            async_iter_sym,
+            object::PartialPropertyDescriptor {
+                value: Some(Value::native_function(native)),
+                writable: Some(true),
+                enumerable: Some(false),
+                configurable: Some(true),
+                ..Default::default()
+            },
+        );
+        Some(proto)
     }
 
     /// Shared `%GeneratorPrototype%` / `%AsyncGeneratorPrototype%` for

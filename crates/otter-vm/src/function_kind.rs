@@ -47,6 +47,7 @@ impl FunctionKindPrototypes {
         heap: &mut otter_gc::GcHeap,
         shape_root: object::ShapeHandle,
         function_proto: JsObject,
+        function_ctor: Option<Value>,
         well_known: &crate::symbol::WellKnownSymbols,
     ) -> Result<Self, JsSurfaceError> {
         let function_proto_value = Value::object(function_proto);
@@ -95,7 +96,16 @@ impl FunctionKindPrototypes {
                 object::alloc_object_with_shape_roots(heap, shape_root, &mut visit)
                     .map_err(|_| JsSurfaceError::OutOfMemory)?
             };
-            object::set_prototype(ctor, heap, Some(function_proto));
+            // §27.4.2 / §27.3.2 / §27.7.2 — the constructor's
+            // [[Prototype]] is %Function% itself (these are Function
+            // subclasses), falling back to %Function.prototype% in a
+            // pre-bootstrap realm without a global Function binding.
+            match function_ctor {
+                Some(ctor_value) => {
+                    object::set_prototype_value(ctor, heap, Some(ctor_value));
+                }
+                None => object::set_prototype(ctor, heap, Some(function_proto)),
+            }
             object::define_own_property(
                 ctor,
                 heap,
@@ -228,10 +238,13 @@ impl Interpreter {
             return;
         };
         let shape_root = self.shape_runtime.root();
+        let function_ctor = object::get(*self.global_this(), &self.gc_heap, "Function")
+            .filter(|v| v.is_object_type());
         self.function_kind_prototypes = FunctionKindPrototypes::build_post_bootstrap(
             &mut self.gc_heap,
             shape_root,
             function_proto,
+            function_ctor,
             &self.well_known_symbols,
         )
         .expect("function-kind prototypes fit within any positive cap");

@@ -287,7 +287,7 @@ error[E0277]: `*const PurePromiseBody` cannot be sent between threads safely
 8 | |     });
   | |______^ `*const PurePromiseBody` cannot be sent between threads safely
   |
-  = help: within `(u64, DynamicImportEntry)`, the trait `Send` is not implemented for `*const PurePromiseBody`
+  = help: within `(Arc<str>, otter_vm::module_records::ModuleRecordState)`, the trait `Send` is not implemented for `*const PurePromiseBody`
 note: required because it appears within the type `PhantomData<*const PurePromiseBody>`
  --> $RUST/core/src/marker.rs
   |
@@ -313,25 +313,25 @@ note: required because it appears within the type `JsPromiseHandle`
   |
   | pub struct JsPromiseHandle {
   |            ^^^^^^^^^^^^^^^
-note: required because it appears within the type `DynamicImportEntry`
- --> $WORKSPACE/crates/otter-vm/src/dynamic_import.rs
+note: required because it appears within the type `Option<JsPromiseHandle>`
+ --> $RUST/core/src/option.rs
   |
-  | pub struct DynamicImportEntry {
-  |            ^^^^^^^^^^^^^^^^^^
-  = note: required because it appears within the type `(u64, DynamicImportEntry)`
-  = note: required for `hashbrown::raw::RawTable<(u64, DynamicImportEntry)>` to implement `Send`
-note: required because it appears within the type `hashbrown::map::HashMap<u64, DynamicImportEntry, RandomState>`
+  | pub enum Option<T> {
+  |          ^^^^^^
+note: required because it appears within the type `otter_vm::module_records::ModuleRecordState`
+ --> $WORKSPACE/crates/otter-vm/src/module_records.rs
+  |
+  | pub(crate) struct ModuleRecordState {
+  |                   ^^^^^^^^^^^^^^^^^
+  = note: required because it appears within the type `(Arc<str>, otter_vm::module_records::ModuleRecordState)`
+  = note: required for `hashbrown::raw::RawTable<(Arc<str>, otter_vm::module_records::ModuleRecordState)>` to implement `Send`
+note: required because it appears within the type `hashbrown::map::HashMap<Arc<str>, otter_vm::module_records::ModuleRecordState, RandomState>`
  --> /rust/deps/hashbrown-0.16.1/src/map.rs:185:11
-note: required because it appears within the type `HashMap<u64, DynamicImportEntry>`
+note: required because it appears within the type `HashMap<Arc<str>, otter_vm::module_records::ModuleRecordState>`
  --> $RUST/std/src/collections/hash/map.rs
   |
   | pub struct HashMap<
   |            ^^^^^^^
-note: required because it appears within the type `DynamicImportRegistry`
- --> $WORKSPACE/crates/otter-vm/src/dynamic_import.rs
-  |
-  | pub struct DynamicImportRegistry {
-  |            ^^^^^^^^^^^^^^^^^^^^^
 note: required because it appears within the type `Interpreter`
  --> $WORKSPACE/crates/otter-vm/src/lib.rs
   |

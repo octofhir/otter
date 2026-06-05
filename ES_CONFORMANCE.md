@@ -3,6 +3,58 @@
 This file tracks measured Test262 results for the active
 `crates/otter-test262` runner.
 
+## Heap corruption eliminated: card-barrier wild writes + unrooted execution windows (2026-06-05)
+
+Closed the long-standing nondeterministic heap corruption in long
+in-process runner sessions (SIGBUS/SIGSEGV/SIGABRT, libmalloc
+freelist aborts, single-bit-flipped path strings in batch reports).
+Three roots, three commits (`56f2f6e5`, `0d93508e`, `0fdec1e8`):
+
+1. **Card-table wild writes** (`56f2f6e5`, the memory smasher). The
+   write barrier derived the dirty card from the *mutated slot's*
+   address, but traced slots routinely live in malloc-owned side
+   storage outside any heap page (boxed parked frames, `VecDeque`
+   buffers, spilled `SmallVec` register files). `alloc_old`'s payload
+   edge barrier fed every such slot through the card path, so parking
+   a generator / async frame with young register references masked a
+   malloc address to a fake "page header" and OR'd a card bit into
+   foreign memory. Card marking is now header-granular (the
+   dirty-card scan re-traces intersecting objects in full, so no
+   edges are lost). Regression test: `card_table.rs::
+   old_to_young_pointer_behind_boxed_slot_survives_scavenge`.
+
+2. **Extra-roots single slot → traced LIFO stack** (`0d93508e`).
+   `install_extra_roots` replaced the previous registration, hiding
+   the outer scope's value/argument roots from collections triggered
+   in nested scopes. The heap now traces every live entry of a
+   registration stack, deduped by source.
+
+3. **Unrooted execution windows** (`0fdec1e8`). Microtask drains run
+   after `Interpreter::run` returns — every promise reaction and
+   async-resume tick executed without the interpreter's runtime roots
+   registered, and `begin_drain` moved queued tasks (including parked
+   async frames) into an untraced driver-local batch. The drain, sync
+   re-entry helpers, dynamic-import settlement, and the dispatch loop
+   now register interpreter roots; the in-flight drain generation
+   stays queue-owned and traced; async resume bodies register a
+   frame-roots provider before their allocating unwind/completion
+   steps.
+
+Stress before → after (release runner, fresh process per iteration):
+
+| Workload | Before | After |
+|---|---|---|
+| `^language/module-code/top-level-await/await-awaits-thenable-not-callable` ×30 | 4/15 SIGBUS (≈27%) | **0/30** |
+| `^language/statements/class/dstr/async-gen-meth-ary` ×10 | 3/6 SIGBUS | **0/10** |
+| `^language/statements/class/dstr/` ×6 | 3/6 SIGBUS | **0/6** |
+| `^language/statements/` ×5 (9 337 tests) | ~1-in-3 runs died (SIGBUS/SIGABRT/SIGSEGV) | **5/5 clean, byte-identical: 8 691 pass / 436 fail / 2 crash** |
+
+The 2 remaining `language/statements` crashes are the known
+deterministic `cpn-class-decl-fields-*-from-await-expression`
+compiler gap (out of scope here). Regression guards:
+`^built-ins/Promise/` 676/676 (100%), `language/statements` pass
+count unchanged (8 691) across all five runs.
+
 ## Shared code space + GlobalDeclarationInstantiation + eval `arguments` early error (2026-06-05)
 
 Three roots fixed this session (engine commits `f9c3abb6`, `2dd2389b`,

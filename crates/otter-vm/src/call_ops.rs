@@ -184,6 +184,14 @@ impl Interpreter {
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
+        // §10.2.5 — only ordinary functions get a [[Construct]] slot;
+        // async functions, generators, and async generators are not
+        // constructors.
+        if function.is_async || function.is_generator {
+            return Err(VmError::TypeError {
+                message: "function is not a constructor".to_string(),
+            });
+        }
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
         // §10.2.2 — a derived constructor enters with `this` in the
@@ -229,6 +237,12 @@ impl Interpreter {
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
+        // §10.2.5 — async / generator functions are not constructors.
+        if function.is_async || function.is_generator {
+            return Err(VmError::TypeError {
+                message: "function is not a constructor".to_string(),
+            });
+        }
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
         let is_derived = function.is_derived_constructor;

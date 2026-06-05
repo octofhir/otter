@@ -91,6 +91,14 @@ impl<'a> RuntimeState<'a> {
         for env in interp.module_environments_for_trace() {
             env.trace_gc_roots(visitor);
         }
+        // 2b) Persistent module-init upvalue cells (module
+        // environment records shared between link and eval phases).
+        for spine in interp.module_init_upvalues_for_trace() {
+            for slot in spine.iter() {
+                let p = slot as *const crate::UpvalueCell as *mut otter_gc::raw::RawGc;
+                visitor(p);
+            }
+        }
         for ns in interp.module_namespaces_for_trace() {
             ns.trace_gc_roots(visitor);
         }

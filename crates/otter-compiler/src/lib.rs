@@ -172,7 +172,8 @@ mod tests {
         assert!(init.is_module);
         assert_eq!(init.name, "<module-init>");
         assert_eq!(init.module_url, "file:///test/main.ts");
-        assert_eq!(init.param_count, 2);
+        // module_env, import_meta, link-phase flag.
+        assert_eq!(init.param_count, 3);
         assert_eq!(module.module, "file:///test/main.ts");
         // Two own-upvalues for module_env + import_meta.
         assert!(init.own_upvalue_count >= 2);

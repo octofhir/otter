@@ -346,10 +346,20 @@ pub(crate) fn pre_declare_lexical_bindings(
         // the source-level declaration would misread as an initialized
         // value. Install the TDZ hole now so such a forward read is a
         // `ReferenceError` until the declaration's store clears it.
+        // The hole is written INTO the existing cell (not via
+        // `Op::FreshUpvalue`, which replaces the cell) so module-init
+        // link/eval phases sharing one persistent spine observe the
+        // same cell.
         if let crate::scope::BindingStorage::Upvalue { idx } =
             cx.declare_binding(name, *is_const, span)?
         {
-            cx.emit(Op::FreshUpvalue, [Operand::Imm32(idx as i32)], span);
+            let hole = cx.alloc_scratch();
+            cx.emit(Op::LoadHole, [Operand::Register(hole)], span);
+            cx.emit(
+                Op::StoreUpvalue,
+                [Operand::Register(hole), Operand::Imm32(idx as i32)],
+                span,
+            );
         }
     }
     Ok(())

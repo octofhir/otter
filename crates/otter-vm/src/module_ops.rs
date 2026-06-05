@@ -267,11 +267,19 @@ impl Interpreter {
                 ModuleStatus::New => {}
             }
         }
+        // §16.2.1.7 InitializeEnvironment — instantiate hoisted
+        // function declarations for every module in the subtree
+        // before ANY body evaluates, so cyclic importers observe the
+        // exporting module's functions during their own evaluation.
+        self.hoist_module_subtree(context, &url_arc)?;
         let mut state = ModuleEvalState {
             stack: Vec::new(),
             next_index: 0,
         };
-        match self.inner_module_evaluation(context, &mut state, &url_arc) {
+        self.module_evaluation_depth += 1;
+        let evaluation = self.inner_module_evaluation(context, &mut state, &url_arc);
+        self.module_evaluation_depth -= 1;
+        match evaluation {
             Ok(()) => {
                 debug_assert!(state.stack.is_empty());
                 Ok(self
@@ -544,11 +552,60 @@ impl Interpreter {
         let Some(env) = self.module_environments.get(url_arc).copied() else {
             return Ok(());
         };
+        // The hoist phase normally ran in the subtree sweep; keep the
+        // pairing as a fallback for inits reached outside
+        // `evaluate_module` (defensive — cells must exist before the
+        // body binds against them).
+        self.run_module_hoist_phase(context, url_arc)?;
         let meta = self.build_import_meta(url)?;
-        let init = Value::function(function_id);
-        let args: SmallVec<[Value; 8]> = smallvec::smallvec![Value::object(env), meta];
-        self.run_callable_sync(context, &init, Value::undefined(), args)?;
+        self.run_module_init(context, function_id, Value::object(env), meta)?;
         Ok(())
+    }
+
+    /// Walk the static + dynamic request edges from `root` and run
+    /// the link-phase (function-hoisting) init pass for every module
+    /// not yet hoisted. Idempotent per module per graph generation.
+    fn hoist_module_subtree(
+        &mut self,
+        context: &ExecutionContext,
+        root: &std::sync::Arc<str>,
+    ) -> Result<(), VmError> {
+        let mut stack: Vec<std::sync::Arc<str>> = vec![root.clone()];
+        let mut seen: std::collections::HashSet<std::sync::Arc<str>> =
+            std::collections::HashSet::new();
+        while let Some(url) = stack.pop() {
+            if !seen.insert(url.clone()) {
+                continue;
+            }
+            self.run_module_hoist_phase(context, &url)?;
+            for (target, _) in context.module_requests(&url) {
+                stack.push(std::sync::Arc::from(target));
+            }
+        }
+        Ok(())
+    }
+
+    /// Run one module's link-phase init pass (§16.2.1.7
+    /// InitializeEnvironment): export TDZ slots + hoisted function
+    /// instantiation into the persistent module environment cells.
+    fn run_module_hoist_phase(
+        &mut self,
+        context: &ExecutionContext,
+        url_arc: &std::sync::Arc<str>,
+    ) -> Result<(), VmError> {
+        if self.module_hoisted.contains(url_arc) {
+            return Ok(());
+        }
+        self.module_hoisted.insert(url_arc.clone());
+        let url = url_arc.as_ref();
+        let Some(function_id) = context.module_init_function_id(url) else {
+            return Ok(());
+        };
+        let Some(env) = self.module_environments.get(url_arc).copied() else {
+            return Ok(());
+        };
+        let meta = self.build_import_meta(url)?;
+        self.run_module_init_hoist(context, function_id, Value::object(env), meta)
     }
 
     /// §16.2.1.9 ExecuteAsyncModule: run a top-level-await module's
@@ -568,6 +625,7 @@ impl Interpreter {
             self.async_module_execution_fulfilled(context, url_arc);
             return Ok(());
         };
+        self.run_module_hoist_phase(context, url_arc)?;
         let meta = self.build_import_meta(url)?;
         match self.run_module_init(context, function_id, Value::object(env), meta) {
             Ok(Some(init_promise)) => {
@@ -824,6 +882,89 @@ impl Interpreter {
     /// side-channel completion counting. The downstream handle rides
     /// in the reaction callables' `captures` list so the GC can trace
     /// and relocate it.
+    /// §13.3.10 ContinueDynamicImport deferral — evaluate `target` in
+    /// a host job (microtask) and settle `pending` with the module's
+    /// namespace / thrown error. Used when `import()` fires while a
+    /// top-level Evaluate DFS is active, so the dynamic target cannot
+    /// preempt the deterministic evaluation order.
+    fn defer_dynamic_import_evaluation(
+        &mut self,
+        context: &ExecutionContext,
+        pending: crate::promise::JsPromiseHandle,
+        target: String,
+        referrer: String,
+        specifier: String,
+    ) -> Result<(), VmError> {
+        let pending_value = Value::promise(pending);
+        let job = crate::native_function::native_value_with_captures_unchecked_with_roots(
+            &mut self.gc_heap,
+            "dynamicImportDeferredEvaluate",
+            smallvec::smallvec![pending_value],
+            &mut |visitor| pending_value.trace_value_slots(visitor),
+            move |ncx, _args, captures| {
+                let (interp, job_context) = ncx.interp_mut_and_context();
+                let Some(job_context) = job_context else {
+                    return Ok(Value::undefined());
+                };
+                let Some(pending) = captures.first().and_then(|v| v.as_promise()) else {
+                    return Ok(Value::undefined());
+                };
+                match interp.evaluate_module(&job_context, &target) {
+                    Ok(Some(gate)) => {
+                        interp
+                            .settle_promise_on_module_evaluation(
+                                &job_context,
+                                pending,
+                                gate,
+                                std::sync::Arc::from(target.as_str()),
+                            )
+                            .map_err(|e| {
+                                crate::native_function::vm_to_native_error(e, "import()")
+                            })?;
+                    }
+                    Ok(None) => {
+                        let namespace = interp
+                            .resolve_module_namespace(&job_context, referrer.as_str(), &specifier)
+                            .map(Value::object)
+                            .unwrap_or_else(Value::undefined);
+                        let jobs =
+                            crate::JsPromise::fulfill(&pending, &mut interp.gc_heap, namespace);
+                        for j in jobs.jobs {
+                            interp.microtasks.enqueue(j);
+                        }
+                    }
+                    Err(err) => {
+                        let reason = match err {
+                            VmError::Uncaught { .. } => interp
+                                .take_pending_uncaught_throw()
+                                .unwrap_or_else(Value::undefined),
+                            other => {
+                                return Err(crate::native_function::vm_to_native_error(
+                                    other, "import()",
+                                ));
+                            }
+                        };
+                        let jobs = crate::JsPromise::reject(&pending, &mut interp.gc_heap, reason);
+                        for j in jobs.jobs {
+                            interp.microtasks.enqueue(j);
+                        }
+                    }
+                }
+                Ok(Value::undefined())
+            },
+        )
+        .map_err(VmError::from)?;
+        self.microtasks.enqueue(crate::microtask::Microtask {
+            callee: job,
+            this_value: Value::undefined(),
+            args: smallvec::SmallVec::new(),
+            context: Some(context.clone()),
+            result_capability: None,
+            kind: crate::microtask::MicrotaskKind::Call,
+        });
+        Ok(())
+    }
+
     pub(crate) fn settle_promise_on_module_evaluation(
         &mut self,
         context: &ExecutionContext,
@@ -1057,6 +1198,28 @@ impl Interpreter {
                     context.module_resolution_target(referrer.as_str(), &specifier)
                 {
                     let target = target.to_string();
+                    // §16.2.1.4 Evaluate step 1 / §13.3.10 — a dynamic
+                    // import during an active Evaluate DFS must not
+                    // preempt it; defer the target's evaluation to a
+                    // host job.
+                    if self.module_evaluation_depth > 0
+                        && self.module_record_status(&target) == ModuleStatus::New
+                    {
+                        let pending =
+                            promise_dispatch::PromiseBuilder::with_context(import_context.clone())
+                                .pending_stack_rooted(self, stack, &[], &[])?;
+                        self.defer_dynamic_import_evaluation(
+                            context,
+                            pending,
+                            target,
+                            referrer.clone(),
+                            specifier.clone(),
+                        )?;
+                        let frame = &mut stack[top_idx];
+                        write_register(frame, dst, Value::promise(pending))?;
+                        frame.advance_pc(self.current_byte_len)?;
+                        return Ok(());
+                    }
                     match self.evaluate_module(context, &target) {
                         Ok(Some(gate)) => {
                             // §13.3.10 — an async-evaluating target

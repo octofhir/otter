@@ -334,6 +334,19 @@ pub struct Interpreter {
     /// interpreter so a fresh script doesn't observe stale
     /// modules.
     module_environments: std::collections::HashMap<std::sync::Arc<str>, JsObject>,
+    /// Per-module persistent `<module-init>` own-upvalue cells — the
+    /// engine's module environment record. The link-phase (hoist) and
+    /// evaluation-phase invocations of one module's init share these
+    /// cells so closures instantiated at link time observe the
+    /// bindings the body later initialises.
+    module_init_upvalues: std::collections::HashMap<std::sync::Arc<str>, Box<[crate::UpvalueCell]>>,
+    /// Depth of active §16.2.1.4 Evaluate calls. Dynamic imports that
+    /// land while this is non-zero defer their target's evaluation to
+    /// a host job so they cannot preempt the running DFS.
+    pub(crate) module_evaluation_depth: u32,
+    /// Modules whose link-phase (function-hoisting) init pass already
+    /// ran. Cleared with the rest of the module state.
+    module_hoisted: std::collections::HashSet<std::sync::Arc<str>>,
     /// Cached `(referrer, specifier) → target` lookup, built
     /// lazily from [`otter_bytecode::BytecodeModule::module_resolutions`]
     /// the first time the running module is observed. Cleared
@@ -745,6 +758,9 @@ impl Interpreter {
             allow_blocking_atomics_wait: false,
             microtasks: MicrotaskQueue::new(),
             module_environments: std::collections::HashMap::new(),
+            module_init_upvalues: std::collections::HashMap::new(),
+            module_hoisted: std::collections::HashSet::new(),
+            module_evaluation_depth: 0,
             module_resolution_cache: std::collections::HashMap::new(),
             module_records: std::collections::HashMap::new(),
             next_module_async_order: 0,
@@ -1117,10 +1133,36 @@ impl Interpreter {
         env: Value,
         import_meta: Value,
     ) -> Result<Option<crate::promise::JsPromiseHandle>, VmError> {
+        self.run_module_init_phase(context, function_id, env, import_meta, false)
+    }
+
+    /// Link-phase init invocation — runs only the §16.2.1.7
+    /// InitializeEnvironment prologue (export TDZ slots + hoisted
+    /// function instantiation) and returns before any body statement.
+    pub fn run_module_init_hoist(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        env: Value,
+        import_meta: Value,
+    ) -> Result<(), VmError> {
+        self.run_module_init_phase(context, function_id, env, import_meta, true)
+            .map(|_| ())
+    }
+
+    fn run_module_init_phase(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        env: Value,
+        import_meta: Value,
+        hoist_phase: bool,
+    ) -> Result<Option<crate::promise::JsPromiseHandle>, VmError> {
         self.enter_sync_reentry()?;
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
         let extra_root_depth = self.gc_heap.push_extra_roots(extra_roots);
-        let result = self.run_module_init_inner(context, function_id, env, import_meta);
+        let result =
+            self.run_module_init_inner(context, function_id, env, import_meta, hoist_phase);
         self.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
         self.leave_sync_reentry();
         result
@@ -1132,15 +1174,31 @@ impl Interpreter {
         function_id: u32,
         env: Value,
         import_meta: Value,
+        hoist_phase: bool,
     ) -> Result<Option<crate::promise::JsPromiseHandle>, VmError> {
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
-        let upvalues =
-            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, Frame::empty_upvalues())?;
+        // The module environment record: link-phase and
+        // evaluation-phase invocations share one persistent set of
+        // own-upvalue cells so hoisted closures and the body bind the
+        // same module-scope storage.
+        let module_url: std::sync::Arc<str> = std::sync::Arc::from(function.module_url.as_ref());
+        let upvalues = if let Some(cells) = self.module_init_upvalues.get(&module_url) {
+            cells.clone()
+        } else {
+            let built = Frame::build_upvalues_for_exec(
+                &mut self.gc_heap,
+                function,
+                Frame::empty_upvalues(),
+            )?;
+            self.module_init_upvalues.insert(module_url, built.clone());
+            built
+        };
         let mut frame =
             Frame::with_exec_return_upvalues_and_this(function, None, upvalues, Value::undefined());
-        let args: SmallVec<[Value; 8]> = smallvec::smallvec![env, import_meta];
+        let args: SmallVec<[Value; 8]> =
+            smallvec::smallvec![env, import_meta, Value::boolean(hoist_phase)];
         self.bind_bytecode_call_arguments(function, &mut frame, args)?;
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         stack.push(frame);
@@ -1579,6 +1637,8 @@ impl Interpreter {
     /// stale modules.
     pub fn reset_module_state(&mut self) {
         self.module_environments.clear();
+        self.module_init_upvalues.clear();
+        self.module_hoisted.clear();
         self.module_resolution_cache.clear();
         self.module_records.clear();
         self.next_module_async_order = 0;
@@ -2165,6 +2225,15 @@ impl Interpreter {
     /// live module bindings.
     pub fn module_environments_for_trace(&self) -> impl Iterator<Item = &JsObject> {
         self.module_environments.values()
+    }
+
+    /// Borrow the persistent module-init upvalue spines for GC root
+    /// tracing. The cells back module-scope bindings shared between
+    /// the link-phase and evaluation-phase init invocations.
+    pub(crate) fn module_init_upvalues_for_trace(
+        &self,
+    ) -> impl Iterator<Item = &Box<[crate::UpvalueCell]>> {
+        self.module_init_upvalues.values()
     }
 
     /// Borrow cached eager + deferred module namespace exotic objects

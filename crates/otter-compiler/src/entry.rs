@@ -367,7 +367,10 @@ pub fn compile_module_program(
         is_async: init_is_async,
         is_strict: true,
         module_url: host.module_url.clone(),
-        param_count: 2, // module_env, import_meta
+        // module_env, import_meta, link-phase flag (§16.2.1.7 — a
+        // truthy third argument runs only the InitializeEnvironment
+        // prologue and returns before the body).
+        param_count: 3,
         ..Default::default()
     });
 
@@ -375,6 +378,13 @@ pub fn compile_module_program(
         .with_strict(true)
         .with_module_url(host.module_url.clone());
     top.captured_names = capture::analyze_module(&program.body);
+    // Hoisted function declarations instantiate during the link-phase
+    // init invocation; the evaluation-phase invocation (a separate
+    // frame) must observe the same closure values, so their bindings
+    // are forced into the persistent own-upvalue cells.
+    for name in top_level_hoistable_function_names(&program.body) {
+        top.captured_names.insert(name);
+    }
     // Also capture names that any inner function references whose
     // bindings live as `module_env` / `import_meta` / `import_record_*`
     // — those are forced own-upvalues (see allocate_module_upvalues).
@@ -738,7 +748,7 @@ pub fn compile_module_program(
         [Operand::Register(1), Operand::Imm32(meta_uv as i32)],
         span0,
     );
-    cx.scratch = 2; // params occupy r0, r1
+    cx.scratch = 3; // params occupy r0 (env), r1 (meta), r2 (link-phase flag)
 
     // For each import source, emit Op::ImportNamespace then
     // StoreUpvalue to populate the per-source record cell.
@@ -776,6 +786,13 @@ pub fn compile_module_program(
             span0,
         );
     }
+
+    // §16.2.1.7 InitializeEnvironment — the prologue below runs only
+    // during the link-phase invocation (third argument truthy); the
+    // evaluation-phase invocation jumps straight to the body. Both
+    // frames share the module's persistent own-upvalue cells, so the
+    // closures and TDZ slots the link phase created stay visible.
+    let eval_phase_jump = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(2), span0);
 
     // §16.2.1.7 InitializeEnvironment — pre-declare exported binding
     // slots on the module environment before hoisting, so the
@@ -843,6 +860,9 @@ pub fn compile_module_program(
     // the module scope so cross-references work regardless of
     // source order.
     hoist_function_declarations(&mut cx, &program.body)?;
+    // Link phase ends here — the body belongs to evaluation.
+    cx.emit(Op::ReturnUndefined, [], span0);
+    cx.patch_branch_to_here(eval_phase_jump);
 
     for stmt in &program.body {
         compile_statement(&mut cx, stmt)?;
@@ -913,6 +933,45 @@ pub fn compile_module_program(
         module_resolutions,
         module_inits: Vec::new(),
     })
+}
+
+/// Names of top-level hoistable function declarations — plain
+/// declarations, `export function`, and named `export default
+/// function`. §16.2.1.7 InitializeEnvironment instantiates these
+/// during the link phase.
+fn top_level_hoistable_function_names(stmts: &[Statement<'_>]) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in stmts {
+        let f = match stmt {
+            Statement::FunctionDeclaration(f) if !f.declare => Some(&**f),
+            Statement::ExportNamedDeclaration(decl) if !decl.export_kind.is_type() => {
+                if let Some(oxc_ast::ast::Declaration::FunctionDeclaration(f)) = &decl.declaration
+                    && !f.declare
+                {
+                    Some(&**f)
+                } else {
+                    None
+                }
+            }
+            Statement::ExportDefaultDeclaration(decl) => {
+                if let oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(f) =
+                    &decl.declaration
+                    && !f.declare
+                {
+                    Some(&**f)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(f) = f
+            && let Some(id) = &f.id
+        {
+            out.push(id.name.as_str().to_string());
+        }
+    }
+    out
 }
 
 /// §16.2.1 — reject `ImportDeclaration` / `ExportDeclaration` in any

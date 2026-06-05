@@ -430,9 +430,13 @@ fn record_exports_from_declaration(
 ) {
     match decl {
         oxc_ast::ast::Declaration::VariableDeclaration(var_decl) => {
+            // §16.2.3.2 ExportedBindings — BoundNames of each
+            // declarator, walking destructuring patterns so
+            // `export const { check } = …` records `check`.
             for declarator in &var_decl.declarations {
-                if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id {
-                    let name = id.name.as_str().to_string();
+                let mut names = Vec::new();
+                crate::hoist::collect_pattern_var_names(&declarator.id, &mut names);
+                for name in names {
                     visitor.record_export(name.clone(), Some(name), from.clone());
                 }
             }

@@ -146,6 +146,10 @@ pub(crate) fn destructure_pattern(
                 let storage = parent.declare_binding(name, false, span)?;
                 parent.emit_store_storage(src_reg, storage, span);
                 parent.mark_initialized(name);
+                // `export const { x } = …` — the mirror is gated on
+                // `module_state.exported_names`, so plain destructuring
+                // declarations emit nothing here.
+                parent.emit_module_export_mirror(name, src_reg, span);
                 Ok(())
             }
         }

@@ -534,11 +534,14 @@ pub fn compile_module_program(
                         oxc_ast::ast::Declaration::VariableDeclaration(var_decl) => {
                             let is_var =
                                 matches!(var_decl.kind, oxc_ast::ast::VariableDeclarationKind::Var);
+                            // §16.2.3.2 ExportedBindings — BoundNames of the
+                            // declaration, including every leaf of a
+                            // destructuring pattern (`export const { check }
+                            // = …` exports `check`).
                             for declarator in &var_decl.declarations {
-                                if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) =
-                                    &declarator.id
-                                {
-                                    let name = id.name.as_str().to_string();
+                                let mut names = Vec::new();
+                                collect_pattern_var_names(&declarator.id, &mut names);
+                                for name in names {
                                     state.exported_names.insert(name.clone());
                                     tdz_inline.push((name, is_var));
                                 }

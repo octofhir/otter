@@ -91,6 +91,16 @@ impl Interpreter {
             .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
         let value = *crate::read_register(frame, value_reg)?;
+        // §9.1.1.4.18 SetMutableBinding shape — an existing own
+        // property keeps its attributes (enumerability,
+        // configurability) and only receives the new value; a
+        // non-writable existing property silently absorbs the write
+        // in sloppy mode. Only an absent property is defined fresh.
+        if object::get_own_descriptor(self.global_this, &self.gc_heap, name).is_some() {
+            let _ = object::set(self.global_this, &mut self.gc_heap, name, value);
+            frame.advance_pc(self.current_byte_len)?;
+            return Ok(());
+        }
         let descriptor = object::PartialPropertyDescriptor {
             value: Some(value),
             writable: Some(true),
@@ -107,6 +117,38 @@ impl Interpreter {
             return Err(VmError::TypeError {
                 message: format!("Cannot declare global var '{name}'"),
             });
+        }
+        frame.advance_pc(self.current_byte_len)?;
+        Ok(())
+    }
+
+    /// §9.1.1.4.17 CreateGlobalVarBinding — define `name` as a
+    /// writable / enumerable / configurable `undefined` data property
+    /// when absent; an existing own property is left untouched.
+    pub(crate) fn run_declare_global_var_reg(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut Frame,
+        name_idx: u32,
+        configurable: bool,
+    ) -> Result<(), VmError> {
+        let name = context
+            .string_constant_str(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        if object::get_own_descriptor(self.global_this, &self.gc_heap, name).is_none() {
+            let descriptor = object::PartialPropertyDescriptor {
+                value: Some(Value::undefined()),
+                writable: Some(true),
+                enumerable: Some(true),
+                configurable: Some(configurable),
+                ..Default::default()
+            };
+            let _ = object::define_own_property_partial(
+                self.global_this,
+                &mut self.gc_heap,
+                name,
+                descriptor,
+            );
         }
         frame.advance_pc(self.current_byte_len)?;
         Ok(())

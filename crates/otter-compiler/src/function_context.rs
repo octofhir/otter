@@ -77,7 +77,7 @@ pub(crate) struct FunctionContext {
     /// declaration's source position syncs into. The `bool` marks
     /// global-script bindings that also mirror via `DefineGlobalVar`.
     pub(crate) annex_b_var_storages:
-        std::collections::HashMap<String, (crate::scope::BindingStorage, bool)>,
+        std::collections::HashMap<String, (Option<crate::scope::BindingStorage>, bool)>,
     /// `true` when an anonymous `export default function/function*` was
     /// already hoisted (compiled + mirrored to `module_env.default`) at
     /// instantiation, so its source-position arm must be a no-op.

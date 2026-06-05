@@ -36,10 +36,6 @@ pub(crate) fn hoist_var_names<'a>(stmts: &[Statement<'a>], out: &mut Vec<String>
     }
 }
 
-pub(crate) fn hoist_var_names_in_stmt<'a>(stmt: &Statement<'a>, out: &mut Vec<String>) {
-    hoist_var_names_in_stmt_at(stmt, out, true);
-}
-
 fn hoist_var_names_nested<'a>(stmts: &[Statement<'a>], out: &mut Vec<String>) {
     for stmt in stmts {
         hoist_var_names_in_stmt_at(stmt, out, false);
@@ -736,27 +732,35 @@ pub(crate) fn pre_declare_annex_b_functions(
     let global_mirror =
         cx.stack.len() == 1 && cx.module_state.is_none() && !cx.suppress_global_mirror;
     for name in candidates {
-        let storage = match cx.lookup_binding(&name) {
-            Some(info) => info.storage,
+        match cx.lookup_binding(&name) {
+            Some(info) => {
+                cx.annex_b_var_storages
+                    .insert(name, (Some(info.storage), global_mirror));
+            }
+            None if global_mirror => {
+                // Script / sloppy-eval bodies: the var extension IS
+                // the global own property — a local shadow would mask
+                // a pre-existing global's value inside this body.
+                // §B.3.3.2 script bindings are non-configurable;
+                // §B.3.3.3 eval bindings are deletable.
+                let configurable = i32::from(cx.in_eval);
+                let name_idx = cx.intern_string_constant(&name);
+                cx.emit(
+                    Op::DeclareGlobalVar,
+                    [Operand::ConstIndex(name_idx), Operand::Imm32(configurable)],
+                    span,
+                );
+                cx.annex_b_var_storages.insert(name, (None, true));
+            }
             None => {
                 let storage = cx.declare_binding(&name, false, span)?;
                 let dst = cx.alloc_scratch();
                 cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
                 cx.emit_store_storage(dst, storage, span);
                 cx.mark_initialized(&name);
-                if global_mirror {
-                    let name_idx = cx.intern_string_constant(&name);
-                    cx.emit(
-                        Op::DefineGlobalVar,
-                        [Operand::ConstIndex(name_idx), Operand::Register(dst)],
-                        span,
-                    );
-                }
-                storage
+                cx.annex_b_var_storages.insert(name, (Some(storage), false));
             }
-        };
-        cx.annex_b_var_storages
-            .insert(name, (storage, global_mirror));
+        }
     }
     Ok(())
 }

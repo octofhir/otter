@@ -190,6 +190,7 @@ pub(crate) fn compile_program_with_mode(
     top.captured_names = capture::analyze_module(&program.body);
     let mut cx = Compiler::new(top);
     cx.suppress_global_mirror = eval_mode && main_is_strict;
+    cx.in_eval = eval_mode;
     cx.enter_scope();
 
     // §16.1.7 GlobalDeclarationInstantiation / §16.2.1.7

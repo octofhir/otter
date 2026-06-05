@@ -424,11 +424,13 @@ pub(crate) fn compile_statement(
                 // with the block binding's current value.
                 if let Some(&(var_storage, global_mirror)) = cx.annex_b_var_storages.get(&name)
                     && let Some(info) = cx.lookup_binding(&name)
-                    && info.storage != var_storage
+                    && var_storage != Some(info.storage)
                 {
                     let tmp = cx.alloc_scratch();
                     cx.emit_load_storage(tmp, info.storage, span);
-                    cx.emit_store_storage(tmp, var_storage, span);
+                    if let Some(var_storage) = var_storage {
+                        cx.emit_store_storage(tmp, var_storage, span);
+                    }
                     if global_mirror {
                         let name_idx = cx.intern_string_constant(&name);
                         cx.emit(
@@ -467,6 +469,24 @@ pub(crate) fn compile_statement(
             emit_make_callable(cx, tmp, const_idx, &captures, false, span)?;
             cx.emit_store_storage(tmp, storage, span);
             cx.mark_initialized(&name);
+            // §B.3.2 — `if (x) function f(){}` single-statement
+            // declarations sync the var-scope extension exactly like
+            // block-level declarations.
+            if let Some(&(var_storage, global_mirror)) = cx.annex_b_var_storages.get(&name) {
+                if let Some(var_storage) = var_storage
+                    && var_storage != storage
+                {
+                    cx.emit_store_storage(tmp, var_storage, span);
+                }
+                if global_mirror {
+                    let name_idx = cx.intern_string_constant(&name);
+                    cx.emit(
+                        Op::DefineGlobalVar,
+                        [Operand::ConstIndex(name_idx), Operand::Register(tmp)],
+                        span,
+                    );
+                }
+            }
             cx.emit_module_export_mirror(&name, tmp, span);
             Ok(None)
         }

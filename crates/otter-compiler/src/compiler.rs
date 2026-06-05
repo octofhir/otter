@@ -37,6 +37,11 @@ pub(crate) struct Compiler {
     /// nested class body is compiled (its `#name` references may
     /// resolve to an outer class).
     pub(crate) class_private_names: Vec<std::collections::HashSet<String>>,
+    /// `true` when compiling any `eval` body — §B.3.3.3 makes the
+    /// Annex B global function extension *deletable* for eval code
+    /// (CreateGlobalVarBinding(F, true)) where script code creates a
+    /// non-configurable binding.
+    pub(crate) in_eval: bool,
     /// `true` when compiling a *strict* `eval` body: §19.2.1.1 gives
     /// strict eval its own variable environment, so top-level `var` /
     /// `function` declarations must NOT mirror onto the global object
@@ -51,6 +56,7 @@ impl Compiler {
             private_namespaces: Vec::new(),
             class_private_names: Vec::new(),
             suppress_global_mirror: false,
+            in_eval: false,
         }
     }
 

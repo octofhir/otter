@@ -4530,6 +4530,15 @@ impl Interpreter {
                     self.run_load_global_or_undefined_reg(context, frame, dst, name_idx)?;
                     continue;
                 }
+                Op::DeclareGlobalVar => {
+                    let name_idx = context
+                        .exec_const_index(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let configurable = context.exec_imm32(instr, 1).unwrap_or(0) != 0;
+                    let frame = &mut stack[top_idx];
+                    self.run_declare_global_var_reg(context, frame, name_idx, configurable)?;
+                    continue;
+                }
                 Op::DefineGlobalVar => {
                     let name_idx = context
                         .exec_const_index(instr, 0)

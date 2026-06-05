@@ -939,6 +939,7 @@ mod tests {
         Op::DefineOwnProperty,
         Op::DefineGlobalVar,
         Op::StoreUpvalueChecked,
+        Op::DeclareGlobalVar,
         Op::StarReexport,
         Op::ModuleNamespaceObject,
         Op::LoadImportBinding,

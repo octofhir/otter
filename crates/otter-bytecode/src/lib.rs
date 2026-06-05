@@ -1015,6 +1015,17 @@ pub enum Op {
     /// - <https://tc39.es/ecma262/#sec-toprimitive>
     /// - <https://tc39.es/ecma262/#sec-ordinarytoprimitive>
     ToPrimitive,
+
+    /// Declare a global `var` binding if absent. Operands:
+    /// `ConstIndex(name), Imm32(configurable)`.
+    ///
+    /// §9.1.1.4.17 CreateGlobalVarBinding — when `globalThis` has no
+    /// own property `name` (and is extensible), define a writable /
+    /// enumerable / configurable data property initialised to
+    /// `undefined`. An existing own property is left untouched, so
+    /// re-declaration (sibling scripts, Annex B extensions over a
+    /// pre-existing global) never resets a live value.
+    DeclareGlobalVar,
 }
 
 impl Op {
@@ -1158,6 +1169,7 @@ impl Op {
             Op::LoadGlobalOrThrow => "LOAD_GLOBAL_OR_THROW",
             Op::LoadGlobalOrUndefined => "LOAD_GLOBAL_OR_UNDEFINED",
             Op::DefineGlobalVar => "DEFINE_GLOBAL_VAR",
+            Op::DeclareGlobalVar => "DECLARE_GLOBAL_VAR",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
@@ -1237,7 +1249,8 @@ impl Op {
             | Op::LoadBuiltinError
             | Op::LoadGlobalOrThrow
             | Op::LoadGlobalOrUndefined
-            | Op::DefineGlobalVar => 2,
+            | Op::DefineGlobalVar
+            | Op::DeclareGlobalVar => 2,
             Op::GetStringIndex
             | Op::Add
             | Op::Sub
@@ -1369,6 +1382,7 @@ impl Op {
             | Op::LoadGlobalOrUndefined => pos == 1,
             // [name_const, value_reg]
             Op::DefineGlobalVar => pos == 0,
+            Op::DeclareGlobalVar => pos == 0,
             // [url_const]
             Op::MarkModuleEvaluated => pos == 0,
             // [gate_dst, url_const]

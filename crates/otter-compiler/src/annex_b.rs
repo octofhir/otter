@@ -213,10 +213,16 @@ fn walk_statement(
         Statement::TryStatement(s) => {
             walk_block(&s.block.body, blocked, out, seen);
             if let Some(handler) = &s.handler {
-                // The catch parameter's names block extensions from
-                // inside the catch block (§B.3.4).
+                // §B.3.5 — a *simple* catch parameter does not block
+                // the extension (VariableStatements in Catch Blocks);
+                // destructuring catch parameters keep the early error.
                 let mut catch_blocked = blocked.clone();
-                if let Some(param) = &handler.param {
+                if let Some(param) = &handler.param
+                    && !matches!(
+                        param.pattern,
+                        oxc_ast::ast::BindingPattern::BindingIdentifier(_)
+                    )
+                {
                     let mut names: Vec<(String, bool)> = Vec::new();
                     collect_pattern_leaf_names_all(&param.pattern, &mut names);
                     catch_blocked.extend(names.into_iter().map(|(name, _)| name));

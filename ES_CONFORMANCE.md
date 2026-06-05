@@ -3,6 +3,36 @@
 This file tracks measured Test262 results for the active
 `crates/otter-test262` runner.
 
+## Script parse goal + lazy dynamic import of TLA modules (2026-06-05, follow-up session)
+
+Three commits (`4f6618f2`, `88262a7a`, `af13fa9b`):
+
+1. **Script parse goal** (`4f6618f2`). Every parse used OXC's default
+   `SourceType` — the Module goal — so script code was held to module
+   grammar (`class await {}` rejected). Classic scripts and eval
+   bodies (§19.2.1.1) now parse with the §16.1 Script goal.
+   `language/statements` +4, `language/expressions` +17
+   (await-as-identifier family), `top-level-await/new-await-script-code`
+   passes.
+2. **Embedder snippet TLA opt-in** (`88262a7a`).
+   `SourceInput::allow_top_level_await` keeps REPL-style
+   `run_typescript` strings module-grade for `await` without leaking
+   that into spec script execution.
+3. **Lazy dynamic import with async gate** (`af13fa9b`).
+   Graph-preloaded `import("./x")` literals no longer share the
+   import-defer eager-evaluation path; a top-level-await target runs
+   its `<module-init>` with an async result promise (§16.2.1.9) and
+   the import promise settles through that gate (spec
+   `[[TopLevelCapability]]` shape).
+   `top-level-await/dynamic-import-rejection` passes.
+
+`language/module-code/top-level-await/` 248 → 250 / 251. Remaining:
+`async-module-does-not-block-sibling-modules` — needs per-module
+record async state (`[[PendingAsyncDependencies]]` /
+AsyncModuleExecutionFulfilled), a separate design. Guards: 0
+regressions across module-code / dynamic-import / statements /
+Promise (676/676) fail-list diffs; TLA-dir stress 5/5 clean.
+
 ## Heap corruption eliminated: card-barrier wild writes + unrooted execution windows (2026-06-05)
 
 Closed the long-standing nondeterministic heap corruption in long

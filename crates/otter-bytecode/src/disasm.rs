@@ -320,7 +320,8 @@ mod tests {
             | Op::CollectArguments
             | Op::BindThisValue
             | Op::LoadGlobalThis => vec![reg(0)],
-            Op::EvaluateModule | Op::MarkModuleEvaluated => vec![konst(0)],
+            Op::MarkModuleEvaluated => vec![konst(0)],
+            Op::EvaluateModule => vec![reg(0), konst(1)],
             Op::Jump | Op::TdzError | Op::FreshUpvalue => vec![imm(-1)],
             Op::JumpViaFinally => vec![imm(-1), imm(1)],
             Op::LoadString

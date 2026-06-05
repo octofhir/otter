@@ -1198,7 +1198,6 @@ impl Op {
             | Op::IteratorCloseEnd
             | Op::CollectArguments
             | Op::FreshUpvalue
-            | Op::EvaluateModule
             | Op::MarkModuleEvaluated
             | Op::LoadGlobalThis => 1,
             Op::LoadString
@@ -1228,6 +1227,7 @@ impl Op {
             | Op::ModuleNamespaceObject
             | Op::ImportNamespaceDynamic
             | Op::ImportMetaResolve
+            | Op::EvaluateModule
             | Op::Eval
             | Op::PromiseFulfilledOf
             | Op::SymbolLoad
@@ -1370,7 +1370,9 @@ impl Op {
             // [name_const, value_reg]
             Op::DefineGlobalVar => pos == 0,
             // [url_const]
-            Op::EvaluateModule | Op::MarkModuleEvaluated => pos == 0,
+            Op::MarkModuleEvaluated => pos == 0,
+            // [gate_dst, url_const]
+            Op::EvaluateModule => pos == 1,
             // [reg, reg, const]
             Op::LoadProperty | Op::DeleteProperty | Op::ToPrimitive => pos == 2,
             // [dst, record_reg, name_const]

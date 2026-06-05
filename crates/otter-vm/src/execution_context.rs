@@ -387,6 +387,20 @@ impl ExecutionContext {
             .map(|r| r.target.as_str())
             .collect()
     }
+
+    /// A module's `[[RequestedModules]]` in source order, with each
+    /// edge's defer phase. `import("x")` preload edges (synthetic
+    /// `deferred && dynamic`) are not source requests and are
+    /// excluded, as are runtime self-loop edges.
+    #[must_use]
+    pub fn module_requests(&self, url: &str) -> Vec<(&str, bool)> {
+        self.module
+            .module_resolutions
+            .iter()
+            .filter(|r| r.referrer == url && r.specifier != r.target && !(r.deferred && r.dynamic))
+            .map(|r| (r.target.as_str(), r.deferred))
+            .collect()
+    }
 }
 
 #[cfg(test)]

@@ -97,6 +97,7 @@ pub mod math;
 mod method_ops;
 pub mod microtask;
 mod module_ops;
+mod module_records;
 pub mod native_function;
 pub mod number;
 pub mod object;
@@ -339,25 +340,16 @@ pub struct Interpreter {
     /// alongside `module_environments`.
     module_resolution_cache:
         std::collections::HashMap<(std::sync::Arc<str>, String), std::sync::Arc<str>>,
-    /// Canonical URLs of modules currently running their `<module-init>`.
-    /// Used to detect deferred namespace force-evaluation of a module
-    /// that is still evaluating in the same cycle.
-    module_evaluating: std::collections::HashSet<std::sync::Arc<str>>,
-    /// Canonical URLs of modules whose `<module-init>` body completed.
-    /// Guards [`Op::EvaluateModule`] / deferred force-eval against
-    /// double evaluation. Cleared with `module_environments`.
-    evaluated_modules: std::collections::HashSet<std::sync::Arc<str>>,
-    /// Cached thrown completion for modules whose synchronous evaluation
-    /// failed. Re-reading a deferred namespace rethrows the identical JS
-    /// value instead of synthesizing a fresh error.
-    module_errors: std::collections::HashMap<std::sync::Arc<str>, Value>,
-    /// Async result promises of top-level-await `<module-init>` bodies
-    /// started by `import()` (§16.2.1.9 ExecuteAsyncModule). A repeat
-    /// `import()` of the same module chains onto the cached promise
-    /// instead of re-running the init. Cleared with
-    /// `module_environments`; traced as a GC root.
-    module_async_init_promises:
-        std::collections::HashMap<std::sync::Arc<str>, crate::promise::JsPromiseHandle>,
+    /// Per-module Cyclic Module Record evaluation state (§16.2.1.4):
+    /// `[[Status]]`, `[[EvaluationError]]`, and the
+    /// `[[TopLevelCapability]]`-shaped promise gate. Promise and error
+    /// values are traced as GC roots. Cleared with
+    /// `module_environments`.
+    module_records:
+        std::collections::HashMap<std::sync::Arc<str>, module_records::ModuleRecordState>,
+    /// Monotonic `[[AsyncEvaluationOrder]]` source (§16.2.1.4); next
+    /// value handed to a module entering async evaluation.
+    next_module_async_order: u64,
     /// Cache of deferred module namespace exotic objects, keyed by
     /// target module URL, so two `import defer * as` of the same module
     /// yield the identical object (§16.2.1). Cleared with
@@ -752,10 +744,8 @@ impl Interpreter {
             microtasks: MicrotaskQueue::new(),
             module_environments: std::collections::HashMap::new(),
             module_resolution_cache: std::collections::HashMap::new(),
-            module_evaluating: std::collections::HashSet::new(),
-            evaluated_modules: std::collections::HashSet::new(),
-            module_errors: std::collections::HashMap::new(),
-            module_async_init_promises: std::collections::HashMap::new(),
+            module_records: std::collections::HashMap::new(),
+            next_module_async_order: 0,
             deferred_namespaces: std::collections::HashMap::new(),
             module_namespaces: std::collections::HashMap::new(),
             module_resolved_exports: std::collections::HashMap::new(),
@@ -1562,10 +1552,8 @@ impl Interpreter {
     pub fn reset_module_state(&mut self) {
         self.module_environments.clear();
         self.module_resolution_cache.clear();
-        self.module_evaluating.clear();
-        self.evaluated_modules.clear();
-        self.module_errors.clear();
-        self.module_async_init_promises.clear();
+        self.module_records.clear();
+        self.next_module_async_order = 0;
         self.deferred_namespaces.clear();
         self.module_namespaces.clear();
         self.module_resolved_exports.clear();
@@ -2163,14 +2151,18 @@ impl Interpreter {
 
     /// Borrow cached module-evaluation thrown values for GC root tracing.
     pub fn module_errors_for_trace(&self) -> impl Iterator<Item = &Value> {
-        self.module_errors.values()
+        self.module_records
+            .values()
+            .filter_map(|record| record.evaluation_error.as_ref())
     }
 
-    /// Borrow the async module-init promise cache for GC root tracing.
+    /// Borrow per-module evaluation gate promises for GC root tracing.
     pub(crate) fn module_async_init_promises_for_trace(
         &self,
     ) -> impl Iterator<Item = &crate::promise::JsPromiseHandle> {
-        self.module_async_init_promises.values()
+        self.module_records
+            .values()
+            .filter_map(|record| record.evaluation_promise.as_ref())
     }
 
     /// Borrow the well-known symbol singleton table. Used by
@@ -4498,11 +4490,14 @@ impl Interpreter {
                     continue;
                 }
                 Op::EvaluateModule => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
                     let url_idx = context
-                        .exec_const_index(instr, 0)
+                        .exec_const_index(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_evaluate_module_const(context, frame, url_idx)?;
+                    self.run_evaluate_module_const(context, frame, dst, url_idx)?;
                     continue;
                 }
                 Op::MarkModuleEvaluated => {
@@ -4511,8 +4506,8 @@ impl Interpreter {
                         .ok_or(VmError::InvalidOperand)?;
                     if let Some(url) = context.string_constant_str(url_idx) {
                         let url_arc: std::sync::Arc<str> = std::sync::Arc::from(url);
-                        self.module_evaluating.remove(&url_arc);
-                        self.evaluated_modules.insert(url_arc);
+                        self.module_record_mut(&url_arc).status =
+                            module_records::ModuleStatus::Evaluated;
                     }
                     stack[top_idx].advance_pc(self.current_byte_len)?;
                     continue;

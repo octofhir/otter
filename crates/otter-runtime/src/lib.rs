@@ -1549,11 +1549,11 @@ pub(crate) enum DynamicImportBegin {
 
 enum DynamicModuleLoad {
     Loaded(otter_vm::Value),
-    /// One or more loaded module inits carry top-level await — the
-    /// import must not settle until their async result promises do
-    /// (§16.2.1.9 ExecuteAsyncModule).
+    /// The loaded graph evaluates async (top-level await somewhere in
+    /// the target's subtree) — the import must not settle until the
+    /// target's per-record evaluation gate does (§16.2.1.9).
     PendingAsyncEvaluation {
-        promises: Vec<otter_vm::JsPromiseHandle>,
+        promise: otter_vm::JsPromiseHandle,
         target_url: String,
         context: ExecutionContext,
     },
@@ -1627,7 +1627,7 @@ impl Runtime {
                 .settle_dynamic_import_result(token, Ok(namespace))
                 .map(|_| DynamicImportBegin::Settled),
             Ok(DynamicModuleLoad::PendingAsyncEvaluation {
-                promises,
+                promise,
                 target_url,
                 context,
             }) => {
@@ -1635,7 +1635,7 @@ impl Runtime {
                     .settle_dynamic_import_on_async_inits(
                         &context,
                         token,
-                        promises,
+                        vec![promise],
                         std::sync::Arc::from(target_url.as_str()),
                     )
                     .map_err(|err| {
@@ -1802,60 +1802,36 @@ impl Runtime {
             self.interp
                 .register_module_env(std::sync::Arc::from(init.url.as_str()), env);
         }
-        let inits: Vec<(String, u32, otter_vm::JsObject)> = context
-            .module_inits()
-            .iter()
-            .filter_map(|init| {
-                self.interp
-                    .module_env(&init.url)
-                    .map(|env| (init.url.clone(), init.function_id, env))
-            })
-            .collect();
-        let mut async_init_promises: Vec<otter_vm::JsPromiseHandle> = Vec::new();
-        for (url, function_id, env) in inits {
-            if otter_vm_init_marker_set(&self.interp, env) {
-                let _ = url;
-                continue;
+        // §13.3.10 step 7 — Evaluate(target): the records-backed
+        // InnerModuleEvaluation walks the target's eager dependency
+        // closure, parking on top-level await instead of blocking.
+        match self.interp.evaluate_module(&context, &target_url) {
+            Ok(Some(promise)) => {
+                return Ok(DynamicModuleLoad::PendingAsyncEvaluation {
+                    promise,
+                    target_url,
+                    context,
+                });
             }
-            otter_vm_init_marker_install(&mut self.interp, env);
-            let import_meta = alloc_dynamic_import_meta(&mut self.interp, env, &url)?;
-            match self.interp.run_module_init(
-                &context,
-                function_id,
-                otter_vm::Value::object(env),
-                otter_vm::Value::object(import_meta),
-            ) {
-                // A top-level-await init suspends instead of running to
-                // completion; its async result promise gates the import's
-                // settlement (§16.2.1.9).
-                Ok(Some(promise)) => async_init_promises.push(promise),
-                Ok(None) => {}
-                Err(err) => {
-                    // §16.2.1.7 step 7.b.i — an evaluation throw maps
-                    // to a promise rejection. Prefer the original
-                    // thrown Value (preserved on
-                    // `pending_uncaught_throw` whenever the throw
-                    // walked the empty stack inside the dispatch
-                    // sub-loop) so `.catch` observes the spec-correct
-                    // payload, not a stringified `VmError::Uncaught`
-                    // rendering.
-                    if matches!(err, otter_vm::VmError::Uncaught { .. })
-                        && let Some(thrown) = self.interp.take_pending_uncaught_throw()
-                    {
-                        return Err(DynLoadError::Thrown(thrown));
-                    }
-                    return Err(DynLoadError::type_error(format!(
-                        "dynamic import: evaluation failed for \"{url}\": {err}"
-                    )));
+            Ok(None) => {}
+            Err(err) => {
+                // §16.2.1.7 step 7.b.i — an evaluation throw maps
+                // to a promise rejection. Prefer the original
+                // thrown Value (preserved on
+                // `pending_uncaught_throw` whenever the throw
+                // walked the empty stack inside the dispatch
+                // sub-loop) so `.catch` observes the spec-correct
+                // payload, not a stringified `VmError::Uncaught`
+                // rendering.
+                if matches!(err, otter_vm::VmError::Uncaught { .. })
+                    && let Some(thrown) = self.interp.take_pending_uncaught_throw()
+                {
+                    return Err(DynLoadError::Thrown(thrown));
                 }
+                return Err(DynLoadError::type_error(format!(
+                    "dynamic import: evaluation failed for \"{target_url}\": {err}"
+                )));
             }
-        }
-        if !async_init_promises.is_empty() {
-            return Ok(DynamicModuleLoad::PendingAsyncEvaluation {
-                promises: async_init_promises,
-                target_url,
-                context,
-            });
         }
         let namespace = self.interp.module_env(&target_url).ok_or_else(|| {
             DynLoadError::type_error(format!(
@@ -3481,18 +3457,11 @@ impl DynLoadError {
 }
 
 /// Sentinel property used to flag a `module_env` as already
-/// having had its `<module-init>` body executed. Dynamic imports
-/// load + invoke each new init exactly once; this avoids
-/// re-running an init when the same module shows up in two
-/// dynamically-loaded sub-graphs (the linker generates separate
-/// `<module-init>` instances per LinkedProgram so the runtime
-/// has to dedupe).
+/// having had its `<module-init>` body executed. The file-backed
+/// dynamic-import path dedupes through the interpreter's module
+/// records; only the HTTPS single-module path still installs the
+/// marker for its separately linked fragments.
 const DYNAMIC_INIT_MARKER: &str = "__otter_module_inited__";
-
-fn otter_vm_init_marker_set(interp: &otter_vm::Interpreter, env: otter_vm::JsObject) -> bool {
-    otter_vm::object::get(env, interp.gc_heap(), DYNAMIC_INIT_MARKER)
-        .is_some_and(|v| v.as_boolean() == Some(true))
-}
 
 fn otter_vm_init_marker_install(interp: &mut otter_vm::Interpreter, env: otter_vm::JsObject) {
     otter_vm::object::set(

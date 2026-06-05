@@ -402,11 +402,14 @@ fn microtask_payload_root_survives_force_gc() {
     let _ = object;
     interp.force_gc();
 
-    let mut batch = interp
+    let _ = interp
         .microtasks_mut()
         .begin_drain()
         .expect("outer drain batch");
-    let task = batch.tasks.pop_front().expect("queued task");
+    let task = interp
+        .microtasks_mut()
+        .next_in_flight()
+        .expect("queued task");
     assert!(
         task.args.first().is_some_and(|v| v.is_object()),
         "microtask payload remains observable after force_gc"

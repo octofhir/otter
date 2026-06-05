@@ -1381,7 +1381,15 @@ impl Interpreter {
         args: SmallVec<[Value; 8]>,
     ) -> Result<Value, VmError> {
         self.enter_sync_reentry()?;
+        // Host callers (timer fire, worker message dispatch) enter
+        // here without `Interpreter::run`'s rooted scope, and the
+        // inner body allocates (upvalue spines, `this` boxing) before
+        // `dispatch_loop` registers frame roots — so the runtime
+        // roots must be registered for the whole call.
+        let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
+        let extra_root_depth = self.gc_heap.push_extra_roots(extra_roots);
         let result = self.run_callable_sync_inner(context, callee, this_value, args);
+        self.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
         self.leave_sync_reentry();
         result
     }
@@ -1581,7 +1589,11 @@ impl Interpreter {
         args: SmallVec<[Value; 8]>,
     ) -> Result<Value, VmError> {
         self.enter_sync_reentry()?;
+        // Same rooting contract as [`Self::run_callable_sync`].
+        let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
+        let extra_root_depth = self.gc_heap.push_extra_roots(extra_roots);
         let result = self.run_construct_sync_inner(context, target, new_target, args);
+        self.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
         self.leave_sync_reentry();
         result
     }

@@ -216,64 +216,85 @@ impl Interpreter {
             &mut self.gc_heap,
             crate::generator::AsyncGeneratorState::Executing,
         );
-        if !fulfilled {
-            if let Err(error) = self.unwind_throw(context, &mut stack, value) {
-                let frames = snapshot_frames(context, &stack);
-                return Err(RunError { error, frames });
-            }
-            if stack.is_empty() {
-                // Throw drained out of the gen body; settle the
-                // front request as rejected.
-                self.async_generator_complete_step(context, &owner, Err(value), true)
-                    .map_err(RunError::bare)?;
-                owner.mark_done(&mut self.gc_heap);
-                self.async_generator_drain_done(context, &owner)
-                    .map_err(RunError::bare)?;
-                return Ok(());
-            }
-        }
-        match self.dispatch_loop(context, &mut stack) {
-            Ok(value) => {
-                let yielded_already = owner.has_yielded(&self.gc_heap);
-                if yielded_already {
-                    // Op::Yield already settled the request and
-                    // saved the frame back to the gen.
-                    owner.take_yielded(&mut self.gc_heap);
-                    return Ok(());
+        // Same rooting contract as [`Self::run_async_resume`]: the
+        // resumed frame, the settlement value, and the owning
+        // generator must be GC roots across the allocating
+        // unwind / completion steps that run outside
+        // `dispatch_loop`'s own provider scope.
+        let anchor_depth = self.push_iteration_anchor(value);
+        self.push_iteration_anchor(Value::generator(owner));
+        let frame_roots = otter_gc::RawFrameRoots::new(
+            &stack as *const SmallVec<[Frame; 8]>,
+            &self.cold_frames as *const crate::cold_frame::ColdFramePool,
+            crate::trace_active_frame_roots,
+        );
+        let frame_root_provider: &dyn otter_gc::FrameRoots = &frame_roots;
+        let frame_root_depth = self
+            .gc_heap
+            .push_frame_roots(frame_root_provider as *const dyn otter_gc::FrameRoots);
+        let result = (|| -> Result<(), RunError> {
+            if !fulfilled {
+                if let Err(error) = self.unwind_throw(context, &mut stack, value) {
+                    let frames = snapshot_frames(context, &stack);
+                    return Err(RunError { error, frames });
                 }
-                // Body completed: settle the front request with
-                // the final return value as `done: true`.
-                self.async_generator_complete_step(context, &owner, Ok(value), true)
-                    .map_err(RunError::bare)?;
-                owner.mark_done(&mut self.gc_heap);
-                self.async_generator_drain_done(context, &owner)
-                    .map_err(RunError::bare)?;
-                Ok(())
-            }
-            Err(error) => {
-                owner.mark_done(&mut self.gc_heap);
-                if matches!(error, VmError::MissingReturn) {
+                if stack.is_empty() {
+                    // Throw drained out of the gen body; settle the
+                    // front request as rejected.
+                    self.async_generator_complete_step(context, &owner, Err(value), true)
+                        .map_err(RunError::bare)?;
+                    owner.mark_done(&mut self.gc_heap);
                     self.async_generator_drain_done(context, &owner)
                         .map_err(RunError::bare)?;
                     return Ok(());
                 }
-                let rejection = if let Some(thrown) = self.pending_uncaught_throw.take() {
-                    Some(thrown)
-                } else {
-                    self.vm_error_to_throwable_with_stack_roots(&stack, &error)
-                };
-                if let Some(reason) = rejection {
-                    self.async_generator_complete_step(context, &owner, Err(reason), true)
+            }
+            match self.dispatch_loop(context, &mut stack) {
+                Ok(value) => {
+                    let yielded_already = owner.has_yielded(&self.gc_heap);
+                    if yielded_already {
+                        // Op::Yield already settled the request and
+                        // saved the frame back to the gen.
+                        owner.take_yielded(&mut self.gc_heap);
+                        return Ok(());
+                    }
+                    // Body completed: settle the front request with
+                    // the final return value as `done: true`.
+                    self.async_generator_complete_step(context, &owner, Ok(value), true)
                         .map_err(RunError::bare)?;
+                    owner.mark_done(&mut self.gc_heap);
                     self.async_generator_drain_done(context, &owner)
                         .map_err(RunError::bare)?;
                     Ok(())
-                } else {
-                    let frames = snapshot_frames(context, &stack);
-                    Err(RunError { error, frames })
+                }
+                Err(error) => {
+                    owner.mark_done(&mut self.gc_heap);
+                    if matches!(error, VmError::MissingReturn) {
+                        self.async_generator_drain_done(context, &owner)
+                            .map_err(RunError::bare)?;
+                        return Ok(());
+                    }
+                    let rejection = if let Some(thrown) = self.pending_uncaught_throw.take() {
+                        Some(thrown)
+                    } else {
+                        self.vm_error_to_throwable_with_stack_roots(&stack, &error)
+                    };
+                    if let Some(reason) = rejection {
+                        self.async_generator_complete_step(context, &owner, Err(reason), true)
+                            .map_err(RunError::bare)?;
+                        self.async_generator_drain_done(context, &owner)
+                            .map_err(RunError::bare)?;
+                        Ok(())
+                    } else {
+                        let frames = snapshot_frames(context, &stack);
+                        Err(RunError { error, frames })
+                    }
                 }
             }
-        }
+        })();
+        self.gc_heap.pop_frame_roots_to(frame_root_depth - 1);
+        self.pop_iteration_anchors_to(anchor_depth - 1);
+        result
     }
 
     /// Drive a [`crate::microtask::MicrotaskKind::AsyncResume`] task: re-push
@@ -323,27 +344,47 @@ impl Interpreter {
         }
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         stack.push(*frame);
-        if !fulfilled {
-            // Inject the rejection as a throw so the parked frame
-            // observes it through its `try`/`catch`/`finally`
-            // structure exactly as a synchronous throw would.
-            if let Err(error) = self.unwind_throw(context, &mut stack, value) {
-                let frames = snapshot_frames(context, &stack);
-                return Err(RunError { error, frames });
+        // The resumed frame and the settlement value must be GC
+        // roots *before* `dispatch_loop` registers its own provider:
+        // the rejection path below allocates (thrown-value
+        // rendering, promise rejection jobs) while the frame only
+        // lives on this local stack.
+        let anchor_depth = self.push_iteration_anchor(value);
+        let frame_roots = otter_gc::RawFrameRoots::new(
+            &stack as *const SmallVec<[Frame; 8]>,
+            &self.cold_frames as *const crate::cold_frame::ColdFramePool,
+            crate::trace_active_frame_roots,
+        );
+        let frame_root_provider: &dyn otter_gc::FrameRoots = &frame_roots;
+        let frame_root_depth = self
+            .gc_heap
+            .push_frame_roots(frame_root_provider as *const dyn otter_gc::FrameRoots);
+        let result = (|| -> Result<(), RunError> {
+            if !fulfilled {
+                // Inject the rejection as a throw so the parked frame
+                // observes it through its `try`/`catch`/`finally`
+                // structure exactly as a synchronous throw would.
+                if let Err(error) = self.unwind_throw(context, &mut stack, value) {
+                    let frames = snapshot_frames(context, &stack);
+                    return Err(RunError { error, frames });
+                }
+                if stack.is_empty() {
+                    // The rejection drained through the async frame's
+                    // result promise — nothing left to dispatch.
+                    return Ok(());
+                }
             }
-            if stack.is_empty() {
-                // The rejection drained through the async frame's
-                // result promise — nothing left to dispatch.
-                return Ok(());
+            match self.dispatch_loop(context, &mut stack) {
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    let frames = snapshot_frames(context, &stack);
+                    Err(RunError { error, frames })
+                }
             }
-        }
-        match self.dispatch_loop(context, &mut stack) {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                let frames = snapshot_frames(context, &stack);
-                Err(RunError { error, frames })
-            }
-        }
+        })();
+        self.gc_heap.pop_frame_roots_to(frame_root_depth - 1);
+        self.pop_iteration_anchors_to(anchor_depth - 1);
+        result
     }
 
     /// Walk the live frame stack looking for a try-handler that

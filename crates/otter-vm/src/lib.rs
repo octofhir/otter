@@ -571,7 +571,7 @@ impl otter_gc::ExtraRootSource for Interpreter {
     }
 }
 
-fn trace_active_frame_roots(
+pub(crate) fn trace_active_frame_roots(
     stack: &SmallVec<[Frame; 8]>,
     pool: &cold_frame::ColdFramePool,
     visitor: &mut dyn FnMut(*mut RawGc),
@@ -1063,6 +1063,21 @@ impl Interpreter {
     /// callers are expected to drain microtasks after calling
     /// this. A missing or already-settled token is a silent no-op.
     pub fn settle_dynamic_import(
+        &mut self,
+        token: u64,
+        outcome: Result<Value, Value>,
+    ) -> Option<ExecutionContext> {
+        // Host-settlement entry point: runs outside any rooted VM
+        // scope, and settling can allocate reaction records — root
+        // the runtime state for the duration.
+        let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
+        let extra_root_depth = self.gc_heap.push_extra_roots(extra_roots);
+        let settled = self.settle_dynamic_import_inner(token, outcome);
+        self.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
+        settled
+    }
+
+    fn settle_dynamic_import_inner(
         &mut self,
         token: u64,
         outcome: Result<Value, Value>,
@@ -2571,18 +2586,43 @@ impl Interpreter {
         &mut self,
         default_context: Option<ExecutionContext>,
     ) -> Result<(), RunError> {
+        // The drain runs outside `Interpreter::run`'s rooted scope
+        // (the runtime layer drains after `run` returns), so register
+        // the interpreter's runtime roots here. Without this, a
+        // scavenge triggered by any allocation in a microtask body —
+        // including async-resume parked frames and queued reaction
+        // values — would miss every root enumerated by
+        // [`crate::runtime_state::RuntimeState`] (shape side tables,
+        // the microtask queue itself, globalThis, module envs) and
+        // free or move objects still reachable through them.
+        let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
+        let extra_root_depth = self.gc_heap.push_extra_roots(extra_roots);
+        let result = self.drain_microtasks_with_default_inner(default_context);
+        self.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
+        result
+    }
+
+    fn drain_microtasks_with_default_inner(
+        &mut self,
+        default_context: Option<ExecutionContext>,
+    ) -> Result<(), RunError> {
         self.record_runtime_microtask_drain_started();
         let mut iters: u32 = 0;
         let mut observed_microtask_budget = false;
         loop {
-            let Some(batch) = self.microtasks.begin_drain() else {
+            let Some(batch_len) = self.microtasks.begin_drain() else {
                 return Ok(());
             };
-            if batch.tasks.is_empty() {
+            if batch_len == 0 {
                 self.microtasks.end_drain();
                 return Ok(());
             }
-            for task in batch.tasks {
+            // Tasks stay queue-owned (`next_in_flight`) rather than
+            // being moved into a driver-local batch, so the ones
+            // waiting behind the executing task remain visible to
+            // the GC root walk — parked async frames in the queue
+            // hold raw register slots a scavenge must rewrite.
+            while let Some(task) = self.microtasks.next_in_flight() {
                 if iters >= microtask::MAX_DRAIN_ITERS {
                     self.microtasks.end_drain();
                     return Err(RunError {
@@ -3003,6 +3043,14 @@ impl Interpreter {
         let frame_root_depth = self
             .gc_heap
             .push_frame_roots(frame_root_provider as *const dyn otter_gc::FrameRoots);
+        // Catch-all runtime-roots registration: every bytecode tick
+        // can allocate, and some dispatch entries (generator
+        // prologues spawned from host-driven drains, future embedder
+        // entry points) reach here without an enclosing rooted scope.
+        // The heap dedupes same-source stack entries, so re-pushing
+        // under `run` / `run_callable_sync` costs one Vec slot.
+        let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
+        let extra_root_depth = self.gc_heap.push_extra_roots(extra_roots);
         // Nested dispatch must not leak its last-instruction byte length
         // into the caller's PC advance: helpers like Op::Eval invoke
         // dispatch_loop on a sub-stack and then expect
@@ -3057,6 +3105,7 @@ impl Interpreter {
                 }
             }
         })();
+        self.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
         self.gc_heap.pop_frame_roots_to(frame_root_depth - 1);
         self.finish_runtime_budget_turn();
         self.current_byte_len = saved_byte_len;

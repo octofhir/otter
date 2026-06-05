@@ -192,6 +192,13 @@ pub struct MicrotaskQueue {
     /// Sync side: pushed by `Op::QueueMicrotask` and host-side
     /// `enqueue` calls running on the interpreter thread.
     pending: VecDeque<Microtask>,
+    /// Tasks of the generation currently being drained. Owned by the
+    /// queue — not handed to the driver by value — so tasks waiting
+    /// behind the one being executed stay visible to the GC root
+    /// walk. A parked async frame in here holds raw `Value` register
+    /// slots; if a scavenge during task `k` cannot see task `k+1`,
+    /// the later frame resumes over freed/moved objects.
+    in_flight: VecDeque<Microtask>,
     /// Reentrant-drain depth. Only the outermost drain finalises;
     /// nested calls return immediately (no-op) so a microtask body
     /// can call `drain_microtasks` itself without recursing.
@@ -234,41 +241,52 @@ impl MicrotaskQueue {
         }
     }
 
-    /// Drain bookkeeping — see module docstring. Returns the
-    /// generation snapshot the caller is now responsible for running.
+    /// Drain bookkeeping — see module docstring. Moves the current
+    /// generation into the queue-owned `in_flight` deque and returns
+    /// its task count. The driver pulls tasks one at a time through
+    /// [`Self::next_in_flight`]; tasks still waiting stay traced by
+    /// [`Self::trace_gc_slots`] while their predecessors execute.
     ///
     /// Returns `None` when this is a reentrant call (drain already
     /// in progress on an outer frame); the caller should yield
     /// without iterating in that case.
-    pub fn begin_drain(&mut self) -> Option<DrainBatch> {
+    pub fn begin_drain(&mut self) -> Option<usize> {
         if self.drain_depth > 0 {
             return None;
         }
         self.drain_depth += 1;
         self.generation += 1;
-        // Take ownership of the current generation. Tasks enqueued
-        // during the drain go on the fresh deque (returned to
-        // `pending` by `mem::take`), which the caller's outer loop
-        // picks up on the next iteration.
-        let batch = std::mem::take(&mut self.pending);
-        Some(DrainBatch {
-            tasks: batch,
-            generation: self.generation,
-        })
+        debug_assert!(self.in_flight.is_empty());
+        // Swap the current generation into `in_flight`. Tasks
+        // enqueued during the drain go on `pending`, which the
+        // caller's outer loop picks up on the next iteration.
+        std::mem::swap(&mut self.pending, &mut self.in_flight);
+        Some(self.in_flight.len())
+    }
+
+    /// Pop the next task of the in-flight generation, if any.
+    pub fn next_in_flight(&mut self) -> Option<Microtask> {
+        self.in_flight.pop_front()
     }
 
     /// End-of-drain bookkeeping. Decrements `drain_depth` and
-    /// drops the temporary deque. Caller is required to invoke
-    /// this once for every successful [`Self::begin_drain`].
+    /// returns any unexecuted in-flight tasks (an erroring drain
+    /// stops mid-generation) to the front of `pending` in their
+    /// original order so a follow-up drain resumes where this one
+    /// stopped. Caller is required to invoke this once for every
+    /// successful [`Self::begin_drain`].
     pub fn end_drain(&mut self) {
         debug_assert!(self.drain_depth > 0);
+        while let Some(task) = self.in_flight.pop_back() {
+            self.pending.push_front(task);
+        }
         self.drain_depth = self.drain_depth.saturating_sub(1);
     }
 
     /// `true` if the sync side has work.
     #[must_use]
     pub fn has_any_pending(&self) -> bool {
-        !self.pending.is_empty()
+        !self.pending.is_empty() || !self.in_flight.is_empty()
     }
 
     /// Hot-path testing helper — clear the queue without going
@@ -277,6 +295,7 @@ impl MicrotaskQueue {
     #[doc(hidden)]
     pub fn clear_for_tests(&mut self) {
         self.pending.clear();
+        self.in_flight.clear();
         self.drain_depth = 0;
     }
 }
@@ -315,24 +334,16 @@ impl Microtask {
 }
 
 impl MicrotaskQueue {
-    /// Trace every queued isolate-local task.
+    /// Trace every queued isolate-local task — both the pending
+    /// generation and the in-flight one a drain is executing.
     pub(crate) fn trace_gc_slots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
         for task in &self.pending {
             task.trace_gc_slots(visitor);
         }
+        for task in &self.in_flight {
+            task.trace_gc_slots(visitor);
+        }
     }
-}
-
-/// One generation of work removed from the queue by
-/// [`MicrotaskQueue::begin_drain`]. The driver iterates this batch,
-/// then asks `begin_drain` again until it returns an empty batch
-/// (no more sync work) **and** `has_any_pending()` is false.
-#[derive(Debug)]
-pub struct DrainBatch {
-    /// Tasks in FIFO order — the caller pops from the front.
-    pub tasks: VecDeque<Microtask>,
-    /// Generation number assigned to this batch.
-    pub generation: u64,
 }
 
 #[cfg(test)]
@@ -356,16 +367,37 @@ mod tests {
         q.enqueue(task_for(1));
         q.enqueue(task_for(2));
         q.enqueue(task_for(3));
-        let batch = q.begin_drain().unwrap();
-        assert_eq!(batch.tasks.len(), 3);
-        let order: Vec<i32> = batch
-            .tasks
-            .iter()
-            .map(|t| t.callee.as_number().unwrap().as_smi().unwrap())
-            .collect();
+        let batch_len = q.begin_drain().unwrap();
+        assert_eq!(batch_len, 3);
+        let mut order: Vec<i32> = Vec::new();
+        while let Some(task) = q.next_in_flight() {
+            order.push(task.callee.as_number().unwrap().as_smi().unwrap());
+        }
         assert_eq!(order, vec![1, 2, 3]);
         q.end_drain();
         assert!(!q.has_pending_sync());
+    }
+
+    #[test]
+    fn end_drain_returns_unexecuted_tasks_to_pending_in_order() {
+        let mut q = MicrotaskQueue::new();
+        q.enqueue(task_for(1));
+        q.enqueue(task_for(2));
+        q.enqueue(task_for(3));
+        let _ = q.begin_drain().unwrap();
+        // Driver executes task 1, then aborts the drain (error path).
+        let first = q.next_in_flight().unwrap();
+        assert_eq!(first.callee.as_number().unwrap().as_smi().unwrap(), 1);
+        q.end_drain();
+        // Tasks 2 and 3 must survive, in order, for the next drain.
+        let next_len = q.begin_drain().unwrap();
+        assert_eq!(next_len, 2);
+        let mut order: Vec<i32> = Vec::new();
+        while let Some(task) = q.next_in_flight() {
+            order.push(task.callee.as_number().unwrap().as_smi().unwrap());
+        }
+        assert_eq!(order, vec![2, 3]);
+        q.end_drain();
     }
 
     #[test]
@@ -382,18 +414,18 @@ mod tests {
     fn enqueue_during_drain_lands_in_next_batch() {
         let mut q = MicrotaskQueue::new();
         q.enqueue(task_for(1));
-        let batch = q.begin_drain().unwrap();
+        let batch_len = q.begin_drain().unwrap();
+        assert_eq!(batch_len, 1);
         // Simulate the driver running a task that pushes another.
+        let _ = q.next_in_flight().unwrap();
         q.enqueue(task_for(2));
-        assert_eq!(batch.tasks.len(), 1);
         // The fresh push lands on the next generation.
         q.end_drain();
-        let next = q.begin_drain().unwrap();
-        assert_eq!(next.tasks.len(), 1);
-        assert_eq!(
-            next.tasks[0].callee.as_number().unwrap().as_smi().unwrap(),
-            2
-        );
+        let next_len = q.begin_drain().unwrap();
+        assert_eq!(next_len, 1);
+        let next = q.next_in_flight().unwrap();
+        assert_eq!(next.callee.as_number().unwrap().as_smi().unwrap(), 2);
+        q.end_drain();
     }
 
     #[test]

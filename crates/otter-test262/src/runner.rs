@@ -357,14 +357,14 @@ pub fn run_one(
         }
     };
 
-    // 8. Build the per-test source.
+    // 8. Build the per-test source. Module tests keep the harness
+    // separate: it must evaluate as a classic script in the global
+    // scope (INTERPRETING.md) so `assert` / `Test262Error` are global
+    // bindings visible to every module in the test's import graph —
+    // sibling test files imported as dependencies reference them too.
     let body = Frontmatter::body_of(&source);
     let combined = if frontmatter.is_module() {
-        // Module-flagged tests are strict by ECMAScript module
-        // semantics; do not inject a directive into the harness.
-        let mut buf = preamble;
-        buf.push_str(body);
-        buf
+        body.to_string()
     } else {
         let mut buf = String::new();
         if frontmatter.is_only_strict() && !frontmatter.is_raw() {
@@ -404,7 +404,7 @@ pub fn run_one(
     // reports from the previous test do not bleed in.
     crate::agent::reset_for_next_test();
     let outcome = if frontmatter.is_module() {
-        run_module_test(&mut runtime, &combined, test_path, exec.timeout)
+        run_module_test(&mut runtime, &preamble, &combined, test_path, exec.timeout)
     } else {
         let stage_script = features.iter().any(|feature| feature == "dynamic-import");
         run_script_test(
@@ -459,13 +459,33 @@ fn run_script_test(
 
 fn run_module_test(
     runtime: &mut Runtime,
-    source: &str,
+    preamble: &str,
+    body: &str,
     test_path: &Path,
     timeout: Duration,
 ) -> Outcome {
+    // INTERPRETING.md — harness files evaluate as classic scripts in
+    // the global scope before the test, so `var assert` & friends are
+    // genuine globals reachable from every module in the import
+    // graph, not bindings local to the entry module's scope.
+    if !preamble.is_empty() {
+        let outcome = run_with_watchdog(runtime, timeout, |rt| {
+            rt.run_script(
+                SourceInput::from_javascript(preamble.to_string()),
+                "test262-harness.js",
+            )
+        });
+        if let mapped @ (Outcome::Fail { .. }
+        | Outcome::Crash { .. }
+        | Outcome::Timeout { .. }
+        | Outcome::OutOfMemory { .. }) = map_watchdog_outcome(outcome)
+        {
+            return mapped;
+        }
+    }
     // Module entry must live on disk (the loader uses the parent
     // directory as the resolution base).
-    let (dir, entry) = match stage_test_entry(source, test_path, "entry.mjs") {
+    let (dir, entry) = match stage_test_entry(body, test_path, "entry.mjs") {
         Ok(staged) => staged,
         Err(reason) => {
             return Outcome::Fail {

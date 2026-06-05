@@ -1403,6 +1403,26 @@ impl Interpreter {
             || value.is_bound_function()
             || value.is_class_constructor()
         {
+            // §10.2 ordinary bytecode functions: the kind prototype
+            // (%GeneratorFunction.prototype% et al.) for generator /
+            // async flavours — resolved context-free through the
+            // shared code space so proto-chain walks (`instanceof`,
+            // `Reflect.getPrototypeOf`) see the same graph as
+            // property reads — else `%Function.prototype%`.
+            if let Some(function_id) = value.as_function().or_else(|| {
+                value
+                    .as_closure(&self.gc_heap)
+                    .map(|c| c.cached_function_id)
+            }) && let Some(chunk) = self.code_space.chunk_for(function_id)
+                && let Some(local) = function_id.checked_sub(chunk.function_base)
+                && let Some(function) = chunk.module.functions.get(local as usize)
+                && let Some(proto) = self.function_kind_prototypes.kind_prototype_for_flags(
+                    function.is_generator,
+                    function.is_async || function.is_async_generator,
+                )
+            {
+                return Ok(Value::object(proto));
+            }
             return Ok(Value::object(self.function_prototype_object()?));
         }
         // §10.4 exotic objects (ArrayBuffer / SharedArrayBuffer /
@@ -6730,7 +6750,11 @@ mod tests {
         let args = [arg];
 
         let result = interp
-            .build_function_constructor(&context, args.as_slice())
+            .build_dynamic_function(
+                &context,
+                args.as_slice(),
+                crate::eval_ops::DynamicFunctionKind::Normal,
+            )
             .expect("Function constructor");
 
         let fid = result.as_function().expect("plain function value");

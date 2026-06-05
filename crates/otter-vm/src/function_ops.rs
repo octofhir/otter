@@ -1679,6 +1679,14 @@ impl Interpreter {
         {
             return Ok(v);
         }
+        // §27.7.4 — async (non-generator) functions have no
+        // `prototype` property at all.
+        if context
+            .function(function_id)
+            .is_some_and(|function| function.is_async && !function.is_generator)
+        {
+            return Ok(Value::undefined());
+        }
 
         let function_root = Value::function(function_id);
         let constructor_value = receiver.unwrap_or(function_root);
@@ -1710,12 +1718,22 @@ impl Interpreter {
             .function(function_id)
             .is_some_and(|function| function.is_generator)
         {
-            let proto_value = Value::object(proto);
-            let parent = self.alloc_stack_rooted_object_with_extra_roots(
-                stack,
-                &[&function_root, &bag_root, &proto_value],
-            )?;
-            self.finish_generator_function_prototype(context, function_id, proto, parent)?;
+            let is_async = context
+                .function(function_id)
+                .is_some_and(|function| function.is_async_generator);
+            if let Some(shared) = self.shared_generator_object_prototype(is_async) {
+                // §27.5.1 / §27.6.1 — generator-function `.prototype`
+                // objects inherit from the one shared
+                // %GeneratorPrototype% / %AsyncGeneratorPrototype%.
+                object::set_prototype(proto, &mut self.gc_heap, Some(shared));
+            } else {
+                let proto_value = Value::object(proto);
+                let parent = self.alloc_stack_rooted_object_with_extra_roots(
+                    stack,
+                    &[&function_root, &bag_root, &proto_value],
+                )?;
+                self.finish_generator_function_prototype(context, function_id, proto, parent)?;
+            }
         }
         let proto_value = Value::object(proto);
         let constructor = object::PropertyDescriptor::data(constructor_value, true, false, true);
@@ -1764,6 +1782,14 @@ impl Interpreter {
         {
             return Ok(v);
         }
+        // §27.7.4 — async (non-generator) functions have no
+        // `prototype` property at all.
+        if context
+            .function(function_id)
+            .is_some_and(|function| function.is_async && !function.is_generator)
+        {
+            return Ok(Value::undefined());
+        }
 
         let function_root = Value::function(function_id);
         let constructor_value = receiver.unwrap_or(function_root);
@@ -1797,14 +1823,24 @@ impl Interpreter {
             .function(function_id)
             .is_some_and(|function| function.is_generator)
         {
-            let proto_value = Value::object(proto);
-            let mut parent_roots = Vec::with_capacity(value_roots.len() + 3);
-            parent_roots.push(&function_root);
-            parent_roots.push(&bag_root);
-            parent_roots.push(&proto_value);
-            parent_roots.extend_from_slice(value_roots);
-            let parent = self.alloc_runtime_rooted_object_with_roots(&parent_roots, slice_roots)?;
-            self.finish_generator_function_prototype(context, function_id, proto, parent)?;
+            let is_async = context
+                .function(function_id)
+                .is_some_and(|function| function.is_async_generator);
+            if let Some(shared) = self.shared_generator_object_prototype(is_async) {
+                // §27.5.1 / §27.6.1 — inherit from the one shared
+                // %GeneratorPrototype% / %AsyncGeneratorPrototype%.
+                object::set_prototype(proto, &mut self.gc_heap, Some(shared));
+            } else {
+                let proto_value = Value::object(proto);
+                let mut parent_roots = Vec::with_capacity(value_roots.len() + 3);
+                parent_roots.push(&function_root);
+                parent_roots.push(&bag_root);
+                parent_roots.push(&proto_value);
+                parent_roots.extend_from_slice(value_roots);
+                let parent =
+                    self.alloc_runtime_rooted_object_with_roots(&parent_roots, slice_roots)?;
+                self.finish_generator_function_prototype(context, function_id, proto, parent)?;
+            }
         }
         let proto_value = Value::object(proto);
         let constructor = object::PropertyDescriptor::data(constructor_value, true, false, true);

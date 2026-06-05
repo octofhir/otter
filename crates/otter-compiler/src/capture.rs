@@ -92,11 +92,38 @@ impl OwnNameCollector {
         if self.nested_depth > 0 {
             return;
         }
-        if let BindingPattern::BindingIdentifier(id) = pattern {
-            self.names.insert(id.name.as_str().to_string());
+        self.collect_pattern_leaves(pattern);
+    }
+
+    /// Collect every leaf identifier a binding pattern declares —
+    /// `let { a, b: [c, ...d] } = …` declares `a`, `c`, `d` — so a
+    /// nested function capturing a destructured leaf promotes it to
+    /// an upvalue cell just like a plain `let` binding.
+    fn collect_pattern_leaves(&mut self, pattern: &BindingPattern<'_>) {
+        match pattern {
+            BindingPattern::BindingIdentifier(id) => {
+                self.names.insert(id.name.as_str().to_string());
+            }
+            BindingPattern::AssignmentPattern(asgn) => {
+                self.collect_pattern_leaves(&asgn.left);
+            }
+            BindingPattern::ArrayPattern(arr) => {
+                for elem in arr.elements.iter().flatten() {
+                    self.collect_pattern_leaves(elem);
+                }
+                if let Some(rest) = &arr.rest {
+                    self.collect_pattern_leaves(&rest.argument);
+                }
+            }
+            BindingPattern::ObjectPattern(obj) => {
+                for prop in &obj.properties {
+                    self.collect_pattern_leaves(&prop.value);
+                }
+                if let Some(rest) = &obj.rest {
+                    self.collect_pattern_leaves(&rest.argument);
+                }
+            }
         }
-        // Foundation slice rejects destructuring patterns at the
-        // call-site, so we skip them here.
     }
 }
 

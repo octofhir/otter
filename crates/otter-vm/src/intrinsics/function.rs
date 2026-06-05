@@ -36,6 +36,44 @@ pub(crate) fn function_ctor_call(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
+    dynamic_function_ctor_call(ctx, args, crate::eval_ops::DynamicFunctionKind::Normal)
+}
+
+/// `%GeneratorFunction%(...)` — ECMA-262 §27.3.1.1.
+pub(crate) fn generator_function_ctor_call(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    dynamic_function_ctor_call(ctx, args, crate::eval_ops::DynamicFunctionKind::Generator)
+}
+
+/// `%AsyncFunction%(...)` — ECMA-262 §27.7.1.1.
+pub(crate) fn async_function_ctor_call(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    dynamic_function_ctor_call(ctx, args, crate::eval_ops::DynamicFunctionKind::Async)
+}
+
+/// `%AsyncGeneratorFunction%(...)` — ECMA-262 §27.4.1.1.
+pub(crate) fn async_generator_function_ctor_call(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    dynamic_function_ctor_call(
+        ctx,
+        args,
+        crate::eval_ops::DynamicFunctionKind::AsyncGenerator,
+    )
+}
+
+/// §20.2.1.1.1 CreateDynamicFunction shared body for the four
+/// dynamic-function constructors.
+fn dynamic_function_ctor_call(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    kind: crate::eval_ops::DynamicFunctionKind,
+) -> Result<Value, NativeError> {
     let new_target_proto = crate::bootstrap::native_new_target_prototype(ctx, "Function")?;
     let (interp, context) = ctx.interp_mut_and_context();
     let Some(context) = context else {
@@ -45,7 +83,7 @@ pub(crate) fn function_ctor_call(
         });
     };
     let result = interp
-        .build_function_constructor(&context, args)
+        .build_dynamic_function(&context, args, kind)
         .map_err(|err| {
             let reason = format!("{err}");
             match err {

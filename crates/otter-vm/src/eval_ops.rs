@@ -32,6 +32,31 @@ use crate::{
     write_register,
 };
 
+/// §20.2.1.1.1 CreateDynamicFunction `kind` parameter: which function
+/// goal symbol the synthesised source compiles under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DynamicFunctionKind {
+    /// `Function(...)` — `normal`.
+    Normal,
+    /// `%GeneratorFunction%(...)` — `generator`.
+    Generator,
+    /// `%AsyncFunction%(...)` — `async`.
+    Async,
+    /// `%AsyncGeneratorFunction%(...)` — `async-generator`.
+    AsyncGenerator,
+}
+
+impl DynamicFunctionKind {
+    pub(crate) fn source_prefix(self) -> &'static str {
+        match self {
+            Self::Normal => "function",
+            Self::Generator => "function*",
+            Self::Async => "async function",
+            Self::AsyncGenerator => "async function*",
+        }
+    }
+}
+
 impl Interpreter {
     pub(crate) fn run_eval_operands(
         &mut self,
@@ -163,23 +188,39 @@ impl Interpreter {
     /// The synthesised module links into the interpreter's code space,
     /// so the returned closure's function id resolves from any frame —
     /// no wrapper indirection is needed.
-    pub(crate) fn build_function_constructor(
+    /// §20.2.1.1.1 CreateDynamicFunction over native-call arguments,
+    /// parameterised by function `kind` so `%GeneratorFunction%`,
+    /// `%AsyncFunction%`, and `%AsyncGeneratorFunction%` compile their
+    /// bodies under the right goal symbol.
+    pub(crate) fn build_dynamic_function(
         &mut self,
         context: &ExecutionContext,
         args: &[Value],
+        kind: DynamicFunctionKind,
     ) -> Result<Value, VmError> {
         // Coerce every argument to a string per §20.2.1.1 step 1.
         let mut parts: Vec<String> = Vec::with_capacity(args.len());
         for arg in args {
             parts.push(self.function_constructor_arg_to_string(context, arg)?);
         }
-        self.build_function_constructor_from_parts(parts)
+        self.build_dynamic_function_from_parts(parts, kind)
     }
 
     /// §20.2.1.1 steps 2+ over already-coerced argument strings.
     pub(crate) fn build_function_constructor_from_parts(
         &mut self,
         parts: Vec<String>,
+    ) -> Result<Value, VmError> {
+        self.build_dynamic_function_from_parts(parts, DynamicFunctionKind::Normal)
+    }
+
+    /// §20.2.1.1.1 CreateDynamicFunction steps 7–20: synthesise the
+    /// `kind`-prefixed source text, compile through the eval hook, and
+    /// return the resulting function value.
+    pub(crate) fn build_dynamic_function_from_parts(
+        &mut self,
+        parts: Vec<String>,
+        kind: DynamicFunctionKind,
     ) -> Result<Value, VmError> {
         let (params, body): (Vec<&str>, &str) = if parts.is_empty() {
             (Vec::new(), "")
@@ -192,7 +233,8 @@ impl Interpreter {
             (params, body)
         };
         let params_joined = params.join(",");
-        let source = format!("(function anonymous({params_joined}) {{\n{body}\n}})");
+        let prefix = kind.source_prefix();
+        let source = format!("({prefix} anonymous({params_joined}\n) {{\n{body}\n}})");
         let module = self.compile_eval_source(&source, EvalCompileOptions::default())?;
         let context = self.link_module(module);
         // Running the synthesised module's `<main>` returns the

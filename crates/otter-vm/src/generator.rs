@@ -252,6 +252,14 @@ impl JsGenerator {
         heap.read_payload(self.inner, |body| body.frame.is_some())
     }
 
+    /// `true` once the body ran to completion (or was force-finished).
+    /// A generator with no parked frame that is *not* done is
+    /// currently executing (§27.5.3.2 GeneratorValidate).
+    #[must_use]
+    pub fn is_done(&self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.inner, |body| body.done)
+    }
+
     /// Resume destination register.
     #[must_use]
     pub fn resume_dst(&self, heap: &otter_gc::GcHeap) -> u16 {

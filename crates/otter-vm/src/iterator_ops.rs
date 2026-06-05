@@ -1200,13 +1200,36 @@ impl Interpreter {
         handle: &crate::generator::JsGenerator,
         kind: GeneratorResumeKind,
     ) -> Result<Value, VmError> {
-        // Already-done generators short-circuit per §27.5.1.2.
         let (frame_opt, resume_dst) = (
             handle.has_frame(&self.gc_heap),
             handle.resume_dst(&self.gc_heap),
         );
         if !frame_opt {
-            return self.make_runtime_rooted_iter_result(Value::undefined(), true, &[], &[]);
+            // §27.5.3.2 GeneratorValidate — a generator whose frame is
+            // checked out but not done is mid-dispatch: state
+            // "executing" throws TypeError.
+            if !handle.is_done(&self.gc_heap) {
+                handle.mark_done(&mut self.gc_heap);
+                return Err(VmError::TypeError {
+                    message: "Generator is already running".to_string(),
+                });
+            }
+            // Completed (§27.5.3.3/.4): `next` yields {undefined, true},
+            // `return` echoes its argument, `throw` re-raises.
+            return match kind {
+                GeneratorResumeKind::Next(_) => {
+                    self.make_runtime_rooted_iter_result(Value::undefined(), true, &[], &[])
+                }
+                GeneratorResumeKind::Return(arg) => {
+                    self.make_runtime_rooted_iter_result(arg, true, &[], &[])
+                }
+                GeneratorResumeKind::Throw(reason) => {
+                    self.set_pending_uncaught_throw(reason);
+                    Err(VmError::Uncaught {
+                        value: self.render_thrown(&reason),
+                    })
+                }
+            };
         }
         // Pull the frame out of the gen body so we can mutate it.
         let (mut frame, cold) = match handle.take_frame(&mut self.gc_heap) {

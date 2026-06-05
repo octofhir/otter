@@ -94,12 +94,29 @@ pub(crate) fn compile_unary(
             && name != "undefined"
         {
             let value_reg = cx.alloc_scratch();
+            // §9.1.1.2.1 — an enclosing `with` environment shadows the
+            // global fallback; probe it first so `typeof name` sees
+            // the with-object's property.
+            let active_with_envs = cx.active_with_envs.clone();
+            let probe =
+                crate::with_statement::emit_with_binding_probe(cx, name, &active_with_envs, span)?;
+            let mut with_done = None;
+            if let Some(probe) = &probe {
+                let fallback =
+                    cx.emit_branch_placeholder(Op::JumpIfFalse, Some(probe.found_reg), span);
+                cx.emit_load_property(value_reg, probe.object_reg, name, span);
+                with_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
+                cx.patch_branch_to_here(fallback);
+            }
             let name_idx = cx.intern_string_constant(name);
             cx.emit(
                 Op::LoadGlobalOrUndefined,
                 [Operand::Register(value_reg), Operand::ConstIndex(name_idx)],
                 span,
             );
+            if let Some(done) = with_done {
+                cx.patch_branch_to_here(done);
+            }
             let dst = cx.alloc_scratch();
             cx.emit(
                 Op::TypeOf,

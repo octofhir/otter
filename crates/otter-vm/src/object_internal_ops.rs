@@ -3800,7 +3800,19 @@ impl Interpreter {
             }
             return Ok(Some(*target));
         }
-        if !target.is_proxy() {
+        // Module Namespace Exotic Objects (§10.4.6) define their own
+        // [[DefineOwnProperty]] / [[OwnPropertyKeys]], so integrity
+        // operations must run the generic §7.3.15 SetIntegrityLevel /
+        // §7.3.16 TestIntegrityLevel over those internal methods —
+        // Object.freeze on a namespace throws (exports stay writable),
+        // while Object.seal succeeds without mutating anything.
+        let namespace_integrity = matches!(
+            method,
+            M::Freeze | M::Seal | M::IsFrozen | M::IsSealed | M::IsExtensible
+        ) && target
+            .as_object()
+            .is_some_and(|obj| crate::object::module_namespace_env(obj, &self.gc_heap).is_some());
+        if !target.is_proxy() && !namespace_integrity {
             return Ok(None);
         }
         match method {

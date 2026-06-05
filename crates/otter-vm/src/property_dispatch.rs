@@ -466,17 +466,28 @@ impl Interpreter {
         let receiver = *read_register(frame, obj_reg)?;
         let idx = *read_register(frame, idx_reg)?;
         let removed = if let Some(obj) = receiver.as_object() {
+            // §10.4.6.10 [[Delete]] — a Module Namespace Exotic Object
+            // refuses to delete an exported string key (incl. integer
+            // index names from arbitrary-module-namespace-names);
+            // strict module code then throws TypeError below. Symbol
+            // keys fall through to OrdinaryDelete.
+            let namespace_env = crate::object::module_namespace_env(obj, &self.gc_heap);
             if let Some(sym) = idx.as_symbol(&self.gc_heap) {
                 crate::object::delete_symbol(obj, &mut self.gc_heap, sym)
             } else if let Some(s) = idx.as_string(&self.gc_heap) {
                 let name = s.to_lossy_string(&self.gc_heap);
-                crate::object::delete(obj, &mut self.gc_heap, &name)
+                match namespace_env {
+                    Some(env) => crate::object::get(env, &self.gc_heap, &name).is_none(),
+                    None => crate::object::delete(obj, &mut self.gc_heap, &name),
+                }
             } else if let Some(n) = idx.as_number() {
-                match n.as_smi() {
-                    Some(v) if v >= 0 => {
-                        crate::object::delete(obj, &mut self.gc_heap, &v.to_string())
-                    }
-                    _ => crate::object::delete(obj, &mut self.gc_heap, &n.to_display_string()),
+                let name = match n.as_smi() {
+                    Some(v) if v >= 0 => v.to_string(),
+                    _ => n.to_display_string(),
+                };
+                match namespace_env {
+                    Some(env) => crate::object::get(env, &self.gc_heap, &name).is_none(),
+                    None => crate::object::delete(obj, &mut self.gc_heap, &name),
                 }
             } else {
                 return Err(VmError::TypeMismatch);

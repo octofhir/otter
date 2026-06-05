@@ -1167,15 +1167,58 @@ fn async_generator_validate(
     Ok(Some(Value::promise(promise)))
 }
 
+/// Run one async-generator resumption method: §27.6.1 always returns
+/// a promise, so a throw completion from the underlying machinery
+/// (e.g. `throw` against a suspended-start or completed body) becomes
+/// a rejection of the returned promise rather than a synchronous
+/// throw.
+fn async_generator_resumption(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+    method: crate::native_function::NativeFastFn,
+) -> Result<Value, crate::NativeError> {
+    if let Some(rejected) = async_generator_validate(ctx, name)? {
+        return Ok(rejected);
+    }
+    match method(ctx, args) {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            let (interp, exec_ctx) = ctx.interp_mut_and_context();
+            let Some(exec_ctx) = exec_ctx else {
+                return Err(err);
+            };
+            let reason = match interp.take_pending_uncaught_throw() {
+                Some(thrown) => thrown,
+                None => interp
+                    .make_type_error_with_stack_roots(
+                        &smallvec::SmallVec::new(),
+                        &format!("{err:?}"),
+                    )
+                    .map_err(|_| err)?,
+            };
+            let promise = crate::promise_dispatch::PromiseBuilder::with_context(exec_ctx)
+                .rejected_runtime_rooted(interp, reason, &[&reason], &[])
+                .map_err(|_| crate::NativeError::TypeError {
+                    name,
+                    reason: "rejection allocation failed".to_string(),
+                })?;
+            Ok(Value::promise(promise))
+        }
+    }
+}
+
 /// §27.6.1.2 `%AsyncGeneratorPrototype%.next(value)`.
 pub(crate) fn async_generator_proto_next(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
-    if let Some(rejected) = async_generator_validate(ctx, "AsyncGenerator.prototype.next")? {
-        return Ok(rejected);
-    }
-    iterator_proto_next(ctx, args)
+    async_generator_resumption(
+        ctx,
+        args,
+        "AsyncGenerator.prototype.next",
+        iterator_proto_next,
+    )
 }
 
 /// §27.6.1.3 `%AsyncGeneratorPrototype%.return(value)`.
@@ -1183,10 +1226,12 @@ pub(crate) fn async_generator_proto_return(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
-    if let Some(rejected) = async_generator_validate(ctx, "AsyncGenerator.prototype.return")? {
-        return Ok(rejected);
-    }
-    iterator_proto_return(ctx, args)
+    async_generator_resumption(
+        ctx,
+        args,
+        "AsyncGenerator.prototype.return",
+        iterator_proto_return,
+    )
 }
 
 /// §27.6.1.4 `%AsyncGeneratorPrototype%.throw(exception)`.
@@ -1194,10 +1239,12 @@ pub(crate) fn async_generator_proto_throw(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
-    if let Some(rejected) = async_generator_validate(ctx, "AsyncGenerator.prototype.throw")? {
-        return Ok(rejected);
-    }
-    iterator_proto_throw(ctx, args)
+    async_generator_resumption(
+        ctx,
+        args,
+        "AsyncGenerator.prototype.throw",
+        iterator_proto_throw,
+    )
 }
 
 /// §27.1.3.1 `%AsyncIteratorPrototype%[@@asyncIterator]` — returns

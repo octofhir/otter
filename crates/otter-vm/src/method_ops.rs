@@ -341,16 +341,37 @@ impl Interpreter {
                         }
                     } else {
                         let state = g.async_state(&self.gc_heap);
-                        g.enqueue_async_request(&mut self.gc_heap, kind, cap.clone());
-                        if matches!(
-                            state,
-                            crate::generator::AsyncGeneratorState::SuspendedStart
-                                | crate::generator::AsyncGeneratorState::SuspendedYield
-                        ) {
-                            let resume = g
-                                .front_async_resume(&self.gc_heap)
-                                .ok_or(VmError::InvalidOperand)?;
-                            self.resume_generator(context, &g, resume)?;
+                        // §27.6.3.2 AsyncGeneratorResumeNext — a throw
+                        // completion delivered while the body is still
+                        // suspended-start closes the generator without
+                        // ever resuming it; the request settles as a
+                        // rejection.
+                        if matches!(state, crate::generator::AsyncGeneratorState::SuspendedStart)
+                            && let GeneratorResumeKind::Throw(reason) = kind
+                        {
+                            g.mark_done(&mut self.gc_heap);
+                            g.set_async_state(
+                                &mut self.gc_heap,
+                                crate::generator::AsyncGeneratorState::Completed,
+                            );
+                            self.async_generator_settle_capability(
+                                context,
+                                &cap,
+                                Err(reason),
+                                true,
+                            )?;
+                        } else {
+                            g.enqueue_async_request(&mut self.gc_heap, kind, cap.clone());
+                            if matches!(
+                                state,
+                                crate::generator::AsyncGeneratorState::SuspendedStart
+                                    | crate::generator::AsyncGeneratorState::SuspendedYield
+                            ) {
+                                let resume = g
+                                    .front_async_resume(&self.gc_heap)
+                                    .ok_or(VmError::InvalidOperand)?;
+                                self.resume_generator(context, &g, resume)?;
+                            }
                         }
                     }
                     let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;

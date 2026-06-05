@@ -31,6 +31,25 @@ pub fn compile_script_source(
     compile_script_source_with_forced_strict(source, kind, module_specifier, false)
 }
 
+/// Compile a classic-script source whose embedder permits top-level
+/// `await` (REPL-style snippet APIs). Parses with the Module goal so
+/// top-level `await` suspends, while lowering stays on the script
+/// pipeline: the produced `<main>` is async when the body awaits and
+/// the runtime drives it through its async entry promise.
+///
+/// # Errors
+/// Returns [`CompileError`] when parsing fails or lowering rejects the AST.
+pub fn compile_script_source_with_top_level_await(
+    source: &str,
+    kind: SyntaxSourceKind,
+    module_specifier: &str,
+) -> Result<BytecodeModule, CompileError> {
+    with_program(source, kind, |program| {
+        compile_program(program, kind, module_specifier, false)
+    })
+    .map_err(CompileError::from)?
+}
+
 /// Compile source text with an optional inherited strict-mode
 /// override. Direct eval uses this to model ECMA-262's caller
 /// strictness inheritance without rewriting source text.

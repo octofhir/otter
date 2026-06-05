@@ -1322,7 +1322,7 @@ impl Worker {
     pub async fn run_script(&self, source: &str) -> Result<ExecutionResult, OtterError> {
         self.handle
             .run_script(
-                SourceInput::from_javascript(source),
+                SourceInput::from_javascript(source).with_top_level_await(),
                 worker_specifier(self.id),
             )
             .await
@@ -1335,7 +1335,7 @@ impl Worker {
     pub async fn run_typescript(&self, source: &str) -> Result<ExecutionResult, OtterError> {
         self.handle
             .run_script(
-                SourceInput::from_typescript(source),
+                SourceInput::from_typescript(source).with_top_level_await(),
                 worker_specifier(self.id),
             )
             .await
@@ -1346,7 +1346,9 @@ impl Worker {
     /// # Errors
     /// See [`OtterError`].
     pub async fn eval(&self, source: &str) -> Result<ExecutionResult, OtterError> {
-        self.handle.eval(SourceInput::from_javascript(source)).await
+        self.handle
+            .eval(SourceInput::from_javascript(source).with_top_level_await())
+            .await
     }
 
     /// Validate that a message already crossed the structured-clone

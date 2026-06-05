@@ -78,6 +78,7 @@ use std::time::Duration;
 use otter_bytecode::{BytecodeModule, SpanEntry};
 use otter_compiler::{
     compile_script_program, compile_script_source, compile_script_source_to_module,
+    compile_script_source_with_top_level_await,
 };
 use otter_gc::GcStats;
 use otter_syntax::{SourceKind, SyntaxDiagnostic, SyntaxError, detect_source_kind, with_program};
@@ -427,6 +428,13 @@ pub struct SourceInput {
     pub kind: SourceKind,
     /// Optional originating path (for diagnostics).
     pub path: Option<PathBuf>,
+    /// Allow top-level `await` in this source even though it
+    /// compiles through the classic-script pipeline. Embedder
+    /// snippet APIs (`Otter::run_typescript` and friends) opt in so
+    /// REPL-style strings keep module-grade `await`; spec-faithful
+    /// script execution (e.g. the test262 runner) leaves this off
+    /// and gets the §16.1 Script-goal early error.
+    pub allow_top_level_await: bool,
 }
 
 impl SourceInput {
@@ -437,7 +445,16 @@ impl SourceInput {
             text: text.into(),
             kind: SourceKind::JavaScript,
             path: None,
+            allow_top_level_await: false,
         }
+    }
+
+    /// Permit top-level `await` in a classic-script source. See
+    /// [`Self::allow_top_level_await`].
+    #[must_use]
+    pub fn with_top_level_await(mut self) -> Self {
+        self.allow_top_level_await = true;
+        self
     }
 
     /// Build a TypeScript source bundle from in-memory text.
@@ -447,6 +464,7 @@ impl SourceInput {
             text: text.into(),
             kind: SourceKind::TypeScript,
             path: None,
+            allow_top_level_await: false,
         }
     }
 
@@ -475,6 +493,7 @@ impl SourceInput {
             text,
             kind,
             path: Some(path.to_path_buf()),
+            allow_top_level_await: false,
         })
     }
 }
@@ -2513,6 +2532,13 @@ impl Runtime {
                 text: source.text.clone(),
             };
             hook.compile(RuntimeCompileRequest { source: &resolved })?
+        } else if source.allow_top_level_await {
+            // Embedder snippet APIs opt into module-grade top-level
+            // `await` while staying on the classic-script pipeline.
+            let bytecode =
+                compile_script_source_with_top_level_await(&source.text, source.kind, specifier)
+                    .map_err(|err| map_compile_error(err, specifier))?;
+            CompiledModule::from_bytecode(bytecode)
         } else {
             compile_script_source_to_module(&source.text, source.kind, specifier)
                 .map_err(|err| map_compile_error(err, specifier))?
@@ -2870,7 +2896,10 @@ impl Otter {
     /// See [`OtterError`] variants.
     pub async fn run_script(&self, source: &str) -> Result<ExecutionResult, OtterError> {
         self.handle
-            .run_script(SourceInput::from_javascript(source), "<script>")
+            .run_script(
+                SourceInput::from_javascript(source).with_top_level_await(),
+                "<script>",
+            )
             .await
     }
 
@@ -2880,7 +2909,10 @@ impl Otter {
     /// See [`OtterError`] variants.
     pub async fn run_typescript(&self, source: &str) -> Result<ExecutionResult, OtterError> {
         self.handle
-            .run_script(SourceInput::from_typescript(source), "<script>")
+            .run_script(
+                SourceInput::from_typescript(source).with_top_level_await(),
+                "<script>",
+            )
             .await
     }
 
@@ -2889,7 +2921,9 @@ impl Otter {
     /// # Errors
     /// See [`OtterError`] variants.
     pub async fn eval(&self, source: &str) -> Result<ExecutionResult, OtterError> {
-        self.handle.eval(SourceInput::from_javascript(source)).await
+        self.handle
+            .eval(SourceInput::from_javascript(source).with_top_level_await())
+            .await
     }
 
     /// Blocking file execution wrapper for sync embedders.
@@ -2922,7 +2956,10 @@ impl Otter {
         let handle = self.handle.clone();
         self.handle.block_on(async move {
             handle
-                .run_script(SourceInput::from_javascript(source), "<script>")
+                .run_script(
+                    SourceInput::from_javascript(source).with_top_level_await(),
+                    "<script>",
+                )
                 .await
         })
     }
@@ -2936,7 +2973,10 @@ impl Otter {
         let handle = self.handle.clone();
         self.handle.block_on(async move {
             handle
-                .run_script(SourceInput::from_typescript(source), "<script>")
+                .run_script(
+                    SourceInput::from_typescript(source).with_top_level_await(),
+                    "<script>",
+                )
                 .await
         })
     }
@@ -2948,8 +2988,11 @@ impl Otter {
     pub fn blocking_eval(&self, source: &str) -> Result<ExecutionResult, OtterError> {
         let source = source.to_string();
         let handle = self.handle.clone();
-        self.handle
-            .block_on(async move { handle.eval(SourceInput::from_javascript(source)).await })
+        self.handle.block_on(async move {
+            handle
+                .eval(SourceInput::from_javascript(source).with_top_level_await())
+                .await
+        })
     }
 
     /// Cooperative cancellation.

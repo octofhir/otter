@@ -248,6 +248,158 @@ impl Interpreter {
         }
     }
 
+    /// §13.3.10 `import()` evaluation of a graph-preloaded target.
+    /// Mirrors [`Self::evaluate_module_rec`], but a top-level-await
+    /// module is legal here: its `<module-init>` runs with an async
+    /// result promise (§16.2.1.9 ExecuteAsyncModule) which is pushed
+    /// onto `pending` so the import-call promise settles only when
+    /// the module body does. Repeat imports chain onto the cached
+    /// init promise instead of re-running the body.
+    pub(crate) fn evaluate_module_rec_dynamic(
+        &mut self,
+        context: &ExecutionContext,
+        url: &str,
+        pending: &mut Vec<crate::promise::JsPromiseHandle>,
+    ) -> Result<(), VmError> {
+        let url_arc: std::sync::Arc<str> = std::sync::Arc::from(url);
+        if let Some(promise) = self.module_async_init_promises.get(&url_arc) {
+            pending.push(*promise);
+            return Ok(());
+        }
+        if self.evaluated_modules.contains(&url_arc) {
+            return Ok(());
+        }
+        if let Some(thrown) = self.module_errors.get(&url_arc).copied() {
+            self.set_pending_uncaught_throw(thrown);
+            return Err(VmError::Uncaught {
+                value: render_thrown_value(&thrown, &self.gc_heap),
+            });
+        }
+        if self.module_evaluating.contains(&url_arc) {
+            return Ok(());
+        }
+        self.module_evaluating.insert(url_arc.clone());
+        let result = (|| -> Result<(), VmError> {
+            let deps: Vec<String> = context
+                .eager_dep_targets(url)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            for dep in deps {
+                self.evaluate_module_rec_dynamic(context, &dep, pending)?;
+            }
+            let Some(function_id) = context.module_init_function_id(url) else {
+                return Ok(());
+            };
+            let Some(env) = self.module_environments.get(&url_arc).copied() else {
+                return Ok(());
+            };
+            let meta = self.build_import_meta(url)?;
+            if let Some(promise) =
+                self.run_module_init(context, function_id, Value::object(env), meta)?
+            {
+                self.module_async_init_promises
+                    .insert(url_arc.clone(), promise);
+                pending.push(promise);
+            }
+            Ok(())
+        })();
+        self.module_evaluating.remove(&url_arc);
+        match result {
+            Ok(()) => {
+                self.evaluated_modules.insert(url_arc);
+                Ok(())
+            }
+            Err(err) => {
+                if matches!(err, VmError::Uncaught { .. })
+                    && let Some(thrown) = self.take_pending_uncaught_throw()
+                {
+                    self.module_errors.insert(url_arc, thrown);
+                    self.set_pending_uncaught_throw(thrown);
+                    return Err(VmError::Uncaught {
+                        value: render_thrown_value(&thrown, &self.gc_heap),
+                    });
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Settle `downstream` when the gating async module-init promise
+    /// settles: a rejection rejects it (§16.2.1.9
+    /// AsyncModuleExecutionRejected); fulfilment resolves it with the
+    /// namespace registered for `namespace_url`. The gate mirrors the
+    /// spec's `[[TopLevelCapability]]` — one promise per import, no
+    /// side-channel completion counting. The downstream handle rides
+    /// in the reaction callables' `captures` list so the GC can trace
+    /// and relocate it.
+    pub(crate) fn settle_promise_on_async_init(
+        &mut self,
+        context: &ExecutionContext,
+        downstream: crate::promise::JsPromiseHandle,
+        init: crate::promise::JsPromiseHandle,
+        namespace_url: std::sync::Arc<str>,
+    ) -> Result<(), VmError> {
+        let downstream_value = Value::promise(downstream);
+        let on_fulfilled = crate::native_function::native_value_with_captures_unchecked_with_roots(
+            &mut self.gc_heap,
+            "dynamicImportModuleFulfilled",
+            smallvec::smallvec![downstream_value],
+            &mut |visitor| downstream_value.trace_value_slots(visitor),
+            move |ncx, _args, captures| {
+                let interp = ncx.interp_mut();
+                if let Some(downstream) = captures.first().and_then(|v| v.as_promise()) {
+                    let namespace = interp
+                        .module_env(&namespace_url)
+                        .map(Value::object)
+                        .unwrap_or_else(Value::undefined);
+                    let jobs =
+                        crate::JsPromise::fulfill(&downstream, &mut interp.gc_heap, namespace);
+                    for j in jobs.jobs {
+                        interp.microtasks.enqueue(j);
+                    }
+                }
+                Ok(Value::undefined())
+            },
+        )
+        .map_err(VmError::from)?;
+        let on_rejected = crate::native_function::native_value_with_captures_unchecked_with_roots(
+            &mut self.gc_heap,
+            "dynamicImportModuleRejected",
+            smallvec::smallvec![downstream_value],
+            &mut |visitor| {
+                downstream_value.trace_value_slots(visitor);
+                on_fulfilled.trace_value_slots(visitor);
+            },
+            move |ncx, args, captures| {
+                let interp = ncx.interp_mut();
+                if let Some(downstream) = captures.first().and_then(|v| v.as_promise()) {
+                    let reason = args.first().copied().unwrap_or_else(Value::undefined);
+                    let jobs = crate::JsPromise::reject(&downstream, &mut interp.gc_heap, reason);
+                    for j in jobs.jobs {
+                        interp.microtasks.enqueue(j);
+                    }
+                }
+                Ok(Value::undefined())
+            },
+        )
+        .map_err(VmError::from)?;
+        let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
+            .capability_runtime_rooted(self, &[&on_fulfilled, &on_rejected], &[])?;
+        let outcome = crate::JsPromise::perform_then_with_context(
+            &init,
+            &mut self.gc_heap,
+            Some(on_fulfilled),
+            Some(on_rejected),
+            capability,
+            Some(context.clone()),
+        );
+        if let Some(job) = outcome.immediate_job {
+            self.microtasks.enqueue(job);
+        }
+        Ok(())
+    }
+
     /// Build a module's `import.meta` object with its `url` property.
     fn build_import_meta(&mut self, url: &str) -> Result<Value, VmError> {
         let obj = self.alloc_host_object_with_roots(&[], &[])?;
@@ -415,7 +567,32 @@ impl Interpreter {
                     context.module_resolution_target(referrer.as_str(), &specifier)
                 {
                     let target = target.to_string();
-                    match self.evaluate_module_rec(context, &target) {
+                    let mut async_inits: Vec<crate::promise::JsPromiseHandle> = Vec::new();
+                    match self.evaluate_module_rec_dynamic(context, &target, &mut async_inits) {
+                        Ok(()) if !async_inits.is_empty() => {
+                            // §13.3.10 — a top-level-await target settles
+                            // the import promise only when its module body
+                            // finishes. The DFS pushes the target's init
+                            // promise last; it is the import's gate
+                            // (spec `[[TopLevelCapability]]` shape).
+                            let gate = *async_inits.last().expect("non-empty checked above");
+                            let pending = promise_dispatch::PromiseBuilder::with_context(
+                                import_context.clone(),
+                            )
+                            .pending_stack_rooted(
+                                self,
+                                stack,
+                                &[],
+                                &[],
+                            )?;
+                            self.settle_promise_on_async_init(
+                                context,
+                                pending,
+                                gate,
+                                std::sync::Arc::from(target.as_str()),
+                            )?;
+                            pending
+                        }
                         Ok(()) => {
                             let ns = self
                                 .resolve_module_namespace(context, referrer.as_str(), &specifier)

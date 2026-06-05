@@ -1934,6 +1934,14 @@ pub struct ModuleResolution {
     /// namespace is first accessed (TC39 import defer).
     #[serde(default)]
     pub deferred: bool,
+    /// `true` when this edge comes from a literal `import("x")`
+    /// expression preloaded into the graph. Like `deferred`, eager
+    /// evaluation skips it — but unlike `import defer`, an async
+    /// (top-level-await) target is **not** force-evaluated eagerly:
+    /// `import()` evaluates its target on call and settles through
+    /// the returned promise (§13.3.10).
+    #[serde(default)]
+    pub dynamic: bool,
 }
 
 /// One module's `<module-init>` entry record: `URL → function ID`.

@@ -97,6 +97,9 @@ impl<'a> RuntimeState<'a> {
         for value in interp.module_errors_for_trace() {
             value.trace_value_slots(visitor);
         }
+        for promise in interp.module_async_init_promises_for_trace() {
+            promise.trace_value_slots(visitor);
+        }
         // 3) Microtask queue.
         interp.microtasks().trace_gc_roots(visitor);
         // 3b) Timer callbacks waiting on host-side fire.

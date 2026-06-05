@@ -351,6 +351,13 @@ pub struct Interpreter {
     /// failed. Re-reading a deferred namespace rethrows the identical JS
     /// value instead of synthesizing a fresh error.
     module_errors: std::collections::HashMap<std::sync::Arc<str>, Value>,
+    /// Async result promises of top-level-await `<module-init>` bodies
+    /// started by `import()` (§16.2.1.9 ExecuteAsyncModule). A repeat
+    /// `import()` of the same module chains onto the cached promise
+    /// instead of re-running the init. Cleared with
+    /// `module_environments`; traced as a GC root.
+    module_async_init_promises:
+        std::collections::HashMap<std::sync::Arc<str>, crate::promise::JsPromiseHandle>,
     /// Cache of deferred module namespace exotic objects, keyed by
     /// target module URL, so two `import defer * as` of the same module
     /// yield the identical object (§16.2.1). Cleared with
@@ -748,6 +755,7 @@ impl Interpreter {
             module_evaluating: std::collections::HashSet::new(),
             evaluated_modules: std::collections::HashSet::new(),
             module_errors: std::collections::HashMap::new(),
+            module_async_init_promises: std::collections::HashMap::new(),
             deferred_namespaces: std::collections::HashMap::new(),
             module_namespaces: std::collections::HashMap::new(),
             module_resolved_exports: std::collections::HashMap::new(),
@@ -1093,6 +1101,131 @@ impl Interpreter {
         Some(entry.context)
     }
 
+    /// Run one dynamically loaded module init to completion or first
+    /// suspension. Mirrors `run_inner`'s entry wiring: a top-level-await
+    /// module body compiles to an async `<main>`, which needs an async
+    /// result promise before `Op::Await` can park the frame (§16.2.1.9
+    /// ExecuteAsyncModule). Returns that promise for async inits so the
+    /// dynamic-import machinery can defer settlement until the module
+    /// body actually finishes; sync inits return `None` after running
+    /// to completion.
+    ///
+    /// # Errors
+    /// Propagates any `VmError` thrown synchronously by the init body.
+    pub fn run_module_init(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        env: Value,
+        import_meta: Value,
+    ) -> Result<Option<crate::promise::JsPromiseHandle>, VmError> {
+        self.enter_sync_reentry()?;
+        let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
+        let extra_root_depth = self.gc_heap.push_extra_roots(extra_roots);
+        let result = self.run_module_init_inner(context, function_id, env, import_meta);
+        self.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
+        self.leave_sync_reentry();
+        result
+    }
+
+    fn run_module_init_inner(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        env: Value,
+        import_meta: Value,
+    ) -> Result<Option<crate::promise::JsPromiseHandle>, VmError> {
+        let function = context
+            .exec_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        let upvalues =
+            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, Frame::empty_upvalues())?;
+        let mut frame =
+            Frame::with_exec_return_upvalues_and_this(function, None, upvalues, Value::undefined());
+        let args: SmallVec<[Value; 8]> = smallvec::smallvec![env, import_meta];
+        self.bind_bytecode_call_arguments(function, &mut frame, args)?;
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        stack.push(frame);
+        let init_promise = if function.is_async {
+            let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
+                .pending_stack_rooted(self, &stack, &[&env, &import_meta], &[])?;
+            stack
+                .last_mut()
+                .expect("init frame was just pushed")
+                .async_state = Some(AsyncFrameState {
+                result_promise: result,
+            });
+            Some(result)
+        } else {
+            None
+        };
+        self.dispatch_loop(context, &mut stack)?;
+        Ok(init_promise)
+    }
+
+    /// Defer settlement of dynamic-import `token` until the gating
+    /// async module-init promise settles — the target's init promise,
+    /// pushed last by the evaluation DFS (spec `[[TopLevelCapability]]`
+    /// shape, §16.2.1.9). A rejection rejects the import; fulfilment
+    /// resolves it with the namespace registered for `namespace_url`.
+    ///
+    /// # Errors
+    /// Returns `VmError` only for allocation failure while building
+    /// the reaction callables.
+    pub fn settle_dynamic_import_on_async_inits(
+        &mut self,
+        context: &ExecutionContext,
+        token: u64,
+        promises: Vec<crate::promise::JsPromiseHandle>,
+        namespace_url: std::sync::Arc<str>,
+    ) -> Result<(), VmError> {
+        debug_assert!(!promises.is_empty());
+        let Some(gate) = promises.last().copied() else {
+            return Ok(());
+        };
+        let url = namespace_url;
+        let on_fulfilled = crate::native_function::native_value_with_captures_unchecked_with_roots(
+            &mut self.gc_heap,
+            "dynamicImportInitFulfilled",
+            SmallVec::new(),
+            &mut |_visitor| {},
+            move |ncx, _args, _captures| {
+                let interp = ncx.interp_mut();
+                let namespace = interp
+                    .module_env(&url)
+                    .map(Value::object)
+                    .unwrap_or_else(Value::undefined);
+                let _ = interp.settle_dynamic_import(token, Ok(namespace));
+                Ok(Value::undefined())
+            },
+        )?;
+        let on_rejected = crate::native_function::native_value_with_captures_unchecked_with_roots(
+            &mut self.gc_heap,
+            "dynamicImportInitRejected",
+            SmallVec::new(),
+            &mut |visitor| on_fulfilled.trace_value_slots(visitor),
+            move |ncx, args, _captures| {
+                let reason = args.first().copied().unwrap_or_else(Value::undefined);
+                let _ = ncx.interp_mut().settle_dynamic_import(token, Err(reason));
+                Ok(Value::undefined())
+            },
+        )?;
+        let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
+            .capability_runtime_rooted(self, &[&on_fulfilled, &on_rejected], &[])?;
+        let outcome = crate::JsPromise::perform_then_with_context(
+            &gate,
+            &mut self.gc_heap,
+            Some(on_fulfilled),
+            Some(on_rejected),
+            capability,
+            Some(context.clone()),
+        );
+        if let Some(job) = outcome.immediate_job {
+            self.microtasks.enqueue(job);
+        }
+        Ok(())
+    }
+
     /// Replace the sink used by `console.*` methods.
     pub fn set_console_sink(&mut self, sink: console::ConsoleSinkHandle) {
         self.console_sink = sink;
@@ -1432,6 +1565,7 @@ impl Interpreter {
         self.module_evaluating.clear();
         self.evaluated_modules.clear();
         self.module_errors.clear();
+        self.module_async_init_promises.clear();
         self.deferred_namespaces.clear();
         self.module_namespaces.clear();
         self.module_resolved_exports.clear();
@@ -2030,6 +2164,13 @@ impl Interpreter {
     /// Borrow cached module-evaluation thrown values for GC root tracing.
     pub fn module_errors_for_trace(&self) -> impl Iterator<Item = &Value> {
         self.module_errors.values()
+    }
+
+    /// Borrow the async module-init promise cache for GC root tracing.
+    pub(crate) fn module_async_init_promises_for_trace(
+        &self,
+    ) -> impl Iterator<Item = &crate::promise::JsPromiseHandle> {
+        self.module_async_init_promises.values()
     }
 
     /// Borrow the well-known symbol singleton table. Used by

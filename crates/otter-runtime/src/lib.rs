@@ -1549,7 +1549,17 @@ pub(crate) enum DynamicImportBegin {
 
 enum DynamicModuleLoad {
     Loaded(otter_vm::Value),
-    FetchHttps { target_url: String },
+    /// One or more loaded module inits carry top-level await — the
+    /// import must not settle until their async result promises do
+    /// (§16.2.1.9 ExecuteAsyncModule).
+    PendingAsyncEvaluation {
+        promises: Vec<otter_vm::JsPromiseHandle>,
+        target_url: String,
+        context: ExecutionContext,
+    },
+    FetchHttps {
+        target_url: String,
+    },
 }
 
 impl Runtime {
@@ -1616,6 +1626,36 @@ impl Runtime {
             Ok(DynamicModuleLoad::Loaded(namespace)) => self
                 .settle_dynamic_import_result(token, Ok(namespace))
                 .map(|_| DynamicImportBegin::Settled),
+            Ok(DynamicModuleLoad::PendingAsyncEvaluation {
+                promises,
+                target_url,
+                context,
+            }) => {
+                self.interp
+                    .settle_dynamic_import_on_async_inits(
+                        &context,
+                        token,
+                        promises,
+                        std::sync::Arc::from(target_url.as_str()),
+                    )
+                    .map_err(|err| {
+                        map_vm_error(otter_vm::RunError {
+                            error: err,
+                            frames: Vec::new(),
+                        })
+                    })?;
+                // Drive the parked top-level-await frames to
+                // completion; their settlement reactions settle the
+                // import token, and the same drain delivers the
+                // import promise's own reactions.
+                if let Err(err) = self.interp.drain_microtasks_with_default(Some(context)) {
+                    return Err(enrich_runtime_diagnostic_with_cause(
+                        &mut self.interp,
+                        map_vm_error(err),
+                    ));
+                }
+                Ok(DynamicImportBegin::Settled)
+            }
             Ok(DynamicModuleLoad::FetchHttps { target_url }) => {
                 Ok(DynamicImportBegin::FetchHttps { target_url })
             }
@@ -1771,6 +1811,7 @@ impl Runtime {
                     .map(|env| (init.url.clone(), init.function_id, env))
             })
             .collect();
+        let mut async_init_promises: Vec<otter_vm::JsPromiseHandle> = Vec::new();
         for (url, function_id, env) in inits {
             if otter_vm_init_marker_set(&self.interp, env) {
                 let _ = url;
@@ -1778,32 +1819,43 @@ impl Runtime {
             }
             otter_vm_init_marker_install(&mut self.interp, env);
             let import_meta = alloc_dynamic_import_meta(&mut self.interp, env, &url)?;
-            let callee = otter_vm::Value::function_id(function_id);
-            let args: smallvec::SmallVec<[otter_vm::Value; 8]> = smallvec::smallvec![
+            match self.interp.run_module_init(
+                &context,
+                function_id,
                 otter_vm::Value::object(env),
                 otter_vm::Value::object(import_meta),
-            ];
-            if let Err(err) =
-                self.interp
-                    .run_callable_sync(&context, &callee, otter_vm::Value::undefined(), args)
-            {
-                // §16.2.1.7 step 7.b.i — an evaluation throw maps
-                // to a promise rejection. Prefer the original
-                // thrown Value (preserved on
-                // `pending_uncaught_throw` whenever the throw
-                // walked the empty stack inside the dispatch
-                // sub-loop) so `.catch` observes the spec-correct
-                // payload, not a stringified `VmError::Uncaught`
-                // rendering.
-                if matches!(err, otter_vm::VmError::Uncaught { .. })
-                    && let Some(thrown) = self.interp.take_pending_uncaught_throw()
-                {
-                    return Err(DynLoadError::Thrown(thrown));
+            ) {
+                // A top-level-await init suspends instead of running to
+                // completion; its async result promise gates the import's
+                // settlement (§16.2.1.9).
+                Ok(Some(promise)) => async_init_promises.push(promise),
+                Ok(None) => {}
+                Err(err) => {
+                    // §16.2.1.7 step 7.b.i — an evaluation throw maps
+                    // to a promise rejection. Prefer the original
+                    // thrown Value (preserved on
+                    // `pending_uncaught_throw` whenever the throw
+                    // walked the empty stack inside the dispatch
+                    // sub-loop) so `.catch` observes the spec-correct
+                    // payload, not a stringified `VmError::Uncaught`
+                    // rendering.
+                    if matches!(err, otter_vm::VmError::Uncaught { .. })
+                        && let Some(thrown) = self.interp.take_pending_uncaught_throw()
+                    {
+                        return Err(DynLoadError::Thrown(thrown));
+                    }
+                    return Err(DynLoadError::type_error(format!(
+                        "dynamic import: evaluation failed for \"{url}\": {err}"
+                    )));
                 }
-                return Err(DynLoadError::type_error(format!(
-                    "dynamic import: evaluation failed for \"{url}\": {err}"
-                )));
             }
+        }
+        if !async_init_promises.is_empty() {
+            return Ok(DynamicModuleLoad::PendingAsyncEvaluation {
+                promises: async_init_promises,
+                target_url,
+                context,
+            });
         }
         let namespace = self.interp.module_env(&target_url).ok_or_else(|| {
             DynLoadError::type_error(format!(
@@ -2648,6 +2700,7 @@ impl Runtime {
                         specifier: url.to_string(),
                         target: url.to_string(),
                         deferred: false,
+                        dynamic: false,
                     });
                 module
                     .module_resolutions
@@ -2656,6 +2709,7 @@ impl Runtime {
                         specifier: url.to_string(),
                         target: url.to_string(),
                         deferred: false,
+                        dynamic: false,
                     });
             });
 

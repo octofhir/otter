@@ -280,6 +280,11 @@ impl<'a> ModuleGraphBuilder<'a> {
                     && !eager_static_specs.contains(&edge.specifier)
                 {
                     edge.deferred = true;
+                    // Distinguish `import("x")` preloads from
+                    // `import defer`: the entry driver must not
+                    // force-evaluate an async dynamic target eagerly
+                    // — `import()` settles through its own promise.
+                    edge.dynamic = true;
                 }
             }
             // §16.2.1.5 InnerModuleEvaluation walks `[[RequestedModules]]`
@@ -1271,7 +1276,12 @@ fn build_entry_body(
                     .entry(edge.referrer.as_str())
                     .or_default()
                     .push(edge.target.clone());
-            } else {
+            } else if !edge.dynamic {
+                // `import defer` only: an async deferred target cannot
+                // be force-evaluated synchronously, so the proposal
+                // evaluates it eagerly. `import("x")` preloads stay
+                // lazy — the import-call evaluates its target and
+                // settles through the returned promise (§13.3.10).
                 let async_roots = collect_tla_descendants(edge.target.as_str());
                 if !async_roots.is_empty() {
                     deferred_async_modules.extend(async_roots.iter().cloned());

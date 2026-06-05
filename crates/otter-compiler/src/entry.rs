@@ -878,6 +878,7 @@ pub fn compile_module_program(
             specifier: specifier.clone(),
             target: target.clone(),
             deferred: deferred_only_specs.contains(specifier),
+            dynamic: false,
         })
         .collect();
 

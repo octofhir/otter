@@ -538,7 +538,14 @@ fn stage_test_entry(
             if sibling_name == basename {
                 continue;
             }
-            if sibling_path.extension().and_then(std::ffi::OsStr::to_str) != Some("js") {
+            let is_js = sibling_path.extension().and_then(std::ffi::OsStr::to_str) == Some("js");
+            // Non-`.js` fixtures (JSON modules, extension-less
+            // `with { type: "text" }` payloads) are part of the
+            // corpus convention too.
+            let is_fixture = sibling_name
+                .to_str()
+                .is_some_and(|name| name.contains("_FIXTURE"));
+            if !is_js && !is_fixture {
                 continue;
             }
             let dest = dir.path().join(&sibling_name);

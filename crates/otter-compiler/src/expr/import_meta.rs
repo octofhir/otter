@@ -78,7 +78,11 @@ pub(crate) fn compile_import(
     // Spec: <https://tc39.es/ecma262/#sec-import-call-runtime-semantics-evaluation>
     let span = (imp.span.start, imp.span.end);
     let is_defer_phase = matches!(imp.phase, Some(oxc_ast::ast::ImportPhase::Defer));
-    match unwrap_ts_expr(&imp.source) {
+    // §13.3.10.1 EvaluateImportCall steps 2-4 — the specifier
+    // expression evaluates first, then the options expression; an
+    // abrupt completion from either propagates synchronously before
+    // any import machinery runs.
+    let spec_reg = match unwrap_ts_expr(&imp.source) {
         Expression::StringLiteral(lit) => {
             // Literal import.defer in module code: linker resolves
             // it during fragment merge, opcode reads the deferred
@@ -89,6 +93,9 @@ pub(crate) fn compile_import(
             let specifier = lit.value.as_str().to_string();
             let spec_const = cx.intern_string_constant(&specifier);
             if is_defer_phase && cx.module_state.is_some() {
+                if let Some(options) = &imp.options {
+                    compile_expr(cx, options, span)?;
+                }
                 let ns_dst = cx.alloc_scratch();
                 cx.emit(
                     Op::ImportNamespaceDeferred,
@@ -101,35 +108,29 @@ pub(crate) fn compile_import(
                     [Operand::Register(promise_dst), Operand::Register(ns_dst)],
                     span,
                 );
-                Ok(promise_dst)
-            } else {
-                let spec_reg = cx.alloc_scratch();
-                cx.emit(
-                    Op::LoadString,
-                    [Operand::Register(spec_reg), Operand::ConstIndex(spec_const)],
-                    span,
-                );
-                let promise_dst = cx.alloc_scratch();
-                cx.emit(
-                    Op::ImportNamespaceDynamic,
-                    [Operand::Register(promise_dst), Operand::Register(spec_reg)],
-                    span,
-                );
-                Ok(promise_dst)
+                return Ok(promise_dst);
             }
-        }
-        other => {
-            // Non-literal: opcode returns a Promise<namespace>
-            // (or Promise<TypeError>) directly, so no
-            // PromiseFulfilledOf wrap is needed.
-            let spec_reg = compile_expr(cx, other, span)?;
-            let promise_dst = cx.alloc_scratch();
+            let spec_reg = cx.alloc_scratch();
             cx.emit(
-                Op::ImportNamespaceDynamic,
-                [Operand::Register(promise_dst), Operand::Register(spec_reg)],
+                Op::LoadString,
+                [Operand::Register(spec_reg), Operand::ConstIndex(spec_const)],
                 span,
             );
-            Ok(promise_dst)
+            spec_reg
         }
+        // Non-literal: opcode returns a Promise<namespace>
+        // (or Promise<TypeError>) directly, so no
+        // PromiseFulfilledOf wrap is needed.
+        other => compile_expr(cx, other, span)?,
+    };
+    if let Some(options) = &imp.options {
+        compile_expr(cx, options, span)?;
     }
+    let promise_dst = cx.alloc_scratch();
+    cx.emit(
+        Op::ImportNamespaceDynamic,
+        [Operand::Register(promise_dst), Operand::Register(spec_reg)],
+        span,
+    );
+    Ok(promise_dst)
 }

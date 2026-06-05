@@ -243,6 +243,50 @@ impl<'a> ModuleGraphBuilder<'a> {
             let mut eager_static_specs: HashSet<String> = HashSet::new();
             let mut dynamic_specs: HashSet<String> = HashSet::new();
             for request in &requests {
+                // import-attributes `type: "text"` — the attribute is
+                // part of the module-map key, so the text variant gets
+                // its own marker URL and a synthesised
+                // `export default "<raw>"` module node. Resolution
+                // accepts extension-less fixture paths the normal
+                // probing resolver would reject.
+                if request.attr_type.as_deref() == Some("text") {
+                    let base = match self.loader.resolve(&request.specifier, Some(&url)) {
+                        Ok(target) => target,
+                        Err(_) => resolve_plain_relative_file(&request.specifier, &url)
+                            .ok_or_else(|| {
+                                GraphError::Loader(LoaderError::Resolve {
+                                    specifier: request.specifier.clone(),
+                                    referrer: url.clone(),
+                                    message: "text module fixture not found".to_string(),
+                                })
+                            })?,
+                    };
+                    let target = format!("{base}{TEXT_MODULE_MARKER}");
+                    resolved_imports.insert(request.specifier.clone(), target.clone());
+                    if !request.deferred && !request.dynamic {
+                        eager_static_specs.insert(request.specifier.clone());
+                    }
+                    deps.push(ModuleEdge {
+                        target: target.clone(),
+                        deferred: request.deferred,
+                    });
+                    if !self.nodes.contains_key(&target) {
+                        let path = base.strip_prefix("file://").unwrap_or(&base);
+                        let raw = std::fs::read_to_string(path).map_err(|e| LoaderError::Load {
+                            url: base.clone(),
+                            message: e.to_string(),
+                        })?;
+                        let escaped = serde_json::to_string(&raw).unwrap_or_default();
+                        let shim = format!("export default ({escaped});\n");
+                        queued.push((
+                            target,
+                            SourceKind::JavaScript,
+                            shim,
+                            optional_dynamic || request.dynamic,
+                        ));
+                    }
+                    continue;
+                }
                 let target = self.loader.resolve(&request.specifier, Some(&url))?;
                 resolved_imports.insert(request.specifier.clone(), target.clone());
                 if request.dynamic {
@@ -404,6 +448,23 @@ fn collect_module_requests(program: &Program<'_>) -> Vec<ModuleRequest> {
     visitor.out
 }
 
+/// Module-map key suffix distinguishing the `with { type: "text" }`
+/// variant of a URL from its JavaScript-module variant. Stripped
+/// nowhere — the synthesised text node carries its full shim source,
+/// so the marker URL is never read from disk.
+const TEXT_MODULE_MARKER: &str = "#otter-module-type=text";
+
+/// Join a relative specifier against the referrer's directory and
+/// canonicalise, without extension probing — text-module fixtures
+/// commonly have no extension at all.
+fn resolve_plain_relative_file(specifier: &str, referrer_url: &str) -> Option<String> {
+    let referrer_path = referrer_url.strip_prefix("file://")?;
+    let dir = Path::new(referrer_path).parent()?;
+    let joined = dir.join(specifier);
+    let canonical = std::fs::canonicalize(&joined).ok()?;
+    Some(format!("file://{}", canonical.display()))
+}
+
 #[derive(Default)]
 struct ModuleRequestVisitor {
     out: Vec<ModuleRequest>,
@@ -415,28 +476,56 @@ struct ModuleRequest {
     specifier: String,
     deferred: bool,
     dynamic: bool,
+    /// `type` import attribute from the `with { type: "…" }` clause,
+    /// when present. Part of the module-map key per the
+    /// import-attributes proposal.
+    attr_type: Option<String>,
 }
 
 impl ModuleRequestVisitor {
     fn record(&mut self, specifier: &str, deferred: bool, dynamic: bool) {
-        let key = (specifier.to_string(), deferred);
+        self.record_with_type(specifier, deferred, dynamic, None);
+    }
+
+    fn record_with_type(
+        &mut self,
+        specifier: &str,
+        deferred: bool,
+        dynamic: bool,
+        attr_type: Option<String>,
+    ) {
+        let key = (format!("{specifier}\x00{attr_type:?}"), deferred);
         if self.seen.insert(key) {
             self.out.push(ModuleRequest {
                 specifier: specifier.to_string(),
                 deferred,
                 dynamic,
+                attr_type,
             });
         }
     }
 }
 
+/// Extract the `type` attribute value from a `with { … }` clause.
+fn with_clause_type(clause: Option<&oxc_ast::ast::WithClause<'_>>) -> Option<String> {
+    let clause = clause?;
+    clause.with_entries.iter().find_map(|entry| {
+        let key = match &entry.key {
+            oxc_ast::ast::ImportAttributeKey::Identifier(id) => id.name.as_str(),
+            oxc_ast::ast::ImportAttributeKey::StringLiteral(lit) => lit.value.as_str(),
+        };
+        (key == "type").then(|| entry.value.value.as_str().to_string())
+    })
+}
+
 impl<'a> Visit<'a> for ModuleRequestVisitor {
     fn visit_import_declaration(&mut self, decl: &oxc_ast::ast::ImportDeclaration<'a>) {
         if !decl.import_kind.is_type() {
-            self.record(
+            self.record_with_type(
                 decl.source.value.as_str(),
                 matches!(decl.phase, Some(oxc_ast::ast::ImportPhase::Defer)),
                 false,
+                with_clause_type(decl.with_clause.as_deref()),
             );
         }
     }

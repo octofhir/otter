@@ -452,6 +452,11 @@ impl Interpreter {
         roots.push(&value);
         roots.extend_from_slice(value_roots);
         let obj = self.alloc_runtime_rooted_object_with_roots(&roots, slice_roots)?;
+        // §7.4.12 CreateIteratorResultObject — OrdinaryObjectCreate
+        // from %Object.prototype%.
+        if let Some(object_proto) = self.object_prototype_object_opt() {
+            crate::object::set_prototype(obj, &mut self.gc_heap, Some(object_proto));
+        }
         self.set_property(obj, "value", value)?;
         self.set_property(obj, "done", Value::boolean(done))?;
         Ok(Value::object(obj))

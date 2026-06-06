@@ -4658,6 +4658,35 @@ impl Interpreter {
                     self.run_init_global_lex_reg(context, frame, value_reg, name_idx)?;
                     continue;
                 }
+                // §7.1.3 ToNumeric on an already-primitive operand:
+                // Number / BigInt pass through, Symbol throws, the
+                // rest convert via ToNumber. Emitted between the two
+                // ToPrimitive coercions of a numeric binary operator
+                // so ToNumeric(lhs) throws before rhs `valueOf` runs.
+                Op::ToNumeric => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let value = *read_register(&stack[top_idx], src)?;
+                    let result = if value.is_number() || value.is_big_int() {
+                        value
+                    } else if value.is_symbol() {
+                        return Err(VmError::TypeError {
+                            message: "Cannot convert a Symbol value to a number".to_string(),
+                        });
+                    } else {
+                        Value::number(crate::number::NumberValue::from_f64(
+                            crate::number::parse::to_number_value(&value, &self.gc_heap),
+                        ))
+                    };
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, result)?;
+                    frame.advance_pc(self.current_byte_len)?;
+                    continue;
+                }
                 // §7.1.18 ToObject — wrap a primitive in its
                 // `%X.prototype%` body; objects pass through;
                 // `null` / `undefined` throw a TypeError. Emitted by

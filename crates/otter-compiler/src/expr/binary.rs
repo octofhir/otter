@@ -196,9 +196,23 @@ pub(crate) fn compile_binary(
         | Op::Shl
         | Op::Shr
         | Op::Ushr => {
+            // §13.15.3 — ToNumeric(lhs) completes (throwing on a
+            // Symbol) before the right operand's ToPrimitive runs.
             let l = emit_to_primitive(cx, lhs, "number", span);
+            let l_num = cx.alloc_scratch();
+            cx.emit(
+                Op::ToNumeric,
+                [Operand::Register(l_num), Operand::Register(l)],
+                span,
+            );
             let r = emit_to_primitive(cx, rhs, "number", span);
-            (l, r)
+            let r_num = cx.alloc_scratch();
+            cx.emit(
+                Op::ToNumeric,
+                [Operand::Register(r_num), Operand::Register(r)],
+                span,
+            );
+            (l_num, r_num)
         }
         _ => (lhs, rhs),
     };

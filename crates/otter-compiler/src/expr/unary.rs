@@ -388,13 +388,14 @@ pub(crate) fn compile_update(
         }
     };
 
-    // §13.4 step 3 — coerce to number (or BigInt via
-    // ToNumeric). The shared run-numeric path now handles
-    // primitives so `cur` can flow through Add/Sub directly.
+    // §13.4 step 3 — ToNumeric applies ToPrimitive(number) first,
+    // so an object operand fires `[Symbol.toPrimitive]` / `valueOf`
+    // / `toString` before the numeric coercion.
+    let old_prim = emit_to_primitive(cx, old, "number", span);
     let cur = cx.alloc_scratch();
     cx.emit(
         Op::ToNumber,
-        [Operand::Register(cur), Operand::Register(old)],
+        [Operand::Register(cur), Operand::Register(old_prim)],
         span,
     );
     let one = cx.alloc_scratch();

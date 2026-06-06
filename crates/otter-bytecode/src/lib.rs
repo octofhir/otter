@@ -1115,6 +1115,20 @@ pub enum Op {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-toobject>
     ToObject,
+
+    /// `r<dst> = ToNumeric(r<src>)` per §7.1.3, for an operand that
+    /// is already primitive: Number and BigInt pass through,
+    /// String / Boolean / null / undefined convert via ToNumber,
+    /// and a Symbol throws TypeError. Emitted between the two
+    /// `ToPrimitive` coercions of a numeric binary operator so
+    /// `ToNumeric(lhs)` completes (and throws) before the right
+    /// operand's `valueOf` runs (§13.15.3 ApplyStringOrNumeric
+    /// BinaryOperator evaluation order). Operands:
+    /// `Register(dst), Register(src)`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-tonumeric>
+    ToNumeric,
 }
 
 impl Op {
@@ -1268,6 +1282,7 @@ impl Op {
             Op::InitGlobalLex => "INIT_GLOBAL_LEX",
             Op::ValidateGlobalDecl => "VALIDATE_GLOBAL_DECL",
             Op::ToObject => "TO_OBJECT",
+            Op::ToNumeric => "TO_NUMERIC",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
@@ -1355,7 +1370,8 @@ impl Op {
             | Op::DeclareGlobalLex
             | Op::InitGlobalLex
             | Op::ValidateGlobalDecl
-            | Op::ToObject => 2,
+            | Op::ToObject
+            | Op::ToNumeric => 2,
             Op::GetStringIndex
             | Op::Add
             | Op::Sub

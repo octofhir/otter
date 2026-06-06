@@ -952,5 +952,6 @@ mod tests {
         Op::InitGlobalLex,
         Op::ValidateGlobalDecl,
         Op::ToObject,
+        Op::ToNumeric,
     ];
 }

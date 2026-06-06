@@ -281,6 +281,33 @@ pub(crate) fn compile_class(
         })
         .collect();
 
+    // §15.7.14 ClassFieldDefinitionEvaluation — a computed field
+    // name is evaluated exactly once, at class-definition time, in
+    // the class's own evaluation context (so `await` in a TLA module
+    // and side effects like `[counter++]` behave per spec). Store
+    // each evaluated key in a synthetic captured binding that the
+    // constructor's field-init code resolves through the standard
+    // upvalue walker — the same mechanism as `__class_home` and the
+    // per-class private-name symbols.
+    for (idx, p) in instance_fields.iter().enumerate() {
+        if !p.computed {
+            continue;
+        }
+        let pspan = (p.span.start, p.span.end);
+        let key_expr = p
+            .key
+            .as_expression()
+            .ok_or_else(|| CompileError::Unsupported {
+                node: "ClassDeclaration: non-expression computed instance field key".to_string(),
+                span: pspan,
+            })?;
+        let key_reg = compile_expr(cx, key_expr, pspan)?;
+        let binding = field_key_binding_name(idx);
+        let storage = cx.declare_captured_binding(&binding, true, pspan)?;
+        cx.emit_store_storage(key_reg, storage, pspan);
+        cx.mark_initialized(&binding);
+    }
+
     // Compile the constructor body. When the user didn't write one,
     // synthesize the spec defaults: a base class gets an empty body,
     // a derived class gets `constructor(...args) { super(...args); }`.
@@ -703,6 +730,14 @@ pub(crate) const SUPER_HOME_NAME: &str = "__class_home";
 /// constructor" upvalue. Holds the parent class value so
 /// `super(args)` knows what to invoke with the current receiver.
 pub(crate) const SUPER_CTOR_NAME: &str = "__class_super";
+
+/// Synthetic captured-binding name for the `idx`-th instance field's
+/// computed property key, evaluated once at class-definition time
+/// per §15.7.14 ClassFieldDefinitionEvaluation. The constructor's
+/// field-init code resolves it through the standard upvalue walker.
+pub(crate) fn field_key_binding_name(idx: usize) -> String {
+    format!("__class_fieldkey_{idx}")
+}
 
 /// Resolve a synthetic captured name (`__class_home` / `__class_super`)
 /// into a register holding its current value. Returns

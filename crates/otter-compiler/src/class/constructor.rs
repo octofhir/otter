@@ -359,7 +359,7 @@ fn emit_instance_field_inits_inner(
     cx: &mut Compiler,
     fields: &[&oxc_ast::ast::PropertyDefinition<'_>],
 ) -> Result<(), CompileError> {
-    for p in fields {
+    for (idx, p) in fields.iter().enumerate() {
         let pspan = (p.span.start, p.span.end);
         let value_reg = match &p.value {
             Some(expr) => compile_expr(cx, expr, pspan)?,
@@ -372,18 +372,12 @@ fn emit_instance_field_inits_inner(
         let this_reg = cx.alloc_scratch();
         cx.emit(Op::LoadThis, [Operand::Register(this_reg)], pspan);
         if p.computed {
-            // §15.7.10 — computed-key field. Evaluate the key
-            // expression at constructor-run time and define a data
-            // property via DefineField / CreateDataPropertyOrThrow.
-            let key_expr = p
-                .key
-                .as_expression()
-                .ok_or_else(|| CompileError::Unsupported {
-                    node: "ClassDeclaration: non-expression computed instance field key"
-                        .to_string(),
-                    span: pspan,
-                })?;
-            let key_reg = compile_expr(cx, key_expr, pspan)?;
+            // §15.7.10 — computed-key field. The key was evaluated
+            // exactly once at class-definition time (§15.7.14) into
+            // a synthetic captured binding; resolve it here instead
+            // of re-evaluating the expression per instance.
+            let binding = crate::class::field_key_binding_name(idx);
+            let key_reg = load_synthetic_capture(cx, &binding, pspan)?;
             emit_public_field_define(cx, this_reg, key_reg, value_reg, pspan);
             continue;
         }

@@ -4682,6 +4682,42 @@ impl Interpreter {
                     self.run_init_global_lex_reg(context, frame, value_reg, name_idx)?;
                     continue;
                 }
+                // §15.7.14 class-definition validation: heritage
+                // IsConstructor / static computed key != "prototype".
+                Op::ClassCheck => {
+                    let kind = context.exec_imm32(instr, 0).unwrap_or(0);
+                    let reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let value = *read_register(&stack[top_idx], reg)?;
+                    match kind {
+                        0 => {
+                            if !value.is_null()
+                                && !abstract_ops::is_constructor(&value, context, &self.gc_heap)
+                            {
+                                return Err(VmError::TypeError {
+                                    message: "Class extends value is not a constructor or null"
+                                        .to_string(),
+                                });
+                            }
+                        }
+                        _ => {
+                            if value
+                                .as_string(&self.gc_heap)
+                                .is_some_and(|s| s.to_lossy_string(&self.gc_heap) == "prototype")
+                            {
+                                return Err(VmError::TypeError {
+                                    message:
+                                        "Classes may not have a static property named 'prototype'"
+                                            .to_string(),
+                                });
+                            }
+                        }
+                    }
+                    let frame = &mut stack[top_idx];
+                    frame.advance_pc(self.current_byte_len)?;
+                    continue;
+                }
                 // §7.3.7 CreateDataPropertyOrThrow — object literal
                 // property definition; never consults inherited
                 // setters (unlike StoreProperty's Set semantics).

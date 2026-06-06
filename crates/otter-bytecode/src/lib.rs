@@ -1191,6 +1191,18 @@ pub enum Op {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-setfunctionname>
     SetFunctionName,
+
+    /// Class-definition runtime validation. Operands:
+    /// `Imm32(kind), Register(reg)`.
+    ///
+    /// - kind 0 — §15.7.14 ClassDefinitionEvaluation step 6.f:
+    ///   `extends` heritage must be `null` or a constructor
+    ///   (arrows, generators, async functions and plain objects
+    ///   throw TypeError before any prototype read).
+    /// - kind 1 — §15.7.14 step 22 / ClassElementEvaluation: a
+    ///   static element's computed key must not be `"prototype"`
+    ///   (TypeError).
+    ClassCheck,
 }
 
 impl Op {
@@ -1350,6 +1362,7 @@ impl Op {
             Op::YieldDelegate => "YIELD_DELEGATE",
             Op::DefineDataProperty => "DEFINE_DATA_PROPERTY",
             Op::SetFunctionName => "SET_FUNCTION_NAME",
+            Op::ClassCheck => "CLASS_CHECK",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
@@ -1437,6 +1450,7 @@ impl Op {
             | Op::DeclareGlobalLex
             | Op::InitGlobalLex
             | Op::ValidateGlobalDecl
+            | Op::ClassCheck
             | Op::ToObject
             | Op::ToNumeric => 2,
             Op::GetStringIndex

@@ -958,5 +958,6 @@ mod tests {
         Op::YieldDelegate,
         Op::DefineDataProperty,
         Op::SetFunctionName,
+        Op::ClassCheck,
     ];
 }

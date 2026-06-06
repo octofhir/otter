@@ -135,7 +135,18 @@ pub(crate) fn compile_class(
     // Evaluate the parent class first so observable side-effects
     // happen exactly once per declaration, in source order.
     let super_reg = match &class.super_class {
-        Some(expr) => Some(compile_expr(cx, expr, span)?),
+        Some(expr) => {
+            let r = compile_expr(cx, expr, span)?;
+            // §15.7.14 step 6.f — the heritage must be null or a
+            // constructor; arrows / generators / async functions /
+            // non-callables throw TypeError before prototype reads.
+            cx.emit(
+                Op::ClassCheck,
+                [Operand::Imm32(0), Operand::Register(r)],
+                span,
+            );
+            Some(r)
+        }
         None => None,
     };
 
@@ -449,7 +460,17 @@ pub(crate) fn compile_class(
                                     .to_string(),
                                 span: method_span,
                             })?;
-                    compile_expr(cx, key_expr, method_span)?
+                    let r = compile_expr(cx, key_expr, method_span)?;
+                    if m.r#static {
+                        // §15.7.14 — static computed key must not be
+                        // "prototype".
+                        cx.emit(
+                            Op::ClassCheck,
+                            [Operand::Imm32(1), Operand::Register(r)],
+                            method_span,
+                        );
+                    }
+                    r
                 }
             };
             let desc_reg = cx.alloc_scratch();
@@ -536,7 +557,17 @@ pub(crate) fn compile_class(
                         node: "ClassDeclaration: non-expression computed key".to_string(),
                         span: method_span,
                     })?;
-                compile_expr(cx, key_expr, method_span)?
+                let r = compile_expr(cx, key_expr, method_span)?;
+                if m.r#static {
+                    // §15.7.14 — static computed key must not be
+                    // "prototype".
+                    cx.emit(
+                        Op::ClassCheck,
+                        [Operand::Imm32(1), Operand::Register(r)],
+                        method_span,
+                    );
+                }
+                r
             }
         };
         let desc_reg = cx.alloc_scratch();
@@ -616,6 +647,13 @@ pub(crate) fn compile_class(
                                 span: pspan,
                             })?;
                     let key_reg = compile_expr(cx, key_expr, pspan)?;
+                    // §15.7.14 — static computed key must not be
+                    // "prototype".
+                    cx.emit(
+                        Op::ClassCheck,
+                        [Operand::Imm32(1), Operand::Register(key_reg)],
+                        pspan,
+                    );
                     cx.emit_store_element(statics_reg, key_reg, value_reg, pspan);
                 } else {
                     let key_str = match &p.key {

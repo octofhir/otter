@@ -299,11 +299,22 @@ pub fn is_constructor(value: &Value, context: &ExecutionContext, heap: &otter_gc
     if let Some(native) = value.as_native_function() {
         return native.is_constructable(heap);
     }
+    // §10.2.5 — only ordinary functions carry [[Construct]]:
+    // arrows, generators, async functions and async generators are
+    // not constructors.
+    let ordinary_fn_is_ctor = |fid: u32| -> bool {
+        if context.function_is_arrow(fid) {
+            return false;
+        }
+        context
+            .function(fid)
+            .is_none_or(|f| !f.is_generator && !f.is_async)
+    };
     if let Some(fid) = value.as_function() {
-        return !context.function_is_arrow(fid);
+        return ordinary_fn_is_ctor(fid);
     }
     if let Some(closure) = value.as_closure(heap) {
-        return !context.function_is_arrow(closure.cached_function_id);
+        return ordinary_fn_is_ctor(closure.cached_function_id);
     }
     if let Some(b) = value.as_bound_function() {
         let (target, _, _) = b.parts(heap);
@@ -315,6 +326,15 @@ pub fn is_constructor(value: &Value, context: &ExecutionContext, heap: &otter_gc
     // produces the spec-required TypeError on actual call.
     if let Some(proxy) = value.as_proxy() {
         return !proxy.is_revoked(heap) && is_constructor(&proxy.target(heap), context, heap);
+    }
+    // Constructor-shaped heap objects (e.g. the Error class registry
+    // installs plain objects carrying a `[[ConstructorNative]]`
+    // slot) construct through their backing native.
+    if let Some(obj) = value.as_object() {
+        if let Some(native) = crate::object::constructor_native(obj, heap) {
+            return is_constructor(&native, context, heap);
+        }
+        return false;
     }
     false
 }

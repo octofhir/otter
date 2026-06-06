@@ -19,6 +19,22 @@ pub(crate) struct WithBindingProbe {
     pub(crate) found_reg: u16,
 }
 
+/// One active `with` object environment, positioned in the lexical
+/// scope chain so identifier sites can decide whether a static
+/// binding shadows it (§9.1.1.2.1 — the chain is walked innermost
+/// first, mixing declarative scopes and object environments).
+#[derive(Clone, Debug)]
+pub(crate) struct WithEnv {
+    /// Synthetic binding holding the captured scope object.
+    pub(crate) binding: String,
+    /// `cx.stack.len()` when the `with` was lowered (1-based
+    /// function nesting depth).
+    pub(crate) fn_depth: usize,
+    /// `scopes.len()` in the declaring function when the `with` was
+    /// lowered (1-based scope nesting depth).
+    pub(crate) scope_depth: usize,
+}
+
 pub(crate) fn compile_with_statement(
     cx: &mut Compiler,
     w: &oxc_ast::ast::WithStatement<'_>,
@@ -32,7 +48,16 @@ pub(crate) fn compile_with_statement(
         });
     }
 
-    let object = compile_expr(cx, &w.object, span)?;
+    let object_raw = compile_expr(cx, &w.object, span)?;
+    // §14.11.2 step 2 — ToObject(expr): a primitive scope expression
+    // resolves identifier lookups against its wrapper object;
+    // `null` / `undefined` throw a TypeError here, before the body.
+    let object = cx.alloc_scratch();
+    cx.emit(
+        Op::ToObject,
+        [Operand::Register(object), Operand::Register(object_raw)],
+        span,
+    );
     let id = cx.next_with_env_id;
     cx.next_with_env_id = id.checked_add(1).expect("with env id overflow");
     let env_name = format!("__otter_with_env_{id}");
@@ -44,7 +69,13 @@ pub(crate) fn compile_with_statement(
     cx.emit_store_storage(object, storage, span);
     cx.mark_initialized(&env_name);
 
-    cx.active_with_envs.push(env_name);
+    let fn_depth = cx.stack.len();
+    let scope_depth = cx.scopes.len();
+    cx.active_with_envs.push(WithEnv {
+        binding: env_name,
+        fn_depth,
+        scope_depth,
+    });
     let result = compile_statement(cx, &w.body);
     cx.active_with_envs.pop();
     result
@@ -53,10 +84,31 @@ pub(crate) fn compile_with_statement(
 pub(crate) fn emit_with_binding_probe(
     cx: &mut Compiler,
     name: &str,
-    active_with_envs: &[String],
+    active_with_envs: &[WithEnv],
     span: (u32, u32),
 ) -> Result<Option<WithBindingProbe>, CompileError> {
     if active_with_envs.is_empty() {
+        return Ok(None);
+    }
+
+    // §9.1.1.2.1 — only object environments *inner* than the
+    // innermost static declaration of `name` participate: walking
+    // the chain innermost-first, the declarative binding is found
+    // before any outer `with` object. A function-local `var` inside
+    // a function defined in a `with` body therefore shadows the
+    // with-object property, while a `var` hoisted *outside* the
+    // `with` is shadowed by it.
+    let binding_pos = cx.binding_position(name);
+    let probed: Vec<String> = active_with_envs
+        .iter()
+        .rev()
+        .take_while(|env| match binding_pos {
+            None => true,
+            Some((bf, bs)) => env.fn_depth > bf || (env.fn_depth == bf && env.scope_depth >= bs),
+        })
+        .map(|env| env.binding.clone())
+        .collect();
+    if probed.is_empty() {
         return Ok(None);
     }
 
@@ -66,7 +118,7 @@ pub(crate) fn emit_with_binding_probe(
     cx.emit(Op::LoadFalse, [Operand::Register(found_reg)], span);
     let mut done_patches = Vec::new();
 
-    for env_name in active_with_envs.iter().rev() {
+    for env_name in &probed {
         let env_reg = load_with_env_object(cx, env_name, span)?;
         let key_reg = cx.alloc_scratch();
         let key_idx = cx.intern_string_constant(name);

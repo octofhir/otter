@@ -121,7 +121,7 @@ pub(crate) struct FunctionContext {
     /// `with` statements that enclose the code currently being
     /// lowered. Entries are binding names whose values are captured
     /// `JsObject` references.
-    pub(crate) active_with_envs: Vec<String>,
+    pub(crate) active_with_envs: Vec<crate::with_statement::WithEnv>,
     /// Monotonic suffix for synthetic `with` bindings in this
     /// function.
     pub(crate) next_with_env_id: u32,

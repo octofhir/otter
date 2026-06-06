@@ -1102,6 +1102,19 @@ pub enum Op {
     /// on an existing lexical; TypeError per §9.1.1.4.16
     /// CanDeclareGlobalFunction).
     ValidateGlobalDecl,
+
+    /// `r<dst> = ToObject(r<src>)` per §7.1.18. Primitives wrap in
+    /// their `%X.prototype%` body with the matching internal data
+    /// slot; objects pass through unchanged; `null` / `undefined`
+    /// throw a TypeError. Operands: `Register(dst), Register(src)`.
+    ///
+    /// Emitted by the `with` statement lowering (§14.11.2 step 2)
+    /// so a primitive scope expression resolves identifier lookups
+    /// against its wrapper object.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-toobject>
+    ToObject,
 }
 
 impl Op {
@@ -1254,6 +1267,7 @@ impl Op {
             Op::StoreGlobalBinding => "STORE_GLOBAL_BINDING",
             Op::InitGlobalLex => "INIT_GLOBAL_LEX",
             Op::ValidateGlobalDecl => "VALIDATE_GLOBAL_DECL",
+            Op::ToObject => "TO_OBJECT",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
@@ -1340,7 +1354,8 @@ impl Op {
             | Op::TypeofDynamic
             | Op::DeclareGlobalLex
             | Op::InitGlobalLex
-            | Op::ValidateGlobalDecl => 2,
+            | Op::ValidateGlobalDecl
+            | Op::ToObject => 2,
             Op::GetStringIndex
             | Op::Add
             | Op::Sub

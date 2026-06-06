@@ -58,6 +58,63 @@ pub(crate) fn compile_unary(
             );
             return Ok(dst);
         }
+        // §13.5.1.2 — sloppy `delete Identifier` resolves the binding:
+        // a `with` object environment or the global object deletes
+        // the property (result reflects configurability); a
+        // declarative binding yields `false`; an unresolvable
+        // reference yields `true`.
+        if let Expression::Identifier(id) = &u.argument {
+            let name = id.name.as_str().to_string();
+            let dst = cx.alloc_scratch();
+            let active_with_envs = cx.active_with_envs.clone();
+            let probe =
+                crate::with_statement::emit_with_binding_probe(cx, &name, &active_with_envs, span)?;
+            let mut with_done = None;
+            if let Some(probe) = &probe {
+                let fallback =
+                    cx.emit_branch_placeholder(Op::JumpIfFalse, Some(probe.found_reg), span);
+                let name_idx = cx.intern_string_constant(&name);
+                cx.emit(
+                    Op::DeleteProperty,
+                    vec![
+                        Operand::Register(dst),
+                        Operand::Register(probe.object_reg),
+                        Operand::ConstIndex(name_idx),
+                    ],
+                    span,
+                );
+                with_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
+                cx.patch_branch_to_here(fallback);
+            }
+            if cx.lookup_binding(&name).is_some() || cx.resolve_capture(&name).is_some() {
+                // §9.1.1.1.7 DeleteBinding on a declarative
+                // environment record — bindings created by
+                // declarations are not deletable.
+                cx.emit(Op::LoadFalse, [Operand::Register(dst)], span);
+            } else {
+                // Global fallback: §9.1.1.4.7 deletes the global
+                // object property; `DeleteProperty` already returns
+                // `false` for non-configurable entries (script vars,
+                // functions) and `true` for absent / configurable
+                // ones.
+                let global_reg = cx.alloc_scratch();
+                cx.emit(Op::LoadGlobalThis, [Operand::Register(global_reg)], span);
+                let name_idx = cx.intern_string_constant(&name);
+                cx.emit(
+                    Op::DeleteProperty,
+                    vec![
+                        Operand::Register(dst),
+                        Operand::Register(global_reg),
+                        Operand::ConstIndex(name_idx),
+                    ],
+                    span,
+                );
+            }
+            if let Some(done) = with_done {
+                cx.patch_branch_to_here(done);
+            }
+            return Ok(dst);
+        }
         // §13.5.1.2 — `delete` on a non-Reference returns
         // `true`. The argument is still evaluated for side
         // effects, then we discard it.

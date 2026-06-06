@@ -17,8 +17,10 @@ pub(crate) fn compile_identifier(
     let _ = span;
     let span = (id.span.start, id.span.end);
     // Foundation pseudo-globals before falling back to
-    // local resolution.
+    // local resolution. An enclosing `with` suppresses the constant
+    // fold — §9.1.1.2.1 lets `with ({NaN: 'x'})` shadow the global.
     match id.name.as_str() {
+        _ if !cx.active_with_envs.is_empty() => {}
         "NaN" => {
             let dst = cx.alloc_scratch();
             let const_idx = cx.intern_number_constant(f64::NAN);
@@ -51,7 +53,7 @@ pub(crate) fn compile_identifier(
 fn compile_identifier_with_envs(
     cx: &mut Compiler,
     name: &str,
-    active_with_envs: &[String],
+    active_with_envs: &[crate::with_statement::WithEnv],
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
     let dst = cx.alloc_scratch();

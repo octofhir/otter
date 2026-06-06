@@ -16,7 +16,7 @@
 use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
 use crate::native_function::NativeCall;
 use crate::object::{self, JsObject};
-use crate::{NativeCtx, NativeError, Value, VmError};
+use crate::{NativeCtx, NativeError, Value};
 
 otter_macros::couch! {
     name = "Number",

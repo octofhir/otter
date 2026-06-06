@@ -99,6 +99,22 @@ impl Compiler {
             .map(|ns| format!("__privsym_{ns}_{name}"))
     }
 
+    /// `(fn_depth, scope_depth)` (both 1-based) of the innermost
+    /// live declaration of `name` across the whole function-context
+    /// stack, or `None` for unresolved / global names. Used by the
+    /// `with` probe to decide which object environments are inner
+    /// than the static binding (§9.1.1.2.1).
+    pub(crate) fn binding_position(&self, name: &str) -> Option<(usize, usize)> {
+        for (fi, frame) in self.stack.iter().enumerate().rev() {
+            for (si, scope) in frame.scopes.iter().enumerate().rev() {
+                if scope.bindings.contains_key(name) {
+                    return Some((fi + 1, si + 1));
+                }
+            }
+        }
+        None
+    }
+
     pub(crate) fn top_mut(&mut self) -> &mut FunctionContext {
         self.stack
             .last_mut()

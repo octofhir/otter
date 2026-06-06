@@ -40,7 +40,12 @@ pub(crate) fn compile_expr(
 ) -> Result<u16, CompileError> {
     let expr = unwrap_ts_expr(expr);
     match expr {
-        Expression::Identifier(id) if id.name.as_str() == "undefined" => {
+        // §9.1.1.2.1 — an enclosing `with` may shadow `undefined`
+        // (`with ({undefined: 1})`), so the constant fold only
+        // applies outside `with` bodies.
+        Expression::Identifier(id)
+            if id.name.as_str() == "undefined" && cx.active_with_envs.is_empty() =>
+        {
             let dst = cx.alloc_scratch();
             cx.emit(Op::LoadUndefined, [Operand::Register(dst)], enclosing_span);
             Ok(dst)
@@ -52,6 +57,7 @@ pub(crate) fn compile_expr(
         // <https://tc39.es/ecma262/#sec-globalthis>
         Expression::Identifier(id)
             if id.name.as_str() == "globalThis"
+                && cx.active_with_envs.is_empty()
                 && cx.lookup_binding("globalThis").is_none()
                 && find_module_import_binding(cx, "globalThis").is_none() =>
         {

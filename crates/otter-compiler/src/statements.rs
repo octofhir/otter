@@ -121,6 +121,41 @@ pub(crate) fn compile_statement(
         }
 
         Statement::VariableDeclaration(decl) => {
+            // Stores an initialized `var` value into its hoisted
+            // binding (or the global object for script top-level
+            // vars), mirroring globals/module exports as needed.
+            // Shared by the plain path and the `with`-probe fallback.
+            fn emit_var_binding_store(
+                cx: &mut Compiler,
+                name: &str,
+                init_reg: u16,
+                span: (u32, u32),
+            ) -> Result<(), CompileError> {
+                if cx.lookup_binding(name).is_none() && cx.script_global_vars.contains(name) {
+                    let name_idx = cx.intern_string_constant(name);
+                    cx.emit(
+                        Op::DefineGlobalVar,
+                        [Operand::ConstIndex(name_idx), Operand::Register(init_reg)],
+                        span,
+                    );
+                    return Ok(());
+                }
+                let info = cx.lookup_binding(name).ok_or(CompileError::Unsupported {
+                    node: format!("var `{name}` not pre-hoisted"),
+                    span,
+                })?;
+                cx.emit_store_storage(init_reg, info.storage, span);
+                if cx.stack.len() == 1 && cx.module_state.is_none() && !cx.suppress_global_mirror {
+                    let name_idx = cx.intern_string_constant(name);
+                    cx.emit(
+                        Op::DefineGlobalVar,
+                        [Operand::ConstIndex(name_idx), Operand::Register(init_reg)],
+                        span,
+                    );
+                }
+                cx.emit_module_export_mirror(name, init_reg, span);
+                Ok(())
+            }
             let is_const = matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Const);
             let is_var = matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Var);
             // §14.3.2 VariableStatement — the binding itself was
@@ -141,43 +176,54 @@ pub(crate) fn compile_statement(
                         let Some(init) = &declarator.init else {
                             continue;
                         };
-                        // §16.1.7 — script global vars live as global
-                        // object properties, not local bindings.
-                        if cx.lookup_binding(&name).is_none()
-                            && cx.script_global_vars.contains(&name)
-                        {
+                        // §14.3.2.1 step 2 — ResolveBinding inside a
+                        // `with` body can hit the object environment:
+                        // `var value = x` assigns `withObj.value` when
+                        // the with-object has a `value` property, not
+                        // the hoisted var binding.
+                        if !cx.active_with_envs.is_empty() {
+                            let active_with_envs = cx.active_with_envs.clone();
+                            let with_ref = crate::with_statement::emit_with_binding_probe(
+                                cx,
+                                &name,
+                                &active_with_envs,
+                                span,
+                            )?;
                             let init_reg = crate::expr::compile_expr_with_inferred_name(
                                 cx, init, &name, span,
                             )?;
-                            let name_idx = cx.intern_string_constant(&name);
-                            cx.emit(
-                                Op::DefineGlobalVar,
-                                [Operand::ConstIndex(name_idx), Operand::Register(init_reg)],
-                                span,
-                            );
+                            if let Some(probe) = &with_ref {
+                                let fallback = cx.emit_branch_placeholder(
+                                    Op::JumpIfFalse,
+                                    Some(probe.found_reg),
+                                    span,
+                                );
+                                let name_idx = cx.intern_string_constant(&name);
+                                let scratch = cx.alloc_scratch();
+                                cx.emit(
+                                    Op::StoreProperty,
+                                    vec![
+                                        Operand::Register(probe.object_reg),
+                                        Operand::ConstIndex(name_idx),
+                                        Operand::Register(init_reg),
+                                        Operand::Register(scratch),
+                                    ],
+                                    span,
+                                );
+                                let done = cx.emit_branch_placeholder(Op::Jump, None, span);
+                                cx.patch_branch_to_here(fallback);
+                                emit_var_binding_store(cx, &name, init_reg, span)?;
+                                cx.patch_branch_to_here(done);
+                                continue;
+                            }
+                            emit_var_binding_store(cx, &name, init_reg, span)?;
                             continue;
                         }
-                        let info = cx.lookup_binding(&name).ok_or(CompileError::Unsupported {
-                            node: format!("var `{name}` not pre-hoisted"),
-                            span,
-                        })?;
                         // §14.3.1.2 — `BindingIdentifier = AnonymousFunction`
                         // infers the binding's name.
                         let init_reg =
                             crate::expr::compile_expr_with_inferred_name(cx, init, &name, span)?;
-                        cx.emit_store_storage(init_reg, info.storage, span);
-                        if cx.stack.len() == 1
-                            && cx.module_state.is_none()
-                            && !cx.suppress_global_mirror
-                        {
-                            let name_idx = cx.intern_string_constant(&name);
-                            cx.emit(
-                                Op::DefineGlobalVar,
-                                [Operand::ConstIndex(name_idx), Operand::Register(init_reg)],
-                                span,
-                            );
-                        }
-                        cx.emit_module_export_mirror(&name, init_reg, span);
+                        emit_var_binding_store(cx, &name, init_reg, span)?;
                         continue;
                     }
                     // Destructuring `var [a, b] = x`. Spec-correct

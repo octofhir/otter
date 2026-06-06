@@ -4658,6 +4658,27 @@ impl Interpreter {
                     self.run_init_global_lex_reg(context, frame, value_reg, name_idx)?;
                     continue;
                 }
+                // §7.1.18 ToObject — wrap a primitive in its
+                // `%X.prototype%` body; objects pass through;
+                // `null` / `undefined` throw a TypeError. Emitted by
+                // the `with` statement lowering (§14.11.2 step 2).
+                Op::ToObject => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let value = *read_register(&stack[top_idx], src)?;
+                    if value.is_nullish() {
+                        return Err(VmError::TypeMismatch);
+                    }
+                    let boxed = self.box_sloppy_this_primitive_stack_rooted(stack, value, &[])?;
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, boxed)?;
+                    frame.advance_pc(self.current_byte_len)?;
+                    continue;
+                }
                 Op::ValidateGlobalDecl => {
                     let name_idx = context
                         .exec_const_index(instr, 0)

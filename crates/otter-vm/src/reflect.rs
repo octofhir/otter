@@ -86,8 +86,13 @@ pub fn call(
         // §28.1.4 Reflect.defineProperty(target, propertyKey, attributes)
         // <https://tc39.es/ecma262/#sec-reflect.defineproperty>
         M::DefineProperty => {
-            let target = expect_object_value(args.first())?;
+            // Step 1 type check runs before key coercion (observable
+            // order), but the key coercion can run user code and move
+            // the heap — re-read the target from the rooted argument
+            // slot afterwards so the local copy is never stale.
+            expect_object_value(args.first())?;
             let key = coerce_property_key(interp, context, args.get(1))?;
+            let target = expect_object_value(args.first())?;
             let attributes = args.get(2).cloned().unwrap_or(Value::undefined());
             let descriptor = interp.evaluate_to_property_descriptor(context, &attributes)?;
             let ok = interp.define_own_property_value(context, &target, &key, descriptor)?;
@@ -96,16 +101,26 @@ pub fn call(
         // §28.1.5 Reflect.deleteProperty(target, propertyKey)
         // <https://tc39.es/ecma262/#sec-reflect.deleteproperty>
         M::DeleteProperty => {
-            let target = expect_object_value(args.first())?;
+            // Step 1 type check runs before key coercion (observable
+            // order), but the key coercion can run user code and move
+            // the heap — re-read the target from the rooted argument
+            // slot afterwards so the local copy is never stale.
+            expect_object_value(args.first())?;
             let key = coerce_property_key(interp, context, args.get(1))?;
+            let target = expect_object_value(args.first())?;
             let removed = interp.ordinary_delete_value(context, target, &key, 0)?;
             Ok(Value::boolean(removed))
         }
         // §28.1.6 Reflect.get(target, propertyKey[, receiver])
         // <https://tc39.es/ecma262/#sec-reflect.get>
         M::Get => {
-            let target = expect_object_value(args.first())?;
+            // Step 1 type check runs before key coercion (observable
+            // order), but the key coercion can run user code and move
+            // the heap — re-read the target from the rooted argument
+            // slot afterwards so the local copy is never stale.
+            expect_object_value(args.first())?;
             let key = coerce_property_key(interp, context, args.get(1))?;
+            let target = expect_object_value(args.first())?;
             let receiver = args.get(2).cloned().unwrap_or(target);
             match interp.ordinary_get_value(context, target, receiver, &key, 0)? {
                 VmGetOutcome::Value(v) => Ok(v),
@@ -118,8 +133,13 @@ pub fn call(
         // §28.1.7 Reflect.getOwnPropertyDescriptor(target, propertyKey)
         // <https://tc39.es/ecma262/#sec-reflect.getownpropertydescriptor>
         M::GetOwnPropertyDescriptor => {
-            let target = expect_object_value(args.first())?;
+            // Step 1 type check runs before key coercion (observable
+            // order), but the key coercion can run user code and move
+            // the heap — re-read the target from the rooted argument
+            // slot afterwards so the local copy is never stale.
+            expect_object_value(args.first())?;
             let key = coerce_property_key(interp, context, args.get(1))?;
+            let target = expect_object_value(args.first())?;
             match interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
                 context,
                 target,
@@ -206,8 +226,13 @@ pub fn call(
         // §28.1.9 Reflect.has(target, propertyKey)
         // <https://tc39.es/ecma262/#sec-reflect.has>
         M::Has => {
-            let target = expect_object_value(args.first())?;
+            // Step 1 type check runs before key coercion (observable
+            // order), but the key coercion can run user code and move
+            // the heap — re-read the target from the rooted argument
+            // slot afterwards so the local copy is never stale.
+            expect_object_value(args.first())?;
             let key = coerce_property_key(interp, context, args.get(1))?;
+            let target = expect_object_value(args.first())?;
             let present = interp.ordinary_has_property_value(context, target, &key, 0)?;
             Ok(Value::boolean(present))
         }
@@ -237,8 +262,13 @@ pub fn call(
         // §28.1.13 Reflect.set(target, propertyKey, V[, receiver])
         // <https://tc39.es/ecma262/#sec-reflect.set>
         M::Set => {
-            let target = expect_object_value(args.first())?;
+            // Step 1 type check runs before key coercion (observable
+            // order), but the key coercion can run user code and move
+            // the heap — re-read the target from the rooted argument
+            // slot afterwards so the local copy is never stale.
+            expect_object_value(args.first())?;
             let key = coerce_property_key(interp, context, args.get(1))?;
+            let target = expect_object_value(args.first())?;
             let value = args.get(2).cloned().unwrap_or(Value::undefined());
             let receiver = args.get(3).cloned().unwrap_or(target);
             // §10.1.9 OrdinarySet with receiver semantics for ordinary

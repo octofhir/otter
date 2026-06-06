@@ -41,6 +41,38 @@ fn emit_loop_exit_jump(cx: &mut Compiler, target_idx: usize, span: (u32, u32)) -
     }
 }
 
+/// Compile one `if` branch statement. §B.3.2 — a sloppy-mode
+/// single-statement function declaration (`if (x) function f() {}`)
+/// behaves like a block containing only the declaration: the
+/// function instantiates into a fresh block scope (never reusing a
+/// same-named outer binding) and its Annex B var-scope sync runs
+/// through the regular `FunctionDeclaration` arm. The name is
+/// temporarily dropped from `hoisted_function_names` so a same-named
+/// top-level hoisted declaration doesn't suppress this branch's
+/// instantiation.
+fn compile_if_branch_statement(
+    cx: &mut Compiler,
+    stmt: &Statement<'_>,
+) -> Result<Option<u16>, CompileError> {
+    if let Statement::FunctionDeclaration(f) = stmt
+        && !f.declare
+        && !cx.is_strict
+    {
+        let name = f.id.as_ref().map(|id| id.name.as_str().to_string());
+        cx.enter_scope();
+        let removed = name
+            .as_ref()
+            .is_some_and(|name| cx.top_mut().hoisted_function_names.remove(name));
+        let result = compile_statement(cx, stmt);
+        if removed && let Some(name) = name {
+            cx.top_mut().hoisted_function_names.insert(name);
+        }
+        cx.exit_scope();
+        return result;
+    }
+    compile_statement(cx, stmt)
+}
+
 pub(crate) fn compile_statement(
     cx: &mut Compiler,
     stmt: &Statement<'_>,
@@ -216,7 +248,7 @@ pub(crate) fn compile_statement(
             let cond_reg = compile_expr(cx, &s.test, span)?;
             // JUMP_IF_FALSE → after consequent
             let jmp_if_false = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(cond_reg), span);
-            if let Some(cons_reg) = compile_statement(cx, &s.consequent)? {
+            if let Some(cons_reg) = compile_if_branch_statement(cx, &s.consequent)? {
                 cx.emit(
                     Op::StoreLocal,
                     [
@@ -231,7 +263,7 @@ pub(crate) fn compile_statement(
                 // alternate.
                 let jmp_end = cx.emit_branch_placeholder(Op::Jump, None, span);
                 cx.patch_branch_to_here(jmp_if_false);
-                if let Some(alt_reg) = compile_statement(cx, alt)? {
+                if let Some(alt_reg) = compile_if_branch_statement(cx, alt)? {
                     cx.emit(
                         Op::StoreLocal,
                         [

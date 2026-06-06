@@ -100,6 +100,7 @@ impl Interpreter {
                     force_strict,
                     forbid_var_arguments,
                     caller_scope: None,
+                    script_goal: false,
                 },
             )?
         } else {
@@ -109,6 +110,7 @@ impl Interpreter {
                     force_strict,
                     forbid_var_arguments,
                     caller_scope: Some(caller_scope),
+                    script_goal: false,
                 },
                 &cell_sources,
                 stack,
@@ -277,6 +279,23 @@ impl Interpreter {
         write_register(frame, dst, result)?;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
+    }
+
+    /// Execute `source` as an ECMAScript *Script* in the current
+    /// realm (§16.1.6 ScriptEvaluation) — the host API behind
+    /// `$262.evalScript`. Differs from indirect eval only in GDI
+    /// semantics: global var bindings are non-configurable.
+    ///
+    /// # Errors
+    /// - [`VmError::SyntaxError`] when parsing / compilation fail.
+    pub fn run_host_script(&mut self, source: &Value) -> Result<Value, VmError> {
+        self.run_eval(
+            source,
+            EvalCompileOptions {
+                script_goal: true,
+                ..Default::default()
+            },
+        )
     }
 
     /// Execute `eval(source)` per §19.4.1.1 indirect-eval semantics:

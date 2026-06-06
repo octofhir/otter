@@ -53,10 +53,9 @@ globalThis.$DONE = function $DONE(reason) {
 ///   detaches the source per §25.1.5.5.
 /// - `$262.IsHTMLDDA` — host native branded by the VM for the Annex B
 ///   `[[IsHTMLDDA]]` ToBoolean / `typeof` / loose-equality rules.
-/// - `$262.evalScript(s)` — uses `new Function(s)()`; differs from
-///   real indirect-`eval` in that top-level `var` declarations
-///   stay function-scoped. Tests sensitive to global scope leakage
-///   fail with that limitation.
+/// - `$262.evalScript(s)` — `__otter_eval_script` native: parses
+///   `s` as an ECMAScript Script and runs it in the current realm
+///   with §16.1.7 GlobalDeclarationInstantiation semantics.
 /// - `$262.agent` — every method throws so tests get a
 ///   deterministic, recognisable error instead of
 ///   `TypeError: undefined is not an object`. Real cross-thread
@@ -77,10 +76,9 @@ var $262 = (function () {
             }
         },
         evalScript: function (source) {
-            // Foundation: function-scoped fallback. Slice 19+ will
-            // route through a real indirect-eval native once `eval`
-            // is installed on the global.
-            return (new Function(source))();
+            // Native host binding running `source` as a real Script
+            // (16.1.7 GlobalDeclarationInstantiation semantics).
+            return __otter_eval_script(String(source));
         },
         IsHTMLDDA: IsHTMLDDA,
         agent: {

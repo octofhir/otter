@@ -617,6 +617,12 @@ pub struct EvalCompileOptions {
     /// each name to that slot. `None` for indirect eval and for
     /// direct eval at script top level (global environment).
     pub caller_scope: Option<Vec<EvalCallerBinding>>,
+    /// `true` to compile the source as *script global code*
+    /// (§16.1.7 GlobalDeclarationInstantiation — non-configurable
+    /// global var bindings) instead of eval code. Used by host hooks
+    /// such as `$262.evalScript` that execute a full Script in the
+    /// current realm.
+    pub script_goal: bool,
 }
 
 /// One caller-environment binding visible to a direct eval body.

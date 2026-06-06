@@ -162,6 +162,7 @@ pub fn install_natives(runtime: &mut Runtime) -> Result<(), OtterError> {
 /// `(name, length, fn)` table installed by [`install_natives`].
 const NATIVES: &[(&str, u8, NativeFastFn)] = &[
     ("__otter_is_htmldda", 0, is_html_dda),
+    ("__otter_eval_script", 1, eval_script),
     ("__otter_agent_start", 1, agent_start),
     ("__otter_agent_broadcast", 2, agent_broadcast),
     ("__otter_agent_get_report", 0, agent_get_report),
@@ -189,6 +190,25 @@ fn type_err(reason: impl Into<String>) -> NativeError {
 
 fn is_html_dda(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     Ok(Value::null())
+}
+
+/// `$262.evalScript(source)` — INTERPRETING.md host API: parse
+/// `source` as an ECMAScript Script and run it in the current realm
+/// with §16.1.7 GlobalDeclarationInstantiation semantics.
+fn eval_script(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
+    ctx.interp_mut()
+        .run_host_script(&arg)
+        .map_err(|err| match err {
+            otter_vm::VmError::SyntaxError { message } => NativeError::SyntaxError {
+                name: "evalScript",
+                reason: message,
+            },
+            err => NativeError::TypeError {
+                name: "evalScript",
+                reason: err.to_string(),
+            },
+        })
 }
 
 fn claim_pending_worker_inbox() {

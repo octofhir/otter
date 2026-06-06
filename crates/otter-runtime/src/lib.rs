@@ -1469,6 +1469,17 @@ impl Runtime {
         // builds a fresh `BytecodeModule`.
         let hook: otter_vm::EvalHook =
             std::sync::Arc::new(|source: &str, options: EvalCompileOptions| {
+                // §16.1.6 ScriptEvaluation — host-requested script
+                // execution ($262.evalScript) compiles under script
+                // GDI semantics, not eval semantics.
+                if options.script_goal {
+                    return otter_compiler::compile_script_source(
+                        source,
+                        SourceKind::JavaScript,
+                        "<evalScript>",
+                    )
+                    .map_err(|e| format!("compile error: {e:?}"));
+                }
                 // §19.2.1.3 — a direct eval inside a function carries
                 // its caller variable environment binding list.
                 let caller_scope: Option<Vec<otter_compiler::EvalCallerBinding>> =

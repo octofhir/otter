@@ -1080,6 +1080,21 @@ impl Interpreter {
     /// `filter` the species result is allocated per §23.2.3.20 / .10 and
     /// pinned on the iteration-anchor stack so a GC triggered inside a
     /// callback cannot reclaim it.
+    /// Live per-iteration element read for callback-driven
+    /// TypedArray methods (§23.2.3 — `Get(O, ToString(k))` each
+    /// step): a buffer detached or shrunk mid-iteration yields
+    /// `undefined`, and writes from earlier callbacks are observed.
+    pub(crate) fn ta_live_element(
+        &mut self,
+        t: &crate::binary::typed_array::JsTypedArray,
+        i: usize,
+    ) -> Result<Value, VmError> {
+        if t.buffer(&self.gc_heap).is_detached(&self.gc_heap) || i >= t.length(&self.gc_heap) {
+            return Ok(Value::undefined());
+        }
+        t.get(&mut self.gc_heap, i).map_err(crate::oom_to_vm)
+    }
+
     pub(crate) fn typed_array_callback_value_dispatch(
         &mut self,
         context: &ExecutionContext,
@@ -1088,20 +1103,21 @@ impl Interpreter {
         args: &[Value],
     ) -> Result<Value, VmError> {
         let ta_value = Value::typed_array(*t);
+        // §23.2.4.4 ValidateTypedArray — a detached backing buffer
+        // throws before the length read or any callback runs.
+        if t.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
+            return Err(VmError::TypeError {
+                message: format!("TypedArray.prototype.{name} called on a detached ArrayBuffer"),
+            });
+        }
         let len = t.length(&self.gc_heap);
-        let elements: Vec<Value> = {
-            let mut tmp = Vec::with_capacity(len);
-            for i in 0..len {
-                tmp.push(t.get(&mut self.gc_heap, i).map_err(crate::oom_to_vm)?);
-            }
-            tmp
-        };
         let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
         match name {
             "forEach" => {
                 let callee = require_callable(args.first())?;
-                for (i, value) in elements.into_iter().enumerate() {
+                for i in 0..len {
+                    let value = self.ta_live_element(t, i)?;
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
                     self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                 }
@@ -1118,7 +1134,8 @@ impl Interpreter {
                 let target_kind = a.kind();
                 let anchor = self.push_iteration_anchor(a_value);
                 let result = (|interp: &mut Self| -> Result<(), VmError> {
-                    for (i, value) in elements.into_iter().enumerate() {
+                    for i in 0..len {
+                        let value = interp.ta_live_element(t, i)?;
                         let cb_args = build_array_cb_args(&value, i, &ta_value);
                         let mapped =
                             interp.run_callable_sync(context, &callee, this_arg, cb_args)?;
@@ -1142,7 +1159,8 @@ impl Interpreter {
                 // the kept count and copy the survivors in.
                 let callee = require_callable(args.first())?;
                 let mut kept: Vec<Value> = Vec::new();
-                for (i, value) in elements.into_iter().enumerate() {
+                for i in 0..len {
+                    let value = self.ta_live_element(t, i)?;
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
                     let selected = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     if selected.to_boolean(&self.gc_heap) {
@@ -1164,7 +1182,8 @@ impl Interpreter {
             "find" => {
                 let callee = require_callable(args.first())?;
                 let mut found = Value::undefined();
-                for (i, value) in elements.into_iter().enumerate() {
+                for i in 0..len {
+                    let value = self.ta_live_element(t, i)?;
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
                     let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     if hit.to_boolean(&self.gc_heap) {
@@ -1177,7 +1196,8 @@ impl Interpreter {
             "findIndex" => {
                 let callee = require_callable(args.first())?;
                 let mut idx: i32 = -1;
-                for (i, value) in elements.into_iter().enumerate() {
+                for i in 0..len {
+                    let value = self.ta_live_element(t, i)?;
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
                     let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     if hit.to_boolean(&self.gc_heap) {
@@ -1191,7 +1211,7 @@ impl Interpreter {
                 let callee = require_callable(args.first())?;
                 let mut found = Value::undefined();
                 for i in (0..len).rev() {
-                    let value = elements[i];
+                    let value = self.ta_live_element(t, i)?;
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
                     let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     if hit.to_boolean(&self.gc_heap) {
@@ -1205,7 +1225,7 @@ impl Interpreter {
                 let callee = require_callable(args.first())?;
                 let mut idx: i32 = -1;
                 for i in (0..len).rev() {
-                    let value = elements[i];
+                    let value = self.ta_live_element(t, i)?;
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
                     let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     if hit.to_boolean(&self.gc_heap) {
@@ -1218,7 +1238,8 @@ impl Interpreter {
             "every" => {
                 let callee = require_callable(args.first())?;
                 let mut all = true;
-                for (i, value) in elements.into_iter().enumerate() {
+                for i in 0..len {
+                    let value = self.ta_live_element(t, i)?;
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
                     let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     if !hit.to_boolean(&self.gc_heap) {
@@ -1231,7 +1252,8 @@ impl Interpreter {
             "some" => {
                 let callee = require_callable(args.first())?;
                 let mut any = false;
-                for (i, value) in elements.into_iter().enumerate() {
+                for i in 0..len {
+                    let value = self.ta_live_element(t, i)?;
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
                     let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     if hit.to_boolean(&self.gc_heap) {
@@ -1253,11 +1275,11 @@ impl Interpreter {
                     (args[1], if reverse { len as i64 - 1 } else { 0 })
                 } else {
                     let seed = if reverse { len - 1 } else { 0 };
-                    (elements[seed], seed as i64 + step)
+                    (self.ta_live_element(t, seed)?, seed as i64 + step)
                 };
                 let mut i = start_idx;
                 while i >= 0 && (i as usize) < len {
-                    let value = elements[i as usize];
+                    let value = self.ta_live_element(t, i as usize)?;
                     let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
                     cb_args.push(acc);
                     cb_args.push(value);

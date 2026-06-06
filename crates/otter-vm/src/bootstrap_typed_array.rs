@@ -384,401 +384,48 @@ fn read_array_like_coerced(
     Ok(out)
 }
 
-/// §22.2.3 TypedArray callback prototype method wrappers — used
-/// for reflective access and `Function.prototype.call` style
-/// re-entries; the method-call fast path bypasses these into
-/// `Interpreter::typed_array_callback_dispatch` directly.
-fn ta_callback_receiver(
-    ctx: &NativeCtx<'_>,
-    method: &'static str,
-) -> Result<crate::binary::typed_array::JsTypedArray, NativeError> {
-    ctx.this_value()
-        .as_typed_array(ctx.heap())
-        .ok_or_else(|| NativeError::TypeError {
-            name: method,
-            reason: "this is not a TypedArray".to_string(),
-        })
-}
-
-fn ta_callback_snapshot(
-    t: &crate::binary::typed_array::JsTypedArray,
-    heap: &mut otter_gc::GcHeap,
-) -> Result<Vec<Value>, otter_gc::OutOfMemory> {
-    let len = t.length(heap);
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        out.push(t.get(heap, i)?);
-    }
-    Ok(out)
-}
-
-fn ta_oom_to_native(method: &'static str) -> impl Fn(otter_gc::OutOfMemory) -> NativeError {
-    move |err: otter_gc::OutOfMemory| NativeError::TypeError {
-        name: method,
-        reason: format!(
-            "out of memory: requested {} bytes, heap limit {}",
-            err.requested_bytes(),
-            err.heap_limit_bytes(),
-        ),
-    }
-}
-
-fn ta_require_callable(args: &[Value], method: &'static str) -> Result<Value, NativeError> {
-    let cb = args.first().cloned().unwrap_or(Value::undefined());
-    if !crate::abstract_ops::is_callable(&cb) {
-        return Err(NativeError::TypeError {
-            name: method,
-            reason: "callback is not callable".to_string(),
-        });
-    }
-    Ok(cb)
-}
-
-fn ta_invoke_callback(
-    ctx: &mut NativeCtx<'_>,
-    callee: &Value,
-    this_arg: &Value,
-    value: &Value,
-    index: usize,
-    ta: &Value,
-) -> Result<Value, NativeError> {
-    let exec_ctx = ctx
-        .execution_context()
-        .cloned()
-        .ok_or_else(|| NativeError::TypeError {
-            name: "TypedArray callback",
-            reason: "missing execution context".to_string(),
-        })?;
-    let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-    cb_args.push(*value);
-    cb_args.push(Value::number(crate::number::NumberValue::from_i32(
-        index as i32,
-    )));
-    cb_args.push(*ta);
-    ctx.cx
-        .interp
-        .run_callable_sync(&exec_ctx, callee, *this_arg, cb_args)
-        .map_err(|e| NativeError::TypeError {
-            name: "TypedArray callback",
-            reason: e.to_string(),
-        })
-}
-
 fn ta_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let t = ta_callback_receiver(ctx, "TypedArray.prototype.forEach")?;
-    let callee = ta_require_callable(args, "TypedArray.prototype.forEach")?;
-    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let ta_value = Value::typed_array(t);
-    let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
-        .map_err(ta_oom_to_native("TypedArray callback"))?;
-    for (i, v) in elements.into_iter().enumerate() {
-        ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
-    }
-    Ok(Value::undefined())
+    ta_callback_dispatch(ctx, args, "forEach")
 }
 
 fn ta_proto_map(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let t = ta_callback_receiver(ctx, "TypedArray.prototype.map")?;
-    let callee = ta_require_callable(args, "TypedArray.prototype.map")?;
-    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let ta_value = Value::typed_array(t);
-    // §23.2.3.20 step 3 — capture `len` before any user callback runs.
-    let len = t.length(ctx.heap());
-    // Step 5 — `A = ? TypedArraySpeciesCreate(O, « len »)` runs before
-    // the per-element callback loop, so a throwing species constructor
-    // is observed before any callback is invoked.
-    let a = ta_species_create(ctx, t, len, "TypedArray.prototype.map")?;
-    let target_kind = a.kind();
-    // Step 6 — read each source element live (so callbacks that mutate
-    // the receiver mid-iteration are observed per `Get(O, k)`), invoke
-    // the callback, then `Set(A, k, mappedValue)` through the target
-    // kind's element coercion.
-    for i in 0..len {
-        let kvalue = t
-            .get(ctx.interp_mut().gc_heap_mut(), i)
-            .map_err(ta_oom_to_native("TypedArray.prototype.map"))?;
-        let mapped = ta_invoke_callback(ctx, &callee, &this_arg, &kvalue, i, &ta_value)?;
-        let coerced = crate::binary::dispatch::coerce_element_for_store(
-            ctx.interp_mut().gc_heap_mut(),
-            target_kind,
-            &mapped,
-        )
-        .map_err(|e| vm_to_native(e, "TypedArray.prototype.map"))?;
-        a.set(ctx.interp_mut().gc_heap_mut(), i, &coerced);
-    }
-    Ok(Value::typed_array(a))
+    ta_callback_dispatch(ctx, args, "map")
 }
 
 fn ta_proto_filter(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let t = ta_callback_receiver(ctx, "TypedArray.prototype.filter")?;
-    let callee = ta_require_callable(args, "TypedArray.prototype.filter")?;
-    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let ta_value = Value::typed_array(t);
-    // §23.2.3.10 — run the predicate over every element first, reading
-    // each live so mid-iteration receiver mutations are observed, and
-    // collect the kept values. The species constructor is only invoked
-    // afterwards with the kept count (step 9).
-    let len = t.length(ctx.heap());
-    let mut kept: Vec<Value> = Vec::new();
-    for i in 0..len {
-        let kvalue = t
-            .get(ctx.interp_mut().gc_heap_mut(), i)
-            .map_err(ta_oom_to_native("TypedArray.prototype.filter"))?;
-        let selected = ta_invoke_callback(ctx, &callee, &this_arg, &kvalue, i, &ta_value)?;
-        if selected.to_boolean(ctx.interp_mut().gc_heap()) {
-            kept.push(kvalue);
-        }
-    }
-    let a = ta_species_create(ctx, t, kept.len(), "TypedArray.prototype.filter")?;
-    let target_kind = a.kind();
-    for (i, v) in kept.iter().enumerate() {
-        let coerced = crate::binary::dispatch::coerce_element_for_store(
-            ctx.interp_mut().gc_heap_mut(),
-            target_kind,
-            v,
-        )
-        .map_err(|e| vm_to_native(e, "TypedArray.prototype.filter"))?;
-        a.set(ctx.interp_mut().gc_heap_mut(), i, &coerced);
-    }
-    Ok(Value::typed_array(a))
+    ta_callback_dispatch(ctx, args, "filter")
 }
 
 fn ta_proto_find(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let t = ta_callback_receiver(ctx, "TypedArray.prototype.find")?;
-    let callee = ta_require_callable(args, "TypedArray.prototype.find")?;
-    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let ta_value = Value::typed_array(t);
-    let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
-        .map_err(ta_oom_to_native("TypedArray callback"))?;
-    for (i, v) in elements.into_iter().enumerate() {
-        let hit = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
-        if hit.to_boolean(ctx.interp_mut().gc_heap()) {
-            return Ok(v);
-        }
-    }
-    Ok(Value::undefined())
+    ta_callback_dispatch(ctx, args, "find")
 }
 
 fn ta_proto_find_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let t = ta_callback_receiver(ctx, "TypedArray.prototype.findIndex")?;
-    let callee = ta_require_callable(args, "TypedArray.prototype.findIndex")?;
-    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let ta_value = Value::typed_array(t);
-    let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
-        .map_err(ta_oom_to_native("TypedArray callback"))?;
-    for (i, v) in elements.into_iter().enumerate() {
-        let hit = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
-        if hit.to_boolean(ctx.interp_mut().gc_heap()) {
-            return Ok(Value::number(crate::number::NumberValue::from_i32(
-                i as i32,
-            )));
-        }
-    }
-    Ok(Value::number(crate::number::NumberValue::from_i32(-1)))
+    ta_callback_dispatch(ctx, args, "findIndex")
 }
 
 fn ta_proto_find_last(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let t = ta_callback_receiver(ctx, "TypedArray.prototype.findLast")?;
-    let callee = ta_require_callable(args, "TypedArray.prototype.findLast")?;
-    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let ta_value = Value::typed_array(t);
-    let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
-        .map_err(ta_oom_to_native("TypedArray callback"))?;
-    for i in (0..elements.len()).rev() {
-        let v = elements[i];
-        let hit = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
-        if hit.to_boolean(ctx.interp_mut().gc_heap()) {
-            return Ok(v);
-        }
-    }
-    Ok(Value::undefined())
+    ta_callback_dispatch(ctx, args, "findLast")
 }
 
 fn ta_proto_find_last_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let t = ta_callback_receiver(ctx, "TypedArray.prototype.findLastIndex")?;
-    let callee = ta_require_callable(args, "TypedArray.prototype.findLastIndex")?;
-    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let ta_value = Value::typed_array(t);
-    let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
-        .map_err(ta_oom_to_native("TypedArray callback"))?;
-    for i in (0..elements.len()).rev() {
-        let v = elements[i];
-        let hit = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
-        if hit.to_boolean(ctx.interp_mut().gc_heap()) {
-            return Ok(Value::number(crate::number::NumberValue::from_i32(
-                i as i32,
-            )));
-        }
-    }
-    Ok(Value::number(crate::number::NumberValue::from_i32(-1)))
+    ta_callback_dispatch(ctx, args, "findLastIndex")
 }
 
 fn ta_proto_every(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let t = ta_callback_receiver(ctx, "TypedArray.prototype.every")?;
-    let callee = ta_require_callable(args, "TypedArray.prototype.every")?;
-    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let ta_value = Value::typed_array(t);
-    let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
-        .map_err(ta_oom_to_native("TypedArray callback"))?;
-    for (i, v) in elements.into_iter().enumerate() {
-        let hit = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
-        if !hit.to_boolean(ctx.interp_mut().gc_heap()) {
-            return Ok(Value::boolean(false));
-        }
-    }
-    Ok(Value::boolean(true))
+    ta_callback_dispatch(ctx, args, "every")
 }
 
 fn ta_proto_some(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let t = ta_callback_receiver(ctx, "TypedArray.prototype.some")?;
-    let callee = ta_require_callable(args, "TypedArray.prototype.some")?;
-    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let ta_value = Value::typed_array(t);
-    let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
-        .map_err(ta_oom_to_native("TypedArray callback"))?;
-    for (i, v) in elements.into_iter().enumerate() {
-        let hit = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
-        if hit.to_boolean(ctx.interp_mut().gc_heap()) {
-            return Ok(Value::boolean(true));
-        }
-    }
-    Ok(Value::boolean(false))
+    ta_callback_dispatch(ctx, args, "some")
 }
 
 fn ta_proto_reduce(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    ta_proto_reduce_dir(ctx, args, false)
+    ta_callback_dispatch(ctx, args, "reduce")
 }
 
 fn ta_proto_reduce_right(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    ta_proto_reduce_dir(ctx, args, true)
-}
-
-fn ta_proto_reduce_dir(
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-    reverse: bool,
-) -> Result<Value, NativeError> {
-    let method = if reverse {
-        "TypedArray.prototype.reduceRight"
-    } else {
-        "TypedArray.prototype.reduce"
-    };
-    let t = ta_callback_receiver(ctx, method)?;
-    let callee = ta_require_callable(args, method)?;
-    let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
-        .map_err(ta_oom_to_native("TypedArray callback"))?;
-    let len = elements.len();
-    let has_init = args.len() >= 2;
-    if len == 0 && !has_init {
-        return Err(NativeError::TypeError {
-            name: method,
-            reason: "reduce of empty array with no initial value".to_string(),
-        });
-    }
-    let ta_value = Value::typed_array(t);
-    let exec_ctx = ctx
-        .execution_context()
-        .cloned()
-        .ok_or_else(|| NativeError::TypeError {
-            name: method,
-            reason: "missing execution context".to_string(),
-        })?;
-    let step: i64 = if reverse { -1 } else { 1 };
-    let (mut acc, start_idx) = if has_init {
-        (args[1], if reverse { len as i64 - 1 } else { 0 })
-    } else {
-        let seed = if reverse { len - 1 } else { 0 };
-        (elements[seed], seed as i64 + step)
-    };
-    let mut i = start_idx;
-    while i >= 0 && (i as usize) < len {
-        let value = elements[i as usize];
-        let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-        cb_args.push(acc);
-        cb_args.push(value);
-        cb_args.push(Value::number(crate::number::NumberValue::from_i32(
-            i as i32,
-        )));
-        cb_args.push(ta_value);
-        acc = ctx
-            .cx
-            .interp
-            .run_callable_sync(&exec_ctx, &callee, Value::undefined(), cb_args)
-            .map_err(|e| NativeError::TypeError {
-                name: method,
-                reason: e.to_string(),
-            })?;
-        i += step;
-    }
-    Ok(acc)
-}
-
-/// §23.2.4.1 `TypedArraySpeciesCreate(exemplar, argumentList)` for the
-/// single-`length` argument case used by `map` / `filter` / `slice` /
-/// `subarray`.
-///
-/// Resolves `SpeciesConstructor(exemplar, %DefaultConstructor%)`
-/// (§7.3.22) — observing a user `constructor` / `Symbol.species`
-/// override — then performs `TypedArrayCreate(constructor, « length »)`
-/// (§23.2.4.2): constructs the result, then verifies it is a
-/// TypedArray, its buffer is not detached, and its length is at least
-/// `length`.
-fn ta_species_create(
-    ctx: &mut NativeCtx<'_>,
-    exemplar: crate::binary::typed_array::JsTypedArray,
-    length: usize,
-    method: &'static str,
-) -> Result<crate::binary::typed_array::JsTypedArray, NativeError> {
-    let exemplar_value = Value::typed_array(exemplar);
-    let default_name = exemplar.kind().name();
-    let default_ctor = {
-        let interp = &ctx.cx.interp;
-        crate::object::get(interp.global_this, &interp.gc_heap, default_name).ok_or_else(|| {
-            NativeError::TypeError {
-                name: method,
-                reason: format!("%{default_name}% intrinsic missing"),
-            }
-        })?
-    };
-    let constructor = crate::regexp_prototype::species_constructor_runtime(
-        ctx,
-        &exemplar_value,
-        &default_ctor,
-        method,
-    )?;
-
-    let mut argv: SmallVec<[Value; 8]> = SmallVec::new();
-    argv.push(Value::number(crate::number::NumberValue::from_f64(
-        length as f64,
-    )));
-    let (interp, exec) = ctx.interp_mut_and_context();
-    let exec = exec.ok_or_else(|| NativeError::TypeError {
-        name: method,
-        reason: "missing execution context".to_string(),
-    })?;
-    let result = interp
-        .run_construct_sync(&exec, &constructor, constructor, argv)
-        .map_err(|e| vm_to_native(e, method))?;
-
-    let Some(new_ta) = result.as_typed_array(&interp.gc_heap) else {
-        return Err(NativeError::TypeError {
-            name: method,
-            reason: "Species constructor did not return a TypedArray".to_string(),
-        });
-    };
-    if new_ta.buffer(&interp.gc_heap).is_detached(&interp.gc_heap) {
-        return Err(NativeError::TypeError {
-            name: method,
-            reason: "Species constructor returned a TypedArray with a detached buffer".to_string(),
-        });
-    }
-    if new_ta.length(&interp.gc_heap) < length {
-        return Err(NativeError::TypeError {
-            name: method,
-            reason: "Species constructor returned a TypedArray smaller than the source".to_string(),
-        });
-    }
-    Ok(new_ta)
+    ta_callback_dispatch(ctx, args, "reduceRight")
 }
 
 /// §22.2.6.1 `get %TypedArray%.prototype.buffer` — return the
@@ -1282,6 +929,11 @@ fn ta_proto_dispatch(
     let int_coerce: &[usize] = match method_name {
         "fill" => &[1, 2],
         "copyWithin" => &[0, 1, 2],
+        // §23.2.3.1 / §23.2.3.36 / §23.2.3.27/.28 — relative-index
+        // operands run ToIntegerOrInfinity (firing valueOf /
+        // toString) before the impl reads them as numbers.
+        "at" | "with" => &[0],
+        "slice" | "subarray" => &[0, 1],
         _ => &[],
     };
     if method_name == "fill" || !int_coerce.is_empty() {
@@ -1450,8 +1102,8 @@ otter_macros::couch! {
             "at"             / 1 => ta_at,
             "subarray"       / 2 => ta_subarray,
             "slice"          / 2 => ta_slice,
-            "fill"           / 3 => ta_fill,
-            "copyWithin"     / 3 => ta_copy_within,
+            "fill"           / 1 => ta_fill,
+            "copyWithin"     / 2 => ta_copy_within,
             "reverse"        / 0 => ta_reverse,
             "indexOf"        / 1 => ta_index_of,
             "lastIndexOf"    / 1 => ta_last_index_of,
@@ -1459,7 +1111,7 @@ otter_macros::couch! {
             "join"           / 1 => ta_join,
             "toString"       / 0 => ta_to_string,
             "toLocaleString" / 0 => ta_to_locale_string,
-            "set"            / 2 => ta_set,
+            "set"            / 1 => ta_set,
             "toReversed"     / 0 => ta_to_reversed,
             "toSorted"       / 1 => ta_to_sorted,
             "sort"           / 1 => ta_sort,

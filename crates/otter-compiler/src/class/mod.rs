@@ -812,48 +812,6 @@ pub(crate) fn load_private_key(
     })
 }
 
-pub(crate) fn emit_private_has_throw(
-    cx: &mut Compiler,
-    obj_reg: u16,
-    key_reg: u16,
-    span: (u32, u32),
-) -> Result<(), CompileError> {
-    let found = cx.alloc_scratch();
-    cx.emit(
-        Op::HasProperty,
-        [
-            Operand::Register(found),
-            Operand::Register(key_reg),
-            Operand::Register(obj_reg),
-        ],
-        span,
-    );
-    let ok = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(found), span);
-    let message_reg = cx.alloc_scratch();
-    let message = cx.intern_string_constant(
-        "Cannot write private member to an object whose class did not declare it",
-    );
-    cx.emit(
-        Op::LoadString,
-        [Operand::Register(message_reg), Operand::ConstIndex(message)],
-        span,
-    );
-    let error_reg = cx.alloc_scratch();
-    let kind = cx.intern_string_constant("TypeError");
-    cx.emit(
-        Op::NewBuiltinError,
-        [
-            Operand::Register(error_reg),
-            Operand::ConstIndex(kind),
-            Operand::Register(message_reg),
-        ],
-        span,
-    );
-    cx.emit(Op::Throw, [Operand::Register(error_reg)], span);
-    cx.patch_branch_to_here(ok);
-    Ok(())
-}
-
 fn emit_private_symbol_key(
     cx: &mut Compiler,
     name: &str,

@@ -71,6 +71,10 @@ pub(crate) fn compile_function_full(
     child.reserve_known_own_upvalues();
     parent.push(child);
     parent.enter_scope();
+    // A non-arrow function owns its `new.target` — the
+    // field-initializer signal does not propagate into its body.
+    let saved_field_init = parent.in_field_initializer;
+    parent.in_field_initializer = false;
 
     // Reserve raw argv slots up front so destructuring / defaults
     // can address them by ordinal. The compiler's scratch counter
@@ -182,6 +186,7 @@ pub(crate) fn compile_function_full(
             direct_eval_meta = collect_direct_eval_bindings(parent, &lex_names);
         }
     }
+    parent.in_field_initializer = saved_field_init;
     parent.exit_scope();
     // Implicit `return undefined;` at the function tail.
     parent.emit(Op::ReturnUndefined, vec![], span);
@@ -221,6 +226,7 @@ pub(crate) fn compile_function_full(
     slot.mapped_argument_bindings = mapped_argument_bindings;
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.direct_eval_bindings = direct_eval_meta;
+    slot.contains_direct_eval = contains_direct_eval;
     slot.code = child.code;
     slot.spans = child.spans;
     Ok((function_id, captures))
@@ -230,7 +236,7 @@ pub(crate) fn compile_function_full(
 /// a [`DirectEvalBinding`] table for `Op::Eval`. Called after the body
 /// is compiled (every hoisted declaration has settled) and before the
 /// function scope is exited.
-fn collect_direct_eval_bindings(
+pub(crate) fn collect_direct_eval_bindings(
     cx: &Compiler,
     lexical_names: &[(String, bool)],
 ) -> Vec<otter_bytecode::DirectEvalBinding> {
@@ -429,6 +435,7 @@ pub(crate) fn compile_arrow_function(
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.is_arrow = true;
     slot.direct_eval_bindings = direct_eval_meta;
+    slot.contains_direct_eval = contains_direct_eval;
     slot.code = child.code;
     slot.spans = child.spans;
     Ok((function_id, captures))

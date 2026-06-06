@@ -683,9 +683,12 @@ mod tests {
     fn undefined_literal_compiles() {
         let module = compile_script_src("undefined;");
         let main = module.main();
-        assert_eq!(main.code.len(), 2);
+        // completion init + statement value + completion store + return.
+        assert_eq!(main.code.len(), 4);
         assert_eq!(main.code[0].op, Op::LoadUndefined);
-        assert_eq!(main.code[1].op, Op::Return);
+        assert_eq!(main.code[1].op, Op::LoadUndefined);
+        assert_eq!(main.code[2].op, Op::StoreLocal);
+        assert_eq!(main.code[3].op, Op::Return);
     }
 
     #[test]
@@ -699,44 +702,44 @@ mod tests {
         let module = compile_script_src("type Foo = number; undefined;");
         // LoadUndefined for the body + Return.
         let main = module.main();
-        assert_eq!(main.code.len(), 2);
+        assert_eq!(main.code.len(), 4);
     }
 
     #[test]
     fn interface_is_erased() {
         let module = compile_script_src("interface I { x: number; } undefined;");
-        assert_eq!(module.main().code.len(), 2);
+        assert_eq!(module.main().code.len(), 4);
     }
 
     #[test]
     fn declare_function_is_erased() {
         let module = compile_script_src("declare function foo(): void; undefined;");
-        assert_eq!(module.main().code.len(), 2);
+        assert_eq!(module.main().code.len(), 4);
     }
 
     #[test]
     fn import_type_is_erased() {
         let module = compile_script_src("import type { Foo } from \"./foo\"; undefined;");
-        assert_eq!(module.main().code.len(), 2);
+        assert_eq!(module.main().code.len(), 4);
     }
 
     #[test]
     fn as_expression_unwraps_to_undefined() {
         let module = compile_script_src("(undefined as any);");
         // `(undefined as any)` is statement-level; LoadUndefined + Return.
-        assert_eq!(module.main().code.len(), 2);
+        assert_eq!(module.main().code.len(), 4);
     }
 
     #[test]
     fn satisfies_expression_unwraps_to_undefined() {
         let module = compile_script_src("(undefined satisfies unknown);");
-        assert_eq!(module.main().code.len(), 2);
+        assert_eq!(module.main().code.len(), 4);
     }
 
     #[test]
     fn non_null_unwraps_to_undefined() {
         let module = compile_script_src("undefined!;");
-        assert_eq!(module.main().code.len(), 2);
+        assert_eq!(module.main().code.len(), 4);
     }
 
     #[test]
@@ -759,7 +762,7 @@ mod tests {
     #[test]
     fn declared_namespace_is_erased() {
         let module = compile_script_src("declare namespace N { function f(): void; } undefined;");
-        assert_eq!(module.main().code.len(), 2);
+        assert_eq!(module.main().code.len(), 4);
     }
 
     #[test]
@@ -768,9 +771,12 @@ mod tests {
         // as a directive prologue.
         let module = compile_script_src("(\"abc\");");
         let main = module.main();
-        assert_eq!(main.code.len(), 2);
-        assert_eq!(main.code[0].op, Op::LoadString);
-        assert_eq!(main.code[1].op, Op::Return);
+        // completion init + statement value + completion store + return.
+        assert_eq!(main.code.len(), 4);
+        assert_eq!(main.code[0].op, Op::LoadUndefined);
+        assert_eq!(main.code[1].op, Op::LoadString);
+        assert_eq!(main.code[2].op, Op::StoreLocal);
+        assert_eq!(main.code[3].op, Op::Return);
         assert_eq!(module.constants.len(), 1);
         let Constant::String { utf16 } = &module.constants[0] else {
             panic!("expected String constant");

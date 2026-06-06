@@ -109,13 +109,14 @@ pub fn compile_eval_source(
     force_strict: bool,
     forbid_var_arguments: bool,
     caller_scope: Option<&[EvalCallerBinding]>,
+    new_target_allowed: bool,
 ) -> Result<BytecodeModule, CompileError> {
     // §19.2.1.1 PerformEval parses the body with the Script goal.
     otter_syntax::with_program_goal(source, kind, otter_syntax::SourceGoal::Script, |program| {
         // §19.2.1.1 step 5 — `new.target` in eval code is an early
-        // SyntaxError unless this is a direct eval contained in
-        // function code (`caller_scope` present).
-        if caller_scope.is_none() && capture::program_references_new_target(&program.body) {
+        // SyntaxError unless the direct-eval call site sits inside
+        // non-arrow function code (arrows are transparent).
+        if !new_target_allowed && capture::program_references_new_target(&program.body) {
             return Err(CompileError::Unsupported {
                 node: "SyntaxError: new.target expression is not allowed here".to_string(),
                 span: (program.span.start, program.span.end),
@@ -131,7 +132,14 @@ pub fn compile_eval_source(
                 });
             }
         }
-        compile_program_for_eval(program, kind, module_specifier, force_strict, caller_scope)
+        compile_program_for_eval(
+            program,
+            kind,
+            module_specifier,
+            force_strict,
+            caller_scope,
+            new_target_allowed,
+        )
     })
     .map_err(CompileError::from)?
 }
@@ -190,14 +198,16 @@ pub(crate) fn compile_program_for_eval(
     module_specifier: &str,
     force_strict: bool,
     caller_scope: Option<&[EvalCallerBinding]>,
+    new_target_allowed: bool,
 ) -> Result<BytecodeModule, CompileError> {
-    compile_program_with_mode(
+    compile_program_with_mode_impl(
         program,
         source_kind,
         module_specifier,
         force_strict,
         true,
         caller_scope,
+        new_target_allowed,
     )
 }
 
@@ -208,6 +218,27 @@ pub(crate) fn compile_program_with_mode(
     force_strict: bool,
     eval_mode: bool,
     caller_scope: Option<&[EvalCallerBinding]>,
+) -> Result<BytecodeModule, CompileError> {
+    compile_program_with_mode_impl(
+        program,
+        source_kind,
+        module_specifier,
+        force_strict,
+        eval_mode,
+        caller_scope,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compile_program_with_mode_impl(
+    program: &Program<'_>,
+    source_kind: SyntaxSourceKind,
+    module_specifier: &str,
+    force_strict: bool,
+    eval_mode: bool,
+    caller_scope: Option<&[EvalCallerBinding]>,
+    new_target_allowed: bool,
 ) -> Result<BytecodeModule, CompileError> {
     let module = Rc::new(RefCell::new(ModuleBuilder::default()));
     let script_module_url = if module_specifier.starts_with("file://") {
@@ -299,6 +330,7 @@ pub(crate) fn compile_program_with_mode(
     // Unresolved names may hit bindings a nested direct eval
     // introduces into this chunk's own frame at runtime.
     cx.contains_direct_eval = !caller.is_empty();
+    cx.eval_new_target_allowed = new_target_allowed;
     cx.enter_scope();
 
     if !caller.is_empty() {
@@ -447,7 +479,17 @@ pub(crate) fn compile_program_with_mode(
         }
     }
 
-    let mut last_value_reg: Option<u16> = None;
+    // §8.4 — the program completion register (spec `V`). Expression
+    // statements store into it as they evaluate; composite statements
+    // reset it on entry, so abrupt exits (break out of a switch,
+    // throw into a catch) still observe the right value.
+    let completion_reg = cx.alloc_scratch();
+    cx.emit(
+        Op::LoadUndefined,
+        [Operand::Register(completion_reg)],
+        program_span,
+    );
+    cx.completion_reg = Some(completion_reg);
     // A directive prologue (`"use strict"`, etc.) is a sequence of
     // string-literal expression statements; each contributes its
     // string value to the script / `eval` completion value (so
@@ -461,12 +503,10 @@ pub(crate) fn compile_program_with_mode(
             [Operand::Register(dst), Operand::ConstIndex(const_idx)],
             (directive.span.start, directive.span.end),
         );
-        last_value_reg = Some(dst);
+        cx.emit_completion_value(dst, (directive.span.start, directive.span.end));
     }
     for stmt in &program.body {
-        if let Some(reg) = compile_statement(&mut cx, stmt)? {
-            last_value_reg = Some(reg);
-        }
+        compile_statement(&mut cx, stmt)?;
     }
     // The chunk's full cell-backed scope table. The runtime adopts
     // the var-shaped entries that were not part of the caller scope
@@ -506,23 +546,10 @@ pub(crate) fn compile_program_with_mode(
     }
     cx.exit_scope();
 
-    // Synthesize the program's completion value. If the body
-    // produced one, return it; otherwise materialize `undefined` in
-    // r0 and return that.
-    let return_reg = match last_value_reg {
-        Some(reg) => reg,
-        None => {
-            let dst = cx.alloc_scratch();
-            cx.emit(
-                Op::LoadUndefined,
-                [Operand::Register(dst)],
-                (program.span.start, program.span.end),
-            );
-            dst
-        }
-    };
+    // The program completion value is whatever the completion
+    // register holds when the body finishes.
     let span = (program.span.start, program.span.end);
-    cx.emit(Op::Return, [Operand::Register(return_reg)], span);
+    cx.emit(Op::Return, [Operand::Register(completion_reg)], span);
 
     // Finalize `<main>` into the module's function table, then
     // drop `cx` so the module Rc has a single owner before
@@ -533,6 +560,9 @@ pub(crate) fn compile_program_with_mode(
         m.functions[0].scratch = cx.scratch;
         m.functions[0].own_upvalue_count = cx.own_upvalue_count;
         m.functions[0].direct_eval_bindings = eval_new_bindings;
+        // §19.2.1.1 — a nested direct eval from this chunk inherits
+        // the in-function signal from the chunk's own caller.
+        m.functions[0].contains_direct_eval = !caller.is_empty();
         m.functions[0].code = std::mem::take(&mut cx.code);
         m.functions[0].spans = std::mem::take(&mut cx.spans);
     }

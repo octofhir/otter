@@ -102,6 +102,16 @@ pub fn all_own_names(
     own.names
 }
 
+/// Expression variant of [`body_contains_direct_eval`] — used for
+/// class field initializers, which compile into the synthesized
+/// constructor's frame.
+#[must_use]
+pub fn expression_contains_direct_eval(expr: &oxc_ast::ast::Expression<'_>) -> bool {
+    let mut finder = DirectEvalFinder::default();
+    finder.visit_expression(expr);
+    finder.found
+}
+
 /// Statement-list variant of [`body_contains_direct_eval`] for
 /// script / eval program bodies.
 #[must_use]

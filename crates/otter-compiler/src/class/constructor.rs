@@ -75,11 +75,22 @@ pub(crate) fn compile_synthetic_constructor(
     instance_fields: &[&oxc_ast::ast::PropertyDefinition<'_>],
 ) -> Result<(u32, Vec<u32>), CompileError> {
     let module = Rc::clone(&parent.top_mut().module);
-    let child = FunctionContext::new(Rc::clone(&module))
+    let mut child = FunctionContext::new(Rc::clone(&module))
         .with_strict(true)
         .with_module_url(parent.module_url.clone());
     // No body to pre-pass; only the synthesised super call needs
-    // outer captures.
+    // outer captures. A direct eval inside a field initializer still
+    // runs with this constructor frame as its caller (§19.2.1.3).
+    let contains_direct_eval = instance_fields.iter().any(|field| {
+        field
+            .value
+            .as_ref()
+            .is_some_and(capture::expression_contains_direct_eval)
+    });
+    if contains_direct_eval {
+        child.captured_names.insert("arguments".to_string());
+    }
+    child.contains_direct_eval = contains_direct_eval;
     parent.push(child);
     parent.enter_scope();
 
@@ -130,6 +141,11 @@ pub(crate) fn compile_synthetic_constructor(
         parent.emit(Op::ReturnUndefined, vec![], span);
     }
 
+    let direct_eval_meta: Vec<otter_bytecode::DirectEvalBinding> = if contains_direct_eval {
+        collect_direct_eval_bindings(parent, &[])
+    } else {
+        Vec::new()
+    };
     parent.exit_scope();
     let child = parent.pop();
     let captures = child.parent_captures.clone();
@@ -145,6 +161,8 @@ pub(crate) fn compile_synthetic_constructor(
     slot.has_rest = is_derived;
     slot.is_derived_constructor = is_derived;
     slot.own_upvalue_count = child.own_upvalue_count;
+    slot.direct_eval_bindings = direct_eval_meta;
+    slot.contains_direct_eval = contains_direct_eval;
     slot.code = child.code;
     slot.spans = child.spans;
     Ok((function_id, captures))
@@ -189,6 +207,28 @@ pub(crate) fn compile_class_constructor(
     if let Some(b) = body {
         child.captured_names = capture::analyze_function(Some(params), b);
     }
+    // §19.2.1.3 — field initializers compile into this constructor
+    // frame; a direct eval in either the body or any initializer
+    // receives the constructor's variable environment (and its
+    // new.target / this).
+    let contains_direct_eval = body
+        .as_ref()
+        .is_some_and(|b| capture::body_contains_direct_eval(Some(params), b))
+        || instance_fields.iter().any(|field| {
+            field
+                .value
+                .as_ref()
+                .is_some_and(capture::expression_contains_direct_eval)
+        });
+    if contains_direct_eval {
+        if let Some(b) = body {
+            child
+                .captured_names
+                .extend(capture::all_own_names(Some(params), b));
+        }
+        child.captured_names.insert("arguments".to_string());
+    }
+    child.contains_direct_eval = contains_direct_eval;
     parent.push(child);
     parent.enter_scope();
 
@@ -270,6 +310,11 @@ pub(crate) fn compile_class_constructor(
         // No body at all (degenerate shape) — emit field inits.
         emit_instance_field_inits(parent, instance_fields)?;
     }
+    let direct_eval_meta: Vec<otter_bytecode::DirectEvalBinding> = if contains_direct_eval {
+        collect_direct_eval_bindings(parent, &[])
+    } else {
+        Vec::new()
+    };
     parent.exit_scope();
     parent.emit(Op::ReturnUndefined, vec![], span);
 
@@ -288,6 +333,8 @@ pub(crate) fn compile_class_constructor(
     slot.is_async = is_async;
     slot.is_derived_constructor = is_derived;
     slot.own_upvalue_count = child.own_upvalue_count;
+    slot.direct_eval_bindings = direct_eval_meta;
+    slot.contains_direct_eval = contains_direct_eval;
     slot.code = child.code;
     slot.spans = child.spans;
     Ok((function_id, captures))
@@ -295,6 +342,20 @@ pub(crate) fn compile_class_constructor(
 
 /// upvalues) per §15.7.10 InitializeFieldsForReceiver.
 pub(crate) fn emit_instance_field_inits(
+    cx: &mut Compiler,
+    fields: &[&oxc_ast::ast::PropertyDefinition<'_>],
+) -> Result<(), CompileError> {
+    // §15.7.10 — field initializers are their own function-like code
+    // with no [[NewTarget]]; a direct eval there observes
+    // `new.target` as `undefined`.
+    let saved_field_init = cx.in_field_initializer;
+    cx.in_field_initializer = true;
+    let result = emit_instance_field_inits_inner(cx, fields);
+    cx.in_field_initializer = saved_field_init;
+    result
+}
+
+fn emit_instance_field_inits_inner(
     cx: &mut Compiler,
     fields: &[&oxc_ast::ast::PropertyDefinition<'_>],
 ) -> Result<(), CompileError> {

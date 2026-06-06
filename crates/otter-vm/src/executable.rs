@@ -229,6 +229,10 @@ pub(crate) struct ExecutableFunction {
     /// function-scope binding; on a compiled eval `<main>` it lists
     /// the new var-scoped bindings the body introduced.
     pub(crate) direct_eval_bindings: Box<[ExecDirectEvalBinding]>,
+    /// §19.2.1.1 `inFunction` signal for `Op::Eval` — `true` when
+    /// this function contains a direct eval call site (the binding
+    /// table may still be empty).
+    pub(crate) contains_direct_eval: bool,
     /// Hot instruction stream. Indexed in source order; the dispatch
     /// loop resolves a frame's byte-offset PC to an entry via
     /// [`Self::instr_at_byte_pc`] (`O(log N)` binary search on `byte_pc`).
@@ -330,6 +334,7 @@ impl ExecutableFunction {
                     lexical: binding.lexical,
                 })
                 .collect(),
+            contains_direct_eval: function.contains_direct_eval,
             code,
             byte_spans,
             code_byte_len,

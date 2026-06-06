@@ -1910,6 +1910,13 @@ pub struct Function {
     /// frame must adopt so later code observes the bindings).
     #[serde(default)]
     pub direct_eval_bindings: Vec<DirectEvalBinding>,
+    /// `true` when this function body (including class field
+    /// initializers compiled into a constructor) contains a direct
+    /// eval call site. `Op::Eval` uses it as the §19.2.1.1
+    /// `inFunction` signal — the binding table above may legitimately
+    /// be empty (a synthesized constructor with no own bindings).
+    #[serde(default)]
+    pub contains_direct_eval: bool,
     /// Encoded instructions.
     pub code: Vec<Instruction>,
     /// `pc -> source span` table.

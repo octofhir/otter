@@ -92,6 +92,10 @@ pub(crate) fn compile_statement(
         Statement::ExpressionStatement(es) => {
             let span = (es.span.start, es.span.end);
             let reg = compile_expr(cx, &es.expression, span)?;
+            // §8.4 — thread the statement value into the program
+            // completion register immediately, so abrupt exits
+            // (break / continue / throw) downstream still observe it.
+            cx.emit_completion_value(reg, span);
             Ok(Some(reg))
         }
 
@@ -266,6 +270,7 @@ pub(crate) fn compile_statement(
 
         Statement::IfStatement(s) => {
             let span = (s.span.start, s.span.end);
+            cx.emit_completion_reset(span);
             // §14.6.2 — the completion value is the taken branch's
             // value, or `undefined` when no branch runs (false test
             // with no `else`).
@@ -308,6 +313,7 @@ pub(crate) fn compile_statement(
 
         Statement::WhileStatement(s) => {
             let span = (s.span.start, s.span.end);
+            cx.emit_completion_reset(span);
             // §14.7.3 — the loop's completion value is the last
             // non-empty body completion (undefined if it never runs).
             let completion_reg = cx.alloc_scratch();
@@ -342,6 +348,7 @@ pub(crate) fn compile_statement(
 
         Statement::DoWhileStatement(s) => {
             let span = (s.span.start, s.span.end);
+            cx.emit_completion_reset(span);
             let completion_reg = cx.alloc_scratch();
             cx.emit(Op::LoadUndefined, [Operand::Register(completion_reg)], span);
             let body_top = cx.next_pc;
@@ -372,6 +379,7 @@ pub(crate) fn compile_statement(
 
         Statement::ForStatement(s) => {
             let span = (s.span.start, s.span.end);
+            cx.emit_completion_reset(span);
             cx.enter_scope();
             // Initializer.
             if let Some(init) = &s.init {
@@ -1134,6 +1142,7 @@ pub(crate) fn compile_switch_statement(
     s: &oxc_ast::ast::SwitchStatement<'_>,
 ) -> Result<Option<u16>, CompileError> {
     let span = (s.span.start, s.span.end);
+    cx.emit_completion_reset(span);
     let disc_reg = compile_expr(cx, &s.discriminant, span)?;
 
     // §14.12.4 CaseBlockEvaluation completion: `V` starts empty
@@ -1268,6 +1277,7 @@ pub(crate) fn compile_labeled_statement(
     s: &oxc_ast::ast::LabeledStatement<'_>,
 ) -> Result<Option<u16>, CompileError> {
     let span = (s.span.start, s.span.end);
+    cx.emit_completion_reset(span);
     let label = s.label.name.as_str().to_string();
     // Reject duplicate labels in the enclosing chain — §14.13.1
     // early error.

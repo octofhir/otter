@@ -629,6 +629,10 @@ pub struct EvalCompileOptions {
     /// such as `$262.evalScript` that execute a full Script in the
     /// current realm.
     pub script_goal: bool,
+    /// §19.2.1.1 step 5 — `true` when the direct-eval call site sits
+    /// inside non-arrow function code (or a class field
+    /// initializer), making `new.target` legal in the eval body.
+    pub new_target_allowed: bool,
 }
 
 /// One caller-environment binding visible to a direct eval body.
@@ -6414,6 +6418,7 @@ mod tests {
             mapped_argument_bindings: Vec::new(),
             module_url: String::new(),
             direct_eval_bindings: Vec::new(),
+            contains_direct_eval: false,
             code,
             spans,
         }
@@ -10027,6 +10032,7 @@ mod tests {
             mapped_argument_bindings: Vec::new(),
             module_url: String::new(),
             direct_eval_bindings: Vec::new(),
+            contains_direct_eval: false,
             code: vec![Instruction {
                 pc: 0,
                 op: Op::ReturnUndefined,
@@ -10085,6 +10091,7 @@ mod tests {
             mapped_argument_bindings: Vec::new(),
             module_url: String::new(),
             direct_eval_bindings: Vec::new(),
+            contains_direct_eval: false,
             code: vec![Instruction {
                 pc: 0,
                 op: Op::ReturnUndefined,
@@ -10536,6 +10543,7 @@ mod tests {
             mapped_argument_bindings: Vec::new(),
             module_url: String::new(),
             direct_eval_bindings: Vec::new(),
+            contains_direct_eval: false,
             code: vec![Instruction {
                 pc: 0,
                 op: Op::ReturnUndefined,
@@ -10568,6 +10576,7 @@ mod tests {
             mapped_argument_bindings: Vec::new(),
             module_url: String::new(),
             direct_eval_bindings: Vec::new(),
+            contains_direct_eval: false,
             code: vec![
                 Instruction {
                     pc: 0,

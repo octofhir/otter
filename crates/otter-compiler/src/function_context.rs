@@ -132,6 +132,18 @@ pub(crate) struct FunctionContext {
     /// hand the eval body its caller variable environment
     /// (§19.2.1.3 EvalDeclarationInstantiation).
     pub(crate) contains_direct_eval: bool,
+    /// §8.4 / §14 — the script / eval `<main>` completion-value
+    /// register (spec `V`). Expression statements store into it as
+    /// they evaluate; composite statements reset it to `undefined`
+    /// on entry (their completion is never *empty*, per UpdateEmpty
+    /// with `undefined`). `None` inside ordinary function bodies —
+    /// only program completion is observable (via `eval` /
+    /// `evalScript` return values).
+    pub(crate) completion_reg: Option<u16>,
+    /// `true` while lowering a `finally` block body: a normal
+    /// finalizer's completion value is discarded (§14.15.3 step 4),
+    /// so its statements must not touch the completion register.
+    pub(crate) completion_suppressed: bool,
 }
 
 impl FunctionContext {
@@ -166,6 +178,8 @@ impl FunctionContext {
             active_with_envs: Vec::new(),
             next_with_env_id: 0,
             contains_direct_eval: false,
+            completion_reg: None,
+            completion_suppressed: false,
         }
     }
 
@@ -551,6 +565,36 @@ impl FunctionContext {
         });
         self.spans.push(SpanEntry { pc, span });
         self.next_pc += 1;
+    }
+
+    /// UpdateEmpty(…, undefined) — a composite statement (`if`,
+    /// loops, `switch`, `try`, `with`, labelled) resets the program
+    /// completion register on entry: its completion is `undefined`
+    /// unless an inner statement produces a value.
+    pub(crate) fn emit_completion_reset(&mut self, span: (u32, u32)) {
+        if self.completion_suppressed {
+            return;
+        }
+        if let Some(reg) = self.completion_reg {
+            self.emit(Op::LoadUndefined, [Operand::Register(reg)], span);
+        }
+    }
+
+    /// Statement-list `V` threading — store a non-empty statement
+    /// completion value into the program completion register.
+    pub(crate) fn emit_completion_value(&mut self, value_reg: u16, span: (u32, u32)) {
+        if self.completion_suppressed {
+            return;
+        }
+        if let Some(reg) = self.completion_reg
+            && reg != value_reg
+        {
+            self.emit(
+                Op::StoreLocal,
+                [Operand::Register(value_reg), Operand::Imm32(reg as i32)],
+                span,
+            );
+        }
     }
 
     /// Emit the appropriate "load this binding into `dst`" op pair

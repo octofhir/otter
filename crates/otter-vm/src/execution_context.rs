@@ -451,6 +451,7 @@ mod tests {
                 mapped_argument_bindings: Vec::new(),
                 module_url: String::new(),
                 direct_eval_bindings: Vec::new(),
+                contains_direct_eval: false,
                 code,
                 spans: Vec::new(),
             }],

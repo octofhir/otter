@@ -86,6 +86,8 @@ impl Interpreter {
         };
         let forbid_var_arguments = flags & 1 != 0;
         let in_param_init = flags & 2 != 0;
+        let new_target_allowed = flags & 4 != 0;
+        let new_target_suppressed = flags & 8 != 0;
         let top_idx = stack.len() - 1;
         let value = *read_register(&stack[top_idx], src_reg)?;
         let force_strict = context.function_is_strict(stack[top_idx].function_id);
@@ -96,7 +98,13 @@ impl Interpreter {
         // evals may have extended the frame with more named cells.
         let (caller_scope, cell_sources) =
             self.collect_caller_scope(context, &stack[top_idx], in_param_init);
-        let result = if cell_sources.is_empty() {
+        // §19.2.1.1 `inFunction` — the compiler's flag, not table
+        // emptiness: a synthesized constructor may carry no bindings
+        // yet still host a field-initializer eval.
+        let in_function_caller = context
+            .exec_function(stack[top_idx].function_id)
+            .is_some_and(|function| function.contains_direct_eval);
+        let result = if !in_function_caller && cell_sources.is_empty() {
             // Script-top-level direct eval: the caller variable
             // environment *is* the global environment, which the
             // compiled chunk reaches through the global mirror.
@@ -107,6 +115,7 @@ impl Interpreter {
                     forbid_var_arguments,
                     caller_scope: None,
                     script_goal: false,
+                    new_target_allowed,
                 },
             )?
         } else {
@@ -117,8 +126,10 @@ impl Interpreter {
                     forbid_var_arguments,
                     caller_scope: Some(caller_scope),
                     script_goal: false,
+                    new_target_allowed,
                 },
                 &cell_sources,
+                new_target_suppressed,
                 stack,
             )?
         };
@@ -186,6 +197,7 @@ impl Interpreter {
         value: &Value,
         options: EvalCompileOptions,
         cell_sources: &[CallerCellSource],
+        new_target_suppressed: bool,
         stack: &mut SmallVec<[Frame; 8]>,
     ) -> Result<Value, VmError> {
         let Some(s) = value.as_string(&self.gc_heap) else {
@@ -252,9 +264,13 @@ impl Interpreter {
         let entry_this = stack[top_idx].this_value;
         // §13.3.3 — `new.target` in the eval body reads the caller
         // frame's value (direct eval is contained in function code).
-        let caller_new_target = self
-            .frame_cold(&stack[top_idx])
-            .and_then(|cold| cold.new_target);
+        // Class field initializers observe `undefined` (§15.7.10).
+        let caller_new_target = if new_target_suppressed {
+            None
+        } else {
+            self.frame_cold(&stack[top_idx])
+                .and_then(|cold| cold.new_target)
+        };
         if !adopted.is_empty() {
             let cold = self.frame_ensure_cold(&mut stack[top_idx]);
             let map = cold.eval_vars.get_or_insert_default();

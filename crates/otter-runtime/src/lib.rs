@@ -1499,6 +1499,7 @@ impl Runtime {
                     options.force_strict,
                     options.forbid_var_arguments,
                     caller_scope.as_deref(),
+                    options.new_target_allowed,
                 )
                 .map_err(|e| format!("compile error: {e:?}"))
             });

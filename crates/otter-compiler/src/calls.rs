@@ -414,10 +414,22 @@ pub(crate) fn compile_method_call(
         // have lexical [[ThisMode]] — the restriction never applies
         // to an arrow variable environment.
         let forbid_var_arguments = cx.in_param_init && cx.binds_arguments;
+        // §19.2.1.1 step 5 — `new.target` in the eval body is legal
+        // only when the call site sits inside *non-arrow* function
+        // code (arrows are transparent: the signal comes from the
+        // enclosing function), or inside a class field initializer.
+        let new_target_allowed = cx.eval_new_target_allowed
+            || cx.in_field_initializer
+            || cx.stack.iter().skip(1).any(|frame| !frame.is_arrow);
         // Flag bits: 0 — forbid var-`arguments` (§19.2.1.3); 1 — the
         // call site sits in a parameter initializer, where the
-        // caller's *body* lexical bindings are not yet in scope.
-        let flags = i32::from(forbid_var_arguments) | (i32::from(cx.in_param_init) << 1);
+        // caller's *body* lexical bindings are not yet in scope;
+        // 2 — `new.target` is legal in the eval body; 3 — the body
+        // observes `new.target` as undefined (field initializer).
+        let flags = i32::from(forbid_var_arguments)
+            | (i32::from(cx.in_param_init) << 1)
+            | (i32::from(new_target_allowed) << 2)
+            | (i32::from(cx.in_field_initializer) << 3);
         cx.emit(
             Op::Eval,
             [

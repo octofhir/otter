@@ -44,6 +44,7 @@ pub(crate) fn compile_try_statement(
     use otter_bytecode::NO_HANDLER_OFFSET;
 
     let span = (s.span.start, s.span.end);
+    cx.emit_completion_reset(span);
     let has_catch = s.handler.is_some();
     let has_finally = s.finalizer.is_some();
     if !has_catch && !has_finally {
@@ -135,6 +136,9 @@ pub(crate) fn compile_catch_clause(
     exc_reg: u16,
     span: (u32, u32),
 ) -> Result<(), CompileError> {
+    // §14.15.3 — a throw discards the try block's completion value;
+    // the catch clause threads its own `V` from `undefined`.
+    cx.emit_completion_reset(span);
     cx.enter_scope();
     if let Some(param) = &handler.param {
         match &param.pattern {
@@ -162,10 +166,19 @@ pub(crate) fn compile_finalizer(
     cx: &mut Compiler,
     finalizer: &oxc_ast::ast::BlockStatement<'_>,
 ) -> Result<(), CompileError> {
+    // §14.15.3 step 4 — a normal finalizer completion value is
+    // discarded; its statements must not touch the program
+    // completion register.
+    let saved = cx.completion_suppressed;
+    cx.top_mut().completion_suppressed = true;
     cx.enter_scope();
-    for inner in &finalizer.body {
-        compile_statement(cx, inner)?;
-    }
+    let result: Result<(), CompileError> = (|| {
+        for inner in &finalizer.body {
+            compile_statement(cx, inner)?;
+        }
+        Ok(())
+    })();
     cx.exit_scope();
-    Ok(())
+    cx.top_mut().completion_suppressed = saved;
+    result
 }

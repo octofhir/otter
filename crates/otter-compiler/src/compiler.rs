@@ -62,6 +62,17 @@ pub(crate) struct Compiler {
     /// `<main>` locals. Empty for modules and eval bodies (eval
     /// lexicals are private to the eval, §19.2.1.1).
     pub(crate) script_global_lexicals: std::collections::HashSet<String>,
+    /// `true` while lowering class instance-field initializers
+    /// (which compile into the constructor frame). A direct eval
+    /// there may use `new.target` but observes `undefined`
+    /// (§15.7.10 — field initializers are their own function-like
+    /// code with no [[NewTarget]]). Cleared on entry to any nested
+    /// non-arrow function.
+    pub(crate) in_field_initializer: bool,
+    /// `true` when this eval body's caller permits `new.target` —
+    /// inherited so a nested direct eval keeps the signal
+    /// (§19.2.1.1 step 5).
+    pub(crate) eval_new_target_allowed: bool,
 }
 
 impl Compiler {
@@ -74,6 +85,8 @@ impl Compiler {
             in_eval: false,
             script_global_vars: std::collections::HashSet::new(),
             script_global_lexicals: std::collections::HashSet::new(),
+            in_field_initializer: false,
+            eval_new_target_allowed: false,
         }
     }
 

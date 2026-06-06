@@ -38,6 +38,7 @@ pub(crate) fn compile_for_of_statement(
     s: &oxc_ast::ast::ForOfStatement<'_>,
 ) -> Result<Option<u16>, CompileError> {
     let span = (s.span.start, s.span.end);
+    cx.emit_completion_reset(span);
     let is_for_await = s.r#await;
 
     // §14.7.5 — a single-identifier `for (let x of RHS)` /
@@ -267,6 +268,7 @@ pub(crate) fn compile_for_in_statement(
     s: &oxc_ast::ast::ForInStatement<'_>,
 ) -> Result<Option<u16>, CompileError> {
     let span = (s.span.start, s.span.end);
+    cx.emit_completion_reset(span);
 
     // Lower through the VM's internal for-in enumerable-key snapshot
     // helper. It intentionally does not alias `Object.keys`: `keys`

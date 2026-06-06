@@ -24,6 +24,7 @@ pub(crate) fn compile_with_statement(
     w: &oxc_ast::ast::WithStatement<'_>,
 ) -> Result<Option<u16>, CompileError> {
     let span = (w.span.start, w.span.end);
+    cx.emit_completion_reset(span);
     if cx.is_strict {
         return Err(CompileError::Unsupported {
             node: "WithStatement is forbidden in strict mode / ES modules (§14.13)".to_string(),

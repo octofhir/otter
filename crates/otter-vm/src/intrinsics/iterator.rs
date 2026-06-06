@@ -1535,13 +1535,46 @@ fn require_sync_generator(
     }
 }
 
+/// Resume the generator receiver directly so the method argument
+/// threads into the suspended frame (§27.5.3.3 — `next(value)` is
+/// the resume value; the generic iterator path drops it).
+fn generator_proto_resume(
+    ctx: &mut crate::NativeCtx<'_>,
+    name: &'static str,
+    kind: crate::GeneratorResumeKind,
+) -> Result<Value, crate::NativeError> {
+    let this = *ctx.this_value();
+    let g = this
+        .as_generator()
+        .ok_or_else(|| crate::NativeError::TypeError {
+            name,
+            reason: "receiver is not a generator object".to_string(),
+        })?;
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name,
+                reason: "missing execution context".to_string(),
+            })?;
+    ctx.cx
+        .interp
+        .resume_generator(&exec_ctx, &g, kind)
+        .map_err(|e| crate::native_function::vm_to_native_error(e, name))
+}
+
 /// §27.5.1.2 `%GeneratorPrototype%.next(value)`.
 pub(crate) fn generator_proto_next(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
     require_sync_generator(ctx, "Generator.prototype.next")?;
-    iterator_proto_next(ctx, args)
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
+    generator_proto_resume(
+        ctx,
+        "Generator.prototype.next",
+        crate::GeneratorResumeKind::Next(arg),
+    )
 }
 
 /// §27.5.1.4 `%GeneratorPrototype%.return(value)`.
@@ -1550,7 +1583,12 @@ pub(crate) fn generator_proto_return(
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
     require_sync_generator(ctx, "Generator.prototype.return")?;
-    iterator_proto_return(ctx, args)
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
+    generator_proto_resume(
+        ctx,
+        "Generator.prototype.return",
+        crate::GeneratorResumeKind::Return(arg),
+    )
 }
 
 /// §27.5.1.5 `%GeneratorPrototype%.throw(exception)`.
@@ -1559,7 +1597,12 @@ pub(crate) fn generator_proto_throw(
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
     require_sync_generator(ctx, "Generator.prototype.throw")?;
-    iterator_proto_throw(ctx, args)
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
+    generator_proto_resume(
+        ctx,
+        "Generator.prototype.throw",
+        crate::GeneratorResumeKind::Throw(arg),
+    )
 }
 
 /// §27.6.1 AsyncGeneratorValidate-shaped guard: a wrong receiver

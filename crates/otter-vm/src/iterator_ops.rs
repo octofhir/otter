@@ -1169,6 +1169,34 @@ impl Interpreter {
         if let Some(c) = cold {
             self.frame_attach_cold(&mut frame, c);
         }
+        // §27.5.3.7 — a frame parked on `Op::YieldDelegate` receives
+        // every resume kind as data (kind code + argument) so the
+        // compiled `yield*` loop can forward it to the inner
+        // iterator's next / throw / return method instead of the
+        // generator unwinding or completing.
+        let delegating = handle.is_delegating(&self.gc_heap);
+        if delegating {
+            handle.clear_delegating(&mut self.gc_heap);
+            let kind_dst = handle.resume_kind_dst(&self.gc_heap);
+            let (code, arg) = match &kind {
+                GeneratorResumeKind::Next(v) => (0, *v),
+                GeneratorResumeKind::Throw(v) => (1, *v),
+                GeneratorResumeKind::Return(v) => (2, *v),
+            };
+            if let Some(slot) = frame.registers.get_mut(kind_dst as usize) {
+                *slot = Value::number_i32(code);
+            }
+            if let Some(slot) = frame.registers.get_mut(resume_dst as usize) {
+                *slot = arg;
+            }
+            let is_async = handle.is_async(&self.gc_heap);
+            if is_async {
+                handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::Executing);
+            }
+            let mut sub_stack: SmallVec<[Frame; 8]> = SmallVec::new();
+            sub_stack.push(*frame);
+            return self.finish_generator_dispatch(context, handle, sub_stack, is_async);
+        }
         // Apply the resume operation to the frame before re-entering
         // dispatch.
         let mut throw_value: Option<Value> = None;
@@ -1254,6 +1282,19 @@ impl Interpreter {
         if is_async {
             handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::Executing);
         }
+        self.finish_generator_dispatch(context, handle, sub_stack, is_async)
+    }
+
+    /// Run the resumed generator frame to its next suspension or
+    /// completion and shape the `.next()` result. Shared by the
+    /// ordinary resume path and the §27.5.3.7 delegating resume.
+    fn finish_generator_dispatch(
+        &mut self,
+        context: &ExecutionContext,
+        handle: &crate::generator::JsGenerator,
+        mut sub_stack: SmallVec<[Frame; 8]>,
+        is_async: bool,
+    ) -> Result<Value, VmError> {
         let outcome = self.dispatch_loop(context, &mut sub_stack);
         match outcome {
             Ok(value) => {
@@ -1267,6 +1308,11 @@ impl Interpreter {
                     // `Op::Yield`.
                     if is_async {
                         return Ok(Value::undefined());
+                    }
+                    // §27.5.3.7 — a delegating suspension surfaces
+                    // the inner iterator result object verbatim.
+                    if handle.is_delegating(&self.gc_heap) {
+                        return Ok(v);
                     }
                     return self.make_runtime_rooted_iter_result(v, false, &[], &[]);
                 }

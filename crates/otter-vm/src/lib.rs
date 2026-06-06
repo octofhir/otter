@@ -3600,6 +3600,30 @@ impl Interpreter {
                 // resume site (i.e. the enclosing
                 // [`Self::resume_generator`] call).
                 // <https://tc39.es/ecma262/#sec-yield>
+                // §27.5.3.7 `yield*` delegating suspension — parks
+                // the frame with the inner iterator result surfaced
+                // verbatim; resume delivers (kind, value) into the
+                // two destination registers without unwinding.
+                Op::YieldDelegate => {
+                    let (kind_dst, value_dst, src) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let yielded = *read_register(&stack[top_idx], src)?;
+                    let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+                    let owner = frame.generator_owner.ok_or(VmError::TypeMismatch)?;
+                    frame.advance_pc(self.current_byte_len)?;
+                    let mut popped = stack.pop().expect("frame present");
+                    let detached_cold = self.frame_detach_cold(&mut popped);
+                    owner.park_after_yield_delegate(
+                        &mut self.gc_heap,
+                        popped,
+                        detached_cold,
+                        kind_dst,
+                        value_dst,
+                        yielded,
+                    );
+                    return Ok(Value::undefined());
+                }
                 Op::Yield => {
                     let dst = register_operand(context.exec_operand(instr, 0))?;
                     let src = register_operand(context.exec_operand(instr, 1))?;

@@ -955,5 +955,6 @@ mod tests {
         Op::ToNumeric,
         Op::PrivateGet,
         Op::PrivateSet,
+        Op::YieldDelegate,
     ];
 }

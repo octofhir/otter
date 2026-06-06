@@ -1153,6 +1153,20 @@ pub enum Op {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-privateset>
     PrivateSet,
+
+    /// `yield*` delegating suspension per §27.5.3.7. Parks the
+    /// generator frame with `r<src>` (the inner iterator result
+    /// object) as the value surfaced verbatim from the outer
+    /// `.next()`. On resume the runtime writes the resume kind code
+    /// into `r<kind_dst>` (0 = next, 1 = throw, 2 = return) and the
+    /// resume argument into `r<value_dst>` — abrupt resumes do NOT
+    /// unwind the body; the compiled delegation loop forwards them
+    /// to the inner iterator's `throw` / `return` method. Operands:
+    /// `Register(kind_dst), Register(value_dst), Register(src)`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-generator-function-definitions-runtime-semantics-evaluation>
+    YieldDelegate,
 }
 
 impl Op {
@@ -1309,6 +1323,7 @@ impl Op {
             Op::ToNumeric => "TO_NUMERIC",
             Op::PrivateGet => "PRIVATE_GET",
             Op::PrivateSet => "PRIVATE_SET",
+            Op::YieldDelegate => "YIELD_DELEGATE",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
@@ -1430,6 +1445,7 @@ impl Op {
             | Op::DefineGlobalFunction
             | Op::PrivateGet
             | Op::PrivateSet
+            | Op::YieldDelegate
             | Op::StoreGlobalBinding => 3,
             Op::GetPrototype
             | Op::SetPrototype

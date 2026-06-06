@@ -404,14 +404,10 @@ impl Interpreter {
             function_metadata::bound_delete_own_property(&bound, &mut self.gc_heap, name)
         } else if let Some(t) = receiver.as_typed_array(&self.gc_heap) {
             if let Some(n) = canonical_numeric_index_string(name) {
-                if t.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
-                    true
-                } else {
-                    !(n.is_finite()
-                        && n.fract() == 0.0
-                        && n >= 0.0
-                        && (n as usize) < t.length(&self.gc_heap))
-                }
+                // §10.4.5.10 [[Delete]] — a valid integer index is a
+                // non-configurable element (false); anything else
+                // deletes vacuously (true).
+                typed_array_valid_index(&t, &self.gc_heap, n).is_none()
             } else if let Some(bag) = t.expando(&self.gc_heap) {
                 crate::object::delete(bag, &mut self.gc_heap, name)
             } else {
@@ -583,16 +579,7 @@ impl Interpreter {
             if let Some(s) = idx.as_string(&self.gc_heap) {
                 let name = s.to_lossy_string(&self.gc_heap);
                 match canonical_numeric_index_string(&name) {
-                    Some(n) => {
-                        if t.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
-                            true
-                        } else {
-                            !(n.is_finite()
-                                && n.fract() == 0.0
-                                && n >= 0.0
-                                && (n as usize) < t.length(&self.gc_heap))
-                        }
-                    }
+                    Some(n) => typed_array_valid_index(&t, &self.gc_heap, n).is_none(),
                     None => {
                         if let Some(bag) = t.expando(&self.gc_heap) {
                             crate::object::delete(bag, &mut self.gc_heap, &name)
@@ -1188,9 +1175,16 @@ impl Interpreter {
                 }
             }
         } else if let Some(t) = receiver.as_typed_array(&self.gc_heap) {
-            // §10.4.5.4 [[Get]] — check the expando bag before
-            // per-kind built-ins so user-installed properties win.
-            if let Some(bag) = t.expando(&self.gc_heap)
+            // §10.4.5.4 [[Get]] — a canonical numeric index never
+            // consults the expando bag or the prototype chain: it is
+            // the element value, or `undefined` when invalid
+            // (out-of-bounds, fractional, `-0`, detached buffer).
+            if let Some(n) = canonical_numeric_index_string(name) {
+                match typed_array_valid_index(&t, &self.gc_heap, n) {
+                    Some(idx) => t.get(&mut self.gc_heap, idx).map_err(crate::oom_to_vm)?,
+                    None => Value::undefined(),
+                }
+            } else if let Some(bag) = t.expando(&self.gc_heap)
                 && let Some(value) = crate::object::get(bag, &self.gc_heap, name)
             {
                 value
@@ -1792,15 +1786,9 @@ impl Interpreter {
             if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let name = key.to_lossy_string(&self.gc_heap);
                 if let Some(n) = canonical_numeric_index_string(&name) {
-                    if n.is_finite()
-                        && n.fract() == 0.0
-                        && n >= 0.0
-                        && (n as usize) < t.length(&self.gc_heap)
-                    {
-                        t.get(&mut self.gc_heap, n as usize)
-                            .map_err(crate::oom_to_vm)?
-                    } else {
-                        Value::undefined()
+                    match typed_array_valid_index(&t, &self.gc_heap, n) {
+                        Some(idx) => t.get(&mut self.gc_heap, idx).map_err(crate::oom_to_vm)?,
+                        None => Value::undefined(),
                     }
                 } else {
                     let mut value = Value::undefined();
@@ -2323,13 +2311,8 @@ impl Interpreter {
             };
             if let Some(nf) = numeric_index {
                 let converted = self.typed_array_coerce_element(context, t.kind(), value)?;
-                let valid = !t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
-                    && nf.is_finite()
-                    && nf.fract() == 0.0
-                    && nf >= 0.0
-                    && (nf as usize) < t.length(&self.gc_heap);
-                if valid {
-                    t.set(&mut self.gc_heap, nf as usize, &converted);
+                if let Some(idx) = typed_array_valid_index(&t, &self.gc_heap, nf) {
+                    t.set(&mut self.gc_heap, idx, &converted);
                 }
             } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let bag = typed_array_ensure_expando(self, &t)?;
@@ -4454,6 +4437,32 @@ pub(crate) fn canonical_numeric_index_string(s: &str) -> Option<f64> {
     let n: f64 = s.parse().ok()?;
     let formatted = crate::number::NumberValue::from_f64(n).to_display_string();
     if formatted == s { Some(n) } else { None }
+}
+
+/// §10.4.5.14 IsValidIntegerIndex — `Some(index)` when `n` addresses
+/// a live element of `t`: the buffer is attached, `n` is an integer,
+/// not `-0`, non-negative, and below the view length. Every
+/// TypedArray exotic internal method funnels its canonical-numeric
+/// validity check through here so `-0` / fractional / out-of-bounds
+/// keys behave identically across [[Get]] / [[Set]] /
+/// [[GetOwnProperty]] / [[DefineOwnProperty]] / [[HasProperty]] /
+/// [[Delete]].
+pub(crate) fn typed_array_valid_index(
+    t: &crate::binary::typed_array::JsTypedArray,
+    heap: &otter_gc::GcHeap,
+    n: f64,
+) -> Option<usize> {
+    if t.buffer(heap).is_detached(heap) {
+        return None;
+    }
+    if !n.is_finite() || n.fract() != 0.0 || n.is_sign_negative() {
+        return None;
+    }
+    let idx = n as usize;
+    if idx >= t.length(heap) {
+        return None;
+    }
+    Some(idx)
 }
 
 /// Lazy-allocate (and cache) the TypedArray expando JsObject used

@@ -1605,11 +1605,8 @@ pub fn call(
                     PropertyKey::String(k) => {
                         if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(k)
                         {
-                            if t.buffer(gc_heap).is_detached(gc_heap)
-                                || !n.is_finite()
-                                || n.fract() != 0.0
-                                || n < 0.0
-                                || (n as usize) >= t.length(gc_heap)
+                            if crate::property_dispatch::typed_array_valid_index(&t, gc_heap, n)
+                                .is_none()
                                 || descriptor.configurable == Some(false)
                                 || descriptor.enumerable == Some(false)
                                 || descriptor.writable == Some(false)
@@ -1628,7 +1625,11 @@ pub fn call(
                                     t.kind(),
                                     &value,
                                 )?;
-                                t.set(gc_heap, n as usize, &coerced);
+                                let idx = crate::property_dispatch::typed_array_valid_index(
+                                    &t, gc_heap, n,
+                                )
+                                .expect("validated above");
+                                t.set(gc_heap, idx, &coerced);
                             }
                         } else {
                             let bag = crate::property_dispatch::typed_array_ensure_expando_pub(
@@ -1879,6 +1880,11 @@ pub fn call(
                 native.prevent_extensions(gc_heap);
             } else if let Some(r) = arg.as_regexp() {
                 r.prevent_extensions(gc_heap);
+            } else if let Some(t) = arg.as_typed_array(gc_heap) {
+                // §10.4.5 — TypedArray extensibility lives on the lazy
+                // expando bag; elements are exempt.
+                let bag = crate::property_dispatch::typed_array_ensure_expando_pub(gc_heap, &t)?;
+                crate::object::prevent_extensions(bag, gc_heap);
             }
             Ok(arg)
         }
@@ -1940,6 +1946,9 @@ pub fn call(
                 native.is_extensible(gc_heap)
             } else if let Some(r) = arg.as_regexp() {
                 r.is_extensible(gc_heap)
+            } else if let Some(t) = arg.as_typed_array(gc_heap) {
+                t.expando(gc_heap)
+                    .is_none_or(|bag| crate::object::is_extensible(bag, gc_heap))
             } else {
                 // §20.1.2.14 step 2 — non-Object returns false; every
                 // spec-Object kind reaches here only when none of the
@@ -2113,6 +2122,20 @@ pub fn call(
             } else if let Some(s) = first.and_then(|v| v.as_string(gc_heap)) {
                 let mut keys: Vec<String> = (0..s.len()).map(|idx| idx.to_string()).collect();
                 keys.push("length".to_string());
+                keys
+            } else if let Some(t) = first.and_then(|v| v.as_typed_array(gc_heap)) {
+                // §10.4.5.11 [[OwnPropertyKeys]] — element indices in
+                // ascending order, then expando string keys.
+                let mut keys: Vec<String> = if t.buffer(gc_heap).is_detached(gc_heap) {
+                    Vec::new()
+                } else {
+                    (0..t.length(gc_heap)).map(|idx| idx.to_string()).collect()
+                };
+                if let Some(bag) = t.expando(gc_heap) {
+                    keys.extend(crate::object::with_properties(bag, gc_heap, |p| {
+                        p.keys().map(|k| k.to_string()).collect::<Vec<_>>()
+                    }));
+                }
                 keys
             } else {
                 return Err(VmError::TypeMismatch);

@@ -941,6 +941,11 @@ impl Interpreter {
         if let Some(obj) = value.as_object() {
             return Ok(object::is_extensible(obj, &self.gc_heap));
         }
+        if let Some(t) = value.as_typed_array(&self.gc_heap) {
+            return Ok(t
+                .expando(&self.gc_heap)
+                .is_none_or(|bag| object::is_extensible(bag, &self.gc_heap)));
+        }
         if let Some(arr) = value.as_array() {
             return Ok(array::is_extensible(arr, &self.gc_heap));
         }
@@ -1384,12 +1389,12 @@ impl Interpreter {
                 return Ok(false);
             };
             if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(name) {
-                if t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
-                    || !n.is_finite()
-                    || n.fract() != 0.0
-                    || n < 0.0
-                    || (n as usize) >= t.length(&self.gc_heap)
-                    || descriptor.configurable == Some(false)
+                let Some(idx) =
+                    crate::property_dispatch::typed_array_valid_index(&t, &self.gc_heap, n)
+                else {
+                    return Ok(false);
+                };
+                if descriptor.configurable == Some(false)
                     || descriptor.enumerable == Some(false)
                     || descriptor.writable == Some(false)
                     || descriptor.is_accessor()
@@ -1402,7 +1407,7 @@ impl Interpreter {
                     // its coercion and throwing for a Symbol / cross-type)
                     // before storing it.
                     let coerced = self.typed_array_coerce_element(context, t.kind(), value)?;
-                    t.set(&mut self.gc_heap, n as usize, &coerced);
+                    t.set(&mut self.gc_heap, idx, &coerced);
                 }
                 return Ok(true);
             }
@@ -2152,6 +2157,39 @@ impl Interpreter {
                 None => self.own_property_keys_value(context, &proxy.target(&self.gc_heap)),
             };
         }
+        // §10.4.5.11 TypedArray [[OwnPropertyKeys]] — integer indices
+        // in ascending order, then expando string keys in insertion
+        // order, then expando symbol keys.
+        if let Some(t) = target.as_typed_array(&self.gc_heap) {
+            let mut keys: Vec<Value> = Vec::new();
+            if !t.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
+                let len = t.length(&self.gc_heap);
+                keys.reserve(len);
+                for idx in 0..len {
+                    keys.push(Value::string(
+                        string::JsString::from_str(&idx.to_string(), &mut self.gc_heap)
+                            .map_err(VmError::from)?,
+                    ));
+                }
+            }
+            if let Some(bag) = t.expando(&self.gc_heap) {
+                let (strings, symbols): (Vec<String>, Vec<Value>) =
+                    object::with_properties(bag, &self.gc_heap, |p| {
+                        (
+                            p.keys().map(str::to_string).collect(),
+                            p.symbol_keys().map(Value::symbol).collect(),
+                        )
+                    });
+                for name in strings {
+                    keys.push(Value::string(
+                        string::JsString::from_str(&name, &mut self.gc_heap)
+                            .map_err(VmError::from)?,
+                    ));
+                }
+                keys.extend(symbols);
+            }
+            return Ok(keys);
+        }
         if let Some(obj) = target.as_object() {
             let mut keys: Vec<Value> = Vec::new();
             let string_data = object::string_data(obj, &self.gc_heap);
@@ -2676,6 +2714,14 @@ impl Interpreter {
         }
         if let Some(obj) = value.as_object() {
             object::prevent_extensions(obj, &mut self.gc_heap);
+            return Ok(true);
+        }
+        // §10.4.5 — a TypedArray's extensibility lives on its lazy
+        // expando bag (elements are exempt from [[Extensible]]).
+        if let Some(t) = value.as_typed_array(&self.gc_heap) {
+            let bag =
+                crate::property_dispatch::typed_array_ensure_expando_pub(&mut self.gc_heap, &t)?;
+            object::prevent_extensions(bag, &mut self.gc_heap);
             return Ok(true);
         }
         if let Some(arr) = value.as_array() {
@@ -3309,10 +3355,13 @@ impl Interpreter {
                     .string_name()
                     .expect("non-symbol key has string spelling");
                 if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(name) {
-                    let value = if n.is_finite() && n.fract() == 0.0 && n >= 0.0 {
-                        t.get(&mut self.gc_heap, n as usize)?
-                    } else {
-                        Value::undefined()
+                    let value = match crate::property_dispatch::typed_array_valid_index(
+                        &t,
+                        &self.gc_heap,
+                        n,
+                    ) {
+                        Some(idx) => t.get(&mut self.gc_heap, idx)?,
+                        None => Value::undefined(),
                     };
                     return Ok(VmGetOutcome::Value(value));
                 }
@@ -3537,17 +3586,13 @@ impl Interpreter {
         if let Some(t) = base.as_typed_array(&self.gc_heap) {
             if let Some(name) = key.string_name() {
                 if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(name) {
-                    if t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
-                        || !n.is_finite()
-                        || n.fract() != 0.0
-                        || n < 0.0
-                        || (n as usize) >= t.length(&self.gc_heap)
-                    {
+                    let Some(idx) =
+                        crate::property_dispatch::typed_array_valid_index(&t, &self.gc_heap, n)
+                    else {
                         return Ok(VmGetOutcome::Value(Value::undefined()));
-                    }
+                    };
                     return Ok(VmGetOutcome::Value(
-                        t.get(&mut self.gc_heap, n as usize)
-                            .map_err(crate::oom_to_vm)?,
+                        t.get(&mut self.gc_heap, idx).map_err(crate::oom_to_vm)?,
                     ));
                 }
                 if let Some(bag) = t.expando(&self.gc_heap)
@@ -4376,6 +4421,93 @@ impl Interpreter {
             && object::module_namespace_env(obj, &self.gc_heap).is_some()
         {
             return Ok(false);
+        }
+        // §10.4.5.5 TypedArray exotic [[Set]]. A canonical numeric
+        // key with the typed array itself as receiver runs
+        // TypedArraySetElement (§10.4.5.16): the value conversion
+        // fires even when the index is invalid, and the result is
+        // `true` regardless. With a foreign receiver, an invalid
+        // index returns `true` without any write; a valid one falls
+        // through to ordinary receiver semantics.
+        if let Some(t) = target.as_typed_array(&self.gc_heap) {
+            match key {
+                VmPropertyKey::Symbol(sym) => {
+                    let bag = crate::property_dispatch::typed_array_ensure_expando_pub(
+                        &mut self.gc_heap,
+                        &t,
+                    )?;
+                    return Ok(object::set_symbol(bag, &mut self.gc_heap, *sym, value));
+                }
+                _ => {
+                    let name = key
+                        .string_name()
+                        .expect("non-symbol key has string spelling")
+                        .to_string();
+                    if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(&name)
+                    {
+                        let same_receiver = receiver
+                            .as_typed_array(&self.gc_heap)
+                            .is_some_and(|r| r == t);
+                        if same_receiver {
+                            let coerced =
+                                self.typed_array_coerce_element(context, t.kind(), value)?;
+                            if let Some(idx) = crate::property_dispatch::typed_array_valid_index(
+                                &t,
+                                &self.gc_heap,
+                                n,
+                            ) {
+                                t.set(&mut self.gc_heap, idx, &coerced);
+                            }
+                            return Ok(true);
+                        }
+                        if crate::property_dispatch::typed_array_valid_index(&t, &self.gc_heap, n)
+                            .is_none()
+                        {
+                            return Ok(true);
+                        }
+                        return self.ordinary_set_data_value(
+                            context,
+                            receiver,
+                            key,
+                            value,
+                            receiver,
+                            hops + 1,
+                        );
+                    }
+                    let bag = crate::property_dispatch::typed_array_ensure_expando_pub(
+                        &mut self.gc_heap,
+                        &t,
+                    )?;
+                    // OrdinarySet on the expando: an own non-writable
+                    // data property rejects, an own accessor invokes
+                    // its setter (receiver = the typed array), and a
+                    // fresh key requires the bag to be extensible.
+                    match object::lookup_own(bag, &self.gc_heap, &name) {
+                        object::PropertyLookup::Data { flags, .. } => {
+                            if !flags.writable() {
+                                return Ok(false);
+                            }
+                            object::set(bag, &mut self.gc_heap, &name, value);
+                            return Ok(true);
+                        }
+                        object::PropertyLookup::Accessor { setter, .. } => {
+                            let Some(setter) = setter else {
+                                return Ok(false);
+                            };
+                            let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
+                            self.run_callable_sync(context, &setter, receiver, argv)?;
+                            return Ok(true);
+                        }
+                        object::PropertyLookup::Absent => {
+                            if !object::is_extensible(bag, &self.gc_heap) {
+                                return Ok(false);
+                            }
+                            object::set(bag, &mut self.gc_heap, &name, value);
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
         }
         if let Some(proxy) = target.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {

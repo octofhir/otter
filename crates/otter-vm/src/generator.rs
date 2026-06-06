@@ -297,6 +297,12 @@ impl JsGenerator {
         heap.record_write(self.inner, &barrier_value);
     }
 
+    /// Sentinel `resume_dst` for a frame parked at `GeneratorStart`:
+    /// §27.5.3.3 discards the value passed to the first `next()`, so
+    /// resume must not write it into any register (register 0 is a
+    /// live local — e.g. the `arguments` binding).
+    pub const RESUME_DST_NONE: u16 = u16::MAX;
+
     /// Store a frame that is suspended before the first body
     /// statement runs.
     pub fn park_frame(
@@ -308,6 +314,7 @@ impl JsGenerator {
         heap.with_payload(self.inner, |body| {
             body.frame = Some(Box::new(frame));
             body.cold = cold;
+            body.resume_dst = Self::RESUME_DST_NONE;
             body.yielded = None;
         });
     }

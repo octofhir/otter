@@ -97,6 +97,17 @@ pub(crate) fn compile_function_full(
     });
 
     predeclare_formal_parameters(parent, params, allow_duplicate_formals, span)?;
+    // §10.2.11 step 22 — bind `arguments` BEFORE
+    // IteratorBindingInitialization (step 24), so a parameter
+    // default expression like `x = arguments[0]` resolves the
+    // arguments object. Skip if a formal named `arguments` exists.
+    if needs_arguments && parent.lookup_binding("arguments").is_none() {
+        let storage = parent.declare_binding("arguments", false, span)?;
+        let tmp = parent.alloc_scratch();
+        parent.emit(Op::CollectArguments, [Operand::Register(tmp)], span);
+        parent.emit_store_storage(tmp, storage, span);
+        parent.mark_initialized("arguments");
+    }
     // Bind every formal parameter, in source order. Side-effects
     // (default-value evaluation, iterator-protocol calls for array
     // patterns) follow the spec's per-call ordering.
@@ -139,17 +150,6 @@ pub(crate) fn compile_function_full(
     // every `var`-declared name in the body to the function scope
     // and pre-bind it to `undefined`. Reads before the source-level
     // declaration site observe the hoisted `undefined` (no TDZ).
-    if needs_arguments && parent.lookup_binding("arguments").is_none() {
-        // §10.2.11 FunctionDeclarationInstantiation step 22 — bind
-        // `arguments` in the function scope before any var/lex
-        // declaration so user code reading it gets the array.
-        // Skip if a parameter named `arguments` already exists.
-        let storage = parent.declare_binding("arguments", false, span)?;
-        let tmp = parent.alloc_scratch();
-        parent.emit(Op::CollectArguments, [Operand::Register(tmp)], span);
-        parent.emit_store_storage(tmp, storage, span);
-        parent.mark_initialized("arguments");
-    }
     let mut direct_eval_meta: Vec<otter_bytecode::DirectEvalBinding> = Vec::new();
     if let Some(body) = body {
         let mut var_names: Vec<String> = Vec::new();

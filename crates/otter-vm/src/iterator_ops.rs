@@ -1175,7 +1175,10 @@ impl Interpreter {
         let mut return_value: Option<Value> = None;
         match &kind {
             GeneratorResumeKind::Next(arg) => {
+                // §27.5.3.3 — the value passed to the first `next()`
+                // (frame parked at GeneratorStart) is discarded.
                 if frame.pc != 0
+                    && resume_dst != crate::generator::JsGenerator::RESUME_DST_NONE
                     && let Some(slot) = frame.registers.get_mut(resume_dst as usize)
                 {
                     *slot = *arg;

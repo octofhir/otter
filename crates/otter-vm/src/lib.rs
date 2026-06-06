@@ -4682,6 +4682,104 @@ impl Interpreter {
                     self.run_init_global_lex_reg(context, frame, value_reg, name_idx)?;
                     continue;
                 }
+                // §7.3.7 CreateDataPropertyOrThrow — object literal
+                // property definition; never consults inherited
+                // setters (unlike StoreProperty's Set semantics).
+                Op::DefineDataProperty => {
+                    let (obj_reg, key_reg, value_reg) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let target = *read_register(&stack[top_idx], obj_reg)?;
+                    let key_value = *read_register(&stack[top_idx], key_reg)?;
+                    let value = *read_register(&stack[top_idx], value_reg)?;
+                    let key = self.to_property_key_sync(context, key_value)?;
+                    // Fast path: a plain object receiver takes the
+                    // shape-friendly construction-time store (no
+                    // prototype consult — define semantics).
+                    if let Some(obj) = target.as_object() {
+                        match &key {
+                            VmPropertyKey::Symbol(sym) => {
+                                object::set_symbol(obj, &mut self.gc_heap, *sym, value);
+                            }
+                            _ => {
+                                let name = key
+                                    .string_name()
+                                    .expect("non-symbol key has string spelling")
+                                    .to_string();
+                                self.set_property(obj, &name, value)?;
+                            }
+                        }
+                    } else {
+                        let descriptor = object::PartialPropertyDescriptor {
+                            value: Some(value),
+                            writable: Some(true),
+                            enumerable: Some(true),
+                            configurable: Some(true),
+                            ..Default::default()
+                        };
+                        if !self.define_own_property_value(context, &target, &key, descriptor)? {
+                            return Err(VmError::TypeError {
+                                message: "Cannot define property on object literal".to_string(),
+                            });
+                        }
+                    }
+                    let frame = &mut stack[top_idx];
+                    frame.advance_pc(self.current_byte_len)?;
+                    continue;
+                }
+                // §10.2.10 SetFunctionName — names an anonymous
+                // function from a run-time property key.
+                Op::SetFunctionName => {
+                    let fn_reg = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let key_reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let prefix_idx = context
+                        .exec_const_index(instr, 2)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let callee = *read_register(&stack[top_idx], fn_reg)?;
+                    let key_value = *read_register(&stack[top_idx], key_reg)?;
+                    let prefix = context
+                        .property_atom(prefix_idx)
+                        .map(|atom| atom.name().to_string())
+                        .unwrap_or_default();
+                    let mut name = if let Some(sym) = key_value.as_symbol(&self.gc_heap) {
+                        match sym.description() {
+                            Some(desc) => format!("[{}]", desc.to_lossy_string(&self.gc_heap)),
+                            None => String::new(),
+                        }
+                    } else {
+                        key_value.display_string(&self.gc_heap)
+                    };
+                    if !prefix.is_empty() {
+                        name = format!("{prefix} {name}");
+                    }
+                    if let Some(fid) = callee.as_function().or_else(|| {
+                        callee
+                            .as_closure(&self.gc_heap)
+                            .map(|c| c.cached_function_id)
+                    }) {
+                        let name_str = JsString::from_str(&name, &mut self.gc_heap)?;
+                        let descriptor = object::PropertyDescriptor {
+                            kind: object::DescriptorKind::Data {
+                                value: Value::string(name_str),
+                            },
+                            flags: object::PropertyFlags::new(false, false, true),
+                        };
+                        self.ordinary_function_define_own_property(
+                            Some(context),
+                            fid,
+                            "name",
+                            None,
+                            descriptor,
+                        )?;
+                    }
+                    let frame = &mut stack[top_idx];
+                    frame.advance_pc(self.current_byte_len)?;
+                    continue;
+                }
                 // §7.3.31 PrivateGet — brand check (absent name
                 // throws), accessor-without-getter throws, accessor
                 // invokes its getter with the receiver as `this`.

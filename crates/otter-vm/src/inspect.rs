@@ -956,5 +956,7 @@ mod tests {
         Op::PrivateGet,
         Op::PrivateSet,
         Op::YieldDelegate,
+        Op::DefineDataProperty,
+        Op::SetFunctionName,
     ];
 }

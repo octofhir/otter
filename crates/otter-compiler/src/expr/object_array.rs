@@ -132,6 +132,7 @@ pub(crate) fn compile_object_literal(
         cx.emit_store_storage(dst, storage, span);
         cx.mark_initialized(crate::class::SUPER_HOME_NAME);
     }
+    let mut seen_proto = false;
     for prop in &obj.properties {
         match prop {
             oxc_ast::ast::ObjectPropertyKind::ObjectProperty(p) => {
@@ -188,13 +189,24 @@ pub(crate) fn compile_object_literal(
                             }
                         };
                     let function_reg = compile_expr(cx, &p.value, key_span)?;
-                    let desc_reg = cx.alloc_scratch();
-                    cx.emit(Op::NewObject, [Operand::Register(desc_reg)], key_span);
                     let accessor_key = match p.kind {
                         oxc_ast::ast::PropertyKind::Get => "get",
                         oxc_ast::ast::PropertyKind::Set => "set",
                         oxc_ast::ast::PropertyKind::Init => unreachable!(),
                     };
+                    // §10.2.10 SetFunctionName(closure, key, "get"/"set").
+                    let prefix_idx = cx.intern_string_constant(accessor_key);
+                    cx.emit(
+                        Op::SetFunctionName,
+                        [
+                            Operand::Register(function_reg),
+                            Operand::Register(key_reg),
+                            Operand::ConstIndex(prefix_idx),
+                        ],
+                        key_span,
+                    );
+                    let desc_reg = cx.alloc_scratch();
+                    cx.emit(Op::NewObject, [Operand::Register(desc_reg)], key_span);
                     let accessor_const = cx.intern_string_constant(accessor_key);
                     let store_scratch = cx.alloc_scratch();
                     cx.emit(
@@ -266,23 +278,140 @@ pub(crate) fn compile_object_literal(
                             }
                         };
                     let value_reg = compile_expr(cx, &p.value, key_span)?;
-                    cx.emit_store_element(dst, key_reg, value_reg, key_span);
+                    // §13.2.5.5 — `[expr]: AnonymousFunctionDefinition`
+                    // names the function from the evaluated key.
+                    if expression_is_anonymous_function(&p.value) {
+                        let empty_idx = cx.intern_string_constant("");
+                        cx.emit(
+                            Op::SetFunctionName,
+                            [
+                                Operand::Register(value_reg),
+                                Operand::Register(key_reg),
+                                Operand::ConstIndex(empty_idx),
+                            ],
+                            key_span,
+                        );
+                    }
+                    // §7.3.7 CreateDataPropertyOrThrow — a computed key
+                    // (including `['__proto__']`) defines an own data
+                    // property and never trips inherited setters.
+                    cx.emit(
+                        Op::DefineDataProperty,
+                        [
+                            Operand::Register(dst),
+                            Operand::Register(key_reg),
+                            Operand::Register(value_reg),
+                        ],
+                        key_span,
+                    );
                     continue;
                 }
                 let key_str = static_key_str.expect("non-computed key resolved above");
+                // §B.3.1 __proto__ Property Names in Object Initializers —
+                // a non-shorthand `__proto__: value` sets the
+                // [[Prototype]] directly when the value is an Object
+                // or null, and is otherwise ignored. Shorthand and
+                // computed forms stay ordinary definitions.
+                if key_str == "__proto__"
+                    && !p.shorthand
+                    && !p.method
+                    && matches!(p.kind, oxc_ast::ast::PropertyKind::Init)
+                {
+                    if std::mem::replace(&mut seen_proto, true) {
+                        return Err(CompileError::Syntax {
+                            messages: vec![
+                                "SyntaxError: duplicate __proto__ property in object literal"
+                                    .to_string(),
+                            ],
+                            diagnostics: vec![crate::SyntaxDiagnostic {
+                                code: "DUPLICATE_PROTO".to_string(),
+                                message:
+                                    "SyntaxError: duplicate __proto__ property in object literal"
+                                        .to_string(),
+                                range: Some((p.span.start, p.span.end)),
+                                help: None,
+                            }],
+                        });
+                    }
+                    let value_reg = compile_expr(cx, &p.value, key_span)?;
+                    let type_reg = cx.alloc_scratch();
+                    cx.emit(
+                        Op::TypeOf,
+                        [Operand::Register(type_reg), Operand::Register(value_reg)],
+                        key_span,
+                    );
+                    let object_idx = cx.intern_string_constant("object");
+                    let object_str = cx.alloc_scratch();
+                    cx.emit(
+                        Op::LoadString,
+                        [
+                            Operand::Register(object_str),
+                            Operand::ConstIndex(object_idx),
+                        ],
+                        key_span,
+                    );
+                    let is_object = cx.alloc_scratch();
+                    cx.emit(
+                        Op::Equal,
+                        [
+                            Operand::Register(is_object),
+                            Operand::Register(type_reg),
+                            Operand::Register(object_str),
+                        ],
+                        key_span,
+                    );
+                    let apply =
+                        cx.emit_branch_placeholder(Op::JumpIfTrue, Some(is_object), key_span);
+                    let function_idx = cx.intern_string_constant("function");
+                    let function_str = cx.alloc_scratch();
+                    cx.emit(
+                        Op::LoadString,
+                        [
+                            Operand::Register(function_str),
+                            Operand::ConstIndex(function_idx),
+                        ],
+                        key_span,
+                    );
+                    let is_function = cx.alloc_scratch();
+                    cx.emit(
+                        Op::Equal,
+                        [
+                            Operand::Register(is_function),
+                            Operand::Register(type_reg),
+                            Operand::Register(function_str),
+                        ],
+                        key_span,
+                    );
+                    let skip =
+                        cx.emit_branch_placeholder(Op::JumpIfFalse, Some(is_function), key_span);
+                    cx.patch_branch_to_here(apply);
+                    cx.emit(
+                        Op::SetPrototype,
+                        vec![Operand::Register(dst), Operand::Register(value_reg)],
+                        key_span,
+                    );
+                    cx.patch_branch_to_here(skip);
+                    continue;
+                }
                 // §13.2.5.5 step — `PropertyName: AnonymousFunctionDefinition`
                 // infers the function's name from the property key.
                 let value_reg =
                     crate::expr::compile_expr_with_inferred_name(cx, &p.value, &key_str, key_span)?;
+                // §7.3.7 CreateDataPropertyOrThrow — definitions never
+                // consult inherited setters.
                 let const_idx = cx.intern_string_constant(&key_str);
-                let store_scratch = cx.alloc_scratch();
+                let key_reg = cx.alloc_scratch();
                 cx.emit(
-                    Op::StoreProperty,
-                    vec![
+                    Op::LoadString,
+                    [Operand::Register(key_reg), Operand::ConstIndex(const_idx)],
+                    key_span,
+                );
+                cx.emit(
+                    Op::DefineDataProperty,
+                    [
                         Operand::Register(dst),
-                        Operand::ConstIndex(const_idx),
+                        Operand::Register(key_reg),
                         Operand::Register(value_reg),
-                        Operand::Register(store_scratch),
                     ],
                     key_span,
                 );
@@ -379,4 +508,18 @@ fn object_literal_uses_super_in_methods(obj: &ObjectExpression<'_>) -> bool {
         }
     }
     false
+}
+
+/// `true` when `expr` is an AnonymousFunctionDefinition per
+/// §13.2.5.5 — an unnamed function / generator / async function
+/// expression, an arrow, or an unnamed class expression (possibly
+/// parenthesized).
+fn expression_is_anonymous_function(expr: &Expression<'_>) -> bool {
+    match expr {
+        Expression::ParenthesizedExpression(p) => expression_is_anonymous_function(&p.expression),
+        Expression::FunctionExpression(f) => f.id.is_none(),
+        Expression::ArrowFunctionExpression(_) => true,
+        Expression::ClassExpression(c) => c.id.is_none(),
+        _ => false,
+    }
 }

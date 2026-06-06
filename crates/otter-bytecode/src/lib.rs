@@ -1167,6 +1167,30 @@ pub enum Op {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-generator-function-definitions-runtime-semantics-evaluation>
     YieldDelegate,
+
+    /// `CreateDataPropertyOrThrow(r<obj>, ToPropertyKey(r<key>),
+    /// r<value>)` per §7.3.7 — defines an own
+    /// `{writable, enumerable, configurable: true}` data property
+    /// WITHOUT consulting setters on the prototype chain. Object
+    /// literal property definitions lower through this (a
+    /// `StoreProperty` would observably fire inherited setters,
+    /// e.g. `Object.prototype.__proto__`). Operands:
+    /// `Register(obj), Register(key), Register(value)`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-createdatapropertyorthrow>
+    DefineDataProperty,
+
+    /// `SetFunctionName(r<fn>, r<key>, prefix)` per §10.2.10 — names
+    /// an anonymous function from a run-time property key: a Symbol
+    /// key gives `"[description]"` (or `""` for a description-less
+    /// symbol), anything else coerces to string; a non-empty prefix
+    /// (`"get"` / `"set"`) prepends with a space. Operands:
+    /// `Register(fn), Register(key), ConstIndex(prefix)`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-setfunctionname>
+    SetFunctionName,
 }
 
 impl Op {
@@ -1324,6 +1348,8 @@ impl Op {
             Op::PrivateGet => "PRIVATE_GET",
             Op::PrivateSet => "PRIVATE_SET",
             Op::YieldDelegate => "YIELD_DELEGATE",
+            Op::DefineDataProperty => "DEFINE_DATA_PROPERTY",
+            Op::SetFunctionName => "SET_FUNCTION_NAME",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
@@ -1446,6 +1472,8 @@ impl Op {
             | Op::PrivateGet
             | Op::PrivateSet
             | Op::YieldDelegate
+            | Op::DefineDataProperty
+            | Op::SetFunctionName
             | Op::StoreGlobalBinding => 3,
             Op::GetPrototype
             | Op::SetPrototype
@@ -1569,6 +1597,7 @@ impl Op {
             Op::LoadImportBinding => pos == 1 || pos == 2,
             // [reg, kind_const, reg]
             Op::NewCollection | Op::NewBuiltinError => pos == 1,
+            Op::SetFunctionName => pos == 2,
             // [reg, class_const, reg, reg]
             Op::NewIntl => pos == 1,
             // [reg, name_const, src_reg, scratch_dst]

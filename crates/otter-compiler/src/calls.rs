@@ -414,12 +414,16 @@ pub(crate) fn compile_method_call(
         // have lexical [[ThisMode]] — the restriction never applies
         // to an arrow variable environment.
         let forbid_var_arguments = cx.in_param_init && cx.binds_arguments;
+        // Flag bits: 0 — forbid var-`arguments` (§19.2.1.3); 1 — the
+        // call site sits in a parameter initializer, where the
+        // caller's *body* lexical bindings are not yet in scope.
+        let flags = i32::from(forbid_var_arguments) | (i32::from(cx.in_param_init) << 1);
         cx.emit(
             Op::Eval,
             [
                 Operand::Register(dst),
                 Operand::Register(src_reg),
-                Operand::Imm32(i32::from(forbid_var_arguments)),
+                Operand::Imm32(flags),
             ],
             span,
         );

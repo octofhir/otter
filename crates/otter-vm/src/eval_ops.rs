@@ -80,7 +80,12 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let src_reg = register_operand(operands.get(1))?;
-        let forbid_var_arguments = matches!(operands.get(2), Some(&Operand::Imm32(1)));
+        let flags = match operands.get(2) {
+            Some(&Operand::Imm32(bits)) => bits,
+            _ => 0,
+        };
+        let forbid_var_arguments = flags & 1 != 0;
+        let in_param_init = flags & 2 != 0;
         let top_idx = stack.len() - 1;
         let value = *read_register(&stack[top_idx], src_reg)?;
         let force_strict = context.function_is_strict(stack[top_idx].function_id);
@@ -89,7 +94,8 @@ impl Interpreter {
         // The compiler promoted every caller function-scope binding
         // into a cell and recorded the name → slot table; earlier
         // evals may have extended the frame with more named cells.
-        let (caller_scope, cell_sources) = self.collect_caller_scope(context, &stack[top_idx]);
+        let (caller_scope, cell_sources) =
+            self.collect_caller_scope(context, &stack[top_idx], in_param_init);
         let result = if cell_sources.is_empty() {
             // Script-top-level direct eval: the caller variable
             // environment *is* the global environment, which the
@@ -130,11 +136,18 @@ impl Interpreter {
         &self,
         context: &ExecutionContext,
         frame: &Frame,
+        in_param_init: bool,
     ) -> (Vec<EvalCallerBinding>, Vec<CallerCellSource>) {
         let mut scope: Vec<EvalCallerBinding> = Vec::new();
         let mut sources: Vec<CallerCellSource> = Vec::new();
         if let Some(function) = context.exec_function(frame.function_id) {
             for binding in function.direct_eval_bindings.iter() {
+                // §10.2.11 — body lexical bindings don't exist yet
+                // while parameter initializers run; an eval there
+                // neither sees them nor collides with them.
+                if in_param_init && binding.lexical {
+                    continue;
+                }
                 scope.push(EvalCallerBinding {
                     name: binding.name.to_string(),
                     lexical: binding.lexical,

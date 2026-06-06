@@ -1051,6 +1051,17 @@ pub enum Op {
     /// `Register(dst), ConstIndex(name)`. An unresolvable name
     /// yields `undefined` instead of throwing (§13.5.3).
     TypeofDynamic,
+
+    /// §9.1.1.4.18 CreateGlobalFunctionBinding. Operands:
+    /// `ConstIndex(name), Register(value), Imm32(deletable)`.
+    ///
+    /// An absent or configurable existing own property is redefined
+    /// as `{value, writable: true, enumerable: true, configurable:
+    /// deletable}`; a non-configurable existing property must be a
+    /// writable + enumerable data property (else `TypeError`,
+    /// §9.1.1.4.16 CanDeclareGlobalFunction) and only receives the
+    /// new value. Scripts pass `deletable = 0`, eval bodies `1`.
+    DefineGlobalFunction,
 }
 
 impl Op {
@@ -1198,6 +1209,7 @@ impl Op {
             Op::LoadDynamic => "LOAD_DYNAMIC",
             Op::StoreDynamic => "STORE_DYNAMIC",
             Op::TypeofDynamic => "TYPEOF_DYNAMIC",
+            Op::DefineGlobalFunction => "DEFINE_GLOBAL_FUNCTION",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
@@ -1310,7 +1322,8 @@ impl Op {
             | Op::LooseEqual
             | Op::LooseNotEqual
             | Op::LoadImportBinding
-            | Op::NewBuiltinError => 3,
+            | Op::NewBuiltinError
+            | Op::DefineGlobalFunction => 3,
             Op::GetPrototype
             | Op::SetPrototype
             | Op::ArrayLength
@@ -1417,6 +1430,8 @@ impl Op {
             // [name_const, value_reg]
             Op::DefineGlobalVar => pos == 0,
             Op::DeclareGlobalVar => pos == 0,
+            // [name_const, value_reg, deletable_imm]
+            Op::DefineGlobalFunction => pos == 0,
             // [url_const]
             Op::MarkModuleEvaluated => pos == 0,
             // [gate_dst, url_const]

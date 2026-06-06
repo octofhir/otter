@@ -946,5 +946,6 @@ mod tests {
         Op::LoadDynamic,
         Op::StoreDynamic,
         Op::TypeofDynamic,
+        Op::DefineGlobalFunction,
     ];
 }

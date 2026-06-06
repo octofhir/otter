@@ -143,12 +143,77 @@ impl Interpreter {
                 configurable: Some(configurable),
                 ..Default::default()
             };
-            let _ = object::define_own_property_partial(
+            // §9.1.1.4.15/16 CanDeclareGlobalVar — a non-extensible
+            // global object cannot accept the new binding.
+            if !object::define_own_property_partial(
                 self.global_this,
                 &mut self.gc_heap,
                 name,
                 descriptor,
-            );
+            ) {
+                return Err(VmError::TypeError {
+                    message: format!("Cannot declare global variable '{name}'"),
+                });
+            }
+        }
+        frame.advance_pc(self.current_byte_len)?;
+        Ok(())
+    }
+
+    /// `Op::DefineGlobalFunction` — §9.1.1.4.18
+    /// CreateGlobalFunctionBinding: absent / configurable existing
+    /// own properties are redefined as `{value, writable: true,
+    /// enumerable: true, configurable: deletable}`; a
+    /// non-configurable existing property must be a writable +
+    /// enumerable data property (§9.1.1.4.16 CanDeclareGlobalFunction)
+    /// and only receives the new value.
+    pub(crate) fn run_define_global_function_reg(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut Frame,
+        name_idx: u32,
+        value_reg: u16,
+        deletable: bool,
+    ) -> Result<(), VmError> {
+        let name = context
+            .string_constant_str(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        let value = *crate::read_register(frame, value_reg)?;
+        let existing = object::get_own_descriptor(self.global_this, &self.gc_heap, name);
+        let redefine = match &existing {
+            None => true,
+            Some(descriptor) => descriptor.flags.configurable(),
+        };
+        if redefine {
+            let descriptor = object::PartialPropertyDescriptor {
+                value: Some(value),
+                writable: Some(true),
+                enumerable: Some(true),
+                configurable: Some(deletable),
+                ..Default::default()
+            };
+            if !object::define_own_property_partial(
+                self.global_this,
+                &mut self.gc_heap,
+                name,
+                descriptor,
+            ) {
+                return Err(VmError::TypeError {
+                    message: format!("Cannot declare global function '{name}'"),
+                });
+            }
+        } else {
+            let permitted = existing.as_ref().is_some_and(|descriptor| {
+                matches!(descriptor.kind, object::DescriptorKind::Data { .. })
+                    && descriptor.flags.writable()
+                    && descriptor.flags.enumerable()
+            });
+            if !permitted {
+                return Err(VmError::TypeError {
+                    message: format!("Cannot declare global function '{name}'"),
+                });
+            }
+            object::set(self.global_this, &mut self.gc_heap, name, value);
         }
         frame.advance_pc(self.current_byte_len)?;
         Ok(())

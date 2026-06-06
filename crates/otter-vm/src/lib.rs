@@ -4590,6 +4590,20 @@ impl Interpreter {
                     self.run_typeof_dynamic_reg(context, frame, dst, name_idx)?;
                     continue;
                 }
+                Op::DefineGlobalFunction => {
+                    let name_idx = context
+                        .exec_const_index(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let value_reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let deletable = context.exec_imm32(instr, 2).unwrap_or(0) != 0;
+                    let frame = &mut stack[top_idx];
+                    self.run_define_global_function_reg(
+                        context, frame, name_idx, value_reg, deletable,
+                    )?;
+                    continue;
+                }
                 Op::DefineGlobalVar => {
                     let name_idx = context
                         .exec_const_index(instr, 0)

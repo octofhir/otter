@@ -318,32 +318,21 @@ pub(crate) fn compile_program_with_mode(
         }
     }
 
-    // §16.1.7 GlobalDeclarationInstantiation step 16 — script global
-    // code creates its top-level `var` / function bindings on the
-    // global object's environment record, not as `<main>` locals:
-    // nested functions, sibling scripts, and eval chunks all resolve
-    // the same property, so no reader can observe a stale local copy.
-    // Eval bodies keep the local-binding model (their variable
-    // environment is the caller's or their own).
+    // §16.1.7 GlobalDeclarationInstantiation step 16 / §19.2.1.3
+    // EvalDeclarationInstantiation step 16.a — script global code and
+    // sloppy global-caller eval code create their top-level `var` /
+    // function bindings on the global object's environment record,
+    // not as `<main>` locals: nested functions, sibling scripts, and
+    // eval chunks all resolve the same property, so no reader can
+    // observe a stale local copy. Script bindings are
+    // non-configurable; eval bindings are deletable. Strict eval and
+    // function-caller eval keep the local / caller-cell model.
     let program_span = (program.span.start, program.span.end);
     let mut top_level_vars: Vec<String> = Vec::new();
     hoist_var_names(&program.body, &mut top_level_vars);
-    if !eval_mode {
+    let global_var_bindings = !eval_mode || (caller.is_empty() && !main_is_strict);
+    if global_var_bindings {
         cx.script_global_vars = top_level_vars.iter().cloned().collect();
-        let mut declared: HashSet<&str> = HashSet::new();
-        for name in &top_level_vars {
-            if !declared.insert(name.as_str()) {
-                continue;
-            }
-            // §9.1.1.4.17 CreateGlobalVarBinding(name, false) —
-            // script bindings are non-configurable.
-            let name_idx = cx.intern_string_constant(name);
-            cx.emit(
-                Op::DeclareGlobalVar,
-                [Operand::ConstIndex(name_idx), Operand::Imm32(0)],
-                program_span,
-            );
-        }
     } else {
         pre_declare_var_bindings(&mut cx, &top_level_vars, program_span)?;
     }
@@ -364,8 +353,32 @@ pub(crate) fn compile_program_with_mode(
     pre_declare_lexical_bindings(&mut cx, &top_level_lex, program_span)?;
     // §10.2.11 step 30 — top-level `function f() {…}` declarations
     // hoist to the script scope so calls before the source-level
-    // declaration resolve to the function value.
+    // declaration resolve to the function value. In global-binding
+    // mode this runs *before* the var pre-pass per §16.1.7 steps
+    // 16–17 / §19.2.1.3 steps 14–15: a CanDeclareGlobalFunction
+    // TypeError must abort before any var binding is created.
     hoist_function_declarations(&mut cx, &program.body)?;
+    if global_var_bindings {
+        let function_names: HashSet<String> = top_level_hoistable_function_names(&program.body)
+            .into_iter()
+            .collect();
+        let mut declared: HashSet<&str> = HashSet::new();
+        for name in &top_level_vars {
+            if !declared.insert(name.as_str()) || function_names.contains(name.as_str()) {
+                continue;
+            }
+            // §9.1.1.4.17 CreateGlobalVarBinding(name, configurable).
+            let name_idx = cx.intern_string_constant(name);
+            cx.emit(
+                Op::DeclareGlobalVar,
+                [
+                    Operand::ConstIndex(name_idx),
+                    Operand::Imm32(i32::from(eval_mode)),
+                ],
+                program_span,
+            );
+        }
+    }
 
     let mut last_value_reg: Option<u16> = None;
     // A directive prologue (`"use strict"`, etc.) is a sequence of

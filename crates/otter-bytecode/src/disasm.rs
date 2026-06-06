@@ -323,6 +323,7 @@ mod tests {
             Op::MarkModuleEvaluated => vec![konst(0)],
             Op::DeclareGlobalVar => vec![konst(0), imm(1)],
             Op::LoadDynamic | Op::StoreDynamic | Op::TypeofDynamic => vec![reg(0), konst(1)],
+            Op::DefineGlobalFunction => vec![konst(0), reg(1), imm(1)],
             Op::EvaluateModule => vec![reg(0), konst(1)],
             Op::Jump | Op::TdzError | Op::FreshUpvalue => vec![imm(-1)],
             Op::JumpViaFinally => vec![imm(-1), imm(1)],

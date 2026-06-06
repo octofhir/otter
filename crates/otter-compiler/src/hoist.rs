@@ -505,12 +505,18 @@ pub(crate) fn hoist_function_declarations_from(
         let script_global =
             cx.stack.len() == 1 && cx.scopes.len() == 1 && cx.script_global_vars.contains(&name);
         if script_global {
-            // §16.1.7 step 17 — the global object property *is* the
-            // binding; there is no local slot to store through.
+            // §16.1.7 step 17 / §19.2.1.3 step 16.a —
+            // CreateGlobalFunctionBinding: the global object property
+            // *is* the binding; eval bindings are deletable.
             let name_idx = cx.intern_string_constant(&name);
+            let deletable = i32::from(cx.in_eval);
             cx.emit(
-                Op::DefineGlobalVar,
-                [Operand::ConstIndex(name_idx), Operand::Register(tmp)],
+                Op::DefineGlobalFunction,
+                [
+                    Operand::ConstIndex(name_idx),
+                    Operand::Register(tmp),
+                    Operand::Imm32(deletable),
+                ],
                 span,
             );
         } else {

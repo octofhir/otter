@@ -70,6 +70,20 @@ pub fn compile_script_source_with_forced_strict(
     .map_err(CompileError::from)?
 }
 
+/// One caller-environment binding a direct eval body can see. Slot
+/// `i` of the caller-scope list maps to upvalue slot `i` of the
+/// compiled `<main>`; the runtime splices the caller's cells into
+/// those slots before running the chunk.
+#[derive(Debug, Clone)]
+pub struct EvalCallerBinding {
+    /// Source-level binding name.
+    pub name: String,
+    /// `true` for `let` / `const` / `class` caller bindings — a
+    /// sloppy eval body var-declaring the same name is a runtime
+    /// `SyntaxError` (§19.2.1.3 step 5).
+    pub lexical: bool,
+}
+
 /// Compile an `eval` / `new Function` body. Differs from script
 /// compilation in two details: a *strict* eval body gets its own
 /// variable environment (§19.2.1.1), so top-level `var` / `function`
@@ -77,6 +91,14 @@ pub fn compile_script_source_with_forced_strict(
 /// direct-eval call site's variable environment binds `arguments`
 /// (`forbid_var_arguments`), a sloppy body var-declaring `arguments`
 /// is an early SyntaxError (§19.2.1.3 EvalDeclarationInstantiation).
+///
+/// `caller_scope` carries the caller variable environment of a
+/// direct eval running inside a function: each binding maps to a
+/// reserved leading upvalue slot of the produced `<main>`, sloppy
+/// `var` / function declarations matching a caller binding reuse the
+/// caller's cell, and new var-scoped names are reported back through
+/// the `<main>`'s `direct_eval_bindings` table for the runtime to
+/// adopt into the caller frame.
 ///
 /// # Errors
 /// Returns [`CompileError`] when parsing fails or lowering rejects the AST.
@@ -86,6 +108,7 @@ pub fn compile_eval_source(
     module_specifier: &str,
     force_strict: bool,
     forbid_var_arguments: bool,
+    caller_scope: Option<&[EvalCallerBinding]>,
 ) -> Result<BytecodeModule, CompileError> {
     // §19.2.1.1 PerformEval parses the body with the Script goal.
     otter_syntax::with_program_goal(source, kind, otter_syntax::SourceGoal::Script, |program| {
@@ -99,7 +122,7 @@ pub fn compile_eval_source(
                 });
             }
         }
-        compile_program_with_mode(program, kind, module_specifier, force_strict, true)
+        compile_program_for_eval(program, kind, module_specifier, force_strict, caller_scope)
     })
     .map_err(CompileError::from)?
 }
@@ -142,7 +165,31 @@ pub(crate) fn compile_program(
     module_specifier: &str,
     force_strict: bool,
 ) -> Result<BytecodeModule, CompileError> {
-    compile_program_with_mode(program, source_kind, module_specifier, force_strict, false)
+    compile_program_with_mode(
+        program,
+        source_kind,
+        module_specifier,
+        force_strict,
+        false,
+        None,
+    )
+}
+
+pub(crate) fn compile_program_for_eval(
+    program: &Program<'_>,
+    source_kind: SyntaxSourceKind,
+    module_specifier: &str,
+    force_strict: bool,
+    caller_scope: Option<&[EvalCallerBinding]>,
+) -> Result<BytecodeModule, CompileError> {
+    compile_program_with_mode(
+        program,
+        source_kind,
+        module_specifier,
+        force_strict,
+        true,
+        caller_scope,
+    )
 }
 
 pub(crate) fn compile_program_with_mode(
@@ -151,6 +198,7 @@ pub(crate) fn compile_program_with_mode(
     module_specifier: &str,
     force_strict: bool,
     eval_mode: bool,
+    caller_scope: Option<&[EvalCallerBinding]>,
 ) -> Result<BytecodeModule, CompileError> {
     let module = Rc::new(RefCell::new(ModuleBuilder::default()));
     let script_module_url = if module_specifier.starts_with("file://") {
@@ -188,10 +236,87 @@ pub(crate) fn compile_program_with_mode(
         .with_strict(main_is_strict)
         .with_module_url(script_module_url);
     top.captured_names = capture::analyze_module(&program.body);
+
+    // §19.2.1.3 EvalDeclarationInstantiation — direct eval inside a
+    // function. The caller's bindings occupy the leading own-upvalue
+    // slots (the runtime splices the caller's cells in); the body's
+    // own var-scoped names are forced into cells so the caller can
+    // adopt them after the eval returns.
+    let caller = caller_scope.unwrap_or(&[]);
+    let caller_slot_count = u16::try_from(caller.len()).expect("eval caller scope too large");
+    let caller_names: HashSet<&str> = caller.iter().map(|b| b.name.as_str()).collect();
+    if !caller.is_empty() && !main_is_strict {
+        // Step 5 — a sloppy body var-scoped name colliding with a
+        // caller lexical binding is a SyntaxError thrown at the eval
+        // call site.
+        let caller_lexical: HashSet<&str> = caller
+            .iter()
+            .filter(|b| b.lexical)
+            .map(|b| b.name.as_str())
+            .collect();
+        let mut body_var_names: Vec<String> = Vec::new();
+        hoist_var_names(&program.body, &mut body_var_names);
+        body_var_names.extend(crate::annex_b::collect_annex_b_candidates(
+            &program.body,
+            &HashSet::new(),
+        ));
+        if let Some(name) = body_var_names
+            .iter()
+            .find(|name| caller_lexical.contains(name.as_str()))
+        {
+            return Err(CompileError::Unsupported {
+                node: format!("SyntaxError: Identifier '{name}' has already been declared"),
+                span: (program.span.start, program.span.end),
+            });
+        }
+        for name in body_var_names {
+            if !caller_names.contains(name.as_str()) {
+                top.captured_names.insert(name);
+            }
+        }
+    }
+    if !caller.is_empty() && capture::program_contains_direct_eval(&program.body) {
+        // A nested direct eval sees this chunk's scope as *its*
+        // caller environment — promote every body-level binding to a
+        // cell so the inner chunk can splice them.
+        top.captured_names
+            .extend(capture::all_program_names(&program.body));
+    }
+    top.own_upvalue_count = caller_slot_count;
+
     let mut cx = Compiler::new(top);
-    cx.suppress_global_mirror = eval_mode && main_is_strict;
+    cx.suppress_global_mirror = eval_mode && (main_is_strict || !caller.is_empty());
     cx.in_eval = eval_mode;
+    // Unresolved names may hit bindings a nested direct eval
+    // introduces into this chunk's own frame at runtime.
+    cx.contains_direct_eval = !caller.is_empty();
     cx.enter_scope();
+
+    if !caller.is_empty() {
+        // Strict eval owns its variable environment (§19.2.1.1) —
+        // a body var name shadows the caller binding with a fresh
+        // local instead of writing through the caller's cell.
+        let shadowed: HashSet<String> = if main_is_strict {
+            let mut names: Vec<String> = Vec::new();
+            hoist_var_names(&program.body, &mut names);
+            names.into_iter().collect()
+        } else {
+            HashSet::new()
+        };
+        for (slot, binding) in caller.iter().enumerate() {
+            if shadowed.contains(&binding.name) {
+                continue;
+            }
+            cx.scopes[0].bindings.insert(
+                binding.name.clone(),
+                BindingInfo {
+                    storage: BindingStorage::Upvalue { idx: slot as u16 },
+                    is_const: false,
+                    initialized: true,
+                },
+            );
+        }
+    }
 
     // §16.1.7 GlobalDeclarationInstantiation / §16.2.1.7
     // ModuleDeclarationInstantiation step 11: top-level `var`
@@ -243,6 +368,42 @@ pub(crate) fn compile_program_with_mode(
             last_value_reg = Some(reg);
         }
     }
+    // The chunk's full cell-backed scope table. The runtime adopts
+    // the var-shaped entries that were not part of the caller scope
+    // into the caller frame (§19.2.1.3 step 16.b); the whole table
+    // doubles as the caller environment for a nested direct eval
+    // running from this chunk's frame.
+    let mut eval_new_bindings: Vec<otter_bytecode::DirectEvalBinding> = Vec::new();
+    if !caller.is_empty() {
+        let body_lexical: HashSet<&str> = top_level_lex
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let caller_lexical: HashSet<&str> = caller
+            .iter()
+            .filter(|binding| binding.lexical)
+            .map(|binding| binding.name.as_str())
+            .collect();
+        if let Some(scope) = cx.scopes.first() {
+            for (name, info) in &scope.bindings {
+                if let BindingStorage::Upvalue { idx } = info.storage {
+                    eval_new_bindings.push(otter_bytecode::DirectEvalBinding {
+                        name: name.clone(),
+                        upvalue: idx,
+                        // A strict eval's own variable environment is
+                        // private (§19.2.1.1) — flagging every entry
+                        // non-adoptable keeps the bindings visible to
+                        // nested evals without leaking them into the
+                        // caller frame.
+                        lexical: main_is_strict
+                            || body_lexical.contains(name.as_str())
+                            || caller_lexical.contains(name.as_str()),
+                    });
+                }
+            }
+        }
+        eval_new_bindings.sort_by(|a, b| a.name.cmp(&b.name));
+    }
     cx.exit_scope();
 
     // Synthesize the program's completion value. If the body
@@ -271,6 +432,7 @@ pub(crate) fn compile_program_with_mode(
         m.functions[0].locals = 0;
         m.functions[0].scratch = cx.scratch;
         m.functions[0].own_upvalue_count = cx.own_upvalue_count;
+        m.functions[0].direct_eval_bindings = eval_new_bindings;
         m.functions[0].code = std::mem::take(&mut cx.code);
         m.functions[0].spans = std::mem::take(&mut cx.spans);
     }

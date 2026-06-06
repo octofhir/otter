@@ -599,7 +599,7 @@ pub(crate) fn trace_active_frame_roots(
 }
 
 /// Compile-time options for dynamic source text.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct EvalCompileOptions {
     /// `true` for direct eval executed from strict code. The
     /// compiler stores the resulting strict bit on `<main>` so
@@ -610,6 +610,24 @@ pub struct EvalCompileOptions {
     /// they bind the name themselves). §19.2.1.3 then makes a sloppy
     /// body var-declaring `arguments` an early SyntaxError.
     pub forbid_var_arguments: bool,
+    /// §19.2.1.3 EvalDeclarationInstantiation — the caller variable
+    /// environment of a direct eval running inside a function. Entry
+    /// `i` corresponds to the upvalue cell the runtime splices into
+    /// slot `i` of the compiled `<main>`'s frame; the compiler binds
+    /// each name to that slot. `None` for indirect eval and for
+    /// direct eval at script top level (global environment).
+    pub caller_scope: Option<Vec<EvalCallerBinding>>,
+}
+
+/// One caller-environment binding visible to a direct eval body.
+#[derive(Debug, Clone)]
+pub struct EvalCallerBinding {
+    /// Source-level binding name.
+    pub name: String,
+    /// `true` for `let` / `const` / `class` caller bindings — a
+    /// sloppy eval body var-declaring the same name is a runtime
+    /// `SyntaxError` (§19.2.1.3 step 5).
+    pub lexical: bool,
 }
 
 /// Embedder-supplied parse + compile callback used by

@@ -1469,12 +1469,25 @@ impl Runtime {
         // builds a fresh `BytecodeModule`.
         let hook: otter_vm::EvalHook =
             std::sync::Arc::new(|source: &str, options: EvalCompileOptions| {
+                // §19.2.1.3 — a direct eval inside a function carries
+                // its caller variable environment binding list.
+                let caller_scope: Option<Vec<otter_compiler::EvalCallerBinding>> =
+                    options.caller_scope.map(|bindings| {
+                        bindings
+                            .into_iter()
+                            .map(|binding| otter_compiler::EvalCallerBinding {
+                                name: binding.name,
+                                lexical: binding.lexical,
+                            })
+                            .collect()
+                    });
                 otter_compiler::compile_eval_source(
                     source,
                     SourceKind::JavaScript,
                     "<eval>",
                     options.force_strict,
                     options.forbid_var_arguments,
+                    caller_scope.as_deref(),
                 )
                 .map_err(|e| format!("compile error: {e:?}"))
             });

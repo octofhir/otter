@@ -224,6 +224,11 @@ pub(crate) struct ExecutableFunction {
     pub(crate) is_module: bool,
     /// Source module URL carried by frames for module resolution.
     pub(crate) module_url: Box<str>,
+    /// §19.2.1.3 — name → own-upvalue table for direct eval. On a
+    /// function containing a direct eval call site this lists every
+    /// function-scope binding; on a compiled eval `<main>` it lists
+    /// the new var-scoped bindings the body introduced.
+    pub(crate) direct_eval_bindings: Box<[ExecDirectEvalBinding]>,
     /// Hot instruction stream. Indexed in source order; the dispatch
     /// loop resolves a frame's byte-offset PC to an entry via
     /// [`Self::instr_at_byte_pc`] (`O(log N)` binary search on `byte_pc`).
@@ -316,6 +321,15 @@ impl ExecutableFunction {
             mapped_argument_bindings,
             is_module: function.is_module,
             module_url: function.module_url.clone().into_boxed_str(),
+            direct_eval_bindings: function
+                .direct_eval_bindings
+                .iter()
+                .map(|binding| ExecDirectEvalBinding {
+                    name: binding.name.clone().into_boxed_str(),
+                    upvalue: binding.upvalue,
+                    lexical: binding.lexical,
+                })
+                .collect(),
             code,
             byte_spans,
             code_byte_len,
@@ -362,6 +376,17 @@ fn rewrite_branch_operands(
         out[slot] = Operand::Imm32(byte_delta_i32);
     }
     out
+}
+
+/// One direct-eval caller binding: name → own-upvalue cell index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExecDirectEvalBinding {
+    /// Source-level binding name.
+    pub(crate) name: Box<str>,
+    /// Own-upvalue cell index inside the owning function's frame.
+    pub(crate) upvalue: u16,
+    /// `true` for `let` / `const` / `class` bindings.
+    pub(crate) lexical: bool,
 }
 
 /// Compact mapped-arguments alias entry.

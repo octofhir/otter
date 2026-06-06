@@ -27,10 +27,24 @@ use smallvec::SmallVec;
 
 use crate::promise::JsPromise;
 use crate::{
-    AsyncFrameState, EvalCompileOptions, ExecutionContext, Frame, Interpreter, Value, VmError,
-    abstract_ops, operand_decode::register_operand, promise_dispatch, read_register,
-    write_register,
+    AsyncFrameState, EvalCallerBinding, EvalCompileOptions, ExecutionContext, Frame, Interpreter,
+    Value, VmError, abstract_ops, operand_decode::register_operand, promise_dispatch,
+    read_register, write_register,
 };
+
+/// Where one caller-scope cell for a direct eval comes from. Cells
+/// are re-read from the caller frame *after* every GC-allocating
+/// step (compile, link, spine building) because young-generation
+/// collections move upvalue cells; only the frame's traced slots
+/// stay current.
+enum CallerCellSource {
+    /// Slot in the caller frame's upvalue array (compile-time
+    /// promoted function-scope binding).
+    Upvalue(u16),
+    /// Entry in the caller frame's runtime eval-introduced binding
+    /// map (created by an earlier direct eval from the same frame).
+    EvalVar(String),
+}
 
 /// §20.2.1.1.1 CreateDynamicFunction `kind` parameter: which function
 /// goal symbol the synthesised source compiles under.
@@ -70,17 +84,169 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let value = *read_register(&stack[top_idx], src_reg)?;
         let force_strict = context.function_is_strict(stack[top_idx].function_id);
-        let result = self.run_eval(
-            &value,
-            EvalCompileOptions {
-                force_strict,
-                forbid_var_arguments,
-            },
-        )?;
+        // §19.2.1.3 EvalDeclarationInstantiation — a direct eval
+        // inside a function receives the caller variable environment.
+        // The compiler promoted every caller function-scope binding
+        // into a cell and recorded the name → slot table; earlier
+        // evals may have extended the frame with more named cells.
+        let (caller_scope, cell_sources) = self.collect_caller_scope(context, &stack[top_idx]);
+        let result = if cell_sources.is_empty() {
+            // Script-top-level direct eval: the caller variable
+            // environment *is* the global environment, which the
+            // compiled chunk reaches through the global mirror.
+            self.run_eval(
+                &value,
+                EvalCompileOptions {
+                    force_strict,
+                    forbid_var_arguments,
+                    caller_scope: None,
+                },
+            )?
+        } else {
+            self.run_direct_eval(
+                &value,
+                EvalCompileOptions {
+                    force_strict,
+                    forbid_var_arguments,
+                    caller_scope: Some(caller_scope),
+                },
+                &cell_sources,
+                stack,
+            )?
+        };
         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
         write_register(frame, dst, result)?;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
+    }
+
+    /// Build the caller-scope binding list (compiler-facing names)
+    /// and the matching cell-source list (runtime cell origins) for
+    /// a direct eval running on `frame`. Entry `i` of both lists
+    /// describes upvalue slot `i` of the compiled eval `<main>`.
+    fn collect_caller_scope(
+        &self,
+        context: &ExecutionContext,
+        frame: &Frame,
+    ) -> (Vec<EvalCallerBinding>, Vec<CallerCellSource>) {
+        let mut scope: Vec<EvalCallerBinding> = Vec::new();
+        let mut sources: Vec<CallerCellSource> = Vec::new();
+        if let Some(function) = context.exec_function(frame.function_id) {
+            for binding in function.direct_eval_bindings.iter() {
+                scope.push(EvalCallerBinding {
+                    name: binding.name.to_string(),
+                    lexical: binding.lexical,
+                });
+                sources.push(CallerCellSource::Upvalue(binding.upvalue));
+            }
+        }
+        if let Some(eval_vars) = self
+            .frame_cold(frame)
+            .and_then(|cold| cold.eval_vars.as_deref())
+        {
+            // Deterministic order for the compiled chunk's slot
+            // layout — the map itself is hash-ordered.
+            let mut names: Vec<&String> = eval_vars.keys().collect();
+            names.sort();
+            for name in names {
+                scope.push(EvalCallerBinding {
+                    name: name.clone(),
+                    lexical: false,
+                });
+                sources.push(CallerCellSource::EvalVar(name.clone()));
+            }
+        }
+        (scope, sources)
+    }
+
+    /// Execute a direct eval whose caller variable environment is a
+    /// function environment (§19.2.1.1 PerformEval with
+    /// `direct = true`). The compiled chunk's leading upvalue slots
+    /// alias the caller's binding cells; new var-scoped bindings the
+    /// body introduces are adopted into the caller frame's
+    /// eval-binding map before the body runs (hoisting), and `this`
+    /// is inherited from the caller.
+    fn run_direct_eval(
+        &mut self,
+        value: &Value,
+        options: EvalCompileOptions,
+        cell_sources: &[CallerCellSource],
+        stack: &mut SmallVec<[Frame; 8]>,
+    ) -> Result<Value, VmError> {
+        let Some(s) = value.as_string(&self.gc_heap) else {
+            // §19.2.1.1 step 2 — non-string operands are returned
+            // unchanged.
+            return Ok(*value);
+        };
+        let source = s.to_lossy_string(&self.gc_heap);
+        let caller_scope_names: std::collections::HashSet<String> = options
+            .caller_scope
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|binding| binding.name.clone())
+            .collect();
+        let module = self.compile_eval_source(&source, options)?;
+        let context = self.link_module(module);
+        let main = context.exec_main();
+        let mut upvalues =
+            Frame::build_upvalues_for_exec(&mut self.gc_heap, main, Frame::empty_upvalues())?;
+        // Splice the caller's cells into the reserved leading slots
+        // and adopt the chunk's new var-binding cells into the caller
+        // frame. No GC allocation happens from here until the spine
+        // is rooted on the entry frame — the cells read below are
+        // only current while nothing moves the heap.
+        let top_idx = stack.len() - 1;
+        {
+            let caller = &stack[top_idx];
+            let cold_eval_vars = self
+                .frame_cold(caller)
+                .and_then(|cold| cold.eval_vars.as_deref());
+            for (i, cell_source) in cell_sources.iter().enumerate() {
+                let cell = match cell_source {
+                    CallerCellSource::Upvalue(idx) => caller
+                        .upvalues
+                        .get(*idx as usize)
+                        .copied()
+                        .ok_or(VmError::InvalidOperand)?,
+                    CallerCellSource::EvalVar(name) => cold_eval_vars
+                        .and_then(|map| map.get(name))
+                        .copied()
+                        .ok_or(VmError::InvalidOperand)?,
+                };
+                *upvalues.get_mut(i).ok_or(VmError::InvalidOperand)? = cell;
+            }
+        }
+        // §19.2.1.3 step 16.b — the body's *new* var-scoped bindings
+        // become caller-environment bindings before the body runs,
+        // matching var hoisting semantics. The chunk's table also
+        // lists caller-scope re-binds and its own lexicals (for
+        // nested evals); both are excluded from adoption.
+        let adopted: Vec<(String, crate::UpvalueCell)> = main
+            .direct_eval_bindings
+            .iter()
+            .filter(|binding| {
+                !binding.lexical && !caller_scope_names.contains(binding.name.as_ref())
+            })
+            .filter_map(|binding| {
+                upvalues
+                    .get(binding.upvalue as usize)
+                    .map(|cell| (binding.name.to_string(), *cell))
+            })
+            .collect();
+        let entry_this = stack[top_idx].this_value;
+        if !adopted.is_empty() {
+            let cold = self.frame_ensure_cold(&mut stack[top_idx]);
+            let map = cold.eval_vars.get_or_insert_default();
+            for (name, cell) in adopted {
+                map.insert(name, cell);
+            }
+        }
+        let main = context.exec_main();
+        let entry = Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this);
+        let mut sub_stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        sub_stack.push(entry);
+        self.dispatch_loop(&context, &mut sub_stack)
     }
 
     pub(crate) fn run_new_function_operands(

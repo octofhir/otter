@@ -102,6 +102,28 @@ pub fn all_own_names(
     own.names
 }
 
+/// Statement-list variant of [`body_contains_direct_eval`] for
+/// script / eval program bodies.
+#[must_use]
+pub fn program_contains_direct_eval(stmts: &[Statement<'_>]) -> bool {
+    let mut finder = DirectEvalFinder::default();
+    for stmt in stmts {
+        finder.visit_statement(stmt);
+    }
+    finder.found
+}
+
+/// Statement-list variant of [`all_own_names`] for script / eval
+/// program bodies.
+#[must_use]
+pub fn all_program_names(stmts: &[Statement<'_>]) -> HashSet<String> {
+    let mut own = OwnNameCollector::default();
+    for stmt in stmts {
+        own.visit_statement(stmt);
+    }
+    own.names
+}
+
 #[derive(Default)]
 struct DirectEvalFinder {
     found: bool,

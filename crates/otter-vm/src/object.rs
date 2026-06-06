@@ -1991,7 +1991,6 @@ pub fn define_own_property_partial(
 ) -> bool {
     let completed = descriptor.complete_for_new_property();
     let barrier_descriptor = completed.clone();
-    let map_descriptor = completed.clone();
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     let dictionary_keys = dictionary_keys_for_shape_transition(heap, obj, existing_offset);
     // §10.1.6.3 ValidateAndApplyPropertyDescriptor runs outside the
@@ -2029,14 +2028,17 @@ pub fn define_own_property_partial(
     if success {
         let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
         if let Some(cell) = mapped_cell {
-            match &map_descriptor.kind {
-                DescriptorKind::Data { value } => {
-                    store_upvalue(heap, cell, *value);
-                    if !map_descriptor.writable() {
-                        heap.with_payload(obj, |body| remove_mapped_argument(body, key));
-                    }
+            // §10.4.4.2 steps 5-6 — consult the PARTIAL descriptor:
+            // only a present [[Value]] writes through the map, and
+            // only an accessor or an explicit writable:false unmaps.
+            // (`{configurable: false}` alone keeps the mapping.)
+            if descriptor.is_accessor() {
+                heap.with_payload(obj, |body| remove_mapped_argument(body, key));
+            } else {
+                if let Some(value) = descriptor.value {
+                    store_upvalue(heap, cell, value);
                 }
-                DescriptorKind::Accessor { .. } => {
+                if descriptor.writable == Some(false) {
                     heap.with_payload(obj, |body| remove_mapped_argument(body, key));
                 }
             }
@@ -2055,7 +2057,6 @@ pub(crate) fn define_own_property_partial_with_shape(
 ) -> bool {
     let completed = descriptor.complete_for_new_property();
     let barrier_descriptor = completed.clone();
-    let map_descriptor = completed.clone();
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     let merged_for_existing = if let Some(offset) = existing_offset {
         let existing = heap.read_payload(obj, |body| body.slots[offset as usize].clone());
@@ -2083,14 +2084,14 @@ pub(crate) fn define_own_property_partial_with_shape(
     if success {
         let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
         if let Some(cell) = mapped_cell {
-            match &map_descriptor.kind {
-                DescriptorKind::Data { value } => {
-                    store_upvalue(heap, cell, *value);
-                    if !map_descriptor.writable() {
-                        heap.with_payload(obj, |body| remove_mapped_argument(body, key));
-                    }
+            // §10.4.4.2 steps 5-6 — see define_own_property_partial.
+            if descriptor.is_accessor() {
+                heap.with_payload(obj, |body| remove_mapped_argument(body, key));
+            } else {
+                if let Some(value) = descriptor.value {
+                    store_upvalue(heap, cell, value);
                 }
-                DescriptorKind::Accessor { .. } => {
+                if descriptor.writable == Some(false) {
                     heap.with_payload(obj, |body| remove_mapped_argument(body, key));
                 }
             }

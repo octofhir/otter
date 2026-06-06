@@ -972,6 +972,44 @@ impl Interpreter {
     /// Proxies dispatch through the `defineProperty` trap and enforce
     /// the §10.5.6 step 14–18 invariants using the field-presence
     /// information carried by [`object::PartialPropertyDescriptor`].
+    /// §7.3.31 / §7.3.32 private-element resolution. Walks the
+    /// receiver's own properties first (instance fields live there),
+    /// then the prototype chain (methods and accessors are installed
+    /// on the class prototype / statics object), looking for the
+    /// class-evaluation private-name symbol. Returns the holder and
+    /// its descriptor, or `None` when the brand check fails.
+    pub(crate) fn private_element_lookup(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: &Value,
+        sym: crate::symbol::JsSymbol,
+    ) -> Result<Option<(Value, object::PropertyDescriptor)>, VmError> {
+        let key = VmPropertyKey::Symbol(sym);
+        let mut current = *receiver;
+        let mut hops = 0;
+        loop {
+            if let Some(desc) = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                context,
+                current,
+                &key,
+                0,
+                &[&current, receiver],
+                &[],
+            )? {
+                return Ok(Some((current, desc)));
+            }
+            if hops >= object::PROTO_CHAIN_HARD_CAP {
+                return Ok(None);
+            }
+            let proto = self.get_prototype_for_op(&current)?;
+            if !proto.is_object() && !proto.is_object_type() {
+                return Ok(None);
+            }
+            current = proto;
+            hops += 1;
+        }
+    }
+
     pub(crate) fn define_own_property_value(
         &mut self,
         context: &ExecutionContext,

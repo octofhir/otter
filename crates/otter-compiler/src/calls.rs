@@ -501,7 +501,7 @@ pub(crate) fn compile_method_call(
         let key_reg = crate::class::load_private_key(cx, member.field.name.as_str(), span)?;
         let callee_reg = cx.alloc_scratch();
         cx.emit(
-            Op::LoadElement,
+            Op::PrivateGet,
             [
                 Operand::Register(callee_reg),
                 Operand::Register(receiver_reg),

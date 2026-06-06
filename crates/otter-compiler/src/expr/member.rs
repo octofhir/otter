@@ -20,10 +20,9 @@ pub(crate) fn compile_private_field(
     let pspan = (p.span.start, p.span.end);
     let obj_reg = compile_expr(cx, &p.object, pspan)?;
     let key_reg = crate::class::load_private_key(cx, p.field.name.as_str(), pspan)?;
-    crate::class::emit_private_has_throw(cx, obj_reg, key_reg, pspan)?;
     let dst = cx.alloc_scratch();
     cx.emit(
-        Op::LoadElement,
+        Op::PrivateGet,
         vec![
             Operand::Register(dst),
             Operand::Register(obj_reg),

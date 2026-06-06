@@ -4658,6 +4658,119 @@ impl Interpreter {
                     self.run_init_global_lex_reg(context, frame, value_reg, name_idx)?;
                     continue;
                 }
+                // §7.3.31 PrivateGet — brand check (absent name
+                // throws), accessor-without-getter throws, accessor
+                // invokes its getter with the receiver as `this`.
+                Op::PrivateGet => {
+                    let (dst, obj_reg, key_reg) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let receiver = *read_register(&stack[top_idx], obj_reg)?;
+                    let key = *read_register(&stack[top_idx], key_reg)?;
+                    // A non-symbol key means the private-name binding
+                    // failed to resolve through the capture chain —
+                    // surface the spec's brand-check TypeError rather
+                    // than a VM invariant crash.
+                    let Some(sym) = key.as_symbol(&self.gc_heap) else {
+                        return Err(VmError::TypeError {
+                            message:
+                                "Cannot read private member from an object whose class did not declare it"
+                                    .to_string(),
+                        });
+                    };
+                    let found = self.private_element_lookup(context, &receiver, sym)?;
+                    let result = match found {
+                        None => {
+                            return Err(VmError::TypeError {
+                                message:
+                                    "Cannot read private member from an object whose class did not declare it"
+                                        .to_string(),
+                            });
+                        }
+                        Some((_, desc)) => match desc.kind {
+                            object::DescriptorKind::Data { value } => value,
+                            object::DescriptorKind::Accessor { getter, .. } => match getter {
+                                Some(getter) => self.run_callable_sync(
+                                    context,
+                                    &getter,
+                                    receiver,
+                                    smallvec::SmallVec::new(),
+                                )?,
+                                None => {
+                                    return Err(VmError::TypeError {
+                                        message: "'#x' was defined without a getter".to_string(),
+                                    });
+                                }
+                            },
+                        },
+                    };
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, result)?;
+                    frame.advance_pc(self.current_byte_len)?;
+                    continue;
+                }
+                // §7.3.32 PrivateSet — brand check, private methods
+                // are not writable, accessor-without-setter throws,
+                // an own field writes in place preserving attributes.
+                Op::PrivateSet => {
+                    let (obj_reg, key_reg, value_reg) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let receiver = *read_register(&stack[top_idx], obj_reg)?;
+                    let key = *read_register(&stack[top_idx], key_reg)?;
+                    let value = *read_register(&stack[top_idx], value_reg)?;
+                    let Some(sym) = key.as_symbol(&self.gc_heap) else {
+                        return Err(VmError::TypeError {
+                            message:
+                                "Cannot write private member to an object whose class did not declare it"
+                                    .to_string(),
+                        });
+                    };
+                    let found = self.private_element_lookup(context, &receiver, sym)?;
+                    match found {
+                        None => {
+                            return Err(VmError::TypeError {
+                                message:
+                                    "Cannot write private member to an object whose class did not declare it"
+                                        .to_string(),
+                            });
+                        }
+                        Some((holder, desc)) => match desc.kind {
+                            object::DescriptorKind::Accessor { setter, .. } => match setter {
+                                Some(setter) => {
+                                    let argv: smallvec::SmallVec<[Value; 8]> =
+                                        smallvec::smallvec![value];
+                                    self.run_callable_sync(context, &setter, receiver, argv)?;
+                                }
+                                None => {
+                                    return Err(VmError::TypeError {
+                                        message: "'#x' was defined without a setter".to_string(),
+                                    });
+                                }
+                            },
+                            object::DescriptorKind::Data { .. } => {
+                                if holder != receiver || !desc.flags.writable() {
+                                    // Prototype side or a non-writable
+                                    // own slot — a private method.
+                                    return Err(VmError::TypeError {
+                                        message: "Private method is not writable".to_string(),
+                                    });
+                                }
+                                let descriptor = object::PartialPropertyDescriptor {
+                                    value: Some(value),
+                                    ..Default::default()
+                                };
+                                let vm_key = VmPropertyKey::Symbol(sym);
+                                self.define_own_property_value(
+                                    context, &receiver, &vm_key, descriptor,
+                                )?;
+                            }
+                        },
+                    }
+                    let frame = &mut stack[top_idx];
+                    frame.advance_pc(self.current_byte_len)?;
+                    continue;
+                }
                 // §7.1.3 ToNumeric on an already-primitive operand:
                 // Number / BigInt pass through, Symbol throws, the
                 // rest convert via ToNumber. Emitted between the two

@@ -557,8 +557,13 @@ pub(crate) fn compile_class(
         cx.emit(Op::LoadTrue, [Operand::Register(true_reg)], method_span);
         let false_reg = cx.alloc_scratch();
         cx.emit(Op::LoadFalse, [Operand::Register(false_reg)], method_span);
+        // §7.3.32 — a private method is not writable: `PrivateSet`
+        // distinguishes it from a private field by this attribute
+        // (static methods live as own data on the statics object,
+        // where holder == receiver can't tell them apart).
+        let writable_reg = if is_private { false_reg } else { true_reg };
         for (attr, value_reg) in [
-            ("writable", true_reg),
+            ("writable", writable_reg),
             ("enumerable", false_reg),
             ("configurable", true_reg),
         ] {

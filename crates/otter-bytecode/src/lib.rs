@@ -1129,6 +1129,30 @@ pub enum Op {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-tonumeric>
     ToNumeric,
+
+    /// `r<dst> = PrivateGet(r<obj>, r<key>)` per §7.3.31. `key`
+    /// holds the class-evaluation private-name symbol. Resolves the
+    /// private element on the receiver (own fields) or its
+    /// prototype chain (methods / accessors): absent name throws
+    /// TypeError (brand check), an accessor without a getter throws
+    /// TypeError, an accessor with one invokes it with the receiver
+    /// as `this`. Operands: `Register(dst), Register(obj),
+    /// Register(key)`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-privateget>
+    PrivateGet,
+
+    /// `PrivateSet(r<obj>, r<key>, r<value>)` per §7.3.32. Absent
+    /// private name throws TypeError (brand check); a private
+    /// method (data element found on the prototype side) throws
+    /// TypeError; an accessor without a setter throws TypeError; an
+    /// accessor with one invokes it; an own field writes in place.
+    /// Operands: `Register(obj), Register(key), Register(value)`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-privateset>
+    PrivateSet,
 }
 
 impl Op {
@@ -1283,6 +1307,8 @@ impl Op {
             Op::ValidateGlobalDecl => "VALIDATE_GLOBAL_DECL",
             Op::ToObject => "TO_OBJECT",
             Op::ToNumeric => "TO_NUMERIC",
+            Op::PrivateGet => "PRIVATE_GET",
+            Op::PrivateSet => "PRIVATE_SET",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
@@ -1402,6 +1428,8 @@ impl Op {
             | Op::LoadImportBinding
             | Op::NewBuiltinError
             | Op::DefineGlobalFunction
+            | Op::PrivateGet
+            | Op::PrivateSet
             | Op::StoreGlobalBinding => 3,
             Op::GetPrototype
             | Op::SetPrototype

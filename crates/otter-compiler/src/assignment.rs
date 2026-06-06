@@ -148,10 +148,9 @@ pub(crate) fn compile_assignment(
         let new_value = match compound_op {
             None => compile_expr(cx, &a.right, span)?,
             Some(op) => {
-                crate::class::emit_private_has_throw(cx, obj_reg, key_reg, span)?;
                 let current = cx.alloc_scratch();
                 cx.emit(
-                    Op::LoadElement,
+                    Op::PrivateGet,
                     vec![
                         Operand::Register(current),
                         Operand::Register(obj_reg),
@@ -174,8 +173,15 @@ pub(crate) fn compile_assignment(
                 dst
             }
         };
-        crate::class::emit_private_has_throw(cx, obj_reg, key_reg, span)?;
-        cx.emit_store_element(obj_reg, key_reg, new_value, span);
+        cx.emit(
+            Op::PrivateSet,
+            vec![
+                Operand::Register(obj_reg),
+                Operand::Register(key_reg),
+                Operand::Register(new_value),
+            ],
+            span,
+        );
         return Ok(new_value);
     }
     if let AssignmentTarget::ComputedMemberExpression(member) = &a.left {
@@ -571,10 +577,9 @@ pub(crate) fn compile_logical_assignment(
         AssignmentTarget::PrivateFieldExpression(m) => {
             let obj_reg = compile_expr(cx, &m.object, span)?;
             let key_reg = crate::class::load_private_key(cx, m.field.name.as_str(), span)?;
-            crate::class::emit_private_has_throw(cx, obj_reg, key_reg, span)?;
             let load = cx.alloc_scratch();
             cx.emit(
-                Op::LoadElement,
+                Op::PrivateGet,
                 vec![
                     Operand::Register(load),
                     Operand::Register(obj_reg),
@@ -743,8 +748,15 @@ pub(crate) fn assign_to_target(
         AssignmentTarget::PrivateFieldExpression(member) => {
             let obj_reg = compile_expr(cx, &member.object, span)?;
             let key_reg = crate::class::load_private_key(cx, member.field.name.as_str(), span)?;
-            crate::class::emit_private_has_throw(cx, obj_reg, key_reg, span)?;
-            cx.emit_store_element(obj_reg, key_reg, value_reg, span);
+            cx.emit(
+                Op::PrivateSet,
+                vec![
+                    Operand::Register(obj_reg),
+                    Operand::Register(key_reg),
+                    Operand::Register(value_reg),
+                ],
+                span,
+            );
             Ok(())
         }
         other => Err(CompileError::Unsupported {
@@ -820,8 +832,15 @@ fn assign_prepared_target(
             Ok(())
         }
         PreparedAssignmentTarget::PrivateField { obj_reg, key_reg } => {
-            crate::class::emit_private_has_throw(cx, obj_reg, key_reg, span)?;
-            cx.emit_store_element(obj_reg, key_reg, value_reg, span);
+            cx.emit(
+                Op::PrivateSet,
+                vec![
+                    Operand::Register(obj_reg),
+                    Operand::Register(key_reg),
+                    Operand::Register(value_reg),
+                ],
+                span,
+            );
             Ok(())
         }
         PreparedAssignmentTarget::ComputedMember { obj_reg, key_reg } => {

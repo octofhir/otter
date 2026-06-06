@@ -582,6 +582,8 @@ pub const OP_BYTE_TABLE: &[(Op, u8)] = &[
     (Op::ValidateGlobalDecl, 0x97),
     (Op::ToObject, 0x98),
     (Op::ToNumeric, 0x99),
+    (Op::PrivateGet, 0x9A),
+    (Op::PrivateSet, 0x9B),
 ];
 
 #[cfg(test)]
@@ -945,7 +947,7 @@ mod tests {
         // Catches accidental opcode additions that forget to wire
         // through OP_BYTE_TABLE. If this fires, append the missing
         // opcode at the next unused byte.
-        const EXPECTED_OPCODE_COUNT: usize = 154;
+        const EXPECTED_OPCODE_COUNT: usize = 156;
         assert_eq!(
             OP_BYTE_TABLE.len(),
             EXPECTED_OPCODE_COUNT,

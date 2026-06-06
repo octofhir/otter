@@ -953,5 +953,7 @@ mod tests {
         Op::ValidateGlobalDecl,
         Op::ToObject,
         Op::ToNumeric,
+        Op::PrivateGet,
+        Op::PrivateSet,
     ];
 }

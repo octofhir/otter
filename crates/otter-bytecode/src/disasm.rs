@@ -425,7 +425,9 @@ mod tests {
             | Op::ToPrimitive
             | Op::PromiseCall
             | Op::LoadImportBinding
-            | Op::DefineOwnProperty => vec![reg(0), reg(1), reg(2)],
+            | Op::DefineOwnProperty
+            | Op::PrivateGet
+            | Op::PrivateSet => vec![reg(0), reg(1), reg(2)],
             Op::IteratorNext => vec![reg(0), reg(1), reg(2)],
             Op::GetAsyncIterator => vec![reg(0), reg(1)],
             Op::IteratorClose | Op::IteratorCloseStart | Op::IteratorCloseEnd => vec![reg(0)],

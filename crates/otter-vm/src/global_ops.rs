@@ -196,8 +196,6 @@ impl Interpreter {
                 });
             }
         }
-        // §9.1.1.4.17 step 4 — record the name in [[VarNames]].
-        self.global_var_names.insert(name.into());
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
@@ -355,14 +353,17 @@ impl Interpreter {
         let name = context
             .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
-        if self.global_lexicals.contains_key(name) || self.global_var_names.contains(name) {
+        if self.global_lexicals.contains_key(name) {
             return Err(VmError::SyntaxError {
                 message: format!("Identifier '{name}' has already been declared"),
             });
         }
         // §9.1.1.4.14 HasRestrictedGlobalProperty — an existing
         // non-configurable own property of the global object
-        // (`undefined`, `NaN`, …) cannot be shadowed by a lexical.
+        // (`undefined`, `NaN`, script vars, …) cannot be shadowed by
+        // a lexical. Sloppy-eval-introduced vars are *configurable*
+        // and may be shadowed (tc39/ecma262#2205 removed
+        // [[VarNames]]; configurability is the only gate).
         if let Some(descriptor) = object::get_own_descriptor(self.global_this, &self.gc_heap, name)
             && !descriptor.flags.configurable()
         {
@@ -393,7 +394,7 @@ impl Interpreter {
             // Lexical: same checks as DeclareGlobalLex, minus the
             // cell creation.
             0 => {
-                if self.global_lexicals.contains_key(name) || self.global_var_names.contains(name) {
+                if self.global_lexicals.contains_key(name) {
                     return Err(VmError::SyntaxError {
                         message: format!("Identifier '{name}' has already been declared"),
                     });

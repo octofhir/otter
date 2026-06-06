@@ -480,45 +480,17 @@ pub(crate) fn compile_assignment(
             cx.emit_module_export_mirror(&name, value, span);
         }
         None => {
-            // §9.1.1.4.5 Object Environment Records
-            // SetMutableBinding(N, V, S): after the compound
-            // assignment has evaluated the getter/RHS, strict stores
-            // must re-check that the global object binding still
-            // exists before PutValue writes the new value.
-            let global = cx.alloc_scratch();
-            cx.emit(Op::LoadGlobalThis, [Operand::Register(global)], span);
+            // §9.1.1.4 global SetMutableBinding — declarative record
+            // (script lexicals) first, then the object record;
+            // strict stores re-check the binding still exists.
             let name_idx = cx.intern_string_constant(&name);
-            if cx.is_strict {
-                let key_reg = cx.alloc_scratch();
-                cx.emit(
-                    Op::LoadString,
-                    [Operand::Register(key_reg), Operand::ConstIndex(name_idx)],
-                    span,
-                );
-                let still_exists = cx.alloc_scratch();
-                cx.emit(
-                    Op::HasProperty,
-                    [
-                        Operand::Register(still_exists),
-                        Operand::Register(key_reg),
-                        Operand::Register(global),
-                    ],
-                    span,
-                );
-                let still_exists_ok =
-                    cx.emit_branch_placeholder(Op::JumpIfTrue, Some(still_exists), span);
-                emit_reference_error(cx, &name, span);
-                cx.patch_branch_to_here(still_exists_ok);
-            }
-            // Store to the globalThis property table.
-            let scratch = cx.alloc_scratch();
+            let strict = i32::from(cx.is_strict);
             cx.emit(
-                Op::StoreProperty,
-                vec![
-                    Operand::Register(global),
-                    Operand::ConstIndex(name_idx),
+                Op::StoreGlobalBinding,
+                [
                     Operand::Register(value),
-                    Operand::Register(scratch),
+                    Operand::ConstIndex(name_idx),
+                    Operand::Imm32(strict),
                 ],
                 span,
             );
@@ -547,11 +519,22 @@ pub(crate) fn compile_logical_assignment(
             } else if let Some(idx) = cx.resolve_capture(&name) {
                 cx.emit_load_storage(load, BindingStorage::Upvalue { idx }, span);
             } else if cx.is_strict {
-                return Ok(emit_reference_error(cx, &name, span));
+                // Runtime resolution: a realm-wide lexical or global
+                // property satisfies the read; a missing binding is a
+                // ReferenceError.
+                let name_idx = cx.intern_string_constant(&name);
+                cx.emit(
+                    Op::LoadGlobalOrThrow,
+                    [Operand::Register(load), Operand::ConstIndex(name_idx)],
+                    span,
+                );
             } else {
-                let global = cx.alloc_scratch();
-                cx.emit(Op::LoadGlobalThis, [Operand::Register(global)], span);
-                cx.emit_load_property(load, global, &name, span);
+                let name_idx = cx.intern_string_constant(&name);
+                cx.emit(
+                    Op::LoadGlobalOrUndefined,
+                    [Operand::Register(load), Operand::ConstIndex(name_idx)],
+                    span,
+                );
             }
             load
         }
@@ -1274,17 +1257,10 @@ pub(crate) fn store_identifier(
             cx.emit_module_export_mirror(name, value_reg, span);
         }
         None => {
-            // §16.1.7 — script global vars are global-object
-            // properties; assignment to one succeeds in strict code
-            // too (the binding exists, it just isn't a local).
-            if cx.is_strict && !cx.script_global_vars.contains(name) {
-                emit_reference_error(cx, name, span);
-                return Ok(());
-            }
-            // §10.2.4.2 PutValue — inside a function with a direct
-            // eval the name may resolve to an eval-introduced
-            // frame binding before the globalThis fallback.
-            if cx.contains_direct_eval {
+            // §10.2.4.2 PutValue — inside a sloppy function with a
+            // direct eval the name may resolve to an eval-introduced
+            // frame binding before the global environment.
+            if cx.contains_direct_eval && !cx.is_strict {
                 let name_idx = cx.intern_string_constant(name);
                 cx.emit(
                     Op::StoreDynamic,
@@ -1293,18 +1269,19 @@ pub(crate) fn store_identifier(
                 );
                 return Ok(());
             }
-            // §10.2.4.1 PutValue fallback to globalThis.
-            let global = cx.alloc_scratch();
-            cx.emit(Op::LoadGlobalThis, [Operand::Register(global)], span);
+            // §9.1.1.4 global SetMutableBinding — the declarative
+            // record (script lexicals, `const` → TypeError, TDZ →
+            // ReferenceError) shadows the object record; strict
+            // writes to a missing binding throw ReferenceError at
+            // runtime.
             let name_idx = cx.intern_string_constant(name);
-            let scratch = cx.alloc_scratch();
+            let strict = i32::from(cx.is_strict);
             cx.emit(
-                Op::StoreProperty,
-                vec![
-                    Operand::Register(global),
-                    Operand::ConstIndex(name_idx),
+                Op::StoreGlobalBinding,
+                [
                     Operand::Register(value_reg),
-                    Operand::Register(scratch),
+                    Operand::ConstIndex(name_idx),
+                    Operand::Imm32(strict),
                 ],
                 span,
             );

@@ -340,6 +340,17 @@ pub struct Interpreter {
     /// cells so closures instantiated at link time observe the
     /// bindings the body later initialises.
     module_init_upvalues: std::collections::HashMap<std::sync::Arc<str>, Box<[crate::UpvalueCell]>>,
+    /// §9.1.1.4 GlobalEnvironmentRecord declarative record — script
+    /// top-level `let` / `const` / `class` bindings, shared across
+    /// every script and eval chunk in the realm and *not* reflected
+    /// as global object properties. Cells start as the TDZ hole.
+    pub(crate) global_lexicals:
+        rustc_hash::FxHashMap<Box<str>, (crate::UpvalueCell, /* is_const */ bool)>,
+    /// §9.1.1.4 `[[VarNames]]` — names bound via
+    /// CreateGlobalVarBinding (script / eval var and function
+    /// declarations). Consulted by global lexical declaration
+    /// validation (§16.1.7 step 5).
+    pub(crate) global_var_names: rustc_hash::FxHashSet<Box<str>>,
     /// Depth of active §16.2.1.4 Evaluate calls. Dynamic imports that
     /// land while this is non-zero defer their target's evaluation to
     /// a host job so they cannot preempt the running DFS.
@@ -783,6 +794,8 @@ impl Interpreter {
             microtasks: MicrotaskQueue::new(),
             module_environments: std::collections::HashMap::new(),
             module_init_upvalues: std::collections::HashMap::new(),
+            global_lexicals: rustc_hash::FxHashMap::default(),
+            global_var_names: rustc_hash::FxHashSet::default(),
             module_hoisted: std::collections::HashSet::new(),
             module_evaluation_depth: 0,
             module_resolution_cache: std::collections::HashMap::new(),
@@ -2258,6 +2271,11 @@ impl Interpreter {
         &self,
     ) -> impl Iterator<Item = &Box<[crate::UpvalueCell]>> {
         self.module_init_upvalues.values()
+    }
+
+    /// Global declarative-record cells for the GC root walk.
+    pub(crate) fn global_lexicals_for_trace(&self) -> impl Iterator<Item = &crate::UpvalueCell> {
+        self.global_lexicals.values().map(|(cell, _)| cell)
     }
 
     /// Borrow cached eager + deferred module namespace exotic objects
@@ -4608,6 +4626,38 @@ impl Interpreter {
                     self.run_define_global_function_reg(
                         context, frame, name_idx, value_reg, deletable,
                     )?;
+                    continue;
+                }
+                Op::DeclareGlobalLex => {
+                    let name_idx = context
+                        .exec_const_index(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let is_const = context.exec_imm32(instr, 1).unwrap_or(0) != 0;
+                    let frame = &mut stack[top_idx];
+                    self.run_declare_global_lex_reg(context, frame, name_idx, is_const)?;
+                    continue;
+                }
+                Op::StoreGlobalBinding => {
+                    let value_reg = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let strict = context.exec_imm32(instr, 2).unwrap_or(0) != 0;
+                    let frame = &mut stack[top_idx];
+                    self.run_store_global_binding_reg(context, frame, value_reg, name_idx, strict)?;
+                    continue;
+                }
+                Op::InitGlobalLex => {
+                    let value_reg = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_init_global_lex_reg(context, frame, value_reg, name_idx)?;
                     continue;
                 }
                 Op::DefineGlobalVar => {

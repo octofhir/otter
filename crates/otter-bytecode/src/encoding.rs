@@ -576,6 +576,9 @@ pub const OP_BYTE_TABLE: &[(Op, u8)] = &[
     (Op::StoreDynamic, 0x91),
     (Op::TypeofDynamic, 0x92),
     (Op::DefineGlobalFunction, 0x93),
+    (Op::DeclareGlobalLex, 0x94),
+    (Op::StoreGlobalBinding, 0x95),
+    (Op::InitGlobalLex, 0x96),
 ];
 
 #[cfg(test)]
@@ -939,7 +942,7 @@ mod tests {
         // Catches accidental opcode additions that forget to wire
         // through OP_BYTE_TABLE. If this fires, append the missing
         // opcode at the next unused byte.
-        const EXPECTED_OPCODE_COUNT: usize = 148;
+        const EXPECTED_OPCODE_COUNT: usize = 151;
         assert_eq!(
             OP_BYTE_TABLE.len(),
             EXPECTED_OPCODE_COUNT,

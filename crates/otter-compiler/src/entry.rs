@@ -347,10 +347,32 @@ pub(crate) fn compile_program_with_mode(
     // §10.2.11 step 33 — pre-declare top-level `let` / `const` /
     // `class` names with TDZ so the function-hoist pass below can
     // see them when an inner function captures one of these
-    // forward references.
+    // forward references. Script global code instead declares them
+    // on the realm's global declarative record (§16.1.7 step 15) so
+    // sibling scripts and eval chunks resolve the same binding; eval
+    // lexicals stay private to the eval body (§19.2.1.1).
     let mut top_level_lex: Vec<(String, bool)> = Vec::new();
     hoist_lexical_names(&program.body, &mut top_level_lex);
-    pre_declare_lexical_bindings(&mut cx, &top_level_lex, program_span)?;
+    if !eval_mode {
+        cx.script_global_lexicals = top_level_lex.iter().map(|(name, _)| name.clone()).collect();
+        let mut declared: HashSet<&str> = HashSet::new();
+        for (name, is_const) in &top_level_lex {
+            if !declared.insert(name.as_str()) {
+                continue;
+            }
+            let name_idx = cx.intern_string_constant(name);
+            cx.emit(
+                Op::DeclareGlobalLex,
+                [
+                    Operand::ConstIndex(name_idx),
+                    Operand::Imm32(i32::from(*is_const)),
+                ],
+                program_span,
+            );
+        }
+    } else {
+        pre_declare_lexical_bindings(&mut cx, &top_level_lex, program_span)?;
+    }
     // §10.2.11 step 30 — top-level `function f() {…}` declarations
     // hoist to the script scope so calls before the source-level
     // declaration resolve to the function value. In global-binding

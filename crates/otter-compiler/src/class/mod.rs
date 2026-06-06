@@ -315,11 +315,24 @@ pub(crate) fn compile_class(
     // for its statics anyway, and the foundation overwrites with
     // the full class value before any user code outside the class
     // body can observe it.
-    if let Some(name) = class_name
-        && let Some(info) = cx.lookup_binding(name)
-    {
-        cx.emit_store_storage(statics_reg, info.storage, span);
-        cx.mark_initialized(name);
+    if let Some(name) = class_name {
+        if let Some(info) = cx.lookup_binding(name) {
+            cx.emit_store_storage(statics_reg, info.storage, span);
+            cx.mark_initialized(name);
+        } else if cx.script_global_lexicals.contains(name) {
+            // Script top-level class — the binding lives on the
+            // realm's global declarative record; clear its TDZ hole
+            // with the statics stand-in for the same reason.
+            let name_idx = cx.intern_string_constant(name);
+            cx.emit(
+                Op::InitGlobalLex,
+                [
+                    Operand::Register(statics_reg),
+                    Operand::ConstIndex(name_idx),
+                ],
+                span,
+            );
+        }
     }
 
     // Install methods (instance + static) onto the right side.

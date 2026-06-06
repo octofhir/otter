@@ -55,6 +55,13 @@ pub(crate) struct Compiler {
     /// chunks — resolves through the global object, so none of them
     /// can observe a stale copy. Empty for modules and eval bodies.
     pub(crate) script_global_vars: std::collections::HashSet<String>,
+    /// §9.1.1.4 global declarative record — names of script
+    /// top-level `let` / `const` / `class` declarations. These live
+    /// in the interpreter's realm-wide lexical map (shared across
+    /// sibling scripts, shadowing global object properties), not as
+    /// `<main>` locals. Empty for modules and eval bodies (eval
+    /// lexicals are private to the eval, §19.2.1.1).
+    pub(crate) script_global_lexicals: std::collections::HashSet<String>,
 }
 
 impl Compiler {
@@ -66,6 +73,7 @@ impl Compiler {
             suppress_global_mirror: false,
             in_eval: false,
             script_global_vars: std::collections::HashSet::new(),
+            script_global_lexicals: std::collections::HashSet::new(),
         }
     }
 

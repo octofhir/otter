@@ -1062,6 +1062,33 @@ pub enum Op {
     /// §9.1.1.4.16 CanDeclareGlobalFunction) and only receives the
     /// new value. Scripts pass `deletable = 0`, eval bodies `1`.
     DefineGlobalFunction,
+
+    /// §9.1.1.4 CreateMutableBinding / CreateImmutableBinding on the
+    /// global *declarative* record. Operands: `ConstIndex(name),
+    /// Imm32(is_const)`.
+    ///
+    /// Validates §16.1.7 steps 4–5 first: an existing global lexical
+    /// of the same name, a global `[[VarNames]]` entry, or a
+    /// restricted global property (existing non-configurable own
+    /// property of the global object) raises `SyntaxError`. The
+    /// fresh cell starts as the TDZ hole.
+    DeclareGlobalLex,
+
+    /// §9.1.1.4 global-environment `SetMutableBinding`. Operands:
+    /// `Register(value), ConstIndex(name), Imm32(strict)`.
+    ///
+    /// The declarative record is consulted first (`const` →
+    /// `TypeError`, TDZ hole → `ReferenceError`, else cell write),
+    /// then the object record: an existing property receives the
+    /// value; an absent one is a `ReferenceError` in strict mode and
+    /// a fresh global property otherwise.
+    StoreGlobalBinding,
+
+    /// §9.1.1.4 global-declarative `InitializeBinding` — write the
+    /// initializer value through a lexical cell created by
+    /// [`Op::DeclareGlobalLex`], clearing its TDZ hole. Operands:
+    /// `Register(value), ConstIndex(name)`.
+    InitGlobalLex,
 }
 
 impl Op {
@@ -1210,6 +1237,9 @@ impl Op {
             Op::StoreDynamic => "STORE_DYNAMIC",
             Op::TypeofDynamic => "TYPEOF_DYNAMIC",
             Op::DefineGlobalFunction => "DEFINE_GLOBAL_FUNCTION",
+            Op::DeclareGlobalLex => "DECLARE_GLOBAL_LEX",
+            Op::StoreGlobalBinding => "STORE_GLOBAL_BINDING",
+            Op::InitGlobalLex => "INIT_GLOBAL_LEX",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
@@ -1293,7 +1323,9 @@ impl Op {
             | Op::DeclareGlobalVar
             | Op::LoadDynamic
             | Op::StoreDynamic
-            | Op::TypeofDynamic => 2,
+            | Op::TypeofDynamic
+            | Op::DeclareGlobalLex
+            | Op::InitGlobalLex => 2,
             Op::GetStringIndex
             | Op::Add
             | Op::Sub
@@ -1323,7 +1355,8 @@ impl Op {
             | Op::LooseNotEqual
             | Op::LoadImportBinding
             | Op::NewBuiltinError
-            | Op::DefineGlobalFunction => 3,
+            | Op::DefineGlobalFunction
+            | Op::StoreGlobalBinding => 3,
             Op::GetPrototype
             | Op::SetPrototype
             | Op::ArrayLength
@@ -1432,6 +1465,10 @@ impl Op {
             Op::DeclareGlobalVar => pos == 0,
             // [name_const, value_reg, deletable_imm]
             Op::DefineGlobalFunction => pos == 0,
+            // [name_const, is_const_imm]
+            Op::DeclareGlobalLex => pos == 0,
+            // [value_reg, name_const(, strict_imm)]
+            Op::StoreGlobalBinding | Op::InitGlobalLex => pos == 1,
             // [url_const]
             Op::MarkModuleEvaluated => pos == 0,
             // [gate_dst, url_const]

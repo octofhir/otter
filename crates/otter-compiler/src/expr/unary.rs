@@ -235,9 +235,15 @@ pub(crate) fn compile_update(
             match storage {
                 Some(s) => cx.emit_load_storage(old, s, span),
                 None => {
-                    let global = cx.alloc_scratch();
-                    cx.emit(Op::LoadGlobalThis, [Operand::Register(global)], span);
-                    cx.emit_load_property(old, global, &name, span);
+                    // §13.4.2 — GetValue resolves through the global
+                    // environment (realm-wide lexicals first); a
+                    // missing binding is a ReferenceError.
+                    let name_idx = cx.intern_string_constant(&name);
+                    cx.emit(
+                        Op::LoadGlobalOrThrow,
+                        [Operand::Register(old), Operand::ConstIndex(name_idx)],
+                        span,
+                    );
                 }
             }
             if let Some(done) = with_done {
@@ -382,17 +388,16 @@ pub(crate) fn compile_update(
             match storage {
                 Some(s) => cx.emit_store_storage(next, s, span),
                 None => {
-                    let global = cx.alloc_scratch();
-                    cx.emit(Op::LoadGlobalThis, [Operand::Register(global)], span);
+                    // §9.1.1.4 global SetMutableBinding — realm-wide
+                    // lexicals shadow the object record.
                     let name_idx = cx.intern_string_constant(&name);
-                    let scratch = cx.alloc_scratch();
+                    let strict = i32::from(cx.is_strict);
                     cx.emit(
-                        Op::StoreProperty,
-                        vec![
-                            Operand::Register(global),
-                            Operand::ConstIndex(name_idx),
+                        Op::StoreGlobalBinding,
+                        [
                             Operand::Register(next),
-                            Operand::Register(scratch),
+                            Operand::ConstIndex(name_idx),
+                            Operand::Imm32(strict),
                         ],
                         span,
                     );

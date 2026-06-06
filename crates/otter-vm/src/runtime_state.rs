@@ -99,6 +99,12 @@ impl<'a> RuntimeState<'a> {
                 visitor(p);
             }
         }
+        // 2c) Global declarative-record cells (§9.1.1.4 script
+        // top-level lexical bindings).
+        for slot in interp.global_lexicals_for_trace() {
+            let p = slot as *const crate::UpvalueCell as *mut otter_gc::raw::RawGc;
+            visitor(p);
+        }
         for ns in interp.module_namespaces_for_trace() {
             ns.trace_gc_roots(visitor);
         }

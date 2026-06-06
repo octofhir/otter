@@ -196,6 +196,32 @@ pub(crate) fn compile_statement(
                 // doesn't pay an extra register copy.
                 if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id {
                     let name = id.name.as_str().to_string();
+                    // §16.1.7 step 15 — script top-level lexicals
+                    // live on the realm's global declarative record;
+                    // the initializer clears their TDZ hole.
+                    if cx.stack.len() == 1
+                        && cx.scopes.len() == 1
+                        && cx.lookup_in_current_scope(&name).is_none()
+                        && cx.script_global_lexicals.contains(&name)
+                    {
+                        let init_reg = match &declarator.init {
+                            Some(init) => {
+                                crate::expr::compile_expr_with_inferred_name(cx, init, &name, span)?
+                            }
+                            None => {
+                                let dst = cx.alloc_scratch();
+                                cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
+                                dst
+                            }
+                        };
+                        let name_idx = cx.intern_string_constant(&name);
+                        cx.emit(
+                            Op::InitGlobalLex,
+                            [Operand::Register(init_reg), Operand::ConstIndex(name_idx)],
+                            span,
+                        );
+                        continue;
+                    }
                     // The entry-point lexical pre-pass already
                     // declared every top-level `let` / `const` name
                     // (TDZ until source-position store) so inner
@@ -587,6 +613,21 @@ pub(crate) fn compile_statement(
                 .as_str()
                 .to_string();
             let class_reg = compile_class(cx, class, Some(&name))?;
+            // §16.1.7 step 15 — script top-level class bindings live
+            // on the realm's global declarative record.
+            if cx.stack.len() == 1
+                && cx.scopes.len() == 1
+                && cx.lookup_in_current_scope(&name).is_none()
+                && cx.script_global_lexicals.contains(&name)
+            {
+                let name_idx = cx.intern_string_constant(&name);
+                cx.emit(
+                    Op::InitGlobalLex,
+                    [Operand::Register(class_reg), Operand::ConstIndex(name_idx)],
+                    span,
+                );
+                return Ok(None);
+            }
             // The lexical pre-pass may have already declared this
             // class name (TDZ) so inner functions could capture it.
             let storage = match cx.lookup_in_current_scope(&name) {

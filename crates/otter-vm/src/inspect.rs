@@ -947,5 +947,8 @@ mod tests {
         Op::StoreDynamic,
         Op::TypeofDynamic,
         Op::DefineGlobalFunction,
+        Op::DeclareGlobalLex,
+        Op::StoreGlobalBinding,
+        Op::InitGlobalLex,
     ];
 }

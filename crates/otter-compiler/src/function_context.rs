@@ -125,6 +125,13 @@ pub(crate) struct FunctionContext {
     /// Monotonic suffix for synthetic `with` bindings in this
     /// function.
     pub(crate) next_with_env_id: u32,
+    /// `true` when this function body contains a direct-eval call
+    /// site. Every function-scope binding is promoted to an
+    /// own-upvalue cell and the name → cell map is recorded on the
+    /// emitted [`Function::direct_eval_bindings`] so `Op::Eval` can
+    /// hand the eval body its caller variable environment
+    /// (§19.2.1.3 EvalDeclarationInstantiation).
+    pub(crate) contains_direct_eval: bool,
 }
 
 impl FunctionContext {
@@ -158,6 +165,7 @@ impl FunctionContext {
             module_state: None,
             active_with_envs: Vec::new(),
             next_with_env_id: 0,
+            contains_direct_eval: false,
         }
     }
 

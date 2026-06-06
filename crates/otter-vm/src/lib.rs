@@ -6289,6 +6289,7 @@ mod tests {
             arguments_object_kind: ArgumentsObjectKind::Unmapped,
             mapped_argument_bindings: Vec::new(),
             module_url: String::new(),
+            direct_eval_bindings: Vec::new(),
             code,
             spans,
         }
@@ -9901,6 +9902,7 @@ mod tests {
             arguments_object_kind: ArgumentsObjectKind::Unmapped,
             mapped_argument_bindings: Vec::new(),
             module_url: String::new(),
+            direct_eval_bindings: Vec::new(),
             code: vec![Instruction {
                 pc: 0,
                 op: Op::ReturnUndefined,
@@ -9958,6 +9960,7 @@ mod tests {
             arguments_object_kind: ArgumentsObjectKind::Unmapped,
             mapped_argument_bindings: Vec::new(),
             module_url: String::new(),
+            direct_eval_bindings: Vec::new(),
             code: vec![Instruction {
                 pc: 0,
                 op: Op::ReturnUndefined,
@@ -10408,6 +10411,7 @@ mod tests {
             arguments_object_kind: ArgumentsObjectKind::Unmapped,
             mapped_argument_bindings: Vec::new(),
             module_url: String::new(),
+            direct_eval_bindings: Vec::new(),
             code: vec![Instruction {
                 pc: 0,
                 op: Op::ReturnUndefined,
@@ -10439,6 +10443,7 @@ mod tests {
             arguments_object_kind: ArgumentsObjectKind::Unmapped,
             mapped_argument_bindings: Vec::new(),
             module_url: String::new(),
+            direct_eval_bindings: Vec::new(),
             code: vec![
                 Instruction {
                     pc: 0,

@@ -706,6 +706,7 @@ mod tests {
                 arguments_object_kind: crate::ArgumentsObjectKind::Unmapped,
                 mapped_argument_bindings: Vec::new(),
                 module_url: String::new(),
+                direct_eval_bindings: Vec::new(),
                 code: Vec::<Instruction>::new(),
                 spans: Vec::<SpanEntry>::new(),
             }],

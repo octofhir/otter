@@ -63,6 +63,62 @@ pub fn analyze_arrow(arrow: &ArrowFunctionExpression<'_>) -> HashSet<String> {
     own.names.intersection(&inner.refs).cloned().collect()
 }
 
+/// `true` when a function body contains a direct-eval call site —
+/// a bare `eval(...)` identifier call — at any nesting depth.
+/// §19.2.1.3 EvalDeclarationInstantiation gives such an eval body
+/// read/write access to the caller's variable environment, so every
+/// function-scope binding must live in an [`UpvalueCell`] the
+/// runtime can hand to the eval chunk. The check is conservative:
+/// a locally shadowed `eval` still trips it (one extra cell per
+/// binding, no semantic change).
+#[must_use]
+pub fn body_contains_direct_eval(
+    params: Option<&FormalParameters<'_>>,
+    body: &FunctionBody<'_>,
+) -> bool {
+    let mut finder = DirectEvalFinder::default();
+    if let Some(p) = params {
+        finder.visit_formal_parameters(p);
+    }
+    finder.visit_function_body(body);
+    finder.found
+}
+
+/// All names a function body declares at its own depth (parameters,
+/// `var` / `let` / `const` / function / class declarations, excluding
+/// nested function internals). Used to promote *every* function-scope
+/// binding to an upvalue cell when the body contains a direct eval.
+#[must_use]
+pub fn all_own_names(
+    params: Option<&FormalParameters<'_>>,
+    body: &FunctionBody<'_>,
+) -> HashSet<String> {
+    let mut own = OwnNameCollector::default();
+    if let Some(p) = params {
+        own.visit_formal_parameters(p);
+    }
+    own.names.insert("arguments".to_string());
+    own.visit_function_body(body);
+    own.names
+}
+
+#[derive(Default)]
+struct DirectEvalFinder {
+    found: bool,
+}
+
+impl<'a> Visit<'a> for DirectEvalFinder {
+    fn visit_call_expression(&mut self, it: &oxc_ast::ast::CallExpression<'a>) {
+        if let oxc_ast::ast::Expression::Identifier(id) = &it.callee
+            && id.name.as_str() == "eval"
+        {
+            self.found = true;
+            return;
+        }
+        walk::walk_call_expression(self, it);
+    }
+}
+
 /// Module-body variant: collect names declared at the top level of
 /// `<main>` that some nested function references.
 #[must_use]

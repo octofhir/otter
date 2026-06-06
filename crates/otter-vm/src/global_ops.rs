@@ -97,7 +97,7 @@ impl Interpreter {
         // non-writable existing property silently absorbs the write
         // in sloppy mode. Only an absent property is defined fresh.
         if object::get_own_descriptor(self.global_this, &self.gc_heap, name).is_some() {
-            let _ = object::set(self.global_this, &mut self.gc_heap, name, value);
+            object::set(self.global_this, &mut self.gc_heap, name, value);
             frame.advance_pc(self.current_byte_len)?;
             return Ok(());
         }

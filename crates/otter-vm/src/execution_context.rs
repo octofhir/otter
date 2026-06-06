@@ -450,6 +450,7 @@ mod tests {
                 arguments_object_kind: ArgumentsObjectKind::Unmapped,
                 mapped_argument_bindings: Vec::new(),
                 module_url: String::new(),
+                direct_eval_bindings: Vec::new(),
                 code,
                 spans: Vec::new(),
             }],

@@ -32,7 +32,14 @@ pub(crate) fn compile_function_full(
     let function_is_strict = force_strict || parent.is_strict || body_has_strict_directive;
     let simple_params = formal_parameters_are_simple(params);
     let allow_duplicate_formals = !function_is_strict && simple_params;
-    let needs_arguments = body_references_arguments(params, body.as_deref());
+    // A direct eval body may reference `arguments` dynamically, so
+    // its presence forces the arguments object to materialize even
+    // when the enclosing body never names it (§19.2.1.3).
+    let contains_direct_eval = body
+        .as_ref()
+        .is_some_and(|b| capture::body_contains_direct_eval(Some(params), b));
+    let needs_arguments =
+        body_references_arguments(params, body.as_deref()) || contains_direct_eval;
     let uses_mapped_arguments = needs_arguments && !function_is_strict && simple_params;
     validate_formal_parameter_names(params, function_is_strict, allow_duplicate_formals, span)?;
     let active_with_envs = parent.active_with_envs.clone();
@@ -48,7 +55,16 @@ pub(crate) fn compile_function_full(
     child.binds_arguments = true;
     if let Some(b) = body {
         child.captured_names = capture::analyze_function(Some(params), b);
+        // §19.2.1.3 — a direct eval body reads and writes caller
+        // bindings through upvalue cells, so promote every
+        // function-scope binding (not just statically captured ones).
+        if contains_direct_eval {
+            child
+                .captured_names
+                .extend(capture::all_own_names(Some(params), b));
+        }
     }
+    child.contains_direct_eval = contains_direct_eval;
     if uses_mapped_arguments {
         child.mapped_argument_names = simple_formal_names(params).into_iter().collect();
     }
@@ -130,6 +146,7 @@ pub(crate) fn compile_function_full(
         parent.emit_store_storage(tmp, storage, span);
         parent.mark_initialized("arguments");
     }
+    let mut direct_eval_meta: Vec<otter_bytecode::DirectEvalBinding> = Vec::new();
     if let Some(body) = body {
         let mut var_names: Vec<String> = Vec::new();
         hoist_var_names(&body.statements, &mut var_names);
@@ -160,6 +177,9 @@ pub(crate) fn compile_function_full(
         }
         for stmt in &body.statements {
             compile_statement(parent, stmt)?;
+        }
+        if contains_direct_eval {
+            direct_eval_meta = collect_direct_eval_bindings(parent, &lex_names);
         }
     }
     parent.exit_scope();
@@ -200,9 +220,42 @@ pub(crate) fn compile_function_full(
     };
     slot.mapped_argument_bindings = mapped_argument_bindings;
     slot.own_upvalue_count = child.own_upvalue_count;
+    slot.direct_eval_bindings = direct_eval_meta;
     slot.code = child.code;
     slot.spans = child.spans;
     Ok((function_id, captures))
+}
+
+/// Snapshot the function-scope bindings that live in upvalue cells as
+/// a [`DirectEvalBinding`] table for `Op::Eval`. Called after the body
+/// is compiled (every hoisted declaration has settled) and before the
+/// function scope is exited.
+fn collect_direct_eval_bindings(
+    cx: &Compiler,
+    lexical_names: &[(String, bool)],
+) -> Vec<otter_bytecode::DirectEvalBinding> {
+    let lexical: std::collections::HashSet<&str> = lexical_names
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let Some(scope) = cx.scopes.first() else {
+        return Vec::new();
+    };
+    let mut entries: Vec<otter_bytecode::DirectEvalBinding> = scope
+        .bindings
+        .iter()
+        .filter_map(|(name, info)| match info.storage {
+            BindingStorage::Upvalue { idx } => Some(otter_bytecode::DirectEvalBinding {
+                name: name.clone(),
+                upvalue: idx,
+                lexical: lexical.contains(name.as_str()),
+            }),
+            BindingStorage::Register { .. } => None,
+        })
+        .collect();
+    // `bindings` is hash-ordered; sort for deterministic bytecode.
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries
 }
 
 /// `true` when an arrow's variable environment will bind
@@ -259,6 +312,16 @@ pub(crate) fn compile_arrow_function(
     // direct-eval-in-parameter-defaults check).
     child.binds_arguments = arrow_binds_arguments(arrow);
     child.captured_names = capture::analyze_arrow(arrow);
+    // §19.2.1.3 — a direct eval inside the arrow body uses the
+    // arrow's own variable scope as its caller environment, so every
+    // arrow-scope binding must live in a cell.
+    let contains_direct_eval = capture::body_contains_direct_eval(Some(&arrow.params), &arrow.body);
+    if contains_direct_eval {
+        child
+            .captured_names
+            .extend(capture::all_own_names(Some(&arrow.params), &arrow.body));
+    }
+    child.contains_direct_eval = contains_direct_eval;
     child.reserve_known_own_upvalues();
     parent.push(child);
     parent.enter_scope();
@@ -297,6 +360,7 @@ pub(crate) fn compile_arrow_function(
     }
     parent.in_param_init = false;
 
+    let mut direct_eval_meta: Vec<otter_bytecode::DirectEvalBinding> = Vec::new();
     if arrow.expression {
         // `() => expr` — body is a single ExpressionStatement
         // whose expression is the implicit return value.
@@ -316,6 +380,9 @@ pub(crate) fn compile_arrow_function(
         };
         let inner_span = (es.span.start, es.span.end);
         let reg = compile_expr(parent, &es.expression, inner_span)?;
+        if contains_direct_eval {
+            direct_eval_meta = collect_direct_eval_bindings(parent, &[]);
+        }
         parent.emit(Op::ReturnValue, [Operand::Register(reg)], inner_span);
     } else {
         // §10.2.11 FunctionDeclarationInstantiation — block-body
@@ -343,6 +410,9 @@ pub(crate) fn compile_arrow_function(
         for stmt in &arrow.body.statements {
             compile_statement(parent, stmt)?;
         }
+        if contains_direct_eval {
+            direct_eval_meta = collect_direct_eval_bindings(parent, &lex_names);
+        }
         parent.emit(Op::ReturnUndefined, vec![], span);
     }
     parent.exit_scope();
@@ -362,6 +432,7 @@ pub(crate) fn compile_arrow_function(
     slot.is_async = arrow.r#async;
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.is_arrow = true;
+    slot.direct_eval_bindings = direct_eval_meta;
     slot.code = child.code;
     slot.spans = child.spans;
     Ok((function_id, captures))

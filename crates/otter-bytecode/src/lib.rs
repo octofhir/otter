@@ -1796,6 +1796,19 @@ pub struct Function {
     /// caller's URL or stay empty.
     #[serde(default)]
     pub module_url: String,
+    /// §19.2.1.3 EvalDeclarationInstantiation support. Non-empty when
+    /// this function body contains a direct `eval(...)` call site: the
+    /// compiler promotes every function-scope binding (parameters,
+    /// `var` / function declarations, top-level lexicals, the
+    /// `arguments` binding) into an own-upvalue cell and records the
+    /// name → cell-index mapping here. `Op::Eval` reads the table to
+    /// hand the eval body its caller variable environment.
+    ///
+    /// Also set on a compiled eval `<main>` itself, where it lists the
+    /// *new* var-scoped names the eval body declares (cells the caller
+    /// frame must adopt so later code observes the bindings).
+    #[serde(default)]
+    pub direct_eval_bindings: Vec<DirectEvalBinding>,
     /// Encoded instructions.
     pub code: Vec<Instruction>,
     /// `pc -> source span` table.
@@ -1811,6 +1824,21 @@ pub enum ArgumentsObjectKind {
     Unmapped,
     /// Sloppy simple-parameter mapped arguments object.
     Mapped,
+}
+
+/// One caller-scope binding a direct `eval` body can see, or one new
+/// var-scoped binding an eval body introduces into its caller.
+/// `upvalue` indexes the owning frame's upvalue array.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectEvalBinding {
+    /// Source-level binding name.
+    pub name: String,
+    /// Own-upvalue cell index inside the owning function's frame.
+    pub upvalue: u16,
+    /// `true` for `let` / `const` / `class` bindings. A sloppy direct
+    /// eval whose body var-declares a name that collides with a caller
+    /// lexical binding is a runtime `SyntaxError` (§19.2.1.3 step 5).
+    pub lexical: bool,
 }
 
 /// One argument index aliased to one formal parameter binding.

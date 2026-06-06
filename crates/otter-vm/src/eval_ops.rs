@@ -237,6 +237,11 @@ impl Interpreter {
             })
             .collect();
         let entry_this = stack[top_idx].this_value;
+        // §13.3.3 — `new.target` in the eval body reads the caller
+        // frame's value (direct eval is contained in function code).
+        let caller_new_target = self
+            .frame_cold(&stack[top_idx])
+            .and_then(|cold| cold.new_target);
         if !adopted.is_empty() {
             let cold = self.frame_ensure_cold(&mut stack[top_idx]);
             let map = cold.eval_vars.get_or_insert_default();
@@ -245,7 +250,10 @@ impl Interpreter {
             }
         }
         let main = context.exec_main();
-        let entry = Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this);
+        let mut entry = Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this);
+        if caller_new_target.is_some() {
+            self.frame_ensure_cold(&mut entry).new_target = caller_new_target;
+        }
         let mut sub_stack: SmallVec<[Frame; 8]> = SmallVec::new();
         sub_stack.push(entry);
         self.dispatch_loop(&context, &mut sub_stack)

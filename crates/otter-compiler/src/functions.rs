@@ -258,11 +258,13 @@ fn collect_direct_eval_bindings(
     entries
 }
 
-/// `true` when an arrow's variable environment will bind
-/// `arguments`: a parameter pattern, body `var` (incl. hoistable
-/// function declarations), or top-level lexical declaration
-/// introduces the name. §10.2.11 — arrows never synthesize an
-/// arguments object of their own.
+/// `true` when an `arguments` binding already exists in an arrow's
+/// variable environment *during parameter instantiation* — i.e. a
+/// formal parameter (or rest pattern) declares the name. Body
+/// declarations don't count: their bindings are created only after
+/// the parameters finish, so a direct eval in a parameter default
+/// may legally var-declare `arguments` (§19.2.1.3). Arrows never
+/// synthesize an arguments object of their own (§10.2.11).
 fn arrow_binds_arguments(arrow: &oxc_ast::ast::ArrowFunctionExpression<'_>) -> bool {
     let mut names: Vec<String> = Vec::new();
     for param in &arrow.params.items {
@@ -271,13 +273,7 @@ fn arrow_binds_arguments(arrow: &oxc_ast::ast::ArrowFunctionExpression<'_>) -> b
     if let Some(rest) = &arrow.params.rest {
         collect_pattern_var_names(&rest.rest.argument, &mut names);
     }
-    hoist_var_names(&arrow.body.statements, &mut names);
-    if names.iter().any(|name| name == "arguments") {
-        return true;
-    }
-    let mut lex: Vec<(String, bool)> = Vec::new();
-    hoist_lexical_names(&arrow.body.statements, &mut lex);
-    lex.iter().any(|(name, _)| name == "arguments")
+    names.iter().any(|name| name == "arguments")
 }
 
 /// Compile an arrow function. Two body shapes share the same

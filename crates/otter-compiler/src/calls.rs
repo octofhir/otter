@@ -410,7 +410,9 @@ pub(crate) fn compile_method_call(
         // calling function binds the name (the binding exists but is
         // still uninitialized during parameter instantiation). After
         // the parameters are bound the same eval body is legal, so
-        // only the parameter-default window arms the flag.
+        // only the parameter-default window arms the flag. Arrows
+        // have lexical [[ThisMode]] — the restriction never applies
+        // to an arrow variable environment.
         let forbid_var_arguments = cx.in_param_init && cx.binds_arguments;
         cx.emit(
             Op::Eval,

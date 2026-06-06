@@ -444,17 +444,10 @@ fn global_is_finite(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
 fn global_eval(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let arg = args.first().cloned().unwrap_or(Value::undefined());
     // §19.2.1.1 indirect eval: sloppy, global variable environment —
-    // no caller-scope restrictions apply.
+    // no caller-scope restrictions apply. Errors keep their spec
+    // class across the native boundary (a TDZ ReferenceError from
+    // the eval body must not collapse to TypeError).
     ctx.interp_mut()
         .run_eval(&arg, crate::EvalCompileOptions::default())
-        .map_err(|err| match err {
-            VmError::SyntaxError { message } => NativeError::SyntaxError {
-                name: "eval",
-                reason: message,
-            },
-            err => NativeError::TypeError {
-                name: "eval",
-                reason: err.to_string(),
-            },
-        })
+        .map_err(|err| crate::native_function::vm_to_native_error(err, "eval"))
 }

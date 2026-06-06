@@ -112,6 +112,15 @@ pub fn compile_eval_source(
 ) -> Result<BytecodeModule, CompileError> {
     // §19.2.1.1 PerformEval parses the body with the Script goal.
     otter_syntax::with_program_goal(source, kind, otter_syntax::SourceGoal::Script, |program| {
+        // §19.2.1.1 step 5 — `new.target` in eval code is an early
+        // SyntaxError unless this is a direct eval contained in
+        // function code (`caller_scope` present).
+        if caller_scope.is_none() && capture::program_references_new_target(&program.body) {
+            return Err(CompileError::Unsupported {
+                node: "SyntaxError: new.target expression is not allowed here".to_string(),
+                span: (program.span.start, program.span.end),
+            });
+        }
         if forbid_var_arguments && !(force_strict || program.has_use_strict_directive()) {
             let mut var_names: Vec<String> = Vec::new();
             hoist_var_names(&program.body, &mut var_names);

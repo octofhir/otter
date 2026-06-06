@@ -124,6 +124,34 @@ pub fn all_program_names(stmts: &[Statement<'_>]) -> HashSet<String> {
     own.names
 }
 
+/// `true` when a program body references `new.target` outside any
+/// non-arrow function. §19.2.1.1 PerformEval step 5 — such a
+/// reference is an early SyntaxError unless the eval is a direct
+/// eval contained in function code (arrows are transparent: they
+/// inherit `new.target` lexically).
+#[must_use]
+pub fn program_references_new_target(stmts: &[Statement<'_>]) -> bool {
+    #[derive(Default)]
+    struct NewTargetFinder {
+        found: bool,
+    }
+    impl<'a> Visit<'a> for NewTargetFinder {
+        fn visit_meta_property(&mut self, it: &oxc_ast::ast::MetaProperty<'a>) {
+            if it.meta.name == "new" && it.property.name == "target" {
+                self.found = true;
+            }
+        }
+        fn visit_function(&mut self, _it: &Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {
+            // Non-arrow function bodies own their `new.target`.
+        }
+    }
+    let mut finder = NewTargetFinder::default();
+    for stmt in stmts {
+        finder.visit_statement(stmt);
+    }
+    finder.found
+}
+
 #[derive(Default)]
 struct DirectEvalFinder {
     found: bool,

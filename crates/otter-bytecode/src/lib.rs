@@ -1026,6 +1026,31 @@ pub enum Op {
     /// re-declaration (sibling scripts, Annex B extensions over a
     /// pre-existing global) never resets a live value.
     DeclareGlobalVar,
+
+    /// Read an identifier that may resolve to an eval-introduced
+    /// caller binding. Operands: `Register(dst), ConstIndex(name)`.
+    ///
+    /// §9.1.2.1 GetIdentifierReference over a function environment a
+    /// direct eval extended at runtime: consult the frame's
+    /// eval-introduced binding map first, then fall back to the
+    /// global environment (`ReferenceError` when absent, like
+    /// [`Op::LoadGlobalOrThrow`]). Emitted only inside functions
+    /// whose body contains a direct eval call site.
+    LoadDynamic,
+
+    /// Write an identifier that may resolve to an eval-introduced
+    /// caller binding. Operands: `Register(value), ConstIndex(name)`.
+    ///
+    /// §10.2.4.2 PutValue counterpart of [`Op::LoadDynamic`]: store
+    /// through the frame's eval-introduced binding when present,
+    /// else fall back to the sloppy-mode `globalThis` property
+    /// write.
+    StoreDynamic,
+
+    /// `typeof` flavour of [`Op::LoadDynamic`]. Operands:
+    /// `Register(dst), ConstIndex(name)`. An unresolvable name
+    /// yields `undefined` instead of throwing (§13.5.3).
+    TypeofDynamic,
 }
 
 impl Op {
@@ -1170,6 +1195,9 @@ impl Op {
             Op::LoadGlobalOrUndefined => "LOAD_GLOBAL_OR_UNDEFINED",
             Op::DefineGlobalVar => "DEFINE_GLOBAL_VAR",
             Op::DeclareGlobalVar => "DECLARE_GLOBAL_VAR",
+            Op::LoadDynamic => "LOAD_DYNAMIC",
+            Op::StoreDynamic => "STORE_DYNAMIC",
+            Op::TypeofDynamic => "TYPEOF_DYNAMIC",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
@@ -1250,7 +1278,10 @@ impl Op {
             | Op::LoadGlobalOrThrow
             | Op::LoadGlobalOrUndefined
             | Op::DefineGlobalVar
-            | Op::DeclareGlobalVar => 2,
+            | Op::DeclareGlobalVar
+            | Op::LoadDynamic
+            | Op::StoreDynamic
+            | Op::TypeofDynamic => 2,
             Op::GetStringIndex
             | Op::Add
             | Op::Sub
@@ -1379,7 +1410,10 @@ impl Op {
             | Op::TemporalLoad
             | Op::LoadBuiltinError
             | Op::LoadGlobalOrThrow
-            | Op::LoadGlobalOrUndefined => pos == 1,
+            | Op::LoadGlobalOrUndefined
+            | Op::LoadDynamic
+            | Op::StoreDynamic
+            | Op::TypeofDynamic => pos == 1,
             // [name_const, value_reg]
             Op::DefineGlobalVar => pos == 0,
             Op::DeclareGlobalVar => pos == 0,

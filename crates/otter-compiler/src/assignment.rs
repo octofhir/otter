@@ -1278,6 +1278,18 @@ pub(crate) fn store_identifier(
                 emit_reference_error(cx, name, span);
                 return Ok(());
             }
+            // §10.2.4.2 PutValue — inside a function with a direct
+            // eval the name may resolve to an eval-introduced
+            // frame binding before the globalThis fallback.
+            if cx.contains_direct_eval {
+                let name_idx = cx.intern_string_constant(name);
+                cx.emit(
+                    Op::StoreDynamic,
+                    [Operand::Register(value_reg), Operand::ConstIndex(name_idx)],
+                    span,
+                );
+                return Ok(());
+            }
             // §10.2.4.1 PutValue fallback to globalThis.
             let global = cx.alloc_scratch();
             cx.emit(Op::LoadGlobalThis, [Operand::Register(global)], span);

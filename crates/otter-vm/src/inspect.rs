@@ -943,5 +943,8 @@ mod tests {
         Op::StarReexport,
         Op::ModuleNamespaceObject,
         Op::LoadImportBinding,
+        Op::LoadDynamic,
+        Op::StoreDynamic,
+        Op::TypeofDynamic,
     ];
 }

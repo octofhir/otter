@@ -153,4 +153,83 @@ impl Interpreter {
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
+
+    /// `Op::LoadDynamic` — identifier read in a function whose body
+    /// contains a direct eval. §9.1.2.1 GetIdentifierReference over
+    /// the runtime-extended function environment: an eval-introduced
+    /// binding wins, otherwise the ordinary throwing global lookup
+    /// runs.
+    pub(crate) fn run_load_dynamic_reg(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut Frame,
+        dst: u16,
+        name_idx: u32,
+    ) -> Result<(), VmError> {
+        let name = context
+            .string_constant_str(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        if let Some(cell) = self.frame_eval_var(frame, name) {
+            let value = crate::read_upvalue(&self.gc_heap, cell);
+            write_register(frame, dst, value)?;
+            frame.advance_pc(self.current_byte_len)?;
+            return Ok(());
+        }
+        self.run_load_global_or_throw_reg(context, frame, dst, name_idx)
+    }
+
+    /// `Op::StoreDynamic` — §10.2.4.2 PutValue counterpart of
+    /// [`Self::run_load_dynamic_reg`]: store through the
+    /// eval-introduced binding when present, else the sloppy-mode
+    /// `globalThis` property write.
+    pub(crate) fn run_store_dynamic_reg(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut Frame,
+        value_reg: u16,
+        name_idx: u32,
+    ) -> Result<(), VmError> {
+        let name = context
+            .string_constant_str(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        let value = *crate::read_register(frame, value_reg)?;
+        if let Some(cell) = self.frame_eval_var(frame, name) {
+            crate::store_upvalue(&mut self.gc_heap, cell, value);
+        } else {
+            object::set(self.global_this, &mut self.gc_heap, name, value);
+        }
+        frame.advance_pc(self.current_byte_len)?;
+        Ok(())
+    }
+
+    /// `Op::TypeofDynamic` — `typeof` flavour of
+    /// [`Self::run_load_dynamic_reg`]; an unresolvable name yields
+    /// `undefined` instead of throwing (§13.5.3).
+    pub(crate) fn run_typeof_dynamic_reg(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut Frame,
+        dst: u16,
+        name_idx: u32,
+    ) -> Result<(), VmError> {
+        let name = context
+            .string_constant_str(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        if let Some(cell) = self.frame_eval_var(frame, name) {
+            let value = crate::read_upvalue(&self.gc_heap, cell);
+            write_register(frame, dst, value)?;
+            frame.advance_pc(self.current_byte_len)?;
+            return Ok(());
+        }
+        self.run_load_global_or_undefined_reg(context, frame, dst, name_idx)
+    }
+
+    /// Look up an eval-introduced var binding on `frame`'s cold
+    /// record.
+    fn frame_eval_var(&self, frame: &Frame, name: &str) -> Option<crate::UpvalueCell> {
+        self.frame_cold(frame)
+            .and_then(|cold| cold.eval_vars.as_ref())
+            .and_then(|map| map.get(name))
+            .copied()
+    }
 }

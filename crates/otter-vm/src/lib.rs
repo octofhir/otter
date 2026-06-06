@@ -4539,6 +4539,39 @@ impl Interpreter {
                     self.run_declare_global_var_reg(context, frame, name_idx, configurable)?;
                     continue;
                 }
+                Op::LoadDynamic => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_load_dynamic_reg(context, frame, dst, name_idx)?;
+                    continue;
+                }
+                Op::StoreDynamic => {
+                    let value_reg = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_store_dynamic_reg(context, frame, value_reg, name_idx)?;
+                    continue;
+                }
+                Op::TypeofDynamic => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_typeof_dynamic_reg(context, frame, dst, name_idx)?;
+                    continue;
+                }
                 Op::DefineGlobalVar => {
                     let name_idx = context
                         .exec_const_index(instr, 0)

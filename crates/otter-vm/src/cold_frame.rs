@@ -143,6 +143,15 @@ pub struct ColdFrame {
     /// undefined return with `this` still in the TDZ is a
     /// `ReferenceError`.
     pub is_derived_constructor: bool,
+    /// Var-scoped bindings a direct eval introduced into this frame's
+    /// variable environment at runtime (§19.2.1.3
+    /// EvalDeclarationInstantiation step 16.b). Consulted by
+    /// [`otter_bytecode::Op::LoadDynamic`] /
+    /// [`otter_bytecode::Op::StoreDynamic`] /
+    /// [`otter_bytecode::Op::TypeofDynamic`] before the global
+    /// fallback, and folded into the caller scope handed to any later
+    /// direct eval from the same frame.
+    pub eval_vars: Option<Box<rustc_hash::FxHashMap<String, crate::UpvalueCell>>>,
 }
 
 impl ColdFrame {
@@ -163,6 +172,7 @@ impl ColdFrame {
             && self.handlers.is_empty()
             && self.active_iterator_closers.is_empty()
             && !self.is_derived_constructor
+            && self.eval_vars.is_none()
     }
 
     /// Trace GC slots reachable through cold protocol state.
@@ -209,6 +219,12 @@ impl ColdFrame {
         }
         for (v, _) in &self.active_iterator_closers {
             v.trace_value_slots(visitor);
+        }
+        if let Some(map) = &self.eval_vars {
+            for cell in map.values() {
+                let p = cell as *const crate::UpvalueCell as *mut otter_gc::raw::RawGc;
+                visitor(p);
+            }
         }
     }
 }

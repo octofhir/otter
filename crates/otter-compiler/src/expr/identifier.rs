@@ -210,12 +210,22 @@ fn compile_identifier_without_with(
     // under that name, the runtime throws a
     // `ReferenceError` per the spec.
     //
+    // Inside a function whose body contains a direct eval,
+    // the name may instead resolve to a binding the eval
+    // introduced into this frame's variable environment at
+    // runtime — `Op::LoadDynamic` checks that map first.
+    //
     // <https://tc39.es/ecma262/#sec-resolvebinding>
     // <https://tc39.es/ecma262/#sec-getvalue>
     let dst = cx.alloc_scratch();
     let name_idx = cx.intern_string_constant(name);
+    let op = if cx.contains_direct_eval {
+        Op::LoadDynamic
+    } else {
+        Op::LoadGlobalOrThrow
+    };
     cx.emit(
-        Op::LoadGlobalOrThrow,
+        op,
         [Operand::Register(dst), Operand::ConstIndex(name_idx)],
         span,
     );

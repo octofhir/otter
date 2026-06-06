@@ -4660,6 +4660,15 @@ impl Interpreter {
                     self.run_init_global_lex_reg(context, frame, value_reg, name_idx)?;
                     continue;
                 }
+                Op::ValidateGlobalDecl => {
+                    let name_idx = context
+                        .exec_const_index(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let kind = context.exec_imm32(instr, 1).unwrap_or(0);
+                    let frame = &mut stack[top_idx];
+                    self.run_validate_global_decl_reg(context, frame, name_idx, kind)?;
+                    continue;
+                }
                 Op::DefineGlobalVar => {
                     let name_idx = context
                         .exec_const_index(instr, 0)

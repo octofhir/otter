@@ -324,7 +324,7 @@ mod tests {
             Op::DeclareGlobalVar => vec![konst(0), imm(1)],
             Op::LoadDynamic | Op::StoreDynamic | Op::TypeofDynamic => vec![reg(0), konst(1)],
             Op::DefineGlobalFunction => vec![konst(0), reg(1), imm(1)],
-            Op::DeclareGlobalLex => vec![konst(0), imm(1)],
+            Op::DeclareGlobalLex | Op::ValidateGlobalDecl => vec![konst(0), imm(1)],
             Op::StoreGlobalBinding => vec![reg(0), konst(1), imm(1)],
             Op::InitGlobalLex => vec![reg(0), konst(1)],
             Op::EvaluateModule => vec![reg(0), konst(1)],

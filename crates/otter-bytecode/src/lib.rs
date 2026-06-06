@@ -1089,6 +1089,19 @@ pub enum Op {
     /// [`Op::DeclareGlobalLex`], clearing its TDZ hole. Operands:
     /// `Register(value), ConstIndex(name)`.
     InitGlobalLex,
+
+    /// §16.1.7 GlobalDeclarationInstantiation steps 1–12 /
+    /// §19.2.1.3 steps 5–11 — validate one declared name against the
+    /// global environment *before any binding is created*, so a
+    /// failing script instantiates nothing. Operands:
+    /// `ConstIndex(name), Imm32(kind)` where kind 0 = lexical
+    /// (SyntaxError on an existing lexical, `[[VarNames]]` entry, or
+    /// restricted global property), 1 = var (SyntaxError on an
+    /// existing lexical; TypeError when a fresh binding cannot be
+    /// created on a non-extensible global), 2 = function (SyntaxError
+    /// on an existing lexical; TypeError per §9.1.1.4.16
+    /// CanDeclareGlobalFunction).
+    ValidateGlobalDecl,
 }
 
 impl Op {
@@ -1240,6 +1253,7 @@ impl Op {
             Op::DeclareGlobalLex => "DECLARE_GLOBAL_LEX",
             Op::StoreGlobalBinding => "STORE_GLOBAL_BINDING",
             Op::InitGlobalLex => "INIT_GLOBAL_LEX",
+            Op::ValidateGlobalDecl => "VALIDATE_GLOBAL_DECL",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
@@ -1325,7 +1339,8 @@ impl Op {
             | Op::StoreDynamic
             | Op::TypeofDynamic
             | Op::DeclareGlobalLex
-            | Op::InitGlobalLex => 2,
+            | Op::InitGlobalLex
+            | Op::ValidateGlobalDecl => 2,
             Op::GetStringIndex
             | Op::Add
             | Op::Sub
@@ -1465,8 +1480,8 @@ impl Op {
             Op::DeclareGlobalVar => pos == 0,
             // [name_const, value_reg, deletable_imm]
             Op::DefineGlobalFunction => pos == 0,
-            // [name_const, is_const_imm]
-            Op::DeclareGlobalLex => pos == 0,
+            // [name_const, is_const_imm] / [name_const, kind_imm]
+            Op::DeclareGlobalLex | Op::ValidateGlobalDecl => pos == 0,
             // [value_reg, name_const(, strict_imm)]
             Op::StoreGlobalBinding | Op::InitGlobalLex => pos == 1,
             // [url_const]

@@ -950,5 +950,6 @@ mod tests {
         Op::DeclareGlobalLex,
         Op::StoreGlobalBinding,
         Op::InitGlobalLex,
+        Op::ValidateGlobalDecl,
     ];
 }

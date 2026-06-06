@@ -333,6 +333,42 @@ pub(crate) fn compile_program_with_mode(
     let global_var_bindings = !eval_mode || (caller.is_empty() && !main_is_strict);
     if global_var_bindings {
         cx.script_global_vars = top_level_vars.iter().cloned().collect();
+        // §16.1.7 steps 1–12 / §19.2.1.3 steps 5–11 — validate every
+        // declared name before any binding is created so a failing
+        // script instantiates nothing: lexicals first, then function
+        // declarations, then plain vars.
+        let function_names: HashSet<String> = top_level_hoistable_function_names(&program.body)
+            .into_iter()
+            .collect();
+        let mut validate_lex: Vec<(String, bool)> = Vec::new();
+        if !eval_mode {
+            hoist_lexical_names(&program.body, &mut validate_lex);
+        }
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut validations: Vec<(&str, i32)> = Vec::new();
+        for (name, _) in &validate_lex {
+            if seen.insert(name.as_str()) {
+                validations.push((name.as_str(), 0));
+            }
+        }
+        for name in &top_level_vars {
+            if seen.insert(name.as_str()) {
+                let kind = if function_names.contains(name.as_str()) {
+                    2
+                } else {
+                    1
+                };
+                validations.push((name.as_str(), kind));
+            }
+        }
+        for (name, kind) in validations {
+            let name_idx = cx.intern_string_constant(name);
+            cx.emit(
+                Op::ValidateGlobalDecl,
+                [Operand::ConstIndex(name_idx), Operand::Imm32(kind)],
+                program_span,
+            );
+        }
     } else {
         pre_declare_var_bindings(&mut cx, &top_level_vars, program_span)?;
     }

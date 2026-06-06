@@ -376,6 +376,73 @@ impl Interpreter {
         Ok(())
     }
 
+    /// `Op::ValidateGlobalDecl` — §16.1.7 steps 1–12 / §19.2.1.3
+    /// steps 5–11: validate one declared name against the global
+    /// environment before any binding is created.
+    pub(crate) fn run_validate_global_decl_reg(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut Frame,
+        name_idx: u32,
+        kind: i32,
+    ) -> Result<(), VmError> {
+        let name = context
+            .string_constant_str(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        match kind {
+            // Lexical: same checks as DeclareGlobalLex, minus the
+            // cell creation.
+            0 => {
+                if self.global_lexicals.contains_key(name) || self.global_var_names.contains(name) {
+                    return Err(VmError::SyntaxError {
+                        message: format!("Identifier '{name}' has already been declared"),
+                    });
+                }
+                if let Some(descriptor) =
+                    object::get_own_descriptor(self.global_this, &self.gc_heap, name)
+                    && !descriptor.flags.configurable()
+                {
+                    return Err(VmError::SyntaxError {
+                        message: format!("Identifier '{name}' has already been declared"),
+                    });
+                }
+            }
+            // Var: §9.1.1.4.15 CanDeclareGlobalVar + the step-5
+            // lexical-collision SyntaxError.
+            1 => {
+                if self.global_lexicals.contains_key(name) {
+                    return Err(VmError::SyntaxError {
+                        message: format!("Identifier '{name}' has already been declared"),
+                    });
+                }
+            }
+            // Function: §9.1.1.4.16 CanDeclareGlobalFunction + the
+            // lexical-collision SyntaxError.
+            _ => {
+                if self.global_lexicals.contains_key(name) {
+                    return Err(VmError::SyntaxError {
+                        message: format!("Identifier '{name}' has already been declared"),
+                    });
+                }
+                if let Some(descriptor) =
+                    object::get_own_descriptor(self.global_this, &self.gc_heap, name)
+                    && !descriptor.flags.configurable()
+                {
+                    let permitted = matches!(descriptor.kind, object::DescriptorKind::Data { .. })
+                        && descriptor.flags.writable()
+                        && descriptor.flags.enumerable();
+                    if !permitted {
+                        return Err(VmError::TypeError {
+                            message: format!("Cannot declare global function '{name}'"),
+                        });
+                    }
+                }
+            }
+        }
+        frame.advance_pc(self.current_byte_len)?;
+        Ok(())
+    }
+
     /// `Op::InitGlobalLex` — §9.1.1.4 InitializeBinding on the
     /// global declarative record.
     pub(crate) fn run_init_global_lex_reg(

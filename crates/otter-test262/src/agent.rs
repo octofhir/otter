@@ -204,6 +204,44 @@ fn eval_script(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
                 name: "evalScript",
                 reason: message,
             },
+            // An uncaught throw from the script body arrives rendered
+            // ("SyntaxError: …"); recover the spec error class so
+            // `assert.throws(SyntaxError, …)` sees the right
+            // constructor.
+            otter_vm::VmError::Uncaught { value } => {
+                let render = value.to_string();
+                let class_mapped = [
+                    ("SyntaxError", 0u8),
+                    ("TypeError", 1),
+                    ("ReferenceError", 2),
+                    ("RangeError", 3),
+                ]
+                .iter()
+                .find(|(prefix, _)| render.starts_with(prefix))
+                .map(|(_, kind)| *kind);
+                let reason = render
+                    .split_once(": ")
+                    .map(|(_, tail)| tail.to_string())
+                    .unwrap_or(render.clone());
+                match class_mapped {
+                    Some(0) => NativeError::SyntaxError {
+                        name: "evalScript",
+                        reason,
+                    },
+                    Some(2) => NativeError::ReferenceError {
+                        name: "evalScript",
+                        reason,
+                    },
+                    Some(3) => NativeError::RangeError {
+                        name: "evalScript",
+                        reason,
+                    },
+                    _ => NativeError::TypeError {
+                        name: "evalScript",
+                        reason: render,
+                    },
+                }
+            }
             err => NativeError::TypeError {
                 name: "evalScript",
                 reason: err.to_string(),

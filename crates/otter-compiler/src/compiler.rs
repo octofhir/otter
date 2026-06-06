@@ -47,6 +47,14 @@ pub(crate) struct Compiler {
     /// `function` declarations must NOT mirror onto the global object
     /// (ordinary scripts mirror per §16.1.7 regardless of strictness).
     pub(crate) suppress_global_mirror: bool,
+    /// §16.1.7 GlobalDeclarationInstantiation — names of script
+    /// top-level `var` and function declarations. These live as
+    /// global-object properties (the global environment's object
+    /// record), not `<main>` locals: every read and write — from the
+    /// script body, nested functions, sibling scripts, and eval
+    /// chunks — resolves through the global object, so none of them
+    /// can observe a stale copy. Empty for modules and eval bodies.
+    pub(crate) script_global_vars: std::collections::HashSet<String>,
 }
 
 impl Compiler {
@@ -57,6 +65,7 @@ impl Compiler {
             class_private_names: Vec::new(),
             suppress_global_mirror: false,
             in_eval: false,
+            script_global_vars: std::collections::HashSet::new(),
         }
     }
 

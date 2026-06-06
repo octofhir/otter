@@ -1274,7 +1274,10 @@ pub(crate) fn store_identifier(
             cx.emit_module_export_mirror(name, value_reg, span);
         }
         None => {
-            if cx.is_strict {
+            // §16.1.7 — script global vars are global-object
+            // properties; assignment to one succeeds in strict code
+            // too (the binding exists, it just isn't a local).
+            if cx.is_strict && !cx.script_global_vars.contains(name) {
                 emit_reference_error(cx, name, span);
                 return Ok(());
             }

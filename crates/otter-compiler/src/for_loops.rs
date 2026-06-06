@@ -370,6 +370,21 @@ pub(crate) fn bind_for_in_of_head(
             match &declarator.id {
                 BindingPattern::BindingIdentifier(id) => {
                     let name = id.name.as_str().to_string();
+                    // §16.1.7 — script global vars are global-object
+                    // properties; the head assignment writes through
+                    // the property, not a local slot.
+                    if is_var
+                        && cx.lookup_binding(&name).is_none()
+                        && cx.script_global_vars.contains(&name)
+                    {
+                        let name_idx = cx.intern_string_constant(&name);
+                        cx.emit(
+                            Op::DefineGlobalVar,
+                            [Operand::ConstIndex(name_idx), Operand::Register(src_reg)],
+                            span,
+                        );
+                        return Ok(());
+                    }
                     let storage = if is_var {
                         cx.lookup_binding(&name)
                             .ok_or(CompileError::Unsupported {

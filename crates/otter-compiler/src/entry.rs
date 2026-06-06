@@ -318,15 +318,35 @@ pub(crate) fn compile_program_with_mode(
         }
     }
 
-    // §16.1.7 GlobalDeclarationInstantiation / §16.2.1.7
-    // ModuleDeclarationInstantiation step 11: top-level `var`
-    // declarations hoist to the script / module scope. Pre-bind
-    // them to `undefined` here so reads before the source-level
-    // declaration see the hoisted value rather than a TDZ error.
+    // §16.1.7 GlobalDeclarationInstantiation step 16 — script global
+    // code creates its top-level `var` / function bindings on the
+    // global object's environment record, not as `<main>` locals:
+    // nested functions, sibling scripts, and eval chunks all resolve
+    // the same property, so no reader can observe a stale local copy.
+    // Eval bodies keep the local-binding model (their variable
+    // environment is the caller's or their own).
     let program_span = (program.span.start, program.span.end);
     let mut top_level_vars: Vec<String> = Vec::new();
     hoist_var_names(&program.body, &mut top_level_vars);
-    pre_declare_var_bindings(&mut cx, &top_level_vars, program_span)?;
+    if !eval_mode {
+        cx.script_global_vars = top_level_vars.iter().cloned().collect();
+        let mut declared: HashSet<&str> = HashSet::new();
+        for name in &top_level_vars {
+            if !declared.insert(name.as_str()) {
+                continue;
+            }
+            // §9.1.1.4.17 CreateGlobalVarBinding(name, false) —
+            // script bindings are non-configurable.
+            let name_idx = cx.intern_string_constant(name);
+            cx.emit(
+                Op::DeclareGlobalVar,
+                [Operand::ConstIndex(name_idx), Operand::Imm32(0)],
+                program_span,
+            );
+        }
+    } else {
+        pre_declare_var_bindings(&mut cx, &top_level_vars, program_span)?;
+    }
     // §B.3.3.2/3 — sloppy script / eval bodies extend the variable
     // scope with block-level function declaration names.
     pre_declare_annex_b_functions(

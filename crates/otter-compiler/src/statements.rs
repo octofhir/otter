@@ -105,6 +105,22 @@ pub(crate) fn compile_statement(
                         let Some(init) = &declarator.init else {
                             continue;
                         };
+                        // §16.1.7 — script global vars live as global
+                        // object properties, not local bindings.
+                        if cx.lookup_binding(&name).is_none()
+                            && cx.script_global_vars.contains(&name)
+                        {
+                            let init_reg = crate::expr::compile_expr_with_inferred_name(
+                                cx, init, &name, span,
+                            )?;
+                            let name_idx = cx.intern_string_constant(&name);
+                            cx.emit(
+                                Op::DefineGlobalVar,
+                                [Operand::ConstIndex(name_idx), Operand::Register(init_reg)],
+                                span,
+                            );
+                            continue;
+                        }
                         let info = cx.lookup_binding(&name).ok_or(CompileError::Unsupported {
                             node: format!("var `{name}` not pre-hoisted"),
                             span,
@@ -954,6 +970,24 @@ pub(crate) fn compile_for_init_decl(
         match &declarator.id {
             oxc_ast::ast::BindingPattern::BindingIdentifier(id) => {
                 let name = id.name.as_str().to_string();
+                // §16.1.7 — script global `for (var i = …;;)` writes
+                // the global-object property, not a local slot.
+                if is_var
+                    && cx.lookup_binding(&name).is_none()
+                    && cx.script_global_vars.contains(&name)
+                {
+                    let init_reg = match &declarator.init {
+                        Some(init) => compile_expr(cx, init, span)?,
+                        None => continue,
+                    };
+                    let name_idx = cx.intern_string_constant(&name);
+                    cx.emit(
+                        Op::DefineGlobalVar,
+                        [Operand::ConstIndex(name_idx), Operand::Register(init_reg)],
+                        span,
+                    );
+                    continue;
+                }
                 // §14.7.4 ForLoopEvaluation — `var` re-uses the
                 // function-scope binding pre-hoisted at function
                 // entry; `let`/`const` declare a fresh per-loop

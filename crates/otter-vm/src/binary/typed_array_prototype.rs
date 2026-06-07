@@ -434,16 +434,23 @@ fn impl_includes(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 fn impl_join(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     check_not_detached(&t, ctx.heap())?;
-    let separator = if let Some(v) = args.first() {
-        if v.is_undefined() {
-            ",".to_string()
-        } else if let Some(s) = v.as_string(ctx.heap_mut()) {
-            s.to_lossy_string(ctx.heap_mut())
-        } else {
-            v.display_string(ctx.heap_mut())
+    // §23.2.3.18 step 3 — ToString(separator) runs user
+    // toString / valueOf for object separators.
+    let separator = match args.first() {
+        None => ",".to_string(),
+        Some(v) if v.is_undefined() => ",".to_string(),
+        Some(v) => {
+            let exec_ctx =
+                ctx.execution_context()
+                    .cloned()
+                    .ok_or_else(|| NativeError::TypeError {
+                        name: "TypedArray.prototype.join",
+                        reason: "missing execution context".to_string(),
+                    })?;
+            crate::coerce::to_string_or_throw(ctx.cx.interp, &exec_ctx, v).map_err(|e| {
+                crate::native_function::vm_to_native_error(e, "TypedArray.prototype.join")
+            })?
         }
-    } else {
-        ",".to_string()
     };
     join_into_string(&t, &separator, ctx.heap_mut())
 }
@@ -666,15 +673,99 @@ fn impl_to_sorted_default(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Va
     build_new_typed_array(ctx, t.kind(), &snapshot)
 }
 
-fn impl_sort_default(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_sort_default(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    // §23.2.3.29 step 1 — comparator must be undefined or callable,
+    // checked before ValidateTypedArray.
+    let comparefn = args.first().copied().filter(|v| !v.is_undefined());
+    if let Some(cmp) = comparefn
+        && !crate::abstract_ops::is_callable(&cmp)
+    {
+        return Err(NativeError::TypeError {
+            name: "TypedArray.prototype.sort",
+            reason: "comparefn must be a function or undefined".to_string(),
+        });
+    }
     let t = receiver(ctx)?;
     check_not_detached(&t, ctx.heap())?;
     let mut snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
-    sort_default(&mut snapshot, t.kind().is_bigint(), ctx.heap_mut());
+    match comparefn {
+        None => sort_default(&mut snapshot, t.kind().is_bigint(), ctx.heap_mut()),
+        Some(cmp) => sort_with_comparefn(ctx, &mut snapshot, &cmp)?,
+    }
     for (i, v) in snapshot.iter().enumerate() {
         t.set(ctx.heap_mut(), i, v);
     }
     Ok(Value::typed_array(t))
+}
+
+/// §23.2.3.29 SortCompare with a user comparator — stable bottom-up
+/// merge that tolerates inconsistent comparators (no Ord panic),
+/// propagating abrupt completions and mapping NaN results to 0.
+fn sort_with_comparefn(
+    ctx: &mut NativeCtx<'_>,
+    items: &mut Vec<Value>,
+    cmp: &Value,
+) -> Result<(), NativeError> {
+    let exec_ctx = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "TypedArray.prototype.sort",
+            reason: "missing execution context".to_string(),
+        })?;
+    let n = items.len();
+    let mut buf: Vec<Value> = items.clone();
+    let mut width = 1usize;
+    while width < n {
+        let mut lo = 0usize;
+        while lo < n {
+            let mid = usize::min(lo + width, n);
+            let hi = usize::min(lo + 2 * width, n);
+            let (mut i, mut j, mut k) = (lo, mid, lo);
+            while i < mid && j < hi {
+                let mut argv: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                argv.push(items[i]);
+                argv.push(items[j]);
+                let raw = ctx
+                    .cx
+                    .interp
+                    .run_callable_sync(&exec_ctx, cmp, Value::undefined(), argv)
+                    .map_err(|e| {
+                        crate::native_function::vm_to_native_error(e, "TypedArray.prototype.sort")
+                    })?;
+                let v = ctx
+                    .cx
+                    .interp
+                    .coerce_to_number(&exec_ctx, &raw)
+                    .map_err(|e| {
+                        crate::native_function::vm_to_native_error(e, "TypedArray.prototype.sort")
+                    })?
+                    .as_f64();
+                if v > 0.0 {
+                    buf[k] = items[j];
+                    j += 1;
+                } else {
+                    buf[k] = items[i];
+                    i += 1;
+                }
+                k += 1;
+            }
+            while i < mid {
+                buf[k] = items[i];
+                i += 1;
+                k += 1;
+            }
+            while j < hi {
+                buf[k] = items[j];
+                j += 1;
+                k += 1;
+            }
+            lo = hi;
+        }
+        std::mem::swap(items, &mut buf);
+        width *= 2;
+    }
+    Ok(())
 }
 
 fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

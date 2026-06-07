@@ -974,6 +974,56 @@ impl Interpreter {
     /// Proxies dispatch through the `defineProperty` trap and enforce
     /// the §10.5.6 step 14–18 invariants using the field-presence
     /// information carried by [`object::PartialPropertyDescriptor`].
+    /// §10.1.9.2 OrdinarySetWithOwnDescriptor steps 2-3 — the
+    /// receiver phase: re-resolve the property on the RECEIVER via
+    /// [[GetOwnProperty]] / [[DefineOwnProperty]] (never its
+    /// [[Set]]), so exotic receivers (TypedArrays, Proxies,
+    /// non-extensible objects) apply their own define semantics.
+    pub(crate) fn ordinary_set_on_receiver(
+        &mut self,
+        context: &ExecutionContext,
+        key: &VmPropertyKey,
+        value: Value,
+        receiver: &Value,
+    ) -> Result<bool, VmError> {
+        if !crate::reflect::is_type_object_value(receiver) {
+            return Ok(false);
+        }
+        let existing = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+            context,
+            *receiver,
+            key,
+            0,
+            &[receiver, &value],
+            &[],
+        )?;
+        match existing {
+            Some(desc) => match desc.kind {
+                object::DescriptorKind::Accessor { .. } => Ok(false),
+                object::DescriptorKind::Data { .. } => {
+                    if !desc.flags.writable() {
+                        return Ok(false);
+                    }
+                    let partial = object::PartialPropertyDescriptor {
+                        value: Some(value),
+                        ..Default::default()
+                    };
+                    self.define_own_property_value(context, receiver, key, partial)
+                }
+            },
+            None => {
+                let descriptor = object::PartialPropertyDescriptor {
+                    value: Some(value),
+                    writable: Some(true),
+                    enumerable: Some(true),
+                    configurable: Some(true),
+                    ..Default::default()
+                };
+                self.define_own_property_value(context, receiver, key, descriptor)
+            }
+        }
+    }
+
     /// §7.3.31 / §7.3.32 private-element resolution. Walks the
     /// receiver's own properties first (instance fields live there),
     /// then the prototype chain (methods and accessors are installed
@@ -4567,14 +4617,11 @@ impl Interpreter {
                         {
                             return Ok(true);
                         }
-                        return self.ordinary_set_data_value(
-                            context,
-                            receiver,
-                            key,
-                            value,
-                            receiver,
-                            hops + 1,
-                        );
+                        // Valid target index + foreign receiver —
+                        // §10.1.9.2 receiver phase (GetOwnProperty +
+                        // DefineOwnProperty on the receiver, never its
+                        // [[Set]]).
+                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
                     }
                     let bag = crate::property_dispatch::typed_array_ensure_expando_pub(
                         &mut self.gc_heap,

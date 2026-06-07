@@ -380,54 +380,17 @@ fn set_data_on_receiver(
     value: Value,
     receiver: &Value,
 ) -> Result<bool, VmError> {
-    // §10.1.9 step 5.b — non-Object receivers reject. Resolution
-    // goes through the value-level internal-method funnels so a
-    // Proxy receiver dispatches its getOwnPropertyDescriptor /
-    // defineProperty traps.
-    if !is_type_object(receiver) {
-        return Ok(false);
-    }
-    let existing = interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
-        context,
-        *receiver,
-        key,
-        0,
-        &[receiver, &value],
-        &[],
-    )?;
-    match existing {
-        Some(desc) => match desc.kind {
-            crate::object::DescriptorKind::Accessor { .. } => Ok(false),
-            crate::object::DescriptorKind::Data { .. } => {
-                if !desc.flags.writable() {
-                    return Ok(false);
-                }
-                // §10.1.9 step 5.e.iii — write only `{value: V}`,
-                // preserving existing attributes.
-                let partial = crate::object::PartialPropertyDescriptor {
-                    value: Some(value),
-                    ..Default::default()
-                };
-                interp.define_own_property_value(context, receiver, key, partial)
-            }
-        },
-        None => {
-            // §10.1.9 step 5.f — CreateDataProperty on receiver.
-            let descriptor = crate::object::PartialPropertyDescriptor {
-                value: Some(value),
-                writable: Some(true),
-                enumerable: Some(true),
-                configurable: Some(true),
-                ..Default::default()
-            };
-            interp.define_own_property_value(context, receiver, key, descriptor)
-        }
-    }
+    let _ = _target;
+    interp.ordinary_set_on_receiver(context, key, value, receiver)
 }
 
 /// `true` when `value` is a member of the spec type Object — anything
 /// allocated on the heap. Mirrors §6.1.7. Primitives (Undefined, Null,
 /// Boolean, Number, BigInt, String, Symbol, Hole) return `false`.
+pub(crate) fn is_type_object_value(value: &Value) -> bool {
+    is_type_object(value)
+}
+
 fn is_type_object(value: &Value) -> bool {
     !(value.is_undefined()
         || value.is_null()

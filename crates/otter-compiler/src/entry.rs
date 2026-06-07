@@ -372,6 +372,28 @@ pub(crate) fn compile_program_with_mode_impl(
                 },
             );
         }
+        // §19.2.1.1 — reconstruct the caller's PrivateEnvironment
+        // from the spliced `__privsym_{ns}_{name}` cells so the eval
+        // body resolves `obj.#name` through the ordinary
+        // private-name machinery. Namespace ids are allocation-
+        // ordered (inner classes allocate later), giving the correct
+        // innermost-last stack.
+        {
+            let mut env: std::collections::BTreeMap<u32, std::collections::HashSet<String>> =
+                std::collections::BTreeMap::new();
+            for binding in caller.iter() {
+                if let Some(rest) = binding.name.strip_prefix("__privsym_")
+                    && let Some((ns_str, priv_name)) = rest.split_once('_')
+                    && let Ok(ns) = ns_str.parse::<u32>()
+                {
+                    env.entry(ns).or_default().insert(priv_name.to_string());
+                }
+            }
+            for (ns, names) in env {
+                cx.private_namespaces.push(ns);
+                cx.class_private_names.push(names);
+            }
+        }
     }
 
     // §16.1.7 GlobalDeclarationInstantiation step 16 / §19.2.1.3

@@ -187,6 +187,27 @@ pub(crate) fn compile_function_full(
             compile_statement(parent, stmt)?;
         }
         if contains_direct_eval {
+            // §19.2.1.1 step ~6 — a direct eval inherits the caller's
+            // PrivateEnvironment. Force a capture of every enclosing
+            // class's private-name (and brand) cells so they ride the
+            // direct-eval binding table into the eval frame.
+            if !parent.private_namespaces.is_empty() {
+                let pairs: Vec<(u32, Vec<String>)> = parent
+                    .private_namespaces
+                    .iter()
+                    .copied()
+                    .zip(parent.class_private_names.iter().cloned())
+                    .map(|(ns, names)| (ns, names.into_iter().collect()))
+                    .collect();
+                for (ns, names) in pairs {
+                    for name in names {
+                        let binding = format!("__privsym_{ns}_{name}");
+                        let _ = parent.resolve_capture(&binding);
+                    }
+                    let brand = format!("__privbrand_{ns}");
+                    let _ = parent.resolve_capture(&brand);
+                }
+            }
             direct_eval_meta = collect_direct_eval_bindings(parent, &lex_names);
         }
     }
@@ -263,6 +284,18 @@ pub(crate) fn collect_direct_eval_bindings(
             BindingStorage::Register { .. } => None,
         })
         .collect();
+    // Captured private-name / brand cells (class scope) ride along
+    // so a direct eval can resolve `obj.#name` (§19.2.1.1
+    // PrivateEnvironment inheritance).
+    for (name, idx) in cx.captured_uv.iter() {
+        if name.starts_with("__privsym_") || name.starts_with("__privbrand_") {
+            entries.push(otter_bytecode::DirectEvalBinding {
+                name: name.clone(),
+                upvalue: *idx,
+                lexical: true,
+            });
+        }
+    }
     // `bindings` is hash-ordered; sort for deterministic bytecode.
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries

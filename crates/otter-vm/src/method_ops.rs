@@ -1483,7 +1483,7 @@ impl Interpreter {
     /// (missing / `undefined` → `0`). Re-enters user `@@toPrimitive`
     /// / `valueOf` via `coerce_to_number` and raises TypeError for
     /// Symbol / BigInt operands.
-    fn integer_or_infinity_for_arg(
+    pub(crate) fn integer_or_infinity_for_arg(
         &mut self,
         context: &ExecutionContext,
         arg: Option<&Value>,

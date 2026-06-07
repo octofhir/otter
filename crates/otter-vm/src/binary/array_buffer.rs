@@ -72,12 +72,19 @@ pub struct LocalArrayBufferBodyGc {
     pub max_byte_length: Option<usize>,
     /// GC-budget reservation for the off-heap byte storage.
     pub external: Option<otter_gc::ExternalMemory>,
+    /// Lazy expando bag for ordinary own properties
+    /// (`ab.constructor = C` for the species protocol, `ab.x = 1`).
+    pub expando: Option<crate::object::JsObject>,
 }
 
 impl otter_gc::SafeTraceable for LocalArrayBufferBodyGc {
     const TYPE_TAG: u8 = LOCAL_ARRAY_BUFFER_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, _visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+    fn trace_slots_safe(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        if let Some(expando) = &self.expando {
+            let p = expando as *const crate::object::JsObject as *mut otter_gc::raw::RawGc;
+            visitor(p);
+        }
         // No outgoing GC slots — `Vec<u8>` is plain data.
     }
 }
@@ -102,6 +109,7 @@ pub fn alloc_local_array_buffer(
         detached: false,
         max_byte_length,
         external,
+        expando: None,
     })
 }
 
@@ -513,6 +521,24 @@ impl JsArrayBuffer {
             body.bytes.resize(new_len, 0u8);
             true
         })
+    }
+
+    /// Lazy expando bag for ordinary own properties. `None` until the
+    /// first own-property write. Shared buffers have no expando.
+    #[must_use]
+    pub fn expando(self, heap: &otter_gc::GcHeap) -> Option<crate::object::JsObject> {
+        match self.storage {
+            BufferStorage::Local(h) => heap.read_payload(h, |body| body.expando),
+            _ => None,
+        }
+    }
+
+    /// Install the expando bag (first own-property write).
+    pub fn set_expando(self, heap: &mut otter_gc::GcHeap, bag: crate::object::JsObject) {
+        if let BufferStorage::Local(h) = self.storage {
+            heap.with_payload(h, |body| body.expando = Some(bag));
+            heap.record_write(h, &crate::Value::object(bag));
+        }
     }
 
     /// Identity comparison. Compares the GC handle offset within the

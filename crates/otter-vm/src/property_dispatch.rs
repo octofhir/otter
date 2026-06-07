@@ -1190,16 +1190,25 @@ impl Interpreter {
         } else if let Some(t) = receiver.as_temporal(&self.gc_heap) {
             temporal::load_property(t, &mut self.gc_heap, name)
         } else if let Some(b) = receiver.as_array_buffer() {
-            let direct = binary::array_buffer_prototype::load_property(b, &self.gc_heap, name);
-            if direct.is_undefined() {
-                let proto_name = if b.is_shared() {
-                    "SharedArrayBuffer"
-                } else {
-                    "ArrayBuffer"
-                };
-                self.load_from_constructor_prototype(context, proto_name, &receiver, name)?
+            // Own expando bag (species `constructor` override) wins
+            // over the data shortcuts and the prototype walk.
+            let expando_hit = b
+                .expando(&self.gc_heap)
+                .and_then(|bag| crate::object::get(bag, &self.gc_heap, name));
+            if let Some(v) = expando_hit {
+                v
             } else {
-                direct
+                let direct = binary::array_buffer_prototype::load_property(b, &self.gc_heap, name);
+                if direct.is_undefined() {
+                    let proto_name = if b.is_shared() {
+                        "SharedArrayBuffer"
+                    } else {
+                        "ArrayBuffer"
+                    };
+                    self.load_from_constructor_prototype(context, proto_name, &receiver, name)?
+                } else {
+                    direct
+                }
             }
         } else if let Some(dv) = receiver.as_data_view() {
             // §25.3 — a `DataView` is an ordinary object; user-installed
@@ -1589,6 +1598,15 @@ impl Interpreter {
                 bag
             };
             Some(bag)
+        } else if let Some(b) = receiver.as_array_buffer() {
+            // §25.1 — ordinary own properties (species `constructor`
+            // override) land in the lazy expando bag. Shared buffers
+            // keep the silent-drop behaviour (no per-handle bag).
+            if b.is_shared() {
+                None
+            } else {
+                Some(array_buffer_ensure_expando_pub(&mut self.gc_heap, &b)?)
+            }
         } else if let Some(dv) = receiver.as_data_view() {
             // §25.3 — ordinary own properties land in the lazy expando.
             Some(data_view_ensure_expando_pub(&mut self.gc_heap, &dv)?)
@@ -5059,6 +5077,25 @@ pub(crate) fn promise_ensure_expando_pub(
 /// Lazy-allocate (and cache) the `DataView` expando `JsObject` backing
 /// ordinary own properties (`dv.x = 1`). A `DataView` is an ordinary
 /// extensible object per §25.3, so it must hold arbitrary own props.
+/// Lazy-allocate (and cache) the ArrayBuffer expando bag backing
+/// ordinary own properties (`ab.constructor = C` for the species
+/// protocol). Local buffers only.
+pub(crate) fn array_buffer_ensure_expando_pub(
+    heap: &mut otter_gc::GcHeap,
+    b: &crate::binary::array_buffer::JsArrayBuffer,
+) -> Result<JsObject, VmError> {
+    if let Some(existing) = b.expando(heap) {
+        return Ok(existing);
+    }
+    let recv = Value::array_buffer(*b);
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        recv.trace_value_slots(visitor);
+    };
+    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    b.set_expando(heap, bag);
+    Ok(bag)
+}
+
 pub(crate) fn data_view_ensure_expando_pub(
     heap: &mut otter_gc::GcHeap,
     dv: &crate::binary::JsDataView,

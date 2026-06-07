@@ -3939,7 +3939,15 @@ impl Interpreter {
             }
             return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
         }
-        if base.is_array_buffer() {
+        if let Some(b) = base.as_array_buffer() {
+            // Own expando bag (e.g. a `constructor` override for the
+            // §25.1.6.16 species protocol) wins over the prototype.
+            if let Some(bag) = b.expando(&self.gc_heap)
+                && let Some(name) = key.string_name()
+                && let Some(v) = object::get(bag, &self.gc_heap, name)
+            {
+                return Ok(VmGetOutcome::Value(v));
+            }
             let proto = self.get_prototype_for_op(&base)?;
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));

@@ -58,11 +58,11 @@ otter_macros::couch! {
     constructor = (length = 1, call = sab_ctor_call),
     prototype = {
         methods = {
-            "slice" / 2 => ab_slice,
+            "slice" / 2 => sab_slice,
             "grow"  / 1 => sab_grow,
         },
         accessors = [
-            ("byteLength",    get = ab_byte_length),
+            ("byteLength",    get = sab_byte_length),
             ("maxByteLength", get = ab_max_byte_length),
             ("growable",      get = sab_growable),
         ],
@@ -282,6 +282,7 @@ fn ab_is_view(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 /// `[0, byteLength]`, returns a fresh fixed-length buffer.
 fn ab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     const NAME: &str = "ArrayBuffer.prototype.slice";
+    let this_value = *ctx.this_value();
     let buf = receiver_ab(ctx, NAME)?;
     if buf.is_detached(ctx.heap()) {
         return Err(NativeError::TypeError {
@@ -289,6 +290,122 @@ fn ab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
             reason: "buffer is detached".to_string(),
         });
     }
+    let exec_ctx = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: NAME,
+            reason: "missing execution context".to_string(),
+        })?;
+    // §25.1.6.16 steps 6-13 — ToIntegerOrInfinity coercion fires
+    // user valueOf for both operands.
+    let len = buf.byte_length(ctx.heap()) as i64;
+    let start_f = ctx
+        .cx
+        .interp
+        .integer_or_infinity_for_arg(&exec_ctx, args.first())
+        .map_err(|e| vm_to_native(e, NAME))?;
+    let first = relative_clamp_f(start_f, len);
+    let end_f = match args.get(1) {
+        None => len as f64,
+        Some(v) if v.is_undefined() => len as f64,
+        Some(_) => ctx
+            .cx
+            .interp
+            .integer_or_infinity_for_arg(&exec_ctx, args.get(1))
+            .map_err(|e| vm_to_native(e, NAME))?,
+    };
+    let final_end = relative_clamp_f(end_f, len);
+    let new_len = (final_end - first).max(0) as usize;
+    // §25.1.6.16 step 14 — SpeciesConstructor(O, %ArrayBuffer%).
+    let default_ctor = crate::object::get(ctx.cx.interp.global_this, ctx.heap(), "ArrayBuffer")
+        .ok_or_else(|| NativeError::TypeError {
+            name: NAME,
+            reason: "%ArrayBuffer% intrinsic is missing".to_string(),
+        })?;
+    let ctor = ctx
+        .cx
+        .interp
+        .species_constructor_value(&exec_ctx, &this_value, &default_ctor)
+        .map_err(|e| vm_to_native(e, NAME))?;
+    let mut argv: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+    argv.push(Value::number(crate::number::NumberValue::from_f64(
+        new_len as f64,
+    )));
+    let new_value = ctx
+        .cx
+        .interp
+        .run_construct_sync(&exec_ctx, &ctor, ctor, argv)
+        .map_err(|e| vm_to_native(e, NAME))?;
+    // Steps 16-21 — result-shape checks.
+    let Some(new_buf) = new_value.as_array_buffer() else {
+        return Err(NativeError::TypeError {
+            name: NAME,
+            reason: "species constructor did not return an ArrayBuffer".to_string(),
+        });
+    };
+    if new_buf.is_shared() {
+        return Err(NativeError::TypeError {
+            name: NAME,
+            reason: "species constructor returned a SharedArrayBuffer".to_string(),
+        });
+    }
+    if new_buf.is_detached(ctx.heap()) {
+        return Err(NativeError::TypeError {
+            name: NAME,
+            reason: "species constructor returned a detached ArrayBuffer".to_string(),
+        });
+    }
+    if new_buf.ptr_eq(buf) {
+        return Err(NativeError::TypeError {
+            name: NAME,
+            reason: "species constructor returned the source ArrayBuffer".to_string(),
+        });
+    }
+    if new_buf.byte_length(ctx.heap()) < new_len {
+        return Err(NativeError::TypeError {
+            name: NAME,
+            reason: "species constructor returned a too-small ArrayBuffer".to_string(),
+        });
+    }
+    // Step 22 — the constructor may have detached the source.
+    if buf.is_detached(ctx.heap()) {
+        return Err(NativeError::TypeError {
+            name: NAME,
+            reason: "buffer was detached by the species constructor".to_string(),
+        });
+    }
+    if new_len > 0 {
+        let first = first as usize;
+        let copy: Vec<u8> = buf.with_bytes(ctx.heap(), |b| b[first..first + new_len].to_vec());
+        new_buf.with_bytes_mut(ctx.heap_mut(), |dst| {
+            dst[..copy.len()].copy_from_slice(&copy)
+        });
+    }
+    Ok(new_value)
+}
+
+/// Resolve a ToIntegerOrInfinity result against `len` with relative
+/// (negative-from-end) semantics, clamped to `[0, len]`.
+fn relative_clamp_f(n: f64, len: i64) -> i64 {
+    if n.is_nan() {
+        return 0;
+    }
+    if n == f64::NEG_INFINITY {
+        return 0;
+    }
+    if n == f64::INFINITY {
+        return len;
+    }
+    let i = n as i64;
+    if i < 0 { (len + i).max(0) } else { i.min(len) }
+}
+
+/// §25.2.5.6 SharedArrayBuffer.prototype.slice — shared-brand
+/// receiver, plain copy (species kept default).
+fn sab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    const NAME: &str = "SharedArrayBuffer.prototype.slice";
+    let buf = receiver_sab(ctx, NAME)?;
     let len = buf.byte_length(ctx.heap()) as i64;
     let start = clamp_relative_index(args.first(), 0, len);
     let end = clamp_relative_index(args.get(1), len, len);
@@ -297,6 +414,12 @@ fn ab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
     let copy: Vec<u8> = buf.with_bytes(ctx.heap(), |b| b[clamped_start..clamped_end].to_vec());
     let new_buf = ctx.array_buffer_from_bytes_rooted(copy, &[], &[args])?;
     Ok(Value::array_buffer(new_buf))
+}
+
+/// §25.2.4.2 — shared-brand byteLength getter.
+fn sab_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let b = receiver_sab(ctx, "get SharedArrayBuffer.prototype.byteLength")?;
+    Ok(Value::number_i32(b.byte_length(ctx.heap()) as i32))
 }
 
 /// §25.1.5.6 `resize(newByteLength)` — only valid for resizable,
@@ -468,13 +591,29 @@ fn receiver_ab(
     ctx: &NativeCtx<'_>,
     name: &'static str,
 ) -> Result<crate::binary::array_buffer::JsArrayBuffer, NativeError> {
-    if let Some(b) = ctx.this_value().as_array_buffer() {
-        Ok(b)
-    } else {
-        Err(NativeError::TypeError {
+    match ctx.this_value().as_array_buffer() {
+        // §25.1.5 — every ArrayBuffer.prototype member brand-checks
+        // [[ArrayBufferData]] WITHOUT [[ArrayBufferByteLengthData]]
+        // being shared; a SharedArrayBuffer receiver is a TypeError.
+        Some(b) if !b.is_shared() => Ok(b),
+        _ => Err(NativeError::TypeError {
             name,
             reason: "this is not an ArrayBuffer".to_string(),
-        })
+        }),
+    }
+}
+
+/// §25.2.4 SharedArrayBuffer.prototype brand check — shared only.
+fn receiver_sab(
+    ctx: &NativeCtx<'_>,
+    name: &'static str,
+) -> Result<crate::binary::array_buffer::JsArrayBuffer, NativeError> {
+    match ctx.this_value().as_array_buffer() {
+        Some(b) if b.is_shared() => Ok(b),
+        _ => Err(NativeError::TypeError {
+            name,
+            reason: "this is not a SharedArrayBuffer".to_string(),
+        }),
     }
 }
 

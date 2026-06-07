@@ -2026,6 +2026,32 @@ impl<'a> Visit<'a> for BlockLexicalValidator {
         self.label_stack.pop();
     }
 
+    fn visit_with_statement(&mut self, it: &oxc_ast::ast::WithStatement<'a>) {
+        // §14.11.1 — the with body cannot be a (labelled) function
+        // declaration.
+        let mut body = &it.body;
+        loop {
+            match body {
+                Statement::FunctionDeclaration(f) => {
+                    self.diagnostics.push(SyntaxDiagnostic {
+                        code: "WITH_BODY_FUNCTION_DECL".to_string(),
+                        message:
+                            "SyntaxError: function declarations are not allowed as the body of a `with` statement (§14.11.1)"
+                                .to_string(),
+                        range: Some((f.span.start, f.span.end)),
+                        help: None,
+                    });
+                    break;
+                }
+                Statement::LabeledStatement(l) => {
+                    body = &l.body;
+                }
+                _ => break,
+            }
+        }
+        walk::walk_with_statement(self, it);
+    }
+
     fn visit_static_block(&mut self, it: &oxc_ast::ast::StaticBlock<'a>) {
         // §15.7.4 — the static-block body is its own statement list
         // (duplicate lexicals, lexical/var conflicts) and may not

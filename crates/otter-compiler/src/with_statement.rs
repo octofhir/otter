@@ -247,3 +247,91 @@ pub(crate) fn load_with_env_object(
         span,
     })
 }
+
+/// §9.1.1.2.6 GetBindingValue through a `with` object environment —
+/// the earlier HasBinding probe passed, but the spec RE-CHECKS
+/// HasProperty (observable on proxy envs, and the @@unscopables
+/// getter may have deleted the binding) before Get; a vanished
+/// binding yields ReferenceError in strict code and `undefined`
+/// otherwise.
+pub(crate) fn emit_with_get_binding_value(
+    cx: &mut Compiler,
+    dst: u16,
+    object_reg: u16,
+    name: &str,
+    span: (u32, u32),
+) {
+    let key_reg = cx.alloc_scratch();
+    let key_idx = cx.intern_string_constant(name);
+    cx.emit(
+        Op::LoadString,
+        [Operand::Register(key_reg), Operand::ConstIndex(key_idx)],
+        span,
+    );
+    let present = cx.alloc_scratch();
+    cx.emit(
+        Op::HasProperty,
+        [
+            Operand::Register(present),
+            Operand::Register(key_reg),
+            Operand::Register(object_reg),
+        ],
+        span,
+    );
+    let missing = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(present), span);
+    cx.emit_load_property(dst, object_reg, name, span);
+    let done = cx.emit_branch_placeholder(Op::Jump, None, span);
+    cx.patch_branch_to_here(missing);
+    if cx.is_strict {
+        crate::assignment::emit_reference_error(cx, name, span);
+    } else {
+        cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
+    }
+    cx.patch_branch_to_here(done);
+}
+
+/// §9.1.1.2.5 SetMutableBinding through a `with` object environment —
+/// HasProperty runs unconditionally (observable trap order); a
+/// vanished binding throws ReferenceError only in strict code, and
+/// the Set proceeds either way.
+pub(crate) fn emit_with_set_mutable_binding(
+    cx: &mut Compiler,
+    object_reg: u16,
+    name: &str,
+    value_reg: u16,
+    span: (u32, u32),
+) {
+    let key_reg = cx.alloc_scratch();
+    let key_idx = cx.intern_string_constant(name);
+    cx.emit(
+        Op::LoadString,
+        [Operand::Register(key_reg), Operand::ConstIndex(key_idx)],
+        span,
+    );
+    let present = cx.alloc_scratch();
+    cx.emit(
+        Op::HasProperty,
+        [
+            Operand::Register(present),
+            Operand::Register(key_reg),
+            Operand::Register(object_reg),
+        ],
+        span,
+    );
+    if cx.is_strict {
+        let ok = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(present), span);
+        crate::assignment::emit_reference_error(cx, name, span);
+        cx.patch_branch_to_here(ok);
+    }
+    let scratch = cx.alloc_scratch();
+    cx.emit(
+        Op::StoreProperty,
+        vec![
+            Operand::Register(object_reg),
+            Operand::ConstIndex(key_idx),
+            Operand::Register(value_reg),
+            Operand::Register(scratch),
+        ],
+        span,
+    );
+}

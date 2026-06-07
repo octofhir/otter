@@ -472,7 +472,13 @@ pub(crate) fn compile_assignment(
             if let Some(probe) = &with_ref {
                 let fallback =
                     cx.emit_branch_placeholder(Op::JumpIfFalse, Some(probe.found_reg), span);
-                cx.emit_load_property(current, probe.object_reg, &name, span);
+                crate::with_statement::emit_with_get_binding_value(
+                    cx,
+                    current,
+                    probe.object_reg,
+                    &name,
+                    span,
+                );
                 with_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
                 cx.patch_branch_to_here(fallback);
             }
@@ -515,38 +521,11 @@ pub(crate) fn compile_assignment(
     let mut with_store_done = None;
     if let Some(probe) = &with_ref {
         let fallback = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(probe.found_reg), span);
-        let name_idx = cx.intern_string_constant(&name);
-        if cx.is_strict {
-            let key_reg = cx.alloc_scratch();
-            cx.emit(
-                Op::LoadString,
-                [Operand::Register(key_reg), Operand::ConstIndex(name_idx)],
-                span,
-            );
-            let still_exists = cx.alloc_scratch();
-            cx.emit(
-                Op::HasProperty,
-                [
-                    Operand::Register(still_exists),
-                    Operand::Register(key_reg),
-                    Operand::Register(probe.object_reg),
-                ],
-                span,
-            );
-            let still_exists_ok =
-                cx.emit_branch_placeholder(Op::JumpIfTrue, Some(still_exists), span);
-            emit_reference_error(cx, &name, span);
-            cx.patch_branch_to_here(still_exists_ok);
-        }
-        let scratch = cx.alloc_scratch();
-        cx.emit(
-            Op::StoreProperty,
-            vec![
-                Operand::Register(probe.object_reg),
-                Operand::ConstIndex(name_idx),
-                Operand::Register(value),
-                Operand::Register(scratch),
-            ],
+        crate::with_statement::emit_with_set_mutable_binding(
+            cx,
+            probe.object_reg,
+            &name,
+            value,
             span,
         );
         with_store_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
@@ -1429,7 +1408,7 @@ fn emit_assignment_type_error(cx: &mut Compiler, message: &str, span: (u32, u32)
     result
 }
 
-fn emit_reference_error(cx: &mut Compiler, name: &str, span: (u32, u32)) -> u16 {
+pub(crate) fn emit_reference_error(cx: &mut Compiler, name: &str, span: (u32, u32)) -> u16 {
     let message_reg = cx.alloc_scratch();
     let message = cx.intern_string_constant(&format!("{name} is not defined"));
     cx.emit(

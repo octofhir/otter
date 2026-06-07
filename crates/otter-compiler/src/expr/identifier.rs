@@ -61,7 +61,7 @@ fn compile_identifier_with_envs(
     let mut with_done = None;
     if let Some(probe) = &probe {
         let fallback = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(probe.found_reg), span);
-        cx.emit_load_property(dst, probe.object_reg, name, span);
+        crate::with_statement::emit_with_get_binding_value(cx, dst, probe.object_reg, name, span);
         with_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
         cx.patch_branch_to_here(fallback);
     }

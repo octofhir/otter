@@ -38,6 +38,9 @@ otter_macros::couch! {
     name = "RegExp",
     feature = CORE,
     constructor = (length = 2, call = regexp_ctor_call),
+    statics = {
+        "escape" / 1 => regexp_escape,
+    },
     prototype = {
         methods = {
             "exec"     / 1 => proto_exec,
@@ -352,6 +355,158 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         },
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------
+// RegExp.escape (sec-regexp.escape)
+// ---------------------------------------------------------------
+
+/// `c` is one of the RegExp `SyntaxCharacter`s (`^ $ \ . * + ? ( ) [ ] { } |`).
+fn is_regexp_syntax_character(c: u32) -> bool {
+    matches!(
+        c,
+        0x5E | 0x24
+            | 0x5C
+            | 0x2E
+            | 0x2A
+            | 0x2B
+            | 0x3F
+            | 0x28
+            | 0x29
+            | 0x5B
+            | 0x5D
+            | 0x7B
+            | 0x7D
+            | 0x7C
+    )
+}
+
+/// `c` is in the `RegExp.escape` "other punctuators" set
+/// `,-=<>#&!%:;@~'`` plus U+0022 QUOTATION MARK.
+fn is_regexp_escape_other_punctuator(c: u32) -> bool {
+    matches!(
+        c,
+        0x2C | 0x2D
+            | 0x3D
+            | 0x3C
+            | 0x3E
+            | 0x23
+            | 0x26
+            | 0x21
+            | 0x25
+            | 0x3A
+            | 0x3B
+            | 0x40
+            | 0x7E
+            | 0x27
+            | 0x60
+            | 0x22
+    )
+}
+
+/// `c` is matched by `WhiteSpace` or `LineTerminator` (§12.2 / §12.3),
+/// excluding the entries already covered by the `ControlEscape` table
+/// (`\t \n \v \f \r`).
+fn is_regexp_escape_space(c: u32) -> bool {
+    matches!(
+        c,
+        0x20 | 0xA0 | 0xFEFF              // SPACE, NBSP, ZWNBSP
+        | 0x1680                          // OGHAM SPACE MARK
+        | 0x2000
+            ..=0x200A                 // EN QUAD .. HAIR SPACE
+        | 0x2028 | 0x2029                 // LINE / PARAGRAPH SEPARATOR
+        | 0x202F | 0x205F | 0x3000 // NNBSP, MMSP, IDEOGRAPHIC SPACE
+    )
+}
+
+/// EncodeForRegExpEscape(c) — append the escape (or the code point
+/// verbatim) for a single code point.
+fn encode_for_regexp_escape(c: u32, out: &mut String) {
+    if is_regexp_syntax_character(c) || c == 0x2F {
+        out.push('\\');
+        if let Some(ch) = char::from_u32(c) {
+            out.push(ch);
+        }
+        return;
+    }
+    match c {
+        0x09 => out.push_str("\\t"),
+        0x0A => out.push_str("\\n"),
+        0x0B => out.push_str("\\v"),
+        0x0C => out.push_str("\\f"),
+        0x0D => out.push_str("\\r"),
+        _ if is_regexp_escape_other_punctuator(c)
+            || is_regexp_escape_space(c)
+            || (0xD800..=0xDFFF).contains(&c) =>
+        {
+            // Hex escape: `\xHH` for ≤ 0xFF, `\uHHHH` otherwise (all
+            // such code points are in the BMP).
+            if c <= 0xFF {
+                out.push_str(&format!("\\x{c:02x}"));
+            } else {
+                out.push_str(&format!("\\u{c:04x}"));
+            }
+        }
+        _ => {
+            // Verbatim. Lone surrogates are handled above, so every
+            // code point reaching here is a Unicode scalar value.
+            if let Some(ch) = char::from_u32(c) {
+                out.push(ch);
+            }
+        }
+    }
+}
+
+/// §22.2.5.2 `RegExp.escape(S)` — escape `S` so it matches itself
+/// literally when used as a RegExp pattern.
+fn regexp_escape(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let arg = args.first().copied().unwrap_or_else(Value::undefined);
+    // step 1 — S must be a String (no coercion).
+    let Some(s) = (if arg.is_string() {
+        arg.as_string(ctx.heap())
+    } else {
+        None
+    }) else {
+        return Err(NativeError::TypeError {
+            name: "RegExp.escape",
+            reason: "argument must be a string".to_string(),
+        });
+    };
+    let units = s.to_utf16_vec(ctx.heap());
+    let mut escaped = String::with_capacity(units.len());
+    let mut first = true;
+    let mut i = 0usize;
+    while i < units.len() {
+        // StringToCodePoints — combine a valid surrogate pair, else
+        // take the lone code unit as its own code point.
+        let unit = units[i];
+        let code_point = if (0xD800..=0xDBFF).contains(&unit)
+            && i + 1 < units.len()
+            && (0xDC00..=0xDFFF).contains(&units[i + 1])
+        {
+            let cp = 0x10000 + (((unit as u32 - 0xD800) << 10) | (units[i + 1] as u32 - 0xDC00));
+            i += 2;
+            cp
+        } else {
+            i += 1;
+            unit as u32
+        };
+        if first && matches!(code_point, 0x30..=0x39 | 0x41..=0x5A | 0x61..=0x7A) {
+            // step 4.a — a leading ASCII letter or digit is hex-escaped
+            // so the output cannot extend a preceding `\0` / `\1` /
+            // `\c` escape in concatenated patterns.
+            escaped.push_str(&format!("\\x{code_point:02x}"));
+        } else {
+            encode_for_regexp_escape(code_point, &mut escaped);
+        }
+        first = false;
+    }
+    let result =
+        JsString::from_str(&escaped, ctx.heap_mut()).map_err(|err| NativeError::TypeError {
+            name: "RegExp.escape",
+            reason: err.to_string(),
+        })?;
+    Ok(Value::string(result))
 }
 
 // ---------------------------------------------------------------

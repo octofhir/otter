@@ -2576,18 +2576,18 @@ impl Interpreter {
         }
         let mut consumed: Vec<bool> = vec![false; trap_result.len()];
         let mut remaining = trap_result.len();
-        let mut consume = |key: &Value,
-                           consumed: &mut Vec<bool>,
-                           remaining: &mut usize,
-                           heap: &otter_gc::GcHeap|
+        let consume = |key: &Value,
+                       consumed: &mut Vec<bool>,
+                       remaining: &mut usize,
+                       heap: &otter_gc::GcHeap|
          -> bool {
             if let Some(name) = key.as_string(heap).map(|s| s.to_lossy_string(heap)) {
-                if let Some(&i) = str_index.get(name.as_str()) {
-                    if !consumed[i] {
-                        consumed[i] = true;
-                        *remaining -= 1;
-                        return true;
-                    }
+                if let Some(&i) = str_index.get(name.as_str())
+                    && !consumed[i]
+                {
+                    consumed[i] = true;
+                    *remaining -= 1;
+                    return true;
                 }
                 return false;
             }

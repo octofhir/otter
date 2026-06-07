@@ -796,6 +796,93 @@ pub fn prevent_extensions(arr: JsArray, heap: &mut otter_gc::GcHeap) {
     });
 }
 
+/// §7.3.16 SetIntegrityLevel on the array exotic — prevent
+/// extensions and clamp every own property's attributes ("sealed":
+/// configurable = false; "frozen": data writability off too).
+pub fn set_integrity_level(arr: JsArray, heap: &mut otter_gc::GcHeap, frozen: bool) {
+    prevent_extensions(arr, heap);
+    heap.with_payload(arr, |body| {
+        let mut keys: Vec<(String, bool)> = Vec::new();
+        for (i, v) in body.elements.iter().enumerate() {
+            if !v.is_hole() {
+                keys.push((i.to_string(), false));
+            }
+        }
+        if let Some(sparse) = &body.sparse_elements {
+            keys.extend(sparse.keys().map(|k| (k.to_string(), false)));
+        }
+        if let Some(named) = &body.named_properties {
+            keys.extend(named.keys().map(|k| (k.clone(), false)));
+        }
+        keys.push(("length".to_string(), true));
+        let flags = body.property_flags.get_or_insert_with(HashMap::new);
+        for (key, is_length) in keys {
+            let entry = flags.entry(key).or_insert_with(|| {
+                if is_length {
+                    PropertyFlags::new(true, false, false)
+                } else {
+                    PropertyFlags::new(true, true, true)
+                }
+            });
+            let writable = if frozen { false } else { entry.writable() };
+            *entry = PropertyFlags::new(writable, entry.enumerable(), false);
+        }
+    });
+}
+
+/// §7.3.17 TestIntegrityLevel on the array exotic.
+#[must_use]
+pub fn test_integrity_level(arr: JsArray, heap: &otter_gc::GcHeap, frozen: bool) -> bool {
+    if is_extensible(arr, heap) {
+        return false;
+    }
+    heap.read_payload(arr, |body| {
+        let mut keys: Vec<String> = Vec::new();
+        for (i, v) in body.elements.iter().enumerate() {
+            if !v.is_hole() {
+                keys.push(i.to_string());
+            }
+        }
+        if let Some(sparse) = &body.sparse_elements {
+            keys.extend(sparse.keys().map(|k| k.to_string()));
+        }
+        if let Some(named) = &body.named_properties {
+            keys.extend(named.keys().cloned());
+        }
+        keys.push("length".to_string());
+        keys.iter().all(|key| {
+            let entry = body
+                .property_flags
+                .as_ref()
+                .and_then(|flags| flags.get(key))
+                .copied()
+                .unwrap_or_else(|| {
+                    if key == "length" {
+                        PropertyFlags::new(true, false, false)
+                    } else {
+                        PropertyFlags::new(true, true, true)
+                    }
+                });
+            !entry.configurable() && (!frozen || !entry.writable())
+        })
+    })
+}
+
+/// Install attribute flags for a named own property (used by
+/// template-object construction for the non-enumerable `.raw`).
+pub fn set_named_property_flags(
+    arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    key: &str,
+    new_flags: PropertyFlags,
+) {
+    heap.with_payload(arr, |body| {
+        body.property_flags
+            .get_or_insert_with(HashMap::new)
+            .insert(key.to_string(), new_flags);
+    });
+}
+
 /// §10.1.3 `[[IsExtensible]]` on the array exotic.
 #[must_use]
 pub fn is_extensible(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
@@ -1204,7 +1291,7 @@ pub fn delete_named_property(arr: JsArray, heap: &mut otter_gc::GcHeap, key: &st
     })
 }
 
-fn can_write_array_property(arr: JsArray, heap: &otter_gc::GcHeap, key: &str) -> bool {
+pub(crate) fn can_write_array_property(arr: JsArray, heap: &otter_gc::GcHeap, key: &str) -> bool {
     heap.read_payload(arr, |body| {
         if body.accessors.as_ref().is_some_and(|m| m.contains_key(key)) {
             return false;

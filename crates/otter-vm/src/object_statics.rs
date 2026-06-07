@@ -1856,6 +1856,8 @@ pub fn call(
             let arg = args.first().cloned().unwrap_or(Value::undefined());
             if let Some(o) = arg.as_object() {
                 crate::object::freeze(o, gc_heap);
+            } else if let Some(a) = arg.as_array() {
+                crate::array::set_integrity_level(a, gc_heap, true);
             }
             // Spec: returns the argument unchanged (non-objects pass
             // through).
@@ -1866,6 +1868,8 @@ pub fn call(
             let arg = args.first().cloned().unwrap_or(Value::undefined());
             if let Some(o) = arg.as_object() {
                 crate::object::seal(o, gc_heap);
+            } else if let Some(a) = arg.as_array() {
+                crate::array::set_integrity_level(a, gc_heap, false);
             }
             Ok(arg)
         }
@@ -1897,6 +1901,8 @@ pub fn call(
             // their `[[Extensible]]` slot.
             let result = if let Some(o) = arg.as_object() {
                 crate::object::is_frozen(o, gc_heap)
+            } else if let Some(a) = arg.as_array() {
+                crate::array::test_integrity_level(a, gc_heap, true)
             } else if let Some(native) = arg.as_native_function() {
                 native.is_frozen(gc_heap)
             } else {
@@ -1921,6 +1927,8 @@ pub fn call(
             // applied through the foundation surface.
             let result = if let Some(o) = arg.as_object() {
                 crate::object::is_sealed(o, gc_heap)
+            } else if let Some(a) = arg.as_array() {
+                crate::array::test_integrity_level(a, gc_heap, false)
             } else if let Some(native) = arg.as_native_function() {
                 native.is_sealed(gc_heap)
             } else {

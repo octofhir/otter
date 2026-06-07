@@ -662,10 +662,18 @@ impl Interpreter {
         }
         crate::array::set_named_property(strings_arr, &mut self.gc_heap, "raw", raw_value)
             .map_err(|_| VmError::TypeMismatch)?;
+        // §13.2.8.4 steps 10-14 — `.raw` is non-enumerable and both
+        // arrays are frozen.
+        crate::array::set_named_property_flags(
+            strings_arr,
+            &mut self.gc_heap,
+            "raw",
+            object::PropertyFlags::new(false, false, false),
+        );
         if let Some(raw_arr) = raw_value.as_array() {
-            crate::array::prevent_extensions(raw_arr, &mut self.gc_heap);
+            crate::array::set_integrity_level(raw_arr, &mut self.gc_heap, true);
         }
-        crate::array::prevent_extensions(strings_arr, &mut self.gc_heap);
+        crate::array::set_integrity_level(strings_arr, &mut self.gc_heap, true);
         Ok(Value::array(strings_arr))
     }
 }

@@ -2084,6 +2084,23 @@ impl Interpreter {
         binary::dispatch::coerce_element_for_store(&mut self.gc_heap, kind, &converted)
     }
 
+    /// §10.4.2 — strict-mode writes to a non-writable array slot
+    /// (frozen / per-key flags) throw TypeError instead of silently
+    /// dropping.
+    fn array_strict_write_guard(
+        &self,
+        arr: crate::array::JsArray,
+        key: &str,
+        strict: bool,
+    ) -> Result<(), VmError> {
+        if strict && !crate::array::can_write_array_property(arr, &self.gc_heap, key) {
+            return Err(VmError::TypeError {
+                message: format!("Cannot assign to read only property '{key}' of array"),
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn run_store_element_regs(
         &mut self,
         context: &ExecutionContext,
@@ -2283,6 +2300,7 @@ impl Interpreter {
                 if self.store_array_accessor_property(context, arr, &name, &value, strict)? {
                     // Accessor setter handled assignment.
                 } else if let Some(idx) = crate::object::array_index_property_name(&name) {
+                    self.array_strict_write_guard(arr, &name, strict)?;
                     let roots = self.collect_allocation_roots(stack);
                     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                         for &slot in &roots {
@@ -2337,6 +2355,7 @@ impl Interpreter {
                 if self.store_array_accessor_property(context, arr, &key, &value, strict)? {
                     // Accessor setter handled.
                 } else if let Some(idx) = crate::array::index_from_number(n) {
+                    self.array_strict_write_guard(arr, &key, strict)?;
                     let roots = self.collect_allocation_roots(stack);
                     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                         for &slot in &roots {
@@ -2351,6 +2370,7 @@ impl Interpreter {
                         &mut external_visit,
                     )?;
                 } else {
+                    self.array_strict_write_guard(arr, &key, strict)?;
                     crate::array::set_named_property(arr, &mut self.gc_heap, &key, value)
                         .map_err(|_| VmError::TypeMismatch)?;
                 }

@@ -105,7 +105,7 @@ pub fn load_property(temporal: JsTemporal, heap: &mut otter_gc::GcHeap, name: &s
 
 fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pmd = require_plain_month_day(ctx)?;
-    let display = parse_display_calendar(args, 0, ctx.heap(), CLASS)?;
+    let display = parse_display_calendar(args, 0, ctx, CLASS)?;
     let s = pmd.to_ixdtf_string(display);
     js_string_value(s, ctx)
 }

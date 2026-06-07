@@ -143,7 +143,7 @@ fn duration_arg(ctx: &mut NativeCtx<'_>, v: &Value) -> Result<temporal_rs::Durat
 
 fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
-    let display = parse_display_calendar(args, 0, ctx.heap(), CLASS)?;
+    let display = parse_display_calendar(args, 0, ctx, CLASS)?;
     let s = pym.to_ixdtf_string(display);
     js_string_value(s, ctx)
 }
@@ -188,7 +188,7 @@ fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
     let other = parse_pym_arg(ctx, &arg_or_undef(args, 0))?;
-    let settings = parse_difference_settings(args, 1, ctx.heap(), CLASS)?;
+    let settings = parse_difference_settings(args, 1, ctx, CLASS)?;
     let result = pym
         .until(&other, settings)
         .map_err(|e| temporal_err(e, CLASS))?;
@@ -198,7 +198,7 @@ fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
     let other = parse_pym_arg(ctx, &arg_or_undef(args, 0))?;
-    let settings = parse_difference_settings(args, 1, ctx.heap(), CLASS)?;
+    let settings = parse_difference_settings(args, 1, ctx, CLASS)?;
     let result = pym
         .since(&other, settings)
         .map_err(|e| temporal_err(e, CLASS))?;

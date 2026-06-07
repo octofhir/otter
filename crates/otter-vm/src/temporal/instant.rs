@@ -157,7 +157,7 @@ pub fn load_property(temporal: JsTemporal, heap: &mut otter_gc::GcHeap, name: &s
 
 fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
-    let rounding = parse_to_string_rounding_options(args, 0, ctx.heap(), CLASS)?;
+    let rounding = parse_to_string_rounding_options(args, 0, ctx, CLASS)?;
     // §sec-temporal.instant.prototype.tostring step 7 — `timeZone`
     // option, when present, is parsed through ToTemporalTimeZone
     // (rejecting e.g. a `-000000` extended year), and the instant is
@@ -234,7 +234,7 @@ fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
     let other = parse_instant_arg(&arg_or_undef(args, 0), ctx.heap())?;
-    let settings = parse_difference_settings(args, 1, ctx.heap(), CLASS)?;
+    let settings = parse_difference_settings(args, 1, ctx, CLASS)?;
     let result = inst
         .until(&other, settings)
         .map_err(|e| temporal_err(e, CLASS))?;
@@ -244,7 +244,7 @@ fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
     let other = parse_instant_arg(&arg_or_undef(args, 0), ctx.heap())?;
-    let settings = parse_difference_settings(args, 1, ctx.heap(), CLASS)?;
+    let settings = parse_difference_settings(args, 1, ctx, CLASS)?;
     let result = inst
         .since(&other, settings)
         .map_err(|e| temporal_err(e, CLASS))?;
@@ -253,7 +253,7 @@ fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
 fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
-    let options = parse_rounding_options(args, 0, ctx.heap(), CLASS)?;
+    let options = parse_rounding_options(args, 0, ctx, CLASS)?;
     let result = inst.round(options).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Instant(result))
 }

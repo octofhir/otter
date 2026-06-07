@@ -204,8 +204,8 @@ fn duration_arg(ctx: &mut NativeCtx<'_>, v: &Value) -> Result<temporal_rs::Durat
 
 fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pdt = require_plain_date_time(ctx)?;
-    let display = parse_display_calendar(args, 0, ctx.heap(), CLASS)?;
-    let rounding = parse_to_string_rounding_options(args, 0, ctx.heap(), CLASS)?;
+    let display = parse_display_calendar(args, 0, ctx, CLASS)?;
+    let rounding = parse_to_string_rounding_options(args, 0, ctx, CLASS)?;
     let s = pdt
         .to_ixdtf_string(rounding, display)
         .map_err(|e| temporal_err(e, CLASS))?;
@@ -219,7 +219,7 @@ fn impl_to_json(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
 fn impl_to_zoned_date_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pdt = require_plain_date_time(ctx)?;
     let tz = parse_time_zone(&arg_or_undef(args, 0), ctx.heap(), CLASS)?;
-    let disambiguation = parse_disambiguation(args, 1, ctx.heap(), CLASS)?;
+    let disambiguation = parse_disambiguation(args, 1, ctx, CLASS)?;
     let zdt = pdt
         .to_zoned_date_time(tz, disambiguation)
         .map_err(|e| temporal_err(e, CLASS))?;
@@ -258,7 +258,7 @@ fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pdt = require_plain_date_time(ctx)?;
     let other = parse_plain_date_time_arg(ctx, &arg_or_undef(args, 0))?;
-    let settings = parse_difference_settings(args, 1, ctx.heap(), CLASS)?;
+    let settings = parse_difference_settings(args, 1, ctx, CLASS)?;
     let result = pdt
         .until(&other, settings)
         .map_err(|e| temporal_err(e, CLASS))?;
@@ -268,7 +268,7 @@ fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pdt = require_plain_date_time(ctx)?;
     let other = parse_plain_date_time_arg(ctx, &arg_or_undef(args, 0))?;
-    let settings = parse_difference_settings(args, 1, ctx.heap(), CLASS)?;
+    let settings = parse_difference_settings(args, 1, ctx, CLASS)?;
     let result = pdt
         .since(&other, settings)
         .map_err(|e| temporal_err(e, CLASS))?;
@@ -277,7 +277,7 @@ fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
 fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pdt = require_plain_date_time(ctx)?;
-    let options = parse_rounding_options(args, 0, ctx.heap(), CLASS)?;
+    let options = parse_rounding_options(args, 0, ctx, CLASS)?;
     let result = pdt.round(options).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainDateTime(result))
 }

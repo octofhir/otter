@@ -160,7 +160,7 @@ fn duration_arg(ctx: &mut NativeCtx<'_>, v: &Value) -> Result<temporal_rs::Durat
 
 fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pt = require_plain_time(ctx)?;
-    let rounding = parse_to_string_rounding_options(args, 0, ctx.heap(), CLASS)?;
+    let rounding = parse_to_string_rounding_options(args, 0, ctx, CLASS)?;
     let s = pt
         .to_ixdtf_string(rounding)
         .map_err(|e| temporal_err(e, CLASS))?;
@@ -201,7 +201,7 @@ fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pt = require_plain_time(ctx)?;
     let other = parse_plain_time_arg(ctx, &arg_or_undef(args, 0))?;
-    let settings = parse_difference_settings(args, 1, ctx.heap(), CLASS)?;
+    let settings = parse_difference_settings(args, 1, ctx, CLASS)?;
     let result = pt
         .until(&other, settings)
         .map_err(|e| temporal_err(e, CLASS))?;
@@ -211,7 +211,7 @@ fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pt = require_plain_time(ctx)?;
     let other = parse_plain_time_arg(ctx, &arg_or_undef(args, 0))?;
-    let settings = parse_difference_settings(args, 1, ctx.heap(), CLASS)?;
+    let settings = parse_difference_settings(args, 1, ctx, CLASS)?;
     let result = pt
         .since(&other, settings)
         .map_err(|e| temporal_err(e, CLASS))?;
@@ -220,7 +220,7 @@ fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
 fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pt = require_plain_time(ctx)?;
-    let options = parse_rounding_options(args, 0, ctx.heap(), CLASS)?;
+    let options = parse_rounding_options(args, 0, ctx, CLASS)?;
     let result = pt.round(options).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainTime(result))
 }

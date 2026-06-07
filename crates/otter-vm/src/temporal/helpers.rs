@@ -162,6 +162,37 @@ pub fn opt_integer_with_truncation(
 /// then matched against the enum (an out-of-list value is a
 /// RangeError). Absent options / overflow → `None` (temporal_rs
 /// defaults to constrain).
+/// §GetOption(options, name, "string", …) — read an option field and
+/// coerce it with ToString (observable; a Symbol throws TypeError),
+/// returning `None` for an absent / undefined field. The caller then
+/// matches the string against the option's allowed values (an
+/// out-of-list value is the caller's RangeError).
+pub fn read_option_string(
+    ctx: &mut NativeCtx<'_>,
+    obj: JsObject,
+    name: &str,
+    class: &'static str,
+) -> Result<Option<String>, NativeError> {
+    let Some(field) = object::get(obj, ctx.heap(), name) else {
+        return Ok(None);
+    };
+    if field.is_undefined() {
+        return Ok(None);
+    }
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: class,
+            reason: "missing execution context".to_string(),
+        })?;
+    ctx.cx
+        .interp
+        .coerce_to_string(&exec, &field)
+        .map(Some)
+        .map_err(|e| crate::native_function::vm_to_native_error(e, class))
+}
+
 pub fn parse_overflow(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
@@ -395,7 +426,7 @@ fn read_string_field(obj: JsObject, name: &str, heap: &otter_gc::GcHeap) -> Opti
 pub fn parse_disambiguation(
     args: &[Value],
     index: usize,
-    heap: &otter_gc::GcHeap,
+    ctx: &mut NativeCtx<'_>,
     class: &'static str,
 ) -> Result<temporal_rs::options::Disambiguation, NativeError> {
     use core::str::FromStr;
@@ -403,7 +434,7 @@ pub fn parse_disambiguation(
     let Some(obj) = options_object(&v, class)? else {
         return Ok(temporal_rs::options::Disambiguation::Compatible);
     };
-    match read_string_field(obj, "disambiguation", heap) {
+    match read_option_string(ctx, obj, "disambiguation", class)? {
         Some(name) => temporal_rs::options::Disambiguation::from_str(&name).map_err(|_| {
             NativeError::RangeError {
                 name: class,
@@ -445,7 +476,7 @@ pub fn parse_time_zone(
 pub fn parse_to_string_rounding_options(
     args: &[Value],
     index: usize,
-    heap: &otter_gc::GcHeap,
+    ctx: &mut NativeCtx<'_>,
     class: &'static str,
 ) -> Result<temporal_rs::options::ToStringRoundingOptions, NativeError> {
     use core::str::FromStr;
@@ -454,7 +485,7 @@ pub fn parse_to_string_rounding_options(
     let Some(obj) = options_object(&v, class)? else {
         return Ok(opts);
     };
-    if let Some(name) = read_string_field(obj, "smallestUnit", heap) {
+    if let Some(name) = read_option_string(ctx, obj, "smallestUnit", class)? {
         opts.smallest_unit = Some(temporal_rs::options::Unit::from_str(&name).map_err(|_| {
             NativeError::RangeError {
                 name: class,
@@ -462,7 +493,7 @@ pub fn parse_to_string_rounding_options(
             }
         })?);
     }
-    if let Some(name) = read_string_field(obj, "roundingMode", heap) {
+    if let Some(name) = read_option_string(ctx, obj, "roundingMode", class)? {
         opts.rounding_mode = Some(temporal_rs::options::RoundingMode::from_str(&name).map_err(
             |_| NativeError::RangeError {
                 name: class,
@@ -470,11 +501,11 @@ pub fn parse_to_string_rounding_options(
             },
         )?);
     }
-    if let Some(val) = object::get(obj, heap, "fractionalSecondDigits")
+    if let Some(val) = object::get(obj, ctx.heap(), "fractionalSecondDigits")
         && !val.is_undefined()
     {
-        if let Some(s) = val.as_string(heap) {
-            if s.to_lossy_string(heap) == "auto" {
+        if let Some(s) = val.as_string(ctx.heap()) {
+            if s.to_lossy_string(ctx.heap()) == "auto" {
                 opts.precision = temporal_rs::parsers::Precision::Auto;
             } else {
                 return Err(NativeError::RangeError {
@@ -509,7 +540,7 @@ pub fn parse_to_string_rounding_options(
 pub fn parse_display_calendar(
     args: &[Value],
     index: usize,
-    heap: &otter_gc::GcHeap,
+    ctx: &mut NativeCtx<'_>,
     class: &'static str,
 ) -> Result<temporal_rs::options::DisplayCalendar, NativeError> {
     use core::str::FromStr;
@@ -517,7 +548,7 @@ pub fn parse_display_calendar(
     let Some(obj) = options_object(&v, class)? else {
         return Ok(temporal_rs::options::DisplayCalendar::Auto);
     };
-    match read_string_field(obj, "calendarName", heap) {
+    match read_option_string(ctx, obj, "calendarName", class)? {
         Some(name) => temporal_rs::options::DisplayCalendar::from_str(&name).map_err(|_| {
             NativeError::RangeError {
                 name: class,
@@ -560,7 +591,7 @@ fn read_partial_integer(
 pub fn parse_difference_settings(
     args: &[Value],
     index: usize,
-    heap: &otter_gc::GcHeap,
+    ctx: &mut NativeCtx<'_>,
     class: &'static str,
 ) -> Result<temporal_rs::options::DifferenceSettings, NativeError> {
     use core::str::FromStr;
@@ -569,7 +600,7 @@ pub fn parse_difference_settings(
     let Some(obj) = options_object(&v, class)? else {
         return Ok(settings);
     };
-    if let Some(name) = read_string_field(obj, "largestUnit", heap)
+    if let Some(name) = read_option_string(ctx, obj, "largestUnit", class)?
         && !name.is_empty()
         && !name.eq_ignore_ascii_case("auto")
     {
@@ -580,7 +611,7 @@ pub fn parse_difference_settings(
             })?;
         settings.largest_unit = Some(unit);
     }
-    if let Some(name) = read_string_field(obj, "smallestUnit", heap) {
+    if let Some(name) = read_option_string(ctx, obj, "smallestUnit", class)? {
         let unit =
             temporal_rs::options::Unit::from_str(&name).map_err(|_| NativeError::RangeError {
                 name: class,
@@ -588,7 +619,7 @@ pub fn parse_difference_settings(
             })?;
         settings.smallest_unit = Some(unit);
     }
-    if let Some(name) = read_string_field(obj, "roundingMode", heap) {
+    if let Some(name) = read_option_string(ctx, obj, "roundingMode", class)? {
         let mode = temporal_rs::options::RoundingMode::from_str(&name).map_err(|_| {
             NativeError::RangeError {
                 name: class,
@@ -597,7 +628,7 @@ pub fn parse_difference_settings(
         })?;
         settings.rounding_mode = Some(mode);
     }
-    if let Some(n) = object::get(obj, heap, "roundingIncrement")
+    if let Some(n) = object::get(obj, ctx.heap(), "roundingIncrement")
         && !n.is_undefined()
         && let Some(num) = n.as_number()
     {
@@ -619,14 +650,14 @@ pub fn parse_difference_settings(
 pub fn parse_rounding_options(
     args: &[Value],
     index: usize,
-    heap: &otter_gc::GcHeap,
+    ctx: &mut NativeCtx<'_>,
     class: &'static str,
 ) -> Result<temporal_rs::options::RoundingOptions, NativeError> {
     use core::str::FromStr;
     let mut options = temporal_rs::options::RoundingOptions::default();
     let v = arg_or_undef(args, index);
-    if let Some(s) = v.as_string(heap) {
-        let name = s.to_lossy_string(heap);
+    if let Some(s) = v.as_string(ctx.heap()) {
+        let name = s.to_lossy_string(ctx.heap());
         let unit =
             temporal_rs::options::Unit::from_str(&name).map_err(|_| NativeError::RangeError {
                 name: class,
@@ -644,7 +675,7 @@ pub fn parse_rounding_options(
             reason: "round() requires an options object or smallest-unit string".to_string(),
         });
     };
-    if let Some(name) = read_string_field(obj, "largestUnit", heap) {
+    if let Some(name) = read_option_string(ctx, obj, "largestUnit", class)? {
         let unit =
             temporal_rs::options::Unit::from_str(&name).map_err(|_| NativeError::RangeError {
                 name: class,
@@ -652,7 +683,7 @@ pub fn parse_rounding_options(
             })?;
         options.largest_unit = Some(unit);
     }
-    if let Some(name) = read_string_field(obj, "smallestUnit", heap) {
+    if let Some(name) = read_option_string(ctx, obj, "smallestUnit", class)? {
         let unit =
             temporal_rs::options::Unit::from_str(&name).map_err(|_| NativeError::RangeError {
                 name: class,
@@ -660,7 +691,7 @@ pub fn parse_rounding_options(
             })?;
         options.smallest_unit = Some(unit);
     }
-    if let Some(name) = read_string_field(obj, "roundingMode", heap) {
+    if let Some(name) = read_option_string(ctx, obj, "roundingMode", class)? {
         let mode = temporal_rs::options::RoundingMode::from_str(&name).map_err(|_| {
             NativeError::RangeError {
                 name: class,
@@ -669,7 +700,7 @@ pub fn parse_rounding_options(
         })?;
         options.rounding_mode = Some(mode);
     }
-    if let Some(n) = object::get(obj, heap, "roundingIncrement")
+    if let Some(n) = object::get(obj, ctx.heap(), "roundingIncrement")
         && !n.is_undefined()
         && let Some(num) = n.as_number()
     {

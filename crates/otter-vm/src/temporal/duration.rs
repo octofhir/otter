@@ -168,7 +168,7 @@ pub fn load_property(temporal: JsTemporal, heap: &otter_gc::GcHeap, name: &str) 
 
 fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let dur = require_duration(ctx)?;
-    let rounding = parse_to_string_rounding_options(args, 0, ctx.heap(), CLASS)?;
+    let rounding = parse_to_string_rounding_options(args, 0, ctx, CLASS)?;
     let s = dur
         .as_temporal_string(rounding)
         .map_err(|e| temporal_err(e, CLASS))?;
@@ -356,7 +356,7 @@ fn parse_relative_to(
 
 fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let dur = require_duration(ctx)?;
-    let options = parse_rounding_options(args, 0, ctx.heap(), CLASS)?;
+    let options = parse_rounding_options(args, 0, ctx, CLASS)?;
     let relative_to = parse_relative_to(ctx, args, 0)?;
     let result = dur
         .round(options, relative_to)

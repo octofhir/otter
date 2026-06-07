@@ -158,8 +158,22 @@ pub fn load_property(temporal: JsTemporal, heap: &mut otter_gc::GcHeap, name: &s
 fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
     let rounding = parse_to_string_rounding_options(args, 0, ctx.heap(), CLASS)?;
+    // §sec-temporal.instant.prototype.tostring step 7 — `timeZone`
+    // option, when present, is parsed through ToTemporalTimeZone
+    // (rejecting e.g. a `-000000` extended year), and the instant is
+    // rendered in that zone.
+    let time_zone = match args.first() {
+        Some(opts) if opts.as_object().is_some() => {
+            let tz_value = crate::object::get(opts.as_object().unwrap(), ctx.heap(), "timeZone");
+            match tz_value {
+                Some(v) if !v.is_undefined() => Some(parse_time_zone(&v, ctx.heap(), CLASS)?),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
     let s = inst
-        .to_ixdtf_string(None, rounding)
+        .to_ixdtf_string(time_zone, rounding)
         .map_err(|e| temporal_err(e, CLASS))?;
     js_string_value(s, ctx)
 }

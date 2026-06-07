@@ -203,7 +203,6 @@ fn arg_as_duration(
         }
     } else if let Some(obj) = v.as_object() {
         crate::temporal::duration::partial_from_object(&obj, heap)
-            .map_err(|e| temporal_err(e, CLASS))
     } else {
         Err(NativeError::TypeError {
             name: CLASS,

@@ -63,6 +63,8 @@ pub enum TypedArrayKind {
     /// `BigUint64Array` — unsigned 8-byte integer; values are JS
     /// `BigInt`.
     BigUint64 = 10,
+    /// `Float16Array` — IEEE-754 half (binary16).
+    Float16 = 11,
 }
 
 impl TypedArrayKind {
@@ -82,6 +84,7 @@ impl TypedArrayKind {
             "Float64Array" => Self::Float64,
             "BigInt64Array" => Self::BigInt64,
             "BigUint64Array" => Self::BigUint64,
+            "Float16Array" => Self::Float16,
             _ => return None,
         })
     }
@@ -101,6 +104,7 @@ impl TypedArrayKind {
             8 => Self::Float64,
             9 => Self::BigInt64,
             10 => Self::BigUint64,
+            11 => Self::Float16,
             _ => return None,
         })
     }
@@ -127,6 +131,7 @@ impl TypedArrayKind {
             Self::Float64 => "Float64Array",
             Self::BigInt64 => "BigInt64Array",
             Self::BigUint64 => "BigUint64Array",
+            Self::Float16 => "Float16Array",
         }
     }
 
@@ -135,7 +140,7 @@ impl TypedArrayKind {
     pub const fn bytes_per_element(self) -> usize {
         match self {
             Self::Int8 | Self::Uint8 | Self::Uint8Clamped => 1,
-            Self::Int16 | Self::Uint16 => 2,
+            Self::Int16 | Self::Uint16 | Self::Float16 => 2,
             Self::Int32 | Self::Uint32 | Self::Float32 => 4,
             Self::Float64 | Self::BigInt64 | Self::BigUint64 => 8,
         }
@@ -189,6 +194,10 @@ impl TypedArrayKind {
             Self::Uint32 => {
                 let v = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
                 Value::number_f64(v as f64)
+            }
+            Self::Float16 => {
+                let bits = u16::from_le_bytes([slice[0], slice[1]]);
+                Value::number_f64(f16_bits_to_f64(bits))
             }
             Self::Float32 => {
                 let v = f32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
@@ -255,6 +264,11 @@ impl TypedArrayKind {
                 let n = bitwise::to_uint32(value_to_number(value, heap));
                 bytes[offset..offset + 4].copy_from_slice(&n.to_le_bytes());
             }
+            Self::Float16 => {
+                let n = value_to_number(value, heap).as_f64();
+                let bits = f64_to_f16_bits(n);
+                bytes[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
+            }
             Self::Float32 => {
                 let n = value_to_number(value, heap).as_f64() as f32;
                 bytes[offset..offset + 4].copy_from_slice(&n.to_le_bytes());
@@ -272,6 +286,90 @@ impl TypedArrayKind {
                 bytes[offset..offset + 8].copy_from_slice(&n.to_le_bytes());
             }
         }
+    }
+}
+
+/// Decode IEEE-754 binary16 bits into an `f64`.
+#[must_use]
+pub fn f16_bits_to_f64(bits: u16) -> f64 {
+    let sign = if (bits >> 15) & 1 == 1 { -1.0 } else { 1.0 };
+    let exp = ((bits >> 10) & 0x1f) as i32;
+    let mant = (bits & 0x3ff) as f64;
+    let magnitude = if exp == 0 {
+        // Subnormal (or zero): value = mantissa × 2^-24.
+        mant * 2f64.powi(-24)
+    } else if exp == 0x1f {
+        if mant == 0.0 { f64::INFINITY } else { f64::NAN }
+    } else {
+        // Normal: (1 + mantissa/1024) × 2^(exp-15).
+        (1.0 + mant / 1024.0) * 2f64.powi(exp - 15)
+    };
+    sign * magnitude
+}
+
+/// Round an `f64` to IEEE-754 binary16, returning the half's bit
+/// pattern. Round-to-nearest, ties-to-even; overflow saturates to
+/// ±Infinity, NaN maps to a canonical quiet NaN.
+#[must_use]
+pub fn f64_to_f16_bits(value: f64) -> u16 {
+    if value.is_nan() {
+        return 0x7E00;
+    }
+    let sign: u16 = if value.is_sign_negative() {
+        0x8000
+    } else {
+        0x0000
+    };
+    let a = value.abs();
+    if a.is_infinite() {
+        return sign | 0x7C00;
+    }
+    if a == 0.0 {
+        return sign;
+    }
+    // 65520 is the midpoint between the largest finite half (65504)
+    // and 2^16; ties-to-even rounds it (and anything larger) to ∞.
+    if a >= 65520.0 {
+        return sign | 0x7C00;
+    }
+    let bits = a.to_bits();
+    let exp = ((bits >> 52) & 0x7ff) as i32 - 1023;
+    let mant = bits & 0x000F_FFFF_FFFF_FFFF;
+    let sig = (1u64 << 52) | mant; // 53-bit significand; a = sig × 2^(exp-52)
+    // Drop `shift` low bits of `sig` to land on the half's ULP:
+    // normal ULP exponent is exp-10 (shift 42), subnormal is fixed at
+    // 2^-24 (shift 28-exp).
+    let (shift, subnormal) = if exp < -14 {
+        (28 - exp, true)
+    } else {
+        (42, false)
+    };
+    if shift >= 64 {
+        return sign; // far below the smallest subnormal → 0
+    }
+    let shift = shift as u32;
+    let mut q = sig >> shift;
+    if shift > 0 {
+        let rem = sig & ((1u64 << shift) - 1);
+        let half = 1u64 << (shift - 1);
+        if rem > half || (rem == half && (q & 1) == 1) {
+            q += 1;
+        }
+    }
+    if subnormal {
+        // q ∈ [0, 1024]; the raw bits encode the subnormal directly,
+        // and q == 1024 carries into the smallest normal (exp field 1).
+        sign | (q as u16)
+    } else if q >= 2048 {
+        // Mantissa carry bumped the exponent.
+        let new_exp = exp + 1;
+        if new_exp > 15 {
+            return sign | 0x7C00;
+        }
+        sign | (((new_exp + 15) as u16) << 10)
+    } else {
+        let biased = (exp + 15) as u16;
+        sign | (biased << 10) | ((q as u16) & 0x3FF)
     }
 }
 

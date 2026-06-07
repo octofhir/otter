@@ -305,6 +305,7 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
     crate::bootstrap_entry!(crate::bootstrap_typed_array::Uint16ArrayIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_typed_array::Int32ArrayIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_typed_array::Uint32ArrayIntrinsic),
+    crate::bootstrap_entry!(crate::bootstrap_typed_array::Float16ArrayIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_typed_array::Float32ArrayIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_typed_array::Float64ArrayIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_typed_array::BigInt64ArrayIntrinsic),
@@ -624,9 +625,10 @@ mod tests {
         // contributes `toLocaleString` as an own prototype builtin.
         // +2 for JSON `rawJSON` / `isRawJSON` (json-parse-with-source).
         // +1 for `Math.sumPrecise` (Math.sumPrecise proposal).
+        // +1 for `Math.f16round` (Float16Array proposal).
         assert_eq!(
             telemetry.native_functions_installed(),
-            132 + reflect::REFLECT_SPEC.methods.len(),
+            133 + reflect::REFLECT_SPEC.methods.len(),
         );
         assert!(
             telemetry.gc_allocations() <= MAX_DEFAULT_GC_ALLOCATIONS,

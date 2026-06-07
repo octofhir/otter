@@ -62,11 +62,12 @@ skip_features = [
 
 # Implement, do NOT skip (Stage 4 / shipped, feasible in our engine):
 #   host-gc-required ($262.gc), tail-call-optimization,
-#   resizable-arraybuffer, arraybuffer-transfer, Float16Array,
-#   Array.fromAsync, uint8array-base64.
+#   resizable-arraybuffer, arraybuffer-transfer, Array.fromAsync,
+#   uint8array-base64.
 # Done so far this pass: hashbang, Error.isError, Math.sumPrecise,
 #   RegExp.escape, upsert (Map.prototype.getOrInsert /
-#   getOrInsertComputed).
+#   getOrInsertComputed), Float16Array (+ Math.f16round, DataView
+#   get/setFloat16).
 # Array.fromAsync deferred: needs a native async coroutine
 #   (sequential awaits via promise .then state machine) — larger,
 #   dedicated effort.

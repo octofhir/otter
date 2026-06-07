@@ -98,6 +98,7 @@ otter_macros::holt! {
         "imul"   / 2 => native_imul,
         "random" / 0 => native_random,
         "sumPrecise" / 1 => native_sum_precise,
+        "f16round" / 1 => native_f16round,
     },
 }
 
@@ -738,6 +739,26 @@ fn native_sum_precise(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
         SumState::Finite => scaled_bigint_to_f64(&acc),
     };
     Ok(Value::number(NumberValue::from_f64(result)))
+}
+
+/// §21.3.2.16 `Math.f16round(x)` — round `x` to the nearest IEEE-754
+/// half (binary16) and return it back as a `Number`.
+fn native_f16round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let coerced = coerce_math_args(ctx, args)?;
+    let nums = coerce_all("Math.f16round", &coerced, ctx.heap()).map_err(|err| match err {
+        MathError::BadArgument { reason, .. } => NativeError::TypeError {
+            name: "Math.f16round",
+            reason: reason.to_string(),
+        },
+        MathError::UnknownMember(member) => NativeError::TypeError {
+            name: "Math.f16round",
+            reason: format!("unknown Math member {member}"),
+        },
+    })?;
+    let x = first_or_nan(&nums).as_f64();
+    let bits = crate::binary::typed_array::f64_to_f16_bits(x);
+    let rounded = crate::binary::typed_array::f16_bits_to_f64(bits);
+    Ok(Value::number(NumberValue::from_f64(rounded)))
 }
 
 /// Add a finite `f64` to the `2^1074`-scaled exact accumulator.

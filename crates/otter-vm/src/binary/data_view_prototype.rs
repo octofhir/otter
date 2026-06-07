@@ -255,6 +255,23 @@ pub(crate) fn dv_get_float64(
     })
 }
 
+pub(crate) fn dv_get_float16(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    read_view(ctx, args, 2, 1, |s, le, _| {
+        let buf = [s[0], s[1]];
+        let bits = if le {
+            u16::from_le_bytes(buf)
+        } else {
+            u16::from_be_bytes(buf)
+        };
+        Ok(number_value(crate::binary::typed_array::f16_bits_to_f64(
+            bits,
+        )))
+    })
+}
+
 pub(crate) fn dv_get_bigint64(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
@@ -412,6 +429,22 @@ pub(crate) fn dv_set_float64(
     write_view(ctx, args, 8, false, |b, v, le, heap| {
         let n = coerce_number(v, heap).as_f64();
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
+        b.copy_from_slice(&bytes);
+    })
+}
+
+pub(crate) fn dv_set_float16(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    write_view(ctx, args, 2, false, |b, v, le, heap| {
+        let n = coerce_number(v, heap).as_f64();
+        let bits = crate::binary::typed_array::f64_to_f16_bits(n);
+        let bytes = if le {
+            bits.to_le_bytes()
+        } else {
+            bits.to_be_bytes()
+        };
         b.copy_from_slice(&bytes);
     })
 }

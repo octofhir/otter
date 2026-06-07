@@ -553,6 +553,7 @@ ta_ctor!(ctor_float32, TypedArrayKind::Float32);
 ta_ctor!(ctor_float64, TypedArrayKind::Float64);
 ta_ctor!(ctor_bigint64, TypedArrayKind::BigInt64);
 ta_ctor!(ctor_biguint64, TypedArrayKind::BigUint64);
+ta_ctor!(ctor_float16, TypedArrayKind::Float16);
 
 /// §23.2.2.1 `%TypedArray%.from(source [, mapfn [, thisArg]])` —
 /// generic over `this`: the receiver is ANY constructor and the
@@ -941,6 +942,7 @@ const fn typed_array_name(kind: TypedArrayKind) -> &'static str {
         TypedArrayKind::Float64 => "Float64Array",
         TypedArrayKind::BigInt64 => "BigInt64Array",
         TypedArrayKind::BigUint64 => "BigUint64Array",
+        TypedArrayKind::Float16 => "Float16Array",
     }
 }
 
@@ -1319,6 +1321,7 @@ typed_array_kind!("Int16Array", Int16ArrayIntrinsic, 2.0, ctor_int16);
 typed_array_kind!("Uint16Array", Uint16ArrayIntrinsic, 2.0, ctor_uint16);
 typed_array_kind!("Int32Array", Int32ArrayIntrinsic, 4.0, ctor_int32);
 typed_array_kind!("Uint32Array", Uint32ArrayIntrinsic, 4.0, ctor_uint32);
+typed_array_kind!("Float16Array", Float16ArrayIntrinsic, 2.0, ctor_float16);
 typed_array_kind!("Float32Array", Float32ArrayIntrinsic, 4.0, ctor_float32);
 typed_array_kind!("Float64Array", Float64ArrayIntrinsic, 8.0, ctor_float64);
 typed_array_kind!("BigInt64Array", BigInt64ArrayIntrinsic, 8.0, ctor_bigint64);

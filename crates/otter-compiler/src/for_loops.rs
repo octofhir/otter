@@ -292,6 +292,29 @@ pub(crate) fn compile_for_in_statement(
         span,
     );
 
+    // §14.7.5.10 EnumerateObjectProperties — a property deleted
+    // before being visited is not visited, so each key from the
+    // snapshot re-checks existence against the live object. The
+    // check target is ToObject(rhs) (§14.7.5.6 step 6.b); a nullish
+    // rhs yields an empty snapshot and never reaches the check, so
+    // the coercion is guarded rather than unconditional.
+    let check_obj_reg = cx.alloc_scratch();
+    cx.emit(
+        Op::StoreLocal,
+        [
+            Operand::Register(obj_reg),
+            Operand::Imm32(check_obj_reg as i32),
+        ],
+        span,
+    );
+    let skip_to_object = cx.emit_branch_placeholder(Op::JumpIfNullish, Some(obj_reg), span);
+    cx.emit(
+        Op::ToObject,
+        [Operand::Register(check_obj_reg), Operand::Register(obj_reg)],
+        span,
+    );
+    cx.patch_branch_to_here(skip_to_object);
+
     let value_reg = cx.alloc_scratch();
     let done_reg = cx.alloc_scratch();
 
@@ -312,6 +335,21 @@ pub(crate) fn compile_for_in_statement(
         span,
     );
     let exit_jmp = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
+
+    // Deleted-during-enumeration skip (§14.7.5.10): absent keys loop
+    // straight back to the next snapshot entry.
+    let present_reg = cx.alloc_scratch();
+    cx.emit(
+        Op::HasProperty,
+        vec![
+            Operand::Register(present_reg),
+            Operand::Register(value_reg),
+            Operand::Register(check_obj_reg),
+        ],
+        span,
+    );
+    let skip_jmp = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(present_reg), span);
+    cx.patch_branch(skip_jmp, loop_top);
 
     // §14.7.5.6 — `let`/`const` rebinds per iteration; `var`
     // re-uses the function-scope binding. Assignment-target heads

@@ -1520,14 +1520,27 @@ impl Interpreter {
             self.invoke(stack, context, &callee, value, SmallVec::new(), dst)?;
             return Ok(true);
         }
-        let Some(obj) = value.as_object() else {
+        if value.as_object().is_none() {
             return Ok(false);
+        }
+        // §7.4.3 GetIterator step 1 — GetMethod(obj, @@iterator) runs
+        // the ordinary [[Get]] ladder, so an accessor-defined
+        // @@iterator fires its getter (and the getter's abrupt
+        // completion propagates) instead of reading a data slot.
+        let callee = match self.ordinary_get_value(
+            context,
+            value,
+            value,
+            &VmPropertyKey::Symbol(iter_sym),
+            0,
+        )? {
+            VmGetOutcome::Value(v) => v,
+            VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(context, &getter, value, SmallVec::new())?
+            }
         };
-        let Some(callee) = crate::object::get_symbol(obj, &self.gc_heap, iter_sym) else {
+        if callee.is_undefined() || callee.is_null() || !is_callable(&callee) {
             // No `[Symbol.iterator]` — §7.4.3 step 2 throws.
-            return Err(VmError::TypeMismatch);
-        };
-        if !is_callable(&callee) {
             return Err(VmError::TypeMismatch);
         }
         self.frame_ensure_cold(&mut stack[top_idx])

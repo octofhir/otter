@@ -1429,9 +1429,44 @@ impl Interpreter {
                     || produced.is_map()
                     || produced.is_set()
                 {
+                    // §7.4.2 GetIteratorDirect — `next` is read ONCE
+                    // here and cached in the iterator record; later
+                    // `IteratorNext` ticks must not re-read it
+                    // (observable via accessor-defined `next`).
+                    let next_method = match self.ordinary_get_value(
+                        context,
+                        produced,
+                        produced,
+                        &VmPropertyKey::String("next"),
+                        0,
+                    ) {
+                        Ok(VmGetOutcome::Value(v)) => v,
+                        Ok(VmGetOutcome::InvokeGetter { getter }) => {
+                            match self.run_callable_sync(
+                                context,
+                                &getter,
+                                produced,
+                                SmallVec::new(),
+                            ) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+                                        cold.pending_get_iterator = None;
+                                    }
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+                                cold.pending_get_iterator = None;
+                            }
+                            return Err(e);
+                        }
+                    };
                     IteratorState::User {
                         iterator: produced,
-                        next_method: None,
+                        next_method: Some(next_method),
                     }
                 } else {
                     if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
@@ -1593,16 +1628,19 @@ impl Interpreter {
             .cloned();
         if let Some(state) = resume {
             let result = *read_register(&stack[top_idx], state.result_reg)?;
-            let Some(obj) = result.as_object() else {
+            // §7.4.5 step 3 — the result record must be Type Object,
+            // which includes Proxy and other exotic shapes, not just
+            // plain JsObject.
+            if !crate::reflect::is_type_object_value(&result) {
                 if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                     cold.pending_iterator_next = None;
                 }
                 return Err(VmError::TypeMismatch);
-            };
+            }
             // A throw out of the `done` / `value` getters also sets
             // [[Done]] (IteratorStepValue); drop the parked state so a
             // later IteratorNext at this pc starts fresh.
-            let step = match iterator_step_read(self, context, &Value::object(obj)) {
+            let step = match iterator_step_read(self, context, &result) {
                 Ok(step) => step,
                 Err(e) => {
                     if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
@@ -1691,32 +1729,72 @@ impl Interpreter {
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return Ok(true);
         }
+        // §23.1.5.1 ArrayIterator `next` performs Get(array, index) —
+        // an element backed by an accessor must run its getter through
+        // the interpreter (and propagate its abrupt completion); the
+        // synchronous fast path below reads raw element storage only.
+        let array_step = self.gc_heap.read_payload(*iter_rc, |state| match state {
+            IteratorState::Array { array, index, .. } => Some((*array, *index)),
+            _ => None,
+        });
+        if let Some((array, index)) = array_step
+            && crate::array::has_accessors(array, &self.gc_heap)
+            && index < crate::array::len(array, &self.gc_heap)
+            && let Some((getter, _)) =
+                crate::array::get_accessor(array, &self.gc_heap, &index.to_string())
+        {
+            // Advance before the getter runs so a re-entrant `next`
+            // from inside it observes the post-step index.
+            self.gc_heap.with_payload(*iter_rc, |state| {
+                if let IteratorState::Array { index, .. } = state {
+                    *index += 1;
+                }
+            });
+            let value = match getter {
+                Some(g) => {
+                    self.run_callable_sync(context, &g, Value::array(array), SmallVec::new())?
+                }
+                None => Value::undefined(),
+            };
+            write_register(&mut stack[top_idx], value_dst, value)?;
+            write_register(&mut stack[top_idx], done_dst, Value::boolean(false))?;
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return Ok(true);
+        }
         // Snapshot the user iterator object out of the inner
         // state so the borrow does not span the `invoke` call
         // below.
         let user_iter = self.gc_heap.read_payload(*iter_rc, |state| match state {
-            IteratorState::User { iterator, .. } => Some(*iterator),
+            IteratorState::User {
+                iterator,
+                next_method,
+            } => Some((*iterator, *next_method)),
             _ => None,
         });
-        let Some(user_iter_value) = user_iter else {
+        let Some((user_iter_value, cached_next)) = user_iter else {
             // Built-in iterator — let the synchronous in-frame
             // path drive it.
             return Ok(false);
         };
-        // Resolve `next` through the ordinary [[Get]] ladder so a
-        // Proxy iterator (or one exposing `next` via an accessor) is
-        // handled, not just plain objects.
-        let next_fn = match self.ordinary_get_value(
-            context,
-            user_iter_value,
-            user_iter_value,
-            &VmPropertyKey::String("next"),
-            0,
-        )? {
-            VmGetOutcome::Value(v) => v,
-            VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, user_iter_value, SmallVec::new())?
-            }
+        // §7.4.2 — the iterator record caches [[NextMethod]] at
+        // GetIterator time; use it when present. Legacy User states
+        // without a cache resolve through the ordinary [[Get]]
+        // ladder so a Proxy iterator (or one exposing `next` via an
+        // accessor) is handled, not just plain objects.
+        let next_fn = match cached_next {
+            Some(cached) => cached,
+            None => match self.ordinary_get_value(
+                context,
+                user_iter_value,
+                user_iter_value,
+                &VmPropertyKey::String("next"),
+                0,
+            )? {
+                VmGetOutcome::Value(v) => v,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, user_iter_value, SmallVec::new())?
+                }
+            },
         };
         if !is_callable(&next_fn) {
             return Err(VmError::TypeMismatch);

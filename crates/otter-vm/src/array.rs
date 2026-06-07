@@ -1204,6 +1204,14 @@ pub fn set_accessor(
     }
 }
 
+/// Cheap probe for the presence of any string-keyed accessor
+/// descriptors. Lets per-element hot paths skip the keyed
+/// [`get_accessor`] lookup (and its key allocation) for plain arrays.
+#[must_use]
+pub fn has_accessors(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
+    heap.read_payload(arr, |body| body.accessors.is_some())
+}
+
 /// Look up an accessor descriptor previously installed via
 /// [`set_accessor`]. Returns `Some((getter, setter))` when an entry
 /// exists; either slot may be `None`.

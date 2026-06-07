@@ -1489,6 +1489,7 @@ impl Runtime {
                             .map(|binding| otter_compiler::EvalCallerBinding {
                                 name: binding.name,
                                 lexical: binding.lexical,
+                                captured: binding.captured,
                             })
                             .collect()
                     });

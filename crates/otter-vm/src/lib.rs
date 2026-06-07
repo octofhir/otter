@@ -654,6 +654,10 @@ pub struct EvalCallerBinding {
     /// sloppy eval body var-declaring the same name is a runtime
     /// `SyntaxError` (§19.2.1.3 step 5).
     pub lexical: bool,
+    /// Passthrough capture from a function enclosing the caller —
+    /// readable, but a `var` of the same name in the eval body
+    /// declares a fresh caller binding (§19.2.1.3).
+    pub captured: bool,
 }
 
 /// Embedder-supplied parse + compile callback used by

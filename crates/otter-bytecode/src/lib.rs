@@ -2095,6 +2095,14 @@ pub enum ArgumentsObjectKind {
 /// `upvalue` indexes the owning frame's upvalue array.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectEvalBinding {
+    /// `true` when the cell is a PASSTHROUGH CAPTURE from an
+    /// enclosing function rather than the caller's own
+    /// variable-environment binding: a direct eval may READ it, but
+    /// a `var` of the same name in the eval body declares a fresh
+    /// caller-frame binding (§19.2.1.3 — HasVarDeclaration consults
+    /// the caller's varEnv only).
+    #[serde(default)]
+    pub captured: bool,
     /// Source-level binding name.
     pub name: String,
     /// Own-upvalue cell index inside the owning function's frame.

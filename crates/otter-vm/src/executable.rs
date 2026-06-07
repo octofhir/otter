@@ -337,6 +337,7 @@ impl ExecutableFunction {
                     name: binding.name.clone().into_boxed_str(),
                     upvalue: binding.upvalue,
                     lexical: binding.lexical,
+                    captured: binding.captured,
                 })
                 .collect(),
             contains_direct_eval: function.contains_direct_eval,
@@ -397,6 +398,9 @@ pub(crate) struct ExecDirectEvalBinding {
     pub(crate) upvalue: u16,
     /// `true` for `let` / `const` / `class` bindings.
     pub(crate) lexical: bool,
+    /// Passthrough capture from an enclosing function (§19.2.1.3 —
+    /// readable, but not part of the caller's varEnv).
+    pub(crate) captured: bool,
 }
 
 /// Compact mapped-arguments alias entry.

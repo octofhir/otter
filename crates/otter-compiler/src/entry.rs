@@ -82,6 +82,11 @@ pub struct EvalCallerBinding {
     /// sloppy eval body var-declaring the same name is a runtime
     /// `SyntaxError` (§19.2.1.3 step 5).
     pub lexical: bool,
+    /// `true` when the cell is a passthrough capture from a function
+    /// ENCLOSING the caller: readable, but a `var` of the same name
+    /// in the eval body declares a FRESH caller binding instead of
+    /// re-binding the outer variable (§19.2.1.3 HasVarDeclaration).
+    pub captured: bool,
 }
 
 /// Compile an `eval` / `new Function` body. Differs from script
@@ -531,7 +536,6 @@ pub(crate) fn compile_program_with_mode_impl_super(
     // adopt them after the eval returns.
     let caller = caller_scope.unwrap_or(&[]);
     let caller_slot_count = u16::try_from(caller.len()).expect("eval caller scope too large");
-    let caller_names: HashSet<&str> = caller.iter().map(|b| b.name.as_str()).collect();
     if !caller.is_empty() && !main_is_strict {
         // Step 5 — a sloppy body var-scoped name colliding with a
         // caller lexical binding is a SyntaxError thrown at the eval
@@ -556,8 +560,16 @@ pub(crate) fn compile_program_with_mode_impl_super(
                 span: program.span,
             });
         }
+        let caller_reusable: HashSet<&str> = caller
+            .iter()
+            .filter(|b| !b.captured)
+            .map(|b| b.name.as_str())
+            .collect();
         for name in body_var_names {
-            if !caller_names.contains(name.as_str()) {
+            // §19.2.1.3 HasVarDeclaration — only the caller's OWN
+            // variable-environment bindings are re-bound; a name the
+            // caller merely CAPTURES gets a fresh cell here.
+            if !caller_reusable.contains(name.as_str()) {
                 top.captured_names.insert(name);
             }
         }
@@ -584,12 +596,26 @@ pub(crate) fn compile_program_with_mode_impl_super(
         // Strict eval owns its variable environment (§19.2.1.1) —
         // a body var name shadows the caller binding with a fresh
         // local instead of writing through the caller's cell.
-        let shadowed: HashSet<String> = if main_is_strict {
+        let shadowed: HashSet<String> = {
             let mut names: Vec<String> = Vec::new();
             hoist_var_names(program.body, &mut names);
-            names.into_iter().collect()
-        } else {
-            HashSet::new()
+            if main_is_strict {
+                names.into_iter().collect()
+            } else {
+                // Sloppy eval: a body `var` matching a CAPTURED
+                // caller binding declares fresh (§19.2.1.3 —
+                // HasVarDeclaration consults the caller's varEnv,
+                // which does not contain passthrough captures).
+                let captured: HashSet<&str> = caller
+                    .iter()
+                    .filter(|b| b.captured)
+                    .map(|b| b.name.as_str())
+                    .collect();
+                names
+                    .into_iter()
+                    .filter(|n| captured.contains(n.as_str()))
+                    .collect()
+            }
         };
         for (slot, binding) in caller.iter().enumerate() {
             if shadowed.contains(&binding.name) {
@@ -798,6 +824,7 @@ pub(crate) fn compile_program_with_mode_impl_super(
             for (name, info) in &scope.bindings {
                 if let BindingStorage::Upvalue { idx } = info.storage {
                     eval_new_bindings.push(otter_bytecode::DirectEvalBinding {
+                        captured: false,
                         name: name.clone(),
                         upvalue: idx,
                         // A strict eval's own variable environment is

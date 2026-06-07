@@ -167,6 +167,7 @@ impl Interpreter {
                 scope.push(EvalCallerBinding {
                     name: binding.name.to_string(),
                     lexical: binding.lexical,
+                    captured: binding.captured,
                 });
                 sources.push(CallerCellSource::Upvalue(binding.upvalue));
             }
@@ -183,6 +184,7 @@ impl Interpreter {
                 scope.push(EvalCallerBinding {
                     name: name.clone(),
                     lexical: false,
+                    captured: false,
                 });
                 sources.push(CallerCellSource::EvalVar(name.clone()));
             }
@@ -211,11 +213,15 @@ impl Interpreter {
             return Ok(*value);
         };
         let source = s.to_lossy_string(&self.gc_heap);
+        // §19.2.1.3 — only the caller's OWN variable-environment
+        // names block adoption; a passthrough CAPTURE of the same
+        // name still receives a fresh caller binding.
         let caller_scope_names: std::collections::HashSet<String> = options
             .caller_scope
             .as_deref()
             .unwrap_or(&[])
             .iter()
+            .filter(|binding| !binding.captured)
             .map(|binding| binding.name.clone())
             .collect();
         let module = self.compile_eval_source(&source, options)?;

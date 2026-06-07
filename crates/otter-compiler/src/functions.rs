@@ -289,6 +289,7 @@ pub(crate) fn collect_direct_eval_bindings(
         .iter()
         .filter_map(|(name, info)| match info.storage {
             BindingStorage::Upvalue { idx } => Some(otter_bytecode::DirectEvalBinding {
+                captured: false,
                 name: name.clone(),
                 upvalue: idx,
                 lexical: lexical.contains(name.as_str()),
@@ -307,6 +308,7 @@ pub(crate) fn collect_direct_eval_bindings(
             || name == crate::class::SUPER_CTOR_NAME;
         if synthetic {
             entries.push(otter_bytecode::DirectEvalBinding {
+                captured: false,
                 name: name.clone(),
                 upvalue: *idx,
                 lexical: true,
@@ -321,6 +323,7 @@ pub(crate) fn collect_direct_eval_bindings(
         // capture. Exposing the cell lets the eval bind the existing
         // variable instead of minting a shadow.
         entries.push(otter_bytecode::DirectEvalBinding {
+            captured: true,
             name: name.clone(),
             upvalue: *idx,
             lexical: false,

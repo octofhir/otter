@@ -286,6 +286,24 @@ pub(crate) fn compile_for_in_statement(
     //     <body>
     //     Jump loop_top
     //   exit:
+    // §14.7.5 — a single-identifier `let`/`const` head binds in an
+    // own-upvalue cell holed during RHS evaluation (head TDZ) and
+    // re-installed fresh per iteration, mirroring the for-of path.
+    let per_iter_head = per_iteration_head_name(&s.left);
+    let per_iter_upvalue = if let Some((name, is_const)) = &per_iter_head {
+        cx.enter_scope();
+        let idx = match cx.declare_captured_binding(name, *is_const, span)? {
+            crate::scope::BindingStorage::Upvalue { idx } => idx,
+            crate::scope::BindingStorage::Register { .. } => {
+                unreachable!("declare_captured_binding always yields an upvalue")
+            }
+        };
+        cx.emit(Op::FreshUpvalue, [Operand::Imm32(idx as i32)], span);
+        Some(idx)
+    } else {
+        None
+    };
+
     let obj_reg = compile_expr(cx, &s.right, span)?;
     let keys_reg = cx.alloc_scratch();
     cx.emit(
@@ -306,6 +324,11 @@ pub(crate) fn compile_for_in_statement(
 
     cx.push_loop_frame(LoopFrame::iteration());
     let loop_top = cx.next_pc;
+    // §14.7.5.6 CreatePerIterationEnvironment — fresh cell before the
+    // next key binds so closures capture a distinct binding.
+    if let Some(idx) = per_iter_upvalue {
+        cx.emit(Op::FreshUpvalue, [Operand::Imm32(idx as i32)], span);
+    }
     cx.emit(
         Op::IteratorNext,
         vec![
@@ -335,6 +358,9 @@ pub(crate) fn compile_for_in_statement(
     }
     for pc in frame.break_patches {
         cx.patch_branch_to_here(pc);
+    }
+    if per_iter_head.is_some() {
+        cx.exit_scope();
     }
     Ok(None)
 }
@@ -394,6 +420,17 @@ pub(crate) fn bind_for_in_of_head(
                                 span,
                             })?
                             .storage
+                    } else if let Some(info) = cx.lookup_binding(&name).filter(|info| {
+                        !info.initialized
+                            && matches!(info.storage, crate::scope::BindingStorage::Upvalue { .. })
+                    }) {
+                        // §14.7.5.6 — the single-identifier head's
+                        // per-iteration cell was pre-declared (holed)
+                        // by the loop prologue; bind THROUGH it so
+                        // Op::FreshUpvalue re-installs the binding
+                        // every iteration and closures capture a
+                        // distinct copy.
+                        info.storage
                     } else {
                         cx.declare_binding(&name, is_const, span)?
                     };

@@ -289,7 +289,16 @@ pub(crate) fn compile_update(
             if let Some(probe) = &with_ref {
                 let fallback =
                     cx.emit_branch_placeholder(Op::JumpIfFalse, Some(probe.found_reg), span);
-                cx.emit_load_property(old, probe.object_reg, &name, span);
+                // §9.1.1.2.6 — GetBindingValue re-checks HasProperty
+                // before the Get (the probe's getter may have deleted
+                // the binding).
+                crate::with_statement::emit_with_get_binding_value(
+                    cx,
+                    old,
+                    probe.object_reg,
+                    &name,
+                    span,
+                );
                 with_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
                 cx.patch_branch_to_here(fallback);
             }
@@ -428,16 +437,14 @@ pub(crate) fn compile_update(
             if let Some(probe) = &with_ref {
                 let fallback =
                     cx.emit_branch_placeholder(Op::JumpIfFalse, Some(probe.found_reg), span);
-                let name_idx = cx.intern_string_constant(&name);
-                let scratch = cx.alloc_scratch();
-                cx.emit(
-                    Op::StoreProperty,
-                    vec![
-                        Operand::Register(probe.object_reg),
-                        Operand::ConstIndex(name_idx),
-                        Operand::Register(next),
-                        Operand::Register(scratch),
-                    ],
+                // §9.1.1.2.5 — SetMutableBinding re-checks HasProperty
+                // before the Set; a binding deleted between the read
+                // and the write throws ReferenceError in strict code.
+                crate::with_statement::emit_with_set_mutable_binding(
+                    cx,
+                    probe.object_reg,
+                    &name,
+                    next,
                     span,
                 );
                 with_store_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));

@@ -1586,7 +1586,18 @@ impl Interpreter {
                 }
                 return Err(VmError::TypeMismatch);
             };
-            let step = iterator_step_read(self, context, &Value::object(obj))?;
+            // A throw out of the `done` / `value` getters also sets
+            // [[Done]] (IteratorStepValue); drop the parked state so a
+            // later IteratorNext at this pc starts fresh.
+            let step = match iterator_step_read(self, context, &Value::object(obj)) {
+                Ok(step) => step,
+                Err(e) => {
+                    if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+                        cold.pending_iterator_next = None;
+                    }
+                    return Err(e);
+                }
+            };
             let (value, done) = match step {
                 Some(value) => (value, false),
                 None => (Value::undefined(), true),
@@ -1697,6 +1708,13 @@ impl Interpreter {
         if !is_callable(&next_fn) {
             return Err(VmError::TypeMismatch);
         }
+        // §7.4.9 / IteratorStepValue — a throw out of `next` (or out
+        // of reading the result record) sets [[Done]] and skips
+        // IteratorClose. The call runs in a pushed frame, so its
+        // throw unwinds without ever returning `Err` to this opcode:
+        // disarm the closer for the span of the call; the resume path
+        // re-arms it once `next` yields `done: false`.
+        self.deregister_frame_iterator_closer(&mut stack[top_idx], iter_value);
         // Park the state and push a call. `result_reg` reuses the
         // `value_dst` slot — the resume step overwrites it with
         // the unpacked value before the user code observes it.

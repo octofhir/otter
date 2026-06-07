@@ -2109,6 +2109,46 @@ impl Interpreter {
         Ok(())
     }
 
+    /// OrdinarySet slow path for an array index write when the
+    /// element-store protector is tripped: an absent own element must
+    /// consult the prototype chain — a setter consumes the write, a
+    /// getter-only accessor or non-writable data property rejects it
+    /// (TypeError in strict code). Returns `true` when the write was
+    /// consumed either way; `false` falls back to the own-element
+    /// fast path.
+    fn array_index_store_via_proto(
+        &mut self,
+        context: &ExecutionContext,
+        arr: crate::array::JsArray,
+        idx: usize,
+        value: Value,
+        strict: bool,
+    ) -> Result<bool, VmError> {
+        if !self.array_index_accessor_protector
+            || crate::array::has_own_element(arr, &self.gc_heap, idx)
+        {
+            return Ok(false);
+        }
+        let proto = self.constructor_prototype_value("Array")?;
+        let Some(proto_obj) = proto.as_object() else {
+            return Ok(false);
+        };
+        let key = idx.to_string();
+        match object::resolve_set(proto_obj, &self.gc_heap, &key) {
+            object::SetOutcome::InvokeSetter { setter } => {
+                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                args.push(value);
+                self.run_callable_sync(context, &setter, Value::array(arr), args)?;
+                Ok(true)
+            }
+            object::SetOutcome::Reject { .. } => {
+                Self::failed_set_result(strict, format!("Cannot assign to property '{key}'"))?;
+                Ok(true)
+            }
+            object::SetOutcome::AssignData | object::SetOutcome::ExoticParent { .. } => Ok(false),
+        }
+    }
+
     pub(crate) fn run_store_element_regs(
         &mut self,
         context: &ExecutionContext,
@@ -2308,20 +2348,30 @@ impl Interpreter {
                 if self.store_array_accessor_property(context, arr, &name, &value, strict)? {
                     // Accessor setter handled assignment.
                 } else if let Some(idx) = crate::object::array_index_property_name(&name) {
-                    self.array_strict_write_guard(arr, &name, strict)?;
-                    let roots = self.collect_allocation_roots(stack);
-                    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                        for &slot in &roots {
-                            visitor(slot);
-                        }
-                    };
-                    crate::array::set_with_roots(
+                    if self.array_index_store_via_proto(
+                        context,
                         arr,
-                        &mut self.gc_heap,
                         idx as usize,
                         value,
-                        &mut external_visit,
-                    )?;
+                        strict,
+                    )? {
+                        // Prototype-chain setter (or rejection) consumed the write.
+                    } else {
+                        self.array_strict_write_guard(arr, &name, strict)?;
+                        let roots = self.collect_allocation_roots(stack);
+                        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                            for &slot in &roots {
+                                visitor(slot);
+                            }
+                        };
+                        crate::array::set_with_roots(
+                            arr,
+                            &mut self.gc_heap,
+                            idx as usize,
+                            value,
+                            &mut external_visit,
+                        )?;
+                    }
                 } else {
                     let has_own_named =
                         crate::array::get_named_property(arr, &self.gc_heap, &name).is_some();
@@ -2363,20 +2413,24 @@ impl Interpreter {
                 if self.store_array_accessor_property(context, arr, &key, &value, strict)? {
                     // Accessor setter handled.
                 } else if let Some(idx) = crate::array::index_from_number(n) {
-                    self.array_strict_write_guard(arr, &key, strict)?;
-                    let roots = self.collect_allocation_roots(stack);
-                    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                        for &slot in &roots {
-                            visitor(slot);
-                        }
-                    };
-                    crate::array::set_with_roots(
-                        arr,
-                        &mut self.gc_heap,
-                        idx,
-                        value,
-                        &mut external_visit,
-                    )?;
+                    if self.array_index_store_via_proto(context, arr, idx, value, strict)? {
+                        // Prototype-chain setter (or rejection) consumed the write.
+                    } else {
+                        self.array_strict_write_guard(arr, &key, strict)?;
+                        let roots = self.collect_allocation_roots(stack);
+                        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                            for &slot in &roots {
+                                visitor(slot);
+                            }
+                        };
+                        crate::array::set_with_roots(
+                            arr,
+                            &mut self.gc_heap,
+                            idx,
+                            value,
+                            &mut external_visit,
+                        )?;
+                    }
                 } else {
                     self.array_strict_write_guard(arr, &key, strict)?;
                     crate::array::set_named_property(arr, &mut self.gc_heap, &key, value)

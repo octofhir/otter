@@ -1109,6 +1109,18 @@ impl Interpreter {
         key: &VmPropertyKey,
         descriptor: object::PartialPropertyDescriptor,
     ) -> Result<bool, VmError> {
+        // Array index-store protector: an accessor landing on an
+        // array-index key anywhere (most relevantly
+        // %Array.prototype% / %Object.prototype%) forces array
+        // element writes onto the OrdinarySet prototype-walk slow
+        // path. Conservative — never reset.
+        if (descriptor.get.is_some() || descriptor.set.is_some())
+            && key
+                .string_name()
+                .is_some_and(|name| crate::object::array_index_property_name(name).is_some())
+        {
+            self.array_index_accessor_protector = true;
+        }
         self.ensure_deferred_namespace_ready(
             context,
             target,

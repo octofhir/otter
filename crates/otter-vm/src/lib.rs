@@ -293,6 +293,13 @@ pub struct Interpreter {
     /// template-strings object per tagged-template site, keyed by
     /// `(chunk function_base, site index)`.
     template_objects: rustc_hash::FxHashMap<(u32, u32), Value>,
+    /// Protector for the array element store fast path: flips to
+    /// `true` once any accessor descriptor lands on an array-index
+    /// key anywhere (e.g. `Array.prototype[1] = {set}`); array index
+    /// writes then re-check the prototype chain per OrdinarySet
+    /// before creating an own element. Stays `false` for the
+    /// overwhelmingly common unpolluted heap, keeping appends cheap.
+    array_index_accessor_protector: bool,
     interrupt: InterruptFlag,
     /// Byte length of the instruction currently being dispatched. Set
     /// by `dispatch_loop_inner` right after each fetch and consumed by
@@ -889,6 +896,7 @@ impl Interpreter {
         startup_timer.mark("vm_shape_runtime");
         let mut interp = Self {
             template_objects: rustc_hash::FxHashMap::default(),
+            array_index_accessor_protector: false,
             interrupt: InterruptFlag::new(),
             current_byte_len: 1,
             gc_heap,

@@ -50,6 +50,27 @@ pub struct ProxyBodyGc {
     /// this slot; revocation nulls the target but never strips it.
     #[pelt(skip)]
     pub callable: bool,
+    /// §6.2.12 [[PrivateElements]] — private names attach to the
+    /// proxy itself and never route through traps. `(name, value)`
+    /// pairs; linear scan (private name counts are tiny). Values are
+    /// traced via `trace_proxy_private_elements`; the symbol keys
+    /// stay alive through the class capture cells.
+    #[pelt(via = trace_proxy_private_elements)]
+    pub private_elements: Option<Vec<(crate::symbol::JsSymbol, Value)>>,
+}
+
+/// Trace helper for proxy [[PrivateElements]]: visit both the symbol
+/// handle and the stored value of every entry.
+fn trace_proxy_private_elements(
+    entries: &Option<Vec<(crate::symbol::JsSymbol, Value)>>,
+    visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc),
+) {
+    if let Some(entries) = entries {
+        for (sym, value) in entries {
+            sym.trace_value_slots(visit);
+            value.trace_value_slots(visit);
+        }
+    }
 }
 
 /// 4-byte compressed GC handle to a [`ProxyBodyGc`]. `Copy`.
@@ -74,6 +95,7 @@ pub fn alloc_proxy(
         handler,
         revoked: false,
         callable,
+        private_elements: None,
     })
 }
 

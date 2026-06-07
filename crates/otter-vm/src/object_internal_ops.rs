@@ -1067,12 +1067,92 @@ impl Interpreter {
     /// on the class prototype / statics object), looking for the
     /// class-evaluation private-name symbol. Returns the holder and
     /// its descriptor, or `None` when the brand check fails.
+    /// Scan a proxy's [[PrivateElements]] bag for `sym`.
+    pub(crate) fn proxy_private_find(
+        &self,
+        proxy: &crate::proxy::JsProxy,
+        sym: crate::symbol::JsSymbol,
+    ) -> Option<Value> {
+        self.gc_heap.read_payload(proxy.handle(), |body| {
+            body.private_elements.as_ref().and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|(s, _)| s.handle() == sym.handle())
+                    .map(|(_, v)| *v)
+            })
+        })
+    }
+
+    /// Insert or overwrite `sym` in a proxy's [[PrivateElements]].
+    pub(crate) fn proxy_private_upsert(
+        &mut self,
+        proxy: &crate::proxy::JsProxy,
+        sym: crate::symbol::JsSymbol,
+        value: Value,
+    ) {
+        self.gc_heap.with_payload(proxy.handle(), |body| {
+            let entries = body.private_elements.get_or_insert_with(Vec::new);
+            match entries.iter_mut().find(|(s, _)| s.handle() == sym.handle()) {
+                Some(slot) => slot.1 = value,
+                None => entries.push((sym, value)),
+            }
+        });
+    }
+
     pub(crate) fn private_element_lookup(
         &mut self,
         context: &ExecutionContext,
         receiver: &Value,
         sym: crate::symbol::JsSymbol,
     ) -> Result<Option<(Value, object::PropertyDescriptor)>, VmError> {
+        // §6.2.12 — a Proxy carries its own [[PrivateElements]];
+        // private names never consult traps or the target/prototype
+        // chain.
+        if sym.is_private_name()
+            && let Some(p) = receiver.as_proxy()
+        {
+            if let Some(value) = self.proxy_private_find(&p, sym) {
+                return Ok(Some((
+                    *receiver,
+                    object::PropertyDescriptor {
+                        kind: object::DescriptorKind::Data { value },
+                        flags: object::PropertyFlags::new(true, false, false),
+                    },
+                )));
+            }
+            // Miss in the bag: brand entries carry the class
+            // prototype object as their value, so private METHODS /
+            // accessors of a branded receiver resolve through it
+            // even though the proxy's chain never reaches the
+            // holder. The holder reported is the prototype, which
+            // keeps the PrivateSet not-writable check intact.
+            let brand_protos: Vec<Value> = self.gc_heap.read_payload(p.handle(), |body| {
+                body.private_elements
+                    .as_ref()
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter(|(_, v)| v.is_object())
+                            .map(|(_, v)| *v)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            });
+            let key = VmPropertyKey::Symbol(sym);
+            for proto in brand_protos {
+                if let Some(desc) = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                    context,
+                    proto,
+                    &key,
+                    0,
+                    &[&proto, receiver],
+                    &[],
+                )? {
+                    return Ok(Some((proto, desc)));
+                }
+            }
+            return Ok(None);
+        }
         let key = VmPropertyKey::Symbol(sym);
         let mut current = *receiver;
         let mut hops = 0;
@@ -1088,18 +1168,51 @@ impl Interpreter {
                 return Ok(Some((current, desc)));
             }
             if hops >= object::PROTO_CHAIN_HARD_CAP {
-                return Ok(None);
+                break;
             }
             // Proxies participate via their getPrototypeOf trap —
             // the context-aware walker handles them (the plain
             // get_prototype_for_op rejects proxy values).
             let proto = self.ordinary_get_prototype_value(context, current, hops)?;
             if !proto.is_object() && !proto.is_object_type() {
-                return Ok(None);
+                break;
             }
             current = proto;
             hops += 1;
         }
+        // Constructor-return override: a branded plain object whose
+        // [[Prototype]] chain misses the method holder still resolves
+        // private methods through its brand entries, whose stored
+        // value is the class prototype object (see `__privproto_*`).
+        if sym.is_private_name()
+            && let Some(obj) = receiver.as_object()
+        {
+            let brand_protos: Vec<Value> =
+                crate::object::with_properties(obj, &self.gc_heap, |props| {
+                    props
+                        .symbol_keys()
+                        .filter(|k| k.is_private_name())
+                        .filter_map(|k| crate::object::get_symbol(obj, &self.gc_heap, k))
+                        .filter(|v| v.is_object())
+                        .collect()
+                });
+            for proto in brand_protos {
+                if proto == *receiver {
+                    continue;
+                }
+                if let Some(desc) = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                    context,
+                    proto,
+                    &key,
+                    0,
+                    &[&proto, receiver],
+                    &[],
+                )? {
+                    return Ok(Some((proto, desc)));
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub(crate) fn define_own_property_value(
@@ -1109,6 +1222,31 @@ impl Interpreter {
         key: &VmPropertyKey,
         descriptor: object::PartialPropertyDescriptor,
     ) -> Result<bool, VmError> {
+        // §6.2.12 / §7.3.28 — private names: a Proxy receiver keeps
+        // them in its own [[PrivateElements]] bag (no traps), and an
+        // ordinary add to a non-extensible object is a TypeError.
+        if let VmPropertyKey::Symbol(sym) = key
+            && sym.is_private_name()
+        {
+            if let Some(p) = target.as_proxy() {
+                let value = descriptor.value.unwrap_or(Value::undefined());
+                self.proxy_private_upsert(&p, *sym, value);
+                return Ok(true);
+            }
+            let own_bag = target.as_object().or_else(|| {
+                target
+                    .as_class_constructor()
+                    .map(|c| c.statics(&self.gc_heap))
+            });
+            if let Some(obj) = own_bag
+                && !crate::object::is_extensible(obj, &self.gc_heap)
+                && crate::object::get_symbol(obj, &self.gc_heap, *sym).is_none()
+            {
+                return Err(VmError::TypeError {
+                    message: "Cannot define private field on a non-extensible object".to_string(),
+                });
+            }
+        }
         // Array index-store protector: an accessor landing on an
         // array-index key anywhere (most relevantly
         // %Array.prototype% / %Object.prototype%) forces array

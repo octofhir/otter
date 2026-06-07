@@ -70,6 +70,22 @@ pub fn alloc_symbol(
         description,
         well_known,
         registered,
+        private_name: false,
+    })
+}
+
+/// Allocate a Private Name carrier — same identity semantics as an
+/// ordinary symbol, plus the `private_name` marker the MOP fast
+/// paths consult.
+pub fn alloc_private_name_symbol(
+    heap: &mut otter_gc::GcHeap,
+    description: Option<JsString>,
+) -> Result<SymbolHandle, otter_gc::OutOfMemory> {
+    heap.alloc_old(SymbolBody {
+        description,
+        well_known: None,
+        registered: false,
+        private_name: true,
     })
 }
 
@@ -104,6 +120,11 @@ pub struct SymbolBody {
     /// used as WeakMap / WeakSet keys.
     #[pelt(skip)]
     pub registered: bool,
+    /// `true` for Private Name carriers minted by the class
+    /// machinery (`Op::NewPrivateName`). Private names never route
+    /// through Proxy traps and gate the §7.3.28 extensibility check.
+    #[pelt(skip)]
+    pub private_name: bool,
 }
 
 /// Heap handle for [`Value::Symbol`].
@@ -121,6 +142,7 @@ pub struct JsSymbol {
     description: Option<JsString>,
     well_known: Option<WellKnown>,
     registered: bool,
+    private_name: bool,
 }
 
 impl JsSymbol {
@@ -145,6 +167,7 @@ impl JsSymbol {
             description,
             well_known: None,
             registered: false,
+            private_name: false,
         })
     }
 
@@ -166,6 +189,7 @@ impl JsSymbol {
             description: Some(description),
             well_known: Some(tag),
             registered: false,
+            private_name: false,
         })
     }
 
@@ -186,6 +210,25 @@ impl JsSymbol {
             description: Some(description),
             well_known: None,
             registered: true,
+            private_name: false,
+        })
+    }
+
+    /// Construct a Private Name carrier (`Op::NewPrivateName`).
+    ///
+    /// # Errors
+    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+    pub fn new_private(
+        heap: &mut otter_gc::GcHeap,
+        description: Option<JsString>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        let inner = alloc_private_name_symbol(heap, description)?;
+        Ok(Self {
+            inner,
+            description,
+            well_known: None,
+            registered: false,
+            private_name: true,
         })
     }
 
@@ -193,6 +236,12 @@ impl JsSymbol {
     #[must_use]
     pub fn is_registered(&self) -> bool {
         self.registered
+    }
+
+    /// Whether this symbol is a Private Name carrier.
+    #[must_use]
+    pub fn is_private_name(&self) -> bool {
+        self.private_name
     }
 
     /// Borrow the description, if any. Reads the wrapper-side cache;
@@ -239,14 +288,21 @@ impl JsSymbol {
     #[inline]
     #[must_use]
     pub fn from_handle(heap: &otter_gc::GcHeap, handle: SymbolHandle) -> Self {
-        let (description, well_known, registered) = heap.read_payload(handle, |body| {
-            (body.description, body.well_known, body.registered)
-        });
+        let (description, well_known, registered, private_name) =
+            heap.read_payload(handle, |body| {
+                (
+                    body.description,
+                    body.well_known,
+                    body.registered,
+                    body.private_name,
+                )
+            });
         Self {
             inner: handle,
             description,
             well_known,
             registered,
+            private_name,
         }
     }
 

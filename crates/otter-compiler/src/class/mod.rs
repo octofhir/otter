@@ -205,13 +205,22 @@ fn compile_class_strict(
                     && matches!(m.key, oxc_ast::ast::PropertyKey::PrivateIdentifier(_))
         )
     });
-    if has_instance_private_methods {
+    let privproto_storage = if has_instance_private_methods {
         let binding = format!("__privbrand_{private_namespace}");
         let storage = cx.declare_captured_binding(&binding, true, span)?;
         let key_reg = emit_private_symbol_key(cx, "brand", span)?;
         cx.emit_store_storage(key_reg, storage, span);
         cx.mark_initialized(&binding);
-    }
+        // The brand's stored VALUE is the class prototype object, so
+        // a branded receiver whose [[Prototype]] chain misses the
+        // method holder (proxy / plain constructor-return override)
+        // can still resolve private methods through the brand entry.
+        let proto_binding = format!("__privproto_{private_namespace}");
+        let proto_storage = cx.declare_captured_binding(&proto_binding, true, span)?;
+        Some((proto_binding, proto_storage))
+    } else {
+        None
+    };
 
     // §15.7.14 step 4 — the class scope gets an immutable binding
     // for the class name before the heritage evaluates: `extends`
@@ -346,6 +355,10 @@ fn compile_class_strict(
     // resolve `super` through the standard upvalue walker.
     cx.emit_store_storage(prototype_reg, home_storage, span);
     cx.mark_initialized(SUPER_HOME_NAME);
+    if let Some((proto_binding, proto_storage)) = &privproto_storage {
+        cx.emit_store_storage(prototype_reg, *proto_storage, span);
+        cx.mark_initialized(proto_binding);
+    }
     cx.emit_store_storage(statics_reg, static_home_storage, span);
     cx.mark_initialized(SUPER_STATIC_HOME_NAME);
     if let (Some(parent_reg), Some(super_storage)) = (super_reg, super_storage) {
@@ -1140,32 +1153,14 @@ fn emit_private_symbol_key(
     name: &str,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
-    let symbol_reg = cx.alloc_scratch();
-    let symbol_const = cx.intern_string_constant("Symbol");
-    cx.emit(
-        Op::LoadGlobalOrThrow,
-        [
-            Operand::Register(symbol_reg),
-            Operand::ConstIndex(symbol_const),
-        ],
-        span,
-    );
-    let desc_reg = cx.alloc_scratch();
+    // §6.2.12 — a dedicated Private Name carrier (not a plain
+    // `Symbol(...)` call): the runtime marker keeps private access
+    // out of Proxy traps and arms the §7.3.28 extensibility check.
+    let key_reg = cx.alloc_scratch();
     let desc = cx.intern_string_constant(&format!("#{name}"));
     cx.emit(
-        Op::LoadString,
-        [Operand::Register(desc_reg), Operand::ConstIndex(desc)],
-        span,
-    );
-    let key_reg = cx.alloc_scratch();
-    cx.emit(
-        Op::Call,
-        [
-            Operand::Register(key_reg),
-            Operand::Register(symbol_reg),
-            Operand::ConstIndex(1),
-            Operand::Register(desc_reg),
-        ],
+        Op::NewPrivateName,
+        [Operand::Register(key_reg), Operand::ConstIndex(desc)],
         span,
     );
     Ok(key_reg)

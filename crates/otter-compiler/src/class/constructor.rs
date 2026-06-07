@@ -416,9 +416,20 @@ fn emit_instance_field_inits_inner(
             let fresh = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(present), span);
             emit_field_add_type_error(cx, span);
             cx.patch_branch_to_here(fresh);
-            let true_reg = cx.alloc_scratch();
-            cx.emit(Op::LoadTrue, [Operand::Register(true_reg)], span);
-            cx.emit_store_element(this_reg, key_reg, true_reg, span);
+            // Brand value = the class prototype object (see
+            // `__privproto_*` in class/mod.rs) so branded receivers
+            // off the prototype chain still resolve private methods.
+            let proto_binding = format!("__privproto_{ns}");
+            let brand_value = if cx.lookup_binding(&proto_binding).is_some()
+                || cx.resolve_capture(&proto_binding).is_some()
+            {
+                crate::class::load_synthetic_capture(cx, &proto_binding, span)?
+            } else {
+                let true_reg = cx.alloc_scratch();
+                cx.emit(Op::LoadTrue, [Operand::Register(true_reg)], span);
+                true_reg
+            };
+            cx.emit_store_element(this_reg, key_reg, brand_value, span);
         }
     }
     for (idx, p) in fields.iter().enumerate() {

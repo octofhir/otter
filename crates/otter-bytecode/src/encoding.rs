@@ -594,6 +594,7 @@ pub const OP_BYTE_TABLE: &[(Op, u8)] = &[
     (Op::LoadShadowedUpvalue, 0xA3),
     (Op::GetTemplateObject, 0xA4),
     (Op::DeleteDynamic, 0xA5),
+    (Op::NewPrivateName, 0xA6),
 ];
 
 #[cfg(test)]

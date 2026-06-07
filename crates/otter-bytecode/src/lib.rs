@@ -1059,6 +1059,12 @@ pub enum Op {
     /// falls through to the global-object delete.
     DeleteDynamic,
 
+    /// Mint a Private Name carrier (§6.2.12) — a symbol whose
+    /// `private_name` marker keeps it out of Proxy traps and arms
+    /// the §7.3.28 extensibility check. Operands:
+    /// `Register(dst), ConstIndex(description)`.
+    NewPrivateName,
+
     /// §9.1.1.4.18 CreateGlobalFunctionBinding. Operands:
     /// `ConstIndex(name), Register(value), Imm32(deletable)`.
     ///
@@ -1387,6 +1393,7 @@ impl Op {
             Op::StoreDynamic => "STORE_DYNAMIC",
             Op::TypeofDynamic => "TYPEOF_DYNAMIC",
             Op::DeleteDynamic => "DELETE_DYNAMIC",
+            Op::NewPrivateName => "NEW_PRIVATE_NAME",
             Op::DefineGlobalFunction => "DEFINE_GLOBAL_FUNCTION",
             Op::DeclareGlobalLex => "DECLARE_GLOBAL_LEX",
             Op::StoreGlobalBinding => "STORE_GLOBAL_BINDING",
@@ -1490,6 +1497,7 @@ impl Op {
             | Op::StoreDynamic
             | Op::TypeofDynamic
             | Op::DeleteDynamic
+            | Op::NewPrivateName
             | Op::DeclareGlobalLex
             | Op::InitGlobalLex
             | Op::ValidateGlobalDecl
@@ -1640,7 +1648,8 @@ impl Op {
             | Op::LoadDynamic
             | Op::StoreDynamic
             | Op::TypeofDynamic
-            | Op::DeleteDynamic => pos == 1,
+            | Op::DeleteDynamic
+            | Op::NewPrivateName => pos == 1,
             // [name_const, value_reg]
             Op::DefineGlobalVar => pos == 0,
             Op::DeclareGlobalVar => pos == 0,

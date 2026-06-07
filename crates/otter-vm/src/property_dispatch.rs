@@ -2176,6 +2176,17 @@ impl Interpreter {
         let idx_value = self.coerce_property_key_value(context, idx_value_raw)?;
         if let Some(obj) = recv.as_object() {
             if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
+                // §7.3.28 — adding a private element (brand install)
+                // to a non-extensible object is a TypeError.
+                if sym.is_private_name()
+                    && object::get_own_symbol_descriptor(obj, &self.gc_heap, sym).is_none()
+                    && !object::is_extensible(obj, &self.gc_heap)
+                {
+                    return Err(VmError::TypeError {
+                        message: "Cannot define private member on a non-extensible object"
+                            .to_string(),
+                    });
+                }
                 if object::deferred_namespace_target(obj, &self.gc_heap).is_some() {
                     self.ensure_deferred_namespace_ready(context, &recv, false)?;
                     if !object::deferred_namespace_is_populated(obj, &self.gc_heap)
@@ -3567,6 +3578,15 @@ impl Interpreter {
             return Ok(false);
         };
         if let Some(proxy) = receiver.as_proxy() {
+            // §6.2.12 — private-name writes land in the proxy's own
+            // [[PrivateElements]]; the set trap never fires.
+            if let ComputedPropertyKey::Symbol(sym) = &key
+                && sym.is_private_name()
+            {
+                self.proxy_private_upsert(&proxy, *sym, value);
+                stack[top_idx].advance_pc(self.current_byte_len)?;
+                return Ok(true);
+            }
             let key_arg = match &key {
                 ComputedPropertyKey::String(key) => {
                     Value::string(JsString::from_str(key, &mut self.gc_heap)?)
@@ -4545,6 +4565,20 @@ impl Interpreter {
         if !(rhs.is_object() || rhs.is_proxy()) {
             return Ok(false);
         };
+        // §6.2.12 — private-name presence checks on a Proxy answer
+        // from its own [[PrivateElements]]; the has trap never fires.
+        if let (Some(p), Some(sym)) = (rhs.as_proxy(), lhs.as_symbol(&self.gc_heap))
+            && sym.is_private_name()
+        {
+            let present = self.proxy_private_find(&p, sym).is_some();
+            Self::finish_property_fast_path_value(
+                &mut stack[top_idx],
+                dst,
+                Value::boolean(present),
+                self.current_byte_len,
+            )?;
+            return Ok(true);
+        }
         if let (Some(obj), Some(key_string)) = (rhs.as_object(), lhs.as_string(&self.gc_heap)) {
             let site = context
                 .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)

@@ -1889,6 +1889,10 @@ pub fn call(
                 // expando bag; elements are exempt.
                 let bag = crate::property_dispatch::typed_array_ensure_expando_pub(gc_heap, &t)?;
                 crate::object::prevent_extensions(bag, gc_heap);
+            } else if let Some(c) = arg.as_class_constructor() {
+                // Class constructor extensibility lives on its
+                // statics object.
+                crate::object::prevent_extensions(c.statics(gc_heap), gc_heap);
             }
             Ok(arg)
         }
@@ -1957,6 +1961,8 @@ pub fn call(
             } else if let Some(t) = arg.as_typed_array(gc_heap) {
                 t.expando(gc_heap)
                     .is_none_or(|bag| crate::object::is_extensible(bag, gc_heap))
+            } else if let Some(c) = arg.as_class_constructor() {
+                crate::object::is_extensible(c.statics(gc_heap), gc_heap)
             } else {
                 // §20.1.2.14 step 2 — non-Object returns false; every
                 // spec-Object kind reaches here only when none of the

@@ -4891,6 +4891,28 @@ impl Interpreter {
                     self.run_delete_dynamic_reg(context, frame, dst, name_idx)?;
                     continue;
                 }
+                // §6.2.12 — mint a Private Name carrier; the marker
+                // keeps it out of Proxy traps and arms the §7.3.28
+                // extensibility check on adds.
+                Op::NewPrivateName => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let desc_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let desc = context
+                        .string_constant_str(desc_idx)
+                        .ok_or(VmError::InvalidOperand)?
+                        .to_string();
+                    let desc_str = JsString::from_str(&desc, &mut self.gc_heap)?;
+                    let sym =
+                        crate::symbol::JsSymbol::new_private(&mut self.gc_heap, Some(desc_str))?;
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, Value::symbol(sym))?;
+                    frame.advance_pc(self.current_byte_len)?;
+                    continue;
+                }
                 Op::DefineGlobalFunction => {
                     let name_idx = context
                         .exec_const_index(instr, 0)
@@ -5292,8 +5314,12 @@ impl Interpreter {
                         });
                     };
                     let key = VmPropertyKey::Symbol(sym);
-                    let found = self
-                        .ordinary_get_own_property_descriptor_value_runtime_rooted(
+                    // §6.2.12 — a Proxy answers brand checks from its
+                    // own [[PrivateElements]] bag, never from traps.
+                    let found = if let Some(p) = receiver.as_proxy() {
+                        self.proxy_private_find(&p, sym).is_some()
+                    } else {
+                        self.ordinary_get_own_property_descriptor_value_runtime_rooted(
                             context,
                             receiver,
                             &key,
@@ -5301,7 +5327,8 @@ impl Interpreter {
                             &[&receiver, &brand],
                             &[],
                         )?
-                        .is_some();
+                        .is_some()
+                    };
                     if !found {
                         return Err(VmError::TypeError {
                             message:

@@ -521,24 +521,17 @@ impl Interpreter {
         argc: usize,
         dst: u16,
     ) -> Result<bool, VmError> {
-        let mut current = *callee;
+        let current = *callee;
         let effective_this = this_value;
-        let mut hops: u32 = 0;
-        loop {
-            if hops >= self.max_stack_depth {
-                return Err(VmError::StackOverflow {
-                    limit: self.max_stack_depth,
-                });
-            }
-            if let Some(cc) = current.as_class_constructor() {
-                hops += 1;
-                current = cc.ctor(&self.gc_heap);
-                continue;
-            }
-            if current.is_bound_function() {
-                return Ok(false);
-            }
-            break;
+        if current.as_class_constructor().is_some() {
+            // §10.3.1 — a class constructor's [[Call]] always
+            // throws; only [[Construct]] may enter it.
+            return Err(VmError::TypeError {
+                message: "Class constructor cannot be invoked without 'new'".to_string(),
+            });
+        }
+        if current.is_bound_function() {
+            return Ok(false);
         }
         if !current.is_function() && !current.is_closure() {
             return Ok(false);
@@ -1451,9 +1444,11 @@ impl Interpreter {
                 effective_this = bound_this;
                 effective_args = combined;
                 current = target;
-            } else if let Some(cc) = current.as_class_constructor() {
-                hops += 1;
-                current = cc.ctor(&self.gc_heap);
+            } else if current.as_class_constructor().is_some() {
+                // §10.3.1 — class constructors reject [[Call]].
+                return Err(VmError::TypeError {
+                    message: "Class constructor cannot be invoked without 'new'".to_string(),
+                });
             } else if let Some(proxy) = current.as_proxy() {
                 // §10.5.12 Proxy [[Call]] — dispatch `apply` trap or
                 // fall through to target.[[Call]] when the trap is

@@ -1020,7 +1020,13 @@ pub fn load_property(t: &JsTypedArray, heap: &otter_gc::GcHeap, name: &str) -> V
     match name {
         "buffer" => Value::array_buffer(t.buffer(heap)),
         "byteLength" => smi(t.byte_length(heap) as i32),
-        "byteOffset" => smi(t.byte_offset(heap) as i32),
+        // §23.2.3.3 — out-of-bounds (incl. shrunk-past-end) views
+        // report byteOffset 0, matching the prototype getter.
+        "byteOffset" => smi(if t.is_out_of_bounds(heap) {
+            0
+        } else {
+            t.byte_offset(heap) as i32
+        }),
         "length" => smi(t.length(heap) as i32),
         "BYTES_PER_ELEMENT" => smi(t.kind().bytes_per_element() as i32),
         _ => {

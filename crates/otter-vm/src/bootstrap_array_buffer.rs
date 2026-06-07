@@ -76,6 +76,12 @@ fn sab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
             reason: "constructor requires 'new'".to_string(),
         });
     }
+    // §25.2.3.1 step 2 — ToIndex(length) observable coercion.
+    let length = observable_to_index_arg(ctx, args.first(), "SharedArrayBuffer")?;
+    let mut coerced_args: smallvec::SmallVec<[Value; 4]> = smallvec::SmallVec::new();
+    coerced_args.push(length);
+    coerced_args.extend(args.iter().skip(1).copied());
+    let args = coerced_args.as_slice();
     let roots = ctx.collect_native_roots();
     let this_value = *ctx.this_value();
     let new_target = ctx.new_target().cloned();
@@ -96,14 +102,21 @@ fn sab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
         &mut external_visit,
     )
     .map_err(|e| vm_to_native(e, "SharedArrayBuffer"))?;
-    // §10.1.13 GetPrototypeFromConstructor — derived `super()`
-    // construction forwards `new.target`, so the allocated exotic
-    // receives `Subclass.prototype` as its observable [[Prototype]].
-    // <https://tc39.es/ecma262/#sec-getprototypefromconstructor>
-    let needs_proto_override = ctx.new_target().is_none_or(|v| !v.is_native_function());
-    if needs_proto_override
+    // §10.1.13 GetPrototypeFromConstructor — newTarget.prototype is
+    // always consulted; only %SharedArrayBuffer% itself keeps the
+    // intrinsic default without an override record.
+    let is_self_target = ctx.new_target().is_some_and(|nt| {
+        crate::object::get(
+            ctx.cx.interp.global_this,
+            &ctx.cx.interp.gc_heap,
+            "SharedArrayBuffer",
+        )
+        .is_some_and(|sab| *nt == sab)
+    });
+    if !is_self_target
         && let Some(proto) =
             crate::bootstrap::native_new_target_prototype(ctx, "SharedArrayBuffer")?
+        && proto.is_object_type()
     {
         ctx.interp_mut()
             .set_non_gc_exotic_prototype_override(&value, Some(proto));
@@ -228,6 +241,35 @@ pub fn install_array_buffer_well_knowns_post_bootstrap(
 // Constructor + statics
 // ---------------------------------------------------------------
 
+/// §7.1.22 ToIndex with the OBSERVABLE ToNumber ladder — fires user
+/// `valueOf` / `@@toPrimitive` and propagates their abrupt
+/// completions before the truncation / range checks.
+fn observable_to_index_arg(
+    ctx: &mut NativeCtx<'_>,
+    arg: Option<&Value>,
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let Some(v) = arg else {
+        return Ok(Value::undefined());
+    };
+    if v.is_undefined() || v.as_number().is_some() {
+        return Ok(*v);
+    }
+    let exec_ctx = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name,
+            reason: "missing execution context".to_string(),
+        })?;
+    let n = ctx
+        .cx
+        .interp
+        .coerce_to_number(&exec_ctx, v)
+        .map_err(|e| crate::native_function::vm_to_native_error(e, name))?;
+    Ok(Value::number(n))
+}
+
 fn ab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     if !ctx.is_construct_call() {
         return Err(NativeError::TypeError {
@@ -235,6 +277,13 @@ fn ab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
             reason: "constructor requires 'new'".to_string(),
         });
     }
+    // §25.1.4.1 step 2 — ToIndex(length) runs the observable
+    // ToNumber ladder before allocation.
+    let length = observable_to_index_arg(ctx, args.first(), "ArrayBuffer")?;
+    let mut coerced_args: smallvec::SmallVec<[Value; 4]> = smallvec::SmallVec::new();
+    coerced_args.push(length);
+    coerced_args.extend(args.iter().skip(1).copied());
+    let args = coerced_args.as_slice();
     let roots = ctx.collect_native_roots();
     let this_value = *ctx.this_value();
     let new_target = ctx.new_target().cloned();
@@ -255,13 +304,22 @@ fn ab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
         &mut external_visit,
     )
     .map_err(|e| vm_to_native(e, "ArrayBuffer"))?;
-    // §10.1.13 GetPrototypeFromConstructor — derived `super()`
-    // construction forwards `new.target`, so the allocated exotic
-    // receives `Subclass.prototype` as its observable [[Prototype]].
-    // <https://tc39.es/ecma262/#sec-getprototypefromconstructor>
-    let needs_proto_override = ctx.new_target().is_none_or(|v| !v.is_native_function());
-    if needs_proto_override
+    // §10.1.13 GetPrototypeFromConstructor — newTarget.prototype is
+    // ALWAYS consulted (Reflect.construct with a foreign newTarget,
+    // accessor-defined prototypes, derived super()); only a
+    // newTarget that IS %ArrayBuffer% itself keeps the intrinsic
+    // default without an override record.
+    let is_self_target = ctx.new_target().is_some_and(|nt| {
+        crate::object::get(
+            ctx.cx.interp.global_this,
+            &ctx.cx.interp.gc_heap,
+            "ArrayBuffer",
+        )
+        .is_some_and(|ab| *nt == ab)
+    });
+    if !is_self_target
         && let Some(proto) = crate::bootstrap::native_new_target_prototype(ctx, "ArrayBuffer")?
+        && proto.is_object_type()
     {
         ctx.interp_mut()
             .set_non_gc_exotic_prototype_override(&value, Some(proto));

@@ -26,17 +26,16 @@ const CLASS: &str = "Temporal.Duration";
 /// minutes, seconds, milliseconds, microseconds, nanoseconds)`.
 pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     require_construct(ctx, CLASS)?;
-    let heap = ctx.heap();
-    let years = opt_integer_if_integral(args, 0, heap, CLASS, "years")? as i64;
-    let months = opt_integer_if_integral(args, 1, heap, CLASS, "months")? as i64;
-    let weeks = opt_integer_if_integral(args, 2, heap, CLASS, "weeks")? as i64;
-    let days = opt_integer_if_integral(args, 3, heap, CLASS, "days")? as i64;
-    let hours = opt_integer_if_integral(args, 4, heap, CLASS, "hours")? as i64;
-    let minutes = opt_integer_if_integral(args, 5, heap, CLASS, "minutes")? as i64;
-    let seconds = opt_integer_if_integral(args, 6, heap, CLASS, "seconds")? as i64;
-    let ms = opt_integer_if_integral(args, 7, heap, CLASS, "milliseconds")? as i64;
-    let us = opt_integer_if_integral(args, 8, heap, CLASS, "microseconds")? as i128;
-    let ns = opt_integer_if_integral(args, 9, heap, CLASS, "nanoseconds")? as i128;
+    let years = opt_integer_if_integral(ctx, args, 0, CLASS, "years")? as i64;
+    let months = opt_integer_if_integral(ctx, args, 1, CLASS, "months")? as i64;
+    let weeks = opt_integer_if_integral(ctx, args, 2, CLASS, "weeks")? as i64;
+    let days = opt_integer_if_integral(ctx, args, 3, CLASS, "days")? as i64;
+    let hours = opt_integer_if_integral(ctx, args, 4, CLASS, "hours")? as i64;
+    let minutes = opt_integer_if_integral(ctx, args, 5, CLASS, "minutes")? as i64;
+    let seconds = opt_integer_if_integral(ctx, args, 6, CLASS, "seconds")? as i64;
+    let ms = opt_integer_if_integral(ctx, args, 7, CLASS, "milliseconds")? as i64;
+    let us = opt_integer_if_integral(ctx, args, 8, CLASS, "microseconds")? as i128;
+    let ns = opt_integer_if_integral(ctx, args, 9, CLASS, "nanoseconds")? as i128;
     let dur = temporal_rs::Duration::new(
         years, months, weeks, days, hours, minutes, seconds, ms, us, ns,
     )
@@ -46,13 +45,13 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 
 fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let first = arg_or_undef(args, 0);
-    let dur = parse_duration_arg(&first, ctx.heap())?;
+    let dur = parse_duration_arg(ctx, &first)?;
     make_temporal(ctx, TemporalPayload::Duration(dur))
 }
 
 fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let a = parse_duration_arg(&arg_or_undef(args, 0), ctx.heap())?;
-    let b = parse_duration_arg(&arg_or_undef(args, 1), ctx.heap())?;
+    let a = parse_duration_arg(ctx, &arg_or_undef(args, 0))?;
+    let b = parse_duration_arg(ctx, &arg_or_undef(args, 1))?;
     let n = match a.compare(&b, None).map_err(|e| temporal_err(e, CLASS))? {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
@@ -62,22 +61,22 @@ fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError
 }
 
 fn parse_duration_arg(
+    ctx: &mut NativeCtx<'_>,
     v: &Value,
-    heap: &otter_gc::GcHeap,
 ) -> Result<temporal_rs::Duration, NativeError> {
-    if let Some(t) = v.as_temporal(heap) {
-        match t.payload_clone(heap) {
+    if let Some(t) = v.as_temporal(ctx.heap()) {
+        match t.payload_clone(ctx.heap()) {
             TemporalPayload::Duration(d) => Ok(d),
             _ => Err(NativeError::TypeError {
                 name: CLASS,
                 reason: "argument must be a Temporal.Duration".to_string(),
             }),
         }
-    } else if let Some(s) = v.as_string(heap) {
-        temporal_rs::Duration::from_utf8(s.to_lossy_string(heap).as_bytes())
+    } else if let Some(s) = v.as_string(ctx.heap()) {
+        temporal_rs::Duration::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))
     } else if let Some(obj) = v.as_object() {
-        partial_from_object(&obj, heap)
+        partial_from_object(ctx, &obj)
     } else {
         Err(NativeError::TypeError {
             name: CLASS,
@@ -88,38 +87,38 @@ fn parse_duration_arg(
 }
 
 pub fn partial_from_object(
+    ctx: &mut NativeCtx<'_>,
     obj: &JsObject,
-    heap: &otter_gc::GcHeap,
 ) -> Result<temporal_rs::Duration, NativeError> {
     let mut partial = temporal_rs::partial::PartialDuration::empty();
-    if let Some(v) = optional_field(obj, "years", heap)? {
+    if let Some(v) = optional_field(ctx, obj, "years")? {
         partial = partial.with_years(v);
     }
-    if let Some(v) = optional_field(obj, "months", heap)? {
+    if let Some(v) = optional_field(ctx, obj, "months")? {
         partial = partial.with_months(v);
     }
-    if let Some(v) = optional_field(obj, "weeks", heap)? {
+    if let Some(v) = optional_field(ctx, obj, "weeks")? {
         partial = partial.with_weeks(v);
     }
-    if let Some(v) = optional_field(obj, "days", heap)? {
+    if let Some(v) = optional_field(ctx, obj, "days")? {
         partial = partial.with_days(v);
     }
-    if let Some(v) = optional_field(obj, "hours", heap)? {
+    if let Some(v) = optional_field(ctx, obj, "hours")? {
         partial = partial.with_hours(v);
     }
-    if let Some(v) = optional_field(obj, "minutes", heap)? {
+    if let Some(v) = optional_field(ctx, obj, "minutes")? {
         partial = partial.with_minutes(v);
     }
-    if let Some(v) = optional_field(obj, "seconds", heap)? {
+    if let Some(v) = optional_field(ctx, obj, "seconds")? {
         partial = partial.with_seconds(v);
     }
-    if let Some(v) = optional_field(obj, "milliseconds", heap)? {
+    if let Some(v) = optional_field(ctx, obj, "milliseconds")? {
         partial = partial.with_milliseconds(v);
     }
-    if let Some(v) = optional_field(obj, "microseconds", heap)? {
+    if let Some(v) = optional_field(ctx, obj, "microseconds")? {
         partial = partial.with_microseconds(v as i128);
     }
-    if let Some(v) = optional_field(obj, "nanoseconds", heap)? {
+    if let Some(v) = optional_field(ctx, obj, "nanoseconds")? {
         partial = partial.with_nanoseconds(v as i128);
     }
     temporal_rs::Duration::from_partial_duration(partial)
@@ -127,11 +126,11 @@ pub fn partial_from_object(
 }
 
 fn optional_field(
+    ctx: &mut NativeCtx<'_>,
     obj: &JsObject,
     name: &str,
-    heap: &otter_gc::GcHeap,
 ) -> Result<Option<i64>, NativeError> {
-    let Some(v) = object::get(*obj, heap, name) else {
+    let Some(v) = object::get(*obj, ctx.heap(), name) else {
         return Ok(None);
     };
     if v.is_undefined() {
@@ -140,7 +139,7 @@ fn optional_field(
     // §ToTemporalPartialDurationRecord — each field runs
     // ToIntegerIfIntegral: ToNumber (observable valueOf), reject NaN
     // / Infinity / a non-integral value with RangeError.
-    let n = crate::temporal::helpers::to_integer_if_integral(&v, heap, CLASS, name)?;
+    let n = crate::temporal::helpers::to_integer_if_integral(ctx, &v, CLASS, name)?;
     Ok(Some(n as i64))
 }
 
@@ -189,14 +188,14 @@ fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
 
 fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let lhs = require_duration(ctx)?;
-    let rhs = duration_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let rhs = duration_arg(ctx, &arg_or_undef(args, 0))?;
     let result = lhs.add(&rhs).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Duration(result))
 }
 
 fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let lhs = require_duration(ctx)?;
-    let rhs = duration_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let rhs = duration_arg(ctx, &arg_or_undef(args, 0))?;
     let result = lhs.subtract(&rhs).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Duration(result))
 }
@@ -239,7 +238,7 @@ fn impl_total(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
             name: CLASS,
             reason: "unknown duration unit".to_string(),
         })?;
-    let relative_to = parse_relative_to(args, 0, ctx.heap())?;
+    let relative_to = parse_relative_to(ctx, args, 0)?;
     let total = dur
         .total(unit, relative_to)
         .map_err(|e| temporal_err(e, CLASS))?;
@@ -268,35 +267,34 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         microseconds: Some(dur.microseconds()),
         nanoseconds: Some(dur.nanoseconds()),
     };
-    let heap = ctx.heap();
-    if let Some(v) = optional_field(&obj, "years", heap)? {
+    if let Some(v) = optional_field(ctx, &obj, "years")? {
         p.years = Some(v);
     }
-    if let Some(v) = optional_field(&obj, "months", heap)? {
+    if let Some(v) = optional_field(ctx, &obj, "months")? {
         p.months = Some(v);
     }
-    if let Some(v) = optional_field(&obj, "weeks", heap)? {
+    if let Some(v) = optional_field(ctx, &obj, "weeks")? {
         p.weeks = Some(v);
     }
-    if let Some(v) = optional_field(&obj, "days", heap)? {
+    if let Some(v) = optional_field(ctx, &obj, "days")? {
         p.days = Some(v);
     }
-    if let Some(v) = optional_field(&obj, "hours", heap)? {
+    if let Some(v) = optional_field(ctx, &obj, "hours")? {
         p.hours = Some(v);
     }
-    if let Some(v) = optional_field(&obj, "minutes", heap)? {
+    if let Some(v) = optional_field(ctx, &obj, "minutes")? {
         p.minutes = Some(v);
     }
-    if let Some(v) = optional_field(&obj, "seconds", heap)? {
+    if let Some(v) = optional_field(ctx, &obj, "seconds")? {
         p.seconds = Some(v);
     }
-    if let Some(v) = optional_field(&obj, "milliseconds", heap)? {
+    if let Some(v) = optional_field(ctx, &obj, "milliseconds")? {
         p.milliseconds = Some(v);
     }
-    if let Some(v) = optional_field(&obj, "microseconds", heap)? {
+    if let Some(v) = optional_field(ctx, &obj, "microseconds")? {
         p.microseconds = Some(v as i128);
     }
-    if let Some(v) = optional_field(&obj, "nanoseconds", heap)? {
+    if let Some(v) = optional_field(ctx, &obj, "nanoseconds")? {
         p.nanoseconds = Some(v as i128);
     }
     let result =
@@ -309,18 +307,19 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
 /// `Temporal.PlainDate`/`PlainDateTime`/`ZonedDateTime`, an ISO
 /// string, or a property bag (`timeZone` present → zoned).
 fn parse_relative_to(
+    ctx: &mut NativeCtx<'_>,
     args: &[Value],
     index: usize,
-    heap: &otter_gc::GcHeap,
 ) -> Result<Option<temporal_rs::options::RelativeTo>, NativeError> {
     let Some(opts) = arg_or_undef(args, index).as_object() else {
         return Ok(None);
     };
-    let Some(rel) = object::get(opts, heap, "relativeTo").filter(|v| !v.is_undefined()) else {
+    let Some(rel) = object::get(opts, ctx.heap(), "relativeTo").filter(|v| !v.is_undefined())
+    else {
         return Ok(None);
     };
-    if let Some(t) = rel.as_temporal(heap) {
-        return match t.payload_clone(heap) {
+    if let Some(t) = rel.as_temporal(ctx.heap()) {
+        return match t.payload_clone(ctx.heap()) {
             TemporalPayload::PlainDate(pd) => Ok(Some(pd.into())),
             TemporalPayload::PlainDateTime(pdt) => Ok(Some(pdt.to_plain_date().into())),
             TemporalPayload::ZonedDateTime(zdt) => Ok(Some(zdt.into())),
@@ -330,22 +329,22 @@ fn parse_relative_to(
             }),
         };
     }
-    if let Some(s) = rel.as_string(heap) {
-        return temporal_rs::options::RelativeTo::try_from_str(&s.to_lossy_string(heap))
+    if let Some(s) = rel.as_string(ctx.heap()) {
+        return temporal_rs::options::RelativeTo::try_from_str(&s.to_lossy_string(ctx.heap()))
             .map(Some)
             .map_err(|e| temporal_err(e, CLASS));
     }
     if let Some(obj) = rel.as_object() {
-        if object::get(obj, heap, "timeZone")
+        if object::get(obj, ctx.heap(), "timeZone")
             .filter(|v| !v.is_undefined())
             .is_some()
         {
             return Ok(Some(
-                crate::temporal::zoned_date_time::parse_zdt_arg(&rel, heap)?.into(),
+                crate::temporal::zoned_date_time::parse_zdt_arg(ctx, &rel)?.into(),
             ));
         }
         return Ok(Some(
-            crate::temporal::plain_date::parse_plain_date_arg(&rel, heap)?.into(),
+            crate::temporal::plain_date::parse_plain_date_arg(ctx, &rel)?.into(),
         ));
     }
     Err(NativeError::TypeError {
@@ -358,16 +357,16 @@ fn parse_relative_to(
 fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let dur = require_duration(ctx)?;
     let options = parse_rounding_options(args, 0, ctx.heap(), CLASS)?;
-    let relative_to = parse_relative_to(args, 0, ctx.heap())?;
+    let relative_to = parse_relative_to(ctx, args, 0)?;
     let result = dur
         .round(options, relative_to)
         .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Duration(result))
 }
 
-fn duration_arg(v: &Value, heap: &otter_gc::GcHeap) -> Result<temporal_rs::Duration, NativeError> {
-    if let Some(t) = v.as_temporal(heap) {
-        match t.payload_clone(heap) {
+fn duration_arg(ctx: &mut NativeCtx<'_>, v: &Value) -> Result<temporal_rs::Duration, NativeError> {
+    if let Some(t) = v.as_temporal(ctx.heap()) {
+        match t.payload_clone(ctx.heap()) {
             TemporalPayload::Duration(d) => Ok(d),
             _ => Err(NativeError::TypeError {
                 name: CLASS,
@@ -375,9 +374,9 @@ fn duration_arg(v: &Value, heap: &otter_gc::GcHeap) -> Result<temporal_rs::Durat
             }),
         }
     } else if let Some(obj) = v.as_object() {
-        partial_from_object(&obj, heap)
-    } else if let Some(s) = v.as_string(heap) {
-        temporal_rs::Duration::from_utf8(s.to_lossy_string(heap).as_bytes())
+        partial_from_object(ctx, &obj)
+    } else if let Some(s) = v.as_string(ctx.heap()) {
+        temporal_rs::Duration::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))
     } else {
         Err(NativeError::TypeError {

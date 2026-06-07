@@ -58,9 +58,13 @@ pub fn require_construct(ctx: &NativeCtx<'_>, class: &'static str) -> Result<(),
 
 /// §7.1.6 `ToIntegerWithTruncation` — `ToNumber`, reject `NaN`/`±∞`
 /// with `RangeError`, truncate toward zero.
-pub fn to_integer_with_truncation(
+/// §7.1.4 ToNumber on a Temporal field, running ToPrimitive(number)
+/// so a user `valueOf` / `@@toPrimitive` fires observably (a Symbol /
+/// BigInt operand is a TypeError). Heap-only paths that cannot reach
+/// user code fall back to the non-observing reader.
+pub fn to_number_field(
+    ctx: &mut NativeCtx<'_>,
     value: &Value,
-    heap: &otter_gc::GcHeap,
     class: &'static str,
     field: &str,
 ) -> Result<f64, NativeError> {
@@ -76,7 +80,31 @@ pub fn to_integer_with_truncation(
             reason: format!("{field}: cannot convert a BigInt to a Number"),
         });
     }
-    let n = crate::number::parse::to_number_value(value, heap);
+    if value.is_object_type() {
+        let exec = ctx
+            .execution_context()
+            .cloned()
+            .ok_or_else(|| NativeError::TypeError {
+                name: class,
+                reason: "missing execution context".to_string(),
+            })?;
+        let n = ctx
+            .cx
+            .interp
+            .number_for_number_ctor(&exec, value)
+            .map_err(|e| crate::native_function::vm_to_native_error(e, class))?;
+        return Ok(n.as_f64());
+    }
+    Ok(crate::number::parse::to_number_value(value, ctx.heap()))
+}
+
+pub fn to_integer_with_truncation(
+    ctx: &mut NativeCtx<'_>,
+    value: &Value,
+    class: &'static str,
+    field: &str,
+) -> Result<f64, NativeError> {
+    let n = to_number_field(ctx, value, class, field)?;
     if n.is_nan() || n.is_infinite() {
         return Err(NativeError::RangeError {
             name: class,
@@ -87,26 +115,31 @@ pub fn to_integer_with_truncation(
 }
 
 pub fn to_integer_if_integral(
+    ctx: &mut NativeCtx<'_>,
     value: &Value,
-    heap: &otter_gc::GcHeap,
     class: &'static str,
     field: &str,
 ) -> Result<f64, NativeError> {
-    let n = to_integer_with_truncation(value, heap, class, field)?;
-    let raw = crate::number::parse::to_number_value(value, heap);
-    if (raw - n).abs() > 0.0 {
+    let raw = to_number_field(ctx, value, class, field)?;
+    if raw.is_nan() || raw.is_infinite() {
+        return Err(NativeError::RangeError {
+            name: class,
+            reason: format!("{field}: must be a finite integer"),
+        });
+    }
+    if (raw - raw.trunc()).abs() > 0.0 {
         return Err(NativeError::RangeError {
             name: class,
             reason: format!("{field}: must be an integer"),
         });
     }
-    Ok(n)
+    Ok(raw.trunc())
 }
 
 pub fn opt_integer_with_truncation(
+    ctx: &mut NativeCtx<'_>,
     args: &[Value],
     index: usize,
-    heap: &otter_gc::GcHeap,
     class: &'static str,
     field: &str,
 ) -> Result<f64, NativeError> {
@@ -114,7 +147,7 @@ pub fn opt_integer_with_truncation(
     if v.is_undefined() {
         return Ok(0.0);
     }
-    to_integer_with_truncation(&v, heap, class, field)
+    to_integer_with_truncation(ctx, &v, class, field)
 }
 
 /// §GetOptionsObject — `undefined` yields `None` (use defaults); any
@@ -123,10 +156,7 @@ pub fn opt_integer_with_truncation(
 /// primitive is a TypeError. Callables expose no plain bag, so option
 /// fields read as absent (defaults), matching the spec for the
 /// no-fields case.
-pub fn options_object(
-    v: &Value,
-    class: &'static str,
-) -> Result<Option<JsObject>, NativeError> {
+pub fn options_object(v: &Value, class: &'static str) -> Result<Option<JsObject>, NativeError> {
     if v.is_undefined() {
         return Ok(None);
     }
@@ -140,9 +170,9 @@ pub fn options_object(
 }
 
 pub fn opt_integer_if_integral(
+    ctx: &mut NativeCtx<'_>,
     args: &[Value],
     index: usize,
-    heap: &otter_gc::GcHeap,
     class: &'static str,
     field: &str,
 ) -> Result<f64, NativeError> {
@@ -150,7 +180,7 @@ pub fn opt_integer_if_integral(
     if v.is_undefined() {
         return Ok(0.0);
     }
-    to_integer_if_integral(&v, heap, class, field)
+    to_integer_if_integral(ctx, &v, class, field)
 }
 
 pub fn arg_to_calendar(
@@ -457,24 +487,19 @@ pub fn parse_display_calendar(
 }
 
 fn read_partial_integer(
+    ctx: &mut NativeCtx<'_>,
     obj: JsObject,
     name: &str,
-    heap: &otter_gc::GcHeap,
     class: &'static str,
 ) -> Result<Option<i64>, NativeError> {
-    let Some(v) = object::get(obj, heap, name) else {
+    let Some(v) = object::get(obj, ctx.heap(), name) else {
         return Ok(None);
     };
     if v.is_undefined() {
         return Ok(None);
     }
-    let Some(n) = v.as_number() else {
-        return Err(NativeError::TypeError {
-            name: class,
-            reason: format!("{name}: partial-record field must be a number"),
-        });
-    };
-    let raw = n.as_f64();
+    // §ToIntegerWithTruncation over the field, observing valueOf.
+    let raw = to_number_field(ctx, &v, class, name)?;
     if !raw.is_finite() {
         return Err(NativeError::RangeError {
             name: class,
@@ -622,27 +647,27 @@ pub fn parse_rounding_options(
 }
 
 pub fn parse_partial_time(
+    ctx: &mut NativeCtx<'_>,
     obj: JsObject,
-    heap: &otter_gc::GcHeap,
     class: &'static str,
 ) -> Result<temporal_rs::partial::PartialTime, NativeError> {
     let mut t = temporal_rs::partial::PartialTime::default();
-    if let Some(v) = read_partial_integer(obj, "hour", heap, class)? {
+    if let Some(v) = read_partial_integer(ctx, obj, "hour", class)? {
         t.hour = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
-    if let Some(v) = read_partial_integer(obj, "minute", heap, class)? {
+    if let Some(v) = read_partial_integer(ctx, obj, "minute", class)? {
         t.minute = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
-    if let Some(v) = read_partial_integer(obj, "second", heap, class)? {
+    if let Some(v) = read_partial_integer(ctx, obj, "second", class)? {
         t.second = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
-    if let Some(v) = read_partial_integer(obj, "millisecond", heap, class)? {
+    if let Some(v) = read_partial_integer(ctx, obj, "millisecond", class)? {
         t.millisecond = Some(v.clamp(0, u16::MAX as i64) as u16);
     }
-    if let Some(v) = read_partial_integer(obj, "microsecond", heap, class)? {
+    if let Some(v) = read_partial_integer(ctx, obj, "microsecond", class)? {
         t.microsecond = Some(v.clamp(0, u16::MAX as i64) as u16);
     }
-    if let Some(v) = read_partial_integer(obj, "nanosecond", heap, class)? {
+    if let Some(v) = read_partial_integer(ctx, obj, "nanosecond", class)? {
         t.nanosecond = Some(v.clamp(0, u16::MAX as i64) as u16);
     }
     Ok(t)
@@ -694,21 +719,21 @@ pub fn read_calendar_field(
 }
 
 pub fn parse_calendar_fields(
+    ctx: &mut NativeCtx<'_>,
     obj: JsObject,
-    heap: &otter_gc::GcHeap,
     class: &'static str,
 ) -> Result<temporal_rs::fields::CalendarFields, NativeError> {
     let mut f = temporal_rs::fields::CalendarFields::default();
-    if let Some(v) = read_partial_integer(obj, "year", heap, class)? {
+    if let Some(v) = read_partial_integer(ctx, obj, "year", class)? {
         f.year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
     }
-    if let Some(v) = read_partial_integer(obj, "month", heap, class)? {
+    if let Some(v) = read_partial_integer(ctx, obj, "month", class)? {
         f.month = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
-    if let Some(v) = read_partial_integer(obj, "day", heap, class)? {
+    if let Some(v) = read_partial_integer(ctx, obj, "day", class)? {
         f.day = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
-    if let Some(s) = read_string_field(obj, "monthCode", heap) {
+    if let Some(s) = read_string_field(obj, "monthCode", ctx.heap()) {
         let code = temporal_rs::MonthCode::try_from_utf8(s.as_bytes()).map_err(|_| {
             NativeError::TypeError {
                 name: class,
@@ -717,7 +742,7 @@ pub fn parse_calendar_fields(
         })?;
         f.month_code = Some(code);
     }
-    if let Some(s) = read_string_field(obj, "era", heap) {
+    if let Some(s) = read_string_field(obj, "era", ctx.heap()) {
         let era = temporal_rs::TinyAsciiStr::<19>::try_from_str(&s).map_err(|_| {
             NativeError::RangeError {
                 name: class,
@@ -726,36 +751,36 @@ pub fn parse_calendar_fields(
         })?;
         f.era = Some(era);
     }
-    if let Some(v) = read_partial_integer(obj, "eraYear", heap, class)? {
+    if let Some(v) = read_partial_integer(ctx, obj, "eraYear", class)? {
         f.era_year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
     }
     Ok(f)
 }
 
 pub fn parse_date_time_fields(
+    ctx: &mut NativeCtx<'_>,
     obj: JsObject,
-    heap: &otter_gc::GcHeap,
     class: &'static str,
 ) -> Result<temporal_rs::fields::DateTimeFields, NativeError> {
     Ok(temporal_rs::fields::DateTimeFields {
-        calendar_fields: parse_calendar_fields(obj, heap, class)?,
-        time: parse_partial_time(obj, heap, class)?,
+        calendar_fields: parse_calendar_fields(ctx, obj, class)?,
+        time: parse_partial_time(ctx, obj, class)?,
     })
 }
 
 pub fn parse_year_month_fields(
+    ctx: &mut NativeCtx<'_>,
     obj: JsObject,
-    heap: &otter_gc::GcHeap,
     class: &'static str,
 ) -> Result<temporal_rs::fields::YearMonthCalendarFields, NativeError> {
     let mut f = temporal_rs::fields::YearMonthCalendarFields::default();
-    if let Some(v) = read_partial_integer(obj, "year", heap, class)? {
+    if let Some(v) = read_partial_integer(ctx, obj, "year", class)? {
         f.year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
     }
-    if let Some(v) = read_partial_integer(obj, "month", heap, class)? {
+    if let Some(v) = read_partial_integer(ctx, obj, "month", class)? {
         f.month = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
-    if let Some(s) = read_string_field(obj, "monthCode", heap) {
+    if let Some(s) = read_string_field(obj, "monthCode", ctx.heap()) {
         let code = temporal_rs::MonthCode::try_from_utf8(s.as_bytes()).map_err(|_| {
             NativeError::TypeError {
                 name: class,
@@ -764,7 +789,7 @@ pub fn parse_year_month_fields(
         })?;
         f.month_code = Some(code);
     }
-    if let Some(s) = read_string_field(obj, "era", heap) {
+    if let Some(s) = read_string_field(obj, "era", ctx.heap()) {
         let era = temporal_rs::TinyAsciiStr::<19>::try_from_str(&s).map_err(|_| {
             NativeError::RangeError {
                 name: class,
@@ -773,7 +798,7 @@ pub fn parse_year_month_fields(
         })?;
         f.era = Some(era);
     }
-    if let Some(v) = read_partial_integer(obj, "eraYear", heap, class)? {
+    if let Some(v) = read_partial_integer(ctx, obj, "eraYear", class)? {
         f.era_year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
     }
     Ok(f)

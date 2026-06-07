@@ -19,15 +19,14 @@ const CLASS: &str = "Temporal.PlainMonthDay";
 
 pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     require_construct(ctx, CLASS)?;
-    let heap = ctx.heap();
-    let month_f = to_integer_with_truncation(&arg_or_undef(args, 0), heap, CLASS, "isoMonth")?;
-    let day_f = to_integer_with_truncation(&arg_or_undef(args, 1), heap, CLASS, "isoDay")?;
-    let calendar = arg_to_calendar(args, 2, heap, CLASS)?;
+    let month_f = to_integer_with_truncation(ctx, &arg_or_undef(args, 0), CLASS, "isoMonth")?;
+    let day_f = to_integer_with_truncation(ctx, &arg_or_undef(args, 1), CLASS, "isoDay")?;
+    let calendar = arg_to_calendar(args, 2, ctx.heap(), CLASS)?;
     let ref_year_v = arg_or_undef(args, 3);
     let ref_year = if ref_year_v.is_undefined() {
         None
     } else {
-        Some(to_integer_with_truncation(&ref_year_v, heap, CLASS, "referenceISOYear")? as i32)
+        Some(to_integer_with_truncation(ctx, &ref_year_v, CLASS, "referenceISOYear")? as i32)
     };
     let month = clamp_to_u8(month_f, CLASS, "isoMonth")?;
     let day = clamp_to_u8(day_f, CLASS, "isoDay")?;
@@ -43,28 +42,28 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let pmd = parse_pmd_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let pmd = parse_pmd_arg(ctx, &arg_or_undef(args, 0))?;
     make_temporal(ctx, TemporalPayload::PlainMonthDay(pmd))
 }
 
 fn parse_pmd_arg(
+    ctx: &mut NativeCtx<'_>,
     v: &Value,
-    heap: &otter_gc::GcHeap,
 ) -> Result<temporal_rs::PlainMonthDay, NativeError> {
-    if let Some(t) = v.as_temporal(heap) {
-        match t.payload_clone(heap) {
+    if let Some(t) = v.as_temporal(ctx.heap()) {
+        match t.payload_clone(ctx.heap()) {
             TemporalPayload::PlainMonthDay(v) => Ok(v),
             _ => Err(NativeError::TypeError {
                 name: CLASS,
                 reason: "argument must be a Temporal.PlainMonthDay".to_string(),
             }),
         }
-    } else if let Some(s) = v.as_string(heap) {
-        temporal_rs::PlainMonthDay::from_utf8(s.to_lossy_string(heap).as_bytes())
+    } else if let Some(s) = v.as_string(ctx.heap()) {
+        temporal_rs::PlainMonthDay::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))
     } else if let Some(obj) = v.as_object() {
-        let fields = parse_calendar_fields(obj, heap, CLASS)?;
-        let calendar = read_calendar_field(obj, heap, CLASS)?;
+        let fields = parse_calendar_fields(ctx, obj, CLASS)?;
+        let calendar = read_calendar_field(obj, ctx.heap(), CLASS)?;
         let partial = temporal_rs::partial::PartialDate {
             calendar_fields: fields,
             calendar,
@@ -113,7 +112,7 @@ fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
 
 fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pmd = require_plain_month_day(ctx)?;
-    let other = parse_pmd_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let other = parse_pmd_arg(ctx, &arg_or_undef(args, 0))?;
     Ok(Value::boolean(pmd == other))
 }
 
@@ -125,7 +124,7 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             reason: "first argument must be an object".to_string(),
         });
     };
-    let fields = parse_calendar_fields(obj, ctx.heap(), CLASS)?;
+    let fields = parse_calendar_fields(ctx, obj, CLASS)?;
     let result = pmd.with(fields, None).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainMonthDay(result))
 }
@@ -138,7 +137,7 @@ fn impl_to_plain_date(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             reason: "first argument must be an object with a `year` field".to_string(),
         });
     };
-    let year_fields = parse_calendar_fields(obj, ctx.heap(), CLASS)?;
+    let year_fields = parse_calendar_fields(ctx, obj, CLASS)?;
     let result = pmd
         .to_plain_date(Some(year_fields))
         .map_err(|e| temporal_err(e, CLASS))?;

@@ -190,11 +190,11 @@ fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
 }
 
 fn arg_as_duration(
+    ctx: &mut NativeCtx<'_>,
     v: &Value,
-    heap: &otter_gc::GcHeap,
 ) -> Result<temporal_rs::Duration, NativeError> {
-    if let Some(t) = v.as_temporal(heap) {
-        match t.payload_clone(heap) {
+    if let Some(t) = v.as_temporal(ctx.heap()) {
+        match t.payload_clone(ctx.heap()) {
             TemporalPayload::Duration(d) => Ok(d),
             _ => Err(NativeError::TypeError {
                 name: CLASS,
@@ -202,7 +202,7 @@ fn arg_as_duration(
             }),
         }
     } else if let Some(obj) = v.as_object() {
-        crate::temporal::duration::partial_from_object(&obj, heap)
+        crate::temporal::duration::partial_from_object(ctx, &obj)
     } else {
         Err(NativeError::TypeError {
             name: CLASS,
@@ -213,14 +213,14 @@ fn arg_as_duration(
 
 fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
-    let dur = arg_as_duration(&arg_or_undef(args, 0), ctx.heap())?;
+    let dur = arg_as_duration(ctx, &arg_or_undef(args, 0))?;
     let result = inst.add(&dur).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Instant(result))
 }
 
 fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
-    let dur = arg_as_duration(&arg_or_undef(args, 0), ctx.heap())?;
+    let dur = arg_as_duration(ctx, &arg_or_undef(args, 0))?;
     let result = inst.subtract(&dur).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Instant(result))
 }

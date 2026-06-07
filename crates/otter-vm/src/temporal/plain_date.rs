@@ -22,11 +22,10 @@ const CLASS: &str = "Temporal.PlainDate";
 
 pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     require_construct(ctx, CLASS)?;
-    let heap = ctx.heap();
-    let year = to_integer_with_truncation(&arg_or_undef(args, 0), heap, CLASS, "isoYear")? as i32;
-    let month_f = to_integer_with_truncation(&arg_or_undef(args, 1), heap, CLASS, "isoMonth")?;
-    let day_f = to_integer_with_truncation(&arg_or_undef(args, 2), heap, CLASS, "isoDay")?;
-    let calendar = arg_to_calendar(args, 3, heap, CLASS)?;
+    let year = to_integer_with_truncation(ctx, &arg_or_undef(args, 0), CLASS, "isoYear")? as i32;
+    let month_f = to_integer_with_truncation(ctx, &arg_or_undef(args, 1), CLASS, "isoMonth")?;
+    let day_f = to_integer_with_truncation(ctx, &arg_or_undef(args, 2), CLASS, "isoDay")?;
+    let calendar = arg_to_calendar(args, 3, ctx.heap(), CLASS)?;
     let month = clamp_to_u8(month_f, CLASS, "isoMonth")?;
     let day = clamp_to_u8(day_f, CLASS, "isoDay")?;
     let pd = temporal_rs::PlainDate::try_new(year, month, day, calendar)
@@ -35,13 +34,13 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let pd = parse_plain_date_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let pd = parse_plain_date_arg(ctx, &arg_or_undef(args, 0))?;
     make_temporal(ctx, TemporalPayload::PlainDate(pd))
 }
 
 fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let a = parse_plain_date_arg(&arg_or_undef(args, 0), ctx.heap())?;
-    let b = parse_plain_date_arg(&arg_or_undef(args, 1), ctx.heap())?;
+    let a = parse_plain_date_arg(ctx, &arg_or_undef(args, 0))?;
+    let b = parse_plain_date_arg(ctx, &arg_or_undef(args, 1))?;
     let n = match a.compare_iso(&b) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
@@ -51,9 +50,10 @@ fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError
 }
 
 pub(crate) fn parse_plain_date_arg(
+    ctx: &mut NativeCtx<'_>,
     v: &Value,
-    heap: &otter_gc::GcHeap,
 ) -> Result<temporal_rs::PlainDate, NativeError> {
+    let heap = ctx.heap();
     // §ToTemporalDate: a Temporal instance with date slots converts
     // directly (PlainDateTime / ZonedDateTime project onto their
     // calendar date); a plain object is read as a calendar-date
@@ -69,8 +69,8 @@ pub(crate) fn parse_plain_date_arg(
             }),
         }
     } else if let Some(obj) = v.as_object() {
-        let calendar_fields = parse_calendar_fields(obj, heap, CLASS)?;
         let calendar = read_calendar_field(obj, heap, CLASS)?;
+        let calendar_fields = parse_calendar_fields(ctx, obj, CLASS)?;
         let partial = temporal_rs::partial::PartialDate {
             calendar_fields,
             calendar,
@@ -120,9 +120,9 @@ pub fn load_property(temporal: JsTemporal, heap: &mut otter_gc::GcHeap, name: &s
     }
 }
 
-fn duration_arg(v: &Value, heap: &otter_gc::GcHeap) -> Result<temporal_rs::Duration, NativeError> {
-    if let Some(t) = v.as_temporal(heap) {
-        match t.payload_clone(heap) {
+fn duration_arg(ctx: &mut NativeCtx<'_>, v: &Value) -> Result<temporal_rs::Duration, NativeError> {
+    if let Some(t) = v.as_temporal(ctx.heap()) {
+        match t.payload_clone(ctx.heap()) {
             TemporalPayload::Duration(d) => Ok(d),
             _ => Err(NativeError::TypeError {
                 name: CLASS,
@@ -130,9 +130,9 @@ fn duration_arg(v: &Value, heap: &otter_gc::GcHeap) -> Result<temporal_rs::Durat
             }),
         }
     } else if let Some(obj) = v.as_object() {
-        partial_from_object(&obj, heap)
-    } else if let Some(s) = v.as_string(heap) {
-        temporal_rs::Duration::from_utf8(s.to_lossy_string(heap).as_bytes())
+        partial_from_object(ctx, &obj)
+    } else if let Some(s) = v.as_string(ctx.heap()) {
+        temporal_rs::Duration::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))
     } else {
         Err(NativeError::TypeError {
@@ -162,14 +162,14 @@ fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
 
 fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
-    let dur = duration_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let dur = duration_arg(ctx, &arg_or_undef(args, 0))?;
     let result = pd.add(&dur, None).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainDate(result))
 }
 
 fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
-    let dur = duration_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let dur = duration_arg(ctx, &arg_or_undef(args, 0))?;
     let result = pd
         .subtract(&dur, None)
         .map_err(|e| temporal_err(e, CLASS))?;
@@ -178,7 +178,7 @@ fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 
 fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
-    let other = parse_plain_date_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let other = parse_plain_date_arg(ctx, &arg_or_undef(args, 0))?;
     Ok(Value::boolean(
         pd.compare_iso(&other) == std::cmp::Ordering::Equal,
     ))
@@ -186,7 +186,7 @@ fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 
 fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
-    let other = parse_plain_date_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let other = parse_plain_date_arg(ctx, &arg_or_undef(args, 0))?;
     let settings = parse_difference_settings(args, 1, ctx.heap(), CLASS)?;
     let result = pd
         .until(&other, settings)
@@ -196,7 +196,7 @@ fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
 fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
-    let other = parse_plain_date_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let other = parse_plain_date_arg(ctx, &arg_or_undef(args, 0))?;
     let settings = parse_difference_settings(args, 1, ctx.heap(), CLASS)?;
     let result = pd
         .since(&other, settings)
@@ -212,7 +212,7 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             reason: "first argument must be an object".to_string(),
         });
     };
-    let fields = parse_calendar_fields(obj, ctx.heap(), CLASS)?;
+    let fields = parse_calendar_fields(ctx, obj, CLASS)?;
     let result = pd.with(fields, None).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainDate(result))
 }
@@ -248,7 +248,7 @@ fn impl_to_plain_date_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
             }
         }
     } else if let Some(obj) = v.as_object() {
-        let partial = parse_partial_time(obj, ctx.heap(), CLASS)?;
+        let partial = parse_partial_time(ctx, obj, CLASS)?;
         let pt = temporal_rs::PlainTime::default()
             .with(partial, None)
             .map_err(|e| temporal_err(e, CLASS))?;
@@ -276,9 +276,9 @@ fn impl_to_zoned_date_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
             Some(tz_v) => {
                 let tz = parse_time_zone(&tz_v, ctx.heap(), CLASS)?;
                 let time = match object::get(obj, ctx.heap(), "plainTime") {
-                    Some(v) if !v.is_undefined() => Some(
-                        crate::temporal::plain_time::parse_plain_time_arg(&v, ctx.heap())?,
-                    ),
+                    Some(v) if !v.is_undefined() => {
+                        Some(crate::temporal::plain_time::parse_plain_time_arg(ctx, &v)?)
+                    }
                     _ => None,
                 };
                 (tz, time)

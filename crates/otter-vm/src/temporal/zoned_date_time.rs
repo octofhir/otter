@@ -31,42 +31,41 @@ const CLASS: &str = "Temporal.ZonedDateTime";
 
 pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     require_construct(ctx, CLASS)?;
-    let heap = ctx.heap();
     let Some(bi) = arg_or_undef(args, 0).as_big_int() else {
         return Err(NativeError::TypeError {
             name: CLASS,
             reason: "epochNanoseconds must be a BigInt".to_string(),
         });
     };
-    let nanos =
-        bi.with_inner(heap, |big| big.to_i128())
-            .ok_or_else(|| NativeError::RangeError {
-                name: CLASS,
-                reason: "epochNanoseconds out of i128 range".to_string(),
-            })?;
-    let Some(tz_str) = arg_or_undef(args, 1).as_string(heap) else {
+    let nanos = bi
+        .with_inner(ctx.heap(), |big| big.to_i128())
+        .ok_or_else(|| NativeError::RangeError {
+            name: CLASS,
+            reason: "epochNanoseconds out of i128 range".to_string(),
+        })?;
+    let Some(tz_str) = arg_or_undef(args, 1).as_string(ctx.heap()) else {
         return Err(NativeError::TypeError {
             name: CLASS,
             reason: "timeZoneIdentifier must be a string".to_string(),
         });
     };
-    let tz_text = tz_str.to_lossy_string(heap);
+    let tz_text = tz_str.to_lossy_string(ctx.heap());
     let time_zone =
         temporal_rs::TimeZone::try_from_str(&tz_text).map_err(|e| temporal_err(e, CLASS))?;
-    let calendar = arg_to_calendar(args, 2, heap, CLASS)?;
+    let calendar = arg_to_calendar(args, 2, ctx.heap(), CLASS)?;
     let zdt = temporal_rs::ZonedDateTime::try_new(nanos, time_zone, calendar)
         .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::ZonedDateTime(zdt))
 }
 
 fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let zdt = parse_zdt_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let zdt = parse_zdt_arg(ctx, &arg_or_undef(args, 0))?;
     make_temporal(ctx, TemporalPayload::ZonedDateTime(zdt))
 }
 
 fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let a = parse_zdt_arg(&arg_or_undef(args, 0), ctx.heap())?;
-    let b = parse_zdt_arg(&arg_or_undef(args, 1), ctx.heap())?;
+    let a = parse_zdt_arg(ctx, &arg_or_undef(args, 0))?;
+    let b = parse_zdt_arg(ctx, &arg_or_undef(args, 1))?;
     let n = match a.compare_instant(&b) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
@@ -76,11 +75,11 @@ fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError
 }
 
 pub(crate) fn parse_zdt_arg(
+    ctx: &mut NativeCtx<'_>,
     v: &Value,
-    heap: &otter_gc::GcHeap,
 ) -> Result<temporal_rs::ZonedDateTime, NativeError> {
-    if let Some(t) = v.as_temporal(heap) {
-        match t.payload_clone(heap) {
+    if let Some(t) = v.as_temporal(ctx.heap()) {
+        match t.payload_clone(ctx.heap()) {
             TemporalPayload::ZonedDateTime(v) => Ok(v),
             _ => Err(NativeError::TypeError {
                 name: CLASS,
@@ -90,16 +89,16 @@ pub(crate) fn parse_zdt_arg(
     } else if let Some(obj) = v.as_object() {
         // §ToTemporalZonedDateTime property bag: `timeZone` is
         // required; calendar/time fields and offset are optional.
-        let tz_v = object::get(obj, heap, "timeZone")
+        let tz_v = object::get(obj, ctx.heap(), "timeZone")
             .filter(|x| !x.is_undefined())
             .ok_or_else(|| NativeError::TypeError {
                 name: CLASS,
                 reason: "object must have a timeZone property".to_string(),
             })?;
-        let tz = parse_time_zone(&tz_v, heap, CLASS)?;
-        let calendar_fields = parse_calendar_fields(obj, heap, CLASS)?;
-        let calendar = read_calendar_field(obj, heap, CLASS)?;
-        let time = parse_partial_time(obj, heap, CLASS)?;
+        let tz = parse_time_zone(&tz_v, ctx.heap(), CLASS)?;
+        let calendar_fields = parse_calendar_fields(ctx, obj, CLASS)?;
+        let calendar = read_calendar_field(obj, ctx.heap(), CLASS)?;
+        let time = parse_partial_time(ctx, obj, CLASS)?;
         let mut partial = temporal_rs::partial::PartialZonedDateTime::new()
             .with_calendar_fields(calendar_fields)
             .with_time(time)
@@ -107,9 +106,9 @@ pub(crate) fn parse_zdt_arg(
         partial.calendar = calendar;
         temporal_rs::ZonedDateTime::from_partial(partial, None, None, None)
             .map_err(|e| temporal_err(e, CLASS))
-    } else if let Some(s) = v.as_string(heap) {
+    } else if let Some(s) = v.as_string(ctx.heap()) {
         temporal_rs::ZonedDateTime::from_utf8(
-            s.to_lossy_string(heap).as_bytes(),
+            s.to_lossy_string(ctx.heap()).as_bytes(),
             temporal_rs::options::Disambiguation::Compatible,
             temporal_rs::options::OffsetDisambiguation::Reject,
         )
@@ -171,9 +170,9 @@ pub fn load_property(temporal: JsTemporal, heap: &mut otter_gc::GcHeap, name: &s
     }
 }
 
-fn duration_arg(v: &Value, heap: &otter_gc::GcHeap) -> Result<temporal_rs::Duration, NativeError> {
-    if let Some(t) = v.as_temporal(heap) {
-        match t.payload_clone(heap) {
+fn duration_arg(ctx: &mut NativeCtx<'_>, v: &Value) -> Result<temporal_rs::Duration, NativeError> {
+    if let Some(t) = v.as_temporal(ctx.heap()) {
+        match t.payload_clone(ctx.heap()) {
             TemporalPayload::Duration(d) => Ok(d),
             _ => Err(NativeError::TypeError {
                 name: CLASS,
@@ -181,9 +180,9 @@ fn duration_arg(v: &Value, heap: &otter_gc::GcHeap) -> Result<temporal_rs::Durat
             }),
         }
     } else if let Some(obj) = v.as_object() {
-        partial_from_object(&obj, heap)
-    } else if let Some(s) = v.as_string(heap) {
-        temporal_rs::Duration::from_utf8(s.to_lossy_string(heap).as_bytes())
+        partial_from_object(ctx, &obj)
+    } else if let Some(s) = v.as_string(ctx.heap()) {
+        temporal_rs::Duration::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))
     } else {
         Err(NativeError::TypeError {
@@ -220,14 +219,14 @@ fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
 
 fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
-    let dur = duration_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let dur = duration_arg(ctx, &arg_or_undef(args, 0))?;
     let result = zdt.add(&dur, None).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::ZonedDateTime(result))
 }
 
 fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
-    let dur = duration_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let dur = duration_arg(ctx, &arg_or_undef(args, 0))?;
     let result = zdt
         .subtract(&dur, None)
         .map_err(|e| temporal_err(e, CLASS))?;
@@ -236,7 +235,7 @@ fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 
 fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
-    let other = parse_zdt_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let other = parse_zdt_arg(ctx, &arg_or_undef(args, 0))?;
     Ok(Value::boolean(
         zdt.equals(&other).map_err(|e| temporal_err(e, CLASS))?,
     ))
@@ -244,7 +243,7 @@ fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 
 fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
-    let other = parse_zdt_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let other = parse_zdt_arg(ctx, &arg_or_undef(args, 0))?;
     let settings = parse_difference_settings(args, 1, ctx.heap(), CLASS)?;
     let result = zdt
         .until(&other, settings)
@@ -254,7 +253,7 @@ fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
 fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
-    let other = parse_zdt_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let other = parse_zdt_arg(ctx, &arg_or_undef(args, 0))?;
     let settings = parse_difference_settings(args, 1, ctx.heap(), CLASS)?;
     let result = zdt
         .since(&other, settings)
@@ -312,9 +311,8 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             reason: "with() requires a ZonedDateTime-like object".to_string(),
         });
     };
-    let heap = ctx.heap();
-    let calendar_fields = parse_calendar_fields(obj, heap, CLASS)?;
-    let time = parse_partial_time(obj, heap, CLASS)?;
+    let calendar_fields = parse_calendar_fields(ctx, obj, CLASS)?;
+    let time = parse_partial_time(ctx, obj, CLASS)?;
     let fields = temporal_rs::fields::ZonedDateTimeFields {
         calendar_fields,
         time,
@@ -332,10 +330,7 @@ fn impl_with_plain_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
     let time = if v.is_undefined() {
         None
     } else {
-        Some(crate::temporal::plain_time::parse_plain_time_arg(
-            &v,
-            ctx.heap(),
-        )?)
+        Some(crate::temporal::plain_time::parse_plain_time_arg(ctx, &v)?)
     };
     let result = zdt
         .with_plain_time(time)

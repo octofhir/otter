@@ -21,15 +21,14 @@ const CLASS: &str = "Temporal.PlainYearMonth";
 
 pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     require_construct(ctx, CLASS)?;
-    let heap = ctx.heap();
-    let year = to_integer_with_truncation(&arg_or_undef(args, 0), heap, CLASS, "isoYear")? as i32;
-    let month_f = to_integer_with_truncation(&arg_or_undef(args, 1), heap, CLASS, "isoMonth")?;
-    let calendar = arg_to_calendar(args, 2, heap, CLASS)?;
+    let year = to_integer_with_truncation(ctx, &arg_or_undef(args, 0), CLASS, "isoYear")? as i32;
+    let month_f = to_integer_with_truncation(ctx, &arg_or_undef(args, 1), CLASS, "isoMonth")?;
+    let calendar = arg_to_calendar(args, 2, ctx.heap(), CLASS)?;
     let ref_day_v = arg_or_undef(args, 3);
     let ref_day = if ref_day_v.is_undefined() {
         None
     } else {
-        let n = to_integer_with_truncation(&ref_day_v, heap, CLASS, "referenceISODay")?;
+        let n = to_integer_with_truncation(ctx, &ref_day_v, CLASS, "referenceISODay")?;
         Some(clamp_to_u8(n, CLASS, "referenceISODay")?)
     };
     let month = clamp_to_u8(month_f, CLASS, "isoMonth")?;
@@ -39,13 +38,13 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let pym = parse_pym_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let pym = parse_pym_arg(ctx, &arg_or_undef(args, 0))?;
     make_temporal(ctx, TemporalPayload::PlainYearMonth(pym))
 }
 
 fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let a = parse_pym_arg(&arg_or_undef(args, 0), ctx.heap())?;
-    let b = parse_pym_arg(&arg_or_undef(args, 1), ctx.heap())?;
+    let a = parse_pym_arg(ctx, &arg_or_undef(args, 0))?;
+    let b = parse_pym_arg(ctx, &arg_or_undef(args, 1))?;
     let n = match a.compare_iso(&b) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
@@ -55,23 +54,23 @@ fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError
 }
 
 fn parse_pym_arg(
+    ctx: &mut NativeCtx<'_>,
     v: &Value,
-    heap: &otter_gc::GcHeap,
 ) -> Result<temporal_rs::PlainYearMonth, NativeError> {
-    if let Some(t) = v.as_temporal(heap) {
-        match t.payload_clone(heap) {
+    if let Some(t) = v.as_temporal(ctx.heap()) {
+        match t.payload_clone(ctx.heap()) {
             TemporalPayload::PlainYearMonth(v) => Ok(v),
             _ => Err(NativeError::TypeError {
                 name: CLASS,
                 reason: "argument must be a Temporal.PlainYearMonth".to_string(),
             }),
         }
-    } else if let Some(s) = v.as_string(heap) {
-        temporal_rs::PlainYearMonth::from_utf8(s.to_lossy_string(heap).as_bytes())
+    } else if let Some(s) = v.as_string(ctx.heap()) {
+        temporal_rs::PlainYearMonth::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))
     } else if let Some(obj) = v.as_object() {
-        let fields = parse_year_month_fields(obj, heap, CLASS)?;
-        let calendar = read_calendar_field(obj, heap, CLASS)?;
+        let fields = parse_year_month_fields(ctx, obj, CLASS)?;
+        let calendar = read_calendar_field(obj, ctx.heap(), CLASS)?;
         let partial = temporal_rs::partial::PartialYearMonth {
             calendar_fields: fields,
             calendar,
@@ -109,9 +108,9 @@ pub fn load_property(temporal: JsTemporal, heap: &mut otter_gc::GcHeap, name: &s
     }
 }
 
-fn duration_arg(v: &Value, heap: &otter_gc::GcHeap) -> Result<temporal_rs::Duration, NativeError> {
-    if let Some(t) = v.as_temporal(heap) {
-        match t.payload_clone(heap) {
+fn duration_arg(ctx: &mut NativeCtx<'_>, v: &Value) -> Result<temporal_rs::Duration, NativeError> {
+    if let Some(t) = v.as_temporal(ctx.heap()) {
+        match t.payload_clone(ctx.heap()) {
             TemporalPayload::Duration(d) => Ok(d),
             _ => Err(NativeError::TypeError {
                 name: CLASS,
@@ -119,9 +118,9 @@ fn duration_arg(v: &Value, heap: &otter_gc::GcHeap) -> Result<temporal_rs::Durat
             }),
         }
     } else if let Some(obj) = v.as_object() {
-        partial_from_object(&obj, heap)
-    } else if let Some(s) = v.as_string(heap) {
-        temporal_rs::Duration::from_utf8(s.to_lossy_string(heap).as_bytes())
+        partial_from_object(ctx, &obj)
+    } else if let Some(s) = v.as_string(ctx.heap()) {
+        temporal_rs::Duration::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))
     } else {
         Err(NativeError::TypeError {
@@ -151,7 +150,7 @@ fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
 
 fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
-    let dur = duration_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let dur = duration_arg(ctx, &arg_or_undef(args, 0))?;
     let result = pym
         .add(&dur, temporal_rs::options::Overflow::Constrain)
         .map_err(|e| temporal_err(e, CLASS))?;
@@ -160,7 +159,7 @@ fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
 
 fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
-    let dur = duration_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let dur = duration_arg(ctx, &arg_or_undef(args, 0))?;
     let result = pym
         .subtract(&dur, temporal_rs::options::Overflow::Constrain)
         .map_err(|e| temporal_err(e, CLASS))?;
@@ -169,7 +168,7 @@ fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 
 fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
-    let other = parse_pym_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let other = parse_pym_arg(ctx, &arg_or_undef(args, 0))?;
     Ok(Value::boolean(
         pym.compare_iso(&other) == std::cmp::Ordering::Equal,
     ))
@@ -177,7 +176,7 @@ fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 
 fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
-    let other = parse_pym_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let other = parse_pym_arg(ctx, &arg_or_undef(args, 0))?;
     let settings = parse_difference_settings(args, 1, ctx.heap(), CLASS)?;
     let result = pym
         .until(&other, settings)
@@ -187,7 +186,7 @@ fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
 fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
-    let other = parse_pym_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let other = parse_pym_arg(ctx, &arg_or_undef(args, 0))?;
     let settings = parse_difference_settings(args, 1, ctx.heap(), CLASS)?;
     let result = pym
         .since(&other, settings)
@@ -203,7 +202,7 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             reason: "first argument must be an object".to_string(),
         });
     };
-    let fields = parse_year_month_fields(obj, ctx.heap(), CLASS)?;
+    let fields = parse_year_month_fields(ctx, obj, CLASS)?;
     let result = pym.with(fields, None).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainYearMonth(result))
 }
@@ -216,7 +215,7 @@ fn impl_to_plain_date(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             reason: "first argument must be an object with a `day` field".to_string(),
         });
     };
-    let day_fields = parse_calendar_fields(obj, ctx.heap(), CLASS)?;
+    let day_fields = parse_calendar_fields(ctx, obj, CLASS)?;
     let result = pym
         .to_plain_date(Some(day_fields))
         .map_err(|e| temporal_err(e, CLASS))?;

@@ -588,6 +588,7 @@ pub const OP_BYTE_TABLE: &[(Op, u8)] = &[
     (Op::DefineDataProperty, 0x9D),
     (Op::SetFunctionName, 0x9E),
     (Op::ClassCheck, 0x9F),
+    (Op::ToPropertyKey, 0xA0),
 ];
 
 #[cfg(test)]
@@ -951,7 +952,7 @@ mod tests {
         // Catches accidental opcode additions that forget to wire
         // through OP_BYTE_TABLE. If this fires, append the missing
         // opcode at the next unused byte.
-        const EXPECTED_OPCODE_COUNT: usize = 160;
+        const EXPECTED_OPCODE_COUNT: usize = 161;
         assert_eq!(
             OP_BYTE_TABLE.len(),
             EXPECTED_OPCODE_COUNT,

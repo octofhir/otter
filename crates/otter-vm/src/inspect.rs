@@ -959,5 +959,6 @@ mod tests {
         Op::DefineDataProperty,
         Op::SetFunctionName,
         Op::ClassCheck,
+        Op::ToPropertyKey,
     ];
 }

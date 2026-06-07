@@ -223,6 +223,29 @@ pub(crate) fn compile_class(
         None
     };
 
+    // Collect instance fields now so their computed-key cells can be
+    // reserved alongside the other synthetics (the keys themselves
+    // evaluate later, in source order).
+    let instance_fields: Vec<&oxc_ast::ast::PropertyDefinition<'_>> = class
+        .body
+        .body
+        .iter()
+        .filter_map(|el| match el {
+            oxc_ast::ast::ClassElement::PropertyDefinition(p) if !p.r#static && !p.declare => {
+                Some(&**p)
+            }
+            _ => None,
+        })
+        .collect();
+    for (idx, p) in instance_fields.iter().enumerate() {
+        if !p.computed {
+            continue;
+        }
+        let pspan = (p.span.start, p.span.end);
+        let binding = field_key_binding_name(idx);
+        cx.declare_captured_binding(&binding, true, pspan)?;
+    }
+
     // Evaluate the parent class first so observable side-effects
     // happen exactly once per declaration, in source order.
     let super_reg = match &class.super_class {
@@ -367,28 +390,15 @@ pub(crate) fn compile_class(
         }
     }
     // Collect the instance-field initialisers (in source order) so
-    // both user-written and synthetic constructors can prepend them
-    // to the body. §15.7.10 InitializeInstanceElements.
-    let instance_fields: Vec<&oxc_ast::ast::PropertyDefinition<'_>> = class
-        .body
-        .body
-        .iter()
-        .filter_map(|el| match el {
-            oxc_ast::ast::ClassElement::PropertyDefinition(p) if !p.r#static && !p.declare => {
-                Some(&**p)
-            }
-            _ => None,
-        })
-        .collect();
-
     // §15.7.14 ClassFieldDefinitionEvaluation — a computed field
     // name is evaluated exactly once, at class-definition time, in
     // the class's own evaluation context (so `await` in a TLA module
-    // and side effects like `[counter++]` behave per spec). Store
-    // each evaluated key in a synthetic captured binding that the
-    // constructor's field-init code resolves through the standard
-    // upvalue walker — the same mechanism as `__class_home` and the
-    // per-class private-name symbols.
+    // and side effects like `[counter++]` behave per spec), and
+    // canonicalized through §7.1.19 ToPropertyKey (user
+    // `@@toPrimitive` / `valueOf` / `toString` fire HERE, not per
+    // instance). The key lands in the synthetic captured cell
+    // reserved before the heritage; the constructor's field-init
+    // code resolves it through the standard upvalue walker.
     for (idx, p) in instance_fields.iter().enumerate() {
         if !p.computed {
             continue;
@@ -402,9 +412,17 @@ pub(crate) fn compile_class(
                 span: pspan,
             })?;
         let key_reg = compile_expr(cx, key_expr, pspan)?;
+        let key_canon = cx.alloc_scratch();
+        cx.emit(
+            Op::ToPropertyKey,
+            [Operand::Register(key_canon), Operand::Register(key_reg)],
+            pspan,
+        );
         let binding = field_key_binding_name(idx);
-        let storage = cx.declare_captured_binding(&binding, true, pspan)?;
-        cx.emit_store_storage(key_reg, storage, pspan);
+        let info = cx
+            .lookup_binding(&binding)
+            .expect("field-key cell reserved before the heritage");
+        cx.emit_store_storage(key_canon, info.storage, pspan);
         cx.mark_initialized(&binding);
     }
 

@@ -5010,6 +5010,35 @@ impl Interpreter {
                     frame.advance_pc(self.current_byte_len)?;
                     continue;
                 }
+                // §7.1.19 ToPropertyKey with full user coercion —
+                // class field definitions canonicalize their
+                // computed names at class-definition time.
+                Op::ToPropertyKey => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let value = *read_register(&stack[top_idx], src)?;
+                    let primitive = self.evaluate_to_primitive(
+                        context,
+                        &value,
+                        abstract_ops::ToPrimitiveHint::String,
+                    )?;
+                    let key = if primitive.as_symbol(&self.gc_heap).is_some()
+                        || primitive.as_string(&self.gc_heap).is_some()
+                    {
+                        primitive
+                    } else {
+                        let text = primitive.display_string(&self.gc_heap);
+                        Value::string(JsString::from_str(&text, &mut self.gc_heap)?)
+                    };
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, key)?;
+                    frame.advance_pc(self.current_byte_len)?;
+                    continue;
+                }
                 Op::ValidateGlobalDecl => {
                     let name_idx = context
                         .exec_const_index(instr, 0)

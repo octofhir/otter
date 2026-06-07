@@ -1203,6 +1203,12 @@ pub enum Op {
     ///   static element's computed key must not be `"prototype"`
     ///   (TypeError).
     ClassCheck,
+    /// `ToPropertyKey dst, src` — §7.1.19 with full user coercion
+    /// (`@@toPrimitive` / `valueOf` / `toString`): `dst` receives the
+    /// canonical property key as a Symbol or String value. Class
+    /// field definitions evaluate their computed names through this
+    /// at class-definition time.
+    ToPropertyKey,
 }
 
 impl Op {
@@ -1363,6 +1369,7 @@ impl Op {
             Op::DefineDataProperty => "DEFINE_DATA_PROPERTY",
             Op::SetFunctionName => "SET_FUNCTION_NAME",
             Op::ClassCheck => "CLASS_CHECK",
+            Op::ToPropertyKey => "TO_PROPERTY_KEY",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
@@ -1452,6 +1459,7 @@ impl Op {
             | Op::ValidateGlobalDecl
             | Op::ClassCheck
             | Op::ToObject
+            | Op::ToPropertyKey
             | Op::ToNumeric => 2,
             Op::GetStringIndex
             | Op::Add

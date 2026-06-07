@@ -300,18 +300,31 @@ pub(crate) fn collect_direct_eval_bindings(
     // so a direct eval can resolve `obj.#name` (§19.2.1.1
     // PrivateEnvironment inheritance).
     for (name, idx) in cx.captured_uv.iter() {
-        if name.starts_with("__privsym_")
+        let synthetic = name.starts_with("__privsym_")
             || name.starts_with("__privbrand_")
             || name == crate::class::SUPER_HOME_NAME
             || name == crate::class::SUPER_STATIC_HOME_NAME
-            || name == crate::class::SUPER_CTOR_NAME
-        {
+            || name == crate::class::SUPER_CTOR_NAME;
+        if synthetic {
             entries.push(otter_bytecode::DirectEvalBinding {
                 name: name.clone(),
                 upvalue: *idx,
                 lexical: true,
             });
+            continue;
         }
+        if name.starts_with("__") {
+            continue;
+        }
+        // §19.2.1.3 — a var the eval re-declares may live in an
+        // ENCLOSING function's scope, reached here as a passthrough
+        // capture. Exposing the cell lets the eval bind the existing
+        // variable instead of minting a shadow.
+        entries.push(otter_bytecode::DirectEvalBinding {
+            name: name.clone(),
+            upvalue: *idx,
+            lexical: false,
+        });
     }
     // `bindings` is hash-ordered; sort for deterministic bytecode.
     entries.sort_by(|a, b| a.name.cmp(&b.name));

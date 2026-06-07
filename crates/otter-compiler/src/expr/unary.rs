@@ -138,8 +138,14 @@ pub(crate) fn compile_unary(
     // `LoadGlobalOrUndefined` so an unbound free identifier
     // never throws under `typeof`.
     // <https://tc39.es/ecma262/#sec-typeof-operator>
+    // §13.5.3 — parentheses preserve the Reference, so
+    // `typeof (x)` is the identifier form too.
+    let mut typeof_arg = &u.argument;
+    while let Expression::ParenthesizedExpression(p) = typeof_arg {
+        typeof_arg = &p.expression;
+    }
     if matches!(u.operator, UnaryOperator::Typeof)
-        && let Expression::Identifier(id) = &u.argument
+        && let Expression::Identifier(id) = typeof_arg
     {
         let name = id.name.as_str();
         if cx.lookup_binding(name).is_none()

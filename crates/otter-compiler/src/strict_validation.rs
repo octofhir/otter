@@ -646,18 +646,6 @@ impl<'a> Visit<'a> for ModuleNewTargetValidator<'_> {
 ///   the outer `arguments` ban.
 /// - Walks `Class.super_class` because the heritage expression is
 ///   evaluated in the surrounding scope.
-/// §19.2.1.1 PerformEval step ~5 — direct eval inside a class field
-/// initializer treats the eval body as field-initializer code: any
-/// free `arguments` reference is an early SyntaxError (functions and
-/// static blocks open their own scope and are skipped).
-pub fn program_contains_arguments(stmts: &[oxc_ast::ast::Statement<'_>]) -> bool {
-    let mut scanner = ContainsArgumentsScanner { found: None };
-    for stmt in stmts {
-        scanner.visit_statement(stmt);
-    }
-    scanner.found.is_some()
-}
-
 struct ContainsArgumentsScanner {
     found: Option<oxc_span::Span>,
 }
@@ -704,6 +692,18 @@ impl<'a> Visit<'a> for ContainsArgumentsScanner {
             }
         }
     }
+}
+
+/// §19.2.1.1 PerformEval step ~5 — direct eval inside a class field
+/// initializer treats the eval body as field-initializer code: any
+/// free `arguments` reference is an early SyntaxError (functions and
+/// static blocks open their own scope and are skipped).
+pub fn program_contains_arguments(stmts: &[oxc_ast::ast::Statement<'_>]) -> bool {
+    let mut scanner = ContainsArgumentsScanner { found: None };
+    for stmt in stmts {
+        scanner.visit_statement(stmt);
+    }
+    scanner.found.is_some()
 }
 
 /// ECMA-262 §15.1.3 IsSimpleParameterList.

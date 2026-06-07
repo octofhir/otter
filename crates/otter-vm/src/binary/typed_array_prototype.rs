@@ -438,6 +438,10 @@ fn impl_includes(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 fn impl_join(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     check_not_detached(&t, ctx.heap())?;
+    // §23.2.3.18 step 2 — the length is captured BEFORE
+    // ToString(separator): a separator coercion that detaches the
+    // buffer still yields len-1 separators with empty elements.
+    let len = t.length(ctx.heap_mut());
     // §23.2.3.18 step 3 — ToString(separator) runs user
     // toString / valueOf for object separators.
     let separator = match args.first() {
@@ -456,19 +460,25 @@ fn impl_join(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             })?
         }
     };
-    join_into_string(&t, &separator, ctx.heap_mut())
+    join_into_string(&t, len, &separator, ctx.heap_mut())
 }
 
 fn join_into_string(
     t: &crate::binary::JsTypedArray,
+    len: usize,
     separator: &str,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, NativeError> {
     let mut out = String::new();
-    let len = t.length(gc_heap);
+    let live_len = t.length(gc_heap);
     for i in 0..len {
         if i > 0 {
             out.push_str(separator);
+        }
+        if i >= live_len {
+            // Detached mid-coercion — elements read as undefined
+            // (empty), only the separators remain.
+            continue;
         }
         let v = t.get(gc_heap, i).map_err(native_oom)?;
         if !(v.is_undefined() || v.is_null()) {
@@ -481,7 +491,8 @@ fn join_into_string(
 fn impl_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     check_not_detached(&t, ctx.heap())?;
-    join_into_string(&t, ",", ctx.heap_mut())
+    let len = t.length(ctx.heap_mut());
+    join_into_string(&t, len, ",", ctx.heap_mut())
 }
 
 fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {

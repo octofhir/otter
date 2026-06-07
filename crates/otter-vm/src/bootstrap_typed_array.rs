@@ -957,6 +957,28 @@ fn ta_proto_dispatch(
         _ => &[],
     };
     if method_name == "fill" || !int_coerce.is_empty() {
+        // §23.2.4.4 ValidateTypedArray runs BEFORE the argument
+        // coercions for these methods — a non-TypedArray or detached
+        // receiver throws before any user valueOf fires. `subarray`
+        // (§23.2.3.30) only requires the internal slot and operates
+        // on detached views.
+        match receiver.as_typed_array(ctx.heap()) {
+            None => {
+                return Err(NativeError::TypeError {
+                    name: NAME,
+                    reason: "method called on a non-TypedArray receiver".to_string(),
+                });
+            }
+            Some(t)
+                if method_name != "subarray" && t.buffer(ctx.heap()).is_detached(ctx.heap()) =>
+            {
+                return Err(NativeError::TypeError {
+                    name: NAME,
+                    reason: "expected non-detached typedarray".to_string(),
+                });
+            }
+            Some(_) => {}
+        }
         let is_bigint = receiver
             .as_typed_array(ctx.heap())
             .is_some_and(|t| t.kind().is_bigint());

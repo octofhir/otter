@@ -5027,6 +5027,13 @@ impl Interpreter {
                     if !prefix.is_empty() {
                         name = format!("{prefix} {name}");
                     }
+                    // A class expression's `name` delegates to the
+                    // inner callable's metadata, so naming the ctor
+                    // names the class.
+                    let callee = match callee.as_class_constructor() {
+                        Some(c) => c.ctor(&self.gc_heap),
+                        None => callee,
+                    };
                     if let Some(fid) = callee.as_function().or_else(|| {
                         callee
                             .as_closure(&self.gc_heap)

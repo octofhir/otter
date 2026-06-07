@@ -341,6 +341,39 @@ impl Interpreter {
         self.run_load_global_or_undefined_reg(context, frame, dst, name_idx)
     }
 
+    /// `Op::DeleteDynamic` — §13.5.1.2 delete of a name that may
+    /// resolve to an eval-created var binding (§19.2.1.3
+    /// CreateMutableBinding(vn, true) — deletable). Removes it from
+    /// the frame's eval-var map and the captured eval-env chain
+    /// (adoption writes to both); otherwise falls through to the
+    /// global-object delete, whose result reflects configurability.
+    pub(crate) fn run_delete_dynamic_reg(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut Frame,
+        dst: u16,
+        name_idx: u32,
+    ) -> Result<(), VmError> {
+        let name = context
+            .string_constant_str(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        let env = self.frame_cold(frame).and_then(|cold| cold.eval_env);
+        let removed_local = self
+            .frame_cold_mut(frame)
+            .and_then(|cold| cold.eval_vars.as_mut())
+            .is_some_and(|map| map.remove(name).is_some());
+        let removed_env =
+            env.is_some_and(|env| crate::eval_env::eval_env_delete(&mut self.gc_heap, env, name));
+        let removed = if removed_local || removed_env {
+            true
+        } else {
+            crate::object::delete(self.global_this, &mut self.gc_heap, name)
+        };
+        write_register(frame, dst, Value::boolean(removed))?;
+        frame.advance_pc(self.current_byte_len)?;
+        Ok(())
+    }
+
     /// Look up an eval-introduced var binding on `frame`'s cold
     /// record.
     fn frame_eval_var(&self, frame: &Frame, name: &str) -> Option<crate::UpvalueCell> {

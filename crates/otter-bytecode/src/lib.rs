@@ -1052,6 +1052,13 @@ pub enum Op {
     /// yields `undefined` instead of throwing (§13.5.3).
     TypeofDynamic,
 
+    /// `delete` flavour of [`Op::LoadDynamic`] — §19.2.1.3 eval-created
+    /// var bindings are deletable. Operands:
+    /// `Register(dst), ConstIndex(name)`. Removes the binding from the
+    /// frame's eval-var map / captured eval-env chain (`true`), else
+    /// falls through to the global-object delete.
+    DeleteDynamic,
+
     /// §9.1.1.4.18 CreateGlobalFunctionBinding. Operands:
     /// `ConstIndex(name), Register(value), Imm32(deletable)`.
     ///
@@ -1379,6 +1386,7 @@ impl Op {
             Op::LoadDynamic => "LOAD_DYNAMIC",
             Op::StoreDynamic => "STORE_DYNAMIC",
             Op::TypeofDynamic => "TYPEOF_DYNAMIC",
+            Op::DeleteDynamic => "DELETE_DYNAMIC",
             Op::DefineGlobalFunction => "DEFINE_GLOBAL_FUNCTION",
             Op::DeclareGlobalLex => "DECLARE_GLOBAL_LEX",
             Op::StoreGlobalBinding => "STORE_GLOBAL_BINDING",
@@ -1481,6 +1489,7 @@ impl Op {
             | Op::LoadDynamic
             | Op::StoreDynamic
             | Op::TypeofDynamic
+            | Op::DeleteDynamic
             | Op::DeclareGlobalLex
             | Op::InitGlobalLex
             | Op::ValidateGlobalDecl
@@ -1630,7 +1639,8 @@ impl Op {
             | Op::LoadGlobalOrUndefined
             | Op::LoadDynamic
             | Op::StoreDynamic
-            | Op::TypeofDynamic => pos == 1,
+            | Op::TypeofDynamic
+            | Op::DeleteDynamic => pos == 1,
             // [name_const, value_reg]
             Op::DefineGlobalVar => pos == 0,
             Op::DeclareGlobalVar => pos == 0,

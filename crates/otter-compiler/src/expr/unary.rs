@@ -121,6 +121,18 @@ pub(crate) fn compile_unary(
                 // environment record — bindings created by
                 // declarations are not deletable.
                 cx.emit(Op::LoadFalse, [Operand::Register(dst)], span);
+            } else if cx.any_enclosing_direct_eval() {
+                // §19.2.1.3 — eval-created var bindings are
+                // CreateMutableBinding(vn, true): deletable. The name
+                // may live in the frame's eval-var map / captured
+                // eval-env chain; otherwise the op falls through to
+                // the global-object delete.
+                let name_idx = cx.intern_string_constant(&name);
+                cx.emit(
+                    Op::DeleteDynamic,
+                    [Operand::Register(dst), Operand::ConstIndex(name_idx)],
+                    span,
+                );
             } else {
                 // Global fallback: §9.1.1.4.7 deletes the global
                 // object property; `DeleteProperty` already returns

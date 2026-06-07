@@ -4880,6 +4880,17 @@ impl Interpreter {
                     self.run_typeof_dynamic_reg(context, frame, dst, name_idx)?;
                     continue;
                 }
+                Op::DeleteDynamic => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_delete_dynamic_reg(context, frame, dst, name_idx)?;
+                    continue;
+                }
                 Op::DefineGlobalFunction => {
                     let name_idx = context
                         .exec_const_index(instr, 0)

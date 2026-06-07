@@ -58,6 +58,31 @@ pub fn alloc_eval_env(
     })
 }
 
+/// Remove `name` from the nearest env in the chain that binds it —
+/// §19.2.1.3 eval-created var bindings are CreateMutableBinding(vn,
+/// true), i.e. deletable. Lookup is by name on every read, so index
+/// compaction here cannot invalidate anything.
+pub fn eval_env_delete(heap: &mut otter_gc::GcHeap, env: EvalEnvHandle, name: &str) -> bool {
+    let mut current = Some(env);
+    while let Some(handle) = current {
+        let (removed, parent) = heap.with_payload(handle, |body| {
+            match body.names.iter().position(|n| n == name) {
+                Some(i) => {
+                    body.names.remove(i);
+                    body.cells.remove(i);
+                    (true, None)
+                }
+                None => (false, body.parent),
+            }
+        });
+        if removed {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
 /// Find `name` in `env` or any ancestor record.
 #[must_use]
 pub fn eval_env_lookup(

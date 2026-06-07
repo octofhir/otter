@@ -1120,11 +1120,15 @@ impl Interpreter {
         args: &[Value],
     ) -> Result<Value, VmError> {
         let ta_value = Value::typed_array(*t);
-        // §23.2.4.4 ValidateTypedArray — a detached backing buffer
-        // throws before the length read or any callback runs.
-        if t.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
+        // §23.2.4.4 ValidateTypedArray — a detached or out-of-bounds
+        // backing buffer (a fixed-length view whose resizable buffer
+        // shrank past its end) throws before the length read or any
+        // callback runs.
+        if t.is_out_of_bounds(&self.gc_heap) {
             return Err(VmError::TypeError {
-                message: format!("TypedArray.prototype.{name} called on a detached ArrayBuffer"),
+                message: format!(
+                    "TypedArray.prototype.{name} called on a detached or out-of-bounds ArrayBuffer"
+                ),
             });
         }
         let len = t.length(&self.gc_heap);
@@ -1439,9 +1443,9 @@ impl Interpreter {
         t: &crate::binary::typed_array::JsTypedArray,
         args: &[Value],
     ) -> Result<Value, VmError> {
-        if t.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
+        if t.is_out_of_bounds(&self.gc_heap) {
             return Err(VmError::TypeError {
-                message: "Cannot slice a TypedArray backed by a detached buffer".to_string(),
+                message: "Cannot slice a detached or out-of-bounds TypedArray".to_string(),
             });
         }
         let len = t.length(&self.gc_heap) as i64;
@@ -1457,14 +1461,22 @@ impl Interpreter {
 
         let a = self.typed_array_species_create(context, t, count)?;
         if count > 0 {
-            if t.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
+            // §23.2.3.27 step 11 — the argument coercion and the species
+            // constructor can both resize the source. Re-validate: an
+            // out-of-bounds (or detached) source throws; otherwise clamp
+            // the copy to the source's current length, leaving the tail
+            // of the freshly-created (zeroed) result untouched.
+            if t.is_out_of_bounds(&self.gc_heap) {
                 return Err(VmError::TypeError {
-                    message: "TypedArray buffer was detached during slice".to_string(),
+                    message: "TypedArray buffer was detached or resized out of bounds during slice"
+                        .to_string(),
                 });
             }
-            let target_kind = a.kind();
             let base = k as usize;
-            for n in 0..count {
+            let cur_len = t.length(&self.gc_heap);
+            let copy_count = count.min(cur_len.saturating_sub(base));
+            let target_kind = a.kind();
+            for n in 0..copy_count {
                 let value = t
                     .get(&mut self.gc_heap, base + n)
                     .map_err(crate::oom_to_vm)?;

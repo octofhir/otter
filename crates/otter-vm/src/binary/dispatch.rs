@@ -359,7 +359,11 @@ fn construct_typed_array_with_roots(
         let length = match args.get(2) {
             None => {
                 let remaining = buf_len - byte_offset;
-                if !remaining.is_multiple_of(bpe) {
+                // §23.2.5.1 — the multiple-of-elementSize requirement
+                // applies only to fixed-length buffers; a resizable
+                // buffer with auto length is length-tracking and simply
+                // floors (bytesAvailable / elementSize).
+                if !buf.is_resizable(gc_heap) && !remaining.is_multiple_of(bpe) {
                     return Err(VmError::RangeError {
                         message: format!(
                             "buffer length minus the offset must be a multiple of {bpe}"
@@ -370,7 +374,11 @@ fn construct_typed_array_with_roots(
             }
             Some(v) if v.is_undefined() => {
                 let remaining = buf_len - byte_offset;
-                if !remaining.is_multiple_of(bpe) {
+                // §23.2.5.1 — the multiple-of-elementSize requirement
+                // applies only to fixed-length buffers; a resizable
+                // buffer with auto length is length-tracking and simply
+                // floors (bytesAvailable / elementSize).
+                if !buf.is_resizable(gc_heap) && !remaining.is_multiple_of(bpe) {
                     return Err(VmError::RangeError {
                         message: format!(
                             "buffer length minus the offset must be a multiple of {bpe}"

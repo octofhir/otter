@@ -1090,7 +1090,10 @@ impl Interpreter {
             if hops >= object::PROTO_CHAIN_HARD_CAP {
                 return Ok(None);
             }
-            let proto = self.get_prototype_for_op(&current)?;
+            // Proxies participate via their getPrototypeOf trap —
+            // the context-aware walker handles them (the plain
+            // get_prototype_for_op rejects proxy values).
+            let proto = self.ordinary_get_prototype_value(context, current, hops)?;
             if !proto.is_object() && !proto.is_object_type() {
                 return Ok(None);
             }

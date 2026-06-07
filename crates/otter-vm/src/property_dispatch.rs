@@ -1313,6 +1313,14 @@ impl Interpreter {
         let target = if let Some(o) = receiver.as_object() {
             Some(o)
         } else if let Some(c) = receiver.as_class_constructor() {
+            if self.class_store_hits_readonly_intrinsic(context, c, name)? {
+                Self::failed_set_result(
+                    strict,
+                    format!("Cannot assign to read-only property '{name}' of class"),
+                )?;
+                stack[top_idx].advance_pc(self.current_byte_len)?;
+                return Ok(());
+            }
             Some(c.statics(&self.gc_heap))
         } else if let Some(r) = receiver.as_regexp() {
             // `lastIndex` lives in the body slot; every other
@@ -3173,6 +3181,42 @@ impl Interpreter {
             .is_some_and(|frame| Self::function_is_strict(context, frame.function_id))
     }
 
+    /// §15.7.14 — `C.prototype`, `C.name`, and `C.length` are
+    /// non-writable own properties of a class constructor. The class
+    /// value keeps them virtually (delegated to the inner callable's
+    /// metadata), so a plain write into the statics object would mint
+    /// a shadowing own slot instead of rejecting. Returns `true` when
+    /// the named store must fail; an own statics property (a static
+    /// method shadow or a post-delete re-creation) falls back to the
+    /// ordinary descriptor-aware path.
+    fn class_store_hits_readonly_intrinsic(
+        &mut self,
+        context: &ExecutionContext,
+        class: crate::class_constructor::ClassConstructor,
+        name: &str,
+    ) -> Result<bool, VmError> {
+        if name == "prototype" {
+            return Ok(true);
+        }
+        if function_metadata::ordinary_function_metadata_key(name).is_none() {
+            return Ok(false);
+        }
+        let statics = class.statics(&self.gc_heap);
+        if crate::object::get_own_descriptor(statics, &self.gc_heap, name).is_some() {
+            return Ok(false);
+        }
+        let ctor = class.ctor(&self.gc_heap);
+        if let Some(fid) = ctor
+            .as_function()
+            .or_else(|| ctor.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
+        {
+            return Ok(self
+                .ordinary_function_own_property_descriptor(Some(context), fid, name)?
+                .is_some_and(|desc| !desc.writable()));
+        }
+        Ok(true)
+    }
+
     fn finish_failed_set(
         stack: &mut SmallVec<[Frame; 8]>,
         context: &ExecutionContext,
@@ -3797,6 +3841,16 @@ impl Interpreter {
         let obj = if let Some(obj) = receiver.as_object() {
             obj
         } else if let Some(class) = receiver.as_class_constructor() {
+            if let ComputedPropertyKey::String(name) = &key
+                && self.class_store_hits_readonly_intrinsic(context, class, name)?
+            {
+                return Self::finish_failed_set(
+                    stack,
+                    context,
+                    format!("Cannot assign to read-only property '{name}' of class"),
+                    self.current_byte_len,
+                );
+            }
             class.statics(&self.gc_heap)
         } else if let Some(fid) = receiver.as_function().or_else(|| {
             receiver
@@ -4236,6 +4290,14 @@ impl Interpreter {
         let obj = if let Some(o) = receiver.as_object() {
             o
         } else if let Some(c) = receiver.as_class_constructor() {
+            if self.class_store_hits_readonly_intrinsic(context, c, name)? {
+                return Self::finish_failed_set(
+                    stack,
+                    context,
+                    format!("Cannot assign to read-only property '{name}' of class"),
+                    self.current_byte_len,
+                );
+            }
             c.statics(&self.gc_heap)
         } else if let Some(fid) = receiver.as_function().or_else(|| {
             receiver

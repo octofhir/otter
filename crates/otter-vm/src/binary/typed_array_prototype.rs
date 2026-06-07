@@ -930,11 +930,17 @@ fn sort_default(values: &mut [Value], bigint_kind: bool, heap: &otter_gc::GcHeap
         values.sort_by(|a, b| {
             let x = a.as_number().map(|n| n.as_f64()).unwrap_or(0.0);
             let y = b.as_number().map(|n| n.as_f64()).unwrap_or(0.0);
-            // NaN sorts to the end per spec; also handles ±0 equal.
+            // §23.2.4.7 CompareTypedArrayElements — NaN sorts to the
+            // end, and -0 orders before +0.
             match (x.is_nan(), y.is_nan()) {
                 (true, true) => std::cmp::Ordering::Equal,
                 (true, false) => std::cmp::Ordering::Greater,
                 (false, true) => std::cmp::Ordering::Less,
+                _ if x == 0.0 && y == 0.0 => {
+                    let xneg = x.is_sign_negative();
+                    let yneg = y.is_sign_negative();
+                    yneg.cmp(&xneg)
+                }
                 _ => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
             }
         });

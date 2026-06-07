@@ -1417,8 +1417,7 @@ impl Interpreter {
         // §23.2.3.30 — a length-tracking source with no end argument
         // produces a length-tracking view: the species constructor is
         // called WITHOUT the length argument.
-        let end_absent =
-            args.get(1).is_none() || args.get(1).is_some_and(|v| v.is_undefined());
+        let end_absent = args.get(1).is_none() || args.get(1).is_some_and(|v| v.is_undefined());
         if !(end_absent && t.is_length_tracking(&self.gc_heap)) {
             argv.push(Value::number(NumberValue::from_f64(new_length as f64)));
         }

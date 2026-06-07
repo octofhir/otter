@@ -135,6 +135,22 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
         install_accessor(heap, "length", "get length", ta_length_getter)?;
     }
 
+    // §23.2.2 — the abstract constructor's observable `name` is
+    // "TypedArray"; the global slot key keeps the hidden `@@` form.
+    if let Some(ctor) =
+        object::get(global, heap, ABSTRACT_CTOR_SLOT).and_then(|v| v.as_native_function())
+    {
+        let name_val = Value::string(
+            crate::string::JsString::from_str("TypedArray", heap)
+                .map_err(|_| JsSurfaceError::OutOfMemory)?,
+        );
+        ctor.define_own_property(
+            heap,
+            "name",
+            PropertyDescriptor::data(name_val, false, false, true),
+        );
+    }
+
     // §22.2.6 — `%TypedArray%.prototype[@@toStringTag]` is an
     // accessor on the abstract prototype. The getter returns the
     // receiver's [[TypedArrayName]] (the kind name string) or
@@ -142,10 +158,38 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
     // prototypes inherit the accessor; per-instance access walks
     // up to %TypedArray%.prototype and triggers the getter.
     if let Some(abstract_proto) = get_abstract_typed_array_prototype(global, heap) {
+        // §23.2.3.34 — %TypedArray%.prototype.toString is the SAME
+        // function object as %Array.prototype.toString%.
+        let array_to_string = object::get(global, heap, "Array")
+            .and_then(|ctor| {
+                if let Some(obj) = ctor.as_object() {
+                    object::get(obj, heap, "prototype")
+                } else if let Some(nf) = ctor.as_native_function() {
+                    nf.own_property_descriptor(heap, "prototype")
+                        .ok()
+                        .flatten()
+                        .and_then(|d| match d.kind {
+                            crate::object::DescriptorKind::Data { value } => Some(value),
+                            _ => None,
+                        })
+                } else {
+                    None
+                }
+            })
+            .and_then(|proto| proto.as_object())
+            .and_then(|proto| object::get(proto, heap, "toString"));
+        if let Some(fun) = array_to_string {
+            object::define_own_property(
+                abstract_proto,
+                heap,
+                "toString",
+                PropertyDescriptor::data(fun, true, false, true),
+            );
+        }
         let abstract_proto_root = Value::object(abstract_proto);
         let getter = crate::bootstrap::native_static_with_value_roots(
             heap,
-            "[Symbol.toStringTag]",
+            "get [Symbol.toStringTag]",
             0,
             tostring_tag_getter,
             &[&abstract_proto_root],

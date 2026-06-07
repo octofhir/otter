@@ -1791,12 +1791,21 @@ impl Interpreter {
             } else {
                 return Err(VmError::TypeMismatch);
             }
-        } else if let Some(native) = recv.as_native_function() {
+        } else if recv.as_native_function().is_some() {
+            // Computed string keys walk the same ordinary [[Get]]
+            // ladder as dotted access (own props, then the
+            // prototype_override chain down to %Function.prototype%) —
+            // the old own-descriptor read made Object['toString']
+            // undefined while Object.toString resolved.
             if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let key = key.to_lossy_string(&self.gc_heap);
-                match native.own_property_descriptor(&mut self.gc_heap, &key)? {
-                    Some(desc) => descriptor_value(&desc),
-                    None => Value::undefined(),
+                let key = VmPropertyKey::OwnedString(key);
+                match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                    crate::VmGetOutcome::Value(v) => v,
+                    crate::VmGetOutcome::InvokeGetter { getter } => {
+                        let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                        self.run_callable_sync(context, &getter, recv, args)?
+                    }
                 }
             } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let key = VmPropertyKey::Symbol(sym);
@@ -1810,17 +1819,18 @@ impl Interpreter {
             } else {
                 return Err(VmError::TypeMismatch);
             }
-        } else if let Some(bound) = recv.as_bound_function() {
-            let bound = &bound;
+        } else if recv.as_bound_function().is_some() {
+            // Same ladder for bound functions — own descriptor first,
+            // then %Function.prototype% via the shared resolver.
             if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let key = key.to_lossy_string(&self.gc_heap);
-                match function_metadata::bound_own_property_descriptor(
-                    bound,
-                    &mut self.gc_heap,
-                    &key,
-                )? {
-                    Some(desc) => descriptor_value(&desc),
-                    None => Value::undefined(),
+                let key = VmPropertyKey::OwnedString(key);
+                match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                    crate::VmGetOutcome::Value(v) => v,
+                    crate::VmGetOutcome::InvokeGetter { getter } => {
+                        let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                        self.run_callable_sync(context, &getter, recv, args)?
+                    }
                 }
             } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let key = VmPropertyKey::Symbol(sym);
@@ -2955,7 +2965,8 @@ impl Interpreter {
                     .as_closure(&self.gc_heap)
                     .map(|c| c.cached_function_id)
             }) {
-                self.function_user_props
+                let bag_has = self
+                    .function_user_props
                     .get(&fid)
                     .copied()
                     .is_some_and(|bag| {
@@ -2963,12 +2974,29 @@ impl Interpreter {
                             object::lookup_own(bag, &self.gc_heap, name),
                             object::PropertyLookup::Absent
                         )
-                    })
+                    });
+                // Virtual own properties (metadata-backed `name` /
+                // `length`, lazily-materialized `prototype`) shadow
+                // %Function.prototype% — §13.2 step 18: an accessor
+                // named `prototype` installed there must never fire
+                // for an ordinary function.
+                let metadata_has = self
+                    .ordinary_function_own_property_descriptor(None, fid, name)
+                    .ok()
+                    .flatten()
+                    .is_some();
+                let prototype_implicit = name == "prototype"
+                    && context.function_has_prototype_property(fid)
+                    && !self.function_deleted_metadata.contains(&(fid, "prototype"));
+                bag_has || metadata_has || prototype_implicit
             } else if let Some(c) = receiver.as_class_constructor() {
-                !matches!(
-                    object::lookup_own(c.statics(&self.gc_heap), &self.gc_heap, name),
-                    object::PropertyLookup::Absent
-                )
+                // Class constructors expose `prototype` / `name` /
+                // `length` virtually when no static shadows them.
+                matches!(name, "prototype" | "name" | "length")
+                    || !matches!(
+                        object::lookup_own(c.statics(&self.gc_heap), &self.gc_heap, name),
+                        object::PropertyLookup::Absent
+                    )
             } else if let Some(native) = receiver.as_native_function() {
                 native
                     .own_property_descriptor(&mut self.gc_heap, name)?
@@ -4296,7 +4324,8 @@ impl Interpreter {
                     .as_closure(&self.gc_heap)
                     .map(|c| c.cached_function_id)
             }) {
-                self.function_user_props
+                let bag_has = self
+                    .function_user_props
                     .get(&fid)
                     .copied()
                     .is_some_and(|bag| {
@@ -4304,12 +4333,29 @@ impl Interpreter {
                             object::lookup_own(bag, &self.gc_heap, name),
                             object::PropertyLookup::Absent
                         )
-                    })
+                    });
+                // Virtual own properties (metadata-backed `name` /
+                // `length`, lazily-materialized `prototype`) shadow
+                // %Function.prototype% — §13.2 step 18: an accessor
+                // named `prototype` installed there must never fire
+                // for an ordinary function.
+                let metadata_has = self
+                    .ordinary_function_own_property_descriptor(None, fid, name)
+                    .ok()
+                    .flatten()
+                    .is_some();
+                let prototype_implicit = name == "prototype"
+                    && context.function_has_prototype_property(fid)
+                    && !self.function_deleted_metadata.contains(&(fid, "prototype"));
+                bag_has || metadata_has || prototype_implicit
             } else if let Some(c) = receiver.as_class_constructor() {
-                !matches!(
-                    object::lookup_own(c.statics(&self.gc_heap), &self.gc_heap, name),
-                    object::PropertyLookup::Absent
-                )
+                // Class constructors expose `prototype` / `name` /
+                // `length` virtually when no static shadows them.
+                matches!(name, "prototype" | "name" | "length")
+                    || !matches!(
+                        object::lookup_own(c.statics(&self.gc_heap), &self.gc_heap, name),
+                        object::PropertyLookup::Absent
+                    )
             } else if let Some(native) = receiver.as_native_function() {
                 native
                     .own_property_descriptor(&mut self.gc_heap, name)?

@@ -953,15 +953,14 @@ impl Interpreter {
             stack,
             &effective_new_target,
         )?;
-        let receiver = match proto.as_ref() {
-            Some(proto_value) => {
-                self.alloc_stack_rooted_object_with_extra_roots(stack, &[proto_value])?
-            }
-            None => self.alloc_stack_rooted_object(stack)?,
+        // OrdinaryCreateFromConstructor — a missing or non-object
+        // `prototype` falls back to %Object.prototype% (§10.1.13).
+        let proto = match proto {
+            Some(proto) => proto,
+            None => self.constructor_prototype_value("Object")?,
         };
-        if let Some(proto) = proto {
-            crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
-        }
+        let receiver = self.alloc_stack_rooted_object_with_extra_roots(stack, &[&proto])?;
+        crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
         let top_idx = stack.len() - 1;
         let frame = {
             let caller = &stack[top_idx];
@@ -1139,16 +1138,18 @@ impl Interpreter {
         // place.
         let proto =
             self.construct_prototype_for_callee_stack_rooted(context, stack, &new_target)?;
+        // OrdinaryCreateFromConstructor — a missing or non-object
+        // `prototype` falls back to %Object.prototype% (§10.1.13).
+        let proto = match proto {
+            Some(proto) => proto,
+            None => self.constructor_prototype_value("Object")?,
+        };
         let receiver = {
-            let mut value_roots: SmallVec<[&Value; 4]> = smallvec::smallvec![&callee, &new_target];
-            if let Some(proto_value) = proto.as_ref() {
-                value_roots.push(proto_value);
-            }
+            let value_roots: SmallVec<[&Value; 4]> =
+                smallvec::smallvec![&callee, &new_target, &proto];
             self.alloc_stack_rooted_object_with_value_roots(stack, value_roots.as_slice(), &args)?
         };
-        if let Some(proto) = proto {
-            crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
-        }
+        crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
         let this_value = Value::object(receiver);
         // Built-in constructor objects (`Number`, `Boolean`, …)
         // surface as a `Value::Object` with an internal native

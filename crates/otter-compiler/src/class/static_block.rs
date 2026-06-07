@@ -55,6 +55,13 @@ pub(crate) fn compile_static_block(
     parent.emit(Op::ReturnUndefined, vec![], span);
 
     let child = parent.pop();
+    if child.register_overflow {
+        return Err(CompileError::Unsupported {
+            node: "function body exhausts the 65535-register window".to_string(),
+            span,
+        });
+    }
+
     let captures = child.parent_captures.clone();
     let mut module_mut = module.borrow_mut();
     let slot = module_mut
@@ -62,7 +69,7 @@ pub(crate) fn compile_static_block(
         .get_mut(function_id as usize)
         .expect("reserved static-block slot");
     slot.locals = 0;
-    slot.scratch = child.scratch;
+    slot.scratch = child.scratch_window();
     slot.param_count = 0;
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.code = child.code;

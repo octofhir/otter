@@ -118,8 +118,10 @@ pub(crate) fn compile_class(
     // class evaluation. Methods capture these bindings, so repeated
     // evaluation of the same class body gets distinct private keys.
     let private_bound = collect_class_private_bound(&class.body);
-    cx.class_private_names.push(private_bound.clone());
+    cx.class_private_names
+        .push(private_bound.iter().cloned().collect());
     for name in &private_bound {
+        let scratch_mark = cx.scratch;
         let binding = cx
             .private_key_binding_name(name)
             .ok_or(CompileError::Unsupported {
@@ -130,7 +132,46 @@ pub(crate) fn compile_class(
         let key_reg = emit_private_symbol_key(cx, name, span)?;
         cx.emit_store_storage(key_reg, storage, span);
         cx.mark_initialized(&binding);
+        cx.scratch = scratch_mark;
     }
+    // Pack every private-name symbol into ONE captured array
+    // (`__privarr_{ns}`) so the constructor's field initializers
+    // index it instead of capturing thousands of individual
+    // `__privsym_*` cells (Op::MakeClosure tops out at 252
+    // captures; see language/identifiers/start-unicode-*-class).
+    if !private_bound.is_empty() {
+        let scratch_mark = cx.scratch;
+        let arr_reg = cx.alloc_scratch();
+        cx.emit(
+            Op::NewArray,
+            [Operand::Register(arr_reg), Operand::ConstIndex(0)],
+            span,
+        );
+        for (i, name) in private_bound.iter().enumerate() {
+            let item_mark = cx.scratch;
+            let binding = cx
+                .private_key_binding_name(name)
+                .expect("namespace pushed above");
+            let info = cx.lookup_binding(&binding).expect("declared above");
+            let sym_reg = cx.alloc_scratch();
+            cx.emit_load_storage(sym_reg, info.storage, span);
+            let idx_reg = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadInt32,
+                [Operand::Register(idx_reg), Operand::Imm32(i as i32)],
+                span,
+            );
+            cx.emit_store_element(arr_reg, idx_reg, sym_reg, span);
+            cx.scratch = item_mark;
+        }
+        let arr_binding = format!("__privarr_{private_namespace}");
+        let storage = cx.declare_captured_binding(&arr_binding, true, span)?;
+        cx.emit_store_storage(arr_reg, storage, span);
+        cx.mark_initialized(&arr_binding);
+        cx.scratch = scratch_mark;
+    }
+    cx.class_private_ordered.push(private_bound.clone());
+
     // §7.3.29 PrivateMethodOrAccessorAdd — instance private methods
     // brand the receiver. Methods live on the prototype side in this
     // engine, so the brand is a dedicated per-class-evaluation
@@ -745,6 +786,7 @@ pub(crate) fn compile_class(
 
     cx.private_namespaces.pop();
     cx.class_private_names.pop();
+    cx.class_private_ordered.pop();
     cx.exit_scope();
     Ok(class_reg)
 }

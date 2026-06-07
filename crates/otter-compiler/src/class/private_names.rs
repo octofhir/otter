@@ -139,25 +139,31 @@ pub(crate) fn validate_no_direct_super_in_methods(
     Ok(())
 }
 
-pub(crate) fn collect_class_private_bound(
-    body: &oxc_ast::ast::ClassBody<'_>,
-) -> std::collections::HashSet<String> {
-    let mut names = std::collections::HashSet::new();
+pub(crate) fn collect_class_private_bound(body: &oxc_ast::ast::ClassBody<'_>) -> Vec<String> {
+    // Declaration order, deduped — the field-init path indexes the
+    // per-class private-symbol array by this order.
+    let mut seen = std::collections::HashSet::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut push = |n: String| {
+        if seen.insert(n.clone()) {
+            names.push(n);
+        }
+    };
     for element in &body.body {
         match element {
             oxc_ast::ast::ClassElement::MethodDefinition(m) => {
                 if let oxc_ast::ast::PropertyKey::PrivateIdentifier(p) = &m.key {
-                    names.insert(p.name.to_string());
+                    push(p.name.to_string());
                 }
             }
             oxc_ast::ast::ClassElement::PropertyDefinition(p) => {
                 if let oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) = &p.key {
-                    names.insert(pid.name.to_string());
+                    push(pid.name.to_string());
                 }
             }
             oxc_ast::ast::ClassElement::AccessorProperty(a) => {
                 if let oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) = &a.key {
-                    names.insert(pid.name.to_string());
+                    push(pid.name.to_string());
                 }
             }
             _ => {}
@@ -310,7 +316,7 @@ pub(crate) fn validate_class_private_names_inner(
         validate_private_refs_in_expression(parent, scopes)?;
     }
     let own = collect_class_private_bound(&class.body);
-    scopes.push(own);
+    scopes.push(own.into_iter().collect());
     let res = (|| -> Result<(), CompileError> {
         for element in &class.body.body {
             match element {

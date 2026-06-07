@@ -187,27 +187,7 @@ pub(crate) fn compile_function_full(
             compile_statement(parent, stmt)?;
         }
         if contains_direct_eval {
-            // §19.2.1.1 step ~6 — a direct eval inherits the caller's
-            // PrivateEnvironment. Force a capture of every enclosing
-            // class's private-name (and brand) cells so they ride the
-            // direct-eval binding table into the eval frame.
-            if !parent.private_namespaces.is_empty() {
-                let pairs: Vec<(u32, Vec<String>)> = parent
-                    .private_namespaces
-                    .iter()
-                    .copied()
-                    .zip(parent.class_private_names.iter().cloned())
-                    .map(|(ns, names)| (ns, names.into_iter().collect()))
-                    .collect();
-                for (ns, names) in pairs {
-                    for name in names {
-                        let binding = format!("__privsym_{ns}_{name}");
-                        let _ = parent.resolve_capture(&binding);
-                    }
-                    let brand = format!("__privbrand_{ns}");
-                    let _ = parent.resolve_capture(&brand);
-                }
-            }
+            capture_private_environment_for_eval(parent);
             direct_eval_meta = collect_direct_eval_bindings(parent, &lex_names);
         }
     }
@@ -217,6 +197,13 @@ pub(crate) fn compile_function_full(
     parent.emit(Op::ReturnUndefined, vec![], span);
 
     let mut child = parent.pop();
+    if child.register_overflow {
+        return Err(CompileError::Unsupported {
+            node: "function body exhausts the 65535-register window".to_string(),
+            span,
+        });
+    }
+
     let captures = child.parent_captures.clone();
     if !captures.is_empty() {
         let self_captures: Vec<u32> = (0..captures.len())
@@ -235,7 +222,7 @@ pub(crate) fn compile_function_full(
         .get_mut(function_id as usize)
         .expect("reserved function slot");
     slot.locals = 0;
-    slot.scratch = child.scratch;
+    slot.scratch = child.scratch_window();
     slot.param_count = param_count;
     slot.length = length;
     slot.has_rest = has_rest;
@@ -457,6 +444,13 @@ pub(crate) fn compile_arrow_function(
     parent.exit_scope();
 
     let child = parent.pop();
+    if child.register_overflow {
+        return Err(CompileError::Unsupported {
+            node: "function body exhausts the 65535-register window".to_string(),
+            span,
+        });
+    }
+
     let captures = child.parent_captures.clone();
     let mut module_mut = module.borrow_mut();
     let slot = module_mut
@@ -464,7 +458,7 @@ pub(crate) fn compile_arrow_function(
         .get_mut(function_id as usize)
         .expect("reserved function slot");
     slot.locals = 0;
-    slot.scratch = child.scratch;
+    slot.scratch = child.scratch_window();
     slot.param_count = param_count;
     slot.length = length;
     slot.has_rest = has_rest;
@@ -539,4 +533,31 @@ fn make_closure_operands(
         operands.push(Operand::Imm32(parent_idx as i32));
     }
     Ok(operands)
+}
+
+/// §19.2.1.1 step ~6 — a direct eval inherits the caller's
+/// PrivateEnvironment. Force a capture of every enclosing class's
+/// private-name (and brand) cells so they ride the direct-eval
+/// binding table into the eval frame. Called by every
+/// function-finalization path that collects direct-eval bindings
+/// (ordinary functions, synthetic and user class constructors).
+pub(crate) fn capture_private_environment_for_eval(cx: &mut Compiler) {
+    if cx.private_namespaces.is_empty() {
+        return;
+    }
+    let pairs: Vec<(u32, Vec<String>)> = cx
+        .private_namespaces
+        .iter()
+        .copied()
+        .zip(cx.class_private_names.iter().cloned())
+        .map(|(ns, names)| (ns, names.into_iter().collect()))
+        .collect();
+    for (ns, names) in pairs {
+        for name in names {
+            let binding = format!("__privsym_{ns}_{name}");
+            let _ = cx.resolve_capture(&binding);
+        }
+        let brand = format!("__privbrand_{ns}");
+        let _ = cx.resolve_capture(&brand);
+    }
 }

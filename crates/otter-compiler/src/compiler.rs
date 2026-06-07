@@ -44,6 +44,10 @@ pub(crate) struct Compiler {
     /// nested class body is compiled (its `#name` references may
     /// resolve to an outer class).
     pub(crate) class_private_names: Vec<std::collections::HashSet<String>>,
+    /// Declaration-ordered private names per enclosing class —
+    /// parallel to `private_namespaces`; indexes the per-class
+    /// `__privarr_{ns}` symbol array.
+    pub(crate) class_private_ordered: Vec<Vec<String>>,
     /// `true` when compiling any `eval` body — §B.3.3.3 makes the
     /// Annex B global function extension *deletable* for eval code
     /// (CreateGlobalVarBinding(F, true)) where script code creates a
@@ -89,6 +93,7 @@ impl Compiler {
             fn_self_immutable_hint: false,
             private_namespaces: Vec::new(),
             class_private_names: Vec::new(),
+            class_private_ordered: Vec::new(),
             suppress_global_mirror: false,
             in_eval: false,
             script_global_vars: std::collections::HashSet::new(),

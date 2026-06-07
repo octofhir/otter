@@ -138,6 +138,7 @@ fn throw_restricted_function_property(
     });
     if let (Some(fid), Some(exec)) = (fid, ctx.execution_context().cloned())
         && !exec.function_is_strict(fid)
+        && !exec.function_is_arrow(fid)
         && exec
             .function(fid)
             .is_some_and(|f| !f.is_generator && !f.is_async)

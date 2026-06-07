@@ -594,7 +594,7 @@ pub(crate) fn compile_program_with_mode_impl(
     {
         let mut m = module.borrow_mut();
         m.functions[0].locals = 0;
-        m.functions[0].scratch = cx.scratch;
+        m.functions[0].scratch = cx.scratch_window();
         m.functions[0].own_upvalue_count = cx.own_upvalue_count;
         m.functions[0].direct_eval_bindings = eval_new_bindings;
         // §19.2.1.1 — a nested direct eval from this chunk inherits
@@ -1215,7 +1215,7 @@ pub fn compile_module_program(
     {
         let mut m = module.borrow_mut();
         m.functions[0].locals = 0;
-        m.functions[0].scratch = cx.scratch;
+        m.functions[0].scratch = cx.scratch_window();
         m.functions[0].own_upvalue_count = cx.own_upvalue_count;
         m.functions[0].code = std::mem::take(&mut cx.code);
         m.functions[0].spans = std::mem::take(&mut cx.spans);

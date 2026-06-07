@@ -122,6 +122,12 @@ pub(crate) struct FunctionContext {
     /// lowered. Entries are binding names whose values are captured
     /// `JsObject` references.
     pub(crate) active_with_envs: Vec<crate::with_statement::WithEnv>,
+    /// Set when `alloc_scratch` exhausted the u16 register window;
+    /// surfaced as a CompileError when the function is finalized.
+    pub(crate) register_overflow: bool,
+    /// High-water mark of `alloc_scratch` — the real window size
+    /// when call sites recycle registers by rolling `scratch` back.
+    pub(crate) scratch_peak: u16,
     /// Monotonic suffix for synthetic `with` bindings in this
     /// function.
     pub(crate) next_with_env_id: u32,
@@ -176,6 +182,8 @@ impl FunctionContext {
             captured_uv: HashMap::new(),
             module_state: None,
             active_with_envs: Vec::new(),
+            register_overflow: false,
+            scratch_peak: 0,
             next_with_env_id: 0,
             contains_direct_eval: false,
             completion_reg: None,
@@ -234,8 +242,27 @@ impl FunctionContext {
 
     pub(crate) fn alloc_scratch(&mut self) -> u16 {
         let r = self.scratch;
-        self.scratch = self.scratch.checked_add(1).expect("register overflow");
+        match self.scratch.checked_add(1) {
+            Some(next) => {
+                self.scratch = next;
+                if next > self.scratch_peak {
+                    self.scratch_peak = next;
+                }
+            }
+            None => {
+                // Defer to a CompileError at function finalization —
+                // a pathological source (tens of thousands of live
+                // registers) must not abort the process.
+                self.register_overflow = true;
+            }
+        }
         r
+    }
+
+    /// Final register-window size: the high-water mark survives
+    /// scratch recycling (`cx.scratch = mark` rollbacks).
+    pub(crate) fn scratch_window(&self) -> u16 {
+        self.scratch.max(self.scratch_peak)
     }
 
     /// Push `frame` onto the loop stack, consuming any pending

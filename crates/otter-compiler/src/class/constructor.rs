@@ -141,12 +141,20 @@ pub(crate) fn compile_synthetic_constructor(
     }
 
     let direct_eval_meta: Vec<otter_bytecode::DirectEvalBinding> = if contains_direct_eval {
+        capture_private_environment_for_eval(parent);
         collect_direct_eval_bindings(parent, &[])
     } else {
         Vec::new()
     };
     parent.exit_scope();
     let child = parent.pop();
+    if child.register_overflow {
+        return Err(CompileError::Unsupported {
+            node: "function body exhausts the 65535-register window".to_string(),
+            span,
+        });
+    }
+
     let captures = child.parent_captures.clone();
     let mut module_mut = module.borrow_mut();
     let slot = module_mut
@@ -154,7 +162,7 @@ pub(crate) fn compile_synthetic_constructor(
         .get_mut(function_id as usize)
         .expect("reserved synthetic ctor slot");
     slot.locals = 0;
-    slot.scratch = child.scratch;
+    slot.scratch = child.scratch_window();
     slot.param_count = 0;
     slot.length = 0;
     slot.has_rest = is_derived;
@@ -310,6 +318,7 @@ pub(crate) fn compile_class_constructor(
         emit_instance_field_inits(parent, instance_fields)?;
     }
     let direct_eval_meta: Vec<otter_bytecode::DirectEvalBinding> = if contains_direct_eval {
+        capture_private_environment_for_eval(parent);
         collect_direct_eval_bindings(parent, &[])
     } else {
         Vec::new()
@@ -318,6 +327,13 @@ pub(crate) fn compile_class_constructor(
     parent.emit(Op::ReturnUndefined, vec![], span);
 
     let child = parent.pop();
+    if child.register_overflow {
+        return Err(CompileError::Unsupported {
+            node: "function body exhausts the 65535-register window".to_string(),
+            span,
+        });
+    }
+
     let captures = child.parent_captures.clone();
     let mut module_mut = module.borrow_mut();
     let slot = module_mut
@@ -325,7 +341,7 @@ pub(crate) fn compile_class_constructor(
         .get_mut(function_id as usize)
         .expect("reserved function slot");
     slot.locals = 0;
-    slot.scratch = child.scratch;
+    slot.scratch = child.scratch_window();
     slot.param_count = param_count;
     slot.length = length;
     slot.has_rest = has_rest;
@@ -386,6 +402,11 @@ fn emit_instance_field_inits_inner(
         }
     }
     for (idx, p) in fields.iter().enumerate() {
+        // Register recycling: nothing emitted for one field-init
+        // survives into the next (key/value/this are all consumed by
+        // the define), so a class with thousands of fields stays
+        // within the u16 register window.
+        let scratch_mark = cx.scratch;
         let pspan = (p.span.start, p.span.end);
         let value_reg = match &p.value {
             Some(expr) => compile_expr(cx, expr, pspan)?,
@@ -405,6 +426,7 @@ fn emit_instance_field_inits_inner(
             let binding = crate::class::field_key_binding_name(idx);
             let key_reg = load_synthetic_capture(cx, &binding, pspan)?;
             emit_public_field_define(cx, this_reg, key_reg, value_reg, pspan);
+            cx.scratch = scratch_mark;
             continue;
         }
         let key_str = match &p.key {
@@ -412,7 +434,7 @@ fn emit_instance_field_inits_inner(
             oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value.to_string(),
             oxc_ast::ast::PropertyKey::NumericLiteral(lit) => lit.value.to_string(),
             oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) => {
-                let key_reg = crate::class::load_private_key(cx, pid.name.as_str(), pspan)?;
+                let key_reg = load_private_key_for_field(cx, pid.name.as_str(), pspan)?;
                 // §7.3.28 PrivateFieldAdd — re-initializing the same
                 // private field on one object (constructor-return
                 // override + second `new`) is a TypeError. Fields
@@ -432,6 +454,7 @@ fn emit_instance_field_inits_inner(
                 emit_field_add_type_error(cx, pspan);
                 cx.patch_branch_to_here(fresh);
                 emit_public_field_define(cx, this_reg, key_reg, value_reg, pspan);
+                cx.scratch = scratch_mark;
                 continue;
             }
             _ => {
@@ -449,6 +472,7 @@ fn emit_instance_field_inits_inner(
             pspan,
         );
         emit_public_field_define(cx, this_reg, key_reg, value_reg, pspan);
+        cx.scratch = scratch_mark;
     }
     Ok(())
 }
@@ -478,4 +502,43 @@ fn emit_field_add_type_error(cx: &mut Compiler, span: (u32, u32)) {
         span,
     );
     cx.emit(Op::Throw, [Operand::Register(error_reg)], span);
+}
+
+/// Resolve a private FIELD's symbol inside the constructor via the
+/// per-class `__privarr_{ns}` array (one capture for the whole
+/// class) instead of one `__privsym_*` capture per name —
+/// `Op::MakeClosure` tops out at 252 captures.
+fn load_private_key_for_field(
+    cx: &mut Compiler,
+    name: &str,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    if let (Some(ns), Some(ordered)) = (
+        cx.private_namespaces.last().copied(),
+        cx.class_private_ordered.last(),
+    ) && let Some(idx) = ordered.iter().position(|n| n == name)
+    {
+        let binding = format!("__privarr_{ns}");
+        if cx.lookup_binding(&binding).is_some() || cx.resolve_capture(&binding).is_some() {
+            let arr_reg = load_synthetic_capture(cx, &binding, span)?;
+            let idx_reg = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadInt32,
+                [Operand::Register(idx_reg), Operand::Imm32(idx as i32)],
+                span,
+            );
+            let dst = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadElement,
+                vec![
+                    Operand::Register(dst),
+                    Operand::Register(arr_reg),
+                    Operand::Register(idx_reg),
+                ],
+                span,
+            );
+            return Ok(dst);
+        }
+    }
+    crate::class::load_private_key(cx, name, span)
 }

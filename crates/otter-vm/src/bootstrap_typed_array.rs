@@ -254,39 +254,48 @@ fn drain_iterable_into_values(
         .interp
         .run_callable_sync(exec_ctx, &iter_method, src_value, no_args)
         .map_err(|e| vm_to_native(e, "TypedArray"))?;
-    let handle = if let Some(h) = iter_obj.as_iterator() {
-        h
-    } else if let Some(g) = iter_obj.as_generator() {
-        let gen_value = Value::generator(g);
-        let state = crate::IteratorState::Generator { handle: g };
-        ctx.alloc_iterator_state(state, &[&gen_value], &[])
-            .map_err(|_| NativeError::TypeError {
-                name: "TypedArray",
-                reason: "iterator allocation failed".to_string(),
-            })?
-    } else {
-        let other_root = iter_obj;
-        let state = crate::IteratorState::User {
-            iterator: iter_obj,
-            next_method: None,
-        };
-        ctx.alloc_iterator_state(state, &[&other_root], &[])
-            .map_err(|_| NativeError::TypeError {
-                name: "TypedArray",
-                reason: "iterator allocation failed".to_string(),
-            })?
-    };
+    // §7.4.2 GetIteratorFromMethod step 4 — `next` is read off the
+    // iterator object as a property, so a user-overridden
+    // `%ArrayIteratorPrototype%.next` (or any custom `next`) drives
+    // the drain rather than the engine's internal iterator step.
+    let next_method = ta_get_via(
+        ctx,
+        exec_ctx,
+        iter_obj,
+        &crate::VmPropertyKey::String("next"),
+    )?;
+    if !ctx.cx.interp.is_callable_runtime(&next_method) {
+        return Err(NativeError::TypeError {
+            name: "TypedArray",
+            reason: "iterator.next is not callable".to_string(),
+        });
+    }
     let mut collected: Vec<Value> = Vec::new();
     loop {
-        let (v, done) = ctx
+        // §7.4.3 IteratorNext — Call(next, iterator); the result must
+        // be an Object, then read `done` / `value` observably.
+        let result = ctx
             .cx
             .interp
-            .iterator_next_full(exec_ctx, &handle)
+            .run_callable_sync(exec_ctx, &next_method, iter_obj, smallvec::SmallVec::new())
             .map_err(|e| vm_to_native(e, "TypedArray"))?;
-        if done {
+        if !crate::reflect::is_type_object_value(&result) {
+            return Err(NativeError::TypeError {
+                name: "TypedArray",
+                reason: "iterator result is not an object".to_string(),
+            });
+        }
+        let done = ta_get_via(ctx, exec_ctx, result, &crate::VmPropertyKey::String("done"))?;
+        if done.to_boolean(&ctx.cx.interp.gc_heap) {
             break;
         }
-        collected.push(v);
+        let value = ta_get_via(
+            ctx,
+            exec_ctx,
+            result,
+            &crate::VmPropertyKey::String("value"),
+        )?;
+        collected.push(value);
     }
     Ok(collected)
 }

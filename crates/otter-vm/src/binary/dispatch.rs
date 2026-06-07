@@ -390,6 +390,13 @@ fn construct_typed_array_with_roots(
             }
         };
         let view = JsTypedArray::new(gc_heap, buf, kind, byte_offset, length).map_err(oom_to_vm)?;
+        // §23.2.5.1 — absent length over a resizable buffer makes
+        // [[ArrayLength]] AUTO (length-tracking).
+        let length_absent =
+            args.get(2).is_none() || args.get(2).is_some_and(|v| v.is_undefined());
+        if length_absent && buf.is_resizable(gc_heap) {
+            view.set_length_tracking(gc_heap);
+        }
         return Ok(Value::typed_array(view));
     }
     if let Some(src) = first.as_typed_array(gc_heap) {

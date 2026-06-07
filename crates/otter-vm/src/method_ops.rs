@@ -1404,14 +1404,24 @@ impl Interpreter {
         let end_index = relative_index_clamp(relative_end, src_len);
         let new_length = (end_index - begin_index).max(0) as usize;
         let bpe = t.kind().bytes_per_element();
-        let begin_byte_offset = t.byte_offset(&self.gc_heap) + begin_index as usize * bpe;
+        // §23.2.3.30 step 13 — [[ByteOffset]] is the construction-time
+        // slot; the `end` coercion may have detached the buffer, which
+        // zeroes the public accessor but not the slot.
+        let begin_byte_offset = t.raw_byte_offset(&self.gc_heap) + begin_index as usize * bpe;
 
         let mut argv: SmallVec<[Value; 8]> = SmallVec::new();
         argv.push(Value::array_buffer(buffer));
         argv.push(Value::number(NumberValue::from_f64(
             begin_byte_offset as f64,
         )));
-        argv.push(Value::number(NumberValue::from_f64(new_length as f64)));
+        // §23.2.3.30 — a length-tracking source with no end argument
+        // produces a length-tracking view: the species constructor is
+        // called WITHOUT the length argument.
+        let end_absent =
+            args.get(1).is_none() || args.get(1).is_some_and(|v| v.is_undefined());
+        if !(end_absent && t.is_length_tracking(&self.gc_heap)) {
+            argv.push(Value::number(NumberValue::from_f64(new_length as f64)));
+        }
         let a = self.typed_array_create_via_species(context, t, argv, None)?;
         Ok(Value::typed_array(a))
     }

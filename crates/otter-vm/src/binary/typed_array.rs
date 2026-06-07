@@ -396,6 +396,10 @@ pub struct TypedArrayBodyGc {
     /// §10.1.2 [[SetPrototypeOf]] override — `None` means the
     /// per-kind `%TypedArray%.prototype` chain applies.
     pub custom_proto: Option<crate::Value>,
+    /// §23.2.5.1 — `true` when constructed over a resizable buffer
+    /// without an explicit length: [[ArrayLength]] is AUTO and tracks
+    /// the buffer's current byte length.
+    pub length_tracking: bool,
 }
 
 impl otter_gc::SafeTraceable for TypedArrayBodyGc {
@@ -438,6 +442,7 @@ pub fn alloc_typed_array(
         kind,
         byte_offset,
         length,
+        length_tracking: false,
         expando: None,
         custom_proto: None,
     })
@@ -571,7 +576,25 @@ impl JsTypedArray {
         let bpe = self.cached_kind.bytes_per_element();
         let bytes_available = buffer.byte_length(heap).saturating_sub(off);
         let max_elems = bytes_available / bpe;
+        if self.is_length_tracking(heap) {
+            // §23.2.5.1 AUTO length — tracks the live buffer size in
+            // both directions (grow and shrink).
+            return max_elems;
+        }
         len.min(max_elems)
+    }
+
+    /// §23.2.5.1 — whether [[ArrayLength]] is AUTO (constructed over a
+    /// resizable buffer without an explicit length).
+    #[must_use]
+    pub fn is_length_tracking(self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.handle, |body| body.length_tracking)
+    }
+
+    /// Flip [[ArrayLength]] to AUTO. Called by the constructor path
+    /// when the length argument is absent over a resizable buffer.
+    pub fn set_length_tracking(self, heap: &mut otter_gc::GcHeap) {
+        heap.with_payload(self.handle, |body| body.length_tracking = true);
     }
 
     /// Construction-time element count, ignoring detached state and

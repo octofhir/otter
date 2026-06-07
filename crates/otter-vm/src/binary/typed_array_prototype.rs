@@ -567,6 +567,13 @@ fn impl_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
             .map_err(|_| type_error("element type mismatch"))
     }
     if let Some(src) = source.as_typed_array(ctx.heap_mut()) {
+        // §23.2.3.26.1 SetTypedArrayFromTypedArray — the offset
+        // coercion above may have detached the SOURCE buffer too.
+        if src.buffer(ctx.heap()).is_detached(ctx.heap()) {
+            return Err(type_error(
+                "Cannot set from a TypedArray backed by a detached buffer",
+            ));
+        }
         let src_len = src.length(ctx.heap_mut());
         if off + src_len > t.length(ctx.heap_mut()) {
             return Err(range_error("source overruns destination"));

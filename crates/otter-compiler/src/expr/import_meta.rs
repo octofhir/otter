@@ -39,24 +39,30 @@ pub(crate) fn compile_meta_property(
             span,
         });
     }
-    let import_meta_uv =
-        cx.module_state
-            .as_ref()
-            .map(|s| s.import_meta_uv)
-            .ok_or(CompileError::Unsupported {
-                node: "`import.meta` outside an ES-module fragment".to_string(),
-                span,
-            })?;
-    let dst = cx.alloc_scratch();
-    cx.emit(
-        Op::LoadUpvalue,
-        vec![
-            Operand::Register(dst),
-            Operand::Imm32(import_meta_uv as i32),
-        ],
+    if let Some(import_meta_uv) = cx.module_state.as_ref().map(|s| s.import_meta_uv) {
+        let dst = cx.alloc_scratch();
+        cx.emit(
+            Op::LoadUpvalue,
+            vec![
+                Operand::Register(dst),
+                Operand::Imm32(import_meta_uv as i32),
+            ],
+            span,
+        );
+        return Ok(dst);
+    }
+    // Nested function inside a module: `module_state` lives on the
+    // module-init frame only, but the init scope registers a
+    // synthetic `__otter_import_meta` binding, so inner functions
+    // reach the same object through the regular capture cascade.
+    let name = crate::synthetic::import_meta_synthetic_name();
+    if cx.resolve_capture(&name).is_some() || cx.lookup_binding(&name).is_some() {
+        return crate::class::load_synthetic_capture(cx, &name, span);
+    }
+    Err(CompileError::Unsupported {
+        node: "`import.meta` outside an ES-module fragment".to_string(),
         span,
-    );
-    Ok(dst)
+    })
 }
 
 pub(crate) fn compile_import(

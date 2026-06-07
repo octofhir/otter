@@ -1808,8 +1808,15 @@ pub fn validate_block_early_errors(
 ) -> Result<(), CompileError> {
     let mut visitor = BlockLexicalValidator {
         strict_stack: vec![source_strict],
+        label_stack: Vec::new(),
+        in_static_block: false,
         diagnostics: Vec::new(),
     };
+    // §16.1.1 / §16.2.1 — the top-level StatementList itself obeys
+    // the duplicate-lexical and lexical/var-conflict rules. Function
+    // declarations are VAR-scoped at this level (§8.2.6
+    // TopLevelLexicallyDeclaredNames), not lexical.
+    visitor.check_top_level_statement_list(body.iter());
     for stmt in body {
         visitor.visit_statement(stmt);
     }
@@ -1829,6 +1836,14 @@ pub fn validate_block_early_errors(
 
 struct BlockLexicalValidator {
     strict_stack: Vec<bool>,
+    /// §8.4.1 ContainsDuplicateLabels — the chain of label names
+    /// currently enclosing the visit position. Cleared across
+    /// function boundaries (labels do not cross them).
+    label_stack: Vec<String>,
+    /// `true` while inside a `static { … }` body (not crossing a
+    /// nested function boundary) — §15.7.1 makes `await` a Syntax
+    /// Error there.
+    in_static_block: bool,
     diagnostics: Vec<SyntaxDiagnostic>,
 }
 
@@ -1840,6 +1855,20 @@ impl BlockLexicalValidator {
             .expect("strict stack starts non-empty")
     }
 
+    /// §8.2.6 TopLevelLexicallyDeclaredNames — at a script /
+    /// function-body / static-block top level, hoistable (function)
+    /// declarations are var-scoped, so only `let` / `const` /
+    /// `class` participate in the duplicate-lexical rule and
+    /// function names join the var side of the conflict check.
+    fn check_top_level_statement_list<'a, 'b>(
+        &mut self,
+        stmts: impl Iterator<Item = &'b Statement<'a>> + Clone,
+    ) where
+        'a: 'b,
+    {
+        self.check_statement_list_impl(stmts, true);
+    }
+
     /// §14.2.1 checks over one statement list (a block body or the
     /// union of a switch statement's case consequents).
     fn check_statement_list<'a, 'b>(
@@ -1848,10 +1877,23 @@ impl BlockLexicalValidator {
     ) where
         'a: 'b,
     {
+        self.check_statement_list_impl(stmts, false);
+    }
+
+    fn check_statement_list_impl<'a, 'b>(
+        &mut self,
+        stmts: impl Iterator<Item = &'b Statement<'a>> + Clone,
+        top_level: bool,
+    ) where
+        'a: 'b,
+    {
         let strict = self.strict();
         // name → is the first declaration a plain function declaration?
         let mut lex_seen: BTreeMap<&str, bool> = BTreeMap::new();
         for stmt in stmts.clone() {
+            if top_level && matches!(stmt, Statement::FunctionDeclaration(_)) {
+                continue;
+            }
             collect_block_lex_decl_names(stmt, &mut |name, span, plain_fn| {
                 match lex_seen.entry(name) {
                     std::collections::btree_map::Entry::Occupied(first) => {
@@ -1883,6 +1925,22 @@ impl BlockLexicalValidator {
             return;
         }
         for stmt in stmts {
+            if top_level
+                && let Statement::FunctionDeclaration(func) = stmt
+                && let Some(id) = &func.id
+                && lex_seen.contains_key(id.name.as_str())
+            {
+                let name = id.name.as_str();
+                self.diagnostics.push(SyntaxDiagnostic {
+                    code: "BLOCK_LEXICAL_VAR_CONFLICT".to_string(),
+                    message: format!(
+                        "SyntaxError: lexical declaration `{name}` conflicts with a \
+                         function declaration at the same top level (§16.1.1)"
+                    ),
+                    range: Some((id.span.start, id.span.end)),
+                    help: None,
+                });
+            }
             collect_var_decl_names_in_stmt(stmt, &mut |name, span| {
                 if lex_seen.contains_key(name) {
                     self.diagnostics.push(SyntaxDiagnostic {
@@ -1943,6 +2001,56 @@ where
 }
 
 impl<'a> Visit<'a> for BlockLexicalValidator {
+    fn visit_function_body(&mut self, it: &oxc_ast::ast::FunctionBody<'a>) {
+        // §10.2.11 — a function body's top-level StatementList obeys
+        // the duplicate-lexical / lexical-var rules with hoistable
+        // declarations on the var side (§8.2.6).
+        self.check_top_level_statement_list(it.statements.iter());
+        walk::walk_function_body(self, it);
+    }
+
+    fn visit_labeled_statement(&mut self, it: &oxc_ast::ast::LabeledStatement<'a>) {
+        let name = it.label.name.as_str();
+        if self.label_stack.iter().any(|l| l == name) {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "DUPLICATE_LABEL".to_string(),
+                message: format!(
+                    "SyntaxError: label `{name}` duplicates an enclosing label (§8.4.1)"
+                ),
+                range: Some((it.span.start, it.span.end)),
+                help: None,
+            });
+        }
+        self.label_stack.push(name.to_string());
+        walk::walk_labeled_statement(self, it);
+        self.label_stack.pop();
+    }
+
+    fn visit_static_block(&mut self, it: &oxc_ast::ast::StaticBlock<'a>) {
+        // §15.7.4 — the static-block body is its own statement list
+        // (duplicate lexicals, lexical/var conflicts) and may not
+        // contain `await` outside a nested function.
+        self.check_top_level_statement_list(it.body.iter());
+        let saved_labels = std::mem::take(&mut self.label_stack);
+        let saved_static = std::mem::replace(&mut self.in_static_block, true);
+        walk::walk_static_block(self, it);
+        self.in_static_block = saved_static;
+        self.label_stack = saved_labels;
+    }
+
+    fn visit_await_expression(&mut self, it: &oxc_ast::ast::AwaitExpression<'a>) {
+        if self.in_static_block {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "STATIC_BLOCK_AWAIT".to_string(),
+                message: "SyntaxError: `await` is not allowed in a class static block (§15.7.1)"
+                    .to_string(),
+                range: Some((it.span.start, it.span.end)),
+                help: None,
+            });
+        }
+        walk::walk_await_expression(self, it);
+    }
+
     fn visit_block_statement(&mut self, it: &BlockStatement<'a>) {
         self.check_statement_list(it.body.iter());
         walk::walk_block_statement(self, it);
@@ -1962,7 +2070,11 @@ impl<'a> Visit<'a> for BlockLexicalValidator {
             .is_some_and(|b| b.has_use_strict_directive());
         let inner_strict = self.strict() || body_strict;
         self.strict_stack.push(inner_strict);
+        let saved_labels = std::mem::take(&mut self.label_stack);
+        let saved_static = std::mem::replace(&mut self.in_static_block, false);
         walk::walk_function(self, it, flags);
+        self.in_static_block = saved_static;
+        self.label_stack = saved_labels;
         self.strict_stack.pop();
     }
 
@@ -1970,7 +2082,9 @@ impl<'a> Visit<'a> for BlockLexicalValidator {
         let body_strict = !it.expression && it.body.has_use_strict_directive();
         let inner_strict = self.strict() || body_strict;
         self.strict_stack.push(inner_strict);
+        let saved_labels = std::mem::take(&mut self.label_stack);
         walk::walk_arrow_function_expression(self, it);
+        self.label_stack = saved_labels;
         self.strict_stack.pop();
     }
 

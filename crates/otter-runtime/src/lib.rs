@@ -4892,9 +4892,8 @@ mod tests {
 
     #[test]
     fn otter_rejects_unsupported_js_feature() {
-        // `with` is permanently outside the strict mode / ES-module subset, so
-        // it makes a stable canary for the FEATURE_NOT_IN_SLICE
-        // diagnostic shape.
+        // `with` in strict mode is a SyntaxError (§14.13) — a stable
+        // canary for the structured Compile diagnostic shape.
         let otter = Otter::new();
         let err = otter
             .blocking_run_typescript("\"use strict\"; with (o) { x; }")
@@ -4902,7 +4901,7 @@ mod tests {
         match err {
             OtterError::Compile { diagnostics } => {
                 assert_eq!(diagnostics.len(), 1);
-                assert_eq!(diagnostics[0].code, "FEATURE_NOT_IN_SLICE");
+                assert_eq!(diagnostics[0].code, "STRICT_MODE_WITH");
             }
             other => panic!("expected Compile, got {other:?}"),
         }

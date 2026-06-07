@@ -42,9 +42,16 @@ pub(crate) fn compile_with_statement(
     let span = (w.span.start, w.span.end);
     cx.emit_completion_reset(span);
     if cx.is_strict {
-        return Err(CompileError::Unsupported {
-            node: "WithStatement is forbidden in strict mode / ES modules (§14.13)".to_string(),
-            span,
+        let message =
+            "SyntaxError: `with` statements are not allowed in strict mode (§14.13)".to_string();
+        return Err(CompileError::Syntax {
+            messages: vec![message.clone()],
+            diagnostics: vec![crate::SyntaxDiagnostic {
+                code: "STRICT_MODE_WITH".to_string(),
+                message,
+                range: Some(span),
+                help: None,
+            }],
         });
     }
 

@@ -102,6 +102,22 @@ pub(crate) fn compile_class(
 
     cx.enter_scope();
 
+    // §15.7.1 — ALL parts of a class definition are strict mode
+    // code: the heritage expression, computed keys, and the inline
+    // static-element evaluation lowered into this frame.
+    let saved_strict = cx.is_strict;
+    cx.is_strict = true;
+    let result = compile_class_strict(cx, class, class_name, span);
+    cx.top_mut().is_strict = saved_strict;
+    result
+}
+
+fn compile_class_strict(
+    cx: &mut Compiler,
+    class: &oxc_ast::ast::Class<'_>,
+    class_name: Option<&str>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
     // Allocate a fresh private-field namespace and push it on the
     // compiler's class-context stack so every `#name` reference
     // inside the class body mangles into this class's slot.

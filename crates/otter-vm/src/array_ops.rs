@@ -376,6 +376,7 @@ mod tests {
     fn empty_context() -> ExecutionContext {
         ExecutionContext::from_module(BytecodeModule {
             module: "array-ops-test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![Function {
                 id: 0,
@@ -413,6 +414,7 @@ mod tests {
     fn empty_module() -> BytecodeModule {
         BytecodeModule {
             module: "array-ops-test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![Function {
                 id: 0,

@@ -196,6 +196,7 @@ mod tests {
             .collect();
         BytecodeModule {
             module: "<test>".to_string(),
+            template_sites: Vec::new(),
             source_kind: SourceKind::JavaScript,
             functions,
             constants: vec![Constant::FunctionId { index: 1 }],

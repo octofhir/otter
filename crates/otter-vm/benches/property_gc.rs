@@ -76,6 +76,7 @@ fn new_object_named_store_loop(iterations: i32) -> ExecutionContext {
     ];
     ExecutionContext::from_module(BytecodeModule {
         module: "property-gc-new-object-store-bench.js".to_string(),
+        template_sites: Vec::new(),
         source_kind: SourceKind::JavaScript,
         functions: vec![Function {
             id: 0,
@@ -150,6 +151,7 @@ fn new_object_two_named_stores_loop(iterations: i32) -> ExecutionContext {
     ];
     ExecutionContext::from_module(BytecodeModule {
         module: "property-gc-new-object-two-stores-bench.js".to_string(),
+        template_sites: Vec::new(),
         source_kind: SourceKind::JavaScript,
         functions: vec![Function {
             id: 0,
@@ -230,6 +232,7 @@ fn inherited_writable_data_store_loop(iterations: i32) -> ExecutionContext {
     ];
     ExecutionContext::from_module(BytecodeModule {
         module: "property-gc-inherited-data-store-bench.js".to_string(),
+        template_sites: Vec::new(),
         source_kind: SourceKind::JavaScript,
         functions: vec![Function {
             id: 0,
@@ -336,6 +339,7 @@ fn inherited_non_writable_data_store_loop(iterations: i32) -> ExecutionContext {
     ];
     ExecutionContext::from_module(BytecodeModule {
         module: "property-gc-inherited-nonwritable-store-bench.js".to_string(),
+        template_sites: Vec::new(),
         source_kind: SourceKind::JavaScript,
         functions: vec![Function {
             id: 0,
@@ -409,6 +413,7 @@ fn direct_prototype_missing_store_loop(iterations: i32) -> ExecutionContext {
     ];
     ExecutionContext::from_module(BytecodeModule {
         module: "property-gc-direct-prototype-missing-store-bench.js".to_string(),
+        template_sites: Vec::new(),
         source_kind: SourceKind::JavaScript,
         functions: vec![Function {
             id: 0,
@@ -472,6 +477,7 @@ fn primitive_boolean_store_loop(iterations: i32) -> ExecutionContext {
     ];
     ExecutionContext::from_module(BytecodeModule {
         module: "property-gc-primitive-boolean-store-bench.js".to_string(),
+        template_sites: Vec::new(),
         source_kind: SourceKind::JavaScript,
         functions: vec![Function {
             id: 0,

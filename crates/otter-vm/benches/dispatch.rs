@@ -32,6 +32,7 @@ fn bench_dispatch(c: &mut Criterion) {
         .collect();
     let module = BytecodeModule {
         module: "bench.ts".to_string(),
+        template_sites: Vec::new(),
         source_kind: SourceKind::TypeScript,
         functions: vec![Function {
             id: 0,

@@ -52,6 +52,7 @@ mod tests {
     fn dump_carries_schema_version() {
         let module = BytecodeModule {
             module: "x.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: SourceKind::TypeScript,
             functions: vec![Function {
                 id: 0,

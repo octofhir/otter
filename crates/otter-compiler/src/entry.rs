@@ -876,6 +876,7 @@ pub(crate) fn compile_program_with_mode_impl_super(
     let ModuleBuilder {
         functions,
         constants,
+        template_sites,
         next_private_namespace: _,
     } = Rc::try_unwrap(module)
         .expect("module builder should be uniquely owned at finalize")
@@ -883,6 +884,7 @@ pub(crate) fn compile_program_with_mode_impl_super(
 
     Ok(BytecodeModule {
         module: module_specifier.to_string(),
+        template_sites,
         source_kind: kind,
         functions,
         constants,
@@ -1518,6 +1520,7 @@ pub fn compile_module_program(
     let ModuleBuilder {
         functions,
         constants,
+        template_sites,
         next_private_namespace: _,
     } = Rc::try_unwrap(module)
         .expect("module builder should be uniquely owned at finalize")
@@ -1541,6 +1544,7 @@ pub fn compile_module_program(
 
     Ok(BytecodeModule {
         module: host.module_url.clone(),
+        template_sites,
         source_kind: kind,
         functions,
         constants,

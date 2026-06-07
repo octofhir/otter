@@ -99,6 +99,10 @@ impl<'a> RuntimeState<'a> {
                 visitor(p);
             }
         }
+        // 2b-ter) Template-object realm cache (§13.2.8.4).
+        for value in interp.template_objects_for_trace() {
+            value.trace_value_slots(visitor);
+        }
         // 2c) Global declarative-record cells (§9.1.1.4 script
         // top-level lexical bindings).
         for slot in interp.global_lexicals_for_trace() {

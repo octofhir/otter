@@ -37,6 +37,7 @@ fn full_gc_with_roots(
 fn empty_module() -> BytecodeModule {
     BytecodeModule {
         module: "weakref-finalization-test".to_string(),
+        template_sites: Vec::new(),
         source_kind: SourceKind::JavaScript,
         functions: Vec::new(),
         constants: Vec::new(),

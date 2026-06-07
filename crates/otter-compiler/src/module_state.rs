@@ -112,6 +112,8 @@ pub struct ModuleHostInfo {
 pub(crate) struct ModuleBuilder {
     pub(crate) functions: Vec<Function>,
     pub(crate) constants: Vec<Constant>,
+    /// §13.2.8.4 — tagged-template sites, one per Parse Node.
+    pub(crate) template_sites: Vec<otter_bytecode::TemplateSite>,
     /// Monotonic counter handed out by `compile_class` so each
     /// lexical class declaration owns a private-field namespace
     /// distinct from every other class — `class A { #x }` and

@@ -683,6 +683,7 @@ mod tests {
     fn empty_context() -> ExecutionContext {
         ExecutionContext::from_module(BytecodeModule {
             module: "reflect-test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![Function {
                 id: 0,

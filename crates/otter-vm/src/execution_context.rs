@@ -182,6 +182,12 @@ impl ExecutionContext {
             .expect("bytecode modules always carry main function 0")
     }
 
+    /// Tagged-template site descriptor (§13.2.8.4).
+    #[must_use]
+    pub fn template_site(&self, idx: u32) -> Option<&otter_bytecode::TemplateSite> {
+        self.module.template_sites.get(idx as usize)
+    }
+
     /// Module initialization records for linked module graphs.
     #[must_use]
     pub fn module_inits(&self) -> &[ModuleInit] {
@@ -441,6 +447,7 @@ mod tests {
     ) -> BytecodeModule {
         BytecodeModule {
             module: "<test>".to_string(),
+            template_sites: Vec::new(),
             source_kind: SourceKind::JavaScript,
             functions: vec![Function {
                 id: 0,

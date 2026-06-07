@@ -1227,6 +1227,11 @@ pub enum Op {
     /// capture (§9.1 — the eval declared it in this frame's variable
     /// environment, which sits inner to the captured one).
     LoadShadowedUpvalue,
+    /// `GetTemplateObject dst, site_const` — §13.2.8.4: the frozen
+    /// (with frozen non-enumerable `.raw`) template-strings object
+    /// for tagged-template site `site_const`, cached realm-wide per
+    /// site.
+    GetTemplateObject,
 }
 
 impl Op {
@@ -1391,6 +1396,7 @@ impl Op {
             Op::Increment => "INCREMENT",
             Op::PrivateBrandCheck => "PRIVATE_BRAND_CHECK",
             Op::LoadShadowedUpvalue => "LOAD_SHADOWED_UPVALUE",
+            Op::GetTemplateObject => "GET_TEMPLATE_OBJECT",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
@@ -1482,6 +1488,7 @@ impl Op {
             | Op::ToObject
             | Op::ToPropertyKey
             | Op::PrivateBrandCheck
+            | Op::GetTemplateObject
             | Op::ToNumeric => 2,
             Op::Increment
             | Op::LoadShadowedUpvalue
@@ -2079,6 +2086,17 @@ pub struct Function {
     pub spans: Vec<SpanEntry>,
 }
 
+/// One tagged-template call site (§13.2.8.4): cooked strings
+/// (`None` for invalid escape sequences, observed as `undefined`)
+/// plus the raw spellings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemplateSite {
+    /// Cooked values; `None` = invalid escape (undefined).
+    pub cooked: Vec<Option<String>>,
+    /// Raw source spellings.
+    pub raw: Vec<String>,
+}
+
 /// Runtime shape for a materialised `arguments` object.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2200,6 +2218,12 @@ pub enum Constant {
 pub struct BytecodeModule {
     /// Module specifier (origin path or virtual name).
     pub module: String,
+    /// §13.2.8.4 GetTemplateObject — one entry per tagged-template
+    /// Parse Node. The runtime caches the frozen template object
+    /// per site, so re-evaluating the same call site hands the tag
+    /// the SAME object.
+    #[serde(default)]
+    pub template_sites: Vec<TemplateSite>,
     /// JavaScript or TypeScript.
     pub source_kind: SourceKind,
     /// Function table; index 0 is `<main>`.

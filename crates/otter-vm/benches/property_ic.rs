@@ -96,6 +96,7 @@ fn named_property_loop(iterations: i32) -> ExecutionContext {
     ];
     ExecutionContext::from_module(BytecodeModule {
         module: "property-ic-bench.js".to_string(),
+        template_sites: Vec::new(),
         source_kind: SourceKind::JavaScript,
         functions: vec![Function {
             id: 0,
@@ -183,6 +184,7 @@ fn computed_string_property_loop(iterations: i32) -> ExecutionContext {
     ];
     ExecutionContext::from_module(BytecodeModule {
         module: "property-computed-bench.js".to_string(),
+        template_sites: Vec::new(),
         source_kind: SourceKind::JavaScript,
         functions: vec![Function {
             id: 0,
@@ -255,6 +257,7 @@ fn own_named_load_loop(iterations: i32) -> ExecutionContext {
     ];
     ExecutionContext::from_module(BytecodeModule {
         module: "property-own-load-bench.js".to_string(),
+        template_sites: Vec::new(),
         source_kind: SourceKind::JavaScript,
         functions: vec![Function {
             id: 0,
@@ -328,6 +331,7 @@ fn own_named_store_loop(iterations: i32) -> ExecutionContext {
     ];
     ExecutionContext::from_module(BytecodeModule {
         module: "property-own-store-bench.js".to_string(),
+        template_sites: Vec::new(),
         source_kind: SourceKind::JavaScript,
         functions: vec![Function {
             id: 0,
@@ -406,6 +410,7 @@ fn prototype_named_load_loop(iterations: i32) -> ExecutionContext {
     ];
     ExecutionContext::from_module(BytecodeModule {
         module: "property-prototype-load-bench.js".to_string(),
+        template_sites: Vec::new(),
         source_kind: SourceKind::JavaScript,
         functions: vec![Function {
             id: 0,
@@ -483,6 +488,7 @@ fn has_property_own_data_loop(iterations: i32) -> ExecutionContext {
     ];
     ExecutionContext::from_module(BytecodeModule {
         module: "property-has-own-bench.js".to_string(),
+        template_sites: Vec::new(),
         source_kind: SourceKind::JavaScript,
         functions: vec![Function {
             id: 0,
@@ -566,6 +572,7 @@ fn has_property_prototype_loop(iterations: i32) -> ExecutionContext {
     ];
     ExecutionContext::from_module(BytecodeModule {
         module: "property-has-prototype-bench.js".to_string(),
+        template_sites: Vec::new(),
         source_kind: SourceKind::JavaScript,
         functions: vec![Function {
             id: 0,
@@ -632,6 +639,7 @@ fn has_property_missing_loop(iterations: i32) -> ExecutionContext {
     ];
     ExecutionContext::from_module(BytecodeModule {
         module: "property-has-missing-bench.js".to_string(),
+        template_sites: Vec::new(),
         source_kind: SourceKind::JavaScript,
         functions: vec![Function {
             id: 0,
@@ -704,6 +712,7 @@ fn named_delete_own_data_loop(iterations: i32) -> ExecutionContext {
     ];
     ExecutionContext::from_module(BytecodeModule {
         module: "property-delete-own-bench.js".to_string(),
+        template_sites: Vec::new(),
         source_kind: SourceKind::JavaScript,
         functions: vec![Function {
             id: 0,
@@ -765,6 +774,7 @@ fn named_delete_missing_loop(iterations: i32) -> ExecutionContext {
     ];
     ExecutionContext::from_module(BytecodeModule {
         module: "property-delete-missing-bench.js".to_string(),
+        template_sites: Vec::new(),
         source_kind: SourceKind::JavaScript,
         functions: vec![Function {
             id: 0,
@@ -843,6 +853,7 @@ fn named_delete_inherited_present_loop(iterations: i32) -> ExecutionContext {
     ];
     ExecutionContext::from_module(BytecodeModule {
         module: "property-delete-inherited-bench.js".to_string(),
+        template_sites: Vec::new(),
         source_kind: SourceKind::JavaScript,
         functions: vec![Function {
             id: 0,

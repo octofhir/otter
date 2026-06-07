@@ -84,6 +84,7 @@ mod tests {
     fn empty_module_renders_banner_only() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: SourceKind::TypeScript,
             functions: vec![Function {
                 id: 0,
@@ -128,6 +129,7 @@ mod tests {
             .collect();
         let module = BytecodeModule {
             module: "all-opcodes.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: SourceKind::TypeScript,
             functions: vec![Function {
                 id: 0,
@@ -436,6 +438,7 @@ mod tests {
             Op::Increment => vec![reg(0), reg(1), imm(2)],
             Op::PrivateBrandCheck => vec![reg(0), reg(1)],
             Op::LoadShadowedUpvalue => vec![reg(0), konst(1), imm(2)],
+            Op::GetTemplateObject => vec![reg(0), konst(1)],
             Op::IteratorNext => vec![reg(0), reg(1), reg(2)],
             Op::GetAsyncIterator => vec![reg(0), reg(1)],
             Op::IteratorClose | Op::IteratorCloseStart | Op::IteratorCloseEnd => vec![reg(0)],

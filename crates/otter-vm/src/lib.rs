@@ -289,6 +289,10 @@ pub fn oom_to_vm(err: otter_gc::OutOfMemory) -> VmError {
 /// later switch to threaded dispatch after benchmark-driven review
 /// (foundation plan §"Interpreter requirements").
 pub struct Interpreter {
+    /// §13.2.8.4 GetTemplateObject realm cache — one frozen
+    /// template-strings object per tagged-template site, keyed by
+    /// `(chunk function_base, site index)`.
+    template_objects: rustc_hash::FxHashMap<(u32, u32), Value>,
     interrupt: InterruptFlag,
     /// Byte length of the instruction currently being dispatched. Set
     /// by `dispatch_loop_inner` right after each fetch and consumed by
@@ -586,6 +590,86 @@ impl Drop for Interpreter {
     }
 }
 
+impl Interpreter {
+    /// Root-tracing view of the template-object cache.
+    pub(crate) fn template_objects_for_trace(&self) -> impl Iterator<Item = &Value> {
+        self.template_objects.values()
+    }
+
+    /// §13.2.8.4 GetTemplateObject steps 7-15 — build the frozen
+    /// template-strings array with its frozen, non-enumerable `.raw`
+    /// companion.
+    fn build_template_object(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &SmallVec<[Frame; 8]>,
+        site_idx: u32,
+    ) -> Result<Value, VmError> {
+        let site = context
+            .template_site(site_idx)
+            .ok_or(VmError::InvalidOperand)?
+            .clone();
+        let mut cooked: Vec<Value> = Vec::with_capacity(site.cooked.len());
+        for entry in &site.cooked {
+            match entry {
+                Some(text) => {
+                    let s = JsString::from_str(text, &mut self.gc_heap)?;
+                    cooked.push(Value::string(s));
+                }
+                None => cooked.push(Value::undefined()),
+            }
+        }
+        let mut raw: Vec<Value> = Vec::with_capacity(site.raw.len());
+        for text in &site.raw {
+            let s = JsString::from_str(text, &mut self.gc_heap)?;
+            raw.push(Value::string(s));
+        }
+        let roots = self.collect_allocation_roots(stack);
+        let raw_value;
+        {
+            let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                for &slot in &roots {
+                    visitor(slot);
+                }
+                for v in cooked.iter().chain(raw.iter()) {
+                    v.trace_value_slots(visitor);
+                }
+            };
+            let raw_arr = crate::array::from_elements_with_roots(
+                &mut self.gc_heap,
+                raw.iter().copied(),
+                &mut visit,
+            )
+            .map_err(crate::oom_to_vm)?;
+            raw_value = Value::array(raw_arr);
+        }
+        let strings_arr;
+        {
+            let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                for &slot in &roots {
+                    visitor(slot);
+                }
+                for v in cooked.iter().chain(std::iter::once(&raw_value)) {
+                    v.trace_value_slots(visitor);
+                }
+            };
+            strings_arr = crate::array::from_elements_with_roots(
+                &mut self.gc_heap,
+                cooked.iter().copied(),
+                &mut visit,
+            )
+            .map_err(crate::oom_to_vm)?;
+        }
+        crate::array::set_named_property(strings_arr, &mut self.gc_heap, "raw", raw_value)
+            .map_err(|_| VmError::TypeMismatch)?;
+        if let Some(raw_arr) = raw_value.as_array() {
+            crate::array::prevent_extensions(raw_arr, &mut self.gc_heap);
+        }
+        crate::array::prevent_extensions(strings_arr, &mut self.gc_heap);
+        Ok(Value::array(strings_arr))
+    }
+}
+
 impl otter_gc::ExtraRootSource for Interpreter {
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
         crate::runtime_state::RuntimeState::new(self).trace_roots(visitor);
@@ -796,6 +880,7 @@ impl Interpreter {
             .expect("shape root fits within any positive cap");
         startup_timer.mark("vm_shape_runtime");
         let mut interp = Self {
+            template_objects: rustc_hash::FxHashMap::default(),
             interrupt: InterruptFlag::new(),
             current_byte_len: 1,
             gc_heap,
@@ -4687,6 +4772,29 @@ impl Interpreter {
                     self.run_declare_global_var_reg(context, frame, name_idx, configurable)?;
                     continue;
                 }
+                // §13.2.8.4 GetTemplateObject — realm-cached frozen
+                // template-strings object per tagged-template site.
+                Op::GetTemplateObject => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let site_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let key = (context.function_base(), site_idx);
+                    let value = match self.template_objects.get(&key) {
+                        Some(v) => *v,
+                        None => {
+                            let built = self.build_template_object(context, &*stack, site_idx)?;
+                            self.template_objects.insert(key, built);
+                            built
+                        }
+                    };
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, value)?;
+                    frame.advance_pc(self.current_byte_len)?;
+                    continue;
+                }
                 // §9.1 — captured-binding read in a frame whose
                 // function contains a direct eval: an
                 // eval-introduced var of the same name shadows the
@@ -6975,6 +7083,7 @@ mod tests {
     fn module_with(code: Vec<Instruction>, scratch: u16) -> BytecodeModule {
         BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, scratch, code)],
             constants: vec![],
@@ -7112,6 +7221,7 @@ mod tests {
         ];
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 5, main_code), callee],
             constants: vec![Constant::FunctionId { index: 1 }],
@@ -7183,6 +7293,7 @@ mod tests {
         ];
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 4, main_code), callee],
             constants: vec![Constant::FunctionId { index: 1 }],
@@ -7271,6 +7382,7 @@ mod tests {
         ];
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 5, main_code), callee],
             constants: vec![Constant::FunctionId { index: 1 }],
@@ -7331,6 +7443,7 @@ mod tests {
         ];
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 3, main_code), callee],
             constants: vec![
@@ -7471,6 +7584,7 @@ mod tests {
         let inner = test_function(1, "anonymous", 0, 1, Vec::new());
         let compiled = BytecodeModule {
             module: "eval.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 1, compiled_main), inner],
             constants: vec![Constant::FunctionId { index: 1 }],
@@ -7599,6 +7713,7 @@ mod tests {
 
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 3, Vec::new())],
             constants: vec![Constant::String {
@@ -7656,6 +7771,7 @@ mod tests {
     fn call_method_on_nullish_receiver_reports_type_error() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -7694,6 +7810,7 @@ mod tests {
     fn call_method_on_missing_primitive_method_reports_not_callable() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -7729,6 +7846,7 @@ mod tests {
     fn call_method_string_prototype_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -7772,6 +7890,7 @@ mod tests {
     fn call_method_number_prototype_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -7819,6 +7938,7 @@ mod tests {
     fn call_method_boolean_prototype_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -7861,6 +7981,7 @@ mod tests {
     fn call_method_bigint_prototype_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -7910,6 +8031,7 @@ mod tests {
     fn call_method_symbol_prototype_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -7953,6 +8075,7 @@ mod tests {
     fn call_method_weak_ref_prototype_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8005,6 +8128,7 @@ mod tests {
 
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8059,6 +8183,7 @@ mod tests {
     fn call_method_promise_expando_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8099,6 +8224,7 @@ mod tests {
     fn call_method_promise_prototype_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8142,6 +8268,7 @@ mod tests {
     fn call_method_array_own_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8185,6 +8312,7 @@ mod tests {
     fn call_method_regexp_own_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8226,6 +8354,7 @@ mod tests {
     fn call_method_regexp_prototype_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8270,6 +8399,7 @@ mod tests {
     fn call_method_date_prototype_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8316,6 +8446,7 @@ mod tests {
     fn call_method_date_setter_prototype_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8362,6 +8493,7 @@ mod tests {
     fn call_method_typed_array_own_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8414,6 +8546,7 @@ mod tests {
     fn call_method_typed_array_callback_prototype_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8468,6 +8601,7 @@ mod tests {
     fn call_method_typed_array_slice_prototype_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8522,6 +8656,7 @@ mod tests {
     fn call_method_iterator_prototype_non_callable_shadows_helper() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 3, Vec::new())],
             constants: vec![Constant::String {
@@ -8573,6 +8708,7 @@ mod tests {
     fn call_method_map_prototype_non_callable_shadows_builtin_for_each() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8616,6 +8752,7 @@ mod tests {
     fn call_method_set_prototype_non_callable_shadows_builtin_for_each() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8659,6 +8796,7 @@ mod tests {
     fn call_method_map_prototype_non_callable_shadows_map_method() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8702,6 +8840,7 @@ mod tests {
     fn call_method_set_prototype_non_callable_shadows_set_add() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8745,6 +8884,7 @@ mod tests {
     fn call_method_weak_map_prototype_non_callable_shadows_weak_map_method() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8788,6 +8928,7 @@ mod tests {
     fn call_method_weak_set_prototype_non_callable_shadows_weak_set_method() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8831,6 +8972,7 @@ mod tests {
     fn call_method_array_buffer_prototype_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8877,6 +9019,7 @@ mod tests {
     fn call_method_data_view_prototype_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8930,6 +9073,7 @@ mod tests {
     fn call_method_set_prototype_non_callable_shadows_es_set_method() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -8973,6 +9117,7 @@ mod tests {
     fn call_method_function_own_non_callable_shadows_call() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(1, "target", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -9013,6 +9158,7 @@ mod tests {
     fn call_method_function_own_non_callable_shadows_object_method() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(1, "target", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -9058,6 +9204,7 @@ mod tests {
     fn call_method_null_proto_object_missing_object_method_is_not_callable() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -9100,6 +9247,7 @@ mod tests {
 
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -9150,6 +9298,7 @@ mod tests {
     fn call_method_primitive_object_prototype_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
             constants: vec![Constant::String {
@@ -9203,6 +9352,7 @@ mod tests {
 
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 4, Vec::new())],
             constants: vec![Constant::String {
@@ -9370,6 +9520,7 @@ mod tests {
                 .unwrap();
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 3, Vec::new())],
             constants: vec![Constant::String {
@@ -9583,6 +9734,7 @@ mod tests {
         ];
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, main_code), cleanup],
             constants: vec![Constant::FunctionId { index: 1 }],
@@ -9644,6 +9796,7 @@ mod tests {
         ];
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 3, main_code), callee],
             constants: vec![Constant::FunctionId { index: 1 }],
@@ -9690,6 +9843,7 @@ mod tests {
         );
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![main.clone(), generator_body.clone()],
             constants: vec![Constant::String {
@@ -9737,6 +9891,7 @@ mod tests {
         let callee = test_function(1, "sloppy_callee", 0, 1, Vec::new());
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![main.clone(), callee],
             constants: Vec::new(),
@@ -9797,6 +9952,7 @@ mod tests {
         main.is_module = true;
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![main],
             constants: Vec::new(),
@@ -9838,6 +9994,7 @@ mod tests {
         ];
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, main_code)],
             constants: Vec::new(),
@@ -9867,6 +10024,7 @@ mod tests {
         function.is_async = true;
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![function],
             constants: Vec::new(),
@@ -10041,6 +10199,7 @@ mod tests {
         ];
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 4, main_code), ctor],
             constants: vec![Constant::FunctionId { index: 1 }],
@@ -10106,6 +10265,7 @@ mod tests {
         ];
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, main_code), ctor],
             constants: vec![Constant::FunctionId { index: 1 }],
@@ -10183,6 +10343,7 @@ mod tests {
         ];
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 4, main_code), ctor],
             constants: vec![Constant::FunctionId { index: 1 }],
@@ -10857,6 +11018,7 @@ mod tests {
         );
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 2, vec![]), ctor],
             constants: Vec::new(),
@@ -10973,6 +11135,7 @@ mod tests {
         );
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 1, Vec::new()), ctor],
             constants: Vec::new(),
@@ -11022,6 +11185,7 @@ mod tests {
         );
         let module = BytecodeModule {
             module: "test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![test_function(0, "<main>", 0, 1, Vec::new()), ctor],
             constants: Vec::new(),
@@ -11148,6 +11312,7 @@ mod tests {
         };
         let module = BytecodeModule {
             module: "arrow.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![main, arrow],
             constants: vec![],

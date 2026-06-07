@@ -1684,6 +1684,7 @@ mod tests {
         use otter_bytecode::{BytecodeModule, Function, Instruction, SourceKind, SpanEntry};
         crate::ExecutionContext::from_module(BytecodeModule {
             module: "regexp-proto-test.ts".to_string(),
+            template_sites: Vec::new(),
             source_kind: SourceKind::TypeScript,
             functions: vec![Function {
                 id: 0,

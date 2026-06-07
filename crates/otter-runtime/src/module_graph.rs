@@ -571,6 +571,7 @@ fn dynamic_literal_should_preload(specifier: &str) -> bool {
 fn hosted_module_fragment(url: &str) -> BytecodeModule {
     BytecodeModule {
         module: url.to_string(),
+        template_sites: Vec::new(),
         source_kind: BytecodeSourceKind::JavaScript,
         functions: vec![Function {
             id: 0,
@@ -1180,6 +1181,7 @@ fn link(nodes: &BTreeMap<String, ModuleNode>, order: &[String], entry_url: &str)
 
     BytecodeModule {
         module: entry_url.to_string(),
+        template_sites: Vec::new(),
         source_kind: BytecodeSourceKind::TypeScript,
         functions,
         constants,

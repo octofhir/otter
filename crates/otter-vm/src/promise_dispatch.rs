@@ -3179,6 +3179,7 @@ mod tests {
     fn empty_context() -> ExecutionContext {
         ExecutionContext::from_module(BytecodeModule {
             module: "promise-dispatch-test".to_string(),
+            template_sites: Vec::new(),
             source_kind: SourceKind::JavaScript,
             functions: Vec::new(),
             constants: Vec::new(),

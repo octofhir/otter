@@ -156,44 +156,75 @@ pub(crate) fn compile_tagged_template(
         return compile_string_raw_template(cx, &t.quasi, span);
     }
 
-    let tag_reg = compile_expr(cx, &t.tag, span)?;
+    // §13.3.11.1 — a member-expression tag receives its base as
+    // `this` (`obj.tag\`…\`` calls with this = obj).
+    let (tag_reg, this_reg): (u16, Option<u16>) = match &t.tag {
+        Expression::StaticMemberExpression(m) if !matches!(m.object, Expression::Super(_)) => {
+            let obj_reg = compile_expr(cx, &m.object, span)?;
+            let callee = cx.alloc_scratch();
+            let name_idx = cx.intern_string_constant(m.property.name.as_str());
+            cx.emit(
+                Op::LoadProperty,
+                vec![
+                    Operand::Register(callee),
+                    Operand::Register(obj_reg),
+                    Operand::ConstIndex(name_idx),
+                ],
+                span,
+            );
+            (callee, Some(obj_reg))
+        }
+        Expression::ComputedMemberExpression(m) if !matches!(m.object, Expression::Super(_)) => {
+            let obj_reg = compile_expr(cx, &m.object, span)?;
+            let key_reg = compile_expr(cx, &m.expression, span)?;
+            let callee = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadElement,
+                vec![
+                    Operand::Register(callee),
+                    Operand::Register(obj_reg),
+                    Operand::Register(key_reg),
+                ],
+                span,
+            );
+            (callee, Some(obj_reg))
+        }
+        other => (compile_expr(cx, other, span)?, None),
+    };
 
-    // Build cooked + raw quasi arrays.
-    let mut cooked_regs: Vec<u16> = Vec::with_capacity(t.quasi.quasis.len());
-    let mut raw_regs: Vec<u16> = Vec::with_capacity(t.quasi.quasis.len());
-    for q in t.quasi.quasis.iter() {
-        let cooked = q.value.cooked.as_deref().unwrap_or("");
-        let raw = q.value.raw.as_str();
-        let cr = cx.alloc_scratch();
-        let ci = cx.intern_string_constant(cooked);
-        cx.emit(
-            Op::LoadString,
-            [Operand::Register(cr), Operand::ConstIndex(ci)],
-            span,
-        );
-        let rr = cx.alloc_scratch();
-        let ri = cx.intern_string_constant(raw);
-        cx.emit(
-            Op::LoadString,
-            [Operand::Register(rr), Operand::ConstIndex(ri)],
-            span,
-        );
-        cooked_regs.push(cr);
-        raw_regs.push(rr);
-    }
-
-    // Materialise the cooked + raw arrays. Dense `NewArray` caps
-    // operand count at `u8::MAX` (255); template literals with more
-    // than a couple hundred quasis fall back to the per-element
-    // `ArrayPush` form so the wire encoder never panics. The
-    // threshold matches `compile_array_literal::DENSE_NEW_ARRAY_MAX_ELEMENTS`.
+    // §13.2.8.4 GetTemplateObject — register this Parse Node as a
+    // template site; the runtime caches the frozen strings object
+    // per site so every evaluation hands the tag the SAME object.
+    let site = otter_bytecode::TemplateSite {
+        cooked: t
+            .quasi
+            .quasis
+            .iter()
+            .map(|q| q.value.cooked.as_ref().map(|c| c.to_string()))
+            .collect(),
+        raw: t
+            .quasi
+            .quasis
+            .iter()
+            .map(|q| q.value.raw.to_string())
+            .collect(),
+    };
+    let site_idx = {
+        let module = Rc::clone(&cx.top_mut().module);
+        let mut m = module.borrow_mut();
+        let idx = m.template_sites.len() as u32;
+        m.template_sites.push(site);
+        idx
+    };
     let strings_reg = cx.alloc_scratch();
-    emit_array_from_regs(cx, strings_reg, &cooked_regs, span);
-    let raw_arr_reg = cx.alloc_scratch();
-    emit_array_from_regs(cx, raw_arr_reg, &raw_regs, span);
-
-    // Attach `strings.raw = raw_arr`.
-    cx.emit_store_property(strings_reg, "raw", raw_arr_reg, span);
+    cx.emit(
+        Op::GetTemplateObject,
+        [
+            Operand::Register(strings_reg),
+            Operand::ConstIndex(site_idx),
+        ],
+        span,
+    );
 
     // Evaluate interpolations.
     let mut arg_regs: Vec<u16> = Vec::with_capacity(1 + t.quasi.expressions.len());
@@ -210,18 +241,32 @@ pub(crate) fn compile_tagged_template(
     if arg_regs.len() > DENSE_CALL_MAX_ARGS {
         let args_arr = cx.alloc_scratch();
         emit_array_from_regs(cx, args_arr, &arg_regs, span);
-        let this_undef = cx.alloc_scratch();
-        cx.emit(Op::LoadUndefined, [Operand::Register(this_undef)], span);
+        let this_value = match this_reg {
+            Some(r) => r,
+            None => {
+                let r = cx.alloc_scratch();
+                cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
+                r
+            }
+        };
         cx.emit(
             Op::CallSpread,
             vec![
                 Operand::Register(dst),
                 Operand::Register(tag_reg),
-                Operand::Register(this_undef),
+                Operand::Register(this_value),
                 Operand::Register(args_arr),
             ],
             span,
         );
+    } else if let Some(this_reg) = this_reg {
+        let mut call_operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
+        call_operands.push(Operand::Register(dst));
+        call_operands.push(Operand::Register(tag_reg));
+        call_operands.push(Operand::Register(this_reg));
+        call_operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        call_operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::CallWithThis, call_operands, span);
     } else {
         let mut call_operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
         call_operands.push(Operand::Register(dst));

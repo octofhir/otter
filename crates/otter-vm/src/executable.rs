@@ -528,6 +528,7 @@ mod tests {
     fn module(function: Function) -> BytecodeModule {
         BytecodeModule {
             module: "exec-test".to_string(),
+            template_sites: Vec::new(),
             source_kind: SourceKind::JavaScript,
             functions: vec![function],
             constants: Vec::new(),

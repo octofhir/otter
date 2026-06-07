@@ -963,5 +963,6 @@ mod tests {
         Op::Increment,
         Op::PrivateBrandCheck,
         Op::LoadShadowedUpvalue,
+        Op::GetTemplateObject,
     ];
 }

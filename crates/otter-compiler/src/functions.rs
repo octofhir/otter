@@ -134,7 +134,11 @@ pub(crate) fn compile_function_full(
 
     // Bind self-name for recursion. Capture operands are finalized after
     // body lowering because parent captures are discovered lazily.
+    let fn_self_immutable = std::mem::take(&mut parent.fn_self_immutable_hint);
     let self_storage = parent.declare_binding(name, false, span)?;
+    if fn_self_immutable {
+        parent.top_mut().mark_fn_self_name(name);
+    }
     let const_idx = parent.intern_function_id(function_id);
     let tmp = parent.alloc_scratch();
     let self_make_idx = parent.code.len();

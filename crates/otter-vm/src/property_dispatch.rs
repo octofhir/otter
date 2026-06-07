@@ -1989,7 +1989,25 @@ impl Interpreter {
                 }
             }
         } else {
-            return Err(VmError::TypeMismatch);
+            // Remaining object-typed receivers (class constructors,
+            // module namespaces, ...) resolve through the generic
+            // value-level [[Get]] funnel.
+            let key = if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
+                VmPropertyKey::Symbol(sym)
+            } else if let Some(k) = idx_value.as_string(&self.gc_heap) {
+                VmPropertyKey::OwnedString(k.to_lossy_string(&self.gc_heap))
+            } else if let Some(n) = idx_value.as_number() {
+                VmPropertyKey::OwnedString(n.to_display_string())
+            } else {
+                return Err(VmError::TypeMismatch);
+            };
+            match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                crate::VmGetOutcome::Value(v) => v,
+                crate::VmGetOutcome::InvokeGetter { getter } => {
+                    let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                    self.run_callable_sync(context, &getter, recv, args)?
+                }
+            }
         };
         write_register(frame, dst, value)?;
         frame.advance_pc(self.current_byte_len)?;
@@ -2903,6 +2921,7 @@ impl Interpreter {
             || receiver.is_finalization_registry()
             || receiver.is_promise()
             || receiver.is_array_buffer()
+            || receiver.is_class_constructor()
             || receiver.is_data_view();
         if prototype_routed {
             stack[top_idx].advance_pc(self.current_byte_len)?;

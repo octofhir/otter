@@ -218,6 +218,9 @@ pub(crate) fn compile_expr(
                 f.id.as_ref()
                     .map(|id| id.name.as_str().to_string())
                     .unwrap_or_else(|| "<anonymous>".to_string());
+            // §10.2.11 — a NAMED function expression's self-name
+            // binding is immutable inside the body.
+            cx.fn_self_immutable_hint = f.id.is_some();
             let (function_id, captures) = compile_function_full(
                 cx,
                 &name,

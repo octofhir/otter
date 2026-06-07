@@ -37,6 +37,11 @@ pub(crate) struct BindingInfo {
     /// `StoreLocal` / `StoreUpvalue`. Reads before that emit
     /// `Op::TdzError`.
     pub(crate) initialized: bool,
+    /// §10.2.11 — `true` for a named function expression's own-name
+    /// binding: immutable, but assignment is a TypeError only in
+    /// strict mode (sloppy writes are silently dropped after the RHS
+    /// evaluates).
+    pub(crate) fn_self_name: bool,
 }
 
 /// Where a binding lives in the running frame.

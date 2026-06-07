@@ -334,6 +334,69 @@ pub(crate) fn compile_assignment(
     // upvalue cell for the hole. Same-function stores never need this —
     // the static `binding_uninitialized` path covers their TDZ.
     let mut capture_store = false;
+    // §10.2.11 — a named function expression's self-name binding is
+    // immutable: the RHS still evaluates, then strict mode throws
+    // TypeError while sloppy mode silently drops the write. Covers
+    // both the local binding and a capture from an enclosing
+    // function-expression body (arrows).
+    let fn_self_target = match cx.lookup_binding(&name) {
+        Some(info) => info.fn_self_name,
+        None => cx.stack.iter().rev().skip(1).any(|frame| {
+            frame
+                .scopes
+                .iter()
+                .rev()
+                .find_map(|scope| scope.bindings.get(&name))
+                .is_some_and(|info| info.fn_self_name)
+        }),
+    };
+    if fn_self_target && compound_op.is_none() {
+        let value = crate::expr::compile_expr_with_inferred_name(cx, &a.right, &name, span)?;
+        if cx.is_strict {
+            return Ok(emit_assignment_type_error(
+                cx,
+                &format!("Assignment to constant variable '{name}'."),
+                span,
+            ));
+        }
+        return Ok(value);
+    }
+    if fn_self_target {
+        // Compound assignment reads the current value, evaluates the
+        // RHS, then hits the same immutable-store rule.
+        let storage = cx
+            .lookup_binding(&name)
+            .map(|info| info.storage)
+            .or_else(|| {
+                cx.resolve_capture(&name)
+                    .map(|idx| BindingStorage::Upvalue { idx })
+            });
+        let current = cx.alloc_scratch();
+        if let Some(s) = storage {
+            cx.emit_load_storage(current, s, span);
+        }
+        let rhs = compile_expr(cx, &a.right, span)?;
+        let op = compound_op.expect("guarded");
+        let (cur_p, rhs_p) = coerce_compound_operands(cx, op, current, rhs, span);
+        let dst = cx.alloc_scratch();
+        cx.emit(
+            op,
+            vec![
+                Operand::Register(dst),
+                Operand::Register(cur_p),
+                Operand::Register(rhs_p),
+            ],
+            span,
+        );
+        if cx.is_strict {
+            return Ok(emit_assignment_type_error(
+                cx,
+                &format!("Assignment to constant variable '{name}'."),
+                span,
+            ));
+        }
+        return Ok(dst);
+    }
     let storage = match cx.lookup_binding(&name) {
         Some(info) if info.is_const => {
             return Err(CompileError::Unsupported {

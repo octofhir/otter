@@ -23,6 +23,13 @@ use crate::*;
 #[derive(Debug)]
 pub(crate) struct Compiler {
     pub(crate) stack: Vec<FunctionContext>,
+    /// One-shot hint set by the NAMED FunctionExpression lowering:
+    /// the next `compile_function_full` marks its self-name binding
+    /// as the §10.2.11 immutable function-expression name (strict
+    /// assignment throws TypeError; sloppy writes are dropped).
+    /// Function declarations leave this false — their name resolves
+    /// to the outer mutable var binding.
+    pub(crate) fn_self_immutable_hint: bool,
     /// Stack of private-field namespace ids — one per enclosing
     /// class declaration. The top entry is the namespace used to
     /// mangle every `#name` reference inside the current class
@@ -79,6 +86,7 @@ impl Compiler {
     pub(crate) fn new(top: FunctionContext) -> Self {
         Self {
             stack: vec![top],
+            fn_self_immutable_hint: false,
             private_namespaces: Vec::new(),
             class_private_names: Vec::new(),
             suppress_global_mirror: false,

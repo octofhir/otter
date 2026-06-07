@@ -368,6 +368,7 @@ pub(crate) fn compile_program_with_mode_impl(
                     storage: BindingStorage::Upvalue { idx: slot as u16 },
                     is_const: false,
                     initialized: true,
+                    fn_self_name: false,
                 },
             );
         }
@@ -1025,6 +1026,7 @@ pub fn compile_module_program(
                 storage: BindingStorage::Upvalue { idx: env_uv_sb },
                 is_const: true,
                 initialized: true,
+                fn_self_name: false,
             },
         );
         cx.scopes[0].bindings.insert(
@@ -1033,6 +1035,7 @@ pub fn compile_module_program(
                 storage: BindingStorage::Upvalue { idx: meta_uv_sb },
                 is_const: true,
                 initialized: true,
+                fn_self_name: false,
             },
         );
         for uv in &record_uvs {
@@ -1042,6 +1045,7 @@ pub fn compile_module_program(
                     storage: BindingStorage::Upvalue { idx: *uv },
                     is_const: true,
                     initialized: true,
+                    fn_self_name: false,
                 },
             );
         }

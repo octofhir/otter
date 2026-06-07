@@ -3306,6 +3306,16 @@ impl Interpreter {
                 )));
             }
             let statics = class.statics(&self.gc_heap);
+            // `name` / `length` live on the backing constructor
+            // function (user-property overrides and deletions
+            // included) unless a static member shadows them.
+            if let Some(k) = key.string_name()
+                && (k == "name" || k == "length")
+                && object::get_own_descriptor(statics, &self.gc_heap, k).is_none()
+            {
+                let ctor = class.ctor(&self.gc_heap);
+                return self.ordinary_get_value(context, ctor, receiver, key, hops + 1);
+            }
             let outcome =
                 self.ordinary_get_value(context, Value::object(statics), receiver, key, hops + 1)?;
             let value = match &outcome {

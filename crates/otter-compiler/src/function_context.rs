@@ -292,6 +292,7 @@ impl FunctionContext {
                 storage,
                 is_const,
                 initialized: false,
+                fn_self_name: false,
             },
         );
         Ok(storage)
@@ -332,6 +333,7 @@ impl FunctionContext {
                 storage,
                 is_const,
                 initialized: false,
+                fn_self_name: false,
             },
         );
         Ok(storage)
@@ -361,6 +363,18 @@ impl FunctionContext {
     /// "merge" branch states — task 14 ships the simple definite-
     /// assignment rule and leaves branch-aware refinement for a
     /// future slice.
+    /// Flag `name`'s innermost binding as a §10.2.11 named
+    /// function expression self-name (immutable; sloppy writes
+    /// silently drop, strict writes throw TypeError).
+    pub(crate) fn mark_fn_self_name(&mut self, name: &str) {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(info) = scope.bindings.get_mut(name) {
+                info.fn_self_name = true;
+                return;
+            }
+        }
+    }
+
     pub(crate) fn mark_initialized(&mut self, name: &str) {
         for scope in self.scopes.iter_mut().rev() {
             if let Some(info) = scope.bindings.get_mut(name) {

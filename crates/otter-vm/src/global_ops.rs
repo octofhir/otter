@@ -333,10 +333,15 @@ impl Interpreter {
     /// Look up an eval-introduced var binding on `frame`'s cold
     /// record.
     fn frame_eval_var(&self, frame: &Frame, name: &str) -> Option<crate::UpvalueCell> {
-        self.frame_cold(frame)
-            .and_then(|cold| cold.eval_vars.as_ref())
-            .and_then(|map| map.get(name))
-            .copied()
+        let cold = self.frame_cold(frame)?;
+        if let Some(cell) = cold.eval_vars.as_ref().and_then(|map| map.get(name)) {
+            return Some(*cell);
+        }
+        // §9.1 — eval-introduced bindings of enclosing functions
+        // reach this frame through the closure-captured environment
+        // chain.
+        let env = cold.eval_env?;
+        crate::eval_env::eval_env_lookup(&self.gc_heap, env, name)
     }
 
     /// `Op::DeclareGlobalLex` — §9.1.1.4 CreateMutableBinding /

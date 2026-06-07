@@ -55,6 +55,7 @@ pub mod console;
 mod constant_ops;
 mod conversion;
 pub mod date;
+pub mod eval_env;
 // `date` is a directory module — see `date/mod.rs`.
 pub mod bootstrap;
 pub mod bootstrap_array_buffer;
@@ -3109,7 +3110,7 @@ impl Interpreter {
                 }
             };
         }
-        let (function_id, parent_upvalues, this_for_callee, _new_target_for_callee) =
+        let (function_id, parent_upvalues, this_for_callee, _new_target_for_callee, _callee_env) =
             match Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap) {
                 Ok(parts) => parts,
                 Err(error) => {
@@ -10649,7 +10650,7 @@ mod tests {
         assert!(is_callable(&Value::function(7)));
         let mut closure_heap = otter_gc::GcHeap::new().expect("closure heap");
         let closure_handle =
-            crate::closure::alloc_closure(&mut closure_heap, 7, Vec::new(), None, None)
+            crate::closure::alloc_closure(&mut closure_heap, 7, Vec::new(), None, None, None)
                 .expect("closure");
         assert!(is_callable(&Value::closure(closure_handle)));
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
@@ -11124,6 +11125,7 @@ mod tests {
             1,
             Vec::new(),
             Some(Value::string(bound)),
+            None,
             None,
         )
         .expect("closure alloc");

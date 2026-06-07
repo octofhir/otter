@@ -277,10 +277,32 @@ impl Interpreter {
                 .and_then(|cold| cold.new_target)
         };
         if !adopted.is_empty() {
-            let cold = self.frame_ensure_cold(&mut stack[top_idx]);
-            let map = cold.eval_vars.get_or_insert_default();
+            // §9.1 — adopted bindings land in BOTH stores: the
+            // legacy per-frame map (same-frame dynamic reads) and
+            // the GC-owned eval environment record that closures
+            // created in this frame capture (cross-closure and
+            // outlives-the-frame visibility).
+            let env = self
+                .frame_cold(&stack[top_idx])
+                .and_then(|cold| cold.eval_env);
+            let env = match env {
+                Some(env) => Some(env),
+                None => {
+                    let fresh = crate::eval_env::alloc_eval_env(&mut self.gc_heap, None)
+                        .map_err(crate::oom_to_vm)?;
+                    self.frame_ensure_cold(&mut stack[top_idx]).eval_env = Some(fresh);
+                    Some(fresh)
+                }
+            };
             for (name, cell) in adopted {
-                map.insert(name, cell);
+                {
+                    let cold = self.frame_ensure_cold(&mut stack[top_idx]);
+                    let map = cold.eval_vars.get_or_insert_default();
+                    map.insert(name.clone(), cell);
+                }
+                if let Some(env) = env {
+                    crate::eval_env::eval_env_insert(&mut self.gc_heap, env, name, cell);
+                }
             }
         }
         let main = context.exec_main();

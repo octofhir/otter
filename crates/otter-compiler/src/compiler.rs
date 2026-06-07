@@ -128,6 +128,14 @@ impl Compiler {
         }
     }
 
+    /// `true` when ANY function on the compile stack contains a
+    /// direct eval call site — free identifiers must then resolve
+    /// dynamically (the eval may have introduced the name into an
+    /// enclosing variable environment at runtime).
+    pub(crate) fn any_enclosing_direct_eval(&self) -> bool {
+        self.stack.iter().any(|frame| frame.contains_direct_eval)
+    }
+
     pub(crate) fn current_private_namespace(&self) -> Option<u32> {
         self.private_namespaces.last().copied()
     }

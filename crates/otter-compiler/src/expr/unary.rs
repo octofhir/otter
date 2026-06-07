@@ -168,7 +168,7 @@ pub(crate) fn compile_unary(
             let name_idx = cx.intern_string_constant(name);
             // An eval-introduced frame binding shadows the global
             // fallback inside a function with a direct eval.
-            let op = if cx.contains_direct_eval {
+            let op = if cx.any_enclosing_direct_eval() {
                 Op::TypeofDynamic
             } else {
                 Op::LoadGlobalOrUndefined

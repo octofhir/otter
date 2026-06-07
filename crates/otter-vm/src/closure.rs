@@ -63,6 +63,11 @@ pub struct JsClosureBody {
     /// Arrow closures: lexical `new.target` captured from the
     /// enclosing frame. Non-arrow closures: `None`.
     pub bound_new_target: Option<Value>,
+    /// §9.1 — the creating frame's direct-eval variable environment
+    /// (when any enclosing function contains a direct eval call
+    /// site). Calls re-expose it so eval-introduced `var` bindings
+    /// stay visible through this closure's scope chain.
+    pub eval_env: Option<crate::eval_env::EvalEnvHandle>,
 }
 
 /// 4-byte compressed `Gc<JsClosureBody>` handle to the underlying
@@ -132,6 +137,12 @@ impl JsClosure {
         heap.read_payload(self.handle, |body| body.bound_new_target)
     }
 
+    /// Captured direct-eval variable environment, if any.
+    #[must_use]
+    pub fn eval_env(self, heap: &GcHeap) -> Option<crate::eval_env::EvalEnvHandle> {
+        heap.read_payload(self.handle, |body| body.eval_env)
+    }
+
     /// Number of captured upvalue cells. Reads the body once.
     #[must_use]
     pub fn upvalue_count(self, heap: &GcHeap) -> usize {
@@ -189,12 +200,14 @@ pub fn alloc_closure(
     upvalues: Vec<UpvalueCell>,
     bound_this: Option<Value>,
     bound_new_target: Option<Value>,
+    eval_env: Option<crate::eval_env::EvalEnvHandle>,
 ) -> Result<JsClosure, OutOfMemory> {
     let handle = heap.alloc_old(JsClosureBody {
         function_id,
         upvalues,
         bound_this,
         bound_new_target,
+        eval_env,
     })?;
     Ok(JsClosure::from_parts(handle, function_id))
 }
@@ -215,6 +228,7 @@ pub fn alloc_closure_with_roots(
     upvalues: Vec<UpvalueCell>,
     bound_this: Option<Value>,
     bound_new_target: Option<Value>,
+    eval_env: Option<crate::eval_env::EvalEnvHandle>,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsClosure, OutOfMemory> {
     let handle = heap.alloc_with_roots(
@@ -223,6 +237,7 @@ pub fn alloc_closure_with_roots(
             upvalues,
             bound_this,
             bound_new_target,
+            eval_env,
         },
         external_visit,
     )?;
@@ -237,7 +252,7 @@ mod tests {
     #[test]
     fn allocates_empty_closure() {
         let mut heap = GcHeap::new().expect("heap");
-        let closure = alloc_closure(&mut heap, 7, Vec::new(), None, None).expect("alloc");
+        let closure = alloc_closure(&mut heap, 7, Vec::new(), None, None, None).expect("alloc");
         assert_eq!(closure.function_id(), 7);
         heap.read_payload(closure.handle(), |body| {
             assert_eq!(body.function_id, 7);
@@ -253,7 +268,7 @@ mod tests {
         let cell_b = alloc_upvalue(&mut heap, Value::undefined()).expect("cell");
         let upvalues = vec![cell_a, cell_b];
         let closure =
-            alloc_closure(&mut heap, 42, upvalues, Some(Value::null()), None).expect("alloc");
+            alloc_closure(&mut heap, 42, upvalues, Some(Value::null()), None, None).expect("alloc");
         assert_eq!(closure.function_id(), 42);
         assert_eq!(closure.upvalue_count(&heap), 2);
         heap.read_payload(closure.handle(), |body| {

@@ -221,7 +221,7 @@ fn compile_identifier_without_with(
     // <https://tc39.es/ecma262/#sec-getvalue>
     let dst = cx.alloc_scratch();
     let name_idx = cx.intern_string_constant(name);
-    let op = if cx.contains_direct_eval {
+    let op = if cx.any_enclosing_direct_eval() {
         Op::LoadDynamic
     } else {
         Op::LoadGlobalOrThrow

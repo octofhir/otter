@@ -100,7 +100,38 @@ struct PreparedBytecodeFrame {
     generator_function_id: u32,
 }
 
+/// `(function_id, upvalues, this, new_target, eval_env)` resolved
+/// from a callable value for a bytecode call.
+pub(crate) type BytecodeCallTargetParts = (
+    u32,
+    crate::frame_state::UpvalueSpine,
+    Value,
+    Option<Value>,
+    Option<crate::eval_env::EvalEnvHandle>,
+);
+
 impl Interpreter {
+    /// §9.1 — install the frame's direct-eval variable environment:
+    /// a `contains_direct_eval` function gets a FRESH record chained
+    /// to the closure's captured one (so probe closures created
+    /// before the eval observe later bindings); other closures just
+    /// re-expose the captured record for the dynamic walkers.
+    pub(crate) fn stash_frame_eval_env(
+        &mut self,
+        function: &crate::executable::ExecutableFunction,
+        frame: &mut Frame,
+        inherited: Option<crate::eval_env::EvalEnvHandle>,
+    ) -> Result<(), VmError> {
+        if function.contains_direct_eval {
+            let env = crate::eval_env::alloc_eval_env(&mut self.gc_heap, inherited)
+                .map_err(crate::oom_to_vm)?;
+            self.frame_ensure_cold(frame).eval_env = Some(env);
+        } else if inherited.is_some() {
+            self.frame_ensure_cold(frame).eval_env = inherited;
+        }
+        Ok(())
+    }
+
     pub(crate) fn bind_bytecode_call_arguments(
         &mut self,
         function: &ExecutableFunction,
@@ -142,19 +173,32 @@ impl Interpreter {
         current: Value,
         effective_this: Value,
         heap: &otter_gc::GcHeap,
-    ) -> Result<(u32, crate::frame_state::UpvalueSpine, Value, Option<Value>), VmError> {
+    ) -> Result<BytecodeCallTargetParts, VmError> {
         if let Some(function_id) = current.as_function() {
-            return Ok((function_id, Frame::empty_upvalues(), effective_this, None));
+            return Ok((
+                function_id,
+                Frame::empty_upvalues(),
+                effective_this,
+                None,
+                None,
+            ));
         }
         if let Some(c) = current.as_closure(heap) {
             let function_id = c.function_id();
-            let (upvalues, bound_this, bound_new_target) = heap.read_payload(c.handle, |body| {
-                let ups: crate::frame_state::UpvalueSpine =
-                    body.upvalues.clone().into_boxed_slice();
-                (ups, body.bound_this, body.bound_new_target)
-            });
+            let (upvalues, bound_this, bound_new_target, eval_env) =
+                heap.read_payload(c.handle, |body| {
+                    let ups: crate::frame_state::UpvalueSpine =
+                        body.upvalues.clone().into_boxed_slice();
+                    (ups, body.bound_this, body.bound_new_target, body.eval_env)
+                });
             let this_value = bound_this.unwrap_or(effective_this);
-            return Ok((function_id, upvalues, this_value, bound_new_target));
+            return Ok((
+                function_id,
+                upvalues,
+                this_value,
+                bound_new_target,
+                eval_env,
+            ));
         }
         Err(VmError::NotCallable)
     }
@@ -301,6 +345,7 @@ impl Interpreter {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_bytecode_call_frame(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
@@ -309,6 +354,7 @@ impl Interpreter {
         parent_upvalues: UpvalueSpine,
         this_for_callee: Value,
         new_target_for_callee: Option<Value>,
+        callee_eval_env: Option<crate::eval_env::EvalEnvHandle>,
         effective_args: SmallVec<[Value; 8]>,
         dst: u16,
     ) -> Result<(), VmError> {
@@ -361,6 +407,7 @@ impl Interpreter {
             let cold = self.frame_ensure_cold(&mut new_frame);
             cold.new_target = Some(new_target);
         }
+        self.stash_frame_eval_env(function, &mut new_frame, callee_eval_env)?;
         self.bind_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
         // §27.5 Generator-call entry: instead of pushing the frame
         // onto the dispatch stack, hand the caller a paused
@@ -403,6 +450,7 @@ impl Interpreter {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_bytecode_call_frame_from_window(
         &mut self,
         context: &ExecutionContext,
@@ -411,6 +459,7 @@ impl Interpreter {
         parent_upvalues: UpvalueSpine,
         this_for_callee: Value,
         new_target_for_callee: Option<Value>,
+        callee_eval_env: Option<crate::eval_env::EvalEnvHandle>,
         args: &BytecodeArgumentWindow<'_>,
         return_register: Option<u16>,
         async_state: Option<AsyncFrameState>,
@@ -439,6 +488,7 @@ impl Interpreter {
             let cold = self.frame_ensure_cold(&mut frame);
             cold.new_target = Some(new_target);
         }
+        self.stash_frame_eval_env(function, &mut frame, callee_eval_env)?;
         Ok(PreparedBytecodeFrame {
             frame,
             is_generator: function.is_generator,
@@ -536,7 +586,7 @@ impl Interpreter {
         if !current.is_function() && !current.is_closure() {
             return Ok(false);
         }
-        let (function_id, parent_upvalues, this_for_callee, new_target_for_callee) =
+        let (function_id, parent_upvalues, this_for_callee, new_target_for_callee, callee_eval_env) =
             Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
         let function = context
             .exec_function(function_id)
@@ -567,6 +617,7 @@ impl Interpreter {
                 parent_upvalues,
                 this_for_callee,
                 new_target_for_callee,
+                callee_eval_env,
                 &args,
                 return_register,
                 async_state,
@@ -730,8 +781,13 @@ impl Interpreter {
             break;
         }
         if current.is_function() || current.is_closure() {
-            let (function_id, parent_upvalues, this_for_callee, new_target_for_callee) =
-                Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
+            let (
+                function_id,
+                parent_upvalues,
+                this_for_callee,
+                new_target_for_callee,
+                callee_eval_env,
+            ) = Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
             return self.push_bytecode_call_frame(
                 stack,
                 context,
@@ -739,6 +795,7 @@ impl Interpreter {
                 parent_upvalues,
                 this_for_callee,
                 new_target_for_callee,
+                callee_eval_env,
                 effective_args,
                 dst,
             );
@@ -816,7 +873,7 @@ impl Interpreter {
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(());
         }
-        let (function_id, parent_upvalues, this_for_callee, new_target_for_callee) =
+        let (function_id, parent_upvalues, this_for_callee, new_target_for_callee, callee_eval_env) =
             Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
         self.push_bytecode_call_frame(
             stack,
@@ -825,6 +882,7 @@ impl Interpreter {
             parent_upvalues,
             this_for_callee,
             new_target_for_callee,
+            callee_eval_env,
             effective_args,
             dst,
         )
@@ -1528,7 +1586,7 @@ impl Interpreter {
                 effective_args.as_slice(),
             );
         }
-        let (function_id, parent_upvalues, this_for_callee, new_target_for_callee) =
+        let (function_id, parent_upvalues, this_for_callee, new_target_for_callee, callee_eval_env) =
             Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
         let function = context
             .exec_function(function_id)
@@ -1547,6 +1605,7 @@ impl Interpreter {
             let cold = self.frame_ensure_cold(&mut new_frame);
             cold.new_target = Some(new_target);
         }
+        self.stash_frame_eval_env(function, &mut new_frame, callee_eval_env)?;
         self.bind_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
         // §27.5.1 GeneratorFunction call evaluation returns a
         // generator object without executing the body. `invoke`

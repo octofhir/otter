@@ -1352,7 +1352,7 @@ pub(crate) fn store_identifier(
             // §10.2.4.2 PutValue — inside a sloppy function with a
             // direct eval the name may resolve to an eval-introduced
             // frame binding before the global environment.
-            if cx.contains_direct_eval && !cx.is_strict {
+            if cx.any_enclosing_direct_eval() && !cx.is_strict {
                 let name_idx = cx.intern_string_constant(name);
                 cx.emit(
                     Op::StoreDynamic,

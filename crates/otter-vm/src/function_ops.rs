@@ -40,7 +40,7 @@ enum BindMetadataGet {
 
 impl Interpreter {
     pub(crate) fn run_make_function_reg(
-        &self,
+        &mut self,
         context: &ExecutionContext,
         frame: &mut Frame,
         dst: u16,
@@ -49,6 +49,29 @@ impl Interpreter {
         let function_id = context
             .function_id_constant(idx)
             .ok_or(VmError::InvalidOperand)?;
+        // §9.1 — a capture-free function created in a frame that
+        // carries a direct-eval variable environment still needs the
+        // env handle (its free identifiers resolve dynamically), so
+        // it materializes as a closure with no upvalues.
+        // The function-expression SELF binding (fid == current
+        // frame) keeps the canonical plain value — promoting it
+        // would mint a fresh closure identity on every entry.
+        if function_id != frame.function_id
+            && let Some(env) = self.frame_cold(frame).and_then(|cold| cold.eval_env)
+        {
+            let closure = crate::closure::alloc_closure(
+                &mut self.gc_heap,
+                function_id,
+                Vec::new(),
+                None,
+                None,
+                Some(env),
+            )
+            .map_err(crate::oom_to_vm)?;
+            write_register(frame, dst, Value::closure(closure))?;
+            frame.advance_pc(self.current_byte_len)?;
+            return Ok(());
+        }
         write_register(frame, dst, Value::function(function_id))?;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
@@ -94,12 +117,17 @@ impl Interpreter {
         } else {
             None
         };
+        // §9.1 — closures made in a frame whose function chain
+        // contains a direct eval capture the frame's eval variable
+        // environment so eval-introduced vars stay reachable.
+        let eval_env = self.frame_cold(frame).and_then(|cold| cold.eval_env);
         let closure = crate::closure::alloc_closure(
             &mut self.gc_heap,
             function_id,
             upvalues,
             bound_this,
             bound_new_target,
+            eval_env,
         )
         .map_err(crate::oom_to_vm)?;
         write_register(frame, dst, Value::closure(closure))?;

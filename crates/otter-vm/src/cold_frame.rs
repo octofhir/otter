@@ -152,6 +152,12 @@ pub struct ColdFrame {
     /// fallback, and folded into the caller scope handed to any later
     /// direct eval from the same frame.
     pub eval_vars: Option<Box<rustc_hash::FxHashMap<String, crate::UpvalueCell>>>,
+    /// §9.1 variable-environment record for direct eval — the
+    /// GC-owned, closure-shareable successor of `eval_vars`.
+    /// Created at frame entry for `contains_direct_eval` functions;
+    /// closures made in this frame capture the handle so
+    /// eval-introduced bindings outlive the frame.
+    pub eval_env: Option<crate::eval_env::EvalEnvHandle>,
 }
 
 impl ColdFrame {
@@ -173,6 +179,7 @@ impl ColdFrame {
             && self.active_iterator_closers.is_empty()
             && !self.is_derived_constructor
             && self.eval_vars.is_none()
+            && self.eval_env.is_none()
     }
 
     /// Trace GC slots reachable through cold protocol state.
@@ -225,6 +232,10 @@ impl ColdFrame {
                 let p = cell as *const crate::UpvalueCell as *mut otter_gc::raw::RawGc;
                 visitor(p);
             }
+        }
+        if let Some(env) = &self.eval_env {
+            let p = env as *const crate::eval_env::EvalEnvHandle as *mut otter_gc::raw::RawGc;
+            visitor(p);
         }
     }
 }

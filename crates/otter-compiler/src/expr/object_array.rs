@@ -278,6 +278,15 @@ pub(crate) fn compile_object_literal(
                                 compile_expr(cx, expr, key_span)?
                             }
                         };
+                    // §13.2.5.4 ComputedPropertyName — ToPropertyKey
+                    // (user @@toPrimitive / valueOf / toString) fires
+                    // BEFORE the value expression evaluates.
+                    let key_canon = cx.alloc_scratch();
+                    cx.emit(
+                        Op::ToPropertyKey,
+                        [Operand::Register(key_canon), Operand::Register(key_reg)],
+                        key_span,
+                    );
                     cx.next_fn_is_method = p.method;
                     let value_reg = compile_expr(cx, &p.value, key_span)?;
                     // §13.2.5.5 — `[expr]: AnonymousFunctionDefinition`
@@ -288,7 +297,7 @@ pub(crate) fn compile_object_literal(
                             Op::SetFunctionName,
                             [
                                 Operand::Register(value_reg),
-                                Operand::Register(key_reg),
+                                Operand::Register(key_canon),
                                 Operand::ConstIndex(empty_idx),
                             ],
                             key_span,
@@ -301,7 +310,7 @@ pub(crate) fn compile_object_literal(
                         Op::DefineDataProperty,
                         [
                             Operand::Register(dst),
-                            Operand::Register(key_reg),
+                            Operand::Register(key_canon),
                             Operand::Register(value_reg),
                         ],
                         key_span,

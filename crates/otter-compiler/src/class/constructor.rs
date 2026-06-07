@@ -102,7 +102,6 @@ pub(crate) fn compile_synthetic_constructor(
         name: name.to_string(),
         span,
         is_strict: true,
-        is_method: true,
         module_url: parent.module_url.clone(),
         ..Default::default()
     });
@@ -191,11 +190,10 @@ pub(crate) fn compile_class_constructor(
 ) -> Result<(u32, Vec<u32>), CompileError> {
     if instance_fields.is_empty() {
         let module = Rc::clone(&parent.top_mut().module);
-        // Constructors are MethodDefinition bodies: no self-name
-        // binding (the class name resolves through the class scope)
-        // and no implicit `prototype` on the raw closure (the class
-        // wrapper owns the real one).
-        parent.next_fn_is_method = true;
+        // Constructors get no self-name binding (the class name
+        // resolves through the class scope) but keep their
+        // [[Construct]] slot — they are NOT flagged is_method.
+        parent.next_fn_no_self_name = true;
         let (function_id, captures) =
             compile_function_full(parent, name, params, body, span, is_async, false, true)?;
         if is_derived {
@@ -257,7 +255,6 @@ pub(crate) fn compile_class_constructor(
         name: name.to_string(),
         span,
         is_strict: true,
-        is_method: true,
         module_url: parent.module_url.clone(),
         ..Default::default()
     });

@@ -213,6 +213,21 @@ pub(crate) fn formal_parameter_length(params: &oxc_ast::ast::FormalParameters<'_
     count
 }
 
+/// §8.2.1 BoundNames of FormalParameters — every binding identifier
+/// across plain, default, pattern, and rest parameters.
+pub(crate) fn formal_parameter_bound_names(
+    params: &oxc_ast::ast::FormalParameters<'_>,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    for param in &params.items {
+        collect_pattern_var_names(&param.pattern, &mut names);
+    }
+    if let Some(rest) = &params.rest {
+        collect_pattern_var_names(&rest.rest.argument, &mut names);
+    }
+    names
+}
+
 pub(crate) fn validate_formal_parameter_names(
     params: &oxc_ast::ast::FormalParameters<'_>,
     is_strict: bool,

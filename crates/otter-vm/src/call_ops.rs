@@ -190,9 +190,9 @@ impl Interpreter {
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
         // §10.2.5 — only ordinary functions get a [[Construct]] slot;
-        // async functions, generators, and async generators are not
-        // constructors.
-        if function.is_async || function.is_generator {
+        // async functions, generators, async generators, and
+        // MethodDefinition bodies are not constructors.
+        if function.is_async || function.is_generator || function.is_method {
             return Err(VmError::TypeError {
                 message: "function is not a constructor".to_string(),
             });
@@ -242,8 +242,9 @@ impl Interpreter {
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
-        // §10.2.5 — async / generator functions are not constructors.
-        if function.is_async || function.is_generator {
+        // §10.2.5 — async / generator functions and methods are not
+        // constructors.
+        if function.is_async || function.is_generator || function.is_method {
             return Err(VmError::TypeError {
                 message: "function is not a constructor".to_string(),
             });

@@ -40,6 +40,12 @@ pub(crate) struct Compiler {
     /// next `compile_function_full` resolves `super.x` through the
     /// statics-side home object (`static` MethodDefinition bodies).
     pub(crate) next_fn_static_home: bool,
+    /// One-shot hint set by class-constructor lowering: the next
+    /// `compile_function_full` skips the function-expression-style
+    /// self-name binding (the class name resolves through the class
+    /// scope) without marking the record as a MethodDefinition (a
+    /// class constructor IS a constructor).
+    pub(crate) next_fn_no_self_name: bool,
     /// Stack of private-field namespace ids — one per enclosing
     /// class declaration. The top entry is the namespace used to
     /// mangle every `#name` reference inside the current class
@@ -103,6 +109,7 @@ impl Compiler {
             fn_self_immutable_hint: false,
             next_fn_is_method: false,
             next_fn_static_home: false,
+            next_fn_no_self_name: false,
             private_namespaces: Vec::new(),
             class_private_names: Vec::new(),
             class_private_ordered: Vec::new(),

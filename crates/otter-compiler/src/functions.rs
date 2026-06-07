@@ -26,6 +26,7 @@ pub(crate) fn compile_function_full(
     let is_async_generator = is_async && is_generator;
     let is_method = std::mem::take(&mut parent.next_fn_is_method);
     let static_home = std::mem::take(&mut parent.next_fn_static_home);
+    let no_self_name = std::mem::take(&mut parent.next_fn_no_self_name);
     let module = Rc::clone(&parent.top_mut().module);
     let body_has_strict_directive = match body {
         Some(b) => b.has_use_strict_directive(),
@@ -33,7 +34,9 @@ pub(crate) fn compile_function_full(
     };
     let function_is_strict = force_strict || parent.is_strict || body_has_strict_directive;
     let simple_params = formal_parameters_are_simple(params);
-    let allow_duplicate_formals = !function_is_strict && simple_params;
+    // §15.4.1 — MethodDefinition uses UniqueFormalParameters even in
+    // sloppy code.
+    let allow_duplicate_formals = !function_is_strict && simple_params && !is_method;
     // A direct eval body may reference `arguments` dynamically, so
     // its presence forces the arguments object to materialize even
     // when the enclosing body never names it (§19.2.1.3).
@@ -142,7 +145,7 @@ pub(crate) fn compile_function_full(
     // constructor's name must resolve to the §15.7.14 class-scope
     // binding, not to a re-made closure of itself.
     let fn_self_immutable = std::mem::take(&mut parent.fn_self_immutable_hint);
-    let self_make_idx = if is_method {
+    let self_make_idx = if is_method || no_self_name {
         None
     } else {
         let self_storage = parent.declare_binding(name, false, span)?;
@@ -186,6 +189,7 @@ pub(crate) fn compile_function_full(
         // functions can capture forward references.
         let mut lex_names: Vec<(String, bool)> = Vec::new();
         hoist_lexical_names(&body.statements, &mut lex_names);
+        validate_no_param_lexical_conflict(params, &lex_names, span)?;
         pre_declare_lexical_bindings(parent, &lex_names, span)?;
         // §10.2.11 step 30 — function declarations hoist to the
         // function scope. Pre-emitting their closure stores here
@@ -593,4 +597,36 @@ pub(crate) fn capture_super_bindings_for_eval(cx: &mut Compiler) {
     let _ = cx.resolve_capture(crate::class::SUPER_HOME_NAME);
     let _ = cx.resolve_capture(crate::class::SUPER_STATIC_HOME_NAME);
     let _ = cx.resolve_capture(crate::class::SUPER_CTOR_NAME);
+}
+
+/// §10.2.11 / §15.2.1 — it is a Syntax Error if any element of the
+/// BoundNames of FormalParameters also occurs in the
+/// LexicallyDeclaredNames of the function body.
+pub(crate) fn validate_no_param_lexical_conflict(
+    params: &oxc_ast::ast::FormalParameters<'_>,
+    lex_names: &[(String, bool)],
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    if lex_names.is_empty() {
+        return Ok(());
+    }
+    let param_names: std::collections::HashSet<String> =
+        formal_parameter_bound_names(params).into_iter().collect();
+    for (name, _) in lex_names {
+        if param_names.contains(name) {
+            let message = format!(
+                "SyntaxError: lexical declaration `{name}` shadows a formal parameter (§15.2.1)"
+            );
+            return Err(CompileError::Syntax {
+                messages: vec![message.clone()],
+                diagnostics: vec![crate::SyntaxDiagnostic {
+                    code: "PARAM_LEXICAL_CONFLICT".to_string(),
+                    message,
+                    range: Some(span),
+                    help: None,
+                }],
+            });
+        }
+    }
+    Ok(())
 }

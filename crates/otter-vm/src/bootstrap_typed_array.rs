@@ -582,6 +582,21 @@ fn ta_from_dispatch(
             name,
             reason: "missing execution context".to_string(),
         })?;
+    // §23.2.2.1 step 1 — `C = this`; a non-constructor receiver
+    // throws before the source is touched.
+    {
+        let receiver = *ctx.this_value();
+        let constructor_ok = ctx
+            .execution_context()
+            .cloned()
+            .is_some_and(|exec| crate::abstract_ops::is_constructor(&receiver, &exec, ctx.heap()));
+        if !constructor_ok {
+            return Err(NativeError::TypeError {
+                name,
+                reason: "this is not a constructor".to_string(),
+            });
+        }
+    }
     let source = args.first().cloned().unwrap_or(Value::undefined());
     let mapfn = args.get(1).cloned().unwrap_or(Value::undefined());
     let mapping = !mapfn.is_undefined();
@@ -677,6 +692,20 @@ fn ta_of_dispatch(
     args: &[Value],
     kind: TypedArrayKind,
 ) -> Result<Value, NativeError> {
+    // §23.2.2.2 step 2 — `C = this`; non-constructor receivers throw.
+    {
+        let receiver = *ctx.this_value();
+        let constructor_ok = ctx
+            .execution_context()
+            .cloned()
+            .is_some_and(|exec| crate::abstract_ops::is_constructor(&receiver, &exec, ctx.heap()));
+        if !constructor_ok {
+            return Err(NativeError::TypeError {
+                name: typed_array_name(kind),
+                reason: "this is not a constructor".to_string(),
+            });
+        }
+    }
     let roots = ctx.collect_native_roots();
     let this_value = *ctx.this_value();
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
@@ -804,9 +833,8 @@ fn ta_ctor_dispatch(
                 let interp = ctx.interp_mut();
                 let primitive = interp
                     .evaluate_to_primitive(exec, slot, crate::abstract_ops::ToPrimitiveHint::Number)
-                    .map_err(|e| NativeError::TypeError {
-                        name: typed_array_name(kind),
-                        reason: e.to_string(),
+                    .map_err(|e| {
+                        crate::native_function::vm_to_native_error(e, typed_array_name(kind))
                     })?;
                 *slot = primitive;
             }

@@ -276,7 +276,12 @@ impl FunctionContext {
     /// `LabeledStatement` label so `break label;` / `continue label;`
     /// inside the body resolves to this frame.
     pub(crate) fn push_loop_frame(&mut self, mut frame: LoopFrame) {
-        frame.label = self.pending_label.take();
+        // A synthetic labeled-block frame arrives with its label
+        // already set — only loop/switch frames consume the pending
+        // label stashed by `compile_labeled_statement`.
+        if frame.label.is_none() {
+            frame.label = self.pending_label.take();
+        }
         frame.handler_floor = self.active_handlers;
         frame.finally_floor = self.active_finally;
         self.loops.push(frame);

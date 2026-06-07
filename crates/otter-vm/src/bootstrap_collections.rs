@@ -75,6 +75,8 @@ otter_macros::couch! {
             "values"  / 0 => map_proto_values,
             "entries" / 0 => map_proto_entries,
             "forEach" / 1 => map_proto_for_each,
+            "getOrInsert"         / 2 => map_proto_get_or_insert,
+            "getOrInsertComputed" / 2 => map_proto_get_or_insert_computed,
         },
         accessors = [
             ("size", get = map_size_get),
@@ -747,6 +749,79 @@ fn map_proto_values(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 fn map_proto_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "Map.prototype.entries")?;
     make_map_iterator(ctx, m, MapIterKind::Entries)
+}
+
+/// CanonicalizeKeyedCollectionKey — normalize a key's `-0` to `+0`;
+/// every other value passes through with its identity intact.
+fn canonicalize_collection_key(key: Value) -> Value {
+    if let Some(n) = key.as_number() {
+        let f = n.as_f64();
+        if f == 0.0 && f.is_sign_negative() {
+            return Value::number(crate::number::NumberValue::from_f64(0.0));
+        }
+    }
+    key
+}
+
+/// Map.prototype.getOrInsert(key, value) — Map.prototype.upsert
+/// proposal. Returns the existing value for `key`, otherwise inserts
+/// `value` and returns it.
+fn map_proto_get_or_insert(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let mut m = receiver_map(ctx, "Map.prototype.getOrInsert")?;
+    let key = args.first().cloned().unwrap_or(Value::undefined());
+    let value = args.get(1).cloned().unwrap_or(Value::undefined());
+    if let Some(existing) = collections::map_get(m, ctx.heap(), &key) {
+        return Ok(existing);
+    }
+    ctx.map_set(&mut m, key, value)
+        .map_err(|_| oom("Map.prototype.getOrInsert"))?;
+    Ok(value)
+}
+
+/// Map.prototype.getOrInsertComputed(key, callbackfn) — like
+/// `getOrInsert` but the value is produced by `callbackfn(key)`, called
+/// only when the key is absent. The callback receives the canonicalized
+/// key and may mutate the map; the final write overwrites any entry it
+/// added (re-scan step), keeping the returned value authoritative.
+fn map_proto_get_or_insert_computed(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let mut m = receiver_map(ctx, "Map.prototype.getOrInsertComputed")?;
+    let key = args.first().cloned().unwrap_or(Value::undefined());
+    let callback = args.get(1).cloned().unwrap_or(Value::undefined());
+    if !ctx.interp_mut().is_callable_runtime(&callback) {
+        return Err(NativeError::TypeError {
+            name: "Map.prototype.getOrInsertComputed",
+            reason: "callbackfn is not callable".to_string(),
+        });
+    }
+    // Present key short-circuits before the callback runs.
+    if let Some(existing) = collections::map_get(m, ctx.heap(), &key) {
+        return Ok(existing);
+    }
+    let canonical = canonicalize_collection_key(key);
+    let context = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "Map.prototype.getOrInsertComputed",
+            reason: "no active execution context".to_string(),
+        })?;
+    let value = ctx
+        .interp_mut()
+        .run_callable_sync(
+            &context,
+            &callback,
+            Value::undefined(),
+            smallvec::smallvec![canonical],
+        )
+        .map_err(|e| vm_to_native(e, "Map.prototype.getOrInsertComputed"))?;
+    // Re-scan / insert: `map_set` overwrites an entry the callback may
+    // have added for `key`, else appends a fresh one.
+    ctx.map_set(&mut m, key, value)
+        .map_err(|_| oom("Map.prototype.getOrInsertComputed"))?;
+    Ok(value)
 }
 
 /// §24.1.3.5 Map.prototype.forEach.

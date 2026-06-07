@@ -143,7 +143,18 @@ pub(crate) fn destructure_pattern(
             if assign_existing {
                 store_identifier(parent, name, src_reg, span)
             } else {
-                let storage = parent.declare_binding(name, false, span)?;
+                // A lexical pre-pass (block / function top-level /
+                // loop-head prologue) may have already declared this
+                // leaf uninitialized (TDZ) — bind through it so
+                // closures made before this point observe the store,
+                // and so a loop head's Op::FreshUpvalue re-mints the
+                // same slot every iteration. The walk crosses scopes
+                // because a for-head binds from inside the body scope;
+                // an *initialized* outer binding never matches.
+                let storage = match parent.lookup_binding(name).filter(|info| !info.initialized) {
+                    Some(info) => info.storage,
+                    None => parent.declare_binding(name, false, span)?,
+                };
                 parent.emit_store_storage(src_reg, storage, span);
                 parent.mark_initialized(name);
                 // `export const { x } = …` — the mirror is gated on

@@ -289,11 +289,18 @@ pub(crate) fn collect_lexical_var_names(
 ) {
     let is_const = matches!(d.kind, oxc_ast::ast::VariableDeclarationKind::Const);
     for declarator in d.declarations.iter() {
-        // Only pre-hoist plain identifier bindings; destructuring
-        // patterns declare each leaf at their source position via
-        // `destructure_into`. A hoisted nested function that
-        // captures a destructured leaf name is filed as a
-        // follow-up.
+        // Destructuring leaves pre-declare alongside plain
+        // identifiers (TDZ); `destructure_pattern` re-uses the
+        // uninitialized binding at the source position.
+        if !matches!(
+            &declarator.id,
+            oxc_ast::ast::BindingPattern::BindingIdentifier(_)
+        ) {
+            let mut leaves: Vec<String> = Vec::new();
+            collect_pattern_var_names(&declarator.id, &mut leaves);
+            out.extend(leaves.into_iter().map(|n| (n, is_const)));
+            continue;
+        }
         if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id {
             out.push((id.name.as_str().to_string(), is_const));
         }

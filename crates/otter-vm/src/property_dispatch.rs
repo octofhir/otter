@@ -1185,9 +1185,15 @@ impl Interpreter {
                     None => Value::undefined(),
                 }
             } else if let Some(bag) = t.expando(&self.gc_heap)
-                && let Some(value) = crate::object::get(bag, &self.gc_heap, name)
+                && let Some(outcome) = Self::expando_own_get_outcome(bag, &self.gc_heap, name)
             {
-                value
+                match outcome {
+                    VmGetOutcome::Value(v) => v,
+                    VmGetOutcome::InvokeGetter { getter } => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.run_callable_sync(context, &getter, receiver, args)?
+                    }
+                }
             } else {
                 let direct = binary::typed_array_prototype::load_property(&t, &self.gc_heap, name);
                 if direct.is_undefined() {
@@ -1794,9 +1800,16 @@ impl Interpreter {
                     let mut value = Value::undefined();
                     let mut found = false;
                     if let Some(bag) = t.expando(&self.gc_heap)
-                        && let Some(v) = crate::object::get(bag, &self.gc_heap, &name)
+                        && let Some(outcome) =
+                            Self::expando_own_get_outcome(bag, &self.gc_heap, &name)
                     {
-                        value = v;
+                        value = match outcome {
+                            VmGetOutcome::Value(v) => v,
+                            VmGetOutcome::InvokeGetter { getter } => {
+                                let args: SmallVec<[Value; 8]> = SmallVec::new();
+                                self.run_callable_sync(context, &getter, recv, args)?
+                            }
+                        };
                         found = true;
                     }
                     if !found {
@@ -4482,6 +4495,29 @@ pub(crate) fn typed_array_valid_index(
         return None;
     }
     Some(idx)
+}
+
+impl Interpreter {
+    /// Own lookup on a TypedArray expando bag preserving accessor
+    /// identity (§10.4.5.4 step 2 — non-canonical keys take
+    /// OrdinaryGet, which must invoke own getters with the typed
+    /// array as receiver).
+    fn expando_own_get_outcome(
+        bag: JsObject,
+        heap: &otter_gc::GcHeap,
+        name: &str,
+    ) -> Option<crate::VmGetOutcome> {
+        match crate::object::lookup_own(bag, heap, name) {
+            crate::object::PropertyLookup::Data { value, .. } => {
+                Some(crate::VmGetOutcome::Value(value))
+            }
+            crate::object::PropertyLookup::Accessor { getter, .. } => Some(match getter {
+                Some(g) => crate::VmGetOutcome::InvokeGetter { getter: g },
+                None => crate::VmGetOutcome::Value(Value::undefined()),
+            }),
+            crate::object::PropertyLookup::Absent => None,
+        }
+    }
 }
 
 /// Lazy-allocate (and cache) the TypedArray expando JsObject used

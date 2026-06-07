@@ -122,8 +122,36 @@ fn old_to_young_pointer_survives_via_dirty_card() {
         "child reaped despite dirty-card remembered set"
     );
 
-    // Scavenge cleared the card (rewritten by the scan).
+    // While the child stays YOUNG (evacuated to to-space, not yet
+    // promoted), the scavenge re-dirties the slot's card — dropping
+    // it would lose the old->young edge and dangle the child after
+    // its next move. Once the child promotes (second scavenge), the
+    // edge is old->old and the card stays clean.
     unsafe {
+        let page_header = Page::header_of(parent_header as *const u8);
+        let page_base = Page::page_base_of(parent_header as *const u8);
+        let parent_payload_addr =
+            parent_header as usize + std::mem::size_of::<otter_gc::GcHeader>();
+        let slot_byte_offset = parent_payload_addr - (page_base as usize);
+        let child_young = (*child_after.as_header_ptr()).is_young();
+        assert_eq!(
+            page_header.is_card_dirty(slot_byte_offset),
+            child_young,
+            "card dirtiness must track the child's generation"
+        );
+    }
+    heap.collect_minor(otter_gc::EmptyRoots);
+    let child_promoted = unsafe {
+        let payload =
+            (parent_header as *mut u8).add(std::mem::size_of::<otter_gc::GcHeader>()) as *mut Box1;
+        (*payload).child
+    };
+    assert!(!child_promoted.is_null());
+    unsafe {
+        assert!(
+            (*child_promoted.as_header_ptr()).is_old(),
+            "child promotes on its second scavenge"
+        );
         let page_header = Page::header_of(parent_header as *const u8);
         let page_base = Page::page_base_of(parent_header as *const u8);
         let parent_payload_addr =
@@ -131,7 +159,7 @@ fn old_to_young_pointer_survives_via_dirty_card() {
         let slot_byte_offset = parent_payload_addr - (page_base as usize);
         assert!(
             !page_header.is_card_dirty(slot_byte_offset),
-            "card still dirty after scavenge"
+            "old->old edge keeps the card clean"
         );
     }
 }

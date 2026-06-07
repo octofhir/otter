@@ -59,7 +59,7 @@ use crate::compressed::{RawGc, cage_base};
 use crate::header::GcHeader;
 use crate::heap::RootSlotVisitor;
 use crate::page::{CARD_SIZE, CELL_SIZE, PAGE_HEADER_SIZE, Page, PageHeader, SpaceKind, align_up};
-use crate::space::{NewSpace, OldSpace};
+use crate::space::{LargeObjectSpace, NewSpace, OldSpace};
 use crate::trace::TraceTable;
 
 /// Promote after this many surviving scavenges. V8 uses 1.
@@ -80,6 +80,7 @@ pub struct ScavengeStats {
 struct ScavCtx {
     new_space: NonNull<NewSpace>,
     old_space: NonNull<OldSpace>,
+    large_space: NonNull<LargeObjectSpace>,
     trace_table: NonNull<TraceTable>,
     stats: ScavengeStats,
 }
@@ -89,6 +90,12 @@ impl ScavCtx {
     fn new_space(&mut self) -> &mut NewSpace {
         // SAFETY: STW pause + single-mutator invariant.
         unsafe { self.new_space.as_mut() }
+    }
+
+    #[inline]
+    fn large_space(&mut self) -> &mut LargeObjectSpace {
+        // SAFETY: STW pause + single-mutator invariant.
+        unsafe { self.large_space.as_mut() }
     }
 
     #[inline]
@@ -121,6 +128,7 @@ impl ScavCtx {
 pub unsafe fn scavenge(
     new_space: &mut NewSpace,
     old_space: &mut OldSpace,
+    large_space: &mut LargeObjectSpace,
     trace_table: &TraceTable,
     root_slots: &[*mut RawGc],
     external_visit: &mut RootSlotVisitor<'_>,
@@ -139,6 +147,7 @@ pub unsafe fn scavenge(
         // SAFETY: borrows are valid for the duration of this fn.
         new_space: unsafe { NonNull::new_unchecked(new_space as *mut _) },
         old_space: unsafe { NonNull::new_unchecked(old_space as *mut _) },
+        large_space: unsafe { NonNull::new_unchecked(large_space as *mut _) },
         trace_table: unsafe { NonNull::new_unchecked(trace_table as *const _ as *mut _) },
         stats: ScavengeStats::default(),
     };
@@ -465,6 +474,23 @@ unsafe fn evacuate(ctx: &mut ScavCtx, header: *mut GcHeader) -> u32 {
 unsafe fn scan_old_dirty_cards(ctx: &mut ScavCtx) {
     // SAFETY: per docstring.
     unsafe {
+        // Large-object pages take generational write-barrier cards
+        // too (their headers report old); each page holds exactly
+        // one object, so any dirty card re-traces that object.
+        let large_count = ctx.large_space().page_count();
+        for idx in 0..large_count {
+            let base = ctx.large_space().pages()[idx].base_ptr();
+            let page_header = &mut *(base as *mut PageHeader);
+            let mut any_dirty = false;
+            page_header.for_each_dirty_card(|_, _| any_dirty = true);
+            page_header.clear_cards();
+            if any_dirty {
+                let header_ptr = base.add(PAGE_HEADER_SIZE) as *mut GcHeader;
+                if (*header_ptr).size_bytes() != 0 {
+                    trace_one(ctx, header_ptr);
+                }
+            }
+        }
         let page_count = ctx.old_space().page_count();
         for idx in 0..page_count {
             let (base, bump_cursor) = {

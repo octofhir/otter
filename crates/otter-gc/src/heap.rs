@@ -1029,6 +1029,7 @@ impl GcHeap {
             crate::scavenger::scavenge(
                 &mut self.new_space,
                 &mut self.old_space,
+                &mut self.large_space,
                 &self.trace_table,
                 &[],
                 &mut combined,

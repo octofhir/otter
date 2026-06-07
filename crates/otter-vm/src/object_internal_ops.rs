@@ -27,8 +27,8 @@ use smallvec::SmallVec;
 
 use crate::{
     ExecutionContext, Frame, Interpreter, JsObject, JsString, Value, VmError, VmGetOutcome,
-    VmPropertyKey, abstract_ops, array, descriptor_value, function_metadata, object,
-    object_statics, proxy, regexp_prototype, string, symbol, to_length,
+    VmPropertyKey, abstract_ops, array, descriptor_value, function_metadata, object, proxy,
+    regexp_prototype, string, symbol, to_length,
 };
 
 #[derive(Clone, Copy)]

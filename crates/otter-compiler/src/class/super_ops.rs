@@ -29,7 +29,24 @@ pub(crate) fn compile_super_call(
     arguments: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
-    let super_ctor = load_synthetic_capture(cx, SUPER_CTOR_NAME, span)?;
+    // §13.3.7.1 step 2 GetSuperConstructor — the parent resolves
+    // through the class's LIVE [[GetPrototypeOf]] (setPrototypeOf
+    // between definition and `new` is observable), BEFORE the
+    // argument list evaluates; IsConstructor is checked after.
+    let super_ctor = if cx.lookup_binding(crate::class::CLASS_SELF_NAME).is_some()
+        || cx.resolve_capture(crate::class::CLASS_SELF_NAME).is_some()
+    {
+        let class_reg = load_synthetic_capture(cx, crate::class::CLASS_SELF_NAME, span)?;
+        let proto_reg = cx.alloc_scratch();
+        cx.emit(
+            Op::GetPrototype,
+            [Operand::Register(proto_reg), Operand::Register(class_reg)],
+            span,
+        );
+        proto_reg
+    } else {
+        load_synthetic_capture(cx, SUPER_CTOR_NAME, span)?
+    };
     let args_reg = compile_spread_call_args(cx, arguments, span)?;
     let dst = cx.alloc_scratch();
     cx.emit(

@@ -250,6 +250,15 @@ fn compile_class_strict(
     } else {
         None
     };
+    // §13.3.7.1 SuperCall resolves the parent DYNAMICALLY via the
+    // active class's [[GetPrototypeOf]] (observable through
+    // Object.setPrototypeOf between definition and `new`). The cell
+    // carries the class value; super() reads its live prototype.
+    let class_self_storage = if class.super_class.is_some() {
+        Some(cx.declare_captured_binding(CLASS_SELF_NAME, true, span)?)
+    } else {
+        None
+    };
 
     // Collect instance fields now so their computed-key cells can be
     // reserved alongside the other synthetics (the keys themselves
@@ -271,6 +280,25 @@ fn compile_class_strict(
         }
         let pspan = (p.span.start, p.span.end);
         let binding = field_key_binding_name(idx);
+        cx.declare_captured_binding(&binding, true, pspan)?;
+    }
+    let static_fields: Vec<&oxc_ast::ast::PropertyDefinition<'_>> = class
+        .body
+        .body
+        .iter()
+        .filter_map(|el| match el {
+            oxc_ast::ast::ClassElement::PropertyDefinition(p) if p.r#static && !p.declare => {
+                Some(&**p)
+            }
+            _ => None,
+        })
+        .collect();
+    for (idx, p) in static_fields.iter().enumerate() {
+        if !p.computed {
+            continue;
+        }
+        let pspan = (p.span.start, p.span.end);
+        let binding = static_field_key_binding_name(idx);
         cx.declare_captured_binding(&binding, true, pspan)?;
     }
 
@@ -433,31 +461,64 @@ fn compile_class_strict(
     // instance). The key lands in the synthetic captured cell
     // reserved before the heritage; the constructor's field-init
     // code resolves it through the standard upvalue walker.
-    for (idx, p) in instance_fields.iter().enumerate() {
-        if !p.computed {
-            continue;
+    // §15.7.14 step 28 — instance and static computed keys evaluate
+    // in ONE source-order walk (intercalated), each landing in its
+    // reserved cell; only the VALUE initializers are deferred.
+    {
+        let mut inst_idx = 0usize;
+        let mut static_idx = 0usize;
+        for element in &class.body.body {
+            let oxc_ast::ast::ClassElement::PropertyDefinition(p) = element else {
+                continue;
+            };
+            if p.declare {
+                continue;
+            }
+            let (idx, is_static) = if p.r#static {
+                let i = static_idx;
+                static_idx += 1;
+                (i, true)
+            } else {
+                let i = inst_idx;
+                inst_idx += 1;
+                (i, false)
+            };
+            if !p.computed {
+                continue;
+            }
+            let pspan = (p.span.start, p.span.end);
+            let key_expr = p
+                .key
+                .as_expression()
+                .ok_or_else(|| CompileError::Unsupported {
+                    node: "ClassDeclaration: non-expression computed field key".to_string(),
+                    span: pspan,
+                })?;
+            let key_reg = compile_expr(cx, key_expr, pspan)?;
+            let key_canon = cx.alloc_scratch();
+            cx.emit(
+                Op::ToPropertyKey,
+                [Operand::Register(key_canon), Operand::Register(key_reg)],
+                pspan,
+            );
+            let binding = if is_static {
+                // §15.7.14 — a static computed key must not be
+                // "prototype"; checked at evaluation time.
+                cx.emit(
+                    Op::ClassCheck,
+                    [Operand::Imm32(1), Operand::Register(key_canon)],
+                    pspan,
+                );
+                static_field_key_binding_name(idx)
+            } else {
+                field_key_binding_name(idx)
+            };
+            let info = cx
+                .lookup_binding(&binding)
+                .expect("field-key cell reserved before the heritage");
+            cx.emit_store_storage(key_canon, info.storage, pspan);
+            cx.mark_initialized(&binding);
         }
-        let pspan = (p.span.start, p.span.end);
-        let key_expr = p
-            .key
-            .as_expression()
-            .ok_or_else(|| CompileError::Unsupported {
-                node: "ClassDeclaration: non-expression computed instance field key".to_string(),
-                span: pspan,
-            })?;
-        let key_reg = compile_expr(cx, key_expr, pspan)?;
-        let key_canon = cx.alloc_scratch();
-        cx.emit(
-            Op::ToPropertyKey,
-            [Operand::Register(key_canon), Operand::Register(key_reg)],
-            pspan,
-        );
-        let binding = field_key_binding_name(idx);
-        let info = cx
-            .lookup_binding(&binding)
-            .expect("field-key cell reserved before the heritage");
-        cx.emit_store_storage(key_canon, info.storage, pspan);
-        cx.mark_initialized(&binding);
     }
 
     // Compile the constructor body. When the user didn't write one,
@@ -797,40 +858,28 @@ fn compile_class_strict(
         cx.emit_store_storage(class_reg, info.storage, span);
         cx.mark_initialized(name);
     }
+    if let Some(storage) = class_self_storage {
+        cx.emit_store_storage(class_reg, storage, span);
+        cx.mark_initialized(CLASS_SELF_NAME);
+    }
 
     // §15.7.10 InitializeStaticElements — walk the body in source
     // order, evaluating static fields and static-init blocks
     // against the statics object.
+    let mut static_field_ordinal = 0usize;
     for element in &class.body.body {
         match element {
             oxc_ast::ast::ClassElement::PropertyDefinition(p) if p.r#static && !p.declare => {
                 let pspan = (p.span.start, p.span.end);
-                // §15.7.10 — the field NAME evaluates before the
-                // initializer; a computed key canonicalizes through
-                // ToPropertyKey and must not be "prototype".
+                let field_idx = static_field_ordinal;
+                static_field_ordinal += 1;
+                // §15.7.10 — the field NAME evaluated earlier, in the
+                // intercalated source-order key pass; computed keys
+                // load from their reserved cell here.
                 let mut inferred_name: Option<String> = None;
                 let key_reg = if p.computed {
-                    let key_expr =
-                        p.key
-                            .as_expression()
-                            .ok_or_else(|| CompileError::Unsupported {
-                                node: "ClassDeclaration: non-expression computed static field key"
-                                    .to_string(),
-                                span: pspan,
-                            })?;
-                    let raw = compile_expr(cx, key_expr, pspan)?;
-                    let canon = cx.alloc_scratch();
-                    cx.emit(
-                        Op::ToPropertyKey,
-                        [Operand::Register(canon), Operand::Register(raw)],
-                        pspan,
-                    );
-                    cx.emit(
-                        Op::ClassCheck,
-                        [Operand::Imm32(1), Operand::Register(canon)],
-                        pspan,
-                    );
-                    canon
+                    let binding = static_field_key_binding_name(field_idx);
+                    load_synthetic_capture(cx, &binding, pspan)?
                 } else {
                     match &p.key {
                         oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) => {
@@ -1034,6 +1083,11 @@ pub(crate) const SUPER_CTOR_NAME: &str = "__class_super";
 /// class's statics).
 pub(crate) const SUPER_STATIC_HOME_NAME: &str = "__class_static_home";
 
+/// Synthetic captured binding carrying the class value itself, so a
+/// derived constructor's `super()` can resolve the parent through the
+/// class's LIVE [[GetPrototypeOf]] (§13.3.7.1 GetSuperConstructor).
+pub(crate) const CLASS_SELF_NAME: &str = "__class_self";
+
 /// Which home-object cell `super.x` resolves through in the current
 /// context (statics side for static elements, prototype side
 /// otherwise).
@@ -1051,6 +1105,13 @@ pub(crate) fn super_home_binding_name(cx: &Compiler) -> &'static str {
 /// field-init code resolves it through the standard upvalue walker.
 pub(crate) fn field_key_binding_name(idx: usize) -> String {
     format!("__class_fieldkey_{idx}")
+}
+
+/// Synthetic captured-binding name for the `idx`-th STATIC field's
+/// pre-evaluated computed key (source-order intercalated with the
+/// instance keys per §15.7.14 step 28).
+pub(crate) fn static_field_key_binding_name(idx: usize) -> String {
+    format!("__class_staticfieldkey_{idx}")
 }
 
 /// Resolve a synthetic captured name (`__class_home` / `__class_super`)

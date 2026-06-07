@@ -213,6 +213,32 @@ pub(crate) fn compile_chain_into(
             );
             Ok(exits)
         }
+        ChainElement::PrivateFieldExpression(m) => {
+            let span = (m.span.start, m.span.end);
+            let mut exits: Vec<u32> = Vec::new();
+            let obj_reg = compile_chain_object(cx, &m.object, &mut exits)?;
+            if m.optional {
+                let pc = cx.emit_branch_placeholder(Op::JumpIfNullish, Some(obj_reg), span);
+                exits.push(pc);
+            }
+            crate::class::emit_private_method_brand_check(
+                cx,
+                obj_reg,
+                m.field.name.as_str(),
+                span,
+            )?;
+            let key_reg = crate::class::load_private_key(cx, m.field.name.as_str(), span)?;
+            cx.emit(
+                Op::PrivateGet,
+                vec![
+                    Operand::Register(result_reg),
+                    Operand::Register(obj_reg),
+                    Operand::Register(key_reg),
+                ],
+                span,
+            );
+            Ok(exits)
+        }
         other => Err(CompileError::Unsupported {
             node: format!("ChainElement ({:?})", std::mem::discriminant(other)),
             span: (0, 0),
@@ -283,6 +309,32 @@ pub(crate) fn compile_chain_into_chain_object(
             );
             Ok(exits)
         }
+        ChainObjectRef::Private(m) => {
+            let span = (m.span.start, m.span.end);
+            let mut exits: Vec<u32> = Vec::new();
+            let obj_reg = compile_chain_object(cx, &m.object, &mut exits)?;
+            if m.optional {
+                let pc = cx.emit_branch_placeholder(Op::JumpIfNullish, Some(obj_reg), span);
+                exits.push(pc);
+            }
+            crate::class::emit_private_method_brand_check(
+                cx,
+                obj_reg,
+                m.field.name.as_str(),
+                span,
+            )?;
+            let key_reg = crate::class::load_private_key(cx, m.field.name.as_str(), span)?;
+            cx.emit(
+                Op::PrivateGet,
+                vec![
+                    Operand::Register(result_reg),
+                    Operand::Register(obj_reg),
+                    Operand::Register(key_reg),
+                ],
+                span,
+            );
+            Ok(exits)
+        }
         ChainObjectRef::Computed(m) => {
             let span = (m.span.start, m.span.end);
             let mut exits: Vec<u32> = Vec::new();
@@ -340,6 +392,7 @@ pub(crate) enum ChainObjectRef<'a> {
     Static(&'a oxc_ast::ast::StaticMemberExpression<'a>),
     Computed(&'a oxc_ast::ast::ComputedMemberExpression<'a>),
     Call(&'a oxc_ast::ast::CallExpression<'a>),
+    Private(&'a oxc_ast::ast::PrivateFieldExpression<'a>),
 }
 
 pub(crate) fn expression_as_chain_element<'a>(
@@ -349,6 +402,7 @@ pub(crate) fn expression_as_chain_element<'a>(
         Expression::StaticMemberExpression(m) => Some(ChainObjectRef::Static(m)),
         Expression::ComputedMemberExpression(m) => Some(ChainObjectRef::Computed(m)),
         Expression::CallExpression(c) => Some(ChainObjectRef::Call(c)),
+        Expression::PrivateFieldExpression(m) => Some(ChainObjectRef::Private(m)),
         _ => None,
     }
 }

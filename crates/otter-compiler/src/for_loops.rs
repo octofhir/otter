@@ -460,9 +460,28 @@ pub(crate) fn bind_for_in_of_head(
             node: "ForOfStatement: TS-wrapped target head".to_string(),
             span,
         }),
-        ForStatementLeft::PrivateFieldExpression(_) => Err(CompileError::Unsupported {
-            node: "ForOfStatement: private-field target head".to_string(),
-            span,
-        }),
+        ForStatementLeft::PrivateFieldExpression(member) => {
+            // §13.15 PutValue on a private reference — brand check,
+            // then §7.3.32 PrivateSet (TypeError when the receiver's
+            // class did not declare the name).
+            let obj_reg = compile_expr(cx, &member.object, span)?;
+            crate::class::emit_private_method_brand_check(
+                cx,
+                obj_reg,
+                member.field.name.as_str(),
+                span,
+            )?;
+            let key_reg = crate::class::load_private_key(cx, member.field.name.as_str(), span)?;
+            cx.emit(
+                Op::PrivateSet,
+                vec![
+                    Operand::Register(obj_reg),
+                    Operand::Register(key_reg),
+                    Operand::Register(src_reg),
+                ],
+                span,
+            );
+            Ok(())
+        }
     }
 }

@@ -20,60 +20,53 @@ max_heap_bytes_per_test = 536870912
 # results_dir = "test262_results"
 
 # Features to skip (tests requiring these features will be skipped).
-# Only skip features we truly cannot support (infra gaps or active proposals).
+# Skip ONLY non-final-stage proposals and features blocked by an
+# external infra gap (regex engine). Everything that is Stage 4 /
+# shipped and implementable in our own engine is intentionally NOT
+# skipped here — those tests stay visible so the gap is tracked and
+# closed (see the "implement, do not skip" list at the bottom).
 skip_features = [
-    # Module proposals / host module kinds not yet wired in Otter.
+    # --- Module proposals / host module kinds not yet wired ---
+    # import-assertions: deprecated legacy syntax, superseded by import
+    # attributes (which are implemented).
     "import-assertions",
     "import-bytes",
     # import-defer (static `import defer * as`) is implemented; dynamic
-    # `import.defer()` expression coverage is now exposed by the
+    # `import.defer()` expression coverage is exposed by the
     # dynamic-import suite.
     "json-modules",
     "source-phase-imports",
     "source-phase-imports-module-source",
 
-    # FinalizationRegistry / WeakRef: host-gc-required tests need $262.gc()
-    # to reliably trigger collection + cleanup callbacks
-    "host-gc-required",
-
-    # ShadowRealm (proposal)
+    # --- Realm-host proposals (Stage 3, need realm infrastructure) ---
     "ShadowRealm",
     "cross-realm",
 
-    # Explicit resource management (using/await using)
+    # --- Explicit resource management (using / await using, Stage 3) ---
     "explicit-resource-management",
 
-    # Tail calls (engine architecture)
-    "tail-call-optimization",
-
-    # Resizable / immutable ArrayBuffer (not yet implemented)
-    "resizable-arraybuffer",
-    "arraybuffer-transfer",
+    # --- Immutable ArrayBuffer (recent proposal, not finalized) ---
     "immutable-arraybuffer",
 
-    # Iterator sequencing & joint iteration (ES2025, not yet implemented)
+    # --- Iterator sequencing & joint iteration (Stage 2.7/3) ---
     "iterator-sequencing",
     "joint-iteration",
 
-    # Hashbang (parser feature)
-    "hashbang",
-
-    # RegExp modifiers (ES2025 Stage 4, not yet implemented in regress crate)
+    # --- Stage 4 BUT blocked by the regex engine ---
+    # These are final ES2025 features; the blocker is the external regex
+    # crate, not our engine. Tracked for a later task: implement our own
+    # regex crate, then unskip both.
     "regexp-modifiers",
-
-    # Duplicate named capture groups (ES2025, not yet in regress crate)
     "regexp-duplicate-named-groups",
-
-    # Active proposals (not yet standardized)
-    "Array.fromAsync",
-    "Error.isError",
-    "Float16Array",
-    "Math.sumPrecise",
-    "RegExp.escape",
-    "upsert",
-    "uint8array-base64",
-    "import-bytes",
 ]
+
+# Implement, do NOT skip (Stage 4 / shipped, feasible in our engine):
+#   hashbang, host-gc-required ($262.gc), tail-call-optimization,
+#   resizable-arraybuffer, arraybuffer-transfer, Float16Array,
+#   Math.sumPrecise, Error.isError, Array.fromAsync, RegExp.escape,
+#   upsert (Map.prototype.getOrInsert), uint8array-base64.
+# Their tests are intentionally left visible (counted as failing until
+# the feature lands) so the work stays tracked.
 
 # Test flags to skip. Strictness is controlled by each test's
 # frontmatter (`onlyStrict`, `noStrict`, `module`, `raw`) rather than

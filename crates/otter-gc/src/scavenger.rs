@@ -125,6 +125,7 @@ impl ScavCtx {
 ///   must address a valid slot inside the cage (or null).
 /// - The trace table must register every type tag occurring in
 ///   from-space and old-space.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn scavenge(
     new_space: &mut NewSpace,
     old_space: &mut OldSpace,

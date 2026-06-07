@@ -1033,10 +1033,25 @@ impl Interpreter {
                         None => Value::undefined(),
                     },
                 },
-                None => self
-                    .load_function_prototype_method(name)
-                    .or_else(|| self.load_object_prototype_method(name))
-                    .unwrap_or(Value::undefined()),
+                // §10.1.8 — a native constructor with an explicit
+                // [[Prototype]] (Int8Array → %TypedArray%) walks that
+                // chain (inherited statics like `from` / `of`) before
+                // the %Function.prototype% fallback.
+                None => match native.prototype_override(&self.gc_heap) {
+                    Some(parent) => {
+                        let key = VmPropertyKey::String(name);
+                        match self.ordinary_get_value(context, parent, receiver, &key, 0)? {
+                            VmGetOutcome::Value(value) => value,
+                            VmGetOutcome::InvokeGetter { getter } => {
+                                self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
+                            }
+                        }
+                    }
+                    None => self
+                        .load_function_prototype_method(name)
+                        .or_else(|| self.load_object_prototype_method(name))
+                        .unwrap_or(Value::undefined()),
+                },
             }
         } else if let Some(bound) = receiver.as_bound_function() {
             let bound = &bound;

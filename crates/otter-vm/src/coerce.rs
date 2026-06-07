@@ -222,6 +222,22 @@ pub(crate) fn to_number_for_number_ctor(
 /// TypeError depending on the source kind, and callers map the
 /// outcome accordingly.
 #[allow(dead_code)]
+/// §7.1.20 ToLength — ToIntegerOrInfinity clamped to
+/// [0, 2^53 - 1], with full user coercion (valueOf / @@toPrimitive)
+/// and abrupt completions propagated.
+pub(crate) fn to_length_or_throw(
+    interp: &mut crate::Interpreter,
+    context: &crate::ExecutionContext,
+    value: &crate::Value,
+) -> Result<usize, crate::VmError> {
+    let number = to_number_or_throw(interp, context, value)?;
+    let n = number.as_f64();
+    if n.is_nan() || n <= 0.0 {
+        return Ok(0);
+    }
+    Ok(n.trunc().min(9_007_199_254_740_991.0) as usize)
+}
+
 pub(crate) fn to_big_int_or_throw(
     interp: &mut Interpreter,
     context: &ExecutionContext,

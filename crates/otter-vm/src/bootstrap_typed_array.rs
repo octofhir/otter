@@ -277,38 +277,6 @@ fn coerce_values_for_kind(
 /// for each `k < ToLength(Get(source, "length"))`, running getters but
 /// **not** numeric-coercing (the caller maps, then converts). Reserves
 /// fallibly so a pathological `length` throws `RangeError`.
-fn read_array_like_raw(
-    ctx: &mut NativeCtx<'_>,
-    exec: &crate::ExecutionContext,
-    source: Value,
-) -> Result<Vec<Value>, NativeError> {
-    let len_value = ta_get_via(ctx, exec, source, &crate::VmPropertyKey::String("length"))?;
-    let len_number = crate::coerce::to_number_or_throw(ctx.cx.interp, exec, &len_value)
-        .map_err(|e| vm_to_native(e, "TypedArray"))?;
-    let n = len_number.as_f64();
-    let len = if n.is_nan() || n <= 0.0 {
-        0
-    } else {
-        n.trunc().min(9_007_199_254_740_991.0) as usize
-    };
-    let mut out: Vec<Value> = Vec::new();
-    if out.try_reserve_exact(len).is_err() {
-        return Err(NativeError::RangeError {
-            name: "TypedArray.from",
-            reason: "Invalid typed array length".to_string(),
-        });
-    }
-    for i in 0..len {
-        out.push(ta_get_via(
-            ctx,
-            exec,
-            source,
-            &crate::VmPropertyKey::OwnedString(i.to_string()),
-        )?);
-    }
-    Ok(out)
-}
-
 /// §7.3.3 Get + run an accessor, propagating an abrupt completion.
 fn ta_get_via(
     ctx: &mut NativeCtx<'_>,
@@ -521,206 +489,6 @@ macro_rules! ta_ctor {
     };
 }
 
-/// Build a per-kind `from` static for the concrete TypedArray
-/// constructor. Mirrors §23.2.2.1 `%TypedArray%.from(source [,
-/// mapfn [, thisArg]])` for the common cases (no `mapfn` and the
-/// receiver is a known concrete constructor). The basic shape
-/// (`Int8Array.from([1,2,3])`, `Int8Array.from(otherTA)`,
-/// `Int8Array.from(arrayLike)`) routes through the existing
-/// `typed_array_call_with_roots` dispatch under `M::From`.
-macro_rules! ta_static_from {
-    ($name:ident, $kind:expr) => {
-        fn $name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-            ta_from_dispatch(ctx, args, $kind)
-        }
-    };
-}
-
-macro_rules! ta_static_of {
-    ($name:ident, $kind:expr) => {
-        fn $name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-            ta_of_dispatch(ctx, args, $kind)
-        }
-    };
-}
-
-ta_static_from!(from_int8, TypedArrayKind::Int8);
-ta_static_from!(from_uint8, TypedArrayKind::Uint8);
-ta_static_from!(from_uint8_clamped, TypedArrayKind::Uint8Clamped);
-ta_static_from!(from_int16, TypedArrayKind::Int16);
-ta_static_from!(from_uint16, TypedArrayKind::Uint16);
-ta_static_from!(from_int32, TypedArrayKind::Int32);
-ta_static_from!(from_uint32, TypedArrayKind::Uint32);
-ta_static_from!(from_float32, TypedArrayKind::Float32);
-ta_static_from!(from_float64, TypedArrayKind::Float64);
-ta_static_from!(from_bigint64, TypedArrayKind::BigInt64);
-ta_static_from!(from_biguint64, TypedArrayKind::BigUint64);
-
-ta_static_of!(of_int8, TypedArrayKind::Int8);
-ta_static_of!(of_uint8, TypedArrayKind::Uint8);
-ta_static_of!(of_uint8_clamped, TypedArrayKind::Uint8Clamped);
-ta_static_of!(of_int16, TypedArrayKind::Int16);
-ta_static_of!(of_uint16, TypedArrayKind::Uint16);
-ta_static_of!(of_int32, TypedArrayKind::Int32);
-ta_static_of!(of_uint32, TypedArrayKind::Uint32);
-ta_static_of!(of_float32, TypedArrayKind::Float32);
-ta_static_of!(of_float64, TypedArrayKind::Float64);
-ta_static_of!(of_bigint64, TypedArrayKind::BigInt64);
-ta_static_of!(of_biguint64, TypedArrayKind::BigUint64);
-
-fn ta_from_dispatch(
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-    kind: TypedArrayKind,
-) -> Result<Value, NativeError> {
-    // §23.2.2.1 %TypedArray%.from(source, mapfn, thisArg).
-    let name = typed_array_name(kind);
-    let exec = ctx
-        .execution_context()
-        .cloned()
-        .ok_or_else(|| NativeError::TypeError {
-            name,
-            reason: "missing execution context".to_string(),
-        })?;
-    // §23.2.2.1 step 1 — `C = this`; a non-constructor receiver
-    // throws before the source is touched.
-    {
-        let receiver = *ctx.this_value();
-        let constructor_ok = ctx
-            .execution_context()
-            .cloned()
-            .is_some_and(|exec| crate::abstract_ops::is_constructor(&receiver, &exec, ctx.heap()));
-        if !constructor_ok {
-            return Err(NativeError::TypeError {
-                name,
-                reason: "this is not a constructor".to_string(),
-            });
-        }
-    }
-    let source = args.first().cloned().unwrap_or(Value::undefined());
-    let mapfn = args.get(1).cloned().unwrap_or(Value::undefined());
-    let mapping = !mapfn.is_undefined();
-    if mapping && !ctx.cx.interp.is_callable_runtime(&mapfn) {
-        return Err(NativeError::TypeError {
-            name,
-            reason: "mapfn is not a function".to_string(),
-        });
-    }
-    let this_arg = args.get(2).cloned().unwrap_or(Value::undefined());
-    // §23.2.2.1 step 4 — GetMethod(source, @@iterator). `GetV` on a
-    // null / undefined source throws a TypeError before that.
-    if source.is_null() || source.is_undefined() {
-        return Err(NativeError::TypeError {
-            name,
-            reason: "cannot create a TypedArray from null or undefined".to_string(),
-        });
-    }
-    let iter_sym = ctx
-        .cx
-        .interp
-        .well_known_symbols()
-        .get(crate::symbol::WellKnown::Iterator);
-    let iter_method = ta_get_via(ctx, &exec, source, &crate::VmPropertyKey::Symbol(iter_sym))?;
-    let raw = if ctx.cx.interp.is_callable_runtime(&iter_method) {
-        drain_iterable_into_values(ctx, &exec, &source, iter_method)?
-    } else {
-        read_array_like_raw(ctx, &exec, source)?
-    };
-    let mut out: Vec<Value> = Vec::new();
-    if out.try_reserve_exact(raw.len()).is_err() {
-        return Err(NativeError::RangeError {
-            name,
-            reason: "Invalid typed array length".to_string(),
-        });
-    }
-    for (k, value) in raw.into_iter().enumerate() {
-        // §23.2.2.1 step 6.e — map the source value (mapfn(value, k))
-        // before the numeric conversion, then convert with
-        // ToNumber / ToBigInt so a Symbol / cross-type element throws.
-        let mapped = if mapping {
-            let index = Value::number(crate::number::NumberValue::from_f64(k as f64));
-            ctx.cx
-                .interp
-                .run_callable_sync(&exec, &mapfn, this_arg, smallvec::smallvec![value, index])
-                .map_err(|e| vm_to_native(e, name))?
-        } else {
-            value
-        };
-        let converted = if kind.is_bigint() {
-            let big = crate::coerce::to_big_int_or_throw(ctx.cx.interp, &exec, &mapped)
-                .map_err(|e| vm_to_native(e, name))?;
-            Value::big_int(big)
-        } else {
-            let number = crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, &mapped)
-                .map_err(|e| vm_to_native(e, name))?;
-            Value::number(number)
-        };
-        out.push(converted);
-    }
-    let arr = ctx
-        .array_from_elements(out)
-        .map_err(|_| NativeError::TypeError {
-            name,
-            reason: "out of memory while allocating array".to_string(),
-        })?;
-    let arr_value = Value::array(arr);
-    let roots = ctx.collect_native_roots();
-    let this_value = *ctx.this_value();
-    let arr_slice = [arr_value];
-    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        crate::runtime_cx::visit_native_roots(
-            visitor,
-            &roots,
-            &this_value,
-            None,
-            &[],
-            &[&arr_slice],
-        );
-    };
-    dispatch::typed_array_call_with_roots(
-        kind,
-        TypedArrayMethod::From,
-        std::slice::from_ref(&arr_value),
-        ctx.heap_mut(),
-        &mut external_visit,
-    )
-    .map_err(|e| vm_to_native(e, name))
-}
-
-fn ta_of_dispatch(
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-    kind: TypedArrayKind,
-) -> Result<Value, NativeError> {
-    // §23.2.2.2 step 2 — `C = this`; non-constructor receivers throw.
-    {
-        let receiver = *ctx.this_value();
-        let constructor_ok = ctx
-            .execution_context()
-            .cloned()
-            .is_some_and(|exec| crate::abstract_ops::is_constructor(&receiver, &exec, ctx.heap()));
-        if !constructor_ok {
-            return Err(NativeError::TypeError {
-                name: typed_array_name(kind),
-                reason: "this is not a constructor".to_string(),
-            });
-        }
-    }
-    let roots = ctx.collect_native_roots();
-    let this_value = *ctx.this_value();
-    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        crate::runtime_cx::visit_native_roots(visitor, &roots, &this_value, None, &[], &[args]);
-    };
-    dispatch::typed_array_call_with_roots(
-        kind,
-        TypedArrayMethod::Of,
-        args,
-        ctx.heap_mut(),
-        &mut external_visit,
-    )
-    .map_err(|e| vm_to_native(e, typed_array_name(kind)))
-}
-
 ta_ctor!(ctor_int8, TypedArrayKind::Int8);
 ta_ctor!(ctor_uint8, TypedArrayKind::Uint8);
 ta_ctor!(ctor_uint8_clamped, TypedArrayKind::Uint8Clamped);
@@ -733,6 +501,203 @@ ta_ctor!(ctor_float64, TypedArrayKind::Float64);
 ta_ctor!(ctor_bigint64, TypedArrayKind::BigInt64);
 ta_ctor!(ctor_biguint64, TypedArrayKind::BigUint64);
 
+/// §23.2.2.1 `%TypedArray%.from(source [, mapfn [, thisArg]])` —
+/// generic over `this`: the receiver is ANY constructor and the
+/// result comes from TypedArrayCreate(this, len), so subclasses and
+/// custom constructors observe spec ordering (create AFTER the
+/// source is materialized, element writes through detach-safe
+/// IntegerIndexedElementSet).
+fn ta_from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let name = "TypedArray.from";
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name,
+            reason: "missing execution context".to_string(),
+        })?;
+    let receiver = *ctx.this_value();
+    if !crate::abstract_ops::is_constructor(&receiver, &exec, ctx.heap()) {
+        return Err(NativeError::TypeError {
+            name,
+            reason: "this is not a constructor".to_string(),
+        });
+    }
+    let source = args.first().cloned().unwrap_or(Value::undefined());
+    let mapfn = args.get(1).cloned().unwrap_or(Value::undefined());
+    let mapping = !mapfn.is_undefined();
+    if mapping && !ctx.cx.interp.is_callable_runtime(&mapfn) {
+        return Err(NativeError::TypeError {
+            name,
+            reason: "mapfn is not a function".to_string(),
+        });
+    }
+    let this_arg = args.get(2).cloned().unwrap_or(Value::undefined());
+    if source.is_null() || source.is_undefined() {
+        return Err(NativeError::TypeError {
+            name,
+            reason: "cannot create a TypedArray from null or undefined".to_string(),
+        });
+    }
+    // §7.3.10 GetMethod(source, @@iterator) — non-callable,
+    // non-nullish answers throw before anything else runs.
+    let iter_sym = ctx
+        .cx
+        .interp
+        .well_known_symbols()
+        .get(crate::symbol::WellKnown::Iterator);
+    let iter_method = ta_get_via(ctx, &exec, source, &crate::VmPropertyKey::Symbol(iter_sym))?;
+    let use_iterator = if iter_method.is_undefined() || iter_method.is_null() {
+        false
+    } else if ctx.cx.interp.is_callable_runtime(&iter_method) {
+        true
+    } else {
+        return Err(NativeError::TypeError {
+            name,
+            reason: "@@iterator is not callable".to_string(),
+        });
+    };
+    if use_iterator {
+        // §23.2.2.1 step 6 — IteratorToList first, THEN create.
+        let values = drain_iterable_into_values(ctx, &exec, &source, iter_method)?;
+        let target = ta_create_from_constructor(ctx, &exec, &receiver, values.len(), name)?;
+        for (k, value) in values.into_iter().enumerate() {
+            ta_from_store(
+                ctx, &exec, target, k, value, mapping, &mapfn, &this_arg, name,
+            )?;
+        }
+        return Ok(target_value_of(target));
+    }
+    // §23.2.2.1 step 7 — array-like: LengthOfArrayLike, create,
+    // then per-index Get / map / Set in order.
+    let len_value = ta_get_via(ctx, &exec, source, &crate::VmPropertyKey::String("length"))?;
+    let len = crate::coerce::to_length_or_throw(ctx.cx.interp, &exec, &len_value)
+        .map_err(|e| vm_to_native(e, name))?;
+    let target = ta_create_from_constructor(ctx, &exec, &receiver, len, name)?;
+    for k in 0..len {
+        let value = ta_get_via(
+            ctx,
+            &exec,
+            source,
+            &crate::VmPropertyKey::OwnedString(k.to_string()),
+        )?;
+        ta_from_store(
+            ctx, &exec, target, k, value, mapping, &mapfn, &this_arg, name,
+        )?;
+    }
+    Ok(target_value_of(target))
+}
+
+/// §23.2.2.2 `%TypedArray%.of(...items)` — generic over `this`.
+fn ta_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let name = "TypedArray.of";
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name,
+            reason: "missing execution context".to_string(),
+        })?;
+    let receiver = *ctx.this_value();
+    if !crate::abstract_ops::is_constructor(&receiver, &exec, ctx.heap()) {
+        return Err(NativeError::TypeError {
+            name,
+            reason: "this is not a constructor".to_string(),
+        });
+    }
+    let target = ta_create_from_constructor(ctx, &exec, &receiver, args.len(), name)?;
+    for (k, value) in args.iter().enumerate() {
+        ta_from_store(
+            ctx,
+            &exec,
+            target,
+            k,
+            *value,
+            false,
+            &Value::undefined(),
+            &Value::undefined(),
+            name,
+        )?;
+    }
+    Ok(target_value_of(target))
+}
+
+/// §23.2.4.2 TypedArrayCreate — `Construct(C, [len])`, then
+/// ValidateTypedArray on the result plus the length floor.
+fn ta_create_from_constructor(
+    ctx: &mut NativeCtx<'_>,
+    exec: &crate::ExecutionContext,
+    ctor: &Value,
+    len: usize,
+    name: &'static str,
+) -> Result<crate::binary::typed_array::JsTypedArray, NativeError> {
+    let len_arg = Value::number(crate::number::NumberValue::from_f64(len as f64));
+    let result = ctx
+        .cx
+        .interp
+        .run_construct_sync(exec, ctor, *ctor, smallvec::smallvec![len_arg])
+        .map_err(|e| vm_to_native(e, name))?;
+    let Some(target) = result.as_typed_array(ctx.heap()) else {
+        return Err(NativeError::TypeError {
+            name,
+            reason: "constructor did not return a TypedArray".to_string(),
+        });
+    };
+    if target.buffer(ctx.heap()).is_detached(ctx.heap()) {
+        return Err(NativeError::TypeError {
+            name,
+            reason: "constructor returned a detached TypedArray".to_string(),
+        });
+    }
+    if target.length(ctx.heap()) < len {
+        return Err(NativeError::TypeError {
+            name,
+            reason: "constructor returned a TypedArray that is too small".to_string(),
+        });
+    }
+    Ok(target)
+}
+
+fn target_value_of(target: crate::binary::typed_array::JsTypedArray) -> Value {
+    Value::typed_array(target)
+}
+
+/// One `from` / `of` element step: optional mapfn call, the
+/// target-kind numeric coercion (full user ToNumber / ToBigInt),
+/// then the detach-safe §10.4.5.16 IntegerIndexedElementSet write.
+#[allow(clippy::too_many_arguments)]
+fn ta_from_store(
+    ctx: &mut NativeCtx<'_>,
+    exec: &crate::ExecutionContext,
+    target: crate::binary::typed_array::JsTypedArray,
+    k: usize,
+    value: Value,
+    mapping: bool,
+    mapfn: &Value,
+    this_arg: &Value,
+    name: &'static str,
+) -> Result<(), NativeError> {
+    let mapped = if mapping {
+        let index = Value::number(crate::number::NumberValue::from_f64(k as f64));
+        ctx.cx
+            .interp
+            .run_callable_sync(exec, mapfn, *this_arg, smallvec::smallvec![value, index])
+            .map_err(|e| vm_to_native(e, name))?
+    } else {
+        value
+    };
+    let converted = if target.kind().is_bigint() {
+        let big = crate::coerce::to_big_int_or_throw(ctx.cx.interp, exec, &mapped)
+            .map_err(|e| vm_to_native(e, name))?;
+        Value::big_int(big)
+    } else {
+        let number = crate::coerce::to_number_or_throw(ctx.cx.interp, exec, &mapped)
+            .map_err(|e| vm_to_native(e, name))?;
+        Value::number(number)
+    };
+    target.set(ctx.heap_mut(), k, &converted);
+    Ok(())
+}
 fn ta_ctor_dispatch(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
@@ -1125,6 +1090,10 @@ otter_macros::couch! {
     feature = CORE,
     intrinsic = AbstractTypedArrayIntrinsic,
     constructor = (length = 0, call = abstract_typed_array_call),
+    statics = {
+        "from" / 1 => ta_from,
+        "of"   / 0 => ta_of,
+    },
     prototype = {
         methods = {
             "at"             / 1 => ta_at,
@@ -1216,16 +1185,12 @@ fn abstract_typed_array_ctor_lookup(global: JsObject, heap: &mut otter_gc::GcHea
 /// `%TypedArray%.prototype`, and overrides the ctor's `[[Prototype]]`
 /// to `%TypedArray%`.
 macro_rules! typed_array_kind {
-    ($name:literal, $intrinsic:ident, $bpe:expr, $ctor:ident, $from:ident, $of:ident) => {
+    ($name:literal, $intrinsic:ident, $bpe:expr, $ctor:ident) => {
         otter_macros::couch! {
             name = $name,
             feature = CORE,
             intrinsic = $intrinsic,
             constructor = (length = 3, call = $ctor),
-            statics = {
-                "from" / 1 => $from,
-                "of"   / 0 => $of,
-            },
             static_constants = [
                 ("BYTES_PER_ELEMENT", Number($bpe)),
             ],
@@ -1240,91 +1205,24 @@ macro_rules! typed_array_kind {
     };
 }
 
-typed_array_kind!(
-    "Int8Array",
-    Int8ArrayIntrinsic,
-    1.0,
-    ctor_int8,
-    from_int8,
-    of_int8
-);
-typed_array_kind!(
-    "Uint8Array",
-    Uint8ArrayIntrinsic,
-    1.0,
-    ctor_uint8,
-    from_uint8,
-    of_uint8
-);
+typed_array_kind!("Int8Array", Int8ArrayIntrinsic, 1.0, ctor_int8);
+typed_array_kind!("Uint8Array", Uint8ArrayIntrinsic, 1.0, ctor_uint8);
 typed_array_kind!(
     "Uint8ClampedArray",
     Uint8ClampedArrayIntrinsic,
     1.0,
-    ctor_uint8_clamped,
-    from_uint8_clamped,
-    of_uint8_clamped
+    ctor_uint8_clamped
 );
-typed_array_kind!(
-    "Int16Array",
-    Int16ArrayIntrinsic,
-    2.0,
-    ctor_int16,
-    from_int16,
-    of_int16
-);
-typed_array_kind!(
-    "Uint16Array",
-    Uint16ArrayIntrinsic,
-    2.0,
-    ctor_uint16,
-    from_uint16,
-    of_uint16
-);
-typed_array_kind!(
-    "Int32Array",
-    Int32ArrayIntrinsic,
-    4.0,
-    ctor_int32,
-    from_int32,
-    of_int32
-);
-typed_array_kind!(
-    "Uint32Array",
-    Uint32ArrayIntrinsic,
-    4.0,
-    ctor_uint32,
-    from_uint32,
-    of_uint32
-);
-typed_array_kind!(
-    "Float32Array",
-    Float32ArrayIntrinsic,
-    4.0,
-    ctor_float32,
-    from_float32,
-    of_float32
-);
-typed_array_kind!(
-    "Float64Array",
-    Float64ArrayIntrinsic,
-    8.0,
-    ctor_float64,
-    from_float64,
-    of_float64
-);
-typed_array_kind!(
-    "BigInt64Array",
-    BigInt64ArrayIntrinsic,
-    8.0,
-    ctor_bigint64,
-    from_bigint64,
-    of_bigint64
-);
+typed_array_kind!("Int16Array", Int16ArrayIntrinsic, 2.0, ctor_int16);
+typed_array_kind!("Uint16Array", Uint16ArrayIntrinsic, 2.0, ctor_uint16);
+typed_array_kind!("Int32Array", Int32ArrayIntrinsic, 4.0, ctor_int32);
+typed_array_kind!("Uint32Array", Uint32ArrayIntrinsic, 4.0, ctor_uint32);
+typed_array_kind!("Float32Array", Float32ArrayIntrinsic, 4.0, ctor_float32);
+typed_array_kind!("Float64Array", Float64ArrayIntrinsic, 8.0, ctor_float64);
+typed_array_kind!("BigInt64Array", BigInt64ArrayIntrinsic, 8.0, ctor_bigint64);
 typed_array_kind!(
     "BigUint64Array",
     BigUint64ArrayIntrinsic,
     8.0,
-    ctor_biguint64,
-    from_biguint64,
-    of_biguint64
+    ctor_biguint64
 );

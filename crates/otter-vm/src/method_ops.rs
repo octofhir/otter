@@ -937,10 +937,27 @@ impl Interpreter {
                 .map(|desc| descriptor_value(&desc))
             {
                 Some(value) => value,
-                None => self
-                    .load_function_prototype_method(name)
-                    .or_else(|| self.load_object_prototype_method(name))
-                    .unwrap_or_else(Value::undefined),
+                // §10.1.8 — explicit [[Prototype]] chain (per-kind
+                // TypedArray ctor → %TypedArray%) resolves inherited
+                // statics before the %Function.prototype% fallback.
+                None => match native.prototype_override(&self.gc_heap) {
+                    Some(parent) => {
+                        let key = VmPropertyKey::String(name);
+                        match self.ordinary_get_value(context, parent, recv_value, &key, 0)? {
+                            VmGetOutcome::Value(value) => value,
+                            VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
+                                context,
+                                &getter,
+                                recv_value,
+                                SmallVec::new(),
+                            )?,
+                        }
+                    }
+                    None => self
+                        .load_function_prototype_method(name)
+                        .or_else(|| self.load_object_prototype_method(name))
+                        .unwrap_or_else(Value::undefined),
+                },
             };
             return Ok(Some(value));
         }

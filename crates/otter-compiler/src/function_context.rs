@@ -845,6 +845,13 @@ pub(crate) fn finalize_virtual_capture_indices(
                     *slot = Operand::Imm32(remap(v));
                 }
             }
+            Op::LoadShadowedUpvalue => {
+                if let Some(slot) = instr.operands.get_mut(2)
+                    && let Operand::Imm32(v) = *slot
+                {
+                    *slot = Operand::Imm32(remap(v));
+                }
+            }
             Op::MakeClosure => {
                 for slot in instr.operands.as_mut_slice().iter_mut().skip(3) {
                     if let Operand::Imm32(v) = *slot {

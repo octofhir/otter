@@ -4683,6 +4683,41 @@ impl Interpreter {
                     self.run_declare_global_var_reg(context, frame, name_idx, configurable)?;
                     continue;
                 }
+                // §9.1 — captured-binding read in a frame whose
+                // function contains a direct eval: an
+                // eval-introduced var of the same name shadows the
+                // capture.
+                Op::LoadShadowedUpvalue => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let uv_idx = context.exec_imm32(instr, 2).unwrap_or(0) as usize;
+                    let frame = &mut stack[top_idx];
+                    if let Some(name) = context.string_constant_str(name_idx)
+                        && let Some(cell) = self
+                            .frame_cold(frame)
+                            .and_then(|cold| cold.eval_vars.as_ref())
+                            .and_then(|map| map.get(name))
+                            .copied()
+                    {
+                        let value = crate::read_upvalue(&self.gc_heap, cell);
+                        write_register(frame, dst, value)?;
+                        frame.advance_pc(self.current_byte_len)?;
+                        continue;
+                    }
+                    let cell = frame
+                        .upvalues
+                        .get(uv_idx)
+                        .copied()
+                        .ok_or(VmError::InvalidOperand)?;
+                    let value = crate::read_upvalue(&self.gc_heap, cell);
+                    write_register(frame, dst, value)?;
+                    frame.advance_pc(self.current_byte_len)?;
+                    continue;
+                }
                 Op::LoadDynamic => {
                     let dst = context
                         .exec_register(instr, 0)

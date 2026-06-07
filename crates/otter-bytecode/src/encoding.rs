@@ -591,6 +591,7 @@ pub const OP_BYTE_TABLE: &[(Op, u8)] = &[
     (Op::ToPropertyKey, 0xA0),
     (Op::Increment, 0xA1),
     (Op::PrivateBrandCheck, 0xA2),
+    (Op::LoadShadowedUpvalue, 0xA3),
 ];
 
 #[cfg(test)]
@@ -954,7 +955,7 @@ mod tests {
         // Catches accidental opcode additions that forget to wire
         // through OP_BYTE_TABLE. If this fires, append the missing
         // opcode at the next unused byte.
-        const EXPECTED_OPCODE_COUNT: usize = 163;
+        const EXPECTED_OPCODE_COUNT: usize = 164;
         assert_eq!(
             OP_BYTE_TABLE.len(),
             EXPECTED_OPCODE_COUNT,

@@ -435,6 +435,7 @@ mod tests {
             Op::ToPropertyKey => vec![reg(0), reg(1)],
             Op::Increment => vec![reg(0), reg(1), imm(2)],
             Op::PrivateBrandCheck => vec![reg(0), reg(1)],
+            Op::LoadShadowedUpvalue => vec![reg(0), konst(1), imm(2)],
             Op::IteratorNext => vec![reg(0), reg(1), reg(2)],
             Op::GetAsyncIterator => vec![reg(0), reg(1)],
             Op::IteratorClose | Op::IteratorCloseStart | Op::IteratorCloseEnd => vec![reg(0)],

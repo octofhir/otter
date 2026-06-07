@@ -198,6 +198,23 @@ fn compile_identifier_without_with(
     // Walk the parent chain for a closure capture.
     if let Some(uv_idx) = cx.resolve_capture(name) {
         let dst = cx.alloc_scratch();
+        // §9.1 — when THIS function body contains a direct eval, an
+        // eval-introduced var of the same name shadows the capture
+        // (it lands in this frame's variable environment, inner to
+        // the captured one).
+        if cx.contains_direct_eval && !cx.is_strict {
+            let name_idx = cx.intern_string_constant(name);
+            cx.emit(
+                Op::LoadShadowedUpvalue,
+                [
+                    Operand::Register(dst),
+                    Operand::ConstIndex(name_idx),
+                    Operand::Imm32(uv_idx as i32),
+                ],
+                span,
+            );
+            return Ok(dst);
+        }
         cx.emit(
             Op::LoadUpvalue,
             [Operand::Register(dst), Operand::Imm32(uv_idx as i32)],

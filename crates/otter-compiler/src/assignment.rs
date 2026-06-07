@@ -598,8 +598,14 @@ pub(crate) fn compile_logical_assignment(
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
     use oxc_ast::ast::AssignmentOperator;
-    // Read current value of the target (load only; no store yet).
-    let cur = match &a.left {
+    // §13.15.2 — the target Reference evaluates ONCE: member bases
+    // and computed keys are captured here and reused by the store,
+    // so `base[key()] ||= rhs` never re-runs `key()`.
+    enum LogicalTarget {
+        Ident(String),
+        Prepared(PreparedAssignmentTarget),
+    }
+    let (target, cur) = match &a.left {
         AssignmentTarget::AssignmentTargetIdentifier(id) => {
             let name = id.name.as_str().to_string();
             let load = cx.alloc_scratch();
@@ -608,9 +614,6 @@ pub(crate) fn compile_logical_assignment(
             } else if let Some(idx) = cx.resolve_capture(&name) {
                 cx.emit_load_storage(load, BindingStorage::Upvalue { idx }, span);
             } else if cx.is_strict {
-                // Runtime resolution: a realm-wide lexical or global
-                // property satisfies the read; a missing binding is a
-                // ReferenceError.
                 let name_idx = cx.intern_string_constant(&name);
                 cx.emit(
                     Op::LoadGlobalOrThrow,
@@ -625,7 +628,7 @@ pub(crate) fn compile_logical_assignment(
                     span,
                 );
             }
-            load
+            (LogicalTarget::Ident(name), load)
         }
         AssignmentTarget::StaticMemberExpression(m) => {
             let obj_reg = compile_expr(cx, &m.object, span)?;
@@ -640,7 +643,13 @@ pub(crate) fn compile_logical_assignment(
                 ],
                 span,
             );
-            load
+            (
+                LogicalTarget::Prepared(PreparedAssignmentTarget::StaticMember {
+                    obj_reg,
+                    name_idx,
+                }),
+                load,
+            )
         }
         AssignmentTarget::ComputedMemberExpression(m) => {
             let obj_reg = compile_expr(cx, &m.object, span)?;
@@ -655,7 +664,13 @@ pub(crate) fn compile_logical_assignment(
                 ],
                 span,
             );
-            load
+            (
+                LogicalTarget::Prepared(PreparedAssignmentTarget::ComputedMember {
+                    obj_reg,
+                    key_reg,
+                }),
+                load,
+            )
         }
         AssignmentTarget::PrivateFieldExpression(m) => {
             let obj_reg = compile_expr(cx, &m.object, span)?;
@@ -676,7 +691,13 @@ pub(crate) fn compile_logical_assignment(
                 ],
                 span,
             );
-            load
+            (
+                LogicalTarget::Prepared(PreparedAssignmentTarget::PrivateField {
+                    obj_reg,
+                    key_reg,
+                }),
+                load,
+            )
         }
         other => {
             return Err(CompileError::Unsupported {
@@ -690,7 +711,6 @@ pub(crate) fn compile_logical_assignment(
     // jump-if-true. For `??=`, test "cur is null or undefined".
     let test_reg = match a.operator {
         AssignmentOperator::LogicalAnd => {
-            // `&&=` — assign only when cur is truthy. Test is cur.
             let bool_r = cx.alloc_scratch();
             cx.emit(
                 Op::ToBoolean,
@@ -700,7 +720,6 @@ pub(crate) fn compile_logical_assignment(
             bool_r
         }
         AssignmentOperator::LogicalOr => {
-            // `||=` — assign only when cur is falsy. Test is !cur.
             let bool_r = cx.alloc_scratch();
             cx.emit(
                 Op::ToBoolean,
@@ -716,8 +735,6 @@ pub(crate) fn compile_logical_assignment(
             not_r
         }
         AssignmentOperator::LogicalNullish => {
-            // `??=` — assign only when cur is null/undefined.
-            // Compare cur === null || cur === undefined.
             let undef_r = cx.alloc_scratch();
             cx.emit(Op::LoadUndefined, [Operand::Register(undef_r)], span);
             let null_r = cx.alloc_scratch();
@@ -742,16 +759,12 @@ pub(crate) fn compile_logical_assignment(
                 ],
                 span,
             );
-            // OR them via boolean-logic: if eq_undef → true; else
-            // result = eq_null. We use a register-merge pattern.
             let merged = cx.alloc_scratch();
             cx.emit(
                 Op::ToBoolean,
                 [Operand::Register(merged), Operand::Register(eq_undef)],
                 span,
             );
-            // `merged = merged || eq_null`. The simplest is a
-            // sequence: jump if merged true; else copy eq_null.
             let jump_if_true = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(merged), span);
             cx.emit(
                 Op::StoreLocal,
@@ -763,8 +776,6 @@ pub(crate) fn compile_logical_assignment(
         }
         _ => unreachable!("non-logical operator in compile_logical_assignment"),
     };
-    // result = cur initially. Skip the assignment when test is
-    // false.
     let result = cx.alloc_scratch();
     cx.emit(
         Op::StoreLocal,
@@ -772,10 +783,21 @@ pub(crate) fn compile_logical_assignment(
         span,
     );
     let skip = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(test_reg), span);
-    // Assignment branch: synthesize a plain-`=` and re-enter
-    // assign_to_target.
-    let new_value = compile_expr(cx, &a.right, span)?;
-    assign_to_target(cx, &a.left, new_value, span)?;
+    // §13.15.2 step 4/6 — `IdentifierRef op= AnonymousFunction`
+    // performs NamedEvaluation; member targets store through the
+    // ALREADY-EVALUATED Reference.
+    let new_value = match &target {
+        LogicalTarget::Ident(name) => {
+            crate::expr::compile_expr_with_inferred_name(cx, &a.right, name, span)?
+        }
+        LogicalTarget::Prepared(_) => compile_expr(cx, &a.right, span)?,
+    };
+    match target {
+        LogicalTarget::Ident(_) => assign_to_target(cx, &a.left, new_value, span)?,
+        LogicalTarget::Prepared(prepared) => {
+            assign_prepared_target(cx, prepared, new_value, span)?;
+        }
+    }
     cx.emit(
         Op::StoreLocal,
         [Operand::Register(new_value), Operand::Imm32(result as i32)],

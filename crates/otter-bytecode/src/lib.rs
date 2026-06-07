@@ -1221,6 +1221,12 @@ pub enum Op {
     /// missing brand throws TypeError. Fields skip this (their own
     /// store lookup already fails).
     PrivateBrandCheck,
+    /// `LoadShadowedUpvalue dst, name_const, upvalue_idx` — read a
+    /// captured binding in a function whose body contains a direct
+    /// eval: an eval-introduced var of the SAME name shadows the
+    /// capture (§9.1 — the eval declared it in this frame's variable
+    /// environment, which sits inner to the captured one).
+    LoadShadowedUpvalue,
 }
 
 impl Op {
@@ -1384,6 +1390,7 @@ impl Op {
             Op::ToPropertyKey => "TO_PROPERTY_KEY",
             Op::Increment => "INCREMENT",
             Op::PrivateBrandCheck => "PRIVATE_BRAND_CHECK",
+            Op::LoadShadowedUpvalue => "LOAD_SHADOWED_UPVALUE",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
@@ -1477,6 +1484,7 @@ impl Op {
             | Op::PrivateBrandCheck
             | Op::ToNumeric => 2,
             Op::Increment
+            | Op::LoadShadowedUpvalue
             | Op::GetStringIndex
             | Op::Add
             | Op::Sub

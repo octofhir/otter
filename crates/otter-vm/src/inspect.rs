@@ -962,5 +962,6 @@ mod tests {
         Op::ToPropertyKey,
         Op::Increment,
         Op::PrivateBrandCheck,
+        Op::LoadShadowedUpvalue,
     ];
 }

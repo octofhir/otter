@@ -378,7 +378,7 @@ fn impl_index_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
         start.min(len)
     } as usize;
     for i in from..(len as usize) {
-        if values_equal_strict(&ta_element_or_undefined(&t, ctx, i), &target) {
+        if values_equal_strict(&ta_element_or_undefined(&t, ctx, i), &target, ctx.heap()) {
             return Ok(smi(i as i32));
         }
     }
@@ -401,7 +401,11 @@ fn impl_last_index_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     };
     let mut i = from;
     while i >= 0 {
-        if values_equal_strict(&ta_element_or_undefined(&t, ctx, i as usize), &target) {
+        if values_equal_strict(
+            &ta_element_or_undefined(&t, ctx, i as usize),
+            &target,
+            ctx.heap(),
+        ) {
             return Ok(smi(i as i32));
         }
         i -= 1;
@@ -424,7 +428,7 @@ fn impl_includes(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
         start.min(len)
     } as usize;
     for i in from..(len as usize) {
-        if values_equal_zero(&ta_element_or_undefined(&t, ctx, i), &target) {
+        if values_equal_zero(&ta_element_or_undefined(&t, ctx, i), &target, ctx.heap()) {
             return Ok(Value::boolean(true));
         }
     }
@@ -824,18 +828,20 @@ fn impl_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
 
 // ---- comparison helpers -------------------------------------------------
 
-fn values_equal_strict(a: &Value, b: &Value) -> bool {
+fn values_equal_strict(a: &Value, b: &Value, heap: &otter_gc::GcHeap) -> bool {
     if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
         crate::number::equals(x, y)
     } else if let (Some(x), Some(y)) = (a.as_big_int(), b.as_big_int()) {
-        x == y
+        // §7.2.12 — BigInt equality compares the NUMERIC values;
+        // two heap cells holding the same integer must match.
+        x.numeric_eq(y, heap)
     } else {
         false
     }
 }
 
 /// SameValueZero — like strict equality but `NaN === NaN`.
-fn values_equal_zero(a: &Value, b: &Value) -> bool {
+fn values_equal_zero(a: &Value, b: &Value, heap: &otter_gc::GcHeap) -> bool {
     // SameValueZero(undefined, undefined) is true. `includes` reads each
     // index with `[[Get]]`, which yields `undefined` on a detached view,
     // so `includes(undefined, …)` after a mid-call detach matches.
@@ -848,7 +854,7 @@ fn values_equal_zero(a: &Value, b: &Value) -> bool {
         }
         crate::number::equals(x, y)
     } else if let (Some(x), Some(y)) = (a.as_big_int(), b.as_big_int()) {
-        x == y
+        x.numeric_eq(y, heap)
     } else {
         false
     }

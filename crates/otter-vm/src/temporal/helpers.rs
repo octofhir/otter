@@ -167,6 +167,47 @@ pub fn opt_integer_with_truncation(
 /// returning `None` for an absent / undefined field. The caller then
 /// matches the string against the option's allowed values (an
 /// out-of-list value is the caller's RangeError).
+/// §GetRoundingIncrementOption — read `roundingIncrement`, ToNumber
+/// the value observably, and require a finite integer in
+/// `[1, 1e9]`. Absent / undefined → `None` (default 1). A non-integer
+/// / NaN / Infinity / out-of-range value is a RangeError; a Symbol
+/// (via ToNumber) is a TypeError.
+pub fn read_rounding_increment(
+    ctx: &mut NativeCtx<'_>,
+    obj: JsObject,
+    class: &'static str,
+) -> Result<Option<temporal_rs::options::RoundingIncrement>, NativeError> {
+    let Some(field) = object::get(obj, ctx.heap(), "roundingIncrement") else {
+        return Ok(None);
+    };
+    if field.is_undefined() {
+        return Ok(None);
+    }
+    let raw = to_number_field(ctx, &field, class, "roundingIncrement")?;
+    // §ToTemporalRoundingIncrement steps 2-4 — a non-finite value is
+    // a RangeError; the integer increment is truncate(value) and must
+    // land in [1, 1e9].
+    if !raw.is_finite() {
+        return Err(NativeError::RangeError {
+            name: class,
+            reason: "roundingIncrement must be finite".to_string(),
+        });
+    }
+    let integer = raw.trunc();
+    if !(1.0..=1_000_000_000.0).contains(&integer) {
+        return Err(NativeError::RangeError {
+            name: class,
+            reason: "roundingIncrement out of range [1, 1e9]".to_string(),
+        });
+    }
+    temporal_rs::options::RoundingIncrement::try_from(integer)
+        .map(Some)
+        .map_err(|_| NativeError::RangeError {
+            name: class,
+            reason: "invalid roundingIncrement".to_string(),
+        })
+}
+
 pub fn read_option_string(
     ctx: &mut NativeCtx<'_>,
     obj: JsObject,
@@ -628,21 +669,8 @@ pub fn parse_difference_settings(
         })?;
         settings.rounding_mode = Some(mode);
     }
-    if let Some(n) = object::get(obj, ctx.heap(), "roundingIncrement")
-        && !n.is_undefined()
-        && let Some(num) = n.as_number()
-    {
-        let raw = num.as_f64();
-        if raw.is_finite() && raw >= 1.0 {
-            if let Ok(incr) = temporal_rs::options::RoundingIncrement::try_from(raw.trunc()) {
-                settings.increment = Some(incr);
-            } else {
-                return Err(NativeError::RangeError {
-                    name: class,
-                    reason: "invalid `roundingIncrement`".to_string(),
-                });
-            }
-        }
+    if let Some(incr) = read_rounding_increment(ctx, obj, class)? {
+        settings.increment = Some(incr);
     }
     Ok(settings)
 }
@@ -700,21 +728,8 @@ pub fn parse_rounding_options(
         })?;
         options.rounding_mode = Some(mode);
     }
-    if let Some(n) = object::get(obj, ctx.heap(), "roundingIncrement")
-        && !n.is_undefined()
-        && let Some(num) = n.as_number()
-    {
-        let raw = num.as_f64();
-        if raw.is_finite() && raw >= 1.0 {
-            if let Ok(incr) = temporal_rs::options::RoundingIncrement::try_from(raw.trunc()) {
-                options.increment = Some(incr);
-            } else {
-                return Err(NativeError::RangeError {
-                    name: class,
-                    reason: "invalid `roundingIncrement`".to_string(),
-                });
-            }
-        }
+    if let Some(incr) = read_rounding_increment(ctx, obj, class)? {
+        options.increment = Some(incr);
     }
     Ok(options)
 }

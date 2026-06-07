@@ -238,10 +238,14 @@ fn impl_at(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError
     let len = t.length(ctx.heap_mut()) as i64;
     let idx = if let Some(n) = args.first().and_then(|v| v.as_number()) {
         let f = n.as_f64();
-        if !f.is_finite() {
+        if f.is_nan() {
+            // §23.2.3.1 — ToIntegerOrInfinity(NaN) is +0.
+            0
+        } else if !f.is_finite() {
             return Ok(Value::undefined());
+        } else {
+            f.trunc() as i64
         }
-        f.trunc() as i64
     } else {
         0
     };
@@ -393,7 +397,14 @@ fn impl_last_index_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
         return Ok(smi(-1));
     }
     let target = args.first().cloned().unwrap_or(Value::undefined());
-    let start = integer_index_arg(ctx, args.get(1), len - 1)?;
+    // §23.2.3.20 — a PRESENT-but-undefined fromIndex still runs
+    // ToIntegerOrInfinity (yielding +0); only an absent argument
+    // defaults to len-1.
+    let start = if args.len() > 1 && args[1].is_undefined() {
+        0
+    } else {
+        integer_index_arg(ctx, args.get(1), len - 1)?
+    };
     let from = if start < 0 {
         (len + start).max(-1)
     } else {
@@ -680,11 +691,25 @@ fn impl_to_reversed(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
     build_new_typed_array(ctx, t.kind(), &snapshot)
 }
 
-fn impl_to_sorted_default(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_sorted_default(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    // §23.2.3.32 step 1 — comparator must be undefined or callable,
+    // checked before ValidateTypedArray.
+    let comparefn = args.first().copied().filter(|v| !v.is_undefined());
+    if let Some(cmp) = comparefn
+        && !crate::abstract_ops::is_callable(&cmp)
+    {
+        return Err(NativeError::TypeError {
+            name: "TypedArray.prototype.toSorted",
+            reason: "comparefn must be a function or undefined".to_string(),
+        });
+    }
     let t = receiver(ctx)?;
     check_not_detached(&t, ctx.heap())?;
     let mut snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
-    sort_default(&mut snapshot, t.kind().is_bigint(), ctx.heap_mut());
+    match comparefn {
+        None => sort_default(&mut snapshot, t.kind().is_bigint(), ctx.heap_mut()),
+        Some(cmp) => sort_with_comparefn(ctx, &mut snapshot, &cmp)?,
+    }
     build_new_typed_array(ctx, t.kind(), &snapshot)
 }
 
@@ -789,10 +814,22 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
     let len = t.length(ctx.heap_mut()) as i64;
     let raw_idx = integer_arg(args.first(), 0);
     let resolved = if raw_idx < 0 { len + raw_idx } else { raw_idx };
+    // §23.2.3.36 step 5 — the VALUE coerces (ToBigInt / ToNumber,
+    // firing user valueOf) BEFORE the step-6 RangeError for an
+    // out-of-range index.
+    let raw_value = args.get(1).cloned().unwrap_or(Value::undefined());
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| type_error("missing execution context"))?;
+    let kind = t.kind();
+    let value = ctx
+        .interp_mut()
+        .typed_array_coerce_element(&exec, kind, raw_value)
+        .map_err(|e| crate::native_function::vm_to_native_error(e, "TypedArray.prototype.with"))?;
     if resolved < 0 || resolved >= len {
         return Err(range_error("index out of range"));
     }
-    let value = args.get(1).cloned().unwrap_or(Value::undefined());
     let mut snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
     snapshot[resolved as usize] = value;
     build_new_typed_array(ctx, t.kind(), &snapshot)

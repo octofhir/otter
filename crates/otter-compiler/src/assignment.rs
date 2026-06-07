@@ -1383,7 +1383,11 @@ pub(crate) fn store_identifier(
     Ok(())
 }
 
-fn emit_assignment_type_error(cx: &mut Compiler, message: &str, span: (u32, u32)) -> u16 {
+pub(crate) fn emit_assignment_type_error(
+    cx: &mut Compiler,
+    message: &str,
+    span: (u32, u32),
+) -> u16 {
     let message_reg = cx.alloc_scratch();
     let message = cx.intern_string_constant(message);
     cx.emit(

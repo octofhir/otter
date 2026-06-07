@@ -273,13 +273,11 @@ pub(crate) fn compile_update(
     let target = match &u.argument {
         SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
             let name = id.name.as_str().to_string();
+            if let Some(info) = cx.lookup_binding(&name).filter(|info| info.is_const) {
+                cx.emit_load_storage(old, info.storage, span);
+                return finish_const_update(cx, &name, old, u, span);
+            }
             let storage = match cx.lookup_binding(&name) {
-                Some(info) if info.is_const => {
-                    return Err(CompileError::Unsupported {
-                        node: format!("update on const `{name}`"),
-                        span,
-                    });
-                }
                 Some(info) => Some(info.storage),
                 None => cx
                     .resolve_capture(&name)
@@ -516,4 +514,29 @@ pub(crate) fn compile_update(
     // update value (post-ToNumber); prefix returns the
     // new value.
     Ok(if u.prefix { next } else { cur })
+}
+
+/// §13.4.2-5 — update on a `const` binding: the old value still loads
+/// and coerces through ToNumeric (firing user `valueOf` /
+/// `[Symbol.toPrimitive]`), then PutValue throws TypeError at runtime.
+fn finish_const_update(
+    cx: &mut Compiler,
+    name: &str,
+    old: u16,
+    u: &UpdateExpression<'_>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    let _ = u;
+    let old_prim = emit_to_primitive(cx, old, "number", span);
+    let cur = cx.alloc_scratch();
+    cx.emit(
+        Op::ToNumeric,
+        [Operand::Register(cur), Operand::Register(old_prim)],
+        span,
+    );
+    Ok(crate::assignment::emit_assignment_type_error(
+        cx,
+        &format!("Assignment to constant variable '{name}'."),
+        span,
+    ))
 }

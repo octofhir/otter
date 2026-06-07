@@ -102,6 +102,7 @@ pub(crate) fn compile_synthetic_constructor(
         name: name.to_string(),
         span,
         is_strict: true,
+        is_method: true,
         module_url: parent.module_url.clone(),
         ..Default::default()
     });
@@ -190,6 +191,11 @@ pub(crate) fn compile_class_constructor(
 ) -> Result<(u32, Vec<u32>), CompileError> {
     if instance_fields.is_empty() {
         let module = Rc::clone(&parent.top_mut().module);
+        // Constructors are MethodDefinition bodies: no self-name
+        // binding (the class name resolves through the class scope)
+        // and no implicit `prototype` on the raw closure (the class
+        // wrapper owns the real one).
+        parent.next_fn_is_method = true;
         let (function_id, captures) =
             compile_function_full(parent, name, params, body, span, is_async, false, true)?;
         if is_derived {
@@ -251,6 +257,7 @@ pub(crate) fn compile_class_constructor(
         name: name.to_string(),
         span,
         is_strict: true,
+        is_method: true,
         module_url: parent.module_url.clone(),
         ..Default::default()
     });
@@ -270,16 +277,10 @@ pub(crate) fn compile_class_constructor(
         compile_rest_parameter(parent, &rest.rest.argument, span)?;
     }
 
-    let self_storage = parent.declare_binding(name, false, span)?;
-    let const_idx = parent.intern_function_id(function_id);
-    let tmp = parent.alloc_scratch();
-    parent.emit(
-        Op::MakeFunction,
-        [Operand::Register(tmp), Operand::ConstIndex(const_idx)],
-        span,
-    );
-    parent.emit_store_storage(tmp, self_storage, span);
-    parent.mark_initialized(name);
+    // No self-name binding here: the class name resolves through
+    // the §15.7.14 class-scope binding (an upvalue capture), so the
+    // constructor body observes the full class value rather than a
+    // bare re-made closure of itself.
 
     // §15.7.10 InitializeInstanceElements — base classes run field
     // initialisers immediately (before the user body); derived

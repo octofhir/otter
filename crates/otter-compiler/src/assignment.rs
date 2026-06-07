@@ -352,6 +352,14 @@ pub(crate) fn compile_assignment(
     };
     if fn_self_target && compound_op.is_none() {
         let value = crate::expr::compile_expr_with_inferred_name(cx, &a.right, &name, span)?;
+        // §6.2.5.5 PutValue — a class-name binding assigned inside
+        // its own heritage expression is still in the TDZ, which
+        // outranks the immutable-binding TypeError.
+        if binding_uninitialized {
+            let diag_idx = tdz_diag_index(cx.lookup_binding(&name).map(|info| info.storage));
+            cx.emit(Op::TdzError, [Operand::Imm32(diag_idx)], span);
+            return Ok(value);
+        }
         if cx.is_strict {
             return Ok(emit_assignment_type_error(
                 cx,
@@ -362,6 +370,12 @@ pub(crate) fn compile_assignment(
         return Ok(value);
     }
     if fn_self_target {
+        if binding_uninitialized {
+            // Compound assignment reads the target first — the TDZ
+            // ReferenceError fires before the RHS evaluates.
+            let diag_idx = tdz_diag_index(cx.lookup_binding(&name).map(|info| info.storage));
+            cx.emit(Op::TdzError, [Operand::Imm32(diag_idx)], span);
+        }
         // Compound assignment reads the current value, evaluates the
         // RHS, then hits the same immutable-store rule.
         let storage = cx

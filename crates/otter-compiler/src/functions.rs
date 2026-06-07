@@ -135,21 +135,30 @@ pub(crate) fn compile_function_full(
 
     // Bind self-name for recursion. Capture operands are finalized after
     // body lowering because parent captures are discovered lazily.
+    // MethodDefinition bodies get NO self-name binding: a method's
+    // property name is not a binding inside it (§15.4), and a class
+    // constructor's name must resolve to the §15.7.14 class-scope
+    // binding, not to a re-made closure of itself.
     let fn_self_immutable = std::mem::take(&mut parent.fn_self_immutable_hint);
-    let self_storage = parent.declare_binding(name, false, span)?;
-    if fn_self_immutable {
-        parent.top_mut().mark_fn_self_name(name);
-    }
-    let const_idx = parent.intern_function_id(function_id);
-    let tmp = parent.alloc_scratch();
-    let self_make_idx = parent.code.len();
-    parent.emit(
-        Op::MakeFunction,
-        [Operand::Register(tmp), Operand::ConstIndex(const_idx)],
-        span,
-    );
-    parent.emit_store_storage(tmp, self_storage, span);
-    parent.mark_initialized(name);
+    let self_make_idx = if is_method {
+        None
+    } else {
+        let self_storage = parent.declare_binding(name, false, span)?;
+        if fn_self_immutable {
+            parent.top_mut().mark_fn_self_name(name);
+        }
+        let const_idx = parent.intern_function_id(function_id);
+        let tmp = parent.alloc_scratch();
+        let idx = parent.code.len();
+        parent.emit(
+            Op::MakeFunction,
+            [Operand::Register(tmp), Operand::ConstIndex(const_idx)],
+            span,
+        );
+        parent.emit_store_storage(tmp, self_storage, span);
+        parent.mark_initialized(name);
+        Some((idx, tmp, const_idx))
+    };
 
     // §10.2.11 FunctionDeclarationInstantiation step 28 — hoist
     // every `var`-declared name in the body to the function scope
@@ -207,7 +216,9 @@ pub(crate) fn compile_function_full(
     }
 
     let captures = child.parent_captures.clone();
-    if !captures.is_empty() {
+    if !captures.is_empty()
+        && let Some((self_make_idx, tmp, const_idx)) = self_make_idx
+    {
         let self_captures: Vec<u32> = (0..captures.len())
             .map(|idx| child.own_upvalue_count as u32 + idx as u32)
             .collect();

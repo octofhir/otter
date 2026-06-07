@@ -195,6 +195,34 @@ pub(crate) fn compile_class(
         cx.mark_initialized(&binding);
     }
 
+    // §15.7.14 step 4 — the class scope gets an immutable binding
+    // for the class name before the heritage evaluates: `extends`
+    // reads / writes hit the TDZ, body code (methods, field and
+    // static initializers) sees the final class value, and writes
+    // throw TypeError (class bodies are strict).
+    if let Some(name) = class_name {
+        let storage = cx.declare_captured_binding(name, false, span)?;
+        let hole = cx.alloc_scratch();
+        cx.emit(Op::LoadHole, [Operand::Register(hole)], span);
+        cx.emit_store_storage(hole, storage, span);
+        cx.mark_fn_self_name(name);
+    }
+
+    // Reserve the synthetic `__class_home` / `__class_super`
+    // captured cells BEFORE any expression in the class body
+    // compiles. `resolve_capture` assigns parent-capture indices
+    // relative to the frame's own-upvalue count at resolution time,
+    // so every own captured cell this class adds must be declared
+    // ahead of the first arbitrary `compile_expr` (the heritage) —
+    // otherwise a capture resolved there would collide with these
+    // cells. Values are stored once the prototype / parent exist.
+    let home_storage = cx.declare_captured_binding(SUPER_HOME_NAME, true, span)?;
+    let super_storage = if class.super_class.is_some() {
+        Some(cx.declare_captured_binding(SUPER_CTOR_NAME, true, span)?)
+    } else {
+        None
+    };
+
     // Evaluate the parent class first so observable side-effects
     // happen exactly once per declaration, in source order.
     let super_reg = match &class.super_class {
@@ -271,14 +299,12 @@ pub(crate) fn compile_class(
         cx.patch_branch_to_here(done);
     }
 
-    // Install the synthetic `__class_home` / `__class_super`
-    // captured bindings so method bodies can resolve `super`
-    // through the standard upvalue walker.
-    let home_storage = cx.declare_captured_binding(SUPER_HOME_NAME, true, span)?;
+    // Fill the synthetic `__class_home` / `__class_super` cells
+    // (declared above, before the heritage) so method bodies can
+    // resolve `super` through the standard upvalue walker.
     cx.emit_store_storage(prototype_reg, home_storage, span);
     cx.mark_initialized(SUPER_HOME_NAME);
-    if let Some(parent_reg) = super_reg {
-        let super_storage = cx.declare_captured_binding(SUPER_CTOR_NAME, true, span)?;
+    if let (Some(parent_reg), Some(super_storage)) = (super_reg, super_storage) {
         cx.emit_store_storage(parent_reg, super_storage, span);
         cx.mark_initialized(SUPER_CTOR_NAME);
     }
@@ -406,35 +432,6 @@ pub(crate) fn compile_class(
     let ctor_const = cx.intern_function_id(ctor_id);
     let ctor_reg = cx.alloc_scratch();
     emit_make_callable(cx, ctor_reg, ctor_const, &ctor_captures, false, span)?;
-
-    // Per §10.2.1.4 ClassDefinitionEvaluation step 24, the class
-    // binding becomes initialised *before* the static elements run
-    // so they can reference it (e.g., `static x = C.someStatic`).
-    // The binding's final value (`MakeClass`) lands at the end of
-    // this function — for the early-bind we use the statics object
-    // as a stand-in: static initialisers usually reach the class
-    // for its statics anyway, and the foundation overwrites with
-    // the full class value before any user code outside the class
-    // body can observe it.
-    if let Some(name) = class_name {
-        if let Some(info) = cx.lookup_binding(name) {
-            cx.emit_store_storage(statics_reg, info.storage, span);
-            cx.mark_initialized(name);
-        } else if cx.script_global_lexicals.contains(name) {
-            // Script top-level class — the binding lives on the
-            // realm's global declarative record; clear its TDZ hole
-            // with the statics stand-in for the same reason.
-            let name_idx = cx.intern_string_constant(name);
-            cx.emit(
-                Op::InitGlobalLex,
-                [
-                    Operand::Register(statics_reg),
-                    Operand::ConstIndex(name_idx),
-                ],
-                span,
-            );
-        }
-    }
 
     // Install methods (instance + static) onto the right side.
     // Foundation: getter / setter accessors round-trip as plain
@@ -715,6 +712,28 @@ pub(crate) fn compile_class(
         );
     }
 
+    // §15.7.14 steps 16/25 — the class value exists (and the class
+    // scope binding initializes to it) *before* the static elements
+    // run, so `static x = C.someStatic` and static blocks observe
+    // the real class.
+    let class_reg = cx.alloc_scratch();
+    cx.emit(
+        Op::MakeClass,
+        vec![
+            Operand::Register(class_reg),
+            Operand::Register(ctor_reg),
+            Operand::Register(prototype_reg),
+            Operand::Register(statics_reg),
+        ],
+        span,
+    );
+    if let Some(name) = class_name
+        && let Some(info) = cx.lookup_in_current_scope(name)
+    {
+        cx.emit_store_storage(class_reg, info.storage, span);
+        cx.mark_initialized(name);
+    }
+
     // §15.7.10 InitializeStaticElements — walk the body in source
     // order, evaluating static fields and static-init blocks
     // against the statics object.
@@ -801,18 +820,6 @@ pub(crate) fn compile_class(
             _ => {}
         }
     }
-
-    let class_reg = cx.alloc_scratch();
-    cx.emit(
-        Op::MakeClass,
-        vec![
-            Operand::Register(class_reg),
-            Operand::Register(ctor_reg),
-            Operand::Register(prototype_reg),
-            Operand::Register(statics_reg),
-        ],
-        span,
-    );
 
     cx.private_namespaces.pop();
     cx.class_private_names.pop();

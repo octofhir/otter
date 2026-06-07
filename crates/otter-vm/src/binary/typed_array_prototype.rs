@@ -834,12 +834,32 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         .interp_mut()
         .typed_array_coerce_element(&exec, kind, raw_value)
         .map_err(|e| crate::native_function::vm_to_native_error(e, "TypedArray.prototype.with"))?;
-    if resolved < 0 || resolved >= len {
+    // §23.2.3.36 step 9 — IsValidIntegerIndex(O, actualIndex) is
+    // re-checked against the CURRENT state: the value's coercion can
+    // detach or resize the backing buffer, so a once-valid index may
+    // now be out of range. `actualIndex` itself stays relative to the
+    // original length (step 5/6).
+    check_not_detached(&t, ctx.heap())?;
+    let cur_len = t.length(ctx.heap_mut()) as i64;
+    if resolved < 0 || resolved >= cur_len {
         return Err(range_error("index out of range"));
     }
-    let mut snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
-    snapshot[resolved as usize] = value;
-    build_new_typed_array(ctx, t.kind(), &snapshot)
+    // §23.2.3.36 steps 10-12 — the result is created with the ORIGINAL
+    // length and filled by reading O[k] for each k < len (a now
+    // out-of-bounds index reads as `undefined`, coerced on store),
+    // substituting numericValue at actualIndex.
+    let cur_snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
+    let mut out: Vec<Value> = Vec::with_capacity(len.max(0) as usize);
+    for k in 0..len {
+        if k == resolved {
+            out.push(value);
+        } else if (k as usize) < cur_snapshot.len() {
+            out.push(cur_snapshot[k as usize]);
+        } else {
+            out.push(Value::undefined());
+        }
+    }
+    build_new_typed_array(ctx, t.kind(), &out)
 }
 
 /// §23.2.5.1 CreateArrayIterator — a *live* TypedArray iterator whose

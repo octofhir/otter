@@ -72,7 +72,69 @@ pub(crate) fn compile_chain_into(
         ChainElement::CallExpression(call) => {
             let span = (call.span.start, call.span.end);
             let mut exits: Vec<u32> = Vec::new();
-            let callee_reg = compile_chain_callee(cx, &call.callee, &mut exits)?;
+            // §13.3.9.1 — a member-expression callee passes its base
+            // object as `this` (`a?.b()` calls with this = a); bare
+            // callees call with undefined.
+            let (callee_reg, this_reg): (u16, Option<u16>) = match &call.callee {
+                expr if matches!(
+                    expression_as_chain_element(expr),
+                    Some(ChainObjectRef::Static(_) | ChainObjectRef::Computed(_))
+                ) =>
+                {
+                    match expression_as_chain_element(expr) {
+                        Some(ChainObjectRef::Static(m)) => {
+                            let mspan = (m.span.start, m.span.end);
+                            let obj_reg = compile_chain_object(cx, &m.object, &mut exits)?;
+                            if m.optional {
+                                let pc = cx.emit_branch_placeholder(
+                                    Op::JumpIfNullish,
+                                    Some(obj_reg),
+                                    mspan,
+                                );
+                                exits.push(pc);
+                            }
+                            let callee = cx.alloc_scratch();
+                            let name_idx = cx.intern_string_constant(m.property.name.as_str());
+                            cx.emit(
+                                Op::LoadProperty,
+                                vec![
+                                    Operand::Register(callee),
+                                    Operand::Register(obj_reg),
+                                    Operand::ConstIndex(name_idx),
+                                ],
+                                mspan,
+                            );
+                            (callee, Some(obj_reg))
+                        }
+                        Some(ChainObjectRef::Computed(m)) => {
+                            let mspan = (m.span.start, m.span.end);
+                            let obj_reg = compile_chain_object(cx, &m.object, &mut exits)?;
+                            if m.optional {
+                                let pc = cx.emit_branch_placeholder(
+                                    Op::JumpIfNullish,
+                                    Some(obj_reg),
+                                    mspan,
+                                );
+                                exits.push(pc);
+                            }
+                            let key_reg = compile_expr(cx, &m.expression, mspan)?;
+                            let callee = cx.alloc_scratch();
+                            cx.emit(
+                                Op::LoadElement,
+                                vec![
+                                    Operand::Register(callee),
+                                    Operand::Register(obj_reg),
+                                    Operand::Register(key_reg),
+                                ],
+                                mspan,
+                            );
+                            (callee, Some(obj_reg))
+                        }
+                        _ => unreachable!("guarded by matches!"),
+                    }
+                }
+                expr => (compile_chain_callee(cx, expr, &mut exits)?, None),
+            };
             if call.optional {
                 let pc = cx.emit_branch_placeholder(Op::JumpIfNullish, Some(callee_reg), span);
                 exits.push(pc);
@@ -90,12 +152,25 @@ pub(crate) fn compile_chain_into(
                 }
             }
             crate::calls::check_call_arity(arg_regs.len(), "Op::Call", span)?;
-            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-            operands.push(Operand::Register(result_reg));
-            operands.push(Operand::Register(callee_reg));
-            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-            operands.extend(arg_regs.into_iter().map(Operand::Register));
-            cx.emit(Op::Call, operands, span);
+            match this_reg {
+                Some(this_reg) => {
+                    let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
+                    operands.push(Operand::Register(result_reg));
+                    operands.push(Operand::Register(callee_reg));
+                    operands.push(Operand::Register(this_reg));
+                    operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+                    operands.extend(arg_regs.into_iter().map(Operand::Register));
+                    cx.emit(Op::CallWithThis, operands, span);
+                }
+                None => {
+                    let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+                    operands.push(Operand::Register(result_reg));
+                    operands.push(Operand::Register(callee_reg));
+                    operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+                    operands.extend(arg_regs.into_iter().map(Operand::Register));
+                    cx.emit(Op::Call, operands, span);
+                }
+            }
             Ok(exits)
         }
         ChainElement::StaticMemberExpression(m) => {

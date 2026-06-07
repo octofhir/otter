@@ -31,6 +31,7 @@ pub(crate) fn compile_static_block(
     // §15.7.4 — `super.x` inside a static block resolves through the
     // statics-side home object.
     child.super_home_static = true;
+    child.contains_direct_eval = crate::capture::program_contains_direct_eval(body);
     parent.push(child);
     parent.enter_scope();
 
@@ -80,6 +81,10 @@ pub(crate) fn compile_static_block(
         .expect("reserved static-block slot");
     slot.locals = 0;
     slot.scratch = child.scratch_window();
+    // Direct eval routing (§19.2.1.1 `inFunction`) reads this flag —
+    // without it the eval body runs on the script path and loses the
+    // synthesized frame's `this` (= the class).
+    slot.contains_direct_eval = child.contains_direct_eval;
     slot.param_count = 0;
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.code = child.code;
@@ -105,6 +110,9 @@ pub(crate) fn compile_static_field_initializer(
         .with_strict(true)
         .with_module_url(parent.module_url.clone());
     child.super_home_static = true;
+    child.contains_direct_eval = value
+        .as_ref()
+        .is_some_and(|expr| crate::capture::expression_contains_direct_eval(expr));
     parent.push(child);
     parent.enter_scope();
 
@@ -153,6 +161,10 @@ pub(crate) fn compile_static_field_initializer(
         .expect("reserved static-field-init slot");
     slot.locals = 0;
     slot.scratch = child.scratch_window();
+    // Direct eval routing (§19.2.1.1 `inFunction`) reads this flag —
+    // without it the eval body runs on the script path and loses the
+    // synthesized frame's `this` (= the class).
+    slot.contains_direct_eval = child.contains_direct_eval;
     slot.param_count = 0;
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.code = child.code;

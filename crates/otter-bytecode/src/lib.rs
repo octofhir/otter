@@ -1589,7 +1589,7 @@ impl Op {
             Op::PromiseNew => 3,      // dst, executor_reg, scratch_dst
             Op::PromiseCall => 3,     // dst, name_const, argc — args follow
             Op::Call | Op::New => 3,  // dst, callee, argc — args follow
-            Op::MakeClass => 4,       // dst, ctor, prototype, statics
+            Op::MakeClass => 5,       // dst, ctor, prototype, statics, parent
             // dst, callee, this, argc — args follow.
             Op::CallWithThis | Op::BindFunction => 4,
             // catch_offset, finally_offset, exc_dst.

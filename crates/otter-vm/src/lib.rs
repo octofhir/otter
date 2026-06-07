@@ -1521,6 +1521,17 @@ impl Interpreter {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-ordinarygetprototypeof>
     pub(crate) fn get_prototype_for_op(&mut self, value: &Value) -> Result<Value, VmError> {
+        // §15.7.14 step 6.b — a class constructor's [[Prototype]] is
+        // the parent class value (identity preserved in the
+        // ctor_proto slot), %Function.prototype% for a base class,
+        // or null for `extends null` / a later setPrototypeOf.
+        if let Some(c) = value.as_class_constructor() {
+            let stored = c.ctor_proto(&self.gc_heap);
+            if !stored.is_undefined() {
+                return Ok(stored);
+            }
+            return Ok(Value::object(self.function_prototype_object()?));
+        }
         let intrinsic_or_null =
             |this: &mut Self, v: &Value| match this.intrinsic_prototype_object_for(v) {
                 Some(o) => Value::object(o),
@@ -4699,6 +4710,9 @@ impl Interpreter {
                     let statics_reg = context
                         .exec_register(instr, 3)
                         .ok_or(VmError::InvalidOperand)?;
+                    // Operand 4 (parent class value) — absent in
+                    // pre-existing bytecode; `undefined` = base class.
+                    let parent_reg = context.exec_register(instr, 4);
                     self.run_make_class_regs(
                         &mut *stack,
                         top_idx,
@@ -4706,6 +4720,7 @@ impl Interpreter {
                         ctor_reg,
                         proto_reg,
                         statics_reg,
+                        parent_reg,
                     )?;
                     continue;
                 }

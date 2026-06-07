@@ -47,6 +47,13 @@ pub struct ClassConstructorBody {
     /// to `C`'s static object so static inheritance just falls out of
     /// the existing prototype walker.
     pub statics: JsObject,
+    /// The constructor's own [[Prototype]] identity — the parent
+    /// class value for `class D extends C`, `null` for
+    /// `extends null`, `undefined` for a base class
+    /// (= %Function.prototype% semantics). The statics object's own
+    /// prototype keeps the parallel walk-able chain; this slot
+    /// preserves identity for getPrototypeOf / super-base checks.
+    pub ctor_proto: Value,
 }
 
 /// Cheap-to-clone class-constructor handle. Wraps a
@@ -82,10 +89,26 @@ impl ClassConstructor {
                     ctor,
                     prototype,
                     statics,
+                    ctor_proto: Value::undefined(),
                 },
                 &mut visit,
             )?,
         })
+    }
+
+    /// Read the constructor's own [[Prototype]] identity slot.
+    /// `undefined` means base class (%Function.prototype%).
+    #[inline]
+    #[must_use]
+    pub fn ctor_proto(self, heap: &otter_gc::GcHeap) -> Value {
+        heap.read_payload(self.inner, |body| body.ctor_proto)
+    }
+
+    /// Write the constructor's [[Prototype]] identity slot.
+    #[inline]
+    pub fn set_ctor_proto(self, heap: &mut otter_gc::GcHeap, proto: Value) {
+        heap.with_payload(self.inner, |body| body.ctor_proto = proto);
+        heap.record_write(self.inner, &proto);
     }
 
     /// Identity comparison — `===` follows the GC handle's

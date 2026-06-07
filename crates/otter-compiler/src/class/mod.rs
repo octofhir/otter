@@ -770,6 +770,16 @@ fn compile_class_strict(
     // run, so `static x = C.someStatic` and static blocks observe
     // the real class.
     let class_reg = cx.alloc_scratch();
+    // Operand 4 — the parent class value (identity for the class's
+    // [[GetPrototypeOf]]); undefined marks a base class.
+    let parent_value_reg = match super_reg {
+        Some(reg) => reg,
+        None => {
+            let r = cx.alloc_scratch();
+            cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
+            r
+        }
+    };
     cx.emit(
         Op::MakeClass,
         vec![
@@ -777,6 +787,7 @@ fn compile_class_strict(
             Operand::Register(ctor_reg),
             Operand::Register(prototype_reg),
             Operand::Register(statics_reg),
+            Operand::Register(parent_value_reg),
         ],
         span,
     );

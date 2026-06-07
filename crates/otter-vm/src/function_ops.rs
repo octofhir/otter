@@ -143,6 +143,7 @@ impl Interpreter {
         ctor_reg: u16,
         proto_reg: u16,
         statics_reg: u16,
+        parent_reg: Option<u16>,
     ) -> Result<(), VmError> {
         let frame = &stack[frame_idx];
         let ctor = *read_register(frame, ctor_reg)?;
@@ -168,6 +169,18 @@ impl Interpreter {
             statics,
             &mut external_visit,
         )?;
+        // §15.7.14 step 6.b — preserve the parent class IDENTITY for
+        // [[GetPrototypeOf]]; the statics object's own prototype
+        // keeps the parallel walk-able static-inheritance chain.
+        if let Some(parent_reg) = parent_reg {
+            let parent = *read_register(&stack[frame_idx], parent_reg)?;
+            // §15.7.14 step 6.c — `extends null` keeps
+            // constructorParent = %Function.prototype% (slot stays
+            // `undefined`); only a real parent class value lands.
+            if !parent.is_undefined() && !parent.is_null() {
+                class.set_ctor_proto(&mut self.gc_heap, parent);
+            }
+        }
         // §15.7.10 ClassDefinitionEvaluation step 24 — install
         // `C.prototype.constructor = C` so reflective probes
         // (`new Sub(...).constructor === Sub`) walk to the

@@ -1170,6 +1170,13 @@ impl Interpreter {
             if hops >= object::PROTO_CHAIN_HARD_CAP {
                 break;
             }
+            // §7.3.30 — private elements never inherit across a class
+            // boundary: a subclass constructor does not see the parent
+            // constructor's static privates (the ctor_proto identity
+            // chain would otherwise leak them).
+            if current.is_class_constructor() {
+                break;
+            }
             // Proxies participate via their getPrototypeOf trap —
             // the context-aware walker handles them (the plain
             // get_prototype_for_op rejects proxy values).
@@ -2924,6 +2931,20 @@ impl Interpreter {
                     proto,
                 ),
             };
+        }
+        // Class constructor [[SetPrototypeOf]] — record the identity
+        // in the ctor_proto slot and mirror the walk-able chain on
+        // the statics object (a class parent maps to its statics so
+        // inherited statics keep resolving).
+        if let Some(c) = target.as_class_constructor() {
+            c.set_ctor_proto(&mut self.gc_heap, *proto);
+            let statics_chain = if let Some(pc) = proto.as_class_constructor() {
+                Value::object(pc.statics(&self.gc_heap))
+            } else {
+                *proto
+            };
+            let statics = Value::object(c.statics(&self.gc_heap));
+            return self.set_prototype_value_proxy_aware(context, &statics, &statics_chain);
         }
         if let Some(obj) = target.as_object() {
             // §10.1.2 OrdinarySetPrototypeOf full algorithm.

@@ -844,6 +844,17 @@ impl Interpreter {
                             format!("Cannot assign to read-only property '{key}'"),
                         )?;
                     }
+                } else if let Some(c) = actual_this.as_class_constructor() {
+                    // Static elements run with `this` = the class
+                    // constructor; its own properties live on the
+                    // statics object.
+                    let statics = c.statics(&self.gc_heap);
+                    if !self.ordinary_set_data_property(statics, &key, value)? {
+                        Self::failed_set_result(
+                            strict,
+                            format!("Cannot assign to read-only property '{key}'"),
+                        )?;
+                    }
                 } else {
                     return Err(VmError::TypeMismatch);
                 }

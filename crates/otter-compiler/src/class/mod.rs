@@ -217,6 +217,7 @@ pub(crate) fn compile_class(
     // otherwise a capture resolved there would collide with these
     // cells. Values are stored once the prototype / parent exist.
     let home_storage = cx.declare_captured_binding(SUPER_HOME_NAME, true, span)?;
+    let static_home_storage = cx.declare_captured_binding(SUPER_STATIC_HOME_NAME, true, span)?;
     let super_storage = if class.super_class.is_some() {
         Some(cx.declare_captured_binding(SUPER_CTOR_NAME, true, span)?)
     } else {
@@ -327,6 +328,8 @@ pub(crate) fn compile_class(
     // resolve `super` through the standard upvalue walker.
     cx.emit_store_storage(prototype_reg, home_storage, span);
     cx.mark_initialized(SUPER_HOME_NAME);
+    cx.emit_store_storage(statics_reg, static_home_storage, span);
+    cx.mark_initialized(SUPER_STATIC_HOME_NAME);
     if let (Some(parent_reg), Some(super_storage)) = (super_reg, super_storage) {
         cx.emit_store_storage(parent_reg, super_storage, span);
         cx.mark_initialized(SUPER_CTOR_NAME);
@@ -495,6 +498,7 @@ pub(crate) fn compile_class(
             _ => "<computed>".to_string(),
         };
         cx.next_fn_is_method = true;
+        cx.next_fn_static_home = m.r#static;
         let (m_id, m_captures) = compile_function_full(
             cx,
             &body_name,
@@ -759,15 +763,11 @@ pub(crate) fn compile_class(
         match element {
             oxc_ast::ast::ClassElement::PropertyDefinition(p) if p.r#static && !p.declare => {
                 let pspan = (p.span.start, p.span.end);
-                let value_reg = match &p.value {
-                    Some(expr) => compile_expr(cx, expr, pspan)?,
-                    None => {
-                        let dst = cx.alloc_scratch();
-                        cx.emit(Op::LoadUndefined, [Operand::Register(dst)], pspan);
-                        dst
-                    }
-                };
-                if p.computed {
+                // §15.7.10 — the field NAME evaluates before the
+                // initializer; a computed key canonicalizes through
+                // ToPropertyKey and must not be "prototype".
+                let mut inferred_name: Option<String> = None;
+                let key_reg = if p.computed {
                     let key_expr =
                         p.key
                             .as_expression()
@@ -776,38 +776,129 @@ pub(crate) fn compile_class(
                                     .to_string(),
                                 span: pspan,
                             })?;
-                    let key_reg = compile_expr(cx, key_expr, pspan)?;
-                    // §15.7.14 — static computed key must not be
-                    // "prototype".
+                    let raw = compile_expr(cx, key_expr, pspan)?;
+                    let canon = cx.alloc_scratch();
                     cx.emit(
-                        Op::ClassCheck,
-                        [Operand::Imm32(1), Operand::Register(key_reg)],
+                        Op::ToPropertyKey,
+                        [Operand::Register(canon), Operand::Register(raw)],
                         pspan,
                     );
-                    cx.emit_store_element(statics_reg, key_reg, value_reg, pspan);
+                    cx.emit(
+                        Op::ClassCheck,
+                        [Operand::Imm32(1), Operand::Register(canon)],
+                        pspan,
+                    );
+                    canon
                 } else {
-                    let key_str = match &p.key {
-                        oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
-                            id.name.as_str().to_string()
-                        }
-                        oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value.to_string(),
-                        oxc_ast::ast::PropertyKey::NumericLiteral(lit) => {
-                            number_literal_property_name(lit.value)
-                        }
+                    match &p.key {
                         oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) => {
-                            let key_reg = load_private_key(cx, pid.name.as_str(), pspan)?;
-                            cx.emit_store_element(statics_reg, key_reg, value_reg, pspan);
-                            continue;
+                            inferred_name = Some(format!("#{}", pid.name.as_str()));
+                            load_private_key(cx, pid.name.as_str(), pspan)?
                         }
                         _ => {
-                            return Err(CompileError::Unsupported {
-                                node: "ClassDeclaration: non-string static field key".to_string(),
-                                span: pspan,
-                            });
+                            let key_str = match &p.key {
+                                oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
+                                    id.name.as_str().to_string()
+                                }
+                                oxc_ast::ast::PropertyKey::StringLiteral(lit) => {
+                                    lit.value.to_string()
+                                }
+                                oxc_ast::ast::PropertyKey::NumericLiteral(lit) => {
+                                    number_literal_property_name(lit.value)
+                                }
+                                _ => {
+                                    return Err(CompileError::Unsupported {
+                                        node: "ClassDeclaration: non-string static field key"
+                                            .to_string(),
+                                        span: pspan,
+                                    });
+                                }
+                            };
+                            inferred_name = Some(key_str.clone());
+                            let r = cx.alloc_scratch();
+                            let const_idx = cx.intern_string_constant(&key_str);
+                            cx.emit(
+                                Op::LoadString,
+                                [Operand::Register(r), Operand::ConstIndex(const_idx)],
+                                pspan,
+                            );
+                            r
                         }
-                    };
-                    cx.emit_store_property(statics_reg, &key_str, value_reg, pspan);
+                    }
+                };
+                // §15.7.10 — the initializer is its own function-like
+                // unit called with `this` = the class value.
+                let (init_id, init_captures) = compile_static_field_initializer(
+                    cx,
+                    &display_name,
+                    p.value.as_ref(),
+                    inferred_name.as_deref(),
+                    pspan,
+                )?;
+                let init_const = cx.intern_function_id(init_id);
+                let init_reg = cx.alloc_scratch();
+                emit_make_callable(cx, init_reg, init_const, &init_captures, false, pspan)?;
+                let value_reg = cx.alloc_scratch();
+                cx.emit(
+                    Op::CallWithThis,
+                    vec![
+                        Operand::Register(value_reg),
+                        Operand::Register(init_reg),
+                        Operand::Register(class_reg),
+                        Operand::ConstIndex(0),
+                    ],
+                    pspan,
+                );
+                let is_private_field =
+                    matches!(p.key, oxc_ast::ast::PropertyKey::PrivateIdentifier(_));
+                if is_private_field {
+                    // Private statics stay in the private store (not
+                    // observable through the ordinary MOP).
+                    cx.emit_store_element(statics_reg, key_reg, value_reg, pspan);
+                    continue;
                 }
+                // §7.3.7 CreateDataPropertyOrThrow on the class —
+                // writable / enumerable / configurable all true,
+                // never invoking inherited setters.
+                let desc_reg = cx.alloc_scratch();
+                cx.emit(Op::NewObject, [Operand::Register(desc_reg)], pspan);
+                let value_const = cx.intern_string_constant("value");
+                let store_scratch = cx.alloc_scratch();
+                cx.emit(
+                    Op::StoreProperty,
+                    vec![
+                        Operand::Register(desc_reg),
+                        Operand::ConstIndex(value_const),
+                        Operand::Register(value_reg),
+                        Operand::Register(store_scratch),
+                    ],
+                    pspan,
+                );
+                let true_reg = cx.alloc_scratch();
+                cx.emit(Op::LoadTrue, [Operand::Register(true_reg)], pspan);
+                for attr in ["writable", "enumerable", "configurable"] {
+                    let attr_const = cx.intern_string_constant(attr);
+                    let attr_scratch = cx.alloc_scratch();
+                    cx.emit(
+                        Op::StoreProperty,
+                        vec![
+                            Operand::Register(desc_reg),
+                            Operand::ConstIndex(attr_const),
+                            Operand::Register(true_reg),
+                            Operand::Register(attr_scratch),
+                        ],
+                        pspan,
+                    );
+                }
+                cx.emit(
+                    Op::DefineOwnProperty,
+                    [
+                        Operand::Register(statics_reg),
+                        Operand::Register(key_reg),
+                        Operand::Register(desc_reg),
+                    ],
+                    pspan,
+                );
             }
             oxc_ast::ast::ClassElement::StaticBlock(s) => {
                 // §15.7.4 StaticBlock — a synthesised function with
@@ -829,7 +920,7 @@ pub(crate) fn compile_class(
                     vec![
                         Operand::Register(dst),
                         Operand::Register(fn_reg),
-                        Operand::Register(statics_reg),
+                        Operand::Register(class_reg),
                         Operand::ConstIndex(0),
                     ],
                     bspan,
@@ -892,6 +983,24 @@ pub(crate) const SUPER_HOME_NAME: &str = "__class_home";
 /// constructor" upvalue. Holds the parent class value so
 /// `super(args)` knows what to invoke with the current receiver.
 pub(crate) const SUPER_CTOR_NAME: &str = "__class_super";
+
+/// Synthetic captured cell holding the STATICS object — the
+/// [[HomeObject]] for `super.x` inside static methods, static
+/// blocks, and static field initializers (§15.7.14: their home is
+/// the class, whose property lookups chain through the parent
+/// class's statics).
+pub(crate) const SUPER_STATIC_HOME_NAME: &str = "__class_static_home";
+
+/// Which home-object cell `super.x` resolves through in the current
+/// context (statics side for static elements, prototype side
+/// otherwise).
+pub(crate) fn super_home_binding_name(cx: &Compiler) -> &'static str {
+    if cx.super_home_static {
+        SUPER_STATIC_HOME_NAME
+    } else {
+        SUPER_HOME_NAME
+    }
+}
 
 /// Synthetic captured-binding name for the `idx`-th instance field's
 /// computed property key, evaluated once at class-definition time

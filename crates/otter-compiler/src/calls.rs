@@ -431,7 +431,10 @@ pub(crate) fn compile_method_call(
         // in the eval body (§19.2.1.1 step 5).
         let super_allowed = cx.in_field_initializer
             || cx.lookup_binding(crate::class::SUPER_HOME_NAME).is_some()
-            || cx.resolve_capture(crate::class::SUPER_HOME_NAME).is_some();
+            || cx.resolve_capture(crate::class::SUPER_HOME_NAME).is_some()
+            || cx
+                .resolve_capture(crate::class::SUPER_STATIC_HOME_NAME)
+                .is_some();
         let flags = i32::from(forbid_var_arguments)
             | (i32::from(cx.in_param_init) << 1)
             | (i32::from(new_target_allowed) << 2)

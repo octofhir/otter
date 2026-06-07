@@ -61,7 +61,7 @@ pub(crate) fn compile_assignment(
             // the parent prototype and invokes it with `this` as the
             // receiver; absent a setter it writes an own property onto
             // `this`. `Op::SetSuperProperty` performs both.
-            let home_reg = load_synthetic_capture(cx, SUPER_HOME_NAME, span)?;
+            let home_reg = load_synthetic_capture(cx, super_home_binding_name(cx), span)?;
             // §13.3.7.1 step 2 — `GetThisBinding` precedes RHS
             // evaluation so a derived-constructor TDZ ReferenceError
             // fires first.
@@ -193,7 +193,7 @@ pub(crate) fn compile_assignment(
             // invokes it with `this`; absent a setter it writes an own
             // property onto `this`. `Op::SetSuperElement` performs both
             // and runs `GetSuperBase` before the key's `ToPropertyKey`.
-            let home_reg = load_synthetic_capture(cx, SUPER_HOME_NAME, span)?;
+            let home_reg = load_synthetic_capture(cx, super_home_binding_name(cx), span)?;
             // §13.3.7.1 step 2 — `GetThisBinding` precedes evaluation
             // of the key expression, so a derived-constructor TDZ
             // ReferenceError fires before any key/RHS side effects.

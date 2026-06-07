@@ -13,7 +13,7 @@
 //! # See also
 //! - [`super`]
 
-use super::{SUPER_CTOR_NAME, SUPER_HOME_NAME, load_synthetic_capture};
+use super::{SUPER_CTOR_NAME, load_synthetic_capture, super_home_binding_name};
 use crate::*;
 
 /// `super(args...)` lowering. Per §13.3.7.3 SuperCall, super-calls
@@ -98,7 +98,7 @@ pub(crate) fn compile_super_computed_method_call(
     arguments: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
-    let home_reg = load_synthetic_capture(cx, SUPER_HOME_NAME, span)?;
+    let home_reg = load_synthetic_capture(cx, super_home_binding_name(cx), span)?;
     let parent_reg = cx.alloc_scratch();
     cx.emit(
         Op::GetPrototype,
@@ -160,7 +160,7 @@ pub(crate) fn compile_super_member_load(
     name: &str,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
-    let home_reg = load_synthetic_capture(cx, SUPER_HOME_NAME, span)?;
+    let home_reg = load_synthetic_capture(cx, super_home_binding_name(cx), span)?;
     let name_idx = cx.intern_string_constant(name);
     let dst = cx.alloc_scratch();
     cx.emit(
@@ -181,7 +181,7 @@ pub(crate) fn load_super_method(
     name: &str,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
-    let home_reg = load_synthetic_capture(cx, SUPER_HOME_NAME, span)?;
+    let home_reg = load_synthetic_capture(cx, super_home_binding_name(cx), span)?;
     let parent_reg = cx.alloc_scratch();
     cx.emit(
         Op::GetPrototype,

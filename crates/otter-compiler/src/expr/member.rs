@@ -155,7 +155,7 @@ pub(crate) fn compile_computed_member(
         // §13.3.5 MakeSuperPropertyReference — `super[key]` resolves
         // against `Object.getPrototypeOf(home)` but runs accessor
         // getters with the current frame's `this` as the receiver.
-        let home_reg = load_synthetic_capture(cx, SUPER_HOME_NAME, span)?;
+        let home_reg = load_synthetic_capture(cx, super_home_binding_name(cx), span)?;
         // §13.3.7.1 step 2 — `GetThisBinding` runs before the key
         // expression is evaluated. A `LoadThis` here surfaces the
         // derived-constructor TDZ ReferenceError before any side

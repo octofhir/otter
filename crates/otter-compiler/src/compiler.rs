@@ -36,6 +36,10 @@ pub(crate) struct Compiler {
     /// runtime never gives it an implicit `prototype` property
     /// (§10.2.5 MakeConstructor skips methods).
     pub(crate) next_fn_is_method: bool,
+    /// One-shot hint paired with [`Self::next_fn_is_method`]: the
+    /// next `compile_function_full` resolves `super.x` through the
+    /// statics-side home object (`static` MethodDefinition bodies).
+    pub(crate) next_fn_static_home: bool,
     /// Stack of private-field namespace ids — one per enclosing
     /// class declaration. The top entry is the namespace used to
     /// mangle every `#name` reference inside the current class
@@ -98,6 +102,7 @@ impl Compiler {
             stack: vec![top],
             fn_self_immutable_hint: false,
             next_fn_is_method: false,
+            next_fn_static_home: false,
             private_namespaces: Vec::new(),
             class_private_names: Vec::new(),
             class_private_ordered: Vec::new(),

@@ -34,6 +34,12 @@ pub(crate) struct FunctionContext {
     /// EvalDeclarationInstantiation `var arguments` early error
     /// (§19.2.1.3) for direct eval call sites inside the body.
     pub(crate) is_arrow: bool,
+    /// `true` when `super.x` in this context resolves its
+    /// [[HomeObject]] through the class STATICS side
+    /// (`__class_static_home`): static methods / accessors, static
+    /// blocks, and static field initializers. Arrows inherit the
+    /// flag lexically from their enclosing context.
+    pub(crate) super_home_static: bool,
     /// `true` while formal-parameter defaults of this function are
     /// being lowered. A direct eval in that window var-declaring
     /// `arguments` is an early SyntaxError when [`Self::binds_arguments`]
@@ -163,6 +169,7 @@ impl FunctionContext {
             scopes: Vec::new(),
             is_strict: false,
             is_arrow: false,
+            super_home_static: false,
             in_param_init: false,
             binds_arguments: false,
             module_url: String::new(),

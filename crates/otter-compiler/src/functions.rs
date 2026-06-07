@@ -25,6 +25,7 @@ pub(crate) fn compile_function_full(
 ) -> Result<(u32, Vec<u32>), CompileError> {
     let is_async_generator = is_async && is_generator;
     let is_method = std::mem::take(&mut parent.next_fn_is_method);
+    let static_home = std::mem::take(&mut parent.next_fn_static_home);
     let module = Rc::clone(&parent.top_mut().module);
     let body_has_strict_directive = match body {
         Some(b) => b.has_use_strict_directive(),
@@ -47,6 +48,7 @@ pub(crate) fn compile_function_full(
     let mut child = FunctionContext::new(Rc::clone(&module))
         .with_strict(function_is_strict)
         .with_module_url(parent.module_url.clone());
+    child.super_home_static = static_home;
     child.active_with_envs = active_with_envs;
     child.is_async_generator = is_async_generator;
     // §10.2.11 — every non-arrow function's variable environment
@@ -292,6 +294,7 @@ pub(crate) fn collect_direct_eval_bindings(
         if name.starts_with("__privsym_")
             || name.starts_with("__privbrand_")
             || name == crate::class::SUPER_HOME_NAME
+            || name == crate::class::SUPER_STATIC_HOME_NAME
             || name == crate::class::SUPER_CTOR_NAME
         {
             entries.push(otter_bytecode::DirectEvalBinding {
@@ -349,6 +352,9 @@ pub(crate) fn compile_arrow_function(
         .with_strict(function_is_strict)
         .with_arrow()
         .with_module_url(parent.module_url.clone());
+    // Arrows resolve `super` lexically — inherit the statics-side
+    // home flag from the enclosing context.
+    child.super_home_static = parent.super_home_static;
     child.active_with_envs = active_with_envs;
     // Arrows have no implicit `arguments` object; the binding exists
     // only when a parameter or a body var / lexical / function
@@ -585,5 +591,6 @@ pub(crate) fn capture_private_environment_for_eval(cx: &mut Compiler) {
 /// synthetic super bindings spliced into its frame.
 pub(crate) fn capture_super_bindings_for_eval(cx: &mut Compiler) {
     let _ = cx.resolve_capture(crate::class::SUPER_HOME_NAME);
+    let _ = cx.resolve_capture(crate::class::SUPER_STATIC_HOME_NAME);
     let _ = cx.resolve_capture(crate::class::SUPER_CTOR_NAME);
 }

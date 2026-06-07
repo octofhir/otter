@@ -677,6 +677,43 @@ impl Interpreter {
             }
             return Ok(None);
         }
+        // §10.4.5.1 TypedArray [[GetOwnProperty]] — canonical numeric
+        // keys resolve to an element data descriptor (or None when
+        // invalid: out-of-bounds / fractional / -0 / detached);
+        // everything else reads the expando bag.
+        if let Some(t) = target.as_typed_array(&self.gc_heap) {
+            match key {
+                VmPropertyKey::Symbol(sym) => {
+                    return Ok(t.expando(&self.gc_heap).and_then(|bag| {
+                        object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym)
+                    }));
+                }
+                _ => {
+                    let name = key.string_name().expect("non-symbol key");
+                    if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(name)
+                    {
+                        return Ok(
+                            match crate::property_dispatch::typed_array_valid_index(
+                                &t,
+                                &self.gc_heap,
+                                n,
+                            ) {
+                                Some(idx) => Some(object::PropertyDescriptor::data(
+                                    t.get(&mut self.gc_heap, idx).map_err(crate::oom_to_vm)?,
+                                    true,
+                                    true,
+                                    true,
+                                )),
+                                None => None,
+                            },
+                        );
+                    }
+                    return Ok(t
+                        .expando(&self.gc_heap)
+                        .and_then(|bag| object::get_own_descriptor(bag, &self.gc_heap, name)));
+                }
+            }
+        }
         if let Some(re) = target.as_regexp() {
             if key.string_name().is_some_and(|key| key == "lastIndex") {
                 return Ok(Some(object::PropertyDescriptor::data(
@@ -2792,6 +2829,13 @@ impl Interpreter {
                 proto_opt,
             ));
         }
+        // §10.1.2 — TypedArrays accept ordinary [[SetPrototypeOf]];
+        // the override rides a dedicated body slot consulted by every
+        // prototype-chain walk.
+        if let Some(t) = target.as_typed_array(&self.gc_heap) {
+            t.set_custom_proto(&mut self.gc_heap, *proto);
+            return Ok(true);
+        }
         if let Some(arr) = target.as_array() {
             let current_proto = self.get_prototype_for_op(target)?;
             if abstract_ops::same_value(proto, &current_proto, &self.gc_heap) {
@@ -3959,7 +4003,6 @@ impl Interpreter {
             || base.is_promise()
             || base.is_array_buffer()
             || base.is_data_view()
-            || base.is_typed_array()
             || base.is_weak_ref()
             || base.is_finalization_registry()
         {
@@ -3967,6 +4010,44 @@ impl Interpreter {
                 VmGetOutcome::Value(v) if v.is_undefined() => Ok(false),
                 _ => Ok(true),
             };
+        }
+        // §10.4.5.2 TypedArray [[HasProperty]] — a canonical numeric
+        // key answers IsValidIntegerIndex with NO prototype walk;
+        // anything else takes OrdinaryHasProperty (own expando, then
+        // the real prototype chain, dispatching Proxy `has` traps).
+        if let Some(t) = base.as_typed_array(&self.gc_heap) {
+            if let Some(name) = key.string_name()
+                && let Some(n) = crate::property_dispatch::canonical_numeric_index_string(name)
+            {
+                return Ok(
+                    crate::property_dispatch::typed_array_valid_index(&t, &self.gc_heap, n)
+                        .is_some(),
+                );
+            }
+            if let Some(bag) = t.expando(&self.gc_heap) {
+                let own = match key {
+                    VmPropertyKey::Symbol(sym) => !matches!(
+                        object::lookup_own_symbol(bag, &self.gc_heap, *sym),
+                        object::PropertyLookup::Absent
+                    ),
+                    _ => !matches!(
+                        object::lookup_own(
+                            bag,
+                            &self.gc_heap,
+                            key.string_name().expect("non-symbol key"),
+                        ),
+                        object::PropertyLookup::Absent
+                    ),
+                };
+                if own {
+                    return Ok(true);
+                }
+            }
+            let proto = self.get_prototype_for_op(&base)?;
+            if crate::reflect::is_type_object_value(&proto) {
+                return self.ordinary_has_property_value(context, proto, key, hops + 1);
+            }
+            return Ok(false);
         }
         Err(VmError::TypeMismatch)
     }

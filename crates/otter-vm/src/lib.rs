@@ -1442,6 +1442,12 @@ impl Interpreter {
             }
             return Ok(stored.unwrap_or(Value::null()));
         }
+        if let Some(t) = value.as_typed_array(&self.gc_heap) {
+            if let Some(over) = t.custom_proto(&self.gc_heap) {
+                return Ok(over);
+            }
+            return Ok(intrinsic_or_null(self, value));
+        }
         if let Some(nf) = value.as_native_function() {
             if let Some(over) = nf.prototype_override(&self.gc_heap) {
                 return Ok(over);

@@ -898,21 +898,18 @@ impl Interpreter {
                             if let Some(n) =
                                 crate::property_dispatch::canonical_numeric_index_string(k)
                             {
-                                if t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
-                                    || !n.is_finite()
-                                    || n.fract() != 0.0
-                                    || n < 0.0
-                                    || (n as usize) >= t.length(&self.gc_heap)
-                                {
-                                    None
-                                } else {
-                                    Some(crate::object::PropertyDescriptor::data(
-                                        t.get(&mut self.gc_heap, n as usize)
-                                            .map_err(crate::oom_to_vm)?,
+                                match crate::property_dispatch::typed_array_valid_index(
+                                    &t,
+                                    &self.gc_heap,
+                                    n,
+                                ) {
+                                    Some(idx) => Some(crate::object::PropertyDescriptor::data(
+                                        t.get(&mut self.gc_heap, idx).map_err(crate::oom_to_vm)?,
                                         true,
                                         true,
                                         true,
-                                    ))
+                                    )),
+                                    None => None,
                                 }
                             } else if let Some(bag) = t.expando(&self.gc_heap) {
                                 crate::object::get_own_descriptor(bag, self.gc_heap(), k)

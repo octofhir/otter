@@ -393,6 +393,9 @@ pub struct TypedArrayBodyGc {
     pub length: usize,
     /// Lazy expando bag for non-canonical-numeric own properties.
     pub expando: Option<crate::object::JsObject>,
+    /// §10.1.2 [[SetPrototypeOf]] override — `None` means the
+    /// per-kind `%TypedArray%.prototype` chain applies.
+    pub custom_proto: Option<crate::Value>,
 }
 
 impl otter_gc::SafeTraceable for TypedArrayBodyGc {
@@ -407,6 +410,9 @@ impl otter_gc::SafeTraceable for TypedArrayBodyGc {
         {
             let p = expando as *const crate::object::JsObject as *mut otter_gc::raw::RawGc;
             visitor(p);
+        }
+        if let Some(proto) = &self.custom_proto {
+            proto.trace_value_slots(visitor);
         }
     }
 }
@@ -433,6 +439,7 @@ pub fn alloc_typed_array(
         byte_offset,
         length,
         expando: None,
+        custom_proto: None,
     })
 }
 
@@ -500,6 +507,18 @@ impl JsTypedArray {
     #[must_use]
     pub fn expando(self, heap: &otter_gc::GcHeap) -> Option<crate::object::JsObject> {
         heap.read_payload(self.handle, |body| body.expando)
+    }
+
+    /// §10.1.2 — custom [[Prototype]] override, if one was set.
+    #[must_use]
+    pub fn custom_proto(self, heap: &otter_gc::GcHeap) -> Option<crate::Value> {
+        heap.read_payload(self.handle, |body| body.custom_proto)
+    }
+
+    /// Install a [[SetPrototypeOf]] override (object / proxy / null).
+    pub fn set_custom_proto(self, heap: &mut otter_gc::GcHeap, proto: crate::Value) {
+        heap.with_payload(self.handle, |body| body.custom_proto = Some(proto));
+        heap.record_write(self.handle, &proto);
     }
 
     /// Install / replace the lazy expando bag.

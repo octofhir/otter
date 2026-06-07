@@ -54,24 +54,19 @@ use crate::CompileError;
 /// `force_strict` lets direct-eval callers inherit the caller's
 /// strictness without rewriting the source.
 pub fn validate_strict_mode_early_errors(
-    program: &Program<'_>,
-    force_strict: bool,
+    body: &[oxc_ast::ast::Statement<'_>],
+    source_strict: bool,
+    super_allowed: bool,
 ) -> Result<(), CompileError> {
-    // Note: `program.source_type` is unreliable here. `otter-syntax`
-    // calls `SourceType::default()` (which is `mjs()` in oxc) for all
-    // script and module inputs alike; the script-vs-module routing is
-    // performed separately by the host runtime. We therefore derive
-    // initial strictness from the caller's `force_strict` (true for
-    // module compilation entry and direct-eval inheritance) plus the
-    // top-level `"use strict"` directive only.
-    let source_strict = force_strict || program.has_use_strict_directive();
     let mut visitor = StrictValidator {
         strict_stack: vec![source_strict],
-        super_stack: vec![false],
+        super_stack: vec![super_allowed],
         next_function_super_allowed: None,
         diagnostics: Vec::new(),
     };
-    visitor.visit_program(program);
+    for stmt in body {
+        visitor.visit_statement(stmt);
+    }
     if visitor.diagnostics.is_empty() {
         return Ok(());
     }
@@ -1808,15 +1803,16 @@ fn is_legacy_numeric_form(raw: &str) -> bool {
 /// exactly one case: two plain (non-async, non-generator) function
 /// declarations may share a name in sloppy mode.
 pub fn validate_block_early_errors(
-    program: &Program<'_>,
-    force_strict: bool,
+    body: &[oxc_ast::ast::Statement<'_>],
+    source_strict: bool,
 ) -> Result<(), CompileError> {
-    let source_strict = force_strict || program.has_use_strict_directive();
     let mut visitor = BlockLexicalValidator {
         strict_stack: vec![source_strict],
         diagnostics: Vec::new(),
     };
-    visitor.visit_program(program);
+    for stmt in body {
+        visitor.visit_statement(stmt);
+    }
     if visitor.diagnostics.is_empty() {
         return Ok(());
     }

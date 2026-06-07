@@ -1501,6 +1501,7 @@ impl Runtime {
                     caller_scope.as_deref(),
                     options.new_target_allowed,
                     options.in_class_field_initializer,
+                    options.super_property_allowed,
                 )
                 .map_err(|e| format!("compile error: {e:?}"))
             });

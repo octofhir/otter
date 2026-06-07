@@ -188,6 +188,7 @@ pub(crate) fn compile_function_full(
         }
         if contains_direct_eval {
             capture_private_environment_for_eval(parent);
+            capture_super_bindings_for_eval(parent);
             direct_eval_meta = collect_direct_eval_bindings(parent, &lex_names);
         }
     }
@@ -275,7 +276,11 @@ pub(crate) fn collect_direct_eval_bindings(
     // so a direct eval can resolve `obj.#name` (§19.2.1.1
     // PrivateEnvironment inheritance).
     for (name, idx) in cx.captured_uv.iter() {
-        if name.starts_with("__privsym_") || name.starts_with("__privbrand_") {
+        if name.starts_with("__privsym_")
+            || name.starts_with("__privbrand_")
+            || name == crate::class::SUPER_HOME_NAME
+            || name == crate::class::SUPER_CTOR_NAME
+        {
             entries.push(otter_bytecode::DirectEvalBinding {
                 name: name.clone(),
                 upvalue: *idx,
@@ -560,4 +565,12 @@ pub(crate) fn capture_private_environment_for_eval(cx: &mut Compiler) {
         let brand = format!("__privbrand_{ns}");
         let _ = cx.resolve_capture(&brand);
     }
+}
+
+/// Companion to [`capture_private_environment_for_eval`] — a direct
+/// eval whose call site has a [[HomeObject]] also needs the
+/// synthetic super bindings spliced into its frame.
+pub(crate) fn capture_super_bindings_for_eval(cx: &mut Compiler) {
+    let _ = cx.resolve_capture(crate::class::SUPER_HOME_NAME);
+    let _ = cx.resolve_capture(crate::class::SUPER_CTOR_NAME);
 }

@@ -426,10 +426,17 @@ pub(crate) fn compile_method_call(
         // caller's *body* lexical bindings are not yet in scope;
         // 2 — `new.target` is legal in the eval body; 3 — the body
         // observes `new.target` as undefined (field initializer).
+        // 4 — the call site's context carries a [[HomeObject]]
+        // (method body or field initializer), so `super.x` is legal
+        // in the eval body (§19.2.1.1 step 5).
+        let super_allowed = cx.in_field_initializer
+            || cx.lookup_binding(crate::class::SUPER_HOME_NAME).is_some()
+            || cx.resolve_capture(crate::class::SUPER_HOME_NAME).is_some();
         let flags = i32::from(forbid_var_arguments)
             | (i32::from(cx.in_param_init) << 1)
             | (i32::from(new_target_allowed) << 2)
-            | (i32::from(cx.in_field_initializer) << 3);
+            | (i32::from(cx.in_field_initializer) << 3)
+            | (i32::from(super_allowed) << 4);
         cx.emit(
             Op::Eval,
             [

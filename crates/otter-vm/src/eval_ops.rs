@@ -88,6 +88,7 @@ impl Interpreter {
         let in_param_init = flags & 2 != 0;
         let new_target_allowed = flags & 4 != 0;
         let new_target_suppressed = flags & 8 != 0;
+        let super_property_allowed = flags & 16 != 0;
         let top_idx = stack.len() - 1;
         let value = *read_register(&stack[top_idx], src_reg)?;
         let force_strict = context.function_is_strict(stack[top_idx].function_id);
@@ -117,6 +118,7 @@ impl Interpreter {
                     script_goal: false,
                     new_target_allowed,
                     in_class_field_initializer: new_target_suppressed,
+                    super_property_allowed,
                 },
             )?
         } else {
@@ -129,6 +131,7 @@ impl Interpreter {
                     script_goal: false,
                     new_target_allowed,
                     in_class_field_initializer: new_target_suppressed,
+                    super_property_allowed,
                 },
                 &cell_sources,
                 new_target_suppressed,

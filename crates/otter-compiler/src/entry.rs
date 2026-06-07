@@ -102,6 +102,7 @@ pub struct EvalCallerBinding {
 ///
 /// # Errors
 /// Returns [`CompileError`] when parsing fails or lowering rejects the AST.
+#[allow(clippy::too_many_arguments)]
 pub fn compile_eval_source(
     source: &str,
     kind: SyntaxSourceKind,
@@ -111,9 +112,187 @@ pub fn compile_eval_source(
     caller_scope: Option<&[EvalCallerBinding]>,
     new_target_allowed: bool,
     in_class_field_initializer: bool,
+    super_property_allowed: bool,
 ) -> Result<BytecodeModule, CompileError> {
     // §19.2.1.1 PerformEval parses the body with the Script goal.
-    otter_syntax::with_program_goal(source, kind, otter_syntax::SourceGoal::Script, |program| {
+    let direct = otter_syntax::with_program_goal(
+        source,
+        kind,
+        otter_syntax::SourceGoal::Script,
+        |program| {
+            compile_eval_parts(
+                ProgramParts::of(program),
+                kind,
+                module_specifier,
+                force_strict,
+                forbid_var_arguments,
+                caller_scope,
+                new_target_allowed,
+                in_class_field_initializer,
+                super_property_allowed,
+            )
+        },
+    )
+    .map_err(CompileError::from)?;
+    match direct {
+        Err(CompileError::Syntax { ref messages, .. })
+            if super_property_allowed && messages.iter().any(|m| m.contains("super")) =>
+        {
+            // §19.2.1.1 — `super` references are legal in eval code
+            // whose call site has a [[HomeObject]] (methods, field
+            // initializers). oxc has no allow-super parse switch, so
+            // re-parse the body inside a synthetic concise method and
+            // lower its statements through the ordinary eval pipeline.
+            let wrapped = format!("({{ __otter_eval__() {{\n{source}\n}} }});");
+            otter_syntax::with_program_goal(
+                &wrapped,
+                kind,
+                otter_syntax::SourceGoal::Script,
+                |program| {
+                    let body = extract_wrapped_eval_body(program)?;
+                    if statements_contain_top_level_return(&body.statements) {
+                        return Err(CompileError::Unsupported {
+                            node: "SyntaxError: return is not allowed in eval code".to_string(),
+                            span: (program.span.start, program.span.end),
+                        });
+                    }
+                    compile_eval_parts(
+                        ProgramParts {
+                            body: &body.statements,
+                            directives: &body.directives,
+                            span: (program.span.start, program.span.end),
+                            strict_directive: body.has_use_strict_directive(),
+                        },
+                        kind,
+                        module_specifier,
+                        force_strict,
+                        forbid_var_arguments,
+                        caller_scope,
+                        new_target_allowed,
+                        in_class_field_initializer,
+                        super_property_allowed,
+                    )
+                },
+            )
+            .map_err(CompileError::from)?
+        }
+        other => other,
+    }
+}
+
+/// Locate the synthetic wrapper's method body:
+/// `({ __otter_eval__() { ... } });`.
+fn extract_wrapped_eval_body<'a, 'b>(
+    program: &'b Program<'a>,
+) -> Result<&'b oxc_ast::ast::FunctionBody<'a>, CompileError> {
+    use oxc_ast::ast::{Expression, ObjectPropertyKind, Statement};
+    let err = || CompileError::Unsupported {
+        node: "internal: eval super-wrapper shape mismatch".to_string(),
+        span: (program.span.start, program.span.end),
+    };
+    let Some(Statement::ExpressionStatement(es)) = program.body.first() else {
+        return Err(err());
+    };
+    let mut expr = &es.expression;
+    while let Expression::ParenthesizedExpression(p) = expr {
+        expr = &p.expression;
+    }
+    let Expression::ObjectExpression(obj) = expr else {
+        return Err(err());
+    };
+    let Some(ObjectPropertyKind::ObjectProperty(prop)) = obj.properties.first() else {
+        return Err(err());
+    };
+    let Expression::FunctionExpression(f) = &prop.value else {
+        return Err(err());
+    };
+    f.body.as_deref().ok_or_else(err)
+}
+
+/// §19.2.1.1 — `return` stays illegal in eval code even though the
+/// wrapper method would let it parse. Walks statements without
+/// descending into nested functions.
+/// §19.2.1.1 — `super()` CALLS stay illegal in eval code unless the
+/// call site is a derived constructor (we only flag SuperProperty
+/// sites today, so any direct super-call in eval is an early
+/// SyntaxError). Arrows are transparent; ordinary functions open
+/// their own home scope.
+fn statements_contain_super_call(stmts: &[oxc_ast::ast::Statement<'_>]) -> bool {
+    use oxc_ast_visit::Visit;
+    #[derive(Default)]
+    struct SuperCallFinder {
+        found: bool,
+    }
+    impl<'a> Visit<'a> for SuperCallFinder {
+        fn visit_call_expression(&mut self, it: &oxc_ast::ast::CallExpression<'a>) {
+            if matches!(it.callee, oxc_ast::ast::Expression::Super(_)) {
+                self.found = true;
+            }
+            oxc_ast_visit::walk::walk_call_expression(self, it);
+        }
+        fn visit_function(
+            &mut self,
+            _: &oxc_ast::ast::Function<'a>,
+            _: oxc_syntax::scope::ScopeFlags,
+        ) {
+        }
+        fn visit_class_body(&mut self, _: &oxc_ast::ast::ClassBody<'a>) {}
+    }
+    let mut finder = SuperCallFinder::default();
+    for stmt in stmts {
+        finder.visit_statement(stmt);
+    }
+    finder.found
+}
+
+fn statements_contain_top_level_return(stmts: &[oxc_ast::ast::Statement<'_>]) -> bool {
+    use oxc_ast_visit::Visit;
+    #[derive(Default)]
+    struct ReturnFinder {
+        found: bool,
+    }
+    impl<'a> Visit<'a> for ReturnFinder {
+        fn visit_return_statement(&mut self, _: &oxc_ast::ast::ReturnStatement<'a>) {
+            self.found = true;
+        }
+        fn visit_function(
+            &mut self,
+            _: &oxc_ast::ast::Function<'a>,
+            _: oxc_syntax::scope::ScopeFlags,
+        ) {
+        }
+        fn visit_arrow_function_expression(
+            &mut self,
+            _: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+        ) {
+        }
+    }
+    let mut finder = ReturnFinder::default();
+    for stmt in stmts {
+        finder.visit_statement(stmt);
+    }
+    finder.found
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_eval_parts(
+    program: ProgramParts<'_, '_>,
+    kind: SyntaxSourceKind,
+    module_specifier: &str,
+    force_strict: bool,
+    forbid_var_arguments: bool,
+    caller_scope: Option<&[EvalCallerBinding]>,
+    new_target_allowed: bool,
+    in_class_field_initializer: bool,
+    super_property_allowed: bool,
+) -> Result<BytecodeModule, CompileError> {
+    if super_property_allowed && statements_contain_super_call(program.body) {
+        return Err(CompileError::Unsupported {
+            node: "SyntaxError: super() call is not allowed in this eval code".to_string(),
+            span: program.span,
+        });
+    }
+    {
         // §19.2.1.1 step 5 — `new.target` in eval code is an early
         // SyntaxError unless the direct-eval call site sits inside
         // non-arrow function code (arrows are transparent).
@@ -121,28 +300,28 @@ pub fn compile_eval_source(
         // initializer may not reference `arguments` (functions and
         // static blocks inside the body open their own scope).
         if in_class_field_initializer
-            && crate::strict_validation::program_contains_arguments(&program.body)
+            && crate::strict_validation::program_contains_arguments(program.body)
         {
             return Err(CompileError::Unsupported {
                 node:
                     "SyntaxError: 'arguments' is not allowed in class field initializer eval code"
                         .to_string(),
-                span: (program.span.start, program.span.end),
+                span: program.span,
             });
         }
-        if !new_target_allowed && capture::program_references_new_target(&program.body) {
+        if !new_target_allowed && capture::program_references_new_target(program.body) {
             return Err(CompileError::Unsupported {
                 node: "SyntaxError: new.target expression is not allowed here".to_string(),
-                span: (program.span.start, program.span.end),
+                span: program.span,
             });
         }
-        if forbid_var_arguments && !(force_strict || program.has_use_strict_directive()) {
+        if forbid_var_arguments && !(force_strict || program.strict_directive) {
             let mut var_names: Vec<String> = Vec::new();
-            hoist_var_names(&program.body, &mut var_names);
+            hoist_var_names(program.body, &mut var_names);
             if var_names.iter().any(|name| name == "arguments") {
                 return Err(CompileError::Unsupported {
                     node: "SyntaxError: eval body may not var-declare 'arguments' here".to_string(),
-                    span: (program.span.start, program.span.end),
+                    span: program.span,
                 });
             }
         }
@@ -153,9 +332,9 @@ pub fn compile_eval_source(
             force_strict,
             caller_scope,
             new_target_allowed,
+            super_property_allowed,
         )
-    })
-    .map_err(CompileError::from)?
+    }
 }
 
 /// Compile source text into the frozen runtime boundary product.
@@ -206,15 +385,17 @@ pub(crate) fn compile_program(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compile_program_for_eval(
-    program: &Program<'_>,
+    program: ProgramParts<'_, '_>,
     source_kind: SyntaxSourceKind,
     module_specifier: &str,
     force_strict: bool,
     caller_scope: Option<&[EvalCallerBinding]>,
     new_target_allowed: bool,
+    super_property_allowed: bool,
 ) -> Result<BytecodeModule, CompileError> {
-    compile_program_with_mode_impl(
+    compile_program_with_mode_impl_super(
         program,
         source_kind,
         module_specifier,
@@ -222,6 +403,7 @@ pub(crate) fn compile_program_for_eval(
         true,
         caller_scope,
         new_target_allowed,
+        super_property_allowed,
     )
 }
 
@@ -234,7 +416,7 @@ pub(crate) fn compile_program_with_mode(
     caller_scope: Option<&[EvalCallerBinding]>,
 ) -> Result<BytecodeModule, CompileError> {
     compile_program_with_mode_impl(
-        program,
+        ProgramParts::of(program),
         source_kind,
         module_specifier,
         force_strict,
@@ -244,15 +426,59 @@ pub(crate) fn compile_program_with_mode(
     )
 }
 
+/// Borrowed program surface: real `Program`s and eval bodies
+/// re-parsed through the super-property method wrapper both lower
+/// through the same pipeline.
+pub(crate) struct ProgramParts<'a, 'b> {
+    pub(crate) body: &'b [oxc_ast::ast::Statement<'a>],
+    pub(crate) directives: &'b [oxc_ast::ast::Directive<'a>],
+    pub(crate) span: (u32, u32),
+    pub(crate) strict_directive: bool,
+}
+
+impl<'a, 'b> ProgramParts<'a, 'b> {
+    pub(crate) fn of(program: &'b Program<'a>) -> Self {
+        Self {
+            body: &program.body,
+            directives: &program.directives,
+            span: (program.span.start, program.span.end),
+            strict_directive: program.has_use_strict_directive(),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compile_program_with_mode_impl(
-    program: &Program<'_>,
+    program: ProgramParts<'_, '_>,
     source_kind: SyntaxSourceKind,
     module_specifier: &str,
     force_strict: bool,
     eval_mode: bool,
     caller_scope: Option<&[EvalCallerBinding]>,
     new_target_allowed: bool,
+) -> Result<BytecodeModule, CompileError> {
+    compile_program_with_mode_impl_super(
+        program,
+        source_kind,
+        module_specifier,
+        force_strict,
+        eval_mode,
+        caller_scope,
+        new_target_allowed,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compile_program_with_mode_impl_super(
+    program: ProgramParts<'_, '_>,
+    source_kind: SyntaxSourceKind,
+    module_specifier: &str,
+    force_strict: bool,
+    eval_mode: bool,
+    caller_scope: Option<&[EvalCallerBinding]>,
+    new_target_allowed: bool,
+    super_property_allowed: bool,
 ) -> Result<BytecodeModule, CompileError> {
     let module = Rc::new(RefCell::new(ModuleBuilder::default()));
     let script_module_url = if module_specifier.starts_with("file://") {
@@ -266,13 +492,20 @@ pub(crate) fn compile_program_with_mode_impl(
     // §12.9.3.1 + §15.7 strict-mode early errors that oxc_parser
     // does not flag on its own (legacy octal / non-octal-decimal
     // integer literals, etc.).
-    strict_validation::validate_strict_mode_early_errors(program, force_strict)?;
+    strict_validation::validate_strict_mode_early_errors(
+        program.body,
+        force_strict || program.strict_directive,
+        super_property_allowed,
+    )?;
     // §14.2.1 / §14.12.1 block-level lexical early errors (duplicate
     // LexicallyDeclaredNames, lexical/var clashes) with the Annex B
     // §B.3.3.1 sloppy-mode plain-function exemption.
-    strict_validation::validate_block_early_errors(program, force_strict)?;
-    let main_is_async = module_body_uses_top_level_await(&program.body);
-    let main_is_strict = force_strict || program.has_use_strict_directive();
+    strict_validation::validate_block_early_errors(
+        program.body,
+        force_strict || program.strict_directive,
+    )?;
+    let main_is_async = module_body_uses_top_level_await(program.body);
+    let main_is_strict = force_strict || program.strict_directive;
     // Reserve slot 0 for `<main>` so nested function compilation
     // can pre-register their ids deterministically (slice 13 only
     // needs the immediate id, but the slot reservation keeps the
@@ -280,7 +513,7 @@ pub(crate) fn compile_program_with_mode_impl(
     module.borrow_mut().functions.push(Function {
         id: 0,
         name: "<main>".to_string(),
-        span: (program.span.start, program.span.end),
+        span: program.span,
         is_async: main_is_async,
         is_strict: main_is_strict,
         module_url: script_module_url.clone(),
@@ -289,7 +522,7 @@ pub(crate) fn compile_program_with_mode_impl(
     let mut top = FunctionContext::new(Rc::clone(&module))
         .with_strict(main_is_strict)
         .with_module_url(script_module_url);
-    top.captured_names = capture::analyze_module(&program.body);
+    top.captured_names = capture::analyze_module(program.body);
 
     // §19.2.1.3 EvalDeclarationInstantiation — direct eval inside a
     // function. The caller's bindings occupy the leading own-upvalue
@@ -309,9 +542,9 @@ pub(crate) fn compile_program_with_mode_impl(
             .map(|b| b.name.as_str())
             .collect();
         let mut body_var_names: Vec<String> = Vec::new();
-        hoist_var_names(&program.body, &mut body_var_names);
+        hoist_var_names(program.body, &mut body_var_names);
         body_var_names.extend(crate::annex_b::collect_annex_b_candidates(
-            &program.body,
+            program.body,
             &HashSet::new(),
         ));
         if let Some(name) = body_var_names
@@ -320,7 +553,7 @@ pub(crate) fn compile_program_with_mode_impl(
         {
             return Err(CompileError::Unsupported {
                 node: format!("SyntaxError: Identifier '{name}' has already been declared"),
-                span: (program.span.start, program.span.end),
+                span: program.span,
             });
         }
         for name in body_var_names {
@@ -329,12 +562,12 @@ pub(crate) fn compile_program_with_mode_impl(
             }
         }
     }
-    if !caller.is_empty() && capture::program_contains_direct_eval(&program.body) {
+    if !caller.is_empty() && capture::program_contains_direct_eval(program.body) {
         // A nested direct eval sees this chunk's scope as *its*
         // caller environment — promote every body-level binding to a
         // cell so the inner chunk can splice them.
         top.captured_names
-            .extend(capture::all_program_names(&program.body));
+            .extend(capture::all_program_names(program.body));
     }
     top.own_upvalue_count = caller_slot_count;
 
@@ -353,7 +586,7 @@ pub(crate) fn compile_program_with_mode_impl(
         // local instead of writing through the caller's cell.
         let shadowed: HashSet<String> = if main_is_strict {
             let mut names: Vec<String> = Vec::new();
-            hoist_var_names(&program.body, &mut names);
+            hoist_var_names(program.body, &mut names);
             names.into_iter().collect()
         } else {
             HashSet::new()
@@ -405,9 +638,9 @@ pub(crate) fn compile_program_with_mode_impl(
     // observe a stale local copy. Script bindings are
     // non-configurable; eval bindings are deletable. Strict eval and
     // function-caller eval keep the local / caller-cell model.
-    let program_span = (program.span.start, program.span.end);
+    let program_span = program.span;
     let mut top_level_vars: Vec<String> = Vec::new();
-    hoist_var_names(&program.body, &mut top_level_vars);
+    hoist_var_names(program.body, &mut top_level_vars);
     let global_var_bindings = !eval_mode || (caller.is_empty() && !main_is_strict);
     if global_var_bindings {
         cx.script_global_vars = top_level_vars.iter().cloned().collect();
@@ -415,12 +648,12 @@ pub(crate) fn compile_program_with_mode_impl(
         // declared name before any binding is created so a failing
         // script instantiates nothing: lexicals first, then function
         // declarations, then plain vars.
-        let function_names: HashSet<String> = top_level_hoistable_function_names(&program.body)
+        let function_names: HashSet<String> = top_level_hoistable_function_names(program.body)
             .into_iter()
             .collect();
         let mut validate_lex: Vec<(String, bool)> = Vec::new();
         if !eval_mode {
-            hoist_lexical_names(&program.body, &mut validate_lex);
+            hoist_lexical_names(program.body, &mut validate_lex);
         }
         let mut seen: HashSet<&str> = HashSet::new();
         let mut validations: Vec<(&str, i32)> = Vec::new();
@@ -454,7 +687,7 @@ pub(crate) fn compile_program_with_mode_impl(
     // scope with block-level function declaration names.
     pre_declare_annex_b_functions(
         &mut cx,
-        &program.body,
+        program.body,
         &std::collections::HashSet::new(),
         program_span,
     )?;
@@ -466,7 +699,7 @@ pub(crate) fn compile_program_with_mode_impl(
     // sibling scripts and eval chunks resolve the same binding; eval
     // lexicals stay private to the eval body (§19.2.1.1).
     let mut top_level_lex: Vec<(String, bool)> = Vec::new();
-    hoist_lexical_names(&program.body, &mut top_level_lex);
+    hoist_lexical_names(program.body, &mut top_level_lex);
     if !eval_mode {
         cx.script_global_lexicals = top_level_lex.iter().map(|(name, _)| name.clone()).collect();
         let mut declared: HashSet<&str> = HashSet::new();
@@ -493,9 +726,9 @@ pub(crate) fn compile_program_with_mode_impl(
     // mode this runs *before* the var pre-pass per §16.1.7 steps
     // 16–17 / §19.2.1.3 steps 14–15: a CanDeclareGlobalFunction
     // TypeError must abort before any var binding is created.
-    hoist_function_declarations(&mut cx, &program.body)?;
+    hoist_function_declarations(&mut cx, program.body)?;
     if global_var_bindings {
-        let function_names: HashSet<String> = top_level_hoistable_function_names(&program.body)
+        let function_names: HashSet<String> = top_level_hoistable_function_names(program.body)
             .into_iter()
             .collect();
         let mut declared: HashSet<&str> = HashSet::new();
@@ -532,7 +765,7 @@ pub(crate) fn compile_program_with_mode_impl(
     // string value to the script / `eval` completion value (so
     // `eval('"x"')` evaluates to `"x"`). oxc lifts these out of
     // `body` into `directives`, so emit them here first.
-    for directive in &program.directives {
+    for directive in program.directives {
         let dst = cx.alloc_scratch();
         let const_idx = cx.intern_string_constant(&directive.expression.value);
         cx.emit(
@@ -542,7 +775,7 @@ pub(crate) fn compile_program_with_mode_impl(
         );
         cx.emit_completion_value(dst, (directive.span.start, directive.span.end));
     }
-    for stmt in &program.body {
+    for stmt in program.body {
         compile_statement(&mut cx, stmt)?;
     }
     // The chunk's full cell-backed scope table. The runtime adopts
@@ -585,7 +818,7 @@ pub(crate) fn compile_program_with_mode_impl(
 
     // The program completion value is whatever the completion
     // register holds when the body finishes.
-    let span = (program.span.start, program.span.end);
+    let span = program.span;
     cx.emit(Op::Return, [Operand::Register(completion_reg)], span);
 
     // Finalize `<main>` into the module's function table, then
@@ -683,10 +916,10 @@ pub fn compile_module_program(
 ) -> Result<BytecodeModule, CompileError> {
     // §12.9.3.1 + §15.7 strict-mode early errors. Module bodies are
     // always strict mode code (§10.2.10).
-    strict_validation::validate_strict_mode_early_errors(program, true)?;
+    strict_validation::validate_strict_mode_early_errors(&program.body, true, false)?;
     // §14.2.1 / §14.12.1 block-level lexical early errors; module
     // code is always strict so no Annex B exemption applies.
-    strict_validation::validate_block_early_errors(program, true)?;
+    strict_validation::validate_block_early_errors(&program.body, true)?;
     strict_validation::validate_module_early_errors(program)?;
     // §16.2.1 Static Semantics: Early Errors — `ImportDeclaration`
     // and `ExportDeclaration` are `ModuleItem` productions, not

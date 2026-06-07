@@ -638,6 +638,10 @@ pub struct EvalCompileOptions {
     /// a free `arguments` reference in the eval body is an early
     /// SyntaxError.
     pub in_class_field_initializer: bool,
+    /// §19.2.1.1 step 5 — the direct-eval call site carries a
+    /// [[HomeObject]] (method / field initializer), making
+    /// `super.x` legal in the eval body.
+    pub super_property_allowed: bool,
 }
 
 /// One caller-environment binding visible to a direct eval body.

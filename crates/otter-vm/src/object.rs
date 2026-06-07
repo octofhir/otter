@@ -2309,6 +2309,10 @@ pub fn resolve_set(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> SetOutc
         PropertyLookup::Absent => {}
     }
     // Walk prototype chain.
+    if let Some(parent) = exotic_prototype_value(obj, heap) {
+        return SetOutcome::ExoticParent { parent };
+    }
+    let mut node = obj;
     let mut current = prototype(obj, heap);
     let mut hops = 0;
     while let Some(proto) = current {
@@ -2340,8 +2344,13 @@ pub fn resolve_set(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> SetOutc
             }
             PropertyLookup::Absent => {}
         }
+        node = proto;
+        if let Some(parent) = exotic_prototype_value(node, heap) {
+            return SetOutcome::ExoticParent { parent };
+        }
         current = prototype(proto, heap);
     }
+    let _ = node;
     // Nothing on the chain — install a fresh data slot.
     if !is_extensible(obj, heap) {
         return SetOutcome::Reject {
@@ -2349,6 +2358,19 @@ pub fn resolve_set(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> SetOutc
         };
     }
     SetOutcome::AssignData
+}
+
+/// A stored `[[Prototype]]` that is NOT an ordinary `JsObject` —
+/// e.g. a TypedArray or Proxy value installed via
+/// `Object.create(exotic)` / `Object.setPrototypeOf`. Ordinary-walk
+/// helpers must stop there and let the value-level funnel dispatch
+/// the exotic's own internal methods.
+fn exotic_prototype_value(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<Value> {
+    let stored = prototype_value(obj, heap)?;
+    if stored.as_object().is_some() || stored.is_null() || stored.is_undefined() {
+        return None;
+    }
+    Some(stored)
 }
 
 /// Symbol-keyed counterpart to [`resolve_set`].

@@ -63,6 +63,15 @@ pub enum SetOutcome {
         /// Stable rejection reason (used by future strict-mode wiring).
         reason: SetRejectReason,
     },
+    /// The walk reached a prototype that is not an ordinary
+    /// `JsObject` (a TypedArray, Proxy value, or other exotic). The
+    /// runtime must continue the §10.1.9 OrdinarySet walk by
+    /// dispatching `parent.[[Set]]` through the value-level funnel —
+    /// exotic [[Set]] overrides (e.g. §10.4.5.5) are observable.
+    ExoticParent {
+        /// The non-ordinary prototype value.
+        parent: Value,
+    },
 }
 
 /// Why a `[[Set]]` was rejected.

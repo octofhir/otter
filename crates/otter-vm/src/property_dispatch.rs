@@ -798,6 +798,18 @@ impl Interpreter {
                     format!("Cannot assign to read-only property '{key}'"),
                 )?;
             }
+            object::SetOutcome::ExoticParent { parent } => {
+                if !self.ordinary_set_data_value(
+                    context,
+                    parent,
+                    &VmPropertyKey::String(&key),
+                    value,
+                    actual_this,
+                    1,
+                )? {
+                    Self::failed_set_result(strict, format!("Cannot assign to property '{key}'"))?;
+                }
+            }
             object::SetOutcome::AssignData => {
                 // No setter on the super base — write an own data
                 // property on the receiver (`this`).
@@ -1339,6 +1351,10 @@ impl Interpreter {
                                 return Ok(());
                             }
                             object::SetOutcome::AssignData => {}
+                            // %RegExp.prototype% chains stay ordinary;
+                            // an exotic link falls back to the own-slot
+                            // install below (pre-existing behaviour).
+                            object::SetOutcome::ExoticParent { .. } => {}
                         }
                     }
                     if !r.is_extensible(&self.gc_heap) {
@@ -1412,6 +1428,8 @@ impl Interpreter {
                                 return Ok(());
                             }
                             object::SetOutcome::AssignData => {}
+                            // %Array.prototype% chains stay ordinary.
+                            object::SetOutcome::ExoticParent { .. } => {}
                         }
                     }
                 }
@@ -2107,7 +2125,7 @@ impl Interpreter {
                     &recv,
                     !Self::deferred_key_is_symbol_like(&VmPropertyKey::String(&key)),
                 )?;
-                self.store_computed_ordinary_property(obj, &key, value, strict)?;
+                self.store_computed_ordinary_property(context, recv, obj, &key, value, strict)?;
             } else if let Some(n) = idx_value.as_number() {
                 let key = n.to_display_string();
                 self.ensure_deferred_namespace_ready(
@@ -2115,7 +2133,7 @@ impl Interpreter {
                     &recv,
                     !Self::deferred_key_is_symbol_like(&VmPropertyKey::String(&key)),
                 )?;
-                self.store_computed_ordinary_property(obj, &key, value, strict)?;
+                self.store_computed_ordinary_property(context, recv, obj, &key, value, strict)?;
             } else {
                 return Err(VmError::TypeMismatch);
             }
@@ -2303,6 +2321,8 @@ impl Interpreter {
                                     return Ok(());
                                 }
                                 object::SetOutcome::AssignData => {}
+                                // %Array.prototype% chains stay ordinary.
+                                object::SetOutcome::ExoticParent { .. } => {}
                             }
                         }
                     }
@@ -2459,6 +2479,8 @@ impl Interpreter {
     /// writes (`obj[key] = value`).
     pub(crate) fn store_computed_ordinary_property(
         &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
         obj: JsObject,
         key: &str,
         value: Value,
@@ -2481,6 +2503,22 @@ impl Interpreter {
             ),
             object::SetOutcome::Reject { .. } => {
                 Self::failed_set_result(strict, format!("Cannot assign to property '{key}'"))
+            }
+            // §10.1.9.2 step 2 — the walk hit an exotic prototype
+            // (e.g. a TypedArray): continue through parent.[[Set]]
+            // so its override (§10.4.5.5) is observable.
+            object::SetOutcome::ExoticParent { parent } => {
+                if !self.ordinary_set_data_value(
+                    context,
+                    parent,
+                    &VmPropertyKey::String(key),
+                    value,
+                    receiver,
+                    1,
+                )? {
+                    Self::failed_set_result(strict, format!("Cannot assign to property '{key}'"))?;
+                }
+                Ok(())
             }
         }
     }
@@ -2521,6 +2559,19 @@ impl Interpreter {
             object::SetOutcome::Reject { .. } => {
                 Self::failed_set_result(strict, format!("Cannot assign to property '{key}'"))
             }
+            object::SetOutcome::ExoticParent { parent } => {
+                if !self.ordinary_set_data_value(
+                    context,
+                    parent,
+                    &VmPropertyKey::String(key),
+                    value,
+                    Value::object(obj),
+                    1,
+                )? {
+                    Self::failed_set_result(strict, format!("Cannot assign to property '{key}'"))?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -2550,6 +2601,19 @@ impl Interpreter {
             }
             object::SetOutcome::Reject { .. } => {
                 Self::failed_set_result(strict, "Cannot assign to symbol property")
+            }
+            object::SetOutcome::ExoticParent { parent } => {
+                if !self.ordinary_set_data_value(
+                    context,
+                    parent,
+                    &VmPropertyKey::Symbol(sym),
+                    value,
+                    Value::object(obj),
+                    1,
+                )? {
+                    Self::failed_set_result(strict, "Cannot assign to symbol property")?;
+                }
+                Ok(())
             }
         }
     }
@@ -3243,6 +3307,21 @@ impl Interpreter {
                                                 "Cannot assign to symbol property",
                                             )?;
                                         }
+                                        object::SetOutcome::ExoticParent { parent } => {
+                                            if !self.ordinary_set_data_value(
+                                                context,
+                                                parent,
+                                                &VmPropertyKey::Symbol(*sym),
+                                                value,
+                                                receiver,
+                                                1,
+                                            )? {
+                                                Self::failed_set_result(
+                                                    strict,
+                                                    "Cannot assign to symbol property",
+                                                )?;
+                                            }
+                                        }
                                     }
                                 }
                                 _ => {
@@ -3268,6 +3347,21 @@ impl Interpreter {
                                                 strict,
                                                 format!("Cannot assign to property '{key}'"),
                                             )?;
+                                        }
+                                        object::SetOutcome::ExoticParent { parent } => {
+                                            if !self.ordinary_set_data_value(
+                                                context,
+                                                parent,
+                                                &VmPropertyKey::String(key),
+                                                value,
+                                                receiver,
+                                                1,
+                                            )? {
+                                                Self::failed_set_result(
+                                                    strict,
+                                                    format!("Cannot assign to property '{key}'"),
+                                                )?;
+                                            }
                                         }
                                     }
                                 }
@@ -3404,6 +3498,24 @@ impl Interpreter {
                         object::SetOutcome::Reject { .. } => {
                             Self::failed_set_result(strict, "Cannot assign to property")?;
                         }
+                        object::SetOutcome::ExoticParent { parent } => {
+                            let pkey = match &key {
+                                ComputedPropertyKey::String(key) => {
+                                    VmPropertyKey::OwnedString(key.clone())
+                                }
+                                ComputedPropertyKey::Symbol(sym) => VmPropertyKey::Symbol(*sym),
+                            };
+                            if !self.ordinary_set_data_value(
+                                context,
+                                parent,
+                                &pkey,
+                                value,
+                                Value::proxy(proxy),
+                                1,
+                            )? {
+                                Self::failed_set_result(strict, "Cannot assign to property")?;
+                            }
+                        }
                     }
                 }
             }
@@ -3538,6 +3650,10 @@ impl Interpreter {
                         self.current_byte_len,
                     );
                 }
+                // The own-properties bag has no exotic prototype.
+                object::SetOutcome::ExoticParent { .. } => {
+                    let _ = object::set_symbol(obj, &mut self.gc_heap, *sym, value);
+                }
             }
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return Ok(true);
@@ -3606,6 +3722,8 @@ impl Interpreter {
                                     );
                                 }
                                 object::SetOutcome::AssignData => {}
+                                // %RegExp.prototype% chains stay ordinary.
+                                object::SetOutcome::ExoticParent { .. } => {}
                             }
                         }
                         if !r.is_extensible(&self.gc_heap) {
@@ -3713,6 +3831,25 @@ impl Interpreter {
             }
         };
         match outcome {
+            // §10.1.9.2 step 2 — an exotic prototype (TypedArray,
+            // Proxy value) owns [[Set]]: continue through the
+            // value-level funnel with the ORIGINAL receiver.
+            object::SetOutcome::ExoticParent { parent } => {
+                let pkey = match &key {
+                    ComputedPropertyKey::String(key) => VmPropertyKey::OwnedString(key.clone()),
+                    ComputedPropertyKey::Symbol(sym) => VmPropertyKey::Symbol(*sym),
+                };
+                if !self.ordinary_set_data_value(context, parent, &pkey, value, receiver, 1)? {
+                    return Self::finish_failed_set(
+                        stack,
+                        context,
+                        "Cannot assign to read-only property",
+                        self.current_byte_len,
+                    );
+                }
+                stack[top_idx].advance_pc(self.current_byte_len)?;
+                Ok(true)
+            }
             object::SetOutcome::AssignData => {
                 let ok = match &key {
                     ComputedPropertyKey::String(key) => {
@@ -3914,6 +4051,21 @@ impl Interpreter {
                         return Ok(true);
                     };
                     match object::resolve_set(target, &self.gc_heap, name) {
+                        object::SetOutcome::ExoticParent { parent } => {
+                            if !self.ordinary_set_data_value(
+                                context,
+                                parent,
+                                &VmPropertyKey::String(name),
+                                value,
+                                Value::proxy(proxy),
+                                1,
+                            )? {
+                                Self::failed_set_result(
+                                    strict,
+                                    format!("Cannot assign to property '{name}'"),
+                                )?;
+                            }
+                        }
                         object::SetOutcome::AssignData => {
                             if !self.ordinary_set_data_property(target, name, value)? {
                                 Self::failed_set_result(
@@ -4090,6 +4242,28 @@ impl Interpreter {
         };
         let outcome = crate::object::resolve_set(obj, &self.gc_heap, name);
         match outcome {
+            // §10.1.9.2 step 2 — an exotic prototype owns [[Set]]:
+            // continue through the value-level funnel (TypedArray
+            // §10.4.5.5 etc. are observable from plain receivers).
+            object::SetOutcome::ExoticParent { parent } => {
+                if !self.ordinary_set_data_value(
+                    context,
+                    parent,
+                    &VmPropertyKey::String(name),
+                    value,
+                    receiver,
+                    1,
+                )? {
+                    return Self::finish_failed_set(
+                        stack,
+                        context,
+                        format!("Cannot assign to property '{name}'"),
+                        self.current_byte_len,
+                    );
+                }
+                stack[top_idx].advance_pc(self.current_byte_len)?;
+                Ok(true)
+            }
             object::SetOutcome::AssignData => {
                 let transition = if receiver.is_object()
                     && object::supports_fast_property_ic(obj, &self.gc_heap)

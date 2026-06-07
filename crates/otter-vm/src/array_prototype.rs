@@ -1398,6 +1398,9 @@ impl Interpreter {
                         });
                     }
                     crate::object::SetOutcome::AssignData => {}
+                    // ordinary_set_data_value below dispatches
+                    // exotic [[Set]] overrides itself.
+                    crate::object::SetOutcome::ExoticParent { .. } => {}
                 }
             }
         }
@@ -1414,6 +1417,7 @@ impl Interpreter {
                     });
                 }
                 crate::object::SetOutcome::AssignData => {}
+                crate::object::SetOutcome::ExoticParent { .. } => {}
             }
         }
         let ok = self.ordinary_set_data_value(
@@ -1547,6 +1551,8 @@ impl Interpreter {
                     }
                     crate::object::SetOutcome::Reject { .. } => return Ok(false),
                     crate::object::SetOutcome::AssignData => {}
+                    // %Array.prototype% chains stay ordinary.
+                    crate::object::SetOutcome::ExoticParent { .. } => {}
                 }
             }
             if !crate::array::is_extensible(arr, self.gc_heap()) {

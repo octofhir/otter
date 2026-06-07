@@ -302,6 +302,11 @@ pub fn call(
                     crate::object::SetOutcome::Reject { .. } => {
                         return Ok(Value::boolean(false));
                     }
+                    crate::object::SetOutcome::ExoticParent { parent } => {
+                        let ok = interp
+                            .ordinary_set_data_value(context, parent, &key, value, receiver, 1)?;
+                        return Ok(Value::boolean(ok));
+                    }
                     crate::object::SetOutcome::AssignData => {
                         // §10.1.9.2 step 2.b — `resolve_set` only walks
                         // ordinary prototype links, so a Proxy in the

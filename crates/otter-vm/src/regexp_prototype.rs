@@ -569,6 +569,9 @@ fn set_property_runtime(
                 return Err(read_only_set_error(name, key));
             }
             crate::object::SetOutcome::AssignData => {}
+            // The value-level funnel below dispatches exotic
+            // [[Set]] overrides itself.
+            crate::object::SetOutcome::ExoticParent { .. } => {}
         }
     }
     let ok = interp

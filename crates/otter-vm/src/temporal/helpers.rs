@@ -117,6 +117,28 @@ pub fn opt_integer_with_truncation(
     to_integer_with_truncation(&v, heap, class, field)
 }
 
+/// §GetOptionsObject — `undefined` yields `None` (use defaults); any
+/// object (including a callable / array) is valid and its plain
+/// object-bag, when present, is returned for field reads; a non-object
+/// primitive is a TypeError. Callables expose no plain bag, so option
+/// fields read as absent (defaults), matching the spec for the
+/// no-fields case.
+pub fn options_object(
+    v: &Value,
+    class: &'static str,
+) -> Result<Option<JsObject>, NativeError> {
+    if v.is_undefined() {
+        return Ok(None);
+    }
+    if !v.is_object_type() {
+        return Err(NativeError::TypeError {
+            name: class,
+            reason: "options must be an object or undefined".to_string(),
+        });
+    }
+    Ok(v.as_object())
+}
+
 pub fn opt_integer_if_integral(
     args: &[Value],
     index: usize,
@@ -306,14 +328,8 @@ pub fn parse_disambiguation(
 ) -> Result<temporal_rs::options::Disambiguation, NativeError> {
     use core::str::FromStr;
     let v = arg_or_undef(args, index);
-    if v.is_undefined() {
+    let Some(obj) = options_object(&v, class)? else {
         return Ok(temporal_rs::options::Disambiguation::Compatible);
-    }
-    let Some(obj) = v.as_object() else {
-        return Err(NativeError::TypeError {
-            name: class,
-            reason: "options must be an object or undefined".to_string(),
-        });
     };
     match read_string_field(obj, "disambiguation", heap) {
         Some(name) => temporal_rs::options::Disambiguation::from_str(&name).map_err(|_| {
@@ -363,14 +379,8 @@ pub fn parse_to_string_rounding_options(
     use core::str::FromStr;
     let mut opts = temporal_rs::options::ToStringRoundingOptions::default();
     let v = arg_or_undef(args, index);
-    if v.is_undefined() {
+    let Some(obj) = options_object(&v, class)? else {
         return Ok(opts);
-    }
-    let Some(obj) = v.as_object() else {
-        return Err(NativeError::TypeError {
-            name: class,
-            reason: "toString() options must be an object or undefined".to_string(),
-        });
     };
     if let Some(name) = read_string_field(obj, "smallestUnit", heap) {
         opts.smallest_unit = Some(temporal_rs::options::Unit::from_str(&name).map_err(|_| {
@@ -432,14 +442,8 @@ pub fn parse_display_calendar(
 ) -> Result<temporal_rs::options::DisplayCalendar, NativeError> {
     use core::str::FromStr;
     let v = arg_or_undef(args, index);
-    if v.is_undefined() {
+    let Some(obj) = options_object(&v, class)? else {
         return Ok(temporal_rs::options::DisplayCalendar::Auto);
-    }
-    let Some(obj) = v.as_object() else {
-        return Err(NativeError::TypeError {
-            name: class,
-            reason: "toString() options must be an object or undefined".to_string(),
-        });
     };
     match read_string_field(obj, "calendarName", heap) {
         Some(name) => temporal_rs::options::DisplayCalendar::from_str(&name).map_err(|_| {
@@ -495,14 +499,8 @@ pub fn parse_difference_settings(
     use core::str::FromStr;
     let mut settings = temporal_rs::options::DifferenceSettings::default();
     let v = arg_or_undef(args, index);
-    if v.is_undefined() {
+    let Some(obj) = options_object(&v, class)? else {
         return Ok(settings);
-    }
-    let Some(obj) = v.as_object() else {
-        return Err(NativeError::TypeError {
-            name: class,
-            reason: "options must be an object".to_string(),
-        });
     };
     if let Some(name) = read_string_field(obj, "largestUnit", heap)
         && !name.is_empty()

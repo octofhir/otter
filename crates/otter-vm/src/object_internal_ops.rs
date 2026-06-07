@@ -4886,10 +4886,20 @@ impl Interpreter {
                     // data property rejects, an own accessor invokes
                     // its setter (receiver = the typed array), and a
                     // fresh key requires the bag to be extensible.
+                    let same_receiver = receiver
+                        .as_typed_array(&self.gc_heap)
+                        .is_some_and(|r| r == t);
                     match object::lookup_own(bag, &self.gc_heap, &name) {
                         object::PropertyLookup::Data { flags, .. } => {
                             if !flags.writable() {
                                 return Ok(false);
+                            }
+                            if !same_receiver {
+                                // §10.1.9.2 — own writable data on the
+                                // chain: the write lands on the
+                                // RECEIVER, never the holder.
+                                return self
+                                    .ordinary_set_on_receiver(context, key, value, &receiver);
                             }
                             object::set(bag, &mut self.gc_heap, &name, value);
                             return Ok(true);
@@ -4903,11 +4913,25 @@ impl Interpreter {
                             return Ok(true);
                         }
                         object::PropertyLookup::Absent => {
-                            if !object::is_extensible(bag, &self.gc_heap) {
-                                return Ok(false);
+                            // §10.1.9 step 2 — own miss continues the
+                            // walk through the typed array's
+                            // [[Prototype]] (a setter on
+                            // %TypedArray.prototype% must fire); only
+                            // a fully-absent chain defines on the
+                            // receiver.
+                            let parent = self.get_prototype_for_op(&target)?;
+                            if parent.is_null() || parent.is_undefined() {
+                                return self
+                                    .ordinary_set_on_receiver(context, key, value, &receiver);
                             }
-                            object::set(bag, &mut self.gc_heap, &name, value);
-                            return Ok(true);
+                            return self.ordinary_set_data_value(
+                                context,
+                                parent,
+                                key,
+                                value,
+                                receiver,
+                                hops + 1,
+                            );
                         }
                     }
                 }
@@ -5003,16 +5027,48 @@ impl Interpreter {
             {
                 return Ok(false);
             }
-            return Ok(if let VmPropertyKey::Symbol(sym) = key {
-                object::set_symbol(obj, &mut self.gc_heap, *sym, value)
+            // §10.1.9 OrdinarySet — full chain walk: a setter
+            // anywhere on the chain fires (receiver-bound), a
+            // non-writable slot rejects, an exotic prototype link
+            // re-enters this funnel, and a data outcome writes with
+            // receiver-phase semantics.
+            let outcome = if let VmPropertyKey::Symbol(sym) = key {
+                object::resolve_symbol_set(obj, &self.gc_heap, *sym)
             } else {
-                self.ordinary_set_data_property(
+                object::resolve_set(
                     obj,
+                    &self.gc_heap,
                     key.string_name()
                         .expect("non-symbol key has string spelling"),
-                    value,
-                )?
-            });
+                )
+            };
+            return match outcome {
+                object::SetOutcome::InvokeSetter { setter } => {
+                    let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
+                    self.run_callable_sync(context, &setter, receiver, argv)?;
+                    Ok(true)
+                }
+                object::SetOutcome::Reject { .. } => Ok(false),
+                object::SetOutcome::ExoticParent { parent } => {
+                    self.ordinary_set_data_value(context, parent, key, value, receiver, hops + 1)
+                }
+                object::SetOutcome::AssignData => {
+                    let same_receiver = receiver.as_object().is_some_and(|r| r == obj);
+                    if !same_receiver {
+                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                    }
+                    Ok(if let VmPropertyKey::Symbol(sym) = key {
+                        object::set_symbol(obj, &mut self.gc_heap, *sym, value)
+                    } else {
+                        self.ordinary_set_data_property(
+                            obj,
+                            key.string_name()
+                                .expect("non-symbol key has string spelling"),
+                            value,
+                        )?
+                    })
+                }
+            };
         }
         if let Some(re) = target.as_regexp() {
             return match key {

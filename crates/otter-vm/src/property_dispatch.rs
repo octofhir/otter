@@ -1474,7 +1474,12 @@ impl Interpreter {
                     t.set(&mut self.gc_heap, n as usize, &converted);
                 }
             } else {
-                typed_array_set_expando(self, &t, name, value)?;
+                // §10.1.9 — non-numeric keys run the full [[Set]]
+                // funnel: own expando, then the prototype chain
+                // (accessors on %TypedArray.prototype% must fire),
+                // receiver-phase define on a fully-absent chain.
+                let vm_key = VmPropertyKey::OwnedString(name.to_string());
+                self.ordinary_set_data_value(context, receiver, &vm_key, value, receiver, 0)?;
             }
             None
         } else if let Some(fid) = receiver.as_function().or_else(|| {
@@ -2145,16 +2150,40 @@ impl Interpreter {
         value: Value,
         strict: bool,
     ) -> Result<bool, VmError> {
-        if !self.array_index_accessor_protector
+        let custom_proto = crate::array::prototype_override(arr, &self.gc_heap);
+        if (!self.array_index_accessor_protector && custom_proto.is_none())
             || crate::array::has_own_element(arr, &self.gc_heap, idx)
         {
             return Ok(false);
         }
-        let proto = self.constructor_prototype_value("Array")?;
+        let key = idx.to_string();
+        // A custom prototype (e.g. a TypedArray installed via
+        // setPrototypeOf) takes the full [[Set]] funnel: an invalid
+        // canonical index on a chained typed array consumes the
+        // write as a no-op (§10.4.5.5), a setter fires, a data
+        // outcome falls back to the own-element fast path.
+        if let Some(proto) = custom_proto {
+            if proto.is_null() {
+                return Ok(false);
+            }
+            if proto.as_object().is_none() {
+                let vm_key = VmPropertyKey::OwnedString(key);
+                let receiver = Value::array(arr);
+                let handled =
+                    self.ordinary_set_data_value(context, proto, &vm_key, value, receiver, 0)?;
+                if !handled {
+                    Self::failed_set_result(strict, "Cannot assign to property")?;
+                }
+                return Ok(true);
+            }
+        }
+        let proto = match custom_proto {
+            Some(p) => p,
+            None => self.constructor_prototype_value("Array")?,
+        };
         let Some(proto_obj) = proto.as_object() else {
             return Ok(false);
         };
-        let key = idx.to_string();
         match object::resolve_set(proto_obj, &self.gc_heap, &key) {
             object::SetOutcome::InvokeSetter { setter } => {
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -2166,7 +2195,17 @@ impl Interpreter {
                 Self::failed_set_result(strict, format!("Cannot assign to property '{key}'"))?;
                 Ok(true)
             }
-            object::SetOutcome::AssignData | object::SetOutcome::ExoticParent { .. } => Ok(false),
+            object::SetOutcome::ExoticParent { parent } => {
+                let vm_key = VmPropertyKey::OwnedString(key);
+                let receiver = Value::array(arr);
+                let handled =
+                    self.ordinary_set_data_value(context, parent, &vm_key, value, receiver, 1)?;
+                if !handled {
+                    Self::failed_set_result(strict, "Cannot assign to property")?;
+                }
+                Ok(true)
+            }
+            object::SetOutcome::AssignData => Ok(false),
         }
     }
 
@@ -2486,7 +2525,10 @@ impl Interpreter {
                 match canonical_numeric_index_string(&name) {
                     Some(nf) => Some(nf),
                     None => {
-                        typed_array_set_expando(self, &t, &name, value)?;
+                        // Same funnel as the named-store arm: chain
+                        // walk + receiver-phase semantics.
+                        let vm_key = VmPropertyKey::OwnedString(name);
+                        self.ordinary_set_data_value(context, recv, &vm_key, value, recv, 0)?;
                         stack[top_idx].advance_pc(self.current_byte_len)?;
                         return Ok(());
                     }
@@ -4968,17 +5010,6 @@ pub(crate) fn typed_array_ensure_expando_pub(
     let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
     t.set_expando(heap, bag);
     Ok(bag)
-}
-
-fn typed_array_set_expando(
-    interp: &mut Interpreter,
-    t: &crate::binary::typed_array::JsTypedArray,
-    name: &str,
-    value: Value,
-) -> Result<(), VmError> {
-    let bag = typed_array_ensure_expando(interp, t)?;
-    interp.set_property(bag, name, value)?;
-    Ok(())
 }
 
 /// Lazy-allocate (and cache) the RegExp expando JsObject used

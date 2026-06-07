@@ -409,10 +409,11 @@ impl Interpreter {
     ///      the handler's `exc_register`, jump pc to the catch
     ///      entry, pop the handler, return `Ok(())` so dispatch
     ///      resumes in that frame.
-    ///    - **Finally-only handler hit** — park the value on
-    ///      `frame.pending_throw`, jump pc to the finally entry,
-    ///      pop the handler, return `Ok(())`.
-    ///      [`otter_bytecode::Op::EndFinally`] re-throws.
+    ///    - **Finally-only handler hit** — park the value on the
+    ///      frame's `parked_finally` stack (tagged with the handler
+    ///      depth), jump pc to the finally entry, pop the handler,
+    ///      return `Ok(())`. [`otter_bytecode::Op::EndFinally`]
+    ///      re-throws unless a later unwind discarded the entry.
     ///    - **No handler in this frame** — if the frame is async
     ///      (`async_state.is_some()`), settle its result promise
     ///      as rejected, drain the resulting jobs into the
@@ -497,6 +498,13 @@ impl Interpreter {
             let floor = self
                 .frame_cold(stack.last().expect("frame"))
                 .map_or(0, |c| c.handlers.len() as i64);
+            // §14.15.3 — completions parked by `finally` blocks this
+            // throw abandons (their handler depth sits above the
+            // landing handler) are replaced by the new throw.
+            if let Some(cold) = self.frame_cold_mut(stack.last_mut().expect("frame")) {
+                cold.parked_finally
+                    .retain(|(_, depth)| i64::from(*depth) <= floor);
+            }
             let closers = self.take_frame_closers_above(stack.last_mut().expect("frame"), floor);
             self.close_unwind_iterators(context, closers);
             let frame = stack.last_mut().expect("frame still present");
@@ -511,7 +519,10 @@ impl Interpreter {
             }
             let finally_pc = handler.finally_pc.ok_or(VmError::InvalidOperand)?;
             frame.pc = finally_pc;
-            self.frame_ensure_cold(frame).pending_throw = Some(payload);
+            let cold = self.frame_ensure_cold(frame);
+            let depth = cold.handlers.len() as u32;
+            cold.parked_finally
+                .push((crate::cold_frame::ParkedFinally::Throw(payload), depth));
             return Ok(());
         }
     }

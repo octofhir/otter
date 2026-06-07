@@ -3708,30 +3708,31 @@ impl Interpreter {
                     continue;
                 }
                 Op::EndFinally => {
-                    let pending = self
+                    let parked = self
                         .frame_cold_mut(&mut stack[top_idx])
-                        .and_then(|c| c.pending_throw.take());
-                    let pending_abrupt = self
-                        .frame_cold_mut(&mut stack[top_idx])
-                        .and_then(|c| c.pending_abrupt.take());
-                    if let Some(value) = pending {
-                        self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
-                        let unwind = self.unwind_throw(context, stack, value);
-                        if unwind.is_ok() {
-                            self.pending_uncaught_frames = None;
-                        } else {
-                            self.pending_uncaught_throw = Some(value);
+                        .and_then(|c| c.parked_finally.pop());
+                    match parked {
+                        Some((crate::cold_frame::ParkedFinally::Throw(value), _)) => {
+                            self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+                            let unwind = self.unwind_throw(context, stack, value);
+                            if unwind.is_ok() {
+                                self.pending_uncaught_frames = None;
+                            } else {
+                                self.pending_uncaught_throw = Some(value);
+                            }
+                            unwind?;
                         }
-                        unwind?;
-                    } else if let Some((completion, floor)) = pending_abrupt {
-                        // Resume the parked `return`/`break`/`continue`:
-                        // run the next enclosing `finally`, or perform
-                        // the completion when none remain.
-                        if let Some(popped) = self.unwind_abrupt(stack, completion, floor)? {
-                            return Ok(popped);
+                        Some((crate::cold_frame::ParkedFinally::Abrupt(completion, floor), _)) => {
+                            // Resume the parked `return`/`break`/`continue`:
+                            // run the next enclosing `finally`, or perform
+                            // the completion when none remain.
+                            if let Some(popped) = self.unwind_abrupt(stack, completion, floor)? {
+                                return Ok(popped);
+                            }
                         }
-                    } else {
-                        stack[top_idx].advance_pc(self.current_byte_len)?;
+                        Some((crate::cold_frame::ParkedFinally::Normal, _)) | None => {
+                            stack[top_idx].advance_pc(self.current_byte_len)?;
+                        }
                     }
                     continue;
                 }
@@ -6071,11 +6072,22 @@ impl Interpreter {
             let handler = self
                 .frame_cold_mut(&mut stack[top_idx])
                 .and_then(|c| c.handlers.pop());
+            // §14.15.3 — discard completions parked by `finally`
+            // blocks this completion abandons (depth above the
+            // remaining handler stack).
+            if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+                let len = cold.handlers.len() as u32;
+                cold.parked_finally.retain(|(_, depth)| *depth <= len);
+            }
             match handler {
                 Some(h) if h.finally_pc.is_some() => {
                     let finally_pc = h.finally_pc.expect("finally_pc checked");
                     let cold = self.frame_ensure_cold(&mut stack[top_idx]);
-                    cold.pending_abrupt = Some((completion, floor));
+                    let depth = cold.handlers.len() as u32;
+                    cold.parked_finally.push((
+                        crate::cold_frame::ParkedFinally::Abrupt(completion, floor),
+                        depth,
+                    ));
                     stack[top_idx].pc = finally_pc;
                     return Ok(None);
                 }

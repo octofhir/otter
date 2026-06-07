@@ -193,8 +193,18 @@ impl Interpreter {
 
     pub(crate) fn run_leave_try(&mut self, frame: &mut Frame) -> Result<(), VmError> {
         let popped = self.frame_cold_mut(frame).and_then(|c| c.handlers.pop());
-        if popped.is_none() {
+        let Some(handler) = popped else {
             return Err(VmError::InvalidOperand);
+        };
+        // §14.15.3 — leaving a try (or catch) body whose handler owns
+        // a `finally` falls through into the finally block; park a
+        // Normal completion so `Op::EndFinally` knows this entry was
+        // not an unwind.
+        if handler.finally_pc.is_some() {
+            let cold = self.frame_ensure_cold(frame);
+            let depth = cold.handlers.len() as u32;
+            cold.parked_finally
+                .push((crate::cold_frame::ParkedFinally::Normal, depth));
         }
         frame.advance_pc(self.current_byte_len)?;
         Ok(())

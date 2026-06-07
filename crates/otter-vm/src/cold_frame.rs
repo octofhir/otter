@@ -52,6 +52,25 @@ pub enum AbruptKind {
     Jump(u32),
 }
 
+/// A completion parked while its `finally` block runs (§14.15.3
+/// Try-statement evaluation: B's completion replaces F when B is
+/// abrupt). One entry per in-flight `finally`, innermost on top; the
+/// paired `u32` in [`ColdFrame::parked_finally`] is the handler-stack
+/// depth recorded at entry — an unwind that pops the handler stack
+/// below that depth abandons the finally block, so the entry is
+/// discarded and the new abrupt completion wins.
+#[derive(Debug, Clone)]
+pub enum ParkedFinally {
+    /// Normal completion — `Op::EndFinally` falls through.
+    Normal,
+    /// In-flight exception that routed into the `finally`; re-thrown
+    /// by `Op::EndFinally`.
+    Throw(Value),
+    /// Parked `return` / `break` / `continue` with its unwind floor;
+    /// `Op::EndFinally` resumes the walk toward the target.
+    Abrupt(AbruptKind, u32),
+}
+
 /// Niche-encoded handle into a [`ColdFramePool`]. Stored as
 /// `Option<ColdFrameIdx>` (4 bytes) on the hot frame; `None` means no
 /// cold record has been acquired yet.
@@ -93,16 +112,14 @@ pub struct ColdFrame {
     pub pending_get_iterator: Option<PendingGetIterator>,
     /// In-flight ECMA-262 §7.4.5 `IteratorNext` over a user iterator.
     pub pending_iterator_next: Option<PendingIteratorNext>,
-    /// In-flight exception parked when a throw routed into a `finally`
-    /// block. [`otter_bytecode::Op::EndFinally`] consumes it: `Some`
-    /// re-throws, `None` falls through.
-    pub pending_throw: Option<Value>,
-    /// A `return`/`break`/`continue` parked while a `finally` block
-    /// runs. The `u32` is the target handler-stack depth (`floor`):
-    /// `unwind_abrupt` runs `finally` blocks until the handler stack
-    /// shrinks to this depth, then performs the completion. Consumed
-    /// by `Op::EndFinally`.
-    pub pending_abrupt: Option<(AbruptKind, u32)>,
+    /// Completions parked while `finally` blocks run, innermost on
+    /// top. Each entry pairs the parked completion with the
+    /// handler-stack depth at finally entry; unwinds that pop below
+    /// that depth discard the entry (§14.15.3 — the finally's own
+    /// abrupt completion replaces the parked one). Pushed by the
+    /// unwind walks and by `Op::LeaveTry` on a finally handler
+    /// (normal entry); popped by `Op::EndFinally`.
+    pub parked_finally: SmallVec<[(ParkedFinally, u32); 2]>,
     /// Newly-allocated receiver when this frame was entered via
     /// `Op::New`. On return, the dispatcher substitutes this object
     /// for any non-object return value so constructors that don't
@@ -169,8 +186,7 @@ impl ColdFrame {
             && self.pending_bind_function.is_none()
             && self.pending_get_iterator.is_none()
             && self.pending_iterator_next.is_none()
-            && self.pending_throw.is_none()
-            && self.pending_abrupt.is_none()
+            && self.parked_finally.is_empty()
             && self.construct_target.is_none()
             && self.new_target.is_none()
             && self.rest_args.is_empty()
@@ -205,11 +221,13 @@ impl ColdFrame {
             p.iterator.trace_value_slots(visitor);
         }
         // `pending_get_iterator` carries only pc + dst, no values.
-        if let Some(v) = &self.pending_throw {
-            v.trace_value_slots(visitor);
-        }
-        if let Some((AbruptKind::Return(v), _)) = &self.pending_abrupt {
-            v.trace_value_slots(visitor);
+        for (parked, _) in &self.parked_finally {
+            match parked {
+                ParkedFinally::Throw(v) | ParkedFinally::Abrupt(AbruptKind::Return(v), _) => {
+                    v.trace_value_slots(visitor);
+                }
+                ParkedFinally::Normal | ParkedFinally::Abrupt(AbruptKind::Jump(_), _) => {}
+            }
         }
         if let Some(obj) = &self.construct_target {
             let p = obj as *const JsObject as *mut otter_gc::raw::RawGc;

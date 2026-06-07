@@ -122,9 +122,25 @@ pub(crate) fn install_restricted_accessors(
 }
 
 fn throw_restricted_function_property(
-    _: &mut NativeCtx<'_>,
+    ctx: &mut NativeCtx<'_>,
     _: &[Value],
 ) -> Result<Value, NativeError> {
+    // ES2017 normative-optional §B legacy semantics — reading
+    // `caller` / `arguments` on a NON-strict ordinary function
+    // yields `null` instead of throwing (matching shipping
+    // engines); strict functions, bound functions and natives keep
+    // the %ThrowTypeError% poisoning.
+    let receiver = *ctx.this_value();
+    let fid = receiver.as_function().or_else(|| {
+        receiver
+            .as_closure(ctx.heap())
+            .map(|c| c.cached_function_id)
+    });
+    if let (Some(fid), Some(exec)) = (fid, ctx.execution_context().cloned())
+        && !exec.function_is_strict(fid)
+    {
+        return Ok(Value::null());
+    }
     Err(NativeError::TypeError {
         name: "%ThrowTypeError%",
         reason: "restricted function property access".to_string(),

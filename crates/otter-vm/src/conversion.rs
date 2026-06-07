@@ -475,11 +475,15 @@ impl Interpreter {
                 return Some(proto);
             }
             "Iterator"
-        } else if value.is_generator() {
-            // §27.5 generators expose `%GeneratorPrototype%`'s
-            // intrinsic ancestor, which is `%IteratorPrototype%`.
-            // The Otter foundation collapses both into the same
-            // realm prototype today.
+        } else if let Some(generator) = value.as_generator() {
+            // §9.1.14 GetPrototypeFromConstructor fallback — a
+            // generator whose function's `.prototype` was replaced
+            // with a non-object uses the realm's shared
+            // `%GeneratorPrototype%` / `%AsyncGeneratorPrototype%`.
+            let is_async = generator.is_async(&self.gc_heap);
+            if let Some(shared) = self.shared_generator_object_prototype(is_async) {
+                return Some(shared);
+            }
             "Iterator"
         } else if let Some(t) = value.as_temporal(&self.gc_heap) {
             return self.temporal_prototype_object(t.kind());

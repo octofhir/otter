@@ -1734,8 +1734,18 @@ impl Interpreter {
             }
         }
         let proto_value = Value::object(proto);
-        let constructor = object::PropertyDescriptor::data(constructor_value, true, false, true);
-        let _ = object::define_own_property(proto, &mut self.gc_heap, "constructor", constructor);
+        // §27.5.1 — a generator function's `.prototype` object has NO
+        // own properties (no back-pointing `constructor`); ordinary
+        // functions get the §10.2.5 MakeConstructor pair.
+        if !context
+            .function(function_id)
+            .is_some_and(|function| function.is_generator)
+        {
+            let constructor =
+                object::PropertyDescriptor::data(constructor_value, true, false, true);
+            let _ =
+                object::define_own_property(proto, &mut self.gc_heap, "constructor", constructor);
+        }
         let prototype_desc = object::PropertyDescriptor::data(proto_value, true, false, false);
         let _ = object::define_own_property(bag, &mut self.gc_heap, "prototype", prototype_desc);
         Ok(proto_value)
@@ -1839,8 +1849,18 @@ impl Interpreter {
             }
         }
         let proto_value = Value::object(proto);
-        let constructor = object::PropertyDescriptor::data(constructor_value, true, false, true);
-        let _ = object::define_own_property(proto, &mut self.gc_heap, "constructor", constructor);
+        // §27.5.1 — a generator function's `.prototype` object has NO
+        // own properties (no back-pointing `constructor`); ordinary
+        // functions get the §10.2.5 MakeConstructor pair.
+        if !context
+            .function(function_id)
+            .is_some_and(|function| function.is_generator)
+        {
+            let constructor =
+                object::PropertyDescriptor::data(constructor_value, true, false, true);
+            let _ =
+                object::define_own_property(proto, &mut self.gc_heap, "constructor", constructor);
+        }
         let prototype_desc = object::PropertyDescriptor::data(proto_value, true, false, false);
         let _ = object::define_own_property(bag, &mut self.gc_heap, "prototype", prototype_desc);
         Ok(proto_value)

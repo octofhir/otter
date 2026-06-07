@@ -92,7 +92,12 @@ struct PreparedBytecodeFrame {
     frame: Frame,
     is_generator: bool,
     is_async_generator: bool,
-    generator_prototype: Option<Value>,
+    /// Callee function id — needed to resolve the generator
+    /// `[[Prototype]]` AFTER the prologue runs (§27.5.1 step 3:
+    /// FunctionDeclarationInstantiation precedes
+    /// OrdinaryCreateFromConstructor, so parameter side effects on
+    /// `fn.prototype` are observable).
+    generator_function_id: u32,
 }
 
 impl Interpreter {
@@ -344,16 +349,6 @@ impl Interpreter {
             this_for_callee,
             &[effective_args.as_slice()],
         )?;
-        let generator_prototype = if function.is_generator {
-            Some(self.function_property_get_stack_rooted(
-                context,
-                stack,
-                function.id,
-                "prototype",
-            )?)
-        } else {
-            None
-        };
         let mut new_frame = Frame::with_exec_return_upvalues_and_this(
             function,
             return_register,
@@ -373,10 +368,11 @@ impl Interpreter {
         if function.is_generator {
             new_frame.return_register = None;
             let async_gen = function.is_async_generator;
+            let generator_function_id = function.id;
             let gen_handle = crate::generator::JsGenerator::new_with_prototype(
                 &mut self.gc_heap,
                 new_frame,
-                generator_prototype,
+                None,
             )?;
             gen_handle.set_async(&mut self.gc_heap, async_gen);
             // Backlink the generator into the frame so `Op::Yield`
@@ -392,6 +388,12 @@ impl Interpreter {
             let mut prologue_stack: SmallVec<[Frame; 8]> = SmallVec::new();
             prologue_stack.push(frame);
             self.dispatch_loop(context, &mut prologue_stack)?;
+            self.resolve_generator_prototype_stack_rooted(
+                context,
+                stack,
+                generator_function_id,
+                &gen_handle,
+            )?;
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, Value::generator(gen_handle))?;
             return Ok(());
@@ -419,16 +421,6 @@ impl Interpreter {
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
         let this_for_callee =
             self.this_for_bytecode_call_stack_rooted(function, stack, this_for_callee, &[])?;
-        let generator_prototype = if function.is_generator {
-            Some(self.function_property_get_stack_rooted(
-                context,
-                stack,
-                function_id,
-                "prototype",
-            )?)
-        } else {
-            None
-        };
         let mut frame = Frame::with_exec_return_upvalues_and_this(
             function,
             return_register,
@@ -450,8 +442,28 @@ impl Interpreter {
             frame,
             is_generator: function.is_generator,
             is_async_generator: function.is_async_generator,
-            generator_prototype,
+            generator_function_id: function_id,
         })
+    }
+
+    /// §27.5.1 step 3 / §9.1.14 — resolve a fresh generator's
+    /// [[Prototype]] from `fn.prototype` AFTER the prologue ran; a
+    /// non-object answer falls back (override `None`) to the realm's
+    /// shared `%GeneratorPrototype%` / `%AsyncGeneratorPrototype%`.
+    fn resolve_generator_prototype_stack_rooted(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &SmallVec<[Frame; 8]>,
+        function_id: u32,
+        gen_handle: &crate::generator::JsGenerator,
+    ) -> Result<(), VmError> {
+        let proto =
+            self.function_property_get_stack_rooted(context, stack, function_id, "prototype")?;
+        gen_handle.set_prototype_override(
+            &mut self.gc_heap,
+            proto.as_object().is_some().then_some(proto),
+        );
+        Ok(())
     }
 
     fn push_prepared_bytecode_call_frame(
@@ -465,15 +477,12 @@ impl Interpreter {
             mut frame,
             is_generator,
             is_async_generator,
-            generator_prototype,
+            generator_function_id,
         } = prepared;
         if is_generator {
             frame.return_register = None;
-            let gen_handle = crate::generator::JsGenerator::new_with_prototype(
-                &mut self.gc_heap,
-                frame,
-                generator_prototype,
-            )?;
+            let gen_handle =
+                crate::generator::JsGenerator::new_with_prototype(&mut self.gc_heap, frame, None)?;
             gen_handle.set_async(&mut self.gc_heap, is_async_generator);
             gen_handle.install_owner_on_frame(&mut self.gc_heap);
             let (frame, cold) = gen_handle
@@ -486,6 +495,12 @@ impl Interpreter {
             let mut prologue_stack: SmallVec<[Frame; 8]> = SmallVec::new();
             prologue_stack.push(frame);
             self.dispatch_loop(context, &mut prologue_stack)?;
+            self.resolve_generator_prototype_stack_rooted(
+                context,
+                stack,
+                generator_function_id,
+                &gen_handle,
+            )?;
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, Value::generator(gen_handle))?;
             return Ok(());
@@ -1529,17 +1544,6 @@ impl Interpreter {
             this_for_callee,
             &[effective_args.as_slice()],
         )?;
-        let generator_prototype = if function.is_generator {
-            Some(self.function_property_get_runtime_rooted(
-                context,
-                function_id,
-                "prototype",
-                &[&this_for_callee],
-                &[effective_args.as_slice()],
-            )?)
-        } else {
-            None
-        };
         let mut inner: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut new_frame =
             Frame::with_exec_return_upvalues_and_this(function, None, upvalues, this_for_callee);
@@ -1560,7 +1564,7 @@ impl Interpreter {
             let gen_handle = crate::generator::JsGenerator::new_with_prototype(
                 &mut self.gc_heap,
                 new_frame,
-                generator_prototype,
+                None,
             )?;
             gen_handle.set_async(&mut self.gc_heap, async_gen);
             gen_handle.install_owner_on_frame(&mut self.gc_heap);
@@ -1581,6 +1585,19 @@ impl Interpreter {
             let mut prologue_stack: SmallVec<[Frame; 8]> = SmallVec::new();
             prologue_stack.push(frame);
             self.dispatch_loop(context, &mut prologue_stack)?;
+            // §27.5.1 step 3 — resolve [[Prototype]] after the
+            // prologue (FunctionDeclarationInstantiation) ran.
+            let proto = self.function_property_get_runtime_rooted(
+                context,
+                function_id,
+                "prototype",
+                &[],
+                &[],
+            )?;
+            gen_handle.set_prototype_override(
+                &mut self.gc_heap,
+                proto.as_object().is_some().then_some(proto),
+            );
             return Ok(Value::generator(gen_handle));
         }
         inner.push(new_frame);

@@ -239,6 +239,19 @@ impl JsGenerator {
         heap.read_payload(self.inner, f)
     }
 
+    /// §9.1.14 GetPrototypeFromConstructor outcome — installed AFTER
+    /// FunctionDeclarationInstantiation runs (parameter side effects
+    /// may replace `fn.prototype` first). `None` falls back to the
+    /// realm's shared `%GeneratorPrototype%` / `%AsyncGeneratorPrototype%`.
+    pub fn set_prototype_override(&self, heap: &mut otter_gc::GcHeap, proto: Option<crate::Value>) {
+        heap.with_payload(self.inner, |body| {
+            body.prototype_override = proto;
+        });
+        if let Some(value) = proto {
+            heap.record_write(self.inner, &value);
+        }
+    }
+
     /// Set the async-generator flag.
     pub fn set_async(&self, heap: &mut otter_gc::GcHeap, is_async: bool) {
         heap.with_payload(self.inner, |body| {

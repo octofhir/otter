@@ -512,8 +512,11 @@ impl Interpreter {
             let statics = class.statics(&self.gc_heap);
             if let Some(sym) = idx.as_symbol(&self.gc_heap) {
                 crate::object::delete_symbol(statics, &mut self.gc_heap, sym)
-            } else if let Some(s) = idx.as_string(&self.gc_heap) {
-                let name = s.to_lossy_string(&self.gc_heap);
+            } else if let Some(name) = idx
+                .as_string(&self.gc_heap)
+                .map(|s| s.to_lossy_string(&self.gc_heap))
+                .or_else(|| idx.as_number().map(|n| n.to_display_string()))
+            {
                 if crate::object::get_own_descriptor(statics, &self.gc_heap, &name).is_some() {
                     crate::object::delete(statics, &mut self.gc_heap, &name)
                 } else if name == "prototype" {

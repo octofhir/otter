@@ -84,51 +84,86 @@ pub(crate) fn compile_chain_into(
                     match expression_as_chain_element(expr) {
                         Some(ChainObjectRef::Static(m)) => {
                             let mspan = (m.span.start, m.span.end);
-                            let obj_reg = compile_chain_object(cx, &m.object, &mut exits)?;
-                            if m.optional {
-                                let pc = cx.emit_branch_placeholder(
-                                    Op::JumpIfNullish,
-                                    Some(obj_reg),
+                            if matches!(m.object, oxc_ast::ast::Expression::Super(_)) {
+                                // §13.3 — `super.m?.()` calls with the
+                                // CURRENT this binding as receiver.
+                                let callee = crate::class::compile_super_member_load(
+                                    cx,
+                                    m.property.name.as_str(),
+                                    mspan,
+                                )?;
+                                let this_reg = cx.alloc_scratch();
+                                cx.emit(Op::LoadThis, [Operand::Register(this_reg)], mspan);
+                                (callee, Some(this_reg))
+                            } else {
+                                let obj_reg = compile_chain_object(cx, &m.object, &mut exits)?;
+                                if m.optional {
+                                    let pc = cx.emit_branch_placeholder(
+                                        Op::JumpIfNullish,
+                                        Some(obj_reg),
+                                        mspan,
+                                    );
+                                    exits.push(pc);
+                                }
+                                let callee = cx.alloc_scratch();
+                                let name_idx = cx.intern_string_constant(m.property.name.as_str());
+                                cx.emit(
+                                    Op::LoadProperty,
+                                    vec![
+                                        Operand::Register(callee),
+                                        Operand::Register(obj_reg),
+                                        Operand::ConstIndex(name_idx),
+                                    ],
                                     mspan,
                                 );
-                                exits.push(pc);
+                                (callee, Some(obj_reg))
                             }
-                            let callee = cx.alloc_scratch();
-                            let name_idx = cx.intern_string_constant(m.property.name.as_str());
-                            cx.emit(
-                                Op::LoadProperty,
-                                vec![
-                                    Operand::Register(callee),
-                                    Operand::Register(obj_reg),
-                                    Operand::ConstIndex(name_idx),
-                                ],
-                                mspan,
-                            );
-                            (callee, Some(obj_reg))
                         }
                         Some(ChainObjectRef::Computed(m)) => {
                             let mspan = (m.span.start, m.span.end);
-                            let obj_reg = compile_chain_object(cx, &m.object, &mut exits)?;
-                            if m.optional {
-                                let pc = cx.emit_branch_placeholder(
-                                    Op::JumpIfNullish,
-                                    Some(obj_reg),
+                            if matches!(m.object, oxc_ast::ast::Expression::Super(_)) {
+                                let home_reg = crate::class::load_synthetic_capture(
+                                    cx,
+                                    crate::class::super_home_binding_name(cx),
+                                    mspan,
+                                )?;
+                                let this_reg = cx.alloc_scratch();
+                                cx.emit(Op::LoadThis, [Operand::Register(this_reg)], mspan);
+                                let key_reg = compile_expr(cx, &m.expression, mspan)?;
+                                let callee = cx.alloc_scratch();
+                                cx.emit(
+                                    Op::LoadSuperElement,
+                                    vec![
+                                        Operand::Register(callee),
+                                        Operand::Register(home_reg),
+                                        Operand::Register(key_reg),
+                                    ],
                                     mspan,
                                 );
-                                exits.push(pc);
+                                (callee, Some(this_reg))
+                            } else {
+                                let obj_reg = compile_chain_object(cx, &m.object, &mut exits)?;
+                                if m.optional {
+                                    let pc = cx.emit_branch_placeholder(
+                                        Op::JumpIfNullish,
+                                        Some(obj_reg),
+                                        mspan,
+                                    );
+                                    exits.push(pc);
+                                }
+                                let key_reg = compile_expr(cx, &m.expression, mspan)?;
+                                let callee = cx.alloc_scratch();
+                                cx.emit(
+                                    Op::LoadElement,
+                                    vec![
+                                        Operand::Register(callee),
+                                        Operand::Register(obj_reg),
+                                        Operand::Register(key_reg),
+                                    ],
+                                    mspan,
+                                );
+                                (callee, Some(obj_reg))
                             }
-                            let key_reg = compile_expr(cx, &m.expression, mspan)?;
-                            let callee = cx.alloc_scratch();
-                            cx.emit(
-                                Op::LoadElement,
-                                vec![
-                                    Operand::Register(callee),
-                                    Operand::Register(obj_reg),
-                                    Operand::Register(key_reg),
-                                ],
-                                mspan,
-                            );
-                            (callee, Some(obj_reg))
                         }
                         _ => unreachable!("guarded by matches!"),
                     }
@@ -139,7 +174,35 @@ pub(crate) fn compile_chain_into(
                 let pc = cx.emit_branch_placeholder(Op::JumpIfNullish, Some(callee_reg), span);
                 exits.push(pc);
             }
-            // Compile call arguments.
+            // §13.3 ArgumentListEvaluation — a spread argument folds
+            // the list into an array and dispatches via CallSpread
+            // (receiver preserved).
+            let has_spread = call
+                .arguments
+                .iter()
+                .any(|arg| matches!(arg, oxc_ast::ast::Argument::SpreadElement(_)));
+            if has_spread {
+                let args_reg = crate::calls::compile_spread_call_args(cx, &call.arguments, span)?;
+                let this_value = match this_reg {
+                    Some(r) => r,
+                    None => {
+                        let r = cx.alloc_scratch();
+                        cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
+                        r
+                    }
+                };
+                cx.emit(
+                    Op::CallSpread,
+                    vec![
+                        Operand::Register(result_reg),
+                        Operand::Register(callee_reg),
+                        Operand::Register(this_value),
+                        Operand::Register(args_reg),
+                    ],
+                    span,
+                );
+                return Ok(exits);
+            }
             let mut arg_regs: Vec<u16> = Vec::with_capacity(call.arguments.len());
             for arg in call.arguments.iter() {
                 if let Some(expr) = arg.as_expression() {
@@ -175,6 +238,19 @@ pub(crate) fn compile_chain_into(
         }
         ChainElement::StaticMemberExpression(m) => {
             let span = (m.span.start, m.span.end);
+            if matches!(m.object, oxc_ast::ast::Expression::Super(_)) {
+                // §13.3.5 — `super.x?.…` never short-circuits at the
+                // base (super is not nullish); load through the
+                // home-object reference.
+                let loaded =
+                    crate::class::compile_super_member_load(cx, m.property.name.as_str(), span)?;
+                cx.emit(
+                    Op::StoreLocal,
+                    [Operand::Register(loaded), Operand::Imm32(result_reg as i32)],
+                    span,
+                );
+                return Ok(Vec::new());
+            }
             let mut exits: Vec<u32> = Vec::new();
             let obj_reg = compile_chain_object(cx, &m.object, &mut exits)?;
             if m.optional {
@@ -195,6 +271,26 @@ pub(crate) fn compile_chain_into(
         }
         ChainElement::ComputedMemberExpression(m) => {
             let span = (m.span.start, m.span.end);
+            if matches!(m.object, oxc_ast::ast::Expression::Super(_)) {
+                let home_reg = crate::class::load_synthetic_capture(
+                    cx,
+                    crate::class::super_home_binding_name(cx),
+                    span,
+                )?;
+                let this_guard = cx.alloc_scratch();
+                cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                let key_reg = compile_expr(cx, &m.expression, span)?;
+                cx.emit(
+                    Op::LoadSuperElement,
+                    vec![
+                        Operand::Register(result_reg),
+                        Operand::Register(home_reg),
+                        Operand::Register(key_reg),
+                    ],
+                    span,
+                );
+                return Ok(Vec::new());
+            }
             let mut exits: Vec<u32> = Vec::new();
             let obj_reg = compile_chain_object(cx, &m.object, &mut exits)?;
             if m.optional {
@@ -291,6 +387,16 @@ pub(crate) fn compile_chain_into_chain_object(
     match elem {
         ChainObjectRef::Static(m) => {
             let span = (m.span.start, m.span.end);
+            if matches!(m.object, oxc_ast::ast::Expression::Super(_)) {
+                let loaded =
+                    crate::class::compile_super_member_load(cx, m.property.name.as_str(), span)?;
+                cx.emit(
+                    Op::StoreLocal,
+                    [Operand::Register(loaded), Operand::Imm32(result_reg as i32)],
+                    span,
+                );
+                return Ok(Vec::new());
+            }
             let mut exits: Vec<u32> = Vec::new();
             let obj_reg = compile_chain_object(cx, &m.object, &mut exits)?;
             if m.optional {
@@ -337,6 +443,26 @@ pub(crate) fn compile_chain_into_chain_object(
         }
         ChainObjectRef::Computed(m) => {
             let span = (m.span.start, m.span.end);
+            if matches!(m.object, oxc_ast::ast::Expression::Super(_)) {
+                let home_reg = crate::class::load_synthetic_capture(
+                    cx,
+                    crate::class::super_home_binding_name(cx),
+                    span,
+                )?;
+                let this_guard = cx.alloc_scratch();
+                cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                let key_reg = compile_expr(cx, &m.expression, span)?;
+                cx.emit(
+                    Op::LoadSuperElement,
+                    vec![
+                        Operand::Register(result_reg),
+                        Operand::Register(home_reg),
+                        Operand::Register(key_reg),
+                    ],
+                    span,
+                );
+                return Ok(Vec::new());
+            }
             let mut exits: Vec<u32> = Vec::new();
             let obj_reg = compile_chain_object(cx, &m.object, &mut exits)?;
             if m.optional {

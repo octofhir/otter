@@ -349,6 +349,39 @@ pub(crate) fn pre_declare_lexical_bindings(
     Ok(())
 }
 
+/// §14.2.3 BlockDeclarationInstantiation — pre-declare a block's
+/// top-level lexical names (TDZ) at block entry, so case selectors,
+/// closures, and statements textually before the declaration resolve
+/// to the block binding instead of an outer same-named one. Unlike
+/// [`pre_declare_lexical_bindings`], an outer binding does not
+/// suppress the block-scope declaration — only a same-scope one does.
+pub(crate) fn pre_declare_block_lexical_bindings(
+    cx: &mut Compiler,
+    names: &[(String, bool)],
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    for (name, is_const) in names {
+        if cx.lookup_in_current_scope(name).is_some() {
+            continue;
+        }
+        // Same TDZ-hole protocol as the function-top-level pre-pass:
+        // a captured binding's cell is holed in place so a closure
+        // running before the declaration reads a ReferenceError.
+        if let crate::scope::BindingStorage::Upvalue { idx } =
+            cx.declare_binding(name, *is_const, span)?
+        {
+            let hole = cx.alloc_scratch();
+            cx.emit(Op::LoadHole, [Operand::Register(hole)], span);
+            cx.emit(
+                Op::StoreUpvalue,
+                [Operand::Register(hole), Operand::Imm32(idx as i32)],
+                span,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Hoist top-level `function f() {…}` declarations from `stmts` to
 /// the start of the current function / script / module scope, per
 /// ECMA-262 §10.2.11 FunctionDeclarationInstantiation step 30.

@@ -155,6 +155,14 @@ pub(crate) fn compile_catch_clause(
             _ => destructure_into(cx, exc_reg, &param.pattern, span)?,
         }
     }
+    // §14.2.3 BlockDeclarationInstantiation — the catch Block's
+    // lexical names pre-declare (TDZ) at entry so closures made
+    // before the declaration bind the block binding. A clash with
+    // the catch parameter is an early error, so sharing the scope
+    // is safe.
+    let mut block_lex: Vec<(String, bool)> = Vec::new();
+    crate::hoist::hoist_lexical_names(&handler.body.body, &mut block_lex);
+    crate::hoist::pre_declare_block_lexical_bindings(cx, &block_lex, span)?;
     for inner in &handler.body.body {
         compile_statement(cx, inner)?;
     }
@@ -173,6 +181,12 @@ pub(crate) fn compile_finalizer(
     cx.top_mut().completion_suppressed = true;
     cx.enter_scope();
     let result: Result<(), CompileError> = (|| {
+        // §14.2.3 — the finally Block's lexical names pre-declare
+        // (TDZ) at entry, same as any other block.
+        let fspan = (finalizer.span.start, finalizer.span.end);
+        let mut block_lex: Vec<(String, bool)> = Vec::new();
+        crate::hoist::hoist_lexical_names(&finalizer.body, &mut block_lex);
+        crate::hoist::pre_declare_block_lexical_bindings(cx, &block_lex, fspan)?;
         for inner in &finalizer.body {
             compile_statement(cx, inner)?;
         }

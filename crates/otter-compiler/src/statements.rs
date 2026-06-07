@@ -102,10 +102,14 @@ pub(crate) fn compile_statement(
         Statement::BlockStatement(b) => {
             let span = (b.span.start, b.span.end);
             cx.enter_scope();
-            // §14.2.3 BlockDeclarationInstantiation — function
-            // declarations instantiate on block entry, before any
-            // statement runs. The hoisted-name set is scoped to this
-            // block so the same name hoists independently elsewhere.
+            // §14.2.3 BlockDeclarationInstantiation — lexical names
+            // pre-declare (TDZ) and function declarations instantiate
+            // on block entry, before any statement runs. The
+            // hoisted-name set is scoped to this block so the same
+            // name hoists independently elsewhere.
+            let mut block_lex: Vec<(String, bool)> = Vec::new();
+            hoist_lexical_names(&b.body, &mut block_lex);
+            pre_declare_block_lexical_bindings(cx, &block_lex, span)?;
             let saved_hoisted = cx.hoisted_function_names.clone();
             hoist_function_declarations(cx, &b.body)?;
             let mut last = None;
@@ -1249,14 +1253,21 @@ pub(crate) fn compile_switch_statement(
 
     // Fresh lexical scope so per-case `let` bindings don't leak.
     cx.enter_scope();
-    // §14.12.3 / §14.2.3 — the CaseBlock instantiates its function
-    // declarations on entry, across every clause.
+    // §14.12.3 / §14.2.3 — the CaseBlock instantiates its lexical
+    // names (TDZ) and function declarations on entry, across every
+    // clause and before any selector expression runs, so selectors
+    // and early closures resolve to the block bindings.
     let saved_hoisted = cx.hoisted_function_names.clone();
     let case_stmts: Vec<&oxc_ast::ast::Statement<'_>> = s
         .cases
         .iter()
         .flat_map(|case| case.consequent.iter())
         .collect();
+    let mut case_lex: Vec<(String, bool)> = Vec::new();
+    for case in &s.cases {
+        hoist_lexical_names(&case.consequent, &mut case_lex);
+    }
+    pre_declare_block_lexical_bindings(cx, &case_lex, span)?;
     hoist_function_declarations_from(cx, &case_stmts)?;
     cx.push_loop_frame(LoopFrame::switch_body());
 

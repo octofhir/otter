@@ -552,9 +552,11 @@ impl Interpreter {
                     )?;
                     Ok(None)
                 }
-                Some(v) if v.is_object() => {
-                    let desc_obj = v.as_object().expect("guarded");
-                    let partial = object_statics::coerce_to_descriptor(&desc_obj, &self.gc_heap)?;
+                Some(v) if v.is_object() || v.is_proxy() => {
+                    // §10.5.5 step 9-ish ToPropertyDescriptor through
+                    // ordinary [[Get]]s so a Proxy descriptor object
+                    // dispatches its own traps.
+                    let partial = self.evaluate_to_property_descriptor(context, &v)?;
                     let desc = partial.complete_for_new_property();
                     let target_desc = self.ordinary_get_own_property_descriptor_value_with_roots(
                         context,

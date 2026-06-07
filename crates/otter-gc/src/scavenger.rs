@@ -222,6 +222,25 @@ unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc) {
         let new_offset = evacuate(ctx, header_ptr);
         (*slot).0 = new_offset;
         ctx.stats.slot_updates += 1;
+        // Generational invariant: evacuation itself can mint an
+        // old->young edge — the SLOT lives in a promoted (now
+        // old-space) object while the child was copied to to-space.
+        // Without a dirty card the next scavenge never rescans that
+        // slot and the child dangles after it moves again. Slots
+        // outside the cage (Rust stack roots, malloc-side frames)
+        // never take this path.
+        let child_header = cage_base().add(new_offset as usize) as *const GcHeader;
+        if (*child_header).is_young() {
+            let slot_addr = slot as usize;
+            let base = crate::compressed::cage_base_addr();
+            if slot_addr >= base && slot_addr < base + crate::compressed::cage_size() {
+                let page_base = Page::page_base_of(slot as *const u8);
+                let page_header = &mut *(page_base as *mut PageHeader);
+                if page_header.space == SpaceKind::Old {
+                    page_header.mark_card(slot_addr - page_base as usize);
+                }
+            }
+        }
     }
 }
 

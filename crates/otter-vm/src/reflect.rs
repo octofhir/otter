@@ -380,37 +380,38 @@ fn set_data_on_receiver(
     value: Value,
     receiver: &Value,
 ) -> Result<bool, VmError> {
-    let Some(recv_obj) = receiver.as_object() else {
-        // §10.1.9 step 5.b — non-object receiver rejects.
+    // §10.1.9 step 5.b — non-Object receivers reject. Resolution
+    // goes through the value-level internal-method funnels so a
+    // Proxy receiver dispatches its getOwnPropertyDescriptor /
+    // defineProperty traps.
+    if !is_type_object(receiver) {
         return Ok(false);
-    };
-    let existing = {
-        let heap = interp.gc_heap();
-        match key {
-            VmPropertyKey::Symbol(sym) => crate::object::lookup_own_symbol(recv_obj, heap, *sym),
-            _ => crate::object::lookup_own(
-                recv_obj,
-                heap,
-                key.string_name()
-                    .expect("non-symbol key has string spelling"),
-            ),
-        }
-    };
+    }
+    let existing = interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
+        context,
+        *receiver,
+        key,
+        0,
+        &[receiver, &value],
+        &[],
+    )?;
     match existing {
-        crate::object::PropertyLookup::Accessor { .. } => Ok(false),
-        crate::object::PropertyLookup::Data { flags, .. } => {
-            if !flags.writable() {
-                return Ok(false);
+        Some(desc) => match desc.kind {
+            crate::object::DescriptorKind::Accessor { .. } => Ok(false),
+            crate::object::DescriptorKind::Data { .. } => {
+                if !desc.flags.writable() {
+                    return Ok(false);
+                }
+                // §10.1.9 step 5.e.iii — write only `{value: V}`,
+                // preserving existing attributes.
+                let partial = crate::object::PartialPropertyDescriptor {
+                    value: Some(value),
+                    ..Default::default()
+                };
+                interp.define_own_property_value(context, receiver, key, partial)
             }
-            // §10.1.9 step 5.e.iii — write only `{value: V}`,
-            // preserving existing attributes.
-            let partial = crate::object::PartialPropertyDescriptor {
-                value: Some(value),
-                ..Default::default()
-            };
-            interp.define_own_property_value(context, &Value::object(recv_obj), key, partial)
-        }
-        crate::object::PropertyLookup::Absent => {
+        },
+        None => {
             // §10.1.9 step 5.f — CreateDataProperty on receiver.
             let descriptor = crate::object::PartialPropertyDescriptor {
                 value: Some(value),
@@ -419,7 +420,7 @@ fn set_data_on_receiver(
                 configurable: Some(true),
                 ..Default::default()
             };
-            interp.define_own_property_value(context, &Value::object(recv_obj), key, descriptor)
+            interp.define_own_property_value(context, receiver, key, descriptor)
         }
     }
 }

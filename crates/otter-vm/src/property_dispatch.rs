@@ -287,12 +287,7 @@ impl Interpreter {
                     .flatten()
                     .is_some();
                 let prototype_implicit = name == "prototype"
-                    && !context.function_is_arrow(function_id)
-                    // §27.7.4 — async (non-generator) functions have
-                    // no `prototype` property.
-                    && !context
-                        .function(function_id)
-                        .is_some_and(|f| f.is_async && !f.is_generator)
+                    && context.function_has_prototype_property(function_id)
                     && !self
                         .function_deleted_metadata
                         .contains(&(function_id, "prototype"));

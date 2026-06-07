@@ -844,7 +844,7 @@ impl Interpreter {
             return Ok(true);
         }
         Ok(key == "prototype"
-            && !context.function_is_arrow(function_id)
+            && context.function_has_prototype_property(function_id)
             && !self
                 .function_deleted_metadata
                 .contains(&(function_id, "prototype")))
@@ -884,7 +884,7 @@ impl Interpreter {
         function_id: u32,
     ) -> Vec<String> {
         let mut keys = Vec::new();
-        let is_arrow = context.function_is_arrow(function_id);
+        let has_prototype = context.function_has_prototype_property(function_id);
         let deleted =
             |key: &'static str| self.function_deleted_metadata.contains(&(function_id, key));
         if !deleted("length") {
@@ -907,7 +907,7 @@ impl Interpreter {
                 }
             });
         }
-        if !is_arrow && !bag_has_prototype {
+        if has_prototype && !bag_has_prototype && !deleted("prototype") {
             keys.push("prototype".to_string());
         }
         keys
@@ -1050,7 +1050,7 @@ impl Interpreter {
                 None => {
                     let has_virtual_prototype = context.is_some_and(|context| {
                         key == "prototype"
-                            && !context.function_is_arrow(function_id)
+                            && context.function_has_prototype_property(function_id)
                             && !self
                                 .function_deleted_metadata
                                 .contains(&(function_id, "prototype"))
@@ -1679,12 +1679,10 @@ impl Interpreter {
         {
             return Ok(v);
         }
-        // §27.7.4 — async (non-generator) functions have no
-        // `prototype` property at all.
-        if context
-            .function(function_id)
-            .is_some_and(|function| function.is_async && !function.is_generator)
-        {
+        // §10.2.5 — arrows, methods, and async (non-generator)
+        // functions have no `prototype` property at all, so there is
+        // nothing to materialize.
+        if !context.function_has_prototype_property(function_id) {
             return Ok(Value::undefined());
         }
 
@@ -1782,12 +1780,10 @@ impl Interpreter {
         {
             return Ok(v);
         }
-        // §27.7.4 — async (non-generator) functions have no
-        // `prototype` property at all.
-        if context
-            .function(function_id)
-            .is_some_and(|function| function.is_async && !function.is_generator)
-        {
+        // §10.2.5 — arrows, methods, and async (non-generator)
+        // functions have no `prototype` property at all, so there is
+        // nothing to materialize.
+        if !context.function_has_prototype_property(function_id) {
             return Ok(Value::undefined());
         }
 

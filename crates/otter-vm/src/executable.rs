@@ -202,6 +202,10 @@ pub(crate) struct ExecutableFunction {
     pub(crate) is_strict: bool,
     /// `true` when this function is an arrow function.
     pub(crate) is_arrow: bool,
+    /// `true` when this function is a MethodDefinition body (class
+    /// or object-literal method / accessor) — never a constructor,
+    /// carries no implicit `prototype` property.
+    pub(crate) is_method: bool,
     /// `true` when this function declares a rest parameter.
     pub(crate) has_rest: bool,
     /// `true` when this function is async.
@@ -315,6 +319,7 @@ impl ExecutableFunction {
             own_upvalue_count: function.own_upvalue_count,
             is_strict: function.is_strict,
             is_arrow: function.is_arrow,
+            is_method: function.is_method,
             has_rest: function.has_rest,
             is_derived_constructor: function.is_derived_constructor,
             is_async: function.is_async,

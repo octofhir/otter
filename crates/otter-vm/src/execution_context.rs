@@ -288,6 +288,19 @@ impl ExecutionContext {
         self.exec_function(function_id).is_some_and(|f| f.is_arrow)
     }
 
+    /// `true` when this function id carries an implicit `prototype`
+    /// own property: normal function declarations / expressions
+    /// (§10.2.5 MakeConstructor), and every generator / async
+    /// generator including generator *methods* (§15.5.5 / §15.6.5
+    /// give each one a fresh `.prototype` for its instances).
+    /// Arrows, non-generator methods, and plain async functions
+    /// never receive one.
+    #[must_use]
+    pub fn function_has_prototype_property(&self, function_id: u32) -> bool {
+        self.exec_function(function_id)
+            .is_none_or(|f| f.is_generator || (!f.is_arrow && !f.is_method && !f.is_async))
+    }
+
     /// `true` when the function id points at a strict function.
     #[must_use]
     pub fn function_is_strict(&self, function_id: u32) -> bool {
@@ -440,6 +453,7 @@ mod tests {
                 own_upvalue_count: 0,
                 is_strict: false,
                 is_arrow: false,
+                is_method: false,
                 has_rest: false,
                 is_async: false,
                 is_generator: false,

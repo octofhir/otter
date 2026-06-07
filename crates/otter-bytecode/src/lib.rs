@@ -1911,6 +1911,12 @@ pub struct Function {
     /// receive `this` from the call site instead.
     #[serde(default)]
     pub is_arrow: bool,
+    /// `true` when this record is a MethodDefinition body — a class
+    /// or object-literal method / accessor. Methods are not
+    /// constructors and §10.2.5 MakeConstructor never runs on them,
+    /// so they carry no implicit `prototype` own property.
+    #[serde(default)]
+    pub is_method: bool,
     /// `true` when this function declares a rest parameter
     /// (`function f(a, b, ...rest) { … }`). The call dispatcher
     /// honours the flag by stashing arguments past `param_count`

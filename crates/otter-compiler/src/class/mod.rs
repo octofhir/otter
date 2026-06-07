@@ -479,6 +479,7 @@ pub(crate) fn compile_class(
             }
             _ => "<computed>".to_string(),
         };
+        cx.next_fn_is_method = true;
         let (m_id, m_captures) = compile_function_full(
             cx,
             &body_name,
@@ -536,13 +537,28 @@ pub(crate) fn compile_class(
                     r
                 }
             };
-            let desc_reg = cx.alloc_scratch();
-            cx.emit(Op::NewObject, [Operand::Register(desc_reg)], method_span);
             let accessor_key = match m.kind {
                 oxc_ast::ast::MethodDefinitionKind::Get => "get",
                 oxc_ast::ast::MethodDefinitionKind::Set => "set",
                 _ => unreachable!(),
             };
+            // §10.2.10 SetFunctionName(closure, key, "get"/"set") —
+            // the runtime key names the accessor; private accessors
+            // keep their compile-time `#name` display name.
+            if !is_private {
+                let prefix_idx = cx.intern_string_constant(accessor_key);
+                cx.emit(
+                    Op::SetFunctionName,
+                    [
+                        Operand::Register(m_reg),
+                        Operand::Register(key_reg),
+                        Operand::ConstIndex(prefix_idx),
+                    ],
+                    method_span,
+                );
+            }
+            let desc_reg = cx.alloc_scratch();
+            cx.emit(Op::NewObject, [Operand::Register(desc_reg)], method_span);
             let accessor_const = cx.intern_string_constant(accessor_key);
             let store_scratch = cx.alloc_scratch();
             cx.emit(
@@ -633,6 +649,20 @@ pub(crate) fn compile_class(
                 r
             }
         };
+        // §10.2.10 SetFunctionName — a computed key resolves the
+        // method's `.name` at run time (symbols render `[desc]`).
+        if m.computed {
+            let empty_idx = cx.intern_string_constant("");
+            cx.emit(
+                Op::SetFunctionName,
+                [
+                    Operand::Register(m_reg),
+                    Operand::Register(key_reg),
+                    Operand::ConstIndex(empty_idx),
+                ],
+                method_span,
+            );
+        }
         let desc_reg = cx.alloc_scratch();
         cx.emit(Op::NewObject, [Operand::Register(desc_reg)], method_span);
         let value_const = cx.intern_string_constant("value");

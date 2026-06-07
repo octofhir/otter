@@ -188,6 +188,7 @@ pub(crate) fn compile_object_literal(
                                 compile_expr(cx, expr, key_span)?
                             }
                         };
+                    cx.next_fn_is_method = true;
                     let function_reg = compile_expr(cx, &p.value, key_span)?;
                     let accessor_key = match p.kind {
                         oxc_ast::ast::PropertyKind::Get => "get",
@@ -277,6 +278,7 @@ pub(crate) fn compile_object_literal(
                                 compile_expr(cx, expr, key_span)?
                             }
                         };
+                    cx.next_fn_is_method = p.method;
                     let value_reg = compile_expr(cx, &p.value, key_span)?;
                     // §13.2.5.5 — `[expr]: AnonymousFunctionDefinition`
                     // names the function from the evaluated key.
@@ -395,6 +397,7 @@ pub(crate) fn compile_object_literal(
                 }
                 // §13.2.5.5 step — `PropertyName: AnonymousFunctionDefinition`
                 // infers the function's name from the property key.
+                cx.next_fn_is_method = p.method;
                 let value_reg =
                     crate::expr::compile_expr_with_inferred_name(cx, &p.value, &key_str, key_span)?;
                 // §7.3.7 CreateDataPropertyOrThrow — definitions never

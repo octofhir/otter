@@ -1693,6 +1693,7 @@ mod tests {
                 own_upvalue_count: 0,
                 is_strict: false,
                 is_arrow: false,
+                is_method: false,
                 has_rest: false,
                 is_async: false,
                 is_generator: false,

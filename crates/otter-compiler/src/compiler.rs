@@ -30,6 +30,12 @@ pub(crate) struct Compiler {
     /// Function declarations leave this false — their name resolves
     /// to the outer mutable var binding.
     pub(crate) fn_self_immutable_hint: bool,
+    /// One-shot hint set by MethodDefinition lowering (class and
+    /// object-literal methods / accessors): the next
+    /// `compile_function_full` marks its record `is_method`, so the
+    /// runtime never gives it an implicit `prototype` property
+    /// (§10.2.5 MakeConstructor skips methods).
+    pub(crate) next_fn_is_method: bool,
     /// Stack of private-field namespace ids — one per enclosing
     /// class declaration. The top entry is the namespace used to
     /// mangle every `#name` reference inside the current class
@@ -91,6 +97,7 @@ impl Compiler {
         Self {
             stack: vec![top],
             fn_self_immutable_hint: false,
+            next_fn_is_method: false,
             private_namespaces: Vec::new(),
             class_private_names: Vec::new(),
             class_private_ordered: Vec::new(),

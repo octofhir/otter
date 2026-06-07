@@ -24,6 +24,7 @@ pub(crate) fn compile_function_full(
     force_strict: bool,
 ) -> Result<(u32, Vec<u32>), CompileError> {
     let is_async_generator = is_async && is_generator;
+    let is_method = std::mem::take(&mut parent.next_fn_is_method);
     let module = Rc::clone(&parent.top_mut().module);
     let body_has_strict_directive = match body {
         Some(b) => b.has_use_strict_directive(),
@@ -230,6 +231,7 @@ pub(crate) fn compile_function_full(
     slot.is_async = is_async;
     slot.is_generator = is_generator;
     slot.is_async_generator = is_async_generator;
+    slot.is_method = is_method;
     slot.needs_arguments = needs_arguments;
     slot.arguments_object_kind = if uses_mapped_arguments {
         ArgumentsObjectKind::Mapped

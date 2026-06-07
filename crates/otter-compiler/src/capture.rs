@@ -63,6 +63,24 @@ pub fn analyze_arrow(arrow: &ArrowFunctionExpression<'_>) -> HashSet<String> {
     own.names.intersection(&inner.refs).cloned().collect()
 }
 
+/// `true` when functions nested inside `params` / `body` reference
+/// `name`. Used to decide whether a function expression's self-name
+/// binding (§10.2.11 funcEnv) must live in an upvalue cell so those
+/// nested closures can capture it.
+#[must_use]
+pub fn inner_references_name(
+    params: Option<&FormalParameters<'_>>,
+    body: &FunctionBody<'_>,
+    name: &str,
+) -> bool {
+    let mut inner = InnerRefCollector::default();
+    if let Some(p) = params {
+        inner.visit_formal_parameters(p);
+    }
+    inner.visit_function_body(body);
+    inner.refs.contains(name)
+}
+
 /// `true` when a function body contains a direct-eval call site —
 /// a bare `eval(...)` identifier call — at any nesting depth.
 /// §19.2.1.3 EvalDeclarationInstantiation gives such an eval body

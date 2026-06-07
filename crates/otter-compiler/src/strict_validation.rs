@@ -371,6 +371,19 @@ impl StrictValidator {
         let ForStatementLeft::VariableDeclaration(decl) = left else {
             return;
         };
+        self.flag_head_decl_lexical_var_conflict(decl, body, context_label);
+    }
+
+    /// Shared core for §14.7.4.1 (C-style `for`) and §14.7.5.1
+    /// (`for-in` / `for-of`): when the head declares `let` / `const`
+    /// bindings, none of their BoundNames may appear in the
+    /// VarDeclaredNames of the loop body.
+    fn flag_head_decl_lexical_var_conflict(
+        &mut self,
+        decl: &oxc_ast::ast::VariableDeclaration<'_>,
+        body: &Statement<'_>,
+        context_label: &str,
+    ) {
         if !matches!(
             decl.kind,
             VariableDeclarationKind::Let | VariableDeclarationKind::Const
@@ -401,6 +414,30 @@ impl StrictValidator {
                 help: Some(format!("rename one of the two `{name}` declarations")),
             });
         }
+    }
+
+    /// §13.6.1 IfStatement Static Semantics: Early Errors — it is a
+    /// Syntax Error if `IsLabelledFunction(Statement)` is true for
+    /// either branch, in *both* modes. Annex B §B.3.2 relaxes only a
+    /// bare `FunctionDeclaration` branch in sloppy code; a labelled
+    /// one (`if (x) L: function f(){}`) is always rejected. The bare
+    /// strict-mode case is handled by `flag_function_declaration_body`.
+    fn flag_labelled_function_branch(&mut self, body: &Statement<'_>, context_label: &str) {
+        if !matches!(body, Statement::LabeledStatement(_)) {
+            return;
+        }
+        let Some(span) = labelled_function_body_span(body) else {
+            return;
+        };
+        self.diagnostics.push(SyntaxDiagnostic {
+            code: "LABELLED_FUNCTION_AS_STATEMENT_BODY".to_string(),
+            message: format!(
+                "SyntaxError: a labelled function declaration cannot be the body of \
+                 `{context_label}` (§13.6.1 IsLabelledFunction early error)"
+            ),
+            range: Some((span.start, span.end)),
+            help: Some("wrap the labelled function declaration in a block `{ … }`".to_string()),
+        });
     }
 
     fn flag_iteration_function_body(&mut self, body: &Statement<'_>, context_label: &str) {
@@ -1282,8 +1319,10 @@ impl<'a> Visit<'a> for StrictValidator {
 
     fn visit_if_statement(&mut self, it: &IfStatement<'a>) {
         self.flag_function_declaration_body(&it.consequent, "if");
+        self.flag_labelled_function_branch(&it.consequent, "if");
         if let Some(alt) = &it.alternate {
             self.flag_function_declaration_body(alt, "else");
+            self.flag_labelled_function_branch(alt, "else");
         }
         walk::walk_if_statement(self, it);
     }
@@ -1300,6 +1339,12 @@ impl<'a> Visit<'a> for StrictValidator {
 
     fn visit_for_statement(&mut self, it: &ForStatement<'a>) {
         self.flag_iteration_function_body(&it.body, "for");
+        // §14.7.4.1 — `for (LexicalDeclaration ; ; ) Statement`: the
+        // head's BoundNames must not appear in the VarDeclaredNames
+        // of the body (`for (let x; ; ) { var x; }`).
+        if let Some(oxc_ast::ast::ForStatementInit::VariableDeclaration(decl)) = &it.init {
+            self.flag_head_decl_lexical_var_conflict(decl, &it.body, "for");
+        }
         walk::walk_for_statement(self, it);
     }
 
@@ -1332,7 +1377,67 @@ impl<'a> Visit<'a> for StrictValidator {
         // body is forbidden; in strict mode all FunctionDeclaration
         // bodies are too, so we flag uniformly.
         self.flag_function_declaration_body(&it.body, "labeled");
+        // §13.1 — a LabelIdentifier follows the same strict-mode
+        // reserved-word rules as any Identifier (`yield: 1;` is a
+        // SyntaxError in strict code, including the `yield`
+        // escaped spelling, which oxc has already decoded).
+        if self.is_strict() {
+            let name = it.label.name.as_str();
+            if matches!(
+                name,
+                "yield"
+                    | "implements"
+                    | "interface"
+                    | "let"
+                    | "package"
+                    | "private"
+                    | "protected"
+                    | "public"
+                    | "static"
+            ) {
+                self.diagnostics.push(SyntaxDiagnostic {
+                    code: "STRICT_RESERVED_LABEL".to_string(),
+                    message: format!(
+                        "SyntaxError: `{name}` is a reserved word in strict mode and \
+                         cannot be used as a label (§13.1)"
+                    ),
+                    range: Some((it.label.span.start, it.label.span.end)),
+                    help: Some("rename the label".to_string()),
+                });
+            }
+        }
         walk::walk_labeled_statement(self, it);
+    }
+
+    fn visit_catch_clause(&mut self, it: &oxc_ast::ast::CatchClause<'a>) {
+        // §14.15.1 Try Statement Static Semantics: Early Errors — it
+        // is a Syntax Error if any element of the BoundNames of
+        // CatchParameter also occurs in the LexicallyDeclaredNames of
+        // Block (`catch (x) { let x; }`, `catch (e) { function e(){} }`).
+        // Annex B §B.3.5 relaxes only the VarDeclaredNames rule, so
+        // lexical clashes are rejected in both modes.
+        if let Some(param) = &it.param {
+            let mut param_names: Vec<&str> = Vec::new();
+            for_each_bound_identifier(&param.pattern, &mut |name, _| param_names.push(name));
+            let mut conflicts: Vec<(String, Span)> = Vec::new();
+            collect_lex_decl_names(&it.body.body, &mut |name, span| {
+                if param_names.contains(&name) {
+                    conflicts.push((name.to_string(), span));
+                }
+            });
+            for (name, span) in conflicts {
+                self.diagnostics.push(SyntaxDiagnostic {
+                    code: "CATCH_PARAM_LEXICAL_CONFLICT".to_string(),
+                    message: format!(
+                        "SyntaxError: `{name}` is bound both by the catch parameter and \
+                         by a lexical declaration in the catch block (§14.15.1)"
+                    ),
+                    range: Some((span.start, span.end)),
+                    help: Some(format!("rename one of the two `{name}` bindings")),
+                });
+            }
+        }
+        walk::walk_catch_clause(self, it);
     }
 
     fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {

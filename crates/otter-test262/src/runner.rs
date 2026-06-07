@@ -363,7 +363,15 @@ pub fn run_one(
     // bindings visible to every module in the test's import graph —
     // sibling test files imported as dependencies reference them too.
     let body = Frontmatter::body_of(&source);
-    let combined = if frontmatter.is_module() {
+    let combined = if frontmatter.is_raw() {
+        // `flags: [raw]` — INTERPRETING.md mandates the file run
+        // verbatim: no harness preamble, no strict prologue, and no
+        // frontmatter stripping. Stripping the frontmatter would also
+        // discard a leading hashbang (it precedes the `/*---*/`
+        // block), so the hashbang grammar (byte-0-only `#!`) could
+        // never be exercised. Feed the original bytes unchanged.
+        source.clone()
+    } else if frontmatter.is_module() {
         body.to_string()
     } else {
         let mut buf = String::new();

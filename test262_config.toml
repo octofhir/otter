@@ -61,7 +61,7 @@ skip_features = [
 ]
 
 # Implement, do NOT skip (Stage 4 / shipped, feasible in our engine):
-#   hashbang, host-gc-required ($262.gc), tail-call-optimization,
+#   host-gc-required ($262.gc), tail-call-optimization,
 #   resizable-arraybuffer, arraybuffer-transfer, Float16Array,
 #   Math.sumPrecise, Error.isError, Array.fromAsync, RegExp.escape,
 #   upsert (Map.prototype.getOrInsert), uint8array-base64.

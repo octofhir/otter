@@ -440,6 +440,35 @@ pub(crate) fn compile_statement(
                     }
                 }
             }
+            // §14.7.4.2 ForBodyEvaluation — a captured `let` head gets
+            // CreatePerIterationEnvironment semantics: each iteration
+            // re-mints the binding cells and copies the previous
+            // iteration's values, so body closures capture distinct
+            // bindings. `const` heads and uncaptured (register) `let`
+            // bindings are exempt (perIterationBindings only lists
+            // non-constant declarations; registers have no shared cell).
+            let per_iter_cells: Vec<u16> = match &s.init {
+                Some(oxc_ast::ast::ForStatementInit::VariableDeclaration(decl))
+                    if matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Let) =>
+                {
+                    decl.declarations
+                        .iter()
+                        .filter_map(|d| {
+                            let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &d.id else {
+                                return None;
+                            };
+                            match cx.lookup_binding(id.name.as_str())?.storage {
+                                crate::scope::BindingStorage::Upvalue { idx } => Some(idx),
+                                crate::scope::BindingStorage::Register { .. } => None,
+                            }
+                        })
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            // Step 2 — the first iteration's environment copies the
+            // loop-initialiser values before the first test runs.
+            emit_per_iteration_copy(cx, &per_iter_cells, span);
             // §14.7.4 — completion value is the last non-empty body
             // completion (undefined when the body never runs).
             let completion_reg = cx.alloc_scratch();
@@ -466,6 +495,11 @@ pub(crate) fn compile_statement(
             }
             // Continue lands on the update.
             let update_pc = cx.next_pc;
+            // §14.7.4.2 step 3.e — CreatePerIterationEnvironment runs
+            // before the increment, so the increment mutates the *next*
+            // iteration's cells while this iteration's closures keep
+            // their values.
+            emit_per_iteration_copy(cx, &per_iter_cells, span);
             if let Some(update) = &s.update {
                 compile_expr(cx, update, span)?;
             }
@@ -1085,6 +1119,20 @@ pub(crate) fn compile_statement(
 /// `VariableDeclaration` arm of `compile_statement` but operates on
 /// the borrowed declaration without re-cloning it through OXC's
 /// allocator.
+/// §14.7.4.2 CreatePerIterationEnvironment — re-mint each captured
+/// `let` head cell and copy the previous cell's value into it. Closures
+/// made before this point keep the old cell; the loop's test / body /
+/// increment continue through the fresh one.
+fn emit_per_iteration_copy(cx: &mut Compiler, cells: &[u16], span: (u32, u32)) {
+    for &idx in cells {
+        let storage = crate::scope::BindingStorage::Upvalue { idx };
+        let tmp = cx.alloc_scratch();
+        cx.emit_load_storage(tmp, storage, span);
+        cx.emit(Op::FreshUpvalue, [Operand::Imm32(i32::from(idx))], span);
+        cx.emit_store_storage(tmp, storage, span);
+    }
+}
+
 pub(crate) fn compile_for_init_decl(
     cx: &mut Compiler,
     decl: &oxc_ast::ast::VariableDeclaration<'_>,

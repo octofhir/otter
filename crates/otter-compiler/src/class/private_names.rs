@@ -414,3 +414,20 @@ pub(crate) fn validate_class_private_names_inner(
     scopes.pop();
     res
 }
+
+/// Instance private METHOD / ACCESSOR names (§7.3.30 — these brand
+/// the receiver; fields do not).
+pub(crate) fn collect_class_private_instance_methods(
+    body: &oxc_ast::ast::ClassBody<'_>,
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for element in &body.body {
+        if let oxc_ast::ast::ClassElement::MethodDefinition(m) = element
+            && !m.r#static
+            && let oxc_ast::ast::PropertyKey::PrivateIdentifier(p) = &m.key
+        {
+            names.insert(p.name.to_string());
+        }
+    }
+    names
+}

@@ -235,6 +235,11 @@ pub(crate) fn compile_function_full(
         instruction.op = Op::MakeClosure;
         instruction.operands = make_closure_operands(tmp, const_idx, &self_captures, span)?.into();
     }
+    crate::function_context::finalize_virtual_capture_indices(
+        &mut child.code,
+        &mut direct_eval_meta,
+        child.own_upvalue_count,
+    );
     let mut module_mut = module.borrow_mut();
     let slot = module_mut
         .functions
@@ -480,6 +485,12 @@ pub(crate) fn compile_arrow_function(
     }
 
     let captures = child.parent_captures.clone();
+    let mut child = child;
+    crate::function_context::finalize_virtual_capture_indices(
+        &mut child.code,
+        &mut direct_eval_meta,
+        child.own_upvalue_count,
+    );
     let mut module_mut = module.borrow_mut();
     let slot = module_mut
         .functions

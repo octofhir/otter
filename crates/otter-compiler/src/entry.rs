@@ -833,7 +833,13 @@ pub(crate) fn compile_program_with_mode_impl_super(
         // §19.2.1.1 — a nested direct eval from this chunk inherits
         // the in-function signal from the chunk's own caller.
         m.functions[0].contains_direct_eval = !caller.is_empty();
-        m.functions[0].code = std::mem::take(&mut cx.code);
+        let mut code = std::mem::take(&mut cx.code);
+        crate::function_context::finalize_virtual_capture_indices(
+            &mut code,
+            &mut m.functions[0].direct_eval_bindings,
+            cx.own_upvalue_count,
+        );
+        m.functions[0].code = code;
         m.functions[0].spans = std::mem::take(&mut cx.spans);
     }
     drop(cx);
@@ -1450,7 +1456,14 @@ pub fn compile_module_program(
         m.functions[0].locals = 0;
         m.functions[0].scratch = cx.scratch_window();
         m.functions[0].own_upvalue_count = cx.own_upvalue_count;
-        m.functions[0].code = std::mem::take(&mut cx.code);
+        let mut code = std::mem::take(&mut cx.code);
+        let mut no_eval_meta: Vec<otter_bytecode::DirectEvalBinding> = Vec::new();
+        crate::function_context::finalize_virtual_capture_indices(
+            &mut code,
+            &mut no_eval_meta,
+            cx.own_upvalue_count,
+        );
+        m.functions[0].code = code;
         m.functions[0].spans = std::mem::take(&mut cx.spans);
     }
     // Capture deferred import specifiers before dropping the compiler

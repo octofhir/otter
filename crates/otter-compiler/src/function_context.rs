@@ -808,3 +808,56 @@ impl FunctionContext {
         }
     }
 }
+
+/// Compile-time marker bit for parent-capture upvalue indices.
+/// `resolve_capture` cannot know the frame's FINAL own-upvalue
+/// count (own captured cells may be declared after a capture
+/// resolves — e.g. a nested class's synthetic cells inside a
+/// constructor that already captured the outer brand), so capture
+/// indices are issued in a virtual space and rewritten to
+/// `own_count + position` when the function finalizes.
+pub(crate) const VIRTUAL_CAPTURE_BASE: u16 = 0x8000;
+
+/// Rewrite every virtual parent-capture index in `code` (and the
+/// direct-eval binding table) to its final absolute position now
+/// that the frame's own-upvalue count is known.
+pub(crate) fn finalize_virtual_capture_indices(
+    code: &mut [otter_bytecode::Instruction],
+    direct_eval_meta: &mut [otter_bytecode::DirectEvalBinding],
+    own_count: u16,
+) {
+    let base = VIRTUAL_CAPTURE_BASE as i32;
+    let remap = |v: i32| -> i32 {
+        if v >= base {
+            own_count as i32 + (v - base)
+        } else {
+            v
+        }
+    };
+    for instr in code.iter_mut() {
+        match instr.op {
+            // `FreshUpvalue` only ever targets OWN cells (for-of
+            // per-iteration bindings) — never a parent capture.
+            Op::LoadUpvalue | Op::StoreUpvalue | Op::StoreUpvalueChecked => {
+                if let Some(slot) = instr.operands.get_mut(1)
+                    && let Operand::Imm32(v) = *slot
+                {
+                    *slot = Operand::Imm32(remap(v));
+                }
+            }
+            Op::MakeClosure => {
+                for slot in instr.operands.as_mut_slice().iter_mut().skip(3) {
+                    if let Operand::Imm32(v) = *slot {
+                        *slot = Operand::Imm32(remap(v));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for binding in direct_eval_meta.iter_mut() {
+        if binding.upvalue >= VIRTUAL_CAPTURE_BASE {
+            binding.upvalue = own_count + (binding.upvalue - VIRTUAL_CAPTURE_BASE);
+        }
+    }
+}

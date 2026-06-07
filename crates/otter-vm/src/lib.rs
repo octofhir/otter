@@ -5039,6 +5039,49 @@ impl Interpreter {
                     frame.advance_pc(self.current_byte_len)?;
                     continue;
                 }
+                // §7.3.31 PrivateElementFind own-only — private
+                // methods / accessors require the class brand marker
+                // as an OWN property of the receiver (installed after
+                // super() returns); the prototype-side method lookup
+                // alone must not satisfy access before that.
+                Op::PrivateBrandCheck => {
+                    let obj_reg = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let brand_reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let receiver = *read_register(&stack[top_idx], obj_reg)?;
+                    let brand = *read_register(&stack[top_idx], brand_reg)?;
+                    let Some(sym) = brand.as_symbol(&self.gc_heap) else {
+                        return Err(VmError::TypeError {
+                            message:
+                                "Cannot read private member from an object whose class did not declare it"
+                                    .to_string(),
+                        });
+                    };
+                    let key = VmPropertyKey::Symbol(sym);
+                    let found = self
+                        .ordinary_get_own_property_descriptor_value_runtime_rooted(
+                            context,
+                            receiver,
+                            &key,
+                            0,
+                            &[&receiver, &brand],
+                            &[],
+                        )?
+                        .is_some();
+                    if !found {
+                        return Err(VmError::TypeError {
+                            message:
+                                "Cannot read private member from an object whose class did not declare it"
+                                    .to_string(),
+                        });
+                    }
+                    let frame = &mut stack[top_idx];
+                    frame.advance_pc(self.current_byte_len)?;
+                    continue;
+                }
                 // §13.4.2 UpdateExpression numeric step — ToNumeric
                 // then ±1, preserving the BigInt type (§6.1.6.2.7).
                 Op::Increment => {

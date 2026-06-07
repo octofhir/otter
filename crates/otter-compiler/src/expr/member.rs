@@ -19,6 +19,7 @@ pub(crate) fn compile_private_field(
     let _ = span;
     let pspan = (p.span.start, p.span.end);
     let obj_reg = compile_expr(cx, &p.object, pspan)?;
+    crate::class::emit_private_method_brand_check(cx, obj_reg, p.field.name.as_str(), pspan)?;
     let key_reg = crate::class::load_private_key(cx, p.field.name.as_str(), pspan)?;
     let dst = cx.alloc_scratch();
     cx.emit(

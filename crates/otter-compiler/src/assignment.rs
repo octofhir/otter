@@ -144,6 +144,12 @@ pub(crate) fn compile_assignment(
     }
     if let AssignmentTarget::PrivateFieldExpression(member) = &a.left {
         let obj_reg = compile_expr(cx, &member.object, span)?;
+        crate::class::emit_private_method_brand_check(
+            cx,
+            obj_reg,
+            member.field.name.as_str(),
+            span,
+        )?;
         let key_reg = crate::class::load_private_key(cx, member.field.name.as_str(), span)?;
         let new_value = match compound_op {
             None => compile_expr(cx, &a.right, span)?,
@@ -653,6 +659,12 @@ pub(crate) fn compile_logical_assignment(
         }
         AssignmentTarget::PrivateFieldExpression(m) => {
             let obj_reg = compile_expr(cx, &m.object, span)?;
+            crate::class::emit_private_method_brand_check(
+                cx,
+                obj_reg,
+                m.field.name.as_str(),
+                span,
+            )?;
             let key_reg = crate::class::load_private_key(cx, m.field.name.as_str(), span)?;
             let load = cx.alloc_scratch();
             cx.emit(
@@ -824,6 +836,12 @@ pub(crate) fn assign_to_target(
         }
         AssignmentTarget::PrivateFieldExpression(member) => {
             let obj_reg = compile_expr(cx, &member.object, span)?;
+            crate::class::emit_private_method_brand_check(
+                cx,
+                obj_reg,
+                member.field.name.as_str(),
+                span,
+            )?;
             let key_reg = crate::class::load_private_key(cx, member.field.name.as_str(), span)?;
             cx.emit(
                 Op::PrivateSet,
@@ -871,6 +889,12 @@ fn prepare_assignment_target(
         }
         AssignmentTarget::PrivateFieldExpression(member) => {
             let obj_reg = compile_expr(cx, &member.object, span)?;
+            crate::class::emit_private_method_brand_check(
+                cx,
+                obj_reg,
+                member.field.name.as_str(),
+                span,
+            )?;
             let key_reg = crate::class::load_private_key(cx, member.field.name.as_str(), span)?;
             Ok(Some(PreparedAssignmentTarget::PrivateField {
                 obj_reg,

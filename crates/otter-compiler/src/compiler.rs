@@ -64,6 +64,11 @@ pub(crate) struct Compiler {
     /// parallel to `private_namespaces`; indexes the per-class
     /// `__privarr_{ns}` symbol array.
     pub(crate) class_private_ordered: Vec<Vec<String>>,
+    /// Instance private METHOD / ACCESSOR names per enclosing class
+    /// (parallel to `private_namespaces`). Access to these emits a
+    /// §7.3.31 brand check — the prototype-side lookup alone must
+    /// not satisfy access before `super()` installs the brand.
+    pub(crate) class_private_instance_methods: Vec<std::collections::HashSet<String>>,
     /// `true` when compiling any `eval` body — §B.3.3.3 makes the
     /// Annex B global function extension *deletable* for eval code
     /// (CreateGlobalVarBinding(F, true)) where script code creates a
@@ -113,6 +118,7 @@ impl Compiler {
             private_namespaces: Vec::new(),
             class_private_names: Vec::new(),
             class_private_ordered: Vec::new(),
+            class_private_instance_methods: Vec::new(),
             suppress_global_mirror: false,
             in_eval: false,
             script_global_vars: std::collections::HashSet::new(),
@@ -216,8 +222,11 @@ impl Compiler {
                 current = existing;
                 continue;
             }
-            let new_idx = frame
-                .own_upvalue_count
+            // Issue the capture in the VIRTUAL index space — the
+            // frame may declare more own captured cells after this
+            // resolution, so the absolute `own_count + position`
+            // index is only computed at function finalization.
+            let new_idx = crate::function_context::VIRTUAL_CAPTURE_BASE
                 .checked_add(frame.parent_captures.len() as u16)
                 .expect("captured upvalue index overflow");
             frame.parent_captures.push(current as u32);

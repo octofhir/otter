@@ -961,5 +961,6 @@ mod tests {
         Op::ClassCheck,
         Op::ToPropertyKey,
         Op::Increment,
+        Op::PrivateBrandCheck,
     ];
 }

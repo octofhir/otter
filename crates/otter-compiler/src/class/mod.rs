@@ -187,6 +187,8 @@ fn compile_class_strict(
         cx.scratch = scratch_mark;
     }
     cx.class_private_ordered.push(private_bound.clone());
+    cx.class_private_instance_methods
+        .push(collect_class_private_instance_methods(&class.body));
 
     // §7.3.29 PrivateMethodOrAccessorAdd — instance private methods
     // brand the receiver. Methods live on the prototype side in this
@@ -949,6 +951,7 @@ fn compile_class_strict(
     cx.private_namespaces.pop();
     cx.class_private_names.pop();
     cx.class_private_ordered.pop();
+    cx.class_private_instance_methods.pop();
     cx.exit_scope();
     Ok(class_reg)
 }
@@ -1054,6 +1057,44 @@ pub(crate) fn load_synthetic_capture(
         node: format!("super used outside a class method (`{name}` not in scope)"),
         span,
     })
+}
+
+/// §7.3.31 PrivateElementFind own-only step — when `#name` resolves
+/// to an instance private METHOD / ACCESSOR of an enclosing class,
+/// the receiver must own the class brand marker. Field names (own
+/// store lookup already enforces presence) emit nothing.
+pub(crate) fn emit_private_method_brand_check(
+    cx: &mut Compiler,
+    obj_reg: u16,
+    name: &str,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    for i in (0..cx.private_namespaces.len()).rev() {
+        if !cx
+            .class_private_names
+            .get(i)
+            .is_some_and(|s| s.contains(name))
+        {
+            continue;
+        }
+        if !cx
+            .class_private_instance_methods
+            .get(i)
+            .is_some_and(|s| s.contains(name))
+        {
+            return Ok(());
+        }
+        let ns = cx.private_namespaces[i];
+        let binding = format!("__privbrand_{ns}");
+        let brand_reg = load_synthetic_capture(cx, &binding, span)?;
+        cx.emit(
+            Op::PrivateBrandCheck,
+            [Operand::Register(obj_reg), Operand::Register(brand_reg)],
+            span,
+        );
+        return Ok(());
+    }
+    Ok(())
 }
 
 pub(crate) fn load_private_key(

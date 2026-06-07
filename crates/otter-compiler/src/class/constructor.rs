@@ -148,7 +148,7 @@ pub(crate) fn compile_synthetic_constructor(
         Vec::new()
     };
     parent.exit_scope();
-    let child = parent.pop();
+    let mut child = parent.pop();
     if child.register_overflow {
         return Err(CompileError::Unsupported {
             node: "function body exhausts the 65535-register window".to_string(),
@@ -157,6 +157,12 @@ pub(crate) fn compile_synthetic_constructor(
     }
 
     let captures = child.parent_captures.clone();
+    let mut direct_eval_meta = direct_eval_meta;
+    crate::function_context::finalize_virtual_capture_indices(
+        &mut child.code,
+        &mut direct_eval_meta,
+        child.own_upvalue_count,
+    );
     let mut module_mut = module.borrow_mut();
     let slot = module_mut
         .functions
@@ -188,7 +194,15 @@ pub(crate) fn compile_class_constructor(
     instance_fields: &[&oxc_ast::ast::PropertyDefinition<'_>],
     is_derived: bool,
 ) -> Result<(u32, Vec<u32>), CompileError> {
-    if instance_fields.is_empty() {
+    // §7.3.30 — a class with instance private METHODS brands every
+    // instance (the brand store lives in the field-init prologue),
+    // so such constructors take the field-init compilation path even
+    // with zero fields.
+    let needs_brand = parent
+        .class_private_instance_methods
+        .last()
+        .is_some_and(|methods| !methods.is_empty());
+    if instance_fields.is_empty() && !needs_brand {
         let module = Rc::clone(&parent.top_mut().module);
         // Constructors get no self-name binding (the class name
         // resolves through the class scope) but keep their
@@ -326,7 +340,7 @@ pub(crate) fn compile_class_constructor(
     parent.exit_scope();
     parent.emit(Op::ReturnUndefined, vec![], span);
 
-    let child = parent.pop();
+    let mut child = parent.pop();
     if child.register_overflow {
         return Err(CompileError::Unsupported {
             node: "function body exhausts the 65535-register window".to_string(),
@@ -335,6 +349,12 @@ pub(crate) fn compile_class_constructor(
     }
 
     let captures = child.parent_captures.clone();
+    let mut direct_eval_meta = direct_eval_meta;
+    crate::function_context::finalize_virtual_capture_indices(
+        &mut child.code,
+        &mut direct_eval_meta,
+        child.own_upvalue_count,
+    );
     let mut module_mut = module.borrow_mut();
     let slot = module_mut
         .functions

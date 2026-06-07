@@ -508,6 +508,12 @@ pub(crate) fn compile_method_call(
     }
     if let Expression::PrivateFieldExpression(member) = callee {
         let receiver_reg = compile_expr(cx, &member.object, span)?;
+        crate::class::emit_private_method_brand_check(
+            cx,
+            receiver_reg,
+            member.field.name.as_str(),
+            span,
+        )?;
         let key_reg = crate::class::load_private_key(cx, member.field.name.as_str(), span)?;
         let callee_reg = cx.alloc_scratch();
         cx.emit(

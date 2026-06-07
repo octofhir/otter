@@ -1214,6 +1214,13 @@ pub enum Op {
     /// the Imm32 `+1` / `-1`. BigInt operands stay BigInt
     /// (§6.1.6.2.7), Numbers fold as f64.
     Increment,
+    /// `PrivateBrandCheck obj, brand` — §7.3.31 PrivateElementFind
+    /// own-only step for private METHODS / ACCESSORS: the receiver
+    /// must carry the class's own brand marker (installed by
+    /// InitializeInstanceElements after `super()` returns); a
+    /// missing brand throws TypeError. Fields skip this (their own
+    /// store lookup already fails).
+    PrivateBrandCheck,
 }
 
 impl Op {
@@ -1376,6 +1383,7 @@ impl Op {
             Op::ClassCheck => "CLASS_CHECK",
             Op::ToPropertyKey => "TO_PROPERTY_KEY",
             Op::Increment => "INCREMENT",
+            Op::PrivateBrandCheck => "PRIVATE_BRAND_CHECK",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
@@ -1466,6 +1474,7 @@ impl Op {
             | Op::ClassCheck
             | Op::ToObject
             | Op::ToPropertyKey
+            | Op::PrivateBrandCheck
             | Op::ToNumeric => 2,
             Op::Increment
             | Op::GetStringIndex

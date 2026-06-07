@@ -58,7 +58,7 @@ pub(crate) fn compile_static_block(
     parent.exit_scope();
     parent.emit(Op::ReturnUndefined, vec![], span);
 
-    let child = parent.pop();
+    let mut child = parent.pop();
     if child.register_overflow {
         return Err(CompileError::Unsupported {
             node: "function body exhausts the 65535-register window".to_string(),
@@ -67,6 +67,12 @@ pub(crate) fn compile_static_block(
     }
 
     let captures = child.parent_captures.clone();
+    let mut no_eval_meta: Vec<otter_bytecode::DirectEvalBinding> = Vec::new();
+    crate::function_context::finalize_virtual_capture_indices(
+        &mut child.code,
+        &mut no_eval_meta,
+        child.own_upvalue_count,
+    );
     let mut module_mut = module.borrow_mut();
     let slot = module_mut
         .functions
@@ -125,7 +131,7 @@ pub(crate) fn compile_static_field_initializer(
     }
     parent.exit_scope();
 
-    let child = parent.pop();
+    let mut child = parent.pop();
     if child.register_overflow {
         return Err(CompileError::Unsupported {
             node: "function body exhausts the 65535-register window".to_string(),
@@ -134,6 +140,12 @@ pub(crate) fn compile_static_field_initializer(
     }
 
     let captures = child.parent_captures.clone();
+    let mut no_eval_meta: Vec<otter_bytecode::DirectEvalBinding> = Vec::new();
+    crate::function_context::finalize_virtual_capture_indices(
+        &mut child.code,
+        &mut no_eval_meta,
+        child.own_upvalue_count,
+    );
     let mut module_mut = module.borrow_mut();
     let slot = module_mut
         .functions

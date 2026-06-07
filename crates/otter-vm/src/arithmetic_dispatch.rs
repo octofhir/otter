@@ -413,9 +413,15 @@ pub(crate) fn bigint_xor_op(
 }
 
 fn bigint_to_vm_error(err: bigint::ops::OpError) -> VmError {
-    match err {
-        bigint::ops::OpError::DivisionByZero
-        | bigint::ops::OpError::NegativeExponent
-        | bigint::ops::OpError::ShiftOutOfRange => VmError::TypeMismatch,
+    // §6.1.6.2.5 / .3 / .9 — BigInt division and remainder by zero,
+    // a negative `**` exponent, and an unrepresentable shift all
+    // raise RangeError, not TypeError.
+    let message = match err {
+        bigint::ops::OpError::DivisionByZero => "Division by zero",
+        bigint::ops::OpError::NegativeExponent => "Exponent must be non-negative",
+        bigint::ops::OpError::ShiftOutOfRange => "Maximum BigInt size exceeded",
+    };
+    VmError::RangeError {
+        message: message.to_string(),
     }
 }

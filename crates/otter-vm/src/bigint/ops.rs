@@ -173,7 +173,10 @@ pub fn compare_to_f64(lhs: &BigInt, rhs: f64) -> Option<Ordering> {
         });
     }
     let truncated = rhs.trunc();
-    let rhs_int = BigInt::from(truncated as i128);
+    // Exact f64 → BigInt via bit decomposition — an `as i128` cast
+    // saturates near 1.7e38 and corrupts comparisons against large
+    // doubles (e.g. Number.MAX_VALUE ≈ 1.8e308).
+    let rhs_int = num_traits::FromPrimitive::from_f64(truncated)?;
     match lhs.cmp(&rhs_int) {
         Ordering::Equal => {
             // BigInt vs non-integer Number: tie-break on the

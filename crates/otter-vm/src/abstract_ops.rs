@@ -497,25 +497,35 @@ pub fn string_to_big_int(text: &str) -> Option<num_bigint::BigInt> {
     if body.is_empty() {
         return None;
     }
+    // §7.1.14 StringToBigInt follows the StringIntegerLiteral
+    // grammar — digits only past this point. `num_bigint`'s
+    // `parse_bytes` accepts its own leading sign, which would let
+    // `"++0"` / `"--0"` parse as 0n; gate each arm on the exact
+    // digit set instead.
+    let digits_only =
+        |s: &str, radix: u32| !s.is_empty() && s.bytes().all(|b| (b as char).is_digit(radix));
     let parsed = if let Some(rest) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
         // §12.9.3.1 NonDecimalIntegerLiteral — no sign allowed in
         // the non-decimal form per the spec grammar; reject when
         // we saw an explicit sign above.
-        if sign_negative {
+        if sign_negative || !digits_only(rest, 16) {
             return None;
         }
         num_bigint::BigInt::parse_bytes(rest.as_bytes(), 16)?
     } else if let Some(rest) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
-        if sign_negative {
+        if sign_negative || !digits_only(rest, 8) {
             return None;
         }
         num_bigint::BigInt::parse_bytes(rest.as_bytes(), 8)?
     } else if let Some(rest) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
-        if sign_negative {
+        if sign_negative || !digits_only(rest, 2) {
             return None;
         }
         num_bigint::BigInt::parse_bytes(rest.as_bytes(), 2)?
     } else {
+        if !digits_only(body, 10) {
+            return None;
+        }
         num_bigint::BigInt::parse_bytes(body.as_bytes(), 10)?
     };
     Some(if sign_negative { -parsed } else { parsed })

@@ -1209,6 +1209,11 @@ pub enum Op {
     /// field definitions evaluate their computed names through this
     /// at class-definition time.
     ToPropertyKey,
+    /// `Increment dst, src, delta` — §13.4.2 UpdateExpression
+    /// numeric step: `dst = ToNumeric(src) + delta` where `delta` is
+    /// the Imm32 `+1` / `-1`. BigInt operands stay BigInt
+    /// (§6.1.6.2.7), Numbers fold as f64.
+    Increment,
 }
 
 impl Op {
@@ -1370,6 +1375,7 @@ impl Op {
             Op::SetFunctionName => "SET_FUNCTION_NAME",
             Op::ClassCheck => "CLASS_CHECK",
             Op::ToPropertyKey => "TO_PROPERTY_KEY",
+            Op::Increment => "INCREMENT",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
@@ -1461,7 +1467,8 @@ impl Op {
             | Op::ToObject
             | Op::ToPropertyKey
             | Op::ToNumeric => 2,
-            Op::GetStringIndex
+            Op::Increment
+            | Op::GetStringIndex
             | Op::Add
             | Op::Sub
             | Op::Mul

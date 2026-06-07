@@ -433,6 +433,7 @@ mod tests {
             Op::SetFunctionName => vec![reg(0), reg(1), konst(2)],
             Op::ClassCheck => vec![imm(0), reg(1)],
             Op::ToPropertyKey => vec![reg(0), reg(1)],
+            Op::Increment => vec![reg(0), reg(1), imm(2)],
             Op::IteratorNext => vec![reg(0), reg(1), reg(2)],
             Op::GetAsyncIterator => vec![reg(0), reg(1)],
             Op::IteratorClose | Op::IteratorCloseStart | Op::IteratorCloseEnd => vec![reg(0)],

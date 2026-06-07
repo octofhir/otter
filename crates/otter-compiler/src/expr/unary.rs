@@ -392,29 +392,25 @@ pub(crate) fn compile_update(
     // so an object operand fires `[Symbol.toPrimitive]` / `valueOf`
     // / `toString` before the numeric coercion.
     let old_prim = emit_to_primitive(cx, old, "number", span);
+    // §13.4.2 — ToNumeric preserves BigInt operands; the VM applies
+    // the ±1 in the operand's own numeric type.
     let cur = cx.alloc_scratch();
     cx.emit(
-        Op::ToNumber,
+        Op::ToNumeric,
         [Operand::Register(cur), Operand::Register(old_prim)],
         span,
     );
-    let one = cx.alloc_scratch();
-    cx.emit(
-        Op::LoadInt32,
-        [Operand::Register(one), Operand::Imm32(1)],
-        span,
-    );
-    let next = cx.alloc_scratch();
-    let op = match u.operator {
-        UpdateOperator::Increment => Op::Add,
-        UpdateOperator::Decrement => Op::Sub,
+    let delta = match u.operator {
+        UpdateOperator::Increment => 1,
+        UpdateOperator::Decrement => -1,
     };
+    let next = cx.alloc_scratch();
     cx.emit(
-        op,
+        Op::Increment,
         vec![
             Operand::Register(next),
             Operand::Register(cur),
-            Operand::Register(one),
+            Operand::Imm32(delta),
         ],
         span,
     );

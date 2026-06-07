@@ -5039,6 +5039,41 @@ impl Interpreter {
                     frame.advance_pc(self.current_byte_len)?;
                     continue;
                 }
+                // §13.4.2 UpdateExpression numeric step — ToNumeric
+                // then ±1, preserving the BigInt type (§6.1.6.2.7).
+                Op::Increment => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let delta = context.exec_imm32(instr, 2).unwrap_or(1);
+                    let value = *read_register(&stack[top_idx], src)?;
+                    let primitive = self.evaluate_to_primitive(
+                        context,
+                        &value,
+                        abstract_ops::ToPrimitiveHint::Number,
+                    )?;
+                    let kind = abstract_ops::to_numeric_kind(&primitive, &self.gc_heap)
+                        .ok_or(VmError::TypeMismatch)?;
+                    let next = match kind {
+                        abstract_ops::NumericKind::Num(n) => Value::number(
+                            crate::number::NumberValue::from_f64(n.as_f64() + f64::from(delta)),
+                        ),
+                        abstract_ops::NumericKind::Big(b) => {
+                            let delta_big = num_bigint::BigInt::from(delta);
+                            let sum = bigint::ops::add(&b, &delta_big);
+                            let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, sum)
+                                .map_err(|_| VmError::TypeMismatch)?;
+                            Value::big_int(handle)
+                        }
+                    };
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, next)?;
+                    frame.advance_pc(self.current_byte_len)?;
+                    continue;
+                }
                 Op::ValidateGlobalDecl => {
                     let name_idx = context
                         .exec_const_index(instr, 0)

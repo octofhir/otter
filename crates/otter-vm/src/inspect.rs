@@ -960,5 +960,6 @@ mod tests {
         Op::SetFunctionName,
         Op::ClassCheck,
         Op::ToPropertyKey,
+        Op::Increment,
     ];
 }

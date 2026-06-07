@@ -129,15 +129,14 @@ pub(crate) fn compile_synthetic_constructor(
         // §13.3.7.3 steps 7–9 — bind `this` so the field initializers
         // below (and the implicit return) see the constructed value.
         parent.emit(Op::BindThisValue, [Operand::Register(dst)], span);
-        if instance_fields.is_empty() {
-            parent.emit(Op::Return, [Operand::Register(dst)], span);
-        }
-    }
-    // §15.7.10 InitializeInstanceElements — run instance-field
-    // initialisers with `this` bound to the new instance, after the
-    // super() call has run.
-    emit_instance_field_inits(parent, instance_fields)?;
-    if !is_derived || !instance_fields.is_empty() {
+        // §15.7.10 InitializeInstanceElements — brand + field
+        // initialisers run against the bound `this` BEFORE the
+        // implicit return (a private-method brand applies even with
+        // no fields).
+        emit_instance_field_inits(parent, instance_fields)?;
+        parent.emit(Op::Return, [Operand::Register(dst)], span);
+    } else {
+        emit_instance_field_inits(parent, instance_fields)?;
         parent.emit(Op::ReturnUndefined, vec![], span);
     }
 
@@ -359,6 +358,33 @@ fn emit_instance_field_inits_inner(
     cx: &mut Compiler,
     fields: &[&oxc_ast::ast::PropertyDefinition<'_>],
 ) -> Result<(), CompileError> {
+    // §7.3.29 — brand the instance when the class declares private
+    // methods; a second branding of the same object throws.
+    if let Some(ns) = cx.private_namespaces.last().copied() {
+        let binding = format!("__privbrand_{ns}");
+        if cx.lookup_binding(&binding).is_some() || cx.resolve_capture(&binding).is_some() {
+            let span = (0, 0);
+            let key_reg = crate::class::load_synthetic_capture(cx, &binding, span)?;
+            let this_reg = cx.alloc_scratch();
+            cx.emit(Op::LoadThis, [Operand::Register(this_reg)], span);
+            let present = cx.alloc_scratch();
+            cx.emit(
+                Op::HasProperty,
+                [
+                    Operand::Register(present),
+                    Operand::Register(key_reg),
+                    Operand::Register(this_reg),
+                ],
+                span,
+            );
+            let fresh = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(present), span);
+            emit_field_add_type_error(cx, span);
+            cx.patch_branch_to_here(fresh);
+            let true_reg = cx.alloc_scratch();
+            cx.emit(Op::LoadTrue, [Operand::Register(true_reg)], span);
+            cx.emit_store_element(this_reg, key_reg, true_reg, span);
+        }
+    }
     for (idx, p) in fields.iter().enumerate() {
         let pspan = (p.span.start, p.span.end);
         let value_reg = match &p.value {
@@ -387,6 +413,24 @@ fn emit_instance_field_inits_inner(
             oxc_ast::ast::PropertyKey::NumericLiteral(lit) => lit.value.to_string(),
             oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) => {
                 let key_reg = crate::class::load_private_key(cx, pid.name.as_str(), pspan)?;
+                // §7.3.28 PrivateFieldAdd — re-initializing the same
+                // private field on one object (constructor-return
+                // override + second `new`) is a TypeError. Fields
+                // never live on the prototype side, so a chain walk
+                // is equivalent to an own-presence check here.
+                let present = cx.alloc_scratch();
+                cx.emit(
+                    Op::HasProperty,
+                    [
+                        Operand::Register(present),
+                        Operand::Register(key_reg),
+                        Operand::Register(this_reg),
+                    ],
+                    pspan,
+                );
+                let fresh = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(present), pspan);
+                emit_field_add_type_error(cx, pspan);
+                cx.patch_branch_to_here(fresh);
                 emit_public_field_define(cx, this_reg, key_reg, value_reg, pspan);
                 continue;
             }
@@ -407,4 +451,31 @@ fn emit_instance_field_inits_inner(
         emit_public_field_define(cx, this_reg, key_reg, value_reg, pspan);
     }
     Ok(())
+}
+
+/// Throw TypeError for a duplicate PrivateFieldAdd (§7.3.28).
+fn emit_field_add_type_error(cx: &mut Compiler, span: (u32, u32)) {
+    let message_reg = cx.alloc_scratch();
+    let message_idx =
+        cx.intern_string_constant("Cannot initialize private field twice on the same object");
+    cx.emit(
+        Op::LoadString,
+        [
+            Operand::Register(message_reg),
+            Operand::ConstIndex(message_idx),
+        ],
+        span,
+    );
+    let error_reg = cx.alloc_scratch();
+    let kind_idx = cx.intern_string_constant("TypeError");
+    cx.emit(
+        Op::NewBuiltinError,
+        [
+            Operand::Register(error_reg),
+            Operand::ConstIndex(kind_idx),
+            Operand::Register(message_reg),
+        ],
+        span,
+    );
+    cx.emit(Op::Throw, [Operand::Register(error_reg)], span);
 }

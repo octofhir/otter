@@ -1500,6 +1500,7 @@ impl Runtime {
                     options.forbid_var_arguments,
                     caller_scope.as_deref(),
                     options.new_target_allowed,
+                    options.in_class_field_initializer,
                 )
                 .map_err(|e| format!("compile error: {e:?}"))
             });

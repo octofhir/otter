@@ -131,6 +131,28 @@ pub(crate) fn compile_class(
         cx.emit_store_storage(key_reg, storage, span);
         cx.mark_initialized(&binding);
     }
+    // §7.3.29 PrivateMethodOrAccessorAdd — instance private methods
+    // brand the receiver. Methods live on the prototype side in this
+    // engine, so the brand is a dedicated per-class-evaluation
+    // symbol installed as an own marker during
+    // InitializeInstanceElements; re-branding (constructor-return
+    // override + second `new`) throws TypeError there.
+    let has_instance_private_methods = class.body.body.iter().any(|el| {
+        matches!(
+            el,
+            oxc_ast::ast::ClassElement::MethodDefinition(m)
+                if !m.r#static
+                    && !matches!(m.kind, oxc_ast::ast::MethodDefinitionKind::Constructor)
+                    && matches!(m.key, oxc_ast::ast::PropertyKey::PrivateIdentifier(_))
+        )
+    });
+    if has_instance_private_methods {
+        let binding = format!("__privbrand_{private_namespace}");
+        let storage = cx.declare_captured_binding(&binding, true, span)?;
+        let key_reg = emit_private_symbol_key(cx, "brand", span)?;
+        cx.emit_store_storage(key_reg, storage, span);
+        cx.mark_initialized(&binding);
+    }
 
     // Evaluate the parent class first so observable side-effects
     // happen exactly once per declaration, in source order.

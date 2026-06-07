@@ -633,6 +633,11 @@ pub struct EvalCompileOptions {
     /// inside non-arrow function code (or a class field
     /// initializer), making `new.target` legal in the eval body.
     pub new_target_allowed: bool,
+    /// §15.7.1 ContainsArguments through §19.2.1.1 — `true` when the
+    /// direct-eval call site sits inside a class field initializer:
+    /// a free `arguments` reference in the eval body is an early
+    /// SyntaxError.
+    pub in_class_field_initializer: bool,
 }
 
 /// One caller-environment binding visible to a direct eval body.

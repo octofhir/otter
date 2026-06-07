@@ -110,12 +110,26 @@ pub fn compile_eval_source(
     forbid_var_arguments: bool,
     caller_scope: Option<&[EvalCallerBinding]>,
     new_target_allowed: bool,
+    in_class_field_initializer: bool,
 ) -> Result<BytecodeModule, CompileError> {
     // §19.2.1.1 PerformEval parses the body with the Script goal.
     otter_syntax::with_program_goal(source, kind, otter_syntax::SourceGoal::Script, |program| {
         // §19.2.1.1 step 5 — `new.target` in eval code is an early
         // SyntaxError unless the direct-eval call site sits inside
         // non-arrow function code (arrows are transparent).
+        // §19.2.1.1 / §15.7.1 — eval code in a class field
+        // initializer may not reference `arguments` (functions and
+        // static blocks inside the body open their own scope).
+        if in_class_field_initializer
+            && crate::strict_validation::program_contains_arguments(&program.body)
+        {
+            return Err(CompileError::Unsupported {
+                node:
+                    "SyntaxError: 'arguments' is not allowed in class field initializer eval code"
+                        .to_string(),
+                span: (program.span.start, program.span.end),
+            });
+        }
         if !new_target_allowed && capture::program_references_new_target(&program.body) {
             return Err(CompileError::Unsupported {
                 node: "SyntaxError: new.target expression is not allowed here".to_string(),

@@ -116,6 +116,7 @@ impl Interpreter {
                     caller_scope: None,
                     script_goal: false,
                     new_target_allowed,
+                    in_class_field_initializer: new_target_suppressed,
                 },
             )?
         } else {
@@ -127,6 +128,7 @@ impl Interpreter {
                     caller_scope: Some(caller_scope),
                     script_goal: false,
                     new_target_allowed,
+                    in_class_field_initializer: new_target_suppressed,
                 },
                 &cell_sources,
                 new_target_suppressed,

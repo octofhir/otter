@@ -2491,13 +2491,47 @@ impl Interpreter {
         proxy: &proxy::JsProxy,
         trap_result: Vec<Value>,
     ) -> Result<Vec<Value>, VmError> {
-        // Step 9 — reject duplicates.
-        for i in 0..trap_result.len() {
-            for j in (i + 1)..trap_result.len() {
-                if same_property_key(&trap_result[i], &trap_result[j], &self.gc_heap) {
-                    return Err(VmError::TypeError {
-                        message: "Proxy ownKeys trap result contains duplicate entries".to_string(),
-                    });
+        // Step 9 — reject duplicates. String keys hash into a set
+        // (the spec requires linear behaviour here — see V8's
+        // ownKeys-linear regression); symbol keys are compared
+        // pairwise, which stays cheap because real handler results
+        // carry at most a handful of symbols.
+        let trap_strs: Vec<Option<String>> = trap_result
+            .iter()
+            .map(|v| {
+                v.as_string(&self.gc_heap)
+                    .map(|s| s.to_lossy_string(&self.gc_heap))
+            })
+            .collect();
+        {
+            let mut seen: std::collections::HashSet<&str> =
+                std::collections::HashSet::with_capacity(trap_result.len());
+            let mut symbol_indices: Vec<usize> = Vec::new();
+            for (i, snap) in trap_strs.iter().enumerate() {
+                match snap {
+                    Some(name) => {
+                        if !seen.insert(name.as_str()) {
+                            return Err(VmError::TypeError {
+                                message: "Proxy ownKeys trap result contains duplicate entries"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                    None => symbol_indices.push(i),
+                }
+            }
+            for a in 0..symbol_indices.len() {
+                for b in (a + 1)..symbol_indices.len() {
+                    if same_property_key(
+                        &trap_result[symbol_indices[a]],
+                        &trap_result[symbol_indices[b]],
+                        &self.gc_heap,
+                    ) {
+                        return Err(VmError::TypeError {
+                            message: "Proxy ownKeys trap result contains duplicate entries"
+                                .to_string(),
+                        });
+                    }
                 }
             }
         }
@@ -2530,45 +2564,63 @@ impl Interpreter {
         if extensible_target && target_nonconfigurable.is_empty() {
             return Ok(trap_result);
         }
-        let mut unchecked: Vec<Value> = trap_result.clone();
+        // Steps 17–21 — consume trap keys against the target key
+        // sets through a hash index (strings) plus a short linear
+        // walk (symbols), keeping the whole validation linear.
+        let mut str_index: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::with_capacity(trap_result.len());
+        for (i, snap) in trap_strs.iter().enumerate() {
+            if let Some(name) = snap {
+                str_index.insert(name.as_str(), i);
+            }
+        }
+        let mut consumed: Vec<bool> = vec![false; trap_result.len()];
+        let mut remaining = trap_result.len();
+        let mut consume = |key: &Value,
+                           consumed: &mut Vec<bool>,
+                           remaining: &mut usize,
+                           heap: &otter_gc::GcHeap|
+         -> bool {
+            if let Some(name) = key.as_string(heap).map(|s| s.to_lossy_string(heap)) {
+                if let Some(&i) = str_index.get(name.as_str()) {
+                    if !consumed[i] {
+                        consumed[i] = true;
+                        *remaining -= 1;
+                        return true;
+                    }
+                }
+                return false;
+            }
+            for (i, v) in trap_result.iter().enumerate() {
+                if !consumed[i] && same_property_key(v, key, heap) {
+                    consumed[i] = true;
+                    *remaining -= 1;
+                    return true;
+                }
+            }
+            false
+        };
         for key in &target_nonconfigurable {
-            match unchecked
-                .iter()
-                .position(|v| same_property_key(v, key, &self.gc_heap))
-            {
-                Some(idx) => {
-                    unchecked.swap_remove(idx);
-                }
-                None => {
-                    return Err(VmError::TypeError {
-                        message:
-                            "Proxy ownKeys trap result omits a non-configurable target own key"
-                                .to_string(),
-                    });
-                }
+            if !consume(key, &mut consumed, &mut remaining, &self.gc_heap) {
+                return Err(VmError::TypeError {
+                    message: "Proxy ownKeys trap result omits a non-configurable target own key"
+                        .to_string(),
+                });
             }
         }
         if extensible_target {
             return Ok(trap_result);
         }
         for key in &target_configurable {
-            match unchecked
-                .iter()
-                .position(|v| same_property_key(v, key, &self.gc_heap))
-            {
-                Some(idx) => {
-                    unchecked.swap_remove(idx);
-                }
-                None => {
-                    return Err(VmError::TypeError {
-                        message:
-                            "Proxy ownKeys trap result omits a target own key while target is non-extensible"
-                                .to_string(),
-                    });
-                }
+            if !consume(key, &mut consumed, &mut remaining, &self.gc_heap) {
+                return Err(VmError::TypeError {
+                    message:
+                        "Proxy ownKeys trap result omits a target own key while target is non-extensible"
+                            .to_string(),
+                });
             }
         }
-        if !unchecked.is_empty() {
+        if remaining != 0 {
             return Err(VmError::TypeError {
                 message:
                     "Proxy ownKeys trap result includes extra keys while target is non-extensible"

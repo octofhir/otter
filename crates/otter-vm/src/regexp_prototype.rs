@@ -795,6 +795,11 @@ pub(crate) fn regexp_string_iterator_next_runtime(
     Ok(Some(result))
 }
 
+/// Engine cap on string length in UTF-16 units (1 GiB of u16 —
+/// matches the same order of magnitude as other engines' limits and
+/// keeps a single string allocation well under the heap cap).
+const MAX_STRING_UNITS: usize = 1 << 29;
+
 /// §22.2.6.11 `RegExp.prototype[@@replace](string, replaceValue)`.
 ///
 /// Walks the user-overridable protocol: `Get(rx, "flags")`,
@@ -982,6 +987,20 @@ pub fn native_regexp_symbol_replace(
         };
 
         if position >= next_source_position {
+            // Engine string-length cap — an unbounded global replace
+            // (huge template x many matches) must surface a
+            // catchable RangeError instead of asking the host for
+            // tens of GB and getting OOM-killed.
+            let projected = accumulated
+                .len()
+                .saturating_add(position - next_source_position)
+                .saturating_add(replacement.len());
+            if projected > MAX_STRING_UNITS {
+                return Err(crate::NativeError::RangeError {
+                    name,
+                    reason: "Invalid string length".to_string(),
+                });
+            }
             accumulated.extend_from_slice(&s_units[next_source_position..position]);
             accumulated.extend_from_slice(&replacement);
             next_source_position = position + match_length;

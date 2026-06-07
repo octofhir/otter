@@ -262,7 +262,16 @@ fn make_date_unclipped(
     let seconds = seconds.trunc();
     let ms = ms.trunc();
 
-    let total_months = year as i64 * 12 + month as i64;
+    // §21.4.1.12 step 8 — `ym = y + floor(m / 12)` in float space:
+    // a finite year/month pair can still overflow the intermediate
+    // (tc39/ecma262#1087), and anything beyond the §21.4.1.1 time
+    // range collapses to NaN at TimeClip anyway — guard before the
+    // i64 cast so debug builds don't trap on the multiply.
+    let total_months_f = year * 12.0 + month;
+    if !total_months_f.is_finite() || total_months_f.abs() > 4e9 {
+        return f64::NAN;
+    }
+    let total_months = total_months_f as i64;
     let final_year = total_months.div_euclid(12) as i32;
     let final_month = total_months.rem_euclid(12) as u8;
 

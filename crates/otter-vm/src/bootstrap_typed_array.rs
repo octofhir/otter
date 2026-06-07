@@ -487,7 +487,12 @@ fn ta_byte_offset_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
             name: "TypedArray.prototype.byteOffset",
             reason: "this is not a TypedArray".to_string(),
         })?;
-    let n = t.byte_offset(ctx.heap());
+    // §23.2.3.3 — IsTypedArrayOutOfBounds → +0; otherwise [[ByteOffset]].
+    let n = if t.is_out_of_bounds(ctx.heap()) {
+        0
+    } else {
+        t.byte_offset(ctx.heap())
+    };
     Ok(Value::number(crate::number::NumberValue::from_f64(
         n as f64,
     )))

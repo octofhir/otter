@@ -672,14 +672,40 @@ impl JsTypedArray {
         // effective length clamps to whatever the backing buffer
         // currently holds at our offset.
         let bpe = self.cached_kind.bytes_per_element();
-        let bytes_available = buffer.byte_length(heap).saturating_sub(off);
-        let max_elems = bytes_available / bpe;
+        let buf_bytes = buffer.byte_length(heap);
         if self.is_length_tracking(heap) {
             // §23.2.5.1 AUTO length — tracks the live buffer size in
             // both directions (grow and shrink).
-            return max_elems;
+            return buf_bytes.saturating_sub(off) / bpe;
         }
-        len.min(max_elems)
+        // Fixed [[ArrayLength]]: IsTypedArrayOutOfBounds — a view that
+        // no longer fits entirely within the (possibly shrunk) buffer
+        // is out of bounds, reporting length 0 rather than a partial
+        // clamp. A view that still fits keeps its full length.
+        let needed = off.saturating_add(len.saturating_mul(bpe));
+        if off > buf_bytes || needed > buf_bytes {
+            return 0;
+        }
+        len
+    }
+
+    /// IsTypedArrayOutOfBounds — `true` when the view no longer fits
+    /// inside its backing buffer (detached, offset past the end, or a
+    /// fixed-length view whose end exceeds a shrunk resizable buffer).
+    #[must_use]
+    pub fn is_out_of_bounds(self, heap: &otter_gc::GcHeap) -> bool {
+        let (buffer, off, len) = heap.read_payload(self.handle, |body| {
+            (body.buffer, body.byte_offset, body.length)
+        });
+        if buffer.is_detached(heap) {
+            return true;
+        }
+        let buf_bytes = buffer.byte_length(heap);
+        if self.is_length_tracking(heap) {
+            return off > buf_bytes;
+        }
+        let bpe = self.cached_kind.bytes_per_element();
+        off > buf_bytes || off.saturating_add(len.saturating_mul(bpe)) > buf_bytes
     }
 
     /// §23.2.5.1 — whether [[ArrayLength]] is AUTO (constructed over a

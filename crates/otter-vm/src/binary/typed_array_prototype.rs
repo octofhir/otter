@@ -50,6 +50,17 @@ fn check_not_detached(t: &JsTypedArray, heap: &otter_gc::GcHeap) -> Result<(), N
     Ok(())
 }
 
+/// ValidateTypedArray(O, seq-cst) — most `%TypedArray%.prototype`
+/// methods begin here: a detached or out-of-bounds view (a fixed-length
+/// view whose backing resizable buffer shrank past its end) is a
+/// TypeError before any further work.
+fn validate_typed_array(t: &JsTypedArray, heap: &otter_gc::GcHeap) -> Result<(), NativeError> {
+    if t.is_out_of_bounds(heap) {
+        return Err(type_error("typedarray is detached or out of bounds"));
+    }
+    Ok(())
+}
+
 /// §22.1.3.27 / §23.2.3.34 helper — clamp a relative integer to
 /// `[0, len]` per §7.1.5 ToIntegerOrInfinity then offset-from-end
 /// for negative values.
@@ -234,7 +245,7 @@ fn build_new_typed_array(
 
 fn impl_at(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
-    check_not_detached(&t, ctx.heap())?;
+    validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut()) as i64;
     let idx = if let Some(n) = args.first().and_then(|v| v.as_number()) {
         let f = n.as_f64();
@@ -269,7 +280,7 @@ fn impl_subarray(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 
 fn impl_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
-    check_not_detached(&t, ctx.heap())?;
+    validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut()) as i64;
     let start = relative_index(args.first(), 0, len);
     let end = relative_index(args.get(1), len, len);
@@ -299,7 +310,7 @@ fn impl_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
 fn impl_fill(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
-    check_not_detached(&t, ctx.heap())?;
+    validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut()) as i64;
     let value = args.first().cloned().unwrap_or(Value::undefined());
     if t.kind().is_bigint() && !value.is_big_int() {
@@ -320,7 +331,7 @@ fn impl_fill(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
 
 fn impl_copy_within(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
-    check_not_detached(&t, ctx.heap())?;
+    validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut()) as i64;
     let target = relative_index(args.first(), 0, len);
     let start = relative_index(args.get(1), 0, len);
@@ -347,7 +358,7 @@ fn impl_copy_within(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
 
 fn impl_reverse(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
-    check_not_detached(&t, ctx.heap())?;
+    validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut());
     if len > 1 {
         let mut i = 0usize;
@@ -369,7 +380,7 @@ fn impl_index_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     // §23.2.3.16 — ValidateTypedArray and the length read precede
     // ToIntegerOrInfinity(fromIndex), so `len` is captured before the
     // coercion's `valueOf` can detach the buffer.
-    check_not_detached(&t, ctx.heap())?;
+    validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut()) as i64;
     if len == 0 {
         return Ok(smi(-1));
@@ -391,7 +402,7 @@ fn impl_index_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 
 fn impl_last_index_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
-    check_not_detached(&t, ctx.heap())?;
+    validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut()) as i64;
     if len == 0 {
         return Ok(smi(-1));
@@ -426,7 +437,7 @@ fn impl_last_index_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 
 fn impl_includes(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
-    check_not_detached(&t, ctx.heap())?;
+    validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut()) as i64;
     if len == 0 {
         return Ok(Value::boolean(false));
@@ -448,7 +459,7 @@ fn impl_includes(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 
 fn impl_join(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
-    check_not_detached(&t, ctx.heap())?;
+    validate_typed_array(&t, ctx.heap())?;
     // §23.2.3.18 step 2 — the length is captured BEFORE
     // ToString(separator): a separator coercion that detaches the
     // buffer still yields len-1 separators with empty elements.
@@ -501,7 +512,7 @@ fn join_into_string(
 
 fn impl_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
-    check_not_detached(&t, ctx.heap())?;
+    validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut());
     join_into_string(&t, len, ",", ctx.heap_mut())
 }
@@ -512,7 +523,7 @@ fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
     // user-overridden `Number.prototype.toLocaleString` runs and its
     // abrupt completion propagates.
     let t = receiver(ctx)?;
-    check_not_detached(&t, ctx.heap())?;
+    validate_typed_array(&t, ctx.heap())?;
     let exec = ctx
         .execution_context()
         .cloned()
@@ -548,7 +559,7 @@ fn impl_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
     if offset_f < 0.0 {
         return Err(range_error("Start offset is out of bounds"));
     }
-    check_not_detached(&t, ctx.heap())?;
+    validate_typed_array(&t, ctx.heap())?;
     // A `+Infinity` or past-the-end offset overruns any source; reject
     // before the `usize` cast so the per-source bound checks stay
     // overflow-free.
@@ -692,7 +703,7 @@ fn ta_coerce_value(
 
 fn impl_to_reversed(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
-    check_not_detached(&t, ctx.heap())?;
+    validate_typed_array(&t, ctx.heap())?;
     let mut snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
     snapshot.reverse();
     build_new_typed_array(ctx, t.kind(), &snapshot)
@@ -711,7 +722,7 @@ fn impl_to_sorted_default(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
         });
     }
     let t = receiver(ctx)?;
-    check_not_detached(&t, ctx.heap())?;
+    validate_typed_array(&t, ctx.heap())?;
     let mut snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
     match comparefn {
         None => sort_default(&mut snapshot, t.kind().is_bigint(), ctx.heap_mut()),
@@ -733,7 +744,7 @@ fn impl_sort_default(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
         });
     }
     let t = receiver(ctx)?;
-    check_not_detached(&t, ctx.heap())?;
+    validate_typed_array(&t, ctx.heap())?;
     let mut snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
     match comparefn {
         None => sort_default(&mut snapshot, t.kind().is_bigint(), ctx.heap_mut()),
@@ -817,7 +828,7 @@ fn sort_with_comparefn(
 
 fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
-    check_not_detached(&t, ctx.heap())?;
+    validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut()) as i64;
     let raw_idx = integer_arg(args.first(), 0);
     let resolved = if raw_idx < 0 { len + raw_idx } else { raw_idx };
@@ -885,19 +896,19 @@ fn live_typed_array_iterator(
 
 fn impl_keys(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
-    check_not_detached(&t, ctx.heap())?;
+    validate_typed_array(&t, ctx.heap())?;
     live_typed_array_iterator(ctx, t, crate::iterator_state::ArrayIterKind::Key)
 }
 
 fn impl_values(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
-    check_not_detached(&t, ctx.heap())?;
+    validate_typed_array(&t, ctx.heap())?;
     live_typed_array_iterator(ctx, t, crate::iterator_state::ArrayIterKind::Value)
 }
 
 fn impl_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
-    check_not_detached(&t, ctx.heap())?;
+    validate_typed_array(&t, ctx.heap())?;
     live_typed_array_iterator(ctx, t, crate::iterator_state::ArrayIterKind::Entry)
 }
 

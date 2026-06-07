@@ -28,6 +28,29 @@ pub(crate) fn compile_unary(
                 span,
             });
         }
+        // §13.5.1.2 step 5.b — `delete super.x` / `delete super[k]`
+        // throws ReferenceError at runtime, after the SuperProperty
+        // reference itself evaluates: GetThisBinding fires first
+        // (derived-constructor TDZ, §13.3.7.1 step 2), then the
+        // computed key expression (GetValue only — ToPropertyKey is
+        // never reached). GetSuperBase is unobservable here, and the
+        // modern spec creates the reference without coercing the
+        // base, so a null prototype still yields ReferenceError.
+        if let Expression::StaticMemberExpression(member) = &u.argument
+            && matches!(member.object, Expression::Super(_))
+        {
+            let this_guard = cx.alloc_scratch();
+            cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+            return Ok(emit_delete_super_reference_error(cx, span));
+        }
+        if let Expression::ComputedMemberExpression(member) = &u.argument
+            && matches!(member.object, Expression::Super(_))
+        {
+            let this_guard = cx.alloc_scratch();
+            cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+            let _ = compile_expr(cx, &member.expression, span)?;
+            return Ok(emit_delete_super_reference_error(cx, span));
+        }
         if let Expression::StaticMemberExpression(member) = &u.argument {
             let obj_reg = compile_expr(cx, &member.object, span)?;
             let name_idx = cx.intern_string_constant(member.property.name.as_str());
@@ -227,6 +250,34 @@ pub(crate) fn compile_unary(
         span,
     );
     Ok(dst)
+}
+
+/// §13.5.1.2 step 5.b — emit the unconditional ReferenceError a
+/// `delete` on a super-reference produces. Returns a result register
+/// (never reached at runtime) so the caller stays expression-shaped.
+fn emit_delete_super_reference_error(cx: &mut Compiler, span: (u32, u32)) -> u16 {
+    let message_reg = cx.alloc_scratch();
+    let message = cx.intern_string_constant("Cannot delete a super property");
+    cx.emit(
+        Op::LoadString,
+        [Operand::Register(message_reg), Operand::ConstIndex(message)],
+        span,
+    );
+    let error_reg = cx.alloc_scratch();
+    let kind = cx.intern_string_constant("ReferenceError");
+    cx.emit(
+        Op::NewBuiltinError,
+        [
+            Operand::Register(error_reg),
+            Operand::ConstIndex(kind),
+            Operand::Register(message_reg),
+        ],
+        span,
+    );
+    cx.emit(Op::Throw, [Operand::Register(error_reg)], span);
+    let result = cx.alloc_scratch();
+    cx.emit(Op::LoadUndefined, [Operand::Register(result)], span);
+    result
 }
 
 pub(crate) fn compile_update(

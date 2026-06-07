@@ -751,6 +751,17 @@ fn ta_ctor_dispatch(
                 src_value,
                 &crate::VmPropertyKey::Symbol(iter_sym),
             )?;
+            // §7.3.10 GetMethod — a non-nullish, non-callable
+            // @@iterator throws TypeError before any reads.
+            if !(iter_method.is_undefined()
+                || iter_method.is_null()
+                || ctx.cx.interp.is_callable_runtime(&iter_method))
+            {
+                return Err(NativeError::TypeError {
+                    name: typed_array_name(kind),
+                    reason: "@@iterator is not callable".to_string(),
+                });
+            }
             let drained = if ctx.cx.interp.is_callable_runtime(&iter_method) {
                 // §22.2.4.4 — IterableToList collects raw values, then each
                 // is converted (ToNumber / ToBigInt) when stored.
@@ -811,6 +822,22 @@ fn ta_ctor_dispatch(
         args.iter().cloned().collect()
     };
     let coerced_slice: &[Value] = coerced.as_slice();
+    // §23.2.5.1 step 6.b ToIndex(length) — a negative or infinite
+    // numeric length throws RangeError before allocation (the
+    // dispatcher's generic path reported TypeError).
+    if let Some(first) = coerced_slice.first()
+        && !first.is_object_type()
+        && let Some(n) = first.as_number()
+    {
+        let f = n.as_f64();
+        let int = if f.is_nan() { 0.0 } else { f.trunc() };
+        if int < 0.0 || int.is_infinite() {
+            return Err(NativeError::RangeError {
+                name: typed_array_name(kind),
+                reason: "Invalid typed array length".to_string(),
+            });
+        }
+    }
     let roots = ctx.collect_native_roots();
     let this_value = *ctx.this_value();
     let new_target = ctx.new_target().cloned();

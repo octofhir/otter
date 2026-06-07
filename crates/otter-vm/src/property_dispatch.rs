@@ -584,8 +584,15 @@ impl Interpreter {
                     }
                 }
             } else if let Some(n) = idx.as_number() {
+                // §7.1.19 ToPropertyKey ran on the VALUE -0 before
+                // [[Delete]], so the key is the string "0" — a valid
+                // index answers false (non-configurable element).
+                let mut f = n.as_f64();
+                if f == 0.0 {
+                    f = 0.0;
+                }
                 t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
-                    || !matches!(n.as_smi(), Some(v) if v >= 0 && (v as usize) < t.length(&self.gc_heap))
+                    || typed_array_valid_index(&t, &self.gc_heap, f).is_none()
             } else if let Some(sym) = idx.as_symbol(&self.gc_heap) {
                 if let Some(bag) = t.expando(&self.gc_heap) {
                     crate::object::delete_symbol(bag, &mut self.gc_heap, sym)

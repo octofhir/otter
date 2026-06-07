@@ -950,6 +950,24 @@ impl ErrorClassRegistry {
         )?;
         object::set_constructor_native(error_ctor, gc_heap, Value::native_function(error_call));
         install_ctor_metadata(error_ctor, "Error", 1, gc_heap)?;
+        // §20.5.8.1 `Error.isError(arg)` — IsError(arg): an ordinary
+        // Object carrying the `[[ErrorData]]` internal slot. Proxies and
+        // plain objects shaped like errors return `false`; the marker is
+        // per-instance, set only by an error constructor.
+        fn error_is_error(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            let arg = args.first().copied().unwrap_or_else(Value::undefined);
+            let is_error = arg
+                .as_object()
+                .is_some_and(|obj| crate::object::has_error_data(obj, ctx.heap()));
+            Ok(Value::boolean(is_error))
+        }
+        let is_error_native = native_static_with_roots(gc_heap, "isError", 1, error_is_error, &[])?;
+        let _ = object::define_own_property(
+            error_ctor,
+            gc_heap,
+            "isError",
+            PropertyDescriptor::data(Value::native_function(is_error_native), true, false, true),
+        );
         entries.push((
             ErrorKind::Error,
             ClassEntry {

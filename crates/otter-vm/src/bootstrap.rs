@@ -623,9 +623,10 @@ mod tests {
         // `copyWithin` / `toReversed` / `with` additions. Number
         // contributes `toLocaleString` as an own prototype builtin.
         // +2 for JSON `rawJSON` / `isRawJSON` (json-parse-with-source).
+        // +1 for `Math.sumPrecise` (Math.sumPrecise proposal).
         assert_eq!(
             telemetry.native_functions_installed(),
-            131 + reflect::REFLECT_SPEC.methods.len(),
+            132 + reflect::REFLECT_SPEC.methods.len(),
         );
         assert!(
             telemetry.gc_allocations() <= MAX_DEFAULT_GC_ALLOCATIONS,

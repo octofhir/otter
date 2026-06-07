@@ -97,6 +97,7 @@ otter_macros::holt! {
         "clz32"  / 1 => native_clz32,
         "imul"   / 2 => native_imul,
         "random" / 0 => native_random,
+        "sumPrecise" / 1 => native_sum_precise,
     },
 }
 
@@ -631,6 +632,184 @@ fn first_or_nan(args: &[NumberValue]) -> NumberValue {
     args.first()
         .copied()
         .unwrap_or(NumberValue::Double(f64::NAN))
+}
+
+/// Running classification of the sum per the `Math.sumPrecise`
+/// state machine (sec-math.sumprecise). Only the [`SumState::Finite`]
+/// case touches the exact accumulator.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SumState {
+    MinusZero,
+    Finite,
+    PlusInfinity,
+    MinusInfinity,
+    NotANumber,
+}
+
+/// §21.3.2.x `Math.sumPrecise(items)` — maximally precise (correctly
+/// rounded) summation of an iterable of Numbers.
+///
+/// Finite addends are summed without rounding error by decomposing
+/// each double into `mantissa × 2^e` (with `e ≥ -1074`) and
+/// accumulating `mantissa << (e + 1074)` into an exact big integer
+/// scaled by `2^1074`. The final magnitude is rounded once,
+/// round-half-to-even, back to an `f64`. Non-finite values and signed
+/// zero are tracked by the state machine, never by the accumulator.
+fn native_sum_precise(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    use crate::native_function::vm_to_native_error;
+
+    let items = args.first().copied().unwrap_or_else(Value::undefined);
+    let (interp, exec) = ctx.interp_mut_and_context();
+    let exec = exec.ok_or(NativeError::TypeError {
+        name: "Math.sumPrecise",
+        reason: "missing execution context".to_string(),
+    })?;
+
+    // step — GetIterator(items, sync). Rejects non-iterables (and the
+    // `Math.sumPrecise()` / `{}` cases) with a TypeError.
+    let (iterator, next) = interp
+        .get_iterator_sync(&exec, &items)
+        .map_err(|e| vm_to_native_error(e, "Math.sumPrecise"))?;
+
+    let mut state = SumState::MinusZero;
+    let mut acc = num_bigint::BigInt::from(0);
+    let mut count: u64 = 0;
+
+    loop {
+        match interp.iterator_step_sync(&exec, &iterator, &next) {
+            Ok(None) => break,
+            Ok(Some(value)) => {
+                count += 1;
+                // step — count is bounded by 2^53 - 1.
+                if count >= (1u64 << 53) {
+                    let _ = interp.iterator_close_sync(&exec, &iterator);
+                    return Err(NativeError::RangeError {
+                        name: "Math.sumPrecise",
+                        reason: "input exceeds 2^53 - 1 elements".to_string(),
+                    });
+                }
+                // step — every element must be a Number, checked before
+                // any state transition and without coercion. A non-Number
+                // closes the iterator, then throws.
+                let Some(n) = value.as_number() else {
+                    let _ = interp.iterator_close_sync(&exec, &iterator);
+                    return Err(NativeError::TypeError {
+                        name: "Math.sumPrecise",
+                        reason: "every element must be a Number".to_string(),
+                    });
+                };
+                if state == SumState::NotANumber {
+                    continue;
+                }
+                let n = n.as_f64();
+                if n.is_nan() {
+                    state = SumState::NotANumber;
+                } else if n == f64::INFINITY {
+                    state = if state == SumState::MinusInfinity {
+                        SumState::NotANumber
+                    } else {
+                        SumState::PlusInfinity
+                    };
+                } else if n == f64::NEG_INFINITY {
+                    state = if state == SumState::PlusInfinity {
+                        SumState::NotANumber
+                    } else {
+                        SumState::MinusInfinity
+                    };
+                } else if (state == SumState::MinusZero || state == SumState::Finite)
+                    && !(n == 0.0 && n.is_sign_negative())
+                {
+                    // Finite, non-(-0) addend joins the exact sum.
+                    state = SumState::Finite;
+                    add_finite_f64(&mut acc, n);
+                }
+            }
+            // IteratorStepValue threw: the record is already closed by
+            // the protocol; propagate without re-closing.
+            Err(e) => return Err(vm_to_native_error(e, "Math.sumPrecise")),
+        }
+    }
+
+    let result = match state {
+        SumState::NotANumber => f64::NAN,
+        SumState::PlusInfinity => f64::INFINITY,
+        SumState::MinusInfinity => f64::NEG_INFINITY,
+        SumState::MinusZero => -0.0,
+        SumState::Finite => scaled_bigint_to_f64(&acc),
+    };
+    Ok(Value::number(NumberValue::from_f64(result)))
+}
+
+/// Add a finite `f64` to the `2^1074`-scaled exact accumulator.
+fn add_finite_f64(acc: &mut num_bigint::BigInt, n: f64) {
+    if n == 0.0 {
+        return; // ±0 contributes nothing to the magnitude.
+    }
+    let bits = n.to_bits();
+    let negative = (bits >> 63) == 1;
+    let exp_field = ((bits >> 52) & 0x7ff) as i64;
+    let frac = bits & 0x000F_FFFF_FFFF_FFFF;
+    // value = mantissa × 2^exp, with exp ≥ -1074 for every finite double.
+    let (mantissa, exp) = if exp_field == 0 {
+        (frac, -1074_i64)
+    } else {
+        (frac | 0x0010_0000_0000_0000, exp_field - 1075)
+    };
+    let shift = (exp + 1074) as usize; // ≥ 0
+    let term = num_bigint::BigInt::from(mantissa) << shift;
+    if negative {
+        *acc -= term;
+    } else {
+        *acc += term;
+    }
+}
+
+/// Round the `2^1074`-scaled exact integer back to the nearest `f64`
+/// (round-half-to-even). The sign of a zero result is positive, matching
+/// `𝔽(0)` for the finite-sum case.
+fn scaled_bigint_to_f64(acc: &num_bigint::BigInt) -> f64 {
+    use num_bigint::Sign;
+    use num_traits::ToPrimitive;
+
+    if acc.sign() == Sign::NoSign {
+        return 0.0;
+    }
+    let negative = acc.sign() == Sign::Minus;
+    let mag = acc.magnitude(); // &BigUint, value = mag × 2^-1074
+    let bits = mag.bits(); // index of MSB + 1
+
+    let abs = if bits <= 53 {
+        // mag ∈ [1, 2^53): `mag × 2^-1074` is exactly a subnormal or the
+        // smallest normal binade, whose bit pattern is `mag` itself.
+        f64::from_bits(mag.to_u64().expect("≤ 53 bits fits in u64"))
+    } else {
+        let drop = bits - 53; // > 0
+        let high_big = mag >> drop as usize;
+        let mut high = high_big.to_u64().expect("53-bit value fits in u64"); // ∈ [2^52, 2^53)
+        // Round-half-to-even on the dropped low bits.
+        let mask =
+            (num_bigint::BigUint::from(1u8) << drop as usize) - num_bigint::BigUint::from(1u8);
+        let rem = mag & &mask;
+        let half = num_bigint::BigUint::from(1u8) << (drop - 1) as usize;
+        let mut e = (bits as i64 - 1) - 1074; // unbiased exponent of the value
+        if rem > half || (rem == half && (high & 1) == 1) {
+            high += 1;
+            if high == (1u64 << 53) {
+                high = 1u64 << 52;
+                e += 1;
+            }
+        }
+        if e > 1023 {
+            f64::INFINITY
+        } else {
+            // bits > 53 ⇒ value ≥ 2^-1021, so the result is normal
+            // (unbiased exponent e ∈ [-1021, 1023], biased ∈ [2, 2046]).
+            let biased = (e + 1023) as u64;
+            let frac = high & 0x000F_FFFF_FFFF_FFFF;
+            f64::from_bits((biased << 52) | frac)
+        }
+    };
+    if negative { -abs } else { abs }
 }
 
 #[cfg(test)]

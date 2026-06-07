@@ -84,6 +84,23 @@ pub(crate) fn compile_method_call(
     {
         return compile_super_method_call(cx, member.property.name.as_str(), &call.arguments, span);
     }
+    // §13.3.9.1 — `(a?.b)(...)`: a parenthesized chain callee keeps
+    // its Reference base as `this`.
+    if let Some((callee_reg, this_reg)) =
+        crate::chain::try_compile_parenthesized_chain_callee(cx, callee, span)?
+    {
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        check_call_arity(arg_regs.len(), "Op::CallWithThis", span)?;
+        let dst = cx.alloc_scratch();
+        let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::Register(callee_reg));
+        operands.push(Operand::Register(this_reg));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::CallWithThis, operands, span);
+        return Ok(dst);
+    }
     // `super[expr](args...)` — computed-key parent-method invocation.
     if let Expression::ComputedMemberExpression(member) = callee
         && matches!(member.object, Expression::Super(_))

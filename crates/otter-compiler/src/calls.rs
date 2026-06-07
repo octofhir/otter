@@ -156,6 +156,30 @@ pub(crate) fn compile_method_call(
     if has_spread {
         return compile_spread_call(cx, callee, &call.arguments, span);
     }
+    // §9.1.1.2 — an enclosing `with` object environment may intercept
+    // any free identifier, so the bare-name fast paths below
+    // (`Object()`, `Boolean()`, `Array()`, …) would bypass its
+    // HasBinding / @@unscopables / Get traps. Route such callees
+    // through the generic path, whose `compile_expr` emits the
+    // with-binding probe. `eval` keeps its fast path — losing it
+    // would silently demote direct eval to indirect.
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() != "eval"
+        && !cx.active_with_envs.is_empty()
+        && cx.lookup_binding(id.name.as_str()).is_none()
+    {
+        let callee_reg = compile_expr(cx, callee, span)?;
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        check_call_arity(arg_regs.len(), "Op::Call", span)?;
+        let dst = cx.alloc_scratch();
+        let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::Register(callee_reg));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::Call, operands, span);
+        return Ok(dst);
+    }
     if let Expression::StaticMemberExpression(member) = callee {
         // `ArrayBuffer.isView(arg)` routes through the real
         // `NativeFunction` installed by `bootstrap_array_buffer` —

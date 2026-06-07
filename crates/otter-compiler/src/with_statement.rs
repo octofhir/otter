@@ -165,6 +165,10 @@ pub(crate) fn emit_with_binding_probe(
             ],
             span,
         );
+        // §9.1.1.2.1 step 4 — only an *Object* @@unscopables blocks;
+        // `typeof null` is "object", so test nullish first.
+        let bind_env_nullish =
+            cx.emit_branch_placeholder(Op::JumpIfNullish, Some(unscopables), span);
         let unscopables_type = cx.alloc_scratch();
         cx.emit(
             Op::TypeOf,
@@ -199,6 +203,7 @@ pub(crate) fn emit_with_binding_probe(
         cx.emit_load_property(blocked, unscopables, name, span);
         let next_env_for_blocked = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(blocked), span);
         cx.patch_branch_to_here(bind_env);
+        cx.patch_branch_to_here(bind_env_nullish);
         cx.emit(
             Op::StoreLocal,
             [

@@ -8,6 +8,7 @@
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::temporal::duration::partial_from_object;
+use crate::temporal::helpers::parse_overflow;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, clamp_to_u8, js_string_value, make_temporal,
     parse_calendar_fields, parse_difference_settings, parse_display_calendar,
@@ -38,7 +39,8 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let pym = parse_pym_arg(ctx, &arg_or_undef(args, 0))?;
+    let overflow = parse_overflow(ctx, args, 1)?;
+    let pym = parse_pym_arg_with_overflow(ctx, &arg_or_undef(args, 0), overflow)?;
     make_temporal(ctx, TemporalPayload::PlainYearMonth(pym))
 }
 
@@ -56,6 +58,14 @@ fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError
 fn parse_pym_arg(
     ctx: &mut NativeCtx<'_>,
     v: &Value,
+) -> Result<temporal_rs::PlainYearMonth, NativeError> {
+    parse_pym_arg_with_overflow(ctx, v, None)
+}
+
+fn parse_pym_arg_with_overflow(
+    ctx: &mut NativeCtx<'_>,
+    v: &Value,
+    overflow: Option<temporal_rs::options::Overflow>,
 ) -> Result<temporal_rs::PlainYearMonth, NativeError> {
     if let Some(t) = v.as_temporal(ctx.heap()) {
         match t.payload_clone(ctx.heap()) {
@@ -75,7 +85,8 @@ fn parse_pym_arg(
             calendar_fields: fields,
             calendar,
         };
-        temporal_rs::PlainYearMonth::from_partial(partial, None).map_err(|e| temporal_err(e, CLASS))
+        temporal_rs::PlainYearMonth::from_partial(partial, overflow)
+            .map_err(|e| temporal_err(e, CLASS))
     } else {
         Err(NativeError::TypeError {
             name: CLASS,

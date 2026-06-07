@@ -8,6 +8,7 @@
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::temporal::duration::partial_from_object;
+use crate::temporal::helpers::parse_overflow;
 use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::helpers::{
     arg_or_undef, clamp_to_u8, clamp_to_u16, js_string_value, make_temporal,
@@ -58,7 +59,8 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let pt = parse_plain_time_arg(ctx, &arg_or_undef(args, 0))?;
+    let overflow = parse_overflow(ctx, args, 1)?;
+    let pt = parse_plain_time_arg_with_overflow(ctx, &arg_or_undef(args, 0), overflow)?;
     make_temporal(ctx, TemporalPayload::PlainTime(pt))
 }
 
@@ -82,6 +84,14 @@ pub(crate) fn parse_plain_time_arg(
     ctx: &mut NativeCtx<'_>,
     v: &Value,
 ) -> Result<temporal_rs::PlainTime, NativeError> {
+    parse_plain_time_arg_with_overflow(ctx, v, None)
+}
+
+pub(crate) fn parse_plain_time_arg_with_overflow(
+    ctx: &mut NativeCtx<'_>,
+    v: &Value,
+    overflow: Option<temporal_rs::options::Overflow>,
+) -> Result<temporal_rs::PlainTime, NativeError> {
     // §ToTemporalTime: PlainDateTime / ZonedDateTime project onto
     // their wall-clock time; a plain object is read as a time
     // property bag; a string is parsed as ISO.
@@ -97,7 +107,7 @@ pub(crate) fn parse_plain_time_arg(
         }
     } else if let Some(obj) = v.as_object() {
         let partial = parse_partial_time(ctx, obj, CLASS)?;
-        temporal_rs::PlainTime::from_partial(partial, None).map_err(|e| temporal_err(e, CLASS))
+        temporal_rs::PlainTime::from_partial(partial, overflow).map_err(|e| temporal_err(e, CLASS))
     } else if let Some(s) = v.as_string(ctx.heap()) {
         temporal_rs::PlainTime::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))

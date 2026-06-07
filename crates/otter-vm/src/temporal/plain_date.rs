@@ -11,9 +11,9 @@ use crate::object;
 use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, clamp_to_u8, js_string_value, make_temporal,
-    parse_calendar_fields, parse_difference_settings, parse_display_calendar, parse_partial_time,
-    parse_time_zone, read_calendar_field, require_construct, require_plain_date, str_or_undef,
-    temporal_err, to_integer_with_truncation,
+    parse_calendar_fields, parse_difference_settings, parse_display_calendar, parse_overflow,
+    parse_partial_time, parse_time_zone, read_calendar_field, require_construct,
+    require_plain_date, str_or_undef, temporal_err, to_integer_with_truncation,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -34,7 +34,8 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let pd = parse_plain_date_arg(ctx, &arg_or_undef(args, 0))?;
+    let overflow = parse_overflow(ctx, args, 1)?;
+    let pd = parse_plain_date_arg_with_overflow(ctx, &arg_or_undef(args, 0), overflow)?;
     make_temporal(ctx, TemporalPayload::PlainDate(pd))
 }
 
@@ -52,6 +53,14 @@ fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError
 pub(crate) fn parse_plain_date_arg(
     ctx: &mut NativeCtx<'_>,
     v: &Value,
+) -> Result<temporal_rs::PlainDate, NativeError> {
+    parse_plain_date_arg_with_overflow(ctx, v, None)
+}
+
+pub(crate) fn parse_plain_date_arg_with_overflow(
+    ctx: &mut NativeCtx<'_>,
+    v: &Value,
+    overflow: Option<temporal_rs::options::Overflow>,
 ) -> Result<temporal_rs::PlainDate, NativeError> {
     let heap = ctx.heap();
     // §ToTemporalDate: a Temporal instance with date slots converts
@@ -75,7 +84,7 @@ pub(crate) fn parse_plain_date_arg(
             calendar_fields,
             calendar,
         };
-        temporal_rs::PlainDate::from_partial(partial, None).map_err(|e| temporal_err(e, CLASS))
+        temporal_rs::PlainDate::from_partial(partial, overflow).map_err(|e| temporal_err(e, CLASS))
     } else if let Some(s) = v.as_string(heap) {
         temporal_rs::PlainDate::from_utf8(s.to_lossy_string(heap).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))

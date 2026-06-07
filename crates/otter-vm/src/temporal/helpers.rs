@@ -156,6 +156,48 @@ pub fn opt_integer_with_truncation(
 /// primitive is a TypeError. Callables expose no plain bag, so option
 /// fields read as absent (defaults), matching the spec for the
 /// no-fields case.
+/// §GetOption(options, "overflow", "string", « "constrain", "reject" »,
+/// "constrain") — read and validate the `overflow` option. The value
+/// is coerced with ToString (observable; a Symbol throws TypeError),
+/// then matched against the enum (an out-of-list value is a
+/// RangeError). Absent options / overflow → `None` (temporal_rs
+/// defaults to constrain).
+pub fn parse_overflow(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    index: usize,
+) -> Result<Option<temporal_rs::options::Overflow>, NativeError> {
+    use core::str::FromStr;
+    let v = arg_or_undef(args, index);
+    let Some(obj) = options_object(&v, "Temporal")? else {
+        return Ok(None);
+    };
+    let Some(field) = object::get(obj, ctx.heap(), "overflow") else {
+        return Ok(None);
+    };
+    if field.is_undefined() {
+        return Ok(None);
+    }
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "Temporal",
+            reason: "missing execution context".to_string(),
+        })?;
+    let s = ctx
+        .cx
+        .interp
+        .coerce_to_string(&exec, &field)
+        .map_err(|e| crate::native_function::vm_to_native_error(e, "Temporal"))?;
+    temporal_rs::options::Overflow::from_str(&s)
+        .map(Some)
+        .map_err(|_| NativeError::RangeError {
+            name: "Temporal",
+            reason: format!("invalid overflow option: {s:?}"),
+        })
+}
+
 pub fn options_object(v: &Value, class: &'static str) -> Result<Option<JsObject>, NativeError> {
     if v.is_undefined() {
         return Ok(None);

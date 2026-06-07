@@ -8,6 +8,7 @@
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::temporal::duration::partial_from_object;
+use crate::temporal::helpers::parse_overflow;
 use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, clamp_to_u8, clamp_to_u16, js_string_value, make_temporal,
@@ -82,7 +83,8 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let pdt = parse_plain_date_time_arg(ctx, &arg_or_undef(args, 0))?;
+    let overflow = parse_overflow(ctx, args, 1)?;
+    let pdt = parse_plain_date_time_arg_with_overflow(ctx, &arg_or_undef(args, 0), overflow)?;
     make_temporal(ctx, TemporalPayload::PlainDateTime(pdt))
 }
 
@@ -101,6 +103,14 @@ fn parse_plain_date_time_arg(
     ctx: &mut NativeCtx<'_>,
     v: &Value,
 ) -> Result<temporal_rs::PlainDateTime, NativeError> {
+    parse_plain_date_time_arg_with_overflow(ctx, v, None)
+}
+
+fn parse_plain_date_time_arg_with_overflow(
+    ctx: &mut NativeCtx<'_>,
+    v: &Value,
+    overflow: Option<temporal_rs::options::Overflow>,
+) -> Result<temporal_rs::PlainDateTime, NativeError> {
     // §ToTemporalDateTime: ZonedDateTime projects onto its wall-clock
     // date-time; a plain object is read as a date-time property bag; a
     // string is parsed as ISO.
@@ -117,7 +127,8 @@ fn parse_plain_date_time_arg(
         let fields = parse_date_time_fields(ctx, obj, CLASS)?;
         let calendar = read_calendar_field(obj, ctx.heap(), CLASS)?;
         let partial = temporal_rs::partial::PartialDateTime { fields, calendar };
-        temporal_rs::PlainDateTime::from_partial(partial, None).map_err(|e| temporal_err(e, CLASS))
+        temporal_rs::PlainDateTime::from_partial(partial, overflow)
+            .map_err(|e| temporal_err(e, CLASS))
     } else if let Some(s) = v.as_string(ctx.heap()) {
         temporal_rs::PlainDateTime::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))

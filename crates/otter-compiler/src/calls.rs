@@ -153,7 +153,14 @@ pub(crate) fn compile_method_call(
         .arguments
         .iter()
         .any(|arg| matches!(arg, oxc_ast::ast::Argument::SpreadElement(_)));
-    if has_spread {
+    // §13.3.6.1 — a direct `eval` call stays direct with spread
+    // arguments (ArgumentListEvaluation drains the iterables, the
+    // first element is the eval text); the eval interception below
+    // owns that shape.
+    let is_bare_eval = matches!(callee, Expression::Identifier(id) if id.name.as_str() == "eval")
+        && cx.lookup_binding("eval").is_none()
+        && find_module_import_binding(cx, "eval").is_none();
+    if has_spread && !is_bare_eval {
         return compile_spread_call(cx, callee, &call.arguments, span);
     }
     // §9.1.1.2 — an enclosing `with` object environment may intercept
@@ -168,16 +175,62 @@ pub(crate) fn compile_method_call(
         && !cx.active_with_envs.is_empty()
         && cx.lookup_binding(id.name.as_str()).is_none()
     {
-        let callee_reg = compile_expr(cx, callee, span)?;
+        // §13.3.6.2 EvaluateCall step 1.b.ii — when the reference
+        // resolves through an object environment record, `this` is
+        // the record's WithBaseObject (the `with` object), not
+        // undefined. Inline the probe so the matched branch can
+        // carry both the callee value and that base.
+        let name = id.name.as_str().to_string();
+        let active_with_envs = cx.active_with_envs.clone();
+        let callee_reg = cx.alloc_scratch();
+        let this_reg = cx.alloc_scratch();
+        cx.emit(Op::LoadUndefined, [Operand::Register(this_reg)], span);
+        let probe =
+            crate::with_statement::emit_with_binding_probe(cx, &name, &active_with_envs, span)?;
+        let mut with_done = None;
+        if let Some(probe) = &probe {
+            let fallback = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(probe.found_reg), span);
+            crate::with_statement::emit_with_get_binding_value(
+                cx,
+                callee_reg,
+                probe.object_reg,
+                &name,
+                span,
+            );
+            cx.emit(
+                Op::StoreLocal,
+                [
+                    Operand::Register(probe.object_reg),
+                    Operand::Imm32(this_reg as i32),
+                ],
+                span,
+            );
+            with_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
+            cx.patch_branch_to_here(fallback);
+        }
+        let fallback_value =
+            crate::expr::identifier::compile_identifier_without_with(cx, &name, span)?;
+        cx.emit(
+            Op::StoreLocal,
+            [
+                Operand::Register(fallback_value),
+                Operand::Imm32(callee_reg as i32),
+            ],
+            span,
+        );
+        if let Some(done) = with_done {
+            cx.patch_branch_to_here(done);
+        }
         let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-        check_call_arity(arg_regs.len(), "Op::Call", span)?;
+        check_call_arity(arg_regs.len(), "Op::CallWithThis", span)?;
         let dst = cx.alloc_scratch();
-        let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+        let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
         operands.push(Operand::Register(dst));
         operands.push(Operand::Register(callee_reg));
+        operands.push(Operand::Register(this_reg));
         operands.push(Operand::ConstIndex(arg_regs.len() as u32));
         operands.extend(arg_regs.into_iter().map(Operand::Register));
-        cx.emit(Op::Call, operands, span);
+        cx.emit(Op::CallWithThis, operands, span);
         return Ok(dst);
     }
     if let Expression::StaticMemberExpression(member) = callee {
@@ -437,13 +490,61 @@ pub(crate) fn compile_method_call(
         && cx.lookup_binding("eval").is_none()
         && find_module_import_binding(cx, "eval").is_none()
     {
-        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-        if arg_regs.is_empty() {
-            let dst = cx.alloc_scratch();
-            cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
-            return Ok(dst);
-        }
-        let src_reg = arg_regs[0];
+        let src_reg = if has_spread {
+            // Spread form: drain every argument into an array per
+            // ArgumentListEvaluation, then take element 0 as the
+            // eval text. An absent element reads as undefined, and
+            // eval(undefined) returns undefined (§19.2.1.1 step 2 —
+            // non-string input passes through), matching the
+            // empty-argument-list rule.
+            let arr = cx.alloc_scratch();
+            cx.emit(
+                Op::NewArray,
+                [Operand::Register(arr), Operand::ConstIndex(0)],
+                span,
+            );
+            for arg in &call.arguments {
+                match arg {
+                    oxc_ast::ast::Argument::SpreadElement(s) => {
+                        let inner_span = (s.span.start, s.span.end);
+                        emit_spread_into_array(cx, arr, &s.argument, inner_span)?;
+                    }
+                    other => {
+                        let r = compile_expr(cx, other.to_expression(), span)?;
+                        cx.emit(
+                            Op::ArrayPush,
+                            [Operand::Register(arr), Operand::Register(r)],
+                            span,
+                        );
+                    }
+                }
+            }
+            let idx = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadInt32,
+                [Operand::Register(idx), Operand::Imm32(0)],
+                span,
+            );
+            let first = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadElement,
+                vec![
+                    Operand::Register(first),
+                    Operand::Register(arr),
+                    Operand::Register(idx),
+                ],
+                span,
+            );
+            first
+        } else {
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            if arg_regs.is_empty() {
+                let dst = cx.alloc_scratch();
+                cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
+                return Ok(dst);
+            }
+            arg_regs[0]
+        };
         let dst = cx.alloc_scratch();
         // §19.2.1.3 EvalDeclarationInstantiation — a sloppy direct
         // eval run from a parameter initializer whose body

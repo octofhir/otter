@@ -77,7 +77,7 @@ fn compile_identifier_with_envs(
     Ok(dst)
 }
 
-fn compile_identifier_without_with(
+pub(crate) fn compile_identifier_without_with(
     cx: &mut Compiler,
     name: &str,
     span: (u32, u32),

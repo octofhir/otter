@@ -24,7 +24,7 @@
 mod async_ops;
 mod binary;
 mod construct;
-mod identifier;
+pub(crate) mod identifier;
 mod import_meta;
 mod literal;
 mod member;

@@ -71,7 +71,7 @@ impl Interpreter {
     }
 
     pub(crate) fn run_load_global_or_undefined_reg(
-        &self,
+        &mut self,
         context: &ExecutionContext,
         frame: &mut Frame,
         dst: u16,
@@ -86,7 +86,18 @@ impl Interpreter {
         let value = if let Some(value) = self.read_global_lexical(name)? {
             value
         } else {
-            crate::object::get(self.global_this, &self.gc_heap, name).unwrap_or(Value::undefined())
+            // §13.5.3 step 2 — GetValue on the resolved global
+            // reference runs the ordinary [[Get]], so an
+            // accessor-defined global fires its getter (and its
+            // abrupt completion propagates).
+            let receiver = Value::object(self.global_this);
+            let key = crate::VmPropertyKey::String(name);
+            match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
+                VmGetOutcome::Value(value) => value,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
+                }
+            }
         };
         write_register(frame, dst, value)?;
         frame.advance_pc(self.current_byte_len)?;

@@ -45,6 +45,11 @@ pub struct ProxyBodyGc {
     /// `true` once `Proxy.revocable().revoke()` has fired.
     #[pelt(skip)]
     pub revoked: bool,
+    /// §10.5.15 ProxyCreate step 7 — whether [[Call]] was installed,
+    /// i.e. the target was callable at creation. `typeof` consults
+    /// this slot; revocation nulls the target but never strips it.
+    #[pelt(skip)]
+    pub callable: bool,
 }
 
 /// 4-byte compressed GC handle to a [`ProxyBodyGc`]. `Copy`.
@@ -63,10 +68,27 @@ pub fn alloc_proxy(
     target: Value,
     handler: Value,
 ) -> Result<ProxyHandle, otter_gc::OutOfMemory> {
+    let callable = proxy_target_callable(heap, &target);
     heap.alloc_old(ProxyBodyGc {
         target,
         handler,
         revoked: false,
+        callable,
+    })
+}
+
+/// Callability of a prospective proxy target: function-family value
+/// shapes, ordinary objects carrying a native [[Call]] slot, and
+/// nested proxies (which answer from their own creation-time slot).
+fn proxy_target_callable(heap: &otter_gc::GcHeap, target: &Value) -> bool {
+    if let Some(p) = target.as_proxy() {
+        return heap.read_payload(p.handle(), |body| body.callable);
+    }
+    if crate::abstract_ops::is_callable(target) {
+        return true;
+    }
+    target.as_object().is_some_and(|obj| {
+        crate::object::call_native(obj, heap).is_some_and(|v| v.is_native_function())
     })
 }
 
@@ -126,6 +148,13 @@ impl JsProxy {
     #[must_use]
     pub fn is_revoked(self, heap: &otter_gc::GcHeap) -> bool {
         heap.read_payload(self.handle, |body| body.revoked)
+    }
+
+    /// `true` when [[Call]] was installed at creation (§10.5.15
+    /// step 7) — survives revocation.
+    #[must_use]
+    pub fn is_callable(self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.handle, |body| body.callable)
     }
 
     /// Revoke the proxy. Idempotent; subsequent calls are no-ops.

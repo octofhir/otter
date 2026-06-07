@@ -1196,6 +1196,16 @@ impl Value {
         {
             return "function";
         }
+        // §10.5.15 ProxyCreate installs [[Call]] iff the target was
+        // callable at creation, and typeof reflects that slot
+        // (Table 35) — including after revocation nulls the target.
+        if let Some(p) = self.as_proxy() {
+            return if p.is_callable(heap) {
+                "function"
+            } else {
+                "object"
+            };
+        }
         self.typeof_string()
     }
 

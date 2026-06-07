@@ -20,8 +20,15 @@ pub(crate) fn compile_unary(
     // `delete obj.prop` is special: the operand isn't a
     // value-producing expression, it's a member reference.
     if matches!(u.operator, UnaryOperator::Delete) {
+        // §13.5.1 — parentheses preserve the Reference, so
+        // `delete (x)` is the identifier / member form too.
+        let mut delete_arg = &u.argument;
+        while let Expression::ParenthesizedExpression(p) = delete_arg {
+            delete_arg = &p.expression;
+        }
+        let delete_arg = delete_arg;
         if cx.is_strict
-            && let Expression::Identifier(id) = &u.argument
+            && let Expression::Identifier(id) = delete_arg
         {
             return Err(CompileError::Unsupported {
                 node: format!("strict delete of identifier `{}`", id.name.as_str()),
@@ -36,14 +43,14 @@ pub(crate) fn compile_unary(
         // never reached). GetSuperBase is unobservable here, and the
         // modern spec creates the reference without coercing the
         // base, so a null prototype still yields ReferenceError.
-        if let Expression::StaticMemberExpression(member) = &u.argument
+        if let Expression::StaticMemberExpression(member) = delete_arg
             && matches!(member.object, Expression::Super(_))
         {
             let this_guard = cx.alloc_scratch();
             cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
             return Ok(emit_delete_super_reference_error(cx, span));
         }
-        if let Expression::ComputedMemberExpression(member) = &u.argument
+        if let Expression::ComputedMemberExpression(member) = delete_arg
             && matches!(member.object, Expression::Super(_))
         {
             let this_guard = cx.alloc_scratch();
@@ -51,7 +58,7 @@ pub(crate) fn compile_unary(
             let _ = compile_expr(cx, &member.expression, span)?;
             return Ok(emit_delete_super_reference_error(cx, span));
         }
-        if let Expression::StaticMemberExpression(member) = &u.argument {
+        if let Expression::StaticMemberExpression(member) = delete_arg {
             let obj_reg = compile_expr(cx, &member.object, span)?;
             let name_idx = cx.intern_string_constant(member.property.name.as_str());
             let dst = cx.alloc_scratch();
@@ -66,7 +73,7 @@ pub(crate) fn compile_unary(
             );
             return Ok(dst);
         }
-        if let Expression::ComputedMemberExpression(member) = &u.argument {
+        if let Expression::ComputedMemberExpression(member) = delete_arg {
             let obj_reg = compile_expr(cx, &member.object, span)?;
             let idx_reg = compile_expr(cx, &member.expression, span)?;
             let dst = cx.alloc_scratch();
@@ -86,7 +93,7 @@ pub(crate) fn compile_unary(
         // the property (result reflects configurability); a
         // declarative binding yields `false`; an unresolvable
         // reference yields `true`.
-        if let Expression::Identifier(id) = &u.argument {
+        if let Expression::Identifier(id) = delete_arg {
             let name = id.name.as_str().to_string();
             let dst = cx.alloc_scratch();
             let active_with_envs = cx.active_with_envs.clone();
@@ -142,7 +149,7 @@ pub(crate) fn compile_unary(
         // `true`. The argument is still evaluated for side
         // effects, then we discard it.
         // <https://tc39.es/ecma262/#sec-delete-operator-runtime-semantics-evaluation>
-        let _ = compile_expr(cx, &u.argument, span)?;
+        let _ = compile_expr(cx, delete_arg, span)?;
         let dst = cx.alloc_scratch();
         cx.emit(Op::LoadTrue, [Operand::Register(dst)], span);
         return Ok(dst);

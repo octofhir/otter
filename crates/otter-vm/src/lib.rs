@@ -3351,6 +3351,14 @@ impl Interpreter {
                             let unwind = self.unwind_throw(context, stack, thrown);
                             if unwind.is_ok() {
                                 self.pending_uncaught_frames = None;
+                            } else {
+                                // No handler in THIS dispatch stack —
+                                // restore the original thrown value so
+                                // an outer dispatch loop (across a
+                                // native boundary) can still unwind
+                                // with identity intact instead of the
+                                // rendered string.
+                                self.pending_uncaught_throw = Some(thrown);
                             }
                             unwind?;
                             if stack.is_empty() {
@@ -3560,6 +3568,12 @@ impl Interpreter {
                     let unwind = self.unwind_throw(context, stack, value);
                     if unwind.is_ok() {
                         self.pending_uncaught_frames = None;
+                    } else {
+                        // No handler in this dispatch stack — stash
+                        // the thrown VALUE so outer loops / native
+                        // boundaries keep identity instead of the
+                        // rendered string.
+                        self.pending_uncaught_throw = Some(value);
                     }
                     unwind?;
                     continue;
@@ -3576,6 +3590,8 @@ impl Interpreter {
                         let unwind = self.unwind_throw(context, stack, value);
                         if unwind.is_ok() {
                             self.pending_uncaught_frames = None;
+                        } else {
+                            self.pending_uncaught_throw = Some(value);
                         }
                         unwind?;
                     } else if let Some((completion, floor)) = pending_abrupt {

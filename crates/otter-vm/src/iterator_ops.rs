@@ -380,8 +380,10 @@ impl Interpreter {
                 }
                 let result =
                     self.run_callable_sync(context, &next_fn, iter_value, SmallVec::new())?;
-                if result.as_object().is_none() {
-                    return Err(VmError::TypeMismatch);
+                if !crate::reflect::is_type_object_value(&result) {
+                    return Err(VmError::TypeError {
+                        message: "iterator result is not an object".to_string(),
+                    });
                 }
                 // §7.4.5 IteratorComplete / §7.4.6 IteratorValue read
                 // `done` then (when not done) `value` through the

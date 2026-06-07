@@ -12,8 +12,8 @@ use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, clamp_to_u8, js_string_value, make_temporal,
     parse_calendar_fields, parse_difference_settings, parse_display_calendar, parse_partial_time,
-    parse_time_zone, require_construct, require_plain_date, str_or_undef, temporal_err,
-    to_integer_with_truncation,
+    parse_time_zone, read_calendar_field, require_construct, require_plain_date, str_or_undef,
+    temporal_err, to_integer_with_truncation,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -70,9 +70,10 @@ pub(crate) fn parse_plain_date_arg(
         }
     } else if let Some(obj) = v.as_object() {
         let calendar_fields = parse_calendar_fields(obj, heap, CLASS)?;
+        let calendar = read_calendar_field(obj, heap, CLASS)?;
         let partial = temporal_rs::partial::PartialDate {
             calendar_fields,
-            calendar: temporal_rs::Calendar::default(),
+            calendar,
         };
         temporal_rs::PlainDate::from_partial(partial, None).map_err(|e| temporal_err(e, CLASS))
     } else if let Some(s) = v.as_string(heap) {

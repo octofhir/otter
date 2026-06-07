@@ -18,6 +18,7 @@ use crate::object;
 use crate::string::JsString;
 use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::parse_to_string_rounding_options;
+use crate::temporal::helpers::read_calendar_field;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, js_string_value, make_temporal, parse_calendar_fields,
     parse_difference_settings, parse_partial_time, parse_rounding_options, parse_time_zone,
@@ -97,11 +98,13 @@ pub(crate) fn parse_zdt_arg(
             })?;
         let tz = parse_time_zone(&tz_v, heap, CLASS)?;
         let calendar_fields = parse_calendar_fields(obj, heap, CLASS)?;
+        let calendar = read_calendar_field(obj, heap, CLASS)?;
         let time = parse_partial_time(obj, heap, CLASS)?;
-        let partial = temporal_rs::partial::PartialZonedDateTime::new()
+        let mut partial = temporal_rs::partial::PartialZonedDateTime::new()
             .with_calendar_fields(calendar_fields)
             .with_time(time)
             .with_timezone(Some(tz));
+        partial.calendar = calendar;
         temporal_rs::ZonedDateTime::from_partial(partial, None, None, None)
             .map_err(|e| temporal_err(e, CLASS))
     } else if let Some(s) = v.as_string(heap) {

@@ -13,8 +13,8 @@ use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, clamp_to_u8, clamp_to_u16, js_string_value, make_temporal,
     opt_integer_with_truncation, parse_date_time_fields, parse_difference_settings,
     parse_disambiguation, parse_display_calendar, parse_partial_time, parse_rounding_options,
-    parse_time_zone, require_construct, require_plain_date_time, str_or_undef, temporal_err,
-    to_integer_with_truncation,
+    parse_time_zone, read_calendar_field, require_construct, require_plain_date_time, str_or_undef,
+    temporal_err, to_integer_with_truncation,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -116,10 +116,8 @@ fn parse_plain_date_time_arg(
         }
     } else if let Some(obj) = v.as_object() {
         let fields = parse_date_time_fields(obj, heap, CLASS)?;
-        let partial = temporal_rs::partial::PartialDateTime {
-            fields,
-            calendar: temporal_rs::Calendar::default(),
-        };
+        let calendar = read_calendar_field(obj, heap, CLASS)?;
+        let partial = temporal_rs::partial::PartialDateTime { fields, calendar };
         temporal_rs::PlainDateTime::from_partial(partial, None).map_err(|e| temporal_err(e, CLASS))
     } else if let Some(s) = v.as_string(heap) {
         temporal_rs::PlainDateTime::from_utf8(s.to_lossy_string(heap).as_bytes())

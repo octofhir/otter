@@ -9,8 +9,8 @@ use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, clamp_to_u8, js_string_value, make_temporal,
-    parse_calendar_fields, parse_display_calendar, require_construct, require_plain_month_day,
-    str_or_undef, temporal_err, to_integer_with_truncation,
+    parse_calendar_fields, parse_display_calendar, read_calendar_field, require_construct,
+    require_plain_month_day, str_or_undef, temporal_err, to_integer_with_truncation,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -64,9 +64,10 @@ fn parse_pmd_arg(
             .map_err(|e| temporal_err(e, CLASS))
     } else if let Some(obj) = v.as_object() {
         let fields = parse_calendar_fields(obj, heap, CLASS)?;
+        let calendar = read_calendar_field(obj, heap, CLASS)?;
         let partial = temporal_rs::partial::PartialDate {
             calendar_fields: fields,
-            calendar: temporal_rs::Calendar::default(),
+            calendar,
         };
         temporal_rs::PlainMonthDay::from_partial(partial, None).map_err(|e| temporal_err(e, CLASS))
     } else {

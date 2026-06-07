@@ -650,6 +650,51 @@ pub fn parse_partial_time(
     Ok(t)
 }
 
+/// §ToTemporalCalendarIdentifier — read the `calendar` property of a
+/// fields object and validate it through temporal_rs. Absent /
+/// undefined → ISO8601 default; a string → validated `Calendar`
+/// (bad / empty / mixed-case-non-ASCII identifiers throw RangeError);
+/// any non-string, non-undefined value (null, number, …) is a
+/// TypeError.
+pub fn read_calendar_field(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    class: &'static str,
+) -> Result<temporal_rs::Calendar, NativeError> {
+    let Some(v) = object::get(obj, heap, "calendar") else {
+        return Ok(temporal_rs::Calendar::default());
+    };
+    if v.is_undefined() {
+        return Ok(temporal_rs::Calendar::default());
+    }
+    if let Some(t) = v.as_temporal(heap) {
+        // A Temporal instance contributes its own calendar slot.
+        return Ok(match t.payload_clone(heap) {
+            TemporalPayload::PlainDate(d) => d.calendar().clone(),
+            TemporalPayload::PlainDateTime(d) => d.calendar().clone(),
+            TemporalPayload::PlainYearMonth(d) => d.calendar().clone(),
+            TemporalPayload::PlainMonthDay(d) => d.calendar().clone(),
+            TemporalPayload::ZonedDateTime(d) => d.calendar().clone(),
+            _ => temporal_rs::Calendar::default(),
+        });
+    }
+    let Some(s) = v.as_string(heap) else {
+        return Err(NativeError::TypeError {
+            name: class,
+            reason: "calendar must be a string or a calendar-bearing Temporal object".to_string(),
+        });
+    };
+    // §13.34 ParseTemporalCalendarString — a bare identifier or an
+    // ISO date/time string carrying a `[u-ca=...]` annotation (an
+    // un-annotated ISO string yields the ISO8601 calendar).
+    let id = s.to_lossy_string(heap);
+    use core::str::FromStr;
+    temporal_rs::Calendar::from_str(&id).map_err(|_| NativeError::RangeError {
+        name: class,
+        reason: format!("invalid calendar identifier: {id:?}"),
+    })
+}
+
 pub fn parse_calendar_fields(
     obj: JsObject,
     heap: &otter_gc::GcHeap,

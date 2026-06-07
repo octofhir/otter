@@ -11,8 +11,8 @@ use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, clamp_to_u8, js_string_value, make_temporal,
     parse_calendar_fields, parse_difference_settings, parse_display_calendar,
-    parse_year_month_fields, require_construct, require_plain_year_month, str_or_undef,
-    temporal_err, to_integer_with_truncation,
+    parse_year_month_fields, read_calendar_field, require_construct, require_plain_year_month,
+    str_or_undef, temporal_err, to_integer_with_truncation,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -71,9 +71,10 @@ fn parse_pym_arg(
             .map_err(|e| temporal_err(e, CLASS))
     } else if let Some(obj) = v.as_object() {
         let fields = parse_year_month_fields(obj, heap, CLASS)?;
+        let calendar = read_calendar_field(obj, heap, CLASS)?;
         let partial = temporal_rs::partial::PartialYearMonth {
             calendar_fields: fields,
-            calendar: temporal_rs::Calendar::default(),
+            calendar,
         };
         temporal_rs::PlainYearMonth::from_partial(partial, None).map_err(|e| temporal_err(e, CLASS))
     } else {

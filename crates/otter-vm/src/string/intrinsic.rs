@@ -85,6 +85,26 @@ fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
             Value::string(empty)
         }
     };
+    // §22.1.1.1 step 2.a — `String(sym)` (NewTarget undefined) returns
+    // SymbolDescriptiveString; `new String(sym)` falls through to
+    // ToString(Symbol), a TypeError. Only the non-construct call gets
+    // the descriptive-string shortcut.
+    if let Some(sym) = raw.as_symbol(ctx.heap()) {
+        if ctx.is_construct_call() {
+            return Err(NativeError::TypeError {
+                name: "String",
+                reason: "Cannot convert a Symbol value to a string".to_string(),
+            });
+        }
+        let descriptive = sym.descriptive_string(ctx.heap());
+        let s = crate::string::JsString::from_str(&descriptive, ctx.heap_mut()).map_err(|_| {
+            NativeError::TypeError {
+                name: "String",
+                reason: "string allocation failed".to_string(),
+            }
+        })?;
+        return Ok(Value::string(s));
+    }
     let is_primitive = raw.is_undefined()
         || raw.is_null()
         || raw.is_boolean()

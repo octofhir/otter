@@ -153,6 +153,18 @@ pub(crate) fn compile_object_literal(
                         }
                         oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value.to_string(),
                         oxc_ast::ast::PropertyKey::NumericLiteral(lit) => lit.value.to_string(),
+                        oxc_ast::ast::PropertyKey::BigIntLiteral(lit) => {
+                            match crate::expr::literal::bigint_literal_property_name(lit) {
+                                Some(name) => name,
+                                None => {
+                                    return Err(CompileError::Unsupported {
+                                        node: "ObjectExpression: invalid BigInt property key"
+                                            .to_string(),
+                                        span: key_span,
+                                    });
+                                }
+                            }
+                        }
                         _ => {
                             return Err(CompileError::Unsupported {
                                 node: "ObjectExpression: non-string property key".to_string(),

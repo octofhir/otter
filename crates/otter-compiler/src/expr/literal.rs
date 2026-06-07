@@ -34,6 +34,18 @@ pub(crate) fn compile_string_literal(
     Ok(dst)
 }
 
+/// §13.2.5.5 — a `BigInt` literal used as a property key becomes the
+/// string `ToString(BigInt)` (always decimal, base-independent). oxc
+/// normalizes `lit.value` to the digit text; reformatting through
+/// `num_bigint` collapses any radix prefix to canonical decimal.
+pub(crate) fn bigint_literal_property_name(lit: &BigIntLiteral<'_>) -> Option<String> {
+    lit.value
+        .as_str()
+        .parse::<num_bigint::BigInt>()
+        .ok()
+        .map(|b| b.to_string())
+}
+
 pub(crate) fn compile_bigint_literal(
     cx: &mut Compiler,
     lit: &BigIntLiteral<'_>,

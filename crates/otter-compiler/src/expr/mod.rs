@@ -26,7 +26,7 @@ mod binary;
 mod construct;
 pub(crate) mod identifier;
 mod import_meta;
-mod literal;
+pub(crate) mod literal;
 mod member;
 mod object_array;
 mod unary;

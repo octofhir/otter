@@ -577,6 +577,9 @@ fn compile_class_strict(
                 oxc_ast::ast::PropertyKey::NumericLiteral(lit) => {
                     Some(number_literal_property_name(lit.value))
                 }
+                oxc_ast::ast::PropertyKey::BigIntLiteral(lit) => {
+                    crate::expr::literal::bigint_literal_property_name(lit)
+                }
                 _ => None,
             }
         } else {
@@ -896,6 +899,15 @@ fn compile_class_strict(
                                 }
                                 oxc_ast::ast::PropertyKey::NumericLiteral(lit) => {
                                     number_literal_property_name(lit.value)
+                                }
+                                oxc_ast::ast::PropertyKey::BigIntLiteral(lit) => {
+                                    crate::expr::literal::bigint_literal_property_name(lit)
+                                        .ok_or_else(|| CompileError::Unsupported {
+                                            node:
+                                                "ClassDeclaration: invalid BigInt static field key"
+                                                    .to_string(),
+                                            span: pspan,
+                                        })?
                                 }
                                 _ => {
                                     return Err(CompileError::Unsupported {

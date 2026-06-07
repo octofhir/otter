@@ -3554,8 +3554,33 @@ impl Interpreter {
                 }
                 Op::BindThisValue => {
                     let src = register_operand(context.exec_operand(instr, 0))?;
-                    let frame = &mut stack[top_idx];
-                    self.run_bind_this_value(frame, src)?;
+                    let value = *read_register(&stack[top_idx], src)?;
+                    // §13.3.7.2 — super() may execute inside an arrow
+                    // (its this/super are lexical); the binding
+                    // belongs to the nearest derived-constructor
+                    // environment, i.e. the closest derived-ctor
+                    // frame below the call site.
+                    let target = (0..=top_idx).rev().find(|&i| {
+                        self.frame_cold(&stack[i])
+                            .is_some_and(|c| c.is_derived_constructor)
+                    });
+                    let Some(ti) = target else {
+                        return Err(VmError::ThisUninitialized {
+                            message: "super called outside a derived constructor".to_string(),
+                        });
+                    };
+                    if !stack[ti].this_value.is_hole() {
+                        return Err(VmError::ThisUninitialized {
+                            message: "super constructor may only be called once".to_string(),
+                        });
+                    }
+                    stack[ti].this_value = value;
+                    if let Some(obj) = value.as_object() {
+                        let frame = &mut stack[ti];
+                        let cold = self.frame_ensure_cold(frame);
+                        cold.construct_target = Some(obj);
+                    }
+                    stack[top_idx].advance_pc(self.current_byte_len)?;
                     continue;
                 }
                 Op::Throw => {
@@ -4426,8 +4451,31 @@ impl Interpreter {
                     let dst = context
                         .exec_register(instr, 0)
                         .ok_or(VmError::InvalidOperand)?;
+                    let mut value = stack[top_idx].this_value;
+                    if value.is_hole() {
+                        // §13.3.7.3 — an arrow's lexical `this` in a
+                        // derived constructor: the hole snapshot
+                        // resolves through the nearest derived-ctor
+                        // frame (bound there by a super() that may
+                        // itself have run inside an arrow).
+                        for i in (0..=top_idx).rev() {
+                            if self
+                                .frame_cold(&stack[i])
+                                .is_some_and(|c| c.is_derived_constructor)
+                            {
+                                value = stack[i].this_value;
+                                break;
+                            }
+                        }
+                    }
+                    if value.is_hole() {
+                        return Err(VmError::ThisUninitialized {
+                            message: "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string(),
+                        });
+                    }
                     let frame = &mut stack[top_idx];
-                    self.run_load_this_reg(frame, dst)?;
+                    write_register(frame, dst, value)?;
+                    frame.advance_pc(self.current_byte_len)?;
                     continue;
                 }
                 Op::LoadNewTarget => {

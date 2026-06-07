@@ -1128,6 +1128,11 @@ pub(crate) fn assign_object_pattern(
             }
             AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
                 let pspan = span;
+                // §13.15.5.6 KeyedDestructuringAssignmentEvaluation
+                // step 1 — the target Reference (member bases, a
+                // derived-constructor `this`, computed keys) evaluates
+                // BEFORE GetV reads the source property.
+                let prepared = prepare_maybe_default_target(cx, &p.binding, pspan)?;
                 let val = cx.alloc_scratch();
                 if p.computed {
                     let key_reg = match &p.name {
@@ -1177,7 +1182,7 @@ pub(crate) fn assign_object_pattern(
                     cx.emit_load_property(val, value_reg, &key_str, pspan);
                     extracted_keys.push(ExtractedKey::Static(key_str));
                 }
-                assign_maybe_default(cx, &p.binding, val, pspan)?;
+                assign_maybe_default_with_prepared(cx, &p.binding, prepared, val, pspan)?;
             }
         }
     }
@@ -1225,39 +1230,6 @@ pub(crate) fn assign_object_pattern(
     Ok(())
 }
 
-pub(crate) fn assign_maybe_default(
-    cx: &mut Compiler,
-    target: &oxc_ast::ast::AssignmentTargetMaybeDefault<'_>,
-    value_reg: u16,
-    span: (u32, u32),
-) -> Result<(), CompileError> {
-    use oxc_ast::ast::AssignmentTargetMaybeDefault;
-    match target {
-        AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
-            let inferred_name = match &d.binding {
-                oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) => {
-                    Some(id.name.as_str())
-                }
-                _ => None,
-            };
-            let resolved = apply_default_with_name(cx, value_reg, &d.init, inferred_name, span)?;
-            assign_to_target(cx, &d.binding, resolved, span)
-        }
-        other => {
-            let inner = other
-                .as_assignment_target()
-                .ok_or_else(|| CompileError::Unsupported {
-                    node: format!("AssignmentTargetMaybeDefault ({other:?})"),
-                    span,
-                })?;
-            assign_to_target(cx, inner, value_reg, span)
-        }
-    }
-}
-
-/// `value_reg === undefined ? init : value_reg`. Foundation
-/// emits the conditional load via JumpIfFalse on
-/// `typeof value_reg === "undefined"`.
 pub(crate) fn apply_default_with_name(
     cx: &mut Compiler,
     value_reg: u16,

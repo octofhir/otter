@@ -247,12 +247,17 @@ impl Interpreter {
         } else {
             None
         };
-        let present = if let Some(obj) = rhs.as_object() {
-            if let Some(sym) = lhs.as_symbol(&self.gc_heap) {
-                self.ordinary_has_property_value(context, rhs, &VmPropertyKey::Symbol(sym), 0)?
+        let present = if rhs.as_object().is_some() {
+            // §13.10.1 `in` → HasProperty: one spec funnel for ordinary
+            // objects, String exotics, and the prototype chain.
+            let vm_key = if let Some(sym) = lhs.as_symbol(&self.gc_heap) {
+                VmPropertyKey::Symbol(sym)
+            } else if let Some(name) = key_name.as_deref() {
+                VmPropertyKey::String(name)
             } else {
-                has_object_property(self, obj, &lhs)
-            }
+                return Err(VmError::TypeMismatch);
+            };
+            self.ordinary_has_property_value(context, rhs, &vm_key, 0)?
         } else if let Some(arr) = rhs.as_array() {
             // §13.10.1 `in` → HasProperty → OrdinaryHasProperty: own
             // elements / named props, then the Array.prototype chain
@@ -360,6 +365,15 @@ impl Interpreter {
             // code then throws TypeError below).
             if let Some(env) = crate::object::module_namespace_env(o, &self.gc_heap) {
                 crate::object::get(env, &self.gc_heap, name).is_none()
+            } else if let Some(key) =
+                self.string_object_exotic_descriptor(o, &VmPropertyKey::String(name))?
+            {
+                // §10.4.3.6 — a String exotic object's own index /
+                // length slots are non-configurable, so [[Delete]]
+                // returns false (strict code then throws below); the
+                // ordinary table is consulted for any other key.
+                let _ = key;
+                false
             } else {
                 crate::object::delete(o, &mut self.gc_heap, name)
             }
@@ -1938,18 +1952,12 @@ impl Interpreter {
                 let name = key.to_lossy_string(&self.gc_heap);
                 self.load_string_primitive_property(context, &recv, s, &name)?
             } else if let Some(n) = idx_value.as_number() {
-                if let Some(idx) = crate::array::index_from_number(n) {
-                    match s.char_code_at(idx as u32, &self.gc_heap) {
-                        Some(unit) => Value::string(crate::JsString::from_utf16_units(
-                            &[unit],
-                            &mut self.gc_heap,
-                        )?),
-                        None => Value::string(crate::JsString::empty(self.gc_heap_mut())?),
-                    }
-                } else {
-                    let name = n.to_display_string();
-                    self.load_string_primitive_property(context, &recv, s, &name)?
-                }
+                // §10.4.3.5 — every numeric index, in- or out-of-bounds,
+                // goes through the one String [[Get]] funnel so OOB
+                // reads return `undefined` (not the empty string) and
+                // the prototype fallback stays consistent.
+                let name = n.to_display_string();
+                self.load_string_primitive_property(context, &recv, s, &name)?
             } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let key = VmPropertyKey::Symbol(sym);
                 let proto = self.constructor_prototype_value("String")?;
@@ -4848,30 +4856,6 @@ fn string_index_property_name(key: &str) -> Option<u32> {
         return None;
     }
     Some(value)
-}
-
-fn has_object_property(interpreter: &Interpreter, obj: JsObject, key: &Value) -> bool {
-    if let Some(s) = key.as_symbol(&interpreter.gc_heap) {
-        crate::object::get_symbol(obj, &interpreter.gc_heap, s).is_some()
-    } else if let Some(s) = key.as_string(&interpreter.gc_heap) {
-        let k = s.to_lossy_string(&interpreter.gc_heap);
-        !matches!(
-            crate::object::lookup(obj, &interpreter.gc_heap, &k),
-            object::PropertyLookup::Absent
-        )
-    } else if let Some(n) = key.as_number() {
-        let k = n.to_display_string();
-        !matches!(
-            crate::object::lookup(obj, &interpreter.gc_heap, &k),
-            object::PropertyLookup::Absent
-        )
-    } else {
-        let k = key.display_string(&interpreter.gc_heap);
-        !matches!(
-            crate::object::lookup(obj, &interpreter.gc_heap, &k),
-            object::PropertyLookup::Absent
-        )
-    }
 }
 
 fn has_array_property(interpreter: &Interpreter, arr: JsArray, key: &Value) -> bool {

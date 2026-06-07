@@ -4073,6 +4073,13 @@ impl Interpreter {
             ) {
                 return Ok(true);
             }
+            // §10.4.3.1 — a String exotic object's own index / length
+            // slots are not in the ordinary property table; consult the
+            // exotic [[GetOwnProperty]] so `in`, for-in, and
+            // getOwnPropertyDescriptor agree on one funnel.
+            if self.string_object_exotic_descriptor(obj, key)?.is_some() {
+                return Ok(true);
+            }
             return match object::prototype_value(obj, &self.gc_heap) {
                 Some(proto) => self.ordinary_has_property_value(context, proto, key, hops + 1),
                 None => Ok(false),

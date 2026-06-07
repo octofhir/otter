@@ -518,6 +518,17 @@ fn object_literal_uses_super_in_methods(obj: &ObjectExpression<'_>) -> bool {
         if finder.found {
             return true;
         }
+        // §19.2.1.1 step 5 — a direct eval inside the method may
+        // legally reference `super.x` through the method's
+        // [[HomeObject]], so the home capture must exist even though
+        // no `super` token is visible in the source.
+        if func
+            .body
+            .as_deref()
+            .is_some_and(|b| capture::body_contains_direct_eval(Some(&func.params), b))
+        {
+            return true;
+        }
     }
     false
 }

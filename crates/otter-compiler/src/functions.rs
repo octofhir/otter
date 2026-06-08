@@ -63,10 +63,12 @@ pub(crate) fn compile_function_full(
         child.captured_names = capture::analyze_function(Some(params), b);
         // §10.2.11 — the function expression's self-name is a funcEnv
         // binding; nested closures referencing it need an upvalue cell.
+        // A direct eval in the body can also reference the self-name
+        // through a string literal, so it must reach a cell too.
         if !is_method
             && !no_self_name
             && !name.is_empty()
-            && capture::inner_references_name(Some(params), b, name)
+            && (contains_direct_eval || capture::inner_references_name(Some(params), b, name))
         {
             child.captured_names.insert(name.to_string());
         }
@@ -306,6 +308,8 @@ pub(crate) fn collect_direct_eval_bindings(
                 name: name.clone(),
                 upvalue: idx,
                 lexical: lexical.contains(name.as_str()),
+                is_const: info.is_const,
+                fn_self_name: info.fn_self_name,
             }),
             BindingStorage::Register { .. } => None,
         })
@@ -325,6 +329,8 @@ pub(crate) fn collect_direct_eval_bindings(
                 name: name.clone(),
                 upvalue: *idx,
                 lexical: true,
+                is_const: false,
+                fn_self_name: false,
             });
             continue;
         }
@@ -340,6 +346,8 @@ pub(crate) fn collect_direct_eval_bindings(
             name: name.clone(),
             upvalue: *idx,
             lexical: false,
+            is_const: false,
+            fn_self_name: false,
         });
     }
     // `bindings` is hash-ordered; sort for deterministic bytecode.

@@ -1490,6 +1490,8 @@ impl Runtime {
                                 name: binding.name,
                                 lexical: binding.lexical,
                                 captured: binding.captured,
+                                is_const: binding.is_const,
+                                fn_self_name: binding.fn_self_name,
                             })
                             .collect()
                     });

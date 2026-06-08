@@ -419,10 +419,15 @@ pub(crate) fn compile_assignment(
     }
     let storage = match cx.lookup_binding(&name) {
         Some(info) if info.is_const => {
-            return Err(CompileError::Unsupported {
-                node: format!("assignment to const `{name}`"),
+            // §13.15.2 PutValue on an immutable binding is a runtime
+            // TypeError, not an early error: the RHS still evaluates
+            // for its side effects before the throw.
+            let _ = compile_expr(cx, &a.right, span)?;
+            return Ok(emit_assignment_type_error(
+                cx,
+                &format!("Assignment to constant variable '{name}'."),
                 span,
-            });
+            ));
         }
         Some(info) => Some(info.storage),
         // §10.2.4.1 PutValue fallback — assignment to an undeclared

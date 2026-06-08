@@ -338,6 +338,8 @@ impl ExecutableFunction {
                     upvalue: binding.upvalue,
                     lexical: binding.lexical,
                     captured: binding.captured,
+                    is_const: binding.is_const,
+                    fn_self_name: binding.fn_self_name,
                 })
                 .collect(),
             contains_direct_eval: function.contains_direct_eval,
@@ -401,6 +403,13 @@ pub(crate) struct ExecDirectEvalBinding {
     /// Passthrough capture from an enclosing function (§19.2.1.3 —
     /// readable, but not part of the caller's varEnv).
     pub(crate) captured: bool,
+    /// `true` for a `const` / `class` caller binding — an eval-body
+    /// assignment throws `TypeError` in every mode (§13.3.1).
+    pub(crate) is_const: bool,
+    /// `true` for a named function expression's self-name binding —
+    /// an eval-body assignment throws `TypeError` in strict mode only
+    /// (§10.2.11, §9.1.1.1.5).
+    pub(crate) fn_self_name: bool,
 }
 
 /// Compact mapped-arguments alias entry.

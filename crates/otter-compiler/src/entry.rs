@@ -87,6 +87,13 @@ pub struct EvalCallerBinding {
     /// in the eval body declares a FRESH caller binding instead of
     /// re-binding the outer variable (§19.2.1.3 HasVarDeclaration).
     pub captured: bool,
+    /// `true` for a `const` / `class` caller binding — an eval-body
+    /// assignment throws `TypeError` in every mode (§13.3.1).
+    pub is_const: bool,
+    /// `true` for a named function expression's self-name binding —
+    /// an eval-body assignment throws `TypeError` in strict mode and
+    /// is silently dropped in sloppy mode (§10.2.11, §9.1.1.1.5).
+    pub fn_self_name: bool,
 }
 
 /// Compile an `eval` / `new Function` body. Differs from script
@@ -625,9 +632,9 @@ pub(crate) fn compile_program_with_mode_impl_super(
                 binding.name.clone(),
                 BindingInfo {
                     storage: BindingStorage::Upvalue { idx: slot as u16 },
-                    is_const: false,
+                    is_const: binding.is_const,
                     initialized: true,
-                    fn_self_name: false,
+                    fn_self_name: binding.fn_self_name,
                 },
             );
         }
@@ -835,6 +842,8 @@ pub(crate) fn compile_program_with_mode_impl_super(
                         lexical: main_is_strict
                             || body_lexical.contains(name.as_str())
                             || caller_lexical.contains(name.as_str()),
+                        is_const: info.is_const,
+                        fn_self_name: info.fn_self_name,
                     });
                 }
             }

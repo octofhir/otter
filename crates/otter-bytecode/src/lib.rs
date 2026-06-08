@@ -2148,6 +2148,16 @@ pub struct DirectEvalBinding {
     /// eval whose body var-declares a name that collides with a caller
     /// lexical binding is a runtime `SyntaxError` (§19.2.1.3 step 5).
     pub lexical: bool,
+    /// `true` for a `const` / `class` caller binding. An eval body
+    /// assigning to it throws `TypeError` in every mode (§13.3.1).
+    #[serde(default)]
+    pub is_const: bool,
+    /// `true` for a named function expression's self-name binding
+    /// (§10.2.11 funcEnv). An eval body assigning to it throws
+    /// `TypeError` in strict mode and is silently dropped in sloppy
+    /// mode (§9.1.1.1.5 SetMutableBinding, immutable binding).
+    #[serde(default)]
+    pub fn_self_name: bool,
 }
 
 /// One argument index aliased to one formal parameter binding.

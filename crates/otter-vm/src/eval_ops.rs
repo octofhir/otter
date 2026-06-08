@@ -168,6 +168,8 @@ impl Interpreter {
                     name: binding.name.to_string(),
                     lexical: binding.lexical,
                     captured: binding.captured,
+                    is_const: binding.is_const,
+                    fn_self_name: binding.fn_self_name,
                 });
                 sources.push(CallerCellSource::Upvalue(binding.upvalue));
             }
@@ -185,6 +187,8 @@ impl Interpreter {
                     name: name.clone(),
                     lexical: false,
                     captured: false,
+                    is_const: false,
+                    fn_self_name: false,
                 });
                 sources.push(CallerCellSource::EvalVar(name.clone()));
             }

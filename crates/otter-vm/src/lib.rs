@@ -758,6 +758,13 @@ pub struct EvalCallerBinding {
     /// readable, but a `var` of the same name in the eval body
     /// declares a fresh caller binding (§19.2.1.3).
     pub captured: bool,
+    /// `true` for a `const` / `class` caller binding — an eval-body
+    /// assignment throws `TypeError` in every mode (§13.3.1).
+    pub is_const: bool,
+    /// `true` for a named function expression's self-name binding —
+    /// an eval-body assignment throws `TypeError` in strict mode only
+    /// (§10.2.11, §9.1.1.1.5).
+    pub fn_self_name: bool,
 }
 
 /// Embedder-supplied parse + compile callback used by

@@ -41,10 +41,12 @@ fn receiver(ctx: &NativeCtx<'_>) -> Result<JsDataView, NativeError> {
         .ok_or_else(|| bad("receiver is not a DataView"))
 }
 
-/// §25.3.1.1 step 5 — read / write guard the buffer's detached state.
-fn check_not_detached(view: &JsDataView, heap: &otter_gc::GcHeap) -> Result<(), NativeError> {
-    if view.buffer(heap).is_detached(heap) {
-        return Err(bad("buffer is detached"));
+/// GetViewValue / SetViewValue step — a detached or out-of-bounds view
+/// (a fixed view whose resizable buffer shrank past its end) throws a
+/// TypeError before the access.
+fn check_in_bounds(view: &JsDataView, heap: &otter_gc::GcHeap) -> Result<(), NativeError> {
+    if view.is_out_of_bounds(heap) {
+        return Err(bad("DataView is detached or out of bounds"));
     }
     Ok(())
 }
@@ -56,8 +58,8 @@ fn ensure_within(
     byte_count: usize,
 ) -> Result<(), NativeError> {
     // §25.3.1.1 step 13 / §25.3.1.2 step 15 — an access past the view's
-    // byte length is a RangeError, not a TypeError.
-    if offset + byte_count > view.byte_length(heap) {
+    // (live) byte length is a RangeError, not a TypeError.
+    if offset + byte_count > view.current_byte_length(heap) {
         return Err(range_bad("Offset is outside the bounds of the DataView"));
     }
     Ok(())
@@ -125,7 +127,7 @@ where
     let request = args.first().cloned().unwrap_or_default();
     let offset = to_index_or_throw(ctx, &request)?;
     let little_endian = to_little_endian_flag(args.get(le_arg), ctx.heap());
-    check_not_detached(&view, ctx.heap())?;
+    check_in_bounds(&view, ctx.heap())?;
     ensure_within(&view, ctx.heap(), offset, byte_count)?;
     let abs_offset = view.byte_offset(ctx.heap()) + offset;
     let buffer = view.buffer(ctx.heap());
@@ -154,7 +156,7 @@ where
     let raw_value = args.get(1).cloned().unwrap_or_default();
     let value = convert_set_value(ctx, is_bigint, &raw_value)?;
     let little_endian = to_little_endian_flag(args.get(2), ctx.heap());
-    check_not_detached(&view, ctx.heap())?;
+    check_in_bounds(&view, ctx.heap())?;
     ensure_within(&view, ctx.heap(), offset, byte_count)?;
     let mut staging = vec![0u8; byte_count];
     f(&mut staging, &value, little_endian, ctx.heap());

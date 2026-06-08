@@ -227,6 +227,8 @@ pub fn data_view_call(
             if byte_offset > buffer_byte_length {
                 return Err(VmError::TypeMismatch);
             }
+            let length_absent =
+                args.get(2).is_none() || args.get(2).is_some_and(|v| v.is_undefined());
             let byte_length = match args.get(2) {
                 None => buffer_byte_length - byte_offset,
                 Some(v) if v.is_undefined() => buffer_byte_length - byte_offset,
@@ -240,6 +242,11 @@ pub fn data_view_call(
             };
             let view =
                 JsDataView::new(gc_heap, buffer, byte_offset, byte_length).map_err(oom_to_vm)?;
+            // §25.3.4.1 — an absent byteLength over a resizable buffer
+            // makes the view length-tracking (AUTO).
+            if length_absent && buffer.is_resizable(gc_heap) {
+                view.set_length_tracking(gc_heap);
+            }
             Ok(Value::data_view(view))
         }
     }

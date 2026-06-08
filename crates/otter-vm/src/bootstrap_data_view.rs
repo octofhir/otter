@@ -167,6 +167,7 @@ fn data_view_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
             reason: "Start offset is outside the bounds of the buffer".to_string(),
         });
     }
+    let length_absent = args.get(2).is_none() || args.get(2).is_some_and(|v| v.is_undefined());
     let byte_length = match args.get(2) {
         None => buffer_byte_length - byte_offset,
         Some(v) if v.is_undefined() => buffer_byte_length - byte_offset,
@@ -187,6 +188,11 @@ fn data_view_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
                 name: "DataView",
                 reason: "out of memory".to_string(),
             })?;
+    // §25.3.2.1 — an absent byteLength over a resizable buffer makes the
+    // view length-tracking (AUTO byte length).
+    if length_absent && buffer.is_resizable(ctx.heap()) {
+        view.set_length_tracking(ctx.heap_mut());
+    }
     let value = Value::data_view(view);
     // §10.1.13 GetPrototypeFromConstructor — derived `super()`
     // construction forwards `new.target`, so the allocated exotic
@@ -213,26 +219,28 @@ fn dv_get_buffer(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nati
 
 fn dv_get_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let view = receiver_dv(ctx, "get DataView.prototype.byteLength")?;
-    // §25.3.4.1 — a detached (out-of-bounds) view has no byte length;
-    // the getter throws a TypeError rather than reporting zero.
-    if view.buffer(ctx.heap()).is_detached(ctx.heap()) {
+    // §25.3.4.1 — a detached or out-of-bounds view (fixed view past a
+    // shrunk resizable buffer) has no byte length; the getter throws a
+    // TypeError. A length-tracking view reports its live size.
+    if view.is_out_of_bounds(ctx.heap()) {
         return Err(NativeError::TypeError {
             name: "get DataView.prototype.byteLength",
-            reason: "Cannot read byteLength of a DataView with a detached buffer".to_string(),
+            reason: "Cannot read byteLength of an out-of-bounds DataView".to_string(),
         });
     }
     Ok(Value::number(crate::number::NumberValue::from_i32(
-        view.byte_length(ctx.heap()) as i32,
+        view.current_byte_length(ctx.heap()) as i32,
     )))
 }
 
 fn dv_get_byte_offset(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let view = receiver_dv(ctx, "get DataView.prototype.byteOffset")?;
-    // §25.3.4.2 — likewise a detached view's byteOffset getter throws.
-    if view.buffer(ctx.heap()).is_detached(ctx.heap()) {
+    // §25.3.4.2 — likewise a detached or out-of-bounds view's
+    // byteOffset getter throws.
+    if view.is_out_of_bounds(ctx.heap()) {
         return Err(NativeError::TypeError {
             name: "get DataView.prototype.byteOffset",
-            reason: "Cannot read byteOffset of a DataView with a detached buffer".to_string(),
+            reason: "Cannot read byteOffset of an out-of-bounds DataView".to_string(),
         });
     }
     Ok(Value::number(crate::number::NumberValue::from_i32(

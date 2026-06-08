@@ -36,8 +36,13 @@ pub struct DataViewBodyGc {
     pub buffer: JsArrayBuffer,
     /// Byte offset into the backing buffer (construction-time).
     pub byte_offset: usize,
-    /// View byte length (construction-time).
+    /// View byte length (construction-time; ignored when
+    /// `length_tracking` is set).
     pub byte_length: usize,
+    /// `true` when the view was constructed without an explicit
+    /// `byteLength` over a resizable buffer — its length auto-tracks the
+    /// live buffer size (§25.3.4.1 GetViewByteLength, AUTO).
+    pub length_tracking: bool,
     /// Lazy expando bag for ordinary own properties (`dv.x = 1`,
     /// `Object.defineProperty(dv, …)`). `None` until first write —
     /// a `DataView` is an ordinary extensible object per §25.3.
@@ -80,6 +85,7 @@ pub fn alloc_data_view(
         buffer,
         byte_offset,
         byte_length,
+        length_tracking: false,
         expando: None,
     })
 }
@@ -134,10 +140,68 @@ impl JsDataView {
         heap.read_payload(self.handle, |body| body.byte_offset)
     }
 
-    /// View byte length.
+    /// View byte length (construction-time slot; for a length-tracking
+    /// view use [`Self::current_byte_length`] for the live size).
     #[must_use]
     pub fn byte_length(self, heap: &otter_gc::GcHeap) -> usize {
         heap.read_payload(self.handle, |body| body.byte_length)
+    }
+
+    /// Whether the view auto-tracks the backing buffer's length
+    /// (constructed without an explicit `byteLength` over a resizable
+    /// buffer).
+    #[must_use]
+    pub fn is_length_tracking(self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.handle, |body| body.length_tracking)
+    }
+
+    /// Mark the view as length-tracking (AUTO byte length).
+    pub fn set_length_tracking(self, heap: &mut otter_gc::GcHeap) {
+        heap.with_payload(self.handle, |body| body.length_tracking = true);
+    }
+
+    /// IsViewOutOfBounds (§25.3.4) — `true` when the backing buffer is
+    /// detached, the offset is past the end, or a fixed-length view no
+    /// longer fits inside a shrunk resizable buffer.
+    #[must_use]
+    pub fn is_out_of_bounds(self, heap: &otter_gc::GcHeap) -> bool {
+        let (buffer, off, len, tracking) = heap.read_payload(self.handle, |body| {
+            (
+                body.buffer,
+                body.byte_offset,
+                body.byte_length,
+                body.length_tracking,
+            )
+        });
+        if buffer.is_detached(heap) {
+            return true;
+        }
+        let buf_bytes = buffer.byte_length(heap);
+        if tracking {
+            return off > buf_bytes;
+        }
+        off > buf_bytes || off.saturating_add(len) > buf_bytes
+    }
+
+    /// GetViewByteLength (§25.3.4) — the live byte length. For a
+    /// length-tracking view this is `bufferByteLength - byteOffset`;
+    /// for a fixed view it is the construction-time length. Callers must
+    /// first reject [`Self::is_out_of_bounds`].
+    #[must_use]
+    pub fn current_byte_length(self, heap: &otter_gc::GcHeap) -> usize {
+        let (buffer, off, len, tracking) = heap.read_payload(self.handle, |body| {
+            (
+                body.buffer,
+                body.byte_offset,
+                body.byte_length,
+                body.length_tracking,
+            )
+        });
+        if tracking {
+            buffer.byte_length(heap).saturating_sub(off)
+        } else {
+            len
+        }
     }
 
     /// Read the lazy expando bag, if one has been created.

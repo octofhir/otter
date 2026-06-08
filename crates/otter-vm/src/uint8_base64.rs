@@ -83,14 +83,20 @@ fn decode_partial(chunk: &[u8; 4], clen: usize, out: &mut Vec<u8>) {
 }
 
 /// § FromBase64 — decode `units` into bytes, stopping once `max_bytes`
-/// full output bytes have been produced. Returns the decoded bytes and
-/// the number of code units consumed (`read`).
+/// output bytes have been produced. Returns the decoded bytes, the
+/// number of code units consumed (`read`), and an optional error.
+/// Bytes decoded before the error are still returned (so `setFromBase64`
+/// can write them before throwing — "writes up to error").
 fn decode_base64(
     units: &[u16],
     url: bool,
     lch: LastChunk,
     max_bytes: usize,
-) -> Result<(Vec<u8>, usize), NativeError> {
+) -> (Vec<u8>, usize, Option<NativeError>) {
+    // § FromBase64 step 3 — a zero output budget reads nothing.
+    if max_bytes == 0 {
+        return (Vec::new(), 0, None);
+    }
     let mut bytes: Vec<u8> = Vec::new();
     let mut read = 0usize;
     let mut chunk = [0u8; 4];
@@ -104,27 +110,30 @@ fn decode_base64(
         if i == n {
             if clen > 0 {
                 match lch {
-                    LastChunk::StopBeforePartial => return Ok((bytes, read)),
+                    LastChunk::StopBeforePartial => return (bytes, read, None),
                     LastChunk::Loose => {
                         if clen == 1 {
-                            return Err(syntax("malformed padding: single trailing character"));
+                            return (bytes, read, Some(syntax("single trailing character")));
+                        }
+                        if bytes.len() + (clen - 1) > max_bytes {
+                            return (bytes, read, None);
                         }
                         decode_partial(&chunk, clen, &mut bytes);
                         read = n;
                     }
                     LastChunk::Strict => {
-                        return Err(syntax("missing padding"));
+                        return (bytes, read, Some(syntax("missing padding")));
                     }
                 }
             } else {
                 read = n;
             }
-            return Ok((bytes, read));
+            return (bytes, read, None);
         }
         let c = units[i];
         if c == b'=' as u16 {
             if clen < 2 {
-                return Err(syntax("unexpected padding"));
+                return (bytes, read, Some(syntax("unexpected padding")));
             }
             i += 1;
             if clen == 2 {
@@ -136,9 +145,9 @@ fn decode_base64(
                     // Incomplete padding: stop-before-partial stops at
                     // the start of this partial chunk; the others throw.
                     if lch == LastChunk::StopBeforePartial {
-                        return Ok((bytes, read));
+                        return (bytes, read, None);
                     }
-                    return Err(syntax("malformed padding"));
+                    return (bytes, read, Some(syntax("malformed padding")));
                 }
                 i += 1;
             }
@@ -146,17 +155,20 @@ fn decode_base64(
                 i += 1;
             }
             if i != n {
-                return Err(syntax("trailing data after padding"));
+                return (bytes, read, Some(syntax("trailing data after padding")));
             }
             if lch == LastChunk::Strict && !trailing_bits_zero(&chunk, clen) {
-                return Err(syntax("non-zero padding bits"));
+                return (bytes, read, Some(syntax("non-zero padding bits")));
+            }
+            if bytes.len() + (clen - 1) > max_bytes {
+                return (bytes, read, None);
             }
             decode_partial(&chunk, clen, &mut bytes);
             read = n;
-            return Ok((bytes, read));
+            return (bytes, read, None);
         }
         let Some(v) = b64_value(c, url) else {
-            return Err(syntax("invalid base64 character"));
+            return (bytes, read, Some(syntax("invalid base64 character")));
         };
         chunk[clen] = v;
         clen += 1;
@@ -164,13 +176,18 @@ fn decode_base64(
         if clen == 4 {
             if bytes.len() + 3 > max_bytes {
                 // No room for a full output chunk — stop before it.
-                return Ok((bytes, read));
+                return (bytes, read, None);
             }
             bytes.push((chunk[0] << 2) | (chunk[1] >> 4));
             bytes.push((chunk[1] << 4) | (chunk[2] >> 2));
             bytes.push((chunk[2] << 6) | chunk[3]);
             clen = 0;
             read = i;
+            // Output budget exhausted — stop before any trailing data
+            // (which is not validated once the buffer is full).
+            if bytes.len() >= max_bytes {
+                return (bytes, read, None);
+            }
         }
     }
 }
@@ -213,25 +230,29 @@ fn encode_base64(bytes: &[u8], url: bool, omit_padding: bool) -> String {
 
 /// § FromHex — decode hex `units` into bytes, up to `max_bytes` output
 /// bytes. Returns the bytes and the number of code units consumed.
-fn decode_hex(units: &[u16], max_bytes: usize) -> Result<(Vec<u8>, usize), NativeError> {
-    // § FromHex — an odd-length input is always a SyntaxError, checked
-    // up front regardless of any output-length limit.
+fn decode_hex(units: &[u16], max_bytes: usize) -> (Vec<u8>, usize, Option<NativeError>) {
+    // § FromHex — an odd-length input is a SyntaxError before any byte
+    // is produced (nothing is written by setFromHex in that case).
     if !units.len().is_multiple_of(2) {
-        return Err(syntax("hex string length must be even"));
+        return (
+            Vec::new(),
+            0,
+            Some(syntax("hex string length must be even")),
+        );
     }
     let mut bytes = Vec::new();
     let mut i = 0usize;
     while i + 2 <= units.len() {
         if bytes.len() >= max_bytes {
-            break;
+            return (bytes, i, None);
         }
         match (hex_value(units[i]), hex_value(units[i + 1])) {
             (Some(h), Some(l)) => bytes.push((h << 4) | l),
-            _ => return Err(syntax("invalid hex character")),
+            _ => return (bytes, i, Some(syntax("invalid hex character"))),
         }
         i += 2;
     }
-    Ok((bytes, i))
+    (bytes, i, None)
 }
 
 fn hex_value(u: u16) -> Option<u8> {
@@ -366,13 +387,19 @@ fn u8_from_base64(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
         "lastChunkHandling",
         &["loose", "strict", "stop-before-partial"],
     )?);
-    let (bytes, _read) = decode_base64(&units, url, lch, usize::MAX)?;
+    let (bytes, _read, err) = decode_base64(&units, url, lch, usize::MAX);
+    if let Some(e) = err {
+        return Err(e);
+    }
     fresh_uint8array(ctx, &bytes)
 }
 
 fn u8_from_hex(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let units = string_units(ctx, args.first())?;
-    let (bytes, _read) = decode_hex(&units, usize::MAX)?;
+    let (bytes, _read, err) = decode_hex(&units, usize::MAX);
+    if let Some(e) = err {
+        return Err(e);
+    }
     fresh_uint8array(ctx, &bytes)
 }
 
@@ -426,6 +453,75 @@ fn u8_to_hex(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeEr
     let s = encode_hex(&bytes);
     let js = JsString::from_str(&s, ctx.heap_mut()).map_err(|_| type_err("out of memory"))?;
     Ok(Value::string(js))
+}
+
+/// Build the `{ read, written }` result Record returned by the
+/// `setFrom*` methods (ordinary object, enumerable data properties).
+fn set_result(ctx: &mut NativeCtx<'_>, read: usize, written: usize) -> Result<Value, NativeError> {
+    let obj = ctx
+        .alloc_object_with_roots(&[], &[])
+        .map_err(|_| type_err("out of memory"))?;
+    object::define_own_property(
+        obj,
+        ctx.heap_mut(),
+        "read",
+        PropertyDescriptor::data(Value::number_i32(read as i32), true, true, true),
+    );
+    object::define_own_property(
+        obj,
+        ctx.heap_mut(),
+        "written",
+        PropertyDescriptor::data(Value::number_i32(written as i32), true, true, true),
+    );
+    Ok(Value::object(obj))
+}
+
+/// Write decoded `bytes` into `t[0..]` (the caller has range-limited the
+/// decode to `t.length`).
+fn write_into(ctx: &mut NativeCtx<'_>, t: &JsTypedArray, bytes: &[u8]) {
+    for (k, &b) in bytes.iter().enumerate() {
+        t.set(ctx.heap_mut(), k, &Value::number_i32(b as i32));
+    }
+}
+
+fn u8_set_from_base64(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver_uint8(ctx, "Uint8Array.prototype.setFromBase64")?;
+    let units = string_units(ctx, args.first())?;
+    options_must_be_object(ctx, args.get(1))?;
+    let url =
+        read_string_option(ctx, args.get(1), "alphabet", &["base64", "base64url"])? == "base64url";
+    let lch = last_chunk_from_str(read_string_option(
+        ctx,
+        args.get(1),
+        "lastChunkHandling",
+        &["loose", "strict", "stop-before-partial"],
+    )?);
+    if t.is_out_of_bounds(ctx.heap()) {
+        return Err(type_err("Uint8Array is detached or out of bounds"));
+    }
+    let max = t.length(ctx.heap_mut());
+    let (bytes, read, err) = decode_base64(&units, url, lch, max);
+    // Write the bytes decoded so far, then surface any error.
+    write_into(ctx, &t, &bytes);
+    if let Some(e) = err {
+        return Err(e);
+    }
+    set_result(ctx, read, bytes.len())
+}
+
+fn u8_set_from_hex(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = receiver_uint8(ctx, "Uint8Array.prototype.setFromHex")?;
+    let units = string_units(ctx, args.first())?;
+    if t.is_out_of_bounds(ctx.heap()) {
+        return Err(type_err("Uint8Array is detached or out of bounds"));
+    }
+    let max = t.length(ctx.heap_mut());
+    let (bytes, read, err) = decode_hex(&units, max);
+    write_into(ctx, &t, &bytes);
+    if let Some(e) = err {
+        return Err(e);
+    }
+    set_result(ctx, read, bytes.len())
 }
 
 // ---------------------------------------------------------------
@@ -496,6 +592,20 @@ pub fn install_uint8_base64(
         heap,
         "toHex",
         PropertyDescriptor::data(to_hex, true, false, true),
+    );
+    let set_from_base64 = make_fn(heap, "setFromBase64", 1, u8_set_from_base64, &proto_value)?;
+    object::define_own_property(
+        proto,
+        heap,
+        "setFromBase64",
+        PropertyDescriptor::data(set_from_base64, true, false, true),
+    );
+    let set_from_hex = make_fn(heap, "setFromHex", 1, u8_set_from_hex, &proto_value)?;
+    object::define_own_property(
+        proto,
+        heap,
+        "setFromHex",
+        PropertyDescriptor::data(set_from_hex, true, false, true),
     );
     Ok(())
 }

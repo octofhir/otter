@@ -226,6 +226,9 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
             },
         );
     }
+    // §23.2 uint8array-base64 — Uint8Array.{fromBase64,fromHex} statics
+    // and the toBase64 / toHex prototype methods.
+    crate::uint8_base64::install_uint8_base64(heap, global)?;
     Ok(())
 }
 

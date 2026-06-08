@@ -130,6 +130,7 @@ pub mod symbol_dispatch;
 pub mod symbol_prototype;
 pub mod temporal;
 pub mod timers;
+pub mod uint8_base64;
 pub mod upvalue;
 pub mod value;
 pub mod weak_refs;

@@ -413,6 +413,9 @@ fn raw_to_value(heap: &otter_gc::GcHeap, raw: RawGc) -> Option<Value> {
         FINALIZATION_REGISTRY_BODY_TYPE_TAG => heap
             .cast_raw_if_type::<FinalizationRegistryBody>(raw)
             .map(Value::finalization_registry),
+        crate::symbol::SYMBOL_BODY_TYPE_TAG => heap
+            .cast_raw_if_type::<crate::symbol::SymbolBody>(raw)
+            .map(|h| Value::symbol(crate::symbol::JsSymbol::from_handle(heap, h))),
         _ => None,
     }
 }

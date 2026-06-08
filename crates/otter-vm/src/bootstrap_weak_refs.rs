@@ -107,10 +107,10 @@ fn weak_ref_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
         });
     }
     let target = args.first().cloned().unwrap_or(Value::undefined());
-    if !target_can_be_weak(&target) {
+    if !target_can_be_weak(&target, ctx.heap()) {
         return Err(NativeError::TypeError {
             name: "WeakRef",
-            reason: "target must be an object".to_string(),
+            reason: "target cannot be held weakly".to_string(),
         });
     }
     let weak_ref = ctx
@@ -165,10 +165,21 @@ fn fr_proto_register(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
     let target = args.first().cloned().unwrap_or(Value::undefined());
     let held_value = args.get(1).cloned().unwrap_or(Value::undefined());
     let unregister_token = args.get(2).cloned();
-    if !target_can_be_weak(&target) {
+    if !target_can_be_weak(&target, ctx.heap()) {
         return Err(NativeError::TypeError {
             name: "FinalizationRegistry.prototype.register",
-            reason: "target must be an object".to_string(),
+            reason: "target cannot be held weakly".to_string(),
+        });
+    }
+    // §26.1.3.2 step 6 — a present, non-undefined unregisterToken must
+    // itself be able to be held weakly.
+    if let Some(token) = unregister_token.as_ref()
+        && !token.is_undefined()
+        && !target_can_be_weak(token, ctx.heap())
+    {
+        return Err(NativeError::TypeError {
+            name: "FinalizationRegistry.prototype.register",
+            reason: "unregisterToken cannot be held weakly".to_string(),
         });
     }
     weak_refs::finalization_registry_register(
@@ -186,6 +197,13 @@ fn fr_proto_unregister(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     let registry =
         receiver_finalization_registry(ctx, "FinalizationRegistry.prototype.unregister")?;
     let token = args.first().cloned().unwrap_or(Value::undefined());
+    // §26.1.3.4 step 3 — the unregisterToken must be able to be held weakly.
+    if !target_can_be_weak(&token, ctx.heap()) {
+        return Err(NativeError::TypeError {
+            name: "FinalizationRegistry.prototype.unregister",
+            reason: "unregisterToken cannot be held weakly".to_string(),
+        });
+    }
     let removed = weak_refs::finalization_registry_unregister(registry, ctx.heap_mut(), &token)
         .map_err(|e| vm_to_native(e, "FinalizationRegistry.prototype.unregister"))?;
     Ok(Value::boolean(removed))
@@ -232,13 +250,16 @@ fn receiver_finalization_registry(
         })
 }
 
-fn target_can_be_weak(v: &Value) -> bool {
-    // ECMA-262 §6.1.7.4 CanBeHeldWeakly — `Object` includes any
-    // heap-backed reference (callable / array / proxy / exotic), not
-    // just `TAG_PTR_OBJECT`. `Value::is_object_like` is narrower
-    // than the spec definition and rejects functions, breaking
-    // `new WeakRef(function () {})`.
-    v.is_object_type() || v.is_symbol()
+fn target_can_be_weak(v: &Value, heap: &otter_gc::GcHeap) -> bool {
+    // ECMA-262 §6.1.7.4 CanBeHeldWeakly — any Object, or a Symbol that
+    // is NOT in the global registry (`Symbol.for` results cannot be
+    // held weakly because they are never collected). `is_object_type`
+    // covers callables / arrays / proxies / exotics, not just plain
+    // `TAG_PTR_OBJECT`.
+    if v.is_symbol() {
+        return v.as_symbol(heap).is_some_and(|s| !s.is_registered());
+    }
+    v.is_object_type()
 }
 
 fn oom(name: &'static str) -> NativeError {

@@ -456,6 +456,17 @@ pub(crate) fn array_includes(
     let len_i = len as i64;
     let n = match from_arg {
         Some(v) => {
+            // §7.1.4 ToNumber — Symbol / BigInt fromIndex throws TypeError.
+            if v.is_symbol() {
+                return Err(VmError::TypeError {
+                    message: "Cannot convert a Symbol value to a number".to_string(),
+                });
+            }
+            if v.is_big_int() {
+                return Err(VmError::TypeError {
+                    message: "Cannot convert a BigInt value to a number".to_string(),
+                });
+            }
             let f = crate::number::parse::to_number_value(&v, interp.gc_heap());
             if f.is_nan() { 0.0 } else { f.trunc() }
         }

@@ -89,9 +89,6 @@ ignored_tests = [
     "assignmenttargettype/callexpression",
     "assignmenttargettype/cover-callexpression",
 
-    # yield* delegation not yet implemented (missing throw/return forwarding)
-    "yield/star-iterable-throw-emulates-undefined",
-    "yield/star-iterable-return-emulates-undefined",
 
     # Global object missing Object.prototype in prototype chain
     "decodeURIComponent/S15.1.3.2_A5.5",

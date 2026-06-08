@@ -1,8 +1,8 @@
-error[E0599]: no associated item named `Undefined` found for struct `otter_vm::Value` in the current scope
+error[E0599]: no associated function or constant named `Undefined` found for struct `otter_vm::Value` in the current scope
   --> tests/compile_fail/native_closure_gc_capture_rejected.rs:12:29
    |
 12 |         Ok(otter_vm::Value::Undefined)
-   |                             ^^^^^^^^^ associated item not found in `otter_vm::Value`
+   |                             ^^^^^^^^^ associated function or constant not found in `otter_vm::Value`
    |
 help: there is an associated function `undefined` with a similar name
   --> src/value/mod.rs

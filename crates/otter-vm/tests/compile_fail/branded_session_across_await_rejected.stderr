@@ -7,7 +7,7 @@ error: future cannot be sent between threads safely
 14 | |         });
    | |__________^ future created by async block is not `Send`
    |
-   = help: within `{async block@$DIR/tests/compile_fail/branded_session_across_await_rejected.rs:11:35: 11:45}`, the trait `Send` is not implemented for `*const ()`
+   = help: within `{async block@$DIR/tests/compile_fail/branded_session_across_await_rejected.rs:11:35: 11:45}`, the trait `Send` is not implemented for `*mut GcHeader`
 note: captured value is not `Send`
   --> tests/compile_fail/branded_session_across_await_rejected.rs:13:34
    |
@@ -31,7 +31,7 @@ error: future cannot be sent between threads safely
 14 | |         });
    | |__________^ future created by async block is not `Send`
    |
-   = help: within `{async block@$DIR/tests/compile_fail/branded_session_across_await_rejected.rs:11:35: 11:45}`, the trait `Send` is not implemented for `*mut GcHeader`
+   = help: within `{async block@$DIR/tests/compile_fail/branded_session_across_await_rejected.rs:11:35: 11:45}`, the trait `Send` is not implemented for `*const ()`
 note: captured value is not `Send`
   --> tests/compile_fail/branded_session_across_await_rejected.rs:13:34
    |

@@ -918,6 +918,23 @@ impl Interpreter {
                             }
                         }
                     }
+                } else if let Some(b) = target.as_array_buffer() {
+                    // §25.1 / §25.2 — ArrayBuffer / SharedArrayBuffer are
+                    // ordinary objects; own properties live in the lazy
+                    // expando bag (the prototype accessors are not own).
+                    match &key {
+                        VmPropertyKey::Symbol(sym) => b.expando(&self.gc_heap).and_then(|bag| {
+                            crate::object::get_own_symbol_descriptor(bag, self.gc_heap(), *sym)
+                        }),
+                        _ => {
+                            let k = key
+                                .string_name()
+                                .expect("non-symbol property key has string spelling");
+                            b.expando(&self.gc_heap).and_then(|bag| {
+                                crate::object::get_own_descriptor(bag, self.gc_heap(), k)
+                            })
+                        }
+                    }
                 } else if target.is_boolean()
                     || target.is_number()
                     || target.is_symbol()

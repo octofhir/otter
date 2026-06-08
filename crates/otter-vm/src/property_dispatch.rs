@@ -1204,13 +1204,20 @@ impl Interpreter {
         } else if let Some(t) = receiver.as_temporal(&self.gc_heap) {
             temporal::load_property(t, &mut self.gc_heap, name)
         } else if let Some(b) = receiver.as_array_buffer() {
-            // Own expando bag (species `constructor` override) wins
-            // over the data shortcuts and the prototype walk.
-            let expando_hit = b
-                .expando(&self.gc_heap)
-                .and_then(|bag| crate::object::get(bag, &self.gc_heap, name));
-            if let Some(v) = expando_hit {
-                v
+            // Own expando bag (species `constructor` override, or a
+            // cross-brand accessor installed via defineProperty) wins
+            // over the data shortcuts and the prototype walk. An own
+            // accessor fires with the buffer as receiver.
+            if let Some(bag) = b.expando(&self.gc_heap)
+                && let Some(outcome) = Self::expando_own_get_outcome(bag, &self.gc_heap, name)
+            {
+                match outcome {
+                    VmGetOutcome::Value(v) => v,
+                    VmGetOutcome::InvokeGetter { getter } => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.run_callable_sync(context, &getter, receiver, args)?
+                    }
+                }
             } else {
                 let direct = binary::array_buffer_prototype::load_property(b, &self.gc_heap, name);
                 if direct.is_undefined() {
@@ -1226,12 +1233,18 @@ impl Interpreter {
             }
         } else if let Some(dv) = receiver.as_data_view() {
             // §25.3 — a `DataView` is an ordinary object; user-installed
-            // own properties (`dv.x = 1`) live in the lazy expando bag
-            // and win over the prototype walk.
+            // own properties (`dv.x = 1`, or an own accessor) live in the
+            // lazy expando bag and win over the prototype walk.
             if let Some(bag) = dv.expando(&self.gc_heap)
-                && let Some(value) = crate::object::get(bag, &self.gc_heap, name)
+                && let Some(outcome) = Self::expando_own_get_outcome(bag, &self.gc_heap, name)
             {
-                value
+                match outcome {
+                    VmGetOutcome::Value(v) => v,
+                    VmGetOutcome::InvokeGetter { getter } => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.run_callable_sync(context, &getter, receiver, args)?
+                    }
+                }
             } else {
                 let direct = binary::data_view_prototype::load_property(&dv, &self.gc_heap, name);
                 if direct.is_undefined() {

@@ -3980,13 +3980,36 @@ impl Interpreter {
             return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
         }
         if let Some(b) = base.as_array_buffer() {
-            // Own expando bag (e.g. a `constructor` override for the
-            // §25.1.6.16 species protocol) wins over the prototype.
-            if let Some(bag) = b.expando(&self.gc_heap)
-                && let Some(name) = key.string_name()
-                && let Some(v) = object::get(bag, &self.gc_heap, name)
-            {
-                return Ok(VmGetOutcome::Value(v));
+            // Own expando bag (a `constructor` override for the
+            // §25.1.6.16 species protocol, or a cross-brand accessor
+            // installed via defineProperty) wins over the prototype.
+            // An own accessor fires with the buffer as receiver.
+            if let Some(bag) = b.expando(&self.gc_heap) {
+                let lookup = match key {
+                    VmPropertyKey::Symbol(sym) => {
+                        object::lookup_own_symbol(bag, &self.gc_heap, *sym)
+                    }
+                    _ => {
+                        let name = key
+                            .string_name()
+                            .expect("non-symbol key has string spelling");
+                        object::lookup_own(bag, &self.gc_heap, name)
+                    }
+                };
+                match lookup {
+                    object::PropertyLookup::Data { value, .. } => {
+                        return Ok(VmGetOutcome::Value(value));
+                    }
+                    object::PropertyLookup::Accessor { getter, .. } => {
+                        return Ok(match getter {
+                            Some(g) if abstract_ops::is_callable(&g) => {
+                                VmGetOutcome::InvokeGetter { getter: g }
+                            }
+                            _ => VmGetOutcome::Value(Value::undefined()),
+                        });
+                    }
+                    object::PropertyLookup::Absent => {}
+                }
             }
             let proto = self.get_prototype_for_op(&base)?;
             if proto.is_nullish() {

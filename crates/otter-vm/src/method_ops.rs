@@ -1589,6 +1589,11 @@ impl Interpreter {
             // foundation defers source preservation to a follow-up.
             // <https://tc39.es/ecma262/#sec-function.prototype.tostring>
             "toString" => {
+                // §20.2.3.5 step 1 — throw a TypeError when `this` is not
+                // callable (e.g. a Proxy wrapping a non-callable target).
+                if !self.is_callable_runtime(callee) {
+                    return Err(VmError::NotCallable);
+                }
                 let display = {
                     let mut ctx = function_metadata::FunctionMetadataContext::new(
                         context,

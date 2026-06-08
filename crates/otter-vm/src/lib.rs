@@ -1725,6 +1725,12 @@ impl Interpreter {
     }
 
     fn is_callable_runtime(&self, value: &Value) -> bool {
+        // §10.5.15 — a Proxy is callable only when its target was
+        // callable at creation (the heap-blind `is_callable` assumes
+        // every proxy is callable). Resolve the real [[Call]] slot here.
+        if let Some(proxy) = value.as_proxy() {
+            return proxy.is_callable(&self.gc_heap);
+        }
         is_callable(value) || object_has_call_slot(value, &self.gc_heap)
     }
 

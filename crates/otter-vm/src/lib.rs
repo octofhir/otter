@@ -6859,10 +6859,17 @@ fn step_iterator(
             }
         }
         FastIteratorSnapshot::TypedArray(typed_array, index, kind) => {
-            // §23.2.5.1 CreateArrayIterator step — read live each
-            // step; a detached buffer terminates iteration.
-            let detached = typed_array.buffer(gc_heap).is_detached(gc_heap);
-            if detached || index >= typed_array.length(gc_heap) {
+            // §23.1.5.1 CreateArrayIterator step — for a typed array the
+            // closure rebuilds a buffer-witness record each step and
+            // throws a TypeError when the array is out of bounds (a
+            // shrunk resizable buffer or a detached one); otherwise it
+            // reads the live element and terminates at the live length.
+            if typed_array.is_out_of_bounds(gc_heap) {
+                return Err(VmError::TypeError {
+                    message: "typed array is out of bounds".to_string(),
+                });
+            }
+            if index >= typed_array.length(gc_heap) {
                 None
             } else {
                 let element = typed_array

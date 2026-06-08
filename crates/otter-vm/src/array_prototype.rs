@@ -867,10 +867,25 @@ impl Interpreter {
                 "entries" => crate::iterator_state::ArrayIterKind::Entry,
                 _ => crate::iterator_state::ArrayIterKind::Value,
             };
-            crate::IteratorState::ArrayLike {
-                object: o,
-                index: 0,
-                kind: iter_kind,
+            // §23.1.5.1 over a TypedArray receiver (`Array.prototype.values
+            // .call(ta)`): the generic array iterator's per-step Get on a
+            // canonical index resolves to the live element, and `length`
+            // tracks the (possibly resizable) backing buffer. Use the live
+            // TypedArray state so grow / shrink mid-iteration is observed,
+            // instead of the object-only ArrayLike path (which reads `0`
+            // for a TypedArray's length and yields nothing).
+            if let Some(ta) = o.as_typed_array(&self.gc_heap) {
+                crate::IteratorState::TypedArray {
+                    typed_array: ta,
+                    index: 0,
+                    kind: iter_kind,
+                }
+            } else {
+                crate::IteratorState::ArrayLike {
+                    object: o,
+                    index: 0,
+                    kind: iter_kind,
+                }
             }
         };
         let arr_root = o;
@@ -2614,6 +2629,18 @@ fn collect_own_indices_below(
                 }
             }
         });
+        return;
+    }
+    // A TypedArray's elements live in the backing buffer, not in object
+    // own data slots, so the generic walk below misses them. Every
+    // in-bounds canonical index `< len` is present (`Get` returns the
+    // element), so add the live element range directly.
+    if let Some(ta) = value.as_typed_array(heap) {
+        if !ta.is_out_of_bounds(heap) {
+            for i in 0..ta.length(heap).min(len) {
+                indices.insert(i);
+            }
+        }
         return;
     }
     if let Some(obj) = value.as_object() {

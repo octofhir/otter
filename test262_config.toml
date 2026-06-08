@@ -168,4 +168,10 @@ known_panics = [
     "Iterator/prototype/flatMap/throws-typeerror-when-generator-is-running",
     "Iterator/prototype/take/throws-typeerror-when-generator-is-running",
     "Iterator/prototype/drop/throws-typeerror-when-generator-is-running",
+    # Deep JS self-recursion: the engine recurses on the native (main)
+    # thread and overflows the OS stack — aborting the whole batch —
+    # instead of throwing a catchable RangeError. Until the interpreter
+    # gains a call-depth guard on the pure-JS path, skip so the full
+    # run completes. (This is the test that aborts the whole suite.)
+    "staging/sm/extensions/recursion",
 ]

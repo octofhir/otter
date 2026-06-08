@@ -134,10 +134,21 @@ impl Iterator for Matches<'_, '_> {
         if self.done {
             return None;
         }
-        let unicode = self.regex.program.unicode;
+        let program = &self.regex.program;
+        let unicode = program.unicode;
         let input = Input::new(self.text, unicode);
         let mut pos = self.next_start;
         loop {
+            // First-set prefilter: skip positions that cannot start a match.
+            if let Some(first) = &program.first_set {
+                while pos < self.text.len() {
+                    let (cp, _) = decode_at(self.text, pos, unicode);
+                    if first.contains(cp) {
+                        break;
+                    }
+                    pos = advance_scan(self.text, pos, unicode);
+                }
+            }
             if pos > self.text.len() {
                 self.done = true;
                 return None;
@@ -161,6 +172,23 @@ impl Iterator for Matches<'_, '_> {
             }
         }
     }
+}
+
+/// Decode the code point at `pos` (which must be `< text.len()`), returning it
+/// and its code-unit width. Surrogate pairs combine only in unicode mode.
+fn decode_at(text: &[u16], pos: usize, unicode: bool) -> (u32, usize) {
+    let hi = text[pos];
+    if unicode
+        && (0xD800..=0xDBFF).contains(&hi)
+        && let Some(&lo) = text.get(pos + 1)
+        && (0xDC00..=0xDFFF).contains(&lo)
+    {
+        return (
+            0x10000 + ((u32::from(hi) - 0xD800) << 10) + (u32::from(lo) - 0xDC00),
+            2,
+        );
+    }
+    (u32::from(hi), 1)
 }
 
 /// Advance a scan position by one code point (two units over a surrogate pair in

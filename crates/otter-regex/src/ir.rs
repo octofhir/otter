@@ -18,6 +18,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-pattern-matching> (§22.2.2)
 
+use crate::classes::CodePointSet;
 use crate::flags::Flags;
 use crate::parser::Parsed;
 use crate::parser::ast::{Assertion, GroupKind, Node, Quantifier};
@@ -39,6 +40,7 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
 
     let has_backref = e.insns.iter().any(|i| matches!(i, Insn::BackRef(_)));
     let loop_marks = e.next_mark - mark_base;
+    let first_set = compute_first_set(&e.insns, flags.ignore_case);
     Program {
         insns: e.insns,
         group_count: parsed.group_count,
@@ -48,6 +50,33 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
         ignore_case: flags.ignore_case,
         unicode: flags.is_unicode_mode(),
         loop_marks,
+        first_set,
+    }
+}
+
+/// If the program must begin by consuming a single literal or non-negated class
+/// (no anchor, no empty alternative), return the set of code points that can
+/// start a match. Conservatively `None` under case-insensitivity (folding widens
+/// the start set) or for any non-trivial leading instruction.
+fn compute_first_set(insns: &[Insn], ignore_case: bool) -> Option<CodePointSet> {
+    if ignore_case {
+        return None;
+    }
+    let mut pc = 0;
+    loop {
+        match insns.get(pc)? {
+            Insn::Save(_) => pc += 1,
+            Insn::Char(c) => {
+                let mut set = CodePointSet::new();
+                set.insert(*c);
+                return Some(set);
+            }
+            Insn::Class {
+                set,
+                negate: false,
+            } if set.strings.is_empty() => return Some(set.code_points.clone()),
+            _ => return None,
+        }
     }
 }
 

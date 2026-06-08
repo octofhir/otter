@@ -23,7 +23,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-pattern-matching> (§22.2.2)
 
-use crate::classes::ClassSet;
+use crate::classes::{ClassSet, CodePointSet};
 
 /// A single matcher instruction.
 #[derive(Debug, Clone)]
@@ -100,6 +100,12 @@ pub(crate) struct Program {
     /// Number of loop-mark slots (one per unbounded quantifier), allocated after
     /// the capture slots.
     pub(crate) loop_marks: usize,
+    /// Code points that can begin a match, when the pattern starts with a single
+    /// literal or non-negated class. Used as a scan prefilter: positions whose
+    /// code point is not a member cannot start a match, so the executor skips
+    /// them without running. `None` when no such prefilter applies (anchored,
+    /// empty-matching, alternation, or case-insensitive starts).
+    pub(crate) first_set: Option<CodePointSet>,
 }
 
 impl Program {

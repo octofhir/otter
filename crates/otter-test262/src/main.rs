@@ -205,16 +205,22 @@ fn run(repo_root: &Path, args: RunArgs) -> Result<ExitCode> {
         Err(other) => return Err(other).context("failed to locate test262 corpus"),
     };
 
+    let config = Test262Config::load_or_default(args.config.as_deref());
+
+    // Precedence: CLI flag, then env var, then `test262_config.toml`, then the
+    // built-in default.
     let timeout_ms = args.timeout.unwrap_or_else(|| {
         std::env::var("OTTER_TEST262_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse().ok())
+            .or_else(|| config.timeout_secs.map(|s| s.saturating_mul(1000)))
             .unwrap_or(DEFAULT_TIMEOUT_MS)
     });
     let max_heap_bytes = args.max_heap_bytes.unwrap_or_else(|| {
         std::env::var("OTTER_TEST262_HEAP_BYTES")
             .ok()
             .and_then(|v| v.parse().ok())
+            .or(config.max_heap_bytes_per_test)
             .unwrap_or(DEFAULT_MAX_HEAP_BYTES)
     });
     if timeout_ms > MAX_TIMEOUT_MS {
@@ -224,8 +230,6 @@ fn run(repo_root: &Path, args: RunArgs) -> Result<ExitCode> {
         );
         return Ok(ExitCode::from(2));
     }
-
-    let config = Test262Config::load_or_default(args.config.as_deref());
 
     let all_tests = list_tests(&paths, args.filter.as_deref());
 

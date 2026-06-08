@@ -1,15 +1,15 @@
-//! JavaScript `RegExp` value, backed by the `regress` engine.
+//! JavaScript `RegExp` value, backed by the configured matcher engine.
 //!
-//! `JsRegExp` is a GC-managed handle. The body owns the compiled
-//! `regress::Regex`, original pattern, parsed flags, and `lastIndex`.
-//! The regex engine is a GC leaf: `regress` owns external allocations
-//! that are not traced and are not counted against the Otter heap cap.
+//! `JsRegExp` is a GC-managed handle. The body owns the compiled matcher,
+//! original pattern, parsed flags, and `lastIndex`. The matcher is a GC leaf:
+//! it owns external allocations that are not traced and are not counted against
+//! the Otter heap cap.
 //!
-//! `regress` does not implement the JavaScript `g` (global) or `y`
-//! (sticky) flags — those are stateful and live above the engine
-//! per spec. We model both flags here through [`JsRegExp::flag_global`]
-//! / [`JsRegExp::flag_sticky`] and the `lastIndex` cell plus descriptor
-//! flags; method implementations consult these during pattern execution.
+//! The matcher does not model the JavaScript `g` (global) or `y` (sticky)
+//! flags — those are stateful and live above the engine per spec. We model both
+//! flags here through [`JsRegExp::flag_global`] / [`JsRegExp::flag_sticky`] and
+//! the `lastIndex` cell plus descriptor flags; method implementations consult
+//! these during pattern execution.
 //!
 //! # Contents
 //! - [`JsRegExp`] — the cheap-to-clone handle used in [`crate::Value`].
@@ -33,19 +33,56 @@
 
 use std::cell::RefCell;
 
+use engine::Regex;
 use otter_gc::raw::{RawGc, SlotVisitor};
-use regress::{ExecConfig, Flags, Regex};
 
-/// ReDoS guard for every `regress` execution. Cuts pathological
-/// backtracking patterns (`(a+)+b` against long inputs, nested
-/// alternation explosions) at a fixed step budget. A budget of
-/// `10_000_000` matches the value documented in `regress` and cuts
-/// runaway inputs within a few milliseconds while leaving realistic
-/// patterns untouched.
+/// RegExp matcher backend — the in-repo `otter-regex` engine.
+///
+/// The rest of the VM depends only on this surface (`Regex`, `Match`,
+/// [`compile`](engine::compile), [`find`](engine::find)). The dependency edge is
+/// one-way: the VM consumes the engine; the engine never reaches back into it.
+pub(crate) mod engine {
+    pub use otter_regex::{Match, Regex};
+
+    /// Compile a pattern (lossy UTF-8 view) under the engine-relevant flags.
+    /// `g`/`y`/`d` are spec state above the matcher and are not passed here.
+    pub(crate) fn compile(
+        source: &str,
+        ignore_case: bool,
+        multiline: bool,
+        dot_all: bool,
+        unicode: bool,
+        unicode_sets: bool,
+    ) -> Result<Regex, String> {
+        let flags = otter_regex::Flags {
+            ignore_case,
+            multiline,
+            dot_all,
+            unicode,
+            unicode_sets,
+        };
+        Regex::with_flags(source, flags).map_err(|e| format!("{e}"))
+    }
+
+    /// Collect every successful match from `start`, dropping a step-budget
+    /// abort as "no further matches" (the ReDoS contract).
+    pub(crate) fn find(re: &Regex, text: &[u16], start: usize, budget: u64) -> Vec<Match> {
+        let config = otter_regex::ExecConfig {
+            step_limit: Some(budget),
+        };
+        re.find_from_utf16_with_config(text, start, config)
+            .map_while(Result::ok)
+            .collect()
+    }
+}
+
+/// ReDoS guard for every matcher execution. Cuts pathological backtracking
+/// patterns (`(a+)+b` against long inputs, nested alternation explosions) at a
+/// fixed step budget. `10_000_000` aborts runaway inputs within a few
+/// milliseconds while leaving realistic patterns untouched.
 ///
 /// # See also
 /// - <https://en.wikipedia.org/wiki/ReDoS>
-/// - [`regress::ExecConfig`]
 pub const REGEX_BACKTRACK_BUDGET: u64 = 10_000_000;
 
 use crate::Value;
@@ -58,10 +95,10 @@ pub const REGEXP_BODY_TYPE_TAG: u8 = 0x1e;
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum RegExpError {
-    /// `regress` rejected the pattern.
+    /// The matcher rejected the pattern.
     #[error("invalid regular expression: {message}")]
     InvalidPattern {
-        /// `regress`-side diagnostic.
+        /// Matcher diagnostic.
         message: String,
     },
     /// Flag string contained a character outside `"dgimsuvy"`.
@@ -189,8 +226,8 @@ impl RegExpFlags {
 #[derive(Debug, otter_macros::Pelt)]
 #[pelt(tag = REGEXP_BODY_TYPE_TAG)]
 pub struct JsRegExpBody {
-    /// Compiled `regress` engine. Always present after construction —
-    /// errors surface during [`compile`] before the body is built.
+    /// Compiled matcher. Always present after construction — errors surface
+    /// during [`compile`] before the body is built.
     #[pelt(skip)]
     pub regex: Regex,
     /// Pattern source code-units (the body between the slashes).
@@ -245,20 +282,17 @@ impl JsRegExp {
         // `\xNN`, surrogate pairs) survive the round-trip because
         // they are ASCII at the byte level.
         let source = String::from_utf16_lossy(pattern_utf16);
-        let engine_flags = Flags {
-            icase: flags.ignore_case,
-            multiline: flags.multiline,
-            dot_all: flags.dot_all,
-            unicode: flags.unicode,
-            unicode_sets: flags.unicode_sets,
-            ..Default::default()
-        };
-        // `g` and `y` are spec-level state that lives above the
-        // matcher; `regress` would silently ignore them anyway.
-        let regex =
-            Regex::with_flags(&source, engine_flags).map_err(|e| RegExpError::InvalidPattern {
-                message: format!("{e}"),
-            })?;
+        // `g`, `y`, and `d` are spec-level state above the matcher and are not
+        // part of the compiled pattern.
+        let regex = engine::compile(
+            &source,
+            flags.ignore_case,
+            flags.multiline,
+            flags.dot_all,
+            flags.unicode,
+            flags.unicode_sets,
+        )
+        .map_err(|message| RegExpError::InvalidPattern { message })?;
         Ok(Self {
             inner: heap.alloc_old(JsRegExpBody {
                 regex,
@@ -287,18 +321,15 @@ impl JsRegExp {
     ) -> Result<(), RegExpError> {
         let flags = RegExpFlags::parse(flag_str)?;
         let source = String::from_utf16_lossy(pattern_utf16);
-        let engine_flags = Flags {
-            icase: flags.ignore_case,
-            multiline: flags.multiline,
-            dot_all: flags.dot_all,
-            unicode: flags.unicode,
-            unicode_sets: flags.unicode_sets,
-            ..Default::default()
-        };
-        let regex =
-            Regex::with_flags(&source, engine_flags).map_err(|e| RegExpError::InvalidPattern {
-                message: format!("{e}"),
-            })?;
+        let regex = engine::compile(
+            &source,
+            flags.ignore_case,
+            flags.multiline,
+            flags.dot_all,
+            flags.unicode,
+            flags.unicode_sets,
+        )
+        .map_err(|message| RegExpError::InvalidPattern { message })?;
         let pattern_units = pattern_utf16.to_vec();
         heap.with_payload(self.inner, |body| {
             body.regex = regex;
@@ -339,15 +370,9 @@ impl JsRegExp {
         heap: &otter_gc::GcHeap,
         text_units: &[u16],
         start: usize,
-    ) -> Vec<regress::Match> {
-        let config = ExecConfig {
-            backtrack_limit: Some(REGEX_BACKTRACK_BUDGET),
-        };
+    ) -> Vec<engine::Match> {
         heap.read_payload(self.inner, |body| {
-            body.regex
-                .find_from_utf16_with_config(text_units, start, config)
-                .map_while(Result::ok)
-                .collect()
+            engine::find(&body.regex, text_units, start, REGEX_BACKTRACK_BUDGET)
         })
     }
 

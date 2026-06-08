@@ -82,20 +82,19 @@ pub(crate) fn compile_regexp_literal(
     let span = (lit.span.start, lit.span.end);
     let pattern_text = lit.regex.pattern.text.as_str();
     let flags_str = lit.regex.flags.to_string();
-    // Compile-time validation: feed the pattern + flags to
-    // `regress` so we surface a clean `Unsupported` for the
-    // few patterns the engine rejects (e.g. unterminated
-    // groups). Mirrors the BigIntLiteral approach. The `g`,
-    // `y`, and `d` flags live above the matcher per JS spec
-    // (§22.2.6.4 [`get RegExp.prototype.flags`](https://tc39.es/ecma262/#sec-get-regexp.prototype.flags)),
-    // so we strip them before asking `regress` to compile.
-    let mut engine_flags = regress::Flags::default();
+    // Compile-time validation: feed the pattern + flags to the matcher engine
+    // so we surface a clean `Unsupported` for patterns it rejects (e.g.
+    // unterminated groups). Mirrors the BigIntLiteral approach. The `g`, `y`,
+    // and `d` flags live above the matcher per JS spec (§22.2.6.4
+    // [`get RegExp.prototype.flags`](https://tc39.es/ecma262/#sec-get-regexp.prototype.flags)),
+    // so we strip them before compiling.
+    let mut engine_flags = otter_regex::Flags::default();
     let mut saw_u = false;
     let mut saw_v = false;
     for c in flags_str.chars() {
         match c {
             'd' | 'g' | 'y' => {}
-            'i' => engine_flags.icase = true,
+            'i' => engine_flags.ignore_case = true,
             'm' => engine_flags.multiline = true,
             's' => engine_flags.dot_all = true,
             'u' => {
@@ -124,7 +123,7 @@ pub(crate) fn compile_regexp_literal(
             span,
         });
     }
-    if let Err(e) = regress::Regex::with_flags(pattern_text, engine_flags) {
+    if let Err(e) = otter_regex::Regex::with_flags(pattern_text, engine_flags) {
         return Err(CompileError::Unsupported {
             node: format!("RegExpLiteral `/{pattern_text}/{flags_str}` rejected: {e}"),
             span,

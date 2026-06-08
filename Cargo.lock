@@ -1856,13 +1856,13 @@ version = "0.1.0"
 dependencies = [
  "num-bigint",
  "otter-bytecode",
+ "otter-regex",
  "otter-syntax",
  "oxc_allocator",
  "oxc_ast",
  "oxc_ast_visit",
  "oxc_span",
  "oxc_syntax",
- "regress",
  "serde",
  "thiserror",
 ]
@@ -1957,6 +1957,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "otter-regex"
+version = "0.0.0"
+dependencies = [
+ "bitflags",
+ "icu_casemap",
+ "icu_properties",
+]
+
+[[package]]
 name = "otter-runtime"
 version = "0.1.0"
 dependencies = [
@@ -2047,7 +2056,7 @@ dependencies = [
  "otter-bytecode",
  "otter-gc",
  "otter-macros",
- "regress",
+ "otter-regex",
  "rustc-hash",
  "serde",
  "serde_json",
@@ -2670,14 +2679,6 @@ name = "regex-syntax"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
-
-[[package]]
-name = "regress"
-version = "0.11.1"
-source = "git+https://github.com/octoshikari/regress#ab3b4962dacb0687fd99ba01d8b20c28d6547050"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "reqwest"

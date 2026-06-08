@@ -5,6 +5,7 @@ members = [
     "crates/otter-syntax",
     "crates/otter-compiler",
     "crates/otter-gc",
+    "crates/otter-regex",
     "crates/otter-macros",
     "crates/otter-vm",
     "crates/otter-vm-codegen",
@@ -86,8 +87,6 @@ icu_experimental = { version = "0.5", features = ["compiled_data"] }
 fixed_decimal = "0.7"
 writeable     = "0.6"
 
-regress     = { git = "https://github.com/octoshikari/regress", features = ["utf16"] }
-
 # Benchmarks.
 criterion   = { version = "0.8", features = ["html_reports"] }
 
@@ -96,6 +95,7 @@ otter-bytecode  = { path = "crates/otter-bytecode" }
 otter-syntax    = { path = "crates/otter-syntax" }
 otter-compiler  = { path = "crates/otter-compiler" }
 otter-gc        = { path = "crates/otter-gc" }
+otter-regex     = { path = "crates/otter-regex" }
 otter-macros    = { path = "crates/otter-macros" }
 otter-vm        = { path = "crates/otter-vm" }
 otter-runtime   = { path = "crates/otter-runtime" }

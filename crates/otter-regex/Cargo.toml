@@ -1,0 +1,29 @@
+[package]
+name = "otter-regex"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Standalone, VM-agnostic ECMAScript RegExp engine for Otter (clean-room)."
+
+# Dependency allowlist — ZERO Otter crates. The dependency edge is one-way:
+# the VM consumes this engine; this engine never reaches back into the VM/GC.
+# Only well-maintained third-party crates are permitted here.
+[dependencies]
+# Flag bit-set ergonomics.
+bitflags = "2"
+# UCD `\p{...}` property data (General_Category, Script, Script_Extensions,
+# binary properties). ICU4X ships the tables under the permissive Unicode
+# license; already present elsewhere in the workspace dependency graph.
+icu_properties = { version = "2.1", features = ["compiled_data", "alloc"] }
+# Unicode Simple Case Folding for `i`+`u`/`v` matching (UCD CaseFolding.txt).
+icu_casemap = { version = "2", features = ["compiled_data"] }
+
+[features]
+# `unicode` pulls in the property-escape data path. Default-on; a future slim
+# build can drop it — the core matcher needs no property tables.
+default = ["unicode"]
+unicode = []
+
+[lints]
+workspace = true

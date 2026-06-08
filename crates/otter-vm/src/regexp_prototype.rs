@@ -141,12 +141,12 @@ pub(crate) fn exec_once_native(
 }
 
 /// §22.2.7.2 steps 26–32 — build the JS-visible match-result array
-/// out of a `regress::Match`. Used by `RegExp.prototype.exec` and
+/// out of a match record. Used by `RegExp.prototype.exec` and
 /// reused by `String.prototype.match` / `.matchAll` so both surfaces
 /// produce identical shapes (full match + capture slots, plus
 /// `index` / `input` / `groups` / optionally `indices`).
 pub(crate) fn build_match_result_native(
-    m: &regress::Match,
+    m: &crate::regexp::engine::Match,
     units: &[u16],
     input: JsString,
     has_indices: bool,

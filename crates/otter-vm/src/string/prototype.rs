@@ -341,7 +341,7 @@ fn is_ws_code_unit(u: u16) -> bool {
 
 /// Run a regex over `text_units` and collect every match. Honours
 /// the `g` flag — without it we stop after the first match. We
-/// collect `regress::Match` directly: it is already owned (owned
+/// collect each match record directly: it is already owned (owned
 /// `Range<usize>` ranges, owned capture vec, owned group-name table)
 /// so we can release the iterator's borrow on `text_units` before
 /// allocating replacement strings or building result arrays.
@@ -349,7 +349,7 @@ fn collect_regex_matches(
     re: &JsRegExp,
     gc_heap: &otter_gc::GcHeap,
     text_units: &[u16],
-) -> Vec<regress::Match> {
+) -> Vec<crate::regexp::engine::Match> {
     let mut out = Vec::new();
     for m in re.find_from_utf16(gc_heap, text_units, 0) {
         out.push(m);
@@ -362,7 +362,11 @@ fn collect_regex_matches(
 
 /// `GetSubstitution`-lite: handles `$$`, `$&`, and `$1`–`$9`.
 /// Named groups (`$<name>`) and `$'` / `$\`` are deferred.
-fn apply_substitution(template: &[u16], text_units: &[u16], m: &regress::Match) -> Vec<u16> {
+fn apply_substitution(
+    template: &[u16],
+    text_units: &[u16],
+    m: &crate::regexp::engine::Match,
+) -> Vec<u16> {
     let mut out = Vec::with_capacity(template.len());
     let mut i = 0;
     while i < template.len() {

@@ -52,28 +52,7 @@ skip_features = [
     "iterator-sequencing",
     "joint-iteration",
 
-    # --- Stage 4 BUT blocked by the regex engine ---
-    # These are final ES2025 features; the blocker is the external regex
-    # crate, not our engine. Tracked for a later task: implement our own
-    # regex crate, then unskip both.
-    "regexp-modifiers",
-    "regexp-duplicate-named-groups",
 ]
-
-# Implement, do NOT skip (Stage 4 / shipped, feasible in our engine):
-#   host-gc-required ($262.gc), tail-call-optimization, Array.fromAsync.
-# Done so far this pass: hashbang, Error.isError, Math.sumPrecise,
-#   RegExp.escape, upsert (Map.prototype.getOrInsert /
-#   getOrInsertComputed), Float16Array (+ Math.f16round, DataView
-#   get/setFloat16), resizable-arraybuffer + arraybuffer-transfer
-#   (TypedArray + DataView out-of-bounds / length-tracking sweep; a few
-#   niche per-method coerced-resize edges remain), uint8array-base64
-#   (fromBase64/fromHex/toBase64/toHex/setFromBase64/setFromHex).
-# Array.fromAsync deferred: needs a native async coroutine
-#   (sequential awaits via promise .then state machine) — larger,
-#   dedicated effort.
-# Their tests are intentionally left visible (counted as failing until
-# the feature lands) so the work stays tracked.
 
 # Test flags to skip. Strictness is controlled by each test's
 # frontmatter (`onlyStrict`, `noStrict`, `module`, `raw`) rather than
@@ -108,25 +87,6 @@ ignored_tests = [
     # returns incorrect results. Tracked upstream, no fix in temporal_rs 0.2.0.
     "Duration/prototype/round/rounding-increment-relativeto",
 
-    # Annex B \c ClassControlLetter escape in character class — regress limitation
-    "literals/regexp/class-escape",
-
-    # Legacy RegExp escape coverage still ignored pending parser / regexp triage.
-    "RegExp/S15.10.3.1_A2_T1",
-    "RegExp/S15.10.2.13_A1_T10",
-    "RegExp/S15.10.2.8_A3_T24",
-
-    # Regress crate doesn't support exotic Unicode ID_Start/ID_Continue in group names
-    "named-groups/unicode-property-names-valid",
-    "named-groups/unicode-property-names",
-    "named-groups/non-unicode-property-names",
-    "named-groups/unicode-references",
-
-    # Regress crate doesn't validate Annex B restrictions in unicode mode
-    "RegExp/unicode_restricted_identity_escape_c",
-    "RegExp/unicode_restricted_octal_escape",
-    "RegExp/S15.10.2.15_A1_T34",
-
     # Temporal PlainDateTime math precision — temporal_rs edge case
     "Temporal/PlainDateTime/datetime-math",
 
@@ -154,11 +114,6 @@ ignored_tests = [
 
 # Tests known to panic/crash the VM (will be skipped with a warning)
 known_panics = [
-    # Stack overflow in regress crate with 200 nested parens
-    "S15.10.2.8_A3_T15",
-    "S15.10.2.8_A3_T16",
-    # Unicode property-escapes generated tests build huge strings, cause OOM/GC crash
-    "RegExp/property-escapes/generated",
     # Iterator-helpers re-entry tests recurse into the underlying
     # iterator from within the helper callback; the VM lacks a
     # "generator-already-running" guard so they exhaust the

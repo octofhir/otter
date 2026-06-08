@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 otter-bytecode = { workspace = true }
 otter-gc = { workspace = true }
+otter-regex = { workspace = true }
 otter-macros = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -22,7 +23,6 @@ rustc-hash = { workspace = true }
 thiserror = { workspace = true }
 num-bigint = { workspace = true }
 num-traits = { workspace = true }
-regress = { workspace = true }
 temporal_rs = { workspace = true }
 icu_collator = { workspace = true }
 icu_normalizer = { workspace = true }

@@ -20,4 +20,4 @@ oxc_syntax = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 num-bigint = { workspace = true }
-regress = { workspace = true }
+otter-regex = { workspace = true }

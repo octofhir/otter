@@ -1715,10 +1715,25 @@ impl Interpreter {
         if name != "prototype" {
             return self.function_property_get_non_prototype(context, function_id, name);
         }
-        if let Some(bag) = self.function_user_props.get(&function_id).copied()
-            && let Some(v) = crate::object::get(bag, &self.gc_heap, name)
-        {
-            return Ok(v);
+        // A user-installed own `prototype` (data or accessor, e.g. via
+        // Object.defineProperty) shadows the implicit one. An accessor
+        // must fire its getter with the function as receiver — §7.3.12
+        // Get(C, "prototype") in OrdinaryHasInstance — so a poisoned
+        // getter propagates instead of reading back `undefined`.
+        if let Some(bag) = self.function_user_props.get(&function_id).copied() {
+            match crate::object::lookup_own(bag, &self.gc_heap, name) {
+                crate::object::PropertyLookup::Data { value, .. } => return Ok(value),
+                crate::object::PropertyLookup::Accessor { getter, .. } => {
+                    return match getter {
+                        Some(g) if abstract_ops::is_callable(&g) => {
+                            let recv = receiver.unwrap_or_else(|| Value::function(function_id));
+                            self.run_callable_sync(context, &g, recv, SmallVec::new())
+                        }
+                        _ => Ok(Value::undefined()),
+                    };
+                }
+                crate::object::PropertyLookup::Absent => {}
+            }
         }
         // §10.2.5 — arrows, methods, and async (non-generator)
         // functions have no `prototype` property at all, so there is
@@ -1826,10 +1841,25 @@ impl Interpreter {
         if name != "prototype" {
             return self.function_property_get_non_prototype(context, function_id, name);
         }
-        if let Some(bag) = self.function_user_props.get(&function_id).copied()
-            && let Some(v) = crate::object::get(bag, &self.gc_heap, name)
-        {
-            return Ok(v);
+        // A user-installed own `prototype` (data or accessor, e.g. via
+        // Object.defineProperty) shadows the implicit one. An accessor
+        // must fire its getter with the function as receiver — §7.3.12
+        // Get(C, "prototype") in OrdinaryHasInstance — so a poisoned
+        // getter propagates instead of reading back `undefined`.
+        if let Some(bag) = self.function_user_props.get(&function_id).copied() {
+            match crate::object::lookup_own(bag, &self.gc_heap, name) {
+                crate::object::PropertyLookup::Data { value, .. } => return Ok(value),
+                crate::object::PropertyLookup::Accessor { getter, .. } => {
+                    return match getter {
+                        Some(g) if abstract_ops::is_callable(&g) => {
+                            let recv = receiver.unwrap_or_else(|| Value::function(function_id));
+                            self.run_callable_sync(context, &g, recv, SmallVec::new())
+                        }
+                        _ => Ok(Value::undefined()),
+                    };
+                }
+                crate::object::PropertyLookup::Absent => {}
+            }
         }
         // §10.2.5 — arrows, methods, and async (non-generator)
         // functions have no `prototype` property at all, so there is

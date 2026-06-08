@@ -1702,6 +1702,41 @@ impl Interpreter {
                 crate::property_dispatch::typed_array_ensure_expando_pub(&mut self.gc_heap, &t)?;
             return self.define_own_property_partial(bag, name, descriptor);
         }
+        // ArrayBuffer / SharedArrayBuffer and DataView are ordinary
+        // objects (no exotic [[DefineOwnProperty]]); own properties live
+        // on a lazily-allocated expando bag, mirroring the set/get path.
+        if let Some(b) = target.as_array_buffer() {
+            let bag =
+                crate::property_dispatch::array_buffer_ensure_expando_pub(&mut self.gc_heap, &b)?;
+            return match key {
+                VmPropertyKey::Symbol(sym) => Ok(object::define_own_symbol_property_partial(
+                    bag,
+                    &mut self.gc_heap,
+                    *sym,
+                    descriptor,
+                )),
+                _ => match key.string_name() {
+                    Some(name) => self.define_own_property_partial(bag, name, descriptor),
+                    None => Ok(false),
+                },
+            };
+        }
+        if let Some(dv) = target.as_data_view() {
+            let bag =
+                crate::property_dispatch::data_view_ensure_expando_pub(&mut self.gc_heap, &dv)?;
+            return match key {
+                VmPropertyKey::Symbol(sym) => Ok(object::define_own_symbol_property_partial(
+                    bag,
+                    &mut self.gc_heap,
+                    *sym,
+                    descriptor,
+                )),
+                _ => match key.string_name() {
+                    Some(name) => self.define_own_property_partial(bag, name, descriptor),
+                    None => Ok(false),
+                },
+            };
+        }
         Ok(false)
     }
 

@@ -122,12 +122,20 @@ pub fn alloc_local_array_buffer(
 pub struct SharedArrayBufferBodyGc {
     /// Shared backing store. `Arc` survives the GC body's lifetime.
     pub inner: Arc<SharedBody>,
+    /// Lazy expando bag for ordinary own properties (`sab.constructor
+    /// = C` for the species protocol, `sab.x = 1`). Per-isolate — own
+    /// properties are a local view, never shipped across the `Arc`.
+    pub expando: Option<crate::object::JsObject>,
 }
 
 impl otter_gc::SafeTraceable for SharedArrayBufferBodyGc {
     const TYPE_TAG: u8 = SHARED_ARRAY_BUFFER_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, _visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+    fn trace_slots_safe(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        if let Some(expando) = &self.expando {
+            let p = expando as *const crate::object::JsObject as *mut otter_gc::raw::RawGc;
+            visitor(p);
+        }
         // Bytes live behind an `Arc` outside the cage.
     }
 }
@@ -145,7 +153,10 @@ pub fn alloc_shared_array_buffer(
     heap: &mut otter_gc::GcHeap,
     inner: Arc<SharedBody>,
 ) -> Result<SharedArrayBufferHandle, otter_gc::OutOfMemory> {
-    heap.alloc_old(SharedArrayBufferBodyGc { inner })
+    heap.alloc_old(SharedArrayBufferBodyGc {
+        inner,
+        expando: None,
+    })
 }
 
 /// Cheap-to-copy `ArrayBuffer` / `SharedArrayBuffer` handle.
@@ -524,20 +535,27 @@ impl JsArrayBuffer {
     }
 
     /// Lazy expando bag for ordinary own properties. `None` until the
-    /// first own-property write. Shared buffers have no expando.
+    /// first own-property write. Shared buffers keep a per-isolate
+    /// expando on the GC wrapper (not the cross-thread `Arc`).
     #[must_use]
     pub fn expando(self, heap: &otter_gc::GcHeap) -> Option<crate::object::JsObject> {
         match self.storage {
             BufferStorage::Local(h) => heap.read_payload(h, |body| body.expando),
-            _ => None,
+            BufferStorage::Shared(h) => heap.read_payload(h, |body| body.expando),
         }
     }
 
     /// Install the expando bag (first own-property write).
     pub fn set_expando(self, heap: &mut otter_gc::GcHeap, bag: crate::object::JsObject) {
-        if let BufferStorage::Local(h) = self.storage {
-            heap.with_payload(h, |body| body.expando = Some(bag));
-            heap.record_write(h, &crate::Value::object(bag));
+        match self.storage {
+            BufferStorage::Local(h) => {
+                heap.with_payload(h, |body| body.expando = Some(bag));
+                heap.record_write(h, &crate::Value::object(bag));
+            }
+            BufferStorage::Shared(h) => {
+                heap.with_payload(h, |body| body.expando = Some(bag));
+                heap.record_write(h, &crate::Value::object(bag));
+            }
         }
     }
 

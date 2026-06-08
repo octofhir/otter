@@ -1613,14 +1613,10 @@ impl Interpreter {
             };
             Some(bag)
         } else if let Some(b) = receiver.as_array_buffer() {
-            // §25.1 — ordinary own properties (species `constructor`
-            // override) land in the lazy expando bag. Shared buffers
-            // keep the silent-drop behaviour (no per-handle bag).
-            if b.is_shared() {
-                None
-            } else {
-                Some(array_buffer_ensure_expando_pub(&mut self.gc_heap, &b)?)
-            }
+            // §25.1 / §25.2 — ArrayBuffer and SharedArrayBuffer are
+            // ordinary objects; own properties (e.g. a species
+            // `constructor` override) land in the lazy expando bag.
+            Some(array_buffer_ensure_expando_pub(&mut self.gc_heap, &b)?)
         } else if let Some(dv) = receiver.as_data_view() {
             // §25.3 — ordinary own properties land in the lazy expando.
             Some(data_view_ensure_expando_pub(&mut self.gc_heap, &dv)?)

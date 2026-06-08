@@ -147,3 +147,46 @@ fn extends_null_defines_and_super_read_throws_type_error() {
     "#);
     assert_eq!(out, "TypeError,true");
 }
+
+#[test]
+fn bound_class_constructor_call_throws_type_error() {
+    // §10.2.1.1 / §10.3.1 — a class constructor's [[Call]] always
+    // throws, including when reached through a bound-function wrapper.
+    let out = run(r#"
+        class Base { constructor(x, y) { this.x = x; this.y = y; } }
+        class Sub extends Base { constructor(x, y) { super(x, y); } }
+        var f = Sub.bind({});
+        var name = "none";
+        try { f(1, 2); } catch (e) { name = e.constructor.name; }
+        name;
+    "#);
+    assert_eq!(out, "TypeError");
+}
+
+#[test]
+fn bound_class_constructor_construct_still_works() {
+    // [[Construct]] through the same bound wrapper must succeed and
+    // produce an instance with the subclass prototype.
+    let out = run(r#"
+        class Base { constructor(x, y) { this.x = x; this.y = y; } }
+        class Sub extends Base { constructor(x, y) { super(x, y); } }
+        var g = Sub.bind({}, 1);
+        var s = new g(8);
+        s.x + "," + s.y + "," + String(Object.getPrototypeOf(s) === Sub.prototype);
+    "#);
+    assert_eq!(out, "1,8,true");
+}
+
+#[test]
+fn class_constructor_apply_throws_type_error() {
+    // Function.prototype.apply forwarding a class constructor is a
+    // [[Call]] and must throw rather than running the constructor body.
+    let out = run(r#"
+        class Base { constructor() {} }
+        class Derived extends Base {}
+        var name = "none";
+        try { Derived.apply({}, []); } catch (e) { name = e.constructor.name; }
+        name;
+    "#);
+    assert_eq!(out, "TypeError");
+}

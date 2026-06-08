@@ -773,10 +773,14 @@ impl Interpreter {
                 current = target;
                 continue;
             }
-            if let Some(cc) = current.as_class_constructor() {
-                hops += 1;
-                current = cc.ctor(&self.gc_heap);
-                continue;
+            if current.as_class_constructor().is_some() {
+                // §10.2.1.1 / §10.3.1 — a class constructor's [[Call]]
+                // always throws, including when reached through a
+                // bound-function wrapper or Reflect/Function call
+                // forwarding. Only [[Construct]] may enter it.
+                return Err(VmError::TypeError {
+                    message: "Class constructor cannot be invoked without 'new'".to_string(),
+                });
             }
             break;
         }

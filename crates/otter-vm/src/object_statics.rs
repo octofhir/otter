@@ -2151,6 +2151,12 @@ pub fn call(
                     }));
                 }
                 keys
+            } else if first.is_some_and(|v| {
+                v.as_weak_ref().is_some() || v.as_finalization_registry().is_some()
+            }) {
+                // WeakRef / FinalizationRegistry are ordinary objects with
+                // internal slots and no own string-keyed properties.
+                Vec::new()
             } else {
                 return Err(VmError::TypeMismatch);
             };
@@ -2171,6 +2177,17 @@ pub fn call(
         // table inside JsObject.
         // <https://tc39.es/ecma262/#sec-object.getownpropertysymbols>
         M::GetOwnPropertySymbols => {
+            // WeakRef / FinalizationRegistry carry no own symbol keys.
+            if args.first().is_some_and(|v| {
+                v.as_weak_ref().is_some() || v.as_finalization_registry().is_some()
+            }) {
+                return Ok(Value::array(rooted_array_from_elements(
+                    gc_heap,
+                    Vec::new(),
+                    &[],
+                    &[args],
+                )?));
+            }
             let target = expect_object(args.first())?;
             let syms: Vec<Value> = crate::object::with_properties(target, gc_heap, |p| {
                 p.symbol_keys().map(Value::symbol).collect()

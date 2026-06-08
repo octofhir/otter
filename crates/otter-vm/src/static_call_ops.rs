@@ -1501,6 +1501,8 @@ fn own_property_names_uses_internal_methods(target: &Value) -> bool {
         || target.is_class_constructor()
         || target.is_data_view()
         || target.is_typed_array()
+        || target.as_weak_ref().is_some()
+        || target.as_finalization_registry().is_some()
 }
 
 fn own_property_descriptors_uses_internal_methods(target: &Value) -> bool {

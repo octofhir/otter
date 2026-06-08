@@ -2409,6 +2409,11 @@ impl Interpreter {
         target: &Value,
     ) -> Result<Vec<Value>, VmError> {
         self.ensure_deferred_namespace_ready(context, target, true)?;
+        // WeakRef / FinalizationRegistry are ordinary objects whose
+        // observable own keys (no expando installed) are empty.
+        if target.as_weak_ref().is_some() || target.as_finalization_registry().is_some() {
+            return Ok(Vec::new());
+        }
         // §10.4.6.13 [[OwnPropertyKeys]] — exported string names in
         // ascending code-unit order, followed by the namespace's own
         // symbol keys (`@@toStringTag`).

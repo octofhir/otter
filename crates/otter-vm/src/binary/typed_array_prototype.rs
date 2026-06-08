@@ -245,25 +245,19 @@ fn build_new_typed_array(
 
 fn impl_at(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
+    // §23.2.3.1 — ValidateTypedArray (step 2) and the length read
+    // (step 3) precede ToIntegerOrInfinity(index) (step 4), whose
+    // observable coercion may resize the backing buffer.
     validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut()) as i64;
-    let idx = if let Some(n) = args.first().and_then(|v| v.as_number()) {
-        let f = n.as_f64();
-        if f.is_nan() {
-            // §23.2.3.1 — ToIntegerOrInfinity(NaN) is +0.
-            0
-        } else if !f.is_finite() {
-            return Ok(Value::undefined());
-        } else {
-            f.trunc() as i64
-        }
-    } else {
-        0
-    };
+    let idx = integer_index_arg(ctx, args.first(), 0)?;
     let resolved = if idx < 0 { len + idx } else { idx };
     if resolved < 0 || resolved >= len {
         return Ok(Value::undefined());
     }
+    // `get` re-checks the current length / out-of-bounds state, so a
+    // resize during the index coercion yields `undefined` rather than a
+    // stale element.
     t.get(ctx.heap_mut(), resolved as usize).map_err(native_oom)
 }
 

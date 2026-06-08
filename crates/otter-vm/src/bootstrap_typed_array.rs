@@ -1015,7 +1015,10 @@ fn ta_proto_dispatch(
         // §23.2.3.1 / §23.2.3.36 / §23.2.3.27/.28 — relative-index
         // operands run ToIntegerOrInfinity (firing valueOf /
         // toString) before the impl reads them as numbers.
-        "at" | "with" => &[0],
+        // `at` coerces its index inside impl_at AFTER ValidateTypedArray
+        // so a resize during ToIntegerOrInfinity is observed in the
+        // correct order (it must not throw, only read out of range).
+        "with" => &[0],
         "slice" | "subarray" => &[0, 1],
         _ => &[],
     };

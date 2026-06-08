@@ -124,6 +124,8 @@ otter_macros::couch! {
             "set"    / 2 => weak_map_proto_set,
             "has"    / 1 => weak_map_proto_has,
             "delete" / 1 => weak_map_proto_delete,
+            "getOrInsert"         / 2 => weak_map_proto_get_or_insert,
+            "getOrInsertComputed" / 2 => weak_map_proto_get_or_insert_computed,
         },
     },
 }
@@ -1302,6 +1304,68 @@ fn weak_map_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
         Ok(b) => Ok(Value::boolean(b)),
         Err(_) => Ok(Value::boolean(false)),
     }
+}
+
+/// WeakMap.prototype.getOrInsert(key, value) — upsert proposal. A key
+/// that cannot be held weakly throws (`weak_map_get` surfaces it).
+fn weak_map_proto_get_or_insert(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let mut m = receiver_weak_map(ctx, "WeakMap.prototype.getOrInsert")?;
+    let key = args.first().cloned().unwrap_or(Value::undefined());
+    let value = args.get(1).cloned().unwrap_or(Value::undefined());
+    match collections::weak_map_get(m, ctx.heap(), &key) {
+        Ok(Some(existing)) => return Ok(existing),
+        Ok(None) => {}
+        Err(e) => return Err(collection_to_native(e, "WeakMap.prototype.getOrInsert")),
+    }
+    ctx.weak_map_set(&mut m, key, value)
+        .map_err(|e| collection_to_native(e, "WeakMap.prototype.getOrInsert"))?;
+    Ok(value)
+}
+
+/// WeakMap.prototype.getOrInsertComputed(key, callbackfn) — computes the
+/// value via the callback only when the key is absent (§ upsert).
+fn weak_map_proto_get_or_insert_computed(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let mut m = receiver_weak_map(ctx, "WeakMap.prototype.getOrInsertComputed")?;
+    let key = args.first().cloned().unwrap_or(Value::undefined());
+    let callback = args.get(1).cloned().unwrap_or(Value::undefined());
+    // step 2 — the key must be able to be held weakly.
+    let present = collections::weak_map_get(m, ctx.heap(), &key)
+        .map_err(|e| collection_to_native(e, "WeakMap.prototype.getOrInsertComputed"))?;
+    // step 3 — callbackfn must be callable (checked even when present).
+    if !ctx.interp_mut().is_callable_runtime(&callback) {
+        return Err(NativeError::TypeError {
+            name: "WeakMap.prototype.getOrInsertComputed",
+            reason: "callbackfn is not callable".to_string(),
+        });
+    }
+    if let Some(existing) = present {
+        return Ok(existing);
+    }
+    let context = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "WeakMap.prototype.getOrInsertComputed",
+            reason: "no active execution context".to_string(),
+        })?;
+    let value = ctx
+        .interp_mut()
+        .run_callable_sync(
+            &context,
+            &callback,
+            Value::undefined(),
+            smallvec::smallvec![key],
+        )
+        .map_err(|e| vm_to_native(e, "WeakMap.prototype.getOrInsertComputed"))?;
+    ctx.weak_map_set(&mut m, key, value)
+        .map_err(|e| collection_to_native(e, "WeakMap.prototype.getOrInsertComputed"))?;
+    Ok(value)
 }
 
 // ---------------------------------------------------------------

@@ -1193,13 +1193,22 @@ fn weak_collection_key(
     value: &Value,
     heap: &otter_gc::GcHeap,
 ) -> Result<WeakCollectionKey, CollectionError> {
-    if let Some(raw) = value.as_raw_gc() {
-        return Ok(WeakCollectionKey::Object(raw));
-    }
-    if let Some(symbol) = value.as_symbol(heap)
-        && !symbol.is_registered()
-    {
+    // §6.1.7.4 CanBeHeldWeakly — check Symbol first: a Symbol is also
+    // GC-backed (as_raw_gc would match it), but a registered
+    // (Symbol.for) symbol cannot be held weakly and must be rejected.
+    if let Some(symbol) = value.as_symbol(heap) {
+        if symbol.is_registered() {
+            return Err(CollectionError::NonObjectKey);
+        }
         return Ok(WeakCollectionKey::Symbol(symbol));
+    }
+    // Only genuine Objects can be held weakly. `as_raw_gc` also matches
+    // GC-backed primitives (String / BigInt), so gate on the positive
+    // object-type predicate first.
+    if value.is_object_type()
+        && let Some(raw) = value.as_raw_gc()
+    {
+        return Ok(WeakCollectionKey::Object(raw));
     }
     Err(CollectionError::NonObjectKey)
 }

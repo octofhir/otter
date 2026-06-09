@@ -65,7 +65,7 @@ pub static ARRAY_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("lastIndexOf", 1, native_last_index_of),
     method("at", 1, native_at),
     method("reverse", 0, native_reverse),
-    method("fill", 3, native_fill),
+    method("fill", 1, native_fill),
     method("flat", 0, native_flat),
     method("splice", 2, native_splice),
     method("sort", 1, native_sort),

@@ -5203,19 +5203,32 @@ impl Interpreter {
             };
         }
         if let Some(re) = target.as_regexp() {
-            return match key {
-                VmPropertyKey::String(key) if *key == "lastIndex" => {
-                    // A non-writable `lastIndex` rejects the write
-                    // (returns false → `Set` with Throw=true raises a
-                    // TypeError); otherwise store the new value.
-                    if !re.last_index_writable(&self.gc_heap) {
-                        return Ok(false);
-                    }
-                    regexp_prototype::store_property(&re, &mut self.gc_heap, key, value);
-                    Ok(true)
+            // Match `lastIndex` by its resolved name, not only the
+            // `String` key variant — a write forwarded through a Proxy
+            // (or any atomised store) arrives as an `Atom` and must still
+            // hit the regex's only own data property.
+            if key.string_name() == Some("lastIndex") {
+                // A non-writable `lastIndex` rejects the write (returns
+                // false → `Set` with Throw=true raises a TypeError);
+                // otherwise store the new value.
+                if !re.last_index_writable(&self.gc_heap) {
+                    return Ok(false);
                 }
-                _ => Ok(false),
-            };
+                regexp_prototype::store_property(&re, &mut self.gc_heap, "lastIndex", value);
+                return Ok(true);
+            }
+            // Any other own property lives on the lazy expando bag, so an
+            // OrdinarySet (e.g. `re.custom = x`) stores there rather than
+            // being silently rejected.
+            let bag = crate::property_dispatch::regexp_ensure_expando_pub(&mut self.gc_heap, &re)?;
+            return self.ordinary_set_data_value(
+                context,
+                Value::object(bag),
+                key,
+                value,
+                receiver,
+                hops + 1,
+            );
         }
         let fid = target.as_function().or_else(|| {
             target

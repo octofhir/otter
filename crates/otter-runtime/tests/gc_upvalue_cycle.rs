@@ -1,18 +1,19 @@
 //! Counter-closure leak regression — verifies that the
 //! canonical `function counter() { let n = 0; return () => ++n; }`
-//! shape returns to baseline `live_bytes` after the outer
-//! reference is dropped and a full GC fires.
+//! shape returns to baseline `live_bytes` once the closure becomes
+//! unreachable and a full GC fires.
 //!
-//! Phase 1 caveat: `JsObject::trace_gc_roots` is still a stub
-//! (lands with task 77), so the script's `globalThis` does NOT
-//! root the inner closure. The test allocates the upvalue chain
-//! through host-side surfaces only, so the leak detection is
-//! on the heap stats — not on JS-level reachability.
+//! `globalThis` and the persistent script scope are both traced, so a
+//! top-level `let` binding would keep its own upvalue cell live for the
+//! lifetime of the runtime. The test therefore runs the whole idiom
+//! inside an IIFE: once it returns, every local (`counter`, `c`, and the
+//! captured `n` cell) is unreachable, so forcing GC must return the
+//! per-type live byte count to baseline — a real reclamation check
+//! rather than a snapshot of an unrooted heap.
 //!
 //! # See also
 //!
 //! - GC architecture plan §4.1, §6.3.
-//! - Task 76 — UpvalueCell migration.
 
 use otter_runtime::{Runtime, SourceInput};
 use otter_vm::UPVALUE_CELL_TYPE_TAG;
@@ -24,27 +25,27 @@ fn counter_closure_no_leak_after_force_gc() {
     // Sample baseline before the script runs.
     let baseline = rt.heap_stats().by_type[UPVALUE_CELL_TYPE_TAG as usize].live_bytes;
 
-    // Run the canonical counter-closure idiom; the outer
-    // function returns the inner arrow that captures `n`.
-    // `MakeClosure` allocates an `UpvalueCellBody` on the GC
-    // heap for `n`.
+    // Run the canonical counter-closure idiom inside an IIFE; the inner
+    // function returns the arrow that captures `n`, and `MakeClosure`
+    // allocates an `UpvalueCellBody` on the GC heap for `n`. Nothing
+    // escapes the IIFE, so when it returns the closure and its captured
+    // upvalue become unreachable.
     let result = rt
         .run_script(
             SourceInput::from_javascript(
-                "function counter() { let n = 0; return () => ++n; }\n\
-                 let c = counter(); c(); c(); c(); c();\n",
+                "(function () {\n\
+                 \x20 function counter() { let n = 0; return () => ++n; }\n\
+                 \x20 let c = counter(); c(); c(); c(); c();\n\
+                 })();\n",
             ),
             "<counter>",
         )
         .expect("script ran");
     let _ = result;
 
-    // After the script returns, host-side roots are gone.
-    // Phase-1 walker stops at `JsObject` (task 77) so the
-    // closure isn't reachable through `globalThis` either —
-    // every upvalue cell becomes unreachable. Force a full GC
-    // and assert the per-type live byte count returns to
-    // baseline.
+    // The IIFE left no live reference, so every upvalue cell is
+    // unreachable. Force a full GC and assert the per-type live byte
+    // count returns to baseline.
     rt.force_gc();
     let after = rt.heap_stats().by_type[UPVALUE_CELL_TYPE_TAG as usize].live_bytes;
     assert_eq!(

@@ -1483,6 +1483,23 @@ impl Interpreter {
             let Some(k) = key.string_name() else {
                 return Ok(false);
             };
+            // Materialize a virtual `prototype` into the function's own
+            // property bag first, so the redefinition below validates
+            // against its real descriptor (writable per the function
+            // kind, configurable:false). Without this the lookup returns
+            // `None` and the non-configurable invariant check is skipped,
+            // wrongly letting `defineProperty(fn, "prototype", {set})` (a
+            // data→accessor change) or a `configurable:true` flip succeed.
+            if k == "prototype" {
+                let _ = self.function_property_get_runtime_rooted_with_receiver(
+                    context,
+                    function_id,
+                    None,
+                    "prototype",
+                    &[],
+                    &[],
+                )?;
+            }
             let completed = match self.ordinary_function_own_property_descriptor(
                 Some(context),
                 function_id,

@@ -309,13 +309,29 @@ fn is_identifier_name(name: &str) -> bool {
     chars.all(|c| c == '$' || c == '_' || c.is_alphanumeric())
 }
 
-/// Render a callable's `Function.prototype.toString` value. Otter does
-/// not retain function source text, so every callable uses the
-/// `NativeFunction` form (§20.2.3.5 permits this when source is
-/// unavailable). The optional name is emitted only when it is a valid
-/// `IdentifierName`, keeping the result parseable by the spec grammar.
+/// Render a callable's `Function.prototype.toString` value (§20.2.3.5).
+/// A user function / class carries its verbatim [[SourceText]], so its
+/// definition source is returned exactly. Native functions, bound
+/// functions, and any synthesized callable without source fall back to
+/// the `NativeFunction` form; the optional name is emitted only when it
+/// is a valid `IdentifierName`, keeping the result parseable.
 #[must_use]
 pub(crate) fn callable_to_string(ctx: &mut FunctionMetadataContext<'_>, callee: &Value) -> String {
+    // A class binding is a class-constructor wrapper; its [[SourceText]]
+    // (the whole `class … {}`) lives on the inner constructor function.
+    let resolved = match callee.as_class_constructor() {
+        Some(class) => class.ctor(ctx.heap()),
+        None => *callee,
+    };
+    if let Some(fid) = resolved.as_function().or_else(|| {
+        resolved
+            .as_closure(ctx.heap())
+            .map(|c| c.cached_function_id)
+    }) && let Some(function) = ctx.context.function(fid)
+        && let Some(source) = &function.source_text
+    {
+        return source.clone();
+    }
     let display = callable_name(ctx, callee).unwrap_or_default();
     if is_identifier_name(&display) {
         format!("function {display}() {{ [native code] }}")

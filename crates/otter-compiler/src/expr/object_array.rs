@@ -201,6 +201,9 @@ pub(crate) fn compile_object_literal(
                             }
                         };
                     cx.next_fn_is_method = true;
+                    // §20.2.3.5 — an accessor reports its whole property
+                    // definition (`get`/`set` prefix and key included).
+                    cx.next_fn_source_text_span = Some(key_span);
                     let function_reg = compile_expr(cx, &p.value, key_span)?;
                     let accessor_key = match p.kind {
                         oxc_ast::ast::PropertyKind::Get => "get",
@@ -300,6 +303,12 @@ pub(crate) fn compile_object_literal(
                         key_span,
                     );
                     cx.next_fn_is_method = p.method;
+                    // §20.2.3.5 — a concise method reports its whole
+                    // definition; a plain `key: function(){}` value keeps
+                    // its own function-expression source.
+                    if p.method {
+                        cx.next_fn_source_text_span = Some(key_span);
+                    }
                     let value_reg = compile_expr(cx, &p.value, key_span)?;
                     // §13.2.5.5 — `[expr]: AnonymousFunctionDefinition`
                     // names the function from the evaluated key.
@@ -419,6 +428,12 @@ pub(crate) fn compile_object_literal(
                 // §13.2.5.5 step — `PropertyName: AnonymousFunctionDefinition`
                 // infers the function's name from the property key.
                 cx.next_fn_is_method = p.method;
+                // §20.2.3.5 — a concise method reports its whole
+                // definition; a plain `key: function(){}` value keeps
+                // its own function-expression source.
+                if p.method {
+                    cx.next_fn_source_text_span = Some(key_span);
+                }
                 let value_reg =
                     crate::expr::compile_expr_with_inferred_name(cx, &p.value, &key_str, key_span)?;
                 // §7.3.7 CreateDataPropertyOrThrow — definitions never

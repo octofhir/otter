@@ -971,8 +971,33 @@ impl Interpreter {
                 Value::object(c.prototype(&self.gc_heap))
             } else {
                 let statics = c.statics(&self.gc_heap);
-                let direct = crate::object::get(statics, &self.gc_heap, name);
-                if let Some(v) = direct {
+                // §10.2.* — `name` / `length` are own properties of the
+                // class constructor (the class name and the constructor
+                // parameter count), supplied by the backing ctor
+                // function unless a static member shadows them. Resolve
+                // them from the ctor BEFORE the inherited
+                // %Function.prototype% walk, whose own `name`=""/
+                // `length`=0 would otherwise shadow the real values.
+                if (name == "name" || name == "length")
+                    && object::get_own_descriptor(statics, &self.gc_heap, name).is_none()
+                {
+                    let ctor = c.ctor(&self.gc_heap);
+                    if ctor.is_function()
+                        || ctor.is_closure()
+                        || ctor.is_native_function()
+                        || ctor.is_bound_function()
+                    {
+                        let mut ctx = function_metadata::FunctionMetadataContext::new(
+                            context,
+                            &mut self.gc_heap,
+                            &self.function_user_props,
+                            &self.function_deleted_metadata,
+                        );
+                        function_metadata::callable_intrinsic_property(&mut ctx, &ctor, name)?
+                    } else {
+                        Value::undefined()
+                    }
+                } else if let Some(v) = crate::object::get(statics, &self.gc_heap, name) {
                     v
                 } else {
                     // §15.7.10 step 6.b — `class D extends C` sets
@@ -1008,30 +1033,9 @@ impl Interpreter {
                         }
                         _ => None,
                     };
-                    match walked {
-                        Some(v) if !v.is_undefined() => v,
-                        _ if name == "name" || name == "length" => {
-                            let ctor = c.ctor(&self.gc_heap);
-                            if ctor.is_function()
-                                || ctor.is_closure()
-                                || ctor.is_native_function()
-                                || ctor.is_bound_function()
-                            {
-                                let mut ctx = function_metadata::FunctionMetadataContext::new(
-                                    context,
-                                    &mut self.gc_heap,
-                                    &self.function_user_props,
-                                    &self.function_deleted_metadata,
-                                );
-                                function_metadata::callable_intrinsic_property(
-                                    &mut ctx, &ctor, name,
-                                )?
-                            } else {
-                                Value::undefined()
-                            }
-                        }
-                        _ => Value::undefined(),
-                    }
+                    walked
+                        .filter(|v| !v.is_undefined())
+                        .unwrap_or_else(Value::undefined)
                 }
             }
         } else if let Some(s) = receiver.as_string(&self.gc_heap) {
@@ -3689,90 +3693,75 @@ impl Interpreter {
             ];
             stack[top_idx].advance_pc(self.current_byte_len)?;
             match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
-                Some(_) => {}
-                None => {
-                    let target_value = proxy.target(&self.gc_heap);
-                    let Some(target) = target_value.as_object() else {
+                Some(result) => {
+                    // §10.5.9 step 13–14 invariants — a trap that reports
+                    // success must not contradict a non-configurable,
+                    // non-writable data property or a setter-less accessor
+                    // on the target.
+                    if result.to_boolean(&self.gc_heap) {
+                        let target_value = proxy.target(&self.gc_heap);
                         let vm_key = match &key {
-                            ComputedPropertyKey::String(key) => {
-                                VmPropertyKey::OwnedString(key.clone())
-                            }
+                            ComputedPropertyKey::String(k) => VmPropertyKey::OwnedString(k.clone()),
                             ComputedPropertyKey::Symbol(sym) => VmPropertyKey::Symbol(*sym),
                         };
-                        if !self.ordinary_set_data_value(
-                            context,
-                            target_value,
-                            &vm_key,
-                            value,
-                            Value::proxy(proxy),
-                            0,
-                        )? {
-                            Self::failed_set_result(strict, "Cannot assign to property")?;
-                        }
-                        return Ok(true);
-                    };
-                    let outcome = match &key {
-                        ComputedPropertyKey::String(key) => {
-                            object::resolve_set(target, &self.gc_heap, key)
-                        }
-                        ComputedPropertyKey::Symbol(sym) => {
-                            object::resolve_symbol_set(target, &self.gc_heap, *sym)
-                        }
-                    };
-                    match outcome {
-                        object::SetOutcome::AssignData => {
-                            let ok = match &key {
-                                ComputedPropertyKey::String(key) => {
-                                    self.ordinary_set_data_property(target, key, value)?
-                                }
-                                ComputedPropertyKey::Symbol(sym) => {
-                                    object::set_symbol(target, &mut self.gc_heap, *sym, value)
-                                }
-                            };
-                            if !ok {
-                                Self::failed_set_result(strict, "Cannot assign to property")?;
-                            }
-                        }
-                        object::SetOutcome::InvokeSetter { setter } => {
-                            if !abstract_ops::is_callable(&setter) {
-                                Self::failed_set_result(
-                                    strict,
-                                    "Cannot assign to accessor property without a setter",
-                                )?;
-                            } else {
-                                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                                args.push(value);
-                                self.invoke(
-                                    stack,
-                                    context,
-                                    &setter,
-                                    Value::proxy(proxy),
-                                    args,
-                                    scratch_reg,
-                                )?;
-                            }
-                        }
-                        object::SetOutcome::Reject { .. } => {
-                            Self::failed_set_result(strict, "Cannot assign to property")?;
-                        }
-                        object::SetOutcome::ExoticParent { parent } => {
-                            let pkey = match &key {
-                                ComputedPropertyKey::String(key) => {
-                                    VmPropertyKey::OwnedString(key.clone())
-                                }
-                                ComputedPropertyKey::Symbol(sym) => VmPropertyKey::Symbol(*sym),
-                            };
-                            if !self.ordinary_set_data_value(
+                        let target_desc = self
+                            .ordinary_get_own_property_descriptor_value_stack_rooted(
                                 context,
-                                parent,
-                                &pkey,
-                                value,
-                                Value::proxy(proxy),
-                                1,
-                            )? {
-                                Self::failed_set_result(strict, "Cannot assign to property")?;
+                                stack,
+                                target_value,
+                                &vm_key,
+                                0,
+                            )?;
+                        if let Some(desc) = target_desc.as_ref()
+                            && !desc.configurable()
+                        {
+                            match &desc.kind {
+                                object::DescriptorKind::Data { value: target_v }
+                                    if !desc.writable()
+                                        && !abstract_ops::same_value(
+                                            target_v,
+                                            &value,
+                                            &self.gc_heap,
+                                        ) =>
+                                {
+                                    return Err(VmError::TypeError {
+                                        message:
+                                            "Proxy set trap reported success but target is non-configurable non-writable with a different value"
+                                                .to_string(),
+                                    });
+                                }
+                                object::DescriptorKind::Accessor { setter: None, .. } => {
+                                    return Err(VmError::TypeError {
+                                        message:
+                                            "Proxy set trap reported success but target is a non-configurable accessor without a setter"
+                                                .to_string(),
+                                    });
+                                }
+                                _ => {}
                             }
                         }
+                    }
+                }
+                None => {
+                    // §10.5.9 step 9 — a missing `set` trap forwards to
+                    // `target.[[Set]](P, V, Receiver)` with the proxy as
+                    // Receiver, so OrdinarySet's own-property steps fire
+                    // the proxy's getOwnPropertyDescriptor / defineProperty
+                    // traps (and an inherited setter sees `this === proxy`).
+                    let target_value = proxy.target(&self.gc_heap);
+                    let vm_key = match &key {
+                        ComputedPropertyKey::String(key) => VmPropertyKey::OwnedString(key.clone()),
+                        ComputedPropertyKey::Symbol(sym) => VmPropertyKey::Symbol(*sym),
+                    };
+                    if !self.ordinary_set_data_value(
+                        context,
+                        target_value,
+                        &vm_key,
+                        value,
+                        Value::proxy(proxy),
+                        0,
+                    )? {
+                        Self::failed_set_result(strict, "Cannot assign to property")?;
                     }
                 }
             }
@@ -4300,74 +4289,28 @@ impl Interpreter {
                     }
                 }
                 None => {
+                    // §10.5.9 step 9 — a missing `set` trap forwards to
+                    // `target.[[Set]](P, V, Receiver)` with the PROXY as
+                    // Receiver. OrdinarySet's own-property steps then run
+                    // against the receiver, so the proxy's
+                    // getOwnPropertyDescriptor / defineProperty traps fire
+                    // and an inherited setter sees `this === proxy`. Route
+                    // every target (ordinary, exotic, or nested proxy)
+                    // through the value-level funnel rather than a
+                    // receiver-blind fast path.
                     let target_value = proxy.target(&self.gc_heap);
-                    let Some(target) = target_value.as_object() else {
-                        if !self.ordinary_set_data_value(
-                            context,
-                            target_value,
-                            &key_vm,
-                            value,
-                            Value::proxy(proxy),
-                            0,
-                        )? {
-                            Self::failed_set_result(
-                                strict,
-                                format!("Cannot assign to property '{name}'"),
-                            )?;
-                        }
-                        return Ok(true);
-                    };
-                    match object::resolve_set(target, &self.gc_heap, name) {
-                        object::SetOutcome::ExoticParent { parent } => {
-                            if !self.ordinary_set_data_value(
-                                context,
-                                parent,
-                                &VmPropertyKey::String(name),
-                                value,
-                                Value::proxy(proxy),
-                                1,
-                            )? {
-                                Self::failed_set_result(
-                                    strict,
-                                    format!("Cannot assign to property '{name}'"),
-                                )?;
-                            }
-                        }
-                        object::SetOutcome::AssignData => {
-                            if !self.ordinary_set_data_property(target, name, value)? {
-                                Self::failed_set_result(
-                                    strict,
-                                    format!("Cannot assign to property '{name}'"),
-                                )?;
-                            }
-                        }
-                        object::SetOutcome::InvokeSetter { setter } => {
-                            if !abstract_ops::is_callable(&setter) {
-                                Self::failed_set_result(
-                                    strict,
-                                    format!(
-                                        "Cannot assign to accessor property '{name}' without a setter"
-                                    ),
-                                )?;
-                            } else {
-                                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                                args.push(value);
-                                self.invoke(
-                                    stack,
-                                    context,
-                                    &setter,
-                                    Value::proxy(proxy),
-                                    args,
-                                    scratch_reg,
-                                )?;
-                            }
-                        }
-                        object::SetOutcome::Reject { .. } => {
-                            Self::failed_set_result(
-                                strict,
-                                format!("Cannot assign to property '{name}'"),
-                            )?;
-                        }
+                    if !self.ordinary_set_data_value(
+                        context,
+                        target_value,
+                        &key_vm,
+                        value,
+                        Value::proxy(proxy),
+                        0,
+                    )? {
+                        Self::failed_set_result(
+                            strict,
+                            format!("Cannot assign to property '{name}'"),
+                        )?;
                     }
                 }
             }
@@ -4759,6 +4702,14 @@ impl Interpreter {
             &VmPropertyKey::atom(atomized_key),
             0,
         )?;
+        // §13.5.1.2 — strict-mode `delete` whose [[Delete]] returns false
+        // throws a TypeError (the computed-key path already does this).
+        let strict = context.function_is_strict(stack[top_idx].function_id);
+        if !removed && strict {
+            return Err(VmError::TypeError {
+                message: "Cannot delete property".to_string(),
+            });
+        }
         write_register(&mut stack[top_idx], dst, Value::boolean(removed))?;
         Ok(true)
     }

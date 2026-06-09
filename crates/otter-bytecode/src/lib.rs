@@ -2099,6 +2099,21 @@ pub struct Function {
     /// be empty (a synthesized constructor with no own bindings).
     #[serde(default)]
     pub contains_direct_eval: bool,
+    /// Verbatim source text of the function / class definition
+    /// (§20.2.3.5 [[SourceText]]). Populated for user code by slicing
+    /// the original source over `source_text_span` (or `span` when
+    /// unset); `None` for synthesized functions with no backing
+    /// source, which `toString` renders in the `NativeFunction` form.
+    #[serde(default)]
+    pub source_text: Option<String>,
+    /// Byte range to slice for [[SourceText]] when it differs from the
+    /// executable `span`: a class constructor reports the whole
+    /// `class … {}` definition, and a method / accessor reports its
+    /// `MethodDefinition` (name and `get`/`set`/`*`/`async` prefixes
+    /// included). Compile-internal — consumed before the module is
+    /// serialized.
+    #[serde(skip)]
+    pub source_text_span: Option<(u32, u32)>,
     /// Encoded instructions.
     pub code: Vec<Instruction>,
     /// `pc -> source span` table.

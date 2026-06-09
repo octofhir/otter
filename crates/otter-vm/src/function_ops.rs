@@ -181,6 +181,21 @@ impl Interpreter {
                 class.set_ctor_proto(&mut self.gc_heap, parent);
             }
         }
+        // §15.7.14 step 6.b/6.d — a base class (no heritage) and an
+        // `extends null` class both have constructorParent =
+        // %Function.prototype%. The compiler only chains the statics
+        // object to a *real* parent class; otherwise it keeps the
+        // default %Object.prototype%, which would shadow
+        // `Function.prototype.{call,apply,bind,toString,…}` with
+        // `Object.prototype` and make `"" + Class` / `Class.call`
+        // resolve the wrong inherited method. Re-seat the statics tail
+        // on %Function.prototype% whenever no parent class identity was
+        // recorded.
+        if class.ctor_proto(&self.gc_heap).is_undefined()
+            && let Some(function_prototype) = self.realm_intrinsics.function_prototype
+        {
+            object::set_prototype(statics, &mut self.gc_heap, Some(function_prototype));
+        }
         // §15.7.10 ClassDefinitionEvaluation step 24 — install
         // `C.prototype.constructor = C` so reflective probes
         // (`new Sub(...).constructor === Sub`) walk to the

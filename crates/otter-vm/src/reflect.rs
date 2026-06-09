@@ -706,6 +706,8 @@ mod tests {
                 needs_arguments: false,
                 arguments_object_kind: crate::ArgumentsObjectKind::Unmapped,
                 mapped_argument_bindings: Vec::new(),
+                source_text: None,
+                source_text_span: None,
                 module_url: String::new(),
                 direct_eval_bindings: Vec::new(),
                 contains_direct_eval: false,

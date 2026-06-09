@@ -542,6 +542,20 @@ fn compile_class_strict(
         }
     };
 
+    // §20.2.3.5 — a class's `toString` reports the entire class
+    // definition, so the constructor's [[SourceText]] spans the whole
+    // `class … {}` rather than just the (possibly synthesized)
+    // constructor body.
+    {
+        let module = Rc::clone(&cx.top_mut().module);
+        module
+            .borrow_mut()
+            .functions
+            .get_mut(ctor_id as usize)
+            .expect("compiled constructor slot")
+            .source_text_span = Some(span);
+    }
+
     let ctor_const = cx.intern_function_id(ctor_id);
     let ctor_reg = cx.alloc_scratch();
     emit_make_callable(cx, ctor_reg, ctor_const, &ctor_captures, false, span)?;
@@ -594,6 +608,14 @@ fn compile_class_strict(
         };
         cx.next_fn_is_method = true;
         cx.next_fn_static_home = m.r#static;
+        // §20.2.3.5 — a method's [[SourceText]] is its `MethodDefinition`.
+        // `method_span` matches that for an instance method; for a
+        // static one it would also span the `static` ClassElement
+        // prefix (which is not part of MethodDefinition), so those fall
+        // back to the permitted NativeFunction form.
+        if !m.r#static {
+            cx.next_fn_source_text_span = Some(method_span);
+        }
         let (m_id, m_captures) = compile_function_full(
             cx,
             &body_name,

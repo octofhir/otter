@@ -174,6 +174,7 @@ pub fn compile_eval_source(
                             directives: &body.directives,
                             span: (program.span.start, program.span.end),
                             strict_directive: body.has_use_strict_directive(),
+                            source_text: program.source_text,
                         },
                         kind,
                         module_specifier,
@@ -446,6 +447,10 @@ pub(crate) struct ProgramParts<'a, 'b> {
     pub(crate) directives: &'b [oxc_ast::ast::Directive<'a>],
     pub(crate) span: (u32, u32),
     pub(crate) strict_directive: bool,
+    /// Full source text the program was parsed from. Function spans
+    /// are byte offsets into this string, so it backs the §20.2.3.5
+    /// [[SourceText]] slice attached to each compiled function.
+    pub(crate) source_text: &'a str,
 }
 
 impl<'a, 'b> ProgramParts<'a, 'b> {
@@ -455,6 +460,37 @@ impl<'a, 'b> ProgramParts<'a, 'b> {
             directives: &program.directives,
             span: (program.span.start, program.span.end),
             strict_directive: program.has_use_strict_directive(),
+            source_text: program.source_text,
+        }
+    }
+}
+
+/// Attach §20.2.3.5 [[SourceText]] to every compiled function by
+/// slicing the original source over the function's byte span. The
+/// `<main>` script/eval/module entry (function 0) is skipped — it is
+/// never observable through `Function.prototype.toString`. Spans that
+/// fall outside the source or on a non-char boundary (synthesized
+/// functions) leave `source_text` as `None`, so `toString` keeps the
+/// `NativeFunction` form for them.
+pub(crate) fn attach_source_text(module: &mut BytecodeModule, source: &str) {
+    for function in module.functions.iter_mut().skip(1) {
+        // A method / accessor reports its `MethodDefinition` source,
+        // whose range is wider than the function body `span` (it
+        // includes the key and any `get`/`set`/`*`/`async` prefix).
+        // Without that explicit range the bare body span would yield a
+        // non-parseable fragment, so leave such functions in the
+        // `NativeFunction` form until their definition span is recorded.
+        let range = match function.source_text_span {
+            Some(range) => range,
+            None if function.is_method => continue,
+            None => function.span,
+        };
+        let (start, end) = range;
+        if start >= end {
+            continue;
+        }
+        if let Some(text) = source.get(start as usize..end as usize) {
+            function.source_text = Some(text.to_string());
         }
     }
 }
@@ -492,6 +528,7 @@ pub(crate) fn compile_program_with_mode_impl_super(
     new_target_allowed: bool,
     super_property_allowed: bool,
 ) -> Result<BytecodeModule, CompileError> {
+    let source_text = program.source_text;
     let module = Rc::new(RefCell::new(ModuleBuilder::default()));
     let script_module_url = if module_specifier.starts_with("file://") {
         module_specifier.to_string()
@@ -891,7 +928,7 @@ pub(crate) fn compile_program_with_mode_impl_super(
         .expect("module builder should be uniquely owned at finalize")
         .into_inner();
 
-    Ok(BytecodeModule {
+    let mut bytecode = BytecodeModule {
         module: module_specifier.to_string(),
         template_sites,
         source_kind: kind,
@@ -899,7 +936,9 @@ pub(crate) fn compile_program_with_mode_impl_super(
         constants,
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
-    })
+    };
+    attach_source_text(&mut bytecode, source_text);
+    Ok(bytecode)
 }
 
 /// Compile a parsed program as one ES-module fragment.
@@ -1551,7 +1590,7 @@ pub fn compile_module_program(
         })
         .collect();
 
-    Ok(BytecodeModule {
+    let mut bytecode = BytecodeModule {
         module: host.module_url.clone(),
         template_sites,
         source_kind: kind,
@@ -1559,7 +1598,9 @@ pub fn compile_module_program(
         constants,
         module_resolutions,
         module_inits: Vec::new(),
-    })
+    };
+    attach_source_text(&mut bytecode, program.source_text);
+    Ok(bytecode)
 }
 
 /// Names of top-level hoistable function declarations — plain

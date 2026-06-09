@@ -27,6 +27,7 @@ pub(crate) fn compile_function_full(
     let is_method = std::mem::take(&mut parent.next_fn_is_method);
     let static_home = std::mem::take(&mut parent.next_fn_static_home);
     let no_self_name = std::mem::take(&mut parent.next_fn_no_self_name);
+    let source_text_span = std::mem::take(&mut parent.next_fn_source_text_span);
     let module = Rc::clone(&parent.top_mut().module);
     let body_has_strict_directive = match body {
         Some(b) => b.has_use_strict_directive(),
@@ -108,6 +109,7 @@ pub(crate) fn compile_function_full(
         id: function_id,
         name: name.to_string(),
         span,
+        source_text_span,
         is_strict: function_is_strict,
         module_url: parent.module_url.clone(),
         ..Default::default()

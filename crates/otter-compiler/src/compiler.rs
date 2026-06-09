@@ -46,6 +46,12 @@ pub(crate) struct Compiler {
     /// scope) without marking the record as a MethodDefinition (a
     /// class constructor IS a constructor).
     pub(crate) next_fn_no_self_name: bool,
+    /// One-shot byte range for the next compiled function's §20.2.3.5
+    /// [[SourceText]] when it differs from the function-body span — a
+    /// concise method / accessor reports its enclosing
+    /// `MethodDefinition` (key and prefixes included). Consumed by
+    /// `compile_function_full`.
+    pub(crate) next_fn_source_text_span: Option<(u32, u32)>,
     /// Stack of private-field namespace ids — one per enclosing
     /// class declaration. The top entry is the namespace used to
     /// mangle every `#name` reference inside the current class
@@ -115,6 +121,7 @@ impl Compiler {
             next_fn_is_method: false,
             next_fn_static_home: false,
             next_fn_no_self_name: false,
+            next_fn_source_text_span: None,
             private_namespaces: Vec::new(),
             class_private_names: Vec::new(),
             class_private_ordered: Vec::new(),

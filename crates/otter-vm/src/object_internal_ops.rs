@@ -3345,6 +3345,17 @@ impl Interpreter {
         Ok(false)
     }
 
+    /// The `[[Prototype]]` an Array exotic object inherits from: a
+    /// per-instance override (a `class X extends Array` instance points
+    /// at `X.prototype`) when present, otherwise the realm's
+    /// %Array.prototype%. `null` for `extends null` is preserved.
+    fn array_get_prototype_value(&mut self, arr: crate::array::JsArray) -> Result<Value, VmError> {
+        match crate::array::prototype_override(arr, &self.gc_heap) {
+            Some(proto) => Ok(proto),
+            None => self.constructor_prototype_value("Array"),
+        }
+    }
+
     pub(crate) fn ordinary_get_value(
         &mut self,
         context: &ExecutionContext,
@@ -3436,19 +3447,17 @@ impl Interpreter {
                     }
                     if let Some(v) = crate::array::get_symbol_property(arr, &self.gc_heap, *sym) {
                         v
-                    } else if let Some(p) = self
-                        .constructor_prototype_value("Array")
-                        .ok()
-                        .and_then(|v| v.as_object())
-                    {
-                        return self.ordinary_get_value(
-                            context,
-                            Value::object(p),
-                            receiver,
-                            key,
-                            hops + 1,
-                        );
                     } else {
+                        let proto = self.array_get_prototype_value(arr)?;
+                        if proto.is_object_type() {
+                            return self.ordinary_get_value(
+                                context,
+                                proto,
+                                receiver,
+                                key,
+                                hops + 1,
+                            );
+                        }
                         Value::undefined()
                     }
                 }
@@ -3469,11 +3478,16 @@ impl Interpreter {
                     match crate::array::get_named_property(arr, &self.gc_heap, key_str) {
                         Some(v) => v,
                         None => {
-                            let proto = self.constructor_prototype_value("Array")?;
-                            if let Some(proto_obj) = proto.as_object() {
+                            // §10.4.2.4 — walk the array's *actual*
+                            // [[Prototype]] so a `class X extends Array`
+                            // instance observes the subclass prototype's
+                            // inherited accessors / data properties, not
+                            // just %Array.prototype%.
+                            let proto = self.array_get_prototype_value(arr)?;
+                            if proto.is_object_type() {
                                 return self.ordinary_get_value(
                                     context,
-                                    Value::object(proto_obj),
+                                    proto,
                                     receiver,
                                     key,
                                     hops + 1,

@@ -1058,7 +1058,29 @@ impl Interpreter {
             };
             match direct {
                 Some(value) => value,
-                None => self.load_from_constructor_prototype(context, "Array", v, name)?,
+                // §10.4.2.4 — walk the array's *actual* [[Prototype]]: a
+                // `class X extends Array` instance carries a per-instance
+                // override (`X.prototype`), so inherited subclass
+                // accessors / data properties resolve, not only
+                // %Array.prototype%.
+                None => match crate::array::prototype_override(a, &self.gc_heap) {
+                    Some(proto) if proto.is_object_type() => {
+                        match self.ordinary_get_value(
+                            context,
+                            proto,
+                            *v,
+                            &crate::VmPropertyKey::String(name),
+                            0,
+                        )? {
+                            VmGetOutcome::Value(val) => val,
+                            VmGetOutcome::InvokeGetter { getter } => {
+                                self.run_callable_sync(context, &getter, *v, SmallVec::new())?
+                            }
+                        }
+                    }
+                    Some(_) => Value::undefined(),
+                    None => self.load_from_constructor_prototype(context, "Array", v, name)?,
+                },
             }
         } else if let Some(fid) = receiver.as_function().or_else(|| {
             receiver

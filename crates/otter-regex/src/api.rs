@@ -39,7 +39,7 @@ use crate::program::Program;
 /// Cheap to share by reference; holds the lowered [`Program`] and the flags it
 /// was compiled under. Construct with [`Regex::compile_utf16`] (the primary
 /// path for UTF-16 hosts) or [`Regex::compile_str`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Regex {
     program: Program,
     flags: Flags,

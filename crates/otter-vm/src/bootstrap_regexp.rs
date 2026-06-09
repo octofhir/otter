@@ -555,12 +555,16 @@ fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
             .to_lossy_string(ctx.heap())
     };
 
-    let heap = ctx.heap_mut();
-    let re = JsRegExp::compile(heap, &pattern_utf16, &flags_str).map_err(|err| {
-        NativeError::SyntaxError {
-            name: "RegExp",
-            reason: format!("{err}"),
-        }
+    let interp = ctx.interp_mut();
+    let re = JsRegExp::compile_cached(
+        &mut interp.gc_heap,
+        &mut interp.regex_compile_cache,
+        &pattern_utf16,
+        &flags_str,
+    )
+    .map_err(|err| NativeError::SyntaxError {
+        name: "RegExp",
+        reason: format!("{err}"),
     })?;
     if let Some(proto) = crate::bootstrap::native_new_target_prototype(ctx, "RegExp")? {
         re.set_prototype_override(ctx.heap_mut(), Some(proto));

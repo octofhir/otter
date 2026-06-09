@@ -85,6 +85,84 @@ pub(crate) mod engine {
 /// - <https://en.wikipedia.org/wiki/ReDoS>
 pub const REGEX_BACKTRACK_BUDGET: u64 = 10_000_000;
 
+/// Per-isolate cache of compiled regex programs.
+///
+/// Owned by the [`crate::Interpreter`] (one per isolate) — **not** a
+/// process- or thread-global, so it never bleeds compiled state across
+/// isolates that share a worker thread, and it is dropped with its
+/// isolate. The same regex literal re-evaluated in a hot loop (or
+/// `new RegExp(samePattern)`) is the common case; recompiling a large
+/// pattern (e.g. the multi-kilobyte Unicode-property classes test262's
+/// `nativeFunctionMatcher` rebuilds on every call) dominated runtime. A
+/// cache hit clones the lowered program (a `memcpy`) instead of
+/// re-parsing and re-lowering.
+///
+/// # Invariants
+/// - A compiled [`engine::Regex`] is a pure function of `(pattern,
+///   engine-relevant flags)` and carries no isolate-specific or GC
+///   state, so caching and cloning it is always sound.
+/// - Bounded: once [`Self::CAP`] distinct programs are cached the table
+///   is cleared wholesale, so a generator of unique patterns cannot grow
+///   it without bound while the hot-loop fast path stays intact.
+#[derive(Debug, Default)]
+pub(crate) struct RegexCompileCache {
+    /// Keyed by the five engine-relevant flag bits, then pattern source.
+    by_flags:
+        std::collections::HashMap<CompileKey, std::collections::HashMap<String, engine::Regex>>,
+}
+
+/// Engine-relevant flag bits that select a distinct compiled program.
+/// `g`/`y`/`d` never reach the matcher, so two patterns sharing these
+/// five bits compile to the identical program.
+type CompileKey = (bool, bool, bool, bool, bool);
+
+impl RegexCompileCache {
+    /// Maximum distinct cached programs before the cache is cleared.
+    const CAP: usize = 1024;
+
+    /// Return the compiled program for `(source, flags)`, compiling and
+    /// caching it on a miss.
+    pub(crate) fn get_or_compile(
+        &mut self,
+        source: &str,
+        ignore_case: bool,
+        multiline: bool,
+        dot_all: bool,
+        unicode: bool,
+        unicode_sets: bool,
+    ) -> Result<engine::Regex, String> {
+        let key: CompileKey = (ignore_case, multiline, dot_all, unicode, unicode_sets);
+        if let Some(hit) = self
+            .by_flags
+            .get(&key)
+            .and_then(|by_source| by_source.get(source))
+        {
+            return Ok(hit.clone());
+        }
+        let regex = engine::compile(
+            source,
+            ignore_case,
+            multiline,
+            dot_all,
+            unicode,
+            unicode_sets,
+        )?;
+        let total: usize = self
+            .by_flags
+            .values()
+            .map(std::collections::HashMap::len)
+            .sum();
+        if total >= Self::CAP {
+            self.by_flags.clear();
+        }
+        self.by_flags
+            .entry(key)
+            .or_default()
+            .insert(source.to_owned(), regex.clone());
+        Ok(regex)
+    }
+}
+
 use crate::Value;
 use crate::number::NumberValue;
 
@@ -293,6 +371,43 @@ impl JsRegExp {
             flags.unicode_sets,
         )
         .map_err(|message| RegExpError::InvalidPattern { message })?;
+        Ok(Self {
+            inner: heap.alloc_old(JsRegExpBody {
+                regex,
+                pattern_utf16: pattern_utf16.to_vec(),
+                source,
+                flags,
+                last_index: RefCell::new(Value::number_i32(0)),
+                last_index_writable: true,
+                expando: None,
+                extensible: true,
+                prototype_override: None,
+            })?,
+        })
+    }
+
+    /// Like [`Self::compile`] but resolves the program through a
+    /// per-isolate [`RegexCompileCache`], so a regex literal evaluated
+    /// repeatedly (or `new RegExp` over a repeated pattern) re-parses the
+    /// pattern only once per isolate.
+    pub(crate) fn compile_cached(
+        heap: &mut otter_gc::GcHeap,
+        cache: &mut RegexCompileCache,
+        pattern_utf16: &[u16],
+        flag_str: &str,
+    ) -> Result<Self, RegExpError> {
+        let flags = RegExpFlags::parse(flag_str)?;
+        let source = String::from_utf16_lossy(pattern_utf16);
+        let regex = cache
+            .get_or_compile(
+                &source,
+                flags.ignore_case,
+                flags.multiline,
+                flags.dot_all,
+                flags.unicode,
+                flags.unicode_sets,
+            )
+            .map_err(|message| RegExpError::InvalidPattern { message })?;
         Ok(Self {
             inner: heap.alloc_old(JsRegExpBody {
                 regex,

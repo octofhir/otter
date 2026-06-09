@@ -572,6 +572,11 @@ pub struct Interpreter {
     /// falling back to the string-name path. See
     /// [`crate::realm_intrinsics::RealmIntrinsics`].
     realm_intrinsics: realm_intrinsics::RealmIntrinsics,
+    /// Per-isolate cache of compiled regex programs, keyed by pattern +
+    /// engine-relevant flags. Re-evaluating the same regex literal (or
+    /// `new RegExp` over a repeated pattern) reuses the lowered program
+    /// instead of re-parsing it. See [`crate::regexp::RegexCompileCache`].
+    regex_compile_cache: regexp::RegexCompileCache,
     /// Optional step-trace observer. When `Some`, the dispatch loop
     /// emits one [`inspect::StepEvent`] per instruction. When `None`,
     /// the hot path pays a single `Option` discriminant check and
@@ -962,6 +967,7 @@ impl Interpreter {
             function_kind_prototypes: function_kind::FunctionKindPrototypes::default(),
             cold_frames: cold_frame::ColdFramePool::new(),
             realm_intrinsics: realm_intrinsics::RealmIntrinsics::default(),
+            regex_compile_cache: regexp::RegexCompileCache::default(),
             tracer: None,
         };
         // Cache typed handles for the well-known constructors and

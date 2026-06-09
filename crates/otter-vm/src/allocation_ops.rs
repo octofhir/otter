@@ -711,12 +711,19 @@ impl Interpreter {
         let (pattern_utf16, flags) = context
             .regexp_constant(idx)
             .ok_or(VmError::InvalidOperand)?;
-        let regex =
-            regexp::JsRegExp::compile(&mut self.gc_heap, pattern_utf16, flags).map_err(|e| {
-                VmError::InvalidRegExp {
-                    message: e.to_string(),
-                }
-            })?;
+        // A regex literal evaluates to a fresh RegExp each time, but the
+        // *compiled* program is a pure function of pattern + flags, so
+        // resolve it through the per-isolate compile cache (a disjoint
+        // field borrow with `gc_heap`) to skip re-parsing on every eval.
+        let regex = regexp::JsRegExp::compile_cached(
+            &mut self.gc_heap,
+            &mut self.regex_compile_cache,
+            pattern_utf16,
+            flags,
+        )
+        .map_err(|e| VmError::InvalidRegExp {
+            message: e.to_string(),
+        })?;
         write_register(frame, dst, Value::regexp(regex))?;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())

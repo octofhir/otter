@@ -2785,6 +2785,23 @@ impl Interpreter {
         self.iteration_anchors.truncate(depth);
     }
 
+    /// Overwrite an existing iteration-anchor slot. Used by loops that
+    /// carry a *mutating* rooted value (an accumulator, the current
+    /// element) across a reentrant callback: the slot is refreshed
+    /// before each callback so a moving scavenge rewrites the live
+    /// value, and read back afterwards via [`Self::iteration_anchor`].
+    pub(crate) fn set_iteration_anchor(&mut self, index: usize, value: Value) {
+        self.iteration_anchors[index] = value;
+    }
+
+    /// Read an iteration-anchor slot back after a reentrant callback —
+    /// a moving scavenge rewrites the slot in place, so this returns the
+    /// relocated handle.
+    #[must_use]
+    pub(crate) fn iteration_anchor(&self, index: usize) -> Value {
+        self.iteration_anchors[index]
+    }
+
     /// Consume the pending uncaught-throw payload, if any. Embedder
     /// callers that catch a `VmError::Uncaught` at a sync entry
     /// point use this to recover the original thrown

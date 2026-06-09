@@ -2729,7 +2729,7 @@ pub(crate) fn array_callback_native_dispatch(
         });
     }
     let callback_roots = [receiver, callback, this_arg];
-    let output_target = match name {
+    let mut output_target = match name {
         "map" => Some(
             interp
                 .array_species_create(&context, receiver, len, &[args, &callback_roots])
@@ -2831,34 +2831,98 @@ pub(crate) fn array_callback_native_dispatch(
     if (name == "reduce" || name == "reduceRight") && reduce_has_init {
         acc = args[1];
     }
-    for idx in index_iter {
-        // Live `HasProperty(O, k)` + `Get(O, k)`. An absent index reads
-        // as `(false, undefined)`; `find`-family methods visit it anyway.
-        let (present, v) = if let Some(s) = string_data {
-            match s.char_code_at(idx as u32, interp.gc_heap()) {
-                Some(unit) => {
-                    let ch =
-                        crate::string::JsString::from_utf16_units(&[unit], interp.gc_heap_mut())
-                            .map(Value::string)
-                            .map_err(|_| NativeError::TypeError {
-                                name: "Array.prototype callback",
-                                reason: "out of memory".to_string(),
-                            })?;
-                    (true, ch)
+    // Root every heap handle the loop carries across a reentrant callback
+    // (or an element getter) on the interpreter's iteration-anchor stack
+    // — the same mechanism `flatMap` (above) and the rest of the VM use.
+    // A moving young-generation scavenge triggered inside
+    // `run_callable_sync` rewrites these slots in place, so the loop
+    // reads each handle back through `iteration_anchor` at the point of
+    // use rather than trusting a stale Rust local. Without this the
+    // receiver array would be left dangling and the walk would mis-read
+    // it as a generic array-like (a spurious `TypeError`).
+    const A_RECEIVER: usize = 0;
+    const A_CALLBACK: usize = 1;
+    const A_CB_THIS: usize = 2;
+    const A_OUTPUT: usize = 3;
+    const A_STRING: usize = 4;
+    const A_ACC: usize = 5;
+    const A_ELEM: usize = 6;
+    let anchor_base = interp.iteration_anchors_for_trace().len();
+    interp.push_iteration_anchor(receiver);
+    interp.push_iteration_anchor(callback);
+    interp.push_iteration_anchor(cb_this);
+    interp.push_iteration_anchor(output_target.unwrap_or_else(Value::undefined));
+    interp.push_iteration_anchor(string_data.map_or_else(Value::undefined, Value::string));
+    interp.push_iteration_anchor(acc);
+    interp.push_iteration_anchor(Value::undefined());
+    // Run the walk inside a closure so the matching
+    // `pop_iteration_anchors_to` always runs — on normal completion and
+    // on every `?` error — without threading a manual cleanup through
+    // each fallible step (mirrors `flatMap`'s capture-then-pop above).
+    let walk: Result<(), NativeError> = (|| {
+        for idx in index_iter {
+            let receiver = interp.iteration_anchor(anchor_base + A_RECEIVER);
+            let string_data = interp
+                .iteration_anchor(anchor_base + A_STRING)
+                .as_string(interp.gc_heap());
+            // Live `HasProperty(O, k)` + `Get(O, k)`. An absent index
+            // reads as `(false, undefined)`; `find`-family methods visit
+            // it anyway.
+            let (present, v) = if let Some(s) = string_data {
+                match s.char_code_at(idx as u32, interp.gc_heap()) {
+                    Some(unit) => {
+                        let ch = crate::string::JsString::from_utf16_units(
+                            &[unit],
+                            interp.gc_heap_mut(),
+                        )
+                        .map(Value::string)
+                        .map_err(|_| NativeError::TypeError {
+                            name: "Array.prototype callback",
+                            reason: "out of memory".to_string(),
+                        })?;
+                        (true, ch)
+                    }
+                    None => (false, Value::undefined()),
                 }
-                None => (false, Value::undefined()),
-            }
-        } else if let Some(arr) = receiver.as_array() {
-            // A present own element (data or accessor) reads through the
-            // ordinary `[[Get]]`. An absent index (hole / beyond the
-            // element store but `< len`) is not skipped outright:
-            // §10.4.2.4 [[Get]] walks the Array.prototype chain, so an
-            // inherited `Array.prototype[k]` is observed; a hole with no
-            // inherited value reads as absent.
-            let key = idx.to_string();
-            let present = crate::array::has_own_element(arr, interp.gc_heap(), idx)
-                || crate::array::get_accessor(arr, interp.gc_heap(), &key).is_some()
-                || interp
+            } else if let Some(arr) = receiver.as_array() {
+                // A present own element (data or accessor) reads through
+                // the ordinary `[[Get]]`. An absent index (hole / beyond
+                // the element store but `< len`) is not skipped outright:
+                // §10.4.2.4 [[Get]] walks the Array.prototype chain, so an
+                // inherited `Array.prototype[k]` is observed; a hole with
+                // no inherited value reads as absent.
+                let key = idx.to_string();
+                let present = crate::array::has_own_element(arr, interp.gc_heap(), idx)
+                    || crate::array::get_accessor(arr, interp.gc_heap(), &key).is_some()
+                    || interp
+                        .ordinary_has_property_value(
+                            &context,
+                            receiver,
+                            &crate::VmPropertyKey::String(&key),
+                            0,
+                        )
+                        .map_err(|err| {
+                            crate::native_function::vm_to_native_error(
+                                err,
+                                "Array.prototype callback",
+                            )
+                        })?;
+                if present {
+                    let v = interp
+                        .get_property_value_for_call(&context, receiver, &key)
+                        .map_err(|err| {
+                            crate::native_function::vm_to_native_error(
+                                err,
+                                "Array.prototype callback",
+                            )
+                        })?;
+                    (true, v)
+                } else {
+                    (false, Value::undefined())
+                }
+            } else {
+                let key = idx.to_string();
+                let has = interp
                     .ordinary_has_property_value(
                         &context,
                         receiver,
@@ -2868,104 +2932,112 @@ pub(crate) fn array_callback_native_dispatch(
                     .map_err(|err| {
                         crate::native_function::vm_to_native_error(err, "Array.prototype callback")
                     })?;
-            if present {
-                let v = interp
-                    .get_property_value_for_call(&context, receiver, &key)
-                    .map_err(|err| {
-                        crate::native_function::vm_to_native_error(err, "Array.prototype callback")
-                    })?;
-                (true, v)
-            } else {
-                (false, Value::undefined())
+                if has {
+                    let v = interp
+                        .get_property_value_for_call(&context, receiver, &key)
+                        .map_err(|err| {
+                            crate::native_function::vm_to_native_error(
+                                err,
+                                "Array.prototype callback",
+                            )
+                        })?;
+                    (true, v)
+                } else {
+                    (false, Value::undefined())
+                }
+            };
+            if !present && !visit_all {
+                continue;
             }
-        } else {
-            let key = idx.to_string();
-            let has = interp
-                .ordinary_has_property_value(
-                    &context,
-                    receiver,
-                    &crate::VmPropertyKey::String(&key),
-                    0,
-                )
+            // Re-root the receiver (a getter above may have moved it) and
+            // park the current element before the callback runs.
+            let receiver = interp.iteration_anchor(anchor_base + A_RECEIVER);
+            interp.set_iteration_anchor(anchor_base + A_ELEM, v);
+            let cb_args: SmallVec<[Value; 8]> = match name {
+                "reduce" | "reduceRight" => {
+                    if !reduce_has_init {
+                        acc = v;
+                        reduce_has_init = true;
+                        interp.set_iteration_anchor(anchor_base + A_ACC, acc);
+                        continue;
+                    }
+                    let acc_now = interp.iteration_anchor(anchor_base + A_ACC);
+                    smallvec::smallvec![acc_now, v, Value::number_f64(idx as f64), receiver,]
+                }
+                _ => smallvec::smallvec![v, Value::number_f64(idx as f64), receiver,],
+            };
+            let callback = interp.iteration_anchor(anchor_base + A_CALLBACK);
+            let cb_this = interp.iteration_anchor(anchor_base + A_CB_THIS);
+            let result = interp
+                .run_callable_sync(&context, &callback, cb_this, cb_args)
                 .map_err(|err| {
                     crate::native_function::vm_to_native_error(err, "Array.prototype callback")
                 })?;
-            if has {
-                let v = interp
-                    .get_property_value_for_call(&context, receiver, &key)
-                    .map_err(|err| {
-                        crate::native_function::vm_to_native_error(err, "Array.prototype callback")
-                    })?;
-                (true, v)
-            } else {
-                (false, Value::undefined())
-            }
-        };
-        if !present && !visit_all {
-            continue;
-        }
-        let cb_args: SmallVec<[Value; 8]> = match name {
-            "reduce" | "reduceRight" => {
-                if !reduce_has_init {
-                    acc = v;
-                    reduce_has_init = true;
-                    continue;
+            // The callback may have moved the element / output target.
+            let v = interp.iteration_anchor(anchor_base + A_ELEM);
+            match name {
+                "forEach" => {}
+                "map" => {
+                    let target = interp.iteration_anchor(anchor_base + A_OUTPUT);
+                    if target.is_undefined() {
+                        return Err(NativeError::TypeError {
+                            name: "map",
+                            reason: "missing output target".to_string(),
+                        });
+                    }
+                    let key = format_index_key(idx as f64);
+                    interp
+                        .create_data_property_or_throw(&context, target, &key, result)
+                        .map_err(|err| crate::native_function::vm_to_native_error(err, "map"))?;
                 }
-                smallvec::smallvec![acc, v, Value::number_f64(idx as f64), receiver,]
+                "filter" if result.to_boolean(interp.gc_heap()) => {
+                    let target = interp.iteration_anchor(anchor_base + A_OUTPUT);
+                    if target.is_undefined() {
+                        return Err(NativeError::TypeError {
+                            name: "filter",
+                            reason: "missing output target".to_string(),
+                        });
+                    }
+                    let key = format_index_key(target_index as f64);
+                    interp
+                        .create_data_property_or_throw(&context, target, &key, v)
+                        .map_err(|err| crate::native_function::vm_to_native_error(err, "filter"))?;
+                    target_index += 1;
+                }
+                "find" | "findLast" if result.to_boolean(interp.gc_heap()) => {
+                    found_val = v;
+                    found_idx = Some(idx);
+                    break;
+                }
+                "findIndex" | "findLastIndex" if result.to_boolean(interp.gc_heap()) => {
+                    found_idx = Some(idx);
+                    break;
+                }
+                "every" if !result.to_boolean(interp.gc_heap()) => {
+                    bool_acc = false;
+                    break;
+                }
+                "some" if result.to_boolean(interp.gc_heap()) => {
+                    bool_acc = true;
+                    break;
+                }
+                "reduce" | "reduceRight" => {
+                    acc = result;
+                    interp.set_iteration_anchor(anchor_base + A_ACC, acc);
+                }
+                _ => {}
             }
-            _ => smallvec::smallvec![v, Value::number_f64(idx as f64), receiver,],
-        };
-        let result = interp
-            .run_callable_sync(&context, &callback, cb_this, cb_args)
-            .map_err(|err| {
-                crate::native_function::vm_to_native_error(err, "Array.prototype callback")
-            })?;
-        match name {
-            "forEach" => {}
-            "map" => {
-                let target = output_target.ok_or(NativeError::TypeError {
-                    name: "map",
-                    reason: "missing output target".to_string(),
-                })?;
-                let key = format_index_key(idx as f64);
-                interp
-                    .create_data_property_or_throw(&context, target, &key, result)
-                    .map_err(|err| crate::native_function::vm_to_native_error(err, "map"))?;
-            }
-            "filter" if result.to_boolean(interp.gc_heap()) => {
-                let target = output_target.ok_or(NativeError::TypeError {
-                    name: "filter",
-                    reason: "missing output target".to_string(),
-                })?;
-                let key = format_index_key(target_index as f64);
-                interp
-                    .create_data_property_or_throw(&context, target, &key, v)
-                    .map_err(|err| crate::native_function::vm_to_native_error(err, "filter"))?;
-                target_index += 1;
-            }
-            "find" | "findLast" if result.to_boolean(interp.gc_heap()) => {
-                found_val = v;
-                found_idx = Some(idx);
-                break;
-            }
-            "findIndex" | "findLastIndex" if result.to_boolean(interp.gc_heap()) => {
-                found_idx = Some(idx);
-                break;
-            }
-            "every" if !result.to_boolean(interp.gc_heap()) => {
-                bool_acc = false;
-                break;
-            }
-            "some" if result.to_boolean(interp.gc_heap()) => {
-                bool_acc = true;
-                break;
-            }
-            "reduce" | "reduceRight" => {
-                acc = result;
-            }
-            _ => {}
         }
-    }
+        Ok(())
+    })();
+    // Read the (possibly relocated) output target and accumulator back
+    // before releasing the anchors so the final result returns a live
+    // handle. `map`/`filter`/`flatMap` keep their target identity; other
+    // methods stay `None`.
+    output_target = output_target.map(|_| interp.iteration_anchor(anchor_base + A_OUTPUT));
+    acc = interp.iteration_anchor(anchor_base + A_ACC);
+    interp.pop_iteration_anchors_to(anchor_base);
+    walk?;
     match name {
         "forEach" => Ok(Value::undefined()),
         "find" | "findLast" => Ok(found_val),

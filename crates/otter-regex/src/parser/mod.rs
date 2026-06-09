@@ -642,6 +642,16 @@ impl<'a> Parser<'a> {
                 }
             }
             x if (b'1' as u16..=b'9' as u16).contains(&x) => self.parse_numeric_backref(),
+            // §22.2.1 — in `v` mode an atom-position `\p{...}` / `\P{...}`
+            // may name a string property (e.g. `\p{RGI_Emoji}`), which
+            // contributes string alternatives, so route it through the
+            // set-aware resolver.
+            x if (x == b'p' as u16 || x == b'P' as u16) && self.flags.unicode_sets => {
+                let negate = x == b'P' as u16;
+                self.pos += 1; // consume `p` / `P`
+                let set = self.parse_property_set_v(negate)?;
+                Ok(self.class_node(set, false))
+            }
             _ => {
                 if let Some(set) = self.try_class_escape_set()? {
                     let (set, negate) = set;

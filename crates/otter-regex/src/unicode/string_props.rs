@@ -20,6 +20,10 @@
 use crate::classes::{ClassSet, CodePointSet};
 use crate::error::RegexError;
 
+mod emoji_data {
+    include!(concat!(env!("OUT_DIR"), "/emoji_data.rs"));
+}
+
 /// The `v`-flag string-property names recognised by the parser (§22.2.1
 /// `ClassSetExpression`). Only `Basic_Emoji` is backed by data today;
 /// the RGI emoji-sequence properties need a UCD codegen pipeline that is
@@ -39,45 +43,83 @@ pub(crate) fn is_string_property(name: &str) -> bool {
     )
 }
 
-/// Resolve a `v`-flag string property (e.g. `Basic_Emoji`) to its class
-/// set (code points plus multi-code-point string alternatives).
-#[cfg(feature = "unicode")]
-pub(crate) fn resolve_string_property(name: &str) -> Result<ClassSet, RegexError> {
-    use icu_properties::EmojiSetData;
-    use icu_properties::props::BasicEmoji;
+/// Build a [`ClassSet`] from generated `(ranges, strings)` tables.
+fn class_set_from(ranges: &[(u32, u32)], strings: &[&[u32]]) -> ClassSet {
+    let mut code_points = CodePointSet::new();
+    for (lo, hi) in ranges {
+        code_points.insert_range(*lo, *hi);
+    }
+    let mut set = ClassSet::from_code_points(code_points);
+    for s in strings {
+        set.add_alternative(s.to_vec());
+    }
+    set
+}
 
-    let data = match name {
-        "Basic_Emoji" => EmojiSetData::new::<BasicEmoji>().static_to_owned(),
-        // §22.2.1 string properties whose sequence data `icu_properties`
-        // does not ship as a usable set in this build.
+/// Resolve a `v`-flag string property (e.g. `Basic_Emoji`, `RGI_Emoji`)
+/// to its class set: single-code-point members plus multi-code-point
+/// string alternatives. Backed by build-time codegen from the vendored
+/// UCD `emoji-sequences.txt` / `emoji-zwj-sequences.txt`. `RGI_Emoji` is
+/// the union of every emoji-sequence property (UTS#51).
+pub(crate) fn resolve_string_property(name: &str) -> Result<ClassSet, RegexError> {
+    use emoji_data as e;
+    let set = match name {
+        "Basic_Emoji" => class_set_from(e::BASIC_EMOJI_RANGES, e::BASIC_EMOJI_STRINGS),
+        "Emoji_Keycap_Sequence" => class_set_from(
+            e::EMOJI_KEYCAP_SEQUENCE_RANGES,
+            e::EMOJI_KEYCAP_SEQUENCE_STRINGS,
+        ),
+        "RGI_Emoji_Flag_Sequence" => class_set_from(
+            e::RGI_EMOJI_FLAG_SEQUENCE_RANGES,
+            e::RGI_EMOJI_FLAG_SEQUENCE_STRINGS,
+        ),
+        "RGI_Emoji_Modifier_Sequence" => class_set_from(
+            e::RGI_EMOJI_MODIFIER_SEQUENCE_RANGES,
+            e::RGI_EMOJI_MODIFIER_SEQUENCE_STRINGS,
+        ),
+        "RGI_Emoji_Tag_Sequence" => class_set_from(
+            e::RGI_EMOJI_TAG_SEQUENCE_RANGES,
+            e::RGI_EMOJI_TAG_SEQUENCE_STRINGS,
+        ),
+        "RGI_Emoji_ZWJ_Sequence" => class_set_from(
+            e::RGI_EMOJI_ZWJ_SEQUENCE_RANGES,
+            e::RGI_EMOJI_ZWJ_SEQUENCE_STRINGS,
+        ),
+        "RGI_Emoji" => {
+            // §22.2.1 RGI_Emoji is the union of every emoji-sequence set.
+            let mut set = class_set_from(e::BASIC_EMOJI_RANGES, e::BASIC_EMOJI_STRINGS);
+            for part in [
+                class_set_from(
+                    e::EMOJI_KEYCAP_SEQUENCE_RANGES,
+                    e::EMOJI_KEYCAP_SEQUENCE_STRINGS,
+                ),
+                class_set_from(
+                    e::RGI_EMOJI_FLAG_SEQUENCE_RANGES,
+                    e::RGI_EMOJI_FLAG_SEQUENCE_STRINGS,
+                ),
+                class_set_from(
+                    e::RGI_EMOJI_MODIFIER_SEQUENCE_RANGES,
+                    e::RGI_EMOJI_MODIFIER_SEQUENCE_STRINGS,
+                ),
+                class_set_from(
+                    e::RGI_EMOJI_TAG_SEQUENCE_RANGES,
+                    e::RGI_EMOJI_TAG_SEQUENCE_STRINGS,
+                ),
+                class_set_from(
+                    e::RGI_EMOJI_ZWJ_SEQUENCE_RANGES,
+                    e::RGI_EMOJI_ZWJ_SEQUENCE_STRINGS,
+                ),
+            ] {
+                set.union_with(&part);
+            }
+            set
+        }
         _ => {
             return Err(RegexError::Syntax {
-                message: format!("unsupported Unicode string property `{name}`"),
+                message: format!("unknown Unicode string property `{name}`"),
                 offset: usize::MAX,
             });
         }
     };
-    let list = data
-        .as_code_point_inversion_list_string_list()
-        .ok_or_else(|| RegexError::Syntax {
-            message: format!("string property `{name}` is unavailable"),
-            offset: usize::MAX,
-        })?;
-    let mut code_points = CodePointSet::new();
-    for range in list.code_points().iter_ranges() {
-        code_points.insert_range(*range.start(), *range.end());
-    }
-    let mut set = ClassSet::from_code_points(code_points);
-    for s in list.strings().iter() {
-        set.add_alternative(s.chars().map(u32::from).collect());
-    }
     Ok(set)
-}
-
-#[cfg(not(feature = "unicode"))]
-pub(crate) fn resolve_string_property(_name: &str) -> Result<ClassSet, RegexError> {
-    Err(RegexError::Syntax {
-        message: "string properties require the `unicode` feature".to_string(),
-        offset: usize::MAX,
-    })
 }

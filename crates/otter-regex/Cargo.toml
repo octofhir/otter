@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 license = "MIT"
 description = "Standalone, VM-agnostic ECMAScript RegExp engine for Otter (clean-room)."
+build = "build.rs"
 
 # Dependency allowlist — ZERO Otter crates. The dependency edge is one-way:
 # the VM consumes this engine; this engine never reaches back into the VM/GC.

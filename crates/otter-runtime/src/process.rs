@@ -330,6 +330,29 @@ fn process_memory_usage(
     Ok(Value::object(object))
 }
 
+/// Resolve `%Function.prototype%` through the realm's `Function`
+/// constructor on `globalThis`. The constructor is a `NativeFunction`
+/// (its `prototype` lives in the native own-property table, not on a
+/// backing `JsObject`), so read it through the descriptor; a plain
+/// `JsObject` constructor is also handled. Returns `None` only if the
+/// global graph has not been bootstrapped.
+fn function_prototype_object(interp: &mut Interpreter) -> Option<otter_vm::object::JsObject> {
+    let global = *interp.global_this();
+    let function_ctor = otter_vm::object::get(global, interp.gc_heap(), "Function")?;
+    if let Some(native) = function_ctor.as_native_function() {
+        return native
+            .own_property_descriptor(interp.gc_heap_mut(), "prototype")
+            .ok()
+            .flatten()
+            .and_then(|desc| match desc.kind {
+                otter_vm::object::DescriptorKind::Data { value } => value.as_object(),
+                _ => None,
+            });
+    }
+    let ctor = function_ctor.as_object()?;
+    otter_vm::object::get(ctor, interp.gc_heap(), "prototype")?.as_object()
+}
+
 fn hrtime_value(interp: &mut Interpreter, start: Instant) -> Result<Value, otter_gc::OutOfMemory> {
     let function =
         interp.native_function_from_call_host_rooted("hrtime", 1, hrtime_call(start), &[], &[])?;
@@ -343,6 +366,16 @@ fn hrtime_value(interp: &mut Interpreter, start: Instant) -> Result<Value, otter
     let object = interp.alloc_host_object_with_roots(&[&function, &bigint], &[])?;
     otter_vm::object::set_call_native(object, interp.gc_heap_mut(), function);
     otter_vm::object::set(object, interp.gc_heap_mut(), "bigint", bigint);
+    // `process.hrtime` is a callable host object (so it can carry the
+    // `.bigint` own property), but a host object defaults to a null
+    // `[[Prototype]]`. A callable with no `%Function.prototype%` in its
+    // chain has no `toString` / `valueOf`, so `String(process.hrtime)`
+    // (and any `ToPrimitive`) throws instead of yielding the native
+    // form. Re-seat it on `%Function.prototype%` to match an ordinary
+    // function object.
+    if let Some(function_prototype) = function_prototype_object(interp) {
+        otter_vm::object::set_prototype(object, interp.gc_heap_mut(), Some(function_prototype));
+    }
     Ok(Value::object(object))
 }
 

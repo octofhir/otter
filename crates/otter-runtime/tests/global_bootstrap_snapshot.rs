@@ -73,6 +73,7 @@ Date w.c function
 Error w.c function
 EvalError w.c function
 FinalizationRegistry w.c function
+Float16Array w.c function
 Float32Array w.c function
 Float64Array w.c function
 Function w.c function
@@ -109,6 +110,11 @@ Uint8ClampedArray w.c function
 WeakMap w.c function
 WeakRef w.c function
 WeakSet w.c function
+Worker w.c function
+__otter_worker_drain w.c function
+__otter_worker_post_message w.c function
+__otter_worker_spawn w.c function
+__otter_worker_terminate w.c function
 clearInterval w.c function
 clearTimeout w.c function
 console w.c object

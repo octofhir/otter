@@ -242,9 +242,10 @@ pub fn data_view_call(
             };
             let view =
                 JsDataView::new(gc_heap, buffer, byte_offset, byte_length).map_err(oom_to_vm)?;
-            // §25.3.4.1 — an absent byteLength over a resizable buffer
+            // §25.3.4.1 — an absent byteLength over a length-resizable
+            // buffer (resizable ArrayBuffer or growable SharedArrayBuffer)
             // makes the view length-tracking (AUTO).
-            if length_absent && buffer.is_resizable(gc_heap) {
+            if length_absent && (buffer.is_resizable(gc_heap) || buffer.is_growable(gc_heap)) {
                 view.set_length_tracking(gc_heap);
             }
             Ok(Value::data_view(view))
@@ -405,10 +406,11 @@ fn construct_typed_array_with_roots(
             }
         };
         let view = JsTypedArray::new(gc_heap, buf, kind, byte_offset, length).map_err(oom_to_vm)?;
-        // §23.2.5.1 — absent length over a resizable buffer makes
+        // §23.2.5.1 — absent length over a length-resizable buffer (a
+        // resizable ArrayBuffer or a growable SharedArrayBuffer) makes
         // [[ArrayLength]] AUTO (length-tracking).
         let length_absent = args.get(2).is_none() || args.get(2).is_some_and(|v| v.is_undefined());
-        if length_absent && buf.is_resizable(gc_heap) {
+        if length_absent && (buf.is_resizable(gc_heap) || buf.is_growable(gc_heap)) {
             view.set_length_tracking(gc_heap);
         }
         return Ok(Value::typed_array(view));

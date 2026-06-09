@@ -188,9 +188,10 @@ fn data_view_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
                 name: "DataView",
                 reason: "out of memory".to_string(),
             })?;
-    // §25.3.2.1 — an absent byteLength over a resizable buffer makes the
+    // §25.3.2.1 — an absent byteLength over a length-resizable buffer
+    // (resizable ArrayBuffer or growable SharedArrayBuffer) makes the
     // view length-tracking (AUTO byte length).
-    if length_absent && buffer.is_resizable(ctx.heap()) {
+    if length_absent && (buffer.is_resizable(ctx.heap()) || buffer.is_growable(ctx.heap())) {
         view.set_length_tracking(ctx.heap_mut());
     }
     let value = Value::data_view(view);

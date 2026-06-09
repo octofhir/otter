@@ -1751,10 +1751,12 @@ impl Interpreter {
         target: &Value,
         level: ObjectIntegrityLevel,
     ) -> Result<bool, VmError> {
-        let keys = self.own_property_keys_value(context, target)?;
+        // §7.3.15 steps 3-4 — `[[PreventExtensions]]` runs *before*
+        // `[[OwnPropertyKeys]]` (observable through Proxy trap order).
         if !self.prevent_extensions_value(context, target)? {
             return Ok(false);
         }
+        let keys = self.own_property_keys_value(context, target)?;
         for key_value in &keys {
             let key = property_key_value_to_vm_key(key_value, &self.gc_heap)?;
             let descriptor = match level {
@@ -1784,8 +1786,16 @@ impl Interpreter {
                     desc
                 }
             };
+            // §7.3.15 step 5.b / 6.b use DefinePropertyOrThrow, so a
+            // rejected redefinition throws a TypeError rather than making
+            // `SetIntegrityLevel` report `false`. This is what makes
+            // `Object.freeze`/`seal` throw on a non-empty TypedArray: its
+            // integer-indexed elements cannot be made non-configurable /
+            // non-writable, so `[[DefineOwnProperty]]` returns false.
             if !self.define_own_property_value(context, target, &key, descriptor)? {
-                return Ok(false);
+                return Err(VmError::TypeError {
+                    message: "Cannot redefine property during SetIntegrityLevel".to_string(),
+                });
             }
         }
         Ok(true)
@@ -3116,9 +3126,23 @@ impl Interpreter {
             object::prevent_extensions(obj, &mut self.gc_heap);
             return Ok(true);
         }
-        // §10.4.5 — a TypedArray's extensibility lives on its lazy
-        // expando bag (elements are exempt from [[Extensible]]).
+        // §10.4.5.4 TypedArray [[PreventExtensions]] returns `false` when
+        // `IsTypedArrayFixedLength(O)` is false, so the internal method —
+        // and therefore `Object.preventExtensions`/`freeze`/`seal` —
+        // throws. A view is *not* fixed-length when it length-tracks its
+        // buffer, or when it has an explicit length over a non-shared
+        // resizable buffer (which can shrink the view out of bounds). A
+        // view over a fixed-length buffer, or a fixed-length view over a
+        // growable SharedArrayBuffer (which only grows, never shrinks),
+        // is fixed-length and succeeds; its extensibility lives on the
+        // lazy expando bag (elements are exempt from [[Extensible]]).
         if let Some(t) = value.as_typed_array(&self.gc_heap) {
+            let buffer = t.buffer(&self.gc_heap);
+            let fixed_length = !t.is_length_tracking(&self.gc_heap)
+                && (!buffer.is_resizable(&self.gc_heap) || buffer.is_shared());
+            if !fixed_length {
+                return Ok(false);
+            }
             let bag =
                 crate::property_dispatch::typed_array_ensure_expando_pub(&mut self.gc_heap, &t)?;
             object::prevent_extensions(bag, &mut self.gc_heap);
@@ -4342,7 +4366,23 @@ impl Interpreter {
         ) && target
             .as_object()
             .is_some_and(|obj| crate::object::module_namespace_env(obj, &self.gc_heap).is_some());
-        if !target.is_proxy() && !namespace_integrity {
+        // §10.4.5 TypedArrays have exotic [[PreventExtensions]] /
+        // [[DefineOwnProperty]] / [[OwnPropertyKeys]], so integrity
+        // operations must run the generic §7.3.15 SetIntegrityLevel over
+        // those internal methods: a length-tracking TypedArray cannot be
+        // made non-extensible, and a non-empty one cannot be frozen or
+        // sealed (its integer-indexed elements stay writable and
+        // configurable), so both throw rather than silently succeeding.
+        let typed_array_integrity = matches!(
+            method,
+            M::Freeze
+                | M::Seal
+                | M::IsFrozen
+                | M::IsSealed
+                | M::IsExtensible
+                | M::PreventExtensions
+        ) && target.as_typed_array(&self.gc_heap).is_some();
+        if !target.is_proxy() && !namespace_integrity && !typed_array_integrity {
             return Ok(None);
         }
         match method {

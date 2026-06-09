@@ -52,8 +52,14 @@ pub static ARRAY_STATIC_METHODS: &[MethodSpec] = &[
     },
 ];
 
-fn native_is_array(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    Ok(Value::boolean(args.first().is_some_and(|v| v.is_array())))
+fn native_is_array(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let value = args.first().copied().unwrap_or_else(Value::undefined);
+    // §7.2.2 IsArray — shared with the `Op::IsArray` fast path so the
+    // direct call and `Array.isArray.call(...)` agree (Proxy recursion,
+    // revoked-Proxy TypeError).
+    let result = crate::abstract_ops::is_array(ctx.heap(), &value)
+        .map_err(|err| crate::native_function::vm_to_native_error(err, "Array.isArray"))?;
+    Ok(Value::boolean(result))
 }
 
 /// §23.1.2.2 `Array.of(...items)` JS-visible NativeFunction. Routes

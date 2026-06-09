@@ -5967,9 +5967,9 @@ impl Interpreter {
                     let src = context
                         .exec_register(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
+                    let value = *read_register(&stack[top_idx], src)?;
+                    let result = abstract_ops::is_array(&self.gc_heap, &value)?;
                     let frame = &mut stack[top_idx];
-                    let value = *read_register(frame, src)?;
-                    let result = abstract_ops::is_array(&value);
                     write_register(frame, dst, Value::boolean(result))?;
                     frame.advance_pc(self.current_byte_len)?;
                     continue;

@@ -232,19 +232,46 @@ fn same_value_zero_numeric(a: NumberValue, b: NumberValue) -> bool {
     a.as_f64() == b.as_f64()
 }
 
-/// Return `true` when `value` is an Array exotic object.
+/// Depth cap for the §7.2.2 `IsArray` Proxy-target walk. A chain of
+/// proxies-of-proxies has no spec bound; this guards against a runaway
+/// (or cyclic) chain blowing the native stack.
+const IS_ARRAY_MAX_PROXY_DEPTH: u32 = 1_000;
+
+/// §7.2.2 `IsArray(argument)`.
 ///
 /// # Algorithm
-/// 1. If `value` is `Value::Array`, return `true`.
-/// 2. Once Proxy lands (task 81), unwrap proxies whose handler is
-///    revoked → `TypeError`; otherwise recurse on the target. Today
-///    no Proxy exists, so the helper is a single match arm.
+/// 1. An Array exotic object is an array.
+/// 2. A Proxy is an array iff its target is — recurse through
+///    `[[ProxyTarget]]`. A revoked Proxy (`[[ProxyHandler]]` is null)
+///    throws a `TypeError`.
+/// 3. Anything else is not an array.
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-isarray>
-#[must_use]
-pub fn is_array(value: &Value) -> bool {
-    value.is_array()
+pub fn is_array(heap: &otter_gc::GcHeap, value: &Value) -> Result<bool, crate::VmError> {
+    let mut current = *value;
+    let mut depth = 0u32;
+    loop {
+        if current.is_array() {
+            return Ok(true);
+        }
+        let Some(proxy) = current.as_proxy() else {
+            return Ok(false);
+        };
+        if depth >= IS_ARRAY_MAX_PROXY_DEPTH {
+            return Err(crate::VmError::StackOverflow {
+                limit: IS_ARRAY_MAX_PROXY_DEPTH,
+            });
+        }
+        // §7.2.2 step 3.a — a revoked Proxy throws.
+        if proxy.is_revoked(heap) {
+            return Err(crate::VmError::TypeError {
+                message: "cannot perform IsArray on a revoked Proxy".to_string(),
+            });
+        }
+        current = proxy.target(heap);
+        depth += 1;
+    }
 }
 
 /// Return `true` when `value` carries an internal `[[Call]]` slot.
@@ -753,13 +780,11 @@ mod tests {
     #[test]
     fn is_array_recognises_array_only() {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
-        assert!(is_array(&Value::array(
-            crate::array::alloc_array_old_for_fixture(&mut heap).unwrap()
-        )));
-        assert!(!is_array(&Value::object(
-            crate::object::alloc_object_old_for_fixture(&mut heap).unwrap()
-        )));
-        assert!(!is_array(&Value::undefined()));
+        let arr = Value::array(crate::array::alloc_array_old_for_fixture(&mut heap).unwrap());
+        let obj = Value::object(crate::object::alloc_object_old_for_fixture(&mut heap).unwrap());
+        assert!(is_array(&heap, &arr).unwrap());
+        assert!(!is_array(&heap, &obj).unwrap());
+        assert!(!is_array(&heap, &Value::undefined()).unwrap());
     }
 
     #[test]

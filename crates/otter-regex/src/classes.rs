@@ -200,6 +200,77 @@ impl ClassSet {
             strings: Vec::new(),
         }
     }
+
+    /// `true` when this set has any multi-code-point string alternative
+    /// (`MayContainStrings`, §22.2.1.4). A negated `v`-mode class
+    /// `[^...]` is a syntax error when this holds.
+    #[must_use]
+    pub(crate) fn may_contain_strings(&self) -> bool {
+        !self.strings.is_empty()
+    }
+
+    /// Add one alternative. A single code point joins `code_points`; a
+    /// multi-code-point (or empty) alternative joins `strings`, kept
+    /// deduplicated.
+    pub(crate) fn add_alternative(&mut self, alt: Vec<u32>) {
+        if alt.len() == 1 {
+            self.code_points.insert(alt[0]);
+        } else if !self.strings.contains(&alt) {
+            self.strings.push(alt);
+        }
+    }
+
+    /// `A ∪ B` (`ClassUnion`).
+    pub(crate) fn union_with(&mut self, other: &ClassSet) {
+        self.code_points.union_with(&other.code_points);
+        for s in &other.strings {
+            if !self.strings.contains(s) {
+                self.strings.push(s.clone());
+            }
+        }
+    }
+
+    /// `A ∩ B` (`ClassIntersection`, `&&`). A string survives only when
+    /// it is present in both operands (single-character members are kept
+    /// in `code_points`, so multi-character strings intersect by value).
+    #[must_use]
+    pub(crate) fn intersection(&self, other: &ClassSet) -> ClassSet {
+        ClassSet {
+            code_points: self.code_points.intersection(&other.code_points),
+            strings: self
+                .strings
+                .iter()
+                .filter(|s| other.strings.contains(*s))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// `A -- B` (`ClassSetDifference`). Removes B's code points and any
+    /// string alternative B also contains.
+    #[must_use]
+    pub(crate) fn difference(&self, other: &ClassSet) -> ClassSet {
+        ClassSet {
+            code_points: self.code_points.difference(&other.code_points),
+            strings: self
+                .strings
+                .iter()
+                .filter(|s| !other.strings.contains(*s))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Negate the code-point membership (`[^...]`). The caller must have
+    /// verified [`Self::may_contain_strings`] is false — a negated class
+    /// with strings is a syntax error.
+    #[must_use]
+    pub(crate) fn negate_code_points(&self) -> ClassSet {
+        ClassSet {
+            code_points: self.code_points.negate(),
+            strings: Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]

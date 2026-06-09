@@ -878,6 +878,13 @@ impl<'a> Parser<'a> {
     // --- Character classes ---------------------------------------------------
 
     fn parse_class(&mut self) -> Result<Node, RegexError> {
+        // §22.2.1.4 — under the `v` flag a class is a `ClassSetExpression`
+        // (nested classes, `--`/`&&` set operations, `\q{...}` string
+        // alternatives) rather than the legacy character-class grammar.
+        if self.flags.unicode_sets {
+            let (set, negate) = self.parse_class_set()?;
+            return Ok(self.class_node(set, negate));
+        }
         self.enter()?;
         debug_assert_eq!(self.peek(), Some(b'[' as u16));
         self.pos += 1; // consume '['
@@ -898,6 +905,196 @@ impl<'a> Parser<'a> {
         }
         self.leave();
         Ok(self.class_node(ClassSet::from_code_points(set), negate))
+    }
+
+    /// §22.2.1.4 `ClassSetExpression` — parse a `v`-mode `[...]` (already
+    /// positioned at `[`) into a resolved [`ClassSet`] plus the negation
+    /// flag. A negated set that may contain strings is a syntax error.
+    fn parse_class_set(&mut self) -> Result<(ClassSet, bool), RegexError> {
+        self.enter()?;
+        debug_assert_eq!(self.peek(), Some(b'[' as u16));
+        self.pos += 1; // consume '['
+        let negate = self.eat(b'^' as u16);
+        let mut set = ClassSet::default();
+        // Empty class `[]` / `[^]`.
+        if self.peek() == Some(b']' as u16) {
+            self.pos += 1;
+            self.leave();
+            return self.finish_class_set(set, negate);
+        }
+        // First member fixes whether this is a union, intersection, or
+        // difference; the three operators do not mix in one class.
+        self.parse_class_set_union_member(&mut set)?;
+        match (self.peek(), self.peek_at(1)) {
+            (Some(a), Some(b)) if a == b'&' as u16 && b == b'&' as u16 => {
+                while self.peek() == Some(b'&' as u16) && self.peek_at(1) == Some(b'&' as u16) {
+                    self.pos += 2;
+                    let operand = self.parse_class_set_operand()?;
+                    set = set.intersection(&operand);
+                }
+            }
+            (Some(a), Some(b)) if a == b'-' as u16 && b == b'-' as u16 => {
+                while self.peek() == Some(b'-' as u16) && self.peek_at(1) == Some(b'-' as u16) {
+                    self.pos += 2;
+                    let operand = self.parse_class_set_operand()?;
+                    set = set.difference(&operand);
+                }
+            }
+            _ => {
+                while self.peek().is_some_and(|c| c != b']' as u16) {
+                    self.parse_class_set_union_member(&mut set)?;
+                }
+            }
+        }
+        if !self.eat(b']' as u16) {
+            self.leave();
+            return Err(self.err("unterminated character class"));
+        }
+        self.leave();
+        self.finish_class_set(set, negate)
+    }
+
+    /// Apply the `[^...]` negation, rejecting it when the set may contain
+    /// strings (§22.2.1.4 `MayContainStrings`).
+    fn finish_class_set(
+        &self,
+        set: ClassSet,
+        negate: bool,
+    ) -> Result<(ClassSet, bool), RegexError> {
+        if negate {
+            if set.may_contain_strings() {
+                return Err(RegexError::Syntax {
+                    message: "negated character class may contain strings".to_string(),
+                    offset: self.pos,
+                });
+            }
+            return Ok((set.negate_code_points(), true));
+        }
+        Ok((set, false))
+    }
+
+    /// One `ClassUnion` member: a `ClassSetRange` (`a-z`) or a
+    /// `ClassSetOperand`, folded into `acc`.
+    fn parse_class_set_union_member(&mut self, acc: &mut ClassSet) -> Result<(), RegexError> {
+        // A bare `ClassSetCharacter` can begin a range; a set-valued
+        // operand (nested class, `\p`, `\d`, `\q`) cannot.
+        if let Some(lo) = self.try_class_set_character()? {
+            // A single `-` forms a range; a `--` is the set-difference
+            // operator (handled by the caller), not a range dash.
+            if self.peek() == Some(b'-' as u16)
+                && self.peek_at(1) != Some(b'-' as u16)
+                && self.peek_at(1) != Some(b']' as u16)
+            {
+                self.pos += 1; // consume '-'
+                let hi = self.try_class_set_character()?.ok_or_else(|| {
+                    self.err("character class range needs a character upper bound")
+                })?;
+                if lo > hi {
+                    return Err(self.err("character class range out of order"));
+                }
+                acc.code_points.insert_range(lo, hi);
+            } else {
+                acc.code_points.insert(lo);
+            }
+            return Ok(());
+        }
+        let operand = self.parse_class_set_operand()?;
+        acc.union_with(&operand);
+        Ok(())
+    }
+
+    /// A `ClassSetOperand` that is *not* a bare character: a nested class,
+    /// a `\q{...}` string disjunction, or a class escape (`\p`, `\d`, …).
+    fn parse_class_set_operand(&mut self) -> Result<ClassSet, RegexError> {
+        match self.peek() {
+            Some(c) if c == b'[' as u16 => {
+                let (set, _negate) = self.parse_class_set()?;
+                Ok(set)
+            }
+            Some(c) if c == b'\\' as u16 => {
+                if self.peek_at(1) == Some(b'q' as u16) {
+                    self.pos += 2; // consume `\q`
+                    return self.parse_class_string_disjunction();
+                }
+                self.pos += 1; // consume '\'
+                if let Some((sub, negate)) = self.try_class_escape_set()? {
+                    let sub = if negate { sub.negate() } else { sub };
+                    return Ok(ClassSet::from_code_points(sub));
+                }
+                let cp = self.parse_class_char_escape()?;
+                let mut set = CodePointSet::new();
+                set.insert(cp);
+                Ok(ClassSet::from_code_points(set))
+            }
+            _ => {
+                // A lone character reached here (e.g. as an `&&`/`--`
+                // operand) is a single-code-point operand.
+                let cp = self
+                    .try_class_set_character()?
+                    .ok_or_else(|| self.err("expected character class operand"))?;
+                let mut set = CodePointSet::new();
+                set.insert(cp);
+                Ok(ClassSet::from_code_points(set))
+            }
+        }
+    }
+
+    /// `\q{ Alt | Alt | ... }` — string alternatives. Each alternative is
+    /// a (possibly empty) sequence of `ClassSetCharacter`s; a
+    /// single-character alternative is folded into the code-point set.
+    fn parse_class_string_disjunction(&mut self) -> Result<ClassSet, RegexError> {
+        if !self.eat(b'{' as u16) {
+            return Err(self.err("expected `{` after \\q"));
+        }
+        let mut set = ClassSet::default();
+        loop {
+            let mut alt: Vec<u32> = Vec::new();
+            while let Some(c) = self.peek() {
+                if c == b'|' as u16 || c == b'}' as u16 {
+                    break;
+                }
+                let cp = self
+                    .try_class_set_character()?
+                    .ok_or_else(|| self.err("invalid \\q{...} alternative"))?;
+                alt.push(cp);
+            }
+            set.add_alternative(alt);
+            if self.eat(b'}' as u16) {
+                break;
+            }
+            if !self.eat(b'|' as u16) {
+                return Err(self.err("unterminated \\q{...}"));
+            }
+        }
+        Ok(set)
+    }
+
+    /// A single `ClassSetCharacter` (`v`-mode): a literal code point or a
+    /// character escape, returning `None` when the cursor is on a
+    /// set-valued construct (`[`, `\p`, `\d`, `\q`) or a class delimiter.
+    fn try_class_set_character(&mut self) -> Result<Option<u32>, RegexError> {
+        match self.peek() {
+            None => Ok(None),
+            Some(c) if c == b']' as u16 || c == b'[' as u16 => Ok(None),
+            Some(c) if c == b'\\' as u16 => {
+                // A class-escape set or `\q` is an operand, not a character.
+                let next = self.peek_at(1);
+                let is_set_escape = matches!(
+                    next,
+                    Some(x) if x == b'd' as u16 || x == b'D' as u16
+                        || x == b'w' as u16 || x == b'W' as u16
+                        || x == b's' as u16 || x == b'S' as u16
+                        || x == b'q' as u16
+                        || ((x == b'p' as u16 || x == b'P' as u16) && self.unicode())
+                );
+                if is_set_escape {
+                    return Ok(None);
+                }
+                self.pos += 1; // consume '\'
+                Ok(Some(self.parse_class_char_escape()?))
+            }
+            Some(_) => Ok(Some(self.read_pattern_codepoint())),
+        }
     }
 
     fn parse_class_member(&mut self, set: &mut CodePointSet) -> Result<(), RegexError> {

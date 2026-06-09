@@ -128,11 +128,46 @@ impl Emitter {
                 negate,
                 ignore_case,
             } => {
-                self.emit(Insn::Class {
-                    set: set.clone(),
-                    negate: *negate,
-                    ignore_case: *ignore_case,
-                });
+                if set.strings.is_empty() {
+                    self.emit(Insn::Class {
+                        set: set.clone(),
+                        negate: *negate,
+                        ignore_case: *ignore_case,
+                    });
+                } else {
+                    // A `v`-mode class with string alternatives matches a
+                    // variable-length input, so lower it as an alternation
+                    // `(?: s1 | s2 | … | [codePoints] )`. Longer strings are
+                    // tried first (§22.2.2 match priority); the parser has
+                    // already rejected a negated string-bearing class.
+                    let mut strings = set.strings.clone();
+                    strings.sort_by_key(|s| std::cmp::Reverse(s.len()));
+                    let mut alts: Vec<Node> = Vec::with_capacity(strings.len() + 1);
+                    for s in strings {
+                        let seq: Vec<Node> = s
+                            .iter()
+                            .map(|cp| Node::Char {
+                                cp: *cp,
+                                ignore_case: *ignore_case,
+                            })
+                            .collect();
+                        alts.push(if seq.is_empty() {
+                            Node::Empty
+                        } else {
+                            Node::Concat(seq)
+                        });
+                    }
+                    if !set.code_points.is_empty() {
+                        alts.push(Node::Class {
+                            set: crate::classes::ClassSet::from_code_points(
+                                set.code_points.clone(),
+                            ),
+                            negate: false,
+                            ignore_case: *ignore_case,
+                        });
+                    }
+                    self.compile_alternation(&alts);
+                }
             }
             Node::Assert(a) => {
                 let insn = match a {

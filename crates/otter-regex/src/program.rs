@@ -28,14 +28,22 @@ use crate::classes::{ClassSet, CodePointSet};
 /// A single matcher instruction.
 #[derive(Debug, Clone)]
 pub(crate) enum Insn {
-    /// Match one literal code point (case-folded comparison under `i`).
-    Char(u32),
+    /// Match one literal code point; case-folded comparison when
+    /// `ignore_case` (the per-node effective `i` flag) is set.
+    Char {
+        /// The literal code point.
+        cp: u32,
+        /// `true` for a case-insensitive comparison.
+        ignore_case: bool,
+    },
     /// Match one code point against a class set; `negate` inverts membership.
     Class {
         /// The class set tested against the current code point.
         set: ClassSet,
         /// `true` for a negated class `[^...]`.
         negate: bool,
+        /// `true` for case-insensitive class membership.
+        ignore_case: bool,
     },
     /// Match any character (line terminators excluded unless `dot_all`).
     AnyChar {
@@ -56,11 +64,22 @@ pub(crate) enum Insn {
     /// (§22.2.2.5.1 prevents the infinite loop).
     CheckProgress(usize),
     /// Match the text previously captured by group `index` (backreference).
-    BackRef(u32),
-    /// `^` — start of input, or of a line under `m`.
-    AssertStart,
-    /// `$` — end of input, or of a line under `m`.
-    AssertEnd,
+    BackRef {
+        /// 1-based group index this resolves to.
+        index: u32,
+        /// `true` for a case-insensitive comparison.
+        ignore_case: bool,
+    },
+    /// `^` — start of input, or of a line when `multiline` is set.
+    AssertStart {
+        /// `true` when the `m` (multiline) flag is in effect here.
+        multiline: bool,
+    },
+    /// `$` — end of input, or of a line when `multiline` is set.
+    AssertEnd {
+        /// `true` when the `m` (multiline) flag is in effect here.
+        multiline: bool,
+    },
     /// `\b` / `\B` — word boundary; `true` inverts (`\B`).
     WordBoundary(bool),
     /// Lookaround: run a sub-search of the body at `entry`. `behind` selects

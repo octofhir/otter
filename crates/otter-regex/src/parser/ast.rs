@@ -35,10 +35,18 @@ pub(crate) struct Quantifier {
 /// A zero-width assertion.
 #[derive(Debug, Clone)]
 pub(crate) enum Assertion {
-    /// `^` — start of input (or line, under `m`).
-    StartOfLine,
-    /// `$` — end of input (or line, under `m`).
-    EndOfLine,
+    /// `^` — start of input, or of a line when `m` is in effect at this
+    /// position (the flag is captured per node so an inline
+    /// `(?m:...)` / `(?-m:...)` modifier scopes it).
+    StartOfLine {
+        /// `true` when the `m` (multiline) flag is in effect here.
+        multiline: bool,
+    },
+    /// `$` — end of input, or of a line when `m` is in effect here.
+    EndOfLine {
+        /// `true` when the `m` (multiline) flag is in effect here.
+        multiline: bool,
+    },
     /// `\b` / `\B` — word boundary (`invert` for `\B`).
     WordBoundary {
         /// `true` for `\B` (non-boundary).
@@ -75,8 +83,16 @@ pub(crate) enum GroupKind {
 pub(crate) enum Node {
     /// Matches the empty string.
     Empty,
-    /// A single literal code point (already case-folded if compiled under `i`).
-    Char(u32),
+    /// A single literal code point. `ignore_case` records whether the `i`
+    /// flag is in effect at this node (captured per node so an inline
+    /// `(?i:...)` / `(?-i:...)` modifier scopes the case-insensitive
+    /// comparison).
+    Char {
+        /// The literal code point.
+        cp: u32,
+        /// `true` when the `i` (ignoreCase) flag is in effect here.
+        ignore_case: bool,
+    },
     /// `.` — any character (any except line terminators unless `s` is set).
     AnyChar {
         /// `true` when the `s` (dotAll) flag is in effect.
@@ -89,6 +105,8 @@ pub(crate) enum Node {
         set: ClassSet,
         /// `true` for a negated class `[^...]`.
         negate: bool,
+        /// `true` when the `i` (ignoreCase) flag is in effect here.
+        ignore_case: bool,
     },
     /// A zero-width assertion.
     Assert(Assertion),
@@ -96,6 +114,8 @@ pub(crate) enum Node {
     BackRef {
         /// 1-based group index this resolves to.
         index: u32,
+        /// `true` when the `i` (ignoreCase) flag is in effect here.
+        ignore_case: bool,
     },
     /// Sequential concatenation of subnodes.
     Concat(Vec<Node>),

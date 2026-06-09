@@ -18,11 +18,12 @@
 //! - Counted quantifiers above [`MAX_REPEAT`] are rejected (Phase 1 expansion
 //!   limit), keeping lowering output bounded.
 //!
-//! # Phase-1 scope
-//! Unsupported constructs raise a clear [`RegexError`] rather than silently
-//! mis-parsing: `\p{...}`/`\P{...}` property escapes, `\q{...}` and `v`-flag set
-//! operations, and inline modifier groups `(?ims-x:...)`. These are wired in
-//! later phases.
+//! # Scope
+//! Inline modifier groups `(?ims-ims:...)` (§22.2.1 RegularExpressionModifiers)
+//! scope the `i`/`m`/`s` flags lexically to the group body; the effective flags
+//! are stamped onto each `Char` / `Class` / `BackRef` / anchor node so the
+//! matcher applies them per node. Still unsupported (raise a clear
+//! [`RegexError`]): `\q{...}` and `v`-flag set operations.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-patterns> (§22.2.1)
@@ -97,6 +98,33 @@ impl<'a> Parser<'a> {
             total_groups: 0,
             group_names: Vec::new(),
             next_group: 0,
+        }
+    }
+
+    /// Build a literal-character node, stamping the `i` flag effective at
+    /// the current parse position (so an inline `(?i:...)` / `(?-i:...)`
+    /// modifier scopes the case-insensitive comparison).
+    fn char_node(&self, cp: u32) -> Node {
+        Node::Char {
+            cp,
+            ignore_case: self.flags.ignore_case,
+        }
+    }
+
+    /// Build a character-class node, stamping the effective `i` flag.
+    fn class_node(&self, set: ClassSet, negate: bool) -> Node {
+        Node::Class {
+            set,
+            negate,
+            ignore_case: self.flags.ignore_case,
+        }
+    }
+
+    /// Build a backreference node, stamping the effective `i` flag.
+    fn backref_node(&self, index: u32) -> Node {
+        Node::BackRef {
+            index,
+            ignore_case: self.flags.ignore_case,
         }
     }
 
@@ -259,11 +287,15 @@ impl<'a> Parser<'a> {
         match c {
             x if x == b'^' as u16 => {
                 self.pos += 1;
-                Ok(Node::Assert(Assertion::StartOfLine))
+                Ok(Node::Assert(Assertion::StartOfLine {
+                    multiline: self.flags.multiline,
+                }))
             }
             x if x == b'$' as u16 => {
                 self.pos += 1;
-                Ok(Node::Assert(Assertion::EndOfLine))
+                Ok(Node::Assert(Assertion::EndOfLine {
+                    multiline: self.flags.multiline,
+                }))
             }
             x if x == b'.' as u16 => {
                 self.pos += 1;
@@ -286,7 +318,7 @@ impl<'a> Parser<'a> {
                     Err(self.err("lone quantifier brace"))
                 } else {
                     self.pos += 1;
-                    Ok(Node::Char(u32::from(c)))
+                    Ok(self.char_node(u32::from(c)))
                 }
             }
             x if x == b']' as u16 || x == b'}' as u16 => {
@@ -294,11 +326,11 @@ impl<'a> Parser<'a> {
                     return Err(self.err("lone bracket"));
                 }
                 self.pos += 1;
-                Ok(Node::Char(u32::from(c)))
+                Ok(self.char_node(u32::from(c)))
             }
             _ => {
                 let cp = self.read_pattern_codepoint();
-                Ok(Node::Char(cp))
+                Ok(self.char_node(cp))
             }
         }
     }
@@ -359,6 +391,16 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
+                // §22.2.1 RegularExpressionModifiers — `(?ims-ims:...)`
+                // scopes the i/m/s flags to the group body.
+                Some(x)
+                    if x == b'i' as u16
+                        || x == b'm' as u16
+                        || x == b's' as u16
+                        || x == b'-' as u16 =>
+                {
+                    return self.parse_modifier_group();
+                }
                 _ => return Err(self.err("unsupported group modifier")),
             }
         } else {
@@ -374,6 +416,80 @@ impl<'a> Parser<'a> {
         }
         Ok(Node::Group {
             kind,
+            body: Box::new(body),
+        })
+    }
+
+    /// Parse a modifier group `(?AddModifiers-RemoveModifiers:Disjunction)`
+    /// after the leading `(?` has been consumed. The `i`/`m`/`s` flags in
+    /// `AddModifiers` are enabled and those in `RemoveModifiers` disabled
+    /// for the body only; the flags are restored afterwards so the
+    /// modifier scopes lexically (§22.2.1).
+    ///
+    /// Early errors (§22.2.1.1): a modifier letter may appear at most once
+    /// across both lists, at least one letter must be present, and the
+    /// dash form must carry at least one removed modifier.
+    fn parse_modifier_group(&mut self) -> Result<Node, RegexError> {
+        let saved = self.flags;
+        let mut seen = [false; 3]; // i, m, s
+        let idx = |c: u16| match c {
+            x if x == b'i' as u16 => Some(0usize),
+            x if x == b'm' as u16 => Some(1usize),
+            x if x == b's' as u16 => Some(2usize),
+            _ => None,
+        };
+        let mut add_count = 0usize;
+        while let Some(c) = self.peek()
+            && let Some(i) = idx(c)
+        {
+            if seen[i] {
+                return Err(self.err("duplicate modifier flag"));
+            }
+            seen[i] = true;
+            match i {
+                0 => self.flags.ignore_case = true,
+                1 => self.flags.multiline = true,
+                _ => self.flags.dot_all = true,
+            }
+            add_count += 1;
+            self.pos += 1;
+        }
+        let mut remove_count = 0usize;
+        if self.eat(b'-' as u16) {
+            while let Some(c) = self.peek()
+                && let Some(i) = idx(c)
+            {
+                if seen[i] {
+                    return Err(self.err("duplicate modifier flag"));
+                }
+                seen[i] = true;
+                match i {
+                    0 => self.flags.ignore_case = false,
+                    1 => self.flags.multiline = false,
+                    _ => self.flags.dot_all = false,
+                }
+                remove_count += 1;
+                self.pos += 1;
+            }
+        }
+        // At least one modifier must appear in total (`(?i-:...)` and
+        // `(?-i:...)` are valid; `(?-:...)` is not).
+        if add_count == 0 && remove_count == 0 {
+            self.flags = saved;
+            return Err(self.err("empty modifier group"));
+        }
+        if !self.eat(b':' as u16) {
+            self.flags = saved;
+            return Err(self.err("expected ':' in modifier group"));
+        }
+        let body = self.parse_disjunction()?;
+        if !self.eat(b')' as u16) {
+            self.flags = saved;
+            return Err(self.err("unterminated group"));
+        }
+        self.flags = saved;
+        Ok(Node::Group {
+            kind: GroupKind::NonCapturing,
             body: Box::new(body),
         })
     }
@@ -517,25 +633,22 @@ impl<'a> Parser<'a> {
                     let index = self
                         .name_to_index(&name)
                         .ok_or_else(|| self.err("backreference to unknown group name"))?;
-                    Ok(Node::BackRef { index })
+                    Ok(self.backref_node(index))
                 } else if self.unicode() || !self.group_names.iter().all(Option::is_none) {
                     Err(self.err("invalid \\k escape"))
                 } else {
                     self.pos += 1;
-                    Ok(Node::Char(u32::from(c)))
+                    Ok(self.char_node(u32::from(c)))
                 }
             }
             x if (b'1' as u16..=b'9' as u16).contains(&x) => self.parse_numeric_backref(),
             _ => {
                 if let Some(set) = self.try_class_escape_set()? {
                     let (set, negate) = set;
-                    Ok(Node::Class {
-                        set: ClassSet::from_code_points(set),
-                        negate,
-                    })
+                    Ok(self.class_node(ClassSet::from_code_points(set), negate))
                 } else {
                     let cp = self.parse_char_escape()?;
-                    Ok(Node::Char(cp))
+                    Ok(self.char_node(cp))
                 }
             }
         }
@@ -545,7 +658,7 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         let value = self.read_decimal();
         if value <= self.total_groups {
-            Ok(Node::BackRef { index: value })
+            Ok(self.backref_node(value))
         } else if self.unicode() {
             Err(RegexError::Syntax {
                 message: "backreference to non-existent group".to_string(),
@@ -558,10 +671,13 @@ impl<'a> Parser<'a> {
             self.pos = start;
             let c = self.peek().expect("at least one digit");
             if (b'1' as u16..=b'7' as u16).contains(&c) {
-                Ok(Node::Char(self.read_legacy_octal()))
+                {
+                    let cp = self.read_legacy_octal();
+                    Ok(self.char_node(cp))
+                }
             } else {
                 self.pos += 1;
-                Ok(Node::Char(u32::from(c)))
+                Ok(self.char_node(u32::from(c)))
             }
         }
     }
@@ -781,10 +897,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.leave();
-        Ok(Node::Class {
-            set: ClassSet::from_code_points(set),
-            negate,
-        })
+        Ok(self.class_node(ClassSet::from_code_points(set), negate))
     }
 
     fn parse_class_member(&mut self, set: &mut CodePointSet) -> Result<(), RegexError> {

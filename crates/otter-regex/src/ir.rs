@@ -38,7 +38,7 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
     e.emit(Insn::Save(1));
     e.emit(Insn::Match);
 
-    let has_backref = e.insns.iter().any(|i| matches!(i, Insn::BackRef(_)));
+    let has_backref = e.insns.iter().any(|i| matches!(i, Insn::BackRef { .. }));
     let loop_marks = e.next_mark - mark_base;
     let first_set = compute_first_set(&e.insns, flags.ignore_case);
     Program {
@@ -66,12 +66,19 @@ fn compute_first_set(insns: &[Insn], ignore_case: bool) -> Option<CodePointSet> 
     loop {
         match insns.get(pc)? {
             Insn::Save(_) => pc += 1,
-            Insn::Char(c) => {
+            Insn::Char {
+                cp,
+                ignore_case: false,
+            } => {
                 let mut set = CodePointSet::new();
-                set.insert(*c);
+                set.insert(*cp);
                 return Some(set);
             }
-            Insn::Class { set, negate: false } if set.strings.is_empty() => {
+            Insn::Class {
+                set,
+                negate: false,
+                ignore_case: false,
+            } if set.strings.is_empty() => {
                 return Some(set.code_points.clone());
             }
             _ => return None,
@@ -107,28 +114,43 @@ impl Emitter {
     fn compile(&mut self, node: &Node) {
         match node {
             Node::Empty => {}
-            Node::Char(c) => {
-                self.emit(Insn::Char(*c));
+            Node::Char { cp, ignore_case } => {
+                self.emit(Insn::Char {
+                    cp: *cp,
+                    ignore_case: *ignore_case,
+                });
             }
             Node::AnyChar { dot_all } => {
                 self.emit(Insn::AnyChar { dot_all: *dot_all });
             }
-            Node::Class { set, negate } => {
+            Node::Class {
+                set,
+                negate,
+                ignore_case,
+            } => {
                 self.emit(Insn::Class {
                     set: set.clone(),
                     negate: *negate,
+                    ignore_case: *ignore_case,
                 });
             }
             Node::Assert(a) => {
                 let insn = match a {
-                    Assertion::StartOfLine => Insn::AssertStart,
-                    Assertion::EndOfLine => Insn::AssertEnd,
+                    Assertion::StartOfLine { multiline } => Insn::AssertStart {
+                        multiline: *multiline,
+                    },
+                    Assertion::EndOfLine { multiline } => Insn::AssertEnd {
+                        multiline: *multiline,
+                    },
                     Assertion::WordBoundary { invert } => Insn::WordBoundary(*invert),
                 };
                 self.emit(insn);
             }
-            Node::BackRef { index } => {
-                self.emit(Insn::BackRef(*index));
+            Node::BackRef { index, ignore_case } => {
+                self.emit(Insn::BackRef {
+                    index: *index,
+                    ignore_case: *ignore_case,
+                });
             }
             Node::Concat(nodes) => {
                 for n in nodes {

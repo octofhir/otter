@@ -121,8 +121,10 @@ impl Matcher<'_, '_> {
                                 Act::Backtrack
                             }
                         }
-                        Insn::Char(c) => match self.decode(pos) {
-                            Some((cp, w)) if self.char_eq(*c, cp) => Act::Consume(pc + 1, pos + w),
+                        Insn::Char { cp: c, ignore_case } => match self.decode(pos) {
+                            Some((cp, w)) if self.char_eq(*c, cp, *ignore_case) => {
+                                Act::Consume(pc + 1, pos + w)
+                            }
                             _ => Act::Backtrack,
                         },
                         Insn::AnyChar { dot_all } => match self.decode(pos) {
@@ -131,8 +133,12 @@ impl Matcher<'_, '_> {
                             }
                             _ => Act::Backtrack,
                         },
-                        Insn::Class { set, negate } => match self.decode(pos) {
-                            Some((cp, w)) if self.class_member(set, *negate, cp) => {
+                        Insn::Class {
+                            set,
+                            negate,
+                            ignore_case,
+                        } => match self.decode(pos) {
+                            Some((cp, w)) if self.class_member(set, *negate, cp, *ignore_case) => {
                                 Act::Consume(pc + 1, pos + w)
                             }
                             _ => Act::Backtrack,
@@ -141,15 +147,15 @@ impl Matcher<'_, '_> {
                         Insn::Split(a, b) => Act::Split(*a, *b),
                         Insn::Save(slot) | Insn::SetMark(slot) => Act::Save(*slot),
                         Insn::CheckProgress(slot) => Act::CheckProgress(*slot),
-                        Insn::AssertStart => {
-                            if self.at_start(pos) {
+                        Insn::AssertStart { multiline } => {
+                            if self.at_start(pos, *multiline) {
                                 Act::Goto(pc + 1)
                             } else {
                                 Act::Backtrack
                             }
                         }
-                        Insn::AssertEnd => {
-                            if self.at_end(pos) {
+                        Insn::AssertEnd { multiline } => {
+                            if self.at_end(pos, *multiline) {
                                 Act::Goto(pc + 1)
                             } else {
                                 Act::Backtrack
@@ -162,10 +168,12 @@ impl Matcher<'_, '_> {
                                 Act::Backtrack
                             }
                         }
-                        Insn::BackRef(group) => match self.match_backref(*group, pos, &caps) {
-                            Some(next) => Act::Consume(pc + 1, next),
-                            None => Act::Backtrack,
-                        },
+                        Insn::BackRef { index, ignore_case } => {
+                            match self.match_backref(*index, pos, &caps, *ignore_case) {
+                                Some(next) => Act::Consume(pc + 1, next),
+                                None => Act::Backtrack,
+                            }
+                        }
                         Insn::Look {
                             negate,
                             behind,
@@ -299,13 +307,13 @@ impl Matcher<'_, '_> {
         }
     }
 
-    fn char_eq(&self, target: u32, cp: u32) -> bool {
-        cp == target || (self.program.ignore_case && self.canon(cp) == self.canon(target))
+    fn char_eq(&self, target: u32, cp: u32, ignore_case: bool) -> bool {
+        cp == target || (ignore_case && self.canon(cp) == self.canon(target))
     }
 
-    fn class_member(&self, set: &ClassSet, negate: bool, cp: u32) -> bool {
+    fn class_member(&self, set: &ClassSet, negate: bool, cp: u32, ignore_case: bool) -> bool {
         let mut inside = set.code_points.contains(cp);
-        if !inside && self.program.ignore_case {
+        if !inside && ignore_case {
             inside = set.code_points.contains(ascii_other_case(cp));
             if !inside && self.program.unicode {
                 inside = set.code_points.contains(fold_unicode(cp));
@@ -314,18 +322,18 @@ impl Matcher<'_, '_> {
         inside != negate
     }
 
-    fn at_start(&self, pos: usize) -> bool {
+    fn at_start(&self, pos: usize, multiline: bool) -> bool {
         if pos == 0 {
             return true;
         }
-        self.program.multiline && self.prev_codepoint(pos).is_some_and(is_line_terminator)
+        multiline && self.prev_codepoint(pos).is_some_and(is_line_terminator)
     }
 
-    fn at_end(&self, pos: usize) -> bool {
+    fn at_end(&self, pos: usize, multiline: bool) -> bool {
         if pos >= self.units().len() {
             return true;
         }
-        self.program.multiline
+        multiline
             && self
                 .decode(pos)
                 .is_some_and(|(cp, _)| is_line_terminator(cp))
@@ -339,7 +347,13 @@ impl Matcher<'_, '_> {
 
     /// Match the text previously captured by `group`, returning the new
     /// position. An unset group matches the empty string (succeeds).
-    fn match_backref(&self, group: u32, pos: usize, caps: &Caps) -> Option<usize> {
+    fn match_backref(
+        &self,
+        group: u32,
+        pos: usize,
+        caps: &Caps,
+        ignore_case: bool,
+    ) -> Option<usize> {
         let g = group as usize;
         let (start, end) = match (
             caps.get(2 * g).copied().flatten(),
@@ -359,7 +373,7 @@ impl Matcher<'_, '_> {
         for k in 0..len {
             let a = u32::from(units[start + k]);
             let b = u32::from(units[pos + k]);
-            let eq = a == b || (self.program.ignore_case && self.canon(a) == self.canon(b));
+            let eq = a == b || (ignore_case && self.canon(a) == self.canon(b));
             if !eq {
                 return None;
             }

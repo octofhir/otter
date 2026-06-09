@@ -1,14 +1,14 @@
 {
   "test262_commit": "7e115f46ac64340827d505fa928ad436cb7ba5a6",
-  "engine_commit": "fcbd6628d03c2c7089b1a28d3570bc32f53803e9",
-  "ran_at": "2026-06-09T11:33:12.519066+00:00",
+  "engine_commit": "9e00b5ca04a2ed77d21d504875283dc285ce095d",
+  "ran_at": "2026-06-09T15:50:22.431464+00:00",
   "totals": {
     "total": 51769,
-    "passed": 47560,
-    "failed": 2946,
+    "passed": 47780,
+    "failed": 2727,
     "skipped": 1248,
     "crashed": 0,
-    "timed_out": 14,
+    "timed_out": 13,
     "oom": 1
   },
   "by_section": {
@@ -1805,11 +1805,11 @@
     },
     "built-ins/Atomics/notify": {
       "total": 52,
-      "passed": 50,
+      "passed": 49,
       "failed": 0,
       "skipped": 1,
       "crashed": 0,
-      "timed_out": 1,
+      "timed_out": 2,
       "oom": 0
     },
     "built-ins/Atomics/or": {
@@ -1868,11 +1868,11 @@
     },
     "built-ins/Atomics/wait": {
       "total": 77,
-      "passed": 76,
+      "passed": 75,
       "failed": 0,
       "skipped": 0,
       "crashed": 0,
-      "timed_out": 1,
+      "timed_out": 2,
       "oom": 0
     },
     "built-ins/Atomics/waitAsync": {
@@ -9698,8 +9698,8 @@
     },
     "built-ins/Proxy/construct": {
       "total": 29,
-      "passed": 16,
-      "failed": 2,
+      "passed": 17,
+      "failed": 1,
       "skipped": 11,
       "crashed": 0,
       "timed_out": 0,
@@ -9869,8 +9869,8 @@
     },
     "built-ins/Proxy/defineProperty": {
       "total": 24,
-      "passed": 15,
-      "failed": 1,
+      "passed": 16,
+      "failed": 0,
       "skipped": 8,
       "crashed": 0,
       "timed_out": 0,
@@ -9932,8 +9932,8 @@
     },
     "built-ins/Proxy/getOwnPropertyDescriptor": {
       "total": 21,
-      "passed": 18,
-      "failed": 1,
+      "passed": 19,
+      "failed": 0,
       "skipped": 2,
       "crashed": 0,
       "timed_out": 0,
@@ -14018,11 +14018,11 @@
     },
     "built-ins/RegExp/property-escapes": {
       "total": 613,
-      "passed": 600,
-      "failed": 11,
+      "passed": 612,
+      "failed": 1,
       "skipped": 0,
       "crashed": 0,
-      "timed_out": 2,
+      "timed_out": 0,
       "oom": 0
     },
     "built-ins/RegExp/proto-from-ctor-realm.js": {
@@ -14036,8 +14036,8 @@
     },
     "built-ins/RegExp/prototype": {
       "total": 487,
-      "passed": 473,
-      "failed": 4,
+      "passed": 474,
+      "failed": 3,
       "skipped": 10,
       "crashed": 0,
       "timed_out": 0,
@@ -14063,8 +14063,8 @@
     },
     "built-ins/RegExp/regexp-modifiers": {
       "total": 70,
-      "passed": 0,
-      "failed": 70,
+      "passed": 67,
+      "failed": 3,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -14576,8 +14576,8 @@
     },
     "built-ins/RegExp/unicodeSets": {
       "total": 114,
-      "passed": 20,
-      "failed": 94,
+      "passed": 114,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16142,8 +16142,8 @@
     },
     "built-ins/String/prototype": {
       "total": 1073,
-      "passed": 1066,
-      "failed": 5,
+      "passed": 1067,
+      "failed": 4,
       "skipped": 2,
       "crashed": 0,
       "timed_out": 0,
@@ -16628,8 +16628,8 @@
     },
     "built-ins/Temporal/Duration": {
       "total": 540,
-      "passed": 462,
-      "failed": 77,
+      "passed": 465,
+      "failed": 74,
       "skipped": 1,
       "crashed": 0,
       "timed_out": 0,
@@ -16637,8 +16637,8 @@
     },
     "built-ins/Temporal/Instant": {
       "total": 465,
-      "passed": 412,
-      "failed": 53,
+      "passed": 414,
+      "failed": 51,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16646,8 +16646,8 @@
     },
     "built-ins/Temporal/Now": {
       "total": 66,
-      "passed": 25,
-      "failed": 41,
+      "passed": 26,
+      "failed": 40,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16655,8 +16655,8 @@
     },
     "built-ins/Temporal/PlainDate": {
       "total": 652,
-      "passed": 563,
-      "failed": 89,
+      "passed": 574,
+      "failed": 78,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16664,8 +16664,8 @@
     },
     "built-ins/Temporal/PlainDateTime": {
       "total": 773,
-      "passed": 672,
-      "failed": 100,
+      "passed": 679,
+      "failed": 93,
       "skipped": 1,
       "crashed": 0,
       "timed_out": 0,
@@ -16673,8 +16673,8 @@
     },
     "built-ins/Temporal/PlainMonthDay": {
       "total": 199,
-      "passed": 170,
-      "failed": 29,
+      "passed": 173,
+      "failed": 26,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16682,8 +16682,8 @@
     },
     "built-ins/Temporal/PlainTime": {
       "total": 493,
-      "passed": 459,
-      "failed": 34,
+      "passed": 461,
+      "failed": 32,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16691,8 +16691,8 @@
     },
     "built-ins/Temporal/PlainYearMonth": {
       "total": 509,
-      "passed": 455,
-      "failed": 54,
+      "passed": 461,
+      "failed": 48,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16700,8 +16700,8 @@
     },
     "built-ins/Temporal/ZonedDateTime": {
       "total": 901,
-      "passed": 752,
-      "failed": 149,
+      "passed": 758,
+      "failed": 143,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16736,8 +16736,8 @@
     },
     "built-ins/Temporal/toStringTag": {
       "total": 2,
-      "passed": 0,
-      "failed": 2,
+      "passed": 1,
+      "failed": 1,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40019,11 +40019,11 @@
     },
     "staging/sm/String": {
       "total": 47,
-      "passed": 40,
+      "passed": 41,
       "failed": 5,
       "skipped": 1,
       "crashed": 0,
-      "timed_out": 1,
+      "timed_out": 0,
       "oom": 0
     },
     "staging/sm/Symbol": {
@@ -40181,8 +40181,8 @@
     },
     "staging/sm/object": {
       "total": 65,
-      "passed": 54,
-      "failed": 11,
+      "passed": 55,
+      "failed": 10,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40500,7 +40500,13 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError but got a Test262Error"
     },
     {
-      "path": "built-ins/Atomics/notify/count-defaults-to-infinity-missing.js",
+      "path": "built-ins/Atomics/notify/notify-all.js",
+      "esid": "sec-atomics.notify",
+      "outcome": "timeout",
+      "reason": "timeout after 10001 ms"
+    },
+    {
+      "path": "built-ins/Atomics/notify/notify-zero.js",
       "esid": "sec-atomics.notify",
       "outcome": "timeout",
       "reason": "timeout after 10005 ms"
@@ -40558,6 +40564,12 @@
       "esid": "sec-atomics.sub",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError but got a Test262Error"
+    },
+    {
+      "path": "built-ins/Atomics/wait/bigint/waiterlist-order-of-operations-is-fifo.js",
+      "esid": "sec-atomics.wait",
+      "outcome": "timeout",
+      "reason": "timeout after 10004 ms"
     },
     {
       "path": "built-ins/Atomics/wait/waiterlist-order-of-operations-is-fifo.js",
@@ -40861,22 +40873,10 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #002B "
     },
     {
-      "path": "built-ins/Proxy/construct/trap-is-missing-target-is-proxy.js",
-      "esid": "sec-proxy-object-internal-methods-and-internal-slots-construct-argumentslist-newtarget",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected true but got undefined"
-    },
-    {
       "path": "built-ins/Proxy/construct/trap-is-null-target-is-proxy.js",
       "esid": "sec-proxy-object-internal-methods-and-internal-slots-construct-argumentslist-newtarget",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected true but got false"
-    },
-    {
-      "path": "built-ins/Proxy/defineProperty/trap-is-missing-target-is-proxy.js",
-      "esid": "sec-proxy-object-internal-methods-and-internal-slots-defineownproperty-p-desc",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
     },
     {
       "path": "built-ins/Proxy/deleteProperty/trap-is-missing-target-is-proxy.js",
@@ -40889,12 +40889,6 @@
       "esid": "sec-proxy-object-internal-methods-and-internal-slots",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: type mismatch: this operation does not accept a value of this type"
-    },
-    {
-      "path": "built-ins/Proxy/getOwnPropertyDescriptor/trap-is-undefined-target-is-proxy.js",
-      "esid": "sec-proxy-object-internal-methods-and-internal-slots-getownproperty-p",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: lastIndex descriptor should be writable"
     },
     {
       "path": "built-ins/Proxy/has/call-in-prototype-index.js",
@@ -40932,7 +40926,7 @@
       "path": "built-ins/Proxy/set/trap-is-missing-target-is-proxy.js",
       "esid": "sec-proxy-object-internal-methods-and-internal-slots-set-p-v-receiver",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«0», «1») to be true"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected true but got false"
     },
     {
       "path": "built-ins/Proxy/set/trap-is-null-target-is-proxy.js",
@@ -41058,82 +41052,10 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"a\"», «undefined») to be true"
     },
     {
-      "path": "built-ins/RegExp/property-escapes/generated/ASCII.js",
-      "esid": "sec-static-semantics-unicodematchproperty-p",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^\\p{ASCII}+$/u` rejected: invalid regular expression: unknown Unicode property `ASCII`]"
-    },
-    {
-      "path": "built-ins/RegExp/property-escapes/generated/Any.js",
-      "esid": "sec-static-semantics-unicodematchproperty-p",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^\\p{Any}+$/u` rejected: invalid regular expression: unknown Unicode property `Any`]"
-    },
-    {
-      "path": "built-ins/RegExp/property-escapes/generated/Assigned.js",
-      "esid": "sec-static-semantics-unicodematchproperty-p",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^\\p{Assigned}+$/u` rejected: invalid regular expression: unknown Unicode property `Assigned`]"
-    },
-    {
       "path": "built-ins/RegExp/property-escapes/generated/White_Space.js",
       "esid": "sec-static-semantics-unicodematchproperty-p",
       "outcome": "fail",
       "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^\\p{space}+$/u` rejected: invalid regular expression: unknown Unicode property `space`]"
-    },
-    {
-      "path": "built-ins/RegExp/property-escapes/generated/XID_Continue.js",
-      "esid": "sec-static-semantics-unicodematchproperty-p",
-      "outcome": "timeout",
-      "reason": "timeout after 10009 ms"
-    },
-    {
-      "path": "built-ins/RegExp/property-escapes/generated/XID_Start.js",
-      "esid": "sec-static-semantics-unicodematchproperty-p",
-      "outcome": "timeout",
-      "reason": "timeout after 10004 ms"
-    },
-    {
-      "path": "built-ins/RegExp/property-escapes/generated/strings/Basic_Emoji.js",
-      "esid": "sec-static-semantics-unicodematchproperty-p",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^\\p{Basic_Emoji}+$/v` rejected: invalid regular expression: unknown Unicode property `Basic_Emoji`]"
-    },
-    {
-      "path": "built-ins/RegExp/property-escapes/generated/strings/Emoji_Keycap_Sequence.js",
-      "esid": "sec-static-semantics-unicodematchproperty-p",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^\\p{Emoji_Keycap_Sequence}+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji.js",
-      "esid": "sec-static-semantics-unicodematchproperty-p",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^\\p{RGI_Emoji}+$/v` rejected: invalid regular expression: unknown Unicode property `RGI_Emoji`]"
-    },
-    {
-      "path": "built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Flag_Sequence.js",
-      "esid": "sec-static-semantics-unicodematchproperty-p",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^\\p{RGI_Emoji_Flag_Sequence}+$/v` rejected: invalid regular expression: unknown Unicode property `RGI_Emoji_Flag_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Modifier_Sequence.js",
-      "esid": "sec-static-semantics-unicodematchproperty-p",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^\\p{RGI_Emoji_Modifier_Sequence}+$/v` rejected: invalid regular expression: unknown Unicode property `RGI_Emoji_Modifier_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Tag_Sequence.js",
-      "esid": "sec-static-semantics-unicodematchproperty-p",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^\\p{RGI_Emoji_Tag_Sequence}+$/v` rejected: invalid regular expression: unknown Unicode property `RGI_Emoji_Tag_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_ZWJ_Sequence.js",
-      "esid": "sec-static-semantics-unicodematchproperty-p",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^\\p{RGI_Emoji_ZWJ_Sequence}+$/v` rejected: invalid regular expression: unknown Unicode property `RGI_Emoji_ZWJ_Sequence`]"
     },
     {
       "path": "built-ins/RegExp/prototype/exec/S15.10.6.2_A1_T6.js",
@@ -41153,1000 +41075,28 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: property read: cannot operate on a value of type null"
     },
     {
-      "path": "built-ins/RegExp/prototype/exec/regexp-builtin-exec-v-u-flag.js",
-      "esid": "sec-regexpbuiltinexec",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/\\p{ASCII}/u` rejected: invalid regular expression: unknown Unicode property `ASCII`]"
-    },
-    {
       "path": "built-ins/RegExp/quantifier-integer-limit.js",
       "esid": "sec-quantifier",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: RegExp: invalid regular expression: invalid regular expression at offset 19: quantifier bound too large (phase 1 limit)"
     },
     {
-      "path": "built-ins/RegExp/regexp-modifiers/add-dotAll-does-not-affect-alternatives-outside.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/a.a|b.b|(?s:c.c)|d.d|e.e/` rejected: invalid regular expression at offset 10: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-dotAll-does-not-affect-dotAll-property.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?s:)/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-dotAll-does-not-affect-ignoreCase-flag.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?s:.es)/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-dotAll-does-not-affect-multiline-flag.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?s:.es$)/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-dotAll.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?s:^.$)/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-backreferences.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(a)(?i:\\1)/` rejected: invalid regular expression at offset 5: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-characterClasses.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?i:[ab])c/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-characterEscapes.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?i:\\x61)b/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
       "path": "built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-lower-b.js",
       "esid": "sec-compileatom",
       "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?i:\\b)/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-lower-p.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?i:\\p{Lu})/u` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-lower-w.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?i:\\w)/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: \\b should match after ſ"
     },
     {
       "path": "built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-upper-b.js",
       "esid": "sec-compileatom",
       "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?i:Z\\B)/u` rejected: invalid regular expression at offset 2: unsupported group modifier]"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: \\B should match between Z and ſ"
     },
     {
       "path": "built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-upper-p.js",
       "esid": "sec-compileatom",
       "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?i:\\P{Lu})/u` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-upper-w.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?i:\\W)/u` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-ignoreCase-does-not-affect-alternatives-outside.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/a|b|(?i:c)|d|e/` rejected: invalid regular expression at offset 6: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-ignoreCase-does-not-affect-dotAll-flag.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?i:.es)/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-ignoreCase-does-not-affect-ignoreCase-property.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?i:)/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-ignoreCase-does-not-affect-multiline-flag.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?i:es$)/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-ignoreCase.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?i:a)b/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-multiline-does-not-affect-alternatives-outside.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^a$|^b$|(?m:^c$)|^d$|^e$/` rejected: invalid regular expression at offset 10: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-multiline-does-not-affect-dotAll-flag.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?m:es.$)/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-multiline-does-not-affect-ignoreCase-flag.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?m:es$)/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-multiline-does-not-affect-multiline-property.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?m:)/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-multiline.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?m:es$)/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/add-remove-modifiers.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?m-i:^a$)/i` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/changing-dotAll-flag-does-not-affect-dotAll-modifier.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?s:^.$)/s` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/changing-ignoreCase-flag-does-not-affect-ignoreCase-modifier.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?i:aB)/i` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/changing-multiline-flag-does-not-affect-multiline-modifier.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?m:es$)/m` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/nested-add-remove-modifiers.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?m:^(?-i:a)$)/i` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/nesting-add-dotAll-within-remove-dotAll.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-s:(?s:^.$))/s` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/nesting-add-ignoreCase-within-remove-ignoreCase.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-i:a(?i:b))c/i` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/nesting-add-multiline-within-remove-multiline.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-m:es(?m:$)|js$)/m` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/nesting-dotAll-does-not-affect-alternatives-outside.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/a.a|(?-s:b.b|(?s:c.c)|d.d|(?-s:e.e)|f.f)|g.g|(?s:h.h)|k.k/s` rejected: invalid regular expression at offset 6: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/nesting-ignoreCase-does-not-affect-alternatives-outside.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/a|(?-i:b|(?i:c)|d|(?-i:e)|f)|g|(?i:h)|k/i` rejected: invalid regular expression at offset 4: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/nesting-multiline-does-not-affect-alternatives-outside.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^a$|(?-m:^b$|(?m:^c$)|^d$|(?-m:^e$)|^f$)|^g$|(?m:^h$)|^k$/m` rejected: invalid regular expression at offset 6: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/nesting-remove-dotAll-within-add-dotAll.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?s:(?-s:^.$))/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/nesting-remove-ignoreCase-within-add-ignoreCase.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?i:a(?-i:b))c/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/nesting-remove-multiline-within-add-multiline.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?m:es$|(?-m:js$))/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-dotAll-does-not-affect-alternatives-outside.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/a.a|b.b|(?-s:c.c)|d.d|e.e/s` rejected: invalid regular expression at offset 10: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-dotAll-does-not-affect-dotAll-property.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-s:^.$)/s` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-dotAll-does-not-affect-ignoreCase-flag.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-s:.es)/s` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-dotAll-does-not-affect-multiline-flag.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-s:.es$)/s` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-dotAll.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-s:^.$)/s` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-backreferences.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(a)(?-i:\\1)/i` rejected: invalid regular expression at offset 5: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-characterClasses.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-i:[ab])c/i` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-characterEscapes.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-i:\\x61)b/i` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-slash-lower-b.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-i:\\b)/iu` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-slash-lower-p.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-i:\\p{Lu})/iu` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-slash-lower-w.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-i:\\w)/iu` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-slash-upper-b.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-i:Z\\B)/iu` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-slash-upper-p.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-i:\\P{Lu})/iu` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-ignoreCase-affects-slash-upper-w.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-i:\\W)/iu` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-ignoreCase-does-not-affect-alternatives-outside.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/a|b|(?-i:c)|d|e/i` rejected: invalid regular expression at offset 6: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-ignoreCase-does-not-affect-dotAll-flag.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-i:.es)/i` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-ignoreCase-does-not-affect-ignoreCase-property.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-i:)/i` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-ignoreCase-does-not-affect-multiline-flag.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-i:es$)/i` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-ignoreCase.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-i:fo)o/i` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-multiline-does-not-affect-alternatives-outside.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^a$|^b$|(?-m:^c$)|^d$|^e$/m` rejected: invalid regular expression at offset 10: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-multiline-does-not-affect-dotAll-flag.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-m:es.$)/m` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-multiline-does-not-affect-ignoreCase-flag.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-m:es$)/m` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-multiline-does-not-affect-multiline-property.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-m:)/m` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/remove-multiline.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^(?-m:es$)/m` rejected: invalid regular expression at offset 3: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/syntax/valid/add-and-remove-modifiers-can-have-empty-remove-modifiers.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?i-:)/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/syntax/valid/add-and-remove-modifiers.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?i-s:)/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/syntax/valid/add-modifiers-when-nested.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?i:(?i:))/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/syntax/valid/add-modifiers-when-not-set-as-flags.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?i:)/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/syntax/valid/add-modifiers-when-set-as-flags.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?i:)/i` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/syntax/valid/remove-modifiers-when-nested.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-i:(?-i:))/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/syntax/valid/remove-modifiers-when-not-set-as-flags.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-i:)/` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/regexp-modifiers/syntax/valid/remove-modifiers-when-set-as-flags.js",
-      "esid": "sec-compileatom",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/(?-i:)/i` rejected: invalid regular expression at offset 2: unsupported group modifier]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-difference-character-class-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[[0-9]--\\d]+$/v` rejected: invalid regular expression at offset 11: lone bracket]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-difference-character-class.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[[0-9]--[0-9]]+$/v` rejected: invalid regular expression at offset 14: lone bracket]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-difference-character-property-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[[0-9]--\\p{ASCII_Hex_Digit}]+$/v` rejected: invalid regular expression at offset 28: lone bracket]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-difference-character.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[[0-9]--_]+$/v` rejected: invalid regular expression at offset 10: lone bracket]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-difference-property-of-strings-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[[0-9]--\\p{Emoji_Keycap_Sequence}]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-difference-string-literal.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[[0-9]--\\q{0|2|4|9\\uFE0F\\u20E3}]+$/v` rejected: invalid regular expression at offset 10: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-escape-difference-character-class-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\d--\\d]+$/v` rejected: invalid regular expression at offset 7: invalid class range]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-escape-difference-character-class.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\d--[0-9]]+$/v` rejected: invalid regular expression at offset 11: lone bracket]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-escape-difference-character-property-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\d--\\p{ASCII_Hex_Digit}]+$/v` rejected: invalid regular expression at offset 7: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-escape-difference-property-of-strings-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\d--\\p{Emoji_Keycap_Sequence}]+$/v` rejected: invalid regular expression at offset 7: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-escape-difference-string-literal.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\d--\\q{0|2|4|9\\uFE0F\\u20E3}]+$/v` rejected: invalid regular expression at offset 7: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-escape-intersection-character-class.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\d&&[0-9]]+$/v` rejected: invalid regular expression at offset 11: lone bracket]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-escape-intersection-property-of-strings-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\d&&\\p{Emoji_Keycap_Sequence}]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-escape-intersection-string-literal.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\d&&\\q{0|2|4|9\\uFE0F\\u20E3}]+$/v` rejected: invalid regular expression at offset 7: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-escape-union-character-class.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\d[0-9]]+$/v` rejected: invalid regular expression at offset 9: lone bracket]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-escape-union-property-of-strings-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\d\\p{Emoji_Keycap_Sequence}]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-escape-union-string-literal.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\d\\q{0|2|4|9\\uFE0F\\u20E3}]+$/v` rejected: invalid regular expression at offset 5: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-intersection-character-class-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[[0-9]&&\\d]+$/v` rejected: invalid regular expression at offset 11: lone bracket]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-intersection-character-class.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[[0-9]&&[0-9]]+$/v` rejected: invalid regular expression at offset 14: lone bracket]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-intersection-character-property-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[[0-9]&&\\p{ASCII_Hex_Digit}]+$/v` rejected: invalid regular expression at offset 28: lone bracket]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-intersection-character.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[[0-9]&&_]+$/v` rejected: invalid regular expression at offset 10: lone bracket]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-intersection-property-of-strings-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[[0-9]&&\\p{Emoji_Keycap_Sequence}]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-intersection-string-literal.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[[0-9]&&\\q{0|2|4|9\\uFE0F\\u20E3}]+$/v` rejected: invalid regular expression at offset 10: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-union-character-class-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[[0-9]\\d]+$/v` rejected: invalid regular expression at offset 9: lone bracket]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-union-character-class.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[[0-9][0-9]]+$/v` rejected: invalid regular expression at offset 12: lone bracket]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-union-character-property-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[[0-9]\\p{ASCII_Hex_Digit}]+$/v` rejected: invalid regular expression at offset 26: lone bracket]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-union-character.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[[0-9]_]+$/v` rejected: invalid regular expression at offset 8: lone bracket]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-union-property-of-strings-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[[0-9]\\p{Emoji_Keycap_Sequence}]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-class-union-string-literal.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[[0-9]\\q{0|2|4|9\\uFE0F\\u20E3}]+$/v` rejected: invalid regular expression at offset 8: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-difference-character-class-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[_--\\d]+$/v` rejected: invalid regular expression at offset 5: character class range out of order]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-difference-character-class.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[_--[0-9]]+$/v` rejected: invalid regular expression at offset 5: character class range out of order]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-difference-character-property-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[_--\\p{ASCII_Hex_Digit}]+$/v` rejected: invalid regular expression at offset 5: character class range out of order]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-difference-character.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[_--_]+$/v` rejected: invalid regular expression at offset 5: character class range out of order]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-difference-property-of-strings-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[_--\\p{Emoji_Keycap_Sequence}]+$/v` rejected: invalid regular expression at offset 5: character class range out of order]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-difference-string-literal.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[_--\\q{0|2|4|9\\uFE0F\\u20E3}]+$/v` rejected: invalid regular expression at offset 5: character class range out of order]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-intersection-character-class.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[_&&[0-9]]+$/v` rejected: invalid regular expression at offset 10: lone bracket]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-intersection-property-of-strings-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[_&&\\p{Emoji_Keycap_Sequence}]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-intersection-string-literal.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[_&&\\q{0|2|4|9\\uFE0F\\u20E3}]+$/v` rejected: invalid regular expression at offset 6: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-character-class-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{ASCII_Hex_Digit}--\\d]+$/v` rejected: invalid regular expression at offset 24: invalid class range]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-character-class.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{ASCII_Hex_Digit}--[0-9]]+$/v` rejected: invalid regular expression at offset 28: lone bracket]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-character-property-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{ASCII_Hex_Digit}--\\p{ASCII_Hex_Digit}]+$/v` rejected: invalid regular expression at offset 24: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-property-of-strings-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{ASCII_Hex_Digit}--\\p{Emoji_Keycap_Sequence}]+$/v` rejected: invalid regular expression at offset 24: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-property-escape-difference-string-literal.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{ASCII_Hex_Digit}--\\q{0|2|4|9\\uFE0F\\u20E3}]+$/v` rejected: invalid regular expression at offset 24: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-property-escape-intersection-character-class.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{ASCII_Hex_Digit}&&[0-9]]+$/v` rejected: invalid regular expression at offset 28: lone bracket]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-property-escape-intersection-property-of-strings-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{ASCII_Hex_Digit}&&\\p{Emoji_Keycap_Sequence}]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-property-escape-intersection-string-literal.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{ASCII_Hex_Digit}&&\\q{0|2|4|9\\uFE0F\\u20E3}]+$/v` rejected: invalid regular expression at offset 24: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-property-escape-union-character-class.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{ASCII_Hex_Digit}[0-9]]+$/v` rejected: invalid regular expression at offset 26: lone bracket]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-property-escape-union-property-of-strings-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{ASCII_Hex_Digit}\\p{Emoji_Keycap_Sequence}]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-property-escape-union-string-literal.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{ASCII_Hex_Digit}\\q{0|2|4|9\\uFE0F\\u20E3}]+$/v` rejected: invalid regular expression at offset 22: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-union-character-class.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[_[0-9]]+$/v` rejected: invalid regular expression at offset 8: lone bracket]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-union-property-of-strings-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[_\\p{Emoji_Keycap_Sequence}]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/character-union-string-literal.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[_\\q{0|2|4|9\\uFE0F\\u20E3}]+$/v` rejected: invalid regular expression at offset 4: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-difference-character-class-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{Emoji_Keycap_Sequence}--\\d]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-difference-character-class.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{Emoji_Keycap_Sequence}--[0-9]]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-difference-character-property-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{Emoji_Keycap_Sequence}--\\p{ASCII_Hex_Digit}]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-difference-character.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{Emoji_Keycap_Sequence}--_]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-difference-property-of-strings-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{Emoji_Keycap_Sequence}--\\p{Emoji_Keycap_Sequence}]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-difference-string-literal.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{Emoji_Keycap_Sequence}--\\q{0|2|4|9\\uFE0F\\u20E3}]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-intersection-character-class-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{Emoji_Keycap_Sequence}&&\\d]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-intersection-character-class.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{Emoji_Keycap_Sequence}&&[0-9]]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-intersection-character-property-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{Emoji_Keycap_Sequence}&&\\p{ASCII_Hex_Digit}]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-intersection-character.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{Emoji_Keycap_Sequence}&&_]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-intersection-property-of-strings-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{Emoji_Keycap_Sequence}&&\\p{Emoji_Keycap_Sequence}]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-intersection-string-literal.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{Emoji_Keycap_Sequence}&&\\q{0|2|4|9\\uFE0F\\u20E3}]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-union-character-class-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{Emoji_Keycap_Sequence}\\d]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-union-character-class.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{Emoji_Keycap_Sequence}[0-9]]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-union-character-property-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{Emoji_Keycap_Sequence}\\p{ASCII_Hex_Digit}]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-union-character.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{Emoji_Keycap_Sequence}_]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-union-property-of-strings-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{Emoji_Keycap_Sequence}\\p{Emoji_Keycap_Sequence}]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/property-of-strings-escape-union-string-literal.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\p{Emoji_Keycap_Sequence}\\q{0|2|4|9\\uFE0F\\u20E3}]+$/v` rejected: invalid regular expression: unknown Unicode property `Emoji_Keycap_Sequence`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/rgi-emoji-13.1.js",
-      "esid": "sec-static-semantics-unicodematchproperty-p",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^\\p{RGI_Emoji}+$/v` rejected: invalid regular expression: unknown Unicode property `RGI_Emoji`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/rgi-emoji-14.0.js",
-      "esid": "sec-static-semantics-unicodematchproperty-p",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^\\p{RGI_Emoji}+$/v` rejected: invalid regular expression: unknown Unicode property `RGI_Emoji`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/rgi-emoji-15.0.js",
-      "esid": "sec-static-semantics-unicodematchproperty-p",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^\\p{RGI_Emoji}+$/v` rejected: invalid regular expression: unknown Unicode property `RGI_Emoji`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/rgi-emoji-15.1.js",
-      "esid": "sec-static-semantics-unicodematchproperty-p",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^\\p{RGI_Emoji}+$/v` rejected: invalid regular expression: unknown Unicode property `RGI_Emoji`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/rgi-emoji-16.0.js",
-      "esid": "sec-static-semantics-unicodematchproperty-p",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^\\p{RGI_Emoji}+$/v` rejected: invalid regular expression: unknown Unicode property `RGI_Emoji`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/rgi-emoji-17.0.js",
-      "esid": "sec-static-semantics-unicodematchproperty-p",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^\\p{RGI_Emoji}+$/v` rejected: invalid regular expression: unknown Unicode property `RGI_Emoji`]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/string-literal-difference-character-class-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\q{0|2|4|9\\uFE0F\\u20E3}--\\d]+$/v` rejected: invalid regular expression at offset 3: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/string-literal-difference-character-class.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\q{0|2|4|9\\uFE0F\\u20E3}--[0-9]]+$/v` rejected: invalid regular expression at offset 3: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/string-literal-difference-character-property-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\q{0|2|4|9\\uFE0F\\u20E3}--\\p{ASCII_Hex_Digit}]+$/v` rejected: invalid regular expression at offset 3: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/string-literal-difference-character.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\q{0|2|4|9\\uFE0F\\u20E3}--_]+$/v` rejected: invalid regular expression at offset 3: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/string-literal-difference-property-of-strings-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\q{0|2|4|9\\uFE0F\\u20E3}--\\p{Emoji_Keycap_Sequence}]+$/v` rejected: invalid regular expression at offset 3: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/string-literal-difference-string-literal.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\q{0|2|4|9\\uFE0F\\u20E3}--\\q{0|2|4|9\\uFE0F\\u20E3}]+$/v` rejected: invalid regular expression at offset 3: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/string-literal-intersection-character-class-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\q{0|2|4|9\\uFE0F\\u20E3}&&\\d]+$/v` rejected: invalid regular expression at offset 3: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/string-literal-intersection-character-class.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\q{0|2|4|9\\uFE0F\\u20E3}&&[0-9]]+$/v` rejected: invalid regular expression at offset 3: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/string-literal-intersection-character-property-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\q{0|2|4|9\\uFE0F\\u20E3}&&\\p{ASCII_Hex_Digit}]+$/v` rejected: invalid regular expression at offset 3: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/string-literal-intersection-character.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\q{0|2|4|9\\uFE0F\\u20E3}&&_]+$/v` rejected: invalid regular expression at offset 3: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/string-literal-intersection-property-of-strings-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\q{0|2|4|9\\uFE0F\\u20E3}&&\\p{Emoji_Keycap_Sequence}]+$/v` rejected: invalid regular expression at offset 3: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/string-literal-intersection-string-literal.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\q{0|2|4|9\\uFE0F\\u20E3}&&\\q{0|2|4|9\\uFE0F\\u20E3}]+$/v` rejected: invalid regular expression at offset 3: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/string-literal-union-character-class-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\q{0|2|4|9\\uFE0F\\u20E3}\\d]+$/v` rejected: invalid regular expression at offset 3: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/string-literal-union-character-class.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\q{0|2|4|9\\uFE0F\\u20E3}[0-9]]+$/v` rejected: invalid regular expression at offset 3: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/string-literal-union-character-property-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\q{0|2|4|9\\uFE0F\\u20E3}\\p{ASCII_Hex_Digit}]+$/v` rejected: invalid regular expression at offset 3: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/string-literal-union-character.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\q{0|2|4|9\\uFE0F\\u20E3}_]+$/v` rejected: invalid regular expression at offset 3: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/string-literal-union-property-of-strings-escape.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\q{0|2|4|9\\uFE0F\\u20E3}\\p{Emoji_Keycap_Sequence}]+$/v` rejected: invalid regular expression at offset 3: invalid identity escape]"
-    },
-    {
-      "path": "built-ins/RegExp/unicodeSets/generated/string-literal-union-string-literal.js",
-      "esid": "sec-patterns",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^[\\q{0|2|4|9\\uFE0F\\u20E3}\\q{0|2|4|9\\uFE0F\\u20E3}]+$/v` rejected: invalid regular expression at offset 3: invalid identity escape]"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: \\P{Lu} should match A (ignores case)"
     },
     {
       "path": "built-ins/RegExp/unicode_full_case_folding.js",
@@ -42218,12 +41168,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: property read: cannot operate on a value of type null"
     },
     {
-      "path": "built-ins/String/prototype/matchAll/regexp-prototype-matchAll-v-u-flag.js",
-      "esid": "sec-regexp.prototype-@@matchall",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/\\P{ASCII}/gu` rejected: invalid regular expression: unknown Unicode property `ASCII`]"
-    },
-    {
       "path": "built-ins/String/prototype/split/separator-regexp.js",
       "esid": "sec-string.prototype.split",
       "outcome": "fail",
@@ -42245,7 +41189,7 @@
       "path": "built-ins/Temporal/Duration/compare/calendar-temporal-object.js",
       "esid": "sec-temporal.duration.compare",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: Temporal.Duration: RangeError"
     },
     {
       "path": "built-ins/Temporal/Duration/compare/exhaustive.js",
@@ -42452,12 +41396,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: rounding a year Duration fails without largest/smallest unit Expected a RangeError to be thrown but no exception was thrown at all"
     },
     {
-      "path": "built-ins/Temporal/Duration/prototype/round/calendar-temporal-object.js",
-      "esid": "sec-temporal.duration.prototype.round",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
-    },
-    {
       "path": "built-ins/Temporal/Duration/prototype/round/exact-multiple-of-larger-unit-plaindate.js",
       "esid": "sec-temporal.duration.prototype.round",
       "outcome": "fail",
@@ -42614,18 +41552,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [get options.fractionalSecondDigits, get options.fractionalSecondDigits.toString, call options.fractionalSecondDigits.toString, get options.roundingMode, get options.roundingMode.toString, call options.roundingMode.toString, get options.smallestUnit, get options.smallestUnit.toString, call options.smallestUnit.toString] should have the same contents. order of operations"
     },
     {
-      "path": "built-ins/Temporal/Duration/prototype/toStringTag/prop-desc.js",
-      "esid": "sec-temporal.duration.prototype-@@tostringtag",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Symbol(Symbol.toStringTag) should be an own property"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/total/calendar-temporal-object.js",
-      "esid": "sec-temporal.duration.prototype.total",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
-    },
-    {
       "path": "built-ins/Temporal/Duration/prototype/total/options-read-before-algorithmic-validation.js",
       "esid": "sec-temporal.duration.prototype.total",
       "outcome": "fail",
@@ -42689,7 +41615,7 @@
       "path": "built-ins/Temporal/Duration/subclass.js",
       "esid": "sec-temporal.duration",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomDuration Expected SameValue(«[object Object]», «[object Object]») to be true"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomDuration Expected SameValue(«[object Temporal.Duration]», «[object Temporal.Duration]») to be true"
     },
     {
       "path": "built-ins/Temporal/Instant/compare/argument-object-tostring.js",
@@ -42707,7 +41633,7 @@
       "path": "built-ins/Temporal/Instant/compare/argument-zoneddatetime.js",
       "esid": "sec-temporal.instant.compare",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.Instant: argument must be a Temporal.Instant"
     },
     {
       "path": "built-ins/Temporal/Instant/from/argument-object-tostring.js",
@@ -42719,7 +41645,7 @@
       "path": "built-ins/Temporal/Instant/from/argument-zoneddatetime.js",
       "esid": "sec-temporal.instant.from",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.Instant: argument must be a Temporal.Instant"
     },
     {
       "path": "built-ins/Temporal/Instant/fromEpochMilliseconds/non-integer.js",
@@ -42782,12 +41708,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.Instant: receiver must be a Temporal.Instant"
     },
     {
-      "path": "built-ins/Temporal/Instant/prototype/builtin.js",
-      "esid": "sec-temporal-instant-objects",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Object.prototype.toString Expected SameValue(«\"[object Object]\"», «\"[object Temporal.Instant]\"») to be true"
-    },
-    {
       "path": "built-ins/Temporal/Instant/prototype/equals/argument-object-tostring.js",
       "esid": "sec-temporal.instant.prototype.equals",
       "outcome": "fail",
@@ -42803,7 +41723,7 @@
       "path": "built-ins/Temporal/Instant/prototype/equals/argument-zoneddatetime.js",
       "esid": "sec-temporal.instant.prototype.until",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.Instant: argument must be a Temporal.Instant"
     },
     {
       "path": "built-ins/Temporal/Instant/prototype/round/options-read-before-algorithmic-validation.js",
@@ -42839,7 +41759,7 @@
       "path": "built-ins/Temporal/Instant/prototype/since/argument-zoneddatetime.js",
       "esid": "sec-temporal.instant.prototype.since",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.Instant: argument must be a Temporal.Instant"
     },
     {
       "path": "built-ins/Temporal/Instant/prototype/since/float64-representable-integer.js",
@@ -42962,12 +41882,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [get options.fractionalSecondDigits, get options.fractionalSecondDigits.toString, call options.fractionalSecondDigits.toString, get options.roundingMode, get options.roundingMode.toString, call options.roundingMode.toString, get options.smallestUnit, get options.smallestUnit.toString, call options.smallestUnit.toString, get options.timeZone] should have the same contents. order of operations"
     },
     {
-      "path": "built-ins/Temporal/Instant/prototype/toStringTag/prop-desc.js",
-      "esid": "sec-temporal.instant.prototype-@@tostringtag",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Symbol(Symbol.toStringTag) should be an own property"
-    },
-    {
       "path": "built-ins/Temporal/Instant/prototype/until/argument-object-tostring.js",
       "esid": "sec-temporal.instant.prototype.until",
       "outcome": "fail",
@@ -42983,7 +41897,7 @@
       "path": "built-ins/Temporal/Instant/prototype/until/argument-zoneddatetime.js",
       "esid": "sec-temporal.instant.prototype.until",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.Instant: argument must be a Temporal.Instant"
     },
     {
       "path": "built-ins/Temporal/Instant/prototype/until/float64-representable-integer.js",
@@ -43007,13 +41921,13 @@
       "path": "built-ins/Temporal/Instant/subclass.js",
       "esid": "sec-temporal.instant",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomInstant Expected SameValue(«[object Object]», «[object Object]») to be true"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomInstant Expected SameValue(«[object Temporal.Instant]», «[object Temporal.Instant]») to be true"
     },
     {
       "path": "built-ins/Temporal/Now/builtin.js",
       "esid": "sec-temporal.now",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Object.prototype.toString Expected SameValue(«\"[object Object]\"», «\"[object Temporal.Now]\"») to be true"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: prototype Expected SameValue(«null», «[object Object]») to be true"
     },
     {
       "path": "built-ins/Temporal/Now/instant/return-value-value.js",
@@ -43154,12 +42068,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
     },
     {
-      "path": "built-ins/Temporal/Now/toStringTag/prop-desc.js",
-      "esid": "sec-temporal-now-@@tostringtag",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Symbol(Symbol.toStringTag) should be an own property"
-    },
-    {
       "path": "built-ins/Temporal/Now/toStringTag/string.js",
       "esid": "sec-temporal-now-@@tostringtag",
       "outcome": "fail",
@@ -43256,40 +42164,16 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: empty string does not convert to a valid ISO string Expected a RangeError but got a TypeError"
     },
     {
-      "path": "built-ins/Temporal/PlainDate/compare/argument-plaindatetime.js",
-      "esid": "sec-temporal.plaindate.compare",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
-    },
-    {
       "path": "built-ins/Temporal/PlainDate/compare/argument-propertybag-calendar-wrong-type.js",
       "esid": "sec-temporal.plaindate.compare",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: duration instance is not a valid property bag and does not convert to a string (first argument) Expected a TypeError to be thrown but no exception was thrown at all"
     },
     {
-      "path": "built-ins/Temporal/PlainDate/compare/calendar-temporal-object.js",
-      "esid": "sec-temporal.plaindate.compare",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDate/from/argument-plaindatetime.js",
-      "esid": "sec-temporal.plaindate.from",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
-    },
-    {
       "path": "built-ins/Temporal/PlainDate/from/argument-propertybag-calendar-wrong-type.js",
       "esid": "sec-temporal.plaindate.from",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: duration instance is not a valid calendar Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDate/from/calendar-temporal-object.js",
-      "esid": "sec-temporal.plaindate.from",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
     },
     {
       "path": "built-ins/Temporal/PlainDate/from/monthcode-invalid.js",
@@ -43382,40 +42266,16 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.PlainDate: receiver must be a Temporal.PlainDate"
     },
     {
-      "path": "built-ins/Temporal/PlainDate/prototype/equals/argument-plaindatetime.js",
-      "esid": "sec-temporal.plaindate.prototype.equals",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
-    },
-    {
       "path": "built-ins/Temporal/PlainDate/prototype/equals/argument-propertybag-calendar-wrong-type.js",
       "esid": "sec-temporal.plaindate.prototype.equals",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: duration instance is not a valid calendar Expected a TypeError to be thrown but no exception was thrown at all"
     },
     {
-      "path": "built-ins/Temporal/PlainDate/prototype/equals/calendar-temporal-object.js",
-      "esid": "sec-temporal.plaindate.prototype.equals",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDate/prototype/since/argument-plaindatetime.js",
-      "esid": "sec-temporal.plaindate.since",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
-    },
-    {
       "path": "built-ins/Temporal/PlainDate/prototype/since/argument-propertybag-calendar-wrong-type.js",
       "esid": "sec-temporal.plaindate.prototype.since",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: duration instance is not a valid calendar Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDate/prototype/since/calendar-temporal-object.js",
-      "esid": "sec-temporal.plaindate.prototype.since",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
     },
     {
       "path": "built-ins/Temporal/PlainDate/prototype/since/exact-multiple-of-larger-unit.js",
@@ -43628,12 +42488,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [get options.calendarName, get options.calendarName.toString, call options.calendarName.toString] should have the same contents. order of operations"
     },
     {
-      "path": "built-ins/Temporal/PlainDate/prototype/toStringTag/prop-desc.js",
-      "esid": "sec-temporal.plaindate.prototype-@@tostringtag",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Symbol(Symbol.toStringTag) should be an own property"
-    },
-    {
       "path": "built-ins/Temporal/PlainDate/prototype/toZonedDateTime/argument-object-get-plainTime-throws.js",
       "esid": "sec-temporal.plaindate.prototype.tozoneddatetime",
       "outcome": "fail",
@@ -43652,22 +42506,10 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.PlainDate: time zone must be a string identifier or a Temporal.ZonedDateTime"
     },
     {
-      "path": "built-ins/Temporal/PlainDate/prototype/until/argument-plaindatetime.js",
-      "esid": "sec-temporal.plaindate.until",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
-    },
-    {
       "path": "built-ins/Temporal/PlainDate/prototype/until/argument-propertybag-calendar-wrong-type.js",
       "esid": "sec-temporal.plaindate.prototype.until",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: duration instance is not a valid calendar Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDate/prototype/until/calendar-temporal-object.js",
-      "esid": "sec-temporal.plaindate.prototype.until",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
     },
     {
       "path": "built-ins/Temporal/PlainDate/prototype/until/exact-multiple-of-larger-unit.js",
@@ -43769,7 +42611,7 @@
       "path": "built-ins/Temporal/PlainDate/prototype/withCalendar/calendar-temporal-object.js",
       "esid": "sec-temporal.plaindate.prototype.withcalendar",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.PlainDate: calendar identifier must be a string"
     },
     {
       "path": "built-ins/Temporal/PlainDate/prototype/withCalendar/calendar-time-string.js",
@@ -43787,13 +42629,13 @@
       "path": "built-ins/Temporal/PlainDate/subclass.js",
       "esid": "sec-temporal.plaindate",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomPlainDate Expected SameValue(«[object Object]», «[object Object]») to be true"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomPlainDate Expected SameValue(«[object Temporal.PlainDate]», «[object Temporal.PlainDate]») to be true"
     },
     {
       "path": "built-ins/Temporal/PlainDateTime/compare/argument-plaindate.js",
       "esid": "sec-temporal.plaindatetime.compare",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.PlainDateTime: argument must be a Temporal.PlainDateTime"
     },
     {
       "path": "built-ins/Temporal/PlainDateTime/compare/argument-propertybag-calendar-wrong-type.js",
@@ -43802,28 +42644,16 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: duration instance is not a valid calendar (first argument) Expected a TypeError to be thrown but no exception was thrown at all"
     },
     {
-      "path": "built-ins/Temporal/PlainDateTime/compare/calendar-temporal-object.js",
-      "esid": "sec-temporal.plaindatetime.compare",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
-    },
-    {
       "path": "built-ins/Temporal/PlainDateTime/from/argument-plaindate.js",
       "esid": "sec-temporal.plaindatetime.from",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.PlainDateTime: argument must be a Temporal.PlainDateTime"
     },
     {
       "path": "built-ins/Temporal/PlainDateTime/from/argument-propertybag-calendar-wrong-type.js",
       "esid": "sec-temporal.plaindatetime.from",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: duration instance is not a valid calendar Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDateTime/from/calendar-temporal-object.js",
-      "esid": "sec-temporal.plaindatetime.from",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
     },
     {
       "path": "built-ins/Temporal/PlainDateTime/from/monthcode-invalid.js",
@@ -43913,19 +42743,13 @@
       "path": "built-ins/Temporal/PlainDateTime/prototype/equals/argument-plaindate.js",
       "esid": "sec-temporal.plaindatetime.prototype.equals",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.PlainDateTime: argument must be a Temporal.PlainDateTime"
     },
     {
       "path": "built-ins/Temporal/PlainDateTime/prototype/equals/argument-propertybag-calendar-wrong-type.js",
       "esid": "sec-temporal.plaindatetime.prototype.equals",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: duration instance is not a valid calendar Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDateTime/prototype/equals/calendar-temporal-object.js",
-      "esid": "sec-temporal.plaindatetime.prototype.equals",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
     },
     {
       "path": "built-ins/Temporal/PlainDateTime/prototype/round/options-read-before-algorithmic-validation.js",
@@ -43961,19 +42785,13 @@
       "path": "built-ins/Temporal/PlainDateTime/prototype/since/argument-plaindate.js",
       "esid": "sec-temporal.plaindatetime.prototype.since",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.PlainDateTime: argument must be a Temporal.PlainDateTime"
     },
     {
       "path": "built-ins/Temporal/PlainDateTime/prototype/since/argument-propertybag-calendar-wrong-type.js",
       "esid": "sec-temporal.plaindatetime.prototype.since",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: duration instance is not a valid calendar Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDateTime/prototype/since/calendar-temporal-object.js",
-      "esid": "sec-temporal.plaindatetime.prototype.since",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
     },
     {
       "path": "built-ins/Temporal/PlainDateTime/prototype/since/exact-multiple-of-larger-unit.js",
@@ -44084,12 +42902,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [get options.calendarName, get options.calendarName.toString, call options.calendarName.toString, get options.fractionalSecondDigits, get options.fractionalSecondDigits.toString, call options.fractionalSecondDigits.toString, get options.roundingMode, get options.roundingMode.toString, call options.roundingMode.toString, get options.smallestUnit, get options.smallestUnit.toString, call options.smallestUnit.toString] should have the same contents. order of operations"
     },
     {
-      "path": "built-ins/Temporal/PlainDateTime/prototype/toStringTag/prop-desc.js",
-      "esid": "sec-temporal.plaindatetime.prototype-@@tostringtag",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Symbol(Symbol.toStringTag) should be an own property"
-    },
-    {
       "path": "built-ins/Temporal/PlainDateTime/prototype/toZonedDateTime/options-read-before-algorithmic-validation.js",
       "esid": "sec-temporal.plaindatetime.prototype.tozoneddatetime",
       "outcome": "fail",
@@ -44105,19 +42917,13 @@
       "path": "built-ins/Temporal/PlainDateTime/prototype/until/argument-plaindate.js",
       "esid": "sec-temporal.plaindatetime.prototype.until",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.PlainDateTime: argument must be a Temporal.PlainDateTime"
     },
     {
       "path": "built-ins/Temporal/PlainDateTime/prototype/until/argument-propertybag-calendar-wrong-type.js",
       "esid": "sec-temporal.plaindatetime.prototype.until",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: duration instance is not a valid calendar Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDateTime/prototype/until/calendar-temporal-object.js",
-      "esid": "sec-temporal.plaindatetime.prototype.until",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
     },
     {
       "path": "built-ins/Temporal/PlainDateTime/prototype/until/exact-multiple-of-larger-unit.js",
@@ -44148,12 +42954,6 @@
       "esid": "sec-temporal.plaindatetime.prototype.until",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: can return lower or higher units (milliseconds): milliseconds result: Expected SameValue(«1557628928», «31622400000») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDateTime/prototype/with/calendar-temporal-object-throws.js",
-      "esid": "sec-temporal.plaindatetime.prototype.with",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
     },
     {
       "path": "built-ins/Temporal/PlainDateTime/prototype/with/calendar-throws.js",
@@ -44189,7 +42989,7 @@
       "path": "built-ins/Temporal/PlainDateTime/prototype/with/order-of-operations.js",
       "esid": "sec-temporal.plaindatetime.prototype.with",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.PlainDateTime: first argument must be an object"
     },
     {
       "path": "built-ins/Temporal/PlainDateTime/prototype/with/overflow-invalid-string.js",
@@ -44231,7 +43031,7 @@
       "path": "built-ins/Temporal/PlainDateTime/prototype/withCalendar/calendar-temporal-object.js",
       "esid": "sec-temporal.plaindatetime.prototype.withcalendar",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.PlainDateTime: calendar identifier must be a string"
     },
     {
       "path": "built-ins/Temporal/PlainDateTime/prototype/withCalendar/calendar-time-string.js",
@@ -44387,19 +43187,13 @@
       "path": "built-ins/Temporal/PlainDateTime/subclass.js",
       "esid": "sec-temporal.plaindatetime",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomPlainDateTime Expected SameValue(«[object Object]», «[object Object]») to be true"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomPlainDateTime Expected SameValue(«[object Temporal.PlainDateTime]», «[object Temporal.PlainDateTime]») to be true"
     },
     {
       "path": "built-ins/Temporal/PlainMonthDay/from/argument-propertybag-calendar-wrong-type.js",
       "esid": "sec-temporal.plainmonthday.from",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: duration instance is not a valid calendar Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/PlainMonthDay/from/calendar-temporal-object.js",
-      "esid": "sec-temporal.plainmonthday.from",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
     },
     {
       "path": "built-ins/Temporal/PlainMonthDay/from/fields-object.js",
@@ -44462,12 +43256,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: duration instance is not a valid calendar Expected a TypeError to be thrown but no exception was thrown at all"
     },
     {
-      "path": "built-ins/Temporal/PlainMonthDay/prototype/equals/calendar-temporal-object.js",
-      "esid": "sec-temporal.plainmonthday.prototype.equals",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
-    },
-    {
       "path": "built-ins/Temporal/PlainMonthDay/prototype/toLocaleString/branding.js",
       "esid": "sec-temporal.plainmonthday.prototype.tolocalestring",
       "outcome": "fail",
@@ -44490,12 +43278,6 @@
       "esid": "sec-temporal.plainmonthday.prototype.tostring",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [get options.calendarName, get options.calendarName.toString, call options.calendarName.toString] should have the same contents. order of operations"
-    },
-    {
-      "path": "built-ins/Temporal/PlainMonthDay/prototype/toStringTag/prop-desc.js",
-      "esid": "sec-temporal.plainmonthday.prototype-@@tostringtag",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Symbol(Symbol.toStringTag) should be an own property"
     },
     {
       "path": "built-ins/Temporal/PlainMonthDay/prototype/with/basic.js",
@@ -44561,19 +43343,13 @@
       "path": "built-ins/Temporal/PlainMonthDay/subclass.js",
       "esid": "sec-temporal.plainmonthday",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomPlainMonthDay Expected SameValue(«[object Object]», «[object Object]») to be true"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomPlainMonthDay Expected SameValue(«[object Temporal.PlainMonthDay]», «[object Temporal.PlainMonthDay]») to be true"
     },
     {
       "path": "built-ins/Temporal/PlainTime/compare/exhaustive.js",
       "esid": "sec-temporal.plaintime.compare",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: millisecond < Expected SameValue(«1», «-1») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/PlainTime/from/argument-plaindatetime.js",
-      "esid": "sec-temporal.plaintime.from",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
     },
     {
       "path": "built-ins/Temporal/PlainTime/from/options-read-before-algorithmic-validation.js",
@@ -44690,12 +43466,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [get options.fractionalSecondDigits, get options.fractionalSecondDigits.toString, call options.fractionalSecondDigits.toString, get options.roundingMode, get options.roundingMode.toString, call options.roundingMode.toString, get options.smallestUnit, get options.smallestUnit.toString, call options.smallestUnit.toString] should have the same contents. order of operations"
     },
     {
-      "path": "built-ins/Temporal/PlainTime/prototype/toStringTag/prop-desc.js",
-      "esid": "sec-temporal.plaintime.prototype-@@tostringtag",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Symbol(Symbol.toStringTag) should be an own property"
-    },
-    {
       "path": "built-ins/Temporal/PlainTime/prototype/until/options-read-before-algorithmic-validation.js",
       "esid": "sec-temporal.plaintime.prototype.until",
       "outcome": "fail",
@@ -44765,19 +43535,13 @@
       "path": "built-ins/Temporal/PlainTime/subclass.js",
       "esid": "sec-temporal.plaintime",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomPlainTime Expected SameValue(«[object Object]», «[object Object]») to be true"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomPlainTime Expected SameValue(«[object Temporal.PlainTime]», «[object Temporal.PlainTime]») to be true"
     },
     {
       "path": "built-ins/Temporal/PlainYearMonth/compare/argument-propertybag-calendar-wrong-type.js",
       "esid": "sec-temporal.plainyearmonth.compare",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: duration instance is not a valid calendar (first argument) Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/PlainYearMonth/compare/calendar-temporal-object.js",
-      "esid": "sec-temporal.plainyearmonth.compare",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
     },
     {
       "path": "built-ins/Temporal/PlainYearMonth/from/argument-plaindate.js",
@@ -44790,12 +43554,6 @@
       "esid": "sec-temporal.plainyearmonth.from",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: duration instance is not a valid calendar Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/PlainYearMonth/from/calendar-temporal-object.js",
-      "esid": "sec-temporal.plainyearmonth.from",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
     },
     {
       "path": "built-ins/Temporal/PlainYearMonth/from/missing-properties.js",
@@ -44894,22 +43652,10 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: duration instance is not a valid calendar Expected a TypeError to be thrown but no exception was thrown at all"
     },
     {
-      "path": "built-ins/Temporal/PlainYearMonth/prototype/equals/calendar-temporal-object.js",
-      "esid": "sec-temporal.plainyearmonth.prototype.equals",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
-    },
-    {
       "path": "built-ins/Temporal/PlainYearMonth/prototype/since/argument-propertybag-calendar-wrong-type.js",
       "esid": "sec-temporal.plainyearmonth.prototype.since",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: duration instance is not a valid calendar Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/PlainYearMonth/prototype/since/calendar-temporal-object.js",
-      "esid": "sec-temporal.plainyearmonth.prototype.since",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
     },
     {
       "path": "built-ins/Temporal/PlainYearMonth/prototype/since/exact-multiple-of-larger-unit.js",
@@ -44996,22 +43742,10 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [get options.calendarName, get options.calendarName.toString, call options.calendarName.toString] should have the same contents. order of operations"
     },
     {
-      "path": "built-ins/Temporal/PlainYearMonth/prototype/toStringTag/prop-desc.js",
-      "esid": "sec-temporal.plainyearmonth.prototype-@@tostringtag",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Symbol(Symbol.toStringTag) should be an own property"
-    },
-    {
       "path": "built-ins/Temporal/PlainYearMonth/prototype/until/argument-propertybag-calendar-wrong-type.js",
       "esid": "sec-temporal.plainyearmonth.prototype.until",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: duration instance is not a valid calendar Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/PlainYearMonth/prototype/until/calendar-temporal-object.js",
-      "esid": "sec-temporal.plainyearmonth.prototype.until",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
     },
     {
       "path": "built-ins/Temporal/PlainYearMonth/prototype/until/exact-multiple-of-larger-unit.js",
@@ -45089,7 +43823,7 @@
       "path": "built-ins/Temporal/PlainYearMonth/subclass.js",
       "esid": "sec-temporal.plainyearmonth",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomPlainYearMonth Expected SameValue(«[object Object]», «[object Object]») to be true"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomPlainYearMonth Expected SameValue(«[object Temporal.PlainYearMonth]», «[object Temporal.PlainYearMonth]») to be true"
     },
     {
       "path": "built-ins/Temporal/ZonedDateTime/argument-convert.js",
@@ -45114,12 +43848,6 @@
       "esid": "sec-temporal.zoneddatetime.compare",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: offset property not matching time zone is rejected (first argument) Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/compare/calendar-temporal-object.js",
-      "esid": "sec-temporal.zoneddatetime.compare",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
     },
     {
       "path": "built-ins/Temporal/ZonedDateTime/compare/order-of-operations.js",
@@ -45174,12 +43902,6 @@
       "esid": "sec-temporal.zoneddatetime.from",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/from/calendar-temporal-object.js",
-      "esid": "sec-temporal.zoneddatetime.from",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
     },
     {
       "path": "built-ins/Temporal/ZonedDateTime/from/calendarresolvefields-error-ordering.js",
@@ -45374,12 +44096,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: offset property not matching time zone is rejected Expected a RangeError to be thrown but no exception was thrown at all"
     },
     {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/equals/calendar-temporal-object.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.equals",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
-    },
-    {
       "path": "built-ins/Temporal/ZonedDateTime/prototype/equals/order-of-operations.js",
       "esid": "sec-temporal.zoneddatetime.prototype.equals",
       "outcome": "fail",
@@ -45540,12 +44256,6 @@
       "esid": "sec-temporal.zoneddatetime.prototype.since",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: offset property not matching time zone is rejected Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/since/calendar-temporal-object.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.since",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
     },
     {
       "path": "built-ins/Temporal/ZonedDateTime/prototype/since/exact-multiple-of-larger-unit.js",
@@ -45740,12 +44450,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: null Expected a RangeError to be thrown but no exception was thrown at all"
     },
     {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/toStringTag/prop-desc.js",
-      "esid": "sec-temporal.zoneddatetime.prototype-@@tostringtag",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Symbol(Symbol.toStringTag) should be an own property"
-    },
-    {
       "path": "built-ins/Temporal/ZonedDateTime/prototype/until/argument-propertybag-calendar-invalid-iso-string.js",
       "esid": "sec-temporal.zoneddatetime.prototype.until",
       "outcome": "fail",
@@ -45768,12 +44472,6 @@
       "esid": "sec-temporal.zoneddatetime.prototype.until",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: offset property not matching time zone is rejected Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/until/calendar-temporal-object.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.until",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
     },
     {
       "path": "built-ins/Temporal/ZonedDateTime/prototype/until/exact-multiple-of-larger-unit.js",
@@ -45935,7 +44633,7 @@
       "path": "built-ins/Temporal/ZonedDateTime/prototype/withCalendar/calendar-temporal-object.js",
       "esid": "sec-temporal.zoneddatetime.prototype.withcalendar",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: defineProperty: Cannot define property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.ZonedDateTime: calendar identifier must be a string"
     },
     {
       "path": "built-ins/Temporal/ZonedDateTime/prototype/withCalendar/calendar-time-string.js",
@@ -45977,7 +44675,7 @@
       "path": "built-ins/Temporal/ZonedDateTime/subclass.js",
       "esid": "sec-temporal.zoneddatetime",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomZonedDateTime Expected SameValue(«[object Object]», «[object Object]») to be true"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomZonedDateTime Expected SameValue(«[object Temporal.ZonedDateTime]», «[object Temporal.ZonedDateTime]») to be true"
     },
     {
       "path": "built-ins/Temporal/ZonedDateTime/timezone-iso-string.js",
@@ -45990,12 +44688,6 @@
       "esid": "sec-temporal-objects",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [Now] and expected [] should have the same contents. "
-    },
-    {
-      "path": "built-ins/Temporal/toStringTag/prop-desc.js",
-      "esid": "sec-temporal-@@tostringtag",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Symbol(Symbol.toStringTag) should be an own property"
     },
     {
       "path": "built-ins/Temporal/toStringTag/string.js",
@@ -46950,25 +45642,25 @@
       "path": "staging/sm/Date/dst-offset-caching-2-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10008 ms"
+      "reason": "timeout after 10015 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-3-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10006 ms"
+      "reason": "timeout after 10010 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-4-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10007 ms"
+      "reason": "timeout after 10005 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-5-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10008 ms"
+      "reason": "timeout after 10005 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-6-of-8.js",
@@ -46980,7 +45672,7 @@
       "path": "staging/sm/Date/dst-offset-caching-7-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10003 ms"
+      "reason": "timeout after 10005 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-8-of-8.js",
@@ -47689,12 +46381,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/String/replace-math.js",
-      "esid": "pending",
-      "outcome": "timeout",
-      "reason": "timeout after 10395 ms"
     },
     {
       "path": "staging/sm/String/replaceAll.js",
@@ -48459,12 +47145,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
     },
     {
-      "path": "staging/sm/object/15.2.3.14-01.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [0, input, groups, index] and expected [0, index, input, groups] should have the same contents. "
-    },
-    {
       "path": "staging/sm/object/accessor-arguments-rest.js",
       "esid": "pending",
       "outcome": "fail",
@@ -48481,6 +47161,12 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"ownKeys,getOwnPropertyDescriptor,getOwnPropertyDescriptor,get,get\"», «\"ownKeys,getOwnPropertyDescriptor,get,getOwnPropertyDescriptor,get\"») to be true"
+    },
+    {
+      "path": "staging/sm/object/entries.js",
+      "esid": "pending",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: subs is not defined"
     },
     {
       "path": "staging/sm/object/extensibility-01.js",
@@ -48517,12 +47203,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [0] should have the same contents. "
-    },
-    {
-      "path": "staging/sm/object/values.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [a, undefined, 0, abc] and expected [a, 0, abc, undefined] should have the same contents. "
     },
     {
       "path": "staging/sm/regress/regress-1383630.js",

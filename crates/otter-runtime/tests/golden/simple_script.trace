@@ -1,9 +1,11 @@
 ; otter step trace v1
-frame=1 fn=<main> pc=000000 op=LOAD_INT32  r1 i32:1
-frame=1 fn=<main> pc=000010 op=LOAD_INT32  r2 i32:2
-frame=1 fn=<main> pc=000020 op=TO_PRIMITIVE  r3 r1 k[0]
-frame=1 fn=<main> pc=000033 op=TO_PRIMITIVE  r4 r2 k[0]
-frame=1 fn=<main> pc=000046 op=ADD  r5 r3 r4
-frame=1 fn=<main> pc=000057 op=STORE_LOCAL  r5 i32:0
-frame=1 fn=<main> pc=000067 op=LOAD_UNDEFINED  r6
-frame=1 fn=<main> pc=000072 op=RETURN  r6
+frame=1 fn=<main> pc=000000 op=VALIDATE_GLOBAL_DECL  k[0] i32:0
+frame=1 fn=<main> pc=000012 op=DECLARE_GLOBAL_LEX  k[0] i32:1
+frame=1 fn=<main> pc=000024 op=LOAD_UNDEFINED  r0
+frame=1 fn=<main> pc=000029 op=LOAD_INT32  r1 i32:1
+frame=1 fn=<main> pc=000039 op=LOAD_INT32  r2 i32:2
+frame=1 fn=<main> pc=000049 op=TO_PRIMITIVE  r3 r1 k[1]
+frame=1 fn=<main> pc=000062 op=TO_PRIMITIVE  r4 r2 k[1]
+frame=1 fn=<main> pc=000075 op=ADD  r5 r3 r4
+frame=1 fn=<main> pc=000086 op=INIT_GLOBAL_LEX  r5 k[0]
+frame=1 fn=<main> pc=000096 op=RETURN  r0

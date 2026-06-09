@@ -144,6 +144,12 @@ pub struct TemporalBody {
     /// embed data needing more than pointer alignment.
     #[pelt(skip)]
     pub payload: Box<TemporalPayload>,
+    /// Lazy expando bag for ordinary own properties. Temporal
+    /// instances are ordinary extensible objects (§ proposal-temporal):
+    /// `Object.defineProperty(dt, "year", …)` / `dt.x = 1` install
+    /// here, shadowing the prototype accessors. Allocated on first
+    /// write; traced like every other GC body field.
+    pub expando: Option<crate::object::JsObject>,
 }
 
 /// 4-byte compressed GC handle to a [`TemporalBody`]. `Copy`. Packs
@@ -161,6 +167,7 @@ pub fn alloc_temporal(
 ) -> Result<TemporalHandle, otter_gc::OutOfMemory> {
     heap.alloc_old(TemporalBody {
         payload: Box::new(payload),
+        expando: None,
     })
 }
 
@@ -217,6 +224,23 @@ impl JsTemporal {
     #[must_use]
     pub fn payload_clone(self, heap: &otter_gc::GcHeap) -> TemporalPayload {
         heap.read_payload(self.inner, |body| (*body.payload).clone())
+    }
+
+    /// Read the lazy expando bag, if any ordinary own property
+    /// (`Object.defineProperty(dt, …)` / `dt.x = 1`) created one.
+    #[inline]
+    #[must_use]
+    pub fn expando(self, heap: &otter_gc::GcHeap) -> Option<crate::object::JsObject> {
+        heap.read_payload(self.inner, |body| body.expando)
+    }
+
+    /// Install / replace the lazy expando bag.
+    pub fn set_expando(self, heap: &mut otter_gc::GcHeap, expando: crate::object::JsObject) {
+        let barrier = crate::Value::object(expando);
+        heap.with_payload(self.inner, |body| {
+            body.expando = Some(expando);
+        });
+        heap.record_write(self.inner, &barrier);
     }
 
     /// Tag for prototype routing. Read from the wrapper-side cache

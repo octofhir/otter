@@ -445,6 +445,14 @@ impl Interpreter {
             } else {
                 true
             }
+        } else if let Some(t) = receiver.as_temporal(&self.gc_heap) {
+            // Ordinary own properties live in the lazy expando; a missing
+            // name deletes vacuously.
+            if let Some(bag) = t.expando(&self.gc_heap) {
+                crate::object::delete(bag, &mut self.gc_heap, name)
+            } else {
+                true
+            }
         } else {
             return Err(VmError::TypeError {
                 message: format!(
@@ -1228,7 +1236,22 @@ impl Interpreter {
                 direct
             }
         } else if let Some(t) = receiver.as_temporal(&self.gc_heap) {
-            temporal::load_property(t, &mut self.gc_heap, name)
+            // An ordinary own property (installed via defineProperty /
+            // assignment) lives in the expando and shadows the prototype
+            // accessor that `load_property` resolves from internal slots.
+            if let Some(bag) = t.expando(&self.gc_heap)
+                && let Some(outcome) = Self::expando_own_get_outcome(bag, &self.gc_heap, name)
+            {
+                match outcome {
+                    VmGetOutcome::Value(v) => v,
+                    VmGetOutcome::InvokeGetter { getter } => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.run_callable_sync(context, &getter, receiver, args)?
+                    }
+                }
+            } else {
+                temporal::load_property(t, &mut self.gc_heap, name)
+            }
         } else if let Some(b) = receiver.as_array_buffer() {
             // Own expando bag (species `constructor` override, or a
             // cross-brand accessor installed via defineProperty) wins
@@ -1659,6 +1682,18 @@ impl Interpreter {
         } else if let Some(dv) = receiver.as_data_view() {
             // §25.3 — ordinary own properties land in the lazy expando.
             Some(data_view_ensure_expando_pub(&mut self.gc_heap, &dv)?)
+        } else if receiver.is_temporal() {
+            // §10.1.9 OrdinarySet — own expando first, then the
+            // prototype chain (a getter-only accessor like `year`
+            // rejects the write), receiver-phase define otherwise.
+            let vm_key = VmPropertyKey::OwnedString(name.to_string());
+            if !self.ordinary_set_data_value(context, receiver, &vm_key, value, receiver, 0)? {
+                Self::failed_set_result(
+                    strict,
+                    format!("Cannot assign to read-only property '{name}'"),
+                )?;
+            }
+            None
         } else if receiver.is_undefined() || receiver.is_null() || receiver.is_hole() {
             return Err(VmError::TypeError {
                 message: format!(
@@ -5020,6 +5055,26 @@ pub(crate) fn regexp_ensure_expando_pub(
     };
     let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
     r.set_expando(heap, bag);
+    Ok(bag)
+}
+
+/// Lazy-allocate (and cache) the Temporal expando `JsObject` backing
+/// ordinary own properties. Temporal instances are ordinary extensible
+/// objects, so `Object.defineProperty(dt, …)` / `dt.x = 1` install onto
+/// this bag, shadowing the prototype accessors.
+pub(crate) fn temporal_ensure_expando_pub(
+    heap: &mut otter_gc::GcHeap,
+    t: &crate::temporal::JsTemporal,
+) -> Result<JsObject, VmError> {
+    if let Some(existing) = t.expando(heap) {
+        return Ok(existing);
+    }
+    let recv = Value::temporal(*t);
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        recv.trace_value_slots(visitor);
+    };
+    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    t.set_expando(heap, bag);
     Ok(bag)
 }
 

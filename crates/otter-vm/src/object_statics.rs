@@ -1776,6 +1776,27 @@ pub fn call(
                     )?)),
                     None => Ok(Value::undefined()),
                 }
+            } else if let Some(t) = first.and_then(|v| v.as_temporal(gc_heap)) {
+                // Temporal instances are ordinary objects; ordinary own
+                // properties live in the lazy expando bag (the
+                // year/month/… accessors are prototype properties).
+                let desc = t.expando(gc_heap).and_then(|bag| match &key {
+                    PropertyKey::String(key) => {
+                        crate::object::get_own_descriptor(bag, gc_heap, key)
+                    }
+                    PropertyKey::Symbol(sym) => {
+                        crate::object::get_own_symbol_descriptor(bag, gc_heap, *sym)
+                    }
+                });
+                match desc {
+                    Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
+                        &desc,
+                        gc_heap,
+                        &[],
+                        &[args],
+                    )?)),
+                    None => Ok(Value::undefined()),
+                }
             } else if let Some(value) = first.and_then(|v| v.as_string(gc_heap)) {
                 let desc = match &key {
                     PropertyKey::String(key) => {

@@ -366,6 +366,9 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     crate::bootstrap_data_view::install_data_view_well_knowns_post_bootstrap(
         heap, global, well_known,
     )?;
+    crate::temporal::intrinsic::install_temporal_well_knowns_post_bootstrap(
+        heap, global, well_known,
+    )?;
     crate::bootstrap_typed_array::install_typed_array_well_knowns_post_bootstrap(
         heap, global, well_known,
     )?;

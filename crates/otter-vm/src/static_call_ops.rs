@@ -54,6 +54,7 @@ fn is_property_bearing_object(v: &Value) -> bool {
         || v.is_data_view()
         || v.is_typed_array()
         || v.is_promise()
+        || v.is_temporal()
 }
 
 impl Interpreter {
@@ -860,6 +861,7 @@ impl Interpreter {
                     || target.is_string()
                     || target.is_data_view()
                     || target.is_class_constructor()
+                    || target.is_temporal()
                 {
                     // §25.3 — a `DataView` is an ordinary object; its
                     // [[GetOwnProperty]] (expando-backed) is handled by
@@ -1518,6 +1520,7 @@ fn own_property_names_uses_internal_methods(target: &Value) -> bool {
         || target.is_class_constructor()
         || target.is_data_view()
         || target.is_typed_array()
+        || target.is_temporal()
         || target.as_weak_ref().is_some()
         || target.as_finalization_registry().is_some()
 }
@@ -1533,6 +1536,7 @@ fn own_property_descriptors_uses_internal_methods(target: &Value) -> bool {
         || target.is_class_constructor()
         || target.is_regexp()
         || target.is_data_view()
+        || target.is_temporal()
 }
 
 pub(crate) fn enumerable_own_string_entries(

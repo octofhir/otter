@@ -751,6 +751,22 @@ impl Interpreter {
             }
             return Ok(None);
         }
+        if let Some(t) = target.as_temporal(&self.gc_heap) {
+            // Ordinary own properties live in the lazy expando; the
+            // year/month/… accessors are prototype properties, not own.
+            if let Some(bag) = t.expando(&self.gc_heap) {
+                if let Some(name) = key.string_name() {
+                    if let Some(desc) = object::get_own_descriptor(bag, &self.gc_heap, name) {
+                        return Ok(Some(desc));
+                    }
+                } else if let VmPropertyKey::Symbol(sym) = key
+                    && let Some(desc) = object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym)
+                {
+                    return Ok(Some(desc));
+                }
+            }
+            return Ok(None);
+        }
         let function_id = target.as_function().or_else(|| {
             target
                 .as_closure(&self.gc_heap)
@@ -1568,6 +1584,21 @@ impl Interpreter {
             // `Object.defineProperty(dv, …)` installs onto the expando.
             let bag =
                 crate::property_dispatch::data_view_ensure_expando_pub(&mut self.gc_heap, &dv)?;
+            return Ok(if let VmPropertyKey::Symbol(sym) = key {
+                object::define_own_symbol_property_partial(bag, &mut self.gc_heap, *sym, descriptor)
+            } else {
+                let k = key
+                    .string_name()
+                    .expect("non-symbol key has string spelling");
+                self.define_own_property_partial(bag, k, descriptor)?
+            });
+        }
+        if let Some(t) = target.as_temporal(&self.gc_heap) {
+            // Temporal instances are ordinary extensible objects; an
+            // own property (commonly an accessor shadowing a prototype
+            // getter in the spec's conversion-fast-path tests) lands on
+            // the lazy expando bag.
+            let bag = crate::property_dispatch::temporal_ensure_expando_pub(&mut self.gc_heap, &t)?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
                 object::define_own_symbol_property_partial(bag, &mut self.gc_heap, *sym, descriptor)
             } else {
@@ -2729,6 +2760,28 @@ impl Interpreter {
             // (byteLength / byteOffset / buffer are prototype getters).
             let mut keys = Vec::new();
             if let Some(expando) = dv.expando(&self.gc_heap) {
+                let (strings, symbols): (Vec<String>, Vec<Value>) =
+                    object::with_properties(expando, &self.gc_heap, |p| {
+                        (
+                            p.keys().map(str::to_string).collect(),
+                            p.symbol_keys().map(Value::symbol).collect(),
+                        )
+                    });
+                for key in strings {
+                    keys.push(Value::string(
+                        string::JsString::from_str(&key, &mut self.gc_heap)
+                            .map_err(VmError::from)?,
+                    ));
+                }
+                keys.extend(symbols);
+            }
+            return Ok(keys);
+        }
+        if let Some(t) = target.as_temporal(&self.gc_heap) {
+            // Own keys are exactly the ordinary expando entries; the
+            // year/month/… accessors are prototype properties.
+            let mut keys = Vec::new();
+            if let Some(expando) = t.expando(&self.gc_heap) {
                 let (strings, symbols): (Vec<String>, Vec<Value>) =
                     object::with_properties(expando, &self.gc_heap, |p| {
                         (
@@ -4110,9 +4163,39 @@ impl Interpreter {
             }
             return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
         }
-        if base.as_temporal(&self.gc_heap).is_some() {
-            // Temporal value: route property lookup through the
-            // per-class prototype installed on `Temporal.<X>.prototype`.
+        if let Some(t) = base.as_temporal(&self.gc_heap) {
+            // An ordinary own property installed via defineProperty /
+            // assignment lives in the expando bag and shadows the
+            // prototype accessor.
+            if let Some(bag) = t.expando(&self.gc_heap) {
+                let lookup = match key {
+                    VmPropertyKey::Symbol(sym) => {
+                        object::lookup_own_symbol(bag, &self.gc_heap, *sym)
+                    }
+                    _ => {
+                        let name = key
+                            .string_name()
+                            .expect("non-symbol key has string spelling");
+                        object::lookup_own(bag, &self.gc_heap, name)
+                    }
+                };
+                match lookup {
+                    object::PropertyLookup::Data { value, .. } => {
+                        return Ok(VmGetOutcome::Value(value));
+                    }
+                    object::PropertyLookup::Accessor { getter, .. } => {
+                        return Ok(match getter {
+                            Some(getter) if abstract_ops::is_callable(&getter) => {
+                                VmGetOutcome::InvokeGetter { getter }
+                            }
+                            _ => VmGetOutcome::Value(Value::undefined()),
+                        });
+                    }
+                    object::PropertyLookup::Absent => {}
+                }
+            }
+            // Otherwise route through the per-class prototype installed
+            // on `Temporal.<X>.prototype`.
             let proto = self.get_prototype_for_op(&base)?;
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
@@ -4312,6 +4395,7 @@ impl Interpreter {
             || base.is_data_view()
             || base.is_weak_ref()
             || base.is_finalization_registry()
+            || base.is_temporal()
         {
             return match self.ordinary_get_value(context, base, base, key, hops + 1)? {
                 VmGetOutcome::Value(v) if v.is_undefined() => Ok(false),
@@ -4767,6 +4851,30 @@ impl Interpreter {
             .into_iter()
             .collect());
         }
+        if target.is_temporal() {
+            // Enumerable own string keys are exactly the enumerable
+            // entries of the lazy expando bag.
+            let own_keys = self.own_property_keys_value(context, &target)?;
+            let mut out = Vec::new();
+            for key_value in own_keys {
+                let Some(name) = key_value.as_string(&self.gc_heap) else {
+                    continue;
+                };
+                let key = name.to_lossy_string(&self.gc_heap);
+                if let Some(desc) = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                    context,
+                    target,
+                    &VmPropertyKey::OwnedString(key.clone()),
+                    hops + 1,
+                    &[&target],
+                    &[],
+                )? && desc.enumerable()
+                {
+                    out.push(key);
+                }
+            }
+            return Ok(out);
+        }
         Ok(Vec::new())
     }
 
@@ -4950,6 +5058,20 @@ impl Interpreter {
         }
         if target.is_regexp() {
             return Ok(key.string_name().is_none_or(|key| key != "lastIndex"));
+        }
+        if let Some(t) = target.as_temporal(&self.gc_heap) {
+            // Only ordinary expando entries are deletable; there are no
+            // own non-configurable internal slots exposed as properties.
+            if let Some(bag) = t.expando(&self.gc_heap) {
+                return Ok(if let Some(name) = key.string_name() {
+                    object::delete(bag, &mut self.gc_heap, name)
+                } else if let VmPropertyKey::Symbol(sym) = key {
+                    object::delete_symbol(bag, &mut self.gc_heap, *sym)
+                } else {
+                    true
+                });
+            }
+            return Ok(true);
         }
         Ok(true)
     }
@@ -5246,6 +5368,70 @@ impl Interpreter {
                 receiver,
                 hops + 1,
             );
+        }
+        if let Some(t) = target.as_temporal(&self.gc_heap) {
+            // OrdinarySet over the expando: an own writable data slot
+            // stores (same receiver) or lands on the receiver; an own
+            // accessor invokes its setter; an own miss continues the
+            // walk through the Temporal instance's real [[Prototype]]
+            // (so `dt.year = x`, a getter-only accessor, rejects).
+            let bag = crate::property_dispatch::temporal_ensure_expando_pub(&mut self.gc_heap, &t)?;
+            let same_receiver = receiver
+                .as_temporal(&self.gc_heap)
+                .is_some_and(|r| r.ptr_eq(t));
+            let lookup = match key {
+                VmPropertyKey::Symbol(sym) => object::lookup_own_symbol(bag, &self.gc_heap, *sym),
+                _ => object::lookup_own(
+                    bag,
+                    &self.gc_heap,
+                    key.string_name()
+                        .expect("non-symbol key has string spelling"),
+                ),
+            };
+            match lookup {
+                object::PropertyLookup::Data { flags, .. } => {
+                    if !flags.writable() {
+                        return Ok(false);
+                    }
+                    if !same_receiver {
+                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                    }
+                    if let VmPropertyKey::Symbol(sym) = key {
+                        object::set_symbol(bag, &mut self.gc_heap, *sym, value);
+                    } else {
+                        object::set(
+                            bag,
+                            &mut self.gc_heap,
+                            key.string_name()
+                                .expect("non-symbol key has string spelling"),
+                            value,
+                        );
+                    }
+                    return Ok(true);
+                }
+                object::PropertyLookup::Accessor { setter, .. } => {
+                    let Some(setter) = setter else {
+                        return Ok(false);
+                    };
+                    let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
+                    self.run_callable_sync(context, &setter, receiver, argv)?;
+                    return Ok(true);
+                }
+                object::PropertyLookup::Absent => {
+                    let parent = self.get_prototype_for_op(&target)?;
+                    if parent.is_null() || parent.is_undefined() {
+                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                    }
+                    return self.ordinary_set_data_value(
+                        context,
+                        parent,
+                        key,
+                        value,
+                        receiver,
+                        hops + 1,
+                    );
+                }
+            }
         }
         let fid = target.as_function().or_else(|| {
             target

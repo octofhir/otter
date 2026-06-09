@@ -176,9 +176,13 @@ impl Frontmatter {
     /// - [`FrontmatterError::Yaml`] on YAML decode failure.
     pub fn parse(source: &str) -> Result<Self, FrontmatterError> {
         let yaml = extract_yaml(source)?;
-        // `\r` lurks in some Windows-style files; normalise so
-        // serde_yaml never sees `\r\n`.
-        let normalised = yaml.replace('\r', "");
+        // Normalise line terminators to `\n` so serde_yaml sees a
+        // well-formed multi-line document. Some tests
+        // (Function.prototype.toString CR-normalisation cases) use lone
+        // `\r` as the *only* line terminator; deleting CR outright would
+        // collapse the whole block onto one line and break YAML
+        // structure, so map CRLF and lone CR to LF instead.
+        let normalised = yaml.replace("\r\n", "\n").replace('\r', "\n");
         serde_yaml::from_str(&normalised).map_err(|e| FrontmatterError::Yaml(e.to_string()))
     }
 
@@ -269,6 +273,18 @@ mod tests {
         assert_eq!(fm.description.as_deref(), Some("A minimal test"));
         assert!(fm.flags.is_empty());
         assert!(fm.negative.is_none());
+    }
+
+    #[test]
+    fn parses_block_with_cr_only_line_terminators() {
+        // Function.prototype.toString CR-normalisation tests use lone
+        // `\r` as their only line terminator. Deleting CR would collapse
+        // the block onto one line and break YAML; the parser normalises
+        // CR (and CRLF) to LF instead.
+        let src = "/*---\rdescription: CR only\resid: sec-foo\r---*/\rx;";
+        let fm = Frontmatter::parse(src).unwrap();
+        assert_eq!(fm.description.as_deref(), Some("CR only"));
+        assert_eq!(fm.esid.as_deref(), Some("sec-foo"));
     }
 
     #[test]

@@ -1219,13 +1219,38 @@ pub enum NativeError {
     /// catchable by user code.
     #[error("native function interrupted")]
     Interrupted,
+    /// Heap-limit exhaustion surfaced from inside a native body. Kept
+    /// distinct from [`NativeError::TypeError`] so it round-trips to
+    /// [`crate::VmError::OutOfMemory`] — a catchable JS `RangeError`
+    /// that still records the host-visible `OutOfMemory` cause — rather
+    /// than collapsing into a misleading `TypeError`.
+    #[error("native function {name}: out of memory")]
+    OutOfMemory {
+        /// Display name of the native.
+        name: &'static str,
+        /// Bytes the failing allocation requested.
+        requested_bytes: u64,
+        /// Configured heap limit in bytes.
+        heap_limit_bytes: u64,
+    },
 }
 
 impl From<otter_gc::OutOfMemory> for NativeError {
-    fn from(_: otter_gc::OutOfMemory) -> Self {
-        Self::TypeError {
-            name: "native",
-            reason: "out of memory".to_string(),
+    fn from(err: otter_gc::OutOfMemory) -> Self {
+        match crate::oom_to_vm(err) {
+            crate::VmError::OutOfMemory {
+                requested_bytes,
+                heap_limit_bytes,
+            } => Self::OutOfMemory {
+                name: "native",
+                requested_bytes,
+                heap_limit_bytes,
+            },
+            _ => Self::OutOfMemory {
+                name: "native",
+                requested_bytes: 0,
+                heap_limit_bytes: 0,
+            },
         }
     }
 }
@@ -1268,6 +1293,19 @@ pub(crate) fn vm_to_native_error(err: crate::VmError, name: &'static str) -> Nat
             }
         }
         crate::VmError::Interrupted => NativeError::Interrupted,
+        // Heap exhaustion must keep its identity across the native
+        // boundary: a generic `TypeError` fallback would render OOM as
+        // an uncatchable-looking type error and lose the host's
+        // `OutOfMemory` cause. Preserve it so it round-trips to a
+        // catchable `RangeError`.
+        crate::VmError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        } => NativeError::OutOfMemory {
+            name,
+            requested_bytes,
+            heap_limit_bytes,
+        },
         other => NativeError::TypeError {
             name,
             reason: other.to_string(),

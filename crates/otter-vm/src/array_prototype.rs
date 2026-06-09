@@ -1587,10 +1587,10 @@ impl Interpreter {
         }
         match idx {
             Some(i) => crate::array::define_index_value(arr, self.gc_heap_mut(), i, value)
-                .map_err(|_| VmError::TypeMismatch)?,
+                .map_err(crate::oom_to_vm)?,
             None => {
                 crate::array::set_named_property(arr, self.gc_heap_mut(), key, value)
-                    .map_err(|_| VmError::TypeMismatch)?;
+                    .map_err(crate::oom_to_vm)?;
             }
         }
         Ok(true)

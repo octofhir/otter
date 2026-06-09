@@ -396,6 +396,14 @@ pub(crate) fn native_to_vm_error(err: NativeError) -> VmError {
         },
         NativeError::Exit { code } => VmError::Exit { code },
         NativeError::Interrupted => VmError::Interrupted,
+        NativeError::OutOfMemory {
+            name: _,
+            requested_bytes,
+            heap_limit_bytes,
+        } => VmError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        },
     }
 }
 

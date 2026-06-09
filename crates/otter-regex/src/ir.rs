@@ -71,10 +71,9 @@ fn compute_first_set(insns: &[Insn], ignore_case: bool) -> Option<CodePointSet> 
                 set.insert(*c);
                 return Some(set);
             }
-            Insn::Class {
-                set,
-                negate: false,
-            } if set.strings.is_empty() => return Some(set.code_points.clone()),
+            Insn::Class { set, negate: false } if set.strings.is_empty() => {
+                return Some(set.code_points.clone());
+            }
             _ => return None,
         }
     }

@@ -229,13 +229,19 @@ fn empty_match_terminates() {
 #[test]
 fn property_escapes() {
     // General_Category group, value, Script, and negation.
-    assert_eq!(matched_text("\\p{L}+", "u", "abc123").as_deref(), Some("abc"));
+    assert_eq!(
+        matched_text("\\p{L}+", "u", "abc123").as_deref(),
+        Some("abc")
+    );
     assert_eq!(matched_text("\\p{Lu}+", "u", "ABcd").as_deref(), Some("AB"));
     assert_eq!(
         matched_text("\\p{Script=Greek}+", "u", "αβγx").map(|s| s.chars().count()),
         Some(3)
     );
-    assert_eq!(matched_text("[\\p{L}\\d]+", "u", "ab12!").as_deref(), Some("ab12"));
+    assert_eq!(
+        matched_text("[\\p{L}\\d]+", "u", "ab12!").as_deref(),
+        Some("ab12")
+    );
     assert_eq!(matched_text("\\P{L}", "u", "5").as_deref(), Some("5"));
     // Binary property.
     assert!(matched_text("\\p{White_Space}", "u", "a b").is_some());

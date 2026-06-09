@@ -64,6 +64,26 @@ pub(crate) fn resolve_property(
 /// A lone `\p{name}`: an ECMA-262 binary property, else a General_Category value.
 #[cfg(feature = "unicode")]
 fn binary_or_general_category(name: &str) -> Option<CodePointSet> {
+    // §22.2.1 lists `Any`, `ASCII`, and `Assigned` as binary properties, but
+    // they are not real Unicode binary properties and `icu_properties` does
+    // not surface them, so resolve them directly.
+    match name {
+        "Any" => {
+            let mut set = CodePointSet::new();
+            set.insert_range(0, 0x10_FFFF);
+            return Some(set);
+        }
+        "ASCII" => {
+            let mut set = CodePointSet::new();
+            set.insert_range(0, 0x7F);
+            return Some(set);
+        }
+        "Assigned" => {
+            // Every code point that is not General_Category=Unassigned (Cn).
+            return general_category("Cn").map(|cn| cn.negate());
+        }
+        _ => {}
+    }
     if let Some(set) = CodePointSetData::new_for_ecma262(name.as_bytes()) {
         return Some(CodePointSet::from_ranges(set.iter_ranges()));
     }

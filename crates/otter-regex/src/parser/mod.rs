@@ -711,6 +711,13 @@ impl<'a> Parser<'a> {
     /// Parse the `{name}` / `{name=value}` body of a `\p`/`\P` escape and resolve
     /// it to a code-point set.
     fn parse_property_body(&mut self) -> Result<CodePointSet, RegexError> {
+        let (name, value) = self.read_property_name_body()?;
+        crate::unicode::resolve_property(&name, value.as_deref())
+    }
+
+    /// Parse the `{name}` / `{name=value}` body of a `\p`/`\P` escape into
+    /// its name and optional value, leaving the cursor after `}`.
+    fn read_property_name_body(&mut self) -> Result<(String, Option<String>), RegexError> {
         if !self.eat(b'{' as u16) {
             return Err(self.err("expected `{` after \\p"));
         }
@@ -730,14 +737,30 @@ impl<'a> Parser<'a> {
             return Err(self.err("unterminated \\p{...}"));
         }
         let to_str = |units: &[u16]| String::from_utf16_lossy(units);
-        let (name, value) = match eq {
+        Ok(match eq {
             Some(eq) => (
                 to_str(&self.units[start..eq]),
                 Some(to_str(&self.units[eq + 1..close])),
             ),
             None => (to_str(&self.units[start..close]), None),
-        };
-        crate::unicode::resolve_property(&name, value.as_deref())
+        })
+    }
+
+    /// `v`-mode `\p{...}` / `\P{...}` operand: a string property (e.g.
+    /// `\p{Basic_Emoji}`) resolves to a [`ClassSet`] with string
+    /// alternatives; any other property resolves to a code-point set.
+    /// A negated string property (`\P{Basic_Emoji}`) is a syntax error.
+    fn parse_property_set_v(&mut self, negate: bool) -> Result<ClassSet, RegexError> {
+        let (name, value) = self.read_property_name_body()?;
+        if value.is_none() && crate::unicode::string_props::is_string_property(&name) {
+            if negate {
+                return Err(self.err("a negated property may not contain strings"));
+            }
+            return crate::unicode::string_props::resolve_string_property(&name);
+        }
+        let set = crate::unicode::resolve_property(&name, value.as_deref())?;
+        let set = if negate { set.negate() } else { set };
+        Ok(ClassSet::from_code_points(set))
     }
 
     /// A single-character escape resolving to one code point.
@@ -1015,6 +1038,15 @@ impl<'a> Parser<'a> {
                 if self.peek_at(1) == Some(b'q' as u16) {
                     self.pos += 2; // consume `\q`
                     return self.parse_class_string_disjunction();
+                }
+                // `\p{...}` / `\P{...}` may name a string property in `v`
+                // mode, so route it through the set-aware resolver.
+                if matches!(self.peek_at(1), Some(x) if x == b'p' as u16 || x == b'P' as u16)
+                    && self.unicode()
+                {
+                    let negate = self.peek_at(1) == Some(b'P' as u16);
+                    self.pos += 2; // consume `\p` / `\P`
+                    return self.parse_property_set_v(negate);
                 }
                 self.pos += 1; // consume '\'
                 if let Some((sub, negate)) = self.try_class_escape_set()? {

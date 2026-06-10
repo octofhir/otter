@@ -755,6 +755,26 @@ pub(crate) fn compile_spread_call(
             );
             (method_dst, recv)
         }
+        // `obj[expr](...args)` — computed-member spread call. The
+        // receiver must be threaded as `this`, mirroring the
+        // non-spread computed-member path (§13.3.6.1 EvaluateCall
+        // step 5.b). Object then property key then args, in source
+        // order.
+        Expression::ComputedMemberExpression(member) => {
+            let recv = compile_expr(cx, &member.object, span)?;
+            let idx_reg = compile_expr(cx, &member.expression, span)?;
+            let method_dst = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadElement,
+                vec![
+                    Operand::Register(method_dst),
+                    Operand::Register(recv),
+                    Operand::Register(idx_reg),
+                ],
+                span,
+            );
+            (method_dst, recv)
+        }
         other => {
             let r = compile_expr(cx, other, span)?;
             let this_dst = cx.alloc_scratch();

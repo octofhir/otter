@@ -330,6 +330,9 @@ fn impl_with_plain_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
         temporal_rs::PlainTime::default()
             .with(partial, None)
             .map_err(|e| temporal_err(e, CLASS))?
+    } else if let Some(s) = arg.as_string(ctx.heap()) {
+        temporal_rs::PlainTime::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
+            .map_err(|e| temporal_err(e, CLASS))?
     } else {
         return Err(NativeError::TypeError {
             name: CLASS,

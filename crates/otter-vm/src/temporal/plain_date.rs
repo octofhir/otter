@@ -262,10 +262,14 @@ fn impl_to_plain_date_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
             .with(partial, None)
             .map_err(|e| temporal_err(e, CLASS))?;
         Some(pt)
+    } else if let Some(s) = v.as_string(ctx.heap()) {
+        let pt = temporal_rs::PlainTime::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
+            .map_err(|e| temporal_err(e, CLASS))?;
+        Some(pt)
     } else {
         return Err(NativeError::TypeError {
             name: CLASS,
-            reason: "first argument must be an object or undefined".to_string(),
+            reason: "first argument must be an object, string, or undefined".to_string(),
         });
     };
     let pdt = pd

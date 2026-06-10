@@ -323,8 +323,9 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         time,
         offset: None,
     };
+    let overflow = parse_overflow(ctx, args, 1)?;
     let result = zdt
-        .with(fields, None, None, None)
+        .with(fields, None, None, overflow)
         .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::ZonedDateTime(result))
 }

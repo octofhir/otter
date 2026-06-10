@@ -224,7 +224,10 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         });
     };
     let fields = parse_calendar_fields(ctx, obj, CLASS)?;
-    let result = pd.with(fields, None).map_err(|e| temporal_err(e, CLASS))?;
+    let overflow = parse_overflow(ctx, args, 1)?;
+    let result = pd
+        .with(fields, overflow)
+        .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainDate(result))
 }
 

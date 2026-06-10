@@ -22,7 +22,7 @@ use crate::temporal::helpers::read_calendar_field;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, js_string_value, make_temporal, parse_calendar_fields,
     parse_difference_settings, parse_partial_time, parse_rounding_options, parse_time_zone,
-    require_construct, require_zoned_date_time, str_or_undef, temporal_err,
+    read_option_string, require_construct, require_zoned_date_time, str_or_undef, temporal_err,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -361,6 +361,60 @@ fn impl_to_plain_date_time(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<V
     )
 }
 
+/// `Temporal.ZonedDateTime.prototype.getTimeZoneTransition` — the next or
+/// previous instant at which the UTC offset of the receiver's time zone
+/// changes. `directionParam` is required: a `"next"`/`"previous"` string,
+/// or an options object carrying a `direction` property (§GetDirectionOption).
+/// Returns a `ZonedDateTime` or `null` when there is no further transition
+/// (e.g. an offset or transition-free zone).
+fn impl_get_time_zone_transition(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    use core::str::FromStr;
+    let zdt = require_zoned_date_time(ctx)?;
+    let param = arg_or_undef(args, 0);
+    if param.is_undefined() {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "getTimeZoneTransition: direction parameter is required".to_string(),
+        });
+    }
+    // A bare string is treated as the `direction` directly; any other
+    // value must be an options object whose `direction` is read and
+    // coerced to a string (observable getter + toString).
+    let dir_str = if let Some(s) = param.as_string(ctx.heap()) {
+        s.to_lossy_string(ctx.heap())
+    } else if let Some(obj) = param.as_object() {
+        read_option_string(ctx, obj, "direction", CLASS)?.ok_or_else(|| {
+            NativeError::RangeError {
+                name: CLASS,
+                reason: "getTimeZoneTransition: `direction` option is required".to_string(),
+            }
+        })?
+    } else {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "getTimeZoneTransition: direction must be a string or options object"
+                .to_string(),
+        });
+    };
+    let direction =
+        temporal_rs::provider::TransitionDirection::from_str(&dir_str).map_err(|_| {
+            NativeError::RangeError {
+                name: CLASS,
+                reason: format!("getTimeZoneTransition: invalid direction `{dir_str}`"),
+            }
+        })?;
+    match zdt
+        .get_time_zone_transition(direction)
+        .map_err(|e| temporal_err(e, CLASS))?
+    {
+        Some(next) => make_temporal(ctx, TemporalPayload::ZonedDateTime(next)),
+        None => Ok(Value::null()),
+    }
+}
+
 /// Generate a `Temporal.ZonedDateTime.prototype` accessor getter,
 /// re-validating the receiver via [`require_zoned_date_time`]
 /// (branding `TypeError`). The heap arm exposes `&mut GcHeap` for
@@ -458,6 +512,7 @@ pub static ZONED_DATE_TIME_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("toPlainDate", 0, impl_to_plain_date),
     method("toPlainTime", 0, impl_to_plain_time),
     method("toPlainDateTime", 0, impl_to_plain_date_time),
+    method("getTimeZoneTransition", 1, impl_get_time_zone_transition),
 ];
 
 otter_macros::couch! {

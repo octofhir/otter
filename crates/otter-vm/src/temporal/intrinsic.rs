@@ -139,6 +139,12 @@ const NOW_SPEC: NamespaceSpec = NamespaceSpec {
     name: "Now",
     methods: &[
         method("instant", 0, crate::temporal::now::instant),
+        method("timeZoneId", 0, crate::temporal::now::time_zone_id),
+        method(
+            "zonedDateTimeISO",
+            0,
+            crate::temporal::now::zoned_date_time_iso,
+        ),
         method(
             "plainDateTimeISO",
             0,

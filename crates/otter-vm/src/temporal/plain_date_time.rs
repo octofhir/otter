@@ -236,15 +236,19 @@ fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
 fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pdt = require_plain_date_time(ctx)?;
     let dur = duration_arg(ctx, &arg_or_undef(args, 0))?;
-    let result = pdt.add(&dur, None).map_err(|e| temporal_err(e, CLASS))?;
+    let overflow = parse_overflow(ctx, args, 1)?;
+    let result = pdt
+        .add(&dur, overflow)
+        .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainDateTime(result))
 }
 
 fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pdt = require_plain_date_time(ctx)?;
     let dur = duration_arg(ctx, &arg_or_undef(args, 0))?;
+    let overflow = parse_overflow(ctx, args, 1)?;
     let result = pdt
-        .subtract(&dur, None)
+        .subtract(&dur, overflow)
         .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainDateTime(result))
 }

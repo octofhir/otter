@@ -59,8 +59,23 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let arg = arg_or_undef(args, 0);
+    // §ToTemporalTime orders the parse of the primary argument before
+    // GetTemporalOverflowOption: an ISO-invalid string must reject
+    // before the `overflow` option is observed. The property-bag and
+    // instance paths read overflow up front (their field reads precede
+    // it through `from_partial`), but a primitive string is parsed
+    // first, then overflow is read for its observable side effects.
+    if arg.as_temporal(ctx.heap()).is_none()
+        && let Some(s) = arg.as_string(ctx.heap())
+    {
+        let pt = temporal_rs::PlainTime::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
+            .map_err(|e| temporal_err(e, CLASS))?;
+        parse_overflow(ctx, args, 1)?;
+        return make_temporal(ctx, TemporalPayload::PlainTime(pt));
+    }
     let overflow = parse_overflow(ctx, args, 1)?;
-    let pt = parse_plain_time_arg_with_overflow(ctx, &arg_or_undef(args, 0), overflow)?;
+    let pt = parse_plain_time_arg_with_overflow(ctx, &arg, overflow)?;
     make_temporal(ctx, TemporalPayload::PlainTime(pt))
 }
 

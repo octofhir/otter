@@ -214,9 +214,7 @@ pub fn read_option_string(
     name: &str,
     class: &'static str,
 ) -> Result<Option<String>, NativeError> {
-    let Some(field) = object::get(obj, ctx.heap(), name) else {
-        return Ok(None);
-    };
+    let field = get_option_value(ctx, Value::object(obj), name, class)?;
     if field.is_undefined() {
         return Ok(None);
     }
@@ -241,12 +239,10 @@ pub fn parse_overflow(
 ) -> Result<Option<temporal_rs::options::Overflow>, NativeError> {
     use core::str::FromStr;
     let v = arg_or_undef(args, index);
-    let Some(obj) = options_object(&v, "Temporal")? else {
+    if options_object(&v, "Temporal")?.is_none() {
         return Ok(None);
-    };
-    let Some(field) = object::get(obj, ctx.heap(), "overflow") else {
-        return Ok(None);
-    };
+    }
+    let field = get_option_value(ctx, v, "overflow", "Temporal")?;
     if field.is_undefined() {
         return Ok(None);
     }
@@ -281,6 +277,43 @@ pub fn options_object(v: &Value, class: &'static str) -> Result<Option<JsObject>
         });
     }
     Ok(v.as_object())
+}
+
+/// Perform a spec [[Get]] (`options.<name>`) that walks the prototype
+/// chain and **fires an accessor getter** with `options` as the
+/// receiver. The raw `object::get` used elsewhere returns `undefined`
+/// for an accessor slot without invoking the getter, so option bags
+/// exposing observable getters (the `propertyBagObserver` Test262
+/// pattern) were silently read as absent. `options` must be the
+/// options object value itself.
+pub fn get_option_value(
+    ctx: &mut NativeCtx<'_>,
+    options: Value,
+    name: &str,
+    class: &'static str,
+) -> Result<Value, NativeError> {
+    use crate::native_function::vm_to_native_error;
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: class,
+            reason: "missing execution context".to_string(),
+        })?;
+    let key = crate::VmPropertyKey::String(name);
+    let outcome = ctx
+        .cx
+        .interp
+        .ordinary_get_value(&exec, options, options, &key, 0)
+        .map_err(|e| vm_to_native_error(e, class))?;
+    match outcome {
+        crate::VmGetOutcome::Value(v) => Ok(v),
+        crate::VmGetOutcome::InvokeGetter { getter } => ctx
+            .cx
+            .interp
+            .run_callable_sync(&exec, &getter, options, smallvec::SmallVec::new())
+            .map_err(|e| vm_to_native_error(e, class)),
+    }
 }
 
 pub fn opt_integer_if_integral(

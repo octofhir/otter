@@ -21,8 +21,9 @@ use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::helpers::read_calendar_field;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, js_string_value, make_temporal, parse_calendar_fields,
-    parse_difference_settings, parse_partial_time, parse_rounding_options, parse_time_zone,
-    read_option_string, require_construct, require_zoned_date_time, str_or_undef, temporal_err,
+    parse_difference_settings, parse_overflow, parse_partial_time, parse_rounding_options,
+    parse_time_zone, read_option_string, require_construct, require_zoned_date_time, str_or_undef,
+    temporal_err,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -220,15 +221,19 @@ fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
 fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
     let dur = duration_arg(ctx, &arg_or_undef(args, 0))?;
-    let result = zdt.add(&dur, None).map_err(|e| temporal_err(e, CLASS))?;
+    let overflow = parse_overflow(ctx, args, 1)?;
+    let result = zdt
+        .add(&dur, overflow)
+        .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::ZonedDateTime(result))
 }
 
 fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
     let dur = duration_arg(ctx, &arg_or_undef(args, 0))?;
+    let overflow = parse_overflow(ctx, args, 1)?;
     let result = zdt
-        .subtract(&dur, None)
+        .subtract(&dur, overflow)
         .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::ZonedDateTime(result))
 }

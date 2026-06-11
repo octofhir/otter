@@ -111,7 +111,7 @@ pub(crate) fn parse_zdt_arg_with_options(
         // Reads fire through getter/Proxy-aware [[Get]]s.
         let calendar = read_calendar_field(ctx, *v, CLASS)?;
         let calendar_fields = parse_calendar_fields(ctx, *v, &calendar, CLASS)?;
-        let offset = read_option_string(ctx, *v, "offset", CLASS)?
+        let offset = crate::temporal::helpers::read_required_string(ctx, *v, "offset", CLASS)?
             .map(|s| {
                 temporal_rs::UtcOffset::from_utf8(s.as_bytes()).map_err(|e| temporal_err(e, CLASS))
             })
@@ -381,18 +381,8 @@ fn impl_start_of_day(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, 
 
 fn impl_with_calendar(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
-    let Some(js) = arg_or_undef(args, 0).as_string(ctx.heap()) else {
-        return Err(NativeError::TypeError {
-            name: CLASS,
-            reason: "calendar identifier must be a string".to_string(),
-        });
-    };
-    let s = js.to_lossy_string(ctx.heap());
-    // ParseTemporalCalendarString: accept bare ids and ISO strings with
-    // a `[u-ca=]` annotation (FromStr), not only bare identifiers.
-    let calendar = s
-        .parse::<temporal_rs::Calendar>()
-        .map_err(|e| temporal_err(e, CLASS))?;
+    let calendar =
+        crate::temporal::helpers::to_calendar_slot_value(ctx, &arg_or_undef(args, 0), CLASS)?;
     let result = zdt.with_calendar(calendar);
     make_temporal(ctx, TemporalPayload::ZonedDateTime(result))
 }

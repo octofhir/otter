@@ -337,18 +337,8 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
 
 fn impl_with_calendar(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pdt = require_plain_date_time(ctx)?;
-    let Some(js) = arg_or_undef(args, 0).as_string(ctx.heap()) else {
-        return Err(NativeError::TypeError {
-            name: CLASS,
-            reason: "calendar identifier must be a string".to_string(),
-        });
-    };
-    let s = js.to_lossy_string(ctx.heap());
-    // ParseTemporalCalendarString: accept bare ids and ISO strings with
-    // a `[u-ca=]` annotation (FromStr), not only bare identifiers.
-    let calendar = s
-        .parse::<temporal_rs::Calendar>()
-        .map_err(|e| temporal_err(e, CLASS))?;
+    let calendar =
+        crate::temporal::helpers::to_calendar_slot_value(ctx, &arg_or_undef(args, 0), CLASS)?;
     let result = pdt.with_calendar(calendar);
     make_temporal(ctx, TemporalPayload::PlainDateTime(result))
 }

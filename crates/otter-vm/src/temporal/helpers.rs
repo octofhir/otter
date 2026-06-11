@@ -230,17 +230,17 @@ pub fn read_option_string(
         .map_err(|e| crate::native_function::vm_to_native_error(e, class))
 }
 
-/// Read a `monthCode` field. §CalendarFieldsToISO requires a String
-/// value: an object is coerced with ToPrimitive(string) (firing
-/// `toString`) and the result must itself be a String, otherwise a
-/// TypeError; any other non-string primitive is a TypeError. A
-/// well-formed-but-invalid string is a RangeError.
-fn read_month_code(
+/// Read a string-typed field that requires a String value (§the field
+/// conversions for `monthCode` / `offset`): the value is coerced with
+/// ToPrimitive(string) (firing `toString`) and the result must itself be
+/// a String, otherwise a TypeError. Returns `None` for an absent field.
+pub fn read_required_string(
     ctx: &mut NativeCtx<'_>,
     target: Value,
+    name: &str,
     class: &'static str,
-) -> Result<Option<temporal_rs::MonthCode>, NativeError> {
-    let field = get_option_value(ctx, target, "monthCode", class)?;
+) -> Result<Option<String>, NativeError> {
+    let field = get_option_value(ctx, target, name, class)?;
     if field.is_undefined() {
         return Ok(None);
     }
@@ -262,14 +262,27 @@ fn read_month_code(
     let Some(s) = prim.as_string(ctx.heap()) else {
         return Err(NativeError::TypeError {
             name: class,
-            reason: "monthCode must be a string".to_string(),
+            reason: format!("{name} must be a string"),
         });
     };
-    let code = temporal_rs::MonthCode::try_from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
-        .map_err(|_| NativeError::RangeError {
+    Ok(Some(s.to_lossy_string(ctx.heap())))
+}
+
+/// Read a `monthCode` field (string-required; malformed → RangeError).
+fn read_month_code(
+    ctx: &mut NativeCtx<'_>,
+    target: Value,
+    class: &'static str,
+) -> Result<Option<temporal_rs::MonthCode>, NativeError> {
+    let Some(s) = read_required_string(ctx, target, "monthCode", class)? else {
+        return Ok(None);
+    };
+    let code = temporal_rs::MonthCode::try_from_utf8(s.as_bytes()).map_err(|_| {
+        NativeError::RangeError {
             name: class,
             reason: "monthCode is not well-formed".to_string(),
-        })?;
+        }
+    })?;
     Ok(Some(code))
 }
 
@@ -620,11 +633,35 @@ pub fn parse_to_string_rounding_options(
     // smallestUnit through getter/Proxy-aware [[Get]]s.
     let frac = get_option_value(ctx, v, "fractionalSecondDigits", class)?;
     if !frac.is_undefined() {
-        // GetTemporalFractionalSecondDigitsOption: "auto" or an integer
-        // 0-9 (a non-"auto" value is coerced via ToNumber, firing
-        // valueOf, then floored and range-checked).
-        if let Some(s) = frac.as_string(ctx.heap()) {
-            if s.to_lossy_string(ctx.heap()) == "auto" {
+        // §GetStringOrNumberOption(« Number, String »): a Number-typed
+        // value is ToNumber'd (floored to a 0-9 digit); ANY other value
+        // (string / boolean / null / object) is ToString'd and must be
+        // the literal "auto". So `null`/`true` coerce to "null"/"true"
+        // → RangeError, not ToNumber.
+        if frac.is_number() {
+            let raw = to_number_field(ctx, &frac, class, "fractionalSecondDigits")?;
+            let d = raw.floor();
+            if raw.is_nan() || !(0.0..=9.0).contains(&d) {
+                return Err(NativeError::RangeError {
+                    name: class,
+                    reason: "`fractionalSecondDigits` must be an integer 0-9".to_string(),
+                });
+            }
+            opts.precision = temporal_rs::parsers::Precision::Digit(d as u8);
+        } else {
+            let exec = ctx
+                .execution_context()
+                .cloned()
+                .ok_or_else(|| NativeError::TypeError {
+                    name: class,
+                    reason: "missing execution context".to_string(),
+                })?;
+            let s = ctx
+                .cx
+                .interp
+                .coerce_to_string(&exec, &frac)
+                .map_err(|e| crate::native_function::vm_to_native_error(e, class))?;
+            if s == "auto" {
                 opts.precision = temporal_rs::parsers::Precision::Auto;
             } else {
                 return Err(NativeError::RangeError {
@@ -633,23 +670,6 @@ pub fn parse_to_string_rounding_options(
                         .to_string(),
                 });
             }
-        } else {
-            let raw = to_number_field(ctx, &frac, class, "fractionalSecondDigits")?;
-            if raw.is_nan() {
-                return Err(NativeError::RangeError {
-                    name: class,
-                    reason: "`fractionalSecondDigits` must be \"auto\" or an integer 0-9"
-                        .to_string(),
-                });
-            }
-            let d = raw.floor();
-            if !(0.0..=9.0).contains(&d) {
-                return Err(NativeError::RangeError {
-                    name: class,
-                    reason: "`fractionalSecondDigits` must be an integer 0-9".to_string(),
-                });
-            }
-            opts.precision = temporal_rs::parsers::Precision::Digit(d as u8);
         }
     }
     if let Some(name) = read_option_string(ctx, v, "roundingMode", class)? {
@@ -875,6 +895,41 @@ pub fn parse_partial_time(
         t.second = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
     Ok(t)
+}
+
+/// §ToTemporalCalendarSlotValue — resolve a `calendarLike` argument
+/// (e.g. `withCalendar`): a calendar-bearing Temporal instance
+/// contributes its `[[Calendar]]` slot directly (no property read); a
+/// string is parsed via ParseTemporalCalendarString; anything else is a
+/// TypeError.
+pub fn to_calendar_slot_value(
+    ctx: &mut NativeCtx<'_>,
+    v: &Value,
+    class: &'static str,
+) -> Result<temporal_rs::Calendar, NativeError> {
+    if let Some(t) = v.as_temporal(ctx.heap()) {
+        return match t.payload_clone(ctx.heap()) {
+            TemporalPayload::PlainDate(d) => Ok(d.calendar().clone()),
+            TemporalPayload::PlainDateTime(d) => Ok(d.calendar().clone()),
+            TemporalPayload::PlainYearMonth(d) => Ok(d.calendar().clone()),
+            TemporalPayload::PlainMonthDay(d) => Ok(d.calendar().clone()),
+            TemporalPayload::ZonedDateTime(d) => Ok(d.calendar().clone()),
+            _ => Err(NativeError::TypeError {
+                name: class,
+                reason: "calendar-less Temporal object is not a valid calendar".to_string(),
+            }),
+        };
+    }
+    if let Some(js) = v.as_string(ctx.heap()) {
+        return js
+            .to_lossy_string(ctx.heap())
+            .parse::<temporal_rs::Calendar>()
+            .map_err(|e| temporal_err(e, class));
+    }
+    Err(NativeError::TypeError {
+        name: class,
+        reason: "calendar must be a calendar identifier string or a Temporal object".to_string(),
+    })
 }
 
 /// §ToTemporalCalendarIdentifier — read the `calendar` property of a

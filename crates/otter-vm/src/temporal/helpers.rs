@@ -210,11 +210,11 @@ pub fn read_rounding_increment(
 
 pub fn read_option_string(
     ctx: &mut NativeCtx<'_>,
-    obj: JsObject,
+    target: Value,
     name: &str,
     class: &'static str,
 ) -> Result<Option<String>, NativeError> {
-    let field = get_option_value(ctx, Value::object(obj), name, class)?;
+    let field = get_option_value(ctx, target, name, class)?;
     if field.is_undefined() {
         return Ok(None);
     }
@@ -358,6 +358,9 @@ pub fn arg_to_calendar(
         });
     };
     let s = js.to_lossy_string(heap);
+    // The constructor's calendar argument is a bare calendar identifier
+    // (not ParseTemporalCalendarString) — an ISO date string is invalid
+    // here, so `try_from_utf8` rather than `FromStr`.
     temporal_rs::Calendar::try_from_utf8(s.as_bytes()).map_err(|e| NativeError::RangeError {
         name: class,
         reason: format!("invalid calendar identifier: {e}"),
@@ -519,7 +522,7 @@ pub fn parse_disambiguation(
     let Some(obj) = options_object(&v, class)? else {
         return Ok(temporal_rs::options::Disambiguation::Compatible);
     };
-    match read_option_string(ctx, obj, "disambiguation", class)? {
+    match read_option_string(ctx, Value::object(obj), "disambiguation", class)? {
         Some(name) => temporal_rs::options::Disambiguation::from_str(&name).map_err(|_| {
             NativeError::RangeError {
                 name: class,
@@ -570,7 +573,7 @@ pub fn parse_to_string_rounding_options(
     let Some(obj) = options_object(&v, class)? else {
         return Ok(opts);
     };
-    if let Some(name) = read_option_string(ctx, obj, "smallestUnit", class)? {
+    if let Some(name) = read_option_string(ctx, Value::object(obj), "smallestUnit", class)? {
         opts.smallest_unit = Some(temporal_rs::options::Unit::from_str(&name).map_err(|_| {
             NativeError::RangeError {
                 name: class,
@@ -578,7 +581,7 @@ pub fn parse_to_string_rounding_options(
             }
         })?);
     }
-    if let Some(name) = read_option_string(ctx, obj, "roundingMode", class)? {
+    if let Some(name) = read_option_string(ctx, Value::object(obj), "roundingMode", class)? {
         opts.rounding_mode = Some(temporal_rs::options::RoundingMode::from_str(&name).map_err(
             |_| NativeError::RangeError {
                 name: class,
@@ -633,7 +636,7 @@ pub fn parse_display_calendar(
     let Some(obj) = options_object(&v, class)? else {
         return Ok(temporal_rs::options::DisplayCalendar::Auto);
     };
-    match read_option_string(ctx, obj, "calendarName", class)? {
+    match read_option_string(ctx, Value::object(obj), "calendarName", class)? {
         Some(name) => temporal_rs::options::DisplayCalendar::from_str(&name).map_err(|_| {
             NativeError::RangeError {
                 name: class,
@@ -646,13 +649,14 @@ pub fn parse_display_calendar(
 
 fn read_partial_integer(
     ctx: &mut NativeCtx<'_>,
-    obj: JsObject,
+    target: Value,
     name: &str,
     class: &'static str,
 ) -> Result<Option<i64>, NativeError> {
-    let Some(v) = object::get(obj, ctx.heap(), name) else {
-        return Ok(None);
-    };
+    // Read through a spec [[Get]] so accessor getters, Proxy traps, and
+    // a Temporal instance's own virtual field accessors all fire — a
+    // raw `object::get` would miss every one of them.
+    let v = get_option_value(ctx, target, name, class)?;
     if v.is_undefined() {
         return Ok(None);
     }
@@ -685,7 +689,7 @@ pub fn parse_difference_settings(
     let Some(obj) = options_object(&v, class)? else {
         return Ok(settings);
     };
-    if let Some(name) = read_option_string(ctx, obj, "largestUnit", class)?
+    if let Some(name) = read_option_string(ctx, Value::object(obj), "largestUnit", class)?
         && !name.is_empty()
         && !name.eq_ignore_ascii_case("auto")
     {
@@ -696,7 +700,7 @@ pub fn parse_difference_settings(
             })?;
         settings.largest_unit = Some(unit);
     }
-    if let Some(name) = read_option_string(ctx, obj, "smallestUnit", class)? {
+    if let Some(name) = read_option_string(ctx, Value::object(obj), "smallestUnit", class)? {
         let unit =
             temporal_rs::options::Unit::from_str(&name).map_err(|_| NativeError::RangeError {
                 name: class,
@@ -704,7 +708,7 @@ pub fn parse_difference_settings(
             })?;
         settings.smallest_unit = Some(unit);
     }
-    if let Some(name) = read_option_string(ctx, obj, "roundingMode", class)? {
+    if let Some(name) = read_option_string(ctx, Value::object(obj), "roundingMode", class)? {
         let mode = temporal_rs::options::RoundingMode::from_str(&name).map_err(|_| {
             NativeError::RangeError {
                 name: class,
@@ -747,7 +751,7 @@ pub fn parse_rounding_options(
             reason: "round() requires an options object or smallest-unit string".to_string(),
         });
     };
-    if let Some(name) = read_option_string(ctx, obj, "largestUnit", class)? {
+    if let Some(name) = read_option_string(ctx, Value::object(obj), "largestUnit", class)? {
         let unit =
             temporal_rs::options::Unit::from_str(&name).map_err(|_| NativeError::RangeError {
                 name: class,
@@ -755,7 +759,7 @@ pub fn parse_rounding_options(
             })?;
         options.largest_unit = Some(unit);
     }
-    if let Some(name) = read_option_string(ctx, obj, "smallestUnit", class)? {
+    if let Some(name) = read_option_string(ctx, Value::object(obj), "smallestUnit", class)? {
         let unit =
             temporal_rs::options::Unit::from_str(&name).map_err(|_| NativeError::RangeError {
                 name: class,
@@ -763,7 +767,7 @@ pub fn parse_rounding_options(
             })?;
         options.smallest_unit = Some(unit);
     }
-    if let Some(name) = read_option_string(ctx, obj, "roundingMode", class)? {
+    if let Some(name) = read_option_string(ctx, Value::object(obj), "roundingMode", class)? {
         let mode = temporal_rs::options::RoundingMode::from_str(&name).map_err(|_| {
             NativeError::RangeError {
                 name: class,
@@ -780,27 +784,27 @@ pub fn parse_rounding_options(
 
 pub fn parse_partial_time(
     ctx: &mut NativeCtx<'_>,
-    obj: JsObject,
+    target: Value,
     class: &'static str,
 ) -> Result<temporal_rs::partial::PartialTime, NativeError> {
     let mut t = temporal_rs::partial::PartialTime::default();
-    if let Some(v) = read_partial_integer(ctx, obj, "hour", class)? {
+    if let Some(v) = read_partial_integer(ctx, target, "hour", class)? {
         t.hour = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
-    if let Some(v) = read_partial_integer(ctx, obj, "minute", class)? {
-        t.minute = Some(v.clamp(0, u8::MAX as i64) as u8);
-    }
-    if let Some(v) = read_partial_integer(ctx, obj, "second", class)? {
-        t.second = Some(v.clamp(0, u8::MAX as i64) as u8);
-    }
-    if let Some(v) = read_partial_integer(ctx, obj, "millisecond", class)? {
-        t.millisecond = Some(v.clamp(0, u16::MAX as i64) as u16);
-    }
-    if let Some(v) = read_partial_integer(ctx, obj, "microsecond", class)? {
+    if let Some(v) = read_partial_integer(ctx, target, "microsecond", class)? {
         t.microsecond = Some(v.clamp(0, u16::MAX as i64) as u16);
     }
-    if let Some(v) = read_partial_integer(ctx, obj, "nanosecond", class)? {
+    if let Some(v) = read_partial_integer(ctx, target, "millisecond", class)? {
+        t.millisecond = Some(v.clamp(0, u16::MAX as i64) as u16);
+    }
+    if let Some(v) = read_partial_integer(ctx, target, "minute", class)? {
+        t.minute = Some(v.clamp(0, u8::MAX as i64) as u8);
+    }
+    if let Some(v) = read_partial_integer(ctx, target, "nanosecond", class)? {
         t.nanosecond = Some(v.clamp(0, u16::MAX as i64) as u16);
+    }
+    if let Some(v) = read_partial_integer(ctx, target, "second", class)? {
+        t.second = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
     Ok(t)
 }
@@ -858,29 +862,18 @@ pub fn read_calendar_field(
 
 pub fn parse_calendar_fields(
     ctx: &mut NativeCtx<'_>,
-    obj: JsObject,
+    target: Value,
     class: &'static str,
 ) -> Result<temporal_rs::fields::CalendarFields, NativeError> {
+    // §PrepareCalendarFields reads the field keys in alphabetical order
+    // (day, era, eraYear, month, monthCode, year), each through a spec
+    // [[Get]] so accessor getters / Proxy traps / Temporal-instance
+    // accessors all fire.
     let mut f = temporal_rs::fields::CalendarFields::default();
-    if let Some(v) = read_partial_integer(ctx, obj, "year", class)? {
-        f.year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
-    }
-    if let Some(v) = read_partial_integer(ctx, obj, "month", class)? {
-        f.month = Some(v.clamp(0, u8::MAX as i64) as u8);
-    }
-    if let Some(v) = read_partial_integer(ctx, obj, "day", class)? {
+    if let Some(v) = read_partial_integer(ctx, target, "day", class)? {
         f.day = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
-    if let Some(s) = read_string_field(obj, "monthCode", ctx.heap()) {
-        let code = temporal_rs::MonthCode::try_from_utf8(s.as_bytes()).map_err(|_| {
-            NativeError::TypeError {
-                name: class,
-                reason: "invalid monthCode".to_string(),
-            }
-        })?;
-        f.month_code = Some(code);
-    }
-    if let Some(s) = read_string_field(obj, "era", ctx.heap()) {
+    if let Some(s) = read_option_string(ctx, target, "era", class)? {
         let era = temporal_rs::TinyAsciiStr::<19>::try_from_str(&s).map_err(|_| {
             NativeError::RangeError {
                 name: class,
@@ -889,8 +882,23 @@ pub fn parse_calendar_fields(
         })?;
         f.era = Some(era);
     }
-    if let Some(v) = read_partial_integer(ctx, obj, "eraYear", class)? {
+    if let Some(v) = read_partial_integer(ctx, target, "eraYear", class)? {
         f.era_year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+    }
+    if let Some(v) = read_partial_integer(ctx, target, "month", class)? {
+        f.month = Some(v.clamp(0, u8::MAX as i64) as u8);
+    }
+    if let Some(s) = read_option_string(ctx, target, "monthCode", class)? {
+        let code = temporal_rs::MonthCode::try_from_utf8(s.as_bytes()).map_err(|_| {
+            NativeError::TypeError {
+                name: class,
+                reason: "invalid monthCode".to_string(),
+            }
+        })?;
+        f.month_code = Some(code);
+    }
+    if let Some(v) = read_partial_integer(ctx, target, "year", class)? {
+        f.year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
     }
     Ok(f)
 }
@@ -901,8 +909,8 @@ pub fn parse_date_time_fields(
     class: &'static str,
 ) -> Result<temporal_rs::fields::DateTimeFields, NativeError> {
     Ok(temporal_rs::fields::DateTimeFields {
-        calendar_fields: parse_calendar_fields(ctx, obj, class)?,
-        time: parse_partial_time(ctx, obj, class)?,
+        calendar_fields: parse_calendar_fields(ctx, Value::object(obj), class)?,
+        time: parse_partial_time(ctx, Value::object(obj), class)?,
     })
 }
 
@@ -912,10 +920,10 @@ pub fn parse_year_month_fields(
     class: &'static str,
 ) -> Result<temporal_rs::fields::YearMonthCalendarFields, NativeError> {
     let mut f = temporal_rs::fields::YearMonthCalendarFields::default();
-    if let Some(v) = read_partial_integer(ctx, obj, "year", class)? {
+    if let Some(v) = read_partial_integer(ctx, Value::object(obj), "year", class)? {
         f.year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
     }
-    if let Some(v) = read_partial_integer(ctx, obj, "month", class)? {
+    if let Some(v) = read_partial_integer(ctx, Value::object(obj), "month", class)? {
         f.month = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
     if let Some(s) = read_string_field(obj, "monthCode", ctx.heap()) {
@@ -936,7 +944,7 @@ pub fn parse_year_month_fields(
         })?;
         f.era = Some(era);
     }
-    if let Some(v) = read_partial_integer(ctx, obj, "eraYear", class)? {
+    if let Some(v) = read_partial_integer(ctx, Value::object(obj), "eraYear", class)? {
         f.era_year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
     }
     Ok(f)

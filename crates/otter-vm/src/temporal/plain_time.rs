@@ -120,8 +120,8 @@ pub(crate) fn parse_plain_time_arg_with_overflow(
                 reason: "argument must be a Temporal.PlainTime".to_string(),
             }),
         }
-    } else if let Some(obj) = v.as_object() {
-        let partial = parse_partial_time(ctx, obj, CLASS)?;
+    } else if v.is_object_type() {
+        let partial = parse_partial_time(ctx, *v, CLASS)?;
         temporal_rs::PlainTime::from_partial(partial, overflow).map_err(|e| temporal_err(e, CLASS))
     } else if let Some(s) = v.as_string(ctx.heap()) {
         temporal_rs::PlainTime::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
@@ -242,13 +242,14 @@ fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
 fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pt = require_plain_time(ctx)?;
-    let Some(obj) = arg_or_undef(args, 0).as_object() else {
+    let arg = arg_or_undef(args, 0);
+    if !arg.is_object_type() {
         return Err(NativeError::TypeError {
             name: CLASS,
             reason: "first argument must be an object".to_string(),
         });
-    };
-    let partial = parse_partial_time(ctx, obj, CLASS)?;
+    }
+    let partial = parse_partial_time(ctx, arg, CLASS)?;
     let overflow = parse_overflow(ctx, args, 1)?;
     let result = pt
         .with(partial, overflow)

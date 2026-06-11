@@ -90,7 +90,7 @@ pub(crate) fn parse_plain_date_arg_with_overflow(
         Ok(pd)
     } else if let Some(obj) = v.as_object() {
         let calendar = read_calendar_field(obj, ctx.heap(), CLASS)?;
-        let calendar_fields = parse_calendar_fields(ctx, obj, CLASS)?;
+        let calendar_fields = parse_calendar_fields(ctx, Value::object(obj), CLASS)?;
         let overflow = match overflow_opts {
             Some(args) => parse_overflow(ctx, args, 1)?,
             None => None,
@@ -242,7 +242,7 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             reason: "first argument must be an object".to_string(),
         });
     };
-    let fields = parse_calendar_fields(ctx, obj, CLASS)?;
+    let fields = parse_calendar_fields(ctx, Value::object(obj), CLASS)?;
     let overflow = parse_overflow(ctx, args, 1)?;
     let result = pd
         .with(fields, overflow)
@@ -276,8 +276,12 @@ fn impl_to_plain_date_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     let time = if v.is_undefined() {
         None
     } else if let Some(t) = v.as_temporal(ctx.heap()) {
+        // §ToTemporalTime: PlainDateTime / ZonedDateTime contribute
+        // their wall-clock time component.
         match t.payload_clone(ctx.heap()) {
             TemporalPayload::PlainTime(pt) => Some(pt),
+            TemporalPayload::PlainDateTime(pdt) => Some(pdt.to_plain_time()),
+            TemporalPayload::ZonedDateTime(zdt) => Some(zdt.to_plain_time()),
             _ => {
                 return Err(NativeError::TypeError {
                     name: CLASS,
@@ -285,8 +289,8 @@ fn impl_to_plain_date_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
                 });
             }
         }
-    } else if let Some(obj) = v.as_object() {
-        let partial = parse_partial_time(ctx, obj, CLASS)?;
+    } else if v.is_object_type() {
+        let partial = parse_partial_time(ctx, v, CLASS)?;
         let pt = temporal_rs::PlainTime::default()
             .with(partial, None)
             .map_err(|e| temporal_err(e, CLASS))?;

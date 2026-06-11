@@ -84,7 +84,7 @@ fn parse_pmd_arg_with_overflow(
         temporal_rs::PlainMonthDay::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))
     } else if let Some(obj) = v.as_object() {
-        let fields = parse_calendar_fields(ctx, obj, CLASS)?;
+        let fields = parse_calendar_fields(ctx, Value::object(obj), CLASS)?;
         let calendar = read_calendar_field(obj, ctx.heap(), CLASS)?;
         let partial = temporal_rs::partial::PartialDate {
             calendar_fields: fields,
@@ -147,7 +147,7 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             reason: "first argument must be an object".to_string(),
         });
     };
-    let fields = parse_calendar_fields(ctx, obj, CLASS)?;
+    let fields = parse_calendar_fields(ctx, Value::object(obj), CLASS)?;
     let overflow = parse_overflow(ctx, args, 1)?;
     let result = pmd
         .with(fields, overflow)
@@ -163,7 +163,7 @@ fn impl_to_plain_date(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             reason: "first argument must be an object with a `year` field".to_string(),
         });
     };
-    let year_fields = parse_calendar_fields(ctx, obj, CLASS)?;
+    let year_fields = parse_calendar_fields(ctx, Value::object(obj), CLASS)?;
     let result = pmd
         .to_plain_date(Some(year_fields))
         .map_err(|e| temporal_err(e, CLASS))?;

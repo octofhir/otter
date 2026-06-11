@@ -245,7 +245,7 @@ fn impl_to_plain_date(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             reason: "first argument must be an object with a `day` field".to_string(),
         });
     };
-    let day_fields = parse_calendar_fields(ctx, obj, CLASS)?;
+    let day_fields = parse_calendar_fields(ctx, Value::object(obj), CLASS)?;
     let result = pym
         .to_plain_date(Some(day_fields))
         .map_err(|e| temporal_err(e, CLASS))?;

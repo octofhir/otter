@@ -343,8 +343,12 @@ fn impl_with_plain_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
     let time = if arg.is_undefined() {
         temporal_rs::PlainTime::default()
     } else if let Some(t) = arg.as_temporal(ctx.heap()) {
+        // §ToTemporalTime: PlainDateTime / ZonedDateTime contribute
+        // their wall-clock time component.
         match t.payload_clone(ctx.heap()) {
             TemporalPayload::PlainTime(pt) => pt,
+            TemporalPayload::PlainDateTime(other) => other.to_plain_time(),
+            TemporalPayload::ZonedDateTime(zdt) => zdt.to_plain_time(),
             _ => {
                 return Err(NativeError::TypeError {
                     name: CLASS,
@@ -352,8 +356,8 @@ fn impl_with_plain_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
                 });
             }
         }
-    } else if let Some(obj) = arg.as_object() {
-        let partial = parse_partial_time(ctx, obj, CLASS)?;
+    } else if arg.is_object_type() {
+        let partial = parse_partial_time(ctx, arg, CLASS)?;
         temporal_rs::PlainTime::default()
             .with(partial, None)
             .map_err(|e| temporal_err(e, CLASS))?

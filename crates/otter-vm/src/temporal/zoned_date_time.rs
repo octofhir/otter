@@ -97,9 +97,9 @@ pub(crate) fn parse_zdt_arg(
                 reason: "object must have a timeZone property".to_string(),
             })?;
         let tz = parse_time_zone(&tz_v, ctx.heap(), CLASS)?;
-        let calendar_fields = parse_calendar_fields(ctx, obj, CLASS)?;
+        let calendar_fields = parse_calendar_fields(ctx, Value::object(obj), CLASS)?;
         let calendar = read_calendar_field(obj, ctx.heap(), CLASS)?;
-        let time = parse_partial_time(ctx, obj, CLASS)?;
+        let time = parse_partial_time(ctx, Value::object(obj), CLASS)?;
         let mut partial = temporal_rs::partial::PartialZonedDateTime::new()
             .with_calendar_fields(calendar_fields)
             .with_time(time)
@@ -319,8 +319,8 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             reason: "with() requires a ZonedDateTime-like object".to_string(),
         });
     };
-    let calendar_fields = parse_calendar_fields(ctx, obj, CLASS)?;
-    let time = parse_partial_time(ctx, obj, CLASS)?;
+    let calendar_fields = parse_calendar_fields(ctx, Value::object(obj), CLASS)?;
+    let time = parse_partial_time(ctx, Value::object(obj), CLASS)?;
     let fields = temporal_rs::fields::ZonedDateTimeFields {
         calendar_fields,
         time,
@@ -395,7 +395,7 @@ fn impl_get_time_zone_transition(
     let dir_str = if let Some(s) = param.as_string(ctx.heap()) {
         s.to_lossy_string(ctx.heap())
     } else if let Some(obj) = param.as_object() {
-        read_option_string(ctx, obj, "direction", CLASS)?.ok_or_else(|| {
+        read_option_string(ctx, Value::object(obj), "direction", CLASS)?.ok_or_else(|| {
             NativeError::RangeError {
                 name: CLASS,
                 reason: "getTimeZoneTransition: `direction` option is required".to_string(),

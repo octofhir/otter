@@ -43,20 +43,7 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let arg = arg_or_undef(args, 0);
-    // §ToTemporalMonthDay: parse a primitive ISO string before
-    // GetTemporalOverflowOption, so an invalid string rejects before
-    // the `overflow` option is observed.
-    if arg.as_temporal(ctx.heap()).is_none()
-        && let Some(s) = arg.as_string(ctx.heap())
-    {
-        let pmd = temporal_rs::PlainMonthDay::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
-            .map_err(|e| temporal_err(e, CLASS))?;
-        parse_overflow(ctx, args, 1)?;
-        return make_temporal(ctx, TemporalPayload::PlainMonthDay(pmd));
-    }
-    let overflow = parse_overflow(ctx, args, 1)?;
-    let pmd = parse_pmd_arg_with_overflow(ctx, &arg, overflow)?;
+    let pmd = parse_pmd_arg_with_overflow(ctx, &arg_or_undef(args, 0), Some(args))?;
     make_temporal(ctx, TemporalPayload::PlainMonthDay(pmd))
 }
 
@@ -70,28 +57,42 @@ fn parse_pmd_arg(
 fn parse_pmd_arg_with_overflow(
     ctx: &mut NativeCtx<'_>,
     v: &Value,
-    overflow: Option<temporal_rs::options::Overflow>,
+    overflow_opts: Option<&[Value]>,
 ) -> Result<temporal_rs::PlainMonthDay, NativeError> {
     if let Some(t) = v.as_temporal(ctx.heap()) {
-        match t.payload_clone(ctx.heap()) {
-            TemporalPayload::PlainMonthDay(v) => Ok(v),
-            _ => Err(NativeError::TypeError {
-                name: CLASS,
-                reason: "argument must be a Temporal.PlainMonthDay".to_string(),
-            }),
+        let pmd = match t.payload_clone(ctx.heap()) {
+            TemporalPayload::PlainMonthDay(v) => v,
+            _ => {
+                return Err(NativeError::TypeError {
+                    name: CLASS,
+                    reason: "argument must be a Temporal.PlainMonthDay".to_string(),
+                });
+            }
+        };
+        if let Some(args) = overflow_opts {
+            parse_overflow(ctx, args, 1)?;
         }
-    } else if let Some(s) = v.as_string(ctx.heap()) {
-        temporal_rs::PlainMonthDay::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
-            .map_err(|e| temporal_err(e, CLASS))
+        Ok(pmd)
     } else if v.is_object_type() {
         let calendar = read_calendar_field(ctx, *v, CLASS)?;
         let fields = parse_calendar_fields(ctx, *v, &calendar, CLASS)?;
+        let overflow = match overflow_opts {
+            Some(args) => parse_overflow(ctx, args, 1)?,
+            None => None,
+        };
         let partial = temporal_rs::partial::PartialDate {
             calendar_fields: fields,
             calendar,
         };
         temporal_rs::PlainMonthDay::from_partial(partial, overflow)
             .map_err(|e| temporal_err(e, CLASS))
+    } else if let Some(s) = v.as_string(ctx.heap()) {
+        let pmd = temporal_rs::PlainMonthDay::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
+            .map_err(|e| temporal_err(e, CLASS))?;
+        if let Some(args) = overflow_opts {
+            parse_overflow(ctx, args, 1)?;
+        }
+        Ok(pmd)
     } else {
         Err(NativeError::TypeError {
             name: CLASS,
@@ -122,8 +123,8 @@ fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     js_string_value(s, ctx)
 }
 
-fn impl_to_json(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    impl_to_string(ctx, args)
+fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    impl_to_string(ctx, &[])
 }
 
 fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {

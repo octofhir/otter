@@ -7,7 +7,7 @@
 
 #![allow(missing_docs)]
 
-use crate::object::{self, JsObject};
+use crate::object::JsObject;
 use crate::string::JsString;
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -563,29 +563,24 @@ pub fn parse_to_string_rounding_options(
     use core::str::FromStr;
     let mut opts = temporal_rs::options::ToStringRoundingOptions::default();
     let v = arg_or_undef(args, index);
-    let Some(obj) = options_object(&v, class)? else {
+    if v.is_undefined() {
         return Ok(opts);
-    };
-    if let Some(name) = read_option_string(ctx, Value::object(obj), "smallestUnit", class)? {
-        opts.smallest_unit = Some(temporal_rs::options::Unit::from_str(&name).map_err(|_| {
-            NativeError::RangeError {
-                name: class,
-                reason: "invalid `smallestUnit`".to_string(),
-            }
-        })?);
     }
-    if let Some(name) = read_option_string(ctx, Value::object(obj), "roundingMode", class)? {
-        opts.rounding_mode = Some(temporal_rs::options::RoundingMode::from_str(&name).map_err(
-            |_| NativeError::RangeError {
-                name: class,
-                reason: "invalid `roundingMode`".to_string(),
-            },
-        )?);
+    if !v.is_object_type() {
+        return Err(NativeError::TypeError {
+            name: class,
+            reason: "options must be an object or undefined".to_string(),
+        });
     }
-    if let Some(val) = object::get(obj, ctx.heap(), "fractionalSecondDigits")
-        && !val.is_undefined()
-    {
-        if let Some(s) = val.as_string(ctx.heap()) {
+    // §ToSecondsStringPrecisionRecord / GetRoundingModeOption read the
+    // keys in the order fractionalSecondDigits, roundingMode,
+    // smallestUnit through getter/Proxy-aware [[Get]]s.
+    let frac = get_option_value(ctx, v, "fractionalSecondDigits", class)?;
+    if !frac.is_undefined() {
+        // GetTemporalFractionalSecondDigitsOption: "auto" or an integer
+        // 0-9 (a non-"auto" value is coerced via ToNumber, firing
+        // valueOf, then floored and range-checked).
+        if let Some(s) = frac.as_string(ctx.heap()) {
             if s.to_lossy_string(ctx.heap()) == "auto" {
                 opts.precision = temporal_rs::parsers::Precision::Auto;
             } else {
@@ -595,8 +590,16 @@ pub fn parse_to_string_rounding_options(
                         .to_string(),
                 });
             }
-        } else if let Some(num) = val.as_number() {
-            let d = num.as_f64().trunc();
+        } else {
+            let raw = to_number_field(ctx, &frac, class, "fractionalSecondDigits")?;
+            if raw.is_nan() {
+                return Err(NativeError::RangeError {
+                    name: class,
+                    reason: "`fractionalSecondDigits` must be \"auto\" or an integer 0-9"
+                        .to_string(),
+                });
+            }
+            let d = raw.floor();
             if !(0.0..=9.0).contains(&d) {
                 return Err(NativeError::RangeError {
                     name: class,
@@ -604,12 +607,23 @@ pub fn parse_to_string_rounding_options(
                 });
             }
             opts.precision = temporal_rs::parsers::Precision::Digit(d as u8);
-        } else {
-            return Err(NativeError::RangeError {
-                name: class,
-                reason: "`fractionalSecondDigits` must be \"auto\" or an integer 0-9".to_string(),
-            });
         }
+    }
+    if let Some(name) = read_option_string(ctx, v, "roundingMode", class)? {
+        opts.rounding_mode = Some(temporal_rs::options::RoundingMode::from_str(&name).map_err(
+            |_| NativeError::RangeError {
+                name: class,
+                reason: "invalid `roundingMode`".to_string(),
+            },
+        )?);
+    }
+    if let Some(name) = read_option_string(ctx, v, "smallestUnit", class)? {
+        opts.smallest_unit = Some(temporal_rs::options::Unit::from_str(&name).map_err(|_| {
+            NativeError::RangeError {
+                name: class,
+                reason: "invalid `smallestUnit`".to_string(),
+            }
+        })?);
     }
     Ok(opts)
 }
@@ -626,10 +640,16 @@ pub fn parse_display_calendar(
 ) -> Result<temporal_rs::options::DisplayCalendar, NativeError> {
     use core::str::FromStr;
     let v = arg_or_undef(args, index);
-    let Some(obj) = options_object(&v, class)? else {
+    if v.is_undefined() {
         return Ok(temporal_rs::options::DisplayCalendar::Auto);
-    };
-    match read_option_string(ctx, Value::object(obj), "calendarName", class)? {
+    }
+    if !v.is_object_type() {
+        return Err(NativeError::TypeError {
+            name: class,
+            reason: "options must be an object or undefined".to_string(),
+        });
+    }
+    match read_option_string(ctx, v, "calendarName", class)? {
         Some(name) => temporal_rs::options::DisplayCalendar::from_str(&name).map_err(|_| {
             NativeError::RangeError {
                 name: class,
@@ -921,9 +941,67 @@ pub fn parse_date_time_fields(
     calendar: &temporal_rs::Calendar,
     class: &'static str,
 ) -> Result<temporal_rs::fields::DateTimeFields, NativeError> {
+    // §PrepareCalendarFields for a date-time bag reads the calendar AND
+    // time keys in a single alphabetical pass (day, era, eraYear, hour,
+    // microsecond, millisecond, minute, month, monthCode, nanosecond,
+    // second, year), each through a getter/Proxy-aware [[Get]]. The ISO
+    // calendar has no era keys.
+    let has_eras = !calendar.is_iso();
+    let mut cf = temporal_rs::fields::CalendarFields::default();
+    let mut time = temporal_rs::partial::PartialTime::default();
+    if let Some(v) = read_partial_integer(ctx, target, "day", class)? {
+        cf.day = Some(v.clamp(0, u8::MAX as i64) as u8);
+    }
+    if has_eras {
+        if let Some(s) = read_option_string(ctx, target, "era", class)? {
+            let era = temporal_rs::TinyAsciiStr::<19>::try_from_str(&s).map_err(|_| {
+                NativeError::RangeError {
+                    name: class,
+                    reason: "invalid era".to_string(),
+                }
+            })?;
+            cf.era = Some(era);
+        }
+        if let Some(v) = read_partial_integer(ctx, target, "eraYear", class)? {
+            cf.era_year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+        }
+    }
+    if let Some(v) = read_partial_integer(ctx, target, "hour", class)? {
+        time.hour = Some(v.clamp(0, u8::MAX as i64) as u8);
+    }
+    if let Some(v) = read_partial_integer(ctx, target, "microsecond", class)? {
+        time.microsecond = Some(v.clamp(0, u16::MAX as i64) as u16);
+    }
+    if let Some(v) = read_partial_integer(ctx, target, "millisecond", class)? {
+        time.millisecond = Some(v.clamp(0, u16::MAX as i64) as u16);
+    }
+    if let Some(v) = read_partial_integer(ctx, target, "minute", class)? {
+        time.minute = Some(v.clamp(0, u8::MAX as i64) as u8);
+    }
+    if let Some(v) = read_partial_integer(ctx, target, "month", class)? {
+        cf.month = Some(v.clamp(0, u8::MAX as i64) as u8);
+    }
+    if let Some(s) = read_option_string(ctx, target, "monthCode", class)? {
+        let code = temporal_rs::MonthCode::try_from_utf8(s.as_bytes()).map_err(|_| {
+            NativeError::TypeError {
+                name: class,
+                reason: "invalid monthCode".to_string(),
+            }
+        })?;
+        cf.month_code = Some(code);
+    }
+    if let Some(v) = read_partial_integer(ctx, target, "nanosecond", class)? {
+        time.nanosecond = Some(v.clamp(0, u16::MAX as i64) as u16);
+    }
+    if let Some(v) = read_partial_integer(ctx, target, "second", class)? {
+        time.second = Some(v.clamp(0, u8::MAX as i64) as u8);
+    }
+    if let Some(v) = read_partial_integer(ctx, target, "year", class)? {
+        cf.year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+    }
     Ok(temporal_rs::fields::DateTimeFields {
-        calendar_fields: parse_calendar_fields(ctx, target, calendar, class)?,
-        time: parse_partial_time(ctx, target, class)?,
+        calendar_fields: cf,
+        time,
     })
 }
 

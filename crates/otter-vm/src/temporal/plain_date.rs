@@ -177,8 +177,8 @@ fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     js_string_value(s, ctx)
 }
 
-fn impl_to_json(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    impl_to_string(ctx, args)
+fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    impl_to_string(ctx, &[])
 }
 
 fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {

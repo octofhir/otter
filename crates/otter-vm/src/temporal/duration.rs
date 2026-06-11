@@ -15,7 +15,7 @@ use crate::object;
 use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::helpers::{
     arg_or_undef, js_string_value, make_temporal, opt_integer_if_integral, options_object,
-    parse_rounding_options, require_construct, require_duration, temporal_err,
+    require_construct, require_duration, temporal_err,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -185,8 +185,8 @@ fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     js_string_value(s, ctx)
 }
 
-fn impl_to_json(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    impl_to_string(ctx, args)
+fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    impl_to_string(ctx, &[])
 }
 
 fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -225,18 +225,18 @@ fn impl_total(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     // §7.3.23 totalOf: a string is the `unit` shorthand; an object
     // supplies `{ unit }`.
     let total_of = arg_or_undef(args, 0);
-    let unit_name = if let Some(s) = total_of.as_string(ctx.heap()) {
-        s.to_lossy_string(ctx.heap())
-    } else if let Some(opts) = total_of.as_object() {
-        object::get(opts, ctx.heap(), "unit")
-            .and_then(|v| {
-                v.as_string(ctx.heap())
-                    .map(|s| s.to_lossy_string(ctx.heap()))
-            })
+    // §7.3.23 reads `relativeTo` before `unit` for an options object.
+    let (unit_name, relative_to) = if let Some(s) = total_of.as_string(ctx.heap()) {
+        (s.to_lossy_string(ctx.heap()), None)
+    } else if total_of.is_object_type() {
+        let rel = crate::temporal::helpers::get_option_value(ctx, total_of, "relativeTo", CLASS)?;
+        let relative_to = parse_relative_to_value(ctx, rel)?;
+        let unit_name = crate::temporal::helpers::read_option_string(ctx, total_of, "unit", CLASS)?
             .ok_or_else(|| NativeError::TypeError {
                 name: CLASS,
                 reason: "options must include a `unit` string".to_string(),
-            })?
+            })?;
+        (unit_name, relative_to)
     } else {
         return Err(NativeError::TypeError {
             name: CLASS,
@@ -248,7 +248,6 @@ fn impl_total(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
             name: CLASS,
             reason: "unknown duration unit".to_string(),
         })?;
-    let relative_to = parse_relative_to(ctx, args, 0)?;
     let total = dur
         .total(unit, relative_to)
         .map_err(|e| temporal_err(e, CLASS))?;
@@ -323,13 +322,24 @@ fn parse_relative_to(
     args: &[Value],
     index: usize,
 ) -> Result<Option<temporal_rs::options::RelativeTo>, NativeError> {
-    let Some(opts) = arg_or_undef(args, index).as_object() else {
+    let v = arg_or_undef(args, index);
+    if !v.is_object_type() {
         return Ok(None);
-    };
-    let Some(rel) = object::get(opts, ctx.heap(), "relativeTo").filter(|v| !v.is_undefined())
-    else {
+    }
+    let rel = crate::temporal::helpers::get_option_value(ctx, v, "relativeTo", CLASS)?;
+    parse_relative_to_value(ctx, rel)
+}
+
+/// Dispatch an already-read `relativeTo` value (§ToRelativeTemporalObject):
+/// `undefined` → `None`; a date/date-time/zoned Temporal instance, an ISO
+/// string, or a property bag (`timeZone` present → zoned).
+fn parse_relative_to_value(
+    ctx: &mut NativeCtx<'_>,
+    rel: Value,
+) -> Result<Option<temporal_rs::options::RelativeTo>, NativeError> {
+    if rel.is_undefined() {
         return Ok(None);
-    };
+    }
     if let Some(t) = rel.as_temporal(ctx.heap()) {
         return match t.payload_clone(ctx.heap()) {
             TemporalPayload::PlainDate(pd) => Ok(Some(pd.into())),
@@ -366,10 +376,81 @@ fn parse_relative_to(
     })
 }
 
+/// Read `Temporal.Duration.prototype.round` options in the exact spec
+/// order (largestUnit, relativeTo, roundingIncrement, roundingMode,
+/// smallestUnit) through getter/Proxy-aware [[Get]]s, returning the
+/// rounding options together with the parsed `relativeTo`.
+fn parse_duration_round_options(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    index: usize,
+) -> Result<
+    (
+        temporal_rs::options::RoundingOptions,
+        Option<temporal_rs::options::RelativeTo>,
+    ),
+    NativeError,
+> {
+    use crate::temporal::helpers::{read_option_string, read_rounding_increment};
+    use core::str::FromStr;
+    let v = arg_or_undef(args, index);
+    let mut options = temporal_rs::options::RoundingOptions::default();
+    if let Some(s) = v.as_string(ctx.heap()) {
+        let name = s.to_lossy_string(ctx.heap());
+        options.smallest_unit =
+            Some(temporal_rs::options::Unit::from_str(&name).map_err(|_| {
+                NativeError::RangeError {
+                    name: CLASS,
+                    reason: "invalid smallest-unit shorthand".to_string(),
+                }
+            })?);
+        return Ok((options, None));
+    }
+    if v.is_undefined() {
+        return Ok((options, None));
+    }
+    if !v.is_object_type() {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "round() requires an options object or smallest-unit string".to_string(),
+        });
+    }
+    if let Some(name) = read_option_string(ctx, v, "largestUnit", CLASS)? {
+        options.largest_unit = Some(temporal_rs::options::Unit::from_str(&name).map_err(|_| {
+            NativeError::RangeError {
+                name: CLASS,
+                reason: "invalid `largestUnit`".to_string(),
+            }
+        })?);
+    }
+    let rel = crate::temporal::helpers::get_option_value(ctx, v, "relativeTo", CLASS)?;
+    let relative_to = parse_relative_to_value(ctx, rel)?;
+    if let Some(incr) = read_rounding_increment(ctx, v, CLASS)? {
+        options.increment = Some(incr);
+    }
+    if let Some(name) = read_option_string(ctx, v, "roundingMode", CLASS)? {
+        options.rounding_mode = Some(temporal_rs::options::RoundingMode::from_str(&name).map_err(
+            |_| NativeError::RangeError {
+                name: CLASS,
+                reason: "invalid `roundingMode`".to_string(),
+            },
+        )?);
+    }
+    if let Some(name) = read_option_string(ctx, v, "smallestUnit", CLASS)? {
+        options.smallest_unit =
+            Some(temporal_rs::options::Unit::from_str(&name).map_err(|_| {
+                NativeError::RangeError {
+                    name: CLASS,
+                    reason: "invalid `smallestUnit`".to_string(),
+                }
+            })?);
+    }
+    Ok((options, relative_to))
+}
+
 fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let dur = require_duration(ctx)?;
-    let options = parse_rounding_options(args, 0, ctx, CLASS)?;
-    let relative_to = parse_relative_to(ctx, args, 0)?;
+    let (options, relative_to) = parse_duration_round_options(ctx, args, 0)?;
     let result = dur
         .round(options, relative_to)
         .map_err(|e| temporal_err(e, CLASS))?;

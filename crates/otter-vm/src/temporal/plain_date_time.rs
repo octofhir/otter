@@ -83,20 +83,7 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let arg = arg_or_undef(args, 0);
-    // §ToTemporalDateTime: parse a primitive ISO string before
-    // GetTemporalOverflowOption, so an invalid string rejects before
-    // the `overflow` option is observed.
-    if arg.as_temporal(ctx.heap()).is_none()
-        && let Some(s) = arg.as_string(ctx.heap())
-    {
-        let pdt = temporal_rs::PlainDateTime::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
-            .map_err(|e| temporal_err(e, CLASS))?;
-        parse_overflow(ctx, args, 1)?;
-        return make_temporal(ctx, TemporalPayload::PlainDateTime(pdt));
-    }
-    let overflow = parse_overflow(ctx, args, 1)?;
-    let pdt = parse_plain_date_time_arg_with_overflow(ctx, &arg, overflow)?;
+    let pdt = parse_plain_date_time_arg_with_overflow(ctx, &arg_or_undef(args, 0), Some(args))?;
     make_temporal(ctx, TemporalPayload::PlainDateTime(pdt))
 }
 
@@ -118,37 +105,55 @@ fn parse_plain_date_time_arg(
     parse_plain_date_time_arg_with_overflow(ctx, v, None)
 }
 
+/// §ToTemporalDateTime. `overflow_opts`, when `Some(args)`, carries the
+/// native arguments whose index-1 element is the options object;
+/// `GetTemporalOverflowOption` is read at the spec point (after the
+/// bag's fields are read / the ISO string is parsed), so the `overflow`
+/// option is observed last.
 fn parse_plain_date_time_arg_with_overflow(
     ctx: &mut NativeCtx<'_>,
     v: &Value,
-    overflow: Option<temporal_rs::options::Overflow>,
+    overflow_opts: Option<&[Value]>,
 ) -> Result<temporal_rs::PlainDateTime, NativeError> {
-    // §ToTemporalDateTime: ZonedDateTime projects onto its wall-clock
-    // date-time; a plain object is read as a date-time property bag; a
-    // string is parsed as ISO.
+    // ZonedDateTime projects onto its wall-clock date-time; a plain
+    // object is read as a date-time property bag; a string is parsed as
+    // ISO.
     if let Some(t) = v.as_temporal(ctx.heap()) {
-        match t.payload_clone(ctx.heap()) {
-            TemporalPayload::PlainDateTime(v) => Ok(v),
-            TemporalPayload::ZonedDateTime(zdt) => Ok(zdt.to_plain_date_time()),
-            // §ToTemporalDateTime fast path: a PlainDate projects onto
-            // midnight of its calendar date.
+        let pdt = match t.payload_clone(ctx.heap()) {
+            TemporalPayload::PlainDateTime(v) => v,
+            TemporalPayload::ZonedDateTime(zdt) => zdt.to_plain_date_time(),
+            // Fast path: a PlainDate projects onto midnight of its date.
             TemporalPayload::PlainDate(pd) => pd
                 .to_plain_date_time(None)
-                .map_err(|e| temporal_err(e, CLASS)),
-            _ => Err(NativeError::TypeError {
-                name: CLASS,
-                reason: "argument must be a Temporal.PlainDateTime".to_string(),
-            }),
+                .map_err(|e| temporal_err(e, CLASS))?,
+            _ => {
+                return Err(NativeError::TypeError {
+                    name: CLASS,
+                    reason: "argument must be a Temporal.PlainDateTime".to_string(),
+                });
+            }
+        };
+        if let Some(args) = overflow_opts {
+            parse_overflow(ctx, args, 1)?;
         }
+        Ok(pdt)
     } else if v.is_object_type() {
         let calendar = read_calendar_field(ctx, *v, CLASS)?;
         let fields = parse_date_time_fields(ctx, *v, &calendar, CLASS)?;
+        let overflow = match overflow_opts {
+            Some(args) => parse_overflow(ctx, args, 1)?,
+            None => None,
+        };
         let partial = temporal_rs::partial::PartialDateTime { fields, calendar };
         temporal_rs::PlainDateTime::from_partial(partial, overflow)
             .map_err(|e| temporal_err(e, CLASS))
     } else if let Some(s) = v.as_string(ctx.heap()) {
-        temporal_rs::PlainDateTime::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
-            .map_err(|e| temporal_err(e, CLASS))
+        let pdt = temporal_rs::PlainDateTime::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
+            .map_err(|e| temporal_err(e, CLASS))?;
+        if let Some(args) = overflow_opts {
+            parse_overflow(ctx, args, 1)?;
+        }
+        Ok(pdt)
     } else {
         Err(NativeError::TypeError {
             name: CLASS,
@@ -229,8 +234,8 @@ fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     js_string_value(s, ctx)
 }
 
-fn impl_to_json(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    impl_to_string(ctx, args)
+fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    impl_to_string(ctx, &[])
 }
 
 fn impl_to_zoned_date_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

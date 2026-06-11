@@ -97,8 +97,8 @@ pub(crate) fn parse_zdt_arg(
                 reason: "object must have a timeZone property".to_string(),
             })?;
         let tz = parse_time_zone(&tz_v, ctx.heap(), CLASS)?;
-        let calendar_fields = parse_calendar_fields(ctx, Value::object(obj), CLASS)?;
-        let calendar = read_calendar_field(obj, ctx.heap(), CLASS)?;
+        let calendar = read_calendar_field(ctx, Value::object(obj), CLASS)?;
+        let calendar_fields = parse_calendar_fields(ctx, Value::object(obj), &calendar, CLASS)?;
         let time = parse_partial_time(ctx, Value::object(obj), CLASS)?;
         let mut partial = temporal_rs::partial::PartialZonedDateTime::new()
             .with_calendar_fields(calendar_fields)
@@ -180,8 +180,8 @@ fn duration_arg(ctx: &mut NativeCtx<'_>, v: &Value) -> Result<temporal_rs::Durat
                 reason: "must be a Temporal.Duration".to_string(),
             }),
         }
-    } else if let Some(obj) = v.as_object() {
-        partial_from_object(ctx, &obj)
+    } else if v.is_object_type() {
+        partial_from_object(ctx, *v)
     } else if let Some(s) = v.as_string(ctx.heap()) {
         temporal_rs::Duration::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))
@@ -313,14 +313,16 @@ fn impl_with_time_zone(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
 
 fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
-    let Some(obj) = arg_or_undef(args, 0).as_object() else {
+    let arg = arg_or_undef(args, 0);
+    if !arg.is_object_type() || arg.as_temporal(ctx.heap()).is_some() {
         return Err(NativeError::TypeError {
             name: CLASS,
-            reason: "with() requires a ZonedDateTime-like object".to_string(),
+            reason: "with() requires a plain ZonedDateTime-like object".to_string(),
         });
-    };
-    let calendar_fields = parse_calendar_fields(ctx, Value::object(obj), CLASS)?;
-    let time = parse_partial_time(ctx, Value::object(obj), CLASS)?;
+    }
+    let calendar = zdt.calendar().clone();
+    let calendar_fields = parse_calendar_fields(ctx, arg, &calendar, CLASS)?;
+    let time = parse_partial_time(ctx, arg, CLASS)?;
     let fields = temporal_rs::fields::ZonedDateTimeFields {
         calendar_fields,
         time,

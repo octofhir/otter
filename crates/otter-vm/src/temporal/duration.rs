@@ -11,7 +11,7 @@ use std::str::FromStr;
 
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
-use crate::object::{self, JsObject};
+use crate::object;
 use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::helpers::{
     arg_or_undef, js_string_value, make_temporal, opt_integer_if_integral, options_object,
@@ -82,8 +82,8 @@ fn parse_duration_arg(
     } else if let Some(s) = v.as_string(ctx.heap()) {
         temporal_rs::Duration::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))
-    } else if let Some(obj) = v.as_object() {
-        partial_from_object(ctx, &obj)
+    } else if v.is_object_type() {
+        partial_from_object(ctx, *v)
     } else {
         Err(NativeError::TypeError {
             name: CLASS,
@@ -95,38 +95,41 @@ fn parse_duration_arg(
 
 pub fn partial_from_object(
     ctx: &mut NativeCtx<'_>,
-    obj: &JsObject,
+    target: Value,
 ) -> Result<temporal_rs::Duration, NativeError> {
+    // §ToTemporalPartialDurationRecord reads the unit keys in
+    // alphabetical order (days, hours, microseconds, milliseconds,
+    // minutes, months, nanoseconds, seconds, weeks, years).
     let mut partial = temporal_rs::partial::PartialDuration::empty();
-    if let Some(v) = optional_field(ctx, obj, "years")? {
-        partial = partial.with_years(v);
-    }
-    if let Some(v) = optional_field(ctx, obj, "months")? {
-        partial = partial.with_months(v);
-    }
-    if let Some(v) = optional_field(ctx, obj, "weeks")? {
-        partial = partial.with_weeks(v);
-    }
-    if let Some(v) = optional_field(ctx, obj, "days")? {
+    if let Some(v) = optional_field(ctx, target, "days")? {
         partial = partial.with_days(v);
     }
-    if let Some(v) = optional_field(ctx, obj, "hours")? {
+    if let Some(v) = optional_field(ctx, target, "hours")? {
         partial = partial.with_hours(v);
     }
-    if let Some(v) = optional_field(ctx, obj, "minutes")? {
-        partial = partial.with_minutes(v);
-    }
-    if let Some(v) = optional_field(ctx, obj, "seconds")? {
-        partial = partial.with_seconds(v);
-    }
-    if let Some(v) = optional_field(ctx, obj, "milliseconds")? {
-        partial = partial.with_milliseconds(v);
-    }
-    if let Some(v) = optional_field(ctx, obj, "microseconds")? {
+    if let Some(v) = optional_field(ctx, target, "microseconds")? {
         partial = partial.with_microseconds(v as i128);
     }
-    if let Some(v) = optional_field(ctx, obj, "nanoseconds")? {
+    if let Some(v) = optional_field(ctx, target, "milliseconds")? {
+        partial = partial.with_milliseconds(v);
+    }
+    if let Some(v) = optional_field(ctx, target, "minutes")? {
+        partial = partial.with_minutes(v);
+    }
+    if let Some(v) = optional_field(ctx, target, "months")? {
+        partial = partial.with_months(v);
+    }
+    if let Some(v) = optional_field(ctx, target, "nanoseconds")? {
         partial = partial.with_nanoseconds(v as i128);
+    }
+    if let Some(v) = optional_field(ctx, target, "seconds")? {
+        partial = partial.with_seconds(v);
+    }
+    if let Some(v) = optional_field(ctx, target, "weeks")? {
+        partial = partial.with_weeks(v);
+    }
+    if let Some(v) = optional_field(ctx, target, "years")? {
+        partial = partial.with_years(v);
     }
     temporal_rs::Duration::from_partial_duration(partial)
         .map_err(|e| crate::temporal::helpers::temporal_err(e, CLASS))
@@ -134,12 +137,12 @@ pub fn partial_from_object(
 
 fn optional_field(
     ctx: &mut NativeCtx<'_>,
-    obj: &JsObject,
+    target: Value,
     name: &str,
 ) -> Result<Option<i64>, NativeError> {
-    let Some(v) = object::get(*obj, ctx.heap(), name) else {
-        return Ok(None);
-    };
+    // Getter/Proxy-aware [[Get]] so a duration-like property bag with
+    // accessors or a Proxy is read observably.
+    let v = crate::temporal::helpers::get_option_value(ctx, target, name, CLASS)?;
     if v.is_undefined() {
         return Ok(None);
     }
@@ -254,14 +257,16 @@ fn impl_total(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
 fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let dur = require_duration(ctx)?;
-    let Some(obj) = arg_or_undef(args, 0).as_object() else {
+    let arg = arg_or_undef(args, 0);
+    if !arg.is_object_type() {
         return Err(NativeError::TypeError {
             name: CLASS,
             reason: "with() requires a Temporal.Duration-like object".to_string(),
         });
-    };
+    }
     // §7.3.21: fields present on the argument override the receiver's;
-    // absent fields are inherited unchanged.
+    // absent fields are inherited unchanged. The argument's keys are
+    // read in alphabetical order (ToTemporalPartialDurationRecord).
     let mut p = temporal_rs::partial::PartialDuration {
         years: Some(dur.years()),
         months: Some(dur.months()),
@@ -274,35 +279,35 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         microseconds: Some(dur.microseconds()),
         nanoseconds: Some(dur.nanoseconds()),
     };
-    if let Some(v) = optional_field(ctx, &obj, "years")? {
-        p.years = Some(v);
-    }
-    if let Some(v) = optional_field(ctx, &obj, "months")? {
-        p.months = Some(v);
-    }
-    if let Some(v) = optional_field(ctx, &obj, "weeks")? {
-        p.weeks = Some(v);
-    }
-    if let Some(v) = optional_field(ctx, &obj, "days")? {
+    if let Some(v) = optional_field(ctx, arg, "days")? {
         p.days = Some(v);
     }
-    if let Some(v) = optional_field(ctx, &obj, "hours")? {
+    if let Some(v) = optional_field(ctx, arg, "hours")? {
         p.hours = Some(v);
     }
-    if let Some(v) = optional_field(ctx, &obj, "minutes")? {
-        p.minutes = Some(v);
-    }
-    if let Some(v) = optional_field(ctx, &obj, "seconds")? {
-        p.seconds = Some(v);
-    }
-    if let Some(v) = optional_field(ctx, &obj, "milliseconds")? {
-        p.milliseconds = Some(v);
-    }
-    if let Some(v) = optional_field(ctx, &obj, "microseconds")? {
+    if let Some(v) = optional_field(ctx, arg, "microseconds")? {
         p.microseconds = Some(v as i128);
     }
-    if let Some(v) = optional_field(ctx, &obj, "nanoseconds")? {
+    if let Some(v) = optional_field(ctx, arg, "milliseconds")? {
+        p.milliseconds = Some(v);
+    }
+    if let Some(v) = optional_field(ctx, arg, "minutes")? {
+        p.minutes = Some(v);
+    }
+    if let Some(v) = optional_field(ctx, arg, "months")? {
+        p.months = Some(v);
+    }
+    if let Some(v) = optional_field(ctx, arg, "nanoseconds")? {
         p.nanoseconds = Some(v as i128);
+    }
+    if let Some(v) = optional_field(ctx, arg, "seconds")? {
+        p.seconds = Some(v);
+    }
+    if let Some(v) = optional_field(ctx, arg, "weeks")? {
+        p.weeks = Some(v);
+    }
+    if let Some(v) = optional_field(ctx, arg, "years")? {
+        p.years = Some(v);
     }
     let result =
         temporal_rs::Duration::from_partial_duration(p).map_err(|e| temporal_err(e, CLASS))?;
@@ -380,8 +385,8 @@ fn duration_arg(ctx: &mut NativeCtx<'_>, v: &Value) -> Result<temporal_rs::Durat
                 reason: "must be a Temporal.Duration".to_string(),
             }),
         }
-    } else if let Some(obj) = v.as_object() {
-        partial_from_object(ctx, &obj)
+    } else if v.is_object_type() {
+        partial_from_object(ctx, *v)
     } else if let Some(s) = v.as_string(ctx.heap()) {
         temporal_rs::Duration::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))

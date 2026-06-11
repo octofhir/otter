@@ -140,9 +140,9 @@ fn parse_plain_date_time_arg_with_overflow(
                 reason: "argument must be a Temporal.PlainDateTime".to_string(),
             }),
         }
-    } else if let Some(obj) = v.as_object() {
-        let fields = parse_date_time_fields(ctx, obj, CLASS)?;
-        let calendar = read_calendar_field(obj, ctx.heap(), CLASS)?;
+    } else if v.is_object_type() {
+        let calendar = read_calendar_field(ctx, *v, CLASS)?;
+        let fields = parse_date_time_fields(ctx, *v, &calendar, CLASS)?;
         let partial = temporal_rs::partial::PartialDateTime { fields, calendar };
         temporal_rs::PlainDateTime::from_partial(partial, overflow)
             .map_err(|e| temporal_err(e, CLASS))
@@ -206,8 +206,8 @@ fn duration_arg(ctx: &mut NativeCtx<'_>, v: &Value) -> Result<temporal_rs::Durat
                 reason: "must be a Temporal.Duration".to_string(),
             }),
         }
-    } else if let Some(obj) = v.as_object() {
-        partial_from_object(ctx, &obj)
+    } else if v.is_object_type() {
+        partial_from_object(ctx, *v)
     } else if let Some(s) = v.as_string(ctx.heap()) {
         temporal_rs::Duration::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))
@@ -305,13 +305,17 @@ fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
 fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pdt = require_plain_date_time(ctx)?;
-    let Some(obj) = arg_or_undef(args, 0).as_object() else {
+    let arg = arg_or_undef(args, 0);
+    // §RejectObjectWithCalendarOrTimeZone: the argument must be a plain
+    // fields object, not a Temporal instance.
+    if !arg.is_object_type() || arg.as_temporal(ctx.heap()).is_some() {
         return Err(NativeError::TypeError {
             name: CLASS,
-            reason: "first argument must be an object".to_string(),
+            reason: "first argument must be a plain object".to_string(),
         });
-    };
-    let fields = parse_date_time_fields(ctx, obj, CLASS)?;
+    }
+    let calendar = pdt.calendar().clone();
+    let fields = parse_date_time_fields(ctx, arg, &calendar, CLASS)?;
     let overflow = parse_overflow(ctx, args, 1)?;
     let result = pdt
         .with(fields, overflow)

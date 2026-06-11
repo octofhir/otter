@@ -503,11 +503,6 @@ pub fn require_zoned_date_time(
 
 // ── Options bag parsers ──────────────────────────────────────────
 
-fn read_string_field(obj: JsObject, name: &str, heap: &otter_gc::GcHeap) -> Option<String> {
-    let v = object::get(obj, heap, name)?;
-    v.as_string(heap).map(|s| s.to_lossy_string(heap))
-}
-
 /// Parse the `disambiguation` option (`"compatible"`/`"earlier"`/
 /// `"later"`/`"reject"`) from an options argument, defaulting to
 /// `Compatible`.
@@ -660,18 +655,14 @@ fn read_partial_integer(
     if v.is_undefined() {
         return Ok(None);
     }
-    // §ToIntegerWithTruncation over the field, observing valueOf.
+    // §ToIntegerWithTruncation over the field, observing valueOf: a
+    // non-finite value is a RangeError, otherwise the value is
+    // truncated toward zero (a fractional field is NOT rejected).
     let raw = to_number_field(ctx, &v, class, name)?;
     if !raw.is_finite() {
         return Err(NativeError::RangeError {
             name: class,
             reason: format!("{name}: partial-record field must be finite"),
-        });
-    }
-    if (raw - raw.trunc()).abs() > 0.0 {
-        return Err(NativeError::RangeError {
-            name: class,
-            reason: format!("{name}: partial-record field must be an integer"),
         });
     }
     Ok(Some(raw.trunc() as i64))
@@ -816,16 +807,17 @@ pub fn parse_partial_time(
 /// any non-string, non-undefined value (null, number, …) is a
 /// TypeError.
 pub fn read_calendar_field(
-    obj: JsObject,
-    heap: &otter_gc::GcHeap,
+    ctx: &mut NativeCtx<'_>,
+    target: Value,
     class: &'static str,
 ) -> Result<temporal_rs::Calendar, NativeError> {
-    let Some(v) = object::get(obj, heap, "calendar") else {
-        return Ok(temporal_rs::Calendar::default());
-    };
+    // Read `calendar` through a spec [[Get]] so accessor getters and
+    // Proxy traps fire on a property bag.
+    let v = get_option_value(ctx, target, "calendar", class)?;
     if v.is_undefined() {
         return Ok(temporal_rs::Calendar::default());
     }
+    let heap = ctx.heap();
     if let Some(t) = v.as_temporal(heap) {
         // A Temporal instance with a [[Calendar]] slot contributes it
         // directly. A calendar-less Temporal type (Duration, Instant)
@@ -863,27 +855,32 @@ pub fn read_calendar_field(
 pub fn parse_calendar_fields(
     ctx: &mut NativeCtx<'_>,
     target: Value,
+    calendar: &temporal_rs::Calendar,
     class: &'static str,
 ) -> Result<temporal_rs::fields::CalendarFields, NativeError> {
-    // §PrepareCalendarFields reads the field keys in alphabetical order
-    // (day, era, eraYear, month, monthCode, year), each through a spec
-    // [[Get]] so accessor getters / Proxy traps / Temporal-instance
-    // accessors all fire.
+    // §PrepareCalendarFields reads the calendar's field keys in
+    // alphabetical order, each through a spec [[Get]] so accessor
+    // getters / Proxy traps / Temporal-instance accessors all fire. The
+    // ISO calendar has no `era`/`eraYear` keys, so they are read only
+    // for era-bearing calendars.
+    let has_eras = !calendar.is_iso();
     let mut f = temporal_rs::fields::CalendarFields::default();
     if let Some(v) = read_partial_integer(ctx, target, "day", class)? {
         f.day = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
-    if let Some(s) = read_option_string(ctx, target, "era", class)? {
-        let era = temporal_rs::TinyAsciiStr::<19>::try_from_str(&s).map_err(|_| {
-            NativeError::RangeError {
-                name: class,
-                reason: "invalid era".to_string(),
-            }
-        })?;
-        f.era = Some(era);
-    }
-    if let Some(v) = read_partial_integer(ctx, target, "eraYear", class)? {
-        f.era_year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+    if has_eras {
+        if let Some(s) = read_option_string(ctx, target, "era", class)? {
+            let era = temporal_rs::TinyAsciiStr::<19>::try_from_str(&s).map_err(|_| {
+                NativeError::RangeError {
+                    name: class,
+                    reason: "invalid era".to_string(),
+                }
+            })?;
+            f.era = Some(era);
+        }
+        if let Some(v) = read_partial_integer(ctx, target, "eraYear", class)? {
+            f.era_year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+        }
     }
     if let Some(v) = read_partial_integer(ctx, target, "month", class)? {
         f.month = Some(v.clamp(0, u8::MAX as i64) as u8);
@@ -905,28 +902,45 @@ pub fn parse_calendar_fields(
 
 pub fn parse_date_time_fields(
     ctx: &mut NativeCtx<'_>,
-    obj: JsObject,
+    target: Value,
+    calendar: &temporal_rs::Calendar,
     class: &'static str,
 ) -> Result<temporal_rs::fields::DateTimeFields, NativeError> {
     Ok(temporal_rs::fields::DateTimeFields {
-        calendar_fields: parse_calendar_fields(ctx, Value::object(obj), class)?,
-        time: parse_partial_time(ctx, Value::object(obj), class)?,
+        calendar_fields: parse_calendar_fields(ctx, target, calendar, class)?,
+        time: parse_partial_time(ctx, target, class)?,
     })
 }
 
 pub fn parse_year_month_fields(
     ctx: &mut NativeCtx<'_>,
-    obj: JsObject,
+    target: Value,
+    calendar: &temporal_rs::Calendar,
     class: &'static str,
 ) -> Result<temporal_rs::fields::YearMonthCalendarFields, NativeError> {
+    // Alphabetical spec field order, each read through a getter/Proxy-
+    // aware [[Get]]. ISO has no era keys, so they are read only for
+    // era-bearing calendars.
+    let has_eras = !calendar.is_iso();
     let mut f = temporal_rs::fields::YearMonthCalendarFields::default();
-    if let Some(v) = read_partial_integer(ctx, Value::object(obj), "year", class)? {
-        f.year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+    if has_eras {
+        if let Some(s) = read_option_string(ctx, target, "era", class)? {
+            let era = temporal_rs::TinyAsciiStr::<19>::try_from_str(&s).map_err(|_| {
+                NativeError::RangeError {
+                    name: class,
+                    reason: "invalid era".to_string(),
+                }
+            })?;
+            f.era = Some(era);
+        }
+        if let Some(v) = read_partial_integer(ctx, target, "eraYear", class)? {
+            f.era_year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+        }
     }
-    if let Some(v) = read_partial_integer(ctx, Value::object(obj), "month", class)? {
+    if let Some(v) = read_partial_integer(ctx, target, "month", class)? {
         f.month = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
-    if let Some(s) = read_string_field(obj, "monthCode", ctx.heap()) {
+    if let Some(s) = read_option_string(ctx, target, "monthCode", class)? {
         let code = temporal_rs::MonthCode::try_from_utf8(s.as_bytes()).map_err(|_| {
             NativeError::TypeError {
                 name: class,
@@ -935,17 +949,8 @@ pub fn parse_year_month_fields(
         })?;
         f.month_code = Some(code);
     }
-    if let Some(s) = read_string_field(obj, "era", ctx.heap()) {
-        let era = temporal_rs::TinyAsciiStr::<19>::try_from_str(&s).map_err(|_| {
-            NativeError::RangeError {
-                name: class,
-                reason: "invalid era".to_string(),
-            }
-        })?;
-        f.era = Some(era);
-    }
-    if let Some(v) = read_partial_integer(ctx, Value::object(obj), "eraYear", class)? {
-        f.era_year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+    if let Some(v) = read_partial_integer(ctx, target, "year", class)? {
+        f.year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
     }
     Ok(f)
 }

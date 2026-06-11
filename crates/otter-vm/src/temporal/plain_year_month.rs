@@ -90,9 +90,9 @@ fn parse_pym_arg_with_overflow(
     } else if let Some(s) = v.as_string(ctx.heap()) {
         temporal_rs::PlainYearMonth::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))
-    } else if let Some(obj) = v.as_object() {
-        let fields = parse_year_month_fields(ctx, obj, CLASS)?;
-        let calendar = read_calendar_field(obj, ctx.heap(), CLASS)?;
+    } else if v.is_object_type() {
+        let calendar = read_calendar_field(ctx, *v, CLASS)?;
+        let fields = parse_year_month_fields(ctx, *v, &calendar, CLASS)?;
         let partial = temporal_rs::partial::PartialYearMonth {
             calendar_fields: fields,
             calendar,
@@ -140,8 +140,8 @@ fn duration_arg(ctx: &mut NativeCtx<'_>, v: &Value) -> Result<temporal_rs::Durat
                 reason: "must be a Temporal.Duration".to_string(),
             }),
         }
-    } else if let Some(obj) = v.as_object() {
-        partial_from_object(ctx, &obj)
+    } else if v.is_object_type() {
+        partial_from_object(ctx, *v)
     } else if let Some(s) = v.as_string(ctx.heap()) {
         temporal_rs::Duration::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))
@@ -223,13 +223,17 @@ fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
 fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
-    let Some(obj) = arg_or_undef(args, 0).as_object() else {
+    let arg = arg_or_undef(args, 0);
+    // §RejectObjectWithCalendarOrTimeZone: a plain fields object, not a
+    // Temporal instance.
+    if !arg.is_object_type() || arg.as_temporal(ctx.heap()).is_some() {
         return Err(NativeError::TypeError {
             name: CLASS,
-            reason: "first argument must be an object".to_string(),
+            reason: "first argument must be a plain object".to_string(),
         });
-    };
-    let fields = parse_year_month_fields(ctx, obj, CLASS)?;
+    }
+    let calendar = pym.calendar().clone();
+    let fields = parse_year_month_fields(ctx, arg, &calendar, CLASS)?;
     let overflow = parse_overflow(ctx, args, 1)?;
     let result = pym
         .with(fields, overflow)
@@ -239,13 +243,15 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
 
 fn impl_to_plain_date(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
-    let Some(obj) = arg_or_undef(args, 0).as_object() else {
+    let arg = arg_or_undef(args, 0);
+    if !arg.is_object_type() || arg.as_temporal(ctx.heap()).is_some() {
         return Err(NativeError::TypeError {
             name: CLASS,
-            reason: "first argument must be an object with a `day` field".to_string(),
+            reason: "first argument must be a plain object with a `day` field".to_string(),
         });
-    };
-    let day_fields = parse_calendar_fields(ctx, Value::object(obj), CLASS)?;
+    }
+    let calendar = pym.calendar().clone();
+    let day_fields = parse_calendar_fields(ctx, arg, &calendar, CLASS)?;
     let result = pym
         .to_plain_date(Some(day_fields))
         .map_err(|e| temporal_err(e, CLASS))?;

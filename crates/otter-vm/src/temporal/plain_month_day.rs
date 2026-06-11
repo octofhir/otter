@@ -83,9 +83,9 @@ fn parse_pmd_arg_with_overflow(
     } else if let Some(s) = v.as_string(ctx.heap()) {
         temporal_rs::PlainMonthDay::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))
-    } else if let Some(obj) = v.as_object() {
-        let fields = parse_calendar_fields(ctx, Value::object(obj), CLASS)?;
-        let calendar = read_calendar_field(obj, ctx.heap(), CLASS)?;
+    } else if v.is_object_type() {
+        let calendar = read_calendar_field(ctx, *v, CLASS)?;
+        let fields = parse_calendar_fields(ctx, *v, &calendar, CLASS)?;
         let partial = temporal_rs::partial::PartialDate {
             calendar_fields: fields,
             calendar,
@@ -141,13 +141,15 @@ fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 
 fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pmd = require_plain_month_day(ctx)?;
-    let Some(obj) = arg_or_undef(args, 0).as_object() else {
+    let arg = arg_or_undef(args, 0);
+    if !arg.is_object_type() || arg.as_temporal(ctx.heap()).is_some() {
         return Err(NativeError::TypeError {
             name: CLASS,
-            reason: "first argument must be an object".to_string(),
+            reason: "first argument must be a plain object".to_string(),
         });
-    };
-    let fields = parse_calendar_fields(ctx, Value::object(obj), CLASS)?;
+    }
+    let calendar = pmd.calendar().clone();
+    let fields = parse_calendar_fields(ctx, arg, &calendar, CLASS)?;
     let overflow = parse_overflow(ctx, args, 1)?;
     let result = pmd
         .with(fields, overflow)
@@ -157,13 +159,15 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
 
 fn impl_to_plain_date(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pmd = require_plain_month_day(ctx)?;
-    let Some(obj) = arg_or_undef(args, 0).as_object() else {
+    let arg = arg_or_undef(args, 0);
+    if !arg.is_object_type() || arg.as_temporal(ctx.heap()).is_some() {
         return Err(NativeError::TypeError {
             name: CLASS,
-            reason: "first argument must be an object with a `year` field".to_string(),
+            reason: "first argument must be a plain object with a `year` field".to_string(),
         });
-    };
-    let year_fields = parse_calendar_fields(ctx, Value::object(obj), CLASS)?;
+    }
+    let calendar = pmd.calendar().clone();
+    let year_fields = parse_calendar_fields(ctx, arg, &calendar, CLASS)?;
     let result = pmd
         .to_plain_date(Some(year_fields))
         .map_err(|e| temporal_err(e, CLASS))?;

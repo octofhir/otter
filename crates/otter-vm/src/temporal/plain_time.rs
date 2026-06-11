@@ -160,8 +160,8 @@ fn duration_arg(ctx: &mut NativeCtx<'_>, v: &Value) -> Result<temporal_rs::Durat
                 reason: "must be a Temporal.Duration".to_string(),
             }),
         }
-    } else if let Some(obj) = v.as_object() {
-        partial_from_object(ctx, &obj)
+    } else if v.is_object_type() {
+        partial_from_object(ctx, *v)
     } else if let Some(s) = v.as_string(ctx.heap()) {
         temporal_rs::Duration::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))

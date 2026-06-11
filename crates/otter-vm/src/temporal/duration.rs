@@ -14,8 +14,8 @@ use crate::native_function::NativeCall;
 use crate::object::{self, JsObject};
 use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::helpers::{
-    arg_or_undef, js_string_value, make_temporal, opt_integer_if_integral, parse_rounding_options,
-    require_construct, require_duration, temporal_err,
+    arg_or_undef, js_string_value, make_temporal, opt_integer_if_integral, options_object,
+    parse_rounding_options, require_construct, require_duration, temporal_err,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -52,7 +52,14 @@ fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
 fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let a = parse_duration_arg(ctx, &arg_or_undef(args, 0))?;
     let b = parse_duration_arg(ctx, &arg_or_undef(args, 1))?;
-    let n = match a.compare(&b, None).map_err(|e| temporal_err(e, CLASS))? {
+    // §7.3.34: GetOptionsObject(options) — a non-object, non-undefined
+    // options argument is a TypeError before relativeTo is read.
+    options_object(&arg_or_undef(args, 2), CLASS)?;
+    let relative_to = parse_relative_to(ctx, args, 2)?;
+    let n = match a
+        .compare(&b, relative_to)
+        .map_err(|e| temporal_err(e, CLASS))?
+    {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,

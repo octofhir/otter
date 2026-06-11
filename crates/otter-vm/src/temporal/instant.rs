@@ -124,6 +124,9 @@ fn parse_instant_arg(
     if let Some(t) = v.as_temporal(heap) {
         match t.payload_clone(heap) {
             TemporalPayload::Instant(v) => Ok(v),
+            // §ToTemporalInstant fast path: a ZonedDateTime yields the
+            // instant at its [[Nanoseconds]].
+            TemporalPayload::ZonedDateTime(zdt) => Ok(zdt.to_instant()),
             _ => Err(NativeError::TypeError {
                 name: CLASS,
                 reason: "argument must be a Temporal.Instant".to_string(),

@@ -174,12 +174,10 @@ pub fn opt_integer_with_truncation(
 /// (via ToNumber) is a TypeError.
 pub fn read_rounding_increment(
     ctx: &mut NativeCtx<'_>,
-    obj: JsObject,
+    target: Value,
     class: &'static str,
 ) -> Result<Option<temporal_rs::options::RoundingIncrement>, NativeError> {
-    let Some(field) = object::get(obj, ctx.heap(), "roundingIncrement") else {
-        return Ok(None);
-    };
+    let field = get_option_value(ctx, target, "roundingIncrement", class)?;
     if field.is_undefined() {
         return Ok(None);
     }
@@ -677,10 +675,23 @@ pub fn parse_difference_settings(
     use core::str::FromStr;
     let mut settings = temporal_rs::options::DifferenceSettings::default();
     let v = arg_or_undef(args, index);
-    let Some(obj) = options_object(&v, class)? else {
+    // §GetOptionsObject: undefined → defaults; a non-object is a
+    // TypeError; a Proxy options bag is accepted (is_object_type) so its
+    // observable getters fire through `get_option_value`.
+    if v.is_undefined() {
         return Ok(settings);
-    };
-    if let Some(name) = read_option_string(ctx, Value::object(obj), "largestUnit", class)?
+    }
+    if !v.is_object_type() {
+        return Err(NativeError::TypeError {
+            name: class,
+            reason: "options must be an object or undefined".to_string(),
+        });
+    }
+    // §GetDifferenceSettings reads the options in the fixed order
+    // largestUnit, roundingIncrement, roundingMode, smallestUnit; the
+    // cross-option (smallestUnit > largestUnit) validation is performed
+    // by temporal_rs afterwards.
+    if let Some(name) = read_option_string(ctx, v, "largestUnit", class)?
         && !name.is_empty()
         && !name.eq_ignore_ascii_case("auto")
     {
@@ -691,15 +702,10 @@ pub fn parse_difference_settings(
             })?;
         settings.largest_unit = Some(unit);
     }
-    if let Some(name) = read_option_string(ctx, Value::object(obj), "smallestUnit", class)? {
-        let unit =
-            temporal_rs::options::Unit::from_str(&name).map_err(|_| NativeError::RangeError {
-                name: class,
-                reason: "invalid `smallestUnit`".to_string(),
-            })?;
-        settings.smallest_unit = Some(unit);
+    if let Some(incr) = read_rounding_increment(ctx, v, class)? {
+        settings.increment = Some(incr);
     }
-    if let Some(name) = read_option_string(ctx, Value::object(obj), "roundingMode", class)? {
+    if let Some(name) = read_option_string(ctx, v, "roundingMode", class)? {
         let mode = temporal_rs::options::RoundingMode::from_str(&name).map_err(|_| {
             NativeError::RangeError {
                 name: class,
@@ -708,8 +714,13 @@ pub fn parse_difference_settings(
         })?;
         settings.rounding_mode = Some(mode);
     }
-    if let Some(incr) = read_rounding_increment(ctx, obj, class)? {
-        settings.increment = Some(incr);
+    if let Some(name) = read_option_string(ctx, v, "smallestUnit", class)? {
+        let unit =
+            temporal_rs::options::Unit::from_str(&name).map_err(|_| NativeError::RangeError {
+                name: class,
+                reason: "invalid `smallestUnit`".to_string(),
+            })?;
+        settings.smallest_unit = Some(unit);
     }
     Ok(settings)
 }
@@ -736,13 +747,17 @@ pub fn parse_rounding_options(
     if v.is_undefined() {
         return Ok(options);
     }
-    let Some(obj) = v.as_object() else {
+    if !v.is_object_type() {
         return Err(NativeError::TypeError {
             name: class,
             reason: "round() requires an options object or smallest-unit string".to_string(),
         });
-    };
-    if let Some(name) = read_option_string(ctx, Value::object(obj), "largestUnit", class)? {
+    }
+    // Fixed option read order (largestUnit, roundingIncrement,
+    // roundingMode, smallestUnit); cross-option validation runs in
+    // temporal_rs afterwards. Reads fire through `get_option_value` so a
+    // Proxy options bag is observed.
+    if let Some(name) = read_option_string(ctx, v, "largestUnit", class)? {
         let unit =
             temporal_rs::options::Unit::from_str(&name).map_err(|_| NativeError::RangeError {
                 name: class,
@@ -750,15 +765,10 @@ pub fn parse_rounding_options(
             })?;
         options.largest_unit = Some(unit);
     }
-    if let Some(name) = read_option_string(ctx, Value::object(obj), "smallestUnit", class)? {
-        let unit =
-            temporal_rs::options::Unit::from_str(&name).map_err(|_| NativeError::RangeError {
-                name: class,
-                reason: "invalid `smallestUnit`".to_string(),
-            })?;
-        options.smallest_unit = Some(unit);
+    if let Some(incr) = read_rounding_increment(ctx, v, class)? {
+        options.increment = Some(incr);
     }
-    if let Some(name) = read_option_string(ctx, Value::object(obj), "roundingMode", class)? {
+    if let Some(name) = read_option_string(ctx, v, "roundingMode", class)? {
         let mode = temporal_rs::options::RoundingMode::from_str(&name).map_err(|_| {
             NativeError::RangeError {
                 name: class,
@@ -767,8 +777,13 @@ pub fn parse_rounding_options(
         })?;
         options.rounding_mode = Some(mode);
     }
-    if let Some(incr) = read_rounding_increment(ctx, obj, class)? {
-        options.increment = Some(incr);
+    if let Some(name) = read_option_string(ctx, v, "smallestUnit", class)? {
+        let unit =
+            temporal_rs::options::Unit::from_str(&name).map_err(|_| NativeError::RangeError {
+                name: class,
+                reason: "invalid `smallestUnit`".to_string(),
+            })?;
+        options.smallest_unit = Some(unit);
     }
     Ok(options)
 }

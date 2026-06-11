@@ -532,7 +532,7 @@ impl Interpreter {
     // The interpreter borrow is `&mut self` because the helper invokes
     // user-defined `toString` / `valueOf`, which can re-enter dispatch.
     #[allow(clippy::wrong_self_convention)]
-    fn to_primitive_string_hint_sync(
+    pub(crate) fn to_primitive_string_hint_sync(
         &mut self,
         context: &ExecutionContext,
         value: Value,

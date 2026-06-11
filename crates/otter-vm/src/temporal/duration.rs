@@ -406,9 +406,7 @@ fn parse_duration_round_options(
             })?);
         return Ok((options, None));
     }
-    if v.is_undefined() {
-        return Ok((options, None));
-    }
+    // round() requires its argument — `undefined` is a TypeError.
     if !v.is_object_type() {
         return Err(NativeError::TypeError {
             name: CLASS,

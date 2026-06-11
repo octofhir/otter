@@ -14,7 +14,6 @@ use num_traits::ToPrimitive;
 use crate::bigint::BigIntValue;
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
-use crate::object;
 use crate::string::JsString;
 use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::parse_to_string_rounding_options;
@@ -87,19 +86,21 @@ pub(crate) fn parse_zdt_arg(
                 reason: "argument must be a Temporal.ZonedDateTime".to_string(),
             }),
         }
-    } else if let Some(obj) = v.as_object() {
+    } else if v.is_object_type() {
         // §ToTemporalZonedDateTime property bag: `timeZone` is
-        // required; calendar/time fields and offset are optional.
-        let tz_v = object::get(obj, ctx.heap(), "timeZone")
-            .filter(|x| !x.is_undefined())
-            .ok_or_else(|| NativeError::TypeError {
+        // required; calendar/time fields and offset are optional. Reads
+        // fire through getter/Proxy-aware [[Get]]s.
+        let calendar = read_calendar_field(ctx, *v, CLASS)?;
+        let calendar_fields = parse_calendar_fields(ctx, *v, &calendar, CLASS)?;
+        let tz_v = crate::temporal::helpers::get_option_value(ctx, *v, "timeZone", CLASS)?;
+        if tz_v.is_undefined() {
+            return Err(NativeError::TypeError {
                 name: CLASS,
                 reason: "object must have a timeZone property".to_string(),
-            })?;
+            });
+        }
         let tz = parse_time_zone(&tz_v, ctx.heap(), CLASS)?;
-        let calendar = read_calendar_field(ctx, Value::object(obj), CLASS)?;
-        let calendar_fields = parse_calendar_fields(ctx, Value::object(obj), &calendar, CLASS)?;
-        let time = parse_partial_time(ctx, Value::object(obj), CLASS)?;
+        let time = parse_partial_time(ctx, *v, CLASS)?;
         let mut partial = temporal_rs::partial::PartialZonedDateTime::new()
             .with_calendar_fields(calendar_fields)
             .with_time(time)
@@ -318,6 +319,13 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         return Err(NativeError::TypeError {
             name: CLASS,
             reason: "with() requires a plain ZonedDateTime-like object".to_string(),
+        });
+    }
+    let options = arg_or_undef(args, 1);
+    if !options.is_undefined() && !options.is_object_type() {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "options must be an object or undefined".to_string(),
         });
     }
     let calendar = zdt.calendar().clone();

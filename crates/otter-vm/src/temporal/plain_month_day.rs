@@ -149,6 +149,13 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             reason: "first argument must be a plain object".to_string(),
         });
     }
+    let options = arg_or_undef(args, 1);
+    if !options.is_undefined() && !options.is_object_type() {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "options must be an object or undefined".to_string(),
+        });
+    }
     let calendar = pmd.calendar().clone();
     let fields = parse_calendar_fields(ctx, arg, &calendar, CLASS)?;
     let overflow = parse_overflow(ctx, args, 1)?;

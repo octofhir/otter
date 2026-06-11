@@ -66,14 +66,18 @@ fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
 }
 
 fn from_epoch_milliseconds(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let Some(ms) = arg_or_undef(args, 0).as_number().map(|n| n.as_f64() as i64) else {
-        return Err(NativeError::TypeError {
+    // §ToNumber then NumberToBigInt: a non-integral / non-finite value
+    // is a RangeError (NumberToBigInt). ToNumber fires a user valueOf.
+    let v = arg_or_undef(args, 0);
+    let n = crate::temporal::helpers::to_number_field(ctx, &v, CLASS, "epochMilliseconds")?;
+    if !n.is_finite() || n.fract() != 0.0 {
+        return Err(NativeError::RangeError {
             name: CLASS,
-            reason: "fromEpochMilliseconds: argument must be a number".to_string(),
+            reason: "fromEpochMilliseconds: epochMilliseconds must be an integer".to_string(),
         });
-    };
-    let inst =
-        temporal_rs::Instant::from_epoch_milliseconds(ms).map_err(|e| temporal_err(e, CLASS))?;
+    }
+    let inst = temporal_rs::Instant::from_epoch_milliseconds(n as i64)
+        .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Instant(inst))
 }
 

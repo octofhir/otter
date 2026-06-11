@@ -230,6 +230,49 @@ pub fn read_option_string(
         .map_err(|e| crate::native_function::vm_to_native_error(e, class))
 }
 
+/// Read a `monthCode` field. §CalendarFieldsToISO requires a String
+/// value: an object is coerced with ToPrimitive(string) (firing
+/// `toString`) and the result must itself be a String, otherwise a
+/// TypeError; any other non-string primitive is a TypeError. A
+/// well-formed-but-invalid string is a RangeError.
+fn read_month_code(
+    ctx: &mut NativeCtx<'_>,
+    target: Value,
+    class: &'static str,
+) -> Result<Option<temporal_rs::MonthCode>, NativeError> {
+    let field = get_option_value(ctx, target, "monthCode", class)?;
+    if field.is_undefined() {
+        return Ok(None);
+    }
+    let prim = if field.is_object_type() {
+        let exec = ctx
+            .execution_context()
+            .cloned()
+            .ok_or_else(|| NativeError::TypeError {
+                name: class,
+                reason: "missing execution context".to_string(),
+            })?;
+        ctx.cx
+            .interp
+            .to_primitive_string_hint_sync(&exec, field)
+            .map_err(|e| crate::native_function::vm_to_native_error(e, class))?
+    } else {
+        field
+    };
+    let Some(s) = prim.as_string(ctx.heap()) else {
+        return Err(NativeError::TypeError {
+            name: class,
+            reason: "monthCode must be a string".to_string(),
+        });
+    };
+    let code = temporal_rs::MonthCode::try_from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
+        .map_err(|_| NativeError::RangeError {
+            name: class,
+            reason: "monthCode is not well-formed".to_string(),
+        })?;
+    Ok(Some(code))
+}
+
 pub fn parse_overflow(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
@@ -764,9 +807,8 @@ pub fn parse_rounding_options(
         options.smallest_unit = Some(unit);
         return Ok(options);
     }
-    if v.is_undefined() {
-        return Ok(options);
-    }
+    // round() requires the `roundTo`/options argument — `undefined` (a
+    // missing argument) is a TypeError, not a defaulted options object.
     if !v.is_object_type() {
         return Err(NativeError::TypeError {
             name: class,
@@ -920,13 +962,7 @@ pub fn parse_calendar_fields(
     if let Some(v) = read_partial_integer(ctx, target, "month", class)? {
         f.month = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
-    if let Some(s) = read_option_string(ctx, target, "monthCode", class)? {
-        let code = temporal_rs::MonthCode::try_from_utf8(s.as_bytes()).map_err(|_| {
-            NativeError::TypeError {
-                name: class,
-                reason: "invalid monthCode".to_string(),
-            }
-        })?;
+    if let Some(code) = read_month_code(ctx, target, class)? {
         f.month_code = Some(code);
     }
     if let Some(v) = read_partial_integer(ctx, target, "year", class)? {
@@ -981,13 +1017,7 @@ pub fn parse_date_time_fields(
     if let Some(v) = read_partial_integer(ctx, target, "month", class)? {
         cf.month = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
-    if let Some(s) = read_option_string(ctx, target, "monthCode", class)? {
-        let code = temporal_rs::MonthCode::try_from_utf8(s.as_bytes()).map_err(|_| {
-            NativeError::TypeError {
-                name: class,
-                reason: "invalid monthCode".to_string(),
-            }
-        })?;
+    if let Some(code) = read_month_code(ctx, target, class)? {
         cf.month_code = Some(code);
     }
     if let Some(v) = read_partial_integer(ctx, target, "nanosecond", class)? {
@@ -1033,13 +1063,7 @@ pub fn parse_year_month_fields(
     if let Some(v) = read_partial_integer(ctx, target, "month", class)? {
         f.month = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
-    if let Some(s) = read_option_string(ctx, target, "monthCode", class)? {
-        let code = temporal_rs::MonthCode::try_from_utf8(s.as_bytes()).map_err(|_| {
-            NativeError::TypeError {
-                name: class,
-                reason: "invalid monthCode".to_string(),
-            }
-        })?;
+    if let Some(code) = read_month_code(ctx, target, class)? {
         f.month_code = Some(code);
     }
     if let Some(v) = read_partial_integer(ctx, target, "year", class)? {

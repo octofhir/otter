@@ -59,7 +59,7 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let zdt = parse_zdt_arg(ctx, &arg_or_undef(args, 0))?;
+    let zdt = parse_zdt_arg_with_options(ctx, &arg_or_undef(args, 0), Some(args))?;
     make_temporal(ctx, TemporalPayload::ZonedDateTime(zdt))
 }
 
@@ -78,20 +78,44 @@ pub(crate) fn parse_zdt_arg(
     ctx: &mut NativeCtx<'_>,
     v: &Value,
 ) -> Result<temporal_rs::ZonedDateTime, NativeError> {
+    parse_zdt_arg_with_options(ctx, v, None)
+}
+
+/// §ToTemporalZonedDateTime. `options_args`, when `Some(args)`, carries
+/// the native arguments whose index-1 element is the options object;
+/// the `disambiguation`, `offset`, and `overflow` options are read from
+/// it (after the bag fields). Other callers (compare/since/until/with,
+/// `relativeTo`) pass `None` and use the defaults.
+pub(crate) fn parse_zdt_arg_with_options(
+    ctx: &mut NativeCtx<'_>,
+    v: &Value,
+    options_args: Option<&[Value]>,
+) -> Result<temporal_rs::ZonedDateTime, NativeError> {
     if let Some(t) = v.as_temporal(ctx.heap()) {
-        match t.payload_clone(ctx.heap()) {
-            TemporalPayload::ZonedDateTime(v) => Ok(v),
-            _ => Err(NativeError::TypeError {
-                name: CLASS,
-                reason: "argument must be a Temporal.ZonedDateTime".to_string(),
-            }),
-        }
-    } else if v.is_object_type() {
+        let zdt = match t.payload_clone(ctx.heap()) {
+            TemporalPayload::ZonedDateTime(v) => v,
+            _ => {
+                return Err(NativeError::TypeError {
+                    name: CLASS,
+                    reason: "argument must be a Temporal.ZonedDateTime".to_string(),
+                });
+            }
+        };
+        // §step 2.c still reads (and validates) the options.
+        read_zdt_options(ctx, options_args)?;
+        return Ok(zdt);
+    }
+    if v.is_object_type() {
         // §ToTemporalZonedDateTime property bag: `timeZone` is
-        // required; calendar/time fields and offset are optional. Reads
-        // fire through getter/Proxy-aware [[Get]]s.
+        // required; calendar/time fields and `offset` are optional.
+        // Reads fire through getter/Proxy-aware [[Get]]s.
         let calendar = read_calendar_field(ctx, *v, CLASS)?;
         let calendar_fields = parse_calendar_fields(ctx, *v, &calendar, CLASS)?;
+        let offset = read_option_string(ctx, *v, "offset", CLASS)?
+            .map(|s| {
+                temporal_rs::UtcOffset::from_utf8(s.as_bytes()).map_err(|e| temporal_err(e, CLASS))
+            })
+            .transpose()?;
         let tz_v = crate::temporal::helpers::get_option_value(ctx, *v, "timeZone", CLASS)?;
         if tz_v.is_undefined() {
             return Err(NativeError::TypeError {
@@ -101,28 +125,103 @@ pub(crate) fn parse_zdt_arg(
         }
         let tz = parse_time_zone(&tz_v, ctx.heap(), CLASS)?;
         let time = parse_partial_time(ctx, *v, CLASS)?;
+        let (overflow, disambiguation, offset_option) = read_zdt_options(ctx, options_args)?;
         let mut partial = temporal_rs::partial::PartialZonedDateTime::new()
             .with_calendar_fields(calendar_fields)
             .with_time(time)
             .with_timezone(Some(tz));
         partial.calendar = calendar;
-        temporal_rs::ZonedDateTime::from_partial(partial, None, None, None)
-            .map_err(|e| temporal_err(e, CLASS))
-    } else if let Some(s) = v.as_string(ctx.heap()) {
+        if let Some(o) = offset {
+            partial = partial.with_offset(o);
+        }
+        return temporal_rs::ZonedDateTime::from_partial(
+            partial,
+            overflow,
+            disambiguation,
+            offset_option,
+        )
+        .map_err(|e| temporal_err(e, CLASS));
+    }
+    if let Some(s) = v.as_string(ctx.heap()) {
+        let text = s.to_lossy_string(ctx.heap());
+        // §ToTemporalZonedDateTime parses the string before reading the
+        // options, so an ISO-invalid string rejects before any option is
+        // observed. Validate the parse first, then read the options and
+        // produce the final result with them applied.
         temporal_rs::ZonedDateTime::from_utf8(
-            s.to_lossy_string(ctx.heap()).as_bytes(),
+            text.as_bytes(),
             temporal_rs::options::Disambiguation::Compatible,
             temporal_rs::options::OffsetDisambiguation::Reject,
         )
-        .map_err(|e| temporal_err(e, CLASS))
-    } else {
-        Err(NativeError::TypeError {
-            name: CLASS,
-            reason:
-                "argument must be a Temporal.ZonedDateTime, ISO string, or object with a timeZone"
-                    .to_string(),
-        })
+        .map_err(|e| temporal_err(e, CLASS))?;
+        let (_, disambiguation, offset_option) = read_zdt_options(ctx, options_args)?;
+        return temporal_rs::ZonedDateTime::from_utf8(
+            text.as_bytes(),
+            disambiguation.unwrap_or(temporal_rs::options::Disambiguation::Compatible),
+            offset_option.unwrap_or(temporal_rs::options::OffsetDisambiguation::Reject),
+        )
+        .map_err(|e| temporal_err(e, CLASS));
     }
+    Err(NativeError::TypeError {
+        name: CLASS,
+        reason: "argument must be a Temporal.ZonedDateTime, ISO string, or object with a timeZone"
+            .to_string(),
+    })
+}
+
+/// Read the `disambiguation`, `offset`, and `overflow` options from a
+/// `ZonedDateTime.from` options argument (`options_args[1]`), each via a
+/// getter/Proxy-aware [[Get]] and validated against its enum.
+#[allow(clippy::type_complexity)]
+fn read_zdt_options(
+    ctx: &mut NativeCtx<'_>,
+    options_args: Option<&[Value]>,
+) -> Result<
+    (
+        Option<temporal_rs::options::Overflow>,
+        Option<temporal_rs::options::Disambiguation>,
+        Option<temporal_rs::options::OffsetDisambiguation>,
+    ),
+    NativeError,
+> {
+    use core::str::FromStr;
+    let Some(args) = options_args else {
+        return Ok((None, None, None));
+    };
+    let v = arg_or_undef(args, 1);
+    if v.is_undefined() {
+        return Ok((None, None, None));
+    }
+    if !v.is_object_type() {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "options must be an object or undefined".to_string(),
+        });
+    }
+    let disambiguation = match read_option_string(ctx, v, "disambiguation", CLASS)? {
+        Some(name) => Some(
+            temporal_rs::options::Disambiguation::from_str(&name).map_err(|_| {
+                NativeError::RangeError {
+                    name: CLASS,
+                    reason: "invalid `disambiguation`".to_string(),
+                }
+            })?,
+        ),
+        None => None,
+    };
+    let offset_option = match read_option_string(ctx, v, "offset", CLASS)? {
+        Some(name) => Some(
+            temporal_rs::options::OffsetDisambiguation::from_str(&name).map_err(|_| {
+                NativeError::RangeError {
+                    name: CLASS,
+                    reason: "invalid `offset`".to_string(),
+                }
+            })?,
+        ),
+        None => None,
+    };
+    let overflow = parse_overflow(ctx, args, 1)?;
+    Ok((overflow, disambiguation, offset_option))
 }
 
 pub fn load_property(temporal: JsTemporal, heap: &mut otter_gc::GcHeap, name: &str) -> Value {

@@ -943,7 +943,13 @@ pub fn parse_calendar_fields(
     let has_eras = !calendar.is_iso();
     let mut f = temporal_rs::fields::CalendarFields::default();
     if let Some(v) = read_partial_integer(ctx, target, "day", class)? {
-        f.day = Some(v.clamp(0, u8::MAX as i64) as u8);
+        if v < 1 {
+            return Err(NativeError::RangeError {
+                name: class,
+                reason: "day must be a positive integer".to_string(),
+            });
+        }
+        f.day = Some(v.min(u8::MAX as i64) as u8);
     }
     if has_eras {
         if let Some(s) = read_option_string(ctx, target, "era", class)? {
@@ -960,7 +966,13 @@ pub fn parse_calendar_fields(
         }
     }
     if let Some(v) = read_partial_integer(ctx, target, "month", class)? {
-        f.month = Some(v.clamp(0, u8::MAX as i64) as u8);
+        if v < 1 {
+            return Err(NativeError::RangeError {
+                name: class,
+                reason: "month must be a positive integer".to_string(),
+            });
+        }
+        f.month = Some(v.min(u8::MAX as i64) as u8);
     }
     if let Some(code) = read_month_code(ctx, target, class)? {
         f.month_code = Some(code);
@@ -986,7 +998,13 @@ pub fn parse_date_time_fields(
     let mut cf = temporal_rs::fields::CalendarFields::default();
     let mut time = temporal_rs::partial::PartialTime::default();
     if let Some(v) = read_partial_integer(ctx, target, "day", class)? {
-        cf.day = Some(v.clamp(0, u8::MAX as i64) as u8);
+        if v < 1 {
+            return Err(NativeError::RangeError {
+                name: class,
+                reason: "day must be a positive integer".to_string(),
+            });
+        }
+        cf.day = Some(v.min(u8::MAX as i64) as u8);
     }
     if has_eras {
         if let Some(s) = read_option_string(ctx, target, "era", class)? {
@@ -1015,7 +1033,13 @@ pub fn parse_date_time_fields(
         time.minute = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
     if let Some(v) = read_partial_integer(ctx, target, "month", class)? {
-        cf.month = Some(v.clamp(0, u8::MAX as i64) as u8);
+        if v < 1 {
+            return Err(NativeError::RangeError {
+                name: class,
+                reason: "month must be a positive integer".to_string(),
+            });
+        }
+        cf.month = Some(v.min(u8::MAX as i64) as u8);
     }
     if let Some(code) = read_month_code(ctx, target, class)? {
         cf.month_code = Some(code);
@@ -1061,7 +1085,13 @@ pub fn parse_year_month_fields(
         }
     }
     if let Some(v) = read_partial_integer(ctx, target, "month", class)? {
-        f.month = Some(v.clamp(0, u8::MAX as i64) as u8);
+        if v < 1 {
+            return Err(NativeError::RangeError {
+                name: class,
+                reason: "month must be a positive integer".to_string(),
+            });
+        }
+        f.month = Some(v.min(u8::MAX as i64) as u8);
     }
     if let Some(code) = read_month_code(ctx, target, class)? {
         f.month_code = Some(code);

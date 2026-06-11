@@ -257,6 +257,12 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
     crate::temporal::helpers::reject_temporal_like_keys(ctx, arg, CLASS)?;
     let calendar = pd.calendar().clone();
     let fields = parse_calendar_fields(ctx, arg, &calendar, CLASS)?;
+    if crate::temporal::helpers::calendar_fields_empty(&fields) {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "with() requires at least one recognized field".to_string(),
+        });
+    }
     let overflow = parse_overflow(ctx, args, 1)?;
     let result = pd
         .with(fields, overflow)

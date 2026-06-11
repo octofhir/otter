@@ -835,18 +835,10 @@ pub fn parse_rounding_options(
             reason: "round() requires an options object or smallest-unit string".to_string(),
         });
     }
-    // Fixed option read order (largestUnit, roundingIncrement,
-    // roundingMode, smallestUnit); cross-option validation runs in
-    // temporal_rs afterwards. Reads fire through `get_option_value` so a
-    // Proxy options bag is observed.
-    if let Some(name) = read_option_string(ctx, v, "largestUnit", class)? {
-        let unit =
-            temporal_rs::options::Unit::from_str(&name).map_err(|_| NativeError::RangeError {
-                name: class,
-                reason: "invalid `largestUnit`".to_string(),
-            })?;
-        options.largest_unit = Some(unit);
-    }
+    // Fixed option read order (roundingIncrement, roundingMode,
+    // smallestUnit) — a plain instant/datetime/time round() has no
+    // `largestUnit` option (only Duration.round does). Reads fire
+    // through `get_option_value` so a Proxy options bag is observed.
     if let Some(incr) = read_rounding_increment(ctx, v, class)? {
         options.increment = Some(incr);
     }
@@ -895,6 +887,19 @@ pub fn parse_partial_time(
         t.second = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
     Ok(t)
+}
+
+/// True when no recognised calendar field was present on a `with()`
+/// partial-fields object — §the PartialRecord must have at least one
+/// field, otherwise `with()` throws a TypeError.
+#[must_use]
+pub fn calendar_fields_empty(f: &temporal_rs::fields::CalendarFields) -> bool {
+    f.year.is_none()
+        && f.month.is_none()
+        && f.month_code.is_none()
+        && f.day.is_none()
+        && f.era.is_none()
+        && f.era_year.is_none()
 }
 
 /// §RejectTemporalLikeObject — a `with()` fields object must not carry a

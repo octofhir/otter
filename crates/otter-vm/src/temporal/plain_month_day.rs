@@ -43,8 +43,20 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let arg = arg_or_undef(args, 0);
+    // §ToTemporalMonthDay: parse a primitive ISO string before
+    // GetTemporalOverflowOption, so an invalid string rejects before
+    // the `overflow` option is observed.
+    if arg.as_temporal(ctx.heap()).is_none()
+        && let Some(s) = arg.as_string(ctx.heap())
+    {
+        let pmd = temporal_rs::PlainMonthDay::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
+            .map_err(|e| temporal_err(e, CLASS))?;
+        parse_overflow(ctx, args, 1)?;
+        return make_temporal(ctx, TemporalPayload::PlainMonthDay(pmd));
+    }
     let overflow = parse_overflow(ctx, args, 1)?;
-    let pmd = parse_pmd_arg_with_overflow(ctx, &arg_or_undef(args, 0), overflow)?;
+    let pmd = parse_pmd_arg_with_overflow(ctx, &arg, overflow)?;
     make_temporal(ctx, TemporalPayload::PlainMonthDay(pmd))
 }
 

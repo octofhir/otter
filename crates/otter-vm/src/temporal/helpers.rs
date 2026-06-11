@@ -239,8 +239,19 @@ pub fn parse_overflow(
 ) -> Result<Option<temporal_rs::options::Overflow>, NativeError> {
     use core::str::FromStr;
     let v = arg_or_undef(args, index);
-    if options_object(&v, "Temporal")?.is_none() {
+    // GetOptionsObject: undefined → no options; a non-object is a
+    // TypeError. We check the type directly (not `options_object`,
+    // whose `as_object()` collapse drops Proxy option bags) so an
+    // observable Proxy options object still routes through the
+    // getter-firing [[Get]] in `get_option_value`.
+    if v.is_undefined() {
         return Ok(None);
+    }
+    if !v.is_object_type() {
+        return Err(NativeError::TypeError {
+            name: "Temporal",
+            reason: "options must be an object or undefined".to_string(),
+        });
     }
     let field = get_option_value(ctx, v, "overflow", "Temporal")?;
     if field.is_undefined() {

@@ -34,8 +34,7 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let overflow = parse_overflow(ctx, args, 1)?;
-    let pd = parse_plain_date_arg_with_overflow(ctx, &arg_or_undef(args, 0), overflow)?;
+    let pd = parse_plain_date_arg_with_overflow(ctx, &arg_or_undef(args, 0), Some(args))?;
     make_temporal(ctx, TemporalPayload::PlainDate(pd))
 }
 
@@ -57,37 +56,57 @@ pub(crate) fn parse_plain_date_arg(
     parse_plain_date_arg_with_overflow(ctx, v, None)
 }
 
+/// §ToTemporalDate. `overflow_opts`, when `Some(args)`, is the native
+/// argument slice whose index-1 element carries the options object;
+/// `GetTemporalOverflowOption` is then performed at the spec-mandated
+/// point (after the primary argument is recognised / its fields are
+/// read / its ISO string is parsed), so a primitive that fails the
+/// type check or an ISO-invalid string rejects before the option is
+/// observed. `None` skips overflow entirely (e.g. `compare`).
 pub(crate) fn parse_plain_date_arg_with_overflow(
     ctx: &mut NativeCtx<'_>,
     v: &Value,
-    overflow: Option<temporal_rs::options::Overflow>,
+    overflow_opts: Option<&[Value]>,
 ) -> Result<temporal_rs::PlainDate, NativeError> {
-    let heap = ctx.heap();
-    // §ToTemporalDate: a Temporal instance with date slots converts
-    // directly (PlainDateTime / ZonedDateTime project onto their
-    // calendar date); a plain object is read as a calendar-date
-    // property bag; a string is parsed as ISO.
-    if let Some(t) = v.as_temporal(heap) {
-        match t.payload_clone(heap) {
-            TemporalPayload::PlainDate(v) => Ok(v),
-            TemporalPayload::PlainDateTime(pdt) => Ok(pdt.to_plain_date()),
-            TemporalPayload::ZonedDateTime(zdt) => Ok(zdt.to_plain_date()),
-            _ => Err(NativeError::TypeError {
-                name: CLASS,
-                reason: "argument must be a Temporal.PlainDate".to_string(),
-            }),
+    // A Temporal instance with date slots converts directly
+    // (PlainDateTime / ZonedDateTime project onto their calendar
+    // date); a plain object is read as a calendar-date property bag;
+    // a string is parsed as ISO.
+    if let Some(t) = v.as_temporal(ctx.heap()) {
+        let pd = match t.payload_clone(ctx.heap()) {
+            TemporalPayload::PlainDate(v) => v,
+            TemporalPayload::PlainDateTime(pdt) => pdt.to_plain_date(),
+            TemporalPayload::ZonedDateTime(zdt) => zdt.to_plain_date(),
+            _ => {
+                return Err(NativeError::TypeError {
+                    name: CLASS,
+                    reason: "argument must be a Temporal.PlainDate".to_string(),
+                });
+            }
+        };
+        if let Some(args) = overflow_opts {
+            parse_overflow(ctx, args, 1)?;
         }
+        Ok(pd)
     } else if let Some(obj) = v.as_object() {
-        let calendar = read_calendar_field(obj, heap, CLASS)?;
+        let calendar = read_calendar_field(obj, ctx.heap(), CLASS)?;
         let calendar_fields = parse_calendar_fields(ctx, obj, CLASS)?;
+        let overflow = match overflow_opts {
+            Some(args) => parse_overflow(ctx, args, 1)?,
+            None => None,
+        };
         let partial = temporal_rs::partial::PartialDate {
             calendar_fields,
             calendar,
         };
         temporal_rs::PlainDate::from_partial(partial, overflow).map_err(|e| temporal_err(e, CLASS))
-    } else if let Some(s) = v.as_string(heap) {
-        temporal_rs::PlainDate::from_utf8(s.to_lossy_string(heap).as_bytes())
-            .map_err(|e| temporal_err(e, CLASS))
+    } else if let Some(s) = v.as_string(ctx.heap()) {
+        let pd = temporal_rs::PlainDate::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
+            .map_err(|e| temporal_err(e, CLASS))?;
+        if let Some(args) = overflow_opts {
+            parse_overflow(ctx, args, 1)?;
+        }
+        Ok(pd)
     } else {
         Err(NativeError::TypeError {
             name: CLASS,

@@ -174,8 +174,10 @@ fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
 fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
     let dur = duration_arg(ctx, &arg_or_undef(args, 0))?;
+    let overflow =
+        parse_overflow(ctx, args, 1)?.unwrap_or(temporal_rs::options::Overflow::Constrain);
     let result = pym
-        .add(&dur, temporal_rs::options::Overflow::Constrain)
+        .add(&dur, overflow)
         .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainYearMonth(result))
 }
@@ -183,8 +185,10 @@ fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
 fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
     let dur = duration_arg(ctx, &arg_or_undef(args, 0))?;
+    let overflow =
+        parse_overflow(ctx, args, 1)?.unwrap_or(temporal_rs::options::Overflow::Constrain);
     let result = pym
-        .subtract(&dur, temporal_rs::options::Overflow::Constrain)
+        .subtract(&dur, overflow)
         .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainYearMonth(result))
 }

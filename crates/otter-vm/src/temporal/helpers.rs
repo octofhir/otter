@@ -823,15 +823,21 @@ pub fn read_calendar_field(
         return Ok(temporal_rs::Calendar::default());
     }
     if let Some(t) = v.as_temporal(heap) {
-        // A Temporal instance contributes its own calendar slot.
-        return Ok(match t.payload_clone(heap) {
-            TemporalPayload::PlainDate(d) => d.calendar().clone(),
-            TemporalPayload::PlainDateTime(d) => d.calendar().clone(),
-            TemporalPayload::PlainYearMonth(d) => d.calendar().clone(),
-            TemporalPayload::PlainMonthDay(d) => d.calendar().clone(),
-            TemporalPayload::ZonedDateTime(d) => d.calendar().clone(),
-            _ => temporal_rs::Calendar::default(),
-        });
+        // A Temporal instance with a [[Calendar]] slot contributes it
+        // directly. A calendar-less Temporal type (Duration, Instant)
+        // is not a valid calendar value — §ToTemporalCalendarSlotValue
+        // throws a TypeError rather than falling back to ISO8601.
+        return match t.payload_clone(heap) {
+            TemporalPayload::PlainDate(d) => Ok(d.calendar().clone()),
+            TemporalPayload::PlainDateTime(d) => Ok(d.calendar().clone()),
+            TemporalPayload::PlainYearMonth(d) => Ok(d.calendar().clone()),
+            TemporalPayload::PlainMonthDay(d) => Ok(d.calendar().clone()),
+            TemporalPayload::ZonedDateTime(d) => Ok(d.calendar().clone()),
+            _ => Err(NativeError::TypeError {
+                name: class,
+                reason: "calendar-less Temporal object is not a valid calendar".to_string(),
+            }),
+        };
     }
     let Some(s) = v.as_string(heap) else {
         return Err(NativeError::TypeError {

@@ -897,6 +897,30 @@ pub fn parse_partial_time(
     Ok(t)
 }
 
+/// §RejectTemporalLikeObject — a `with()` fields object must not carry a
+/// `calendar` or `timeZone` property (those identify a full Temporal-like
+/// object, not a partial-fields record). Each is read with an observable
+/// [[Get]]; a present (non-undefined) value is a TypeError.
+pub fn reject_temporal_like_keys(
+    ctx: &mut NativeCtx<'_>,
+    target: Value,
+    class: &'static str,
+) -> Result<(), NativeError> {
+    if !get_option_value(ctx, target, "calendar", class)?.is_undefined() {
+        return Err(NativeError::TypeError {
+            name: class,
+            reason: "fields object must not have a `calendar` property".to_string(),
+        });
+    }
+    if !get_option_value(ctx, target, "timeZone", class)?.is_undefined() {
+        return Err(NativeError::TypeError {
+            name: class,
+            reason: "fields object must not have a `timeZone` property".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// §ToTemporalCalendarSlotValue — resolve a `calendarLike` argument
 /// (e.g. `withCalendar`): a calendar-bearing Temporal instance
 /// contributes its `[[Calendar]]` slot directly (no property read); a

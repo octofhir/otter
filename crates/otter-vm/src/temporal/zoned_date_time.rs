@@ -417,6 +417,7 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             reason: "options must be an object or undefined".to_string(),
         });
     }
+    crate::temporal::helpers::reject_temporal_like_keys(ctx, arg, CLASS)?;
     let calendar = zdt.calendar().clone();
     let calendar_fields = parse_calendar_fields(ctx, arg, &calendar, CLASS)?;
     let time = parse_partial_time(ctx, arg, CLASS)?;

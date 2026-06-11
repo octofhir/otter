@@ -130,6 +130,11 @@ fn parse_plain_date_time_arg_with_overflow(
         match t.payload_clone(ctx.heap()) {
             TemporalPayload::PlainDateTime(v) => Ok(v),
             TemporalPayload::ZonedDateTime(zdt) => Ok(zdt.to_plain_date_time()),
+            // §ToTemporalDateTime fast path: a PlainDate projects onto
+            // midnight of its calendar date.
+            TemporalPayload::PlainDate(pd) => pd
+                .to_plain_date_time(None)
+                .map_err(|e| temporal_err(e, CLASS)),
             _ => Err(NativeError::TypeError {
                 name: CLASS,
                 reason: "argument must be a Temporal.PlainDateTime".to_string(),
@@ -323,8 +328,11 @@ fn impl_with_calendar(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
         });
     };
     let s = js.to_lossy_string(ctx.heap());
-    let calendar =
-        temporal_rs::Calendar::try_from_utf8(s.as_bytes()).map_err(|e| temporal_err(e, CLASS))?;
+    // ParseTemporalCalendarString: accept bare ids and ISO strings with
+    // a `[u-ca=]` annotation (FromStr), not only bare identifiers.
+    let calendar = s
+        .parse::<temporal_rs::Calendar>()
+        .map_err(|e| temporal_err(e, CLASS))?;
     let result = pdt.with_calendar(calendar);
     make_temporal(ctx, TemporalPayload::PlainDateTime(result))
 }

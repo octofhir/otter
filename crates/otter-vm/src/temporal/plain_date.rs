@@ -259,8 +259,13 @@ fn impl_with_calendar(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
         });
     };
     let s = js.to_lossy_string(ctx.heap());
-    let calendar =
-        temporal_rs::Calendar::try_from_utf8(s.as_bytes()).map_err(|e| temporal_err(e, CLASS))?;
+    // §ToTemporalCalendarSlotValue → ParseTemporalCalendarString: a
+    // bare identifier or an ISO date/time string carrying a `[u-ca=]`
+    // annotation (un-annotated ISO yields ISO8601). `FromStr` performs
+    // that parse; `try_from_utf8` only accepts bare identifiers.
+    let calendar = s
+        .parse::<temporal_rs::Calendar>()
+        .map_err(|e| temporal_err(e, CLASS))?;
     let result = pd.with_calendar(calendar);
     make_temporal(ctx, TemporalPayload::PlainDate(result))
 }

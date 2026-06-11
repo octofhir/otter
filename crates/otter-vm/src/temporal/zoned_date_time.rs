@@ -288,8 +288,11 @@ fn impl_with_calendar(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
         });
     };
     let s = js.to_lossy_string(ctx.heap());
-    let calendar =
-        temporal_rs::Calendar::try_from_utf8(s.as_bytes()).map_err(|e| temporal_err(e, CLASS))?;
+    // ParseTemporalCalendarString: accept bare ids and ISO strings with
+    // a `[u-ca=]` annotation (FromStr), not only bare identifiers.
+    let calendar = s
+        .parse::<temporal_rs::Calendar>()
+        .map_err(|e| temporal_err(e, CLASS))?;
     let result = zdt.with_calendar(calendar);
     make_temporal(ctx, TemporalPayload::ZonedDateTime(result))
 }

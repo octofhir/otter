@@ -61,7 +61,7 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let inst = parse_instant_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let inst = parse_instant_arg(ctx, &arg_or_undef(args, 0))?;
     make_temporal(ctx, TemporalPayload::Instant(inst))
 }
 
@@ -107,8 +107,8 @@ fn from_epoch_nanoseconds(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
 }
 
 fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let a = parse_instant_arg(&arg_or_undef(args, 0), ctx.heap())?;
-    let b = parse_instant_arg(&arg_or_undef(args, 1), ctx.heap())?;
+    let a = parse_instant_arg(ctx, &arg_or_undef(args, 0))?;
+    let b = parse_instant_arg(ctx, &arg_or_undef(args, 1))?;
     let n = match a.as_i128().cmp(&b.as_i128()) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
@@ -118,11 +118,11 @@ fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError
 }
 
 fn parse_instant_arg(
+    ctx: &mut NativeCtx<'_>,
     v: &Value,
-    heap: &otter_gc::GcHeap,
 ) -> Result<temporal_rs::Instant, NativeError> {
-    if let Some(t) = v.as_temporal(heap) {
-        match t.payload_clone(heap) {
+    if let Some(t) = v.as_temporal(ctx.heap()) {
+        return match t.payload_clone(ctx.heap()) {
             TemporalPayload::Instant(v) => Ok(v),
             // §ToTemporalInstant fast path: a ZonedDateTime yields the
             // instant at its [[Nanoseconds]].
@@ -131,16 +131,34 @@ fn parse_instant_arg(
                 name: CLASS,
                 reason: "argument must be a Temporal.Instant".to_string(),
             }),
-        }
-    } else if let Some(s) = v.as_string(heap) {
-        temporal_rs::Instant::from_utf8(s.to_lossy_string(heap).as_bytes())
-            .map_err(|e| temporal_err(e, CLASS))
-    } else {
-        Err(NativeError::TypeError {
-            name: CLASS,
-            reason: "argument must be a Temporal.Instant or ISO string".to_string(),
-        })
+        };
     }
+    if let Some(s) = v.as_string(ctx.heap()) {
+        return temporal_rs::Instant::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
+            .map_err(|e| temporal_err(e, CLASS));
+    }
+    // §ToTemporalInstant: a non-Temporal Object is coerced with
+    // ToPrimitive(string) — firing a user `toString` — and the result
+    // parsed as an ISO instant string. Other primitives are a TypeError.
+    if v.is_object_type() {
+        let exec = ctx
+            .execution_context()
+            .cloned()
+            .ok_or_else(|| NativeError::TypeError {
+                name: CLASS,
+                reason: "missing execution context".to_string(),
+            })?;
+        let s = ctx
+            .cx
+            .interp
+            .coerce_to_string(&exec, v)
+            .map_err(|e| crate::native_function::vm_to_native_error(e, CLASS))?;
+        return temporal_rs::Instant::from_utf8(s.as_bytes()).map_err(|e| temporal_err(e, CLASS));
+    }
+    Err(NativeError::TypeError {
+        name: CLASS,
+        reason: "argument must be a Temporal.Instant, ISO string, or coercible object".to_string(),
+    })
 }
 
 pub fn load_property(temporal: JsTemporal, heap: &mut otter_gc::GcHeap, name: &str) -> Value {
@@ -233,13 +251,13 @@ fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 
 fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
-    let other = parse_instant_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let other = parse_instant_arg(ctx, &arg_or_undef(args, 0))?;
     Ok(Value::boolean(inst.as_i128() == other.as_i128()))
 }
 
 fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
-    let other = parse_instant_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let other = parse_instant_arg(ctx, &arg_or_undef(args, 0))?;
     let settings = parse_difference_settings(args, 1, ctx, CLASS)?;
     let result = inst
         .until(&other, settings)
@@ -249,7 +267,7 @@ fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
 fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
-    let other = parse_instant_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let other = parse_instant_arg(ctx, &arg_or_undef(args, 0))?;
     let settings = parse_difference_settings(args, 1, ctx, CLASS)?;
     let result = inst
         .since(&other, settings)

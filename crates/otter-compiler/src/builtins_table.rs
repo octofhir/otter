@@ -104,44 +104,18 @@ pub(crate) fn math_static_constant(name: &str) -> Option<()> {
 /// call without losing semantics — i.e. when the call only
 /// supplies the operand shapes the opcode encodes.
 ///
-/// `new Error(message, { cause })` / `new TypeError(message,
-/// { cause })` etc. can stay on the opcode path because the
-/// compiler emits an explicit `cause` store. Option bags without a
-/// static `cause` property fall through to the runtime constructor
-/// path so the property is not installed spuriously.
+/// `new Error(message, options)` / `new TypeError(message,
+/// options)` etc. fall through to the real runtime constructor:
+/// `InstallErrorCause` must perform `HasProperty`/`Get`, preserve
+/// abrupt completions, install a non-enumerable property, and run
+/// after observable message `ToString`.
 pub(crate) fn builtin_error_construct_fast_path_applies(
     kind: &str,
     arguments: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
 ) -> bool {
-    let cause_arg_index = if kind == "AggregateError" { 2 } else { 1 };
-    if arguments.len() <= cause_arg_index {
-        return true;
+    if kind == "AggregateError" {
+        return false;
     }
-    arguments.len() == cause_arg_index + 1
-        && argument_is_object_literal_with_static_key(&arguments[cause_arg_index], "cause")
-}
-
-fn argument_is_object_literal_with_static_key(
-    argument: &oxc_ast::ast::Argument<'_>,
-    name: &str,
-) -> bool {
-    let Some(expr) = argument.as_expression() else {
-        return false;
-    };
-    let oxc_ast::ast::Expression::ObjectExpression(obj) = expr else {
-        return false;
-    };
-    obj.properties.iter().any(|prop| {
-        let oxc_ast::ast::ObjectPropertyKind::ObjectProperty(prop) = prop else {
-            return false;
-        };
-        if prop.computed {
-            return false;
-        }
-        match &prop.key {
-            oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name == name,
-            oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value == name,
-            _ => false,
-        }
-    })
+    let cause_arg_index = if kind == "AggregateError" { 2 } else { 1 };
+    arguments.len() <= cause_arg_index
 }

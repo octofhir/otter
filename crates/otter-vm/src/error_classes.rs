@@ -40,12 +40,12 @@
 //! - <https://tc39.es/ecma262/#sec-error-message>
 //! - <https://tc39.es/ecma262/#sec-error.prototype.tostring>
 
-use crate::Value;
 use crate::gc_trace::GcRootVisitor;
 use crate::native_function::NativeFunction;
 use crate::number::NumberValue;
 use crate::object::{self, JsObject, PropertyDescriptor};
 use crate::string::JsString;
+use crate::{ExecutionContext, Value};
 use crate::{NativeCtx, NativeError};
 use otter_gc::raw::RawGc;
 
@@ -602,10 +602,6 @@ impl ErrorClassRegistry {
                     &[],
                 )
                 .map_err(map_err)?;
-            let throw = || NativeError::TypeError {
-                name: "set Error.prototype.stack",
-                reason: "cannot set stack".to_string(),
-            };
             match existing {
                 // step 4 — no own "stack": CreateDataPropertyOrThrow.
                 None => {
@@ -614,41 +610,9 @@ impl ErrorClassRegistry {
                         .map_err(map_err)?;
                 }
                 // step 5 — own "stack" exists: Set(this, p, v, true).
-                Some(desc) => match desc.kind {
-                    crate::object::DescriptorKind::Accessor { setter, .. } => match setter {
-                        Some(s) if crate::abstract_ops::is_callable(&s) => {
-                            let mut a: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                            a.push(value);
-                            interp
-                                .run_callable_sync(&context, &s, receiver, a)
-                                .map_err(map_err)?;
-                        }
-                        // Set with Throw=true on an accessor without a
-                        // setter raises a TypeError.
-                        _ => return Err(throw()),
-                    },
-                    crate::object::DescriptorKind::Data { .. } => {
-                        // A non-writable own data property rejects the write.
-                        if !desc.flags.writable() {
-                            return Err(throw());
-                        }
-                        let descriptor = crate::object::PartialPropertyDescriptor {
-                            value: Some(value),
-                            ..Default::default()
-                        };
-                        let ok = interp
-                            .define_own_property_value(
-                                &context,
-                                &receiver,
-                                &crate::VmPropertyKey::String("stack"),
-                                descriptor,
-                            )
-                            .map_err(map_err)?;
-                        if !ok {
-                            return Err(throw());
-                        }
-                    }
-                },
+                Some(_) => interp
+                    .array_set_property_throwing(&context, receiver, "stack", value)
+                    .map_err(map_err)?,
             }
             Ok(Value::undefined())
         }
@@ -738,22 +702,34 @@ impl ErrorClassRegistry {
             kind: ErrorKind,
             args: &[Value],
         ) -> Result<Value, NativeError> {
+            let map_vm_err = |err: crate::VmError| match err {
+                crate::VmError::Uncaught { value } => NativeError::Thrown {
+                    name: kind.class_name(),
+                    message: value,
+                },
+                other => NativeError::TypeError {
+                    name: kind.class_name(),
+                    reason: other.to_string(),
+                },
+            };
+            let context =
+                ctx.execution_context()
+                    .cloned()
+                    .ok_or_else(|| NativeError::TypeError {
+                        name: kind.class_name(),
+                        reason: "missing execution context".to_string(),
+                    })?;
             // §20.5.1.1 step 3 — when `message` is not undefined,
-            // `msg = ? ToString(message)`. Foundation: handle the
-            // common primitive cases inline; full ToString
-            // (with `Symbol.toPrimitive`) lands in a follow-up.
+            // `msg = ? ToString(message)`.
             let message = if let Some(v) = args.first() {
                 if v.is_undefined() {
                     None
-                } else if let Some(s) = v.as_string(ctx.heap()) {
-                    Some(s.to_lossy_string(ctx.heap()))
-                } else if v.is_symbol() {
-                    return Err(NativeError::TypeError {
-                        name: kind.class_name(),
-                        reason: "Cannot convert a Symbol value to a string".to_string(),
-                    });
                 } else {
-                    Some(v.display_string(ctx.heap()))
+                    Some(
+                        ctx.interp_mut()
+                            .coerce_to_string(&context, v)
+                            .map_err(map_vm_err)?,
+                    )
                 }
             } else {
                 None
@@ -764,7 +740,7 @@ impl ErrorClassRegistry {
                 ErrorKind::AggregateError => args.get(2),
                 _ => args.get(1),
             };
-            let cause = read_options_cause(options, ctx.heap());
+            let cause = read_options_cause(ctx, &context, options).map_err(map_vm_err)?;
             let registry = ctx.interp_mut().error_classes_clone();
             let mut extra_roots = Vec::with_capacity(1);
             if let Some(cause) = &cause {
@@ -791,9 +767,34 @@ impl ErrorClassRegistry {
         /// of the constructor's options bag. Returns `None` when
         /// `options` is missing / non-object, or when `cause` is
         /// not an own / inherited property of the options bag.
-        fn read_options_cause(options: Option<&Value>, heap: &otter_gc::GcHeap) -> Option<Value> {
-            let opt_obj = options?.as_object()?;
-            object::get(opt_obj, heap, "cause")
+        fn read_options_cause(
+            ctx: &mut NativeCtx<'_>,
+            context: &ExecutionContext,
+            options: Option<&Value>,
+        ) -> Result<Option<Value>, crate::VmError> {
+            let Some(options) = options else {
+                return Ok(None);
+            };
+            if !options.is_object_type() {
+                return Ok(None);
+            }
+            let key = crate::VmPropertyKey::String("cause");
+            let interp = ctx.interp_mut();
+            if !interp.ordinary_has_property_value(context, *options, &key, 0)? {
+                return Ok(None);
+            }
+            match interp.ordinary_get_value(context, *options, *options, &key, 0)? {
+                crate::VmGetOutcome::Value(value) => Ok(Some(value)),
+                crate::VmGetOutcome::InvokeGetter { getter } => {
+                    let value = interp.run_callable_sync(
+                        context,
+                        &getter,
+                        *options,
+                        smallvec::SmallVec::<[Value; 8]>::new(),
+                    )?;
+                    Ok(Some(value))
+                }
+            }
         }
 
         /// §20.5.6.1.1 InstallErrorCause step 1.b —
@@ -837,30 +838,44 @@ impl ErrorClassRegistry {
         ///   - `message` is arg 1,
         ///   - `options.cause` lives at arg 2.
         fn ctor_aggregate(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+            let map_vm_err = |err: crate::VmError| match err {
+                crate::VmError::Uncaught { value } => NativeError::Thrown {
+                    name: "AggregateError",
+                    message: value,
+                },
+                other => NativeError::TypeError {
+                    name: "AggregateError",
+                    reason: other.to_string(),
+                },
+            };
+            let context = c
+                .execution_context()
+                .cloned()
+                .ok_or_else(|| NativeError::TypeError {
+                    name: "AggregateError",
+                    reason: "missing execution context".to_string(),
+                })?;
             let message = if let Some(v) = a.get(1) {
                 if v.is_undefined() {
                     None
-                } else if let Some(s) = v.as_string(c.heap()) {
-                    Some(s.to_lossy_string(c.heap()))
-                } else if v.is_symbol() {
-                    return Err(NativeError::TypeError {
-                        name: "AggregateError",
-                        reason: "Cannot convert a Symbol value to a string".to_string(),
-                    });
                 } else {
-                    Some(v.display_string(c.heap()))
+                    Some(
+                        c.interp_mut()
+                            .coerce_to_string(&context, v)
+                            .map_err(map_vm_err)?,
+                    )
                 }
             } else {
                 None
             };
             let errors_arg = a.first().cloned().unwrap_or(Value::undefined());
-            let cause = read_options_cause(a.get(2), c.heap());
+            let cause = read_options_cause(c, &context, a.get(2)).map_err(map_vm_err)?;
 
             // §20.5.7.1 step 4 — IterableToList(errors). Spec
             // throws `TypeError` for `null`/`undefined`. Spread
             // through a dense array fast path before falling back
             // to the iterator protocol.
-            let errors_list = iterable_to_value_list(c, &errors_arg)?;
+            let errors_list = iterable_to_value_list(c, &context, &errors_arg)?;
             let registry = c.interp_mut().error_classes_clone();
             let mut extra_roots = Vec::with_capacity(2);
             extra_roots.push(&errors_arg);
@@ -892,16 +907,22 @@ impl ErrorClassRegistry {
         /// IterableToList helper for AggregateError.
         ///
         /// Spec §7.4.3 IterableToList allocates an iterator and
-        /// drains it through IteratorStep/IteratorValue. The
-        /// foundation slice covers the common `Array` argument
-        /// (the only shape the conformance corpus exercises
-        /// extensively); other iterables fall back to a TypeError
-        /// until the IteratorStep protocol lands as a
-        /// reusable native helper.
+        /// drains it through IteratorStep/IteratorValue.
         fn iterable_to_value_list(
             ctx: &mut NativeCtx<'_>,
+            context: &ExecutionContext,
             value: &Value,
         ) -> Result<Vec<Value>, NativeError> {
+            let map_err = |err: crate::VmError| match err {
+                crate::VmError::Uncaught { value } => NativeError::Thrown {
+                    name: "AggregateError",
+                    message: value,
+                },
+                other => NativeError::TypeError {
+                    name: "AggregateError",
+                    reason: other.to_string(),
+                },
+            };
             if value.is_undefined() || value.is_null() {
                 return Err(NativeError::TypeError {
                     name: "AggregateError",
@@ -912,10 +933,34 @@ impl ErrorClassRegistry {
                 let heap = ctx.heap();
                 return Ok(crate::array::with_elements(arr, heap, <[Value]>::to_vec));
             }
-            Err(NativeError::TypeError {
-                name: "AggregateError",
-                reason: "errors argument must be an Array (foundation slice)".to_string(),
-            })
+            let interp = ctx.interp_mut();
+            let anchor_base = interp.push_iteration_anchor(*value) - 1;
+            let result = (|interp: &mut crate::Interpreter| -> Result<Vec<Value>, crate::VmError> {
+                let value = interp.iteration_anchor(anchor_base);
+                let (iterator, next_method) = interp.get_iterator_sync(context, &value)?;
+                let iterator_anchor = interp.push_iteration_anchor(iterator) - 1;
+                let next_method_anchor = interp.push_iteration_anchor(next_method) - 1;
+                let values_start = next_method_anchor + 1;
+                let mut out_count = 0usize;
+                loop {
+                    let iterator = interp.iteration_anchor(iterator_anchor);
+                    let next_method = interp.iteration_anchor(next_method_anchor);
+                    match interp.iterator_step_sync(context, &iterator, &next_method)? {
+                        Some(value) => {
+                            interp.push_iteration_anchor(value);
+                            out_count += 1;
+                        }
+                        None => break,
+                    }
+                }
+                let mut out = Vec::with_capacity(out_count);
+                for index in values_start..values_start + out_count {
+                    out.push(interp.iteration_anchor(index));
+                }
+                Ok(out)
+            })(interp);
+            interp.pop_iteration_anchors_to(anchor_base);
+            result.map_err(map_err)
         }
 
         let mut entries: Vec<(ErrorKind, ClassEntry)> = Vec::with_capacity(7);
@@ -1277,11 +1322,12 @@ impl ErrorClassRegistry {
                 requested_bytes: 0,
                 heap_limit_bytes: ctx.heap().max_heap_bytes(),
             })?;
-        ctx.set_property(obj, "errors", Value::array(arr))
-            .map_err(|_| otter_gc::OutOfMemory::HeapCapExceeded {
-                requested_bytes: 0,
-                heap_limit_bytes: ctx.heap().max_heap_bytes(),
-            })?;
+        let _ = object::define_own_property(
+            obj,
+            ctx.heap_mut(),
+            "errors",
+            PropertyDescriptor::data(Value::array(arr), true, false, true),
+        );
         Ok(obj)
     }
 }

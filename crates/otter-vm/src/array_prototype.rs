@@ -2807,6 +2807,12 @@ pub(crate) fn array_callback_native_dispatch(
         } else {
             Box::new(0..len)
         }
+    } else if visit_all && reverse {
+        // `findLast` / `findLastIndex` must visit absent indices too.
+        // For pathological array-like lengths we cannot probe the whole
+        // range, but the spec-observable first reverse callback is the
+        // clamped final index.
+        Box::new(std::iter::once(len.saturating_sub(1)))
     } else {
         let mut indices: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         let mut current = receiver;

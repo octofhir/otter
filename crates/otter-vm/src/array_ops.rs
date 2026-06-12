@@ -184,53 +184,68 @@ impl Interpreter {
             // Step 6 — iterator path. `A = Construct(C)` (no length
             // forwarded; the count is unknown up front) or a fresh
             // Array.
-            let target = self.array_from_make_target(context, use_ctor, &constructor, None)?;
-            let (iterator, next_method) = self.get_iterator_sync(context, &items)?;
-            let anchor_base = self.push_iteration_anchor(iterator) - 1;
-            self.push_iteration_anchor(next_method);
-            self.push_iteration_anchor(items);
+            let anchor_base = self.push_iteration_anchor(items) - 1;
             self.push_iteration_anchor(map_fn);
             self.push_iteration_anchor(this_arg);
-            self.push_iteration_anchor(target);
-            let mut k = 0usize;
-            let result = loop {
-                let value = match self.iterator_step_sync(context, &iterator, &next_method) {
-                    Ok(Some(value)) => value,
-                    Ok(None) => break Ok(()),
-                    // `next` threw: the iterator is already done, no close.
-                    Err(err) => break Err(err),
-                };
-                let mapped = if has_map {
-                    let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
-                    cb_args.push(value);
-                    cb_args.push(Value::number_f64(k as f64));
-                    match self.run_callable_sync(context, &map_fn, this_arg, cb_args) {
-                        Ok(mapped) => mapped,
-                        Err(err) => {
-                            let _ = self.iterator_close_sync(context, &iterator);
-                            break Err(err);
+            let result = (|interp: &mut Self| -> Result<Value, VmError> {
+                let target =
+                    interp.array_from_make_target(context, use_ctor, &constructor, None)?;
+                let target_anchor = interp.push_iteration_anchor(target) - 1;
+                let items = interp.iteration_anchor(anchor_base);
+                let (iterator, next_method) = interp.get_iterator_sync(context, &items)?;
+                let iterator_anchor = interp.push_iteration_anchor(iterator) - 1;
+                let next_method_anchor = interp.push_iteration_anchor(next_method) - 1;
+                let mut k = 0usize;
+                let result = loop {
+                    let iterator = interp.iteration_anchor(iterator_anchor);
+                    let next_method = interp.iteration_anchor(next_method_anchor);
+                    let value = match interp.iterator_step_sync(context, &iterator, &next_method) {
+                        Ok(Some(value)) => value,
+                        Ok(None) => break Ok(()),
+                        // `next` threw: the iterator is already done, no close.
+                        Err(err) => break Err(err),
+                    };
+                    let mapped = if has_map {
+                        let map_fn = interp.iteration_anchor(anchor_base + 1);
+                        let this_arg = interp.iteration_anchor(anchor_base + 2);
+                        let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
+                        cb_args.push(value);
+                        cb_args.push(Value::number_f64(k as f64));
+                        match interp.run_callable_sync(context, &map_fn, this_arg, cb_args) {
+                            Ok(mapped) => mapped,
+                            Err(err) => {
+                                let _ = interp.iterator_close_sync(context, &iterator);
+                                break Err(err);
+                            }
                         }
+                    } else {
+                        value
+                    };
+                    let iterator = interp.iteration_anchor(iterator_anchor);
+                    let target = interp.iteration_anchor(target_anchor);
+                    if let Err(err) = interp.create_data_property_or_throw(
+                        context,
+                        target,
+                        &k.to_string(),
+                        mapped,
+                    ) {
+                        let _ = interp.iterator_close_sync(context, &iterator);
+                        break Err(err);
                     }
-                } else {
-                    value
+                    k = k.saturating_add(1);
                 };
-                if let Err(err) =
-                    self.create_data_property_or_throw(context, target, &k.to_string(), mapped)
-                {
-                    let _ = self.iterator_close_sync(context, &iterator);
-                    break Err(err);
-                }
-                k = k.saturating_add(1);
-            };
+                result?;
+                let target = interp.iteration_anchor(target_anchor);
+                interp.array_set_property_throwing(
+                    context,
+                    target,
+                    "length",
+                    Value::number_f64(k as f64),
+                )?;
+                Ok(target)
+            })(self);
             self.pop_iteration_anchors_to(anchor_base);
-            result?;
-            self.array_set_property_throwing(
-                context,
-                target,
-                "length",
-                Value::number_f64(k as f64),
-            )?;
-            return Ok(target);
+            return result;
         }
 
         // Step 4 — array-like path.

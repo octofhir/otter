@@ -156,14 +156,14 @@ pub unsafe fn scavenge(
     // 1) Explicit root slots.
     for &slot in root_slots {
         // SAFETY: caller guarantees slot is a valid pointer.
-        unsafe { process_slot(&mut ctx, slot) };
+        unsafe { process_slot(&mut ctx, slot, None) };
     }
 
     // 2) External roots (handle stack, global handles).
     let ctx_ptr = &mut ctx as *mut ScavCtx;
     external_visit(&mut move |slot: *mut RawGc| {
         // SAFETY: ctx is alive on the surrounding stack frame.
-        unsafe { process_slot(&mut *ctx_ptr, slot) };
+        unsafe { process_slot(&mut *ctx_ptr, slot, None) };
     });
 
     // 3) Walk dirty cards on old-space pages — every card may
@@ -214,7 +214,7 @@ pub unsafe fn scavenge(
 /// # Safety
 ///
 /// `slot` must be a dereferenceable `*mut RawGc`.
-unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc) {
+unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc, parent_header: Option<*mut GcHeader>) {
     // SAFETY: slot is dereferenceable per precondition.
     unsafe {
         let raw = (*slot).0;
@@ -227,29 +227,52 @@ unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc) {
             return; // old / large objects do not move on scavenge.
         }
         if Page::header_of(header_ptr as *const u8).space == SpaceKind::NewTo {
+            remember_parent_card_for_young_child(parent_header, header_ptr);
             return; // already evacuated during this scavenge.
         }
         let new_offset = evacuate(ctx, header_ptr);
         (*slot).0 = new_offset;
         ctx.stats.slot_updates += 1;
         // Generational invariant: evacuation itself can mint an
-        // old->young edge — the SLOT lives in a promoted (now
-        // old-space) object while the child was copied to to-space.
-        // Without a dirty card the next scavenge never rescans that
-        // slot and the child dangles after it moves again. Slots
-        // outside the cage (Rust stack roots, malloc-side frames)
-        // never take this path.
+        // old->young edge — the parent may already be old/promoted
+        // while the child was copied to to-space. Without a dirty
+        // card the next scavenge never rescans that edge and the
+        // child dangles after it moves again. Mark the parent's
+        // card, not the slot's card: traced slots can live in
+        // malloc-owned side storage (Box/Vec/SmallVec) outside the
+        // cage, while dirty-card scanning re-traces the whole parent
+        // object.
         let child_header = cage_base().add(new_offset as usize) as *const GcHeader;
-        if (*child_header).is_young() {
-            let slot_addr = slot as usize;
-            let base = crate::compressed::cage_base_addr();
-            if slot_addr >= base && slot_addr < base + crate::compressed::cage_size() {
-                let page_base = Page::page_base_of(slot as *const u8);
-                let page_header = &mut *(page_base as *mut PageHeader);
-                if page_header.space == SpaceKind::Old {
-                    page_header.mark_card(slot_addr - page_base as usize);
-                }
-            }
+        remember_parent_card_for_young_child(parent_header, child_header);
+    }
+}
+
+/// Re-dirty the card for an old/large parent that still points at a
+/// young child after slot processing. This covers both slots rewritten
+/// by this trace and slots already rewritten to NewTo by an earlier root
+/// pass in the same scavenge.
+///
+/// # Safety
+///
+/// `parent_header`, when present, and `child_header` must be live heap
+/// object headers under the current STW scavenge.
+unsafe fn remember_parent_card_for_young_child(
+    parent_header: Option<*mut GcHeader>,
+    child_header: *const GcHeader,
+) {
+    // SAFETY: preconditions are inherited from `process_slot`.
+    unsafe {
+        if !(*child_header).is_young() {
+            return;
+        }
+        let Some(parent_header) = parent_header else {
+            return;
+        };
+        let parent_page = Page::header_of_mut(parent_header as *const u8);
+        if matches!(parent_page.space, SpaceKind::Old | SpaceKind::Large) {
+            let parent_addr = parent_header as usize;
+            let page_base = Page::page_base_of(parent_header as *const u8);
+            parent_page.mark_card(parent_addr - page_base as usize);
         }
     }
 }
@@ -400,7 +423,7 @@ unsafe fn trace_ephemeron_table(ctx: &mut ScavCtx, header: *mut GcHeader) {
                   visit_value_slots: &mut crate::trace::EphemeronValueVisitor<'_>| {
                 if process_ephemeron_key_slot(&mut *ctx_ptr, key_slot) {
                     let mut strong_visitor = |slot: *mut RawGc| {
-                        process_slot(&mut *ctx_ptr, slot);
+                        process_slot(&mut *ctx_ptr, slot, Some(header));
                     };
                     visit_value_slots(&mut strong_visitor);
                 }
@@ -634,7 +657,7 @@ unsafe fn trace_one(ctx: &mut ScavCtx, header: *mut GcHeader) {
         let table_ptr = ctx.trace_table.as_ptr();
         let ctx_ptr = ctx as *mut ScavCtx;
         let mut visitor = move |slot: *mut RawGc| {
-            process_slot(&mut *ctx_ptr, slot);
+            process_slot(&mut *ctx_ptr, slot, Some(header));
         };
         (*table_ptr).trace(header, &mut visitor);
     }

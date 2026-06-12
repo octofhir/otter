@@ -215,4 +215,118 @@ fn old_to_young_pointer_behind_boxed_slot_survives_scavenge() {
         Box1::TYPE_TAG,
         "boxed-slot child header clobbered after scavenge"
     );
+    unsafe {
+        let parent_addr = parent.as_header_ptr() as *const u8;
+        let page_header = Page::header_of(parent_addr);
+        let page_base = Page::page_base_of(parent_addr);
+        let byte_offset = parent_addr as usize - page_base as usize;
+        assert!(
+            page_header.is_card_dirty(byte_offset),
+            "boxed-slot edge must re-dirty the parent card while the child remains young"
+        );
+    }
+
+    heap.collect_minor(otter_gc::EmptyRoots);
+    let child_after_second = heap.read_payload(parent, |body| *body.child);
+    assert!(
+        !child_after_second.is_null(),
+        "boxed-slot child reaped after the second scavenge"
+    );
+    assert_eq!(
+        unsafe { (*child_after_second.as_header_ptr()).type_tag() },
+        Box1::TYPE_TAG,
+        "boxed-slot child header clobbered after second scavenge"
+    );
+    unsafe {
+        assert!(
+            (*child_after_second.as_header_ptr()).is_old(),
+            "child promotes on its second scavenge"
+        );
+        let parent_addr = parent.as_header_ptr() as *const u8;
+        let page_header = Page::header_of(parent_addr);
+        let page_base = Page::page_base_of(parent_addr);
+        let byte_offset = parent_addr as usize - page_base as usize;
+        assert!(
+            !page_header.is_card_dirty(byte_offset),
+            "old->old boxed-slot edge keeps the parent card clean"
+        );
+    }
+}
+
+#[test]
+fn old_slot_already_rewritten_to_to_space_redirties_parent_card() {
+    let mut heap = GcHeap::new().expect("heap");
+    heap.register_traceable::<Box1>();
+
+    let parent_offset_after_promotion;
+    let child_slot;
+    {
+        let scope = unsafe { HandleScope::from_ptr(heap.handle_stack_ptr()) };
+        let p = heap.alloc(Box1 { child: Gc::null() }).unwrap();
+        let local = scope.local(p);
+        heap.collect_minor(otter_gc::EmptyRoots);
+        heap.collect_minor(otter_gc::EmptyRoots);
+        let promoted = local.get();
+        assert!(unsafe { (*promoted.as_header_ptr()).is_old() });
+        parent_offset_after_promotion = promoted.offset();
+
+        let child = heap.alloc(Box1 { child: Gc::null() }).unwrap();
+        assert!(unsafe { (*child.as_header_ptr()).is_young() });
+        unsafe {
+            let parent_payload = (promoted.as_header_ptr() as *mut u8)
+                .add(std::mem::size_of::<otter_gc::GcHeader>())
+                as *mut Box1;
+            let slot_addr = std::ptr::addr_of_mut!((*parent_payload).child);
+            (*slot_addr) = child;
+            child_slot = slot_addr as *mut RawGc;
+            heap.write_barrier(promoted, child);
+        }
+        otter_gc::with_gc_session(&mut heap, |mut session| {
+            let root = session.root(promoted);
+            std::mem::forget(root);
+        });
+    }
+
+    // Simulate an external root provider that visits an interior slot
+    // before dirty cards are scanned. The root phase rewrites
+    // parent.child to NewTo; the later card scan must still re-dirty
+    // the old parent while that child remains young.
+    let mut external = |visit: &mut dyn FnMut(*mut RawGc)| {
+        visit(child_slot);
+    };
+    heap.collect_minor_with_roots(&mut external);
+
+    let parent: Gc<Box1> = unsafe { Gc::from_offset(parent_offset_after_promotion) };
+    let child_after = heap.read_payload(parent, |body| body.child);
+    assert!(
+        !child_after.is_null(),
+        "child reaped despite external-root slot rewrite"
+    );
+    unsafe {
+        assert!(
+            (*child_after.as_header_ptr()).is_young(),
+            "child should still be young after one scavenge"
+        );
+        let parent_addr = parent.as_header_ptr() as *const u8;
+        let page_header = Page::header_of(parent_addr);
+        let page_base = Page::page_base_of(parent_addr);
+        let byte_offset = parent_addr as usize - page_base as usize;
+        assert!(
+            page_header.is_card_dirty(byte_offset),
+            "old parent card must be re-dirtied when slot already points to NewTo"
+        );
+    }
+
+    heap.collect_minor(otter_gc::EmptyRoots);
+    let child_after_second = heap.read_payload(parent, |body| body.child);
+    assert!(
+        !child_after_second.is_null(),
+        "child reaped after already-NewTo edge lost its remembered card"
+    );
+    unsafe {
+        assert_eq!(
+            (*child_after_second.as_header_ptr()).type_tag(),
+            Box1::TYPE_TAG
+        );
+    }
 }

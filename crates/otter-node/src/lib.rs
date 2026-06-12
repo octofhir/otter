@@ -19,6 +19,7 @@
 pub mod assert;
 pub mod fs;
 pub mod path;
+pub mod stubs;
 
 pub use otter_runtime::otter_gc;
 use otter_runtime::{HostedModule, HostedModuleInstall, OtterBuilder, RuntimeBuilder};
@@ -46,6 +47,33 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         "path",
         HostedModuleInstall::new(path::install_path_module),
         path::path_cjs_value,
+    ),
+    HostedModule::new("node:util", HostedModuleInstall::new(stubs::install_util)),
+    HostedModule::new("util", HostedModuleInstall::new(stubs::install_util)),
+    HostedModule::new("node:net", HostedModuleInstall::new(stubs::install_net)),
+    HostedModule::new("net", HostedModuleInstall::new(stubs::install_net)),
+    HostedModule::new(
+        "node:worker_threads",
+        HostedModuleInstall::new(stubs::install_worker_threads),
+    ),
+    HostedModule::new(
+        "worker_threads",
+        HostedModuleInstall::new(stubs::install_worker_threads),
+    ),
+    HostedModule::new(
+        "node:buffer",
+        HostedModuleInstall::new(stubs::install_buffer),
+    ),
+    HostedModule::new("buffer", HostedModuleInstall::new(stubs::install_buffer)),
+    HostedModule::new("node:url", HostedModuleInstall::new(stubs::install_url)),
+    HostedModule::new("url", HostedModuleInstall::new(stubs::install_url)),
+    HostedModule::new(
+        "node:child_process",
+        HostedModuleInstall::new(stubs::install_child_process),
+    ),
+    HostedModule::new(
+        "child_process",
+        HostedModuleInstall::new(stubs::install_child_process),
     ),
 ];
 

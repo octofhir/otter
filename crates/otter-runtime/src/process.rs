@@ -210,8 +210,77 @@ pub(crate) fn install_global(
     )?;
     let hrtime = hrtime_value(interp, start).map_err(gc_oom_to_error)?;
     otter_vm::object::set(process, interp.gc_heap_mut(), "hrtime", hrtime);
+
+    define_process_method(
+        interp,
+        process,
+        &process_root,
+        "umask",
+        1,
+        NativeCall::Static(process_umask),
+    )?;
+
+    // `process.config.variables.*` is read by the Node test harness at load.
+    let config = interp
+        .alloc_host_object_with_roots(&[&process_root], &[])
+        .map_err(gc_oom_to_error)?;
+    let variables = interp
+        .alloc_host_object_with_roots(&[&process_root], &[])
+        .map_err(gc_oom_to_error)?;
+    otter_vm::object::set(
+        variables,
+        interp.gc_heap_mut(),
+        "v8_enable_i18n_support",
+        Value::boolean(false),
+    );
+    otter_vm::object::set(
+        config,
+        interp.gc_heap_mut(),
+        "variables",
+        otter_vm::Value::object(variables),
+    );
+    otter_vm::object::set(
+        process,
+        interp.gc_heap_mut(),
+        "config",
+        otter_vm::Value::object(config),
+    );
+
+    // `process.features.*` — feature flags read by the Node test harness.
+    let features = interp
+        .alloc_host_object_with_roots(&[&process_root], &[])
+        .map_err(gc_oom_to_error)?;
+    for (name, on) in [
+        ("inspector", false),
+        ("quic", false),
+        ("tls", false),
+        ("debug", false),
+        ("uv", true),
+        ("ipv6", true),
+        ("cached_builtins", false),
+        ("require_module", true),
+        ("typescript", false),
+    ] {
+        otter_vm::object::set(features, interp.gc_heap_mut(), name, Value::boolean(on));
+    }
+    otter_vm::object::set(
+        process,
+        interp.gc_heap_mut(),
+        "features",
+        otter_vm::Value::object(features),
+    );
+
     interp.set_global("process", otter_vm::Value::object(process));
     Ok(())
+}
+
+/// `process.umask([mask])` — returns the previous mask. Otter does not change
+/// the process umask; it reports `0` so harness setup code proceeds.
+fn process_umask(
+    _ctx: &mut NativeCtx<'_>,
+    _args: &[otter_vm::Value],
+) -> Result<otter_vm::Value, NativeError> {
+    Ok(Value::number(NumberValue::from_i32(0)))
 }
 
 fn define_process_method(

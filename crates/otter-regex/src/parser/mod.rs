@@ -30,6 +30,8 @@
 
 pub(crate) mod ast;
 
+use std::collections::BTreeSet;
+
 use crate::classes::{ClassSet, CodePointSet};
 use crate::error::RegexError;
 use crate::flags::Flags;
@@ -68,11 +70,64 @@ pub(crate) fn parse(pattern: &[u16], flags: Flags) -> Result<Parsed, RegexError>
         // unmatched `)`.
         return Err(p.err("unmatched ')'"));
     }
+    validate_duplicate_named_groups_by_path(&root)?;
     Ok(Parsed {
         root,
         group_count: p.total_groups,
         group_names: p.group_names,
     })
+}
+
+fn validate_duplicate_named_groups_by_path(root: &Node) -> Result<(), RegexError> {
+    let initial = vec![BTreeSet::new()];
+    validate_names(root, initial).map(|_| ())
+}
+
+fn validate_names(
+    node: &Node,
+    states: Vec<BTreeSet<String>>,
+) -> Result<Vec<BTreeSet<String>>, RegexError> {
+    match node {
+        Node::Empty
+        | Node::Char { .. }
+        | Node::AnyChar { .. }
+        | Node::Class { .. }
+        | Node::Assert(_)
+        | Node::BackRef { .. } => Ok(states),
+        Node::Concat(nodes) => {
+            let mut current = states;
+            for node in nodes {
+                current = validate_names(node, current)?;
+            }
+            Ok(current)
+        }
+        Node::Alternate(alts) => {
+            let mut out = Vec::new();
+            for alt in alts {
+                out.extend(validate_names(alt, states.clone())?);
+            }
+            Ok(out)
+        }
+        Node::Repeat { node, .. } => validate_names(node, states),
+        Node::Group { kind, body } => {
+            let mut states = states;
+            if let GroupKind::Capturing {
+                name: Some(name), ..
+            } = kind
+            {
+                for state in &mut states {
+                    if !state.insert(name.clone()) {
+                        return Err(RegexError::Syntax {
+                            message: "duplicate named capturing group in the same alternative"
+                                .to_string(),
+                            offset: 0,
+                        });
+                    }
+                }
+            }
+            validate_names(body, states)
+        }
+    }
 }
 
 struct Parser<'a> {
@@ -1490,6 +1545,19 @@ mod tests {
             p.group_names,
             vec![Some("first".to_string()), Some("second".to_string())]
         );
+    }
+
+    #[test]
+    fn rejects_duplicate_named_groups_in_same_alternative() {
+        assert!(matches!(
+            parse_err("(?<x>a)(?<x>b)", Flags::default()),
+            RegexError::Syntax { .. }
+        ));
+        let _ = parse_ok("(?<x>a)|(?<x>b)", Flags::default());
+        assert!(matches!(
+            parse_err("(?<x>a)(?:b|(?<x>c))", Flags::default()),
+            RegexError::Syntax { .. }
+        ));
     }
 
     #[test]

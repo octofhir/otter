@@ -18,6 +18,7 @@ members = [
     "crates/otter-cli",
     "crates/otter-modules",
     "crates/otter-node",
+    "crates/otter-node-compat",
     "crates/otter-web",
 ]
 exclude = [
@@ -42,6 +43,10 @@ oxc_codegen     = "0.129"
 oxc_resolver    = "11.19"
 
 # Errors and serialization.
+anyhow      = "1"
+chrono      = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+glob        = "0.3"
+libc        = "0.2"
 thiserror   = "2"
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"

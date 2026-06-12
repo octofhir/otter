@@ -1914,6 +1914,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "otter-node-compat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "glob",
+ "libc",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "otter-pm"
 version = "0.1.0"
 dependencies = [

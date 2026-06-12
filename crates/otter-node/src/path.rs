@@ -68,6 +68,8 @@ const PATH_METHODS: &[Method] = &[
     ("relative", 2, path_relative),
     ("parse", 1, path_parse),
     ("format", 1, path_format),
+    ("toNamespacedPath", 1, path_to_namespaced),
+    ("matchesGlob", 2, path_matches_glob),
 ];
 
 const WIN32_METHODS: &[Method] = &[
@@ -81,6 +83,8 @@ const WIN32_METHODS: &[Method] = &[
     ("relative", 2, win32_relative),
     ("parse", 1, win32_parse),
     ("format", 1, win32_format),
+    ("toNamespacedPath", 1, win32_to_namespaced),
+    ("matchesGlob", 2, path_matches_glob),
 ];
 
 // ---- pure POSIX algorithms ----
@@ -448,6 +452,88 @@ fn string_err(message: String) -> NativeError {
     crate::type_error("path", message)
 }
 
+/// posix `toNamespacedPath` is the identity (non-strings pass through too).
+fn path_to_namespaced(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    Ok(args.first().copied().unwrap_or_else(Value::undefined))
+}
+
+/// win32 `toNamespacedPath`: prefix absolute drive/UNC paths with `\\?\`.
+fn win32_to_namespaced(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let Some(first) = args.first() else {
+        return Ok(Value::undefined());
+    };
+    if !first.is_string() {
+        return Ok(*first);
+    }
+    let path = otter_runtime::runtime_arg_to_string(args, 0, ctx.heap());
+    if path.is_empty() {
+        return Ok(*first);
+    }
+    let resolved = win32_resolve_str(std::slice::from_ref(&path));
+    if resolved.len() <= 2 {
+        return string_value(ctx, &path);
+    }
+    let b = resolved.as_bytes();
+    let out = if b[0] == b'\\' && b.get(1) == Some(&b'\\') {
+        // UNC: \\server\share -> \\?\UNC\server\share (unless already \\?\).
+        if b.get(2) == Some(&b'?') {
+            resolved.clone()
+        } else {
+            format!("\\\\?\\UNC\\{}", &resolved[2..])
+        }
+    } else if b[0].is_ascii_alphabetic() && b.get(1) == Some(&b':') && b.get(2) == Some(&b'\\') {
+        format!("\\\\?\\{resolved}")
+    } else {
+        resolved.clone()
+    };
+    string_value(ctx, &out)
+}
+
+/// `matchesGlob(path, pattern)` — basic glob match (`*` = any non-separator run,
+/// `**` = any run, `?` = one non-separator).
+fn path_matches_glob(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let path = require_str(args, 0, ctx)?;
+    let pattern = require_str(args, 1, ctx)?;
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = path.chars().collect();
+    Ok(Value::boolean(glob_match(&p, &t)))
+}
+
+fn glob_match(p: &[char], t: &[char]) -> bool {
+    if p.is_empty() {
+        return t.is_empty();
+    }
+    match p[0] {
+        '*' => {
+            if p.get(1) == Some(&'*') {
+                // `**` matches any run, including separators.
+                let rest = if p.get(2) == Some(&'/') {
+                    &p[3..]
+                } else {
+                    &p[2..]
+                };
+                (0..=t.len()).any(|i| glob_match(rest, &t[i..]))
+            } else {
+                // `*` matches a run of non-separator characters.
+                let rest = &p[1..];
+                let mut i = 0;
+                loop {
+                    if glob_match(rest, &t[i..]) {
+                        return true;
+                    }
+                    if i < t.len() && t[i] != '/' {
+                        i += 1;
+                    } else {
+                        return false;
+                    }
+                }
+            }
+        }
+        '?' => !t.is_empty() && t[0] != '/' && glob_match(&p[1..], &t[1..]),
+        c => !t.is_empty() && t[0] == c && glob_match(&p[1..], &t[1..]),
+    }
+}
+
 // ---- win32 algorithms (both `/` and `\` are separators) ----
 
 fn win32_is_sep(c: char) -> bool {
@@ -623,8 +709,7 @@ fn win32_join(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     string_value(ctx, &win32_normalize_str(&parts.join("\\")))
 }
 
-fn win32_resolve(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let parts = collect_strings(args, ctx)?;
+fn win32_resolve_str(parts: &[String]) -> String {
     let mut resolved = String::new();
     let mut is_abs = false;
     for part in parts.iter().rev() {
@@ -651,13 +736,18 @@ fn win32_resolve(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     }
     let normalized = win32_normalize_str(&resolved);
     let trimmed = normalized.trim_end_matches('\\');
-    let out = if trimmed.is_empty() {
+    if trimmed.is_empty() {
         "\\".to_string()
     } else if trimmed.ends_with(':') {
         format!("{trimmed}\\")
     } else {
         trimmed.to_string()
-    };
+    }
+}
+
+fn win32_resolve(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let parts = collect_strings(args, ctx)?;
+    let out = win32_resolve_str(&parts);
     string_value(ctx, &out)
 }
 

@@ -63,6 +63,8 @@ const ASSERT_METHODS: &[Method] = &[
     ("doesNotThrow", 2, assert_does_not_throw),
     ("ifError", 1, assert_if_error),
     ("fail", 1, assert_fail),
+    ("match", 2, assert_match),
+    ("doesNotMatch", 2, assert_does_not_match),
 ];
 
 fn fail(message: impl Into<String>) -> NativeError {
@@ -310,4 +312,52 @@ fn assert_if_error(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
 
 fn assert_fail(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     Err(fail("assert.fail: failed"))
+}
+
+/// Run `regexp.test(string)` and return whether it matched.
+fn regexp_test(ctx: &mut NativeCtx<'_>, string: Value, regexp: Value) -> Result<bool, NativeError> {
+    let (interp, context) = ctx.interp_mut_and_context();
+    let Some(context) = context else {
+        return Err(fail("assert.match: no execution context"));
+    };
+    let test_fn = interp
+        .get_property(&context, regexp, "test")
+        .map_err(|_| fail("assert.match: second argument must be a RegExp"))?;
+    let result = interp
+        .run_callable_sync(
+            &context,
+            &test_fn,
+            regexp,
+            std::iter::once(string).collect(),
+        )
+        .map_err(|_| fail("assert.match: error evaluating RegExp"))?;
+    Ok(result.as_boolean().unwrap_or(false))
+}
+
+fn assert_match(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let value = arg(args, 0);
+    if !value.is_string() {
+        return Err(fail("assert.match: first argument must be a string"));
+    }
+    if regexp_test(ctx, value, arg(args, 1))? {
+        Ok(Value::undefined())
+    } else {
+        Err(fail(
+            "assert.match: input did not match the regular expression",
+        ))
+    }
+}
+
+fn assert_does_not_match(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let value = arg(args, 0);
+    if !value.is_string() {
+        return Err(fail("assert.doesNotMatch: first argument must be a string"));
+    }
+    if regexp_test(ctx, value, arg(args, 1))? {
+        Err(fail(
+            "assert.doesNotMatch: input matched the regular expression",
+        ))
+    } else {
+        Ok(Value::undefined())
+    }
 }

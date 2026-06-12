@@ -148,26 +148,34 @@ fn basename(path: &str, ext: Option<&str>) -> String {
     base.to_string()
 }
 
+/// Faithful port of Node's posix `dirname` (preserves a leading `//`).
 fn dirname(path: &str) -> String {
-    if path.is_empty() {
+    let chars: Vec<char> = path.chars().collect();
+    if chars.is_empty() {
         return ".".to_string();
     }
-    let has_root = path.starts_with('/');
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        return "/".to_string();
-    }
-    match trimmed.rfind('/') {
-        None => {
-            if has_root {
-                "/".to_string()
-            } else {
-                ".".to_string()
+    let has_root = chars[0] == '/';
+    let mut end: isize = -1;
+    let mut matched_slash = true;
+    let mut i = chars.len() as isize - 1;
+    while i >= 1 {
+        if chars[i as usize] == '/' {
+            if !matched_slash {
+                end = i;
+                break;
             }
+        } else {
+            matched_slash = false;
         }
-        Some(0) => "/".to_string(),
-        Some(i) => trimmed[..i].to_string(),
+        i -= 1;
     }
+    if end == -1 {
+        return if has_root { "/" } else { "." }.to_string();
+    }
+    if has_root && end == 1 {
+        return "//".to_string();
+    }
+    chars[..end as usize].iter().collect()
 }
 
 /// Node's `extname` algorithm (faithful port of `lib/path.js`), parameterised by
@@ -411,34 +419,59 @@ fn win32_is_sep(c: char) -> bool {
     c == '/' || c == '\\'
 }
 
-/// Split a Windows path into `(root, rest)`. `root` is the drive/UNC/leading-sep
-/// prefix; when it ends in `\` the path is absolute. Drive-relative (`C:foo`)
-/// returns root `C:` (no trailing sep).
-fn win32_split_root(p: &str) -> (String, &str) {
-    let chars: Vec<char> = p.chars().collect();
-    if chars.len() >= 2 && chars[1] == ':' && chars[0].is_ascii_alphabetic() {
-        let drive = format!("{}:", chars[0]);
-        if chars.len() >= 3 && win32_is_sep(chars[2]) {
-            return (format!("{drive}\\"), &p[3..]);
+/// Split a Windows path into `(device, is_absolute, rest)`. `device` is the
+/// drive (`C:`) or UNC (`\\server\share`) prefix *without* the root separator;
+/// `is_absolute` is whether a root separator follows the device; `rest` is the
+/// remainder after the device + optional root sep. Separator bytes are ASCII so
+/// byte slicing at their positions is safe.
+fn win32_split_root(p: &str) -> (String, bool, &str) {
+    let b = p.as_bytes();
+    let is_sep_b = |c: u8| c == b'/' || c == b'\\';
+    if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+        let device = format!("{}:", b[0] as char);
+        if b.len() >= 3 && is_sep_b(b[2]) {
+            return (device, true, &p[3..]);
         }
-        return (drive, &p[2..]);
+        return (device, false, &p[2..]);
     }
-    if chars.first().is_some_and(|c| win32_is_sep(*c)) {
-        return ("\\".to_string(), &p[1..]);
+    if b.len() >= 2 && is_sep_b(b[0]) && is_sep_b(b[1]) {
+        // UNC: \\server\share
+        let mut i = 2;
+        while i < b.len() && !is_sep_b(b[i]) {
+            i += 1;
+        }
+        if i > 2 && i < b.len() {
+            let server_end = i;
+            let mut j = i + 1;
+            while j < b.len() && !is_sep_b(b[j]) {
+                j += 1;
+            }
+            if j > i + 1 {
+                let device = format!("\\\\{}\\{}", &p[2..server_end], &p[i + 1..j]);
+                // Skip the root separator that follows the share, if present, so
+                // `rest` never starts with it (UNC paths are always absolute).
+                let rest = if j < b.len() { &p[j + 1..] } else { &p[j..] };
+                return (device, true, rest);
+            }
+        }
+        // Too many / malformed leading slashes: treat as a plain absolute root.
+        return (String::new(), true, &p[1..]);
     }
-    (String::new(), p)
+    if !b.is_empty() && is_sep_b(b[0]) {
+        return (String::new(), true, &p[1..]);
+    }
+    (String::new(), false, p)
 }
 
 fn win32_is_absolute_str(p: &str) -> bool {
-    let (root, _) = win32_split_root(p);
-    root.ends_with('\\')
+    win32_split_root(p).1
 }
 
 fn win32_basename(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let path = arg_string(args, 0, "path.win32.basename", ctx.heap())?;
     let ext = opt_arg_string(args, 1, ctx);
     // Strip the drive/UNC root first so `C:\` / `C:` basename to "".
-    let (_, rest) = win32_split_root(&path);
+    let (_, _, rest) = win32_split_root(&path);
     let base = rest
         .rsplit(win32_is_sep)
         .find(|s| !s.is_empty())
@@ -458,21 +491,28 @@ fn win32_dirname(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     if path.is_empty() {
         return string_value(ctx, ".");
     }
-    let (root, rest) = win32_split_root(&path);
+    let (device, is_abs, rest) = win32_split_root(&path);
+    let root = if is_abs {
+        format!("{device}\\")
+    } else {
+        device.clone()
+    };
     let rest_trimmed = rest.trim_end_matches(win32_is_sep);
-    let last = rest_trimmed.rfind(win32_is_sep);
-    let out = match last {
+    let out = match rest_trimmed.rfind(win32_is_sep) {
         Some(i) => format!("{root}{}", &rest_trimmed[..i]),
-        None => {
+        // A single component below the root: dirname is the root (with sep).
+        None if !rest_trimmed.is_empty() => {
             if root.is_empty() {
                 ".".to_string()
-            } else if root.ends_with('\\') {
-                root
             } else {
-                // drive-relative `C:foo` -> `C:`
                 root
             }
         }
+        // No component at all (path is just the root): a UNC root is its own
+        // dirname (no trailing sep); a drive root keeps its separator.
+        None if device.starts_with("\\\\") => device,
+        None if !root.is_empty() => root,
+        None => ".".to_string(),
     };
     let out = if out.is_empty() { ".".to_string() } else { out };
     string_value(ctx, &out)
@@ -481,7 +521,7 @@ fn win32_dirname(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 fn win32_extname(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let path = arg_string(args, 0, "path.win32.extname", ctx.heap())?;
     // Strip the drive/UNC root so the extension scan starts at the basename.
-    let (_, rest) = win32_split_root(&path);
+    let (_, _, rest) = win32_split_root(&path);
     string_value(ctx, &extname_with(rest, win32_is_sep))
 }
 
@@ -494,8 +534,7 @@ fn win32_normalize_str(p: &str) -> String {
     if p.is_empty() {
         return ".".to_string();
     }
-    let (root, rest) = win32_split_root(p);
-    let is_abs = root.ends_with('\\');
+    let (device, is_abs, rest) = win32_split_root(p);
     let trailing = rest.chars().next_back().is_some_and(win32_is_sep);
     let mut parts: Vec<&str> = Vec::new();
     for seg in rest.split(win32_is_sep) {
@@ -515,22 +554,20 @@ fn win32_normalize_str(p: &str) -> String {
             other => parts.push(other),
         }
     }
-    let body = parts.join("\\");
-    let mut out = root;
-    if !out.is_empty() && !out.ends_with('\\') && !body.is_empty() {
+    let mut body = parts.join("\\");
+    if body.is_empty() && !is_abs {
+        body.push('.');
+    }
+    if !body.is_empty() && trailing && !body.ends_with('\\') {
+        body.push('\\');
+    }
+    let mut out = device;
+    if is_abs {
         out.push('\\');
     }
     out.push_str(&body);
     if out.is_empty() {
-        // Node win32: empty relative result keeps a trailing slash as "./".
-        return if trailing {
-            "./".to_string()
-        } else {
-            ".".to_string()
-        };
-    }
-    if trailing && !out.ends_with('\\') {
-        out.push('\\');
+        out.push('.');
     }
     out
 }
@@ -597,6 +634,12 @@ fn win32_relative(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     if from.eq_ignore_ascii_case(&to) {
         return string_value(ctx, "");
     }
+    // Different drive/UNC roots cannot be relativised — return the target.
+    let (from_dev, _, _) = win32_split_root(&from);
+    let (to_dev, _, _) = win32_split_root(&to);
+    if !from_dev.eq_ignore_ascii_case(&to_dev) {
+        return string_value(ctx, &to);
+    }
     let from_parts: Vec<&str> = from.split('\\').filter(|s| !s.is_empty()).collect();
     let to_parts: Vec<&str> = to.split('\\').filter(|s| !s.is_empty()).collect();
     let common = from_parts
@@ -612,29 +655,28 @@ fn win32_relative(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
 
 fn win32_parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let path = arg_string(args, 0, "path.win32.parse", ctx.heap())?;
-    let (root, _) = win32_split_root(&path);
-    let base = path
+    let (device, is_abs, rest) = win32_split_root(&path);
+    let root = if is_abs {
+        format!("{device}\\")
+    } else {
+        device.clone()
+    };
+    let base = rest
         .rsplit(win32_is_sep)
         .find(|s| !s.is_empty())
         .unwrap_or("")
         .to_string();
-    let ext = match base.rfind('.') {
-        Some(i) if i > 0 => base[i..].to_string(),
-        _ => String::new(),
-    };
+    let ext = extname_with(&base, win32_is_sep);
     let name = base[..base.len() - ext.len()].to_string();
-    let rest_trimmed = path.trim_end_matches(win32_is_sep);
+    let rest_trimmed = rest.trim_end_matches(win32_is_sep);
     let dir = match rest_trimmed.rfind(win32_is_sep) {
-        Some(0) => "\\".to_string(),
-        Some(i) => rest_trimmed[..i].to_string(),
-        None => root.trim_end_matches('\\').to_string(),
+        Some(i) => format!("{root}{}", &rest_trimmed[..i]),
+        None => root.clone(),
     };
 
     let mut scope = ModuleScope::new(ctx);
     let obj = scope.object().map_err(string_err)?;
-    scope
-        .set_string(obj, "root", root.trim_end_matches('\\'))
-        .map_err(string_err)?;
+    scope.set_string(obj, "root", &root).map_err(string_err)?;
     scope.set_string(obj, "dir", &dir).map_err(string_err)?;
     scope.set_string(obj, "base", &base).map_err(string_err)?;
     scope.set_string(obj, "ext", &ext).map_err(string_err)?;

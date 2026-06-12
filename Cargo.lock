@@ -1923,7 +1923,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
- "glob",
  "libc",
  "serde",
  "serde_json",

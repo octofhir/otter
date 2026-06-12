@@ -5,9 +5,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use glob::Pattern;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -209,52 +208,44 @@ fn collect_tests(
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("js"))
         .collect();
 
-    let requested_modules: Vec<_> = if options.selected_modules.is_empty() {
-        config.modules.keys().cloned().collect()
-    } else {
-        options.selected_modules.clone()
-    };
+    // Full-suite coverage: discover every `test-*.js`, derive its module from
+    // the `test-<module>-` filename prefix. The config no longer scopes which
+    // tests run (that hid most of the suite) — it only supplies skip-lists.
+    // A module argument filters to that prefix; no argument runs everything.
+    let selected: HashMap<&str, ()> = options
+        .selected_modules
+        .iter()
+        .map(|m| (m.as_str(), ()))
+        .collect();
+    let skipped: HashMap<&str, ()> = config
+        .modules
+        .values()
+        .flat_map(|m| m.skip.iter())
+        .map(|item| (item.as_str(), ()))
+        .collect();
 
     let mut planned = Vec::new();
-    for module in requested_modules {
-        let module_config = config
-            .modules
-            .get(&module)
-            .ok_or_else(|| anyhow!("node-compat module '{module}' is not present in config"))?;
-        let patterns = module_config
-            .patterns
-            .iter()
-            .map(|pattern| Pattern::new(pattern))
-            .collect::<Result<Vec<_>, _>>()
-            .with_context(|| format!("invalid glob pattern in module '{module}'"))?;
-        let skipped: HashMap<_, _> = module_config
-            .skip
-            .iter()
-            .map(|item| (item.as_str(), ()))
-            .collect();
-
-        for path in &available {
-            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            if skipped.contains_key(file_name) {
-                continue;
-            }
-            if !patterns.iter().any(|pattern| pattern.matches(file_name)) {
-                continue;
-            }
-            if let Some(filter) = &options.substring_filter
-                && !file_name.contains(filter)
-            {
-                continue;
-            }
-
-            planned.push(PlannedTest {
-                module: module.clone(),
-                display_path: format!("{module}/{file_name}"),
-                file_path: path.clone(),
-            });
+    for path in &available {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !file_name.starts_with("test-") || skipped.contains_key(file_name) {
+            continue;
         }
+        let module = module_from_filename(file_name);
+        if !selected.is_empty() && !selected.contains_key(module.as_str()) {
+            continue;
+        }
+        if let Some(filter) = &options.substring_filter
+            && !file_name.contains(filter)
+        {
+            continue;
+        }
+        planned.push(PlannedTest {
+            display_path: format!("{module}/{file_name}"),
+            module,
+            file_path: path.clone(),
+        });
     }
 
     planned.sort_by(|left, right| left.display_path.cmp(&right.display_path));
@@ -262,6 +253,14 @@ fn collect_tests(
         planned.truncate(limit);
     }
     Ok(planned)
+}
+
+/// Derive the module name from a `test-<module>-...js` filename: the run of
+/// characters after `test-` up to the next `-` or `.`. `test-fs-read.js` -> `fs`,
+/// `test-http2-foo.js` -> `http2`, `test-path.js` -> `path`.
+fn module_from_filename(file_name: &str) -> String {
+    let rest = file_name.strip_prefix("test-").unwrap_or(file_name);
+    rest.split(['-', '.']).next().unwrap_or("misc").to_string()
 }
 
 fn run_one_test(

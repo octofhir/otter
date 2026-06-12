@@ -1908,6 +1908,7 @@ dependencies = [
 name = "otter-node"
 version = "0.1.0"
 dependencies = [
+ "globset",
  "otter-gc",
  "otter-runtime",
  "otter-vm",

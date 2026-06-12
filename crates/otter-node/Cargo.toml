@@ -11,6 +11,7 @@ otter-runtime = { workspace = true }
 otter-vm = { workspace = true }
 otter-gc = { workspace = true }
 thiserror = { workspace = true }
+globset = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

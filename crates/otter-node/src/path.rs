@@ -84,7 +84,7 @@ const WIN32_METHODS: &[Method] = &[
     ("parse", 1, win32_parse),
     ("format", 1, win32_format),
     ("toNamespacedPath", 1, win32_to_namespaced),
-    ("matchesGlob", 2, path_matches_glob),
+    ("matchesGlob", 2, win32_matches_glob),
 ];
 
 // ---- pure POSIX algorithms ----
@@ -489,49 +489,27 @@ fn win32_to_namespaced(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     string_value(ctx, &out)
 }
 
-/// `matchesGlob(path, pattern)` — basic glob match (`*` = any non-separator run,
-/// `**` = any run, `?` = one non-separator).
+/// posix `matchesGlob(path, pattern)` — glob matching via `globset` (supports
+/// `*`, `**`, `?`, and `[...]` character classes).
 fn path_matches_glob(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let path = require_str(args, 0, ctx)?;
     let pattern = require_str(args, 1, ctx)?;
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = path.chars().collect();
-    Ok(Value::boolean(glob_match(&p, &t)))
+    Ok(Value::boolean(glob_matches(&pattern, &path)))
 }
 
-fn glob_match(p: &[char], t: &[char]) -> bool {
-    if p.is_empty() {
-        return t.is_empty();
-    }
-    match p[0] {
-        '*' => {
-            if p.get(1) == Some(&'*') {
-                // `**` matches any run, including separators.
-                let rest = if p.get(2) == Some(&'/') {
-                    &p[3..]
-                } else {
-                    &p[2..]
-                };
-                (0..=t.len()).any(|i| glob_match(rest, &t[i..]))
-            } else {
-                // `*` matches a run of non-separator characters.
-                let rest = &p[1..];
-                let mut i = 0;
-                loop {
-                    if glob_match(rest, &t[i..]) {
-                        return true;
-                    }
-                    if i < t.len() && t[i] != '/' {
-                        i += 1;
-                    } else {
-                        return false;
-                    }
-                }
-            }
-        }
-        '?' => !t.is_empty() && t[0] != '/' && glob_match(&p[1..], &t[1..]),
-        c => !t.is_empty() && t[0] == c && glob_match(&p[1..], &t[1..]),
-    }
+/// win32 `matchesGlob` — both `/` and `\` are separators; normalise to `/`.
+fn win32_matches_glob(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let path = require_str(args, 0, ctx)?.replace('\\', "/");
+    let pattern = require_str(args, 1, ctx)?.replace('\\', "/");
+    Ok(Value::boolean(glob_matches(&pattern, &path)))
+}
+
+fn glob_matches(pattern: &str, path: &str) -> bool {
+    globset::GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()
+        .map(|g| g.compile_matcher().is_match(path))
+        .unwrap_or(false)
 }
 
 // ---- win32 algorithms (both `/` and `\` are separators) ----

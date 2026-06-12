@@ -3671,13 +3671,15 @@ impl Interpreter {
                             });
                         }
                         None => {
-                            // §10.1.8 — a native constructor with a
-                            // non-default [[Prototype]] (e.g. `Uint8Array`
-                            // → abstract `%TypedArray%`) must walk that
-                            // chain for inherited accessors like
-                            // `@@species`, not jump straight to
-                            // `Function.prototype`.
-                            if let Some(proto) = native.prototype_override(&self.gc_heap) {
+                            // §10.1.8 — native callables walk their real
+                            // [[Prototype]] chain. TypedArray constructors
+                            // may override it; ordinary natives inherit from
+                            // %Function.prototype%, whose prototype is
+                            // %Object.prototype%.
+                            let proto = native.prototype_override(&self.gc_heap).or_else(|| {
+                                self.function_prototype_object().ok().map(Value::object)
+                            });
+                            if let Some(proto) = proto {
                                 return self.ordinary_get_value(
                                     context,
                                     proto,
@@ -3686,10 +3688,7 @@ impl Interpreter {
                                     hops + 1,
                                 );
                             }
-                            self.function_prototype_object()
-                                .ok()
-                                .and_then(|p| object::get_symbol(p, &self.gc_heap, *sym))
-                                .unwrap_or(Value::undefined())
+                            Value::undefined()
                         }
                     }
                 }
@@ -3723,9 +3722,16 @@ impl Interpreter {
                                     hops + 1,
                                 );
                             }
-                            self.load_function_prototype_method(key_name)
-                                .or_else(|| self.load_object_prototype_method(key_name))
-                                .unwrap_or(Value::undefined())
+                            if let Ok(proto) = self.function_prototype_object() {
+                                return self.ordinary_get_value(
+                                    context,
+                                    Value::object(proto),
+                                    receiver,
+                                    key,
+                                    hops + 1,
+                                );
+                            }
+                            Value::undefined()
                         }
                     }
                 }

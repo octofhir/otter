@@ -460,6 +460,46 @@ fn bound_function_has_and_for_in_walk_function_prototype() {
 }
 
 #[test]
+fn native_function_computed_get_walks_object_prototype_accessors() {
+    let completion = run(r#"
+        Object.defineProperty(Object.prototype, "1", {
+            get() { return 6.99; },
+            configurable: true,
+        });
+        try {
+            Array[1];
+        } finally {
+            delete Object.prototype[1];
+        }
+        "#);
+    assert_eq!(completion, "6.99");
+}
+
+#[test]
+fn array_filter_observes_prototype_indices_added_mid_iteration() {
+    let completion = run(r#"
+        const obj = { length: 2 };
+        Object.defineProperty(obj, "0", {
+            get() {
+                Object.defineProperty(Object.prototype, "1", {
+                    get() { return 6.99; },
+                    configurable: true,
+                });
+                return 0;
+            },
+            configurable: true,
+        });
+        try {
+            const filtered = Array.prototype.filter.call(obj, () => true);
+            filtered.length + "|" + filtered[0] + "|" + filtered[1] + "|" + Array[1];
+        } finally {
+            delete Object.prototype[1];
+        }
+        "#);
+    assert_eq!(completion, "2|0|6.99|6.99");
+}
+
+#[test]
 fn extracted_object_define_property_routes_user_function_bag() {
     let completion = run(r#"
         function f() {}

@@ -1066,10 +1066,28 @@ impl Interpreter {
                             }
                         }
                     }
-                    None => self
-                        .load_function_prototype_method(name)
-                        .or_else(|| self.load_object_prototype_method(name))
-                        .unwrap_or(Value::undefined()),
+                    None => {
+                        if let Ok(proto) = self.function_prototype_object() {
+                            let key = VmPropertyKey::String(name);
+                            match self.ordinary_get_value(
+                                context,
+                                Value::object(proto),
+                                receiver,
+                                &key,
+                                0,
+                            )? {
+                                VmGetOutcome::Value(value) => value,
+                                VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
+                                    context,
+                                    &getter,
+                                    receiver,
+                                    SmallVec::new(),
+                                )?,
+                            }
+                        } else {
+                            Value::undefined()
+                        }
+                    }
                 },
             }
         } else if let Some(bound) = receiver.as_bound_function() {
@@ -3227,6 +3245,7 @@ impl Interpreter {
             || receiver.is_promise()
             || receiver.is_array_buffer()
             || receiver.is_class_constructor()
+            || receiver.as_native_function().is_some()
             || receiver.is_data_view();
         if prototype_routed {
             stack[top_idx].advance_pc(self.current_byte_len)?;

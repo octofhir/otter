@@ -697,10 +697,69 @@ impl Interpreter {
         let start = self.array_relative_index(context, args.get(1), 0.0, len)?;
         let end = self.array_relative_index(context, args.get(2), len as f64, len)?;
         let bounded_end = end.min(start.saturating_add(MAX_ARRAY_LIKE_PROBE_LEN));
+        if let Some(arr) = o.as_array()
+            && crate::array::can_fast_fill_dense_range(arr, self.gc_heap(), start, bounded_end)
+            && !self.array_prototype_chain_has_indexed_property(start, bounded_end)?
+        {
+            let receiver_root = o;
+            let value_root = value;
+            let mut external_visit = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                receiver_root.trace_value_slots(visit);
+                value_root.trace_value_slots(visit);
+                for root in roots {
+                    for value in *root {
+                        value.trace_value_slots(visit);
+                    }
+                }
+            };
+            crate::array::fill_dense_range_with_roots(
+                arr,
+                self.gc_heap_mut(),
+                start,
+                bounded_end,
+                value,
+                &mut external_visit,
+            )
+            .map_err(|_| VmError::RangeError {
+                message: "Invalid array length".to_string(),
+            })?;
+            return Ok(o);
+        }
         for k in start..bounded_end {
             self.array_set_property_throwing(context, o, &format_index_key(k as f64), value)?;
         }
         Ok(o)
+    }
+
+    fn array_prototype_chain_has_indexed_property(
+        &mut self,
+        start: usize,
+        end: usize,
+    ) -> Result<bool, VmError> {
+        if start >= end {
+            return Ok(false);
+        }
+        let mut proto = self.constructor_prototype_value("Array")?;
+        for _ in 0..object::PROTO_CHAIN_HARD_CAP {
+            if proto.is_null() {
+                return Ok(false);
+            }
+            let Some(obj) = proto.as_object() else {
+                return Ok(true);
+            };
+            let has_indexed = object::with_properties(obj, self.gc_heap(), |props| {
+                props.keys().any(|key| {
+                    object::array_index_property_name(key)
+                        .and_then(|idx| usize::try_from(idx).ok())
+                        .is_some_and(|idx| (start..end).contains(&idx))
+                })
+            });
+            if has_indexed {
+                return Ok(true);
+            }
+            proto = object::prototype_value(obj, self.gc_heap()).unwrap_or(Value::null());
+        }
+        Ok(true)
     }
 
     /// §23.1.3.11 live `Array.prototype.flat`.

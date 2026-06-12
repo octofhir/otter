@@ -764,6 +764,24 @@ impl JsTypedArray {
         }
     }
 
+    /// Fast `Uint8Array` indexed read for byte-copy hot paths.
+    #[must_use]
+    pub fn get_uint8_value(self, heap: &otter_gc::GcHeap, index: usize) -> Option<Value> {
+        if self.cached_kind != TypedArrayKind::Uint8
+            || self.buffer(heap).is_detached(heap)
+            || index >= self.length(heap)
+        {
+            return None;
+        }
+        let (buffer, off) = heap.read_payload(self.handle, |body| (body.buffer, body.byte_offset));
+        let offset = off + index;
+        buffer.with_bytes(heap, |bytes| {
+            bytes
+                .get(offset)
+                .map(|byte| Value::number(crate::number::NumberValue::from_f64(f64::from(*byte))))
+        })
+    }
+
     /// Write `value` at element `index`. Out-of-range indices and
     /// detached buffers silently drop the write per §10.4.5.14
     /// `IntegerIndexedElementSet`.
@@ -785,6 +803,56 @@ impl JsTypedArray {
                 bytes[offset..offset + bpe].copy_from_slice(&staging[..bpe]);
             }
         });
+    }
+
+    /// Fast `Uint8Array` indexed write for byte-copy hot paths.
+    ///
+    /// Returns `true` when the write was fully handled.
+    pub fn set_uint8_value(self, heap: &mut otter_gc::GcHeap, index: usize, value: &Value) -> bool {
+        if self.cached_kind != TypedArrayKind::Uint8
+            || self.buffer(heap).is_detached(heap)
+            || index >= self.length(heap)
+        {
+            return false;
+        }
+        let n = number_to_int_truncated(value, heap) as u8;
+        let (buffer, off) = heap.read_payload(self.handle, |body| (body.buffer, body.byte_offset));
+        let offset = off + index;
+        buffer.with_bytes_mut(heap, |bytes| {
+            if let Some(slot) = bytes.get_mut(offset) {
+                *slot = n;
+            }
+        });
+        true
+    }
+
+    /// Fast `Uint8Array` indexed write when the input is already a Number.
+    pub fn set_uint8_number(
+        self,
+        heap: &mut otter_gc::GcHeap,
+        index: usize,
+        number: crate::number::NumberValue,
+    ) -> bool {
+        if self.cached_kind != TypedArrayKind::Uint8
+            || self.buffer(heap).is_detached(heap)
+            || index >= self.length(heap)
+        {
+            return false;
+        }
+        let raw = number.as_f64();
+        let n = if raw.is_finite() {
+            raw.trunc() as i64
+        } else {
+            0
+        } as u8;
+        let (buffer, off) = heap.read_payload(self.handle, |body| (body.buffer, body.byte_offset));
+        let offset = off + index;
+        buffer.with_bytes_mut(heap, |bytes| {
+            if let Some(slot) = bytes.get_mut(offset) {
+                *slot = n;
+            }
+        });
+        true
     }
 
     /// Identity comparison via GC handle offset.

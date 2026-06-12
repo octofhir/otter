@@ -41,3 +41,16 @@ fn array_fast_path_still_populates_elements_and_length() {
         "#);
     assert_eq!(completion, "true");
 }
+
+#[test]
+fn direct_array_from_array_materializes_holes_as_undefined() {
+    let completion = run(r#"
+        const source = [, 2];
+        const out = Array.from(source);
+        Object.prototype.hasOwnProperty.call(out, "0") &&
+            out[0] === undefined &&
+            out[1] === 2 &&
+            out.length === 2;
+        "#);
+    assert_eq!(completion, "true");
+}

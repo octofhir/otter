@@ -273,6 +273,25 @@ fn drain_iterable_into_values(
             reason: "iterator.next is not callable".to_string(),
         });
     }
+    if let Some(handle) = iter_obj.as_iterator()
+        && next_method.as_native_function().is_some_and(|native| {
+            native.is_static_fn(ctx.heap(), crate::intrinsics::iterator::iterator_proto_next)
+        })
+    {
+        let mut collected: Vec<Value> = Vec::new();
+        loop {
+            let (value, done) = ctx
+                .cx
+                .interp
+                .iterator_next_full(exec_ctx, &handle)
+                .map_err(|e| vm_to_native(e, "TypedArray"))?;
+            if done {
+                break;
+            }
+            collected.push(value);
+        }
+        return Ok(collected);
+    }
     let mut collected: Vec<Value> = Vec::new();
     loop {
         // §7.4.3 IteratorNext — Call(next, iterator); the result must
@@ -832,6 +851,31 @@ fn ta_ctor_dispatch(
             } else {
                 read_array_like_coerced(ctx, exec, src_value, kind)?
             };
+            if args.len() == 1 {
+                let roots = ctx.collect_native_roots();
+                let this_value = *ctx.this_value();
+                let new_target = ctx.new_target().cloned();
+                let drained_slice = drained.as_slice();
+                let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                    crate::runtime_cx::visit_native_roots(
+                        visitor,
+                        &roots,
+                        &this_value,
+                        new_target.as_ref(),
+                        &[&src_value],
+                        &[drained_slice],
+                    );
+                };
+                let value = dispatch::typed_array_from_values_with_roots(
+                    kind,
+                    drained_slice,
+                    ctx.heap_mut(),
+                    &mut external_visit,
+                )
+                .map_err(|e| vm_to_native(e, typed_array_name(kind)))?;
+                apply_typed_array_new_target_proto(ctx, kind, &value)?;
+                return Ok(value);
+            }
             let arr = ctx
                 .array_from_elements(drained)
                 .map_err(|_| NativeError::TypeError {
@@ -926,15 +970,24 @@ fn ta_ctor_dispatch(
     // array receives `Subclass.prototype` as its observable
     // [[Prototype]].
     // <https://tc39.es/ecma262/#sec-getprototypefromconstructor>
+    apply_typed_array_new_target_proto(ctx, kind, &value)?;
+    Ok(value)
+}
+
+fn apply_typed_array_new_target_proto(
+    ctx: &mut NativeCtx<'_>,
+    kind: TypedArrayKind,
+    value: &Value,
+) -> Result<(), NativeError> {
     let needs_proto_override = !ctx.new_target().is_some_and(|v| v.is_native_function());
     if needs_proto_override
         && let Some(proto) =
             crate::bootstrap::native_new_target_prototype(ctx, typed_array_name(kind))?
     {
         ctx.interp_mut()
-            .set_non_gc_exotic_prototype_override(&value, Some(proto));
+            .set_non_gc_exotic_prototype_override(value, Some(proto));
     }
-    Ok(value)
+    Ok(())
 }
 
 const fn typed_array_name(kind: TypedArrayKind) -> &'static str {

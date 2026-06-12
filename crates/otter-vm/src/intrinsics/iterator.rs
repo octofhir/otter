@@ -1118,7 +1118,7 @@ fn iterator_proto_find(
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-%25iteratorprototype%25.next>
-fn iterator_proto_next(
+pub(crate) fn iterator_proto_next(
     ctx: &mut crate::NativeCtx<'_>,
     _args: &[Value],
 ) -> Result<Value, crate::NativeError> {

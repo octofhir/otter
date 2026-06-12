@@ -146,6 +146,21 @@ impl Interpreter {
         let use_ctor = !constructor.is_undefined()
             && crate::abstract_ops::is_constructor(&constructor, context, &self.gc_heap);
 
+        if !has_map
+            && !use_ctor
+            && let Some(arr) = items.as_array()
+        {
+            let len = crate::array::len(arr, &self.gc_heap);
+            let values = (0..len)
+                .map(|index| crate::array::get(arr, &self.gc_heap, index))
+                .collect::<Vec<_>>();
+            return Ok(Value::array(self.alloc_runtime_rooted_array_from_values(
+                values,
+                &[&items],
+                &[],
+            )?));
+        }
+
         if !has_map && let Some(arr) = items.as_array() {
             let len = crate::array::len(arr, &self.gc_heap);
             let anchor_base = self.push_iteration_anchor(items) - 1;

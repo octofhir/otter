@@ -306,7 +306,7 @@ fn typed_array_byte_len(len: usize, bpe: usize) -> Result<usize, VmError> {
     })
 }
 
-fn typed_array_from_values_with_roots(
+pub(crate) fn typed_array_from_values_with_roots(
     kind: TypedArrayKind,
     values: &[Value],
     gc_heap: &mut otter_gc::GcHeap,
@@ -314,7 +314,13 @@ fn typed_array_from_values_with_roots(
 ) -> Result<Value, VmError> {
     let bpe = kind.bytes_per_element();
     let byte_len = typed_array_byte_len(values.len(), bpe)?;
-    let new_buf = JsArrayBuffer::try_new_with_roots(byte_len, gc_heap, external_visit)
+    let mut buffer_roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        external_visit(visitor);
+        for value in values {
+            value.trace_value_slots(visitor);
+        }
+    };
+    let new_buf = JsArrayBuffer::try_new_with_roots(byte_len, gc_heap, &mut buffer_roots)
         .map_err(oom_to_vm)?
         .ok_or_else(|| VmError::RangeError {
             message: format!(
@@ -322,9 +328,11 @@ fn typed_array_from_values_with_roots(
             ),
         })?;
     let view = JsTypedArray::new(gc_heap, new_buf, kind, 0, values.len()).map_err(oom_to_vm)?;
+    let mut encoded = vec![0u8; byte_len];
     for (i, value) in values.iter().enumerate() {
-        view.set(gc_heap, i, value);
+        kind.write(gc_heap, &mut encoded, i * bpe, value);
     }
+    new_buf.with_bytes_mut(gc_heap, |bytes| bytes.copy_from_slice(&encoded));
     Ok(Value::typed_array(view))
 }
 

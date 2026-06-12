@@ -918,6 +918,15 @@ impl NativeFunction {
         })
     }
 
+    /// `true` when this callable is the exact static native function.
+    #[must_use]
+    pub(crate) fn is_static_fn(&self, heap: &otter_gc::GcHeap, expected: NativeFastFn) -> bool {
+        heap.read_payload(self.inner, |body| match body.call {
+            NativeCallStorage::Static(call) => std::ptr::fn_addr_eq(call, expected),
+            _ => false,
+        })
+    }
+
     /// `true` when this callable resolves to the named VM intrinsic.
     /// Used by §13.10.2 InstanceofOperator's fast path so the spec's
     /// `Call(Function.prototype[@@hasInstance], target, « V »)`

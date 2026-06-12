@@ -59,3 +59,28 @@ fn constructor_rejects_out_of_bounds_typed_array_source() {
         "#);
     assert_eq!(completion, "TypeError");
 }
+
+#[test]
+fn iterable_constructor_observes_custom_array_iterator_next() {
+    let completion = run(r#"
+        const proto = Object.getPrototypeOf([][Symbol.iterator]());
+        const original = proto.next;
+        let calls = 0;
+        proto.next = function() {
+            calls++;
+            return original.call(this);
+        };
+        try {
+            const source = {
+                [Symbol.iterator]: function() {
+                    return [1, 2, 3][Symbol.iterator]();
+                }
+            };
+            const out = new Uint8Array(source);
+            calls === 4 && out.length === 3 && out[2] === 3;
+        } finally {
+            proto.next = original;
+        }
+        "#);
+    assert_eq!(completion, "true");
+}

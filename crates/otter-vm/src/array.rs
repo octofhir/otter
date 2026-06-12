@@ -503,6 +503,95 @@ pub(crate) fn set_with_roots(
     Ok(())
 }
 
+/// Return whether a dense bulk fill can bypass generic `[[Set]]`.
+///
+/// Callers must still prove the prototype chain has no indexed
+/// properties in the target range. This helper only checks receiver
+/// state that would make direct data writes observably different from
+/// ordinary array assignment.
+#[must_use]
+pub(crate) fn can_fast_fill_dense_range(
+    arr: JsArray,
+    heap: &otter_gc::GcHeap,
+    start: usize,
+    end: usize,
+) -> bool {
+    if start >= end {
+        return true;
+    }
+    const MAX_DENSE_INDEX: usize = 1 << 20;
+    heap.read_payload(arr, |body| {
+        if !body.extensible.0 || body.prototype_override.is_some() || end > MAX_DENSE_INDEX {
+            return false;
+        }
+        if start.saturating_sub(body.elements.len()) > 1024 {
+            return false;
+        }
+        let in_range = |key: &str| {
+            crate::object::array_index_property_name(key)
+                .and_then(|idx| usize::try_from(idx).ok())
+                .is_some_and(|idx| (start..end).contains(&idx))
+        };
+        if body
+            .accessors
+            .as_ref()
+            .is_some_and(|accessors| accessors.keys().any(|key| in_range(key)))
+        {
+            return false;
+        }
+        if body
+            .property_flags
+            .as_ref()
+            .is_some_and(|flags| flags.keys().any(|key| in_range(key)))
+        {
+            return false;
+        }
+        true
+    })
+}
+
+/// Fill a proven-plain dense array range with one data value.
+///
+/// The caller owns the spec checks; this function performs only the
+/// rooted reservation and contiguous writes.
+pub(crate) fn fill_dense_range_with_roots(
+    mut arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    start: usize,
+    end: usize,
+    value: Value,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<(), otter_gc::OutOfMemory> {
+    if start >= end {
+        return Ok(());
+    }
+    {
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            value.trace_value_slots(visitor);
+        };
+        reserve_for_target_len_with_roots(&mut arr, heap, end, &mut reserve_roots)?;
+    }
+    heap.with_payload(arr, |body| {
+        body.elements
+            .reserve_exact(end.saturating_sub(body.elements.len()));
+        while body.elements.len() < start {
+            body.elements.push(Value::hole());
+        }
+        let existing_end = end.min(body.elements.len());
+        for idx in start..existing_end {
+            body.elements[idx] = value;
+        }
+        while body.elements.len() < end {
+            body.elements.push(value);
+        }
+        body.length = body.length.max(end);
+        body.dirty = true;
+    });
+    heap.record_write(arr, &value);
+    Ok(())
+}
+
 /// Push to the tail. Returns the new length.
 ///
 /// # Errors

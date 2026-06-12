@@ -649,12 +649,12 @@ impl Interpreter {
             let lower_key = lower.to_string();
             let upper_key = format_index_key(upper as f64);
             let lower_exists = self.array_method_has_property(context, o, &lower_key)?;
-            let upper_exists = self.array_method_has_property(context, o, &upper_key)?;
             let lower_value = if lower_exists {
                 Some(self.array_method_get_property(context, o, &lower_key)?)
             } else {
                 None
             };
+            let upper_exists = self.array_method_has_property(context, o, &upper_key)?;
             let upper_value = if upper_exists {
                 Some(self.array_method_get_property(context, o, &upper_key)?)
             } else {

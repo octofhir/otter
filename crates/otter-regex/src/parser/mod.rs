@@ -521,7 +521,23 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `true` when the cursor sits on a quantifier (`* + ?` or a valid
+    /// `{n,m}` brace).
+    fn peek_is_quantifier(&self) -> bool {
+        match self.peek() {
+            Some(c) if c == b'*' as u16 || c == b'+' as u16 || c == b'?' as u16 => true,
+            Some(c) if c == b'{' as u16 => self.looks_like_quantifier(),
+            _ => false,
+        }
+    }
+
     fn maybe_quantify(&mut self, atom: Node) -> Result<Node, RegexError> {
+        // §22.2.1 — in unicode (`u`/`v`) mode a Quantifier may only follow an
+        // Atom, never an Assertion. Annex B keeps the legacy
+        // QuantifiableAssertion leniency (`(?=.)?`, `^*`) in non-unicode mode.
+        if self.unicode() && is_assertion_node(&atom) && self.peek_is_quantifier() {
+            return Err(self.err("quantifier may not follow an assertion in unicode mode"));
+        }
         let (min, max) = match self.peek() {
             Some(c) if c == b'*' as u16 => {
                 self.pos += 1;
@@ -625,8 +641,14 @@ impl<'a> Parser<'a> {
                 Ok(Node::Assert(Assertion::WordBoundary { invert: true }))
             }
             x if x == b'k' as u16 => {
-                // `\k<name>` named backreference.
-                if self.peek_at(1) == Some(b'<' as u16) {
+                // `\k<name>` is a named backreference only when the pattern
+                // actually contains a named capturing group. With no named
+                // group present, Annex B §B.1.4 / §22.2.1 parse `\k` in
+                // non-unicode mode as an identity escape (a literal `k`,
+                // leaving the following `<…>` as ordinary atoms); unicode
+                // mode keeps it a hard error.
+                let has_named = !self.group_names.iter().all(Option::is_none);
+                if (self.unicode() || has_named) && self.peek_at(1) == Some(b'<' as u16) {
                     let (name, next) = read_group_name(self.units, self.pos + 2)
                         .ok_or_else(|| self.err("invalid backreference name"))?;
                     self.pos = next;
@@ -634,7 +656,7 @@ impl<'a> Parser<'a> {
                         .name_to_index(&name)
                         .ok_or_else(|| self.err("backreference to unknown group name"))?;
                     Ok(self.backref_node(index))
-                } else if self.unicode() || !self.group_names.iter().all(Option::is_none) {
+                } else if self.unicode() || has_named {
                     Err(self.err("invalid \\k escape"))
                 } else {
                     self.pos += 1;
@@ -657,7 +679,7 @@ impl<'a> Parser<'a> {
                     let (set, negate) = set;
                     Ok(self.class_node(ClassSet::from_code_points(set), negate))
                 } else {
-                    let cp = self.parse_char_escape()?;
+                    let cp = self.parse_char_escape(false)?;
                     Ok(self.char_node(cp))
                 }
             }
@@ -774,7 +796,7 @@ impl<'a> Parser<'a> {
     }
 
     /// A single-character escape resolving to one code point.
-    fn parse_char_escape(&mut self) -> Result<u32, RegexError> {
+    fn parse_char_escape(&mut self, in_class: bool) -> Result<u32, RegexError> {
         let c = self.peek().expect("char escape at end");
         match c {
             x if x == b'n' as u16 => {
@@ -815,11 +837,33 @@ impl<'a> Parser<'a> {
             }
             x if x == b'x' as u16 => {
                 self.pos += 1;
+                // Annex B §B.1.2: in non-unicode mode `\x` not followed by two
+                // hex digits is the identity escape for `x`.
+                let two_hex = self.peek().is_some_and(|d| hex_digit(d).is_some())
+                    && self.peek_at(1).is_some_and(|d| hex_digit(d).is_some());
+                if !self.unicode() && !two_hex {
+                    return Ok(u32::from(b'x'));
+                }
                 self.read_fixed_hex(2)
             }
             x if x == b'u' as u16 => {
                 self.pos += 1;
-                self.read_unicode_escape()
+                if self.unicode() {
+                    self.read_unicode_escape()
+                } else {
+                    // Annex B §B.1.2: in non-unicode mode `\u` that is not a
+                    // valid `\uXXXX` / `\u{…}` escape is the identity escape
+                    // for `u`; restore any hex digits consumed on the failed
+                    // attempt so they parse as ordinary atoms.
+                    let save = self.pos;
+                    match self.read_unicode_escape() {
+                        Ok(v) => Ok(v),
+                        Err(_) => {
+                            self.pos = save;
+                            Ok(u32::from(b'u'))
+                        }
+                    }
+                }
             }
             x if x == b'c' as u16 => {
                 // `\cX` control escape.
@@ -835,16 +879,23 @@ impl<'a> Parser<'a> {
                 if self.unicode() {
                     Err(self.err("invalid \\c escape"))
                 } else {
-                    // Annex B: a bare `\c` is a literal backslash.
-                    self.pos += 1;
+                    // Annex B §B.1.2: `\c` not followed by a ControlLetter is a
+                    // literal backslash; the `c` is NOT consumed — it parses as
+                    // an ordinary atom so `/\cZ/` (Z non-letter) matches the
+                    // three characters `\`, `c`, `Z`.
                     Ok(u32::from(b'\\'))
                 }
             }
             _ => {
-                // Identity escape. In unicode mode only syntax characters (plus
-                // `/` and the class-only `-`) may be escaped; in non-unicode
-                // mode any character may.
-                if self.unicode() && !is_syntax_char(c) && c != b'/' as u16 && c != b'-' as u16 {
+                // Identity escape. In unicode mode only SyntaxCharacter and `/`
+                // may be escaped in an Atom; inside a character class `-` is
+                // additionally a valid ClassEscape. Non-unicode mode escapes
+                // any character.
+                if self.unicode()
+                    && !is_syntax_char(c)
+                    && c != b'/' as u16
+                    && !(in_class && c == b'-' as u16)
+                {
                     return Err(self.err("invalid identity escape"));
                 }
                 let cp = self.read_pattern_codepoint();
@@ -1147,6 +1198,16 @@ impl<'a> Parser<'a> {
             if let Some((sub, negate)) = self.try_class_escape_set()? {
                 let sub = if negate { sub.negate() } else { sub };
                 set.union_with(&sub);
+                // §22.2.1.4 — a CharacterClassEscape (`\d`, `\p{…}`, …) cannot
+                // be a range endpoint. In unicode mode `[\d-a]` is a syntax
+                // error; Annex B keeps the `-` literal (handled by the union
+                // loop's next iteration).
+                if self.unicode()
+                    && self.peek() == Some(b'-' as u16)
+                    && self.peek_at(1) != Some(b']' as u16)
+                {
+                    return Err(self.err("invalid class range"));
+                }
                 return Ok(());
             }
             let lo = self.parse_class_char_escape()?;
@@ -1232,7 +1293,7 @@ impl<'a> Parser<'a> {
         {
             return Ok(self.read_legacy_octal());
         }
-        self.parse_char_escape()
+        self.parse_char_escape(true)
     }
 }
 
@@ -1240,6 +1301,19 @@ impl<'a> Parser<'a> {
 
 /// Read a `(?<name>` / `\k<name>` group name starting at `start` (just past the
 /// `<`). Returns the name and the index just past the closing `>`.
+/// `true` when `node` is a zero-width assertion (`^ $ \b \B`) or a
+/// lookaround group — the atoms a Quantifier may not follow in unicode mode.
+fn is_assertion_node(node: &Node) -> bool {
+    matches!(
+        node,
+        Node::Assert(_)
+            | Node::Group {
+                kind: GroupKind::Lookahead { .. } | GroupKind::Lookbehind { .. },
+                ..
+            }
+    )
+}
+
 fn read_group_name(units: &[u16], start: usize) -> Option<(String, usize)> {
     let mut i = start;
     let mut name_units = Vec::new();

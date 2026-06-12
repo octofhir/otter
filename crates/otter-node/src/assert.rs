@@ -206,14 +206,79 @@ fn assert_throws(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     if !otter_vm::is_callable_value(&callee) {
         return Err(fail("assert.throws: first argument must be a function"));
     }
+    let expected = arg(args, 1);
     let (interp, context) = ctx.interp_mut_and_context();
     let Some(context) = context else {
         return Err(fail("assert.throws: no execution context"));
     };
-    match interp.run_callable_sync(&context, &callee, Value::undefined(), Default::default()) {
-        Ok(_) => Err(fail("assert.throws: missing expected exception")),
-        Err(_) => Ok(Value::undefined()),
+    if interp
+        .run_callable_sync(&context, &callee, Value::undefined(), Default::default())
+        .is_ok()
+    {
+        return Err(fail("Missing expected exception."));
     }
+    // Recover the real thrown Error value and validate it against the matcher.
+    let thrown = interp
+        .take_pending_uncaught_throw()
+        .unwrap_or_else(Value::undefined);
+    let depth = interp.push_module_root(thrown);
+    let thrown = interp.module_root(depth - 1);
+    let result = validate_thrown(interp, &context, thrown, expected);
+    interp.pop_module_roots_to(depth - 1);
+    result.map(|()| Value::undefined())
+}
+
+/// Validate a thrown value against `assert.throws`'s expected matcher.
+/// Supports: object matchers (`{ code, name, message }`), error constructors
+/// (matched by `name`), and ignores a string second argument (it is the
+/// assertion message, not a matcher).
+fn validate_thrown(
+    interp: &mut otter_vm::Interpreter,
+    context: &otter_vm::ExecutionContext,
+    thrown: Value,
+    expected: Value,
+) -> Result<(), NativeError> {
+    // No matcher, or a plain message string: any throw satisfies it.
+    if expected.is_undefined() || expected.is_string() {
+        return Ok(());
+    }
+    let get = |interp: &mut otter_vm::Interpreter, recv: Value, key: &str| -> Value {
+        interp
+            .get_property(context, recv, key)
+            .unwrap_or_else(|_| Value::undefined())
+    };
+    if expected.is_object() && otter_vm::is_callable_value(&expected) {
+        // Error constructor: match by class name.
+        let want = get(interp, expected, "name");
+        let got = get(interp, thrown, "name");
+        if abstract_ops::is_strictly_equal(&want, &got, interp.gc_heap()) {
+            return Ok(());
+        }
+        return Err(fail(format!(
+            "The error is expected to be an instance of \"{}\". Received \"{}\"",
+            want.display_string(interp.gc_heap()),
+            got.display_string(interp.gc_heap()),
+        )));
+    }
+    if expected.is_object() {
+        // Object matcher: every checked key must strictly match.
+        for key in ["name", "code", "message"] {
+            let want = get(interp, expected, key);
+            if want.is_undefined() {
+                continue;
+            }
+            let got = get(interp, thrown, key);
+            if !abstract_ops::is_strictly_equal(&want, &got, interp.gc_heap()) {
+                return Err(fail(format!(
+                    "error.{key} mismatch: expected {}, got {}",
+                    want.display_string(interp.gc_heap()),
+                    got.display_string(interp.gc_heap()),
+                )));
+            }
+        }
+        return Ok(());
+    }
+    Ok(())
 }
 
 fn assert_does_not_throw(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

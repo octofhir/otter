@@ -702,6 +702,22 @@ impl Interpreter {
         Ok(values)
     }
 
+    /// Public `[[Get]]` for host code (e.g. `assert.throws` inspecting a thrown
+    /// error's `code`/`name`/`message`): walks the prototype chain and invokes
+    /// accessors. Out-of-crate runtime/native bindings use this instead of the
+    /// own-only `object::get`.
+    ///
+    /// # Errors
+    /// Propagates any error thrown by an invoked getter.
+    pub fn get_property(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        key: &str,
+    ) -> Result<Value, VmError> {
+        self.get_property_value_for_call(context, receiver, key)
+    }
+
     pub(crate) fn get_property_value_for_call(
         &mut self,
         context: &ExecutionContext,

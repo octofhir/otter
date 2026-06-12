@@ -1349,12 +1349,9 @@ fn read_group_name(units: &[u16], start: usize, unicode: bool) -> Option<(String
 fn read_group_name_unicode_escape(
     units: &[u16],
     start: usize,
-    unicode: bool,
+    _unicode: bool,
 ) -> Option<(char, usize)> {
     if units.get(start) == Some(&(b'{' as u16)) {
-        if !unicode {
-            return None;
-        }
         let mut i = start + 1;
         let mut value = 0u32;
         let mut any = false;
@@ -1377,8 +1374,7 @@ fn read_group_name_unicode_escape(
     }
 
     let (hi, mut next) = read_group_name_fixed_hex(units, start)?;
-    if unicode
-        && (0xD800..=0xDBFF).contains(&hi)
+    if (0xD800..=0xDBFF).contains(&hi)
         && units.get(next) == Some(&(b'\\' as u16))
         && units.get(next + 1) == Some(&(b'u' as u16))
         && let Some((lo, after)) = read_group_name_fixed_hex(units, next + 2)
@@ -1507,6 +1503,18 @@ mod tests {
             p.group_names,
             vec![Some("π".to_string()), Some("a𐒤".to_string())]
         );
+
+        let p = parse_ok(
+            "(?<\\u{1d4d1}\\u{1d4fb}\\u{1d4f8}\\u{1d500}\\u{1d4f7}>brown)",
+            Flags::default(),
+        );
+        assert_eq!(p.group_names, vec![Some("𝓑𝓻𝓸𝔀𝓷".to_string())]);
+
+        let p = parse_ok(
+            "(?<\\ud835\\udcd1\\ud835\\udcfb\\ud835\\udcf8\\ud835\\udd00\\ud835\\udcf7>brown)",
+            Flags::default(),
+        );
+        assert_eq!(p.group_names, vec![Some("𝓑𝓻𝓸𝔀𝓷".to_string())]);
     }
 
     #[test]

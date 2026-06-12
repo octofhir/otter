@@ -20,8 +20,9 @@
 //! # Phase-1 note
 //! Lookbehind is evaluated by scanning candidate start positions and requiring
 //! the body to end exactly at the assertion point. This is boolean-correct and
-//! variable-length-capable; spec-exact right-to-left capture selection inside a
-//! lookbehind is a later-phase refinement (reverse-compiled bodies).
+//! variable-length-capable; capture slots inside the body keep their first write
+//! so repeated captures report the leftmost text selected by ECMAScript's
+//! right-to-left lookbehind matching semantics.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-pattern-matching>
@@ -51,7 +52,7 @@ pub(crate) fn attempt(
         step_limit: config.step_limit,
     };
     let caps = vec![None; program.slot_count()];
-    match m.run(0, at, None, caps)? {
+    match m.run(0, at, None, false, caps)? {
         Some((_, caps)) => Ok(Some(caps)),
         None => Ok(None),
     }
@@ -81,19 +82,22 @@ enum Act {
     Split(usize, usize),
     Save(usize),
     ClearCapture(u32),
+    SetMark(usize),
     CheckProgress(usize),
     Look(bool, bool, usize),
 }
 
 impl Matcher<'_, '_> {
     /// Run from `entry` at `start`. `end_anchor`, when set, only accepts a
-    /// terminator reached exactly at that offset (used by lookbehind). Returns
-    /// the accepting position and capture slots.
+    /// terminator reached exactly at that offset (used by lookbehind).
+    /// `freeze_capture_saves` preserves the first write to capture slots while
+    /// still allowing internal progress marks to update.
     fn run(
         &mut self,
         entry: usize,
         start: usize,
         end_anchor: Option<usize>,
+        freeze_capture_saves: bool,
         caps0: Caps,
     ) -> Result<Option<(usize, Caps)>, ExecError> {
         let mut stack = vec![Frame {
@@ -147,7 +151,8 @@ impl Matcher<'_, '_> {
                         Insn::Jump(t) => Act::Goto(*t),
                         Insn::Split(a, b) => Act::Split(*a, *b),
                         Insn::ClearCapture(index) => Act::ClearCapture(*index),
-                        Insn::Save(slot) | Insn::SetMark(slot) => Act::Save(*slot),
+                        Insn::Save(slot) => Act::Save(*slot),
+                        Insn::SetMark(slot) => Act::SetMark(*slot),
                         Insn::CheckProgress(slot) => Act::CheckProgress(*slot),
                         Insn::AssertStart { multiline } => {
                             if self.at_start(pos, *multiline) {
@@ -202,13 +207,23 @@ impl Matcher<'_, '_> {
                         pc = a;
                     }
                     Act::Save(slot) => {
+                        if !freeze_capture_saves || caps[slot].is_none() {
+                            caps[slot] = Some(pos);
+                        }
+                        pc += 1;
+                    }
+                    Act::SetMark(slot) => {
                         caps[slot] = Some(pos);
                         pc += 1;
                     }
                     Act::ClearCapture(index) => {
                         let g = index as usize;
-                        caps[2 * g] = None;
-                        caps[2 * g + 1] = None;
+                        if !freeze_capture_saves
+                            || (caps[2 * g].is_none() && caps[2 * g + 1].is_none())
+                        {
+                            caps[2 * g] = None;
+                            caps[2 * g + 1] = None;
+                        }
                         pc += 1;
                     }
                     Act::CheckProgress(slot) => {
@@ -249,14 +264,15 @@ impl Matcher<'_, '_> {
         let found = if behind {
             let mut hit = None;
             for s in 0..=pos {
-                if let Some((_, updated)) = self.run(entry, s, Some(pos), caps.clone())? {
+                if let Some((_, updated)) = self.run(entry, s, Some(pos), true, caps.clone())? {
                     hit = Some(updated);
                     break;
                 }
             }
             hit
         } else {
-            self.run(entry, pos, None, caps.clone())?.map(|(_, c)| c)
+            self.run(entry, pos, None, false, caps.clone())?
+                .map(|(_, c)| c)
         };
 
         Ok(match (negate, found) {

@@ -236,6 +236,9 @@ fn lookbehind() {
         matched_text("(?<!\\$)\\d+", "", "#42").as_deref(),
         Some("42")
     );
+    let lookbehind_capture = first_match("(?<=(\\w){3})f", "", "abcdef").unwrap();
+    assert_eq!((lookbehind_capture.0, lookbehind_capture.1), (5, 6));
+    assert_eq!(lookbehind_capture.2[0], Some((2, 3)));
 }
 
 #[test]

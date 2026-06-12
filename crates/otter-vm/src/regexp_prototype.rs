@@ -1532,6 +1532,15 @@ fn get_substitution(
             }
             n if n == b'<' as u16 => {
                 // §22.2.6.11.1 step 12 — named capture reference.
+                if named_captures.is_none() {
+                    // Without named captures, `$<` is a two-code-unit literal
+                    // substitution. The remaining template text is still
+                    // scanned, so `$<42$1>` can substitute `$1`.
+                    out.push(c);
+                    out.push(n);
+                    i += 2;
+                    continue;
+                }
                 let mut end = i + 2;
                 while end < template.len() && template[end] != b'>' as u16 {
                     end += 1;
@@ -1544,25 +1553,13 @@ fn get_substitution(
                 }
                 let group_name_units = &template[i + 2..end];
                 let group_name = String::from_utf16_lossy(group_name_units);
-                match named_captures {
-                    None => {
-                        // No named groups at all → emit literally
-                        // including the `<…>` payload.
-                        out.push(c);
-                        for k in 1..=(end - i) {
-                            out.push(template[i + k]);
-                        }
-                        i = end + 1;
-                        continue;
+                if let Some(nc) = named_captures {
+                    let val = get_property_runtime(ctx, nc, &group_name, name)?;
+                    if !val.is_undefined() {
+                        let coerced = coerce_to_jsstring_runtime(ctx, &val, name)?;
+                        out.extend_from_slice(&coerced.to_utf16_vec(ctx.heap()));
                     }
-                    Some(nc) => {
-                        let val = get_property_runtime(ctx, nc, &group_name, name)?;
-                        if !val.is_undefined() {
-                            let coerced = coerce_to_jsstring_runtime(ctx, &val, name)?;
-                            out.extend_from_slice(&coerced.to_utf16_vec(ctx.heap()));
-                        }
-                        i = end + 1;
-                    }
+                    i = end + 1;
                 }
             }
             _ => {

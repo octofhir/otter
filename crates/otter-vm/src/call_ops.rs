@@ -1856,7 +1856,7 @@ impl Interpreter {
         if let Some(native) = current.as_native_function()
             && matches!(
                 native.name(&self.gc_heap),
-                "ArrayBuffer" | "SharedArrayBuffer"
+                "ArrayBuffer" | "SharedArrayBuffer" | "DataView"
             )
         {
             return self.invoke_native_construct(

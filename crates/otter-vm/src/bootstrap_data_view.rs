@@ -182,6 +182,30 @@ fn data_view_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
             requested
         }
     };
+    // §25.3.2.1 step 10 — GetPrototypeFromConstructor may run user code. The
+    // initial offset/length bounds above must happen first, but the buffer must
+    // be revalidated after this observable lookup before a view is installed.
+    let needs_proto_override = ctx.new_target().is_none_or(|v| !v.is_native_function());
+    let proto_override = if needs_proto_override {
+        crate::bootstrap::native_new_target_prototype(ctx, "DataView")?
+    } else {
+        None
+    };
+    if buffer.is_detached(ctx.heap()) {
+        return Err(NativeError::TypeError {
+            name: "DataView",
+            reason: "Cannot construct a DataView with a detached ArrayBuffer".to_string(),
+        });
+    }
+    let current_buffer_byte_length = buffer.byte_length(ctx.heap());
+    if byte_offset > current_buffer_byte_length
+        || (!length_absent && byte_offset + byte_length > current_buffer_byte_length)
+    {
+        return Err(NativeError::RangeError {
+            name: "DataView",
+            reason: "Invalid DataView length".to_string(),
+        });
+    }
     let view =
         crate::binary::data_view::JsDataView::new(ctx.heap_mut(), buffer, byte_offset, byte_length)
             .map_err(|_| NativeError::TypeError {
@@ -195,14 +219,7 @@ fn data_view_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
         view.set_length_tracking(ctx.heap_mut());
     }
     let value = Value::data_view(view);
-    // §10.1.13 GetPrototypeFromConstructor — derived `super()`
-    // construction forwards `new.target`, so the allocated exotic
-    // receives `Subclass.prototype` as its observable [[Prototype]].
-    // <https://tc39.es/ecma262/#sec-getprototypefromconstructor>
-    let needs_proto_override = ctx.new_target().is_none_or(|v| !v.is_native_function());
-    if needs_proto_override
-        && let Some(proto) = crate::bootstrap::native_new_target_prototype(ctx, "DataView")?
-    {
+    if let Some(proto) = proto_override {
         ctx.interp_mut()
             .set_non_gc_exotic_prototype_override(&value, Some(proto));
     }

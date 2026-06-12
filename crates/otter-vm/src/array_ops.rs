@@ -151,7 +151,7 @@ impl Interpreter {
             let anchor_base = self.push_iteration_anchor(items) - 1;
             let result = (|interp: &mut Self| -> Result<Value, VmError> {
                 let target =
-                    interp.array_from_make_target(context, use_ctor, &constructor, Some(len))?;
+                    interp.array_from_make_target(context, use_ctor, &constructor, None)?;
                 let target_anchor = interp.push_iteration_anchor(target) - 1;
                 for index in 0..len {
                     let items = interp.iteration_anchor(anchor_base);

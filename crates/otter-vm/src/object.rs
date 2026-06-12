@@ -2571,6 +2571,40 @@ impl<'a> Properties<'a> {
             }
         })
     }
+
+    /// Return dense own data values for integer indices `0..len`.
+    ///
+    /// Accessors and holes return `None` so callers can fall back to
+    /// ordinary `[[Get]]` and preserve observable getter/prototype
+    /// behaviour.
+    pub fn dense_indexed_data_values(&self, len: usize) -> Option<Vec<Value>> {
+        let mut values = vec![None; len];
+        let mut seen = 0usize;
+        for (key, idx) in &self.string_keys {
+            let Some(array_index) = key_order::array_index_property_name(key) else {
+                continue;
+            };
+            let Ok(index) = usize::try_from(array_index) else {
+                continue;
+            };
+            if index >= len {
+                continue;
+            }
+            match &self.body.slots[*idx].body {
+                SlotBody::Data { value } => {
+                    if values[index].is_none() {
+                        seen += 1;
+                    }
+                    values[index] = Some(*value);
+                }
+                SlotBody::Accessor { .. } => return None,
+            }
+        }
+        if seen != len {
+            return None;
+        }
+        values.into_iter().collect()
+    }
 }
 
 fn ordinary_string_key_entries(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Vec<(String, usize)> {

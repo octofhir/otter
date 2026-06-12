@@ -146,6 +146,38 @@ impl Interpreter {
         let use_ctor = !constructor.is_undefined()
             && crate::abstract_ops::is_constructor(&constructor, context, &self.gc_heap);
 
+        if !has_map && let Some(arr) = items.as_array() {
+            let len = crate::array::len(arr, &self.gc_heap);
+            let anchor_base = self.push_iteration_anchor(items) - 1;
+            let result = (|interp: &mut Self| -> Result<Value, VmError> {
+                let target =
+                    interp.array_from_make_target(context, use_ctor, &constructor, Some(len))?;
+                let target_anchor = interp.push_iteration_anchor(target) - 1;
+                for index in 0..len {
+                    let items = interp.iteration_anchor(anchor_base);
+                    let arr = items.as_array().expect("array fast path anchor");
+                    let value = crate::array::get(arr, &interp.gc_heap, index);
+                    let target = interp.iteration_anchor(target_anchor);
+                    interp.create_data_property_or_throw(
+                        context,
+                        target,
+                        &index.to_string(),
+                        value,
+                    )?;
+                }
+                let target = interp.iteration_anchor(target_anchor);
+                interp.array_set_property_throwing(
+                    context,
+                    target,
+                    "length",
+                    Value::number_f64(len as f64),
+                )?;
+                Ok(target)
+            })(self);
+            self.pop_iteration_anchors_to(anchor_base);
+            return result;
+        }
+
         // `usingIterator = GetMethod(items, @@iterator)`. Built-in
         // iterables short-circuit the property round-trip via a
         // sentinel; everything else looks `@@iterator` up directly.

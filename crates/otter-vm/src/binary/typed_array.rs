@@ -748,16 +748,19 @@ impl JsTypedArray {
         let bpe = self.cached_kind.bytes_per_element();
         let (buffer, off) = heap.read_payload(self.handle, |body| (body.buffer, body.byte_offset));
         let offset = off + index * bpe;
-        let snapshot: Option<Vec<u8>> = buffer.with_bytes(heap, |bytes| {
+        let mut snapshot = [0u8; 8];
+        let present = buffer.with_bytes(heap, |bytes| {
             if offset + bpe <= bytes.len() {
-                Some(bytes[offset..offset + bpe].to_vec())
+                snapshot[..bpe].copy_from_slice(&bytes[offset..offset + bpe]);
+                true
             } else {
-                None
+                false
             }
         });
-        match snapshot {
-            Some(b) => self.cached_kind.read(heap, &b, 0),
-            None => Ok(Value::undefined()),
+        if present {
+            self.cached_kind.read(heap, &snapshot[..bpe], 0)
+        } else {
+            Ok(Value::undefined())
         }
     }
 
@@ -775,11 +778,11 @@ impl JsTypedArray {
         // Convert the Value to a raw byte snapshot first (BigInt
         // writes only need read access to the source body), then
         // commit under exclusive heap access.
-        let mut staging = vec![0u8; bpe];
-        kind.write(heap, &mut staging, 0, value);
+        let mut staging = [0u8; 8];
+        kind.write(heap, &mut staging[..bpe], 0, value);
         buffer.with_bytes_mut(heap, |bytes| {
             if offset + bpe <= bytes.len() {
-                bytes[offset..offset + bpe].copy_from_slice(&staging);
+                bytes[offset..offset + bpe].copy_from_slice(&staging[..bpe]);
             }
         });
     }

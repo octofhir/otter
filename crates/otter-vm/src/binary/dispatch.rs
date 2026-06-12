@@ -462,6 +462,15 @@ fn construct_typed_array_with_roots(
     if let Some(obj) = first.as_object() {
         let length_value = crate::object::get(obj, gc_heap, "length").unwrap_or(Value::undefined());
         let len = to_index(&length_value, gc_heap).ok_or(VmError::TypeMismatch)? as usize;
+        if let Some(dense_values) = crate::object::with_properties(obj, gc_heap, |props| {
+            props.dense_indexed_data_values(len)
+        }) {
+            let mut values = Vec::with_capacity(len);
+            for value in dense_values {
+                values.push(coerce_for_kind(gc_heap, kind, &value)?);
+            }
+            return typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit);
+        }
         let mut values: Vec<Value> = Vec::with_capacity(len);
         for i in 0..len {
             let v = crate::object::get(obj, gc_heap, &i.to_string()).unwrap_or(Value::undefined());

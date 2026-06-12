@@ -67,8 +67,14 @@ fn native_is_array(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
     // §7.2.2 IsArray — shared with the `Op::IsArray` fast path so the
     // direct call and `Array.isArray.call(...)` agree (Proxy recursion,
     // revoked-Proxy TypeError).
-    let result = crate::abstract_ops::is_array(ctx.heap(), &value)
+    let mut result = crate::abstract_ops::is_array(ctx.heap(), &value)
         .map_err(|err| crate::native_function::vm_to_native_error(err, "Array.isArray"))?;
+    if !result
+        && let Some(obj) = value.as_object()
+        && let Some(array_prototype) = ctx.cx.interp.realm_intrinsics.array_prototype
+    {
+        result = obj == array_prototype;
+    }
     Ok(Value::boolean(result))
 }
 

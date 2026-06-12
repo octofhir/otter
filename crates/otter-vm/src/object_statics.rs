@@ -1215,6 +1215,11 @@ pub(crate) fn builtin_to_string_tag_value(v: Value, interp: &crate::Interpreter)
     if v.is_array() {
         return "Array".to_string();
     }
+    if let Some(obj) = v.as_object()
+        && interp.realm_intrinsics.array_prototype == Some(obj)
+    {
+        return "Array".to_string();
+    }
     if v.is_regexp() {
         return "RegExp".to_string();
     }

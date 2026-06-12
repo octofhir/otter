@@ -2660,6 +2660,32 @@ impl Interpreter {
             && self.shape_offset_of(shape, key).is_none()
     }
 
+    fn update_array_prototype_length_after_index_store(
+        &mut self,
+        obj: object::JsObject,
+        key: &str,
+    ) {
+        if self.realm_intrinsics.array_prototype != Some(obj) {
+            return;
+        }
+        let Some(index) = object::array_index_property_name(key) else {
+            return;
+        };
+        let new_len = f64::from(index) + 1.0;
+        let current = object::get(obj, &self.gc_heap, "length")
+            .and_then(|value| value.as_number())
+            .map(|number| number.as_f64())
+            .unwrap_or(0.0);
+        if new_len > current {
+            object::set(
+                obj,
+                &mut self.gc_heap,
+                "length",
+                Value::number(NumberValue::from_f64(new_len)),
+            );
+        }
+    }
+
     /// Descriptor-aware data assignment that advances the object's GC-managed
     /// hidden class when a new own data property is created.
     pub(crate) fn ordinary_set_data_property(
@@ -2693,6 +2719,9 @@ impl Interpreter {
         } else {
             object::ordinary_set_data_property(obj, &mut self.gc_heap, key, value)
         };
+        if ok {
+            self.update_array_prototype_length_after_index_store(obj, key);
+        }
         Ok(ok)
     }
 
@@ -2718,6 +2747,7 @@ impl Interpreter {
         } else {
             object::set(obj, &mut self.gc_heap, key, value);
         }
+        self.update_array_prototype_length_after_index_store(obj, key);
         Ok(())
     }
 
@@ -2750,6 +2780,7 @@ impl Interpreter {
         } else {
             object::set(obj, &mut self.gc_heap, key, value);
         }
+        self.update_array_prototype_length_after_index_store(obj, key);
         Ok(())
     }
 
@@ -6026,7 +6057,13 @@ impl Interpreter {
                         .exec_register(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
                     let value = *read_register(&stack[top_idx], src)?;
-                    let result = abstract_ops::is_array(&self.gc_heap, &value)?;
+                    let mut result = abstract_ops::is_array(&self.gc_heap, &value)?;
+                    if !result
+                        && let Some(obj) = value.as_object()
+                        && self.realm_intrinsics.array_prototype == Some(obj)
+                    {
+                        result = true;
+                    }
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::boolean(result))?;
                     frame.advance_pc(self.current_byte_len)?;

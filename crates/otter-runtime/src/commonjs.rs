@@ -135,12 +135,18 @@ pub(crate) fn cjs_load(
         if let Some(cached) = object::get(cache, ctx.heap(), key) {
             return Ok(cached);
         }
-        let namespace = {
+        let value = {
             let interp = ctx.interp_mut();
-            hm.install(interp, &cfg.capabilities)
-                .map_err(|err| runtime_type_error("require", err))?
+            if let Some(value_install) = hm.cjs_value() {
+                value_install(interp, &cfg.capabilities)
+                    .map_err(|err| runtime_type_error("require", err))?
+            } else {
+                let namespace = hm
+                    .install(interp, &cfg.capabilities)
+                    .map_err(|err| runtime_type_error("require", err))?;
+                Value::object(namespace)
+            }
         };
-        let value = Value::object(namespace);
         object::set(cache, ctx.heap_mut(), key, value);
         return Ok(value);
     }

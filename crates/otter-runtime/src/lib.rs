@@ -286,26 +286,62 @@ impl HostedModuleInstall {
     }
 }
 
+/// Produces the full CommonJS export value for a hosted module — used when the
+/// export must be a callable (for example `assert`, invoked directly as
+/// `assert(cond)` as well as via `assert.strictEqual`). The object-namespace
+/// [`HostedModuleInstall`] path cannot represent a callable, so a builtin that
+/// needs one supplies this instead; `require()` returns its result verbatim.
+pub type HostedModuleValueInstall =
+    fn(&mut Interpreter, &CapabilitySet) -> Result<otter_vm::Value, String>;
+
 /// One runtime-hosted module.
 #[derive(Debug, Clone, Copy)]
 pub struct HostedModule {
     /// Module specifier, for example `otter:kv`.
     specifier: &'static str,
-    /// Namespace installer.
+    /// Namespace installer (object export). Also used as the ESM module env.
     install: HostedModuleInstall,
+    /// Optional callable/value export used by `require()` in place of the
+    /// object namespace. `None` => `require()` returns the namespace object.
+    cjs_value: Option<HostedModuleValueInstall>,
 }
 
 impl HostedModule {
     /// Create a hosted module spec from an opaque runtime installer.
     #[must_use]
     pub const fn new(specifier: &'static str, install: HostedModuleInstall) -> Self {
-        Self { specifier, install }
+        Self {
+            specifier,
+            install,
+            cjs_value: None,
+        }
+    }
+
+    /// Create a hosted module whose CommonJS export is a value (e.g. a
+    /// callable). The `install` namespace is still used for ESM imports.
+    #[must_use]
+    pub const fn new_with_cjs_value(
+        specifier: &'static str,
+        install: HostedModuleInstall,
+        cjs_value: HostedModuleValueInstall,
+    ) -> Self {
+        Self {
+            specifier,
+            install,
+            cjs_value: Some(cjs_value),
+        }
     }
 
     /// Module specifier, for example `otter:kv`.
     #[must_use]
     pub const fn specifier(self) -> &'static str {
         self.specifier
+    }
+
+    /// The optional CommonJS value-export installer, if any.
+    #[must_use]
+    pub(crate) const fn cjs_value(self) -> Option<HostedModuleValueInstall> {
+        self.cjs_value
     }
 
     fn install(

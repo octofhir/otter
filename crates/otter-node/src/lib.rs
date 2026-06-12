@@ -16,6 +16,7 @@
 //! - Host state is owned Rust data; no VM values, handles, or contexts are
 //!   stored in futures or long-lived module state.
 
+pub mod assert;
 pub mod fs;
 
 pub use otter_runtime::otter_gc;
@@ -25,6 +26,16 @@ use otter_runtime::{HostedModule, HostedModuleInstall, OtterBuilder, RuntimeBuil
 pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::new("node:fs", HostedModuleInstall::new(fs::install_fs_module)),
     HostedModule::new("fs", HostedModuleInstall::new(fs::install_fs_module)),
+    HostedModule::new_with_cjs_value(
+        "node:assert",
+        HostedModuleInstall::new(assert::install_assert_module),
+        assert::assert_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "assert",
+        HostedModuleInstall::new(assert::install_assert_module),
+        assert::assert_cjs_value,
+    ),
 ];
 
 /// Return active Node hosted module installers.

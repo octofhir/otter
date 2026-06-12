@@ -1,0 +1,267 @@
+//! Minimal `node:assert` / `assert` hosted module.
+//!
+//! The CommonJS export is a *callable* (`assert(value[, message])`) that also
+//! carries the assertion methods (`strictEqual`, `deepStrictEqual`, `throws`,
+//! ...). Because the hosted-module object-namespace path cannot represent a
+//! callable, assert registers a `cjs_value` installer that builds a callable
+//! host object. The ESM namespace ([`install_assert_module`]) exposes the same
+//! methods as plain properties.
+//!
+//! # Invariants
+//! - Comparison uses the VM abstract operations (`is_strictly_equal`,
+//!   `is_loosely_equal`) so semantics match the engine's `===` / `==`.
+//! - Failures throw so the caller's `try`/`catch` (and the test harness) observe
+//!   them. AssertionError fidelity (error subclass, `actual`/`expected` props) is
+//!   a follow-up; the message carries the detail today.
+
+use otter_gc::GcHeap;
+use otter_runtime::CapabilitySet;
+use otter_vm::{Interpreter, NativeCall, NativeCtx, NativeError, Value, abstract_ops, object};
+
+/// Build the ESM namespace object for `node:assert` (methods as properties; the
+/// namespace itself is not callable). CommonJS `require` uses [`assert_cjs_value`].
+pub fn install_assert_module(ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Result<(), String> {
+    for (name, len, f) in ASSERT_METHODS {
+        ctx.builtin_method(name, *len, *f)?;
+    }
+    Ok(())
+}
+
+/// Build the callable CommonJS export: a host object whose `[[Call]]` runs
+/// `assert(value, message)` and which carries the assertion methods.
+pub fn assert_cjs_value(
+    interp: &mut Interpreter,
+    _capabilities: &CapabilitySet,
+) -> Result<Value, String> {
+    let oom = |e: otter_gc::OutOfMemory| format!("out of memory: {e}");
+
+    let assert_fn = interp
+        .native_function_from_call_host_rooted("assert", 2, NativeCall::Static(assert_ok), &[], &[])
+        .map_err(oom)?;
+
+    // Build every method as a rooted native function, accumulating roots so
+    // earlier ones survive allocation of later ones.
+    let mut roots: Vec<Value> = vec![assert_fn];
+    for (name, len, f) in ASSERT_METHODS {
+        let root_refs: Vec<&Value> = roots.iter().collect();
+        let method = interp
+            .native_function_from_call_host_rooted(
+                name,
+                *len,
+                NativeCall::Static(*f),
+                &root_refs,
+                &[],
+            )
+            .map_err(oom)?;
+        roots.push(method);
+    }
+
+    let root_refs: Vec<&Value> = roots.iter().collect();
+    let export = interp
+        .alloc_host_object_with_roots(&root_refs, &[])
+        .map_err(oom)?;
+    object::set_call_native(export, interp.gc_heap_mut(), assert_fn);
+    // roots[0] is assert_fn; the rest line up with ASSERT_METHODS in order.
+    for (i, (name, _len, _f)) in ASSERT_METHODS.iter().enumerate() {
+        object::set(export, interp.gc_heap_mut(), name, roots[i + 1]);
+    }
+    // `assert.strict` aliases assert itself (close enough until a separate
+    // strict variant lands).
+    object::set(
+        export,
+        interp.gc_heap_mut(),
+        "strict",
+        Value::object(export),
+    );
+    Ok(Value::object(export))
+}
+
+type Method = (
+    &'static str,
+    u8,
+    fn(&mut NativeCtx<'_>, &[Value]) -> Result<Value, NativeError>,
+);
+
+const ASSERT_METHODS: &[Method] = &[
+    ("ok", 1, assert_ok),
+    ("strictEqual", 2, assert_strict_equal),
+    ("notStrictEqual", 2, assert_not_strict_equal),
+    ("equal", 2, assert_equal),
+    ("notEqual", 2, assert_not_equal),
+    ("deepStrictEqual", 2, assert_deep_strict_equal),
+    ("notDeepStrictEqual", 2, assert_not_deep_strict_equal),
+    ("deepEqual", 2, assert_deep_strict_equal),
+    ("notDeepEqual", 2, assert_not_deep_strict_equal),
+    ("throws", 2, assert_throws),
+    ("doesNotThrow", 2, assert_does_not_throw),
+    ("ifError", 1, assert_if_error),
+    ("fail", 1, assert_fail),
+];
+
+fn fail(message: impl Into<String>) -> NativeError {
+    NativeError::Thrown {
+        name: "assert",
+        message: message.into(),
+    }
+}
+
+fn arg(args: &[Value], i: usize) -> Value {
+    args.get(i).copied().unwrap_or_else(Value::undefined)
+}
+
+/// JS truthiness (`ToBoolean`).
+fn is_truthy(v: &Value, heap: &GcHeap) -> bool {
+    if v.is_nullish() {
+        return false;
+    }
+    if let Some(b) = v.as_boolean() {
+        return b;
+    }
+    if let Some(n) = v.as_number() {
+        let f = n.as_f64();
+        return f != 0.0 && !f.is_nan();
+    }
+    if let Some(s) = v.as_string(heap) {
+        return !s.to_lossy_string(heap).is_empty();
+    }
+    true
+}
+
+fn assert_ok(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let value = arg(args, 0);
+    if is_truthy(&value, ctx.heap()) {
+        Ok(Value::undefined())
+    } else {
+        Err(fail("assertion failed: value is not truthy"))
+    }
+}
+
+fn assert_strict_equal(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let (a, b) = (arg(args, 0), arg(args, 1));
+    if abstract_ops::is_strictly_equal(&a, &b, ctx.heap()) {
+        Ok(Value::undefined())
+    } else {
+        Err(fail("assert.strictEqual: values are not strictly equal"))
+    }
+}
+
+fn assert_not_strict_equal(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let (a, b) = (arg(args, 0), arg(args, 1));
+    if abstract_ops::is_strictly_equal(&a, &b, ctx.heap()) {
+        Err(fail("assert.notStrictEqual: values are strictly equal"))
+    } else {
+        Ok(Value::undefined())
+    }
+}
+
+fn assert_equal(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let (a, b) = (arg(args, 0), arg(args, 1));
+    if abstract_ops::is_loosely_equal(&a, &b, ctx.heap()) {
+        Ok(Value::undefined())
+    } else {
+        Err(fail("assert.equal: values are not loosely equal"))
+    }
+}
+
+fn assert_not_equal(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let (a, b) = (arg(args, 0), arg(args, 1));
+    if abstract_ops::is_loosely_equal(&a, &b, ctx.heap()) {
+        Err(fail("assert.notEqual: values are loosely equal"))
+    } else {
+        Ok(Value::undefined())
+    }
+}
+
+/// Structural deep equality over primitives and arrays. Plain-object key
+/// comparison is a follow-up (no public key-enumeration helper wired yet);
+/// objects currently compare by reference.
+fn deep_equal(a: &Value, b: &Value, heap: &GcHeap) -> bool {
+    if abstract_ops::is_strictly_equal(a, b, heap) {
+        return true;
+    }
+    if let (Some(xa), Some(xb)) = (a.as_array(), b.as_array()) {
+        let (la, lb) = (
+            otter_vm::array::len(xa, heap),
+            otter_vm::array::len(xb, heap),
+        );
+        if la != lb {
+            return false;
+        }
+        for i in 0..la {
+            let ea = otter_vm::array::get(xa, heap, i);
+            let eb = otter_vm::array::get(xb, heap, i);
+            if !deep_equal(&ea, &eb, heap) {
+                return false;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+fn assert_deep_strict_equal(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let (a, b) = (arg(args, 0), arg(args, 1));
+    if deep_equal(&a, &b, ctx.heap()) {
+        Ok(Value::undefined())
+    } else {
+        Err(fail("assert.deepStrictEqual: values are not deeply equal"))
+    }
+}
+
+fn assert_not_deep_strict_equal(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let (a, b) = (arg(args, 0), arg(args, 1));
+    if deep_equal(&a, &b, ctx.heap()) {
+        Err(fail("assert.notDeepStrictEqual: values are deeply equal"))
+    } else {
+        Ok(Value::undefined())
+    }
+}
+
+fn assert_throws(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let callee = arg(args, 0);
+    if !otter_vm::is_callable_value(&callee) {
+        return Err(fail("assert.throws: first argument must be a function"));
+    }
+    let (interp, context) = ctx.interp_mut_and_context();
+    let Some(context) = context else {
+        return Err(fail("assert.throws: no execution context"));
+    };
+    match interp.run_callable_sync(&context, &callee, Value::undefined(), Default::default()) {
+        Ok(_) => Err(fail("assert.throws: missing expected exception")),
+        Err(_) => Ok(Value::undefined()),
+    }
+}
+
+fn assert_does_not_throw(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let callee = arg(args, 0);
+    if !otter_vm::is_callable_value(&callee) {
+        return Err(fail(
+            "assert.doesNotThrow: first argument must be a function",
+        ));
+    }
+    let (interp, context) = ctx.interp_mut_and_context();
+    let Some(context) = context else {
+        return Err(fail("assert.doesNotThrow: no execution context"));
+    };
+    match interp.run_callable_sync(&context, &callee, Value::undefined(), Default::default()) {
+        Ok(_) => Ok(Value::undefined()),
+        Err(_) => Err(fail("assert.doesNotThrow: got unwanted exception")),
+    }
+}
+
+fn assert_if_error(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let value = arg(args, 0);
+    let _ = ctx;
+    if value.is_nullish() {
+        Ok(Value::undefined())
+    } else {
+        Err(fail("assert.ifError: got an error value"))
+    }
+}
+
+fn assert_fail(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    Err(fail("assert.fail: failed"))
+}

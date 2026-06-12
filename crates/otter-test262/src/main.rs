@@ -81,6 +81,19 @@ enum Command {
     Merge(MergeArgs),
     /// Render a baseline JSON into a static HTML dashboard.
     Site(SiteArgs),
+    /// Generate the Markdown conformance report (ES_CONFORMANCE.md) from a
+    /// baseline JSON — auto-generated, never hand-edited.
+    Conformance(ConformanceArgs),
+}
+
+#[derive(Parser, Debug)]
+struct ConformanceArgs {
+    /// Path to a baseline / merged report (`*.json`).
+    #[arg(default_value = "test262_results/latest.json")]
+    input: PathBuf,
+    /// Where to write the Markdown report.
+    #[arg(long, default_value = "ES_CONFORMANCE.md")]
+    output: PathBuf,
 }
 
 #[derive(Parser, Debug)]
@@ -200,6 +213,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::Diff(args) => diff_cmd(&repo_root, args),
         Command::Merge(args) => merge_cmd(args),
         Command::Site(args) => site_cmd(args),
+        Command::Conformance(args) => conformance_cmd(args),
     }
 }
 
@@ -673,6 +687,19 @@ fn git_head(repo: &Path) -> Option<String> {
             .map(|s| s.trim().to_string());
     }
     Some(head.to_string())
+}
+
+fn conformance_cmd(args: ConformanceArgs) -> Result<ExitCode> {
+    let baseline = Baseline::from_path(&args.input)
+        .with_context(|| format!("failed to read baseline {}", args.input.display()))?;
+    std::fs::write(&args.output, baseline.to_markdown())
+        .with_context(|| format!("failed to write {}", args.output.display()))?;
+    println!(
+        "wrote {} ({:.2}% pass)",
+        args.output.display(),
+        baseline.totals.pass_rate()
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 fn parse(args: ParseArgs) -> Result<ExitCode> {

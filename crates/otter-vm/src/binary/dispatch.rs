@@ -435,7 +435,7 @@ fn construct_typed_array_with_roots(
         return Ok(Value::typed_array(view));
     }
     if let Some(src) = first.as_typed_array(gc_heap) {
-        if src.buffer(gc_heap).is_detached(gc_heap) {
+        if src.is_out_of_bounds(gc_heap) {
             return Err(VmError::TypeMismatch);
         }
         let len = src.length(gc_heap);

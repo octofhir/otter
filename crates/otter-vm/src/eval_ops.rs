@@ -473,6 +473,37 @@ impl Interpreter {
         self.build_dynamic_function_from_parts(parts, DynamicFunctionKind::Normal)
     }
 
+    /// Build a CommonJS module wrapper function and return it as a callable
+    /// value:
+    ///
+    /// ```text
+    /// (function anonymous(exports, require, module, __filename, __dirname) {
+    ///   <body>
+    /// })
+    /// ```
+    ///
+    /// Reentry-safe: like `new Function`, the synthesised body links into the
+    /// interpreter's code space (it does NOT go through [`Interpreter::run`],
+    /// which swaps `code_space` and is unsafe to call nested), so the returned
+    /// closure can be created from inside a native call and invoked through
+    /// [`Interpreter::run_callable_sync`]. Used by the runtime CommonJS loader
+    /// to execute `require`d modules.
+    ///
+    /// # Errors
+    /// Returns a `VmError` if the body fails to compile (surfaced as a
+    /// `SyntaxError`) or if the eval/compiler hook is not installed.
+    pub fn create_commonjs_wrapper(&mut self, body: &str) -> Result<Value, VmError> {
+        let parts = vec![
+            "exports".to_string(),
+            "require".to_string(),
+            "module".to_string(),
+            "__filename".to_string(),
+            "__dirname".to_string(),
+            body.to_string(),
+        ];
+        self.build_function_constructor_from_parts(parts)
+    }
+
     /// §20.2.1.1.1 CreateDynamicFunction steps 7–20: synthesise the
     /// `kind`-prefixed source text, compile through the eval hook, and
     /// return the resulting function value.

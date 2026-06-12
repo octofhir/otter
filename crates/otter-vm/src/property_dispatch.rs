@@ -2602,10 +2602,10 @@ impl Interpreter {
                     return Ok(());
                 }
                 let converted = self.typed_array_coerce_element(context, t.kind(), value)?;
-                if let Some(idx) = typed_array_valid_index(&t, &self.gc_heap, nf) {
-                    if !t.set_uint8_value(&mut self.gc_heap, idx, &converted) {
-                        t.set(&mut self.gc_heap, idx, &converted);
-                    }
+                if let Some(idx) = typed_array_valid_index(&t, &self.gc_heap, nf)
+                    && !t.set_uint8_value(&mut self.gc_heap, idx, &converted)
+                {
+                    t.set(&mut self.gc_heap, idx, &converted);
                 }
             } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let bag = typed_array_ensure_expando(self, &t)?;

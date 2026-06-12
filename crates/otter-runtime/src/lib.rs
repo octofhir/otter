@@ -52,6 +52,7 @@
 //! - [Engine architecture](../../../docs/book/src/engine/architecture.md)
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 
+mod commonjs;
 pub mod compiled_program;
 pub mod diagnostics;
 pub mod error;
@@ -998,6 +999,10 @@ pub(crate) struct RuntimeConfig {
     capabilities: CapabilitySet,
     loader: Option<module_loader::LoaderConfig>,
     hosted_modules: Vec<HostedModule>,
+    /// Enable Node-style CommonJS module execution (`require` / `module.exports`
+    /// / `__dirname`) for script-shaped sources. Off by default; opt in via
+    /// [`RuntimeBuilder::with_nodejs_modules`].
+    commonjs_enabled: bool,
     global_classes: Vec<GlobalClass>,
     global_installers: Vec<RuntimeGlobalInstaller>,
     allow_blocking_atomics_wait: bool,
@@ -1180,6 +1185,7 @@ impl Default for RuntimeConfig {
             capabilities: CapabilitySet::default(),
             loader: None,
             hosted_modules: Vec::new(),
+            commonjs_enabled: false,
             global_classes: Vec::new(),
             global_installers: Vec::new(),
             allow_blocking_atomics_wait: false,
@@ -1209,6 +1215,16 @@ fn string_oom_to_error(err: otter_gc::OutOfMemory) -> OtterError {
     OtterError::OutOfMemory {
         requested_bytes: err.requested_bytes(),
         heap_limit_bytes: err.heap_limit_bytes(),
+    }
+}
+
+/// Map a CommonJS loader error into the runtime error type. Errors thrown while
+/// loading a module surface as an internal diagnostic for now; richer
+/// thrown-value propagation lands with the Node module conformance work.
+fn commonjs_native_to_error(err: otter_vm::NativeError) -> OtterError {
+    OtterError::Internal {
+        code: "COMMONJS_LOAD".to_string(),
+        message: err.to_string(),
     }
 }
 
@@ -1271,6 +1287,17 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn hosted_modules(mut self, modules: impl IntoIterator<Item = HostedModule>) -> Self {
         self.config.hosted_modules.extend(modules);
+        self
+    }
+
+    /// Enable Node-style CommonJS module execution (`require`,
+    /// `module.exports`, `exports`, `__dirname`, `__filename`) for
+    /// script-shaped sources (`.cjs`, CommonJS-typed `.js`, and ambiguous
+    /// non-module `.js`). Builtin `require('node:fs')` / `require('fs')` resolve
+    /// through the registered hosted modules.
+    #[must_use]
+    pub fn with_nodejs_modules(mut self) -> Self {
+        self.config.commonjs_enabled = true;
         self
     }
 
@@ -2941,6 +2968,32 @@ impl Runtime {
             return self.run_module_with_context(path);
         }
         let specifier = path.to_string_lossy().to_string();
+        // The CommonJS wrapper compiles its body as JavaScript (through the
+        // eval/`new Function` path), so only route JavaScript-kind sources here.
+        // TypeScript CommonJS (`.cts`) needs type-stripping in the wrapper and
+        // is handled by the existing path until that lands.
+        let commonjs_kind = matches!(
+            source.kind,
+            SourceKind::JavaScript | SourceKind::JavaScriptJsx
+        );
+        if self.config.commonjs_enabled && commonjs_kind {
+            // CommonJS handles every script-shaped source. Only explicit ESM
+            // (module extension / package type, handled above) or an ambiguous
+            // source that actually parses as a module takes the ESM path.
+            if package_type == Some(module_loader::LoaderPackageType::CommonJs)
+                || source_path_has_script_extension(path)
+            {
+                return self.run_commonjs_file(path, source);
+            }
+            let looks_module = with_program(&source.text, source.kind, |program| {
+                Ok::<bool, OtterError>(program_looks_like_module(program))
+            })
+            .map_err(|err| map_syntax_error(err, &specifier))??;
+            if looks_module {
+                return self.run_module_with_context(path);
+            }
+            return self.run_commonjs_file(path, source);
+        }
         if package_type == Some(module_loader::LoaderPackageType::CommonJs) {
             return self.run_script_with_context(source, &specifier);
         }
@@ -2962,6 +3015,54 @@ impl Runtime {
         }
         let specifier = path.to_string_lossy().to_string();
         self.run_script_with_context(source, &specifier)
+    }
+
+    /// Execute a file as a CommonJS module: wrap it in
+    /// `(function (exports, require, module, __filename, __dirname) { ... })`,
+    /// invoke it with a per-module `require`, and run any microtasks it queued.
+    ///
+    /// Enabled by [`RuntimeBuilder::with_nodejs_modules`].
+    ///
+    /// # Errors
+    /// See [`OtterError`] variants — compile failures, capability denials, and
+    /// errors thrown while loading the module or its dependencies.
+    pub(crate) fn run_commonjs_file(
+        &mut self,
+        path: &Path,
+        source: SourceInput,
+    ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
+        let start = std::time::Instant::now();
+        let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let cfg = std::sync::Arc::new(commonjs::CjsConfig {
+            capabilities: self.config.capabilities.clone(),
+            hosted: self.config.hosted_modules.clone(),
+        });
+        // Entry execution context, linked into the interpreter code space so the
+        // wrapper closures resolve from any frame.
+        let empty = compile_script_source("", SourceKind::JavaScript, "<commonjs-root>")
+            .map_err(|err| map_compile_error(err, "<commonjs-root>"))?;
+        let context = self.interp.link_module(empty);
+        let load = {
+            let mut ctx = otter_vm::NativeCtx::new_with_call_info_and_context(
+                &mut self.interp,
+                otter_vm::NativeCallInfo::default_call(),
+                Some(context.clone()),
+            );
+            let cache = ctx.alloc_object().map_err(gc_oom_to_error)?;
+            commonjs::cjs_instantiate_file(&mut ctx, &cfg, cache, &abs, &source.text)
+        };
+        load.map_err(commonjs_native_to_error)?;
+        // Drain microtasks queued during module execution.
+        self.interp.drain_microtasks(&context).map_err(|err| {
+            enrich_runtime_diagnostic_with_cause(&mut self.interp, map_vm_error(err))
+        })?;
+        let result = ExecutionResult::from_vm_value(
+            otter_vm::Value::undefined(),
+            start.elapsed(),
+            self.interp.gc_heap_mut(),
+        )
+        .with_exit_code(process::exit_code(&self.interp));
+        Ok((result, context))
     }
 }
 
@@ -3222,6 +3323,14 @@ impl OtterBuilder {
     #[must_use]
     pub fn hosted_modules(mut self, modules: impl IntoIterator<Item = HostedModule>) -> Self {
         self.runtime = self.runtime.hosted_modules(modules);
+        self
+    }
+
+    /// Enable Node-style CommonJS module execution. See
+    /// [`RuntimeBuilder::with_nodejs_modules`].
+    #[must_use]
+    pub fn with_nodejs_modules(mut self) -> Self {
+        self.runtime = self.runtime.with_nodejs_modules();
         self
     }
 

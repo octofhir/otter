@@ -41,13 +41,15 @@ pub trait NodeApiBuilderExt: Sized {
 
 impl NodeApiBuilderExt for RuntimeBuilder {
     fn with_node_apis(self) -> Self {
-        self.hosted_modules(HOSTED_MODULES.iter().copied())
+        self.with_nodejs_modules()
+            .hosted_modules(HOSTED_MODULES.iter().copied())
     }
 }
 
 impl NodeApiBuilderExt for OtterBuilder {
     fn with_node_apis(self) -> Self {
-        self.hosted_modules(HOSTED_MODULES.iter().copied())
+        self.with_nodejs_modules()
+            .hosted_modules(HOSTED_MODULES.iter().copied())
     }
 }
 

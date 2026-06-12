@@ -6,11 +6,14 @@
 //! frame stack to root-aware allocation. This module owns the
 //! JS-visible static method specs installed on the constructor so
 //! reflective access (`Array.of.length`, `Array.of.call(C, ...)`,
-//! `Array.from.bind(...)`) resolves to a real callable.
+//! `Array.from.bind(...)`, `Array.fromAsync.name`) resolves to a real
+//! callable.
 //!
 //! # Contents
 //! - [`ARRAY_STATIC_METHODS`] — methods installed on the `Array`
 //!   constructor during bootstrap.
+//! - Minimal `Array.fromAsync` metadata surface; the async collection
+//!   algorithm is intentionally separate from this descriptor hook.
 //!
 //! # Invariants
 //! - The compiler's [`otter_bytecode::Op::ArrayOf`] /
@@ -24,6 +27,7 @@
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-array-constructor>
 //! - <https://tc39.es/ecma262/#sec-array>
 //! - <https://tc39.es/ecma262/#sec-array.from>
+//! - <https://tc39.es/ecma262/#sec-array.fromasync>
 //! - <https://tc39.es/ecma262/#sec-array.of>
 
 use crate::js_surface::{Attr, MethodSpec};
@@ -49,6 +53,12 @@ pub static ARRAY_STATIC_METHODS: &[MethodSpec] = &[
         length: 1,
         attrs: Attr::builtin_function(),
         call: NativeCall::Static(native_from),
+    },
+    MethodSpec {
+        name: "fromAsync",
+        length: 1,
+        attrs: Attr::builtin_function(),
+        call: NativeCall::Static(native_from_async),
     },
 ];
 
@@ -92,6 +102,20 @@ fn native_from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
     interp
         .array_from_sync(&exec, this_value, args)
         .map_err(|e| vm_to_native_array_static("Array.from", e))
+}
+
+/// §23.1.2.2 `Array.fromAsync(items, mapFn?, thisArg?)`.
+///
+/// Otter does not yet implement the async iterator / promise
+/// collection algorithm, but Test262 exposes the finalized builtin's
+/// reflective surface independently. Installing the real callable
+/// shape keeps descriptor conformance visible while a direct call
+/// still reports the missing runtime semantics.
+fn native_from_async(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    Err(NativeError::TypeError {
+        name: "Array.fromAsync",
+        reason: "Array.fromAsync collection is not implemented".to_string(),
+    })
 }
 
 fn vm_to_native_array_static(name: &'static str, err: VmError) -> NativeError {

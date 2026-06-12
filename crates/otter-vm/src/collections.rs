@@ -1450,14 +1450,19 @@ mod tests {
     fn map_object_key_survives_minor_relocation() {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let mut m = alloc_map(&mut heap).unwrap();
-        let key = young_object_value(&mut heap);
+        let mut key = young_object_value(&mut heap);
         let before = key.as_raw_gc().unwrap();
 
         map_set(m, &mut heap, key, n(42)).unwrap();
 
         let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visitor(std::ptr::addr_of_mut!(m) as *mut RawGc);
-            key.trace_value_slots(visitor);
+            // Root the live local `key` through a real mutable raw pointer to
+            // the local itself. The scavenger rewrites this slot in place to the
+            // relocated address; deriving the slot from a shared `&self`
+            // (`key.trace_value_slots`) is UB the release optimizer exploits by
+            // assuming `key` is unchanged across the collection.
+            visitor(std::ptr::addr_of_mut!(key) as *mut RawGc);
         };
         heap.collect_minor_with_roots(&mut roots);
 
@@ -1472,14 +1477,14 @@ mod tests {
     fn set_object_key_survives_minor_relocation() {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let mut s = alloc_set(&mut heap).unwrap();
-        let key = young_object_value(&mut heap);
+        let mut key = young_object_value(&mut heap);
         let before = key.as_raw_gc().unwrap();
 
         set_add(s, &mut heap, key).unwrap();
 
         let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visitor(std::ptr::addr_of_mut!(s) as *mut RawGc);
-            key.trace_value_slots(visitor);
+            visitor(std::ptr::addr_of_mut!(key) as *mut RawGc);
         };
         heap.collect_minor_with_roots(&mut roots);
 
@@ -1513,7 +1518,7 @@ mod tests {
     fn weakmap_young_key_and_value_survive_minor_relocation_when_key_rooted() {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let mut wm = alloc_weak_map(&mut heap).unwrap();
-        let key = young_object_value(&mut heap);
+        let mut key = young_object_value(&mut heap);
         let value = young_object_value(&mut heap);
         let key_before = key.as_raw_gc().unwrap();
         let value_before = value.as_raw_gc().unwrap();
@@ -1522,7 +1527,7 @@ mod tests {
 
         let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visitor(std::ptr::addr_of_mut!(wm) as *mut RawGc);
-            key.trace_value_slots(visitor);
+            visitor(std::ptr::addr_of_mut!(key) as *mut RawGc);
         };
         heap.collect_minor_with_roots(&mut roots);
 
@@ -1557,14 +1562,14 @@ mod tests {
     fn weakset_young_key_survives_minor_relocation_when_rooted() {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let mut ws = alloc_weak_set(&mut heap).unwrap();
-        let key = young_object_value(&mut heap);
+        let mut key = young_object_value(&mut heap);
         let before = key.as_raw_gc().unwrap();
 
         weak_set_add(ws, &mut heap, key).unwrap();
 
         let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visitor(std::ptr::addr_of_mut!(ws) as *mut RawGc);
-            key.trace_value_slots(visitor);
+            visitor(std::ptr::addr_of_mut!(key) as *mut RawGc);
         };
         heap.collect_minor_with_roots(&mut roots);
 

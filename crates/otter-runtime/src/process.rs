@@ -220,6 +220,32 @@ pub(crate) fn install_global(
         NativeCall::Static(process_umask),
     )?;
 
+    // Minimal EventEmitter surface so harness/test code that registers process
+    // event listeners loads. TODO: real event dispatch (exit/uncaughtException).
+    for name in [
+        "on",
+        "once",
+        "off",
+        "addListener",
+        "removeListener",
+        "prependListener",
+        "prependOnceListener",
+        "removeAllListeners",
+        "emit",
+        "listenerCount",
+        "listeners",
+        "setMaxListeners",
+    ] {
+        define_process_method(
+            interp,
+            process,
+            &process_root,
+            name,
+            1,
+            NativeCall::Static(process_event_noop),
+        )?;
+    }
+
     // `process.config.variables.*` is read by the Node test harness at load.
     let config = interp
         .alloc_host_object_with_roots(&[&process_root], &[])
@@ -281,6 +307,15 @@ fn process_umask(
     _args: &[otter_vm::Value],
 ) -> Result<otter_vm::Value, NativeError> {
     Ok(Value::number(NumberValue::from_i32(0)))
+}
+
+/// Placeholder for the `process` EventEmitter methods — accepts the call and
+/// does nothing. Returns `process` so chained calls work.
+fn process_event_noop(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[otter_vm::Value],
+) -> Result<otter_vm::Value, NativeError> {
+    Ok(*ctx.this_value())
 }
 
 fn define_process_method(

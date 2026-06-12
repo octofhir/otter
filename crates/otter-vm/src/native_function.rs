@@ -1270,7 +1270,7 @@ impl From<otter_gc::OutOfMemory> for NativeError {
 /// as [`NativeError::Thrown`] so callbacks that `throw` surface intact;
 /// the spec error classes map to their `NativeError` counterparts and
 /// everything else falls back to a `TypeError` with the rendered cause.
-pub(crate) fn vm_to_native_error(err: crate::VmError, name: &'static str) -> NativeError {
+pub fn vm_to_native_error(err: crate::VmError, name: &'static str) -> NativeError {
     match err {
         crate::VmError::Uncaught { value } => NativeError::Thrown {
             name,

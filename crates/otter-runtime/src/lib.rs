@@ -1255,13 +1255,22 @@ fn string_oom_to_error(err: otter_gc::OutOfMemory) -> OtterError {
     }
 }
 
-/// Map a CommonJS loader error into the runtime error type. Errors thrown while
-/// loading a module surface as an internal diagnostic for now; richer
-/// thrown-value propagation lands with the Node module conformance work.
+/// Map a CommonJS loader error into the runtime error type, rendering the
+/// carried context once at this outermost boundary (a thrown JS value is
+/// preserved intact through nested `require`s and only stringified here).
 fn commonjs_native_to_error(err: otter_vm::NativeError) -> OtterError {
+    let message = match err {
+        otter_vm::NativeError::Thrown { message, .. } => message,
+        otter_vm::NativeError::TypeError { reason, .. }
+        | otter_vm::NativeError::RangeError { reason, .. }
+        | otter_vm::NativeError::SyntaxError { reason, .. }
+        | otter_vm::NativeError::ReferenceError { reason, .. }
+        | otter_vm::NativeError::URIError { reason, .. } => reason,
+        other => other.to_string(),
+    };
     OtterError::Internal {
         code: "COMMONJS_LOAD".to_string(),
-        message: err.to_string(),
+        message,
     }
 }
 
@@ -2067,6 +2076,13 @@ impl Runtime {
 
     pub(crate) fn global_this_value(&self) -> otter_vm::Value {
         otter_vm::Value::object(*self.interp.global_this())
+    }
+
+    /// The `globalThis` object as a value. Used by hosts that expose an alias
+    /// global (e.g. Node's `global`).
+    #[must_use]
+    pub fn global_this(&self) -> otter_vm::Value {
+        self.global_this_value()
     }
 
     /// Install a host-defined native function as a global binding.
@@ -3368,6 +3384,14 @@ impl OtterBuilder {
     #[must_use]
     pub fn with_nodejs_modules(mut self) -> Self {
         self.runtime = self.runtime.with_nodejs_modules();
+        self
+    }
+
+    /// Register a global installer that runs on every isolate. See
+    /// [`RuntimeBuilder::global_installer`].
+    #[must_use]
+    pub fn global_installer(mut self, installer: RuntimeGlobalInstaller) -> Self {
+        self.runtime = self.runtime.global_installer(installer);
         self
     }
 

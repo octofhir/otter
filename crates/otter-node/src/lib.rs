@@ -18,6 +18,7 @@
 
 pub mod assert;
 pub mod fs;
+pub mod globals;
 pub mod path;
 pub mod stubs;
 
@@ -92,6 +93,7 @@ pub trait NodeApiBuilderExt: Sized {
 impl NodeApiBuilderExt for RuntimeBuilder {
     fn with_node_apis(self) -> Self {
         self.with_nodejs_modules()
+            .global_installer(globals::node_globals_installer())
             .hosted_modules(HOSTED_MODULES.iter().copied())
     }
 }
@@ -99,6 +101,7 @@ impl NodeApiBuilderExt for RuntimeBuilder {
 impl NodeApiBuilderExt for OtterBuilder {
     fn with_node_apis(self) -> Self {
         self.with_nodejs_modules()
+            .global_installer(globals::node_globals_installer())
             .hosted_modules(HOSTED_MODULES.iter().copied())
     }
 }

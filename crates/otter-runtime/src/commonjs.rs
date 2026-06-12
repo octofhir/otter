@@ -47,8 +47,11 @@ fn oom(err: impl std::fmt::Display) -> NativeError {
     runtime_type_error("require", format!("out of memory: {err}"))
 }
 
+/// Propagate a VM error across the `require` boundary *intact* — a thrown JS
+/// value stays a thrown value (no re-wrapping/stringifying at each nested
+/// require level), so the original error survives to the outermost boundary.
 fn vm_err(err: otter_vm::VmError) -> NativeError {
-    runtime_type_error("require", format!("{err:?}"))
+    otter_vm::native_function::vm_to_native_error(err, "require")
 }
 
 /// Resolve a builtin (hosted) module by specifier. Matches the bare specifier

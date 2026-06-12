@@ -24,6 +24,7 @@
 extern crate otter_runtime as otter_vm;
 
 pub mod blob;
+pub mod globals;
 pub mod headers;
 pub mod request_response;
 pub mod url;
@@ -55,13 +56,17 @@ pub const fn web_api_classes() -> &'static [GlobalClass] {
 /// Register active Web API globals on a runtime builder.
 #[must_use]
 pub fn with_web_apis(builder: RuntimeBuilder) -> RuntimeBuilder {
-    builder.global_classes(WEB_API_CLASSES.iter().copied())
+    builder
+        .global_classes(WEB_API_CLASSES.iter().copied())
+        .global_installer(globals::web_globals_installer())
 }
 
 /// Register active Web API globals on a Layer-A builder.
 #[must_use]
 pub fn with_web_apis_for_otter(builder: OtterBuilder) -> OtterBuilder {
-    builder.global_classes(WEB_API_CLASSES.iter().copied())
+    builder
+        .global_classes(WEB_API_CLASSES.iter().copied())
+        .global_installer(globals::web_globals_installer())
 }
 
 /// Ergonomic extension trait for enabling Web APIs on builders.

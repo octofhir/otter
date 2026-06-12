@@ -127,9 +127,9 @@ test262-site:
     cargo run --release -p otter-test262 --bin otter-test262 -- site test262_results/latest.json --output test262_results/site/index.html
     cp test262_results/latest.json docs/site/public/conformance/data.json
 
-# Generate ES_CONFORMANCE.md from latest test262 results
-test262-conformance:
-    @echo "test262 conformance generation is not wired in the current otter-test262 runner; update ES_CONFORMANCE.md from the generated JSON/Markdown report."
+# Generate ES_CONFORMANCE.md from a test262 results JSON (default: latest run).
+test262-conformance input="test262_results/run.json":
+    cargo run -p otter-test262 -- conformance {{input}} --output ES_CONFORMANCE.md
 
 # === Test262 (active engine, crates/otter-test262) ===
 #

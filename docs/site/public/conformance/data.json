@@ -1,14 +1,14 @@
 {
   "test262_commit": "7e115f46ac64340827d505fa928ad436cb7ba5a6",
-  "engine_commit": "7ce8096f886e1110a04dc6744cd83d0a918bb5f2",
-  "ran_at": "2026-06-11T20:11:43.771701+00:00",
+  "engine_commit": "9cf6c244852130acfb83a74e624660dbdcdf4420",
+  "ran_at": "2026-06-12T22:21:42.325561+00:00",
   "totals": {
-    "total": 51769,
-    "passed": 48573,
-    "failed": 1933,
-    "skipped": 1248,
+    "total": 53173,
+    "passed": 50151,
+    "failed": 1753,
+    "skipped": 1256,
     "crashed": 0,
-    "timed_out": 14,
+    "timed_out": 12,
     "oom": 1
   },
   "by_section": {
@@ -50,8 +50,8 @@
     },
     "annexB/built-ins/RegExp": {
       "total": 62,
-      "passed": 46,
-      "failed": 7,
+      "passed": 52,
+      "failed": 1,
       "skipped": 9,
       "crashed": 0,
       "timed_out": 0,
@@ -149,8 +149,8 @@
     },
     "annexB/language/statements": {
       "total": 22,
-      "passed": 18,
-      "failed": 4,
+      "passed": 19,
+      "failed": 3,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -212,8 +212,8 @@
     },
     "built-ins/AggregateError/cause-property.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -221,8 +221,8 @@
     },
     "built-ins/AggregateError/errors-iterabletolist-failures.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -230,8 +230,8 @@
     },
     "built-ins/AggregateError/errors-iterabletolist.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -347,8 +347,8 @@
     },
     "built-ins/AggregateError/order-of-args-evaluation.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -761,8 +761,8 @@
     },
     "built-ins/Array/fromAsync": {
       "total": 95,
-      "passed": 90,
-      "failed": 5,
+      "passed": 95,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -779,8 +779,8 @@
     },
     "built-ins/Array/isArray": {
       "total": 29,
-      "passed": 28,
-      "failed": 1,
+      "passed": 29,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -788,8 +788,8 @@
     },
     "built-ins/Array/length": {
       "total": 30,
-      "passed": 28,
-      "failed": 1,
+      "passed": 29,
+      "failed": 0,
       "skipped": 1,
       "crashed": 0,
       "timed_out": 0,
@@ -896,8 +896,8 @@
     },
     "built-ins/Array/prototype": {
       "total": 2810,
-      "passed": 2791,
-      "failed": 9,
+      "passed": 2800,
+      "failed": 0,
       "skipped": 10,
       "crashed": 0,
       "timed_out": 0,
@@ -1022,8 +1022,8 @@
     },
     "built-ins/ArrayBuffer/options-maxbytelength-compared-before-object-creation.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -1040,8 +1040,8 @@
     },
     "built-ins/ArrayBuffer/options-maxbytelength-diminuitive.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -1067,8 +1067,8 @@
     },
     "built-ins/ArrayBuffer/options-maxbytelength-object.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -1076,8 +1076,8 @@
     },
     "built-ins/ArrayBuffer/options-maxbytelength-poisoned.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -1085,8 +1085,8 @@
     },
     "built-ins/ArrayBuffer/options-maxbytelength-undefined.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -1805,11 +1805,11 @@
     },
     "built-ins/Atomics/notify": {
       "total": 52,
-      "passed": 49,
+      "passed": 51,
       "failed": 0,
       "skipped": 1,
       "crashed": 0,
-      "timed_out": 2,
+      "timed_out": 0,
       "oom": 0
     },
     "built-ins/Atomics/or": {
@@ -1868,11 +1868,11 @@
     },
     "built-ins/Atomics/wait": {
       "total": 77,
-      "passed": 76,
+      "passed": 75,
       "failed": 0,
       "skipped": 0,
       "crashed": 0,
-      "timed_out": 1,
+      "timed_out": 2,
       "oom": 0
     },
     "built-ins/Atomics/waitAsync": {
@@ -2408,8 +2408,8 @@
     },
     "built-ins/DataView/byteOffset-validated-against-initial-buffer-length.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -3794,8 +3794,8 @@
     },
     "built-ins/Error/cause_abrupt.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -3803,8 +3803,8 @@
     },
     "built-ins/Error/cause_property.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -3812,8 +3812,8 @@
     },
     "built-ins/Error/constructor.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -3920,8 +3920,8 @@
     },
     "built-ins/Error/prototype": {
       "total": 65,
-      "passed": 59,
-      "failed": 4,
+      "passed": 63,
+      "failed": 0,
       "skipped": 2,
       "crashed": 0,
       "timed_out": 0,
@@ -5666,8 +5666,8 @@
     },
     "built-ins/Function/internals": {
       "total": 8,
-      "passed": 3,
-      "failed": 1,
+      "passed": 4,
+      "failed": 0,
       "skipped": 4,
       "crashed": 0,
       "timed_out": 0,
@@ -8807,8 +8807,8 @@
     },
     "built-ins/Object/defineProperty": {
       "total": 1131,
-      "passed": 1129,
-      "failed": 2,
+      "passed": 1131,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -8852,8 +8852,8 @@
     },
     "built-ins/Object/getOwnPropertyDescriptors": {
       "total": 18,
-      "passed": 17,
-      "failed": 1,
+      "passed": 18,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -9698,8 +9698,8 @@
     },
     "built-ins/Proxy/construct": {
       "total": 29,
-      "passed": 17,
-      "failed": 1,
+      "passed": 18,
+      "failed": 0,
       "skipped": 11,
       "crashed": 0,
       "timed_out": 0,
@@ -9878,8 +9878,8 @@
     },
     "built-ins/Proxy/deleteProperty": {
       "total": 17,
-      "passed": 15,
-      "failed": 1,
+      "passed": 16,
+      "failed": 0,
       "skipped": 1,
       "crashed": 0,
       "timed_out": 0,
@@ -9887,8 +9887,8 @@
     },
     "built-ins/Proxy/enumerate": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -9950,8 +9950,8 @@
     },
     "built-ins/Proxy/has": {
       "total": 26,
-      "passed": 22,
-      "failed": 3,
+      "passed": 25,
+      "failed": 0,
       "skipped": 1,
       "crashed": 0,
       "timed_out": 0,
@@ -10022,8 +10022,8 @@
     },
     "built-ins/Proxy/proxy-no-prototype.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -10049,8 +10049,8 @@
     },
     "built-ins/Proxy/revocable": {
       "total": 18,
-      "passed": 16,
-      "failed": 2,
+      "passed": 18,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -10058,8 +10058,8 @@
     },
     "built-ins/Proxy/set": {
       "total": 27,
-      "passed": 24,
-      "failed": 2,
+      "passed": 26,
+      "failed": 0,
       "skipped": 1,
       "crashed": 0,
       "timed_out": 0,
@@ -11435,8 +11435,8 @@
     },
     "built-ins/RegExp/S15.10.2.5_A1_T4.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -13676,8 +13676,8 @@
     },
     "built-ins/RegExp/duplicate-named-capturing-groups-syntax.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -13964,8 +13964,8 @@
     },
     "built-ins/RegExp/lookBehind": {
       "total": 17,
-      "passed": 13,
-      "failed": 4,
+      "passed": 14,
+      "failed": 3,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -13982,8 +13982,8 @@
     },
     "built-ins/RegExp/match-indices": {
       "total": 14,
-      "passed": 13,
-      "failed": 1,
+      "passed": 14,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -13991,8 +13991,8 @@
     },
     "built-ins/RegExp/named-groups": {
       "total": 36,
-      "passed": 26,
-      "failed": 10,
+      "passed": 36,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -14036,8 +14036,8 @@
     },
     "built-ins/RegExp/prototype": {
       "total": 487,
-      "passed": 474,
-      "failed": 3,
+      "passed": 477,
+      "failed": 0,
       "skipped": 10,
       "crashed": 0,
       "timed_out": 0,
@@ -14621,8 +14621,8 @@
     },
     "built-ins/RegExp/unicode_restricted_character_class_escape.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -14630,8 +14630,8 @@
     },
     "built-ins/RegExp/unicode_restricted_identity_escape.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -14693,8 +14693,8 @@
     },
     "built-ins/RegExp/unicode_restricted_quantifiable_assertion.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -15161,8 +15161,8 @@
     },
     "built-ins/SharedArrayBuffer/options-maxbytelength-compared-before-object-creation.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -15179,8 +15179,8 @@
     },
     "built-ins/SharedArrayBuffer/options-maxbytelength-diminuitive.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -15206,8 +15206,8 @@
     },
     "built-ins/SharedArrayBuffer/options-maxbytelength-object.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -15215,8 +15215,8 @@
     },
     "built-ins/SharedArrayBuffer/options-maxbytelength-poisoned.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -15224,8 +15224,8 @@
     },
     "built-ins/SharedArrayBuffer/options-maxbytelength-undefined.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16142,8 +16142,8 @@
     },
     "built-ins/String/prototype": {
       "total": 1073,
-      "passed": 1067,
-      "failed": 4,
+      "passed": 1071,
+      "failed": 0,
       "skipped": 2,
       "crashed": 0,
       "timed_out": 0,
@@ -16637,8 +16637,8 @@
     },
     "built-ins/Temporal/Instant": {
       "total": 465,
-      "passed": 453,
-      "failed": 12,
+      "passed": 454,
+      "failed": 11,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16664,8 +16664,8 @@
     },
     "built-ins/Temporal/PlainDateTime": {
       "total": 773,
-      "passed": 759,
-      "failed": 13,
+      "passed": 760,
+      "failed": 12,
       "skipped": 1,
       "crashed": 0,
       "timed_out": 0,
@@ -16682,8 +16682,8 @@
     },
     "built-ins/Temporal/PlainTime": {
       "total": 493,
-      "passed": 484,
-      "failed": 9,
+      "passed": 485,
+      "failed": 8,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16700,8 +16700,8 @@
     },
     "built-ins/Temporal/ZonedDateTime": {
       "total": 901,
-      "passed": 843,
-      "failed": 58,
+      "passed": 845,
+      "failed": 56,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16950,6 +16950,15 @@
       "timed_out": 0,
       "oom": 0
     },
+    "built-ins/TypedArray/prototype": {
+      "total": 1404,
+      "passed": 1396,
+      "failed": 0,
+      "skipped": 8,
+      "crashed": 0,
+      "timed_out": 0,
+      "oom": 0
+    },
     "built-ins/TypedArray/prototype.js": {
       "total": 1,
       "passed": 1,
@@ -17078,8 +17087,8 @@
     },
     "built-ins/TypedArrayConstructors/ctors": {
       "total": 116,
-      "passed": 108,
-      "failed": 2,
+      "passed": 110,
+      "failed": 0,
       "skipped": 6,
       "crashed": 0,
       "timed_out": 0,
@@ -17105,8 +17114,8 @@
     },
     "built-ins/TypedArrayConstructors/internals": {
       "total": 240,
-      "passed": 228,
-      "failed": 2,
+      "passed": 230,
+      "failed": 0,
       "skipped": 10,
       "crashed": 0,
       "timed_out": 0,
@@ -18041,11 +18050,11 @@
     },
     "built-ins/decodeURI/S15.1.3.1_A2.5_T1.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
       "skipped": 0,
       "crashed": 0,
-      "timed_out": 1,
+      "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURI/S15.1.3.1_A3_T1.js": {
@@ -21740,8 +21749,8 @@
     },
     "intl402/DisplayNames/ctor-custom-get-prototype-poison-throws.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -23675,8 +23684,8 @@
     },
     "intl402/Segmenter/ctor-custom-get-prototype-poison-throws.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -24143,8 +24152,8 @@
     },
     "language/arguments-object/10.6-13-a-2.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -24152,8 +24161,8 @@
     },
     "language/arguments-object/10.6-13-a-3.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -25907,8 +25916,8 @@
     },
     "language/arguments-object/mapped": {
       "total": 43,
-      "passed": 40,
-      "failed": 3,
+      "passed": 43,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -26915,8 +26924,8 @@
     },
     "language/block-scope/shadowing": {
       "total": 15,
-      "passed": 14,
-      "failed": 1,
+      "passed": 15,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -27923,8 +27932,8 @@
     },
     "language/expressions/class": {
       "total": 4059,
-      "passed": 4040,
-      "failed": 9,
+      "passed": 4041,
+      "failed": 8,
       "skipped": 10,
       "crashed": 0,
       "timed_out": 0,
@@ -31019,8 +31028,8 @@
     },
     "language/global-code/new.target-arrow.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -31028,8 +31037,8 @@
     },
     "language/global-code/new.target.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -38309,8 +38318,8 @@
     },
     "language/statements/class": {
       "total": 4367,
-      "passed": 4351,
-      "failed": 16,
+      "passed": 4355,
+      "failed": 12,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39254,8 +39263,8 @@
     },
     "staging/built-ins/RegExp": {
       "total": 4,
-      "passed": 2,
-      "failed": 2,
+      "passed": 4,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39821,8 +39830,8 @@
     },
     "staging/sm/Array": {
       "total": 90,
-      "passed": 68,
-      "failed": 22,
+      "passed": 76,
+      "failed": 14,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39830,8 +39839,8 @@
     },
     "staging/sm/ArrayBuffer": {
       "total": 5,
-      "passed": 4,
-      "failed": 1,
+      "passed": 5,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39848,8 +39857,8 @@
     },
     "staging/sm/Atomics": {
       "total": 2,
-      "passed": 0,
-      "failed": 2,
+      "passed": 1,
+      "failed": 1,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39884,8 +39893,8 @@
     },
     "staging/sm/Date": {
       "total": 28,
-      "passed": 17,
-      "failed": 3,
+      "passed": 18,
+      "failed": 2,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 8,
@@ -39920,8 +39929,8 @@
     },
     "staging/sm/Iterator": {
       "total": 174,
-      "passed": 146,
-      "failed": 28,
+      "passed": 149,
+      "failed": 25,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39974,8 +39983,8 @@
     },
     "staging/sm/Promise": {
       "total": 6,
-      "passed": 5,
-      "failed": 1,
+      "passed": 6,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39983,8 +39992,8 @@
     },
     "staging/sm/Proxy": {
       "total": 24,
-      "passed": 13,
-      "failed": 11,
+      "passed": 15,
+      "failed": 9,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39992,8 +40001,8 @@
     },
     "staging/sm/Reflect": {
       "total": 17,
-      "passed": 11,
-      "failed": 6,
+      "passed": 13,
+      "failed": 4,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40001,8 +40010,8 @@
     },
     "staging/sm/RegExp": {
       "total": 91,
-      "passed": 63,
-      "failed": 28,
+      "passed": 69,
+      "failed": 22,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40019,8 +40028,8 @@
     },
     "staging/sm/String": {
       "total": 47,
-      "passed": 40,
-      "failed": 5,
+      "passed": 43,
+      "failed": 2,
       "skipped": 1,
       "crashed": 0,
       "timed_out": 1,
@@ -40028,8 +40037,8 @@
     },
     "staging/sm/Symbol": {
       "total": 30,
-      "passed": 24,
-      "failed": 6,
+      "passed": 27,
+      "failed": 3,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40037,8 +40046,8 @@
     },
     "staging/sm/TypedArray": {
       "total": 96,
-      "passed": 60,
-      "failed": 36,
+      "passed": 87,
+      "failed": 9,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40073,8 +40082,8 @@
     },
     "staging/sm/class": {
       "total": 94,
-      "passed": 71,
-      "failed": 23,
+      "passed": 72,
+      "failed": 22,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40082,8 +40091,8 @@
     },
     "staging/sm/destructuring": {
       "total": 7,
-      "passed": 5,
-      "failed": 2,
+      "passed": 6,
+      "failed": 1,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40109,8 +40118,8 @@
     },
     "staging/sm/extensions": {
       "total": 64,
-      "passed": 49,
-      "failed": 14,
+      "passed": 51,
+      "failed": 12,
       "skipped": 1,
       "crashed": 0,
       "timed_out": 0,
@@ -40181,8 +40190,8 @@
     },
     "staging/sm/object": {
       "total": 65,
-      "passed": 54,
-      "failed": 11,
+      "passed": 55,
+      "failed": 10,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40190,8 +40199,8 @@
     },
     "staging/sm/regress": {
       "total": 106,
-      "passed": 86,
-      "failed": 19,
+      "passed": 88,
+      "failed": 17,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40208,8 +40217,8 @@
     },
     "staging/sm/strict": {
       "total": 51,
-      "passed": 43,
-      "failed": 8,
+      "passed": 47,
+      "failed": 4,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40217,8 +40226,8 @@
     },
     "staging/sm/syntax": {
       "total": 11,
-      "passed": 9,
-      "failed": 2,
+      "passed": 10,
+      "failed": 1,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40253,156 +40262,6 @@
     }
   },
   "failing_tests": [
-    {
-      "path": "built-ins/AggregateError/cause-property.js",
-      "esid": "sec-aggregate-error",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: cause descriptor should not be enumerable"
-    },
-    {
-      "path": "built-ins/AggregateError/errors-iterabletolist-failures.js",
-      "esid": "sec-aggregate-error",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: get Symbol.iterator Expected a Test262Error to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/AggregateError/errors-iterabletolist.js",
-      "esid": "sec-aggregate-error",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«0», «3») to be true"
-    },
-    {
-      "path": "built-ins/AggregateError/order-of-args-evaluation.js",
-      "esid": "sec-aggregate-error",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«1», «3») to be true"
-    },
-    {
-      "path": "built-ins/Array/fromAsync/builtin.js",
-      "esid": "sec-array.fromasync",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Array.fromAsync is extensible"
-    },
-    {
-      "path": "built-ins/Array/fromAsync/length.js",
-      "esid": "sec-array.fromasync",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: getOwnPropertyDescriptor: Object static method called on null or undefined"
-    },
-    {
-      "path": "built-ins/Array/fromAsync/name.js",
-      "esid": "sec-array.fromasync",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: getOwnPropertyDescriptor: Object static method called on null or undefined"
-    },
-    {
-      "path": "built-ins/Array/fromAsync/not-a-constructor.js",
-      "esid": "sec-array.fromasync",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: isConstructor invoked with a non-function value"
-    },
-    {
-      "path": "built-ins/Array/fromAsync/prop-desc.js",
-      "esid": "sec-array.fromasync",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Array.fromAsync is callable Expected SameValue(«\"undefined\"», «\"function\"») to be true"
-    },
-    {
-      "path": "built-ins/Array/isArray/15.4.3.2-0-5.js",
-      "esid": "sec-array.isarray",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Array.isArray(Array.prototype) must return true Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "built-ins/Array/length/S15.4.4_A1.3_T1.js",
-      "esid": "sec-properties-of-the-array-prototype-object",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: The value of Array.prototype.length is expected to be 0 Expected SameValue(«undefined», «0») to be true"
-    },
-    {
-      "path": "built-ins/Array/prototype/exotic-array.js",
-      "esid": "sec-properties-of-the-array-prototype-object",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «3») to be true"
-    },
-    {
-      "path": "built-ins/Array/prototype/filter/15.4.4.20-9-b-6.js",
-      "esid": "sec-array.prototype.filter",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: type mismatch: this operation does not accept a value of this type"
-    },
-    {
-      "path": "built-ins/Array/prototype/findLast/maximum-index.js",
-      "esid": "sec-array.prototype.findlast",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: predicate invoked once Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "built-ins/Array/prototype/findLastIndex/maximum-index.js",
-      "esid": "sec-array.prototype.findlastindex",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: predicate invoked once Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "built-ins/Array/prototype/length.js",
-      "esid": "sec-properties-of-the-array-prototype-object",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «0») to be true"
-    },
-    {
-      "path": "built-ins/Array/prototype/reverse/get_if_present_with_delete.js",
-      "esid": "sec-array.prototype.reverse",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Indexed property '0' not present Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "built-ins/Array/prototype/reverse/length-exceeding-integer-limit-with-proxy.js",
-      "esid": "sec-array.prototype.reverse",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [Get:length, Has:0, Has:9007199254740990, Get:0, Get:9007199254740990, Set:0, GetOwnPropertyDescriptor:0, DefineProperty:0, Set:9007199254740990, GetOwnPropertyDescriptor:9007199254740990, DefineProperty:9007199254740990, Has:1, Has:9007199254740989, Has:2, Has:9007199254740988, Get:2, Delete:2, Set:9007199254740988, GetOwnPropertyDescriptor:9007199254740988, DefineProperty:9007199254740988, Has:3, Has:9007199254740987, Get:9007199254740987, Set:3, GetOwnPropertyDescriptor:3, DefineProperty:3, Delete:9007199254740987, Has:4, Has:9007199254740986, Get:4] and expected [Get:length, Has:0, Get:0, Has:9007199254740990, Get:9007199254740990, Set:0, GetOwnPropertyDescriptor:0, DefineProperty:0, Set:9007199254740990, GetOwnPropertyDescriptor:9007199254740990, DefineProperty:9007199254740990, Has:1, Has:9007199254740989, Has:2, Get:2, Has:9007199254740988, Delete:2, Set:9007199254740988, GetOwnPropertyDescriptor:9007199254740988, DefineProperty:9007199254740988, Has:3, Has:9007199254740987, Get:9007199254740987, Set:3, GetOwnPropertyDescriptor:3, DefineProperty:3, Delete:9007199254740987, Has:4, Get:4] should have the same contents. The value of traps is expected to be [\n  // Initial get length operation.\n  \"Get:length\",\n\n  // Lower and upper index are both present.\n  \"Has:0\",\n  \"Get:0\",\n  \"Has:9007199254740990\",\n  \"Get:9007199254740990\",\n  \"Set:0\",\n  \"GetOwnPropertyDescriptor:0\",\n  \"DefineProperty:0\",\n  \"Set:9007199254740990\",\n  \"GetOwnPropertyDescriptor:9007199254740990\",\n  \"DefineProperty:9007199254740990\",\n\n  // Lower and upper index are both absent.\n  \"Has:1\",\n  \"Has:9007199254740989\",\n\n  // Lower index is present, upper index is absent.\n  \"Has:2\",\n  \"Get:2\",\n  \"Has:9007199254740988\",\n  \"Delete:2\",\n  \"Set:9007199254740988\",\n  \"GetOwnPropertyDescriptor:9007199254740988\",\n  \"DefineProperty:9007199254740988\",\n\n  // Lower index is absent, upper index is present.\n  \"Has:3\",\n  \"Has:9007199254740987\",\n  \"Get:9007199254740987\",\n  \"Set:3\",\n  \"GetOwnPropertyDescriptor:3\",\n  \"DefineProperty:3\",\n  \"Delete:9007199254740987\",\n\n  // Stop exception.\n  \"Has:4\",\n  \"Get:4\",\n]"
-    },
-    {
-      "path": "built-ins/Array/prototype/splice/create-species-length-exceeding-integer-limit.js",
-      "esid": "sec-array.prototype.splice",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: // deleteCount argument exceeding 2^53-1. Array.prototype.splice.call(source, 0, 2 ** 53 + 4) throws a StopSplice exception Expected a StopSplice but got a TypeError"
-    },
-    {
-      "path": "built-ins/Array/prototype/splice/property-traps-order-with-species.js",
-      "esid": "sec-array.prototype.splice",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [defineProperty, defineProperty, set, getOwnPropertyDescriptor, defineProperty] and expected [defineProperty, defineProperty, set] should have the same contents. "
-    },
-    {
-      "path": "built-ins/ArrayBuffer/options-maxbytelength-compared-before-object-creation.js",
-      "esid": "sec-arraybuffer-length",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError but got a Test262Error"
-    },
-    {
-      "path": "built-ins/ArrayBuffer/options-maxbytelength-diminuitive.js",
-      "esid": "sec-arraybuffer-constructor",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError but got a TypeError"
-    },
-    {
-      "path": "built-ins/ArrayBuffer/options-maxbytelength-object.js",
-      "esid": "sec-arraybuffer-constructor",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError but got a RangeError"
-    },
-    {
-      "path": "built-ins/ArrayBuffer/options-maxbytelength-poisoned.js",
-      "esid": "sec-arraybuffer-constructor",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a Test262Error to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/ArrayBuffer/options-maxbytelength-undefined.js",
-      "esid": "sec-arraybuffer-constructor",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«true», «false») to be true"
-    },
     {
       "path": "built-ins/AsyncFunction/AsyncFunction-is-extensible.js",
       "esid": "pending",
@@ -40500,18 +40359,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError but got a Test262Error"
     },
     {
-      "path": "built-ins/Atomics/notify/bigint/notify-all-on-loc.js",
-      "esid": "sec-atomics.notify",
-      "outcome": "timeout",
-      "reason": "timeout after 10005 ms"
-    },
-    {
-      "path": "built-ins/Atomics/notify/notify-zero.js",
-      "esid": "sec-atomics.notify",
-      "outcome": "timeout",
-      "reason": "timeout after 10005 ms"
-    },
-    {
       "path": "built-ins/Atomics/or/non-shared-int-views-throws.js",
       "esid": "sec-atomics.or",
       "outcome": "fail",
@@ -40569,7 +40416,13 @@
       "path": "built-ins/Atomics/wait/bigint/waiterlist-order-of-operations-is-fifo.js",
       "esid": "sec-atomics.wait",
       "outcome": "timeout",
-      "reason": "timeout after 10003 ms"
+      "reason": "timeout after 10004 ms"
+    },
+    {
+      "path": "built-ins/Atomics/wait/waiterlist-order-of-operations-is-fifo.js",
+      "esid": "sec-atomics.wait",
+      "outcome": "timeout",
+      "reason": "timeout after 10002 ms"
     },
     {
       "path": "built-ins/Atomics/waitAsync/bigint/false-for-timeout.js",
@@ -40662,12 +40515,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError but got a Test262Error"
     },
     {
-      "path": "built-ins/DataView/byteOffset-validated-against-initial-buffer-length.js",
-      "esid": "sec-dataview-buffer-byteoffset-bytelength",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError but got a Test262Error"
-    },
-    {
       "path": "built-ins/decodeURI/S15.1.3.1_A1.10_T1.js",
       "esid": "sec-decodeuri-encodeduri",
       "outcome": "fail",
@@ -40722,12 +40569,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #D800 differs"
     },
     {
-      "path": "built-ins/decodeURI/S15.1.3.1_A2.5_T1.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "timeout",
-      "reason": "timeout after 10188 ms"
-    },
-    {
       "path": "built-ins/decodeURI/S15.1.3.1_A3_T1.js",
       "esid": "sec-decodeuri-encodeduri",
       "outcome": "fail",
@@ -40764,58 +40605,10 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: If B = 11110xxx (n = 4) and (string.charAt(k + 10) and string.charAt(k + 11)) do not represent hexadecimal digits, throw URIError"
     },
     {
-      "path": "built-ins/Error/cause_abrupt.js",
-      "esid": "sec-error-message",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: HasProperty Expected a Test262Error to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Error/cause_property.js",
-      "esid": "sec-error-message",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: cause descriptor should not be enumerable"
-    },
-    {
-      "path": "built-ins/Error/constructor.js",
-      "esid": "sec-error-message",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [cause, toString] and expected [toString, cause] should have the same contents. accessing own properties on sequence"
-    },
-    {
-      "path": "built-ins/Error/prototype/stack/setter-proxy-trap-rejects.js",
-      "esid": "sec-set-error.prototype.stack",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: set trap returns false Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Error/prototype/stack/setter-proxy-trap-throws.js",
-      "esid": "sec-set-error.prototype.stack",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: set trap throw Expected a Sentinel to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Error/prototype/stack/setter-proxy-wrapping-prototype.js",
-      "esid": "sec-set-error.prototype.stack",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: set Error.prototype.stack: maximum call stack size exceeded (limit 256)"
-    },
-    {
-      "path": "built-ins/Error/prototype/stack/setter-receiver-is-proxy.js",
-      "esid": "sec-set-error.prototype.stack",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: (b): [[DefineOwnProperty]] trap called"
-    },
-    {
       "path": "built-ins/FinalizationRegistry/prototype/register/return-undefined-register-object.js",
       "esid": "sec-finalization-registry.prototype.register",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: FinalizationRegistry.prototype.register: type mismatch: this operation does not accept a value of this type"
-    },
-    {
-      "path": "built-ins/Function/internals/Construct/base-ctor-revoked-proxy.js",
-      "esid": "sec-ecmascript-function-objects-construct-argumentslist-newtarget",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
     },
     {
       "path": "built-ins/global/10.2.1.1.3-4-16-s.js",
@@ -40845,22 +40638,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: The result of evaluating (1 / Math.round(x)) is expected to be 1 / 0 Expected SameValue(«1», «Infinity») to be true"
     },
     {
-      "path": "built-ins/Object/defineProperty/15.2.3.6-4-419.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: verifyEnumerable !== true"
-    },
-    {
-      "path": "built-ins/Object/defineProperty/15.2.3.6-4-595.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: verifyEnumerable !== true"
-    },
-    {
-      "path": "built-ins/Object/getOwnPropertyDescriptors/proxy-undefined-descriptor.js",
-      "esid": "sec-object.getownpropertydescriptors",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Reflect: Proxy ownKeys trap result is not an Object"
-    },
-    {
       "path": "built-ins/parseFloat/S15.1.2.3_A4_T2.js",
       "esid": "sec-parsefloat-string",
       "outcome": "fail",
@@ -40873,73 +40650,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #002B "
     },
     {
-      "path": "built-ins/Proxy/construct/trap-is-null-target-is-proxy.js",
-      "esid": "sec-proxy-object-internal-methods-and-internal-slots-construct-argumentslist-newtarget",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected true but got false"
-    },
-    {
-      "path": "built-ins/Proxy/deleteProperty/trap-is-missing-target-is-proxy.js",
-      "esid": "sec-proxy-object-internal-methods-and-internal-slots-delete-p",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Proxy/enumerate/removed-does-not-trigger.js",
-      "esid": "sec-proxy-object-internal-methods-and-internal-slots",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: type mismatch: this operation does not accept a value of this type"
-    },
-    {
-      "path": "built-ins/Proxy/has/call-in-prototype-index.js",
-      "esid": "sec-proxy-object-internal-methods-and-internal-slots-hasproperty-p",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: handler is context Expected SameValue(«undefined», «[object Object]») to be true"
-    },
-    {
-      "path": "built-ins/Proxy/has/trap-is-undefined-using-with.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: length is not defined"
-    },
-    {
-      "path": "built-ins/Proxy/has/trap-is-undefined.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "built-ins/Proxy/proxy-no-prototype.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Proxy constructor does not have a prototype property"
-    },
-    {
-      "path": "built-ins/Proxy/revocable/revocation-function-name.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: name descriptor value should be ; name value should be "
-    },
-    {
-      "path": "built-ins/Proxy/revocable/tco-fn-realm.js",
-      "esid": "sec-tail-position-calls",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "built-ins/Proxy/set/trap-is-missing-target-is-proxy.js",
-      "esid": "sec-proxy-object-internal-methods-and-internal-slots-set-p-v-receiver",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected true but got false"
-    },
-    {
-      "path": "built-ins/Proxy/set/trap-is-null-target-is-proxy.js",
-      "esid": "sec-proxy-object-internal-methods-and-internal-slots-set-p-v-receiver",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected true but got false"
-    },
-    {
-      "path": "built-ins/RegExp/S15.10.2.5_A1_T4.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: The value of __executed[index] is expected to equal the value of __expected[index] Expected SameValue(«\"bbb\"», «undefined») to be true"
-    },
-    {
       "path": "built-ins/RegExp/S15.10.2.8_A3_T15.js",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: RegExp: invalid regular expression: regular expression nesting exceeds limit 200"
@@ -40948,12 +40658,6 @@
       "path": "built-ins/RegExp/S15.10.2.8_A3_T16.js",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: RegExp: invalid regular expression: regular expression nesting exceeds limit 200"
-    },
-    {
-      "path": "built-ins/RegExp/duplicate-named-capturing-groups-syntax.js",
-      "esid": "sec-regexp-pattern-flags",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duplicate named capturing groups in the same alternative do not parse Expected a SyntaxError to be thrown but no exception was thrown at all"
     },
     {
       "path": "built-ins/RegExp/lookBehind/alternations.js",
@@ -40968,12 +40672,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [c, abab] and expected [c, ab] should have the same contents. #3"
     },
     {
-      "path": "built-ins/RegExp/lookBehind/captures.js",
-      "esid": "sec-assertion",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [def, c] and expected [def, a] should have the same contents. #4"
-    },
-    {
       "path": "built-ins/RegExp/lookBehind/mutual-recursive.js",
       "esid": "sec-assertion",
       "outcome": "fail",
@@ -40986,93 +40684,10 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [a, abc] and expected [a, undefined] should have the same contents. ? quantifier"
     },
     {
-      "path": "built-ins/RegExp/match-indices/indices-array-unicode-property-names.js",
-      "esid": "sec-makeindicesarray",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected argument [undefined] shouldn't be primitive. "
-    },
-    {
-      "path": "built-ins/RegExp/named-groups/duplicate-names-exec.js",
-      "esid": "prod-GroupSpecifier",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [b, undefined, b] and expected [bb, undefined, b] should have the same contents. "
-    },
-    {
-      "path": "built-ins/RegExp/named-groups/duplicate-names-match.js",
-      "esid": "prod-GroupSpecifier",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [b, undefined, b] and expected [bb, undefined, b] should have the same contents. "
-    },
-    {
-      "path": "built-ins/RegExp/named-groups/lookbehind.js",
-      "esid": "prod-GroupSpecifier",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [f, c] and expected [f, e] should have the same contents. "
-    },
-    {
-      "path": "built-ins/RegExp/named-groups/non-unicode-property-names-invalid.js",
-      "esid": "prod-GroupSpecifier",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a SyntaxError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/RegExp/named-groups/non-unicode-property-names-valid.js",
-      "esid": "prod-GroupSpecifier",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «\"brown\"») to be true"
-    },
-    {
-      "path": "built-ins/RegExp/named-groups/non-unicode-property-names.js",
-      "esid": "prod-GroupSpecifier",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"a\"», «undefined») to be true"
-    },
-    {
-      "path": "built-ins/RegExp/named-groups/string-replace-nocaptures.js",
-      "esid": "sec-getsubstitution",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"$<42a>cd\"», «\"$<42$1>cd\"») to be true"
-    },
-    {
-      "path": "built-ins/RegExp/named-groups/unicode-property-names-invalid.js",
-      "esid": "prod-GroupSpecifier",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a SyntaxError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/RegExp/named-groups/unicode-property-names-valid.js",
-      "esid": "prod-GroupSpecifier",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «\"brown\"») to be true"
-    },
-    {
-      "path": "built-ins/RegExp/named-groups/unicode-property-names.js",
-      "esid": "prod-GroupSpecifier",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"a\"», «undefined») to be true"
-    },
-    {
       "path": "built-ins/RegExp/property-escapes/generated/White_Space.js",
       "esid": "sec-static-semantics-unicodematchproperty-p",
       "outcome": "fail",
       "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/^\\p{space}+$/u` rejected: invalid regular expression: unknown Unicode property `space`]"
-    },
-    {
-      "path": "built-ins/RegExp/prototype/exec/S15.10.6.2_A1_T6.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: The value of __executed[index] is expected to equal the value of __expected[index] Expected SameValue(«\"bbb\"», «undefined») to be true"
-    },
-    {
-      "path": "built-ins/RegExp/prototype/exec/duplicate-named-groups-properties.js",
-      "esid": "prod-GroupSpecifier",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: property read: cannot operate on a value of type null"
-    },
-    {
-      "path": "built-ins/RegExp/prototype/exec/duplicate-named-indices-groups-properties.js",
-      "esid": "prod-GroupSpecifier",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: property read: cannot operate on a value of type null"
     },
     {
       "path": "built-ins/RegExp/quantifier-integer-limit.js",
@@ -41103,75 +40718,6 @@
       "esid": "sec-runtime-semantics-canonicalize-ch",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: \\u1fd3 does not match \\u0390"
-    },
-    {
-      "path": "built-ins/RegExp/unicode_restricted_character_class_escape.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: RegExp(\"[\\d-a]\", \"u\"):  Expected a SyntaxError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/RegExp/unicode_restricted_identity_escape.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Invalid IdentityEscape in AtomEscape: '\\-' Expected a SyntaxError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/RegExp/unicode_restricted_quantifiable_assertion.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: RegExp(\"(?=.)*\", \"u\"):  Expected a SyntaxError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/SharedArrayBuffer/options-maxbytelength-compared-before-object-creation.js",
-      "esid": "sec-sharedarraybuffer-length",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError but got a Test262Error"
-    },
-    {
-      "path": "built-ins/SharedArrayBuffer/options-maxbytelength-diminuitive.js",
-      "esid": "sec-sharedarraybuffer-constructor",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError but got a TypeError"
-    },
-    {
-      "path": "built-ins/SharedArrayBuffer/options-maxbytelength-object.js",
-      "esid": "sec-sharedarraybuffer-constructor",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError but got a RangeError"
-    },
-    {
-      "path": "built-ins/SharedArrayBuffer/options-maxbytelength-poisoned.js",
-      "esid": "sec-sharedarraybuffer-constructor",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a Test262Error to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/SharedArrayBuffer/options-maxbytelength-undefined.js",
-      "esid": "sec-sharedarraybuffer-constructor",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "built-ins/String/prototype/localeCompare/15.5.4.9_CE.js",
-      "esid": "sec-string.prototype.localecompare",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: String.prototype.localeCompare considers ö (\\u006f\\u0308) ≠ ö (\\u00f6)."
-    },
-    {
-      "path": "built-ins/String/prototype/match/duplicate-named-groups-properties.js",
-      "esid": "prod-GroupSpecifier",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: property read: cannot operate on a value of type null"
-    },
-    {
-      "path": "built-ins/String/prototype/match/duplicate-named-indices-groups-properties.js",
-      "esid": "prod-GroupSpecifier",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: property read: cannot operate on a value of type null"
-    },
-    {
-      "path": "built-ins/String/prototype/split/separator-regexp.js",
-      "esid": "sec-string.prototype.split",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/\\k<x>/` rejected: invalid regular expression at offset 5: backreference to unknown group name]"
     },
     {
       "path": "built-ins/Temporal/Duration/compare/order-of-operations.js",
@@ -41372,12 +40918,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Minimum to maximum instant by adding nanoseconds Expected SameValue(«-8630776627963145224193n», «8640000000000000000000n») to be true"
     },
     {
-      "path": "built-ins/Temporal/Instant/prototype/round/options-read-before-algorithmic-validation.js",
-      "esid": "sec-temporal.instant.prototype.round",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get options.largestUnit, get options.roundingIncrement, get options.roundingIncrement.valueOf, call options.roundingIncrement.valueOf, get options.roundingMode, get options.roundingMode.toString, call options.roundingMode.toString, get options.smallestUnit, get options.smallestUnit.toString, call options.smallestUnit.toString] and expected [get options.roundingIncrement, get options.roundingIncrement.valueOf, call options.roundingIncrement.valueOf, get options.roundingMode, get options.roundingMode.toString, call options.roundingMode.toString, get options.smallestUnit, get options.smallestUnit.toString, call options.smallestUnit.toString] should have the same contents. all options should be read first"
-    },
-    {
       "path": "built-ins/Temporal/Instant/prototype/since/float64-representable-integer.js",
       "esid": "sec-temporal.instant.prototype.since",
       "outcome": "fail",
@@ -41522,12 +41062,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomPlainDate Expected SameValue(«[object Temporal.PlainDate]», «[object Temporal.PlainDate]») to be true"
     },
     {
-      "path": "built-ins/Temporal/PlainDateTime/prototype/round/options-read-before-algorithmic-validation.js",
-      "esid": "sec-temporal.plaindatetime.prototype.round",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get options.largestUnit, get options.roundingIncrement, get options.roundingIncrement.valueOf, call options.roundingIncrement.valueOf, get options.roundingMode, get options.roundingMode.toString, call options.roundingMode.toString, get options.smallestUnit, get options.smallestUnit.toString, call options.smallestUnit.toString] and expected [get options.roundingIncrement, get options.roundingIncrement.valueOf, call options.roundingIncrement.valueOf, get options.roundingMode, get options.roundingMode.toString, call options.roundingMode.toString, get options.smallestUnit, get options.smallestUnit.toString, call options.smallestUnit.toString] should have the same contents. all options should be read first"
-    },
-    {
       "path": "built-ins/Temporal/PlainDateTime/prototype/since/exact-multiple-of-larger-unit.js",
       "esid": "sec-temporal.plaindatetime.prototype.since",
       "outcome": "fail",
@@ -41652,12 +41186,6 @@
       "esid": "sec-temporal.plaintime.from",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get options.overflow, get options.overflow.toString, call options.overflow.toString, get fields.hour, get fields.hour.valueOf, call fields.hour.valueOf, get fields.microsecond, get fields.microsecond.valueOf, call fields.microsecond.valueOf, get fields.millisecond, get fields.millisecond.valueOf, call fields.millisecond.valueOf, get fields.minute, get fields.minute.valueOf, call fields.minute.valueOf, get fields.nanosecond, get fields.nanosecond.valueOf, call fields.nanosecond.valueOf, get fields.second, get fields.second.valueOf, call fields.second.valueOf] and expected [get fields.hour, get fields.hour.valueOf, call fields.hour.valueOf, get fields.microsecond, get fields.microsecond.valueOf, call fields.microsecond.valueOf, get fields.millisecond, get fields.millisecond.valueOf, call fields.millisecond.valueOf, get fields.minute, get fields.minute.valueOf, call fields.minute.valueOf, get fields.nanosecond, get fields.nanosecond.valueOf, call fields.nanosecond.valueOf, get fields.second, get fields.second.valueOf, call fields.second.valueOf, get options.overflow, get options.overflow.toString, call options.overflow.toString] should have the same contents. order of operations"
-    },
-    {
-      "path": "built-ins/Temporal/PlainTime/prototype/round/options-read-before-algorithmic-validation.js",
-      "esid": "sec-temporal.plaintime.prototype.round",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get options.largestUnit, get options.roundingIncrement, get options.roundingIncrement.valueOf, call options.roundingIncrement.valueOf, get options.roundingMode, get options.roundingMode.toString, call options.roundingMode.toString, get options.smallestUnit, get options.smallestUnit.toString, call options.smallestUnit.toString] and expected [get options.roundingIncrement, get options.roundingIncrement.valueOf, call options.roundingIncrement.valueOf, get options.roundingMode, get options.roundingMode.toString, call options.roundingMode.toString, get options.smallestUnit, get options.smallestUnit.toString, call options.smallestUnit.toString] should have the same contents. all options should be read first"
     },
     {
       "path": "built-ins/Temporal/PlainTime/prototype/toLocaleString/branding.js",
@@ -41850,18 +41378,6 @@
       "esid": "sec-temporal.zoneddatetime.prototype.monthcode",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read properties of undefined"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/round/options-read-before-algorithmic-validation.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.round",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get options.largestUnit, get options.roundingIncrement, get options.roundingIncrement.valueOf, call options.roundingIncrement.valueOf, get options.roundingMode, get options.roundingMode.toString, call options.roundingMode.toString, get options.smallestUnit, get options.smallestUnit.toString, call options.smallestUnit.toString] and expected [get options.roundingIncrement, get options.roundingIncrement.valueOf, call options.roundingIncrement.valueOf, get options.roundingMode, get options.roundingMode.toString, call options.roundingMode.toString, get options.smallestUnit, get options.smallestUnit.toString, call options.smallestUnit.toString] should have the same contents. all options should be read first"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/round/order-of-operations.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.round",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get options.largestUnit, get options.roundingIncrement, get options.roundingIncrement.valueOf, call options.roundingIncrement.valueOf, get options.roundingMode, get options.roundingMode.toString, call options.roundingMode.toString, get options.smallestUnit, get options.smallestUnit.toString, call options.smallestUnit.toString] and expected [get options.roundingIncrement, get options.roundingIncrement.valueOf, call options.roundingIncrement.valueOf, get options.roundingMode, get options.roundingMode.toString, call options.roundingMode.toString, get options.smallestUnit, get options.smallestUnit.toString, call options.smallestUnit.toString] should have the same contents. order of operations"
     },
     {
       "path": "built-ins/Temporal/ZonedDateTime/prototype/since/exact-multiple-of-larger-unit.js",
@@ -42110,66 +41626,10 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: String: OrdinaryToPrimitive could not convert object to primitive"
     },
     {
-      "path": "built-ins/TypedArrayConstructors/ctors/typedarray-arg/src-typedarray-resizable-buffer.js",
-      "esid": "sec-initializetypedarrayfromtypedarray",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/TypedArrayConstructors/ctors/typedarray-arg/throw-type-error-before-custom-proto-access.js",
-      "esid": "sec-typedarray",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError but got a Test262Error (Testing with Float64Array and makePassthrough.)"
-    },
-    {
-      "path": "built-ins/TypedArrayConstructors/internals/DefineOwnProperty/BigInt/detached-buffer-throws-realm.js",
-      "esid": "sec-integer-indexed-exotic-objects-defineownproperty-p-desc",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "built-ins/TypedArrayConstructors/internals/DefineOwnProperty/detached-buffer-throws-realm.js",
-      "esid": "sec-integer-indexed-exotic-objects-defineownproperty-p-desc",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
       "path": "built-ins/undefined/15.1.1.3-2.js",
       "esid": "sec-undefined",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read property of null or undefined"
-    },
-    {
-      "path": "language/arguments-object/10.6-13-a-2.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "language/arguments-object/10.6-13-a-3.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "language/arguments-object/mapped/mapped-arguments-nonconfigurable-nonwritable-3.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«1», «2») to be true"
-    },
-    {
-      "path": "language/arguments-object/mapped/nonconfigurable-nonenumerable-nonwritable-descriptors-set-by-param.js",
-      "esid": "sec-arguments-exotic-objects-defineownproperty-p-desc",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: 0 descriptor value should be 2; 0 value should be 2"
-    },
-    {
-      "path": "language/arguments-object/mapped/nonconfigurable-nonwritable-descriptors-set-by-param.js",
-      "esid": "sec-arguments-exotic-objects-defineownproperty-p-desc",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: 0 descriptor value should be 2; 0 value should be 2"
-    },
-    {
-      "path": "language/block-scope/shadowing/parameter-name-shadowing-catch-parameter.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"stuff3\"», «1») to be true"
     },
     {
       "path": "language/computed-property-names/class/method/constructor.js",
@@ -42379,11 +41839,6 @@
       "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: ClassDeclaration: decorators]"
     },
     {
-      "path": "language/expressions/class/subclass-builtins/subclass-Function.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected true but got false"
-    },
-    {
       "path": "language/expressions/coalesce/tco-pos-null.js",
       "esid": "sec-static-semantics-hascallintailposition",
       "outcome": "fail",
@@ -42497,18 +41952,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: 'this' had incorrect value!"
     },
     {
-      "path": "language/global-code/new.target-arrow.js",
-      "esid": "sec-scripts-static-semantics-early-errors",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/global-code/new.target.js",
-      "esid": "sec-scripts-static-semantics-early-errors",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
       "path": "language/identifier-resolution/assign-to-global-undefined.js",
       "esid": "sec-initializeboundname",
       "outcome": "fail",
@@ -42522,7 +41965,7 @@
     {
       "path": "language/literals/regexp/S7.8.5_A1.4_T2.js",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: compile error: Unsupported { node: \"RegExpLiteral `/\\\\x/` rejected: invalid regular expression at offset 2: incomplete hex escape\", span: (0, 4) }"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Code unit: d800 Expected SameValue(«\"\\\\�\"», «\"\\\\\\ud800\"») to be true"
     },
     {
       "path": "language/literals/regexp/S7.8.5_A2.1_T2.js",
@@ -42532,7 +41975,7 @@
     {
       "path": "language/literals/regexp/S7.8.5_A2.4_T2.js",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: compile error: Unsupported { node: \"RegExpLiteral `/a\\\\x/` rejected: invalid regular expression at offset 3: incomplete hex escape\", span: (0, 5) }"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Code unit: d800 Expected SameValue(«\"a\\\\�\"», «\"a\\\\\\ud800\"») to be true"
     },
     {
       "path": "language/statements/block/tco-stmt-list.js",
@@ -42619,32 +42062,16 @@
       "reason": "compile: codes=[TS_UNSUPPORTED] messages=[typescript Decorator is not supported in foundation]"
     },
     {
-      "path": "language/statements/class/elements/private-method-comparison-multiple-evaluations-of-class.js",
-      "esid": "sec-privatefieldget",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«#m() { return 'test262'; }», «#m() { return 'test262'; }») to be false"
-    },
-    {
-      "path": "language/statements/class/subclass/builtin-objects/Proxy/no-prototype-throws.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "language/statements/class/subclass/derived-class-return-override-for-of-arrow.js",
-      "esid": "sec-ecmascript-function-objects-construct-argumentslist-newtarget",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: super called outside a derived constructor"
-    },
-    {
-      "path": "language/statements/class/subclass-builtins/subclass-Function.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected true but got false"
-    },
-    {
       "path": "language/statements/do-while/tco-body.js",
       "esid": "sec-static-semantics-hascallintailposition",
       "outcome": "fail",
       "reason": "runtime: RangeError (STACK_OVERFLOW) maximum call stack size exceeded (limit 1024)"
+    },
+    {
+      "path": "language/statements/for-in/order-after-define-property.js",
+      "esid": "sec-enumerate-object-properties",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [b, a] and expected [a, b] should have the same contents. "
     },
     {
       "path": "language/statements/for/tco-const-body.js",
@@ -42669,12 +42096,6 @@
       "esid": "sec-static-semantics-hascallintailposition",
       "outcome": "fail",
       "reason": "runtime: RangeError (STACK_OVERFLOW) maximum call stack size exceeded (limit 1024)"
-    },
-    {
-      "path": "language/statements/for-in/order-after-define-property.js",
-      "esid": "sec-enumerate-object-properties",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [b, a] and expected [a, b] should have the same contents. "
     },
     {
       "path": "language/statements/if/tco-else-body.js",
@@ -42749,45 +42170,10 @@
       "reason": "runtime: RangeError (STACK_OVERFLOW) maximum call stack size exceeded (limit 1024)"
     },
     {
-      "path": "annexB/built-ins/RegExp/RegExp-control-escape-russian-letter.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: invalid \\c escape failed to match \\c when followed by А Expected SameValue(«null», «null») to be false"
-    },
-    {
-      "path": "annexB/built-ins/RegExp/RegExp-invalid-control-escape-character-class.js",
-      "esid": "prod-annexB-ClassAtomNoDash",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Character c missing from character class [\\c\u0000]"
-    },
-    {
-      "path": "annexB/built-ins/RegExp/incomplete_hex_unicode_escape.js",
-      "esid": "prod-AtomEscape",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/\\x/` rejected: invalid regular expression at offset 2: incomplete hex escape]"
-    },
-    {
       "path": "annexB/built-ins/RegExp/legacy-accessors/input/this-subclass-constructor.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: RegExp.input setter throws for subclass receiver Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "annexB/built-ins/RegExp/named-groups/non-unicode-malformed-lookbehind.js",
-      "esid": "prod-GroupSpecifier",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/\\k<a>(?<=>)a/` rejected: invalid regular expression at offset 5: backreference to unknown group name]"
-    },
-    {
-      "path": "annexB/built-ins/RegExp/named-groups/non-unicode-malformed.js",
-      "esid": "prod-GroupSpecifier",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/\\k<a>/` rejected: invalid regular expression at offset 5: backreference to unknown group name]"
-    },
-    {
-      "path": "annexB/built-ins/RegExp/prototype/compile/duplicate-named-capturing-groups-syntax.js",
-      "esid": "sec-regexp.prototype.compile",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duplicate named capturing groups in the same alternative do not parse Expected a SyntaxError to be thrown but no exception was thrown at all"
     },
     {
       "path": "annexB/language/expressions/assignment/dstr/array-pattern-emulates-undefined.js",
@@ -42820,12 +42206,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read property of null or undefined"
     },
     {
-      "path": "annexB/language/statements/class/subclass/superclass-prototype-emulates-undefined.js",
-      "esid": "sec-runtime-semantics-classdefinitionevaluation",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: instanceof prototype is not an object"
-    },
-    {
       "path": "annexB/language/statements/for-in/nonstrict-initializer.js",
       "esid": "sec-initializers-in-forin-statement-heads",
       "outcome": "fail",
@@ -42840,16 +42220,6 @@
       "path": "annexB/language/statements/try/catch-redeclared-var-statement.js",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"initializer in catch\"», «\"prior to throw\"») to be true"
-    },
-    {
-      "path": "staging/built-ins/RegExp/named-groups/duplicate-named-groups-replace.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"x2zyyxxy\"», «\"x2zzyyxxy\"») to be true"
-    },
-    {
-      "path": "staging/built-ins/RegExp/named-groups/duplicate-named-groups.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [xxyy, undefined, y] and expected [yy, undefined, y] should have the same contents. "
     },
     {
       "path": "staging/decorators/private-auto-accessor.js",
@@ -42870,25 +42240,19 @@
       "path": "staging/sm/Array/change-array-by-copy-cross-compartment-create.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: with returned an instance of Array Expected SameValue(«true», «false») to be true"
     },
     {
       "path": "staging/sm/Array/change-array-by-copy-errors-from-correct-realm.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
       "path": "staging/sm/Array/concat-proxy.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: Argument::SpreadElement]"
-    },
-    {
-      "path": "staging/sm/Array/fill.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
     },
     {
       "path": "staging/sm/Array/for_of_2.js",
@@ -42921,34 +42285,10 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: subs is not defined"
     },
     {
-      "path": "staging/sm/Array/from_realms.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
       "path": "staging/sm/Array/from_string.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: iterator method is not callable"
-    },
-    {
-      "path": "staging/sm/Array/frozen-dense-array.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "staging/sm/Array/indexOf-packed-array.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [Has:0, Has:1, Has:2] should have the same contents. "
-    },
-    {
-      "path": "staging/sm/Array/isArray.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
     },
     {
       "path": "staging/sm/Array/join-01.js",
@@ -42963,24 +42303,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: join: Object.getPrototypeOf: cannot operate on a value of type proxy"
     },
     {
-      "path": "staging/sm/Array/pop-no-has-trap.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get:length, set:length] and expected [get:length, set:length, getOwnPropertyDescriptor:length, defineProperty:length] should have the same contents. "
-    },
-    {
-      "path": "staging/sm/Array/reverse-order-of-low-high-accesses.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«4», «6») to be true"
-    },
-    {
-      "path": "staging/sm/Array/shift-no-has-trap.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get:length, set:length] and expected [get:length, set:length, getOwnPropertyDescriptor:length, defineProperty:length] should have the same contents. "
-    },
-    {
       "path": "staging/sm/Array/sort_holes.js",
       "esid": "pending",
       "outcome": "fail",
@@ -42990,7 +42312,7 @@
       "path": "staging/sm/Array/species.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«function FakeArray(n) {\n    this.length = n;\n  }», «function FakeArray(n) {\n    this.length = n;\n  }») to be true"
     },
     {
       "path": "staging/sm/Array/to-length.js",
@@ -42999,22 +42321,10 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Assertion failed: expected exception, no exception thrown"
     },
     {
-      "path": "staging/sm/ArrayBuffer/slice-species.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get @@species, call ctor] and expected [get @@species, get ctor.prototype, call ctor] should have the same contents. "
-    },
-    {
       "path": "staging/sm/AsyncGenerators/create-function-parse-before-getprototype.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "staging/sm/Atomics/cross-compartment.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
     },
     {
       "path": "staging/sm/Atomics/detached-buffers.js",
@@ -43035,12 +42345,6 @@
       "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: ClassDeclaration: non-string instance field key]"
     },
     {
-      "path": "staging/sm/Date/constructor-one-Date-argument.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
       "path": "staging/sm/Date/defaultvalue.js",
       "esid": "pending",
       "outcome": "fail",
@@ -43050,43 +42354,43 @@
       "path": "staging/sm/Date/dst-offset-caching-1-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10004 ms"
+      "reason": "timeout after 10010 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-2-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10016 ms"
+      "reason": "timeout after 10005 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-3-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10011 ms"
+      "reason": "timeout after 10005 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-4-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10000 ms"
+      "reason": "timeout after 10005 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-5-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10000 ms"
+      "reason": "timeout after 10005 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-6-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10005 ms"
+      "reason": "timeout after 10007 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-7-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10005 ms"
+      "reason": "timeout after 10108 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-8-of-8.js",
@@ -43101,10 +42405,10 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«NaN», «857845150000») to be true"
     },
     {
-      "path": "staging/sm/Error/AggregateError.js",
+      "path": "staging/sm/Error/constructor-ordering.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Error: uncaught exception: Test262Error: Expected SameValue(«2», «0») to be true"
     },
     {
       "path": "staging/sm/Error/constructor-proto.js",
@@ -43131,12 +42435,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: should have been set in valueOf called via ToUint32 Expected SameValue(«false», «true») to be true"
     },
     {
-      "path": "staging/sm/Function/arguments-iterator.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
       "path": "staging/sm/Function/arguments-parameter-shadowing.js",
       "esid": "pending",
       "outcome": "fail",
@@ -43152,7 +42450,7 @@
       "path": "staging/sm/Function/configurable-length-builtins.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«function hypot() { [native code] }», «0») to be true"
     },
     {
       "path": "staging/sm/Function/configurable-length.js",
@@ -43171,6 +42469,12 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«true», «false») to be true"
+    },
+    {
+      "path": "staging/sm/Function/function-caller-restrictions.js",
+      "esid": "pending",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «null») to be true"
     },
     {
       "path": "staging/sm/Function/function-name-assignment.js",
@@ -43281,16 +42585,10 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: type mismatch: this operation does not accept a value of this type"
     },
     {
-      "path": "staging/sm/Iterator/from/wrap-functions-on-other-global.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
       "path": "staging/sm/Iterator/from/wrap-new-global.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
       "path": "staging/sm/Iterator/from/wrap-next-not-object-throws.js",
@@ -43308,13 +42606,13 @@
       "path": "staging/sm/Iterator/prototype/every/error-from-correct-realm.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
       "path": "staging/sm/Iterator/prototype/find/error-from-correct-realm.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
       "path": "staging/sm/Iterator/prototype/flatMap/close-iterator-when-inner-complete-throws.js",
@@ -43344,25 +42642,13 @@
       "path": "staging/sm/Iterator/prototype/forEach/error-from-correct-realm.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
       "path": "staging/sm/Iterator/prototype/iterator-helper-methods-throw-on-generators.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "staging/sm/Iterator/prototype/iterator-helpers-from-other-global.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/Iterator/prototype/lazy-methods-from-other-global.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
     },
     {
       "path": "staging/sm/Iterator/prototype/lazy-methods-reentry-not-close-iterator.js",
@@ -43392,13 +42678,13 @@
       "path": "staging/sm/Iterator/prototype/reduce/error-from-correct-realm.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
       "path": "staging/sm/Iterator/prototype/some/error-from-correct-realm.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
       "path": "staging/sm/Iterator/prototype/take-drop-throw-eagerly-on-non-integer.js",
@@ -43410,13 +42696,13 @@
       "path": "staging/sm/Iterator/prototype/toArray/create-in-current-realm.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«true», «false») to be true"
     },
     {
       "path": "staging/sm/JSON/parse-with-source.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
       "path": "staging/sm/Map/constructor-iterator-close.js",
@@ -43461,12 +42747,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«1», «0») to be true"
     },
     {
-      "path": "staging/sm/Promise/bug-1289040.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
       "path": "staging/sm/Proxy/getPrototypeOf.js",
       "esid": "pending",
       "outcome": "fail",
@@ -43483,12 +42763,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«function () { [native code] }», «null») to be true"
-    },
-    {
-      "path": "staging/sm/Proxy/proxy-with-revoked-arguments.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
     },
     {
       "path": "staging/sm/Proxy/regress-bug1037770.js",
@@ -43509,12 +42783,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Object.getPrototypeOf: type mismatch: this operation does not accept a value of this type"
     },
     {
-      "path": "staging/sm/Proxy/revoke-no-name.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"revoke\"», «\"\"») to be true"
-    },
-    {
       "path": "staging/sm/Proxy/revoked-get-function-realm-typeerror.js",
       "esid": "pending",
       "outcome": "fail",
@@ -43533,12 +42801,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«function () { [native code] }», «null») to be true"
     },
     {
-      "path": "staging/sm/Reflect/apply.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
       "path": "staging/sm/Reflect/argumentsList.js",
       "esid": "pending",
       "outcome": "fail",
@@ -43548,19 +42810,13 @@
       "path": "staging/sm/Reflect/construct.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/Reflect/ownKeys.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«», «[object Object]») to be true"
     },
     {
       "path": "staging/sm/Reflect/set.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Reflect: Proxy defineProperty trap added a non-configurable property absent on the target"
     },
     {
       "path": "staging/sm/Reflect/setPrototypeOf.js",
@@ -43578,7 +42834,7 @@
       "path": "staging/sm/RegExp/constructor-constructor.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«true», «false») to be true"
     },
     {
       "path": "staging/sm/RegExp/constructor-ordering.js",
@@ -43587,22 +42843,10 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"b\"», «\"a\"») to be true"
     },
     {
-      "path": "staging/sm/RegExp/constructor-regexp-unicode.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a SyntaxError to be thrown but no exception was thrown at all"
-    },
-    {
       "path": "staging/sm/RegExp/constructor-regexp.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"bar\"», «\"foo\"») to be true"
-    },
-    {
-      "path": "staging/sm/RegExp/cross-compartment-getter.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
     },
     {
       "path": "staging/sm/RegExp/escape.js",
@@ -43638,31 +42882,13 @@
       "path": "staging/sm/RegExp/prototype-different-global.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
       "path": "staging/sm/RegExp/prototype.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: RegExp.prototype.toString: this is not a RegExp"
-    },
-    {
-      "path": "staging/sm/RegExp/regress-613820-1.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [aaa, aa, a] and expected [aa, a, a] should have the same contents. "
-    },
-    {
-      "path": "staging/sm/RegExp/regress-613820-2.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [foobar, f, o, o, b, a, r] and expected [foobar, undefined, undefined, undefined, b, a, r] should have the same contents. "
-    },
-    {
-      "path": "staging/sm/RegExp/regress-613820-3.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [aab, a, undefined, ab] and expected [aa, undefined, a, undefined] should have the same contents. "
     },
     {
       "path": "staging/sm/RegExp/regress-yarr-regexp.js",
@@ -43693,12 +42919,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«foo�bar�,�», «null») to be true"
-    },
-    {
-      "path": "staging/sm/RegExp/unicode-braced.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: RegExpLiteral `/\\u{41}/` rejected: invalid regular expression at offset 3: \\u{...} requires the u flag]"
     },
     {
       "path": "staging/sm/RegExp/unicode-class-ignoreCase.js",
@@ -43785,28 +43005,10 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
-      "path": "staging/sm/String/iterator_edge_cases.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/String/matchAll.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
       "path": "staging/sm/String/replace-math.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 11023 ms"
-    },
-    {
-      "path": "staging/sm/String/replaceAll.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "timeout after 11791 ms"
     },
     {
       "path": "staging/sm/Symbol/conversions.js",
@@ -43827,76 +43029,22 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«true», «false») to be true"
     },
     {
-      "path": "staging/sm/Symbol/realms.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/Symbol/toPrimitive.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/Symbol/well-known.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/Tconstructor-fromTypedArray-byteLength.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/at.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
       "path": "staging/sm/TypedArray/constructor-ArrayBuffer-species-wrap.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: Identifier 'origSpecies' has already been declared"
     },
     {
       "path": "staging/sm/TypedArray/constructor-buffer-sequence.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a ExpectedError but got a Error"
     },
     {
-      "path": "staging/sm/TypedArray/constructor-typedarray-species-other-global.js",
+      "path": "staging/sm/TypedArray/fill-detached.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/entries.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/every-and-some.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/fill.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/forEach.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
     },
     {
       "path": "staging/sm/TypedArray/from_constructor.js",
@@ -43905,64 +43053,10 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
-      "path": "staging/sm/TypedArray/from_realms.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/includes.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/iterator-next-with-detached.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/iterator.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/join.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/keys.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/map-and-filter.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
       "path": "staging/sm/TypedArray/of.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/reduce-and-reduceRight.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/reverse.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«true», «false») to be true"
     },
     {
       "path": "staging/sm/TypedArray/seal-and-freeze.js",
@@ -43971,88 +43065,16 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
     },
     {
-      "path": "staging/sm/TypedArray/set-detached-bigint.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a SyntaxError but got a RangeError"
-    },
-    {
       "path": "staging/sm/TypedArray/set-detached.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError but got a RangeError"
     },
     {
-      "path": "staging/sm/TypedArray/set-wrapped.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
       "path": "staging/sm/TypedArray/slice-bitwise-same.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/slice-memcpy.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/slice.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/sort-negative-nan.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/sort_byteoffset.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/sort_errors.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/sort_globals.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/toLocaleString-detached.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: TypedArray.prototype: type mismatch: this operation does not accept a value of this type"
-    },
-    {
-      "path": "staging/sm/TypedArray/toLocaleString.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/toStringTag-cross-compartment.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "staging/sm/TypedArray/values.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«2143289344», «2139095041») to be true"
     },
     {
       "path": "staging/sm/TypedArray/with.js",
@@ -44094,7 +43116,7 @@
       "path": "staging/sm/class/derivedConstructorArrowEvalEscapeUninitialized.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: super called outside a derived constructor"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: must call super constructor in derived class before accessing 'this' or returning from derived constructor"
     },
     {
       "path": "staging/sm/class/derivedConstructorArrowEvalNestedSuperCall.js",
@@ -44112,7 +43134,7 @@
       "path": "staging/sm/class/extendBuiltinConstructors.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «\"A\"») to be true"
     },
     {
       "path": "staging/sm/class/fields-instance-class-name-binding-eval.js",
@@ -44143,12 +43165,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Class constructor cannot be invoked without 'new'"
-    },
-    {
-      "path": "staging/sm/class/newTargetCCW.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
     },
     {
       "path": "staging/sm/class/strictExecution.js",
@@ -44209,12 +43225,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: Super: bare `super` outside call or member expression]"
-    },
-    {
-      "path": "staging/sm/destructuring/order.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: type mismatch: this operation does not accept a value of this type"
     },
     {
       "path": "staging/sm/eval/exhaustive-fun-normalcaller-direct-normalcode.js",
@@ -44325,28 +43335,22 @@
       "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: Super: bare `super` outside call or member expression]"
     },
     {
-      "path": "staging/sm/extensions/DataView-construct-arguments-detaching.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: byteLength weirdness should have thrown Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "staging/sm/extensions/TypedArray-set-object-funky-length-detaches.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: TypedArray.prototype: source overruns destination"
-    },
-    {
       "path": "staging/sm/extensions/arguments-property-access-in-function.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read property of null or undefined"
+    },
+    {
+      "path": "staging/sm/extensions/censor-strict-caller.js",
+      "esid": "pending",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «null») to be true"
     },
     {
       "path": "staging/sm/extensions/cross-global-eval-is-indirect.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
       "path": "staging/sm/extensions/dataview.js",
@@ -44370,25 +43374,19 @@
       "path": "staging/sm/extensions/function-caller-skips-eval-frames.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«null», «function nest() { return eval(\"innermost();\"); }») to be true"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «function nest() { return eval(\"innermost();\"); }») to be true"
     },
     {
       "path": "staging/sm/extensions/function-properties.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: property read: cannot operate on a value of type null"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «null») to be true"
     },
     {
       "path": "staging/sm/extensions/nested-delete-name-in-evalcode.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "staging/sm/extensions/new-cross-compartment.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
     },
     {
       "path": "staging/sm/extensions/newer-type-functions-caller-arguments.js",
@@ -44565,6 +43563,12 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
     },
     {
+      "path": "staging/sm/object/15.2.3.14-01.js",
+      "esid": "pending",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [0, groups, input, index] and expected [0, index, input, groups] should have the same contents. "
+    },
+    {
       "path": "staging/sm/object/accessor-arguments-rest.js",
       "esid": "pending",
       "outcome": "fail",
@@ -44607,12 +43611,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«[object Object]», «3») to be true"
     },
     {
-      "path": "staging/sm/object/setPrototypeOf-cross-realm-cycle.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
       "path": "staging/sm/object/toLocaleString.js",
       "esid": "pending",
       "outcome": "fail",
@@ -44623,12 +43621,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [0] should have the same contents. "
-    },
-    {
-      "path": "staging/sm/object/values.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [a, abc, 0, undefined] and expected [a, 0, abc, undefined] should have the same contents. "
     },
     {
       "path": "staging/sm/regress/regress-1383630.js",
@@ -44661,16 +43653,10 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error:  Expected SameValue(«true», «false») to be true"
     },
     {
-      "path": "staging/sm/regress/regress-583429.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
       "path": "staging/sm/regress/regress-584355.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error:  Expected SameValue(«\"function f () { ff (); }\"», «\"null\"») to be true"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error:  Expected SameValue(«\"function f () { ff (); }\"», «\"undefined\"») to be true"
     },
     {
       "path": "staging/sm/regress/regress-586482-1.js",
@@ -44694,7 +43680,7 @@
       "path": "staging/sm/regress/regress-586482-4.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: ok Expected SameValue(«function() { this.f(); }», «null») to be true"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: ok Expected SameValue(«function() { this.f(); }», «undefined») to be true"
     },
     {
       "path": "staging/sm/regress/regress-598176.js",
@@ -44731,12 +43717,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "staging/sm/regress/regress-636364.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
     },
     {
       "path": "staging/sm/regress/regress-665355.js",
@@ -44778,7 +43758,7 @@
       "path": "staging/sm/statements/for-of-iterator-close-throw.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10010 ms"
+      "reason": "timeout after 10002 ms"
     },
     {
       "path": "staging/sm/statements/regress-642975.js",
@@ -44794,30 +43774,6 @@
     },
     {
       "path": "staging/sm/strict/15.3.5.2.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "staging/sm/strict/15.4.4.12.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "staging/sm/strict/15.4.4.13.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "staging/sm/strict/15.4.4.8.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "staging/sm/strict/15.4.4.9.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
@@ -44845,12 +43801,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: compile error: Syntax { messages: [\"Unexpected token\"], diagnostics: [SyntaxDiagnostic { code: \"SYNTAX_ERROR\", message: \"Unexpected token\", range: Some((28, 29)), help: None }] }"
-    },
-    {
-      "path": "staging/sm/syntax/yield-as-identifier.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
     },
     {
       "path": "intl402/Array/prototype/toLocaleString/calls-toLocaleString-number-elements.js",
@@ -46230,12 +45180,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Time zone name UTC was not correctly accepted. Expected SameValue(«undefined», «\"UTC\"») to be true"
     },
     {
-      "path": "intl402/DisplayNames/ctor-custom-get-prototype-poison-throws.js",
-      "esid": "sec-Intl.DisplayNames",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a Test262Error to be thrown but no exception was thrown at all"
-    },
-    {
       "path": "intl402/DisplayNames/ctor-custom-prototype.js",
       "esid": "sec-Intl.DisplayNames",
       "outcome": "fail",
@@ -46528,6 +45472,12 @@
       "esid": "sec-intl.DurationFormat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: DurationFormat should be an own property"
+    },
+    {
+      "path": "intl402/DurationFormat/prototype.js",
+      "esid": "sec-Intl.DurationFormat",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
     },
     {
       "path": "intl402/DurationFormat/prototype/constructor/prop-desc.js",
@@ -47014,12 +45964,6 @@
       "esid": "sec-intl.DurationFormat.prototype-@@tostringtag",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: property read: cannot operate on a value of type undefined"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype.js",
-      "esid": "sec-Intl.DurationFormat",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
     },
     {
       "path": "intl402/DurationFormat/supportedLocalesOf/basic.js",
@@ -50318,12 +49262,6 @@
       "esid": "sec-Intl.Segmenter.supportedLocalesOf",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
-    },
-    {
-      "path": "intl402/Segmenter/ctor-custom-get-prototype-poison-throws.js",
-      "esid": "sec-intl.segmenter",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a Test262Error to be thrown but no exception was thrown at all"
     },
     {
       "path": "intl402/Segmenter/ctor-custom-prototype.js",

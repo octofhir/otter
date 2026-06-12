@@ -546,6 +546,9 @@ pub(crate) fn compile_program_with_mode_impl_super(
         force_strict || program.strict_directive,
         super_property_allowed,
     )?;
+    if !new_target_allowed {
+        strict_validation::validate_script_new_target_early_errors(program.body)?;
+    }
     // §14.2.1 / §14.12.1 block-level lexical early errors (duplicate
     // LexicallyDeclaredNames, lexical/var clashes) with the Annex B
     // §B.3.3.1 sloppy-mode plain-function exemption.

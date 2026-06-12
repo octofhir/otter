@@ -81,6 +81,33 @@ pub fn validate_strict_mode_early_errors(
     })
 }
 
+/// Validate script/eval early errors for `new.target` when the
+/// surrounding compilation context does not allow it.
+///
+/// ECMA-262 script early errors reject a StatementList that Contains
+/// NewTarget unless direct eval is running inside non-arrow function
+/// code. `Contains` intentionally looks through arrow functions, but
+/// not through ordinary function or class bodies.
+pub fn validate_script_new_target_early_errors(
+    body: &[oxc_ast::ast::Statement<'_>],
+) -> Result<(), CompileError> {
+    let mut diagnostics = Vec::new();
+    let mut visitor = ScriptNewTargetValidator {
+        diagnostics: &mut diagnostics,
+    };
+    for stmt in body {
+        visitor.visit_statement(stmt);
+    }
+    if diagnostics.is_empty() {
+        return Ok(());
+    }
+    let messages = diagnostics.iter().map(|d| d.message.clone()).collect();
+    Err(CompileError::Syntax {
+        messages,
+        diagnostics,
+    })
+}
+
 /// Validate module-body early errors that are stricter than ordinary
 /// strict-mode script validation.
 ///
@@ -641,6 +668,27 @@ impl<'a> Visit<'a> for ModuleLabelValidator<'_> {
 
 struct ModuleNewTargetValidator<'d> {
     diagnostics: &'d mut Vec<SyntaxDiagnostic>,
+}
+
+struct ScriptNewTargetValidator<'d> {
+    diagnostics: &'d mut Vec<SyntaxDiagnostic>,
+}
+
+impl<'a> Visit<'a> for ScriptNewTargetValidator<'_> {
+    fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
+    fn visit_class(&mut self, _: &Class<'a>) {}
+
+    fn visit_meta_property(&mut self, it: &MetaProperty<'a>) {
+        if it.meta.name.as_str() == "new" && it.property.name.as_str() == "target" {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "SCRIPT_NEW_TARGET".to_string(),
+                message: "SyntaxError: `new.target` is not valid in this script context (§16.1.1)"
+                    .to_string(),
+                range: Some((it.span.start, it.span.end)),
+                help: Some("use `new.target` inside a function or class constructor".to_string()),
+            });
+        }
+    }
 }
 
 impl<'a> Visit<'a> for ModuleNewTargetValidator<'_> {

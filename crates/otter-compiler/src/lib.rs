@@ -489,6 +489,30 @@ mod tests {
     }
 
     #[test]
+    fn script_top_level_new_target_is_syntax_error() {
+        let err = compile_script_src_err("new.target;");
+        let CompileError::Syntax { messages, .. } = err else {
+            panic!("expected syntax error");
+        };
+        assert!(messages.iter().any(|m| m.contains("new.target")));
+    }
+
+    #[test]
+    fn script_arrow_containing_new_target_is_syntax_error() {
+        let err = compile_script_src_err("() => { new.target; };");
+        let CompileError::Syntax { messages, .. } = err else {
+            panic!("expected syntax error");
+        };
+        assert!(messages.iter().any(|m| m.contains("new.target")));
+    }
+
+    #[test]
+    fn script_nested_function_new_target_stays_allowed() {
+        let module = compile_script_src("function f() { return new.target; }");
+        assert!(module.functions.iter().any(|f| f.name == "f"));
+    }
+
+    #[test]
     fn try_catch_emits_enter_and_leave() {
         let module = compile_script_src("try { throw new Error(\"x\"); } catch (e) { e; }");
         let main = module.main();

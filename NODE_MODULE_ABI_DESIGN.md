@@ -121,8 +121,26 @@ Modeled on Deno `op2` fast-calls.
 
 ### Builder + scope (auto-rooting, no UAF footgun)
 Under the macro sits `ModuleScope` (Layer 1): `string/number/bool/array/object/
-function/callable`, every produced `Value` rooted in the scope arena until the
-export is built. Replaces the manual `roots: Vec` pattern used in `assert`.
+function/callable`, every produced `Value` rooted until the export is built.
+Replaces the manual `roots: Vec` pattern used in `assert`.
+
+**Rooting mechanism (the crux):** back `ModuleScope` with the engine's own moving-GC
+rooting — the `iteration_anchors` stack (`push_iteration_anchor`/
+`pop_iteration_anchors_to`/`set_iteration_anchor`/`iteration_anchor`, used by
+Array callbacks) or a dedicated `ExtraRootSource`. Because the GC is moving, a
+plain `Vec<Value>` does NOT root (and stale `Value` copies after an alloc are a
+UAF). The builder must register each value as an anchor and, where it allocates
+again afterward, read values back by anchor index — never trust a `Value` held
+across an allocation. `ModuleScope` takes `&mut NativeCtx` (CJS already has one;
+ESM builds one) so it reaches `alloc_object`, heap, and the interpreter.
+Get this right first — it is the foundation everything else sits on.
+
+**L1 task 0:** `iteration_anchors` push/pop are `pub(crate)` in `otter-vm`
+(lib.rs:2849+). Expose a pub rooting handle on `Interpreter` (e.g.
+`push_module_root`/`pop_module_roots_to` wrapping the anchor stack, or a small
+`ModuleRootScope` RAII guard) so `otter-runtime`'s `ModuleScope` can root during
+the build. `Interpreter` already `impl ExtraRootSource` and traces
+`iteration_anchors`, so anchors are the natural backing.
 
 ### Curated native surface
 `NativeCtx` gains `strict_equal`/`loose_equal`/`same_value`/`deep_equal`/

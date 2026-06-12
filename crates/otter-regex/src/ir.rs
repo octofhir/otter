@@ -65,7 +65,7 @@ fn compute_first_set(insns: &[Insn], ignore_case: bool) -> Option<CodePointSet> 
     let mut pc = 0;
     loop {
         match insns.get(pc)? {
-            Insn::Save(_) => pc += 1,
+            Insn::Save(_) | Insn::ClearCapture(_) => pc += 1,
             Insn::Char {
                 cp,
                 ignore_case: false,
@@ -224,12 +224,14 @@ impl Emitter {
 
     fn compile_repeat(&mut self, node: &Node, quant: Quantifier) {
         let Quantifier { min, max, greedy } = quant;
+        let captures = capture_indices(node);
         for _ in 0..min {
+            self.clear_captures(&captures);
             self.compile(node);
         }
         match max {
-            None => self.compile_star(node, greedy),
-            Some(max) => self.compile_bounded(node, max - min, greedy),
+            None => self.compile_star(node, greedy, &captures),
+            Some(max) => self.compile_bounded(node, max - min, greedy, &captures),
         }
     }
 
@@ -237,11 +239,12 @@ impl Emitter {
     /// guards against an empty-matching body re-iterating forever
     /// (§22.2.2.5.1): each iteration records its start position and fails the
     /// back-edge if the body consumed nothing.
-    fn compile_star(&mut self, node: &Node, greedy: bool) {
+    fn compile_star(&mut self, node: &Node, greedy: bool, captures: &[u32]) {
         let mark = self.new_mark();
         let head = self.emit(Insn::SetMark(mark));
         let split = self.emit(Insn::Split(0, 0));
         let body = self.here();
+        self.clear_captures(captures);
         self.compile(node);
         self.emit(Insn::CheckProgress(mark));
         self.emit(Insn::Jump(head));
@@ -254,10 +257,11 @@ impl Emitter {
     }
 
     /// `count` optional copies of `node` that may each bail to the end.
-    fn compile_bounded(&mut self, node: &Node, count: u32, greedy: bool) {
+    fn compile_bounded(&mut self, node: &Node, count: u32, greedy: bool, captures: &[u32]) {
         let mut splits = Vec::with_capacity(count as usize);
         for _ in 0..count {
             splits.push(self.emit(Insn::Split(0, 0)));
+            self.clear_captures(captures);
             self.compile(node);
         }
         let end = self.here();
@@ -285,6 +289,12 @@ impl Emitter {
         }
     }
 
+    fn clear_captures(&mut self, captures: &[u32]) {
+        for index in captures {
+            self.emit(Insn::ClearCapture(*index));
+        }
+    }
+
     fn compile_look(&mut self, behind: bool, negate: bool, body: &Node) {
         let look = self.emit(Insn::Look {
             negate,
@@ -303,4 +313,33 @@ impl Emitter {
         };
         self.insns[jump] = Insn::Jump(after);
     }
+}
+
+fn capture_indices(node: &Node) -> Vec<u32> {
+    fn visit(node: &Node, out: &mut Vec<u32>) {
+        match node {
+            Node::Group { kind, body } => {
+                if let GroupKind::Capturing { index, .. } = kind {
+                    out.push(*index);
+                }
+                visit(body, out);
+            }
+            Node::Concat(nodes) | Node::Alternate(nodes) => {
+                for node in nodes {
+                    visit(node, out);
+                }
+            }
+            Node::Repeat { node, .. } => visit(node, out),
+            Node::Empty
+            | Node::Char { .. }
+            | Node::AnyChar { .. }
+            | Node::Class { .. }
+            | Node::Assert(_)
+            | Node::BackRef { .. } => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    visit(node, &mut out);
+    out
 }

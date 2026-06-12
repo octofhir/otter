@@ -147,6 +147,20 @@ fn named_group_and_backref() {
 }
 
 #[test]
+fn quantified_duplicate_named_group_clears_previous_iteration_capture() {
+    let flags = Flags::default();
+    let re = Regex::compile_str("(?:(?:(?<x>a)|(?<x>b)|c)\\k<x>){2}", flags).unwrap();
+    let units: Vec<u16> = "aac".encode_utf16().collect();
+    let m = re
+        .find_utf16(&units, 0, ExecConfig::default())
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(m.range, 0..3);
+    assert_eq!(m.named_group("x"), None);
+}
+
+#[test]
 fn case_insensitive_ascii() {
     assert_eq!(matched_text("abc", "i", "ABC").as_deref(), Some("ABC"));
     assert_eq!(

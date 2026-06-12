@@ -80,6 +80,7 @@ enum Act {
     Consume(usize, usize),
     Split(usize, usize),
     Save(usize),
+    ClearCapture(u32),
     CheckProgress(usize),
     Look(bool, bool, usize),
 }
@@ -145,6 +146,7 @@ impl Matcher<'_, '_> {
                         },
                         Insn::Jump(t) => Act::Goto(*t),
                         Insn::Split(a, b) => Act::Split(*a, *b),
+                        Insn::ClearCapture(index) => Act::ClearCapture(*index),
                         Insn::Save(slot) | Insn::SetMark(slot) => Act::Save(*slot),
                         Insn::CheckProgress(slot) => Act::CheckProgress(*slot),
                         Insn::AssertStart { multiline } => {
@@ -200,6 +202,12 @@ impl Matcher<'_, '_> {
                     }
                     Act::Save(slot) => {
                         caps[slot] = Some(pos);
+                        pc += 1;
+                    }
+                    Act::ClearCapture(index) => {
+                        let g = index as usize;
+                        caps[2 * g] = None;
+                        caps[2 * g + 1] = None;
                         pc += 1;
                     }
                     Act::CheckProgress(slot) => {

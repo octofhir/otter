@@ -56,6 +56,9 @@ pub(crate) enum Insn {
     Split(usize, usize),
     /// Record the current position into capture slot `index`.
     Save(usize),
+    /// Clear the start/end slots for capture group `index` before a repeated
+    /// body tries a fresh iteration.
+    ClearCapture(u32),
     /// Store the current position into loop-mark slot `index`, marking the start
     /// of an unbounded-quantifier iteration.
     SetMark(usize),

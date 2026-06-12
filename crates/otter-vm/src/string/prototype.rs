@@ -2066,21 +2066,29 @@ fn impl_last_index_of(
     Ok(Value::number(value))
 }
 
-/// §22.1.3.12 String.prototype.localeCompare. Foundation falls
-/// back to spec-default Unicode code-point comparison; locale-
-/// aware ordering ships through `Intl.Collator`.
+/// §22.1.3.12 String.prototype.localeCompare. Foundation falls back
+/// to NFC-normalized UTF-16 code-unit comparison; locale-aware
+/// ordering ships through `Intl.Collator`.
 fn impl_locale_compare(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let recv = receiver_string(ctx, receiver)?.to_lossy_string(ctx.heap_mut());
+    let recv = receiver_string(ctx, receiver)?;
     // §22.1.3.10 step 3 — `That = ? ToString(that)`. Object operands
     // arrive pre-coerced to primitives by `coerce_string_method_args`;
     // `arg_to_string` finishes the primitive rendering (a String
     // wrapper unwraps to its `[[StringData]]`, not "[object Object]").
-    let other = arg_to_string(ctx, args, 0)?.to_lossy_string(ctx.heap_mut());
-    let cmp = match recv.cmp(&other) {
+    let other = arg_to_string(ctx, args, 0)?;
+    let recv_units = recv.to_utf16_vec(ctx.heap());
+    let other_units = other.to_utf16_vec(ctx.heap());
+    let recv_normalized: Vec<u16> = icu_normalizer::ComposingNormalizerBorrowed::new_nfc()
+        .normalize_utf16(&recv_units)
+        .into();
+    let other_normalized: Vec<u16> = icu_normalizer::ComposingNormalizerBorrowed::new_nfc()
+        .normalize_utf16(&other_units)
+        .into();
+    let cmp = match recv_normalized.cmp(&other_normalized) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,

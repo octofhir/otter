@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./otter-logo.png" alt="Otter logo" width="200">
+</p>
+
 # Otter
 
 Embeddable TypeScript/JavaScript runtime and CLI powered by a custom bytecode VM.

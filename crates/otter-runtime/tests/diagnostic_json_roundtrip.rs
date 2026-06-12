@@ -142,11 +142,11 @@ fn otter_error_envelope_round_trips_byte_identical() {
 
     // Runtime-side envelope: single diagnostic with frames.
     let runtime_err = OtterError::Runtime {
-        diagnostic: Diagnostic::new(
+        diagnostic: Box::new(Diagnostic::new(
             DiagnosticKind::Type,
             DiagnosticCode::Uncaught,
             "uncaught exception: TypeError: boom",
-        ),
+        )),
     };
     assert_round_trip(&runtime_err);
 

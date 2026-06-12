@@ -19,7 +19,6 @@ pub fn web_globals_installer() -> RuntimeGlobalInstaller {
     RuntimeGlobalInstaller::new(install)
 }
 
-#[allow(clippy::result_large_err)] // OtterError shape is fixed by the installer API.
 fn install(runtime: &mut Runtime) -> Result<(), OtterError> {
     runtime.install_native_global("atob", 1, atob)?;
     runtime.install_native_global("btoa", 1, btoa)?;

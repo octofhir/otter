@@ -99,7 +99,7 @@ fn runtime_category_json_envelope() {
     let (status, env) = run_with_json("throw new Error(\"boom\");\n", "entry.ts");
     assert_ne!(status, 0);
     let diagnostic = match env.error {
-        OtterError::Runtime { diagnostic } => diagnostic,
+        OtterError::Runtime { diagnostic } => *diagnostic,
         other => panic!("expected Runtime error, got {other:?}"),
     };
     let code = DiagnosticCode::parse(&diagnostic.code)

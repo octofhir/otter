@@ -3913,7 +3913,7 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
     let display = error.to_string();
     let runtime_diagnostic =
         |kind: DiagnosticKind, code: DiagnosticCode, message: String| OtterError::Runtime {
-            diagnostic: Diagnostic {
+            diagnostic: Box::new(Diagnostic {
                 kind,
                 code: code.as_str().to_string(),
                 message,
@@ -3924,7 +3924,7 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
                 frames: stack_frames.clone(),
                 cause: None,
                 aggregated_errors: Vec::new(),
-            },
+            }),
         };
     match error {
         VmError::Interrupted => OtterError::Interrupted,
@@ -4006,7 +4006,7 @@ fn map_native_error(err: otter_vm::NativeError) -> OtterError {
     match err {
         otter_vm::NativeError::Interrupted => OtterError::Interrupted,
         otter_vm::NativeError::Exit { code } => OtterError::Runtime {
-            diagnostic: Diagnostic {
+            diagnostic: Box::new(Diagnostic {
                 kind: DiagnosticKind::Type,
                 code: DiagnosticCode::Uncaught.as_str().to_string(),
                 message: format!("native function requested process exit with code {code}"),
@@ -4017,10 +4017,10 @@ fn map_native_error(err: otter_vm::NativeError) -> OtterError {
                 frames: Vec::new(),
                 cause: None,
                 aggregated_errors: Vec::new(),
-            },
+            }),
         },
         other => OtterError::Runtime {
-            diagnostic: Diagnostic {
+            diagnostic: Box::new(Diagnostic {
                 kind: DiagnosticKind::Type,
                 code: DiagnosticCode::TypeError.as_str().to_string(),
                 message: other.to_string(),
@@ -4031,7 +4031,7 @@ fn map_native_error(err: otter_vm::NativeError) -> OtterError {
                 frames: Vec::new(),
                 cause: None,
                 aggregated_errors: Vec::new(),
-            },
+            }),
         },
     }
 }

@@ -15,7 +15,7 @@ fn run_throwing(source: &str) -> Diagnostic {
         .run_script(SourceInput::from_javascript(source), "<cause-test>")
         .expect_err("script throws");
     match err {
-        OtterError::Runtime { diagnostic } => diagnostic,
+        OtterError::Runtime { diagnostic } => *diagnostic,
         other => panic!("expected Runtime error, got {other:?}"),
     }
 }

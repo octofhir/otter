@@ -70,8 +70,9 @@ pub enum OtterError {
     /// A catchable JS error escaped the script.
     #[error("runtime error: {}", .diagnostic.message)]
     Runtime {
-        /// Structured diagnostic payload.
-        diagnostic: Diagnostic,
+        /// Structured diagnostic payload. Boxed to keep [`OtterError`] small
+        /// (the diagnostic is the enum's largest variant).
+        diagnostic: Box<Diagnostic>,
     },
     /// Configured timeout fired.
     #[error("timeout after {} ms", .elapsed_ms)]

@@ -18,7 +18,7 @@ fn top_frame_span_points_at_failing_source_substring() {
         .run_script(SourceInput::from_javascript(source), "<source-map-test>")
         .expect_err("script throws");
     let diagnostic = match err {
-        OtterError::Runtime { diagnostic } => diagnostic,
+        OtterError::Runtime { diagnostic } => *diagnostic,
         other => panic!("expected Runtime error, got {other:?}"),
     };
 
@@ -67,7 +67,7 @@ fn module_field_uses_per_function_module_url_for_multi_module_graph() {
         )
         .expect_err("script throws");
     let diagnostic = match err {
-        OtterError::Runtime { diagnostic } => diagnostic,
+        OtterError::Runtime { diagnostic } => *diagnostic,
         other => panic!("expected Runtime error, got {other:?}"),
     };
     let module = diagnostic

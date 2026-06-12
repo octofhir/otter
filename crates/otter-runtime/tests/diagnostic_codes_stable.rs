@@ -120,7 +120,7 @@ fn vm_json_diagnostic_codes_live_in_the_enum() {
         )
         .expect_err("JSON.parse should reject malformed input");
     let diagnostic = match err {
-        OtterError::Runtime { diagnostic } => diagnostic,
+        OtterError::Runtime { diagnostic } => *diagnostic,
         other => panic!("expected runtime error, got {other:?}"),
     };
     let typed = DiagnosticCode::parse(&diagnostic.code)

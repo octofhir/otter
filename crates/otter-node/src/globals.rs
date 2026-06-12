@@ -15,7 +15,6 @@ pub fn node_globals_installer() -> RuntimeGlobalInstaller {
     RuntimeGlobalInstaller::new(install)
 }
 
-#[allow(clippy::result_large_err)] // OtterError shape is fixed by the installer API.
 fn install(runtime: &mut Runtime) -> Result<(), OtterError> {
     // `global` aliases `globalThis` (Node compatibility).
     let global_this = runtime.global_this();

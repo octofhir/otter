@@ -94,6 +94,14 @@ fn relative_index(arg: Option<&Value>, default: i64, len: i64) -> i64 {
     }
 }
 
+fn clamp_relative_index(index: i64, len: i64) -> i64 {
+    if index < 0 {
+        (len + index).max(0)
+    } else {
+        index.min(len)
+    }
+}
+
 fn integer_arg(arg: Option<&Value>, default: i64) -> i64 {
     let Some(v) = arg else {
         return default;
@@ -121,6 +129,38 @@ fn integer_arg(arg: Option<&Value>, default: i64) -> i64 {
         };
     }
     n.trunc() as i64
+}
+
+fn to_integer_or_infinity_arg(
+    ctx: &mut NativeCtx<'_>,
+    arg: Option<&Value>,
+    default: i64,
+    name: &'static str,
+) -> Result<i64, NativeError> {
+    let Some(value) = arg else {
+        return Ok(default);
+    };
+    if value.is_undefined() {
+        return Ok(default);
+    }
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| type_error("missing execution context"))?;
+    let number = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, value)
+        .map_err(|e| crate::native_function::vm_to_native_error(e, name))?;
+    let n = number.as_f64();
+    if n.is_nan() {
+        return Ok(0);
+    }
+    if !n.is_finite() {
+        return Ok(if n.is_sign_positive() {
+            i64::MAX
+        } else {
+            i64::MIN
+        });
+    }
+    Ok(n.trunc() as i64)
 }
 
 /// `ToIntegerOrInfinity(fromIndex)` for the `indexOf` / `lastIndexOf` /
@@ -324,16 +364,29 @@ fn impl_fill(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
 }
 
 fn impl_copy_within(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let name = "TypedArray.prototype.copyWithin";
     let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut()) as i64;
-    let target = relative_index(args.first(), 0, len);
-    let start = relative_index(args.get(1), 0, len);
-    let end = relative_index(args.get(2), len, len);
-    let to = target.clamp(0, len);
-    let from = start.clamp(0, len);
-    let final_end = end.clamp(start, len);
-    let count = (final_end - from).min(len - to).max(0) as usize;
+    let target = to_integer_or_infinity_arg(ctx, args.first(), 0, name)?;
+    let start = to_integer_or_infinity_arg(ctx, args.get(1), 0, name)?;
+    let end = to_integer_or_infinity_arg(ctx, args.get(2), len, name)?;
+    let to = clamp_relative_index(target, len);
+    let from = clamp_relative_index(start, len);
+    let final_end = clamp_relative_index(end, len);
+    let mut count = (final_end - from).min(len - to).max(0) as usize;
+    if count == 0 {
+        return Ok(Value::typed_array(t));
+    }
+    if t.buffer(ctx.heap()).is_detached(ctx.heap())
+        || (!t.is_length_tracking(ctx.heap()) && t.is_out_of_bounds(ctx.heap()))
+    {
+        return Err(type_error("typedarray is detached or out of bounds"));
+    }
+    let live_len = t.length(ctx.heap()) as i64;
+    count = count
+        .min((live_len - from).max(0) as usize)
+        .min((live_len - to).max(0) as usize);
     if count == 0 {
         return Ok(Value::typed_array(t));
     }

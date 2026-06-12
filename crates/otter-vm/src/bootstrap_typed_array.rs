@@ -1011,7 +1011,6 @@ fn ta_proto_dispatch(
     // detaches the buffer must not pre-empt that ordering.
     let int_coerce: &[usize] = match method_name {
         "fill" => &[1, 2],
-        "copyWithin" => &[0, 1, 2],
         // §23.2.3.1 / §23.2.3.36 / §23.2.3.27/.28 — relative-index
         // operands run ToIntegerOrInfinity (firing valueOf /
         // toString) before the impl reads them as numbers.

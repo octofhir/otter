@@ -2212,8 +2212,9 @@ impl Interpreter {
         }
 
         let removed = self.array_species_create(context, o, actual_delete_count, roots)?;
-        if actual_delete_count <= MAX_ARRAY_LIKE_PROBE_LEN {
-            for n in 0..actual_delete_count {
+        if actual_delete_count <= MAX_ARRAY_LIKE_PROBE_LEN || o.is_proxy() {
+            let copy_count = actual_delete_count.min(MAX_ARRAY_LIKE_PROBE_LEN);
+            for n in 0..copy_count {
                 self.splice_copy_deleted_index(context, o, removed, actual_start + n, n)?;
             }
         } else {

@@ -11,7 +11,8 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-array-constructor>
 
-use crate::object;
+use crate::js_surface::JsSurfaceError;
+use crate::object::{self, PropertyDescriptor};
 use crate::{NativeCtx, NativeError, Value, array, descriptor_value};
 
 otter_macros::couch! {
@@ -22,6 +23,31 @@ otter_macros::couch! {
     prototype = {
         method_specs = [crate::array_prototype::ARRAY_PROTOTYPE_METHODS],
     },
+    post_install = install_array_prototype_length,
+}
+
+fn install_array_prototype_length(
+    heap: &mut otter_gc::GcHeap,
+    _global: object::JsObject,
+    ctor: crate::native_function::NativeFunction,
+) -> Result<(), JsSurfaceError> {
+    let Some(descriptor) = ctor
+        .own_property_descriptor(&mut *heap, "prototype")
+        .map_err(|_| JsSurfaceError::DefinePropertyFailed("prototype"))?
+    else {
+        return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
+    };
+    let object::DescriptorKind::Data { value } = descriptor.kind else {
+        return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
+    };
+    let Some(prototype) = value.as_object() else {
+        return Ok(());
+    };
+    let desc = PropertyDescriptor::data(Value::number_i32(0), true, false, false);
+    if !object::define_own_property(prototype, heap, "length", desc) {
+        return Err(JsSurfaceError::DefinePropertyFailed("length"));
+    }
+    Ok(())
 }
 
 /// §23.1.1.1 Array(...values) — both `Array(…)` and `new Array(…)`

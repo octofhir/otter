@@ -581,6 +581,18 @@ pub(crate) fn emit_make_callable(
     Ok(())
 }
 
+pub(crate) fn emit_make_callable_object(
+    cx: &mut Compiler,
+    dst: u16,
+    function_const: u32,
+    captures: &[u32],
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    let operands = make_closure_operands(dst, function_const, captures, span)?;
+    cx.emit(Op::MakeClosure, operands, span);
+    Ok(())
+}
+
 fn make_closure_operands(
     dst: u16,
     function_const: u32,

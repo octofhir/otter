@@ -498,6 +498,11 @@ pub struct Interpreter {
     /// underlying function so writes through any closure handle
     /// land on the same place.
     function_user_props: std::collections::HashMap<u32, JsObject>,
+    /// Per ordinary-function `[[Prototype]]` overrides. Used by
+    /// `CreateDynamicFunction` when subclassing `%Function%`:
+    /// `new Subclass extends Function` returns a fresh ordinary
+    /// function whose internal prototype is `new.target.prototype`.
+    function_prototype_overrides: std::collections::HashMap<u32, Value>,
     /// Function ids whose ordinary function object has had
     /// `[[PreventExtensions]]` applied. Kept separate from the
     /// lazy user bag so materialising spec-existing virtual
@@ -949,6 +954,7 @@ impl Interpreter {
             iteration_anchors: Vec::new(),
             pending_uncaught_frames: None,
             function_user_props: std::collections::HashMap::new(),
+            function_prototype_overrides: std::collections::HashMap::new(),
             function_non_extensible: std::collections::HashSet::new(),
             function_deleted_metadata: std::collections::HashSet::new(),
             non_gc_exotic_prototype_overrides: std::collections::HashMap::new(),
@@ -1660,15 +1666,20 @@ impl Interpreter {
                 value
                     .as_closure(&self.gc_heap)
                     .map(|c| c.cached_function_id)
-            }) && let Some(chunk) = self.code_space.chunk_for(function_id)
-                && let Some(local) = function_id.checked_sub(chunk.function_base)
-                && let Some(function) = chunk.module.functions.get(local as usize)
-                && let Some(proto) = self.function_kind_prototypes.kind_prototype_for_flags(
-                    function.is_generator,
-                    function.is_async || function.is_async_generator,
-                )
-            {
-                return Ok(Value::object(proto));
+            }) {
+                if let Some(over) = self.function_prototype_overrides.get(&function_id).copied() {
+                    return Ok(over);
+                }
+                if let Some(chunk) = self.code_space.chunk_for(function_id)
+                    && let Some(local) = function_id.checked_sub(chunk.function_base)
+                    && let Some(function) = chunk.module.functions.get(local as usize)
+                    && let Some(proto) = self.function_kind_prototypes.kind_prototype_for_flags(
+                        function.is_generator,
+                        function.is_async || function.is_async_generator,
+                    )
+                {
+                    return Ok(Value::object(proto));
+                }
             }
             return Ok(Value::object(self.function_prototype_object()?));
         }
@@ -2484,6 +2495,29 @@ impl Interpreter {
         self.function_user_props.values()
     }
 
+    /// Iterator over ordinary-function `[[Prototype]]` override
+    /// values. Used by the GC root walker because subclassed
+    /// dynamic functions can retain user-created prototype objects.
+    pub fn function_prototype_overrides_for_trace(&self) -> impl Iterator<Item = &Value> {
+        self.function_prototype_overrides.values()
+    }
+
+    pub(crate) fn set_function_prototype_override(&mut self, value: &Value, proto: Option<Value>) {
+        let function_id = value.as_function().or_else(|| {
+            value
+                .as_closure(&self.gc_heap)
+                .map(|closure| closure.cached_function_id)
+        });
+        let Some(function_id) = function_id else {
+            return;
+        };
+        if let Some(proto) = proto {
+            self.function_prototype_overrides.insert(function_id, proto);
+        } else {
+            self.function_prototype_overrides.remove(&function_id);
+        }
+    }
+
     /// Iterator over cached per-kind iterator prototypes.
     pub fn iterator_prototypes_for_trace(&self) -> impl Iterator<Item = &JsObject> {
         [
@@ -3263,16 +3297,22 @@ impl Interpreter {
                 }
             };
         }
-        let (function_id, parent_upvalues, this_for_callee, _new_target_for_callee, _callee_env) =
-            match Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap) {
-                Ok(parts) => parts,
-                Err(error) => {
-                    return Err(RunError {
-                        error,
-                        frames: Vec::new(),
-                    });
-                }
-            };
+        let (
+            function_id,
+            parent_upvalues,
+            this_for_callee,
+            _new_target_for_callee,
+            _derived_this_cell,
+            _callee_env,
+        ) = match Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap) {
+            Ok(parts) => parts,
+            Err(error) => {
+                return Err(RunError {
+                    error,
+                    frames: Vec::new(),
+                });
+            }
+        };
         let function = match context.exec_function(function_id) {
             Some(f) => f,
             None => {
@@ -3718,21 +3758,39 @@ impl Interpreter {
                         self.frame_cold(&stack[i])
                             .is_some_and(|c| c.is_derived_constructor)
                     });
-                    let Some(ti) = target else {
-                        return Err(VmError::ThisUninitialized {
-                            message: "super called outside a derived constructor".to_string(),
-                        });
-                    };
-                    if !stack[ti].this_value.is_hole() {
-                        return Err(VmError::ThisUninitialized {
-                            message: "super constructor may only be called once".to_string(),
-                        });
-                    }
-                    stack[ti].this_value = value;
-                    if let Some(obj) = value.as_object() {
+                    if let Some(ti) = target {
+                        if !stack[ti].this_value.is_hole() {
+                            return Err(VmError::ThisUninitialized {
+                                message: "super constructor may only be called once".to_string(),
+                            });
+                        }
+                        stack[ti].this_value = value;
                         let frame = &mut stack[ti];
-                        let cold = self.frame_ensure_cold(frame);
-                        cold.construct_target = Some(obj);
+                        let derived_this_cell = self
+                            .frame_cold(frame)
+                            .and_then(|cold| cold.derived_this_cell);
+                        if let Some(cell) = derived_this_cell {
+                            crate::store_upvalue(&mut self.gc_heap, cell, value);
+                        }
+                        if let Some(obj) = value.as_object() {
+                            let cold = self.frame_ensure_cold(frame);
+                            cold.construct_target = Some(obj);
+                        }
+                    } else {
+                        let derived_this_cell = self
+                            .frame_cold(&stack[top_idx])
+                            .and_then(|cold| cold.derived_this_cell);
+                        let Some(cell) = derived_this_cell else {
+                            return Err(VmError::ThisUninitialized {
+                                message: "super called outside a derived constructor".to_string(),
+                            });
+                        };
+                        if !crate::read_upvalue(&self.gc_heap, cell).is_hole() {
+                            return Err(VmError::ThisUninitialized {
+                                message: "super constructor may only be called once".to_string(),
+                            });
+                        }
+                        crate::store_upvalue(&mut self.gc_heap, cell, value);
                     }
                     stack[top_idx].advance_pc(self.current_byte_len)?;
                     continue;
@@ -6087,7 +6145,12 @@ impl Interpreter {
         let is_derived_ctor = self
             .frame_cold(&popped)
             .is_some_and(|c| c.is_derived_constructor);
-        let derived_this = popped.this_value;
+        let mut derived_this = popped.this_value;
+        if derived_this.is_hole()
+            && let Some(cell) = self.frame_cold(&popped).and_then(|c| c.derived_this_cell)
+        {
+            derived_this = crate::read_upvalue(&self.gc_heap, cell);
+        }
         // Release the cold slot now so the pool can reuse it; the
         // remaining cold-record reads above already happened.
         self.frame_release_cold(&mut popped);
@@ -10988,7 +11051,7 @@ mod tests {
         assert!(is_callable(&Value::function(7)));
         let mut closure_heap = otter_gc::GcHeap::new().expect("closure heap");
         let closure_handle =
-            crate::closure::alloc_closure(&mut closure_heap, 7, Vec::new(), None, None, None)
+            crate::closure::alloc_closure(&mut closure_heap, 7, Vec::new(), None, None, None, None)
                 .expect("closure");
         assert!(is_callable(&Value::closure(closure_handle)));
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
@@ -11471,6 +11534,7 @@ mod tests {
             1,
             Vec::new(),
             Some(Value::string(bound)),
+            None,
             None,
             None,
         )

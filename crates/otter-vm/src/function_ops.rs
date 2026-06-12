@@ -65,6 +65,7 @@ impl Interpreter {
                 Vec::new(),
                 None,
                 None,
+                None,
                 Some(env),
             )
             .map_err(crate::oom_to_vm)?;
@@ -117,6 +118,12 @@ impl Interpreter {
         } else {
             None
         };
+        let bound_derived_this = if context.function_is_arrow(function_id) {
+            self.frame_cold(frame)
+                .and_then(|cold| cold.derived_this_cell)
+        } else {
+            None
+        };
         // §9.1 — closures made in a frame whose function chain
         // contains a direct eval capture the frame's eval variable
         // environment so eval-introduced vars stay reachable.
@@ -127,6 +134,7 @@ impl Interpreter {
             upvalues,
             bound_this,
             bound_new_target,
+            bound_derived_this,
             eval_env,
         )
         .map_err(crate::oom_to_vm)?;
@@ -518,7 +526,7 @@ impl Interpreter {
         let Some(prototype) = self.instanceof_target_prototype(context, c)? else {
             return Ok(false);
         };
-        if !(prototype.is_object() || prototype.is_proxy()) {
+        if !(prototype.is_object_type() || prototype.is_proxy()) {
             return Err(VmError::TypeError {
                 message: "Function has non-object prototype 'undefined' in instanceof check"
                     .to_string(),
@@ -548,7 +556,7 @@ impl Interpreter {
         else {
             return Ok(false);
         };
-        if !(prototype.is_object() || prototype.is_proxy()) {
+        if !(prototype.is_object_type() || prototype.is_proxy()) {
             return Err(VmError::TypeError {
                 message: "Function has non-object prototype 'undefined' in instanceof check"
                     .to_string(),

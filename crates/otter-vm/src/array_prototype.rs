@@ -856,7 +856,17 @@ impl Interpreter {
         // generic array-like (e.g. an `arguments` object) holds a live
         // `ArrayLike` state so a `length` / element change between
         // `next()` calls is observed rather than snapshot at creation.
-        let state = if let Some(arr) = o.as_array() {
+        let proxy_array_target = if let Some(proxy) = o.as_proxy() {
+            if proxy.is_revoked(&self.gc_heap) {
+                return Err(VmError::TypeError {
+                    message: "Cannot perform 'get' on a proxy that has been revoked".to_string(),
+                });
+            }
+            proxy.target(&self.gc_heap).as_array()
+        } else {
+            None
+        };
+        let state = if let Some(arr) = o.as_array().or(proxy_array_target) {
             match kind {
                 "keys" => crate::IteratorState::ArrayKey {
                     array: arr,

@@ -1555,7 +1555,7 @@ impl Interpreter {
             self.invoke(stack, context, &callee, value, SmallVec::new(), dst)?;
             return Ok(true);
         }
-        if value.as_object().is_none() {
+        if value.as_object().is_none() && value.as_proxy().is_none() {
             return Ok(false);
         }
         // §7.4.3 GetIterator step 1 — GetMethod(obj, @@iterator) runs

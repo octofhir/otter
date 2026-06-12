@@ -628,7 +628,7 @@ fn compile_class_strict(
         )?;
         let m_const = cx.intern_function_id(m_id);
         let m_reg = cx.alloc_scratch();
-        emit_make_callable(cx, m_reg, m_const, &m_captures, false, method_span)?;
+        emit_make_callable_object(cx, m_reg, m_const, &m_captures, method_span)?;
         let is_accessor = matches!(
             m.kind,
             oxc_ast::ast::MethodDefinitionKind::Get | oxc_ast::ast::MethodDefinitionKind::Set

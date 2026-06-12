@@ -100,13 +100,14 @@ struct PreparedBytecodeFrame {
     generator_function_id: u32,
 }
 
-/// `(function_id, upvalues, this, new_target, eval_env)` resolved
-/// from a callable value for a bytecode call.
+/// `(function_id, upvalues, this, new_target, derived_this_cell,
+/// eval_env)` resolved from a callable value for a bytecode call.
 pub(crate) type BytecodeCallTargetParts = (
     u32,
     crate::frame_state::UpvalueSpine,
     Value,
     Option<Value>,
+    Option<crate::UpvalueCell>,
     Option<crate::eval_env::EvalEnvHandle>,
 );
 
@@ -181,15 +182,22 @@ impl Interpreter {
                 effective_this,
                 None,
                 None,
+                None,
             ));
         }
         if let Some(c) = current.as_closure(heap) {
             let function_id = c.function_id();
-            let (upvalues, bound_this, bound_new_target, eval_env) =
-                heap.read_payload(c.handle, |body| {
+            let (upvalues, bound_this, bound_new_target, bound_derived_this, eval_env) = heap
+                .read_payload(c.handle, |body| {
                     let ups: crate::frame_state::UpvalueSpine =
                         body.upvalues.clone().into_boxed_slice();
-                    (ups, body.bound_this, body.bound_new_target, body.eval_env)
+                    (
+                        ups,
+                        body.bound_this,
+                        body.bound_new_target,
+                        body.bound_derived_this,
+                        body.eval_env,
+                    )
                 });
             let this_value = bound_this.unwrap_or(effective_this);
             return Ok((
@@ -197,6 +205,7 @@ impl Interpreter {
                 upvalues,
                 this_value,
                 bound_new_target,
+                bound_derived_this,
                 eval_env,
             ));
         }
@@ -259,10 +268,16 @@ impl Interpreter {
             upvalues,
             this_value,
         );
+        let derived_this_cell = if is_derived {
+            Some(crate::alloc_upvalue(&mut self.gc_heap, Value::hole())?)
+        } else {
+            None
+        };
         {
             let cold = self.frame_ensure_cold(&mut frame);
             if is_derived {
                 cold.is_derived_constructor = true;
+                cold.derived_this_cell = derived_this_cell;
             } else {
                 cold.construct_target = Some(receiver);
             }
@@ -308,10 +323,16 @@ impl Interpreter {
             this_value,
         );
         let extras = args.bind_into(function, &mut frame)?;
+        let derived_this_cell = if is_derived {
+            Some(crate::alloc_upvalue(&mut self.gc_heap, Value::hole())?)
+        } else {
+            None
+        };
         {
             let cold = self.frame_ensure_cold(&mut frame);
             if is_derived {
                 cold.is_derived_constructor = true;
+                cold.derived_this_cell = derived_this_cell;
             } else {
                 cold.construct_target = Some(receiver);
             }
@@ -354,6 +375,7 @@ impl Interpreter {
         parent_upvalues: UpvalueSpine,
         this_for_callee: Value,
         new_target_for_callee: Option<Value>,
+        derived_this_cell: Option<crate::UpvalueCell>,
         callee_eval_env: Option<crate::eval_env::EvalEnvHandle>,
         effective_args: SmallVec<[Value; 8]>,
         dst: u16,
@@ -407,6 +429,10 @@ impl Interpreter {
             let cold = self.frame_ensure_cold(&mut new_frame);
             cold.new_target = Some(new_target);
         }
+        if let Some(cell) = derived_this_cell {
+            let cold = self.frame_ensure_cold(&mut new_frame);
+            cold.derived_this_cell = Some(cell);
+        }
         self.stash_frame_eval_env(function, &mut new_frame, callee_eval_env)?;
         self.bind_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
         // §27.5 Generator-call entry: instead of pushing the frame
@@ -459,6 +485,7 @@ impl Interpreter {
         parent_upvalues: UpvalueSpine,
         this_for_callee: Value,
         new_target_for_callee: Option<Value>,
+        derived_this_cell: Option<crate::UpvalueCell>,
         callee_eval_env: Option<crate::eval_env::EvalEnvHandle>,
         args: &BytecodeArgumentWindow<'_>,
         return_register: Option<u16>,
@@ -487,6 +514,10 @@ impl Interpreter {
         if let Some(new_target) = new_target_for_callee {
             let cold = self.frame_ensure_cold(&mut frame);
             cold.new_target = Some(new_target);
+        }
+        if let Some(cell) = derived_this_cell {
+            let cold = self.frame_ensure_cold(&mut frame);
+            cold.derived_this_cell = Some(cell);
         }
         self.stash_frame_eval_env(function, &mut frame, callee_eval_env)?;
         Ok(PreparedBytecodeFrame {
@@ -586,8 +617,14 @@ impl Interpreter {
         if !current.is_function() && !current.is_closure() {
             return Ok(false);
         }
-        let (function_id, parent_upvalues, this_for_callee, new_target_for_callee, callee_eval_env) =
-            Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
+        let (
+            function_id,
+            parent_upvalues,
+            this_for_callee,
+            new_target_for_callee,
+            derived_this_cell,
+            callee_eval_env,
+        ) = Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -617,6 +654,7 @@ impl Interpreter {
                 parent_upvalues,
                 this_for_callee,
                 new_target_for_callee,
+                derived_this_cell,
                 callee_eval_env,
                 &args,
                 return_register,
@@ -790,6 +828,7 @@ impl Interpreter {
                 parent_upvalues,
                 this_for_callee,
                 new_target_for_callee,
+                derived_this_cell,
                 callee_eval_env,
             ) = Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
             return self.push_bytecode_call_frame(
@@ -799,6 +838,7 @@ impl Interpreter {
                 parent_upvalues,
                 this_for_callee,
                 new_target_for_callee,
+                derived_this_cell,
                 callee_eval_env,
                 effective_args,
                 dst,
@@ -877,8 +917,14 @@ impl Interpreter {
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(());
         }
-        let (function_id, parent_upvalues, this_for_callee, new_target_for_callee, callee_eval_env) =
-            Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
+        let (
+            function_id,
+            parent_upvalues,
+            this_for_callee,
+            new_target_for_callee,
+            derived_this_cell,
+            callee_eval_env,
+        ) = Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
         self.push_bytecode_call_frame(
             stack,
             context,
@@ -886,6 +932,7 @@ impl Interpreter {
             parent_upvalues,
             this_for_callee,
             new_target_for_callee,
+            derived_this_cell,
             callee_eval_env,
             effective_args,
             dst,
@@ -1261,6 +1308,9 @@ impl Interpreter {
         if let Some(c) = callee.as_class_constructor() {
             return Ok(Some(Value::object(c.prototype(&self.gc_heap))));
         }
+        if callee.as_proxy().is_some() {
+            return self.construct_prototype_via_get(context, callee);
+        }
         if let Some(obj) = callee.as_object() {
             return Ok(match crate::object::get(obj, &self.gc_heap, "prototype") {
                 Some(proto) if proto.is_object_type() => Some(proto),
@@ -1314,6 +1364,9 @@ impl Interpreter {
         if let Some(c) = callee.as_class_constructor() {
             return Ok(Some(Value::object(c.prototype(&self.gc_heap))));
         }
+        if callee.as_proxy().is_some() {
+            return self.construct_prototype_via_get(context, callee);
+        }
         if let Some(obj) = callee.as_object() {
             return Ok(match crate::object::get(obj, &self.gc_heap, "prototype") {
                 Some(proto) if proto.is_object_type() => Some(proto),
@@ -1344,6 +1397,7 @@ impl Interpreter {
         context: &ExecutionContext,
         callee: &Value,
     ) -> Result<Option<Value>, VmError> {
+        let proxy = callee.as_proxy();
         let key = VmPropertyKey::String("prototype");
         let proto = match self.ordinary_get_value(context, *callee, *callee, &key, 0)? {
             VmGetOutcome::Value(value) => value,
@@ -1351,6 +1405,11 @@ impl Interpreter {
                 self.run_callable_sync(context, &getter, *callee, SmallVec::new())?
             }
         };
+        if !proto.is_object_type() && proxy.is_some_and(|proxy| proxy.is_revoked(&self.gc_heap)) {
+            return Err(VmError::TypeError {
+                message: "Cannot get prototype from a revoked proxy".to_string(),
+            });
+        }
         Ok(proto.is_object_type().then_some(proto))
     }
 
@@ -1591,8 +1650,14 @@ impl Interpreter {
                 effective_args.as_slice(),
             );
         }
-        let (function_id, parent_upvalues, this_for_callee, new_target_for_callee, callee_eval_env) =
-            Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
+        let (
+            function_id,
+            parent_upvalues,
+            this_for_callee,
+            new_target_for_callee,
+            derived_this_cell,
+            callee_eval_env,
+        ) = Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -1609,6 +1674,10 @@ impl Interpreter {
         if let Some(new_target) = new_target_for_callee {
             let cold = self.frame_ensure_cold(&mut new_frame);
             cold.new_target = Some(new_target);
+        }
+        if let Some(cell) = derived_this_cell {
+            let cold = self.frame_ensure_cold(&mut new_frame);
+            cold.derived_this_cell = Some(cell);
         }
         self.stash_frame_eval_env(function, &mut new_frame, callee_eval_env)?;
         self.bind_bytecode_call_arguments(function, &mut new_frame, effective_args)?;

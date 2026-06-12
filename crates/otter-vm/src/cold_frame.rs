@@ -32,7 +32,7 @@ use otter_gc::raw::SlotVisitor;
 use crate::frame_state::{
     PendingBindFunction, PendingGetIterator, PendingIteratorNext, PendingToPrimitive, TryHandler,
 };
-use crate::{JsObject, Value};
+use crate::{JsObject, UpvalueCell, Value};
 use smallvec::SmallVec;
 
 /// A non-throw abrupt completion (`return` / `break` / `continue`)
@@ -160,6 +160,11 @@ pub struct ColdFrame {
     /// undefined return with `this` still in the TDZ is a
     /// `ReferenceError`.
     pub is_derived_constructor: bool,
+    /// Shared `this` binding cell for derived constructors. Arrow
+    /// closures created in the constructor capture this cell so
+    /// `super()` can bind the original constructor environment even
+    /// when the arrow runs through a nested sync dispatch.
+    pub derived_this_cell: Option<UpvalueCell>,
     /// Var-scoped bindings a direct eval introduced into this frame's
     /// variable environment at runtime (§19.2.1.3
     /// EvalDeclarationInstantiation step 16.b). Consulted by
@@ -194,6 +199,7 @@ impl ColdFrame {
             && self.handlers.is_empty()
             && self.active_iterator_closers.is_empty()
             && !self.is_derived_constructor
+            && self.derived_this_cell.is_none()
             && self.eval_vars.is_none()
             && self.eval_env.is_none()
     }
@@ -235,6 +241,10 @@ impl ColdFrame {
         }
         if let Some(v) = &self.new_target {
             v.trace_value_slots(visitor);
+        }
+        if let Some(cell) = &self.derived_this_cell {
+            let p = cell as *const UpvalueCell as *mut otter_gc::raw::RawGc;
+            visitor(p);
         }
         for v in &self.rest_args {
             v.trace_value_slots(visitor);

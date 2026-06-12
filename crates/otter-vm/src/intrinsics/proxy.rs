@@ -68,7 +68,7 @@ fn proxy_revocable_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
     let proxy_value = Value::proxy(proxy);
     let revoke = ctx
         .native_value_with_captures(
-            "revoke",
+            "",
             smallvec::smallvec![proxy_value],
             &[],
             &[args],
@@ -102,6 +102,7 @@ otter_macros::couch! {
     name = "Proxy",
     feature = CORE,
     constructor = (length = 2, call = proxy_ctor_call),
+    no_prototype = true,
     statics = {
         "revocable" / 2 => proxy_revocable_call,
     },

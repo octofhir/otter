@@ -99,6 +99,8 @@ fn dynamic_function_ctor_call(
         })?;
     if let (Some(native), Some(proto)) = (result.as_native_function(), new_target_proto) {
         native.set_prototype_override(interp.gc_heap_mut(), Some(proto));
+    } else {
+        interp.set_function_prototype_override(&result, new_target_proto);
     }
     Ok(result)
 }

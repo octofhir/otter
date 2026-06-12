@@ -720,7 +720,7 @@ fn impl_to_sorted_default(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
     let mut snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
     match comparefn {
         None => sort_default(&mut snapshot, t.kind().is_bigint(), ctx.heap_mut()),
-        Some(cmp) => sort_with_comparefn(ctx, &mut snapshot, &cmp)?,
+        Some(cmp) => sort_with_comparefn(ctx, &mut snapshot, &cmp, None)?,
     }
     build_new_typed_array(ctx, t.kind(), &snapshot)
 }
@@ -742,7 +742,10 @@ fn impl_sort_default(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
     let mut snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
     match comparefn {
         None => sort_default(&mut snapshot, t.kind().is_bigint(), ctx.heap_mut()),
-        Some(cmp) => sort_with_comparefn(ctx, &mut snapshot, &cmp)?,
+        Some(cmp) => sort_with_comparefn(ctx, &mut snapshot, &cmp, Some(t))?,
+    }
+    if t.buffer(ctx.heap()).is_detached(ctx.heap()) {
+        return Ok(Value::typed_array(t));
     }
     for (i, v) in snapshot.iter().enumerate() {
         t.set(ctx.heap_mut(), i, v);
@@ -757,6 +760,7 @@ fn sort_with_comparefn(
     ctx: &mut NativeCtx<'_>,
     items: &mut Vec<Value>,
     cmp: &Value,
+    detach_watch: Option<JsTypedArray>,
 ) -> Result<(), NativeError> {
     let exec_ctx = ctx
         .execution_context()
@@ -793,6 +797,9 @@ fn sort_with_comparefn(
                         crate::native_function::vm_to_native_error(e, "TypedArray.prototype.sort")
                     })?
                     .as_f64();
+                if detach_watch.is_some_and(|t| t.buffer(ctx.heap()).is_detached(ctx.heap())) {
+                    return Ok(());
+                }
                 if v > 0.0 {
                     buf[k] = items[j];
                     j += 1;

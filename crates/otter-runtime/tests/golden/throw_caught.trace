@@ -13,8 +13,8 @@ frame=2 fn=boom pc=000020 op=LOAD_STRING  r2 k[2]
 frame=2 fn=boom pc=000030 op=NEW_ERROR  r3 r2
 frame=2 fn=boom pc=000038 op=THROW  r3
 frame=1 fn=<main> pc=000104 op=LOAD_UNDEFINED  r1
-frame=1 fn=<main> pc=000109 op=STORE_LOCAL  r2 i32:5
-frame=1 fn=<main> pc=000119 op=LOAD_LOCAL  r6 i32:5
-frame=1 fn=<main> pc=000129 op=LOAD_PROPERTY  r7 r6 k[3]
-frame=1 fn=<main> pc=000142 op=STORE_LOCAL  r7 i32:1
+frame=1 fn=<main> pc=000109 op=STORE_UPVALUE  r2 i32:0
+frame=1 fn=<main> pc=000119 op=LOAD_UPVALUE  r5 i32:0
+frame=1 fn=<main> pc=000129 op=LOAD_PROPERTY  r6 r5 k[3]
+frame=1 fn=<main> pc=000142 op=STORE_LOCAL  r6 i32:1
 frame=1 fn=<main> pc=000152 op=RETURN  r1

@@ -144,7 +144,12 @@ pub(crate) fn compile_catch_clause(
         match &param.pattern {
             oxc_ast::ast::BindingPattern::BindingIdentifier(id) => {
                 let pname = id.name.as_str().to_string();
-                let storage = cx.declare_binding(&pname, false, span)?;
+                // Catch parameters are fresh declarative bindings.
+                // When an outer `var` with the same name is captured,
+                // the generic name-keyed capture allocator would reuse
+                // that upvalue cell. Force a new cell for the catch
+                // binding so it shadows instead of aliasing.
+                let storage = cx.declare_captured_binding(&pname, false, span)?;
                 cx.emit_store_storage(exc_reg, storage, span);
                 cx.mark_initialized(&pname);
             }

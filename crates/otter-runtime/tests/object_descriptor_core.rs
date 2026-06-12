@@ -247,8 +247,49 @@ fn proxy_get_fallback_invokes_getter_with_proxy_receiver() {
         proxy = new Proxy(target, {});
         const key = "x";
         proxy[key];
-        "#);
+    "#);
     assert_eq!(completion, "17");
+}
+
+#[test]
+fn proxy_set_fallback_honors_array_extensibility() {
+    let completion = run(r#"
+        const target = [1, 2, 3];
+        const proxy = new Proxy(new Proxy(target, {}), { set: null });
+        proxy.length = 0;
+        const emptied = target.length === 0;
+        Object.preventExtensions(target);
+        emptied + ":" + Reflect.set(proxy, "foo", 2);
+        "#);
+    assert_eq!(completion, "true:false");
+}
+
+#[test]
+fn proxy_set_fallback_honors_regexp_readonly_accessors() {
+    let completion = run(r#"
+        const target = /(?:)/g;
+        const proxy = new Proxy(new Proxy(target, {}), {});
+        const globalResult = Reflect.set(proxy, "global", true);
+        proxy.lastIndex = 7;
+        globalResult + ":" + target.lastIndex;
+        "#);
+    assert_eq!(completion, "false:7");
+}
+
+#[test]
+fn array_has_uses_actual_prototype_and_array_prototype_length() {
+    let completion = run(r#"
+        const target = Object.create(Array.prototype);
+        const proxy = new Proxy(target, {});
+        const proto = [14];
+        const holder = Object.create(proto);
+        const handler = { has(target, prop) { return false; } };
+        const parent = new Proxy(holder, handler);
+        const array = [];
+        Object.setPrototypeOf(array, parent);
+        ("length" in proxy) + ":" + (1 in array);
+        "#);
+    assert_eq!(completion, "true:false");
 }
 
 #[test]

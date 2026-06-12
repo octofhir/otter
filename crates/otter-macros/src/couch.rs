@@ -54,6 +54,8 @@
 //!   the default `%Object.prototype%` link with whatever
 //!   `path(global, heap) -> JsObject` returns — used by per-kind
 //!   TypedArrays that chain to `%TypedArray%.prototype`.
+//! - `no_prototype = true` — suppresses the constructor's own
+//!   `.prototype` property for spec outliers such as `%Proxy%`.
 //! - `prototype_constants = [("NAME", Kind(expr) [, attrs]), ...]` —
 //!   mirrors `static_constants` but pins on the prototype. Used for
 //!   `TypedArray.prototype.BYTES_PER_ELEMENT` per §23.2.6.1.
@@ -321,6 +323,9 @@ pub(crate) struct CouchInput {
     /// the **prototype** instead of the constructor. Used for
     /// `TypedArray.prototype.BYTES_PER_ELEMENT` per §23.2.6.1.
     pub(crate) prototype_constants: Vec<ConstantEntry>,
+    /// Suppress the constructor's own `.prototype` property. Most
+    /// constructors have one; `%Proxy%` is the spec outlier.
+    pub(crate) no_prototype: bool,
     /// Optional `ctor_parent = path` override. When set, the install
     /// body resolves the constructor's `[[Prototype]]` override via
     /// `path(global, heap) -> Value`. Used for concrete TypedArray
@@ -354,6 +359,7 @@ impl Parse for CouchInput {
         let mut static_constants: Vec<ConstantEntry> = Vec::new();
         let mut prototype_constants: Vec<ConstantEntry> = Vec::new();
         let mut prototype: PrototypeBlock = PrototypeBlock::default();
+        let mut no_prototype = false;
         let mut ctor_parent: Option<Path> = None;
         let mut install_on: Option<Path> = None;
         let mut post_install: Option<Path> = None;
@@ -410,6 +416,10 @@ impl Parse for CouchInput {
                 "prototype" => {
                     prototype = input.parse()?;
                 }
+                "no_prototype" => {
+                    let lit: LitBool = input.parse()?;
+                    no_prototype = lit.value;
+                }
                 "ctor_parent" => {
                     ctor_parent = Some(input.parse()?);
                 }
@@ -425,8 +435,8 @@ impl Parse for CouchInput {
                         format!(
                             "unknown `couch!` field `{other}` — expected `name`, `feature`, \
                              `spec`, `intrinsic`, `constructor`, `statics`, `static_method_specs`, \
-                             `static_constants`, `prototype`, `ctor_parent`, `install_on`, or \
-                             `post_install`"
+                             `static_constants`, `prototype`, `no_prototype`, `ctor_parent`, \
+                             `install_on`, or `post_install`"
                         ),
                     ));
                 }
@@ -473,6 +483,7 @@ impl Parse for CouchInput {
             static_method_specs,
             static_constants,
             prototype_constants,
+            no_prototype,
             prototype,
             ctor_parent,
             install_on,
@@ -493,6 +504,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         static_method_specs,
         static_constants,
         prototype_constants,
+        no_prototype,
         prototype,
         ctor_parent,
         install_on,
@@ -751,11 +763,9 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
             }
         }
     });
-    // Every builtin constructor exposes a `.prototype` data property
-    // per ECMA-262 §19.4; even a content-empty prototype must exist so
-    // `instanceof` lookups and `<Class>.prototype.constructor`
-    // round-trip succeed.
-    let prototype_block_needed = true;
+    // Nearly every builtin constructor exposes a `.prototype` data
+    // property; `%Proxy%` is the named exception (§28.2.1).
+    let prototype_block_needed = !no_prototype;
 
     let post_install_call = match post_install {
         Some(path) => quote! {

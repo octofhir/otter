@@ -34,3 +34,18 @@ fn plain_user_iterator_still_works() {
         "3"
     );
 }
+
+#[test]
+fn for_of_over_proxy_array_uses_array_iterator() {
+    let out = run(r#"
+        var target = [1, 2, 3];
+        var proxy = new Proxy(target, {
+            enumerate() { throw new Error("legacy enumerate trap must not run"); }
+        });
+        var values = [];
+        for (var x of proxy) values.push(x);
+        var it = proxy[Symbol.iterator]();
+        values.join(",") + ";" + it.next().value + ":" + it.next().value + ":" + it.next().done;
+    "#);
+    assert_eq!(out, "1,2,3;1:2:false");
+}

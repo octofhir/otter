@@ -8,6 +8,8 @@
 //! - an optional bound `this` (arrow closures capture their receiver
 //!   lexically; non-arrow closures take `this` from the call site),
 //! - an optional bound `new.target` for arrow closures.
+//! - an optional derived-constructor `this` cell for arrow
+//!   `super()` calls that run after the original frame is off-stack.
 //!
 //! # Contents
 //!
@@ -63,6 +65,10 @@ pub struct JsClosureBody {
     /// Arrow closures: lexical `new.target` captured from the
     /// enclosing frame. Non-arrow closures: `None`.
     pub bound_new_target: Option<Value>,
+    /// Arrow closures created inside derived constructors capture the
+    /// constructor's shared `this` cell so `super()` can bind it even
+    /// when the arrow is invoked through a nested sync dispatch.
+    pub bound_derived_this: Option<UpvalueCell>,
     /// §9.1 — the creating frame's direct-eval variable environment
     /// (when any enclosing function contains a direct eval call
     /// site). Calls re-expose it so eval-introduced `var` bindings
@@ -137,6 +143,13 @@ impl JsClosure {
         heap.read_payload(self.handle, |body| body.bound_new_target)
     }
 
+    /// Shared derived-constructor `this` cell captured by arrow
+    /// closures that may run `super()`.
+    #[must_use]
+    pub fn bound_derived_this(self, heap: &GcHeap) -> Option<UpvalueCell> {
+        heap.read_payload(self.handle, |body| body.bound_derived_this)
+    }
+
     /// Captured direct-eval variable environment, if any.
     #[must_use]
     pub fn eval_env(self, heap: &GcHeap) -> Option<crate::eval_env::EvalEnvHandle> {
@@ -200,6 +213,7 @@ pub fn alloc_closure(
     upvalues: Vec<UpvalueCell>,
     bound_this: Option<Value>,
     bound_new_target: Option<Value>,
+    bound_derived_this: Option<UpvalueCell>,
     eval_env: Option<crate::eval_env::EvalEnvHandle>,
 ) -> Result<JsClosure, OutOfMemory> {
     let handle = heap.alloc_old(JsClosureBody {
@@ -207,6 +221,7 @@ pub fn alloc_closure(
         upvalues,
         bound_this,
         bound_new_target,
+        bound_derived_this,
         eval_env,
     })?;
     Ok(JsClosure::from_parts(handle, function_id))
@@ -228,6 +243,7 @@ pub fn alloc_closure_with_roots(
     upvalues: Vec<UpvalueCell>,
     bound_this: Option<Value>,
     bound_new_target: Option<Value>,
+    bound_derived_this: Option<UpvalueCell>,
     eval_env: Option<crate::eval_env::EvalEnvHandle>,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsClosure, OutOfMemory> {
@@ -237,6 +253,7 @@ pub fn alloc_closure_with_roots(
             upvalues,
             bound_this,
             bound_new_target,
+            bound_derived_this,
             eval_env,
         },
         external_visit,
@@ -252,7 +269,8 @@ mod tests {
     #[test]
     fn allocates_empty_closure() {
         let mut heap = GcHeap::new().expect("heap");
-        let closure = alloc_closure(&mut heap, 7, Vec::new(), None, None, None).expect("alloc");
+        let closure =
+            alloc_closure(&mut heap, 7, Vec::new(), None, None, None, None).expect("alloc");
         assert_eq!(closure.function_id(), 7);
         heap.read_payload(closure.handle(), |body| {
             assert_eq!(body.function_id, 7);
@@ -267,8 +285,16 @@ mod tests {
         let cell_a = alloc_upvalue(&mut heap, Value::undefined()).expect("cell");
         let cell_b = alloc_upvalue(&mut heap, Value::undefined()).expect("cell");
         let upvalues = vec![cell_a, cell_b];
-        let closure =
-            alloc_closure(&mut heap, 42, upvalues, Some(Value::null()), None, None).expect("alloc");
+        let closure = alloc_closure(
+            &mut heap,
+            42,
+            upvalues,
+            Some(Value::null()),
+            None,
+            None,
+            None,
+        )
+        .expect("alloc");
         assert_eq!(closure.function_id(), 42);
         assert_eq!(closure.upvalue_count(&heap), 2);
         heap.read_payload(closure.handle(), |body| {

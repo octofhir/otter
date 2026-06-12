@@ -135,6 +135,9 @@ impl<'a> RuntimeState<'a> {
         for obj in interp.function_user_props_for_trace() {
             obj.trace_gc_roots(visitor);
         }
+        for value in interp.function_prototype_overrides_for_trace() {
+            value.trace_value_slots(visitor);
+        }
         for obj in interp.iterator_prototypes_for_trace() {
             obj.trace_gc_roots(visitor);
         }

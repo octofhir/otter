@@ -63,6 +63,7 @@ mod host_services;
 pub mod module_graph;
 pub mod module_loader;
 mod module_records;
+pub mod module_scope;
 mod package_graph_resolver;
 mod process;
 pub mod promise_registry;
@@ -292,7 +293,7 @@ impl HostedModuleInstall {
 /// [`HostedModuleInstall`] path cannot represent a callable, so a builtin that
 /// needs one supplies this instead; `require()` returns its result verbatim.
 pub type HostedModuleValueInstall =
-    fn(&mut Interpreter, &CapabilitySet) -> Result<otter_vm::Value, String>;
+    for<'rt> fn(&mut otter_vm::NativeCtx<'rt>, &CapabilitySet) -> Result<otter_vm::Value, String>;
 
 /// One runtime-hosted module.
 #[derive(Debug, Clone, Copy)]

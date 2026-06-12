@@ -16,7 +16,8 @@
 
 use otter_gc::GcHeap;
 use otter_runtime::CapabilitySet;
-use otter_vm::{Interpreter, NativeCall, NativeCtx, NativeError, Value, abstract_ops, object};
+use otter_runtime::module_scope::ModuleScope;
+use otter_vm::{NativeCtx, NativeError, Value, abstract_ops};
 
 /// Build the ESM namespace object for `node:assert` (methods as properties; the
 /// namespace itself is not callable). CommonJS `require` uses [`assert_cjs_value`].
@@ -28,52 +29,18 @@ pub fn install_assert_module(ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Re
 }
 
 /// Build the callable CommonJS export: a host object whose `[[Call]]` runs
-/// `assert(value, message)` and which carries the assertion methods.
+/// `assert(value, message)` and which carries the assertion methods. Built via
+/// [`ModuleScope`], which handles moving-GC rooting (no manual root juggling).
 pub fn assert_cjs_value(
-    interp: &mut Interpreter,
+    ctx: &mut NativeCtx<'_>,
     _capabilities: &CapabilitySet,
 ) -> Result<Value, String> {
-    let oom = |e: otter_gc::OutOfMemory| format!("out of memory: {e}");
-
-    let assert_fn = interp
-        .native_function_from_call_host_rooted("assert", 2, NativeCall::Static(assert_ok), &[], &[])
-        .map_err(oom)?;
-
-    // Build every method as a rooted native function, accumulating roots so
-    // earlier ones survive allocation of later ones.
-    let mut roots: Vec<Value> = vec![assert_fn];
-    for (name, len, f) in ASSERT_METHODS {
-        let root_refs: Vec<&Value> = roots.iter().collect();
-        let method = interp
-            .native_function_from_call_host_rooted(
-                name,
-                *len,
-                NativeCall::Static(*f),
-                &root_refs,
-                &[],
-            )
-            .map_err(oom)?;
-        roots.push(method);
-    }
-
-    let root_refs: Vec<&Value> = roots.iter().collect();
-    let export = interp
-        .alloc_host_object_with_roots(&root_refs, &[])
-        .map_err(oom)?;
-    object::set_call_native(export, interp.gc_heap_mut(), assert_fn);
-    // roots[0] is assert_fn; the rest line up with ASSERT_METHODS in order.
-    for (i, (name, _len, _f)) in ASSERT_METHODS.iter().enumerate() {
-        object::set(export, interp.gc_heap_mut(), name, roots[i + 1]);
-    }
+    let mut scope = ModuleScope::new(ctx);
+    let export = scope.callable("assert", 2, assert_ok, ASSERT_METHODS)?;
     // `assert.strict` aliases assert itself (close enough until a separate
     // strict variant lands).
-    object::set(
-        export,
-        interp.gc_heap_mut(),
-        "strict",
-        Value::object(export),
-    );
-    Ok(Value::object(export))
+    scope.set(export, "strict", export);
+    Ok(scope.finish(export))
 }
 
 type Method = (

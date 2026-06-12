@@ -2873,6 +2873,45 @@ impl Interpreter {
         self.iteration_anchors[index]
     }
 
+    /// Root a value for the duration of an out-of-crate builder (e.g. the
+    /// runtime's module `ModuleScope`). Backed by the iteration-anchor stack,
+    /// which the GC traces and rewrites in place, so the rooted value survives a
+    /// moving scavenge triggered by a later allocation. Returns the new depth;
+    /// pass it (minus one) to read the value back via [`Self::module_root`].
+    ///
+    /// Because the GC moves, a `Value` copy held across an allocation is stale —
+    /// re-read it with [`Self::module_root`] after any allocation, and balance
+    /// every push with [`Self::pop_module_roots_to`].
+    pub fn push_module_root(&mut self, value: Value) -> usize {
+        self.push_iteration_anchor(value)
+    }
+
+    /// Current module-root stack depth. Capture before a build and pass to
+    /// [`Self::pop_module_roots_to`] to release everything pushed since.
+    #[must_use]
+    pub fn module_root_depth(&self) -> usize {
+        self.iteration_anchors.len()
+    }
+
+    /// Pop module roots back to a depth previously returned by
+    /// [`Self::push_module_root`] / [`Self::module_root_depth`]. Must be called
+    /// to balance the pushes.
+    pub fn pop_module_roots_to(&mut self, depth: usize) {
+        self.pop_iteration_anchors_to(depth);
+    }
+
+    /// Read a module-root slot back after an allocation/reentry — the moving GC
+    /// rewrites the slot in place, so this returns the relocated handle.
+    #[must_use]
+    pub fn module_root(&self, index: usize) -> Value {
+        self.iteration_anchor(index)
+    }
+
+    /// Overwrite a module-root slot (for a value mutated across allocations).
+    pub fn set_module_root(&mut self, index: usize, value: Value) {
+        self.set_iteration_anchor(index, value);
+    }
+
     /// Consume the pending uncaught-throw payload, if any. Embedder
     /// callers that catch a `VmError::Uncaught` at a sync entry
     /// point use this to recover the original thrown

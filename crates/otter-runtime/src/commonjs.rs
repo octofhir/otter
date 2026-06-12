@@ -135,19 +135,24 @@ pub(crate) fn cjs_load(
         if let Some(cached) = object::get(cache, ctx.heap(), key) {
             return Ok(cached);
         }
-        let value = {
+        let value = if let Some(value_install) = hm.cjs_value() {
+            // Value installers (e.g. `assert`) build via `ModuleScope`, which
+            // pops its roots on return — so root the export across the cache
+            // store, which itself may allocate.
+            value_install(ctx, &cfg.capabilities)
+                .map_err(|err| runtime_type_error("require", err))?
+        } else {
             let interp = ctx.interp_mut();
-            if let Some(value_install) = hm.cjs_value() {
-                value_install(interp, &cfg.capabilities)
-                    .map_err(|err| runtime_type_error("require", err))?
-            } else {
-                let namespace = hm
-                    .install(interp, &cfg.capabilities)
-                    .map_err(|err| runtime_type_error("require", err))?;
-                Value::object(namespace)
-            }
+            let namespace = hm
+                .install(interp, &cfg.capabilities)
+                .map_err(|err| runtime_type_error("require", err))?;
+            Value::object(namespace)
         };
+        let depth = ctx.interp_mut().push_module_root(value);
+        let value = ctx.interp_mut().module_root(depth - 1);
         object::set(cache, ctx.heap_mut(), key, value);
+        let value = object::get(cache, ctx.heap(), key).unwrap_or(value);
+        ctx.interp_mut().pop_module_roots_to(depth - 1);
         return Ok(value);
     }
 

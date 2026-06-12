@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 
 use otter_test262::config::Test262Config;
 use otter_test262::diff::{self, DiffReport};
@@ -129,6 +130,17 @@ struct RunArgs {
     /// dead worker without re-running passed tests.
     #[arg(long, default_value_t = 0)]
     resume: usize,
+
+    /// Number of in-process worker threads. `0` (default) picks the
+    /// host's logical core count for a single-shard run and `1` for a
+    /// multi-shard run (CI already parallelises across shard
+    /// processes, so per-shard threads would oversubscribe). Each
+    /// worker drives its own isolate; tests exercising `$262.agent` /
+    /// shared memory (feature `Atomics` / `SharedArrayBuffer`) run on
+    /// a single serial pass because the agent registry is
+    /// process-global.
+    #[arg(long, default_value_t = 0)]
+    jobs: usize,
 }
 
 #[derive(Parser, Debug)]
@@ -259,8 +271,34 @@ fn run(repo_root: &Path, args: RunArgs) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // Resolve worker count: explicit `--jobs`, else core count for a
+    // single-shard run (and 1 under sharding to avoid oversubscribing
+    // the CI shard processes).
+    let jobs = if args.jobs > 0 {
+        args.jobs
+    } else if shard.total > 1 {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+    };
+
     if otter_runtime::otter_gc::cage_size() == 0 {
-        otter_runtime::otter_gc::init_cage_with_size(TEST262_CAGE_BYTES)
+        // N concurrent isolates can each grow toward `max_heap_bytes`,
+        // so the shared pointer-compression cage must hold the sum or a
+        // heavy test pair exhausts it (a `CageExhausted`, distinct from
+        // the per-isolate cap). Scale with `jobs`, clamped to the cage
+        // maximum (4 GiB).
+        const MAX_CAGE: u64 = 1u64 << 32;
+        let per_worker = if max_heap_bytes > 0 {
+            max_heap_bytes
+        } else {
+            256 * 1024 * 1024
+        };
+        let want = (jobs as u64).saturating_mul(per_worker);
+        let cage = want.max(TEST262_CAGE_BYTES as u64).min(MAX_CAGE) as usize;
+        otter_runtime::otter_gc::init_cage_with_size(cage)
             .context("failed to initialise Test262 GC cage")?;
     }
 
@@ -285,6 +323,7 @@ fn run(repo_root: &Path, args: RunArgs) -> Result<ExitCode> {
         args.output.as_deref(),
         args.cursor.as_deref(),
         args.resume,
+        jobs,
     )
 }
 
@@ -298,6 +337,7 @@ fn execute_in_process(
     output: Option<&Path>,
     cursor: Option<&Path>,
     resume_offset: usize,
+    jobs: usize,
 ) -> Result<ExitCode> {
     let mut harness = HarnessCache::new(&paths.harness_dir);
     if let Err(err) = harness.prewarm() {
@@ -325,31 +365,22 @@ fn execute_in_process(
     let interrupted = Arc::new(AtomicBool::new(false));
     let _ = ctrlc_install(Arc::clone(&interrupted));
 
-    let mut results: Vec<TestResult> = Vec::with_capacity(tests.len());
     let start = Instant::now();
-    let mut seen_since_flush: u64 = 0;
 
-    for (idx, path) in tests.iter().enumerate() {
-        if interrupted.load(Ordering::Relaxed) {
-            eprintln!("\ninterrupted by user — writing partial baseline");
-            break;
-        }
-        if std::env::var_os("OTTER_TEST262_TRACE_CURRENT").is_some() {
-            let rel = path.strip_prefix(&paths.test_dir).unwrap_or(path).display();
-            eprintln!("test262-current {} {rel}", resume_offset + idx);
-        }
-        let result = run_one(path, paths, &mut harness, &exec);
-        record_progress(&pb, &result.outcome);
-        results.push(result);
-        seen_since_flush += 1;
-        if let Some(cursor_path) = cursor
-            && seen_since_flush >= CURSOR_FLUSH_EVERY
-        {
-            seen_since_flush = 0;
-            write_cursor(cursor_path, resume_offset + idx + 1);
-        }
-        pb.inc(1);
-    }
+    let results: Vec<TestResult> = if jobs > 1 {
+        run_parallel(paths, tests, &exec, jobs, &pb, &interrupted)
+    } else {
+        run_sequential(
+            paths,
+            tests,
+            &exec,
+            &mut harness,
+            &pb,
+            &interrupted,
+            cursor,
+            resume_offset,
+        )
+    };
     pb.finish_and_clear();
 
     if let Some(cursor_path) = cursor {
@@ -357,6 +388,20 @@ fn execute_in_process(
     }
 
     let elapsed = start.elapsed();
+    if let Some(timings_path) = std::env::var_os("OTTER_TEST262_TIMINGS") {
+        let mut rows: Vec<(&str, u64)> = results
+            .iter()
+            .map(|r| (r.path.as_str(), r.wall_ms))
+            .collect();
+        rows.sort_by_key(|b| std::cmp::Reverse(b.1));
+        let mut out = String::new();
+        for (rel, ms) in &rows {
+            out.push_str(&format!("{ms}\t{rel}\n"));
+        }
+        if let Err(err) = std::fs::write(&timings_path, out) {
+            eprintln!("warning: failed to write timings: {err}");
+        }
+    }
     let baseline = build_baseline(paths, &results);
     print_summary(&baseline, elapsed);
 
@@ -381,6 +426,153 @@ fn execute_in_process(
         return Ok(ExitCode::from(1));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Single-threaded driver — preserves cursor flushing and the
+/// `OTTER_TEST262_TRACE_CURRENT` hang-tracing hook.
+#[allow(clippy::too_many_arguments)]
+fn run_sequential(
+    paths: &CorpusPaths,
+    tests: &[PathBuf],
+    exec: &ExecConfig,
+    harness: &mut HarnessCache,
+    pb: &ProgressBar,
+    interrupted: &AtomicBool,
+    cursor: Option<&Path>,
+    resume_offset: usize,
+) -> Vec<TestResult> {
+    let mut results: Vec<TestResult> = Vec::with_capacity(tests.len());
+    let mut seen_since_flush: u64 = 0;
+    for (idx, path) in tests.iter().enumerate() {
+        if interrupted.load(Ordering::Relaxed) {
+            eprintln!("\ninterrupted by user — writing partial baseline");
+            break;
+        }
+        if std::env::var_os("OTTER_TEST262_TRACE_CURRENT").is_some() {
+            let rel = path.strip_prefix(&paths.test_dir).unwrap_or(path).display();
+            eprintln!("test262-current {} {rel}", resume_offset + idx);
+        }
+        let result = run_one(path, paths, harness, exec);
+        record_progress(pb, &result.outcome);
+        results.push(result);
+        seen_since_flush += 1;
+        if let Some(cursor_path) = cursor
+            && seen_since_flush >= CURSOR_FLUSH_EVERY
+        {
+            seen_since_flush = 0;
+            write_cursor(cursor_path, resume_offset + idx + 1);
+        }
+        pb.inc(1);
+    }
+    results
+}
+
+/// Multi-threaded driver. Each rayon worker owns its own
+/// [`HarnessCache`] and drives a fresh isolate per test; isolates are
+/// independent (per-isolate GC heaps carving pages from the shared,
+/// mutex-guarded cage), so they run concurrently without coordination.
+///
+/// Tests that touch the process-global `$262.agent` registry (feature
+/// `Atomics` / `SharedArrayBuffer`) are pulled out and run on a single
+/// serial pass — `agent::reset_for_next_test` clears that registry
+/// wholesale, so two agent tests in flight at once would corrupt each
+/// other. The parallel phase contains no agent tests, so the registry
+/// stays empty there and the per-test reset is a no-op on empty maps.
+///
+/// Results are sorted by path so the report is deterministic regardless
+/// of completion order.
+fn run_parallel(
+    paths: &CorpusPaths,
+    tests: &[PathBuf],
+    exec: &ExecConfig,
+    jobs: usize,
+    pb: &ProgressBar,
+    interrupted: &AtomicBool,
+) -> Vec<TestResult> {
+    let pool = match rayon::ThreadPoolBuilder::new().num_threads(jobs).build() {
+        Ok(pool) => pool,
+        Err(err) => {
+            eprintln!("error: failed to build worker pool ({err}); falling back to 1 thread");
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("single-thread pool")
+        }
+    };
+
+    // Classify in parallel: which tests must run serially.
+    let serial_mask: Vec<bool> =
+        pool.install(|| tests.par_iter().map(|p| is_serial_test(p)).collect());
+    let parallel: Vec<&PathBuf> = tests
+        .iter()
+        .zip(&serial_mask)
+        .filter_map(|(p, &s)| (!s).then_some(p))
+        .collect();
+    let serial: Vec<&PathBuf> = tests
+        .iter()
+        .zip(&serial_mask)
+        .filter_map(|(p, &s)| s.then_some(p))
+        .collect();
+
+    let run = |path: &PathBuf, harness: &mut HarnessCache| -> TestResult {
+        let result = run_one(path, paths, harness, exec);
+        record_progress(pb, &result.outcome);
+        pb.inc(1);
+        result
+    };
+
+    let mut results: Vec<TestResult> = pool.install(|| {
+        parallel
+            .par_iter()
+            .map_init(
+                || {
+                    let mut h = HarnessCache::new(&paths.harness_dir);
+                    let _ = h.prewarm();
+                    h
+                },
+                |harness, path| {
+                    if interrupted.load(Ordering::Relaxed) {
+                        return None;
+                    }
+                    Some(run(path, harness))
+                },
+            )
+            .flatten()
+            .collect()
+    });
+
+    // Serial pass for agent / shared-memory tests.
+    if !serial.is_empty() {
+        let mut harness = HarnessCache::new(&paths.harness_dir);
+        let _ = harness.prewarm();
+        for path in serial {
+            if interrupted.load(Ordering::Relaxed) {
+                break;
+            }
+            results.push(run(path, &mut harness));
+        }
+    }
+
+    results.sort_by(|a, b| a.path.cmp(&b.path));
+    results
+}
+
+/// `true` when a test must run on the serial pass because it can reach
+/// the process-global `$262.agent` registry / shared memory. Detected
+/// from frontmatter features; an unreadable or frontmatter-less file is
+/// safe to run in parallel (the driver will skip / fail it without
+/// touching agent state).
+fn is_serial_test(path: &Path) -> bool {
+    let Ok(source) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(frontmatter) = Frontmatter::parse(&source) else {
+        return false;
+    };
+    frontmatter
+        .features
+        .iter()
+        .any(|f| f == "Atomics" || f == "SharedArrayBuffer")
 }
 
 fn record_progress(pb: &ProgressBar, outcome: &Outcome) {

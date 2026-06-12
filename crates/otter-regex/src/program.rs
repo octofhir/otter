@@ -66,10 +66,12 @@ pub(crate) enum Insn {
     /// body matched the empty string, so re-iterating cannot progress
     /// (§22.2.2.5.1 prevents the infinite loop).
     CheckProgress(usize),
-    /// Match the text previously captured by group `index` (backreference).
+    /// Match the text previously captured by one of `indices` (backreference).
     BackRef {
-        /// 1-based group index this resolves to.
-        index: u32,
+        /// 1-based group indices this resolves to. Duplicate named
+        /// backreferences try the capture that participated; if none did, the
+        /// backreference matches the empty string.
+        indices: Vec<u32>,
         /// `true` for a case-insensitive comparison.
         ignore_case: bool,
     },

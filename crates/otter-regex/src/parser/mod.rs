@@ -121,9 +121,9 @@ impl<'a> Parser<'a> {
     }
 
     /// Build a backreference node, stamping the effective `i` flag.
-    fn backref_node(&self, index: u32) -> Node {
+    fn backref_node(&self, indices: Vec<u32>) -> Node {
         Node::BackRef {
-            index,
+            indices,
             ignore_case: self.flags.ignore_case,
         }
     }
@@ -218,11 +218,12 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn name_to_index(&self, name: &str) -> Option<u32> {
+    fn name_to_indices(&self, name: &str) -> Vec<u32> {
         self.group_names
             .iter()
-            .position(|n| n.as_deref() == Some(name))
-            .map(|p| (p + 1) as u32)
+            .enumerate()
+            .filter_map(|(idx, n)| (n.as_deref() == Some(name)).then_some((idx + 1) as u32))
+            .collect()
     }
 
     // --- Grammar -------------------------------------------------------------
@@ -652,10 +653,11 @@ impl<'a> Parser<'a> {
                     let (name, next) = read_group_name(self.units, self.pos + 2, self.unicode())
                         .ok_or_else(|| self.err("invalid backreference name"))?;
                     self.pos = next;
-                    let index = self
-                        .name_to_index(&name)
-                        .ok_or_else(|| self.err("backreference to unknown group name"))?;
-                    Ok(self.backref_node(index))
+                    let indices = self.name_to_indices(&name);
+                    if indices.is_empty() {
+                        return Err(self.err("backreference to unknown group name"));
+                    }
+                    Ok(self.backref_node(indices))
                 } else if self.unicode() || has_named {
                     Err(self.err("invalid \\k escape"))
                 } else {
@@ -690,7 +692,7 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         let value = self.read_decimal();
         if value <= self.total_groups {
-            Ok(self.backref_node(value))
+            Ok(self.backref_node(vec![value]))
         } else if self.unicode() {
             Err(RegexError::Syntax {
                 message: "backreference to non-existent group".to_string(),

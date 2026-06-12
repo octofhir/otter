@@ -170,12 +170,13 @@ impl Matcher<'_, '_> {
                                 Act::Backtrack
                             }
                         }
-                        Insn::BackRef { index, ignore_case } => {
-                            match self.match_backref(*index, pos, &caps, *ignore_case) {
-                                Some(next) => Act::Consume(pc + 1, next),
-                                None => Act::Backtrack,
-                            }
-                        }
+                        Insn::BackRef {
+                            indices,
+                            ignore_case,
+                        } => match self.match_backref(indices, pos, &caps, *ignore_case) {
+                            Some(next) => Act::Consume(pc + 1, next),
+                            None => Act::Backtrack,
+                        },
                         Insn::Look {
                             negate,
                             behind,
@@ -353,22 +354,27 @@ impl Matcher<'_, '_> {
         before != after
     }
 
-    /// Match the text previously captured by `group`, returning the new
-    /// position. An unset group matches the empty string (succeeds).
+    /// Match the text previously captured by one of `groups`, returning the new
+    /// position. If no candidate group participated, the backreference matches
+    /// the empty string (succeeds).
     fn match_backref(
         &self,
-        group: u32,
+        groups: &[u32],
         pos: usize,
         caps: &Caps,
         ignore_case: bool,
     ) -> Option<usize> {
-        let g = group as usize;
-        let (start, end) = match (
-            caps.get(2 * g).copied().flatten(),
-            caps.get(2 * g + 1).copied().flatten(),
-        ) {
-            (Some(s), Some(e)) => (s, e),
-            _ => return Some(pos),
+        let Some((start, end)) = groups.iter().find_map(|group| {
+            let g = *group as usize;
+            match (
+                caps.get(2 * g).copied().flatten(),
+                caps.get(2 * g + 1).copied().flatten(),
+            ) {
+                (Some(s), Some(e)) => Some((s, e)),
+                _ => None,
+            }
+        }) else {
+            return Some(pos);
         };
         let len = end.saturating_sub(start);
         if len == 0 {

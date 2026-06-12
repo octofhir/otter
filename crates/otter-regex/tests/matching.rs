@@ -161,6 +161,45 @@ fn quantified_duplicate_named_group_clears_previous_iteration_capture() {
 }
 
 #[test]
+fn duplicate_named_backreference_uses_participating_capture() {
+    let flags = Flags::default();
+    let re = Regex::compile_str("(?:(?<x>a)|(?<x>b))\\k<x>", flags).unwrap();
+
+    let aa: Vec<u16> = "aa".encode_utf16().collect();
+    let aa_match = re
+        .find_utf16(&aa, 0, ExecConfig::default())
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(aa_match.captures, vec![Some(0..1), None]);
+    assert_eq!(aa_match.named_group("x"), Some(0..1));
+
+    let bb: Vec<u16> = "bb".encode_utf16().collect();
+    let bb_match = re
+        .find_utf16(&bb, 0, ExecConfig::default())
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(bb_match.captures, vec![None, Some(0..1)]);
+    assert_eq!(bb_match.named_group("x"), Some(0..1));
+}
+
+#[test]
+fn duplicate_named_backreference_is_empty_when_no_candidate_participates() {
+    let flags = Flags::default();
+    let re = Regex::compile_str("^(?:(?<a>x)|(?<a>y)|z)\\k<a>$", flags).unwrap();
+    let units: Vec<u16> = "z".encode_utf16().collect();
+    let m = re
+        .find_utf16(&units, 0, ExecConfig::default())
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(m.range, 0..1);
+    assert_eq!(m.captures, vec![None, None]);
+    assert_eq!(m.named_group("a"), None);
+}
+
+#[test]
 fn case_insensitive_ascii() {
     assert_eq!(matched_text("abc", "i", "ABC").as_deref(), Some("ABC"));
     assert_eq!(

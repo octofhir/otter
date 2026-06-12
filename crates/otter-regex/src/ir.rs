@@ -181,9 +181,12 @@ impl Emitter {
                 };
                 self.emit(insn);
             }
-            Node::BackRef { index, ignore_case } => {
+            Node::BackRef {
+                indices,
+                ignore_case,
+            } => {
                 self.emit(Insn::BackRef {
-                    index: *index,
+                    indices: indices.clone(),
                     ignore_case: *ignore_case,
                 });
             }

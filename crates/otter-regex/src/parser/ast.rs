@@ -112,8 +112,9 @@ pub(crate) enum Node {
     Assert(Assertion),
     /// `\1` / `\k<name>` — a backreference to a (possibly named) capture group.
     BackRef {
-        /// 1-based group index this resolves to.
-        index: u32,
+        /// 1-based candidate group indices this resolves to. Numeric
+        /// backreferences have one entry; duplicate named groups may have more.
+        indices: Vec<u32>,
         /// `true` when the `i` (ignoreCase) flag is in effect here.
         ignore_case: bool,
     },

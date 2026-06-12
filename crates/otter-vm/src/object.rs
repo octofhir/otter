@@ -754,6 +754,50 @@ fn remove_mapped_argument(body: &mut ObjectBody, key: &str) {
     }
 }
 
+fn apply_mapped_arguments_partial_define(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    key: &str,
+    descriptor: PartialPropertyDescriptor,
+    existing_offset: Option<u16>,
+) {
+    let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
+    let Some(cell) = mapped_cell else {
+        return;
+    };
+
+    // §10.4.4.2 steps 5-6 — consult the partial descriptor:
+    // only a present [[Value]] writes through the map, and only an
+    // accessor or an explicit writable:false unmaps. If
+    // writable:false is present without [[Value]], the unmapped own
+    // data property must first capture the current parameter value.
+    if descriptor.is_accessor() {
+        heap.with_payload(obj, |body| remove_mapped_argument(body, key));
+        return;
+    }
+
+    if let Some(value) = descriptor.value {
+        store_upvalue(heap, cell, value);
+    }
+
+    if descriptor.writable == Some(false) {
+        if descriptor.value.is_none() {
+            let current = read_upvalue(heap, cell);
+            if let Some(offset) = existing_offset {
+                heap.with_payload(obj, |body| {
+                    if let Some(slot) = body.slots.get_mut(offset as usize)
+                        && let SlotBody::Data { value } = &mut slot.body
+                    {
+                        *value = current;
+                    }
+                });
+                heap.record_write(obj, &current);
+            }
+        }
+        heap.with_payload(obj, |body| remove_mapped_argument(body, key));
+    }
+}
+
 // ---------- read accessors -----------------------------------------------
 
 /// Number of own (string-keyed) properties.
@@ -2026,23 +2070,7 @@ pub fn define_own_property_partial(
         }
     });
     if success {
-        let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
-        if let Some(cell) = mapped_cell {
-            // §10.4.4.2 steps 5-6 — consult the PARTIAL descriptor:
-            // only a present [[Value]] writes through the map, and
-            // only an accessor or an explicit writable:false unmaps.
-            // (`{configurable: false}` alone keeps the mapping.)
-            if descriptor.is_accessor() {
-                heap.with_payload(obj, |body| remove_mapped_argument(body, key));
-            } else {
-                if let Some(value) = descriptor.value {
-                    store_upvalue(heap, cell, value);
-                }
-                if descriptor.writable == Some(false) {
-                    heap.with_payload(obj, |body| remove_mapped_argument(body, key));
-                }
-            }
-        }
+        apply_mapped_arguments_partial_define(obj, heap, key, descriptor, existing_offset);
         heap.record_write(obj, &barrier_descriptor);
     }
     success
@@ -2082,20 +2110,7 @@ pub(crate) fn define_own_property_partial_with_shape(
         }
     });
     if success {
-        let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
-        if let Some(cell) = mapped_cell {
-            // §10.4.4.2 steps 5-6 — see define_own_property_partial.
-            if descriptor.is_accessor() {
-                heap.with_payload(obj, |body| remove_mapped_argument(body, key));
-            } else {
-                if let Some(value) = descriptor.value {
-                    store_upvalue(heap, cell, value);
-                }
-                if descriptor.writable == Some(false) {
-                    heap.with_payload(obj, |body| remove_mapped_argument(body, key));
-                }
-            }
-        }
+        apply_mapped_arguments_partial_define(obj, heap, key, descriptor, existing_offset);
         heap.record_write(obj, &barrier_descriptor);
         heap.record_write(obj, &next_shape);
     }

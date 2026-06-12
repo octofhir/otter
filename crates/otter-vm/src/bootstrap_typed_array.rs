@@ -1000,17 +1000,12 @@ fn ta_proto_dispatch(
     let receiver = *ctx.this_value();
     let mut small_args: SmallVec<[Value; 4]> = args.iter().cloned().collect();
 
-    // §23.2.3.{8,5} — `fill` / `copyWithin` open with `ToNumber` /
-    // `ToIntegerOrInfinity` on their operands (and `fill` coerces its
-    // value first, as a BigInt for bigint element kinds). The intrinsic
-    // impl reads raw `Value`s, so coerce here in spec order.
-    //
-    // `includes` / `indexOf` / `lastIndexOf` coerce their `fromIndex`
-    // inside the impl instead: §23.2.3.16 runs ToIntegerOrInfinity only
-    // after ValidateTypedArray + the length read, so a `valueOf` that
-    // detaches the buffer must not pre-empt that ordering.
+    // Some relative-index operands are coerced in the wrapper before
+    // calling shared implementations. Methods whose spec first reads
+    // TypedArray length, such as `fill`, `copyWithin`, `includes`,
+    // `indexOf`, and `lastIndexOf`, do their coercions inside the impl
+    // so user side effects cannot pre-empt the length snapshot.
     let int_coerce: &[usize] = match method_name {
-        "fill" => &[1, 2],
         // §23.2.3.1 / §23.2.3.36 / §23.2.3.27/.28 — relative-index
         // operands run ToIntegerOrInfinity (firing valueOf /
         // toString) before the impl reads them as numbers.
@@ -1021,7 +1016,7 @@ fn ta_proto_dispatch(
         "slice" | "subarray" => &[0, 1],
         _ => &[],
     };
-    if method_name == "fill" || !int_coerce.is_empty() {
+    if !int_coerce.is_empty() {
         // §23.2.4.4 ValidateTypedArray runs BEFORE the argument
         // coercions for these methods — a non-TypedArray or detached
         // receiver throws before any user valueOf fires. `subarray`
@@ -1044,25 +1039,8 @@ fn ta_proto_dispatch(
             }
             Some(_) => {}
         }
-        let is_bigint = receiver
-            .as_typed_array(ctx.heap())
-            .is_some_and(|t| t.kind().is_bigint());
         let (interp, ctx_opt) = ctx.interp_mut_and_context();
         if let Some(context) = ctx_opt {
-            if method_name == "fill"
-                && let Some(value) = small_args.first().copied()
-            {
-                if is_bigint {
-                    let b = crate::coerce::to_big_int_or_throw(interp, &context, &value)
-                        .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
-                    small_args[0] = Value::big_int(b);
-                } else if !value.is_number() {
-                    let n = interp
-                        .coerce_to_number(&context, &value)
-                        .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
-                    small_args[0] = Value::number(n);
-                }
-            }
             for &idx in int_coerce {
                 let Some(value) = small_args.get(idx).copied() else {
                     continue;

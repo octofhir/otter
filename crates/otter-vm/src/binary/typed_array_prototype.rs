@@ -343,20 +343,24 @@ fn impl_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 }
 
 fn impl_fill(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let name = "TypedArray.prototype.fill";
     let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut()) as i64;
-    let value = args.first().cloned().unwrap_or(Value::undefined());
-    if t.kind().is_bigint() && !value.is_big_int() {
-        return Err(type_error("must be a BigInt"));
+    let raw_value = args.first().cloned().unwrap_or(Value::undefined());
+    let value = ta_coerce_value(ctx, t.kind(), &raw_value)?;
+    let start = to_integer_or_infinity_arg(ctx, args.get(1), 0, name)?;
+    let end = to_integer_or_infinity_arg(ctx, args.get(2), len, name)?;
+    let s = clamp_relative_index(start, len) as usize;
+    let e = clamp_relative_index(end, len) as usize;
+    if s >= e {
+        return Ok(Value::typed_array(t));
     }
-    if !t.kind().is_bigint() && value.is_big_int() {
-        return Err(type_error("must be a Number"));
+    if t.buffer(ctx.heap()).is_detached(ctx.heap())
+        || (!t.is_length_tracking(ctx.heap()) && t.is_out_of_bounds(ctx.heap()))
+    {
+        return Err(type_error("typedarray is detached or out of bounds"));
     }
-    let start = relative_index(args.get(1), 0, len);
-    let end = relative_index(args.get(2), len, len);
-    let s = start.clamp(0, len) as usize;
-    let e = end.clamp(start, len) as usize;
     for i in s..e {
         t.set(ctx.heap_mut(), i, &value);
     }
@@ -614,6 +618,7 @@ fn impl_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
         return Err(range_error("Start offset is out of bounds"));
     }
     let off = offset_f as usize;
+    let target_len = t.length(ctx.heap_mut());
     let source = args.first().cloned().unwrap_or(Value::undefined());
     let kind = t.kind();
     fn coerce(
@@ -627,13 +632,13 @@ fn impl_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
     if let Some(src) = source.as_typed_array(ctx.heap_mut()) {
         // §23.2.3.26.1 SetTypedArrayFromTypedArray — the offset
         // coercion above may have detached the SOURCE buffer too.
-        if src.buffer(ctx.heap()).is_detached(ctx.heap()) {
+        if src.is_out_of_bounds(ctx.heap()) {
             return Err(type_error(
-                "Cannot set from a TypedArray backed by a detached buffer",
+                "Cannot set from a TypedArray backed by a detached or out-of-bounds buffer",
             ));
         }
         let src_len = src.length(ctx.heap_mut());
-        if off + src_len > t.length(ctx.heap_mut()) {
+        if src_len > target_len.saturating_sub(off) {
             return Err(range_error("source overruns destination"));
         }
         // Snapshot first to handle aliasing of the same buffer.
@@ -658,7 +663,7 @@ fn impl_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
             return Err(type_error("cannot set a TypedArray from null or undefined"));
         }
         let src_len = ta_array_like_length(ctx, source)?;
-        if off + src_len > t.length(ctx.heap_mut()) {
+        if src_len > target_len.saturating_sub(off) {
             return Err(range_error("source overruns destination"));
         }
         for i in 0..src_len {

@@ -582,6 +582,10 @@ fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
     let len = t.length(ctx.heap_mut());
     let mut parts: Vec<String> = Vec::new();
     for i in 0..len {
+        if i >= t.length(ctx.heap()) {
+            parts.push(String::new());
+            continue;
+        }
         let element = t.get(ctx.heap_mut(), i).map_err(native_oom)?;
         let method = ta_get(ctx, element, crate::VmPropertyKey::String("toLocaleString"))?;
         if !ctx.cx.interp.is_callable_runtime(&method) {

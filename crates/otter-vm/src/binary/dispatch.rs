@@ -83,24 +83,33 @@ pub fn array_buffer_call_with_roots(
                     to_index(v, gc_heap).ok_or_else(|| to_index_error(v, "ArrayBuffer length"))?
                 }
             };
-            let max_byte_length = if let Some(opts) = args.get(1).and_then(|v| v.as_object()) {
-                if let Some(v) = crate::object::get(opts, gc_heap, "maxByteLength") {
-                    Some(
-                        to_index(&v, gc_heap)
-                            .ok_or_else(|| to_index_error(&v, "ArrayBuffer maxByteLength"))?,
-                    )
-                } else {
-                    None
+            let max_byte_length = match args.get(1) {
+                None => None,
+                Some(v) if v.is_undefined() => None,
+                Some(opts) if opts.as_object().is_some() => {
+                    let opts = opts.as_object().expect("checked object");
+                    crate::object::get(opts, gc_heap, "maxByteLength")
+                        .filter(|value| !value.is_undefined())
+                        .map(|value| {
+                            to_index(&value, gc_heap)
+                                .ok_or_else(|| to_index_error(&value, "ArrayBuffer maxByteLength"))
+                        })
+                        .transpose()?
                 }
-            } else {
-                None
+                Some(v) => Some(
+                    to_index(v, gc_heap)
+                        .ok_or_else(|| to_index_error(v, "ArrayBuffer maxByteLength"))?,
+                ),
             };
             let len = length as usize;
             let buf = match max_byte_length {
                 Some(max) => {
                     let max = max as usize;
                     if max < len {
-                        return Err(VmError::TypeMismatch);
+                        return Err(VmError::RangeError {
+                            message: "ArrayBuffer maxByteLength is smaller than byteLength"
+                                .to_string(),
+                        });
                     }
                     JsArrayBuffer::new_resizable_with_roots(len, max, gc_heap, external_visit)
                         .map_err(oom_to_vm)?
@@ -149,24 +158,34 @@ pub fn shared_array_buffer_call_with_roots(
                 Some(v) => to_index(v, gc_heap)
                     .ok_or_else(|| to_index_error(v, "SharedArrayBuffer length"))?,
             };
-            let max_byte_length = if let Some(opts) = args.get(1).and_then(|v| v.as_object()) {
-                if let Some(v) = crate::object::get(opts, gc_heap, "maxByteLength") {
-                    Some(
-                        to_index(&v, gc_heap)
-                            .ok_or_else(|| to_index_error(&v, "SharedArrayBuffer maxByteLength"))?,
-                    )
-                } else {
-                    None
+            let max_byte_length = match args.get(1) {
+                None => None,
+                Some(v) if v.is_undefined() => None,
+                Some(opts) if opts.as_object().is_some() => {
+                    let opts = opts.as_object().expect("checked object");
+                    crate::object::get(opts, gc_heap, "maxByteLength")
+                        .filter(|value| !value.is_undefined())
+                        .map(|value| {
+                            to_index(&value, gc_heap).ok_or_else(|| {
+                                to_index_error(&value, "SharedArrayBuffer maxByteLength")
+                            })
+                        })
+                        .transpose()?
                 }
-            } else {
-                None
+                Some(v) => Some(
+                    to_index(v, gc_heap)
+                        .ok_or_else(|| to_index_error(v, "SharedArrayBuffer maxByteLength"))?,
+                ),
             };
             let len = length as usize;
             let buf = match max_byte_length {
                 Some(max) => {
                     let max = max as usize;
                     if max < len {
-                        return Err(VmError::TypeMismatch);
+                        return Err(VmError::RangeError {
+                            message: "SharedArrayBuffer maxByteLength is smaller than byteLength"
+                                .to_string(),
+                        });
                     }
                     JsArrayBuffer::new_shared_growable_with_roots(
                         len,

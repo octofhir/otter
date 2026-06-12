@@ -1853,6 +1853,20 @@ impl Interpreter {
                 effective_args.as_slice(),
             );
         }
+        if let Some(native) = current.as_native_function()
+            && matches!(
+                native.name(&self.gc_heap),
+                "ArrayBuffer" | "SharedArrayBuffer"
+            )
+        {
+            return self.invoke_native_construct(
+                context,
+                native,
+                &Value::undefined(),
+                &effective_new_target,
+                effective_args.as_slice(),
+            );
+        }
 
         let mut proto = self.construct_prototype_for_callee_runtime_rooted(
             context,

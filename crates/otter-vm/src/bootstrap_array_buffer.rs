@@ -19,7 +19,7 @@ use crate::abstract_ops::{self, ToPrimitiveHint};
 use crate::binary::dispatch;
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject, PartialPropertyDescriptor};
-use crate::{NativeCtx, NativeError, Value, VmError};
+use crate::{NativeCtx, NativeError, Value, VmError, VmGetOutcome, VmPropertyKey};
 
 /// §7.1.5 `ToIntegerOrInfinity(value)` with an observable
 /// `ToPrimitive` (number hint): object arguments route through
@@ -146,9 +146,16 @@ fn sab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     }
     // §25.2.3.1 step 2 — ToIndex(length) observable coercion.
     let length = observable_to_index_arg(ctx, args.first(), "SharedArrayBuffer")?;
+    let max_byte_length = observable_max_byte_length_option(ctx, args.get(1), "SharedArrayBuffer")?;
+    let proto = array_buffer_new_target_prototype_before_allocation(
+        ctx,
+        "SharedArrayBuffer",
+        &length,
+        &max_byte_length,
+    )?;
     let mut coerced_args: smallvec::SmallVec<[Value; 4]> = smallvec::SmallVec::new();
     coerced_args.push(length);
-    coerced_args.extend(args.iter().skip(1).copied());
+    coerced_args.push(max_byte_length);
     let args = coerced_args.as_slice();
     let roots = ctx.collect_native_roots();
     let this_value = *ctx.this_value();
@@ -170,22 +177,7 @@ fn sab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
         &mut external_visit,
     )
     .map_err(|e| vm_to_native(e, "SharedArrayBuffer"))?;
-    // §10.1.13 GetPrototypeFromConstructor — newTarget.prototype is
-    // always consulted; only %SharedArrayBuffer% itself keeps the
-    // intrinsic default without an override record.
-    let is_self_target = ctx.new_target().is_some_and(|nt| {
-        crate::object::get(
-            ctx.cx.interp.global_this,
-            &ctx.cx.interp.gc_heap,
-            "SharedArrayBuffer",
-        )
-        .is_some_and(|sab| *nt == sab)
-    });
-    if !is_self_target
-        && let Some(proto) =
-            crate::bootstrap::native_new_target_prototype(ctx, "SharedArrayBuffer")?
-        && proto.is_object_type()
-    {
+    if let Some(proto) = proto {
         ctx.interp_mut()
             .set_non_gc_exotic_prototype_override(&value, Some(proto));
     }
@@ -347,6 +339,98 @@ fn observable_to_index_arg(
     Ok(Value::number(n))
 }
 
+/// §25.1.4.1 GetArrayBufferMaxByteLengthOption(options).
+///
+/// The option bag is only observed when it is an ECMAScript Object.
+/// The `maxByteLength` property read must go through ordinary
+/// `[[Get]]`, so accessors and proxies can throw user values before
+/// allocation or newTarget prototype lookup.
+fn observable_max_byte_length_option(
+    ctx: &mut NativeCtx<'_>,
+    arg: Option<&Value>,
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let Some(options) = arg.copied() else {
+        return Ok(Value::undefined());
+    };
+    if !options.is_object_type() && !options.is_proxy() {
+        return Ok(Value::undefined());
+    }
+
+    let value = {
+        let (interp, exec_ctx) = ctx.interp_mut_and_context();
+        let exec_ctx = exec_ctx.ok_or_else(|| NativeError::TypeError {
+            name,
+            reason: "missing execution context".to_string(),
+        })?;
+        match interp
+            .ordinary_get_value(
+                &exec_ctx,
+                options,
+                options,
+                &VmPropertyKey::String("maxByteLength"),
+                0,
+            )
+            .map_err(|err| vm_to_native(err, name))?
+        {
+            VmGetOutcome::Value(value) => value,
+            VmGetOutcome::InvokeGetter { getter } => interp
+                .run_callable_sync(&exec_ctx, &getter, options, smallvec::SmallVec::new())
+                .map_err(|err| vm_to_native(err, name))?,
+        }
+    };
+
+    if value.is_undefined() {
+        Ok(Value::undefined())
+    } else {
+        observable_to_index_arg(ctx, Some(&value), name)
+    }
+}
+
+fn array_buffer_allocation_reaches_object_creation(
+    heap: &otter_gc::GcHeap,
+    length: &Value,
+    max_byte_length: &Value,
+) -> bool {
+    let Some(length) = crate::binary::to_index(length, heap) else {
+        return false;
+    };
+    if max_byte_length.is_undefined() {
+        return true;
+    }
+    let Some(max_byte_length) = crate::binary::to_index(max_byte_length, heap) else {
+        return false;
+    };
+    length <= max_byte_length
+}
+
+fn array_buffer_new_target_prototype_before_allocation(
+    ctx: &mut NativeCtx<'_>,
+    intrinsic_name: &'static str,
+    length: &Value,
+    max_byte_length: &Value,
+) -> Result<Option<Value>, NativeError> {
+    if !array_buffer_allocation_reaches_object_creation(ctx.heap(), length, max_byte_length) {
+        return Ok(None);
+    }
+    let Some(new_target) = ctx.new_target().cloned() else {
+        return Ok(None);
+    };
+    let is_self_target = crate::object::get(
+        ctx.cx.interp.global_this,
+        &ctx.cx.interp.gc_heap,
+        intrinsic_name,
+    )
+    .is_some_and(|intrinsic| new_target == intrinsic);
+    if is_self_target {
+        return Ok(None);
+    }
+    Ok(
+        crate::bootstrap::native_new_target_prototype(ctx, intrinsic_name)?
+            .filter(|proto| proto.is_object_type()),
+    )
+}
+
 fn ab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     if !ctx.is_construct_call() {
         return Err(NativeError::TypeError {
@@ -357,9 +441,16 @@ fn ab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
     // §25.1.4.1 step 2 — ToIndex(length) runs the observable
     // ToNumber ladder before allocation.
     let length = observable_to_index_arg(ctx, args.first(), "ArrayBuffer")?;
+    let max_byte_length = observable_max_byte_length_option(ctx, args.get(1), "ArrayBuffer")?;
+    let proto = array_buffer_new_target_prototype_before_allocation(
+        ctx,
+        "ArrayBuffer",
+        &length,
+        &max_byte_length,
+    )?;
     let mut coerced_args: smallvec::SmallVec<[Value; 4]> = smallvec::SmallVec::new();
     coerced_args.push(length);
-    coerced_args.extend(args.iter().skip(1).copied());
+    coerced_args.push(max_byte_length);
     let args = coerced_args.as_slice();
     let roots = ctx.collect_native_roots();
     let this_value = *ctx.this_value();
@@ -381,23 +472,7 @@ fn ab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
         &mut external_visit,
     )
     .map_err(|e| vm_to_native(e, "ArrayBuffer"))?;
-    // §10.1.13 GetPrototypeFromConstructor — newTarget.prototype is
-    // ALWAYS consulted (Reflect.construct with a foreign newTarget,
-    // accessor-defined prototypes, derived super()); only a
-    // newTarget that IS %ArrayBuffer% itself keeps the intrinsic
-    // default without an override record.
-    let is_self_target = ctx.new_target().is_some_and(|nt| {
-        crate::object::get(
-            ctx.cx.interp.global_this,
-            &ctx.cx.interp.gc_heap,
-            "ArrayBuffer",
-        )
-        .is_some_and(|ab| *nt == ab)
-    });
-    if !is_self_target
-        && let Some(proto) = crate::bootstrap::native_new_target_prototype(ctx, "ArrayBuffer")?
-        && proto.is_object_type()
-    {
+    if let Some(proto) = proto {
         ctx.interp_mut()
             .set_non_gc_exotic_prototype_override(&value, Some(proto));
     }
@@ -795,26 +870,5 @@ fn receiver_sab(
 }
 
 fn vm_to_native(err: VmError, name: &'static str) -> NativeError {
-    match err {
-        VmError::TypeError { message } => NativeError::TypeError {
-            name,
-            reason: message,
-        },
-        VmError::TypeMismatch => NativeError::TypeError {
-            name,
-            reason: "type mismatch".to_string(),
-        },
-        VmError::RangeError { message } => NativeError::RangeError {
-            name,
-            reason: message,
-        },
-        VmError::OutOfMemory { .. } => NativeError::RangeError {
-            name,
-            reason: err.to_string(),
-        },
-        other => NativeError::TypeError {
-            name,
-            reason: other.to_string(),
-        },
-    }
+    crate::native_function::vm_to_native_error(err, name)
 }

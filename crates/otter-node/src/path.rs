@@ -131,11 +131,13 @@ fn basename_of(path: &str) -> &str {
 fn basename(path: &str, ext: Option<&str>) -> String {
     let base = basename_of(path);
     if let Some(ext) = ext {
+        // Node: `ext === path` => "". Otherwise strip the suffix only when the
+        // basename is strictly longer (a whole-component match is NOT stripped).
+        if path == ext {
+            return String::new();
+        }
         if !ext.is_empty() && base.len() > ext.len() && base.ends_with(ext) {
             return base[..base.len() - ext.len()].to_string();
-        }
-        if base == ext {
-            return String::new();
         }
     }
     base.to_string()
@@ -163,12 +165,54 @@ fn dirname(path: &str) -> String {
     }
 }
 
-fn extname(path: &str) -> String {
-    let base = basename_of(path);
-    match base.rfind('.') {
-        Some(i) if i > 0 => base[i..].to_string(),
-        _ => String::new(),
+/// Node's `extname` algorithm (faithful port of `lib/path.js`), parameterised by
+/// the separator predicate so posix and win32 share it. Handles leading-dot /
+/// all-dots basenames (`..` -> "", `..file` -> ".file", `file.` -> ".").
+fn extname_with(path: &str, is_sep: fn(char) -> bool) -> String {
+    let chars: Vec<char> = path.chars().collect();
+    let mut start_dot: isize = -1;
+    let mut start_part: isize = 0;
+    let mut end: isize = -1;
+    let mut matched_slash = true;
+    let mut pre_dot_state: i32 = 0;
+    let mut i = chars.len() as isize - 1;
+    while i >= 0 {
+        let c = chars[i as usize];
+        if is_sep(c) {
+            if !matched_slash {
+                start_part = i + 1;
+                break;
+            }
+            i -= 1;
+            continue;
+        }
+        if end == -1 {
+            matched_slash = false;
+            end = i + 1;
+        }
+        if c == '.' {
+            if start_dot == -1 {
+                start_dot = i;
+            } else if pre_dot_state != 1 {
+                pre_dot_state = 1;
+            }
+        } else if start_dot != -1 {
+            pre_dot_state = -1;
+        }
+        i -= 1;
     }
+    if start_dot == -1
+        || end == -1
+        || pre_dot_state == 0
+        || (pre_dot_state == 1 && start_dot == end - 1 && start_dot == start_part + 1)
+    {
+        return String::new();
+    }
+    chars[start_dot as usize..end as usize].iter().collect()
+}
+
+fn extname(path: &str) -> String {
+    extname_with(path, |c| c == '/')
 }
 
 fn join(parts: &[String]) -> String {
@@ -388,21 +432,17 @@ fn win32_is_absolute_str(p: &str) -> bool {
 fn win32_basename(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let path = arg_string(args, 0, "path.win32.basename", ctx.heap())?;
     let ext = opt_arg_string(args, 1, ctx);
-    let base = path
+    // Strip the drive/UNC root first so `C:\` / `C:` basename to "".
+    let (_, rest) = win32_split_root(&path);
+    let base = rest
         .rsplit(win32_is_sep)
         .find(|s| !s.is_empty())
         .unwrap_or("");
-    // strip a drive-relative prefix like `C:` if no separators were present
-    let base = base
-        .strip_prefix(|c: char| c.is_ascii_alphabetic())
-        .and_then(|r| r.strip_prefix(':'))
-        .filter(|_| !path.contains(win32_is_sep))
-        .unwrap_or(base);
     let out = match ext.as_deref() {
+        Some(ext) if path == ext => "",
         Some(ext) if !ext.is_empty() && base.len() > ext.len() && base.ends_with(ext) => {
             &base[..base.len() - ext.len()]
         }
-        Some(ext) if base == ext => "",
         _ => base,
     };
     string_value(ctx, out)
@@ -435,15 +475,9 @@ fn win32_dirname(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 
 fn win32_extname(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let path = arg_string(args, 0, "path.win32.extname", ctx.heap())?;
-    let base = path
-        .rsplit(win32_is_sep)
-        .find(|s| !s.is_empty())
-        .unwrap_or("");
-    let out = match base.rfind('.') {
-        Some(i) if i > 0 => &base[i..],
-        _ => "",
-    };
-    string_value(ctx, out)
+    // Strip the drive/UNC root so the extension scan starts at the basename.
+    let (_, rest) = win32_split_root(&path);
+    string_value(ctx, &extname_with(rest, win32_is_sep))
 }
 
 fn win32_is_absolute(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

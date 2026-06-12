@@ -103,12 +103,26 @@ fn assert_ok(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
     }
 }
 
+/// Build a comparison failure. If the caller passed an explicit message
+/// (3rd argument), use it (Node behaviour); otherwise render actual/expected.
+fn cmp_fail(ctx: &NativeCtx<'_>, op: &str, args: &[Value], a: &Value, b: &Value) -> NativeError {
+    let heap = ctx.heap();
+    if let Some(msg) = args.get(2).filter(|v| !v.is_undefined()) {
+        return fail(msg.display_string(heap));
+    }
+    fail(format!(
+        "Expected values to be {op}:\n  actual:   {}\n  expected: {}",
+        a.display_string(heap),
+        b.display_string(heap)
+    ))
+}
+
 fn assert_strict_equal(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let (a, b) = (arg(args, 0), arg(args, 1));
     if abstract_ops::is_strictly_equal(&a, &b, ctx.heap()) {
         Ok(Value::undefined())
     } else {
-        Err(fail("assert.strictEqual: values are not strictly equal"))
+        Err(cmp_fail(ctx, "strictly equal", args, &a, &b))
     }
 }
 

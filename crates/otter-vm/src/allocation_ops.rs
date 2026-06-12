@@ -34,18 +34,30 @@ use crate::{
 
 impl Interpreter {
     pub(crate) fn collect_allocation_roots(&self, stack: &SmallVec<[Frame; 8]>) -> Vec<*mut RawGc> {
+        // Fast path: when the dispatch loop has registered its frame-roots
+        // and extra-roots providers, an allocation-triggered collection walks
+        // both of them *internally* — see `GcHeap::collect_minor_internal`
+        // (`visit_extra_roots_deduped` + `frame_root_providers.trace`) and the
+        // full-GC `mark_phase`. Re-tracing the entire root set here, eagerly,
+        // on *every* allocation (most of which never trigger a collection)
+        // is pure waste — it dominated allocation-heavy workloads (e.g. the
+        // RegExp property-escape harness building 100k-element strings). Hand
+        // the heap an empty external set and let it pull roots lazily, only
+        // when a collection actually fires.
+        if self.gc_heap.has_frame_root_providers() {
+            return Vec::new();
+        }
+        // Fallback: no frame-roots provider registered (out-of-band alloc with
+        // no active dispatch loop). The GC cannot reach the live Rust frame
+        // stack on its own, so snapshot the runtime + frame roots here to keep
+        // a collection at this site sound.
         let mut roots = Vec::new();
         RuntimeState::new(self).trace_roots(&mut |slot| roots.push(slot));
-        let has_registered_frames = self.gc_heap.has_frame_root_providers();
-        self.gc_heap
-            .trace_frame_root_providers(&mut |slot| roots.push(slot));
-        if !has_registered_frames {
-            let pool = self.cold_frames();
-            for frame in stack {
-                frame.trace_frame_slots(&mut |slot| roots.push(slot));
-                if let Some(idx) = frame.cold {
-                    pool.get(idx).trace_cold_slots(&mut |slot| roots.push(slot));
-                }
+        let pool = self.cold_frames();
+        for frame in stack {
+            frame.trace_frame_slots(&mut |slot| roots.push(slot));
+            if let Some(idx) = frame.cold {
+                pool.get(idx).trace_cold_slots(&mut |slot| roots.push(slot));
             }
         }
         roots

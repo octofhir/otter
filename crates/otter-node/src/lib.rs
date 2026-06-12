@@ -18,6 +18,7 @@
 
 pub mod assert;
 pub mod fs;
+pub mod path;
 
 pub use otter_runtime::otter_gc;
 use otter_runtime::{HostedModule, HostedModuleInstall, OtterBuilder, RuntimeBuilder};
@@ -35,6 +36,16 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         "assert",
         HostedModuleInstall::new(assert::install_assert_module),
         assert::assert_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:path",
+        HostedModuleInstall::new(path::install_path_module),
+        path::path_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "path",
+        HostedModuleInstall::new(path::install_path_module),
+        path::path_cjs_value,
     ),
 ];
 

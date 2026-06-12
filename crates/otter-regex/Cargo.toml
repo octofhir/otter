@@ -19,6 +19,8 @@ bitflags = "2"
 icu_properties = { version = "2.1", features = ["compiled_data", "alloc"] }
 # Unicode Simple Case Folding for `i`+`u`/`v` matching (UCD CaseFolding.txt).
 icu_casemap = { version = "2", features = ["compiled_data"] }
+# Identifier-name validation for named capture groups.
+unicode-ident = "1"
 
 [features]
 # `unicode` pulls in the property-escape data path. Default-on; a future slim

@@ -194,12 +194,11 @@ impl<'a> Parser<'a> {
                         && self.units.get(i + 3) != Some(&(b'!' as u16));
                     if is_named {
                         count += 1;
-                        let (name, next) = read_group_name(self.units, i + 3).ok_or_else(|| {
-                            RegexError::Syntax {
+                        let (name, next) = read_group_name(self.units, i + 3, self.unicode())
+                            .ok_or_else(|| RegexError::Syntax {
                                 message: "invalid group name".to_string(),
                                 offset: i + 3,
-                            }
-                        })?;
+                            })?;
                         names.push(Some(name));
                         i = next;
                         continue;
@@ -380,8 +379,9 @@ impl<'a> Parser<'a> {
                         }
                         _ => {
                             // `(?<name>` named capture.
-                            let (name, next) = read_group_name(self.units, self.pos + 1)
-                                .ok_or_else(|| self.err("invalid group name"))?;
+                            let (name, next) =
+                                read_group_name(self.units, self.pos + 1, self.unicode())
+                                    .ok_or_else(|| self.err("invalid group name"))?;
                             self.pos = next;
                             self.next_group += 1;
                             GroupKind::Capturing {
@@ -649,7 +649,7 @@ impl<'a> Parser<'a> {
                 // mode keeps it a hard error.
                 let has_named = !self.group_names.iter().all(Option::is_none);
                 if (self.unicode() || has_named) && self.peek_at(1) == Some(b'<' as u16) {
-                    let (name, next) = read_group_name(self.units, self.pos + 2)
+                    let (name, next) = read_group_name(self.units, self.pos + 2, self.unicode())
                         .ok_or_else(|| self.err("invalid backreference name"))?;
                     self.pos = next;
                     let index = self
@@ -1314,21 +1314,111 @@ fn is_assertion_node(node: &Node) -> bool {
     )
 }
 
-fn read_group_name(units: &[u16], start: usize) -> Option<(String, usize)> {
+fn read_group_name(units: &[u16], start: usize, unicode: bool) -> Option<(String, usize)> {
     let mut i = start;
-    let mut name_units = Vec::new();
+    let mut name = String::new();
+    let mut first = true;
     while let Some(&c) = units.get(i) {
         if c == b'>' as u16 {
-            if name_units.is_empty() {
+            if name.is_empty() {
                 return None;
             }
-            let name = String::from_utf16_lossy(&name_units);
             return Some((name, i + 1));
         }
-        name_units.push(c);
-        i += 1;
+        let (ch, next) = if c == b'\\' as u16 && units.get(i + 1) == Some(&(b'u' as u16)) {
+            read_group_name_unicode_escape(units, i + 2, unicode)?
+        } else {
+            read_group_name_code_point(units, i)?
+        };
+        if first {
+            if !is_group_name_start(ch) {
+                return None;
+            }
+            first = false;
+        } else if !is_group_name_continue(ch) {
+            return None;
+        }
+        name.push(ch);
+        i = next;
     }
     None
+}
+
+fn read_group_name_unicode_escape(
+    units: &[u16],
+    start: usize,
+    unicode: bool,
+) -> Option<(char, usize)> {
+    if units.get(start) == Some(&(b'{' as u16)) {
+        if !unicode {
+            return None;
+        }
+        let mut i = start + 1;
+        let mut value = 0u32;
+        let mut any = false;
+        while let Some(&c) = units.get(i) {
+            if c == b'}' as u16 {
+                if !any {
+                    return None;
+                }
+                return char::from_u32(value).map(|ch| (ch, i + 1));
+            }
+            let digit = hex_digit(c)?;
+            value = value.checked_mul(16)?.checked_add(digit)?;
+            if value > 0x10FFFF {
+                return None;
+            }
+            any = true;
+            i += 1;
+        }
+        return None;
+    }
+
+    let (hi, mut next) = read_group_name_fixed_hex(units, start)?;
+    if unicode
+        && (0xD800..=0xDBFF).contains(&hi)
+        && units.get(next) == Some(&(b'\\' as u16))
+        && units.get(next + 1) == Some(&(b'u' as u16))
+        && let Some((lo, after)) = read_group_name_fixed_hex(units, next + 2)
+        && (0xDC00..=0xDFFF).contains(&lo)
+    {
+        next = after;
+        let cp = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
+        return char::from_u32(cp).map(|ch| (ch, next));
+    }
+    char::from_u32(hi).map(|ch| (ch, next))
+}
+
+fn read_group_name_fixed_hex(units: &[u16], start: usize) -> Option<(u32, usize)> {
+    let mut value = 0u32;
+    let mut i = start;
+    for _ in 0..4 {
+        value = value * 16 + hex_digit(*units.get(i)?)?;
+        i += 1;
+    }
+    Some((value, i))
+}
+
+fn read_group_name_code_point(units: &[u16], start: usize) -> Option<(char, usize)> {
+    let hi = *units.get(start)?;
+    if (0xD800..=0xDBFF).contains(&hi)
+        && let Some(&lo) = units.get(start + 1)
+        && (0xDC00..=0xDFFF).contains(&lo)
+    {
+        let cp = 0x10000 + ((u32::from(hi) - 0xD800) << 10) + (u32::from(lo) - 0xDC00);
+        return char::from_u32(cp).map(|ch| (ch, start + 2));
+    }
+    char::from_u32(u32::from(hi)).map(|ch| (ch, start + 1))
+}
+
+fn is_group_name_start(ch: char) -> bool {
+    ch == '$' || ch == '_' || unicode_ident::is_xid_start(ch)
+}
+
+fn is_group_name_continue(ch: char) -> bool {
+    is_group_name_start(ch)
+        || unicode_ident::is_xid_continue(ch)
+        || matches!(ch, '\u{200c}' | '\u{200d}')
 }
 
 fn hex_digit(c: u16) -> Option<u32> {
@@ -1402,6 +1492,36 @@ mod tests {
             p.group_names,
             vec![Some("first".to_string()), Some("second".to_string())]
         );
+    }
+
+    #[test]
+    fn decodes_escaped_named_group_names() {
+        let u = Flags {
+            unicode: true,
+            ..Flags::default()
+        };
+        let p = parse_ok("(?<\\u{03C0}>a)(?<a\\u{104A4}>b)", u);
+        assert_eq!(
+            p.group_names,
+            vec![Some("π".to_string()), Some("a𐒤".to_string())]
+        );
+    }
+
+    #[test]
+    fn validates_named_group_identifier_names() {
+        let u = Flags {
+            unicode: true,
+            ..Flags::default()
+        };
+        let _ = parse_ok("(?<$>a)(?<_\\u200C>b)(?<ಠ_ಠ>c)", u);
+        assert!(matches!(
+            parse_err("(?<🦊>fox)", u),
+            RegexError::Syntax { .. }
+        ));
+        assert!(matches!(
+            parse_err("(?<𝟚the>the)", u),
+            RegexError::Syntax { .. }
+        ));
     }
 
     #[test]

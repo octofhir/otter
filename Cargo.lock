@@ -1963,6 +1963,7 @@ dependencies = [
  "bitflags",
  "icu_casemap",
  "icu_properties",
+ "unicode-ident",
 ]
 
 [[package]]

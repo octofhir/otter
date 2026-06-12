@@ -4389,11 +4389,69 @@ impl Interpreter {
                 }
             };
         }
-        if base.is_function()
-            || base.is_closure()
-            || base.is_bound_function()
-            || base.is_native_function()
-            || base.is_class_constructor()
+        if let Some(function_id) = base
+            .as_function()
+            .or_else(|| base.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
+        {
+            if let Some(name) = key.string_name()
+                && self
+                    .ordinary_function_own_property_descriptor(Some(context), function_id, name)?
+                    .is_some()
+            {
+                return Ok(true);
+            }
+            let proto = self.get_prototype_for_op(&base)?;
+            return if proto.is_null() || proto.is_undefined() {
+                Ok(false)
+            } else {
+                self.ordinary_has_property_value(context, proto, key, hops + 1)
+            };
+        }
+        if let Some(native) = base.as_native_function() {
+            let has_own = match key {
+                VmPropertyKey::Symbol(sym) => native
+                    .own_symbol_property_descriptor(&self.gc_heap, *sym)
+                    .is_some(),
+                _ => {
+                    let name = key
+                        .string_name()
+                        .expect("non-symbol key has string spelling");
+                    native
+                        .own_property_descriptor(&mut self.gc_heap, name)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                }
+            };
+            if has_own {
+                return Ok(true);
+            }
+            let proto = self.get_prototype_for_op(&base)?;
+            return if proto.is_null() || proto.is_undefined() {
+                Ok(false)
+            } else {
+                self.ordinary_has_property_value(context, proto, key, hops + 1)
+            };
+        }
+        if let Some(bound) = base.as_bound_function() {
+            if let Some(name) = key.string_name()
+                && function_metadata::bound_own_property_descriptor(
+                    &bound,
+                    &mut self.gc_heap,
+                    name,
+                )?
+                .is_some()
+            {
+                return Ok(true);
+            }
+            let proto = self.get_prototype_for_op(&base)?;
+            return if proto.is_null() || proto.is_undefined() {
+                Ok(false)
+            } else {
+                self.ordinary_has_property_value(context, proto, key, hops + 1)
+            };
+        }
+        if base.is_class_constructor()
             || base.is_regexp()
             || base.is_map()
             || base.is_set()
@@ -4406,9 +4464,22 @@ impl Interpreter {
             || base.is_finalization_registry()
             || base.is_temporal()
         {
-            return match self.ordinary_get_value(context, base, base, key, hops + 1)? {
-                VmGetOutcome::Value(v) if v.is_undefined() => Ok(false),
-                _ => Ok(true),
+            let own = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                context,
+                base,
+                key,
+                hops + 1,
+                &[&base],
+                &[],
+            )?;
+            if own.is_some() {
+                return Ok(true);
+            }
+            let proto = self.get_prototype_for_op(&base)?;
+            return if proto.is_null() || proto.is_undefined() {
+                Ok(false)
+            } else {
+                self.ordinary_has_property_value(context, proto, key, hops + 1)
             };
         }
         // §10.4.5.2 TypedArray [[HasProperty]] — a canonical numeric

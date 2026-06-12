@@ -6,7 +6,7 @@
 //!
 //! # Contents
 //! - Legacy `instanceof` prototype-chain fallback.
-//! - Synchronous `in` / `HasProperty` checks for arrays and class static sides.
+//! - Synchronous `in` / `HasProperty` checks through the shared object resolver.
 //! - Synchronous property and element load/store tails.
 //!
 //! # Invariants
@@ -24,8 +24,8 @@ use otter_bytecode::Operand;
 use otter_gc::raw::RawGc;
 
 use crate::{
-    ClassConstructor, ExecutionContext, Frame, Interpreter, JsObject, JsString, NumberValue,
-    SuperReadKey, Value, VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
+    ExecutionContext, Frame, Interpreter, JsObject, JsString, NumberValue, SuperReadKey, Value,
+    VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
     array::JsArray,
     binary, collections_prototype, descriptor_value, function_metadata,
     is_restricted_function_property, object,
@@ -270,69 +270,7 @@ impl Interpreter {
             } else {
                 has_array_property(self, arr, &lhs)
             }
-        } else if let Some(c) = rhs.as_class_constructor() {
-            has_class_static_property(self, &c, &lhs)
-        } else if let Some(function_id) = rhs
-            .as_function()
-            .or_else(|| rhs.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
-        {
-            if let Some(name) = key_name.as_deref() {
-                let bag_has = self
-                    .function_user_props
-                    .get(&function_id)
-                    .copied()
-                    .is_some_and(|bag| {
-                        crate::object::with_properties(bag, &self.gc_heap, |p| {
-                            p.keys().any(|k| k == name)
-                        })
-                    });
-                let metadata_has = self
-                    .ordinary_function_own_property_descriptor(None, function_id, name)
-                    .ok()
-                    .flatten()
-                    .is_some();
-                let prototype_implicit = name == "prototype"
-                    && context.function_has_prototype_property(function_id)
-                    && !self
-                        .function_deleted_metadata
-                        .contains(&(function_id, "prototype"));
-                bag_has
-                    || metadata_has
-                    || prototype_implicit
-                    || matches!(name, "call" | "apply" | "bind" | "toString")
-            } else {
-                false
-            }
-        } else if let Some(native) = rhs.as_native_function() {
-            if let Some(name) = key_name.as_deref() {
-                native
-                    .own_property_descriptor(&mut self.gc_heap, name)
-                    .ok()
-                    .flatten()
-                    .is_some()
-                    || matches!(name, "call" | "apply" | "bind" | "toString")
-            } else if let Some(sym) = lhs.as_symbol(&self.gc_heap) {
-                native
-                    .own_symbol_property_descriptor(&self.gc_heap, sym)
-                    .is_some()
-            } else {
-                false
-            }
-        } else if let Some(bound) = rhs.as_bound_function() {
-            if let Some(name) = key_name.as_deref() {
-                function_metadata::bound_own_property_descriptor(&bound, &mut self.gc_heap, name)
-                    .ok()
-                    .flatten()
-                    .is_some()
-                    || matches!(name, "call" | "apply" | "bind" | "toString")
-            } else {
-                false
-            }
         } else if rhs.is_object_type() {
-            // §13.10.1 `in` on every other object-typed value — typed
-            // arrays (§10.4.5.2), Map/Set/Date/Promise/error wrappers,
-            // … Delegate to the shared §7.3.12 resolver so `in`
-            // matches `Reflect.has` and walks the prototype chain.
             let key = if let Some(sym) = lhs.as_symbol(&self.gc_heap) {
                 VmPropertyKey::Symbol(sym)
             } else if let Some(name) = key_name.as_deref() {
@@ -4901,39 +4839,6 @@ fn has_array_property(interpreter: &Interpreter, arr: JsArray, key: &Value) -> b
     } else if let Some(sym) = key.as_symbol(&interpreter.gc_heap) {
         // §22.1 Array exotic — symbol-keyed own table.
         crate::array::get_symbol_property(arr, &interpreter.gc_heap, sym).is_some()
-    } else {
-        false
-    }
-}
-
-fn has_class_static_property(
-    interpreter: &Interpreter,
-    class: &ClassConstructor,
-    key: &Value,
-) -> bool {
-    if let Some(sym) = key.as_symbol(&interpreter.gc_heap) {
-        return !matches!(
-            crate::object::lookup_own_symbol(
-                class.statics(&interpreter.gc_heap),
-                &interpreter.gc_heap,
-                sym
-            ),
-            object::PropertyLookup::Absent
-        );
-    }
-    if let Some(s) = key.as_string(&interpreter.gc_heap) {
-        let k = s.to_lossy_string(&interpreter.gc_heap);
-        if k == "prototype" {
-            return true;
-        }
-        !matches!(
-            crate::object::lookup(
-                class.statics(&interpreter.gc_heap),
-                &interpreter.gc_heap,
-                &k
-            ),
-            object::PropertyLookup::Absent
-        )
     } else {
         false
     }

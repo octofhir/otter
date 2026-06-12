@@ -401,8 +401,62 @@ fn user_function_define_symbol_property_uses_descriptor_bag() {
         });
         const desc = Object.getOwnPropertyDescriptor(f, sym);
         f[sym] + ":" + Object.hasOwn(f, sym) + ":" + desc.enumerable;
-        "#);
+    "#);
     assert_eq!(completion, "29:true:false");
+}
+
+#[test]
+fn inferred_object_method_function_name_does_not_shadow_outer_binding() {
+    let completion = run(r#"
+        const ownKeys = ["a"];
+        const handler = {
+            ownKeys: function() {
+                return ownKeys;
+            }
+        };
+        const sameBinding = handler.ownKeys() === ownKeys;
+        sameBinding + ":" + handler.ownKeys.name;
+        "#);
+    assert_eq!(completion, "true:ownKeys");
+}
+
+#[test]
+fn object_get_own_property_descriptors_skips_proxy_undefined_descriptor() {
+    let completion = run(r#"
+        const proxy = new Proxy({ a: 1 }, {
+            ownKeys: function() {
+                return ["a"];
+            },
+            getOwnPropertyDescriptor: function() {
+                return undefined;
+            }
+        });
+        Object.keys(Object.getOwnPropertyDescriptors(proxy)).length;
+        "#);
+    assert_eq!(completion, "0");
+}
+
+#[test]
+fn bound_function_has_and_for_in_walk_function_prototype() {
+    let completion = run(r#"
+        function f() {}
+        Object.defineProperty(Function.prototype, "prop", {
+            value: 1001,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
+        const bound = f.bind({});
+        const keys = [];
+        for (const key in bound) {
+            keys.push(key);
+        }
+        const present = "prop" in bound;
+        const own = bound.hasOwnProperty("prop");
+        delete Function.prototype.prop;
+        present + ":" + own + ":" + keys.join(",");
+        "#);
+    assert_eq!(completion, "true:false:prop");
 }
 
 #[test]

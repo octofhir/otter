@@ -297,6 +297,7 @@ pub(crate) fn compile_expr_with_inferred_name(
         ),
         Expression::FunctionExpression(f) if f.id.is_none() => {
             let span = (f.span.start, f.span.end);
+            cx.next_fn_no_self_name = true;
             let (function_id, captures) = compile_function_full(
                 cx,
                 inferred_name,

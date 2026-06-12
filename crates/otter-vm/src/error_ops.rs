@@ -169,7 +169,18 @@ impl Interpreter {
     ) -> Option<Value> {
         let dynamic_message: String;
         let is_oom = matches!(err, VmError::OutOfMemory { .. });
+        // Node-style `.code` to stamp on the instance after it is built.
+        let mut node_code: Option<&'static str> = None;
         let (kind, message) = match err {
+            VmError::Coded {
+                kind,
+                code,
+                message,
+            } => {
+                node_code = Some(code);
+                dynamic_message = message.clone();
+                (*kind, dynamic_message.as_str())
+            }
             VmError::TypeMismatch => (
                 error_classes::ErrorKind::TypeError,
                 "type mismatch: this operation does not accept a value of this type",
@@ -287,6 +298,18 @@ impl Interpreter {
                 Value::string(message_str),
             );
         }
+        // Stamp the Node-style `.code` as an own, non-enumerable, writable,
+        // configurable property (matches Node's error.code descriptor).
+        if let Some(code) = node_code
+            && let Ok(code_str) = JsString::from_str(code, self.gc_heap_mut())
+        {
+            crate::object::define_own_property(
+                obj,
+                &mut self.gc_heap,
+                "code",
+                crate::object::PropertyDescriptor::data(Value::string(code_str), true, false, true),
+            );
+        }
         Some(Value::object(obj))
     }
 }
@@ -377,6 +400,15 @@ pub(crate) fn symbol_to_vm_error(err: symbol_dispatch::SymbolError) -> VmError {
 pub(crate) fn native_to_vm_error(err: NativeError) -> VmError {
     match err {
         NativeError::Thrown { name: _, message } => VmError::Uncaught { value: message },
+        NativeError::Coded {
+            kind,
+            code,
+            message,
+        } => VmError::Coded {
+            kind,
+            code,
+            message,
+        },
         NativeError::TypeError { name, reason } => VmError::TypeError {
             message: format!("{name}: {reason}"),
         },

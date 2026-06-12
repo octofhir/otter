@@ -1163,6 +1163,18 @@ pub enum NativeError {
         /// The thrown value. Foundation: rendered to a string.
         message: String,
     },
+    /// A JS error carrying a Node-style `.code` (`ERR_*`). `kind` selects the
+    /// error class; `code` becomes an own property on the thrown instance.
+    /// Native modules use this for structured `error.code` (no string munging).
+    #[error("{message}")]
+    Coded {
+        /// JS error class for the thrown instance.
+        kind: crate::error_classes::ErrorKind,
+        /// Stable Node error code (`"ERR_*"`).
+        code: &'static str,
+        /// Human-readable message.
+        message: String,
+    },
     /// Type or value error inside the native body that does not
     /// originate as a `throw` (e.g. wrong arity). Surfaces as
     /// `VmError::TypeMismatch`.
@@ -1275,6 +1287,15 @@ pub fn vm_to_native_error(err: crate::VmError, name: &'static str) -> NativeErro
         crate::VmError::Uncaught { value } => NativeError::Thrown {
             name,
             message: value,
+        },
+        crate::VmError::Coded {
+            kind,
+            code,
+            message,
+        } => NativeError::Coded {
+            kind,
+            code,
+            message,
         },
         crate::VmError::TypeError { message } => NativeError::TypeError {
             name,

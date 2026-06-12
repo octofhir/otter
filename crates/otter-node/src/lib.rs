@@ -113,6 +113,16 @@ pub(crate) fn type_error(
     otter_runtime::runtime_type_error(name, reason)
 }
 
+/// A `TypeError` carrying Node's `ERR_INVALID_ARG_TYPE` code. Structured: the
+/// code rides through the engine and lands as `error.code` on the instance.
+pub(crate) fn invalid_arg_type(message: impl Into<String>) -> otter_runtime::RuntimeNativeError {
+    otter_vm::NativeError::Coded {
+        kind: otter_vm::ErrorKind::TypeError,
+        code: "ERR_INVALID_ARG_TYPE",
+        message: message.into(),
+    }
+}
+
 pub(crate) fn arg_string(
     args: &[otter_runtime::RuntimeValue],
     index: usize,

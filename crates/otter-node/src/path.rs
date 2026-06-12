@@ -12,7 +12,7 @@ use otter_runtime::CapabilitySet;
 use otter_runtime::module_scope::ModuleScope;
 use otter_vm::{NativeCtx, NativeError, Value};
 
-use crate::{arg_string, string_value};
+use crate::{invalid_arg_type, string_value};
 
 /// ESM namespace install (methods only; `sep`/`delimiter` are on the CJS value).
 pub fn install_path_module(ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Result<(), String> {
@@ -302,62 +302,97 @@ fn relative(from: &str, to: &str) -> String {
 
 // ---- native method wrappers ----
 
-fn opt_arg_string(args: &[Value], i: usize, ctx: &mut NativeCtx<'_>) -> Option<String> {
-    args.get(i)
-        .filter(|v| !v.is_undefined())
-        .map(|_| otter_runtime::runtime_arg_to_string(args, i, ctx.heap()))
+/// A required string path argument. Throws Node's `ERR_INVALID_ARG_TYPE`
+/// (a `TypeError` carrying `.code`) when the value is missing or not a string.
+fn require_str(args: &[Value], i: usize, ctx: &mut NativeCtx<'_>) -> Result<String, NativeError> {
+    match args.get(i) {
+        Some(v) if v.is_string() => Ok(otter_runtime::runtime_arg_to_string(args, i, ctx.heap())),
+        _ => Err(invalid_arg_type(
+            "The \"path\" argument must be of type string.",
+        )),
+    }
 }
 
-fn collect_strings(args: &[Value], ctx: &mut NativeCtx<'_>) -> Vec<String> {
-    (0..args.len())
-        .map(|i| otter_runtime::runtime_arg_to_string(args, i, ctx.heap()))
-        .collect()
+/// An optional string argument (e.g. `basename`'s suffix): `undefined`/absent is
+/// `None`; any other non-string throws `ERR_INVALID_ARG_TYPE`.
+fn opt_arg_string(
+    args: &[Value],
+    i: usize,
+    ctx: &mut NativeCtx<'_>,
+) -> Result<Option<String>, NativeError> {
+    match args.get(i) {
+        None => Ok(None),
+        Some(v) if v.is_undefined() => Ok(None),
+        Some(v) if v.is_string() => Ok(Some(otter_runtime::runtime_arg_to_string(
+            args,
+            i,
+            ctx.heap(),
+        ))),
+        _ => Err(invalid_arg_type(
+            "The \"suffix\" argument must be of type string.",
+        )),
+    }
+}
+
+/// Collect variadic path segments, each of which must be a string
+/// (`join`/`resolve`). An empty arg list is allowed; a non-string arg throws.
+fn collect_strings(args: &[Value], ctx: &mut NativeCtx<'_>) -> Result<Vec<String>, NativeError> {
+    let mut out = Vec::with_capacity(args.len());
+    for (i, v) in args.iter().enumerate() {
+        if !v.is_string() {
+            return Err(invalid_arg_type(
+                "The \"path\" argument must be of type string.",
+            ));
+        }
+        out.push(otter_runtime::runtime_arg_to_string(args, i, ctx.heap()));
+    }
+    Ok(out)
 }
 
 fn path_basename(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let path = arg_string(args, 0, "path.basename", ctx.heap())?;
-    let ext = opt_arg_string(args, 1, ctx);
+    let path = require_str(args, 0, ctx)?;
+    let ext = opt_arg_string(args, 1, ctx)?;
     string_value(ctx, &basename(&path, ext.as_deref()))
 }
 
 fn path_dirname(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let path = arg_string(args, 0, "path.dirname", ctx.heap())?;
+    let path = require_str(args, 0, ctx)?;
     string_value(ctx, &dirname(&path))
 }
 
 fn path_extname(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let path = arg_string(args, 0, "path.extname", ctx.heap())?;
+    let path = require_str(args, 0, ctx)?;
     string_value(ctx, &extname(&path))
 }
 
 fn path_is_absolute(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let path = arg_string(args, 0, "path.isAbsolute", ctx.heap())?;
+    let path = require_str(args, 0, ctx)?;
     Ok(Value::boolean(path.starts_with('/')))
 }
 
 fn path_join(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let parts = collect_strings(args, ctx);
+    let parts = collect_strings(args, ctx)?;
     string_value(ctx, &join(&parts))
 }
 
 fn path_normalize(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let path = arg_string(args, 0, "path.normalize", ctx.heap())?;
+    let path = require_str(args, 0, ctx)?;
     string_value(ctx, &normalize_posix(&path))
 }
 
 fn path_resolve(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let parts = collect_strings(args, ctx);
+    let parts = collect_strings(args, ctx)?;
     string_value(ctx, &resolve(&parts))
 }
 
 fn path_relative(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let from = arg_string(args, 0, "path.relative", ctx.heap())?;
-    let to = arg_string(args, 1, "path.relative", ctx.heap())?;
+    let from = require_str(args, 0, ctx)?;
+    let to = require_str(args, 1, ctx)?;
     string_value(ctx, &relative(&from, &to))
 }
 
 fn path_parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let path = arg_string(args, 0, "path.parse", ctx.heap())?;
+    let path = require_str(args, 0, ctx)?;
     let root = if path.starts_with('/') { "/" } else { "" };
     let base = basename_of(&path).to_string();
     let ext = extname(&path);
@@ -468,8 +503,8 @@ fn win32_is_absolute_str(p: &str) -> bool {
 }
 
 fn win32_basename(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let path = arg_string(args, 0, "path.win32.basename", ctx.heap())?;
-    let ext = opt_arg_string(args, 1, ctx);
+    let path = require_str(args, 0, ctx)?;
+    let ext = opt_arg_string(args, 1, ctx)?;
     // Strip the drive/UNC root first so `C:\` / `C:` basename to "".
     let (_, _, rest) = win32_split_root(&path);
     let base = rest
@@ -487,7 +522,7 @@ fn win32_basename(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
 }
 
 fn win32_dirname(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let path = arg_string(args, 0, "path.win32.dirname", ctx.heap())?;
+    let path = require_str(args, 0, ctx)?;
     if path.is_empty() {
         return string_value(ctx, ".");
     }
@@ -519,14 +554,14 @@ fn win32_dirname(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn win32_extname(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let path = arg_string(args, 0, "path.win32.extname", ctx.heap())?;
+    let path = require_str(args, 0, ctx)?;
     // Strip the drive/UNC root so the extension scan starts at the basename.
     let (_, _, rest) = win32_split_root(&path);
     string_value(ctx, &extname_with(rest, win32_is_sep))
 }
 
 fn win32_is_absolute(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let path = arg_string(args, 0, "path.win32.isAbsolute", ctx.heap())?;
+    let path = require_str(args, 0, ctx)?;
     Ok(Value::boolean(win32_is_absolute_str(&path)))
 }
 
@@ -573,12 +608,12 @@ fn win32_normalize_str(p: &str) -> String {
 }
 
 fn win32_normalize(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let path = arg_string(args, 0, "path.win32.normalize", ctx.heap())?;
+    let path = require_str(args, 0, ctx)?;
     string_value(ctx, &win32_normalize_str(&path))
 }
 
 fn win32_join(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let parts: Vec<String> = collect_strings(args, ctx)
+    let parts: Vec<String> = collect_strings(args, ctx)?
         .into_iter()
         .filter(|s| !s.is_empty())
         .collect();
@@ -589,7 +624,7 @@ fn win32_join(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 }
 
 fn win32_resolve(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let parts = collect_strings(args, ctx);
+    let parts = collect_strings(args, ctx)?;
     let mut resolved = String::new();
     let mut is_abs = false;
     for part in parts.iter().rev() {
@@ -627,8 +662,8 @@ fn win32_resolve(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn win32_relative(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let from = arg_string(args, 0, "path.win32.relative", ctx.heap())?;
-    let to = arg_string(args, 1, "path.win32.relative", ctx.heap())?;
+    let from = require_str(args, 0, ctx)?;
+    let to = require_str(args, 1, ctx)?;
     let from = win32_normalize_str(&from).replace('/', "\\");
     let to = win32_normalize_str(&to).replace('/', "\\");
     if from.eq_ignore_ascii_case(&to) {
@@ -654,7 +689,7 @@ fn win32_relative(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
 }
 
 fn win32_parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let path = arg_string(args, 0, "path.win32.parse", ctx.heap())?;
+    let path = require_str(args, 0, ctx)?;
     let (device, is_abs, rest) = win32_split_root(&path);
     let root = if is_abs {
         format!("{device}\\")

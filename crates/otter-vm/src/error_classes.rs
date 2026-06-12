@@ -59,7 +59,7 @@ use otter_gc::raw::RawGc;
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-error-objects>
 /// - <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard>
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum ErrorKind {
     /// `Error` — root of the hierarchy. §20.5.1.

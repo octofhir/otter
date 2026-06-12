@@ -197,6 +197,19 @@ pub enum VmError {
         /// for `JSON_PARSE`.
         message: String,
     },
+    /// A JS error carrying a Node-style `.code` (e.g.
+    /// `ERR_INVALID_ARG_TYPE`). `kind` selects the error class; `code` is set
+    /// as an own non-enumerable property on the thrown instance. Lets native
+    /// modules surface structured `error.code` without folding it into the
+    /// message string.
+    Coded {
+        /// JS error class for the thrown instance.
+        kind: crate::error_classes::ErrorKind,
+        /// Stable Node error code (`"ERR_*"`).
+        code: &'static str,
+        /// Human-readable message.
+        message: String,
+    },
     /// Host-visible termination requested by a native such as
     /// `process.exit(code)`. This is not a JS exception and is not
     /// routed through catch/finally handlers.
@@ -244,6 +257,7 @@ impl std::fmt::Display for VmError {
             VmError::Uncaught { value } => write!(f, "uncaught exception: {value}"),
             VmError::InvalidRegExp { message } => write!(f, "{message}"),
             VmError::JsonError { message, .. } => write!(f, "{message}"),
+            VmError::Coded { message, .. } => write!(f, "{message}"),
             VmError::Exit { code } => write!(f, "process exited with code {code}"),
         }
     }

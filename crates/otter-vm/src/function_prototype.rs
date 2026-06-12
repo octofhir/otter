@@ -125,11 +125,11 @@ fn throw_restricted_function_property(
     ctx: &mut NativeCtx<'_>,
     _: &[Value],
 ) -> Result<Value, NativeError> {
-    // ES2017 normative-optional §B legacy semantics — reading
-    // `caller` / `arguments` on a NON-strict ordinary function
-    // yields `null` instead of throwing (matching shipping
-    // engines); strict functions, bound functions and natives keep
-    // the %ThrowTypeError% poisoning.
+    // ES legacy `caller` is normative-optional. Otter does not expose
+    // a stack-sensitive caller object yet; return `undefined` for
+    // unsupported non-strict ordinary functions while strict
+    // functions, bound functions and natives keep the %ThrowTypeError%
+    // poisoning.
     let receiver = *ctx.this_value();
     let fid = receiver.as_function().or_else(|| {
         receiver
@@ -143,7 +143,7 @@ fn throw_restricted_function_property(
             .function(fid)
             .is_some_and(|f| !f.is_generator && !f.is_async)
     {
-        return Ok(Value::null());
+        return Ok(Value::undefined());
     }
     Err(NativeError::TypeError {
         name: "%ThrowTypeError%",

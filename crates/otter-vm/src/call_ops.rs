@@ -1856,7 +1856,21 @@ impl Interpreter {
         if let Some(native) = current.as_native_function()
             && matches!(
                 native.name(&self.gc_heap),
-                "ArrayBuffer" | "SharedArrayBuffer" | "DataView"
+                "ArrayBuffer"
+                    | "SharedArrayBuffer"
+                    | "DataView"
+                    | "Int8Array"
+                    | "Uint8Array"
+                    | "Uint8ClampedArray"
+                    | "Int16Array"
+                    | "Uint16Array"
+                    | "Int32Array"
+                    | "Uint32Array"
+                    | "Float16Array"
+                    | "Float32Array"
+                    | "Float64Array"
+                    | "BigInt64Array"
+                    | "BigUint64Array"
             )
         {
             return self.invoke_native_construct(

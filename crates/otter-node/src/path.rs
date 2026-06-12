@@ -110,13 +110,18 @@ fn normalize_posix(input: &str) -> String {
             other => parts.push(other),
         }
     }
-    let mut out = parts.join("/");
-    if is_abs {
-        out = format!("/{out}");
+    let body = parts.join("/");
+    if body.is_empty() {
+        // Node: empty result keeps a relative trailing slash as "./".
+        return if is_abs {
+            "/".into()
+        } else if trailing {
+            "./".into()
+        } else {
+            ".".into()
+        };
     }
-    if out.is_empty() {
-        return if is_abs { "/".into() } else { ".".into() };
-    }
+    let mut out = if is_abs { format!("/{body}") } else { body };
     if trailing && !out.ends_with('/') {
         out.push('/');
     }
@@ -517,7 +522,12 @@ fn win32_normalize_str(p: &str) -> String {
     }
     out.push_str(&body);
     if out.is_empty() {
-        return ".".to_string();
+        // Node win32: empty relative result keeps a trailing slash as "./".
+        return if trailing {
+            "./".to_string()
+        } else {
+            ".".to_string()
+        };
     }
     if trailing && !out.ends_with('\\') {
         out.push('\\');

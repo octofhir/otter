@@ -128,6 +128,12 @@ pub struct ColdFrame {
     /// `new.target` visible to the active function body. Set only for
     /// frames entered through `[[Construct]]`.
     pub new_target: Option<Value>,
+    /// The closure value executing this frame, when entered through a
+    /// closure call. Lets the named-function SELF binding resolve to the
+    /// running instance (so `this instanceof Self` / `Self.prototype`
+    /// inside the body observe the same per-instance `.prototype` the
+    /// constructor installed). `None` for bare-function / `<main>` frames.
+    pub callee_closure: Option<crate::closure::JsClosure>,
     /// Trailing arguments past the declared `param_count`. Populated
     /// by the call dispatcher only when the callee declares a rest
     /// parameter; consumed by `Op::CollectRest`.
@@ -194,6 +200,7 @@ impl ColdFrame {
             && self.parked_finally.is_empty()
             && self.construct_target.is_none()
             && self.new_target.is_none()
+            && self.callee_closure.is_none()
             && self.rest_args.is_empty()
             && self.incoming_args.is_empty()
             && self.handlers.is_empty()
@@ -238,6 +245,9 @@ impl ColdFrame {
         if let Some(obj) = &self.construct_target {
             let p = obj as *const JsObject as *mut otter_gc::raw::RawGc;
             visitor(p);
+        }
+        if let Some(closure) = &self.callee_closure {
+            closure.trace_value_slots(visitor);
         }
         if let Some(v) = &self.new_target {
             v.trace_value_slots(visitor);

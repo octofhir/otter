@@ -268,6 +268,7 @@ impl Interpreter {
             upvalues,
             this_value,
         );
+        let callee_closure = current.as_closure(&self.gc_heap);
         let derived_this_cell = if is_derived {
             Some(crate::alloc_upvalue(&mut self.gc_heap, Value::hole())?)
         } else {
@@ -282,6 +283,7 @@ impl Interpreter {
                 cold.construct_target = Some(receiver);
             }
             cold.new_target = Some(new_target);
+            cold.callee_closure = callee_closure;
         }
         self.bind_bytecode_call_arguments(function, &mut frame, args)?;
         Ok(frame)
@@ -322,6 +324,7 @@ impl Interpreter {
             upvalues,
             this_value,
         );
+        let callee_closure = current.as_closure(&self.gc_heap);
         let extras = args.bind_into(function, &mut frame)?;
         let derived_this_cell = if is_derived {
             Some(crate::alloc_upvalue(&mut self.gc_heap, Value::hole())?)
@@ -337,6 +340,7 @@ impl Interpreter {
                 cold.construct_target = Some(receiver);
             }
             cold.new_target = Some(new_target);
+            cold.callee_closure = callee_closure;
             if !extras.is_empty() {
                 cold.rest_args = extras.rest_args;
                 cold.incoming_args = extras.incoming_args;
@@ -1683,6 +1687,11 @@ impl Interpreter {
         let mut inner: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut new_frame =
             Frame::with_exec_return_upvalues_and_this(function, None, upvalues, this_for_callee);
+        // A closure frame records its instance so the named-function SELF
+        // binding inside the body resolves to it (per-instance `.prototype`).
+        if let Some(closure) = current.as_closure(&self.gc_heap) {
+            self.frame_ensure_cold(&mut new_frame).callee_closure = Some(closure);
+        }
         if let Some(new_target) = new_target_for_callee {
             let cold = self.frame_ensure_cold(&mut new_frame);
             cold.new_target = Some(new_target);

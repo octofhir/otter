@@ -71,6 +71,19 @@ impl Interpreter {
             frame.advance_pc(self.current_byte_len)?;
             return Ok(());
         }
+        // §10.2 — the named-function SELF binding (`function_id` is the
+        // running function) must resolve to the EXACT instance executing
+        // this frame, not a fresh interned bare value: otherwise
+        // `this instanceof Self` / `Self.prototype` inside the body would
+        // observe a different per-instance `.prototype` than the one the
+        // constructor installed on `this`.
+        if function_id == frame.function_id
+            && let Some(closure) = self.frame_cold(frame).and_then(|cold| cold.callee_closure)
+        {
+            write_register(frame, dst, Value::closure(closure))?;
+            frame.advance_pc(self.current_byte_len)?;
+            return Ok(());
+        }
         write_register(frame, dst, Value::function(function_id))?;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
@@ -87,6 +100,19 @@ impl Interpreter {
         let function_id = context
             .function_id_constant(idx)
             .ok_or(VmError::InvalidOperand)?;
+        // §10.2 — a named function referencing its own binding inside its
+        // body (`function_id` is the running function) must resolve to the
+        // EXACT instance executing this frame, not a freshly minted one:
+        // a fresh instance owns a distinct per-instance `.prototype`, so
+        // `this instanceof Self` / `Self.prototype` would diverge from the
+        // prototype the constructor installed on `this`.
+        if function_id == frame.function_id
+            && let Some(closure) = self.frame_cold(frame).and_then(|cold| cold.callee_closure)
+        {
+            write_register(frame, dst, Value::closure(closure))?;
+            frame.advance_pc(self.current_byte_len)?;
+            return Ok(());
+        }
         let count = match operands.get(2) {
             Some(&Operand::ConstIndex(n)) => n as usize,
             _ => return Err(VmError::InvalidOperand),

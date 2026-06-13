@@ -184,9 +184,18 @@ impl Interpreter {
     fn function_user_bag_with_stack_roots(
         &mut self,
         stack: &SmallVec<[Frame; 8]>,
+        owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         value_roots: &[&Value],
     ) -> Result<JsObject, VmError> {
+        if let Some(c) = owner {
+            if let Some(bag) = c.own_props(&self.gc_heap) {
+                return Ok(bag);
+            }
+            let bag = self.alloc_stack_rooted_object_with_extra_roots(stack, value_roots)?;
+            c.set_own_props(&mut self.gc_heap, bag);
+            return Ok(bag);
+        }
         match self.function_user_props.get(&function_id).copied() {
             Some(bag) => Ok(bag),
             None => {
@@ -331,7 +340,8 @@ impl Interpreter {
                         .map(|c| c.cached_function_id)
                 })
             {
-                self.ordinary_function_delete_own_property(function_id, name)
+                let owner = class.ctor(&self.gc_heap).as_closure(&self.gc_heap);
+                self.ordinary_function_delete_own_property(owner, function_id, name)
             } else if let Some(native) = class.ctor(&self.gc_heap).as_native_function() {
                 native.delete_own_property(&mut self.gc_heap, name)
             } else if let Some(bound) = class.ctor(&self.gc_heap).as_bound_function() {
@@ -344,7 +354,8 @@ impl Interpreter {
                 .as_closure(&self.gc_heap)
                 .map(|c| c.cached_function_id)
         }) {
-            self.ordinary_function_delete_own_property(function_id, name)
+            let owner = receiver.as_closure(&self.gc_heap);
+            self.ordinary_function_delete_own_property(owner, function_id, name)
         } else if let Some(native) = receiver.as_native_function() {
             native.delete_own_property(&mut self.gc_heap, name)
         } else if let Some(bound) = receiver.as_bound_function() {
@@ -489,7 +500,8 @@ impl Interpreter {
                             .map(|c| c.cached_function_id)
                     })
                 {
-                    self.ordinary_function_delete_own_property(function_id, &name)
+                    let owner = class.ctor(&self.gc_heap).as_closure(&self.gc_heap);
+                    self.ordinary_function_delete_own_property(owner, function_id, &name)
                 } else if let Some(native) = class.ctor(&self.gc_heap).as_native_function() {
                     native.delete_own_property(&mut self.gc_heap, &name)
                 } else if let Some(bound) = class.ctor(&self.gc_heap).as_bound_function() {
@@ -513,7 +525,8 @@ impl Interpreter {
         }) {
             if let Some(s) = idx.as_string(&self.gc_heap) {
                 let name = s.to_lossy_string(&self.gc_heap);
-                self.ordinary_function_delete_own_property(function_id, &name)
+                let owner = receiver.as_closure(&self.gc_heap);
+                self.ordinary_function_delete_own_property(owner, function_id, &name)
             } else {
                 return Err(VmError::TypeMismatch);
             }
@@ -933,10 +946,11 @@ impl Interpreter {
                         || ctor.is_native_function()
                         || ctor.is_bound_function()
                     {
+                        let owner_bag = self.callable_bag_for_value(&ctor);
                         let mut ctx = function_metadata::FunctionMetadataContext::new(
                             context,
                             &mut self.gc_heap,
-                            &self.function_user_props,
+                            owner_bag,
                             &self.function_deleted_metadata,
                         );
                         function_metadata::callable_intrinsic_property(&mut ctx, &ctor, name)?
@@ -1033,9 +1047,11 @@ impl Interpreter {
                 .as_closure(&self.gc_heap)
                 .map(|c| c.cached_function_id)
         }) {
+            let owner = receiver.as_closure(&self.gc_heap);
             self.function_property_get_stack_rooted_with_receiver(
                 context,
                 stack,
+                owner,
                 fid,
                 Some(receiver),
                 name,
@@ -1528,11 +1544,13 @@ impl Interpreter {
                 .as_closure(&self.gc_heap)
                 .map(|c| c.cached_function_id)
         }) {
-            let has_own = self
-                .ordinary_function_has_own_string_property_for_extensibility(context, fid, name)?;
+            let owner = receiver.as_closure(&self.gc_heap);
+            let has_own = self.ordinary_function_has_own_string_property_for_extensibility(
+                context, owner, fid, name,
+            )?;
             if matches!(name, "name" | "length") {
                 if let Some(desc) =
-                    self.ordinary_function_own_property_descriptor(Some(context), fid, name)?
+                    self.ordinary_function_own_property_descriptor(Some(context), owner, fid, name)?
                     && !desc.writable()
                 {
                     Self::failed_set_result(
@@ -1541,8 +1559,12 @@ impl Interpreter {
                     )?;
                     None
                 } else {
-                    let bag =
-                        self.function_user_bag_with_stack_roots(stack, fid, &[&receiver, &value])?;
+                    let bag = self.function_user_bag_with_stack_roots(
+                        stack,
+                        owner,
+                        fid,
+                        &[&receiver, &value],
+                    )?;
                     if let Some(metadata_key) =
                         function_metadata::ordinary_function_metadata_key(name)
                     {
@@ -1557,8 +1579,12 @@ impl Interpreter {
                 )?;
                 None
             } else {
-                let bag =
-                    self.function_user_bag_with_stack_roots(stack, fid, &[&receiver, &value])?;
+                let bag = self.function_user_bag_with_stack_roots(
+                    stack,
+                    owner,
+                    fid,
+                    &[&receiver, &value],
+                )?;
                 Some(bag)
             }
         } else if let Some(native) = receiver.as_native_function() {
@@ -1844,9 +1870,11 @@ impl Interpreter {
             .as_function()
             .or_else(|| recv.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
         {
+            let owner = recv.as_closure(&self.gc_heap);
             if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 match self.ordinary_function_own_property_descriptor(
                     Some(context),
+                    owner,
                     fid,
                     &key.to_lossy_string(&self.gc_heap),
                 )? {
@@ -2335,12 +2363,18 @@ impl Interpreter {
             .as_function()
             .or_else(|| recv.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
         {
+            let owner = recv.as_closure(&self.gc_heap);
             if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let key = key.to_lossy_string(&self.gc_heap);
                 let has_own = self.ordinary_function_has_own_string_property_for_extensibility(
-                    context, fid, &key,
+                    context, owner, fid, &key,
                 )?;
-                match self.ordinary_function_own_property_descriptor(Some(context), fid, &key)? {
+                match self.ordinary_function_own_property_descriptor(
+                    Some(context),
+                    owner,
+                    fid,
+                    &key,
+                )? {
                     Some(desc) if !desc.writable() => {
                         Self::failed_set_result(
                             strict,
@@ -2356,6 +2390,7 @@ impl Interpreter {
                         } else {
                             let bag = self.function_user_bag_stack_rooted(
                                 stack,
+                                owner,
                                 fid,
                                 &[&recv, &idx_value, &value],
                             )?;
@@ -2369,7 +2404,8 @@ impl Interpreter {
                     }
                 }
             } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
-                if !self.ordinary_function_has_own_symbol_property_for_extensibility(fid, sym)
+                if !self
+                    .ordinary_function_has_own_symbol_property_for_extensibility(owner, fid, sym)
                     && !self.ordinary_function_is_extensible(fid)
                 {
                     Self::failed_set_result(
@@ -2379,8 +2415,12 @@ impl Interpreter {
                     stack[top_idx].advance_pc(self.current_byte_len)?;
                     return Ok(());
                 }
-                let bag =
-                    self.function_user_bag_stack_rooted(stack, fid, &[&recv, &idx_value, &value])?;
+                let bag = self.function_user_bag_stack_rooted(
+                    stack,
+                    owner,
+                    fid,
+                    &[&recv, &idx_value, &value],
+                )?;
                 if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
                     return Err(VmError::TypeError {
                         message: "Cannot store symbol property on function".to_string(),
@@ -3095,23 +3135,20 @@ impl Interpreter {
                     .as_closure(&self.gc_heap)
                     .map(|c| c.cached_function_id)
             }) {
-                let bag_has = self
-                    .function_user_props
-                    .get(&fid)
-                    .copied()
-                    .is_some_and(|bag| {
-                        !matches!(
-                            object::lookup_own(bag, &self.gc_heap, name),
-                            object::PropertyLookup::Absent
-                        )
-                    });
+                let owner = receiver.as_closure(&self.gc_heap);
+                let bag_has = self.callable_bag_read(owner, fid).is_some_and(|bag| {
+                    !matches!(
+                        object::lookup_own(bag, &self.gc_heap, name),
+                        object::PropertyLookup::Absent
+                    )
+                });
                 // Virtual own properties (metadata-backed `name` /
                 // `length`, lazily-materialized `prototype`) shadow
                 // %Function.prototype% — §13.2 step 18: an accessor
                 // named `prototype` installed there must never fire
                 // for an ordinary function.
                 let metadata_has = self
-                    .ordinary_function_own_property_descriptor(None, fid, name)
+                    .ordinary_function_own_property_descriptor(None, owner, fid, name)
                     .ok()
                     .flatten()
                     .is_some();
@@ -3160,9 +3197,10 @@ impl Interpreter {
                 .as_closure(&self.gc_heap)
                 .map(|c| c.cached_function_id)
         }) {
-            match self.function_user_props.get(&fid).copied() {
+            let owner = receiver.as_closure(&self.gc_heap);
+            match self.callable_bag_read(owner, fid) {
                 Some(bag) => bag,
-                None => self.function_user_bag_with_stack_roots(stack, fid, &[&receiver])?,
+                None => self.function_user_bag_with_stack_roots(stack, owner, fid, &[&receiver])?,
             }
         } else {
             return Ok(false);
@@ -3343,7 +3381,8 @@ impl Interpreter {
                 .as_closure(&self.gc_heap)
                 .map(|c| c.cached_function_id)
         }) {
-            let Some(bag) = self.function_user_props.get(&fid).copied() else {
+            let owner = receiver.as_closure(&self.gc_heap);
+            let Some(bag) = self.callable_bag_read(owner, fid) else {
                 return Ok(false);
             };
             bag
@@ -3423,8 +3462,9 @@ impl Interpreter {
             .as_function()
             .or_else(|| ctor.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
         {
+            let owner = ctor.as_closure(&self.gc_heap);
             return Ok(self
-                .ordinary_function_own_property_descriptor(Some(context), fid, name)?
+                .ordinary_function_own_property_descriptor(Some(context), owner, fid, name)?
                 .is_some_and(|desc| !desc.writable()));
         }
         Ok(true)
@@ -3856,15 +3896,13 @@ impl Interpreter {
                     .as_closure(&self.gc_heap)
                     .map(|c| c.cached_function_id)
             }) {
-                self.function_user_props
-                    .get(&fid)
-                    .copied()
-                    .is_some_and(|bag| {
-                        !matches!(
-                            object::lookup_own(bag, &self.gc_heap, key),
-                            object::PropertyLookup::Absent
-                        )
-                    })
+                let owner = receiver.as_closure(&self.gc_heap);
+                self.callable_bag_read(owner, fid).is_some_and(|bag| {
+                    !matches!(
+                        object::lookup_own(bag, &self.gc_heap, key),
+                        object::PropertyLookup::Absent
+                    )
+                })
             } else if let Some(c) = receiver.as_class_constructor() {
                 !matches!(
                     object::lookup_own(c.statics(&self.gc_heap), &self.gc_heap, key),
@@ -4064,11 +4102,16 @@ impl Interpreter {
                 .as_closure(&self.gc_heap)
                 .map(|c| c.cached_function_id)
         }) {
+            let owner = receiver.as_closure(&self.gc_heap);
             match &key {
                 ComputedPropertyKey::String(key) => {
                     if function_metadata::ordinary_function_metadata_key(key).is_some()
-                        && let Some(desc) =
-                            self.ordinary_function_own_property_descriptor(Some(context), fid, key)?
+                        && let Some(desc) = self.ordinary_function_own_property_descriptor(
+                            Some(context),
+                            owner,
+                            fid,
+                            key,
+                        )?
                         && !desc.writable()
                     {
                         return Self::finish_failed_set(
@@ -4080,7 +4123,7 @@ impl Interpreter {
                     }
                     let has_own = self
                         .ordinary_function_has_own_string_property_for_extensibility(
-                            context, fid, key,
+                            context, owner, fid, key,
                         )?;
                     if !has_own && !self.ordinary_function_is_extensible(fid) {
                         return Self::finish_failed_set(
@@ -4092,8 +4135,9 @@ impl Interpreter {
                     }
                 }
                 ComputedPropertyKey::Symbol(sym) => {
-                    if !self.ordinary_function_has_own_symbol_property_for_extensibility(fid, *sym)
-                        && !self.ordinary_function_is_extensible(fid)
+                    if !self.ordinary_function_has_own_symbol_property_for_extensibility(
+                        owner, fid, *sym,
+                    ) && !self.ordinary_function_is_extensible(fid)
                     {
                         return Self::finish_failed_set(
                             stack,
@@ -4104,7 +4148,7 @@ impl Interpreter {
                     }
                 }
             }
-            self.function_user_bag_stack_rooted(stack, fid, &[&receiver, &value])?
+            self.function_user_bag_stack_rooted(stack, owner, fid, &[&receiver, &value])?
         } else {
             return Ok(false);
         };
@@ -4403,23 +4447,20 @@ impl Interpreter {
                     .as_closure(&self.gc_heap)
                     .map(|c| c.cached_function_id)
             }) {
-                let bag_has = self
-                    .function_user_props
-                    .get(&fid)
-                    .copied()
-                    .is_some_and(|bag| {
-                        !matches!(
-                            object::lookup_own(bag, &self.gc_heap, name),
-                            object::PropertyLookup::Absent
-                        )
-                    });
+                let owner = receiver.as_closure(&self.gc_heap);
+                let bag_has = self.callable_bag_read(owner, fid).is_some_and(|bag| {
+                    !matches!(
+                        object::lookup_own(bag, &self.gc_heap, name),
+                        object::PropertyLookup::Absent
+                    )
+                });
                 // Virtual own properties (metadata-backed `name` /
                 // `length`, lazily-materialized `prototype`) shadow
                 // %Function.prototype% — §13.2 step 18: an accessor
                 // named `prototype` installed there must never fire
                 // for an ordinary function.
                 let metadata_has = self
-                    .ordinary_function_own_property_descriptor(None, fid, name)
+                    .ordinary_function_own_property_descriptor(None, owner, fid, name)
                     .ok()
                     .flatten()
                     .is_some();
@@ -4483,9 +4524,10 @@ impl Interpreter {
                 .as_closure(&self.gc_heap)
                 .map(|c| c.cached_function_id)
         }) {
+            let owner = receiver.as_closure(&self.gc_heap);
             if function_metadata::ordinary_function_metadata_key(name).is_some()
                 && let Some(desc) =
-                    self.ordinary_function_own_property_descriptor(Some(context), fid, name)?
+                    self.ordinary_function_own_property_descriptor(Some(context), owner, fid, name)?
                 && !desc.writable()
             {
                 return Self::finish_failed_set(
@@ -4495,11 +4537,14 @@ impl Interpreter {
                     self.current_byte_len,
                 );
             }
-            match self.function_user_props.get(&fid).copied() {
+            match self.callable_bag_read(owner, fid) {
                 Some(bag) => bag,
-                None => {
-                    self.function_user_bag_with_stack_roots(stack, fid, &[&receiver, &value])?
-                }
+                None => self.function_user_bag_with_stack_roots(
+                    stack,
+                    owner,
+                    fid,
+                    &[&receiver, &value],
+                )?,
             }
         } else {
             return Ok(false);

@@ -43,6 +43,7 @@ use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
 use otter_macros::Pelt;
 
+use crate::object::JsObject;
 use crate::{UpvalueCell, Value};
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`JsClosureBody`].
@@ -74,6 +75,14 @@ pub struct JsClosureBody {
     /// site). Calls re-expose it so eval-introduced `var` bindings
     /// stay visible through this closure's scope chain.
     pub eval_env: Option<crate::eval_env::EvalEnvHandle>,
+    /// §10.2 — this closure instance's own-property bag. Each function
+    /// object created by evaluating a function expression/declaration
+    /// owns a DISTINCT property store (`f.foo = 1`, the materialized
+    /// `f.prototype`, etc.), so it lives per-instance here rather than
+    /// in a side table keyed by the bytecode template id (which every
+    /// sibling closure of the same source would share). `None` until
+    /// the first own property or `prototype` materialization.
+    pub own_props: Option<JsObject>,
 }
 
 /// 4-byte compressed `Gc<JsClosureBody>` handle to the underlying
@@ -156,6 +165,21 @@ impl JsClosure {
         heap.read_payload(self.handle, |body| body.eval_env)
     }
 
+    /// This closure instance's own-property bag, if it has been
+    /// materialized. See [`JsClosureBody::own_props`].
+    #[must_use]
+    pub fn own_props(self, heap: &GcHeap) -> Option<JsObject> {
+        heap.read_payload(self.handle, |body| body.own_props)
+    }
+
+    /// Install the per-instance own-property bag. Records the
+    /// closure→bag edge with the GC write barrier (the body lives in
+    /// old space; the bag may be younger).
+    pub fn set_own_props(self, heap: &mut GcHeap, bag: JsObject) {
+        heap.with_payload(self.handle, |body| body.own_props = Some(bag));
+        heap.write_barrier(self.handle, bag);
+    }
+
     /// Number of captured upvalue cells. Reads the body once.
     #[must_use]
     pub fn upvalue_count(self, heap: &GcHeap) -> usize {
@@ -223,6 +247,7 @@ pub fn alloc_closure(
         bound_new_target,
         bound_derived_this,
         eval_env,
+        own_props: None,
     })?;
     Ok(JsClosure::from_parts(handle, function_id))
 }
@@ -255,6 +280,7 @@ pub fn alloc_closure_with_roots(
             bound_new_target,
             bound_derived_this,
             eval_env,
+            own_props: None,
         },
         external_visit,
     )?;

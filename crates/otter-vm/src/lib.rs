@@ -5261,6 +5261,7 @@ impl Interpreter {
                             .as_closure(&self.gc_heap)
                             .map(|c| c.cached_function_id)
                     }) {
+                        let owner = callee.as_closure(&self.gc_heap);
                         let name_str = JsString::from_str(&name, &mut self.gc_heap)?;
                         let descriptor = object::PropertyDescriptor {
                             kind: object::DescriptorKind::Data {
@@ -5270,6 +5271,7 @@ impl Interpreter {
                         };
                         self.ordinary_function_define_own_property(
                             Some(context),
+                            owner,
                             fid,
                             "name",
                             None,
@@ -7738,7 +7740,7 @@ mod tests {
             "StoreProperty should allocate function user props in young space"
         );
         let desc = interp
-            .ordinary_function_own_property_descriptor(Some(&context), 1, "custom")
+            .ordinary_function_own_property_descriptor(Some(&context), None, 1, "custom")
             .unwrap()
             .expect("custom property descriptor");
         assert_eq!(
@@ -7759,7 +7761,7 @@ mod tests {
 
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
         let prototype = interp
-            .function_property_get_stack_rooted(&context, &stack, 1, "prototype")
+            .function_property_get_stack_rooted(&context, &stack, None, 1, "prototype")
             .expect("prototype");
         let after = interp.gc_heap_mut().stats().new_allocated_bytes;
         assert!(
@@ -7787,7 +7789,14 @@ mod tests {
 
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
         let prototype = interp
-            .function_property_get_runtime_rooted(&context, 1, "prototype", &[&target], &[&args])
+            .function_property_get_runtime_rooted(
+                &context,
+                None,
+                1,
+                "prototype",
+                &[&target],
+                &[&args],
+            )
             .expect("prototype");
         let after = interp.gc_heap_mut().stats().new_allocated_bytes;
         assert!(
@@ -7834,7 +7843,7 @@ mod tests {
         );
         assert_eq!(stack[0].registers[0], Value::boolean(false));
         let desc = interp
-            .ordinary_function_own_property_descriptor(Some(&context), 1, "prototype")
+            .ordinary_function_own_property_descriptor(Some(&context), None, 1, "prototype")
             .unwrap()
             .expect("prototype descriptor");
         assert!(descriptor_value(&desc).is_object());
@@ -9407,7 +9416,7 @@ mod tests {
         stack.push(frame);
         let function_value = Value::function(1);
         let bag = interp
-            .function_user_bag_stack_rooted(&stack, 1, &[&function_value])
+            .function_user_bag_stack_rooted(&stack, None, 1, &[&function_value])
             .expect("function user bag");
         object::set(bag, interp.gc_heap_mut(), "call", Value::number_i32(1));
 
@@ -9448,7 +9457,7 @@ mod tests {
         stack.push(frame);
         let function_value = Value::function(1);
         let bag = interp
-            .function_user_bag_stack_rooted(&stack, 1, &[&function_value])
+            .function_user_bag_stack_rooted(&stack, None, 1, &[&function_value])
             .expect("function user bag");
         object::set(
             bag,

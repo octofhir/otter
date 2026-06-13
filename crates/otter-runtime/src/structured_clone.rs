@@ -597,10 +597,10 @@ fn is_identifier_path_segment(value: &str) -> bool {
 fn value_type_name(value: &Value) -> &'static str {
     if value.is_symbol() {
         "symbol"
-    } else if value.is_function() {
+    } else if value.is_function() || value.is_closure() {
+        // Closures and bare interned function values are both ordinary
+        // functions to the user; report a single "function" label.
         "function"
-    } else if value.is_closure() {
-        "closure"
     } else if value.is_bound_function() {
         "bound_function"
     } else if value.is_native_function() {

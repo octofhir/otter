@@ -25,7 +25,7 @@
 //! - <https://tc39.es/ecma262/#sec-setfunctionname>
 //! - <https://tc39.es/ecma262/#sec-setfunctionlength>
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::number::NumberValue;
 use crate::object::{self, DescriptorKind, JsObject, PropertyDescriptor};
@@ -36,7 +36,11 @@ use crate::{BoundFunction, BoundFunctionMetadataProperty, ExecutionContext, Valu
 pub(crate) struct FunctionMetadataContext<'a> {
     context: &'a ExecutionContext,
     pub(crate) gc_heap: &'a mut otter_gc::GcHeap,
-    function_user_props: &'a HashMap<u32, JsObject>,
+    /// This callable instance's own-property bag (per-instance for
+    /// closures, the template side-table bag for bare functions), or
+    /// `None` when no expandos exist. Used to honour user overrides of
+    /// the intrinsic `name` / `length` properties.
+    owner_bag: Option<JsObject>,
     function_deleted_metadata: &'a HashSet<(u32, &'static str)>,
 }
 
@@ -54,13 +58,13 @@ impl<'a> FunctionMetadataContext<'a> {
     pub(crate) fn new(
         context: &'a ExecutionContext,
         gc_heap: &'a mut otter_gc::GcHeap,
-        function_user_props: &'a HashMap<u32, JsObject>,
+        owner_bag: Option<JsObject>,
         function_deleted_metadata: &'a HashSet<(u32, &'static str)>,
     ) -> Self {
         Self {
             context,
             gc_heap,
-            function_user_props,
+            owner_bag,
             function_deleted_metadata,
         }
     }
@@ -510,7 +514,7 @@ fn ordinary_function_user_property(
     if ordinary_function_metadata_deleted(ctx, function_id, key) {
         return None;
     }
-    let bag = ctx.function_user_props.get(&function_id).copied()?;
+    let bag = ctx.owner_bag?;
     object::get_own(bag, ctx.gc_heap, key)
 }
 

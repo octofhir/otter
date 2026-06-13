@@ -539,8 +539,16 @@ impl Interpreter {
         function_id: u32,
         gen_handle: &crate::generator::JsGenerator,
     ) -> Result<(), VmError> {
-        let proto =
-            self.function_property_get_stack_rooted(context, stack, function_id, "prototype")?;
+        // Generator `.prototype` flows only the template id this deep in
+        // dispatch; the per-instance owner is not threaded here (generator
+        // closures keep template-keyed prototype materialization).
+        let proto = self.function_property_get_stack_rooted(
+            context,
+            stack,
+            None,
+            function_id,
+            "prototype",
+        )?;
         gen_handle.set_prototype_override(
             &mut self.gc_heap,
             proto.as_object().is_some().then_some(proto),
@@ -1294,9 +1302,11 @@ impl Interpreter {
                 .map(|c| c.cached_function_id)
         });
         if let Some(function_id) = function_id {
+            let owner = callee.as_closure(&self.gc_heap);
             return match self.function_property_get_stack_rooted_with_receiver(
                 context,
                 stack,
+                owner,
                 function_id,
                 Some(*callee),
                 "prototype",
@@ -1349,8 +1359,10 @@ impl Interpreter {
                 .map(|c| c.cached_function_id)
         });
         if let Some(function_id) = function_id {
+            let owner = callee.as_closure(&self.gc_heap);
             return match self.function_property_get_runtime_rooted_with_receiver(
                 context,
+                owner,
                 function_id,
                 Some(*callee),
                 "prototype",
@@ -1715,9 +1727,11 @@ impl Interpreter {
             prologue_stack.push(frame);
             self.dispatch_loop(context, &mut prologue_stack)?;
             // §27.5.1 step 3 — resolve [[Prototype]] after the
-            // prologue (FunctionDeclarationInstantiation) ran.
+            // prologue (FunctionDeclarationInstantiation) ran. Only the
+            // template id flows this deep; per-instance owner not threaded.
             let proto = self.function_property_get_runtime_rooted(
                 context,
+                None,
                 function_id,
                 "prototype",
                 &[],

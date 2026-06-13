@@ -49,13 +49,11 @@ impl Interpreter {
         let function_id = context
             .function_id_constant(idx)
             .ok_or(VmError::InvalidOperand)?;
-        // §9.1 — a capture-free function created in a frame that
-        // carries a direct-eval variable environment still needs the
-        // env handle (its free identifiers resolve dynamically), so
-        // it materializes as a closure with no upvalues.
-        // The function-expression SELF binding (fid == current
-        // frame) keeps the canonical plain value — promoting it
-        // would mint a fresh closure identity on every entry.
+        // §9.1 — a capture-free function created in a frame that carries a
+        // direct-eval variable environment still needs the env handle (its
+        // free identifiers resolve dynamically), so it materializes as a
+        // closure with no upvalues. Otherwise a capture-free function keeps
+        // the canonical interned value.
         if function_id != frame.function_id
             && let Some(env) = self.frame_cold(frame).and_then(|cold| cold.eval_env)
         {
@@ -440,10 +438,11 @@ impl Interpreter {
                 let mut iter = args.into_iter();
                 let receiver = iter.next().unwrap_or(Value::undefined());
                 let bound_args: SmallVec<[Value; 4]> = iter.collect();
+                let owner_bag = self.callable_bag_for_value(&this_value);
                 let mut ctx = function_metadata::FunctionMetadataContext::new(
                     context,
                     &mut self.gc_heap,
-                    &self.function_user_props,
+                    owner_bag,
                     &self.function_deleted_metadata,
                 );
                 let metadata = function_metadata::bound_create_metadata(
@@ -480,10 +479,11 @@ impl Interpreter {
                     return Err(VmError::NotCallable);
                 }
                 let display = {
+                    let owner_bag = self.callable_bag_for_value(&this_value);
                     let mut ctx = function_metadata::FunctionMetadataContext::new(
                         context,
                         &mut self.gc_heap,
-                        &self.function_user_props,
+                        owner_bag,
                         &self.function_deleted_metadata,
                     );
                     function_metadata::callable_to_string(&mut ctx, &this_value)
@@ -782,6 +782,7 @@ impl Interpreter {
         if let Some(function_id) = target.as_function() {
             return match self.ordinary_function_own_property_descriptor(
                 Some(context),
+                None,
                 function_id,
                 key,
             )? {
@@ -792,6 +793,7 @@ impl Interpreter {
         if let Some(closure) = target.as_closure(&self.gc_heap) {
             return match self.ordinary_function_own_property_descriptor(
                 Some(context),
+                Some(closure),
                 closure.cached_function_id,
                 key,
             )? {
@@ -861,12 +863,51 @@ impl Interpreter {
         Err(VmError::TypeMismatch)
     }
 
+    /// Read a callable's own-property bag without creating one.
+    ///
+    /// Closures own a per-instance bag in their GC body (so siblings
+    /// minted from the same source template do NOT share expandos);
+    /// bare interned function values fall back to the template-keyed
+    /// [`Self::function_user_props`] side table.
+    pub(crate) fn callable_bag_read(
+        &self,
+        owner: Option<crate::closure::JsClosure>,
+        function_id: u32,
+    ) -> Option<JsObject> {
+        match owner {
+            Some(c) => c.own_props(&self.gc_heap),
+            None => self.function_user_props.get(&function_id).copied(),
+        }
+    }
+
+    /// Resolve a callable value's own-property bag directly (closure →
+    /// per-instance body bag; bare function → template side table).
+    /// Returns `None` for non-callables or callables with no expandos.
+    pub(crate) fn callable_bag_for_value(&self, value: &Value) -> Option<JsObject> {
+        if let Some(c) = value.as_closure(&self.gc_heap) {
+            return c.own_props(&self.gc_heap);
+        }
+        if let Some(fid) = value.as_function() {
+            return self.function_user_props.get(&fid).copied();
+        }
+        None
+    }
+
     pub(crate) fn function_user_bag_stack_rooted(
         &mut self,
         stack: &SmallVec<[Frame; 8]>,
+        owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         value_roots: &[&Value],
     ) -> Result<JsObject, VmError> {
+        if let Some(c) = owner {
+            if let Some(bag) = c.own_props(&self.gc_heap) {
+                return Ok(bag);
+            }
+            let bag = self.alloc_stack_rooted_object_with_extra_roots(stack, value_roots)?;
+            c.set_own_props(&mut self.gc_heap, bag);
+            return Ok(bag);
+        }
         match self.function_user_props.get(&function_id).copied() {
             Some(bag) => Ok(bag),
             None => {
@@ -879,10 +920,19 @@ impl Interpreter {
 
     pub(crate) fn function_user_bag_runtime_rooted(
         &mut self,
+        owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<JsObject, VmError> {
+        if let Some(c) = owner {
+            if let Some(bag) = c.own_props(&self.gc_heap) {
+                return Ok(bag);
+            }
+            let bag = self.alloc_runtime_rooted_object_with_roots(value_roots, slice_roots)?;
+            c.set_own_props(&mut self.gc_heap, bag);
+            return Ok(bag);
+        }
         match self.function_user_props.get(&function_id).copied() {
             Some(bag) => Ok(bag),
             None => {
@@ -914,11 +964,12 @@ impl Interpreter {
     pub(crate) fn ordinary_function_has_own_string_property_for_extensibility(
         &mut self,
         context: &ExecutionContext,
+        owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         key: &str,
     ) -> Result<bool, VmError> {
         if self
-            .ordinary_function_own_property_descriptor(Some(context), function_id, key)?
+            .ordinary_function_own_property_descriptor(Some(context), owner, function_id, key)?
             .is_some()
         {
             return Ok(true);
@@ -932,12 +983,11 @@ impl Interpreter {
 
     pub(crate) fn ordinary_function_has_own_symbol_property_for_extensibility(
         &self,
+        owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         key: crate::symbol::JsSymbol,
     ) -> bool {
-        self.function_user_props
-            .get(&function_id)
-            .copied()
+        self.callable_bag_read(owner, function_id)
             .and_then(|bag| crate::object::get_own_symbol_descriptor(bag, &self.gc_heap, key))
             .is_some()
     }
@@ -961,6 +1011,7 @@ impl Interpreter {
     pub(crate) fn ordinary_function_own_property_keys(
         &self,
         context: &ExecutionContext,
+        owner: Option<crate::closure::JsClosure>,
         function_id: u32,
     ) -> Vec<String> {
         let mut keys = Vec::new();
@@ -974,7 +1025,7 @@ impl Interpreter {
             keys.push("name".to_string());
         }
         let mut bag_has_prototype = false;
-        if let Some(bag) = self.function_user_props.get(&function_id).copied() {
+        if let Some(bag) = self.callable_bag_read(owner, function_id) {
             crate::object::with_properties(bag, &self.gc_heap, |p| {
                 for k in p.keys() {
                     if k == "length" || k == "name" {
@@ -1009,11 +1060,12 @@ impl Interpreter {
         let function_id = ctor
             .as_function()
             .or_else(|| ctor.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
+        let ctor_owner = ctor.as_closure(&self.gc_heap);
         let mut keys = if let Some(function_id) = function_id {
             let Some(context) = context else {
                 return Err(VmError::InvalidOperand);
             };
-            self.ordinary_function_own_property_keys(context, function_id)
+            self.ordinary_function_own_property_keys(context, ctor_owner, function_id)
         } else if let Some(native) = ctor.as_native_function() {
             native.own_property_keys(&self.gc_heap)
         } else if let Some(bound) = ctor.as_bound_function() {
@@ -1042,10 +1094,11 @@ impl Interpreter {
     pub(crate) fn ordinary_function_own_property_descriptor(
         &mut self,
         context: Option<&ExecutionContext>,
+        owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         key: &str,
     ) -> Result<Option<object::PropertyDescriptor>, VmError> {
-        if let Some(bag) = self.function_user_props.get(&function_id).copied()
+        if let Some(bag) = self.callable_bag_read(owner, function_id)
             && let Some(desc) = crate::object::get_own_descriptor(bag, &self.gc_heap, key)
         {
             return Ok(Some(desc));
@@ -1062,10 +1115,11 @@ impl Interpreter {
         let Some(context) = context else {
             return Ok(None);
         };
+        let owner_bag = self.callable_bag_read(owner, function_id);
         let mut ctx = function_metadata::FunctionMetadataContext::new(
             context,
             &mut self.gc_heap,
-            &self.function_user_props,
+            owner_bag,
             &self.function_deleted_metadata,
         );
         let value =
@@ -1078,6 +1132,7 @@ impl Interpreter {
     pub(crate) fn ordinary_function_define_own_property(
         &mut self,
         context: Option<&ExecutionContext>,
+        owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         key: &str,
         desc_obj: Option<JsObject>,
@@ -1085,6 +1140,7 @@ impl Interpreter {
     ) -> Result<bool, VmError> {
         self.ordinary_function_define_own_property_with_roots(
             context,
+            owner,
             function_id,
             key,
             desc_obj,
@@ -1097,6 +1153,7 @@ impl Interpreter {
     fn ordinary_function_define_own_property_with_roots(
         &mut self,
         context: Option<&ExecutionContext>,
+        owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         key: &str,
         desc_obj: Option<JsObject>,
@@ -1104,44 +1161,46 @@ impl Interpreter {
         stack_roots: Option<&SmallVec<[Frame; 8]>>,
         value_roots: &[&Value],
     ) -> Result<bool, VmError> {
-        let descriptor =
-            match self.ordinary_function_own_property_descriptor(context, function_id, key)? {
-                Some(existing) => {
-                    let descriptor =
-                        if function_metadata::ordinary_function_metadata_key(key).is_some() {
-                            match desc_obj {
-                                Some(desc_obj) => complete_descriptor_defaults_from_object(
-                                    desc_obj,
-                                    &self.gc_heap,
-                                    descriptor,
-                                    &existing,
-                                ),
-                                None => descriptor,
-                            }
-                        } else {
-                            descriptor
-                        };
-                    match object::validate_descriptor_update(&existing, &descriptor, &self.gc_heap)
-                    {
-                        Some(merged) => merged,
-                        None => return Ok(false),
+        let descriptor = match self.ordinary_function_own_property_descriptor(
+            context,
+            owner,
+            function_id,
+            key,
+        )? {
+            Some(existing) => {
+                let descriptor = if function_metadata::ordinary_function_metadata_key(key).is_some()
+                {
+                    match desc_obj {
+                        Some(desc_obj) => complete_descriptor_defaults_from_object(
+                            desc_obj,
+                            &self.gc_heap,
+                            descriptor,
+                            &existing,
+                        ),
+                        None => descriptor,
                     }
-                }
-                None => {
-                    let has_virtual_prototype = context.is_some_and(|context| {
-                        key == "prototype"
-                            && context.function_has_prototype_property(function_id)
-                            && !self
-                                .function_deleted_metadata
-                                .contains(&(function_id, "prototype"))
-                    });
-                    if !has_virtual_prototype && !self.ordinary_function_is_extensible(function_id)
-                    {
-                        return Ok(false);
-                    }
+                } else {
                     descriptor
+                };
+                match object::validate_descriptor_update(&existing, &descriptor, &self.gc_heap) {
+                    Some(merged) => merged,
+                    None => return Ok(false),
                 }
-            };
+            }
+            None => {
+                let has_virtual_prototype = context.is_some_and(|context| {
+                    key == "prototype"
+                        && context.function_has_prototype_property(function_id)
+                        && !self
+                            .function_deleted_metadata
+                            .contains(&(function_id, "prototype"))
+                });
+                if !has_virtual_prototype && !self.ordinary_function_is_extensible(function_id) {
+                    return Ok(false);
+                }
+                descriptor
+            }
+        };
         let mut roots = Vec::with_capacity(value_roots.len() + 3);
         roots.extend_from_slice(value_roots);
         let desc_obj_root = desc_obj.map(Value::object);
@@ -1160,8 +1219,10 @@ impl Interpreter {
             }
         }
         let bag = match stack_roots {
-            Some(stack) => self.function_user_bag_stack_rooted(stack, function_id, &roots)?,
-            None => self.function_user_bag_runtime_rooted(function_id, &roots, &[])?,
+            Some(stack) => {
+                self.function_user_bag_stack_rooted(stack, owner, function_id, &roots)?
+            }
+            None => self.function_user_bag_runtime_rooted(owner, function_id, &roots, &[])?,
         };
         let ok = crate::object::define_own_property(bag, &mut self.gc_heap, key, descriptor);
         if ok && let Some(metadata_key) = function_metadata::ordinary_function_metadata_key(key) {
@@ -1173,18 +1234,17 @@ impl Interpreter {
 
     pub(crate) fn ordinary_function_delete_own_property(
         &mut self,
+        owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         key: &str,
     ) -> bool {
         let Some(metadata_key) = function_metadata::ordinary_function_metadata_key(key) else {
             return self
-                .function_user_props
-                .get(&function_id)
-                .copied()
+                .callable_bag_read(owner, function_id)
                 .map(|bag| crate::object::delete(bag, &mut self.gc_heap, key))
                 .unwrap_or(true);
         };
-        if let Some(bag) = self.function_user_props.get(&function_id).copied()
+        if let Some(bag) = self.callable_bag_read(owner, function_id)
             && crate::object::get_own_descriptor(bag, &self.gc_heap, key).is_some()
         {
             if !crate::object::delete(bag, &mut self.gc_heap, key) {
@@ -1374,9 +1434,10 @@ impl Interpreter {
                 None => Ok(Some(Value::undefined())),
             };
         }
+        let owner = target.as_closure(&self.gc_heap);
         let function_id = if let Some(id) = target.as_function() {
             Some(id)
-        } else if let Some(closure) = target.as_closure(&self.gc_heap) {
+        } else if let Some(closure) = owner {
             Some(closure.cached_function_id)
         } else if target.is_bound_function() {
             None
@@ -1395,6 +1456,7 @@ impl Interpreter {
                 let ok = match (function_id, &key) {
                     (Some(function_id), VmPropertyKey::Symbol(sym)) => {
                         if !self.ordinary_function_has_own_symbol_property_for_extensibility(
+                            owner,
                             function_id,
                             *sym,
                         ) && !self.ordinary_function_is_extensible(function_id)
@@ -1402,10 +1464,14 @@ impl Interpreter {
                             return Err(VmError::TypeMismatch);
                         }
                         let bag = match stack_roots {
-                            Some(stack) => {
-                                self.function_user_bag_stack_rooted(stack, function_id, &[&target])?
-                            }
+                            Some(stack) => self.function_user_bag_stack_rooted(
+                                stack,
+                                owner,
+                                function_id,
+                                &[&target],
+                            )?,
                             None => self.function_user_bag_runtime_rooted(
+                                owner,
                                 function_id,
                                 &[&target],
                                 &[args],
@@ -1421,6 +1487,7 @@ impl Interpreter {
                     (Some(function_id), _) => self
                         .ordinary_function_define_own_property_with_roots(
                             context,
+                            owner,
                             function_id,
                             key.string_name()
                                 .expect("non-symbol key has string spelling"),
@@ -1452,13 +1519,14 @@ impl Interpreter {
                 let key = Self::coerce_vm_property_key(args.get(1), &self.gc_heap)?;
                 let desc = match (function_id, &key) {
                     (Some(function_id), VmPropertyKey::Symbol(sym)) => {
-                        let Some(bag) = self.function_user_props.get(&function_id).copied() else {
+                        let Some(bag) = self.callable_bag_read(owner, function_id) else {
                             return Ok(Some(Value::undefined()));
                         };
                         crate::object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym)
                     }
                     (Some(function_id), _) => self.ordinary_function_own_property_descriptor(
                         context,
+                        owner,
                         function_id,
                         key.string_name()
                             .expect("non-symbol key has string spelling"),
@@ -1492,9 +1560,7 @@ impl Interpreter {
                 let key = Self::coerce_vm_property_key(args.get(1), &self.gc_heap)?;
                 let present = match (function_id, &key) {
                     (Some(function_id), VmPropertyKey::Symbol(sym)) => self
-                        .function_user_props
-                        .get(&function_id)
-                        .copied()
+                        .callable_bag_read(owner, function_id)
                         .map(|bag| crate::object::has_own_symbol(bag, &self.gc_heap, *sym))
                         .unwrap_or(false),
                     (Some(function_id), _) => {
@@ -1502,9 +1568,7 @@ impl Interpreter {
                             .string_name()
                             .expect("non-symbol key has string spelling");
                         let user_present = self
-                            .function_user_props
-                            .get(&function_id)
-                            .copied()
+                            .callable_bag_read(owner, function_id)
                             .map(|bag| {
                                 !matches!(
                                     crate::object::lookup_own(bag, &self.gc_heap, key),
@@ -1674,31 +1738,41 @@ impl Interpreter {
     pub(crate) fn function_property_get(
         &mut self,
         context: &ExecutionContext,
+        owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         name: &str,
     ) -> Result<Value, VmError> {
         if name == "prototype" {
-            return self.function_property_get_runtime_rooted(context, function_id, name, &[], &[]);
+            return self.function_property_get_runtime_rooted(
+                context,
+                owner,
+                function_id,
+                name,
+                &[],
+                &[],
+            );
         }
-        self.function_property_get_non_prototype(context, function_id, name)
+        self.function_property_get_non_prototype(context, owner, function_id, name)
     }
 
     fn function_property_get_non_prototype(
         &mut self,
         context: &ExecutionContext,
+        owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         name: &str,
     ) -> Result<Value, VmError> {
-        if let Some(bag) = self.function_user_props.get(&function_id).copied()
+        if let Some(bag) = self.callable_bag_read(owner, function_id)
             && let Some(v) = crate::object::get(bag, &self.gc_heap, name)
         {
             return Ok(v);
         }
         if name == "name" || name == "length" {
+            let owner_bag = self.callable_bag_read(owner, function_id);
             let mut ctx = function_metadata::FunctionMetadataContext::new(
                 context,
                 &mut self.gc_heap,
-                &self.function_user_props,
+                owner_bag,
                 &self.function_deleted_metadata,
             );
             return function_metadata::ordinary_function_intrinsic_property(
@@ -1725,12 +1799,14 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         stack: &SmallVec<[Frame; 8]>,
+        owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         name: &str,
     ) -> Result<Value, VmError> {
         self.function_property_get_stack_rooted_with_receiver(
             context,
             stack,
+            owner,
             function_id,
             None,
             name,
@@ -1747,19 +1823,20 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         stack: &SmallVec<[Frame; 8]>,
+        owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         receiver: Option<Value>,
         name: &str,
     ) -> Result<Value, VmError> {
         if name != "prototype" {
-            return self.function_property_get_non_prototype(context, function_id, name);
+            return self.function_property_get_non_prototype(context, owner, function_id, name);
         }
         // A user-installed own `prototype` (data or accessor, e.g. via
         // Object.defineProperty) shadows the implicit one. An accessor
         // must fire its getter with the function as receiver — §7.3.12
         // Get(C, "prototype") in OrdinaryHasInstance — so a poisoned
         // getter propagates instead of reading back `undefined`.
-        if let Some(bag) = self.function_user_props.get(&function_id).copied() {
+        if let Some(bag) = self.callable_bag_read(owner, function_id) {
             match crate::object::lookup_own(bag, &self.gc_heap, name) {
                 crate::object::PropertyLookup::Data { value, .. } => return Ok(value),
                 crate::object::PropertyLookup::Accessor { getter, .. } => {
@@ -1785,6 +1862,7 @@ impl Interpreter {
         let constructor_value = receiver.unwrap_or(function_root);
         let bag = self.function_user_bag_stack_rooted(
             stack,
+            owner,
             function_id,
             &[&function_root, &constructor_value],
         )?;
@@ -1849,6 +1927,7 @@ impl Interpreter {
     pub(crate) fn function_property_get_runtime_rooted(
         &mut self,
         context: &ExecutionContext,
+        owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         name: &str,
         value_roots: &[&Value],
@@ -1856,6 +1935,7 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         self.function_property_get_runtime_rooted_with_receiver(
             context,
+            owner,
             function_id,
             None,
             name,
@@ -1871,6 +1951,7 @@ impl Interpreter {
     pub(crate) fn function_property_get_runtime_rooted_with_receiver(
         &mut self,
         context: &ExecutionContext,
+        owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         receiver: Option<Value>,
         name: &str,
@@ -1878,14 +1959,14 @@ impl Interpreter {
         slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {
         if name != "prototype" {
-            return self.function_property_get_non_prototype(context, function_id, name);
+            return self.function_property_get_non_prototype(context, owner, function_id, name);
         }
         // A user-installed own `prototype` (data or accessor, e.g. via
         // Object.defineProperty) shadows the implicit one. An accessor
         // must fire its getter with the function as receiver — §7.3.12
         // Get(C, "prototype") in OrdinaryHasInstance — so a poisoned
         // getter propagates instead of reading back `undefined`.
-        if let Some(bag) = self.function_user_props.get(&function_id).copied() {
+        if let Some(bag) = self.callable_bag_read(owner, function_id) {
             match crate::object::lookup_own(bag, &self.gc_heap, name) {
                 crate::object::PropertyLookup::Data { value, .. } => return Ok(value),
                 crate::object::PropertyLookup::Accessor { getter, .. } => {
@@ -1913,7 +1994,8 @@ impl Interpreter {
         bag_roots.push(&function_root);
         bag_roots.push(&constructor_value);
         bag_roots.extend_from_slice(value_roots);
-        let bag = self.function_user_bag_runtime_rooted(function_id, &bag_roots, slice_roots)?;
+        let bag =
+            self.function_user_bag_runtime_rooted(owner, function_id, &bag_roots, slice_roots)?;
         if let Some(existing) = crate::object::get(bag, &self.gc_heap, "prototype") {
             return Ok(existing);
         }

@@ -773,8 +773,9 @@ impl Interpreter {
                 .map(|c| c.cached_function_id)
         });
         if let Some(function_id) = function_id {
+            let owner = target.as_closure(&self.gc_heap);
             if let VmPropertyKey::Symbol(sym) = key {
-                let Some(bag) = self.function_user_props.get(&function_id).copied() else {
+                let Some(bag) = self.callable_bag_read(owner, function_id) else {
                     return Ok(None);
                 };
                 return Ok(object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym));
@@ -789,6 +790,7 @@ impl Interpreter {
                         slice_roots,
                     } => self.function_property_get_runtime_rooted_with_receiver(
                         context,
+                        owner,
                         function_id,
                         Some(target),
                         "prototype",
@@ -799,17 +801,23 @@ impl Interpreter {
                         .function_property_get_stack_rooted_with_receiver(
                             context,
                             stack,
+                            owner,
                             function_id,
                             Some(target),
                             "prototype",
                         )?,
                 };
-                let Some(bag) = self.function_user_props.get(&function_id).copied() else {
+                let Some(bag) = self.callable_bag_read(owner, function_id) else {
                     return Ok(None);
                 };
                 return Ok(object::get_own_descriptor(bag, &self.gc_heap, key));
             }
-            return self.ordinary_function_own_property_descriptor(Some(context), function_id, key);
+            return self.ordinary_function_own_property_descriptor(
+                Some(context),
+                owner,
+                function_id,
+                key,
+            );
         }
         if let Some(bound) = target.as_bound_function() {
             let Some(key) = key.string_name() else {
@@ -860,8 +868,10 @@ impl Interpreter {
                 .as_function()
                 .or_else(|| ctor.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
             {
+                let owner = ctor.as_closure(&self.gc_heap);
                 return self.ordinary_function_own_property_descriptor(
                     Some(context),
+                    owner,
                     function_id,
                     key,
                 );
@@ -1487,8 +1497,9 @@ impl Interpreter {
                 .map(|c| c.cached_function_id)
         });
         if let Some(function_id) = fid {
+            let owner = target.as_closure(&self.gc_heap);
             if let VmPropertyKey::Symbol(sym) = key {
-                let bag = self.function_user_bag_runtime_rooted(function_id, &[], &[])?;
+                let bag = self.function_user_bag_runtime_rooted(owner, function_id, &[], &[])?;
                 return Ok(object::define_own_symbol_property_partial(
                     bag,
                     &mut self.gc_heap,
@@ -1509,6 +1520,7 @@ impl Interpreter {
             if k == "prototype" {
                 let _ = self.function_property_get_runtime_rooted_with_receiver(
                     context,
+                    owner,
                     function_id,
                     None,
                     "prototype",
@@ -1518,6 +1530,7 @@ impl Interpreter {
             }
             let completed = match self.ordinary_function_own_property_descriptor(
                 Some(context),
+                owner,
                 function_id,
                 k,
             )? {
@@ -1526,6 +1539,7 @@ impl Interpreter {
             };
             return self.ordinary_function_define_own_property(
                 Some(context),
+                owner,
                 function_id,
                 k,
                 None,
@@ -2696,7 +2710,8 @@ impl Interpreter {
                 .map(|c| c.cached_function_id)
         });
         if let Some(function_id) = fid {
-            let names = self.ordinary_function_own_property_keys(context, function_id);
+            let owner = target.as_closure(&self.gc_heap);
+            let names = self.ordinary_function_own_property_keys(context, owner, function_id);
             let mut keys: Vec<Value> = Vec::with_capacity(names.len());
             for n in names {
                 let s = string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
@@ -3274,7 +3289,8 @@ impl Interpreter {
             .as_function()
             .or_else(|| rhs.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         if let Some(function_id) = fid {
-            let value = self.function_property_get(context, function_id, "prototype")?;
+            let owner = rhs.as_closure(&self.gc_heap);
+            let value = self.function_property_get(context, owner, function_id, "prototype")?;
             return if value.is_object_type() || value.is_proxy() {
                 Ok(Some(value))
             } else {
@@ -3351,8 +3367,14 @@ impl Interpreter {
             .as_function()
             .or_else(|| rhs.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         if let Some(function_id) = fid {
-            let value =
-                self.function_property_get_stack_rooted(context, stack, function_id, "prototype")?;
+            let owner = rhs.as_closure(&self.gc_heap);
+            let value = self.function_property_get_stack_rooted(
+                context,
+                stack,
+                owner,
+                function_id,
+                "prototype",
+            )?;
             return if value.is_object_type() || value.is_proxy() {
                 Ok(Some(value))
             } else {
@@ -3581,12 +3603,11 @@ impl Interpreter {
             .as_function()
             .or_else(|| base.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         if let Some(function_id) = fid {
+            let owner = base.as_closure(&self.gc_heap);
             let lookup = match key {
                 VmPropertyKey::Symbol(sym) => {
                     match self
-                        .function_user_props
-                        .get(&function_id)
-                        .copied()
+                        .callable_bag_read(owner, function_id)
                         .and_then(|bag| object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym))
                     {
                         Some(desc) => descriptor_to_lookup(desc),
@@ -3612,6 +3633,7 @@ impl Interpreter {
                         .expect("non-symbol key has string spelling");
                     let own = self.ordinary_function_own_property_descriptor(
                         Some(context),
+                        owner,
                         function_id,
                         key_name,
                     )?;
@@ -4399,9 +4421,15 @@ impl Interpreter {
             .as_function()
             .or_else(|| base.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
         {
+            let owner = base.as_closure(&self.gc_heap);
             if let Some(name) = key.string_name()
                 && self
-                    .ordinary_function_own_property_descriptor(Some(context), function_id, name)?
+                    .ordinary_function_own_property_descriptor(
+                        Some(context),
+                        owner,
+                        function_id,
+                        name,
+                    )?
                     .is_some()
             {
                 return Ok(true);
@@ -4909,11 +4937,13 @@ impl Interpreter {
                 .map(|c| c.cached_function_id)
         });
         if let Some(function_id) = fid {
-            let keys = self.ordinary_function_own_property_keys(context, function_id);
+            let owner = target.as_closure(&self.gc_heap);
+            let keys = self.ordinary_function_own_property_keys(context, owner, function_id);
             let mut out = Vec::with_capacity(keys.len());
             for key in keys {
                 if let Some(desc) = self.ordinary_function_own_property_descriptor(
                     Some(context),
+                    owner,
                     function_id,
                     &key,
                 )? && desc.enumerable()
@@ -5113,25 +5143,22 @@ impl Interpreter {
                 .map(|c| c.cached_function_id)
         });
         if let Some(function_id) = fid {
+            let owner = target.as_closure(&self.gc_heap);
             return Ok(if let Some(key) = key.string_name() {
                 if key == "prototype"
                     && context.function_has_prototype_property(function_id)
                     && self
-                        .function_user_props
-                        .get(&function_id)
-                        .copied()
+                        .callable_bag_read(owner, function_id)
                         .is_none_or(|bag| {
                             object::get_own_descriptor(bag, &self.gc_heap, key).is_none()
                         })
                 {
                     false
                 } else {
-                    self.ordinary_function_delete_own_property(function_id, key)
+                    self.ordinary_function_delete_own_property(owner, function_id, key)
                 }
             } else if let VmPropertyKey::Symbol(sym) = key {
-                self.function_user_props
-                    .get(&function_id)
-                    .copied()
+                self.callable_bag_read(owner, function_id)
                     .map(|bag| object::delete_symbol(bag, &mut self.gc_heap, *sym))
                     .unwrap_or(true)
             } else {
@@ -5595,16 +5622,19 @@ impl Interpreter {
                 .map(|c| c.cached_function_id)
         });
         if let Some(function_id) = fid {
+            let owner = target.as_closure(&self.gc_heap);
             return match key {
                 VmPropertyKey::Symbol(sym) => {
                     if !self.ordinary_function_has_own_symbol_property_for_extensibility(
+                        owner,
                         function_id,
                         *sym,
                     ) && !self.ordinary_function_is_extensible(function_id)
                     {
                         return Ok(false);
                     }
-                    let bag = self.function_user_bag_runtime_rooted(function_id, &[&value], &[])?;
+                    let bag =
+                        self.function_user_bag_runtime_rooted(owner, function_id, &[&value], &[])?;
                     Ok(object::set_symbol(bag, &mut self.gc_heap, *sym, value))
                 }
                 _ => {
@@ -5614,6 +5644,7 @@ impl Interpreter {
                     let has_own = self
                         .ordinary_function_has_own_string_property_for_extensibility(
                             context,
+                            owner,
                             function_id,
                             key,
                         )?;
@@ -5622,6 +5653,7 @@ impl Interpreter {
                     }
                     let descriptor = match self.ordinary_function_own_property_descriptor(
                         Some(context),
+                        owner,
                         function_id,
                         key,
                     )? {
@@ -5636,6 +5668,7 @@ impl Interpreter {
                     };
                     self.ordinary_function_define_own_property(
                         Some(context),
+                        owner,
                         function_id,
                         key,
                         None,

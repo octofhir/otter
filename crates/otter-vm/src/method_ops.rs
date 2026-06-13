@@ -781,8 +781,10 @@ impl Interpreter {
                 .as_closure(&self.gc_heap)
                 .map(|c| c.cached_function_id)
         }) {
+            let owner = recv_value.as_closure(&self.gc_heap);
             return self.ordinary_function_has_own_string_property_for_extensibility(
                 context,
+                owner,
                 function_id,
                 name,
             );
@@ -916,10 +918,12 @@ impl Interpreter {
         }) {
             // §10.1.8 OrdinaryGet on a callable receiver — user
             // properties resolve via the function-properties side table.
+            let owner = recv_value.as_closure(&self.gc_heap);
             return Ok(Some(
                 self.function_property_get_stack_rooted_with_receiver(
                     context,
                     stack,
+                    owner,
                     fid,
                     Some(recv_value),
                     name,
@@ -1547,10 +1551,11 @@ impl Interpreter {
                 let mut iter = args.into_iter();
                 let this_value = iter.next().unwrap_or(Value::undefined());
                 let bound_args: SmallVec<[Value; 4]> = iter.collect();
+                let owner_bag = self.callable_bag_for_value(callee);
                 let mut ctx = function_metadata::FunctionMetadataContext::new(
                     context,
                     &mut self.gc_heap,
-                    &self.function_user_props,
+                    owner_bag,
                     &self.function_deleted_metadata,
                 );
                 let metadata =
@@ -1595,10 +1600,11 @@ impl Interpreter {
                     return Err(VmError::NotCallable);
                 }
                 let display = {
+                    let owner_bag = self.callable_bag_for_value(callee);
                     let mut ctx = function_metadata::FunctionMetadataContext::new(
                         context,
                         &mut self.gc_heap,
-                        &self.function_user_props,
+                        owner_bag,
                         &self.function_deleted_metadata,
                     );
                     function_metadata::callable_to_string(&mut ctx, callee)

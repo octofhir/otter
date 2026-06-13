@@ -115,6 +115,7 @@ __otter_worker_drain w.c function
 __otter_worker_post_message w.c function
 __otter_worker_spawn w.c function
 __otter_worker_terminate w.c function
+clearImmediate w.c function
 clearInterval w.c function
 clearTimeout w.c function
 console w.c object
@@ -130,6 +131,7 @@ isNaN w.c function
 parseFloat w.c function
 parseInt w.c function
 process w.c object
+setImmediate w.c function
 setInterval w.c function
 setTimeout w.c function
 undefined ... undefined

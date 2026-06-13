@@ -391,6 +391,16 @@ function deepEqual(a, b, strict, memo, skipProto) {
     if (a.source !== b.source || a.flags !== b.flags || a.lastIndex !== b.lastIndex) return false;
     return compareKeys(a, b, strict, memo, skipProto, false);
   }
+  // §Errors — name / message / cause are non-enumerable, so they are compared
+  // explicitly (own enumerable extras still go through compareKeys below).
+  if (a instanceof Error && b instanceof Error) {
+    if (a.name !== b.name || a.message !== b.message) return false;
+    const aHasCause = 'cause' in a;
+    const bHasCause = 'cause' in b;
+    if (aHasCause !== bHasCause) return false;
+    if (aHasCause && !deepEqual(a.cause, b.cause, strict, memo, skipProto)) return false;
+    return compareKeys(a, b, strict, memo, skipProto, false);
+  }
   if (isTypedArray(a)) {
     if (a.length !== b.length) return false;
     for (let i = 0; i < a.length; i++) if (!Object.is(a[i], b[i])) return false;

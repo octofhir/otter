@@ -19,6 +19,11 @@ use otter_runtime::{
 /// install over the already-bootstrapped intrinsics.
 const WEB_BOOTSTRAP: &str = include_str!("web_bootstrap.js");
 
+/// WHATWG Streams globals (`ReadableStream` / `WritableStream` /
+/// `TransformStream` + encoding transform streams). Evaluated after
+/// [`WEB_BOOTSTRAP`] (depends on its `TextEncoder` / `TextDecoder`).
+const WEB_STREAMS: &str = include_str!("web_streams.js");
+
 /// Installer for the Web function globals. Registered by `with_web_apis`.
 #[must_use]
 pub fn web_globals_installer() -> RuntimeGlobalInstaller {
@@ -36,6 +41,12 @@ fn install(runtime: &mut Runtime) -> Result<(), OtterError> {
         .map_err(|err| OtterError::Internal {
             code: "WEB_BOOTSTRAP".to_string(),
             message: format!("web globals bootstrap failed: {err}"),
+        })?;
+    runtime
+        .eval(SourceInput::from_javascript(WEB_STREAMS.to_string()))
+        .map_err(|err| OtterError::Internal {
+            code: "WEB_STREAMS".to_string(),
+            message: format!("web streams bootstrap failed: {err}"),
         })?;
     Ok(())
 }

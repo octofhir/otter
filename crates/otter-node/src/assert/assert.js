@@ -8,9 +8,38 @@
 const util = require('util');
 const { isDeepStrictEqual, inspect } = util;
 const makeCallTracker = require('internal/assert/calltracker');
+const { myersDiff } = require('internal/assert/myers_diff');
 
 function inspectValue(v) {
   return inspect(v, { depth: null, breakLength: Infinity, compact: 3 });
+}
+
+// Operators whose generated message is a line-by-line +/- diff of the
+// (multi-line) inspect of actual vs expected.
+const kDiffOperators = new Set([
+  'deepStrictEqual', 'notDeepStrictEqual', 'deepEqual', 'notDeepEqual',
+  'partialDeepStrictEqual', 'strictEqual', 'notStrictEqual',
+]);
+
+// §createErrDiff — Node's actual/expected diff. Each value is inspected with
+// compact:false so it spans one entry per line; the line arrays are run
+// through the Myers diff and prefixed `  ` (common) / `+ ` (actual) / `- `
+// (expected) under a "+ actual - expected" legend.
+function createErrDiff(actual, expected) {
+  const opts = {
+    compact: false, breakLength: Infinity, depth: 1000,
+    customInspect: false, sorted: true,
+  };
+  const actualLines = inspect(actual, opts).split('\n');
+  const expectedLines = inspect(expected, opts).split('\n');
+  const edits = myersDiff(actualLines, expectedLines);
+  const lines = [];
+  for (const { type, value } of edits) {
+    if (type === 0) lines.push(`  ${value}`);
+    else if (type === -1) lines.push(`+ ${value}`);
+    else lines.push(`- ${value}`);
+  }
+  return `+ actual - expected\n\n${lines.join('\n')}\n`;
 }
 
 class AssertionError extends Error {
@@ -18,14 +47,21 @@ class AssertionError extends Error {
     const { message, actual, expected, operator, stackStartFn } = options;
     let msg = message;
     let generatedMessage = false;
+    const wantsDiff = kDiffOperators.has(operator) &&
+      !(typeof operator === 'string' && operator.startsWith('not'));
     if (msg === undefined) {
       generatedMessage = true;
       if (operator === 'fail') {
         msg = 'Failed';
+      } else if (wantsDiff) {
+        msg = createErrDiff(actual, expected);
       } else {
         const op = operator || 'deepStrictEqual';
         msg = `${inspectValue(actual)} ${op} ${inspectValue(expected)}`;
       }
+    } else if (wantsDiff) {
+      // An explicit message prefixes the generated diff.
+      msg = `${message}\n${createErrDiff(actual, expected)}`;
     }
     super(msg);
     this.name = 'AssertionError';

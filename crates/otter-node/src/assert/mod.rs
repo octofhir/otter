@@ -36,11 +36,17 @@ pub fn assert_cjs_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result
         CALLTRACKER_JS,
         &[],
     )?;
+    let myers =
+        otter_runtime::run_builtin_cjs_shim(ctx, "internal/assert/myers_diff", MYERS_DIFF_JS, &[])?;
     otter_runtime::run_builtin_cjs_shim(
         ctx,
         "assert",
         ASSERT_JS,
-        &[("util", util), ("internal/assert/calltracker", calltracker)],
+        &[
+            ("util", util),
+            ("internal/assert/calltracker", calltracker),
+            ("internal/assert/myers_diff", myers),
+        ],
     )
 }
 

@@ -2113,6 +2113,7 @@ dependencies = [
 name = "otter-web"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "otter-gc",
  "otter-macros",
  "otter-runtime",

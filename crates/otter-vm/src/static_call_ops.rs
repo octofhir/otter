@@ -1521,6 +1521,8 @@ fn own_property_names_uses_internal_methods(target: &Value) -> bool {
         || target.is_regexp()
         || target.is_data_view()
         || target.is_typed_array()
+        || target.is_map()
+        || target.is_set()
         || target.is_temporal()
         || target.as_weak_ref().is_some()
         || target.as_finalization_registry().is_some()

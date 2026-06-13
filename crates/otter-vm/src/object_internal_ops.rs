@@ -4947,6 +4947,18 @@ impl Interpreter {
             }
             return Ok(keys);
         }
+        // §22.2 — a RegExp's only intrinsic own property (`lastIndex`) is
+        // non-enumerable, so its enumerable own string keys are exactly the
+        // enumerable string-keyed expando properties.
+        if let Some(re) = target.as_regexp() {
+            let mut keys = Vec::new();
+            if let Some(bag) = re.expando(&self.gc_heap) {
+                keys.extend(object::with_properties(bag, &self.gc_heap, |p| {
+                    p.enumerable_keys().map(str::to_string).collect::<Vec<_>>()
+                }));
+            }
+            return Ok(keys);
+        }
         let fid = target.as_function().or_else(|| {
             target
                 .as_closure(&self.gc_heap)

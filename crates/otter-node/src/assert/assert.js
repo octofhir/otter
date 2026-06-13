@@ -8,7 +8,6 @@
 const util = require('util');
 const { isDeepStrictEqual, inspect } = util;
 const makeCallTracker = require('internal/assert/calltracker');
-const { myersDiff } = require('internal/assert/myers_diff');
 
 function inspectValue(v) {
   return inspect(v, { depth: null, breakLength: Infinity, compact: 3 });
@@ -54,11 +53,46 @@ const kDiffHeaders = {
   partialDeepStrictEqual: 'Expected values to be partially and strictly deep-equal:',
 };
 
-// §createErrDiff — Node's actual/expected diff. Each value is inspected with
-// compact:false so it spans one entry per line; the line arrays are run
-// through the Myers diff and prefixed `  ` (common) / `+ ` (actual) / `- `
-// (expected) under a "+ actual - expected" legend. `prefix` is the operator
-// header (generated message) or the caller's custom message.
+// Two inspected lines are "the same" for diff purposes if they are equal or
+// differ only by a trailing comma (the last element of a block loses its comma
+// when it has no following sibling). Node keeps the comma'd form so an added
+// sibling shows as a single inserted line, not a remove+add of the element.
+function lineEq(a, b) {
+  return a === b ||
+    (a.endsWith(',') && a.slice(0, -1) === b) ||
+    (b.endsWith(',') && b.slice(0, -1) === a);
+}
+function commonLine(a, b) {
+  return a.endsWith(',') ? a : b;
+}
+
+// §createErrDiff — line-by-line LCS of inspect(actual)/inspect(expected) (both
+// compact:false so each entry is its own line), prefixed `  ` (common) / `+ `
+// (actual) / `- ` (expected) under a "+ actual - expected" legend. Comma-aware
+// (see lineEq), mirroring Node's lib/internal/assert/assertion_error.js.
+function diffLines(a, e) {
+  const n = a.length;
+  const m = e.length;
+  const dp = [];
+  for (let i = 0; i <= n; i++) dp.push(new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = lineEq(a[i], e[j])
+        ? dp[i + 1][j + 1] + 1
+        : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const out = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (lineEq(a[i], e[j])) { out.push(`  ${commonLine(a[i], e[j])}`); i++; j++; } else if (dp[i + 1][j] >= dp[i][j + 1]) { out.push(`+ ${a[i]}`); i++; } else { out.push(`- ${e[j]}`); j++; }
+  }
+  while (i < n) out.push(`+ ${a[i++]}`);
+  while (j < m) out.push(`- ${e[j++]}`);
+  return out;
+}
+
 function createErrDiff(actual, expected, prefix) {
   const opts = {
     compact: false, breakLength: Infinity, depth: 1000,
@@ -66,13 +100,7 @@ function createErrDiff(actual, expected, prefix) {
   };
   const actualLines = inspect(actual, opts).split('\n');
   const expectedLines = inspect(expected, opts).split('\n');
-  const edits = myersDiff(actualLines, expectedLines);
-  const lines = [];
-  for (const { type, value } of edits) {
-    if (type === 0) lines.push(`  ${value}`);
-    else if (type === -1) lines.push(`+ ${value}`);
-    else lines.push(`- ${value}`);
-  }
+  const lines = diffLines(actualLines, expectedLines);
   return `${prefix}\n+ actual - expected\n\n${lines.join('\n')}\n`;
 }
 

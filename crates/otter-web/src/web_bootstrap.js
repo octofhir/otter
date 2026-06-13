@@ -598,13 +598,139 @@
   tagged(ProgressEvent.prototype, 'ProgressEvent');
   def('ProgressEvent', ProgressEvent);
 
-  // ---- URLSearchParams as a global (also exposed via the URL native class) ----
-  if (typeof global.URLSearchParams === 'undefined' && typeof global.URL !== 'undefined') {
-    try {
-      const sp = new global.URL('http://x/').searchParams;
-      if (sp && sp.constructor && sp.constructor.name === 'URLSearchParams') {
-        def('URLSearchParams', sp.constructor);
+  // ---- URLSearchParams (WHATWG URL § application/x-www-form-urlencoded) ----
+  const kList = Symbol('list');
+
+  // form-urlencoded byte serializer: space -> '+', and percent-encode the rest
+  // outside the unreserved set, over the UTF-8 bytes.
+  function formEncode(str) {
+    let out = '';
+    const enc = new TextEncoder().encode(String(str));
+    for (let i = 0; i < enc.length; i++) {
+      const b = enc[i];
+      if (b === 0x20) out += '+';
+      else if (
+        (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5A) ||
+        (b >= 0x61 && b <= 0x7A) || b === 0x2A || b === 0x2D ||
+        b === 0x2E || b === 0x5F
+      ) {
+        out += String.fromCharCode(b);
+      } else {
+        out += '%' + b.toString(16).toUpperCase().padStart(2, '0');
       }
-    } catch (_) { /* URL has no searchParams ctor to borrow */ }
+    }
+    return out;
   }
+
+  function formDecode(str) {
+    const replaced = String(str).replace(/\+/g, ' ');
+    try { return decodeURIComponent(replaced); } catch (_) { return replaced; }
+  }
+
+  function parseQuery(input) {
+    const list = [];
+    let s = String(input);
+    if (s.charCodeAt(0) === 0x3F) s = s.slice(1); // leading '?'
+    if (s === '') return list;
+    for (const pair of s.split('&')) {
+      if (pair === '') continue;
+      const eq = pair.indexOf('=');
+      let name, value;
+      if (eq < 0) { name = pair; value = ''; }
+      else { name = pair.slice(0, eq); value = pair.slice(eq + 1); }
+      list.push([formDecode(name), formDecode(value)]);
+    }
+    return list;
+  }
+
+  class URLSearchParams {
+    constructor(init = '') {
+      let list;
+      if (init == null || init === '') {
+        list = [];
+      } else if (typeof init === 'string') {
+        list = parseQuery(init);
+      } else if (init instanceof URLSearchParams) {
+        list = init[kList].map((p) => [p[0], p[1]]);
+      } else if (typeof init[Symbol.iterator] === 'function') {
+        list = [];
+        for (const pair of init) {
+          const arr = Array.from(pair);
+          if (arr.length !== 2) {
+            throw new TypeError('Each query pair must be an iterable [name, value] tuple');
+          }
+          list.push([String(arr[0]), String(arr[1])]);
+        }
+      } else if (typeof init === 'object') {
+        list = Object.keys(init).map((k) => [k, String(init[k])]);
+      } else {
+        list = parseQuery(init);
+      }
+      Object.defineProperty(this, kList, { value: list, enumerable: false });
+    }
+
+    get size() { return this[kList].length; }
+
+    append(name, value) { this[kList].push([String(name), String(value)]); }
+
+    delete(name, value) {
+      name = String(name);
+      const list = this[kList];
+      for (let i = list.length - 1; i >= 0; i--) {
+        if (list[i][0] === name && (value === undefined || list[i][1] === String(value))) {
+          list.splice(i, 1);
+        }
+      }
+    }
+
+    get(name) {
+      name = String(name);
+      for (const p of this[kList]) if (p[0] === name) return p[1];
+      return null;
+    }
+
+    getAll(name) {
+      name = String(name);
+      return this[kList].filter((p) => p[0] === name).map((p) => p[1]);
+    }
+
+    has(name, value) {
+      name = String(name);
+      return this[kList].some(
+        (p) => p[0] === name && (value === undefined || p[1] === String(value)));
+    }
+
+    set(name, value) {
+      name = String(name);
+      value = String(value);
+      const list = this[kList];
+      let found = false;
+      for (let i = list.length - 1; i >= 0; i--) {
+        if (list[i][0] === name) {
+          if (found) list.splice(i, 1);
+          else { list[i][1] = value; found = true; }
+        }
+      }
+      if (!found) list.push([name, value]);
+    }
+
+    sort() { this[kList].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); }
+
+    forEach(callback, thisArg) {
+      for (const [name, value] of this[kList].slice()) {
+        callback.call(thisArg, value, name, this);
+      }
+    }
+
+    *entries() { for (const p of this[kList].slice()) yield [p[0], p[1]]; }
+    *keys() { for (const p of this[kList].slice()) yield p[0]; }
+    *values() { for (const p of this[kList].slice()) yield p[1]; }
+    [Symbol.iterator]() { return this.entries(); }
+
+    toString() {
+      return this[kList].map((p) => `${formEncode(p[0])}=${formEncode(p[1])}`).join('&');
+    }
+  }
+  tagged(URLSearchParams.prototype, 'URLSearchParams');
+  def('URLSearchParams', URLSearchParams);
 })(globalThis);

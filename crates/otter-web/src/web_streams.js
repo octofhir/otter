@@ -488,4 +488,65 @@
   Object.defineProperty(TextDecoderStream.prototype, Symbol.toStringTag,
     { value: 'TextDecoderStream', configurable: true });
   def('TextDecoderStream', TextDecoderStream);
+
+  // ---- CompressionStream / DecompressionStream (native deflate/gzip codec) ----
+  const nativeCodec = global.__otterStreamCodec;
+  delete global.__otterStreamCodec;
+
+  function concatChunks(chunks) {
+    let total = 0;
+    for (const c of chunks) total += c.length;
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) { out.set(c, offset); offset += c.length; }
+    return out;
+  }
+
+  function toBytes(chunk) {
+    if (chunk instanceof Uint8Array) return chunk;
+    if (ArrayBuffer.isView(chunk)) return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+    if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
+    throw new TypeError('Chunk must be a BufferSource');
+  }
+
+  const FORMATS = new Set(['gzip', 'deflate', 'deflate-raw']);
+
+  function makeCodecStream(format, decompress) {
+    if (!FORMATS.has(format)) {
+      throw new TypeError(`Unsupported compression format: '${format}'`);
+    }
+    if (typeof nativeCodec !== 'function') {
+      throw new TypeError('Compression codec is unavailable');
+    }
+    const chunks = [];
+    return new TransformStream({
+      transform(chunk) { chunks.push(toBytes(chunk)); },
+      flush(controller) {
+        const input = concatChunks(chunks);
+        controller.enqueue(nativeCodec(format, input, decompress));
+      },
+    });
+  }
+
+  class CompressionStream {
+    constructor(format) {
+      const ts = makeCodecStream(String(format), false);
+      this.readable = ts.readable;
+      this.writable = ts.writable;
+    }
+  }
+  Object.defineProperty(CompressionStream.prototype, Symbol.toStringTag,
+    { value: 'CompressionStream', configurable: true });
+  def('CompressionStream', CompressionStream);
+
+  class DecompressionStream {
+    constructor(format) {
+      const ts = makeCodecStream(String(format), true);
+      this.readable = ts.readable;
+      this.writable = ts.writable;
+    }
+  }
+  Object.defineProperty(DecompressionStream.prototype, Symbol.toStringTag,
+    { value: 'DecompressionStream', configurable: true });
+  def('DecompressionStream', DecompressionStream);
 })(globalThis);

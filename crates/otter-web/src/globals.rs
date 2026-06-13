@@ -4,9 +4,9 @@
 //! AbortController/AbortSignal/MessageEvent/…).
 //!
 //! These belong to the Web platform (not Node), so they live here and are
-//! installed for every runtime that enables Web APIs. `atob`/`btoa` are
-//! implemented natively; `structuredClone`/`fetch` are still minimal
-//! placeholders pending their conformance work.
+//! installed for every runtime that enables Web APIs. `atob`/`btoa` and the
+//! native in-realm `structuredClone` + Streams compression codec are
+//! implemented; `fetch` is still a placeholder.
 
 use otter_runtime::{
     OtterError, Runtime, RuntimeGlobalInstaller, RuntimeNativeCtx as NativeCtx,
@@ -36,6 +36,7 @@ fn install(runtime: &mut Runtime) -> Result<(), OtterError> {
     runtime.install_native_global("queueMicrotask", 1, queue_microtask)?;
     runtime.install_native_global("structuredClone", 1, structured_clone)?;
     runtime.install_native_global("fetch", 1, fetch)?;
+    runtime.install_native_global("__otterStreamCodec", 3, stream_codec)?;
     runtime
         .eval(SourceInput::from_javascript(WEB_BOOTSTRAP.to_string()))
         .map_err(|err| OtterError::Internal {
@@ -137,4 +138,77 @@ fn fetch(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError
 fn structured_clone(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let value = args.first().copied().unwrap_or_else(Value::undefined);
     otter_runtime::web_structured_clone::structured_clone(ctx, value)
+}
+
+/// Native deflate/gzip codec backing `CompressionStream`/`DecompressionStream`.
+/// Args: `(format: string, data: Uint8Array|ArrayBuffer, decompress: boolean)`;
+/// returns a `Uint8Array`.
+fn stream_codec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    use std::io::{Read, Write};
+
+    let format = runtime_arg_to_string(args, 0, ctx.heap());
+    let decompress = args.get(2).and_then(|v| v.as_boolean()).unwrap_or(false);
+    let data = args.get(1).copied().unwrap_or_else(Value::undefined);
+    let input: Vec<u8> = if let Some(ta) = data.as_typed_array(ctx.heap()) {
+        let off = ta.byte_offset(ctx.heap());
+        let len = ta.byte_length(ctx.heap());
+        ta.buffer(ctx.heap())
+            .with_bytes(ctx.heap(), |b| b.get(off..off + len).map(<[u8]>::to_vec))
+            .unwrap_or_default()
+    } else if let Some(buf) = data.as_array_buffer() {
+        buf.with_bytes(ctx.heap(), |b| b.to_vec())
+    } else {
+        return Err(runtime_type_error(
+            "CompressionStream",
+            "chunk must be a BufferSource",
+        ));
+    };
+
+    let out = if decompress {
+        let mut buf = Vec::new();
+        let res = match format.as_str() {
+            "gzip" => flate2::read::GzDecoder::new(&input[..]).read_to_end(&mut buf),
+            "deflate" => flate2::read::ZlibDecoder::new(&input[..]).read_to_end(&mut buf),
+            "deflate-raw" => flate2::read::DeflateDecoder::new(&input[..]).read_to_end(&mut buf),
+            other => {
+                return Err(runtime_type_error(
+                    "DecompressionStream",
+                    format!("unsupported format '{other}'"),
+                ));
+            }
+        };
+        res.map_err(|e| runtime_type_error("DecompressionStream", e.to_string()))?;
+        buf
+    } else {
+        let level = flate2::Compression::default();
+        let res: std::io::Result<Vec<u8>> = match format.as_str() {
+            "gzip" => {
+                let mut e = flate2::write::GzEncoder::new(Vec::new(), level);
+                e.write_all(&input).and_then(|()| e.finish())
+            }
+            "deflate" => {
+                let mut e = flate2::write::ZlibEncoder::new(Vec::new(), level);
+                e.write_all(&input).and_then(|()| e.finish())
+            }
+            "deflate-raw" => {
+                let mut e = flate2::write::DeflateEncoder::new(Vec::new(), level);
+                e.write_all(&input).and_then(|()| e.finish())
+            }
+            other => {
+                return Err(runtime_type_error(
+                    "CompressionStream",
+                    format!("unsupported format '{other}'"),
+                ));
+            }
+        };
+        res.map_err(|e| runtime_type_error("CompressionStream", e.to_string()))?
+    };
+
+    let buffer = ctx
+        .array_buffer_from_bytes_rooted(out, &[], &[])
+        .map_err(|e| runtime_type_error("CompressionStream", e.to_string()))?;
+    let ctor = ctx
+        .global_value("Uint8Array")
+        .ok_or_else(|| runtime_type_error("CompressionStream", "Uint8Array is unavailable"))?;
+    ctx.construct(ctor, &[Value::array_buffer(buffer)])
 }

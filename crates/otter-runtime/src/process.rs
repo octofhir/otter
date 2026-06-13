@@ -211,6 +211,8 @@ pub(crate) fn install_global(
     let hrtime = hrtime_value(interp, start).map_err(gc_oom_to_error)?;
     otter_vm::object::set(process, interp.gc_heap_mut(), "hrtime", hrtime);
 
+    install_stdio_streams(interp, process, &process_root)?;
+
     define_process_method(
         interp,
         process,
@@ -312,6 +314,170 @@ fn process_umask(
 /// Placeholder for the `process` EventEmitter methods — accepts the call and
 /// does nothing. Returns `process` so chained calls work.
 fn process_event_noop(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[otter_vm::Value],
+) -> Result<otter_vm::Value, NativeError> {
+    Ok(*ctx.this_value())
+}
+
+/// Install `process.stdout` / `process.stderr` / `process.stdin` as minimal
+/// stream-like objects. Many tests gate on `process.stdout.isTTY` (reading a
+/// property off `undefined` otherwise throws) and write through
+/// `process.stdout.write`; the EventEmitter-style methods are no-ops that
+/// return the stream for chaining.
+fn install_stdio_streams(
+    interp: &mut Interpreter,
+    process: otter_vm::object::JsObject,
+    process_root: &Value,
+) -> Result<(), OtterError> {
+    install_one_stdio(
+        interp,
+        process,
+        process_root,
+        "stdout",
+        1,
+        false,
+        NativeCall::Static(stdout_write),
+    )?;
+    install_one_stdio(
+        interp,
+        process,
+        process_root,
+        "stderr",
+        2,
+        false,
+        NativeCall::Static(stderr_write),
+    )?;
+    install_one_stdio(
+        interp,
+        process,
+        process_root,
+        "stdin",
+        0,
+        true,
+        NativeCall::Static(stdio_return_this),
+    )?;
+    Ok(())
+}
+
+fn install_one_stdio(
+    interp: &mut Interpreter,
+    process: otter_vm::object::JsObject,
+    process_root: &Value,
+    name: &'static str,
+    fd: i32,
+    readable: bool,
+    write_call: NativeCall,
+) -> Result<(), OtterError> {
+    let stream = interp
+        .alloc_host_object_with_roots(&[process_root], &[])
+        .map_err(gc_oom_to_error)?;
+    let stream_root = Value::object(stream);
+    let i32n = |n: i32| Value::number(NumberValue::from_i32(n));
+    otter_vm::object::set(stream, interp.gc_heap_mut(), "isTTY", Value::boolean(false));
+    otter_vm::object::set(stream, interp.gc_heap_mut(), "fd", i32n(fd));
+    otter_vm::object::set(
+        stream,
+        interp.gc_heap_mut(),
+        "writable",
+        Value::boolean(!readable),
+    );
+    otter_vm::object::set(
+        stream,
+        interp.gc_heap_mut(),
+        "readable",
+        Value::boolean(readable),
+    );
+    otter_vm::object::set(stream, interp.gc_heap_mut(), "columns", i32n(80));
+    otter_vm::object::set(stream, interp.gc_heap_mut(), "rows", i32n(24));
+
+    define_method_on(
+        interp,
+        stream,
+        &stream_root,
+        process_root,
+        "write",
+        1,
+        write_call,
+    )?;
+    for method in [
+        "end",
+        "cork",
+        "uncork",
+        "destroy",
+        "on",
+        "once",
+        "addListener",
+        "removeListener",
+        "removeAllListeners",
+        "emit",
+        "setEncoding",
+        "pause",
+        "resume",
+        "ref",
+        "unref",
+    ] {
+        define_method_on(
+            interp,
+            stream,
+            &stream_root,
+            process_root,
+            method,
+            0,
+            NativeCall::Static(stdio_return_this),
+        )?;
+    }
+    otter_vm::object::set(process, interp.gc_heap_mut(), name, stream_root);
+    Ok(())
+}
+
+fn define_method_on(
+    interp: &mut Interpreter,
+    target: otter_vm::object::JsObject,
+    target_root: &Value,
+    extra_root: &Value,
+    name: &'static str,
+    length: u8,
+    call: NativeCall,
+) -> Result<(), OtterError> {
+    let value = interp
+        .native_function_from_call_host_rooted(name, length, call, &[target_root, extra_root], &[])
+        .map_err(gc_oom_to_error)?;
+    let descriptor = otter_vm::object::PropertyDescriptor {
+        kind: otter_vm::object::DescriptorKind::Data { value },
+        flags: Attr::builtin_function().to_flags(),
+    };
+    otter_vm::object::define_own_property(target, interp.gc_heap_mut(), name, descriptor);
+    Ok(())
+}
+
+fn stdout_write(
+    ctx: &mut NativeCtx<'_>,
+    args: &[otter_vm::Value],
+) -> Result<otter_vm::Value, NativeError> {
+    use std::io::Write;
+    let text = crate::runtime_arg_to_string(args, 0, ctx.heap());
+    let mut out = std::io::stdout();
+    let _ = out.write_all(text.as_bytes());
+    let _ = out.flush();
+    Ok(Value::boolean(true))
+}
+
+fn stderr_write(
+    ctx: &mut NativeCtx<'_>,
+    args: &[otter_vm::Value],
+) -> Result<otter_vm::Value, NativeError> {
+    use std::io::Write;
+    let text = crate::runtime_arg_to_string(args, 0, ctx.heap());
+    let mut err = std::io::stderr();
+    let _ = err.write_all(text.as_bytes());
+    let _ = err.flush();
+    Ok(Value::boolean(true))
+}
+
+/// No-op stream method that returns the receiver, so `stream.on(...).on(...)`
+/// and similar chains do not break.
+fn stdio_return_this(
     ctx: &mut NativeCtx<'_>,
     _args: &[otter_vm::Value],
 ) -> Result<otter_vm::Value, NativeError> {

@@ -793,4 +793,131 @@
   }
   tagged(URLSearchParams.prototype, 'URLSearchParams');
   def('URLSearchParams', URLSearchParams);
+
+  // ---- FormData (XHR § FormData) ----
+  const kEntries = Symbol('entries');
+
+  function toFormValue(value, filename) {
+    const isBlob = typeof global.Blob !== 'undefined' && value instanceof global.Blob;
+    if (isBlob) {
+      // A bare Blob appended to FormData becomes a File named "blob".
+      const name = filename !== undefined ? String(filename)
+        : (typeof value.name === 'string' ? value.name : 'blob');
+      return { value, filename: name };
+    }
+    return { value: String(value), filename: undefined };
+  }
+
+  class FormData {
+    constructor() {
+      Object.defineProperty(this, kEntries, { value: [], enumerable: false });
+    }
+
+    append(name, value, filename) {
+      const e = toFormValue(value, filename);
+      this[kEntries].push([String(name), e.value, e.filename]);
+    }
+
+    set(name, value, filename) {
+      name = String(name);
+      const e = toFormValue(value, filename);
+      const list = this[kEntries];
+      let placed = false;
+      for (let i = list.length - 1; i >= 0; i--) {
+        if (list[i][0] === name) {
+          if (placed) list.splice(i, 1);
+          else { list[i] = [name, e.value, e.filename]; placed = true; }
+        }
+      }
+      if (!placed) list.push([name, e.value, e.filename]);
+    }
+
+    get(name) {
+      name = String(name);
+      for (const e of this[kEntries]) if (e[0] === name) return e[1];
+      return null;
+    }
+
+    getAll(name) {
+      name = String(name);
+      return this[kEntries].filter((e) => e[0] === name).map((e) => e[1]);
+    }
+
+    has(name) {
+      name = String(name);
+      return this[kEntries].some((e) => e[0] === name);
+    }
+
+    delete(name) {
+      name = String(name);
+      const list = this[kEntries];
+      for (let i = list.length - 1; i >= 0; i--) if (list[i][0] === name) list.splice(i, 1);
+    }
+
+    forEach(callback, thisArg) {
+      for (const e of this[kEntries].slice()) callback.call(thisArg, e[1], e[0], this);
+    }
+
+    *entries() { for (const e of this[kEntries].slice()) yield [e[0], e[1]]; }
+    *keys() { for (const e of this[kEntries].slice()) yield e[0]; }
+    *values() { for (const e of this[kEntries].slice()) yield e[1]; }
+    [Symbol.iterator]() { return this.entries(); }
+  }
+  tagged(FormData.prototype, 'FormData');
+  def('FormData', FormData);
+
+  // ---- BroadcastChannel (HTML § Broadcasting, single agent) ----
+  const channelRegistry = new Map(); // name -> Set<BroadcastChannel>
+  const kChannelName = Symbol('channelName');
+  const kClosed = Symbol('closed');
+  const kBcOnmessage = Symbol('bcOnmessage');
+
+  class BroadcastChannel extends EventTarget {
+    constructor(name) {
+      if (arguments.length === 0) {
+        throw new TypeError("Failed to construct 'BroadcastChannel': 1 argument required");
+      }
+      super();
+      this[kChannelName] = String(name);
+      this[kClosed] = false;
+      this[kBcOnmessage] = null;
+      let peers = channelRegistry.get(this[kChannelName]);
+      if (!peers) { peers = new Set(); channelRegistry.set(this[kChannelName], peers); }
+      peers.add(this);
+    }
+
+    get name() { return this[kChannelName]; }
+
+    get onmessage() { return this[kBcOnmessage]; }
+    set onmessage(fn) {
+      if (this[kBcOnmessage]) this.removeEventListener('message', this[kBcOnmessage]);
+      this[kBcOnmessage] = typeof fn === 'function' ? fn : null;
+      if (this[kBcOnmessage]) this.addEventListener('message', this[kBcOnmessage]);
+    }
+
+    postMessage(message) {
+      if (this[kClosed]) throw new DOMException('Channel is closed', 'InvalidStateError');
+      const data = structuredClone(message);
+      const peers = channelRegistry.get(this[kChannelName]);
+      if (!peers) return;
+      for (const peer of peers) {
+        if (peer === this || peer[kClosed]) continue;
+        queueMicrotask(() => {
+          if (!peer[kClosed]) peer.dispatchEvent(new MessageEvent('message', { data }));
+        });
+      }
+    }
+
+    close() {
+      if (this[kClosed]) return;
+      this[kClosed] = true;
+      const peers = channelRegistry.get(this[kChannelName]);
+      if (peers) {
+        peers.delete(this);
+        if (peers.size === 0) channelRegistry.delete(this[kChannelName]);
+      }
+    }
+  }
+  tagged(BroadcastChannel.prototype, 'BroadcastChannel');
+  def('BroadcastChannel', BroadcastChannel);
 })(globalThis);

@@ -9,6 +9,7 @@ use otter_runtime::CapabilitySet;
 use otter_vm::{NativeCtx, Value};
 
 const SHIM: &str = include_str!("stream.js");
+const WEB_SHIM: &str = include_str!("stream_web.js");
 
 /// CommonJS export: the `stream` namespace (the `Stream` base with the stream
 /// classes and helpers attached).
@@ -21,6 +22,14 @@ pub fn stream_cjs_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result
         SHIM,
         &[("events", events), ("buffer", buffer)],
     )
+}
+
+/// CommonJS export: the WHATWG `stream/web` namespace.
+pub fn stream_web_cjs_value(
+    ctx: &mut NativeCtx<'_>,
+    _caps: &CapabilitySet,
+) -> Result<Value, String> {
+    otter_runtime::run_builtin_cjs_shim(ctx, "node:stream/web", WEB_SHIM, &[])
 }
 
 /// ESM namespace install — CommonJS is the supported surface for now.

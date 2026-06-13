@@ -26,6 +26,7 @@ pub mod node_test;
 pub mod os;
 pub mod path;
 pub mod querystring;
+pub mod readline;
 pub mod stream;
 pub mod string_decoder;
 pub mod stubs;
@@ -95,6 +96,16 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         stream::stream_cjs_value,
     ),
     HostedModule::new_with_cjs_value(
+        "node:stream/web",
+        HostedModuleInstall::new(stream::install_stream_module),
+        stream::stream_web_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "stream/web",
+        HostedModuleInstall::new(stream::install_stream_module),
+        stream::stream_web_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
         "node:timers",
         HostedModuleInstall::new(timers::install_noop),
         timers::timers_cjs_value,
@@ -113,6 +124,26 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         "timers/promises",
         HostedModuleInstall::new(timers::install_noop),
         timers::timers_promises_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:readline",
+        HostedModuleInstall::new(readline::install_readline_module),
+        readline::readline_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "readline",
+        HostedModuleInstall::new(readline::install_readline_module),
+        readline::readline_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:readline/promises",
+        HostedModuleInstall::new(readline::install_readline_module),
+        readline::readline_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "readline/promises",
+        HostedModuleInstall::new(readline::install_readline_module),
+        readline::readline_cjs_value,
     ),
     HostedModule::new_with_cjs_value(
         "node:diagnostics_channel",

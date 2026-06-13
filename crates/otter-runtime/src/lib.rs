@@ -70,6 +70,7 @@ mod process;
 pub mod promise_registry;
 pub mod structured_clone;
 pub mod surface;
+pub mod web_structured_clone;
 pub mod worker;
 
 use std::cell::RefCell;

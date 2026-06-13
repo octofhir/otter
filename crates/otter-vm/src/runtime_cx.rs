@@ -485,6 +485,31 @@ impl<'rt> NativeCtx<'rt> {
         collections::alloc_set_with_roots(self.heap_mut(), &mut external_visit)
     }
 
+    /// `new target(...args)` — construct an instance via the VM construct path.
+    ///
+    /// Re-enters the interpreter synchronously (same rooting contract as
+    /// [`Interpreter::run_callable_sync`]); used by native code that needs to
+    /// build platform objects through their real constructors (e.g. the
+    /// structured-clone materializer rebuilding `Date`/`RegExp`/typed arrays).
+    pub fn construct(&mut self, target: Value, args: &[Value]) -> Result<Value, NativeError> {
+        let context = self.context.clone().ok_or_else(|| NativeError::TypeError {
+            name: "construct",
+            reason: "missing execution context".to_string(),
+        })?;
+        let argv: smallvec::SmallVec<[Value; 8]> = args.iter().copied().collect();
+        self.cx
+            .interp
+            .run_construct_sync(&context, &target, target, argv)
+            .map_err(|err| native_function::vm_to_native_error(err, "construct"))
+    }
+
+    /// Resolve a `globalThis.<name>` value (e.g. a constructor) for native use.
+    #[must_use]
+    pub fn global_value(&self, name: &str) -> Option<Value> {
+        let global = *self.cx.interp.global_this();
+        object::get(global, self.heap(), name)
+    }
+
     /// Allocate a `WeakMap` body through the native root contract.
     pub fn alloc_weak_map(&mut self) -> Result<collections::JsWeakMap, otter_gc::OutOfMemory> {
         let roots = self.collect_native_roots();

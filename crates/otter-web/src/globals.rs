@@ -29,6 +29,7 @@ fn install(runtime: &mut Runtime) -> Result<(), OtterError> {
     runtime.install_native_global("atob", 1, atob)?;
     runtime.install_native_global("btoa", 1, btoa)?;
     runtime.install_native_global("queueMicrotask", 1, queue_microtask)?;
+    runtime.install_native_global("structuredClone", 1, structured_clone)?;
     runtime.install_native_global("fetch", 1, fetch)?;
     runtime
         .eval(SourceInput::from_javascript(WEB_BOOTSTRAP.to_string()))
@@ -120,4 +121,9 @@ fn queue_microtask(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 
 fn fetch(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     Err(runtime_type_error("fetch", "fetch is not implemented"))
+}
+
+fn structured_clone(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let value = args.first().copied().unwrap_or_else(Value::undefined);
+    otter_runtime::web_structured_clone::structured_clone(ctx, value)
 }

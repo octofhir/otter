@@ -77,23 +77,29 @@ pub fn install_fs_module(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String> {
         },
     );
     let caps = ctx.capabilities().clone();
-    let exists_sync = Arc::new(move |ctx: &mut NativeCtx<'_>, args: &[Value], _c: &[Value]| {
-        let path = path_arg(ctx, args, 0, "fs.existsSync")?;
-        Ok(Value::boolean(caps.read.matches_path(&path) && path.exists()))
-    });
+    let exists_sync = Arc::new(
+        move |ctx: &mut NativeCtx<'_>, args: &[Value], _c: &[Value]| {
+            let path = path_arg(ctx, args, 0, "fs.existsSync")?;
+            Ok(Value::boolean(
+                caps.read.matches_path(&path) && path.exists(),
+            ))
+        },
+    );
     let caps = ctx.capabilities().clone();
-    let mkdir_sync = Arc::new(move |ctx: &mut NativeCtx<'_>, args: &[Value], _c: &[Value]| {
-        let path = path_arg(ctx, args, 0, "fs.mkdirSync")?;
-        require_write(&path, &caps).map_err(fs_error)?;
-        let recursive = args.get(1).is_some_and(truthy);
-        let r = if recursive {
-            std::fs::create_dir_all(&path)
-        } else {
-            std::fs::create_dir(&path)
-        };
-        r.map_err(|e| fs_error(io_error(&path, &e)))?;
-        Ok(Value::undefined())
-    });
+    let mkdir_sync = Arc::new(
+        move |ctx: &mut NativeCtx<'_>, args: &[Value], _c: &[Value]| {
+            let path = path_arg(ctx, args, 0, "fs.mkdirSync")?;
+            require_write(&path, &caps).map_err(fs_error)?;
+            let recursive = args.get(1).is_some_and(truthy);
+            let r = if recursive {
+                std::fs::create_dir_all(&path)
+            } else {
+                std::fs::create_dir(&path)
+            };
+            r.map_err(|e| fs_error(io_error(&path, &e)))?;
+            Ok(Value::undefined())
+        },
+    );
     ctx.method("readFileSync", 2, HostedNativeCall::dynamic(read_file_sync))?
         .method(
             "writeFileSync",

@@ -133,7 +133,7 @@ function truncateSync(path, len) { native.truncate(pathStr(path), Number(len) ||
 function asyncify(syncFn) {
   return function (...args) {
     const cb = typeof args[args.length - 1] === 'function' ? args.pop() : () => {};
-    setImmediate(() => {
+    setTimeout(() => {
       let result;
       try { result = syncFn(...args); } catch (err) { return cb(err); }
       cb(null, result);
@@ -158,13 +158,13 @@ const rename = asyncify(renameSync);
 const readlink = asyncify(readlinkSync);
 const chmod = asyncify(chmodSync);
 const truncate = asyncify(truncateSync);
-function exists(path, cb) { setImmediate(() => cb(existsSync(path))); }
+function exists(path, cb) { setTimeout(() => cb(existsSync(path))); }
 
 // ---- promises ----
 function promisify(syncFn) {
   return function (...args) {
     return new Promise((resolve, reject) => {
-      setImmediate(() => {
+      setTimeout(() => {
         try { resolve(syncFn(...args)); } catch (err) { reject(err); }
       });
     });
@@ -198,7 +198,7 @@ class ReadStream extends Readable {
     this.path = pathStr(path);
     this.bytesRead = 0;
     const enc = encodingOf(options);
-    setImmediate(() => {
+    setTimeout(() => {
       try {
         const buf = readFileSync(this.path);
         this.emit('open', 0);
@@ -213,7 +213,7 @@ class ReadStream extends Readable {
       } catch (err) { this.destroy(err); }
     });
   }
-  close(cb) { if (cb) setImmediate(cb); }
+  close(cb) { if (cb) setTimeout(cb); }
 }
 class WriteStream extends Writable {
   constructor(path, options = {}) {
@@ -223,7 +223,7 @@ class WriteStream extends Writable {
     this._chunks = [];
     const flags = (options && options.flags) || 'w';
     this._append = flags.includes('a');
-    setImmediate(() => { this.emit('open', 0); this.emit('ready'); });
+    setTimeout(() => { this.emit('open', 0); this.emit('ready'); });
   }
   _write(chunk, encoding, cb) {
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), encoding || 'utf8');

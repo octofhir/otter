@@ -18,6 +18,7 @@
 
 pub mod assert;
 pub mod buffer;
+pub mod child_process;
 pub mod diagnostics_channel;
 pub mod events;
 pub mod fs;
@@ -281,13 +282,15 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     ),
     HostedModule::new("node:url", HostedModuleInstall::new(stubs::install_url)),
     HostedModule::new("url", HostedModuleInstall::new(stubs::install_url)),
-    HostedModule::new(
+    HostedModule::new_with_cjs_value(
         "node:child_process",
-        HostedModuleInstall::new(stubs::install_child_process),
+        HostedModuleInstall::new(child_process::install_child_process_module),
+        child_process::child_process_cjs_value,
     ),
-    HostedModule::new(
+    HostedModule::new_with_cjs_value(
         "child_process",
-        HostedModuleInstall::new(stubs::install_child_process),
+        HostedModuleInstall::new(child_process::install_child_process_module),
+        child_process::child_process_cjs_value,
     ),
 ];
 

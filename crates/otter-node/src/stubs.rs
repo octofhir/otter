@@ -49,11 +49,3 @@ pub fn install_url(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String> {
     ctx.builtin_method("pathToFileURL", 1, not_implemented)?;
     Ok(())
 }
-
-/// `node:child_process` — stub functions; harness uses them lazily.
-pub fn install_child_process(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String> {
-    for name in ["spawnSync", "spawn", "exec", "execSync", "execFileSync"] {
-        ctx.builtin_method(name, 1, not_implemented)?;
-    }
-    Ok(())
-}

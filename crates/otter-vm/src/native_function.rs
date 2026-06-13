@@ -1336,6 +1336,10 @@ pub fn vm_to_native_error(err: crate::VmError, name: &'static str) -> NativeErro
             requested_bytes,
             heap_limit_bytes,
         },
+        // `process.exit(code)` must keep its identity across the native
+        // boundary so a host (e.g. the CommonJS loader) can surface a clean
+        // process termination instead of an uncatchable-looking TypeError.
+        crate::VmError::Exit { code } => NativeError::Exit { code },
         other => NativeError::TypeError {
             name,
             reason: other.to_string(),

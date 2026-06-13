@@ -1,12 +1,23 @@
-//! `node:path` / `path` hosted module (POSIX semantics).
+//! `node:path` / `path` hosted module.
 //!
 //! Pure string algorithms — no I/O — so the whole module is built with
 //! [`ModuleScope`]. `resolve`/`relative` consult the process cwd via
 //! `std::env::current_dir`.
 //!
+//! # Contents
+//! - `normalize_string`: shared `.`/`..` collapsing core (Node's `normalizeString`).
+//! - posix algorithms (`posix_*`) and win32 algorithms (`win32_*`), each a
+//!   faithful port of Node v24 `lib/path.js`.
+//! - native method wrappers + the CJS/ESM install surface.
+//!
 //! # Invariants
-//! - POSIX separator `/`; `sep` = "/", `delimiter` = ":".
-//! - Algorithms mirror Node's `lib/path.js` posix branch.
+//! - posix separator `/`, `delimiter` `:`; win32 separator `\`, `delimiter` `;`.
+//! - Algorithms operate on `Vec<char>` to mirror Node's UTF-16 `charCodeAt`/
+//!   `slice` semantics (BMP-exact) and slice the *original* string rather than
+//!   reconstructing it, so original separators are preserved like Node.
+//!
+//! # See also
+//! - Node v24 `lib/path.js` (the reference implementation this mirrors).
 
 use otter_runtime::CapabilitySet;
 use otter_runtime::module_scope::ModuleScope;
@@ -87,74 +98,249 @@ const WIN32_METHODS: &[Method] = &[
     ("matchesGlob", 2, win32_matches_glob),
 ];
 
-// ---- pure POSIX algorithms ----
+// ---- shared core ----
 
-/// Normalize `.`/`..`/`//` segments, preserving a leading and trailing slash.
-fn normalize_posix(input: &str) -> String {
-    if input.is_empty() {
+fn is_path_sep(c: char) -> bool {
+    c == '/' || c == '\\'
+}
+
+fn is_posix_sep(c: char) -> bool {
+    c == '/'
+}
+
+fn is_win_device_root(c: char) -> bool {
+    c.is_ascii_alphabetic()
+}
+
+/// Faithful port of Node's `normalizeString`: resolves `.`/`..` segments.
+/// Operates on a char slice and returns the collapsed body (no leading root).
+fn normalize_string(
+    path: &[char],
+    allow_above_root: bool,
+    sep: char,
+    is_sep: fn(char) -> bool,
+) -> String {
+    let mut res: Vec<char> = Vec::new();
+    let mut last_segment_length: isize = 0;
+    let mut last_slash: isize = -1;
+    let mut dots: isize = 0;
+    let mut code: char = '\0';
+    let len = path.len();
+    for i in 0..=len {
+        if i < len {
+            code = path[i];
+        } else if is_sep(code) {
+            break;
+        } else {
+            code = '/';
+        }
+        let ii = i as isize;
+        if is_sep(code) {
+            if last_slash == ii - 1 || dots == 1 {
+                // NOOP
+            } else if dots == 2 {
+                let needs = res.len() < 2
+                    || last_segment_length != 2
+                    || res[res.len() - 1] != '.'
+                    || res[res.len() - 2] != '.';
+                if needs {
+                    if res.len() > 2 {
+                        match res.iter().rposition(|&c| c == sep) {
+                            None => {
+                                res.clear();
+                                last_segment_length = 0;
+                            }
+                            Some(idx) => {
+                                res.truncate(idx);
+                                let new_last = res
+                                    .iter()
+                                    .rposition(|&c| c == sep)
+                                    .map(|p| p as isize)
+                                    .unwrap_or(-1);
+                                last_segment_length = res.len() as isize - 1 - new_last;
+                            }
+                        }
+                        last_slash = ii;
+                        dots = 0;
+                        continue;
+                    } else if !res.is_empty() {
+                        res.clear();
+                        last_segment_length = 0;
+                        last_slash = ii;
+                        dots = 0;
+                        continue;
+                    }
+                }
+                if allow_above_root {
+                    if !res.is_empty() {
+                        res.push(sep);
+                    }
+                    res.push('.');
+                    res.push('.');
+                    last_segment_length = 2;
+                }
+            } else {
+                if !res.is_empty() {
+                    res.push(sep);
+                }
+                res.extend_from_slice(&path[(last_slash + 1) as usize..i]);
+                last_segment_length = ii - last_slash - 1;
+            }
+            last_slash = ii;
+            dots = 0;
+        } else if code == '.' && dots != -1 {
+            dots += 1;
+        } else {
+            dots = -1;
+        }
+    }
+    res.into_iter().collect()
+}
+
+fn cwd() -> String {
+    std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "/".to_string())
+}
+
+/// `formatExt`: prepend a dot to a non-empty extension that lacks one.
+fn format_ext(ext: &str) -> String {
+    if ext.is_empty() {
+        String::new()
+    } else if ext.starts_with('.') {
+        ext.to_string()
+    } else {
+        format!(".{ext}")
+    }
+}
+
+// ---- posix algorithms ----
+
+fn posix_resolve_str(args: &[String]) -> String {
+    let mut resolved = String::new();
+    let mut resolved_absolute = false;
+    let mut i = args.len() as isize - 1;
+    while i >= 0 && !resolved_absolute {
+        let path = &args[i as usize];
+        if !path.is_empty() {
+            resolved = format!("{path}/{resolved}");
+            resolved_absolute = path.starts_with('/');
+        }
+        i -= 1;
+    }
+    if !resolved_absolute {
+        let c = cwd();
+        resolved_absolute = c.starts_with('/');
+        resolved = format!("{c}/{resolved}");
+    }
+    let chars: Vec<char> = resolved.chars().collect();
+    let normalized = normalize_string(&chars, !resolved_absolute, '/', is_posix_sep);
+    if resolved_absolute {
+        format!("/{normalized}")
+    } else if !normalized.is_empty() {
+        normalized
+    } else {
+        ".".to_string()
+    }
+}
+
+fn posix_normalize_str(p: &str) -> String {
+    if p.is_empty() {
         return ".".to_string();
     }
-    let is_abs = input.starts_with('/');
-    let trailing = input.len() > 1 && input.ends_with('/');
-    let mut parts: Vec<&str> = Vec::new();
-    for seg in input.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                if let Some(&last) = parts.last() {
-                    if last == ".." {
-                        parts.push("..");
-                    } else {
-                        parts.pop();
-                    }
-                } else if !is_abs {
-                    parts.push("..");
-                }
-            }
-            other => parts.push(other),
+    let chars: Vec<char> = p.chars().collect();
+    let is_absolute = chars[0] == '/';
+    let trailing = chars[chars.len() - 1] == '/';
+    let normalized = normalize_string(&chars, !is_absolute, '/', is_posix_sep);
+    if normalized.is_empty() {
+        if is_absolute {
+            return "/".to_string();
         }
+        return if trailing { "./" } else { "." }.to_string();
     }
-    let body = parts.join("/");
-    if body.is_empty() {
-        // Node: empty result keeps a relative trailing slash as "./".
-        return if is_abs {
-            "/".into()
-        } else if trailing {
-            "./".into()
-        } else {
-            ".".into()
-        };
-    }
-    let mut out = if is_abs { format!("/{body}") } else { body };
-    if trailing && !out.ends_with('/') {
+    let mut out = normalized;
+    if trailing {
         out.push('/');
     }
-    out
+    if is_absolute { format!("/{out}") } else { out }
 }
 
-/// Last path component (after stripping trailing slashes).
-fn basename_of(path: &str) -> &str {
-    path.rsplit('/').find(|s| !s.is_empty()).unwrap_or("")
+fn posix_join_str(args: &[String]) -> String {
+    if args.is_empty() {
+        return ".".to_string();
+    }
+    let parts: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return ".".to_string();
+    }
+    posix_normalize_str(&parts.join("/"))
 }
 
-fn basename(path: &str, ext: Option<&str>) -> String {
-    let base = basename_of(path);
-    if let Some(ext) = ext {
-        // Node: `ext === path` => "". Otherwise strip the suffix only when the
-        // basename is strictly longer (a whole-component match is NOT stripped).
-        if path == ext {
-            return String::new();
+fn posix_relative_str(from_in: &str, to_in: &str) -> String {
+    if from_in == to_in {
+        return String::new();
+    }
+    let from = posix_resolve_str(std::slice::from_ref(&from_in.to_string()));
+    let to = posix_resolve_str(std::slice::from_ref(&to_in.to_string()));
+    if from == to {
+        return String::new();
+    }
+    let from_c: Vec<char> = from.chars().collect();
+    let to_c: Vec<char> = to.chars().collect();
+    let from_start = 1isize;
+    let from_end = from_c.len() as isize;
+    let from_len = from_end - from_start;
+    let to_start = 1isize;
+    let to_len = to_c.len() as isize - to_start;
+    let length = from_len.min(to_len);
+    let mut last_common_sep: isize = -1;
+    let mut i = 0isize;
+    while i < length {
+        let fc = from_c[(from_start + i) as usize];
+        if fc != to_c[(to_start + i) as usize] {
+            break;
+        } else if fc == '/' {
+            last_common_sep = i;
         }
-        if !ext.is_empty() && base.len() > ext.len() && base.ends_with(ext) {
-            return base[..base.len() - ext.len()].to_string();
+        i += 1;
+    }
+    if i == length {
+        if to_len > length {
+            if to_c[(to_start + i) as usize] == '/' {
+                return to_c[(to_start + i + 1) as usize..].iter().collect();
+            }
+            if i == 0 {
+                return to_c[(to_start + i) as usize..].iter().collect();
+            }
+        } else if from_len > length {
+            if from_c[(from_start + i) as usize] == '/' {
+                last_common_sep = i;
+            } else if i == 0 {
+                last_common_sep = 0;
+            }
         }
     }
-    base.to_string()
+    let mut out = String::new();
+    let mut k = from_start + last_common_sep + 1;
+    while k <= from_end {
+        if k == from_end || from_c[k as usize] == '/' {
+            out.push_str(if out.is_empty() { ".." } else { "/.." });
+        }
+        k += 1;
+    }
+    let tail: String = to_c[(to_start + last_common_sep) as usize..]
+        .iter()
+        .collect();
+    format!("{out}{tail}")
 }
 
-/// Faithful port of Node's posix `dirname` (preserves a leading `//`).
-fn dirname(path: &str) -> String {
-    let chars: Vec<char> = path.chars().collect();
+/// Faithful port of Node posix `dirname` (preserves a leading `//`).
+fn posix_dirname_str(p: &str) -> String {
+    let chars: Vec<char> = p.chars().collect();
     if chars.is_empty() {
         return ".".to_string();
     }
@@ -182,20 +368,84 @@ fn dirname(path: &str) -> String {
     chars[..end as usize].iter().collect()
 }
 
-/// Node's `extname` algorithm (faithful port of `lib/path.js`), parameterised by
-/// the separator predicate so posix and win32 share it. Handles leading-dot /
-/// all-dots basenames (`..` -> "", `..file` -> ".file", `file.` -> ".").
-fn extname_with(path: &str, is_sep: fn(char) -> bool) -> String {
-    let chars: Vec<char> = path.chars().collect();
-    let mut start_dot: isize = -1;
-    let mut start_part: isize = 0;
+fn posix_basename_str(p: &str, suffix: Option<&str>) -> String {
+    let path: Vec<char> = p.chars().collect();
+    let mut start = 0usize;
     let mut end: isize = -1;
     let mut matched_slash = true;
-    let mut pre_dot_state: i32 = 0;
-    let mut i = chars.len() as isize - 1;
+    if let Some(suf) = suffix {
+        let suffix_c: Vec<char> = suf.chars().collect();
+        if !suffix_c.is_empty() && suffix_c.len() <= path.len() {
+            if suf == p {
+                return String::new();
+            }
+            let mut ext_idx: isize = suffix_c.len() as isize - 1;
+            let mut first_non_slash_end: isize = -1;
+            let mut i = path.len() as isize - 1;
+            while i >= 0 {
+                let code = path[i as usize];
+                if code == '/' {
+                    if !matched_slash {
+                        start = (i + 1) as usize;
+                        break;
+                    }
+                } else {
+                    if first_non_slash_end == -1 {
+                        matched_slash = false;
+                        first_non_slash_end = i + 1;
+                    }
+                    if ext_idx >= 0 {
+                        if code == suffix_c[ext_idx as usize] {
+                            ext_idx -= 1;
+                            if ext_idx == -1 {
+                                end = i;
+                            }
+                        } else {
+                            ext_idx = -1;
+                            end = first_non_slash_end;
+                        }
+                    }
+                }
+                i -= 1;
+            }
+            if start as isize == end {
+                end = first_non_slash_end;
+            } else if end == -1 {
+                end = path.len() as isize;
+            }
+            return path[start..end as usize].iter().collect();
+        }
+    }
+    let mut i = path.len() as isize - 1;
     while i >= 0 {
-        let c = chars[i as usize];
-        if is_sep(c) {
+        if path[i as usize] == '/' {
+            if !matched_slash {
+                start = (i + 1) as usize;
+                break;
+            }
+        } else if end == -1 {
+            matched_slash = false;
+            end = i + 1;
+        }
+        i -= 1;
+    }
+    if end == -1 {
+        return String::new();
+    }
+    path[start..end as usize].iter().collect()
+}
+
+fn posix_extname_str(p: &str) -> String {
+    let path: Vec<char> = p.chars().collect();
+    let mut start_dot: isize = -1;
+    let mut start_part = 0isize;
+    let mut end: isize = -1;
+    let mut matched_slash = true;
+    let mut pre_dot_state = 0i32;
+    let mut i = path.len() as isize - 1;
+    while i >= 0 {
+        let c = path[i as usize];
+        if c == '/' {
             if !matched_slash {
                 start_part = i + 1;
                 break;
@@ -225,83 +475,889 @@ fn extname_with(path: &str, is_sep: fn(char) -> bool) -> String {
     {
         return String::new();
     }
-    chars[start_dot as usize..end as usize].iter().collect()
+    path[start_dot as usize..end as usize].iter().collect()
 }
 
-fn extname(path: &str) -> String {
-    extname_with(path, |c| c == '/')
-}
-
-fn join(parts: &[String]) -> String {
-    let joined: Vec<&str> = parts
-        .iter()
-        .map(String::as_str)
-        .filter(|s| !s.is_empty())
-        .collect();
-    if joined.is_empty() {
-        return ".".to_string();
+/// Returns `(root, dir, base, ext, name)`.
+fn posix_parse_parts(p: &str) -> (String, String, String, String, String) {
+    let path: Vec<char> = p.chars().collect();
+    let mut root = String::new();
+    let mut dir = String::new();
+    let mut base = String::new();
+    let mut ext = String::new();
+    let mut name = String::new();
+    if path.is_empty() {
+        return (root, dir, base, ext, name);
     }
-    normalize_posix(&joined.join("/"))
-}
-
-fn cwd() -> String {
-    std::env::current_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "/".to_string())
-}
-
-fn resolve(parts: &[String]) -> String {
-    let mut resolved = String::new();
-    let mut is_abs = false;
-    for part in parts.iter().rev() {
-        if part.is_empty() {
+    let is_absolute = path[0] == '/';
+    let start: isize = if is_absolute {
+        root = "/".to_string();
+        1
+    } else {
+        0
+    };
+    let mut start_dot: isize = -1;
+    let mut start_part = 0isize;
+    let mut end: isize = -1;
+    let mut matched_slash = true;
+    let mut pre_dot_state = 0i32;
+    let mut i = path.len() as isize - 1;
+    while i >= start {
+        let code = path[i as usize];
+        if code == '/' {
+            if !matched_slash {
+                start_part = i + 1;
+                break;
+            }
+            i -= 1;
             continue;
         }
-        resolved = if resolved.is_empty() {
-            part.clone()
+        if end == -1 {
+            matched_slash = false;
+            end = i + 1;
+        }
+        if code == '.' {
+            if start_dot == -1 {
+                start_dot = i;
+            } else if pre_dot_state != 1 {
+                pre_dot_state = 1;
+            }
+        } else if start_dot != -1 {
+            pre_dot_state = -1;
+        }
+        i -= 1;
+    }
+    if end != -1 {
+        let st = if start_part == 0 && is_absolute {
+            1
         } else {
-            format!("{part}/{resolved}")
+            start_part
         };
-        if part.starts_with('/') {
-            is_abs = true;
-            break;
+        if start_dot == -1
+            || pre_dot_state == 0
+            || (pre_dot_state == 1 && start_dot == end - 1 && start_dot == start_part + 1)
+        {
+            base = path[st as usize..end as usize].iter().collect();
+            name = base.clone();
+        } else {
+            name = path[st as usize..start_dot as usize].iter().collect();
+            base = path[st as usize..end as usize].iter().collect();
+            ext = path[start_dot as usize..end as usize].iter().collect();
         }
     }
-    if !is_abs {
-        let base = cwd();
-        resolved = if resolved.is_empty() {
-            base
-        } else {
-            format!("{base}/{resolved}")
-        };
+    if start_part > 0 {
+        dir = path[..(start_part - 1) as usize].iter().collect();
+    } else if is_absolute {
+        dir = "/".to_string();
     }
-    let normalized = normalize_posix(&resolved);
-    // resolve() yields an absolute path with no trailing slash (except root).
-    let trimmed = normalized.trim_end_matches('/');
-    if trimmed.is_empty() {
-        "/".to_string()
+    (root, dir, base, ext, name)
+}
+
+// ---- win32 algorithms ----
+
+fn win32_is_absolute_str(p: &str) -> bool {
+    let path: Vec<char> = p.chars().collect();
+    let len = path.len();
+    if len == 0 {
+        return false;
+    }
+    let code = path[0];
+    is_path_sep(code)
+        || (len > 2 && is_win_device_root(code) && path[1] == ':' && is_path_sep(path[2]))
+}
+
+fn win32_resolve_str(args: &[String]) -> String {
+    let mut resolved_device = String::new();
+    let mut resolved_tail = String::new();
+    let mut resolved_absolute = false;
+    let mut idx: isize = args.len() as isize - 1;
+    while idx >= -1 {
+        let path_owned: String;
+        if idx >= 0 {
+            let p = &args[idx as usize];
+            if p.is_empty() {
+                idx -= 1;
+                continue;
+            }
+            path_owned = p.clone();
+        } else if resolved_device.is_empty() {
+            path_owned = cwd();
+        } else {
+            // Windows tracks per-drive cwd via `process.env['=C:']`; we don't on
+            // non-Windows hosts, so fall back to the process cwd and apply the
+            // same drive-mismatch guard Node uses.
+            let mut p = cwd();
+            let pch: Vec<char> = p.chars().collect();
+            let first2: String = pch.iter().take(2).collect();
+            if first2.to_lowercase() != resolved_device.to_lowercase() && pch.get(2) == Some(&'\\')
+            {
+                p = format!("{resolved_device}\\");
+            }
+            path_owned = p;
+        }
+        let path: Vec<char> = path_owned.chars().collect();
+        let len = path.len();
+        let mut root_end = 0usize;
+        let mut device = String::new();
+        let mut is_absolute = false;
+        let code = path.first().copied().unwrap_or('\0');
+        if len == 1 {
+            if is_path_sep(code) {
+                root_end = 1;
+                is_absolute = true;
+            }
+        } else if is_path_sep(code) {
+            is_absolute = true;
+            if is_path_sep(path[1]) {
+                let mut j = 2usize;
+                let mut last = j;
+                while j < len && !is_path_sep(path[j]) {
+                    j += 1;
+                }
+                if j < len && j != last {
+                    let first_part: String = path[last..j].iter().collect();
+                    last = j;
+                    while j < len && is_path_sep(path[j]) {
+                        j += 1;
+                    }
+                    if j < len && j != last {
+                        last = j;
+                        while j < len && !is_path_sep(path[j]) {
+                            j += 1;
+                        }
+                        if j == len || j != last {
+                            if first_part != "." && first_part != "?" {
+                                let share: String = path[last..j].iter().collect();
+                                device = format!("\\\\{first_part}\\{share}");
+                                root_end = j;
+                            } else {
+                                device = format!("\\\\{first_part}");
+                                root_end = 4;
+                            }
+                        }
+                    }
+                }
+            } else {
+                root_end = 1;
+            }
+        } else if is_win_device_root(code) && path.get(1) == Some(&':') {
+            device = path[0..2].iter().collect();
+            root_end = 2;
+            if len > 2 && is_path_sep(path[2]) {
+                is_absolute = true;
+                root_end = 3;
+            }
+        }
+
+        if !device.is_empty() {
+            if !resolved_device.is_empty() {
+                if device.to_lowercase() != resolved_device.to_lowercase() {
+                    idx -= 1;
+                    continue;
+                }
+            } else {
+                resolved_device = device.clone();
+            }
+        }
+
+        if resolved_absolute {
+            if !resolved_device.is_empty() {
+                break;
+            }
+        } else {
+            let tail_slice: String = path[root_end..].iter().collect();
+            resolved_tail = format!("{tail_slice}\\{resolved_tail}");
+            resolved_absolute = is_absolute;
+            if is_absolute && !resolved_device.is_empty() {
+                break;
+            }
+        }
+        idx -= 1;
+    }
+    let tail_chars: Vec<char> = resolved_tail.chars().collect();
+    let normalized_tail = normalize_string(&tail_chars, !resolved_absolute, '\\', is_path_sep);
+    if resolved_absolute {
+        format!("{resolved_device}\\{normalized_tail}")
     } else {
-        trimmed.to_string()
+        let r = format!("{resolved_device}{normalized_tail}");
+        if r.is_empty() { ".".to_string() } else { r }
     }
 }
 
-fn relative(from: &str, to: &str) -> String {
-    let from = resolve(std::slice::from_ref(&from.to_string()));
-    let to = resolve(std::slice::from_ref(&to.to_string()));
+fn win32_normalize_str(p: &str) -> String {
+    let path: Vec<char> = p.chars().collect();
+    let len = path.len();
+    if len == 0 {
+        return ".".to_string();
+    }
+    let mut root_end = 0usize;
+    let mut device: Option<String> = None;
+    let mut is_absolute = false;
+    let code = path[0];
+    if len == 1 {
+        return if is_posix_sep(code) {
+            "\\".to_string()
+        } else {
+            p.to_string()
+        };
+    }
+    if is_path_sep(code) {
+        is_absolute = true;
+        if is_path_sep(path[1]) {
+            let mut j = 2usize;
+            let mut last = j;
+            while j < len && !is_path_sep(path[j]) {
+                j += 1;
+            }
+            if j < len && j != last {
+                let first_part: String = path[last..j].iter().collect();
+                last = j;
+                while j < len && is_path_sep(path[j]) {
+                    j += 1;
+                }
+                if j < len && j != last {
+                    last = j;
+                    while j < len && !is_path_sep(path[j]) {
+                        j += 1;
+                    }
+                    if j == len || j != last {
+                        if first_part == "." || first_part == "?" {
+                            device = Some(format!("\\\\{first_part}"));
+                            root_end = 4;
+                        } else if j == len {
+                            let share: String = path[last..].iter().collect();
+                            return format!("\\\\{first_part}\\{share}\\");
+                        } else {
+                            let share: String = path[last..j].iter().collect();
+                            device = Some(format!("\\\\{first_part}\\{share}"));
+                            root_end = j;
+                        }
+                    }
+                }
+            }
+        } else {
+            root_end = 1;
+        }
+    } else if is_win_device_root(code) && path.get(1) == Some(&':') {
+        device = Some(path[0..2].iter().collect());
+        root_end = 2;
+        if len > 2 && is_path_sep(path[2]) {
+            is_absolute = true;
+            root_end = 3;
+        }
+    }
+
+    let mut tail = if root_end < len {
+        normalize_string(&path[root_end..], !is_absolute, '\\', is_path_sep)
+    } else {
+        String::new()
+    };
+    if tail.is_empty() && !is_absolute {
+        tail = ".".to_string();
+    }
+    if !tail.is_empty() && is_path_sep(path[len - 1]) {
+        tail.push('\\');
+    }
+    if !is_absolute && device.is_none() && p.contains(':') {
+        // CVE-2024-36139: a relative path must not normalize into something
+        // Windows would read as device-absolute.
+        let tail_c: Vec<char> = tail.chars().collect();
+        if tail_c.len() >= 2 && is_win_device_root(tail_c[0]) && tail_c[1] == ':' {
+            return format!(".\\{tail}");
+        }
+        let mut search = 0usize;
+        while let Some(rel) = p[search..].find(':') {
+            let index = search + rel;
+            let next = path.get(index + 1).copied();
+            if index == len - 1 || next.is_some_and(is_path_sep) {
+                return format!(".\\{tail}");
+            }
+            search = index + 1;
+            if search >= p.len() {
+                break;
+            }
+        }
+    }
+    match device {
+        None => {
+            if is_absolute {
+                format!("\\{tail}")
+            } else {
+                tail
+            }
+        }
+        Some(dev) => {
+            if is_absolute {
+                format!("{dev}\\{tail}")
+            } else {
+                format!("{dev}{tail}")
+            }
+        }
+    }
+}
+
+fn win32_join_str(args: &[String]) -> String {
+    if args.is_empty() {
+        return ".".to_string();
+    }
+    let mut joined: Option<String> = None;
+    let mut first_part = String::new();
+    for arg in args {
+        if !arg.is_empty() {
+            match &mut joined {
+                None => {
+                    joined = Some(arg.clone());
+                    first_part = arg.clone();
+                }
+                Some(j) => {
+                    j.push('\\');
+                    j.push_str(arg);
+                }
+            }
+        }
+    }
+    let Some(mut joined) = joined else {
+        return ".".to_string();
+    };
+    let fp: Vec<char> = first_part.chars().collect();
+    let mut needs_replace = true;
+    let mut slash_count = 0usize;
+    if !fp.is_empty() && is_path_sep(fp[0]) {
+        slash_count += 1;
+        let first_len = fp.len();
+        if first_len > 1 && is_path_sep(fp[1]) {
+            slash_count += 1;
+            if first_len > 2 {
+                if is_path_sep(fp[2]) {
+                    slash_count += 1;
+                } else {
+                    needs_replace = false;
+                }
+            }
+        }
+    }
+    if needs_replace {
+        let jc: Vec<char> = joined.chars().collect();
+        while slash_count < jc.len() && is_path_sep(jc[slash_count]) {
+            slash_count += 1;
+        }
+        if slash_count >= 2 {
+            let rest: String = jc[slash_count..].iter().collect();
+            joined = format!("\\{rest}");
+        }
+    }
+    // CVE-2025-27210: skip normalization when a reserved device name is present,
+    // so `..` traversal past a device segment (`CON:..\..`) is not collapsed.
+    let jc: Vec<char> = joined.chars().collect();
+    let mut parts: Vec<String> = Vec::new();
+    let mut part = String::new();
+    let mut i = 0usize;
+    while i < jc.len() {
+        if jc[i] == '\\' {
+            if !part.is_empty() {
+                parts.push(std::mem::take(&mut part));
+            }
+            while i + 1 < jc.len() && jc[i + 1] == '\\' {
+                i += 1;
+            }
+        } else {
+            part.push(jc[i]);
+        }
+        i += 1;
+    }
+    if !part.is_empty() {
+        parts.push(part);
+    }
+    if parts.iter().any(|p| is_windows_reserved_name(p)) {
+        return joined.replace('/', "\\");
+    }
+    win32_normalize_str(&joined)
+}
+
+/// `isWindowsReservedName`: the part before a `:` is a reserved device name
+/// (`CON`, `PRN`, `COM1`…, `LPT1`…, including the `¹²³` superscript variants).
+fn is_windows_reserved_name(p: &str) -> bool {
+    let Some(colon) = p.find(':') else {
+        return false;
+    };
+    let device = p[..colon].to_uppercase();
+    const NAMES: &[&str] = &[
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "COM1",
+        "COM2",
+        "COM3",
+        "COM4",
+        "COM5",
+        "COM6",
+        "COM7",
+        "COM8",
+        "COM9",
+        "LPT1",
+        "LPT2",
+        "LPT3",
+        "LPT4",
+        "LPT5",
+        "LPT6",
+        "LPT7",
+        "LPT8",
+        "LPT9",
+        "COM\u{b9}",
+        "COM\u{b2}",
+        "COM\u{b3}",
+        "LPT\u{b9}",
+        "LPT\u{b2}",
+        "LPT\u{b3}",
+    ];
+    NAMES.contains(&device.as_str())
+}
+
+fn win32_relative_str(from_in: &str, to_in: &str) -> String {
+    if from_in == to_in {
+        return String::new();
+    }
+    let from_orig = win32_resolve_str(std::slice::from_ref(&from_in.to_string()));
+    let to_orig = win32_resolve_str(std::slice::from_ref(&to_in.to_string()));
+    if from_orig == to_orig {
+        return String::new();
+    }
+    let from = from_orig.to_lowercase();
+    let to = to_orig.to_lowercase();
     if from == to {
         return String::new();
     }
-    let from_parts: Vec<&str> = from.split('/').filter(|s| !s.is_empty()).collect();
-    let to_parts: Vec<&str> = to.split('/').filter(|s| !s.is_empty()).collect();
-    let common = from_parts
-        .iter()
-        .zip(to_parts.iter())
-        .take_while(|(a, b)| a == b)
-        .count();
-    let mut out: Vec<&str> = Vec::new();
-    out.extend(std::iter::repeat_n("..", from_parts.len() - common));
-    out.extend_from_slice(&to_parts[common..]);
-    out.join("/")
+
+    // When lowercasing changes length (e.g. `İ` -> `i̇`), index alignment with
+    // the original strings is lost, so fall back to segment-wise comparison.
+    if from_orig.chars().count() != from.chars().count()
+        || to_orig.chars().count() != to.chars().count()
+    {
+        let mut from_split: Vec<&str> = from_orig.split('\\').collect();
+        let mut to_split: Vec<&str> = to_orig.split('\\').collect();
+        if from_split.last() == Some(&"") {
+            from_split.pop();
+        }
+        if to_split.last() == Some(&"") {
+            to_split.pop();
+        }
+        let from_len = from_split.len();
+        let to_len = to_split.len();
+        let length = from_len.min(to_len);
+        let mut i = 0usize;
+        while i < length {
+            if from_split[i].to_lowercase() != to_split[i].to_lowercase() {
+                break;
+            }
+            i += 1;
+        }
+        if i == 0 {
+            return to_orig;
+        } else if i == length {
+            if to_len > length {
+                return to_split[i..].join("\\");
+            }
+            if from_len > length {
+                return "..\\".repeat(from_len - 1 - i) + "..";
+            }
+            return String::new();
+        }
+        return "..\\".repeat(from_len - i) + &to_split[i..].join("\\");
+    }
+
+    let from_c: Vec<char> = from.chars().collect();
+    let to_c: Vec<char> = to.chars().collect();
+    let to_orig_c: Vec<char> = to_orig.chars().collect();
+    let mut from_start = 0usize;
+    while from_start < from_c.len() && from_c[from_start] == '\\' {
+        from_start += 1;
+    }
+    let mut from_end = from_c.len();
+    while from_end as isize - 1 > from_start as isize && from_c[from_end - 1] == '\\' {
+        from_end -= 1;
+    }
+    let from_len = from_end - from_start;
+    let mut to_start = 0usize;
+    while to_start < to_c.len() && to_c[to_start] == '\\' {
+        to_start += 1;
+    }
+    let mut to_end = to_c.len();
+    while to_end as isize - 1 > to_start as isize && to_c[to_end - 1] == '\\' {
+        to_end -= 1;
+    }
+    let to_len = to_end - to_start;
+    let length = from_len.min(to_len);
+    let mut last_common_sep: isize = -1;
+    let mut i = 0usize;
+    while i < length {
+        let fc = from_c[from_start + i];
+        if fc != to_c[to_start + i] {
+            break;
+        } else if fc == '\\' {
+            last_common_sep = i as isize;
+        }
+        i += 1;
+    }
+    if i != length {
+        if last_common_sep == -1 {
+            return to_orig;
+        }
+    } else {
+        if to_len > length {
+            if to_c[to_start + i] == '\\' {
+                return to_orig_c[to_start + i + 1..].iter().collect();
+            }
+            if i == 2 {
+                return to_orig_c[to_start + i..].iter().collect();
+            }
+        }
+        if from_len > length {
+            if from_c[from_start + i] == '\\' {
+                last_common_sep = i as isize;
+            } else if i == 2 {
+                last_common_sep = 3;
+            }
+        }
+        if last_common_sep == -1 {
+            last_common_sep = 0;
+        }
+    }
+    let mut out = String::new();
+    let mut k = from_start as isize + last_common_sep + 1;
+    while k <= from_end as isize {
+        if k == from_end as isize || from_c[k as usize] == '\\' {
+            out.push_str(if out.is_empty() { ".." } else { "\\.." });
+        }
+        k += 1;
+    }
+    let to_start2 = to_start + last_common_sep as usize;
+    if !out.is_empty() {
+        let tail: String = to_orig_c[to_start2..to_end].iter().collect();
+        return format!("{out}{tail}");
+    }
+    let mut ts = to_start2;
+    if to_orig_c.get(ts) == Some(&'\\') {
+        ts += 1;
+    }
+    to_orig_c[ts..to_end].iter().collect()
+}
+
+fn win32_dirname_str(p: &str) -> String {
+    let path: Vec<char> = p.chars().collect();
+    let len = path.len();
+    if len == 0 {
+        return ".".to_string();
+    }
+    let mut root_end: isize = -1;
+    let mut offset = 0usize;
+    let code = path[0];
+    if len == 1 {
+        return if is_path_sep(code) {
+            p.to_string()
+        } else {
+            ".".to_string()
+        };
+    }
+    if is_path_sep(code) {
+        root_end = 1;
+        offset = 1;
+        if is_path_sep(path[1]) {
+            let mut j = 2usize;
+            let mut last = j;
+            while j < len && !is_path_sep(path[j]) {
+                j += 1;
+            }
+            if j < len && j != last {
+                last = j;
+                while j < len && is_path_sep(path[j]) {
+                    j += 1;
+                }
+                if j < len && j != last {
+                    last = j;
+                    while j < len && !is_path_sep(path[j]) {
+                        j += 1;
+                    }
+                    if j == len {
+                        return p.to_string();
+                    }
+                    if j != last {
+                        root_end = (j + 1) as isize;
+                        offset = j + 1;
+                    }
+                }
+            }
+        }
+    } else if is_win_device_root(code) && path.get(1) == Some(&':') {
+        root_end = if len > 2 && is_path_sep(path[2]) {
+            3
+        } else {
+            2
+        };
+        offset = root_end as usize;
+    }
+    let mut end: isize = -1;
+    let mut matched_slash = true;
+    let mut i = len as isize - 1;
+    while i >= offset as isize {
+        if is_path_sep(path[i as usize]) {
+            if !matched_slash {
+                end = i;
+                break;
+            }
+        } else {
+            matched_slash = false;
+        }
+        i -= 1;
+    }
+    if end == -1 {
+        if root_end == -1 {
+            return ".".to_string();
+        }
+        end = root_end;
+    }
+    path[..end as usize].iter().collect()
+}
+
+fn win32_basename_str(p: &str, suffix: Option<&str>) -> String {
+    let path: Vec<char> = p.chars().collect();
+    let mut start = 0usize;
+    let mut end: isize = -1;
+    let mut matched_slash = true;
+    if path.len() >= 2 && is_win_device_root(path[0]) && path[1] == ':' {
+        start = 2;
+    }
+    if let Some(suf) = suffix {
+        let suffix_c: Vec<char> = suf.chars().collect();
+        if !suffix_c.is_empty() && suffix_c.len() <= path.len() {
+            if suf == p {
+                return String::new();
+            }
+            let mut ext_idx: isize = suffix_c.len() as isize - 1;
+            let mut first_non_slash_end: isize = -1;
+            let mut i = path.len() as isize - 1;
+            while i >= start as isize {
+                let code = path[i as usize];
+                if is_path_sep(code) {
+                    if !matched_slash {
+                        start = (i + 1) as usize;
+                        break;
+                    }
+                } else {
+                    if first_non_slash_end == -1 {
+                        matched_slash = false;
+                        first_non_slash_end = i + 1;
+                    }
+                    if ext_idx >= 0 {
+                        if code == suffix_c[ext_idx as usize] {
+                            ext_idx -= 1;
+                            if ext_idx == -1 {
+                                end = i;
+                            }
+                        } else {
+                            ext_idx = -1;
+                            end = first_non_slash_end;
+                        }
+                    }
+                }
+                i -= 1;
+            }
+            if start as isize == end {
+                end = first_non_slash_end;
+            } else if end == -1 {
+                end = path.len() as isize;
+            }
+            return path[start..end as usize].iter().collect();
+        }
+    }
+    let mut i = path.len() as isize - 1;
+    while i >= start as isize {
+        if is_path_sep(path[i as usize]) {
+            if !matched_slash {
+                start = (i + 1) as usize;
+                break;
+            }
+        } else if end == -1 {
+            matched_slash = false;
+            end = i + 1;
+        }
+        i -= 1;
+    }
+    if end == -1 {
+        return String::new();
+    }
+    path[start..end as usize].iter().collect()
+}
+
+fn win32_extname_str(p: &str) -> String {
+    let path: Vec<char> = p.chars().collect();
+    let mut start = 0usize;
+    let mut start_dot: isize = -1;
+    let mut start_part = 0isize;
+    let mut end: isize = -1;
+    let mut matched_slash = true;
+    let mut pre_dot_state = 0i32;
+    if path.len() >= 2 && path[1] == ':' && is_win_device_root(path[0]) {
+        start = 2;
+        start_part = 2;
+    }
+    let mut i = path.len() as isize - 1;
+    while i >= start as isize {
+        let code = path[i as usize];
+        if is_path_sep(code) {
+            if !matched_slash {
+                start_part = i + 1;
+                break;
+            }
+            i -= 1;
+            continue;
+        }
+        if end == -1 {
+            matched_slash = false;
+            end = i + 1;
+        }
+        if code == '.' {
+            if start_dot == -1 {
+                start_dot = i;
+            } else if pre_dot_state != 1 {
+                pre_dot_state = 1;
+            }
+        } else if start_dot != -1 {
+            pre_dot_state = -1;
+        }
+        i -= 1;
+    }
+    if start_dot == -1
+        || end == -1
+        || pre_dot_state == 0
+        || (pre_dot_state == 1 && start_dot == end - 1 && start_dot == start_part + 1)
+    {
+        return String::new();
+    }
+    path[start_dot as usize..end as usize].iter().collect()
+}
+
+/// Returns `(root, dir, base, ext, name)`.
+fn win32_parse_parts(p: &str) -> (String, String, String, String, String) {
+    let path: Vec<char> = p.chars().collect();
+    let mut root = String::new();
+    let mut dir = String::new();
+    let mut base = String::new();
+    let mut ext = String::new();
+    let mut name = String::new();
+    if path.is_empty() {
+        return (root, dir, base, ext, name);
+    }
+    let len = path.len();
+    let mut root_end = 0usize;
+    let code = path[0];
+    if len == 1 {
+        if is_path_sep(code) {
+            root = p.to_string();
+            dir = p.to_string();
+            return (root, dir, base, ext, name);
+        }
+        base = p.to_string();
+        name = p.to_string();
+        return (root, dir, base, ext, name);
+    }
+    if is_path_sep(code) {
+        root_end = 1;
+        if is_path_sep(path[1]) {
+            let mut j = 2usize;
+            let mut last = j;
+            while j < len && !is_path_sep(path[j]) {
+                j += 1;
+            }
+            if j < len && j != last {
+                last = j;
+                while j < len && is_path_sep(path[j]) {
+                    j += 1;
+                }
+                if j < len && j != last {
+                    last = j;
+                    while j < len && !is_path_sep(path[j]) {
+                        j += 1;
+                    }
+                    if j == len {
+                        root_end = j;
+                    } else if j != last {
+                        root_end = j + 1;
+                    }
+                }
+            }
+        }
+    } else if is_win_device_root(code) && path.get(1) == Some(&':') {
+        if len <= 2 {
+            root = p.to_string();
+            dir = p.to_string();
+            return (root, dir, base, ext, name);
+        }
+        root_end = 2;
+        if is_path_sep(path[2]) {
+            if len == 3 {
+                root = p.to_string();
+                dir = p.to_string();
+                return (root, dir, base, ext, name);
+            }
+            root_end = 3;
+        }
+    }
+    if root_end > 0 {
+        root = path[..root_end].iter().collect();
+    }
+    let mut start_dot: isize = -1;
+    let mut start_part = root_end as isize;
+    let mut end: isize = -1;
+    let mut matched_slash = true;
+    let mut pre_dot_state = 0i32;
+    let mut i = len as isize - 1;
+    while i >= root_end as isize {
+        let c = path[i as usize];
+        if is_path_sep(c) {
+            if !matched_slash {
+                start_part = i + 1;
+                break;
+            }
+            i -= 1;
+            continue;
+        }
+        if end == -1 {
+            matched_slash = false;
+            end = i + 1;
+        }
+        if c == '.' {
+            if start_dot == -1 {
+                start_dot = i;
+            } else if pre_dot_state != 1 {
+                pre_dot_state = 1;
+            }
+        } else if start_dot != -1 {
+            pre_dot_state = -1;
+        }
+        i -= 1;
+    }
+    if end != -1 {
+        if start_dot == -1
+            || pre_dot_state == 0
+            || (pre_dot_state == 1 && start_dot == end - 1 && start_dot == start_part + 1)
+        {
+            base = path[start_part as usize..end as usize].iter().collect();
+            name = base.clone();
+        } else {
+            name = path[start_part as usize..start_dot as usize]
+                .iter()
+                .collect();
+            base = path[start_part as usize..end as usize].iter().collect();
+            ext = path[start_dot as usize..end as usize].iter().collect();
+        }
+    }
+    if start_part > 0 && start_part != root_end as isize {
+        dir = path[..(start_part - 1) as usize].iter().collect();
+    } else {
+        dir = root.clone();
+    }
+    (root, dir, base, ext, name)
 }
 
 // ---- native method wrappers ----
@@ -356,62 +1412,53 @@ fn collect_strings(args: &[Value], ctx: &mut NativeCtx<'_>) -> Result<Vec<String
 fn path_basename(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let path = require_str(args, 0, ctx)?;
     let ext = opt_arg_string(args, 1, ctx)?;
-    string_value(ctx, &basename(&path, ext.as_deref()))
+    string_value(ctx, &posix_basename_str(&path, ext.as_deref()))
 }
 
 fn path_dirname(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let path = require_str(args, 0, ctx)?;
-    string_value(ctx, &dirname(&path))
+    string_value(ctx, &posix_dirname_str(&path))
 }
 
 fn path_extname(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let path = require_str(args, 0, ctx)?;
-    string_value(ctx, &extname(&path))
+    string_value(ctx, &posix_extname_str(&path))
 }
 
 fn path_is_absolute(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let path = require_str(args, 0, ctx)?;
-    Ok(Value::boolean(path.starts_with('/')))
+    Ok(Value::boolean(!path.is_empty() && path.starts_with('/')))
 }
 
 fn path_join(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let parts = collect_strings(args, ctx)?;
-    string_value(ctx, &join(&parts))
+    string_value(ctx, &posix_join_str(&parts))
 }
 
 fn path_normalize(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let path = require_str(args, 0, ctx)?;
-    string_value(ctx, &normalize_posix(&path))
+    string_value(ctx, &posix_normalize_str(&path))
 }
 
 fn path_resolve(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let parts = collect_strings(args, ctx)?;
-    string_value(ctx, &resolve(&parts))
+    string_value(ctx, &posix_resolve_str(&parts))
 }
 
 fn path_relative(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let from = require_str(args, 0, ctx)?;
     let to = require_str(args, 1, ctx)?;
-    string_value(ctx, &relative(&from, &to))
+    string_value(ctx, &posix_relative_str(&from, &to))
 }
 
-fn path_parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let path = require_str(args, 0, ctx)?;
-    let root = if path.starts_with('/') { "/" } else { "" };
-    let base = basename_of(&path).to_string();
-    let ext = extname(&path);
-    let name = base[..base.len() - ext.len()].to_string();
-    // dir = everything up to the last slash of the trailing-stripped path.
-    let trimmed = path.trim_end_matches('/');
-    let dir = match trimmed.rfind('/') {
-        Some(0) => "/".to_string(),
-        Some(i) => trimmed[..i].to_string(),
-        None => String::new(),
-    };
-
+fn build_parse_object(
+    ctx: &mut NativeCtx<'_>,
+    parts: (String, String, String, String, String),
+) -> Result<Value, NativeError> {
+    let (root, dir, base, ext, name) = parts;
     let mut scope = ModuleScope::new(ctx);
-    let obj = scope.object().map_err(string_err)?;
-    scope.set_string(obj, "root", root).map_err(string_err)?;
+    let obj = scope.ordinary_object().map_err(string_err)?;
+    scope.set_string(obj, "root", &root).map_err(string_err)?;
     scope.set_string(obj, "dir", &dir).map_err(string_err)?;
     scope.set_string(obj, "base", &base).map_err(string_err)?;
     scope.set_string(obj, "ext", &ext).map_err(string_err)?;
@@ -419,42 +1466,135 @@ fn path_parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     Ok(scope.finish(obj))
 }
 
-fn path_format(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let obj = args
-        .first()
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| crate::type_error("path.format", "argument must be an object"))?;
+fn path_parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let path = require_str(args, 0, ctx)?;
+    build_parse_object(ctx, posix_parse_parts(&path))
+}
+
+/// Shared `_format` body (`dir === root ? dir+base : dir+sep+base`).
+fn format_path(ctx: &mut NativeCtx<'_>, args: &[Value], sep: char) -> Result<Value, NativeError> {
+    let arg = args.first().copied().unwrap_or_else(Value::undefined);
+    let Some(obj) = arg.as_object() else {
+        let suffix = arg_type_helper(&arg, ctx.heap());
+        return Err(invalid_arg_type(format!(
+            "The \"pathObject\" argument must be of type object.{suffix}"
+        )));
+    };
     let heap = ctx.heap();
     let read = |key: &str| -> Option<String> {
         otter_vm::object::get(obj, heap, key)
             .filter(|v| !v.is_undefined() && !v.is_null())
             .map(|v| v.display_string(heap))
     };
-    let dir = read("dir").or_else(|| read("root")).unwrap_or_default();
-    let base = read("base").unwrap_or_else(|| {
-        format!(
-            "{}{}",
-            read("name").unwrap_or_default(),
-            read("ext").unwrap_or_default()
-        )
-    });
-    let out = if dir.is_empty() {
-        base
-    } else if dir.ends_with('/') {
+    let truthy = |o: &Option<String>| o.as_deref().is_some_and(|s| !s.is_empty());
+
+    let dir_prop = read("dir");
+    let root_prop = read("root");
+    let dir = if truthy(&dir_prop) {
+        dir_prop.unwrap()
+    } else {
+        root_prop.clone().unwrap_or_default()
+    };
+    let base_prop = read("base");
+    let base = if truthy(&base_prop) {
+        base_prop.unwrap()
+    } else {
+        let name = read("name").filter(|s| !s.is_empty()).unwrap_or_default();
+        let ext = read("ext").unwrap_or_default();
+        format!("{name}{}", format_ext(&ext))
+    };
+    if dir.is_empty() {
+        return string_value(ctx, &base);
+    }
+    // `dir === pathObject.root`: the *effective* dir equals the raw root value.
+    let dir_is_root = root_prop.as_deref() == Some(dir.as_str());
+    let out = if dir_is_root {
         format!("{dir}{base}")
     } else {
-        format!("{dir}/{base}")
+        format!("{dir}{sep}{base}")
     };
     string_value(ctx, &out)
+}
+
+fn path_format(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    format_path(ctx, args, '/')
 }
 
 fn string_err(message: String) -> NativeError {
     crate::type_error("path", message)
 }
 
+/// Node's `invalidArgTypeHelper` suffix for a rejected value (` Received ...`).
+fn arg_type_helper(v: &Value, heap: &otter_gc::GcHeap) -> String {
+    if v.is_undefined() {
+        " Received undefined".to_string()
+    } else if v.is_null() {
+        " Received null".to_string()
+    } else if v.is_string() {
+        format!(" Received type string ('{}')", v.display_string(heap))
+    } else if v.is_boolean() {
+        format!(" Received type boolean ({})", v.display_string(heap))
+    } else if v.is_number() {
+        format!(" Received type number ({})", v.display_string(heap))
+    } else {
+        format!(" Received {}", v.display_string(heap))
+    }
+}
+
 /// posix `toNamespacedPath` is the identity (non-strings pass through too).
 fn path_to_namespaced(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     Ok(args.first().copied().unwrap_or_else(Value::undefined))
+}
+
+fn win32_basename(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let path = require_str(args, 0, ctx)?;
+    let ext = opt_arg_string(args, 1, ctx)?;
+    string_value(ctx, &win32_basename_str(&path, ext.as_deref()))
+}
+
+fn win32_dirname(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let path = require_str(args, 0, ctx)?;
+    string_value(ctx, &win32_dirname_str(&path))
+}
+
+fn win32_extname(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let path = require_str(args, 0, ctx)?;
+    string_value(ctx, &win32_extname_str(&path))
+}
+
+fn win32_is_absolute(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let path = require_str(args, 0, ctx)?;
+    Ok(Value::boolean(win32_is_absolute_str(&path)))
+}
+
+fn win32_normalize(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let path = require_str(args, 0, ctx)?;
+    string_value(ctx, &win32_normalize_str(&path))
+}
+
+fn win32_join(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let parts = collect_strings(args, ctx)?;
+    string_value(ctx, &win32_join_str(&parts))
+}
+
+fn win32_resolve(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let parts = collect_strings(args, ctx)?;
+    string_value(ctx, &win32_resolve_str(&parts))
+}
+
+fn win32_relative(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let from = require_str(args, 0, ctx)?;
+    let to = require_str(args, 1, ctx)?;
+    string_value(ctx, &win32_relative_str(&from, &to))
+}
+
+fn win32_parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let path = require_str(args, 0, ctx)?;
+    build_parse_object(ctx, win32_parse_parts(&path))
+}
+
+fn win32_format(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    format_path(ctx, args, '\\')
 }
 
 /// win32 `toNamespacedPath`: prefix absolute drive/UNC paths with `\\?\`.
@@ -469,24 +1609,27 @@ fn win32_to_namespaced(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     if path.is_empty() {
         return Ok(*first);
     }
-    let resolved = win32_resolve_str(std::slice::from_ref(&path));
-    if resolved.len() <= 2 {
-        return string_value(ctx, &path);
+    string_value(ctx, &win32_to_namespaced_str(&path))
+}
+
+fn win32_to_namespaced_str(p: &str) -> String {
+    let resolved = win32_resolve_str(std::slice::from_ref(&p.to_string()));
+    let rc: Vec<char> = resolved.chars().collect();
+    if rc.len() <= 2 {
+        return p.to_string();
     }
-    let b = resolved.as_bytes();
-    let out = if b[0] == b'\\' && b.get(1) == Some(&b'\\') {
-        // UNC: \\server\share -> \\?\UNC\server\share (unless already \\?\).
-        if b.get(2) == Some(&b'?') {
-            resolved.clone()
-        } else {
-            format!("\\\\?\\UNC\\{}", &resolved[2..])
+    if rc[0] == '\\' {
+        if rc[1] == '\\' {
+            let code = rc[2];
+            if code != '?' && code != '.' {
+                let rest: String = rc[2..].iter().collect();
+                return format!("\\\\?\\UNC\\{rest}");
+            }
         }
-    } else if b[0].is_ascii_alphabetic() && b.get(1) == Some(&b':') && b.get(2) == Some(&b'\\') {
-        format!("\\\\?\\{resolved}")
-    } else {
-        resolved.clone()
-    };
-    string_value(ctx, &out)
+    } else if is_win_device_root(rc[0]) && rc[1] == ':' && rc[2] == '\\' {
+        return format!("\\\\?\\{resolved}");
+    }
+    resolved
 }
 
 /// posix `matchesGlob(path, pattern)` — glob matching via `globset` (supports
@@ -510,308 +1653,4 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
         .build()
         .map(|g| g.compile_matcher().is_match(path))
         .unwrap_or(false)
-}
-
-// ---- win32 algorithms (both `/` and `\` are separators) ----
-
-fn win32_is_sep(c: char) -> bool {
-    c == '/' || c == '\\'
-}
-
-/// Split a Windows path into `(device, is_absolute, rest)`. `device` is the
-/// drive (`C:`) or UNC (`\\server\share`) prefix *without* the root separator;
-/// `is_absolute` is whether a root separator follows the device; `rest` is the
-/// remainder after the device + optional root sep. Separator bytes are ASCII so
-/// byte slicing at their positions is safe.
-fn win32_split_root(p: &str) -> (String, bool, &str) {
-    let b = p.as_bytes();
-    let is_sep_b = |c: u8| c == b'/' || c == b'\\';
-    if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
-        let device = format!("{}:", b[0] as char);
-        if b.len() >= 3 && is_sep_b(b[2]) {
-            return (device, true, &p[3..]);
-        }
-        return (device, false, &p[2..]);
-    }
-    if b.len() >= 2 && is_sep_b(b[0]) && is_sep_b(b[1]) {
-        // UNC: \\server\share
-        let mut i = 2;
-        while i < b.len() && !is_sep_b(b[i]) {
-            i += 1;
-        }
-        if i > 2 && i < b.len() {
-            let server_end = i;
-            let mut j = i + 1;
-            while j < b.len() && !is_sep_b(b[j]) {
-                j += 1;
-            }
-            if j > i + 1 {
-                let device = format!("\\\\{}\\{}", &p[2..server_end], &p[i + 1..j]);
-                // Skip the root separator that follows the share, if present, so
-                // `rest` never starts with it (UNC paths are always absolute).
-                let rest = if j < b.len() { &p[j + 1..] } else { &p[j..] };
-                return (device, true, rest);
-            }
-        }
-        // Too many / malformed leading slashes: treat as a plain absolute root.
-        return (String::new(), true, &p[1..]);
-    }
-    if !b.is_empty() && is_sep_b(b[0]) {
-        return (String::new(), true, &p[1..]);
-    }
-    (String::new(), false, p)
-}
-
-fn win32_is_absolute_str(p: &str) -> bool {
-    win32_split_root(p).1
-}
-
-fn win32_basename(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let path = require_str(args, 0, ctx)?;
-    let ext = opt_arg_string(args, 1, ctx)?;
-    // Strip the drive/UNC root first so `C:\` / `C:` basename to "".
-    let (_, _, rest) = win32_split_root(&path);
-    let base = rest
-        .rsplit(win32_is_sep)
-        .find(|s| !s.is_empty())
-        .unwrap_or("");
-    let out = match ext.as_deref() {
-        Some(ext) if path == ext => "",
-        Some(ext) if !ext.is_empty() && base.len() > ext.len() && base.ends_with(ext) => {
-            &base[..base.len() - ext.len()]
-        }
-        _ => base,
-    };
-    string_value(ctx, out)
-}
-
-fn win32_dirname(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let path = require_str(args, 0, ctx)?;
-    if path.is_empty() {
-        return string_value(ctx, ".");
-    }
-    let (device, is_abs, rest) = win32_split_root(&path);
-    let root = if is_abs {
-        format!("{device}\\")
-    } else {
-        device.clone()
-    };
-    let rest_trimmed = rest.trim_end_matches(win32_is_sep);
-    let out = match rest_trimmed.rfind(win32_is_sep) {
-        Some(i) => format!("{root}{}", &rest_trimmed[..i]),
-        // A single component below the root: dirname is the root (with sep).
-        None if !rest_trimmed.is_empty() => {
-            if root.is_empty() {
-                ".".to_string()
-            } else {
-                root
-            }
-        }
-        // No component at all (path is just the root): a UNC root is its own
-        // dirname (no trailing sep); a drive root keeps its separator.
-        None if device.starts_with("\\\\") => device,
-        None if !root.is_empty() => root,
-        None => ".".to_string(),
-    };
-    let out = if out.is_empty() { ".".to_string() } else { out };
-    string_value(ctx, &out)
-}
-
-fn win32_extname(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let path = require_str(args, 0, ctx)?;
-    // Strip the drive/UNC root so the extension scan starts at the basename.
-    let (_, _, rest) = win32_split_root(&path);
-    string_value(ctx, &extname_with(rest, win32_is_sep))
-}
-
-fn win32_is_absolute(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let path = require_str(args, 0, ctx)?;
-    Ok(Value::boolean(win32_is_absolute_str(&path)))
-}
-
-fn win32_normalize_str(p: &str) -> String {
-    if p.is_empty() {
-        return ".".to_string();
-    }
-    let (device, is_abs, rest) = win32_split_root(p);
-    let trailing = rest.chars().next_back().is_some_and(win32_is_sep);
-    let mut parts: Vec<&str> = Vec::new();
-    for seg in rest.split(win32_is_sep) {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                if let Some(&last) = parts.last() {
-                    if last == ".." {
-                        parts.push("..");
-                    } else {
-                        parts.pop();
-                    }
-                } else if !is_abs {
-                    parts.push("..");
-                }
-            }
-            other => parts.push(other),
-        }
-    }
-    let mut body = parts.join("\\");
-    if body.is_empty() && !is_abs {
-        body.push('.');
-    }
-    if !body.is_empty() && trailing && !body.ends_with('\\') {
-        body.push('\\');
-    }
-    let mut out = device;
-    if is_abs {
-        out.push('\\');
-    }
-    out.push_str(&body);
-    if out.is_empty() {
-        out.push('.');
-    }
-    out
-}
-
-fn win32_normalize(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let path = require_str(args, 0, ctx)?;
-    string_value(ctx, &win32_normalize_str(&path))
-}
-
-fn win32_join(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let parts: Vec<String> = collect_strings(args, ctx)?
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect();
-    if parts.is_empty() {
-        return string_value(ctx, ".");
-    }
-    string_value(ctx, &win32_normalize_str(&parts.join("\\")))
-}
-
-fn win32_resolve_str(parts: &[String]) -> String {
-    let mut resolved = String::new();
-    let mut is_abs = false;
-    for part in parts.iter().rev() {
-        if part.is_empty() {
-            continue;
-        }
-        resolved = if resolved.is_empty() {
-            part.clone()
-        } else {
-            format!("{part}\\{resolved}")
-        };
-        if win32_is_absolute_str(part) {
-            is_abs = true;
-            break;
-        }
-    }
-    if !is_abs {
-        let base = cwd().replace('/', "\\");
-        resolved = if resolved.is_empty() {
-            base
-        } else {
-            format!("{base}\\{resolved}")
-        };
-    }
-    let normalized = win32_normalize_str(&resolved);
-    let trimmed = normalized.trim_end_matches('\\');
-    if trimmed.is_empty() {
-        "\\".to_string()
-    } else if trimmed.ends_with(':') {
-        format!("{trimmed}\\")
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn win32_resolve(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let parts = collect_strings(args, ctx)?;
-    let out = win32_resolve_str(&parts);
-    string_value(ctx, &out)
-}
-
-fn win32_relative(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let from = require_str(args, 0, ctx)?;
-    let to = require_str(args, 1, ctx)?;
-    let from = win32_normalize_str(&from).replace('/', "\\");
-    let to = win32_normalize_str(&to).replace('/', "\\");
-    if from.eq_ignore_ascii_case(&to) {
-        return string_value(ctx, "");
-    }
-    // Different drive/UNC roots cannot be relativised — return the target.
-    let (from_dev, _, _) = win32_split_root(&from);
-    let (to_dev, _, _) = win32_split_root(&to);
-    if !from_dev.eq_ignore_ascii_case(&to_dev) {
-        return string_value(ctx, &to);
-    }
-    let from_parts: Vec<&str> = from.split('\\').filter(|s| !s.is_empty()).collect();
-    let to_parts: Vec<&str> = to.split('\\').filter(|s| !s.is_empty()).collect();
-    let common = from_parts
-        .iter()
-        .zip(to_parts.iter())
-        .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
-        .count();
-    let mut out: Vec<&str> = Vec::new();
-    out.extend(std::iter::repeat_n("..", from_parts.len() - common));
-    out.extend_from_slice(&to_parts[common..]);
-    string_value(ctx, &out.join("\\"))
-}
-
-fn win32_parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let path = require_str(args, 0, ctx)?;
-    let (device, is_abs, rest) = win32_split_root(&path);
-    let root = if is_abs {
-        format!("{device}\\")
-    } else {
-        device.clone()
-    };
-    let base = rest
-        .rsplit(win32_is_sep)
-        .find(|s| !s.is_empty())
-        .unwrap_or("")
-        .to_string();
-    let ext = extname_with(&base, win32_is_sep);
-    let name = base[..base.len() - ext.len()].to_string();
-    let rest_trimmed = rest.trim_end_matches(win32_is_sep);
-    let dir = match rest_trimmed.rfind(win32_is_sep) {
-        Some(i) => format!("{root}{}", &rest_trimmed[..i]),
-        None => root.clone(),
-    };
-
-    let mut scope = ModuleScope::new(ctx);
-    let obj = scope.object().map_err(string_err)?;
-    scope.set_string(obj, "root", &root).map_err(string_err)?;
-    scope.set_string(obj, "dir", &dir).map_err(string_err)?;
-    scope.set_string(obj, "base", &base).map_err(string_err)?;
-    scope.set_string(obj, "ext", &ext).map_err(string_err)?;
-    scope.set_string(obj, "name", &name).map_err(string_err)?;
-    Ok(scope.finish(obj))
-}
-
-fn win32_format(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let obj = args
-        .first()
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| crate::type_error("path.win32.format", "argument must be an object"))?;
-    let heap = ctx.heap();
-    let read = |key: &str| -> Option<String> {
-        otter_vm::object::get(obj, heap, key)
-            .filter(|v| !v.is_undefined() && !v.is_null())
-            .map(|v| v.display_string(heap))
-    };
-    let dir = read("dir").or_else(|| read("root")).unwrap_or_default();
-    let base = read("base").unwrap_or_else(|| {
-        format!(
-            "{}{}",
-            read("name").unwrap_or_default(),
-            read("ext").unwrap_or_default()
-        )
-    });
-    let out = if dir.is_empty() {
-        base
-    } else if dir.ends_with('\\') || dir.ends_with('/') {
-        format!("{dir}{base}")
-    } else {
-        format!("{dir}\\{base}")
-    };
-    string_value(ctx, &out)
 }

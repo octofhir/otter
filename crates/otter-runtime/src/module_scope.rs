@@ -97,6 +97,48 @@ impl<'a, 'rt> ModuleScope<'a, 'rt> {
         Ok(self.root(Value::object(obj)))
     }
 
+    /// Allocate an ordinary object and seat it on `%Object.prototype%`.
+    ///
+    /// [`ModuleScope::object`] leaves a fresh host object with a null
+    /// `[[Prototype]]`; use this when the result is handed back to user code as
+    /// a plain object (e.g. `path.parse`), so `Object.getPrototypeOf(o) ===
+    /// Object.prototype` and structural `deepStrictEqual` against an object
+    /// literal holds.
+    ///
+    /// # Errors
+    /// Returns the error message on allocation failure.
+    pub fn ordinary_object(&mut self) -> Result<Rooted, String> {
+        let rooted = self.object()?;
+        if let Some(proto) = self.object_prototype() {
+            let obj = self
+                .value(rooted)
+                .as_object()
+                .expect("freshly allocated object");
+            object::set_prototype(obj, self.ctx.heap_mut(), Some(proto));
+        }
+        Ok(rooted)
+    }
+
+    /// Resolve `%Object.prototype%` via `globalThis.Object.prototype`.
+    fn object_prototype(&mut self) -> Option<object::JsObject> {
+        let interp = self.ctx.interp_mut();
+        let global = *interp.global_this();
+        let ctor = object::get(global, interp.gc_heap(), "Object")?;
+        if let Some(native) = ctor.as_native_function() {
+            return native
+                .own_property_descriptor(interp.gc_heap_mut(), "prototype")
+                .ok()
+                .flatten()
+                .and_then(|desc| match desc.kind {
+                    object::DescriptorKind::Data { value } => value.as_object(),
+                    _ => None,
+                });
+        }
+        ctor.as_object()
+            .and_then(|o| object::get(o, interp.gc_heap(), "prototype"))
+            .and_then(|p| p.as_object())
+    }
+
     /// Build a native function from a static fast fn.
     ///
     /// # Errors

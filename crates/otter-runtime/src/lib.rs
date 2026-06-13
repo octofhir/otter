@@ -3105,7 +3105,16 @@ impl Runtime {
             let cache = ctx.alloc_object().map_err(gc_oom_to_error)?;
             commonjs::cjs_instantiate_file(&mut ctx, &cfg, cache, &abs, &source.text)
         };
-        load.map_err(commonjs_native_to_error)?;
+        if let Err(err) = load {
+            // `process.exit(code)` during module evaluation (e.g. `common.skip`)
+            // is a clean process termination, not a load failure — surface the
+            // exit code instead of wrapping it as a COMMONJS_LOAD error.
+            if let otter_vm::NativeError::Exit { code } = err {
+                let result = ExecutionResult::from_exit_code(code, start.elapsed());
+                return Ok((result, context));
+            }
+            return Err(commonjs_native_to_error(err));
+        }
         // Drain microtasks queued during module execution.
         self.interp.drain_microtasks(&context).map_err(|err| {
             enrich_runtime_diagnostic_with_cause(&mut self.interp, map_vm_error(err))

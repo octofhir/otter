@@ -17,6 +17,30 @@ pub(crate) fn compile_new(
     let _ = span;
     let new_span = (new_expr.span.start, new_expr.span.end);
     let callee = unwrap_ts_expr(&new_expr.callee);
+    // §13.3.5 — a `new C(...args)` whose arguments include a SpreadElement
+    // must build its argument list dynamically. Route it straight to the
+    // general `Op::NewSpread` path; the special-case constructor fast paths
+    // below (Object / Array / Function / Intl, …) only accept positional
+    // arguments and would otherwise reject the spread.
+    if new_expr
+        .arguments
+        .iter()
+        .any(|arg| matches!(arg, oxc_ast::ast::Argument::SpreadElement(_)))
+    {
+        let callee_reg = compile_expr(cx, callee, new_span)?;
+        let args_reg = compile_spread_call_args(cx, &new_expr.arguments, new_span)?;
+        let dst = cx.alloc_scratch();
+        cx.emit(
+            Op::NewSpread,
+            vec![
+                Operand::Register(dst),
+                Operand::Register(callee_reg),
+                Operand::Register(args_reg),
+            ],
+            new_span,
+        );
+        return Ok(dst);
+    }
     // ECMA-262 §19.3 / §20.5 native error constructors —
     // every one of `Error`, `TypeError`, `RangeError`,
     // `SyntaxError`, `ReferenceError`, `URIError`,
@@ -196,28 +220,9 @@ pub(crate) fn compile_new(
     // `NativeFunction`, the constructor flows through the
     // ordinary `Op::New` dispatch like every other
     // builtin (§27.2.3.1).
-    // §13.3.5 NewExpression — `new C(...args)` may include
-    // SpreadElement arguments. Route those through
-    // `Op::NewSpread` (mirrors `Op::CallSpread` for calls).
-    let has_spread = new_expr
-        .arguments
-        .iter()
-        .any(|arg| matches!(arg, oxc_ast::ast::Argument::SpreadElement(_)));
+    // §13.3.5 NewExpression — positional arguments (spread is handled by the
+    // early-return path above).
     let callee_reg = compile_expr(cx, callee, new_span)?;
-    if has_spread {
-        let args_reg = compile_spread_call_args(cx, &new_expr.arguments, new_span)?;
-        let dst = cx.alloc_scratch();
-        cx.emit(
-            Op::NewSpread,
-            vec![
-                Operand::Register(dst),
-                Operand::Register(callee_reg),
-                Operand::Register(args_reg),
-            ],
-            new_span,
-        );
-        return Ok(dst);
-    }
     let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
     let dst = cx.alloc_scratch();
     let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());

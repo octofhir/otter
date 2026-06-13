@@ -8,6 +8,7 @@ const V8_SHIM: &str = include_str!("v8.js");
 const MODULE_SHIM: &str = include_str!("module_builtin.js");
 const CLUSTER_SHIM: &str = include_str!("cluster.js");
 const INTERNAL_UTIL_SHIM: &str = include_str!("internal_util.js");
+const VM_SHIM: &str = include_str!("vm.js");
 
 /// `node:cluster` — single-process stub (always primary, no workers).
 pub fn cluster_cjs_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result<Value, String> {
@@ -41,6 +42,11 @@ pub fn internal_util_cjs_value(
     _caps: &CapabilitySet,
 ) -> Result<Value, String> {
     otter_runtime::run_builtin_cjs_shim(ctx, "internal/util", INTERNAL_UTIL_SHIM, &[])
+}
+
+/// `node:vm` — best-effort in-realm sandbox (with-scoped Proxy).
+pub fn vm_cjs_value(ctx: &mut NativeCtx<'_>, _caps: &CapabilitySet) -> Result<Value, String> {
+    otter_runtime::run_builtin_cjs_shim(ctx, "node:vm", VM_SHIM, &[])
 }
 
 /// ESM namespace install — CommonJS is the supported surface for now.

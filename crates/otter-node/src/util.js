@@ -113,9 +113,6 @@ function formatValue(value, options, depth, seen) {
   // object-like
   if (seen.has(value)) return '[Circular *1]';
 
-  if (types.isRegExp(value)) return value.toString();
-  if (types.isDate(value)) return Number.isNaN(value.getTime()) ? 'Invalid Date' : value.toISOString();
-
   if (depth > options.depth && options.depth !== null) {
     if (Array.isArray(value)) return '[Array]';
     return '[Object]';
@@ -132,7 +129,9 @@ function formatValue(value, options, depth, seen) {
   seen.add(value);
   let out;
   try {
-    if (value instanceof Error) out = formatError(value, options, depth, seen);
+    if (types.isRegExp(value)) out = formatWrappedPrimitive(value, value.toString(), options, depth, seen);
+    else if (types.isDate(value)) out = formatWrappedPrimitive(value, Number.isNaN(value.getTime()) ? 'Invalid Date' : value.toISOString(), options, depth, seen);
+    else if (value instanceof Error) out = formatError(value, options, depth, seen);
     else if (Array.isArray(value)) out = formatArray(value, options, depth, seen);
     else if (types.isMap(value)) out = formatMap(value, options, depth, seen);
     else if (types.isSet(value)) out = formatSet(value, options, depth, seen);
@@ -142,6 +141,28 @@ function formatValue(value, options, depth, seen) {
     seen.delete(value);
   }
   return out;
+}
+
+// §Date / RegExp — the primitive rendering (ISO string / `/re/flags`), prefixed
+// with the constructor name when it is a subclass, plus any own enumerable
+// expando properties as a trailing block (e.g. `MyDate 2016-...Z { '0': '1' }`).
+function formatWrappedPrimitive(value, base, options, depth, seen) {
+  const ctorName = value.constructor && value.constructor.name ? value.constructor.name : '';
+  const tag = Object.prototype.toString.call(value).slice(8, -1);
+  const prefixed = ctorName && ctorName !== tag ? `${ctorName} ${base}` : base;
+  const parts = [];
+  const keys = Object.keys(value);
+  if (options.sorted) keys.sort();
+  for (const k of keys) {
+    parts.push(`${keyToString(k)}: ${formatValue(value[k], options, depth + 1, seen)}`);
+  }
+  for (const sym of Object.getOwnPropertySymbols(value)) {
+    if (Object.getOwnPropertyDescriptor(value, sym).enumerable) {
+      parts.push(`${keyToString(sym)}: ${formatValue(value[sym], options, depth + 1, seen)}`);
+    }
+  }
+  if (parts.length === 0) return prefixed;
+  return reduceToSingleString(parts, `${prefixed} `, ['{', '}'], options, depth);
 }
 
 // §Errors — `[Name: message]`, with non-enumerable `cause` and any extra own

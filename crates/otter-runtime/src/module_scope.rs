@@ -20,6 +20,7 @@
 //!   before the scope drops (the CommonJS loader stores it into `require.cache`
 //!   under a fresh root).
 
+use otter_vm::object::PartialPropertyDescriptor;
 use otter_vm::{NativeCall, NativeCtx, NativeFastFn, Value, number::NumberValue, object};
 
 fn oom(err: otter_gc::OutOfMemory) -> String {
@@ -180,6 +181,47 @@ impl<'a, 'rt> ModuleScope<'a, 'rt> {
         let value = self.string(s)?;
         self.set(obj, key, value);
         Ok(())
+    }
+
+    /// Define a non-writable, configurable, enumerable string property
+    /// (e.g. `os.EOL`, which must throw on assignment in strict mode yet stay
+    /// redefinable via `Object.defineProperties`).
+    ///
+    /// # Errors
+    /// Returns the error message on allocation failure.
+    pub fn set_string_readonly(&mut self, obj: Rooted, key: &str, s: &str) -> Result<(), String> {
+        let value = self.string(s)?;
+        let v = self.value(value);
+        let target = self
+            .value(obj)
+            .as_object()
+            .expect("ModuleScope::set_string_readonly target is not an object");
+        let descriptor = PartialPropertyDescriptor {
+            value: Some(v),
+            writable: Some(false),
+            enumerable: Some(true),
+            configurable: Some(true),
+            ..PartialPropertyDescriptor::default()
+        };
+        object::define_own_property_partial(target, self.ctx.heap_mut(), key, descriptor);
+        Ok(())
+    }
+
+    /// Define a number property on `obj`.
+    pub fn set_number(&mut self, obj: Rooted, key: &str, n: f64) {
+        let value = self.number(n);
+        self.set(obj, key, value);
+    }
+
+    /// Build an array from already-rooted elements. Reads each element live
+    /// from its root slot, so it is safe across the intermediate allocations.
+    ///
+    /// # Errors
+    /// Returns the error message on allocation failure.
+    pub fn array(&mut self, items: &[Rooted]) -> Result<Rooted, String> {
+        let values: Vec<Value> = items.iter().map(|r| self.value(*r)).collect();
+        let arr = self.ctx.array_from_elements(values).map_err(oom)?;
+        Ok(self.root(Value::array(arr)))
     }
 
     /// Return the export value. It is read live from its root slot; the caller

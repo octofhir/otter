@@ -17,7 +17,7 @@
 use otter_gc::GcHeap;
 use otter_runtime::CapabilitySet;
 use otter_runtime::module_scope::ModuleScope;
-use otter_vm::{NativeCtx, NativeError, Value, abstract_ops};
+use otter_vm::{ErrorKind, NativeCtx, NativeError, Value, abstract_ops};
 
 /// Build the ESM namespace object for `node:assert` (methods as properties; the
 /// namespace itself is not callable). CommonJS `require` uses [`assert_cjs_value`].
@@ -67,9 +67,15 @@ const ASSERT_METHODS: &[Method] = &[
     ("doesNotMatch", 2, assert_does_not_match),
 ];
 
+/// An assertion failure. Uses the structured `Coded` path (not `Thrown`, whose
+/// `message`-only form lowers to the lossy `VmError::Uncaught{String}` that the
+/// CommonJS boundary cannot turn back into a catchable Error). `Coded`
+/// materializes a real Error instance carrying `code = 'ERR_ASSERTION'`, so
+/// user `try`/`catch` and the `node:test` harness observe it.
 fn fail(message: impl Into<String>) -> NativeError {
-    NativeError::Thrown {
-        name: "assert",
+    NativeError::Coded {
+        kind: ErrorKind::Error,
+        code: "ERR_ASSERTION",
         message: message.into(),
     }
 }

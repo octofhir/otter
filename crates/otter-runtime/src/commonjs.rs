@@ -54,6 +54,80 @@ fn vm_err(err: otter_vm::VmError) -> NativeError {
     otter_vm::native_function::vm_to_native_error(err, "require")
 }
 
+/// Run an embedded JavaScript shim as a CommonJS module and return its
+/// `module.exports`. For builtin modules whose natural implementation is a
+/// self-contained JS class or helper set (e.g. `events`, `node:test`).
+///
+/// The shim runs through the same wrapper as a file module
+/// (`(function (exports, require, module, __filename, __dirname) { ... })`).
+/// `require` resolves only the explicitly supplied `deps` (name → value);
+/// anything else throws `Cannot find module`. `__filename`/`__dirname` are the
+/// module name (diagnostics only). Pass `&[]` for a dependency-free shim.
+///
+/// # Errors
+/// Returns a string on compile or runtime failure of the shim.
+pub fn run_builtin_cjs_shim(
+    ctx: &mut NativeCtx<'_>,
+    name: &str,
+    source: &str,
+    deps: &[(&str, Value)],
+) -> Result<Value, String> {
+    let exports = ctx.alloc_object().map_err(|e| e.to_string())?;
+    let module = ctx.alloc_object().map_err(|e| e.to_string())?;
+    let exports_val = Value::object(exports);
+    object::set(module, ctx.heap_mut(), "exports", exports_val);
+    let id_val = runtime_string_value(ctx, name).map_err(|e| e.to_string())?;
+    object::set(module, ctx.heap_mut(), "id", id_val);
+    object::set(module, ctx.heap_mut(), "loaded", Value::boolean(false));
+    let module_val = Value::object(module);
+    let name_val = runtime_string_value(ctx, name).map_err(|e| e.to_string())?;
+    let require_val = make_shim_require(ctx, deps)?;
+
+    let (interp, context) = ctx.interp_mut_and_context();
+    let context = context.ok_or_else(|| "missing execution context for shim load".to_string())?;
+    let wrapper = interp
+        .create_commonjs_wrapper(source)
+        .map_err(|e| e.to_string())?;
+    let call_args: SmallVec<[Value; 8]> =
+        smallvec![exports_val, require_val, module_val, name_val, name_val,];
+    interp
+        .run_callable_sync(&context, &wrapper, exports_val, call_args)
+        .map_err(|e| e.to_string())?;
+
+    let final_exports = object::get(module, interp.gc_heap(), "exports").unwrap_or(exports_val);
+    Ok(final_exports)
+}
+
+/// Build a `require` for a shim that resolves only the supplied dependencies.
+/// The deps are stored on a plain JS object (which roots their values) captured
+/// by the closure; `require(spec)` returns `deps[spec]` or throws.
+fn make_shim_require(ctx: &mut NativeCtx<'_>, deps: &[(&str, Value)]) -> Result<Value, String> {
+    let table = ctx.alloc_object().map_err(|e| e.to_string())?;
+    for (spec, value) in deps {
+        object::set(table, ctx.heap_mut(), spec, *value);
+    }
+    let captures: SmallVec<[Value; 4]> = smallvec![Value::object(table)];
+    let closure = move |ctx: &mut NativeCtx<'_>,
+                        args: &[Value],
+                        captures: &[Value]|
+          -> Result<Value, NativeError> {
+        let table = captures
+            .first()
+            .and_then(|value| value.as_object())
+            .ok_or_else(|| runtime_type_error("require", "missing shim dependency table"))?;
+        let spec = crate::runtime_arg_to_string(args, 0, ctx.heap());
+        match object::get(table, ctx.heap(), &spec) {
+            Some(value) => Ok(value),
+            None => Err(runtime_type_error(
+                "require",
+                format!("Cannot find module '{spec}'"),
+            )),
+        }
+    };
+    otter_vm::native_value_with_captures(ctx.heap_mut(), "require", captures, closure)
+        .map_err(|e| e.to_string())
+}
+
 /// Resolve a builtin (hosted) module by specifier. Matches the bare specifier
 /// directly (`fs`) or the `node:`-prefixed form (`node:fs`).
 fn resolve_builtin(cfg: &CjsConfig, spec: &str) -> Option<HostedModule> {

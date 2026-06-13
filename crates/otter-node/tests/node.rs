@@ -4,9 +4,21 @@ use otter_runtime::{CapabilitySet, Permission, Runtime};
 #[test]
 fn hosted_node_module_specs_are_static_and_ordered() {
     let specs = hosted_modules();
-    assert_eq!(specs.len(), 2);
+    // `fs` leads the list; the exact length grows as modules are ported.
     assert_eq!(specs[0].specifier(), "node:fs");
     assert_eq!(specs[1].specifier(), "fs");
+
+    // Every `node:`-prefixed builtin has a matching bare specifier.
+    let names: Vec<&str> = specs.iter().map(|m| m.specifier()).collect();
+    for name in &names {
+        if let Some(bare) = name.strip_prefix("node:") {
+            assert!(names.contains(&bare), "missing bare specifier for {name}");
+        }
+    }
+    // Core modules ported so far are registered.
+    for expected in ["os", "node:os", "node:test", "assert", "path"] {
+        assert!(names.contains(&expected), "missing hosted module {expected}");
+    }
 }
 
 #[test]

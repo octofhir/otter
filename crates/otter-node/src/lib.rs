@@ -19,6 +19,8 @@
 pub mod assert;
 pub mod fs;
 pub mod globals;
+pub mod node_test;
+pub mod os;
 pub mod path;
 pub mod stubs;
 
@@ -48,6 +50,26 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         "path",
         HostedModuleInstall::new(path::install_path_module),
         path::path_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:os",
+        HostedModuleInstall::new(os::install_os_module),
+        os::os_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "os",
+        HostedModuleInstall::new(os::install_os_module),
+        os::os_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:test",
+        HostedModuleInstall::new(node_test::install_node_test_module),
+        node_test::node_test_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "test",
+        HostedModuleInstall::new(node_test::install_node_test_module),
+        node_test::node_test_cjs_value,
     ),
     HostedModule::new("node:util", HostedModuleInstall::new(stubs::install_util)),
     HostedModule::new("util", HostedModuleInstall::new(stubs::install_util)),

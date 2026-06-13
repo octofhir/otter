@@ -1909,6 +1909,7 @@ name = "otter-node"
 version = "0.1.0"
 dependencies = [
  "globset",
+ "libc",
  "otter-gc",
  "otter-runtime",
  "otter-vm",

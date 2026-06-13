@@ -53,6 +53,7 @@
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 
 mod commonjs;
+pub use commonjs::run_builtin_cjs_shim;
 pub mod compiled_program;
 pub mod diagnostics;
 pub mod error;

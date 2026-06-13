@@ -22,6 +22,7 @@ pub mod diagnostics_channel;
 pub mod events;
 pub mod fs;
 pub mod globals;
+pub mod misc_modules;
 pub mod node_test;
 pub mod os;
 pub mod path;
@@ -164,6 +165,36 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         "readline/promises",
         HostedModuleInstall::new(readline::install_readline_module),
         readline::readline_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:perf_hooks",
+        HostedModuleInstall::new(misc_modules::install_noop),
+        misc_modules::perf_hooks_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "perf_hooks",
+        HostedModuleInstall::new(misc_modules::install_noop),
+        misc_modules::perf_hooks_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:v8",
+        HostedModuleInstall::new(misc_modules::install_noop),
+        misc_modules::v8_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "v8",
+        HostedModuleInstall::new(misc_modules::install_noop),
+        misc_modules::v8_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:module",
+        HostedModuleInstall::new(misc_modules::install_noop),
+        misc_modules::module_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "module",
+        HostedModuleInstall::new(misc_modules::install_noop),
+        misc_modules::module_cjs_value,
     ),
     HostedModule::new_with_cjs_value(
         "node:diagnostics_channel",

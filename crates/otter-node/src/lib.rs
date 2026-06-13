@@ -25,6 +25,7 @@ pub mod node_test;
 pub mod os;
 pub mod path;
 pub mod querystring;
+pub mod stream;
 pub mod string_decoder;
 pub mod stubs;
 pub mod util;
@@ -85,6 +86,16 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         "test",
         HostedModuleInstall::new(node_test::install_node_test_module),
         node_test::node_test_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:stream",
+        HostedModuleInstall::new(stream::install_stream_module),
+        stream::stream_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "stream",
+        HostedModuleInstall::new(stream::install_stream_module),
+        stream::stream_cjs_value,
     ),
     HostedModule::new_with_cjs_value(
         "node:querystring",

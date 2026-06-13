@@ -14,12 +14,32 @@ function inspectValue(v) {
   return inspect(v, { depth: null, breakLength: Infinity, compact: 3 });
 }
 
-// Operators whose generated message is a line-by-line +/- diff of the
-// (multi-line) inspect of actual vs expected.
+// Strict operators render a line-by-line +/- diff; loose operators render the
+// two values around a "should (not) loosely (deep-)equal" separator.
 const kDiffOperators = new Set([
-  'deepStrictEqual', 'notDeepStrictEqual', 'deepEqual', 'notDeepEqual',
-  'partialDeepStrictEqual', 'strictEqual', 'notStrictEqual',
+  'deepStrictEqual', 'notDeepStrictEqual', 'partialDeepStrictEqual',
+  'strictEqual', 'notStrictEqual',
 ]);
+const kLooseOperators = {
+  deepEqual: 'should loosely deep-equal',
+  notDeepEqual: 'should not loosely deep-equal',
+  equal: 'should loosely equal',
+  notEqual: 'should not loosely equal',
+};
+const kLooseHeaders = {
+  deepEqual: 'Expected values to be loosely deep-equal:',
+  notDeepEqual: 'Expected "actual" not to be loosely deep-equal to:',
+  equal: 'Expected values to be loosely equal:',
+  notEqual: 'Expected "actual" not to be loosely equal to:',
+};
+function looseDiffMessage(actual, expected, operator) {
+  const opts = {
+    compact: false, depth: 1000, customInspect: false,
+    maxArrayLength: Infinity, breakLength: Infinity, sorted: true, getters: true,
+  };
+  return `${kLooseHeaders[operator]}\n\n${inspect(actual, opts)}\n\n` +
+    `${kLooseOperators[operator]}\n\n${inspect(expected, opts)}`;
+}
 
 // Per-operator header for a generated diff message (replaced by a custom
 // message when one is supplied).
@@ -63,12 +83,15 @@ class AssertionError extends Error {
     let generatedMessage = false;
     const wantsDiff = kDiffOperators.has(operator) &&
       !(typeof operator === 'string' && operator.startsWith('not'));
+    const wantsLoose = Object.prototype.hasOwnProperty.call(kLooseOperators, operator);
     if (msg === undefined) {
       generatedMessage = true;
       if (operator === 'fail') {
         msg = 'Failed';
       } else if (wantsDiff) {
         msg = createErrDiff(actual, expected, kDiffHeaders[operator] || '');
+      } else if (wantsLoose) {
+        msg = looseDiffMessage(actual, expected, operator);
       } else {
         const op = operator || 'deepStrictEqual';
         msg = `${inspectValue(actual)} ${op} ${inspectValue(expected)}`;

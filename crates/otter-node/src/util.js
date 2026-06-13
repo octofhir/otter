@@ -115,10 +115,6 @@ function formatValue(value, options, depth, seen) {
 
   if (types.isRegExp(value)) return value.toString();
   if (types.isDate(value)) return Number.isNaN(value.getTime()) ? 'Invalid Date' : value.toISOString();
-  if (value instanceof Error) {
-    const stack = value.stack;
-    return typeof stack === 'string' ? stack : `${value.name}: ${value.message}`;
-  }
 
   if (depth > options.depth && options.depth !== null) {
     if (Array.isArray(value)) return '[Array]';
@@ -136,7 +132,8 @@ function formatValue(value, options, depth, seen) {
   seen.add(value);
   let out;
   try {
-    if (Array.isArray(value)) out = formatArray(value, options, depth, seen);
+    if (value instanceof Error) out = formatError(value, options, depth, seen);
+    else if (Array.isArray(value)) out = formatArray(value, options, depth, seen);
     else if (types.isMap(value)) out = formatMap(value, options, depth, seen);
     else if (types.isSet(value)) out = formatSet(value, options, depth, seen);
     else if (types.isTypedArray(value)) out = formatArray(Array.from(value), options, depth, seen, value.constructor.name);
@@ -145,6 +142,26 @@ function formatValue(value, options, depth, seen) {
     seen.delete(value);
   }
   return out;
+}
+
+// §Errors — `[Name: message]`, with non-enumerable `cause` and any extra own
+// enumerable properties (but not the stack/message) shown as a trailing block.
+// This is the structural form Node's assert diff and nested-value inspection
+// use (the bare stack string is a separate top-level console concern).
+function formatError(err, options, depth, seen) {
+  const name = err.name || 'Error';
+  const message = typeof err.message === 'string' ? err.message : '';
+  const base = message ? `[${name}: ${message}]` : `[${name}]`;
+  const parts = [];
+  if ('cause' in err) {
+    parts.push(`[cause]: ${formatValue(err.cause, options, depth + 1, seen)}`);
+  }
+  for (const key of Object.keys(err)) {
+    if (key === 'stack' || key === 'message') continue;
+    parts.push(`${keyToString(key)}: ${formatValue(err[key], options, depth + 1, seen)}`);
+  }
+  if (parts.length === 0) return base;
+  return reduceToSingleString(parts, `${base} `, ['{', '}'], options, depth);
 }
 
 function keyToString(key) {

@@ -153,6 +153,31 @@ function keyToString(key) {
   return quoteString(key);
 }
 
+function indentStr(depth) {
+  return '  '.repeat(depth);
+}
+
+// §reduceToSingleString — join already-formatted entries either onto one line
+// (`{ a, b }`) or, when `compact === false` or the single line would exceed
+// `breakLength` (or an entry already spans lines), across multiple indented
+// lines:
+//   prefix{
+//     a,
+//     b
+//   }
+function reduceToSingleString(parts, prefix, braces, options, depth) {
+  if (parts.length === 0) return `${prefix}${braces[0]}${braces[1]}`;
+  const hasNewline = parts.some((p) => p.includes('\n'));
+  if (options.compact !== false && !hasNewline) {
+    const single = `${prefix}${braces[0]} ${parts.join(', ')} ${braces[1]}`;
+    const start = single.length + depth * 2;
+    if (start <= options.breakLength) return single;
+  }
+  const inner = indentStr(depth + 1);
+  const body = parts.map((p) => inner + p).join(',\n');
+  return `${prefix}${braces[0]}\n${body}\n${indentStr(depth)}${braces[1]}`;
+}
+
 function formatArray(arr, options, depth, seen, prefix) {
   const items = [];
   const limit = Math.min(arr.length, options.maxArrayLength);
@@ -161,29 +186,36 @@ function formatArray(arr, options, depth, seen, prefix) {
   }
   if (arr.length > limit) items.push(`... ${arr.length - limit} more item${arr.length - limit > 1 ? 's' : ''}`);
   const head = prefix ? `${prefix}(${arr.length}) ` : '';
-  if (items.length === 0) return `${head}[]`;
-  return `${head}[ ${items.join(', ')} ]`;
+  return reduceToSingleString(items, head, ['[', ']'], options, depth);
+}
+
+function objectPrefix(obj) {
+  const tag = obj[Symbol.toStringTag];
+  const proto = Object.getPrototypeOf(obj);
+  if (proto === null) {
+    return `[${typeof tag === 'string' ? tag : 'Object'}: null prototype] `;
+  }
+  let name = '';
+  if (proto.constructor && proto.constructor.name && proto.constructor.name !== 'Object') {
+    name = proto.constructor.name;
+  }
+  if (typeof tag === 'string') {
+    return name ? `${name} [${tag}] ` : `Object [${tag}] `;
+  }
+  return name ? `${name} ` : '';
 }
 
 function formatObject(obj, options, depth, seen) {
-  const keys = Object.keys(obj);
-  const symbols = Object.getOwnPropertySymbols(obj).filter(
-    (s) => Object.getOwnPropertyDescriptor(obj, s).enumerable);
   const parts = [];
-  for (const key of keys) {
+  for (const key of Object.keys(obj)) {
     parts.push(`${keyToString(key)}: ${formatValue(obj[key], options, depth + 1, seen)}`);
   }
-  for (const sym of symbols) {
-    parts.push(`${keyToString(sym)}: ${formatValue(obj[sym], options, depth + 1, seen)}`);
+  for (const sym of Object.getOwnPropertySymbols(obj)) {
+    if (Object.getOwnPropertyDescriptor(obj, sym).enumerable) {
+      parts.push(`${keyToString(sym)}: ${formatValue(obj[sym], options, depth + 1, seen)}`);
+    }
   }
-  let ctorName = '';
-  const proto = Object.getPrototypeOf(obj);
-  if (proto === null) ctorName = '[Object: null prototype] ';
-  else if (proto.constructor && proto.constructor.name && proto.constructor.name !== 'Object') {
-    ctorName = `${proto.constructor.name} `;
-  }
-  if (parts.length === 0) return `${ctorName}{}`;
-  return `${ctorName}{ ${parts.join(', ')} }`;
+  return reduceToSingleString(parts, objectPrefix(obj), ['{', '}'], options, depth);
 }
 
 function formatMap(map, options, depth, seen) {
@@ -191,15 +223,13 @@ function formatMap(map, options, depth, seen) {
   for (const [k, v] of map) {
     parts.push(`${formatValue(k, options, depth + 1, seen)} => ${formatValue(v, options, depth + 1, seen)}`);
   }
-  if (parts.length === 0) return `Map(0) {}`;
-  return `Map(${map.size}) { ${parts.join(', ')} }`;
+  return reduceToSingleString(parts, `Map(${map.size}) `, ['{', '}'], options, depth);
 }
 
 function formatSet(set, options, depth, seen) {
   const parts = [];
   for (const v of set) parts.push(formatValue(v, options, depth + 1, seen));
-  if (parts.length === 0) return `Set(0) {}`;
-  return `Set(${set.size}) { ${parts.join(', ')} }`;
+  return reduceToSingleString(parts, `Set(${set.size}) `, ['{', '}'], options, depth);
 }
 
 // ---------- format ----------

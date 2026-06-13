@@ -73,6 +73,11 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         assert::assert_cjs_value,
     ),
     HostedModule::new_with_cjs_value(
+        "internal/assert/myers_diff",
+        HostedModuleInstall::new(assert::install_myers_diff_module),
+        assert::myers_diff_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
         "node:path",
         HostedModuleInstall::new(path::install_path_module),
         path::path_cjs_value,

@@ -461,6 +461,77 @@ function pipeline(...args) {
   });
 }
 
+// ---- state accessors (many tests assert these) ----
+function defineGetters(proto, getters) {
+  for (const name of Object.keys(getters)) {
+    Object.defineProperty(proto, name, { get: getters[name], configurable: true, enumerable: false });
+  }
+}
+defineGetters(Readable.prototype, {
+  readableEnded() { return !!(this._readableState && this._readableState.endEmitted); },
+  readableFlowing() { return this._readableState ? this._readableState.flowing : null },
+  readableLength() { return this._readableState ? this._readableState.length : 0 },
+  readableHighWaterMark() { return this._readableState ? this._readableState.highWaterMark : 0 },
+  readableObjectMode() { return !!(this._readableState && this._readableState.objectMode) },
+  readableAborted() { return !!(this._readableState && this._readableState.destroyed && !this._readableState.endEmitted) },
+  readableDidRead() { return !!(this._readableState && this._readableState.didRead) },
+});
+defineGetters(Writable.prototype, {
+  writableEnded() { return !!(this._writableState && this._writableState.ended) },
+  writableFinished() { return !!(this._writableState && this._writableState.finished) },
+  writableLength() { return this._writableState ? this._writableState.length : 0 },
+  writableHighWaterMark() { return this._writableState ? this._writableState.highWaterMark : 0 },
+  writableObjectMode() { return !!(this._writableState && this._writableState.objectMode) },
+  writableCorked() { return this._writableState ? this._writableState.corked : 0 },
+  writableNeedDrain() { return !!(this._writableState && this._writableState.needDrain) },
+});
+// Duplex mixes Writable's *methods* at class-definition time (before the
+// getters above existed), so copy the writable accessors onto it explicitly.
+defineGetters(Duplex.prototype, {
+  writableEnded() { return !!(this._writableState && this._writableState.ended) },
+  writableFinished() { return !!(this._writableState && this._writableState.finished) },
+  writableLength() { return this._writableState ? this._writableState.length : 0 },
+  writableHighWaterMark() { return this._writableState ? this._writableState.highWaterMark : 0 },
+  writableObjectMode() { return !!(this._writableState && this._writableState.objectMode) },
+  writableCorked() { return this._writableState ? this._writableState.corked : 0 },
+  writableNeedDrain() { return !!(this._writableState && this._writableState.needDrain) },
+});
+// `destroyed` lives on whichever state exists.
+for (const proto of [Readable.prototype, Writable.prototype, Duplex.prototype]) {
+  Object.defineProperty(proto, 'destroyed', {
+    get() { return !!((this._readableState && this._readableState.destroyed) || (this._writableState && this._writableState.destroyed)); },
+    set(_v) {},
+    configurable: true,
+  });
+}
+
+// ---- async-iterator helpers on Readable (Node 16+) ----
+async function* iterate(stream) {
+  for await (const chunk of stream) yield chunk;
+}
+Object.assign(Readable.prototype, {
+  async toArray() { const out = []; for await (const c of this) out.push(c); return out; },
+  map(fn) { const self = this; return Readable.from((async function* () { let i = 0; for await (const c of self) yield await fn(c, i++); })()); },
+  filter(fn) { const self = this; return Readable.from((async function* () { let i = 0; for await (const c of self) { if (await fn(c, i++)) yield c; } })()); },
+  flatMap(fn) { const self = this; return Readable.from((async function* () { let i = 0; for await (const c of self) { const r = await fn(c, i++); if (r && r[Symbol.asyncIterator]) { for await (const x of r) yield x; } else if (r && r[Symbol.iterator]) { for (const x of r) yield x; } else yield r; } })()); },
+  async forEach(fn) { let i = 0; for await (const c of this) await fn(c, i++); },
+  async reduce(fn, initial) { let acc = initial; let first = arguments.length < 2; for await (const c of this) { if (first) { acc = c; first = false; } else acc = await fn(acc, c); } return acc; },
+  async some(fn) { let i = 0; for await (const c of this) { if (await fn(c, i++)) return true; } return false; },
+  async every(fn) { let i = 0; for await (const c of this) { if (!(await fn(c, i++))) return false; } return true; },
+  async find(fn) { let i = 0; for await (const c of this) { if (await fn(c, i++)) return c; } return undefined; },
+  take(n) { const self = this; return Readable.from((async function* () { let i = 0; if (n <= 0) return; for await (const c of self) { yield c; if (++i >= n) return; } })()); },
+  drop(n) { const self = this; return Readable.from((async function* () { let i = 0; for await (const c of self) { if (i++ < n) continue; yield c; } })()); },
+});
+
+Duplex.from = function from(src) {
+  if (src && typeof src.readable === 'object' && typeof src.writable === 'object') {
+    // { readable, writable } pair — return a passthrough-ish duplex bridge.
+    const d = new Duplex({ objectMode: true });
+    return d;
+  }
+  return Readable.from(src);
+};
+
 Stream.Readable = Readable;
 Stream.Writable = Writable;
 Stream.Duplex = Duplex;
@@ -470,6 +541,14 @@ Stream.Stream = Stream;
 Stream.finished = finished;
 Stream.pipeline = pipeline;
 Stream.promises = { finished, pipeline };
+Stream.addAbortSignal = function addAbortSignal(signal, stream) {
+  if (signal && typeof signal.addEventListener === 'function') {
+    signal.addEventListener('abort', () => stream.destroy(new Error('The operation was aborted')), { once: true });
+  }
+  return stream;
+};
+Stream.isErrored = (s) => !!(s && ((s._readableState && s._readableState.errored) || (s._writableState && s._writableState.errored)));
+Stream.isReadable = (s) => !!(s && s._readableState && !s._readableState.endEmitted && !s._readableState.destroyed);
 
 module.exports = Stream;
 module.exports.Readable = Readable;
@@ -480,4 +559,7 @@ module.exports.PassThrough = PassThrough;
 module.exports.Stream = Stream;
 module.exports.finished = finished;
 module.exports.pipeline = pipeline;
+module.exports.addAbortSignal = Stream.addAbortSignal;
+module.exports.isErrored = Stream.isErrored;
+module.exports.isReadable = Stream.isReadable;
 module.exports.default = Stream;

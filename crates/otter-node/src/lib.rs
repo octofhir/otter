@@ -106,6 +106,26 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         stream::stream_web_cjs_value,
     ),
     HostedModule::new_with_cjs_value(
+        "node:stream/consumers",
+        HostedModuleInstall::new(stream::install_stream_module),
+        stream::stream_consumers_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "stream/consumers",
+        HostedModuleInstall::new(stream::install_stream_module),
+        stream::stream_consumers_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:stream/promises",
+        HostedModuleInstall::new(stream::install_stream_module),
+        stream::stream_promises_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "stream/promises",
+        HostedModuleInstall::new(stream::install_stream_module),
+        stream::stream_promises_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
         "node:timers",
         HostedModuleInstall::new(timers::install_noop),
         timers::timers_cjs_value,

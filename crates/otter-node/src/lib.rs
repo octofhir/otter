@@ -17,6 +17,7 @@
 //!   stored in futures or long-lived module state.
 
 pub mod assert;
+pub mod events;
 pub mod fs;
 pub mod globals;
 pub mod node_test;
@@ -50,6 +51,16 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         "path",
         HostedModuleInstall::new(path::install_path_module),
         path::path_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:events",
+        HostedModuleInstall::new(events::install_events_module),
+        events::events_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "events",
+        HostedModuleInstall::new(events::install_events_module),
+        events::events_cjs_value,
     ),
     HostedModule::new_with_cjs_value(
         "node:os",

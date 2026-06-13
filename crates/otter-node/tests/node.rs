@@ -17,7 +17,10 @@ fn hosted_node_module_specs_are_static_and_ordered() {
     }
     // Core modules ported so far are registered.
     for expected in ["os", "node:os", "node:test", "assert", "path"] {
-        assert!(names.contains(&expected), "missing hosted module {expected}");
+        assert!(
+            names.contains(&expected),
+            "missing hosted module {expected}"
+        );
     }
 }
 

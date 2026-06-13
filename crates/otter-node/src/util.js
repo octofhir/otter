@@ -6,6 +6,28 @@
 
 const objToString = (v) => Object.prototype.toString.call(v);
 
+// Node's lib/internal/errors invalidArgTypeHelper suffix, used by the
+// ERR_INVALID_ARG_TYPE messages this module raises.
+function invalidArgTypeSuffix(input) {
+  if (input == null) return ` Received ${input}`;
+  if (typeof input === 'function') {
+    return ` Received function ${input.name}`;
+  }
+  if (typeof input === 'object') {
+    if (input.constructor && input.constructor.name) {
+      return ` Received an instance of ${input.constructor.name}`;
+    }
+    return ` Received an instance of Object`;
+  }
+  if (typeof input === 'string') return ` Received type string ('${input}')`;
+  return ` Received type ${typeof input} (${String(input)})`;
+}
+function argTypeError(name, expected, input) {
+  const e = new TypeError(`The "${name}" ${expected}.${invalidArgTypeSuffix(input)}`);
+  e.code = 'ERR_INVALID_ARG_TYPE';
+  return e;
+}
+
 // ---------- types ----------
 function tagged(tag) {
   return (v) => objToString(v) === `[object ${tag}]`;
@@ -181,8 +203,55 @@ function formatSet(set, options, depth, seen) {
 }
 
 // ---------- format ----------
+// Node groups integer digits with "_" separators (every 3 from the right) for
+// numbers and bigints in inspect / format. Non-integer or exponential strings
+// (e.g. "1.5", "1.18e+21") are left untouched.
+function groupDigits(s) {
+  const neg = s[0] === '-';
+  const digits = neg ? s.slice(1) : s;
+  if (digits.length <= 3 || !/^\d+$/.test(digits)) return s;
+  let out = '';
+  let count = 0;
+  for (let i = digits.length - 1; i >= 0; i--) {
+    out = digits[i] + out;
+    if (++count % 3 === 0 && i !== 0) out = `_${out}`;
+  }
+  return (neg ? '-' : '') + out;
+}
+// Node renders negative zero as "-0" in %d / %i / %f (String() would drop it).
+// Thousands separators apply only when `numericSeparator` is enabled (default
+// off, per Node).
+function numToStr(n, sep) {
+  if (Object.is(n, -0)) return '-0';
+  const s = String(n);
+  return sep ? groupDigits(s) : s;
+}
+function bigIntToStr(n, sep) {
+  const s = String(n);
+  return `${sep ? groupDigits(s) : s}n`;
+}
+
+// §%s — an object whose `toString` is still a built-in (Object/Array/...) is
+// rendered with inspect(depth:0); an object that overrides `toString` is
+// stringified through it (so `{ toString() { return 'Foo'; } }` → "Foo").
+function hasBuiltInToString(o) {
+  let proto = o;
+  while (proto !== null) {
+    const desc = Object.getOwnPropertyDescriptor(proto, 'toString');
+    if (desc) {
+      // A non-callable `toString` is not a usable override → inspect.
+      if (typeof desc.value !== 'function') return true;
+      return proto === Object.prototype || proto === Array.prototype ||
+        proto === Error.prototype;
+    }
+    proto = Object.getPrototypeOf(proto);
+  }
+  return true;
+}
+
 function formatWithOptions(inspectOptions, ...args) {
   const first = args[0];
+  const sep = !!(inspectOptions && inspectOptions.numericSeparator);
   let str = '';
   let a = 0;
   if (typeof first === 'string') {
@@ -192,14 +261,16 @@ function formatWithOptions(inspectOptions, ...args) {
       if (a >= args.length) return match;
       const arg = args[a];
       switch (match) {
-        case '%s': a++; return typeof arg === 'bigint' ? `${arg}n`
-          : (typeof arg === 'object' && arg !== null) ? inspect(arg, { ...inspectOptions, depth: 0 })
-          : String(arg);
-        case '%d': a++; return typeof arg === 'bigint' ? `${arg}n`
-          : typeof arg === 'symbol' ? arg.toString() : String(Number(arg));
-        case '%i': a++; return typeof arg === 'bigint' ? `${arg}n`
-          : typeof arg === 'symbol' ? arg.toString() : String(parseInt(arg, 10));
-        case '%f': a++; return typeof arg === 'symbol' ? arg.toString() : String(parseFloat(arg));
+        case '%s': a++; return typeof arg === 'bigint' ? bigIntToStr(arg, sep)
+          : typeof arg === 'number' ? numToStr(arg, sep)
+          : (typeof arg === 'object' && arg !== null && hasBuiltInToString(arg))
+            ? inspect(arg, { ...inspectOptions, depth: 0 })
+            : String(arg);
+        case '%d': a++; return typeof arg === 'bigint' ? bigIntToStr(arg, sep)
+          : typeof arg === 'symbol' ? 'NaN' : numToStr(Number(arg), sep);
+        case '%i': a++; return typeof arg === 'bigint' ? bigIntToStr(arg, sep)
+          : typeof arg === 'symbol' ? 'NaN' : numToStr(parseInt(arg, 10), sep);
+        case '%f': a++; return typeof arg === 'symbol' ? 'NaN' : numToStr(parseFloat(arg), sep);
         case '%j': a++; try { return JSON.stringify(arg); } catch { return '[Circular]'; }
         case '%o': a++; return inspect(arg, { ...inspectOptions, showHidden: true, depth: 4 });
         case '%O': a++; return inspect(arg, inspectOptions);
@@ -217,51 +288,163 @@ function formatWithOptions(inspectOptions, ...args) {
 }
 
 function format(...args) {
-  return formatWithOptions(undefined, ...args);
+  // Honor mutations to util.inspect.defaultOptions (e.g. numericSeparator).
+  return formatWithOptions(inspect.defaultOptions, ...args);
 }
 
 // ---------- isDeepStrictEqual ----------
-function isDeepStrictEqual(a, b) {
-  return deepEqual(a, b, true, new Map());
+function isDeepStrictEqual(a, b, skipPrototype) {
+  return deepEqual(a, b, true, new Map(), !!skipPrototype);
 }
 
-function deepEqual(a, b, strict, memo) {
+// Detect the TRUE boxed-primitive class of an object (independent of any
+// @@toStringTag / prototype tampering) by trying each wrapper's own valueOf,
+// which throws on a receiver lacking that internal slot.
+function boxedPrimitiveType(v) {
+  try { Boolean.prototype.valueOf.call(v); return 'boolean'; } catch { /* not a Boolean */ }
+  try { Number.prototype.valueOf.call(v); return 'number'; } catch { /* not a Number */ }
+  try { String.prototype.valueOf.call(v); return 'string'; } catch { /* not a String */ }
+  try { Symbol.prototype.valueOf.call(v); return 'symbol'; } catch { /* not a Symbol */ }
+  try { BigInt.prototype.valueOf.call(v); return 'bigint'; } catch { /* not a BigInt */ }
+  return null;
+}
+function unboxPrimitive(v, kind) {
+  switch (kind) {
+    case 'boolean': return Boolean.prototype.valueOf.call(v);
+    case 'number': return Number.prototype.valueOf.call(v);
+    case 'string': return String.prototype.valueOf.call(v);
+    case 'symbol': return Symbol.prototype.valueOf.call(v);
+    case 'bigint': return BigInt.prototype.valueOf.call(v);
+    default: return undefined;
+  }
+}
+
+function isTypedArray(v) {
+  return ArrayBuffer.isView(v) && !(v instanceof DataView);
+}
+
+function deepEqual(a, b, strict, memo, skipProto) {
   if (Object.is(a, b)) return true;
   if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) {
-    return strict ? false : a == b; // eslint-disable-line eqeqeq
+    if (!strict) {
+      // eslint-disable-next-line eqeqeq
+      return a == b;
+    }
+    return false;
+  }
+  // §strict mode requires the same [[Prototype]] (a tampered toStringTag or
+  // re-parented wrapper must NOT compare equal to the genuine type), unless
+  // the caller opted into `skipPrototype`.
+  if (strict && !skipProto && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) {
+    return false;
   }
   const ta = objToString(a);
   if (ta !== objToString(b)) return false;
+
+  // Boxed primitives compare by their internal value first, then own keys.
+  const boxedA = boxedPrimitiveType(a);
+  const boxedB = boxedPrimitiveType(b);
+  if (boxedA !== null || boxedB !== null) {
+    if (boxedA !== boxedB) return false;
+    if (!Object.is(unboxPrimitive(a, boxedA), unboxPrimitive(b, boxedB))) return false;
+    // fall through to compare any extra own properties (e.g. wrapper.slow)
+  }
+
   if (memo.get(a) === b) return true;
   memo.set(a, b);
 
-  if (types.isDate(a)) return a.getTime() === b.getTime();
-  if (types.isRegExp(a)) return a.source === b.source && a.flags === b.flags;
+  if (types.isDate(a)) {
+    if (a.getTime() !== b.getTime()) return false;
+    return compareKeys(a, b, strict, memo, skipProto, false);
+  }
+  if (types.isRegExp(a)) {
+    if (a.source !== b.source || a.flags !== b.flags || a.lastIndex !== b.lastIndex) return false;
+    return compareKeys(a, b, strict, memo, skipProto, false);
+  }
+  if (isTypedArray(a)) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (!Object.is(a[i], b[i])) return false;
+    return compareKeys(a, b, strict, memo, skipProto, true);
+  }
   if (Array.isArray(a)) {
     if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) if (!deepEqual(a[i], b[i], strict, memo)) return false;
-    return compareKeys(a, b, strict, memo, true);
+    for (let i = 0; i < a.length; i++) {
+      if (!deepEqual(a[i], b[i], strict, memo, skipProto)) return false;
+    }
+    return compareKeys(a, b, strict, memo, skipProto, true);
   }
   if (types.isMap(a)) {
     if (a.size !== b.size) return false;
-    for (const [k, v] of a) { if (!b.has(k) || !deepEqual(v, b.get(k), strict, memo)) return false; }
-    return true;
+    if (!compareMap(a, b, strict, memo, skipProto)) return false;
+    return compareKeys(a, b, strict, memo, skipProto, false);
   }
   if (types.isSet(a)) {
     if (a.size !== b.size) return false;
-    for (const v of a) if (!b.has(v)) return false;
-    return true;
+    if (!compareSet(a, b, strict, memo, skipProto)) return false;
+    return compareKeys(a, b, strict, memo, skipProto, false);
   }
-  return compareKeys(a, b, strict, memo, false);
+  return compareKeys(a, b, strict, memo, skipProto, false);
 }
 
-function compareKeys(a, b, strict, memo, isArray) {
-  const ka = Object.keys(a).filter((k) => !(isArray && /^\d+$/.test(k)));
-  const kb = Object.keys(b).filter((k) => !(isArray && /^\d+$/.test(k)));
+// Own enumerable string + symbol keys (Node compares both); array index
+// entries are handled by the element walk, so they are excluded here.
+function ownEnumerableKeys(obj, isArray) {
+  const keys = Object.keys(obj).filter((k) => !(isArray && /^(0|[1-9]\d*)$/.test(k)));
+  for (const sym of Object.getOwnPropertySymbols(obj)) {
+    if (Object.prototype.propertyIsEnumerable.call(obj, sym)) keys.push(sym);
+  }
+  return keys;
+}
+
+function compareKeys(a, b, strict, memo, skipProto, isArray) {
+  const ka = ownEnumerableKeys(a, isArray);
+  const kb = ownEnumerableKeys(b, isArray);
   if (ka.length !== kb.length) return false;
   for (const k of ka) {
-    if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
-    if (!deepEqual(a[k], b[k], strict, memo)) return false;
+    if (!Object.prototype.propertyIsEnumerable.call(b, k)) return false;
+    if (!deepEqual(a[k], b[k], strict, memo, skipProto)) return false;
+  }
+  return true;
+}
+
+// §Map deep-key matching — keys compared with SameValueZero match directly;
+// object keys with no direct hit are matched structurally against the other
+// map's unconsumed entries (Node's CompareMap).
+function compareMap(a, b, strict, memo, skipProto) {
+  const bEntries = [...b];
+  const used = new Array(bEntries.length).fill(false);
+  for (const [ka, va] of a) {
+    if (b.has(ka) && deepEqual(va, b.get(ka), strict, memo, skipProto)) {
+      const idx = bEntries.findIndex(([kb], i) => !used[i] && Object.is(kb, ka));
+      if (idx !== -1) { used[idx] = true; continue; }
+    }
+    let matched = false;
+    for (let i = 0; i < bEntries.length; i++) {
+      if (used[i]) continue;
+      const [kb, vb] = bEntries[i];
+      if (deepEqual(ka, kb, strict, memo, skipProto) && deepEqual(va, vb, strict, memo, skipProto)) {
+        used[i] = true; matched = true; break;
+      }
+    }
+    if (!matched) return false;
+  }
+  return true;
+}
+
+function compareSet(a, b, strict, memo, skipProto) {
+  const bValues = [...b];
+  const used = new Array(bValues.length).fill(false);
+  for (const va of a) {
+    if (b.has(va)) {
+      const idx = bValues.findIndex((vb, i) => !used[i] && Object.is(vb, va));
+      if (idx !== -1) { used[idx] = true; continue; }
+    }
+    let matched = false;
+    for (let i = 0; i < bValues.length; i++) {
+      if (used[i]) continue;
+      if (deepEqual(va, bValues[i], strict, memo, skipProto)) { used[i] = true; matched = true; break; }
+    }
+    if (!matched) return false;
   }
   return true;
 }
@@ -306,19 +489,17 @@ function callbackify(original) {
 // ---------- inherits ----------
 function inherits(ctor, superCtor) {
   if (ctor === undefined || ctor === null) {
-    const err = new TypeError('The "ctor" argument must be of type function.');
-    err.code = 'ERR_INVALID_ARG_TYPE';
-    throw err;
+    throw argTypeError('ctor', 'argument must be of type function', ctor);
   }
   if (superCtor === undefined || superCtor === null) {
-    const err = new TypeError('The "superCtor" argument must be of type function.');
-    err.code = 'ERR_INVALID_ARG_TYPE';
-    throw err;
+    throw argTypeError('superCtor', 'argument must be of type function', superCtor);
   }
   if (superCtor.prototype === undefined) {
-    const err = new TypeError('The "superCtor.prototype" property must be of type object.');
-    err.code = 'ERR_INVALID_ARG_TYPE';
-    throw err;
+    throw argTypeError(
+      'superCtor.prototype',
+      'property must be of type object',
+      superCtor.prototype
+    );
   }
   Object.defineProperty(ctor, 'super_', {
     value: superCtor, writable: true, configurable: true,
@@ -328,6 +509,9 @@ function inherits(ctor, superCtor) {
 
 // ---------- deprecate ----------
 function deprecate(fn, msg, code) {
+  if (code !== undefined && typeof code !== 'string') {
+    throw argTypeError('code', 'argument must be of type string', code);
+  }
   let warned = false;
   function deprecated(...args) {
     if (!warned) {
@@ -342,12 +526,15 @@ function deprecate(fn, msg, code) {
 }
 
 // ---------- ANSI helpers ----------
-const ansiPattern = /[][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d/#&.:=?%@~_]*)*)?)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
+const ansiPattern = new RegExp(
+  '[\\u001B\\u009B][[\\]()#;?]*(?:(?:(?:(?:;[-a-zA-Z\\d/#&.:=?%@~_]+)*' +
+    '|[a-zA-Z\\d]+(?:;[-a-zA-Z\\d/#&.:=?%@~_]*)*)?(?:\\u0007|\\u001B\\u005C|\\u009C))' +
+    '|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PR-TZcf-ntqry=><~]))',
+  'g'
+);
 function stripVTControlCharacters(str) {
   if (typeof str !== 'string') {
-    const err = new TypeError('The "str" argument must be of type string.');
-    err.code = 'ERR_INVALID_ARG_TYPE';
-    throw err;
+    throw argTypeError('str', 'argument must be of type string', str);
   }
   return str.replace(ansiPattern, '');
 }

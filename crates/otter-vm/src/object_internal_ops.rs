@@ -4931,6 +4931,22 @@ impl Interpreter {
             }
             return Ok(out);
         }
+        // §23.2.3.* — a TypedArray's enumerable own string keys are its
+        // canonical integer indices (all enumerable) in ascending order,
+        // followed by any enumerable string-keyed expando properties.
+        if let Some(t) = target.as_typed_array(&self.gc_heap) {
+            let mut keys = Vec::new();
+            if !t.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
+                let len = t.length(&self.gc_heap);
+                keys.extend((0..len).map(|idx| idx.to_string()));
+            }
+            if let Some(bag) = t.expando(&self.gc_heap) {
+                keys.extend(object::with_properties(bag, &self.gc_heap, |p| {
+                    p.enumerable_keys().map(str::to_string).collect::<Vec<_>>()
+                }));
+            }
+            return Ok(keys);
+        }
         let fid = target.as_function().or_else(|| {
             target
                 .as_closure(&self.gc_heap)

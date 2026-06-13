@@ -1,11 +1,12 @@
 //! Standard Web-platform function globals: `atob`, `btoa`, `queueMicrotask`,
-//! `structuredClone`, `fetch`, and `AbortController`/`AbortSignal`.
+//! `structuredClone`, `fetch`, plus the JS-implemented class globals in
+//! [`WEB_BOOTSTRAP`] (Event/EventTarget/DOMException/TextEncoder/Decoder/
+//! AbortController/AbortSignal/MessageEvent/…).
 //!
 //! These belong to the Web platform (not Node), so they live here and are
 //! installed for every runtime that enables Web APIs. `atob`/`btoa` are
-//! implemented; the remainder are present-but-minimal placeholders so platform
-//! code and test harnesses that *reference* them load — full implementations
-//! land alongside their conformance work.
+//! implemented natively; `structuredClone`/`fetch` are still minimal
+//! placeholders pending their conformance work.
 
 use otter_runtime::{
     OtterError, Runtime, RuntimeGlobalInstaller, RuntimeNativeCtx as NativeCtx,
@@ -30,8 +31,8 @@ fn install(runtime: &mut Runtime) -> Result<(), OtterError> {
     runtime.install_native_global("queueMicrotask", 1, queue_microtask)?;
     runtime.install_native_global("structuredClone", 1, structured_clone)?;
     runtime.install_native_global("fetch", 1, fetch)?;
-    runtime.install_native_global("AbortController", 0, abort_controller)?;
-    runtime.install_native_global("AbortSignal", 0, abort_signal)?;
+    // AbortController / AbortSignal are provided by the JS bootstrap below
+    // (real EventTarget-based implementations).
     runtime
         .eval(SourceInput::from_javascript(WEB_BOOTSTRAP.to_string()))
         .map_err(|err| OtterError::Internal {
@@ -128,12 +129,4 @@ fn structured_clone(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
 
 fn fetch(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     Err(runtime_type_error("fetch", "fetch is not implemented"))
-}
-
-fn abort_controller(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    Err(runtime_type_error("AbortController", "not implemented"))
-}
-
-fn abort_signal(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    Err(runtime_type_error("AbortSignal", "not implemented"))
 }

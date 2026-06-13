@@ -469,6 +469,135 @@
   tagged(TextDecoder.prototype, 'TextDecoder');
   def('TextDecoder', TextDecoder);
 
+  // ---- AbortController / AbortSignal (DOM § Aborting) ----
+  const kAbortInternal = Symbol('AbortSignalInternal');
+  const kAborted = Symbol('aborted');
+  const kReason = Symbol('reason');
+  const kOnabort = Symbol('onabort');
+  const kSignal = Symbol('signal');
+
+  function makeAbortReason(reason) {
+    return reason !== undefined
+      ? reason
+      : new DOMException('This operation was aborted', 'AbortError');
+  }
+
+  function runAbort(signal, reason) {
+    if (signal[kAborted]) return;
+    signal[kAborted] = true;
+    signal[kReason] = makeAbortReason(reason);
+    signal.dispatchEvent(new Event('abort'));
+  }
+
+  class AbortSignal extends EventTarget {
+    constructor(key) {
+      if (key !== kAbortInternal) {
+        throw new TypeError('Illegal constructor');
+      }
+      super();
+      this[kAborted] = false;
+      this[kReason] = undefined;
+      this[kOnabort] = null;
+    }
+    get aborted() { return this[kAborted]; }
+    get reason() { return this[kReason]; }
+    get onabort() { return this[kOnabort]; }
+    set onabort(fn) {
+      if (this[kOnabort]) this.removeEventListener('abort', this[kOnabort]);
+      this[kOnabort] = typeof fn === 'function' ? fn : null;
+      if (this[kOnabort]) this.addEventListener('abort', this[kOnabort]);
+    }
+    throwIfAborted() { if (this[kAborted]) throw this[kReason]; }
+    static abort(reason) {
+      const s = new AbortSignal(kAbortInternal);
+      s[kAborted] = true;
+      s[kReason] = makeAbortReason(reason);
+      return s;
+    }
+    static timeout(ms) {
+      const s = new AbortSignal(kAbortInternal);
+      setTimeout(() => runAbort(s, new DOMException('The operation timed out', 'TimeoutError')),
+        Number(ms));
+      return s;
+    }
+    static any(signals) {
+      const result = new AbortSignal(kAbortInternal);
+      for (const sig of signals) {
+        if (sig.aborted) { runAbort(result, sig.reason); break; }
+        sig.addEventListener('abort', () => runAbort(result, sig.reason), { once: true });
+      }
+      return result;
+    }
+  }
+  tagged(AbortSignal.prototype, 'AbortSignal');
+  def('AbortSignal', AbortSignal);
+
+  class AbortController {
+    constructor() {
+      Object.defineProperty(this, kSignal, {
+        value: new AbortSignal(kAbortInternal),
+        enumerable: false,
+      });
+    }
+    get signal() { return this[kSignal]; }
+    abort(reason) { runAbort(this[kSignal], reason); }
+  }
+  tagged(AbortController.prototype, 'AbortController');
+  def('AbortController', AbortController);
+
+  // ---- Event subclasses ----
+  class MessageEvent extends Event {
+    constructor(type, options = {}) {
+      super(type, options);
+      const o = options || {};
+      this.data = 'data' in o ? o.data : null;
+      this.origin = o.origin !== undefined ? String(o.origin) : '';
+      this.lastEventId = o.lastEventId !== undefined ? String(o.lastEventId) : '';
+      this.source = o.source !== undefined ? o.source : null;
+      this.ports = o.ports !== undefined ? o.ports : [];
+    }
+  }
+  tagged(MessageEvent.prototype, 'MessageEvent');
+  def('MessageEvent', MessageEvent);
+
+  class CloseEvent extends Event {
+    constructor(type, options = {}) {
+      super(type, options);
+      const o = options || {};
+      this.wasClean = Boolean(o.wasClean);
+      this.code = o.code !== undefined ? Number(o.code) : 0;
+      this.reason = o.reason !== undefined ? String(o.reason) : '';
+    }
+  }
+  tagged(CloseEvent.prototype, 'CloseEvent');
+  def('CloseEvent', CloseEvent);
+
+  class ErrorEvent extends Event {
+    constructor(type, options = {}) {
+      super(type, options);
+      const o = options || {};
+      this.message = o.message !== undefined ? String(o.message) : '';
+      this.filename = o.filename !== undefined ? String(o.filename) : '';
+      this.lineno = o.lineno !== undefined ? Number(o.lineno) : 0;
+      this.colno = o.colno !== undefined ? Number(o.colno) : 0;
+      this.error = 'error' in o ? o.error : undefined;
+    }
+  }
+  tagged(ErrorEvent.prototype, 'ErrorEvent');
+  def('ErrorEvent', ErrorEvent);
+
+  class ProgressEvent extends Event {
+    constructor(type, options = {}) {
+      super(type, options);
+      const o = options || {};
+      this.lengthComputable = Boolean(o.lengthComputable);
+      this.loaded = o.loaded !== undefined ? Number(o.loaded) : 0;
+      this.total = o.total !== undefined ? Number(o.total) : 0;
+    }
+  }
+  tagged(ProgressEvent.prototype, 'ProgressEvent');
+  def('ProgressEvent', ProgressEvent);
+
   // ---- URLSearchParams as a global (also exposed via the URL native class) ----
   if (typeof global.URLSearchParams === 'undefined' && typeof global.URL !== 'undefined') {
     try {

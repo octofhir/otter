@@ -6,7 +6,7 @@
 // so matcher checks observe it; the `Assert` class is the constructible form.
 
 const util = require('util');
-const { isDeepStrictEqual, inspect } = util;
+const { isDeepStrictEqual, isDeepEqual, inspect } = util;
 const makeCallTracker = require('internal/assert/calltracker');
 
 function inspectValue(v) {
@@ -225,59 +225,18 @@ function notDeepStrictEqual(actual, expected, message) {
   }
 }
 
-// §isDeepEqual (loose) — like isDeepStrictEqual but primitives compare with ==
-// and only enumerable own keys are considered. Handles Map/Set/Date/RegExp and
-// boxed primitives the way the suite expects.
-function tag(v) { return Object.prototype.toString.call(v); }
-function looseDeepEqual(a, b, seen) {
-  // eslint-disable-next-line eqeqeq
-  if (a == b) return true;
-  if (typeof a === 'number' && typeof b === 'number') {
-    return Number.isNaN(a) && Number.isNaN(b);
-  }
-  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) {
-    // eslint-disable-next-line eqeqeq
-    return a == b;
-  }
-  const ta = tag(a);
-  if (ta !== tag(b)) return false;
-  if (ta === '[object Date]') return a.getTime() === b.getTime();
-  if (ta === '[object RegExp]') return a.source === b.source && a.flags === b.flags;
-  if (a instanceof Error && b instanceof Error) {
-    if (a.name !== b.name || a.message !== b.message) return false;
-  }
-  if (seen.has(a)) return true;
-  seen.add(a);
-  if (ta === '[object Map]') {
-    if (a.size !== b.size) return false;
-    for (const [k, v] of a) {
-      if (!b.has(k) || !looseDeepEqual(v, b.get(k), seen)) return false;
-    }
-    return true;
-  }
-  if (ta === '[object Set]') {
-    if (a.size !== b.size) return false;
-    for (const v of a) if (!b.has(v)) return false;
-    return true;
-  }
-  const ka = Object.keys(a);
-  const kb = Object.keys(b);
-  if (ka.length !== kb.length) return false;
-  for (const k of ka) {
-    if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
-    if (!looseDeepEqual(a[k], b[k], seen)) return false;
-  }
-  return true;
-}
+// Loose deep equality reuses util's comparison engine (Date/RegExp expandos,
+// Map/Set structural keys, boxed primitives, Error name/message/cause) so
+// assert.deepEqual and util.isDeepStrictEqual stay consistent.
 function deepEqual(actual, expected, message) {
   requireTwoArgs(arguments.length);
-  if (!looseDeepEqual(actual, expected, new Set())) {
+  if (!isDeepEqual(actual, expected)) {
     innerFail({ actual, expected, message, operator: 'deepEqual', stackStartFn: deepEqual });
   }
 }
 function notDeepEqual(actual, expected, message) {
   requireTwoArgs(arguments.length);
-  if (looseDeepEqual(actual, expected, new Set())) {
+  if (isDeepEqual(actual, expected)) {
     innerFail({ actual, expected, message, operator: 'notDeepEqual', stackStartFn: notDeepEqual });
   }
 }
@@ -295,7 +254,19 @@ function partialMatch(actual, expected, seen) {
   seen.add(expected);
   if (Array.isArray(expected)) {
     if (!Array.isArray(actual)) return false;
-    return expected.every((e) => actual.some((a) => partialMatch(a, e, seen)));
+    // Each expected element must match a DISTINCT actual element (a
+    // consumed subset), not merely some element — so duplicates in
+    // expected need duplicates in actual.
+    const consumed = new Array(actual.length).fill(false);
+    return expected.every((e) => {
+      for (let i = 0; i < actual.length; i++) {
+        if (!consumed[i] && partialMatch(actual[i], e, seen)) {
+          consumed[i] = true;
+          return true;
+        }
+      }
+      return false;
+    });
   }
   for (const k of Reflect.ownKeys(expected)) {
     if (!Reflect.has(actual, k)) return false;

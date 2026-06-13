@@ -375,6 +375,11 @@ function format(...args) {
 function isDeepStrictEqual(a, b, skipPrototype) {
   return deepEqual(a, b, true, new Map(), !!skipPrototype);
 }
+// Loose (`==`-based) structural equality — not a public Node API, exported for
+// assert.deepEqual which shares util's comparison fidelity.
+function isDeepEqual(a, b) {
+  return deepEqual(a, b, false, new Map(), false);
+}
 
 // Detect the TRUE boxed-primitive class of an object (independent of any
 // @@toStringTag / prototype tampering) by trying each wrapper's own valueOf,
@@ -664,6 +669,7 @@ const exportsObj = {
   formatWithOptions,
   types,
   isDeepStrictEqual,
+  isDeepEqual,
   promisify,
   callbackify,
   inherits,

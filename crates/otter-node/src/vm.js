@@ -16,6 +16,15 @@ const hiddenGlobals = new Set([
 
 const contexts = new WeakSet();
 
+function argTypeError(name, expected, value) {
+  let received;
+  if (value === null || value === undefined) received = ` Received ${value}`;
+  else received = ` Received type ${typeof value} (${typeof value === 'string' ? `'${value}'` : String(value)})`;
+  const e = new TypeError(`The "${name}" argument must be ${expected}.${received}`);
+  e.code = 'ERR_INVALID_ARG_TYPE';
+  return e;
+}
+
 function makeSandboxProxy(sandbox) {
   return new Proxy(sandbox, {
     // Claim every identifier so `with` routes all reads/writes through here.
@@ -53,12 +62,19 @@ function runWith(code, sandbox) {
   return fn.call(sandbox, proxy);
 }
 
-function createContext(sandbox = {}, _options) {
+function createContext(sandbox, _options) {
+  if (sandbox === undefined) sandbox = {};
+  if (typeof sandbox !== 'object' || sandbox === null) {
+    throw argTypeError('contextObject', 'an instance of Object', sandbox);
+  }
   contexts.add(sandbox);
   return sandbox;
 }
 
 function isContext(sandbox) {
+  if (typeof sandbox !== 'object' || sandbox === null) {
+    throw argTypeError('contextifiedObject', 'an instance of Object', sandbox);
+  }
   return contexts.has(sandbox);
 }
 
@@ -81,8 +97,17 @@ function compileFunction(code, params = [], _options) {
 }
 
 class Script {
-  constructor(code, _options) {
+  constructor(code, options) {
     this.code = String(code);
+    // Code caching is not implemented; accept any supplied cachedData as
+    // valid (never rejected) and hand back an opaque buffer on request.
+    this.cachedDataRejected = options && options.cachedData ? false : undefined;
+    this.cachedDataProduced = false;
+  }
+
+  createCachedData() {
+    this.cachedDataProduced = true;
+    return Buffer.from([]);
   }
 
   runInThisContext(_options) {

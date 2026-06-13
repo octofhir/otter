@@ -1918,6 +1918,7 @@ dependencies = [
 name = "otter-node"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "getrandom 0.2.17",
  "globset",
  "libc",

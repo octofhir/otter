@@ -35,6 +35,7 @@ pub mod string_decoder;
 pub mod stubs;
 pub mod timers;
 pub mod util;
+pub mod zlib;
 
 pub use otter_runtime::otter_gc;
 use otter_runtime::{HostedModule, HostedModuleInstall, OtterBuilder, RuntimeBuilder};
@@ -205,6 +206,16 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         "crypto",
         HostedModuleInstall::new(crypto::install_crypto_module),
         crypto::crypto_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:zlib",
+        HostedModuleInstall::new(zlib::install_zlib_module),
+        zlib::zlib_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "zlib",
+        HostedModuleInstall::new(zlib::install_zlib_module),
+        zlib::zlib_cjs_value,
     ),
     HostedModule::new_with_cjs_value(
         "node:perf_hooks",

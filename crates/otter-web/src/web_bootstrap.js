@@ -664,6 +664,149 @@
   tagged(MessageChannel.prototype, 'MessageChannel');
   def('MessageChannel', MessageChannel);
 
+  // ---- structuredClone (HTML § StructuredClone, in-realm) ----
+  // Faithful StructuredSerialize/StructuredDeserialize over one realm: clones
+  // the supported platform object graph (no cross-realm transfer), preserves
+  // internal references / cycles via a memory map, and throws DataCloneError
+  // for non-serializable inputs.
+  const TA_CTORS = {
+    '[object Int8Array]': () => Int8Array,
+    '[object Uint8Array]': () => Uint8Array,
+    '[object Uint8ClampedArray]': () => Uint8ClampedArray,
+    '[object Int16Array]': () => Int16Array,
+    '[object Uint16Array]': () => Uint16Array,
+    '[object Int32Array]': () => Int32Array,
+    '[object Uint32Array]': () => Uint32Array,
+    '[object Float32Array]': () => Float32Array,
+    '[object Float64Array]': () => Float64Array,
+    '[object BigInt64Array]': () => typeof BigInt64Array !== 'undefined' ? BigInt64Array : null,
+    '[object BigUint64Array]': () => typeof BigUint64Array !== 'undefined' ? BigUint64Array : null,
+  };
+
+  function dataCloneError(detail) {
+    return new DOMException(`${detail} could not be cloned.`, 'DataCloneError');
+  }
+
+  function structuredClone(value, options) {
+    const memory = new Map();
+    let transfer = [];
+    if (options != null) {
+      if (typeof options !== 'object') {
+        throw new TypeError('The "options" argument must be of type object.');
+      }
+      if (options.transfer != null) transfer = Array.from(options.transfer);
+    }
+    // Transfer is not supported across the in-realm clone (no detach); a
+    // non-empty transfer list of ArrayBuffers is treated as clone-by-copy.
+    void transfer;
+
+    function clone(v) {
+      // Primitives (immutable) pass through; symbols are not serializable.
+      if (v === null) return null;
+      const t = typeof v;
+      if (t === 'undefined' || t === 'boolean' || t === 'number' ||
+          t === 'string' || t === 'bigint') {
+        return v;
+      }
+      if (t === 'symbol') throw dataCloneError('Symbol');
+      if (t === 'function') throw dataCloneError('Function');
+
+      if (memory.has(v)) return memory.get(v);
+
+      const tag = Object.prototype.toString.call(v);
+
+      // Boxed primitives.
+      switch (tag) {
+        case '[object Boolean]': { const o = new Boolean(v.valueOf()); memory.set(v, o); return o; }
+        case '[object Number]': { const o = new Number(v.valueOf()); memory.set(v, o); return o; }
+        case '[object String]': { const o = new String(v.valueOf()); memory.set(v, o); return o; }
+        case '[object Date]': { const o = new Date(v.getTime()); memory.set(v, o); return o; }
+        case '[object RegExp]': {
+          const o = new RegExp(v.source, v.flags);
+          o.lastIndex = v.lastIndex;
+          memory.set(v, o);
+          return o;
+        }
+        case '[object ArrayBuffer]': {
+          if (typeof v.slice !== 'function') throw dataCloneError('ArrayBuffer');
+          const o = v.slice(0);
+          memory.set(v, o);
+          return o;
+        }
+        case '[object SharedArrayBuffer]': { memory.set(v, v); return v; }
+        case '[object DataView]': {
+          const buf = clone(v.buffer);
+          const o = new DataView(buf, v.byteOffset, v.byteLength);
+          memory.set(v, o);
+          return o;
+        }
+      }
+
+      // Typed arrays.
+      const taCtor = TA_CTORS[tag];
+      if (taCtor) {
+        const Ctor = taCtor();
+        if (!Ctor) throw dataCloneError(tag.slice(8, -1));
+        const buf = clone(v.buffer);
+        const o = new Ctor(buf, v.byteOffset, v.length);
+        memory.set(v, o);
+        return o;
+      }
+
+      if (Array.isArray(v)) {
+        const o = new Array(v.length);
+        memory.set(v, o);
+        for (const key of Object.keys(v)) o[key] = clone(v[key]);
+        return o;
+      }
+      if (tag === '[object Map]') {
+        const o = new Map();
+        memory.set(v, o);
+        for (const [k, val] of v) o.set(clone(k), clone(val));
+        return o;
+      }
+      if (tag === '[object Set]') {
+        const o = new Set();
+        memory.set(v, o);
+        for (const val of v) o.add(clone(val));
+        return o;
+      }
+      if (v instanceof Error) {
+        const name = v.name;
+        const Ctor = (name === 'Error' || name === 'EvalError' || name === 'RangeError' ||
+          name === 'ReferenceError' || name === 'SyntaxError' || name === 'TypeError' ||
+          name === 'URIError') ? global[name] : Error;
+        const o = new Ctor(v.message);
+        memory.set(v, o);
+        if (v.name !== o.name) o.name = v.name;
+        if (v.stack !== undefined) o.stack = v.stack;
+        if ('cause' in v) o.cause = clone(v.cause);
+        return o;
+      }
+
+      // Reject platform objects that are not serializable.
+      if (tag !== '[object Object]') {
+        const proto = Object.getPrototypeOf(v);
+        if (proto !== Object.prototype && proto !== null) {
+          throw dataCloneError(tag.slice(8, -1));
+        }
+      }
+
+      // Plain object: clone own enumerable string + symbol data properties.
+      const o = {};
+      memory.set(v, o);
+      for (const key of Object.keys(v)) o[key] = clone(v[key]);
+      for (const sym of Object.getOwnPropertySymbols(v)) {
+        const d = Object.getOwnPropertyDescriptor(v, sym);
+        if (d && d.enumerable) o[sym] = clone(v[sym]);
+      }
+      return o;
+    }
+
+    return clone(value);
+  }
+  def('structuredClone', structuredClone);
+
   // ---- URLSearchParams (WHATWG URL § application/x-www-form-urlencoded) ----
   const kList = Symbol('list');
 

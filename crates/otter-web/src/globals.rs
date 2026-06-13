@@ -29,10 +29,7 @@ fn install(runtime: &mut Runtime) -> Result<(), OtterError> {
     runtime.install_native_global("atob", 1, atob)?;
     runtime.install_native_global("btoa", 1, btoa)?;
     runtime.install_native_global("queueMicrotask", 1, queue_microtask)?;
-    runtime.install_native_global("structuredClone", 1, structured_clone)?;
     runtime.install_native_global("fetch", 1, fetch)?;
-    // AbortController / AbortSignal are provided by the JS bootstrap below
-    // (real EventTarget-based implementations).
     runtime
         .eval(SourceInput::from_javascript(WEB_BOOTSTRAP.to_string()))
         .map_err(|err| OtterError::Internal {
@@ -119,12 +116,6 @@ fn atob(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
 fn queue_microtask(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     // TODO: enqueue the callback on the microtask queue.
     Ok(Value::undefined())
-}
-
-fn structured_clone(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    // TODO: real structured clone via otter_runtime::structured_clone.
-    let _ = ctx;
-    Ok(args.first().copied().unwrap_or_else(Value::undefined))
 }
 
 fn fetch(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {

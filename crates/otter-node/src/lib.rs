@@ -18,6 +18,7 @@
 
 pub mod assert;
 pub mod buffer;
+pub mod diagnostics_channel;
 pub mod events;
 pub mod fs;
 pub mod globals;
@@ -28,6 +29,7 @@ pub mod querystring;
 pub mod stream;
 pub mod string_decoder;
 pub mod stubs;
+pub mod timers;
 pub mod util;
 
 pub use otter_runtime::otter_gc;
@@ -91,6 +93,36 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         "node:stream",
         HostedModuleInstall::new(stream::install_stream_module),
         stream::stream_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:timers",
+        HostedModuleInstall::new(timers::install_noop),
+        timers::timers_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "timers",
+        HostedModuleInstall::new(timers::install_noop),
+        timers::timers_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:timers/promises",
+        HostedModuleInstall::new(timers::install_noop),
+        timers::timers_promises_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "timers/promises",
+        HostedModuleInstall::new(timers::install_noop),
+        timers::timers_promises_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:diagnostics_channel",
+        HostedModuleInstall::new(diagnostics_channel::install_diagnostics_channel_module),
+        diagnostics_channel::diagnostics_channel_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "diagnostics_channel",
+        HostedModuleInstall::new(diagnostics_channel::install_diagnostics_channel_module),
+        diagnostics_channel::diagnostics_channel_cjs_value,
     ),
     HostedModule::new_with_cjs_value(
         "stream",

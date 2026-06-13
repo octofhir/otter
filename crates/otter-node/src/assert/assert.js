@@ -21,11 +21,25 @@ const kDiffOperators = new Set([
   'partialDeepStrictEqual', 'strictEqual', 'notStrictEqual',
 ]);
 
+// Per-operator header for a generated diff message (replaced by a custom
+// message when one is supplied).
+const kDiffHeaders = {
+  strictEqual: 'Expected values to be strictly equal:',
+  notStrictEqual: 'Expected "actual" to be strictly unequal to:',
+  deepStrictEqual: 'Expected values to be strictly deep-equal:',
+  notDeepStrictEqual: 'Expected "actual" not to be strictly deep-equal to:',
+  deepEqual: 'Expected values to be loosely deep-equal:',
+  notDeepEqual: 'Expected "actual" not to be loosely deep-equal to:',
+  equal: 'Expected values to be loosely equal:',
+  partialDeepStrictEqual: 'Expected values to be partially and strictly deep-equal:',
+};
+
 // §createErrDiff — Node's actual/expected diff. Each value is inspected with
 // compact:false so it spans one entry per line; the line arrays are run
 // through the Myers diff and prefixed `  ` (common) / `+ ` (actual) / `- `
-// (expected) under a "+ actual - expected" legend.
-function createErrDiff(actual, expected) {
+// (expected) under a "+ actual - expected" legend. `prefix` is the operator
+// header (generated message) or the caller's custom message.
+function createErrDiff(actual, expected, prefix) {
   const opts = {
     compact: false, breakLength: Infinity, depth: 1000,
     customInspect: false, sorted: true,
@@ -39,7 +53,7 @@ function createErrDiff(actual, expected) {
     else if (type === -1) lines.push(`+ ${value}`);
     else lines.push(`- ${value}`);
   }
-  return `+ actual - expected\n\n${lines.join('\n')}\n`;
+  return `${prefix}\n+ actual - expected\n\n${lines.join('\n')}\n`;
 }
 
 class AssertionError extends Error {
@@ -54,14 +68,14 @@ class AssertionError extends Error {
       if (operator === 'fail') {
         msg = 'Failed';
       } else if (wantsDiff) {
-        msg = createErrDiff(actual, expected);
+        msg = createErrDiff(actual, expected, kDiffHeaders[operator] || '');
       } else {
         const op = operator || 'deepStrictEqual';
         msg = `${inspectValue(actual)} ${op} ${inspectValue(expected)}`;
       }
     } else if (wantsDiff) {
-      // An explicit message prefixes the generated diff.
-      msg = `${message}\n${createErrDiff(actual, expected)}`;
+      // An explicit message replaces the header but keeps the diff.
+      msg = createErrDiff(actual, expected, message);
     }
     super(msg);
     this.name = 'AssertionError';
@@ -478,6 +492,8 @@ function assignMethods(target) {
 // object carrying the assertion methods; calling without `new` throws
 // ERR_CONSTRUCT_CALL_REQUIRED (a plain function, not an ES class, so the code
 // is ours to set rather than the engine's bare "requires new").
+const kValidDiff = new Set([undefined, 'simple', 'full']);
+
 function Assert(options) {
   if (!(this instanceof Assert)) {
     const e = new TypeError("Class constructor Assert cannot be invoked without 'new'");
@@ -485,8 +501,51 @@ function Assert(options) {
     throw e;
   }
   options = options || {};
-  this.strict = options.strict !== false;
-  assignMethods(this);
+  const diffMode = options.diff;
+  if (!kValidDiff.has(diffMode)) {
+    const e = new TypeError(
+      `The property 'options.diff' must be one of: 'simple', 'full'. ` +
+        `Received ${inspectValue(diffMode)}`
+    );
+    e.code = 'ERR_INVALID_ARG_VALUE';
+    throw e;
+  }
+  const strict = options.strict !== false;
+  this.strict = strict;
+
+  // Tag any AssertionError thrown through this instance with its diff mode.
+  const wrap = diffMode === undefined ? (fn) => fn : (fn) => function wrapped(...args) {
+    try { return fn.apply(this, args); } catch (e) {
+      if (e instanceof AssertionError && e.diff === undefined) e.diff = diffMode;
+      throw e;
+    }
+  };
+
+  // Strict instances alias the loose comparators to the strict ones (so
+  // `instance.equal === instance.strictEqual`).
+  const strictEqualM = wrap(strictEqual);
+  const notStrictEqualM = wrap(notStrictEqual);
+  const deepStrictEqualM = wrap(deepStrictEqual);
+  const notDeepStrictEqualM = wrap(notDeepStrictEqual);
+
+  this.ok = wrap(ok);
+  this.strictEqual = strictEqualM;
+  this.notStrictEqual = notStrictEqualM;
+  this.deepStrictEqual = deepStrictEqualM;
+  this.notDeepStrictEqual = notDeepStrictEqualM;
+  this.equal = strict ? strictEqualM : wrap(equal);
+  this.notEqual = strict ? notStrictEqualM : wrap(notEqual);
+  this.deepEqual = strict ? deepStrictEqualM : wrap(deepEqual);
+  this.notDeepEqual = strict ? notDeepStrictEqualM : wrap(notDeepEqual);
+  this.partialDeepStrictEqual = wrap(partialDeepStrictEqual);
+  this.throws = throws;
+  this.doesNotThrow = doesNotThrow;
+  this.rejects = rejects;
+  this.doesNotReject = doesNotReject;
+  this.ifError = ifError;
+  this.fail = wrap(fail);
+  this.match = match;
+  this.doesNotMatch = doesNotMatch;
   this.AssertionError = AssertionError;
   this.CallTracker = CallTracker;
 }

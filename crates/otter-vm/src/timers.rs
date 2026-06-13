@@ -177,6 +177,8 @@ const TIMER_NATIVES: &[(&str, u8, NativeFastFn)] = &[
     ("setInterval", 1, set_interval_native),
     ("clearTimeout", 1, clear_timeout_native),
     ("clearInterval", 1, clear_interval_native),
+    ("setImmediate", 1, set_immediate_native),
+    ("clearImmediate", 1, clear_immediate_native),
 ];
 
 /// Install the `setTimeout` / `setInterval` / `clearTimeout` /
@@ -331,4 +333,41 @@ fn clear_timeout_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
 
 fn clear_interval_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     cancel_timer_common(ctx, args, "clearInterval")
+}
+
+/// `setImmediate(callback, ...args)` — schedule a zero-delay one-shot timer.
+/// Unlike `setTimeout`, the first argument after the callback is already an
+/// extra callback argument (there is no delay parameter).
+fn set_immediate_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let callback = args.first().cloned().unwrap_or(Value::undefined());
+    ensure_callable(&callback, "setImmediate")?;
+    let extra: SmallVec<[Value; 4]> = args.iter().skip(1).cloned().collect();
+    let context = ctx
+        .execution_context()
+        .ok_or(NativeError::TypeError {
+            name: "setImmediate",
+            reason: "timer callback is missing its execution context".to_string(),
+        })?
+        .clone();
+    let interp = ctx.interp_mut();
+    let scheduler = interp.timer_scheduler().ok_or(NativeError::TypeError {
+        name: "setImmediate",
+        reason: "host runtime did not install a timer scheduler".to_string(),
+    })?;
+    interp.record_runtime_host_op_enqueued();
+    let token = scheduler.schedule(0, None);
+    interp.timer_callbacks_mut().insert(
+        token,
+        TimerEntry {
+            callback,
+            extra_args: extra,
+            context,
+            repeat_ms: None,
+        },
+    );
+    Ok(Value::number_f64(token as f64))
+}
+
+fn clear_immediate_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    cancel_timer_common(ctx, args, "clearImmediate")
 }

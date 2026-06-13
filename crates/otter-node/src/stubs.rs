@@ -44,13 +44,6 @@ pub fn install_worker_threads(ctx: &mut HostedModuleCtx<'_>) -> Result<(), Strin
     Ok(())
 }
 
-/// `node:buffer` — `atob`/`btoa` are destructured by the harness.
-pub fn install_buffer(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String> {
-    ctx.builtin_method("atob", 1, not_implemented)?;
-    ctx.builtin_method("btoa", 1, not_implemented)?;
-    Ok(())
-}
-
 /// `node:url` — `pathToFileURL` is destructured by `tmpdir.js`.
 pub fn install_url(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String> {
     ctx.builtin_method("pathToFileURL", 1, not_implemented)?;

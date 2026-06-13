@@ -17,6 +17,7 @@
 //!   stored in futures or long-lived module state.
 
 pub mod assert;
+pub mod buffer;
 pub mod events;
 pub mod fs;
 pub mod globals;
@@ -103,11 +104,16 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         "worker_threads",
         HostedModuleInstall::new(stubs::install_worker_threads),
     ),
-    HostedModule::new(
+    HostedModule::new_with_cjs_value(
         "node:buffer",
-        HostedModuleInstall::new(stubs::install_buffer),
+        HostedModuleInstall::new(buffer::install_buffer_module),
+        buffer::buffer_cjs_value,
     ),
-    HostedModule::new("buffer", HostedModuleInstall::new(stubs::install_buffer)),
+    HostedModule::new_with_cjs_value(
+        "buffer",
+        HostedModuleInstall::new(buffer::install_buffer_module),
+        buffer::buffer_cjs_value,
+    ),
     HostedModule::new("node:url", HostedModuleInstall::new(stubs::install_url)),
     HostedModule::new("url", HostedModuleInstall::new(stubs::install_url)),
     HostedModule::new(

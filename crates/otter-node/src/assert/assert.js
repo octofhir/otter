@@ -242,31 +242,87 @@ function notDeepEqual(actual, expected, message) {
 }
 
 function partialDeepStrictEqual(actual, expected, message) {
-  if (!partialMatch(actual, expected, new Set())) {
+  if (!partialMatch(actual, expected, new Map())) {
     innerFail({ actual, expected, message, operator: 'partialDeepStrictEqual', stackStartFn: partialDeepStrictEqual });
   }
 }
+// Maximum-bipartite-matching subset check: every expected item must map to a
+// DISTINCT actual item it matches. A greedy first-match is unsound — an empty
+// `{}` expected matches both `{}` and `[]`, so consuming the wrong one can
+// starve a stricter expected item. Kuhn's augmenting-path algorithm finds a
+// complete matching whenever one exists. `canMatch(ei, aj)` is the precomputed
+// adjacency: expected item `ei` is compatible with actual item `aj`.
+function subsetMatchExists(expectedCount, actualCount, canMatch) {
+  if (expectedCount > actualCount) return false;
+  const actualToExpected = new Array(actualCount).fill(-1);
+  const assign = (ei, visited) => {
+    for (let aj = 0; aj < actualCount; aj++) {
+      if (visited[aj] || !canMatch(ei, aj)) continue;
+      visited[aj] = true;
+      if (actualToExpected[aj] === -1 || assign(actualToExpected[aj], visited)) {
+        actualToExpected[aj] = ei;
+        return true;
+      }
+    }
+    return false;
+  };
+  for (let ei = 0; ei < expectedCount; ei++) {
+    if (!assign(ei, new Array(actualCount).fill(false))) return false;
+  }
+  return true;
+}
+
 function partialMatch(actual, expected, seen) {
   if (Object.is(actual, expected)) return true;
   if (typeof expected !== 'object' || expected === null) return Object.is(actual, expected);
   if (typeof actual !== 'object' || actual === null) return false;
-  if (seen.has(expected)) return true;
-  seen.add(expected);
+  // Cycle guard keyed on the (expected → actual) PAIR with recursion-stack
+  // semantics (popped on exit, below). When `expected` is re-encountered on
+  // the current path it must close against the SAME `actual` — a circular
+  // expected matched against an unrelated actual is NOT a back-edge and must
+  // be rejected, not vacuously accepted.
+  if (seen.has(expected)) return seen.get(expected) === actual;
+  seen.set(expected, actual);
+  const result = partialMatchBody(actual, expected, seen);
+  seen.delete(expected);
+  return result;
+}
+
+function partialMatchBody(actual, expected, seen) {
+  // Each candidate comparison gets its own copy of the cycle context so a
+  // failed match attempt cannot pollute the `seen` map for sibling
+  // candidates explored by the bipartite matcher.
+  const childMatch = (a, e) => partialMatch(a, e, new Map(seen));
   if (Array.isArray(expected)) {
     if (!Array.isArray(actual)) return false;
     // Each expected element must match a DISTINCT actual element (a
     // consumed subset), not merely some element — so duplicates in
     // expected need duplicates in actual.
-    const consumed = new Array(actual.length).fill(false);
-    return expected.every((e) => {
-      for (let i = 0; i < actual.length; i++) {
-        if (!consumed[i] && partialMatch(actual[i], e, seen)) {
-          consumed[i] = true;
-          return true;
-        }
-      }
+    const adj = expected.map((e) => actual.map((a) => childMatch(a, e)));
+    if (!subsetMatchExists(expected.length, actual.length, (ei, aj) => adj[ei][aj])) {
       return false;
-    });
+    }
+  } else if (expected instanceof Set) {
+    // A Set/Map expected value is a containment check: every expected
+    // member must match a DISTINCT actual member (so duplicates in the
+    // expected collection demand duplicates in the actual one). Own
+    // enumerable properties are then compared by the key loop below.
+    if (!(actual instanceof Set)) return false;
+    const actualValues = [...actual];
+    const expectedValues = [...expected];
+    const adj = expectedValues.map((e) => actualValues.map((a) => childMatch(a, e)));
+    if (!subsetMatchExists(expectedValues.length, actualValues.length, (ei, aj) => adj[ei][aj])) {
+      return false;
+    }
+  } else if (expected instanceof Map) {
+    if (!(actual instanceof Map)) return false;
+    const actualEntries = [...actual];
+    const expectedEntries = [...expected];
+    const adj = expectedEntries.map(([ek, ev]) =>
+      actualEntries.map(([ak, av]) => childMatch(ak, ek) && childMatch(av, ev)));
+    if (!subsetMatchExists(expectedEntries.length, actualEntries.length, (ei, aj) => adj[ei][aj])) {
+      return false;
+    }
   }
   for (const k of Reflect.ownKeys(expected)) {
     if (!Reflect.has(actual, k)) return false;

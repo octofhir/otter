@@ -402,6 +402,14 @@ impl Interpreter {
             } else {
                 true
             }
+        } else if receiver.is_map() || receiver.is_set() {
+            // Ordinary own properties on a Map/Set live in the lazy
+            // expando; a missing name deletes vacuously.
+            if let Some(bag) = self.collection_expando(&receiver) {
+                crate::object::delete(bag, &mut self.gc_heap, name)
+            } else {
+                true
+            }
         } else {
             return Err(VmError::TypeError {
                 message: format!(
@@ -1191,21 +1199,36 @@ impl Interpreter {
             || receiver.is_weak_map()
             || receiver.is_weak_set()
         {
-            let direct =
-                collections_prototype::load_property_with_heap(&receiver, name, &self.gc_heap);
-            if direct.is_undefined() {
-                let proto_name = if receiver.is_map() {
-                    "Map"
-                } else if receiver.is_set() {
-                    "Set"
-                } else if receiver.is_weak_map() {
-                    "WeakMap"
-                } else {
-                    "WeakSet"
-                };
-                self.load_from_constructor_prototype(context, proto_name, &receiver, name)?
+            // A user-assigned own property (`m.x = 5`,
+            // `Object.defineProperty(m, …)`) lives in the lazy expando
+            // and shadows the prototype methods.
+            if let Some(bag) = self.collection_expando(&receiver)
+                && let Some(outcome) = Self::expando_own_get_outcome(bag, &self.gc_heap, name)
+            {
+                match outcome {
+                    VmGetOutcome::Value(v) => v,
+                    VmGetOutcome::InvokeGetter { getter } => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.run_callable_sync(context, &getter, receiver, args)?
+                    }
+                }
             } else {
-                direct
+                let direct =
+                    collections_prototype::load_property_with_heap(&receiver, name, &self.gc_heap);
+                if direct.is_undefined() {
+                    let proto_name = if receiver.is_map() {
+                        "Map"
+                    } else if receiver.is_set() {
+                        "Set"
+                    } else if receiver.is_weak_map() {
+                        "WeakMap"
+                    } else {
+                        "WeakSet"
+                    };
+                    self.load_from_constructor_prototype(context, proto_name, &receiver, name)?
+                } else {
+                    direct
+                }
             }
         } else if let Some(t) = receiver.as_temporal(&self.gc_heap) {
             // An ordinary own property (installed via defineProperty /
@@ -1668,6 +1691,19 @@ impl Interpreter {
             // §10.1.9 OrdinarySet — own expando first, then the
             // prototype chain (a getter-only accessor like `year`
             // rejects the write), receiver-phase define otherwise.
+            let vm_key = VmPropertyKey::OwnedString(name.to_string());
+            if !self.ordinary_set_data_value(context, receiver, &vm_key, value, receiver, 0)? {
+                Self::failed_set_result(
+                    strict,
+                    format!("Cannot assign to read-only property '{name}'"),
+                )?;
+            }
+            None
+        } else if receiver.is_map() || receiver.is_set() {
+            // §10.1.9 OrdinarySet — a user-assigned own property
+            // (`m.x = 5`) lands in the lazy expando; the prototype
+            // walk first lets a getter-only accessor (`size`) reject
+            // the write.
             let vm_key = VmPropertyKey::OwnedString(name.to_string());
             if !self.ordinary_set_data_value(context, receiver, &vm_key, value, receiver, 0)? {
                 Self::failed_set_result(
@@ -2717,6 +2753,21 @@ impl Interpreter {
                 }
             } else {
                 return Err(VmError::TypeMismatch);
+            }
+        } else if recv.is_map() || recv.is_set() {
+            // §10.1.9 OrdinarySet — computed string/symbol writes land
+            // in the lazy expando via the shared [[Set]] funnel.
+            let vm_key = if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
+                VmPropertyKey::Symbol(sym)
+            } else if let Some(s) = idx_value.as_string(&self.gc_heap) {
+                VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
+            } else if let Some(n) = idx_value.as_number() {
+                VmPropertyKey::OwnedString(n.to_display_string())
+            } else {
+                return Err(VmError::TypeMismatch);
+            };
+            if !self.ordinary_set_data_value(context, recv, &vm_key, value, recv, 0)? {
+                Self::failed_set_result(strict, "Cannot assign to read-only property")?;
             }
         } else if recv.is_undefined() || recv.is_null() || recv.is_hole() {
             return Err(VmError::TypeError {
@@ -5038,6 +5089,42 @@ pub(crate) fn regexp_ensure_expando_pub(
     };
     let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
     r.set_expando(heap, bag);
+    Ok(bag)
+}
+
+/// Lazy-allocate (and cache) the ordinary own-property bag for a Map. Maps are
+/// ordinary extensible objects whose `[[MapData]]` entries are not own
+/// properties; `m.x = 1` / `Object.defineProperty(m, …)` install onto this bag.
+pub(crate) fn map_ensure_expando_pub(
+    heap: &mut otter_gc::GcHeap,
+    m: crate::collections::JsMap,
+) -> Result<JsObject, VmError> {
+    if let Some(existing) = crate::collections::map_expando(m, heap) {
+        return Ok(existing);
+    }
+    let recv = Value::map(m);
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        recv.trace_value_slots(visitor);
+    };
+    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    crate::collections::map_set_expando(m, heap, bag);
+    Ok(bag)
+}
+
+/// As [`map_ensure_expando_pub`] for a Set.
+pub(crate) fn set_ensure_expando_pub(
+    heap: &mut otter_gc::GcHeap,
+    s: crate::collections::JsSet,
+) -> Result<JsObject, VmError> {
+    if let Some(existing) = crate::collections::set_expando(s, heap) {
+        return Ok(existing);
+    }
+    let recv = Value::set(s);
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        recv.trace_value_slots(visitor);
+    };
+    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    crate::collections::set_set_expando(s, heap, bag);
     Ok(bag)
 }
 

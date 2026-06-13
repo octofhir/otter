@@ -393,13 +393,24 @@ function format(...args) {
 }
 
 // ---------- isDeepStrictEqual ----------
+// Circular-reference memo: a bidirectional (val1→position, val2→position)
+// map with recursion-stack semantics (entries are deleted on exit). A pair
+// (a, b) is a back-edge — and assumed equal — only when BOTH a and b were
+// recorded at the SAME position on the current path, so a self-referential
+// value can never vacuously match an unrelated one, and a repeated
+// comparison of two distinct objects is re-evaluated rather than served a
+// stale cached verdict.
+function newMemo() {
+  return { val1: new Map(), val2: new Map(), position: 0 };
+}
+
 function isDeepStrictEqual(a, b, skipPrototype) {
-  return deepEqual(a, b, true, new Map(), !!skipPrototype);
+  return deepEqual(a, b, true, newMemo(), !!skipPrototype);
 }
 // Loose (`==`-based) structural equality — not a public Node API, exported for
 // assert.deepEqual which shares util's comparison fidelity.
 function isDeepEqual(a, b) {
-  return deepEqual(a, b, false, new Map(), false);
+  return deepEqual(a, b, false, newMemo(), false);
 }
 
 // Detect the TRUE boxed-primitive class of an object (independent of any
@@ -455,9 +466,35 @@ function deepEqual(a, b, strict, memo, skipProto) {
     // fall through to compare any extra own properties (e.g. wrapper.slow)
   }
 
-  if (memo.get(a) === b) return true;
-  memo.set(a, b);
+  // §Circular references — a back-edge is a true cycle only when both a and
+  // b were already recorded at the same position on the CURRENT recursion
+  // path. Entries are popped on exit (below) so sibling comparisons of the
+  // same object against a different partner are re-evaluated, never served a
+  // stale verdict.
+  const aPos = memo.val1.get(a);
+  const bPos = memo.val2.get(b);
+  if (aPos !== undefined || bPos !== undefined) {
+    // A back-edge is a true cycle (equal) only when BOTH sides close
+    // their cycle at the SAME position. If only one side is already on
+    // the path, the actual graph loops where the expected graph still
+    // descends (or vice-versa) — structurally different. `aPos === bPos`
+    // captures all three: both-and-equal → true, both-and-different or
+    // exactly-one-defined (number === undefined) → false.
+    return aPos === bPos;
+  }
+  memo.position += 1;
+  const position = memo.position;
+  memo.val1.set(a, position);
+  memo.val2.set(b, position);
+  const result = deepEqualBody(a, b, strict, memo, skipProto);
+  memo.val1.delete(a);
+  memo.val2.delete(b);
+  return result;
+}
 
+// The structural dispatch for two objects already pushed onto the
+// circular-reference memo by `deepEqual`.
+function deepEqualBody(a, b, strict, memo, skipProto) {
   if (types.isDate(a)) {
     if (a.getTime() !== b.getTime()) return false;
     return compareKeys(a, b, strict, memo, skipProto, false);

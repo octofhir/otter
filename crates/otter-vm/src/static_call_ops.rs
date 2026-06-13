@@ -862,6 +862,8 @@ impl Interpreter {
                     || target.is_data_view()
                     || target.is_class_constructor()
                     || target.is_temporal()
+                    || target.is_map()
+                    || target.is_set()
                 {
                     // §25.3 — a `DataView` is an ordinary object; its
                     // [[GetOwnProperty]] (expando-backed) is handled by

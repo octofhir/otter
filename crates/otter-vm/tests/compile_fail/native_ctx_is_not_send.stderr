@@ -616,6 +616,80 @@ note: required by a bound in `assert_send`
 3 | fn assert_send<T: Send>() {}
   |                   ^^^^ required by this bound in `assert_send`
 
+error[E0277]: `*const JsClosureBody` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*const JsClosureBody` cannot be sent between threads safely
+  |
+  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `*const JsClosureBody`
+note: required because it appears within the type `PhantomData<*const JsClosureBody>`
+ --> $RUST/core/src/marker.rs
+  |
+  | pub struct PhantomData<T: PointeeSized>;
+  |            ^^^^^^^^^^^
+note: required because it appears within the type `otter_gc::compressed::Gc<JsClosureBody>`
+ --> $WORKSPACE/crates/otter-gc/src/compressed.rs
+  |
+  | pub struct Gc<T: ?Sized> {
+  |            ^^
+note: required because it appears within the type `JsClosure`
+ --> src/closure.rs
+  |
+  | pub struct JsClosure {
+  |            ^^^^^^^^^
+note: required because it appears within the type `Option<JsClosure>`
+ --> $RUST/core/src/option.rs
+  |
+  | pub enum Option<T> {
+  |          ^^^^^^
+note: required because it appears within the type `ColdFrame`
+ --> src/cold_frame.rs
+  |
+  | pub struct ColdFrame {
+  |            ^^^^^^^^^
+note: required because it appears within the type `PhantomData<ColdFrame>`
+ --> $RUST/core/src/marker.rs
+  |
+  | pub struct PhantomData<T: PointeeSized>;
+  |            ^^^^^^^^^^^
+note: required because it appears within the type `alloc::raw_vec::RawVec<ColdFrame>`
+ --> $RUST/alloc/src/raw_vec/mod.rs
+  |
+  | pub(crate) struct RawVec<T, A: Allocator = Global> {
+  |                   ^^^^^^
+note: required because it appears within the type `Vec<ColdFrame>`
+ --> $RUST/alloc/src/vec/mod.rs
+  |
+  | pub struct Vec<T, #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global> {
+  |            ^^^
+note: required because it appears within the type `ColdFramePool`
+ --> src/cold_frame.rs
+  |
+  | pub struct ColdFramePool {
+  |            ^^^^^^^^^^^^^
+note: required because it appears within the type `Interpreter`
+ --> src/lib.rs
+  |
+  | pub struct Interpreter {
+  |            ^^^^^^^^^^^
+  = note: required because it appears within the type `&'static mut Interpreter`
+note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub(crate) struct RuntimeCx<'rt> {
+  |                   ^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
 error[E0277]: `*const PurePromiseBody` cannot be sent between threads safely
  --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
   |

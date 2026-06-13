@@ -736,6 +736,22 @@ impl Interpreter {
             }
             return Ok(None);
         }
+        if target.is_map() || target.is_set() {
+            // Ordinary own properties on a Map/Set live in the lazy
+            // expando; size/keys/… are prototype accessors, not own.
+            if let Some(bag) = self.collection_expando(&target) {
+                if let Some(key) = key.string_name() {
+                    if let Some(desc) = object::get_own_descriptor(bag, &self.gc_heap, key) {
+                        return Ok(Some(desc));
+                    }
+                } else if let VmPropertyKey::Symbol(sym) = key
+                    && let Some(desc) = object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym)
+                {
+                    return Ok(Some(desc));
+                }
+            }
+            return Ok(None);
+        }
         if let Some(dv) = target.as_data_view() {
             // §25.3 — ordinary own properties live in the lazy expando.
             if let Some(bag) = dv.expando(&self.gc_heap) {
@@ -1028,9 +1044,44 @@ impl Interpreter {
         if let Some(regexp) = value.as_regexp() {
             return Ok(regexp.is_extensible(&self.gc_heap));
         }
+        if let Some(bag) = self.collection_expando(value) {
+            return Ok(object::is_extensible(bag, &self.gc_heap));
+        }
         // Per §10.1.3 every other ordinary heap value is extensible
         // by default.
         Ok(true)
+    }
+
+    /// Read the lazily-allocated expando bag carrying user-defined
+    /// own properties on a Map or Set instance, if one has been
+    /// materialised. Returns `None` for non-collection values or
+    /// collections that have never had a property written.
+    pub(crate) fn collection_expando(&self, value: &Value) -> Option<object::JsObject> {
+        if let Some(m) = value.as_map() {
+            return crate::collections::map_expando(m, &self.gc_heap);
+        }
+        if let Some(s) = value.as_set() {
+            return crate::collections::set_expando(s, &self.gc_heap);
+        }
+        None
+    }
+
+    /// Materialise (or fetch) the expando bag for a Map or Set so a
+    /// user-defined own property can be stored on it. Caller must have
+    /// already established that `value` is a Map or Set.
+    pub(crate) fn collection_ensure_expando(
+        &mut self,
+        value: &Value,
+    ) -> Result<object::JsObject, VmError> {
+        if let Some(m) = value.as_map() {
+            return crate::property_dispatch::map_ensure_expando_pub(&mut self.gc_heap, m);
+        }
+        if let Some(s) = value.as_set() {
+            return crate::property_dispatch::set_ensure_expando_pub(&mut self.gc_heap, s);
+        }
+        Err(VmError::TypeError {
+            message: "collection_ensure_expando on non-collection value".to_string(),
+        })
     }
 
     /// §10.5.6 / §10.1.6 — value-level `[[DefineOwnProperty]]`.
@@ -1569,6 +1620,17 @@ impl Interpreter {
             }
             let bag =
                 crate::property_dispatch::regexp_ensure_expando_pub(&mut self.gc_heap, &regexp)?;
+            return Ok(if let VmPropertyKey::Symbol(sym) = key {
+                object::define_own_symbol_property_partial(bag, &mut self.gc_heap, *sym, descriptor)
+            } else {
+                let k = key
+                    .string_name()
+                    .expect("non-symbol key has string spelling");
+                self.define_own_property_partial(bag, k, descriptor)?
+            });
+        }
+        if target.is_map() || target.is_set() {
+            let bag = self.collection_ensure_expando(target)?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
                 object::define_own_symbol_property_partial(bag, &mut self.gc_heap, *sym, descriptor)
             } else {
@@ -2792,6 +2854,28 @@ impl Interpreter {
             }
             return Ok(keys);
         }
+        if target.is_map() || target.is_set() {
+            // Own keys on a Map/Set are exactly the lazy expando entries;
+            // size and the iterator methods are prototype properties.
+            let mut keys = Vec::new();
+            if let Some(expando) = self.collection_expando(target) {
+                let (strings, symbols): (Vec<String>, Vec<Value>) =
+                    object::with_properties(expando, &self.gc_heap, |p| {
+                        (
+                            p.keys().map(str::to_string).collect(),
+                            p.symbol_keys().map(Value::symbol).collect(),
+                        )
+                    });
+                for key in strings {
+                    keys.push(Value::string(
+                        string::JsString::from_str(&key, &mut self.gc_heap)
+                            .map_err(VmError::from)?,
+                    ));
+                }
+                keys.extend(symbols);
+            }
+            return Ok(keys);
+        }
         if let Some(t) = target.as_temporal(&self.gc_heap) {
             // Own keys are exactly the ordinary expando entries; the
             // year/month/… accessors are prototype properties.
@@ -3252,6 +3336,14 @@ impl Interpreter {
         }
         if let Some(regexp) = value.as_regexp() {
             regexp.prevent_extensions(&mut self.gc_heap);
+            return Ok(true);
+        }
+        if value.is_map() || value.is_set() {
+            // Materialise the expando and mark it non-extensible so the
+            // collection reports [[IsExtensible]] = false and rejects
+            // further own-property additions.
+            let bag = self.collection_ensure_expando(value)?;
+            object::prevent_extensions(bag, &mut self.gc_heap);
             return Ok(true);
         }
         Ok(true)
@@ -3979,6 +4071,36 @@ impl Interpreter {
             };
         }
         if base.is_map() || base.is_set() || base.is_weak_map() || base.is_weak_set() {
+            // User-assigned own properties live in the lazy expando and
+            // shadow the prototype methods (Map/Set only — Weak* never
+            // grow an expando in the [[Set]] path).
+            if let Some(bag) = self.collection_expando(&base) {
+                let lookup = match key {
+                    VmPropertyKey::Symbol(sym) => {
+                        object::lookup_own_symbol(bag, &self.gc_heap, *sym)
+                    }
+                    _ => {
+                        let name = key
+                            .string_name()
+                            .expect("non-symbol key has string spelling");
+                        object::lookup_own(bag, &self.gc_heap, name)
+                    }
+                };
+                match lookup {
+                    object::PropertyLookup::Data { value, .. } => {
+                        return Ok(VmGetOutcome::Value(value));
+                    }
+                    object::PropertyLookup::Accessor { getter, .. } => {
+                        return Ok(match getter {
+                            Some(getter) if abstract_ops::is_callable(&getter) => {
+                                VmGetOutcome::InvokeGetter { getter }
+                            }
+                            _ => VmGetOutcome::Value(Value::undefined()),
+                        });
+                    }
+                    object::PropertyLookup::Absent => {}
+                }
+            }
             let proto_name = if base.is_map() {
                 "Map"
             } else if base.is_set() {
@@ -4959,6 +5081,15 @@ impl Interpreter {
             }
             return Ok(keys);
         }
+        if target.is_map() || target.is_set() {
+            let mut keys = Vec::new();
+            if let Some(bag) = self.collection_expando(&target) {
+                keys.extend(object::with_properties(bag, &self.gc_heap, |p| {
+                    p.enumerable_keys().map(str::to_string).collect::<Vec<_>>()
+                }));
+            }
+            return Ok(keys);
+        }
         let fid = target.as_function().or_else(|| {
             target
                 .as_closure(&self.gc_heap)
@@ -5217,6 +5348,20 @@ impl Interpreter {
             // Only ordinary expando entries are deletable; there are no
             // own non-configurable internal slots exposed as properties.
             if let Some(bag) = t.expando(&self.gc_heap) {
+                return Ok(if let Some(name) = key.string_name() {
+                    object::delete(bag, &mut self.gc_heap, name)
+                } else if let VmPropertyKey::Symbol(sym) = key {
+                    object::delete_symbol(bag, &mut self.gc_heap, *sym)
+                } else {
+                    true
+                });
+            }
+            return Ok(true);
+        }
+        if target.is_map() || target.is_set() {
+            // Only ordinary expando entries are deletable; size and the
+            // iterator methods are non-own prototype properties.
+            if let Some(bag) = self.collection_expando(&target) {
                 return Ok(if let Some(name) = key.string_name() {
                     object::delete(bag, &mut self.gc_heap, name)
                 } else if let VmPropertyKey::Symbol(sym) = key {
@@ -5579,6 +5724,76 @@ impl Interpreter {
                 return self.ordinary_set_on_receiver(context, key, value, &receiver);
             }
             return self.ordinary_set_data_value(context, parent, key, value, receiver, hops + 1);
+        }
+        if target.is_map() || target.is_set() {
+            // OrdinarySet over the lazy expando: an own writable data
+            // slot stores (same receiver) or lands on the receiver; an
+            // own accessor invokes its setter; an own miss continues the
+            // walk through the collection's [[Prototype]] (Map.prototype
+            // / Set.prototype, whose `size` accessor has no setter).
+            let bag = self.collection_ensure_expando(&target)?;
+            let same_receiver = if target.is_map() {
+                receiver
+                    .as_map()
+                    .zip(target.as_map())
+                    .is_some_and(|(r, t)| r == t)
+            } else {
+                receiver
+                    .as_set()
+                    .zip(target.as_set())
+                    .is_some_and(|(r, t)| r == t)
+            };
+            let lookup = match key {
+                VmPropertyKey::Symbol(sym) => object::lookup_own_symbol(bag, &self.gc_heap, *sym),
+                _ => object::lookup_own(
+                    bag,
+                    &self.gc_heap,
+                    key.string_name()
+                        .expect("non-symbol key has string spelling"),
+                ),
+            };
+            match lookup {
+                object::PropertyLookup::Data { flags, .. } => {
+                    if !flags.writable() {
+                        return Ok(false);
+                    }
+                    if !same_receiver {
+                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                    }
+                    return Ok(if let VmPropertyKey::Symbol(sym) = key {
+                        object::set_symbol(bag, &mut self.gc_heap, *sym, value)
+                    } else {
+                        self.ordinary_set_data_property(
+                            bag,
+                            key.string_name()
+                                .expect("non-symbol key has string spelling"),
+                            value,
+                        )?
+                    });
+                }
+                object::PropertyLookup::Accessor { setter, .. } => {
+                    let Some(setter) = setter else {
+                        return Ok(false);
+                    };
+                    let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
+                    self.run_callable_sync(context, &setter, receiver, argv)?;
+                    return Ok(true);
+                }
+                object::PropertyLookup::Absent => {
+                    let parent = self.get_prototype_for_op(&target)?;
+                    if parent.is_null() || parent.is_undefined() {
+                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                    }
+                    return self.ordinary_set_data_value(
+                        context,
+                        parent,
+                        key,
+                        value,
+                        receiver,
+                        hops + 1,
+                    );
+                }
+            }
         }
         if let Some(t) = target.as_temporal(&self.gc_heap) {
             // OrdinarySet over the expando: an own writable data slot

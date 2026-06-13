@@ -201,6 +201,10 @@ pub type JsMap = otter_gc::Gc<MapBody>;
 pub struct MapBody {
     entries: Vec<MapEntry>,
     prototype_override: Option<Value>,
+    /// Lazy ordinary own-property bag. Maps are ordinary extensible
+    /// objects, so `m.x = 1` / `Object.defineProperty(m, …)` install here
+    /// (the `[[MapData]]` entries are NOT own properties).
+    expando: Option<crate::object::JsObject>,
 }
 
 #[derive(Debug)]
@@ -281,6 +285,21 @@ pub(crate) fn set_map_prototype_override(
     if let Some(value) = &barrier_value {
         heap.record_write(map, value);
     }
+}
+
+/// Ordinary own-property bag for a Map, if materialized.
+pub(crate) fn map_expando(map: JsMap, heap: &otter_gc::GcHeap) -> Option<crate::object::JsObject> {
+    heap.read_payload(map, |body| body.expando)
+}
+
+/// Install the Map's ordinary own-property bag.
+pub(crate) fn map_set_expando(
+    map: JsMap,
+    heap: &mut otter_gc::GcHeap,
+    bag: crate::object::JsObject,
+) {
+    heap.with_payload(map, |body| body.expando = Some(bag));
+    heap.write_barrier(map, bag);
 }
 
 /// Number of entries.
@@ -482,6 +501,8 @@ pub struct SetBody {
     /// additions before exhaustion.
     entries: Vec<SetEntry>,
     prototype_override: Option<Value>,
+    /// Lazy ordinary own-property bag (see [`MapBody::expando`]).
+    expando: Option<crate::object::JsObject>,
 }
 
 #[derive(Debug)]
@@ -538,6 +559,21 @@ pub(crate) fn alloc_set_with_roots(
 
 pub(crate) fn set_prototype_override(set: JsSet, heap: &otter_gc::GcHeap) -> Option<Value> {
     heap.read_payload(set, |body| body.prototype_override)
+}
+
+/// Ordinary own-property bag for a Set, if materialized.
+pub(crate) fn set_expando(set: JsSet, heap: &otter_gc::GcHeap) -> Option<crate::object::JsObject> {
+    heap.read_payload(set, |body| body.expando)
+}
+
+/// Install the Set's ordinary own-property bag.
+pub(crate) fn set_set_expando(
+    set: JsSet,
+    heap: &mut otter_gc::GcHeap,
+    bag: crate::object::JsObject,
+) {
+    heap.with_payload(set, |body| body.expando = Some(bag));
+    heap.write_barrier(set, bag);
 }
 
 pub(crate) fn set_set_prototype_override(

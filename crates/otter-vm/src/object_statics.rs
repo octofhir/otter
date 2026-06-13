@@ -1802,6 +1802,36 @@ pub fn call(
                     )?)),
                     None => Ok(Value::undefined()),
                 }
+            } else if first.is_some_and(|v| v.is_map() || v.is_set()) {
+                // Map/Set instances are ordinary objects whose
+                // user-assigned own properties live in the lazy expando
+                // bag (size and the iterator methods are prototype
+                // properties, not own).
+                let bag = first.and_then(|v| {
+                    v.as_map()
+                        .and_then(|m| crate::collections::map_expando(m, gc_heap))
+                        .or_else(|| {
+                            v.as_set()
+                                .and_then(|s| crate::collections::set_expando(s, gc_heap))
+                        })
+                });
+                let desc = bag.and_then(|bag| match &key {
+                    PropertyKey::String(key) => {
+                        crate::object::get_own_descriptor(bag, gc_heap, key)
+                    }
+                    PropertyKey::Symbol(sym) => {
+                        crate::object::get_own_symbol_descriptor(bag, gc_heap, *sym)
+                    }
+                });
+                match desc {
+                    Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
+                        &desc,
+                        gc_heap,
+                        &[],
+                        &[args],
+                    )?)),
+                    None => Ok(Value::undefined()),
+                }
             } else if let Some(value) = first.and_then(|v| v.as_string(gc_heap)) {
                 let desc = match &key {
                     PropertyKey::String(key) => {

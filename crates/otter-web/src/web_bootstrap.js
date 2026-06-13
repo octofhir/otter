@@ -598,6 +598,72 @@
   tagged(ProgressEvent.prototype, 'ProgressEvent');
   def('ProgressEvent', ProgressEvent);
 
+  // ---- MessageChannel / MessagePort (HTML § channel messaging) ----
+  const kPortInternal = Symbol('MessagePortInternal');
+  const kOther = Symbol('otherPort');
+  const kStarted = Symbol('started');
+  const kQueue = Symbol('queue');
+  const kOnmessage = Symbol('onmessage');
+
+  function deliver(port, data) {
+    port.dispatchEvent(new MessageEvent('message', { data }));
+  }
+
+  class MessagePort extends EventTarget {
+    constructor(key) {
+      if (key !== kPortInternal) throw new TypeError('Illegal constructor');
+      super();
+      this[kOther] = null;
+      this[kStarted] = false;
+      this[kQueue] = [];
+      this[kOnmessage] = null;
+    }
+
+    get onmessage() { return this[kOnmessage]; }
+    set onmessage(fn) {
+      if (this[kOnmessage]) this.removeEventListener('message', this[kOnmessage]);
+      this[kOnmessage] = typeof fn === 'function' ? fn : null;
+      if (this[kOnmessage]) {
+        this.addEventListener('message', this[kOnmessage]);
+        this.start();
+      }
+    }
+
+    postMessage(message) {
+      const other = this[kOther];
+      if (!other) return;
+      queueMicrotask(() => {
+        if (other[kStarted]) deliver(other, message);
+        else other[kQueue].push(message);
+      });
+    }
+
+    start() {
+      if (this[kStarted]) return;
+      this[kStarted] = true;
+      const queued = this[kQueue];
+      this[kQueue] = [];
+      for (const data of queued) queueMicrotask(() => deliver(this, data));
+    }
+
+    close() { this[kOther] = null; }
+  }
+  tagged(MessagePort.prototype, 'MessagePort');
+  def('MessagePort', MessagePort);
+
+  class MessageChannel {
+    constructor() {
+      const p1 = new MessagePort(kPortInternal);
+      const p2 = new MessagePort(kPortInternal);
+      p1[kOther] = p2;
+      p2[kOther] = p1;
+      this.port1 = p1;
+      this.port2 = p2;
+    }
+  }
+  tagged(MessageChannel.prototype, 'MessageChannel');
+  def('MessageChannel', MessageChannel);
+
   // ---- URLSearchParams (WHATWG URL § application/x-www-form-urlencoded) ----
   const kList = Symbol('list');
 

@@ -136,7 +136,7 @@ function formatValue(value, options, depth, seen) {
     else if (Array.isArray(value)) out = formatArray(value, options, depth, seen);
     else if (types.isMap(value)) out = formatMap(value, options, depth, seen);
     else if (types.isSet(value)) out = formatSet(value, options, depth, seen);
-    else if (types.isTypedArray(value)) out = formatArray(Array.from(value), options, depth, seen, value.constructor.name);
+    else if (types.isTypedArray(value)) out = formatTypedArray(value, options, depth, seen);
     else out = formatObject(value, options, depth, seen);
   } finally {
     seen.delete(value);
@@ -222,9 +222,41 @@ function objectPrefix(obj) {
   return name ? `${name} ` : '';
 }
 
+// §TypedArrays — `Ctor(len) [ ...elements ]`, with `[Tag]` when the
+// @@toStringTag differs from the constructor name (e.g. Buffer →
+// `Buffer(4) [Uint8Array]`), plus any extra non-index own properties.
+function formatTypedArray(ta, options, depth, seen) {
+  const ctorName = ta.constructor && ta.constructor.name ? ta.constructor.name : 'TypedArray';
+  const tag = ta[Symbol.toStringTag];
+  let prefix = `${ctorName}(${ta.length})`;
+  if (typeof tag === 'string' && tag !== ctorName) prefix += ` [${tag}]`;
+  prefix += ' ';
+  const parts = [];
+  const limit = Math.min(ta.length, options.maxArrayLength);
+  for (let i = 0; i < limit; i++) {
+    parts.push(formatValue(ta[i], options, depth + 1, seen));
+  }
+  if (ta.length > limit) {
+    const extra = ta.length - limit;
+    parts.push(`... ${extra} more item${extra > 1 ? 's' : ''}`);
+  }
+  for (const key of Object.keys(ta)) {
+    if (/^(0|[1-9]\d*)$/.test(key)) continue;
+    parts.push(`${keyToString(key)}: ${formatValue(ta[key], options, depth + 1, seen)}`);
+  }
+  for (const sym of Object.getOwnPropertySymbols(ta)) {
+    if (Object.getOwnPropertyDescriptor(ta, sym).enumerable) {
+      parts.push(`${keyToString(sym)}: ${formatValue(ta[sym], options, depth + 1, seen)}`);
+    }
+  }
+  return reduceToSingleString(parts, prefix, ['[', ']'], options, depth);
+}
+
 function formatObject(obj, options, depth, seen) {
   const parts = [];
-  for (const key of Object.keys(obj)) {
+  const keys = Object.keys(obj);
+  if (options.sorted) keys.sort();
+  for (const key of keys) {
     parts.push(`${keyToString(key)}: ${formatValue(obj[key], options, depth + 1, seen)}`);
   }
   for (const sym of Object.getOwnPropertySymbols(obj)) {

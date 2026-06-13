@@ -24,6 +24,8 @@ pub mod globals;
 pub mod node_test;
 pub mod os;
 pub mod path;
+pub mod querystring;
+pub mod string_decoder;
 pub mod stubs;
 pub mod util;
 
@@ -83,6 +85,26 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         "test",
         HostedModuleInstall::new(node_test::install_node_test_module),
         node_test::node_test_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:querystring",
+        HostedModuleInstall::new(querystring::install_querystring_module),
+        querystring::querystring_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "querystring",
+        HostedModuleInstall::new(querystring::install_querystring_module),
+        querystring::querystring_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:string_decoder",
+        HostedModuleInstall::new(string_decoder::install_string_decoder_module),
+        string_decoder::string_decoder_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "string_decoder",
+        HostedModuleInstall::new(string_decoder::install_string_decoder_module),
+        string_decoder::string_decoder_cjs_value,
     ),
     HostedModule::new_with_cjs_value(
         "node:util",

@@ -9,7 +9,7 @@ use otter_runtime::{
     RuntimeValue as Value,
 };
 
-use crate::{string_value, type_error};
+use crate::type_error;
 
 /// Native stub that throws when invoked (the symbol exists for destructuring /
 /// feature checks, but the operation is not implemented yet).
@@ -63,41 +63,4 @@ pub fn install_child_process(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String
         ctx.builtin_method(name, 1, not_implemented)?;
     }
     Ok(())
-}
-
-/// `node:util` — basic `inspect`/`format`; the rest are stubs for now.
-pub fn install_util(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String> {
-    ctx.builtin_method("inspect", 1, util_inspect)?;
-    ctx.builtin_method("format", 1, util_format)?;
-    ctx.builtin_method("getCallSites", 0, util_get_call_sites)?;
-    ctx.builtin_method("inherits", 2, util_inherits)?;
-    ctx.builtin_method("deprecate", 2, util_deprecate)?;
-    Ok(())
-}
-
-fn util_inspect(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let rendered = args
-        .first()
-        .map(|v| v.display_string(ctx.heap()))
-        .unwrap_or_default();
-    string_value(ctx, &rendered)
-}
-
-fn util_format(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let parts: Vec<String> = args.iter().map(|v| v.display_string(ctx.heap())).collect();
-    string_value(ctx, &parts.join(" "))
-}
-
-fn util_get_call_sites(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    // Returns undefined for now; the harness only reads call sites on failure.
-    Ok(Value::undefined())
-}
-
-fn util_inherits(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    Ok(Value::undefined())
-}
-
-fn util_deprecate(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    // Return the wrapped function unchanged.
-    Ok(args.first().copied().unwrap_or_else(Value::undefined))
 }

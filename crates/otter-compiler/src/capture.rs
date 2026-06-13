@@ -282,6 +282,17 @@ impl<'a> Visit<'a> for OwnNameCollector {
         self.nested_depth = self.nested_depth.saturating_sub(1);
     }
 
+    fn visit_formal_parameters(&mut self, it: &FormalParameters<'a>) {
+        // The rest element (`function f(...args)`) lives in `FormalParameters.rest`,
+        // not in `items`, so `visit_formal_parameter` never sees it. Collect its
+        // leaves explicitly, otherwise a rest parameter referenced from a nested
+        // closure is not promoted to an upvalue cell and resolves as undefined.
+        if let Some(rest) = &it.rest {
+            self.maybe_collect_pattern(&rest.rest.argument);
+        }
+        walk::walk_formal_parameters(self, it);
+    }
+
     fn visit_formal_parameter(&mut self, it: &oxc_ast::ast::FormalParameter<'a>) {
         self.maybe_collect_pattern(&it.pattern);
         walk::walk_formal_parameter(self, it);

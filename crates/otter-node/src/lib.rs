@@ -24,6 +24,7 @@ pub mod node_test;
 pub mod os;
 pub mod path;
 pub mod stubs;
+pub mod util;
 
 pub use otter_runtime::otter_gc;
 use otter_runtime::{HostedModule, HostedModuleInstall, OtterBuilder, RuntimeBuilder};
@@ -82,8 +83,16 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         HostedModuleInstall::new(node_test::install_node_test_module),
         node_test::node_test_cjs_value,
     ),
-    HostedModule::new("node:util", HostedModuleInstall::new(stubs::install_util)),
-    HostedModule::new("util", HostedModuleInstall::new(stubs::install_util)),
+    HostedModule::new_with_cjs_value(
+        "node:util",
+        HostedModuleInstall::new(util::install_util_module),
+        util::util_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "util",
+        HostedModuleInstall::new(util::install_util_module),
+        util::util_cjs_value,
+    ),
     HostedModule::new("node:net", HostedModuleInstall::new(stubs::install_net)),
     HostedModule::new("net", HostedModuleInstall::new(stubs::install_net)),
     HostedModule::new(

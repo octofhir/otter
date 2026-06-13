@@ -2060,6 +2060,10 @@ impl Runtime {
                 "dynamic import: HTTPS evaluation failed for \"{target_url}\": {err}"
             )));
         }
+        // `run_callable_sync` may have moved `env` (the local handle is not in
+        // any root set). Re-read the relocated handle from the GC-traced module
+        // env registry rather than returning the stale local.
+        let env = self.interp.module_env(target_url).unwrap_or(env);
         Ok(otter_vm::Value::object(env))
     }
 

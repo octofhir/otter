@@ -9,9 +9,14 @@
 
 use otter_runtime::{
     OtterError, Runtime, RuntimeGlobalInstaller, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeValue as Value, runtime_arg_to_string,
+    RuntimeNativeError as NativeError, RuntimeValue as Value, SourceInput, runtime_arg_to_string,
     runtime_string_value, runtime_type_error,
 };
+
+/// Pure-JS Web Platform globals (Event/EventTarget/CustomEvent/DOMException,
+/// TextEncoder/TextDecoder, performance, URLSearchParams). Evaluated once at
+/// install over the already-bootstrapped intrinsics.
+const WEB_BOOTSTRAP: &str = include_str!("web_bootstrap.js");
 
 /// Installer for the Web function globals. Registered by `with_web_apis`.
 #[must_use]
@@ -27,6 +32,12 @@ fn install(runtime: &mut Runtime) -> Result<(), OtterError> {
     runtime.install_native_global("fetch", 1, fetch)?;
     runtime.install_native_global("AbortController", 0, abort_controller)?;
     runtime.install_native_global("AbortSignal", 0, abort_signal)?;
+    runtime
+        .eval(SourceInput::from_javascript(WEB_BOOTSTRAP.to_string()))
+        .map_err(|err| OtterError::Internal {
+            code: "WEB_BOOTSTRAP".to_string(),
+            message: format!("web globals bootstrap failed: {err}"),
+        })?;
     Ok(())
 }
 

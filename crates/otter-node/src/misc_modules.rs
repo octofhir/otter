@@ -10,6 +10,40 @@ const CLUSTER_SHIM: &str = include_str!("cluster.js");
 const INTERNAL_UTIL_SHIM: &str = include_str!("internal_util.js");
 const VM_SHIM: &str = include_str!("vm.js");
 
+/// `internal/event_target` (exposed under `--expose-internals`) — re-exports the
+/// `Event` / `EventTarget` / `CustomEvent` globals (installed by the Web API
+/// bootstrap) plus the internal symbols Node's tests reach for.
+const INTERNAL_EVENT_TARGET_SHIM: &str = "\
+'use strict';
+const g = globalThis;
+module.exports = {
+  Event: g.Event,
+  EventTarget: g.EventTarget,
+  CustomEvent: g.CustomEvent,
+  NodeEventTarget: g.EventTarget,
+  kWeakHandler: Symbol('kWeakHandler'),
+  kEvents: Symbol('events'),
+  kMaxEventTargetListeners: Symbol('kMaxEventTargetListeners'),
+  kMaxEventTargetListenersWarned: Symbol('kMaxEventTargetListenersWarned'),
+  initEventTarget(self) { return self; },
+  defineEventHandler() {},
+  isEventTarget(v) { return v instanceof g.EventTarget; },
+};
+";
+
+/// `internal/event_target` CommonJS export.
+pub fn internal_event_target_cjs_value(
+    ctx: &mut NativeCtx<'_>,
+    _caps: &CapabilitySet,
+) -> Result<Value, String> {
+    otter_runtime::run_builtin_cjs_shim(
+        ctx,
+        "internal/event_target",
+        INTERNAL_EVENT_TARGET_SHIM,
+        &[],
+    )
+}
+
 /// `node:cluster` — single-process stub (always primary, no workers).
 pub fn cluster_cjs_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result<Value, String> {
     let events = crate::events::events_cjs_value(ctx, caps)?;

@@ -114,6 +114,13 @@ function formatValue(value, options, depth, seen) {
   if (seen.has(value)) return '[Circular *1]';
 
   if (depth > options.depth && options.depth !== null) {
+    // A custom formatter (e.g. Event) may still render at over-limit depth
+    // (Node consults `inspect.custom` before applying the depth cutoff).
+    const customAtLimit = value[inspect.custom];
+    if (typeof customAtLimit === 'function') {
+      const r = customAtLimit.call(value, options.depth, options);
+      if (typeof r === 'string') return r;
+    }
     if (Array.isArray(value)) return '[Array]';
     return '[Object]';
   }

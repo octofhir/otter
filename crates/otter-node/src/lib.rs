@@ -83,6 +83,11 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         misc_modules::internal_util_cjs_value,
     ),
     HostedModule::new_with_cjs_value(
+        "internal/event_target",
+        HostedModuleInstall::new(misc_modules::install_noop),
+        misc_modules::internal_event_target_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
         "node:vm",
         HostedModuleInstall::new(misc_modules::install_noop),
         misc_modules::vm_cjs_value,

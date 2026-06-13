@@ -39,8 +39,26 @@ use otter_runtime::{HostedModule, HostedModuleInstall, OtterBuilder, RuntimeBuil
 
 /// Active Node-compatible hosted modules in deterministic install order.
 pub const HOSTED_MODULES: &[HostedModule] = &[
-    HostedModule::new("node:fs", HostedModuleInstall::new(fs::install_fs_module)),
-    HostedModule::new("fs", HostedModuleInstall::new(fs::install_fs_module)),
+    HostedModule::new_with_cjs_value(
+        "node:fs",
+        HostedModuleInstall::new(fs::install_fs_module),
+        fs::fs_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "fs",
+        HostedModuleInstall::new(fs::install_fs_module),
+        fs::fs_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:fs/promises",
+        HostedModuleInstall::new(fs::install_fs_module),
+        fs::fs_promises_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "fs/promises",
+        HostedModuleInstall::new(fs::install_fs_module),
+        fs::fs_promises_cjs_value,
+    ),
     HostedModule::new_with_cjs_value(
         "node:assert",
         HostedModuleInstall::new(assert::install_assert_module),

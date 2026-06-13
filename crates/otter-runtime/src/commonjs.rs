@@ -90,12 +90,28 @@ pub fn run_builtin_cjs_shim(
         .map_err(|e| e.to_string())?;
     let call_args: SmallVec<[Value; 8]> =
         smallvec![exports_val, require_val, module_val, name_val, name_val,];
-    interp
-        .run_callable_sync(&context, &wrapper, exports_val, call_args)
-        .map_err(|e| e.to_string())?;
 
-    let final_exports = object::get(module, interp.gc_heap(), "exports").unwrap_or(exports_val);
-    Ok(final_exports)
+    // See `cjs_instantiate_file`: park `module` / `exports` on the GC-traced
+    // module-root stack so a collection during the shim body does not leave
+    // these young-object handles dangling.
+    let root_base = interp.module_root_depth();
+    let module_idx = interp.push_module_root(module_val) - 1;
+    let exports_idx = interp.push_module_root(exports_val) - 1;
+
+    let run = interp.run_callable_sync(&context, &wrapper, exports_val, call_args);
+
+    let module = interp
+        .module_root(module_idx)
+        .as_object()
+        .expect("module object survives module-root rooting");
+    let exports_val = interp.module_root(exports_idx);
+
+    let result = run
+        .map_err(|e| e.to_string())
+        .map(|_ret| object::get(module, interp.gc_heap(), "exports").unwrap_or(exports_val));
+
+    interp.pop_module_roots_to(root_base);
+    result
 }
 
 /// Build a `require` for a shim that resolves only the supplied dependencies.
@@ -297,13 +313,39 @@ pub(crate) fn cjs_instantiate_file(
         filename_arg,
         dirname_val,
     ];
-    interp
-        .run_callable_sync(&context, &wrapper, exports_val, call_args)
-        .map_err(vm_err)?;
+    // `run_callable_sync` evaluates the whole module body, which can trigger any
+    // number of moving collections. `module` / `cache` / `exports` are young
+    // objects held only in these Rust locals, so park them on the GC-traced
+    // module-root stack (the collector rewrites the slots in place) and read the
+    // relocated handles back afterwards. Without this, a module whose body
+    // allocates enough to scavenge leaves these handles dangling and the
+    // post-run `module.exports` read dereferences a forwarded (moved) object.
+    let root_base = interp.module_root_depth();
+    let module_idx = interp.push_module_root(module_val) - 1;
+    let cache_idx = interp.push_module_root(Value::object(cache)) - 1;
+    let exports_idx = interp.push_module_root(exports_val) - 1;
 
-    // `module.exports` may have been reassigned by the module body.
-    let final_exports = object::get(module, interp.gc_heap(), "exports").unwrap_or(exports_val);
-    object::set(module, interp.gc_heap_mut(), "loaded", Value::boolean(true));
-    object::set(cache, interp.gc_heap_mut(), &id, final_exports);
-    Ok(final_exports)
+    let run = interp.run_callable_sync(&context, &wrapper, exports_val, call_args);
+
+    // Relocated handles (the collector may have moved them during the run).
+    let module = interp
+        .module_root(module_idx)
+        .as_object()
+        .expect("module object survives module-root rooting");
+    let cache = interp
+        .module_root(cache_idx)
+        .as_object()
+        .expect("require cache survives module-root rooting");
+    let exports_val = interp.module_root(exports_idx);
+
+    let result = run.map_err(vm_err).map(|_ret| {
+        // `module.exports` may have been reassigned by the module body.
+        let final_exports = object::get(module, interp.gc_heap(), "exports").unwrap_or(exports_val);
+        object::set(module, interp.gc_heap_mut(), "loaded", Value::boolean(true));
+        object::set(cache, interp.gc_heap_mut(), &id, final_exports);
+        final_exports
+    });
+
+    interp.pop_module_roots_to(root_base);
+    result
 }

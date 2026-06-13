@@ -292,6 +292,10 @@ fn run_one_test(
         .arg("--allow-all")
         .arg(&test.file_path)
         .current_dir(workspace_root)
+        // The harness's `common` re-execs the test with V8-specific `// Flags:`
+        // when it detects them; otter is a different engine and rejects those
+        // flags, so disable the flag-reexec path.
+        .env("NODE_SKIP_FLAG_CHECK", "1")
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
     configure_watchdog_process_group(&mut command);

@@ -104,6 +104,12 @@ pub(crate) fn install_global(
     otter_vm::object::set(versions, interp.gc_heap_mut(), "otter", otter_version);
     let node_version = string_value(interp, env!("CARGO_PKG_VERSION"))?;
     otter_vm::object::set(versions, interp.gc_heap_mut(), "node", node_version);
+    // The crypto subset (hashing / HMAC / CSPRNG) is available, so advertise an
+    // OpenSSL version — the test harness gates `hasCrypto` on `versions.openssl`.
+    let openssl_version = string_value(interp, "3.0.0")?;
+    otter_vm::object::set(versions, interp.gc_heap_mut(), "openssl", openssl_version);
+    let v8_version = string_value(interp, "12.0.0")?;
+    otter_vm::object::set(versions, interp.gc_heap_mut(), "v8", v8_version);
     otter_vm::object::set(
         process,
         interp.gc_heap_mut(),

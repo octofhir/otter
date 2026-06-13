@@ -6,6 +6,13 @@ use otter_vm::{NativeCtx, Value};
 const PERF_HOOKS_SHIM: &str = include_str!("perf_hooks.js");
 const V8_SHIM: &str = include_str!("v8.js");
 const MODULE_SHIM: &str = include_str!("module_builtin.js");
+const CLUSTER_SHIM: &str = include_str!("cluster.js");
+
+/// `node:cluster` — single-process stub (always primary, no workers).
+pub fn cluster_cjs_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result<Value, String> {
+    let events = crate::events::events_cjs_value(ctx, caps)?;
+    otter_runtime::run_builtin_cjs_shim(ctx, "node:cluster", CLUSTER_SHIM, &[("events", events)])
+}
 
 /// `node:perf_hooks` — performance timeline subset.
 pub fn perf_hooks_cjs_value(

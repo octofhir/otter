@@ -181,8 +181,148 @@ pub fn fs_native_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result<
     m!("readlink", 1, fs_readlink);
     m!("chmod", 2, fs_chmod);
     m!("truncate", 2, fs_truncate);
+    m!("openFd", 2, fs_open_fd);
+    m!("readFd", 3, fs_read_fd);
+    m!("writeFd", 3, fs_write_fd);
+    m!("closeFd", 1, fs_close_fd);
+    m!("fstatFd", 1, fs_fstat_fd);
 
     Ok(Value::object(builder.build()))
+}
+
+// ---- file-descriptor table (open/read/write/close/fstat) ----
+
+thread_local! {
+    static FD_TABLE: std::cell::RefCell<std::collections::HashMap<i32, std::fs::File>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    static NEXT_FD: std::cell::Cell<i32> = const { std::cell::Cell::new(3) };
+}
+
+fn open_options_for_flags(flags: &str) -> std::fs::OpenOptions {
+    let mut opts = std::fs::OpenOptions::new();
+    match flags {
+        "r" => opts.read(true),
+        "r+" => opts.read(true).write(true),
+        "w" => opts.write(true).create(true).truncate(true),
+        "w+" => opts.read(true).write(true).create(true).truncate(true),
+        "a" => opts.append(true).create(true),
+        "a+" => opts.read(true).append(true).create(true),
+        "wx" | "xw" => opts.write(true).create_new(true),
+        "ax" | "xa" => opts.append(true).create_new(true),
+        _ => opts.read(true),
+    };
+    opts
+}
+
+fn fs_open_fd(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    caps: &CapabilitySet,
+) -> Result<Value, NativeError> {
+    let path = path_arg(ctx, args, 0, "fs.open")?;
+    let flags = args
+        .get(1)
+        .map(|_| runtime_arg_to_string(args, 1, ctx.heap()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "r".to_string());
+    let writing = flags.contains(['w', 'a', '+']) || flags == "r+";
+    if writing {
+        require_write(&path, caps).map_err(fs_error)?;
+    } else {
+        require_read(&path, caps).map_err(fs_error)?;
+    }
+    let file = open_options_for_flags(&flags)
+        .open(&path)
+        .map_err(|e| fs_error(io_error(&path, &e)))?;
+    let fd = NEXT_FD.with(|n| {
+        let cur = n.get();
+        n.set(cur + 1);
+        cur
+    });
+    FD_TABLE.with(|t| t.borrow_mut().insert(fd, file));
+    Ok(Value::number(otter_vm::number::NumberValue::from_i32(fd)))
+}
+
+fn fs_read_fd(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    _caps: &CapabilitySet,
+) -> Result<Value, NativeError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let fd = args.first().and_then(|v| v.as_f64()).unwrap_or(-1.0) as i32;
+    let length = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0) as usize;
+    let position = args.get(2).and_then(|v| v.as_f64());
+    let bytes = FD_TABLE
+        .with(|t| -> std::io::Result<Vec<u8>> {
+            let mut table = t.borrow_mut();
+            let file = table
+                .get_mut(&fd)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(9))?;
+            if let Some(pos) = position.filter(|p| *p >= 0.0) {
+                file.seek(SeekFrom::Start(pos as u64))?;
+            }
+            let mut buf = vec![0u8; length];
+            let n = file.read(&mut buf)?;
+            buf.truncate(n);
+            Ok(buf)
+        })
+        .map_err(|e| fs_error(io_error(Path::new("<fd>"), &e)))?;
+    crate::string_value(ctx, &bytes_to_latin1(&bytes))
+}
+
+fn fs_write_fd(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    _caps: &CapabilitySet,
+) -> Result<Value, NativeError> {
+    use std::io::{Seek, SeekFrom, Write};
+    let fd = args.first().and_then(|v| v.as_f64()).unwrap_or(-1.0) as i32;
+    let data = latin1_to_bytes(&runtime_arg_to_string(args, 1, ctx.heap()));
+    let position = args.get(2).and_then(|v| v.as_f64());
+    let written = FD_TABLE
+        .with(|t| -> std::io::Result<usize> {
+            let mut table = t.borrow_mut();
+            let file = table
+                .get_mut(&fd)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(9))?;
+            if let Some(pos) = position.filter(|p| *p >= 0.0) {
+                file.seek(SeekFrom::Start(pos as u64))?;
+            }
+            file.write_all(&data)?;
+            Ok(data.len())
+        })
+        .map_err(|e| fs_error(io_error(Path::new("<fd>"), &e)))?;
+    Ok(Value::number(otter_vm::number::NumberValue::from_f64(
+        written as f64,
+    )))
+}
+
+fn fs_close_fd(
+    _ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    _caps: &CapabilitySet,
+) -> Result<Value, NativeError> {
+    let fd = args.first().and_then(|v| v.as_f64()).unwrap_or(-1.0) as i32;
+    FD_TABLE.with(|t| t.borrow_mut().remove(&fd));
+    Ok(Value::undefined())
+}
+
+fn fs_fstat_fd(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    _caps: &CapabilitySet,
+) -> Result<Value, NativeError> {
+    let fd = args.first().and_then(|v| v.as_f64()).unwrap_or(-1.0) as i32;
+    let meta = FD_TABLE
+        .with(|t| t.borrow().get(&fd).map(std::fs::File::metadata))
+        .ok_or_else(|| {
+            fs_error(io_error(
+                Path::new("<fd>"),
+                &std::io::Error::from_raw_os_error(9),
+            ))
+        })?
+        .map_err(|e| fs_error(io_error(Path::new("<fd>"), &e)))?;
+    stat_object(ctx, &meta)
 }
 
 // ---- raw byte/latin1 bridging ----
@@ -262,7 +402,11 @@ fn fs_stat_raw(
         std::fs::metadata(&path)
     }
     .map_err(|e| fs_error(io_error(&path, &e)))?;
+    stat_object(ctx, &meta)
+}
 
+/// Build the raw Stats-data object that `fs.js` wraps into a `Stats` instance.
+fn stat_object(ctx: &mut NativeCtx<'_>, meta: &std::fs::Metadata) -> Result<Value, NativeError> {
     let to_ms = |t: Option<std::time::SystemTime>| -> f64 {
         t.and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs_f64() * 1000.0)
@@ -277,7 +421,7 @@ fn fs_stat_raw(
     let mut scope = ModuleScope::new(ctx);
     let obj = scope.object().map_err(oom)?;
     scope.set_number(obj, "size", meta.len() as f64);
-    scope.set_number(obj, "mode", file_mode(&meta) as f64);
+    scope.set_number(obj, "mode", file_mode(meta) as f64);
     scope.set_number(obj, "mtimeMs", mtime);
     scope.set_number(obj, "atimeMs", atime);
     scope.set_number(obj, "ctimeMs", ctime);
@@ -285,7 +429,7 @@ fn fs_stat_raw(
     set_bool(&mut scope, obj, "isFile", file_type.is_file());
     set_bool(&mut scope, obj, "isDirectory", file_type.is_dir());
     set_bool(&mut scope, obj, "isSymbolicLink", file_type.is_symlink());
-    let (blksize, blocks, dev, ino, nlink, uid, gid, rdev) = stat_extra(&meta);
+    let (blksize, blocks, dev, ino, nlink, uid, gid, rdev) = stat_extra(meta);
     scope.set_number(obj, "blksize", blksize);
     scope.set_number(obj, "blocks", blocks);
     scope.set_number(obj, "dev", dev);

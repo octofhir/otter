@@ -19,6 +19,7 @@
 pub mod assert;
 pub mod buffer;
 pub mod child_process;
+pub mod crypto;
 pub mod diagnostics_channel;
 pub mod events;
 pub mod fs;
@@ -184,6 +185,26 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         "readline/promises",
         HostedModuleInstall::new(readline::install_readline_module),
         readline::readline_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:cluster",
+        HostedModuleInstall::new(misc_modules::install_noop),
+        misc_modules::cluster_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "cluster",
+        HostedModuleInstall::new(misc_modules::install_noop),
+        misc_modules::cluster_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:crypto",
+        HostedModuleInstall::new(crypto::install_crypto_module),
+        crypto::crypto_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "crypto",
+        HostedModuleInstall::new(crypto::install_crypto_module),
+        crypto::crypto_cjs_value,
     ),
     HostedModule::new_with_cjs_value(
         "node:perf_hooks",

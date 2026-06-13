@@ -129,6 +129,42 @@ function readlinkSync(path) { return native.readlink(pathStr(path)); }
 function chmodSync(path, mode) { native.chmod(pathStr(path), Number(mode)); }
 function truncateSync(path, len) { native.truncate(pathStr(path), Number(len) || 0); }
 
+// ---- file descriptors ----
+function openSync(path, flags, mode) {
+  return native.openFd(pathStr(path), typeof flags === 'string' ? flags : 'r');
+}
+function closeSync(fd) { native.closeFd(fd); }
+function readSync(fd, buffer, offset, length, position) {
+  if (offset && typeof offset === 'object') {
+    // readSync(fd, buffer, { offset, length, position })
+    const o = offset;
+    offset = o.offset || 0; length = o.length === undefined ? buffer.length - offset : o.length;
+    position = o.position === undefined ? null : o.position;
+  }
+  offset = offset || 0;
+  if (length === undefined || length === null) length = buffer.length - offset;
+  const raw = native.readFd(fd, length, position === undefined || position === null ? -1 : position);
+  const bytes = Buffer.from(raw, 'latin1');
+  for (let i = 0; i < bytes.length; i++) buffer[offset + i] = bytes[i];
+  return bytes.length;
+}
+function writeSync(fd, data, offsetOrPosition, lengthOrEncoding, position) {
+  let latin1;
+  if (typeof data === 'string') {
+    latin1 = Buffer.from(data, typeof lengthOrEncoding === 'string' ? lengthOrEncoding : 'utf8').toString('latin1');
+    position = typeof offsetOrPosition === 'number' ? offsetOrPosition : null;
+  } else {
+    const off = typeof offsetOrPosition === 'number' ? offsetOrPosition : 0;
+    const len = typeof lengthOrEncoding === 'number' ? lengthOrEncoding : (data.length - off);
+    latin1 = Buffer.from(data).slice(off, off + len).toString('latin1');
+  }
+  return native.writeFd(fd, latin1, position === undefined || position === null ? -1 : position);
+}
+function fstatSync(fd, options) { return new Stats(native.fstatFd(fd)); }
+function ftruncateSync() {}
+function fsyncSync() {}
+function fdatasyncSync() {}
+
 // ---- async (callback) ----
 function asyncify(syncFn) {
   return function (...args) {
@@ -158,6 +194,22 @@ const rename = asyncify(renameSync);
 const readlink = asyncify(readlinkSync);
 const chmod = asyncify(chmodSync);
 const truncate = asyncify(truncateSync);
+const open = asyncify(openSync);
+const close = asyncify(closeSync);
+const fstat = asyncify(fstatSync);
+function read(fd, buffer, offset, length, position, cb) {
+  if (typeof offset === 'object') { cb = length; const o = offset; offset = o.offset; length = o.length; position = o.position; }
+  setTimeout(() => {
+    try { const n = readSync(fd, buffer, offset, length, position); cb(null, n, buffer); } catch (e) { cb(e); }
+  }, 0);
+}
+function write(fd, data, a, b, c, cb) {
+  const args = [data, a, b, c].filter((x) => x !== undefined);
+  cb = typeof args[args.length - 1] === 'function' ? args.pop() : (typeof c === 'function' ? c : () => {});
+  setTimeout(() => {
+    try { const n = writeSync(fd, data, a, b, c); cb(null, n, data); } catch (e) { cb(e); }
+  }, 0);
+}
 function exists(path, cb) { setTimeout(() => cb(existsSync(path))); }
 
 // ---- promises ----
@@ -258,8 +310,10 @@ module.exports = {
   readFileSync, writeFileSync, appendFileSync, existsSync, statSync, lstatSync,
   readdirSync, mkdirSync, rmSync, rmdirSync, unlinkSync, realpathSync,
   copyFileSync, accessSync, renameSync, readlinkSync, chmodSync, truncateSync,
+  openSync, closeSync, readSync, writeSync, fstatSync, ftruncateSync, fsyncSync, fdatasyncSync,
   readFile, writeFile, appendFile, exists, stat, lstat, readdir, mkdir, rm, rmdir,
   unlink, realpath, copyFile, access, rename, readlink, chmod, truncate,
+  open, close, read, write, fstat,
   createReadStream, createWriteStream, watch, watchFile, unwatchFile,
   promises,
 };

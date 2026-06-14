@@ -66,6 +66,40 @@ Three project constraints shape this plan:
 Newest first. Each entry is gated per §5 (test262 failing-set unchanged +
 benchmarks no-regression + GC stress clean). Benches are min-ms, 10 runs.
 
+- **Phase 1 step 2 — baseline arm64 emitter, integer core. DONE, unit-verified
+  (not yet bench-visible).** Sparkplug-style template emitter in
+  `crates/otter-jit/src/baseline.rs` (dynasm-rs, arm64): one linear pass, one
+  emit routine per opcode, no IR/regalloc/deopt. Lowers a `JitFunctionView` to
+  native code for the **allocation-free integer subset**: `LoadInt32`(imm),
+  `LoadLocal`/`StoreLocal` moves, `Add`/`Sub`/`Mul` with inline int32 guard +
+  overflow→bail, the six int comparisons → boolean Value, `Jump`/`JumpIfFalse`/
+  `JumpIfTrue` with CFG resolved from byte-offset branch deltas via per-instr
+  dynasm dynamic labels, `Return`. Whole-function opt-in: any other opcode/
+  operand shape → `Unsupported` → silent interpreter fallback. **GC-trivial by
+  construction:** operands/results flow through the caller-owned register array
+  (`*mut u64` = `Frame.registers.as_mut_ptr()`); the subset has no allocation and
+  no `Call`, so no safepoint and no value is ever live in a register across a GC
+  move — reuses the interpreter's precise `FrameRoots`, no stack maps. ABI
+  `extern "C" fn(regs, bailed) -> u64`; failed typed guard sets `bailed` and
+  returns so the caller re-runs on the interpreter (every guard fires *before*
+  its result store, so a bailed register array is never partially mutated).
+  9 in-crate execution tests pass, incl. a real counted loop computing
+  `sum(1..=100)=5050` through emitted branches. `BaselineJitCompiler` now drives
+  the emitter and returns `Compiled{code}`. **Still runtime-inert in the VM** (no
+  tier-up dispatch wired), so no bench/test262/GC-surface change yet — the bench
+  number arrives with the call ABI + function-entry tier-up (next).
+- **Phase 1 step 1 — dependency-inverted JIT compile hook. DONE.** New
+  `crates/otter-vm/src/jit.rs`: `JitCompilerHook` trait + borrow-free owned
+  compile-input DTOs (`JitFunctionView`/`JitInstrView`) snapshotting the frozen
+  executable stream (`Op` + `Operand` + `byte_pc` + `byte_len` +
+  `property_ic_site`; branch immediates already byte-offset deltas).
+  **Bytecode source decided here:** snapshot the already-decoded `ExecInstr`
+  view (`ExecutableFunction::jit_view`, `ExecutionContext::jit_function_view`),
+  not a re-decode of raw `otter-bytecode` and not an `ExecInstr` layout leak.
+  `Interpreter` holds `Option<Arc<dyn JitCompilerHook>>` (`set_jit_compiler`),
+  defaulting to `None` → surface is runtime-inert until a compiler installs.
+  No `otter-vm → otter-jit` dependency (no cycle); `otter-jit` depends on
+  `otter-vm`, `otter-runtime` will wire the two.
 - **Phase 0 step 3 — hoist per-op context/function re-resolution. TRIED,
   REVERTED (negative result).** Cached the top frame's resolved
   `(function_id, &ExecutableFunction)` and reused it while the top frame stayed

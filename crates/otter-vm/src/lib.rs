@@ -2935,6 +2935,16 @@ impl Interpreter {
         value: &Value,
         extra_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<object::ShapeHandle, VmError> {
+        // Fast path: a previously seen field-shape transition resolves with no
+        // allocation, so it needs no rooting. Building an object whose layout
+        // already exists (every object after the first of its class) lands
+        // here and skips the full runtime-root walk below.
+        if let Some(child) = self
+            .shape_runtime
+            .child_if_cached(&self.gc_heap, parent, key)
+        {
+            return Ok(child);
+        }
         let roots = self.collect_runtime_roots_without_shape_runtime();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             extra_visit(visitor);
@@ -2957,6 +2967,12 @@ impl Interpreter {
         obj: &mut object::JsObject,
         descriptor: &object::PropertyDescriptor,
     ) -> Result<object::ShapeHandle, VmError> {
+        if let Some(child) = self
+            .shape_runtime
+            .child_if_cached(&self.gc_heap, parent, key)
+        {
+            return Ok(child);
+        }
         let roots = self.collect_runtime_roots_without_shape_runtime();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {

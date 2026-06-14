@@ -155,6 +155,35 @@ impl ShapeRuntime {
         Ok(handle)
     }
 
+    /// Return the cached transition for appending `key` to `parent`, or
+    /// `None` when no such transition exists yet.
+    ///
+    /// This is the allocation-free fast path: an already-interned key plus a
+    /// recorded transition resolve through two hash lookups and two payload
+    /// reads with **no rooting and no allocation**. Construction of an object
+    /// with a previously seen field shape (the overwhelmingly common case)
+    /// hits here, so callers can skip the eager root-set collection that the
+    /// allocating [`Self::child_with_roots`] path requires. A `None` result
+    /// means the key has never been interned or the transition has not been
+    /// taken before — the caller must fall back to `child_with_roots`.
+    pub(crate) fn child_if_cached(
+        &mut self,
+        heap: &GcHeap,
+        parent: ShapeHandle,
+        key: &str,
+    ) -> Option<ShapeHandle> {
+        let key_handle = *self.interned_keys.get(key)?;
+        let parent_id = heap.read_payload(parent, ShapeBody::id);
+        let key_id = heap.read_payload(key_handle, JsStringBody::id);
+        let transition_key = TransitionKey {
+            parent: parent_id,
+            key: key_id,
+        };
+        let child = *self.transitions.get(&transition_key)?;
+        self.notify_observer(heap, parent_id, child, key, true);
+        Some(child)
+    }
+
     /// Return the transition reached by appending `key` to `parent`.
     pub(crate) fn child_with_roots(
         &mut self,

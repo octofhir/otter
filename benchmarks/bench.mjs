@@ -35,6 +35,21 @@ function otterBin() {
   return null;
 }
 
+// Resolve the installed `node` version once and cache whether it strips
+// TypeScript types without a flag (v23.6+, or the v22.18+ LTS backport).
+let _nodeStrips = null;
+function nodeStripsTypesByDefault() {
+  if (_nodeStrips !== null) return _nodeStrips;
+  try {
+    const v = execSync("node --version", { encoding: "utf8" }).trim().replace(/^v/, "");
+    const [major, minor] = v.split(".").map((n) => parseInt(n, 10));
+    _nodeStrips = major > 23 || (major === 23 && minor >= 6) || (major === 22 && minor >= 18);
+  } catch {
+    _nodeStrips = false;
+  }
+  return _nodeStrips;
+}
+
 const RUNTIMES = [
   {
     name: "otter",
@@ -53,8 +68,10 @@ const RUNTIMES = [
   {
     name: "node",
     bin: "node",
+    // Node strips TypeScript types by default from v23.6 (and v22.18 LTS).
+    // On those, run `.ts` directly; older nodes need the explicit flag.
     argv: (f) =>
-      extname(f) === ".ts"
+      extname(f) === ".ts" && !nodeStripsTypesByDefault()
         ? ["node", ["--experimental-strip-types", f]]
         : ["node", [f]],
     ts: true,

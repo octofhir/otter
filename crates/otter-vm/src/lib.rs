@@ -4424,6 +4424,20 @@ impl Interpreter {
                 // match below has no arm for `Op::ToPrimitive`.
                 Op::ToPrimitive => {
                     let operands = context.exec_operands(instr);
+                    // Hot fast path: an already-primitive source (the dominant
+                    // case — numeric loop operands) is its own ToPrimitive
+                    // result. Skip the hint-token decode and the parked-ladder
+                    // resume check; a primitive operand never parks. Reading
+                    // `src` (the original operand, not `dst`) keeps the object
+                    // resume path — where `src` stays non-primitive — intact.
+                    let dst = register_operand(operands.first())?;
+                    let src = register_operand(operands.get(1))?;
+                    let recv = *read_register(&stack[top_idx], src)?;
+                    if abstract_ops::is_primitive(&recv) {
+                        write_register(&mut stack[top_idx], dst, recv)?;
+                        stack[top_idx].advance_pc(self.current_byte_len)?;
+                        continue;
+                    }
                     self.drive_to_primitive(stack, context, operands)?;
                     continue;
                 }

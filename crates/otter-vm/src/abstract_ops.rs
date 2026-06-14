@@ -596,6 +596,16 @@ pub fn abstract_relational_comparison(
     y: &Value,
     heap: &otter_gc::GcHeap,
 ) -> RelationalOutcome {
+    // Fast path: two int32 SMIs (the dominant case in numeric loops) compare
+    // directly, skipping the String / BigInt / ToNumeric ladder below. No NaN
+    // or coercion is possible, so the result is never `Undefined`.
+    if let (Some(a), Some(b)) = (x.as_i32(), y.as_i32()) {
+        return if a < b {
+            RelationalOutcome::LessThan
+        } else {
+            RelationalOutcome::NotLessThan
+        };
+    }
     // Step 1: both String → lexicographic.
     if let (Some(a), Some(b)) = (x.as_string(heap), y.as_string(heap)) {
         return match a.compare_lex(b, heap) {

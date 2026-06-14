@@ -17,6 +17,8 @@
 //! - Each `ExecInstr` carries its own `byte_pc` and `byte_len` so the
 //!   dispatch loop advances by `byte_len` and resolves jump targets in the
 //!   same coordinate system as the source-map spans.
+//! - `ExecutableFunction::byte_to_instr` is a dense byte-offset → `code`
+//!   index map, so PC resolution is `O(1)`, not a binary search.
 //! - Operands live in a per-instruction `Box<[Operand]>`; there is no
 //!   shared side table. Variadic opcodes just hold a longer slice.
 //! - Branch-class `Imm32` operands hold byte-offset deltas relative to
@@ -36,6 +38,10 @@ use otter_bytecode::{
 };
 
 const NO_PROPERTY_IC_SITE: u32 = u32::MAX;
+
+/// Sentinel in [`ExecutableFunction::byte_to_instr`] for byte offsets
+/// that are not an instruction boundary (interior bytes / past-end).
+const NO_INSTR_AT_BYTE: u32 = u32::MAX;
 
 /// Transient builder for [`ExecutableModule`].
 ///
@@ -174,16 +180,17 @@ impl ExecutableFunction {
         self.code_byte_len
     }
 
-    /// Resolve a byte-offset PC to its `ExecInstr`. Returns `None` when
-    /// `byte_pc` does not fall on an instruction boundary (which only
-    /// happens on corrupt bytecode).
+    /// Resolve a byte-offset PC to its `ExecInstr` in `O(1)` via the
+    /// dense `byte_to_instr` boundary map. Returns `None` when `byte_pc`
+    /// is out of range or does not fall on an instruction boundary (which
+    /// only happens on corrupt bytecode).
     #[must_use]
     pub(crate) fn instr_at_byte_pc(&self, byte_pc: u32) -> Option<&ExecInstr> {
-        let idx = self
-            .code
-            .binary_search_by_key(&byte_pc, |instr| instr.byte_pc())
-            .ok()?;
-        self.code.get(idx)
+        let idx = *self.byte_to_instr.get(byte_pc as usize)?;
+        if idx == NO_INSTR_AT_BYTE {
+            return None;
+        }
+        self.code.get(idx as usize)
     }
 }
 
@@ -239,8 +246,14 @@ pub(crate) struct ExecutableFunction {
     pub(crate) contains_direct_eval: bool,
     /// Hot instruction stream. Indexed in source order; the dispatch
     /// loop resolves a frame's byte-offset PC to an entry via
-    /// [`Self::instr_at_byte_pc`] (`O(log N)` binary search on `byte_pc`).
+    /// [`Self::instr_at_byte_pc`] (`O(1)` lookup through `byte_to_instr`).
     pub(crate) code: Box<[ExecInstr]>,
+    /// Dense byte-offset → `code` index map (length `code_byte_len`).
+    /// Instruction-boundary bytes hold the entry's index; interior bytes
+    /// hold [`NO_INSTR_AT_BYTE`]. Turns PC resolution into a single array
+    /// index instead of an `O(log N)` binary search over `code`. Costs
+    /// `4 × code_byte_len` bytes per function — paid once at build.
+    pub(crate) byte_to_instr: Box<[u32]>,
     /// Source-map entries with `pc` expressed as a byte offset into the
     /// encoded stream. Empty when the underlying [`Function::spans`] is empty.
     pub(crate) byte_spans: Box<[SpanEntry]>,
@@ -309,6 +322,14 @@ impl ExecutableFunction {
                 storage: binding.storage,
             })
             .collect();
+        // Invert `instr_to_byte_pc` into a dense byte → index map so the
+        // dispatch loop resolves a byte-offset PC in O(1). Interior /
+        // past-end bytes stay `NO_INSTR_AT_BYTE`.
+        let mut byte_to_instr = vec![NO_INSTR_AT_BYTE; code_byte_len as usize];
+        for (idx, &bpc) in instr_to_byte_pc.iter().enumerate() {
+            byte_to_instr[bpc as usize] = idx as u32;
+        }
+        let byte_to_instr = byte_to_instr.into_boxed_slice();
         let byte_spans =
             translate_spans_to_byte_pcs(&function.spans, &instr_to_byte_pc, code_byte_len)
                 .into_boxed_slice();
@@ -344,6 +365,7 @@ impl ExecutableFunction {
                 .collect(),
             contains_direct_eval: function.contains_direct_eval,
             code,
+            byte_to_instr,
             byte_spans,
             code_byte_len,
         }
@@ -472,12 +494,6 @@ impl ExecInstr {
     #[must_use]
     pub(crate) const fn byte_len(&self) -> u32 {
         self.byte_len as u32
-    }
-
-    /// Byte-offset PC of this instruction in the encoded stream.
-    #[must_use]
-    pub(crate) const fn byte_pc(&self) -> u32 {
-        self.byte_pc
     }
 
     /// Dense property IC site index for named property opcodes.

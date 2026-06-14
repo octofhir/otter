@@ -694,7 +694,7 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         let site = context
             .template_site(site_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?
+            .ok_or(VmError::InvalidOperand)?
             .clone();
         let mut cooked: Vec<Value> = Vec::with_capacity(site.cooked.len());
         for entry in &site.cooked {
@@ -1277,30 +1277,26 @@ impl Interpreter {
         callee_reg: u16,
         arg_regs: &[u16],
     ) -> Result<(), VmError> {
-        let frame = stack
-            .get(frame_index)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+        let frame = stack.get(frame_index).ok_or(VmError::InvalidOperand)?;
         let callee = *frame
             .registers
             .get(callee_reg as usize)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(arg_regs.len());
         for &r in arg_regs {
             args.push(
                 *frame
                     .registers
                     .get(r as usize)
-                    .ok_or_else(|| VmError::InvalidOperand)?,
+                    .ok_or(VmError::InvalidOperand)?,
             );
         }
         let result = self.run_callable_sync(context, &callee, Value::undefined(), args)?;
-        let frame = stack
-            .get_mut(frame_index)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+        let frame = stack.get_mut(frame_index).ok_or(VmError::InvalidOperand)?;
         *frame
             .registers
             .get_mut(dst as usize)
-            .ok_or_else(|| VmError::InvalidOperand)? = result;
+            .ok_or(VmError::InvalidOperand)? = result;
         Ok(())
     }
 
@@ -1320,10 +1316,81 @@ impl Interpreter {
         idx: u32,
     ) -> Result<(), VmError> {
         // `self` and `stack` are disjoint, so the two `&mut` are non-aliasing.
-        let frame = stack
-            .get_mut(frame_index)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+        let frame = stack.get_mut(frame_index).ok_or(VmError::InvalidOperand)?;
         self.run_make_function_reg(context, frame, dst, idx)
+    }
+
+    /// JIT bridge — perform a named `LoadProperty` from compiled code, reusing
+    /// the interpreter's full property-read path (inline cache + accessor
+    /// dispatch). Reads the receiver from register `obj_reg` of frame
+    /// `frame_index` and writes the result into register `dst`.
+    ///
+    /// The compiled tier owns its own control flow, so the frame PC is saved
+    /// and restored across the call: a later guard bail must re-run the whole
+    /// function from PC 0, which requires `frame.pc` to stay untouched here.
+    ///
+    /// # Errors
+    /// Propagates any error the read raises (e.g. a throwing getter), and
+    /// `InvalidOperand` for an unknown property-name index.
+    pub fn jit_runtime_load_property(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut jit::JitFrameStack,
+        frame_index: usize,
+        dst: u16,
+        obj_reg: u16,
+        name_idx: u32,
+    ) -> Result<(), VmError> {
+        let key = context
+            .property_atom(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        let saved_pc = stack[frame_index].pc;
+        let result = self.run_load_property_reg(context, stack, frame_index, dst, obj_reg, key);
+        stack[frame_index].pc = saved_pc;
+        result
+    }
+
+    /// JIT bridge — perform a named `StoreProperty` from compiled code, reusing
+    /// the interpreter's full property-write path (shape transition + accessor
+    /// setters). Reads the receiver from register `obj_reg` and the value from
+    /// register `src` of frame `frame_index`.
+    ///
+    /// As with [`Self::jit_runtime_load_property`], the frame PC is saved and
+    /// restored: the store path advances the interpreter PC, which compiled
+    /// code must not observe (a later bail re-runs the function from PC 0).
+    ///
+    /// # Errors
+    /// Propagates write failures (read-only target in strict mode, throwing
+    /// setter) and `InvalidOperand` for an unknown property-name index.
+    pub fn jit_runtime_store_property(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut jit::JitFrameStack,
+        frame_index: usize,
+        obj_reg: u16,
+        name_idx: u32,
+        src: u16,
+    ) -> Result<(), VmError> {
+        let key = context
+            .property_atom(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        let saved_pc = stack[frame_index].pc;
+        let result = self.run_store_property_reg(context, stack, frame_index, obj_reg, key, src);
+        stack[frame_index].pc = saved_pc;
+        result
+    }
+
+    /// JIT bridge — boxed `Value` bits of frame `frame_index`'s `this` binding,
+    /// read once at compiled-entry setup so a `LoadThis` is a direct `JitCtx`
+    /// read. A hole (`this` not yet initialized in a derived constructor)
+    /// surfaces verbatim; the emitter guards against it and bails to the
+    /// interpreter, which owns the derived-constructor resolution and throw.
+    #[must_use]
+    pub fn jit_frame_this_bits(&self, stack: &jit::JitFrameStack, frame_index: usize) -> u64 {
+        match stack.get(frame_index) {
+            Some(frame) => frame.this_value.to_bits(),
+            None => Value::undefined().to_bits(),
+        }
     }
 
     /// JIT bridge — boxed `Value` bits of frame `frame_index`'s SELF closure,
@@ -1670,7 +1737,7 @@ impl Interpreter {
     ) -> Result<Option<crate::promise::JsPromiseHandle>, VmError> {
         let function = context
             .exec_function(function_id)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         // The module environment record: link-phase and
         // evaluation-phase invocations share one persistent set of
         // own-upvalue cells so hoisted closures and the body bind the
@@ -2067,10 +2134,10 @@ impl Interpreter {
         }
         let function_ctor = object::get(self.global_this, &self.gc_heap, "Function")
             .and_then(|v| v.as_object())
-            .ok_or_else(|| VmError::TypeMismatch)?;
+            .ok_or(VmError::TypeMismatch)?;
         object::get(function_ctor, &self.gc_heap, "prototype")
             .and_then(|v| v.as_object())
-            .ok_or_else(|| VmError::TypeMismatch)
+            .ok_or(VmError::TypeMismatch)
     }
 
     fn is_callable_runtime(&self, value: &Value) -> bool {
@@ -2523,7 +2590,7 @@ impl Interpreter {
 
     fn primitive_wrapper_prototype(&mut self, constructor_name: &str) -> Result<JsObject, VmError> {
         let constructor = object::get(self.global_this, &self.gc_heap, constructor_name)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         let prototype = if let Some(ctor) = constructor.as_object() {
             object::get(ctor, &self.gc_heap, "prototype")
         } else if let Some(native) = constructor.as_native_function() {
@@ -2539,7 +2606,7 @@ impl Interpreter {
         };
         prototype
             .and_then(|v| v.as_object())
-            .ok_or_else(|| VmError::InvalidOperand)
+            .ok_or(VmError::InvalidOperand)
     }
 
     fn box_sloppy_this_primitive_runtime_rooted(
@@ -4091,17 +4158,15 @@ impl Interpreter {
                         _ => None,
                     };
                 }
-                foreign_context
-                    .as_ref()
-                    .ok_or_else(|| VmError::InvalidOperand)?
+                foreign_context.as_ref().ok_or(VmError::InvalidOperand)?
             };
             let function = context
                 .exec_function(function_id)
-                .ok_or_else(|| VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)?;
             let pc = stack[top_idx].pc;
             let instr = function
                 .instr_at_byte_pc(pc)
-                .ok_or_else(|| VmError::MissingReturn)?;
+                .ok_or(VmError::MissingReturn)?;
             let op = instr.op();
             self.current_byte_len = instr.byte_len();
             // Inlined runtime metering on the dispatch hot path. The three
@@ -4157,7 +4222,7 @@ impl Interpreter {
                         .registers
                         .get(src as usize)
                         .cloned()
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     if let Some(popped) = self.return_running_finally(stack, value)? {
                         return Ok(popped);
                     }
@@ -4190,7 +4255,16 @@ impl Interpreter {
                 }
                 Op::CallMethodValue => {
                     let operands = context.exec_operands(instr);
+                    let depth_before = stack.len();
                     self.do_call_method_value(stack, context, operands)?;
+                    // Tier-up hook, mirroring `Op::Call`: a bytecode method
+                    // callee pushed via `invoke` lands as a fresh pc==0 frame.
+                    if self.jit_hook.is_some()
+                        && stack.len() > depth_before
+                        && let Some(Some(value)) = self.maybe_dispatch_jit(stack, context)?
+                    {
+                        return Ok(value);
+                    }
                     continue;
                 }
                 Op::CallSpread => {
@@ -4268,7 +4342,7 @@ impl Interpreter {
                         .registers
                         .get(src as usize)
                         .cloned()
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     // Capture frames at the originating throw site
                     // before `unwind_throw` pops handler-less
                     // frames. If a catch absorbs the throw the
@@ -4343,10 +4417,10 @@ impl Interpreter {
                 Op::YieldDelegate => {
                     let (kind_dst, value_dst, src) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let yielded = *read_register(&stack[top_idx], src)?;
-                    let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
-                    let owner = frame.generator_owner.ok_or_else(|| VmError::TypeMismatch)?;
+                    let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+                    let owner = frame.generator_owner.ok_or(VmError::TypeMismatch)?;
                     frame.advance_pc(self.current_byte_len)?;
                     let mut popped = stack.pop().expect("frame present");
                     let detached_cold = self.frame_detach_cold(&mut popped);
@@ -4364,8 +4438,8 @@ impl Interpreter {
                     let dst = register_operand(context.exec_operand(instr, 0))?;
                     let src = register_operand(context.exec_operand(instr, 1))?;
                     let yielded = *read_register(&stack[top_idx], src)?;
-                    let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
-                    let owner = frame.generator_owner.ok_or_else(|| VmError::TypeMismatch)?;
+                    let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+                    let owner = frame.generator_owner.ok_or(VmError::TypeMismatch)?;
                     frame.advance_pc(self.current_byte_len)?;
                     let mut popped = stack.pop().expect("frame present");
                     let detached_cold = self.frame_detach_cold(&mut popped);
@@ -4385,8 +4459,8 @@ impl Interpreter {
                     return Ok(yielded);
                 }
                 Op::GeneratorStart => {
-                    let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
-                    let owner = frame.generator_owner.ok_or_else(|| VmError::TypeMismatch)?;
+                    let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+                    let owner = frame.generator_owner.ok_or(VmError::TypeMismatch)?;
                     frame.advance_pc(self.current_byte_len)?;
                     let mut popped = stack.pop().expect("frame present");
                     let detached_cold = self.frame_detach_cold(&mut popped);
@@ -4405,10 +4479,10 @@ impl Interpreter {
                     }
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let src = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_to_number_regs(frame, dst, src)?;
                     continue;
@@ -4452,20 +4526,20 @@ impl Interpreter {
                     }
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let src = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     self.run_get_iterator_regs(&mut *stack, top_idx, dst, src)?;
                     continue;
                 }
                 Op::GetAsyncIterator => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let src = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     self.run_get_async_iterator_regs(context, &mut *stack, top_idx, dst, src)?;
                     continue;
                 }
@@ -4482,7 +4556,7 @@ impl Interpreter {
                     // throw-unwind does not invoke `[[return]]`.
                     let iter_reg = context
                         .exec_register(instr, 2)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let iterator = *read_register(&stack[top_idx], iter_reg)?;
                     let operands = context.exec_operands(instr);
                     match self.drive_iterator_next(stack, context, operands) {
@@ -4495,10 +4569,10 @@ impl Interpreter {
                     }
                     let value_dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let done_dst = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     if let Err(e) =
                         self.run_iterator_next_regs(frame, value_dst, done_dst, iter_reg)
@@ -4511,7 +4585,7 @@ impl Interpreter {
                 Op::IteratorClose => {
                     let iter_reg = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let iterator = *read_register(&stack[top_idx], iter_reg)?;
                     // §7.4.9 — mark the iterator done *before* running its
                     // `[[return]]`: if `return` throws, the unwind must
@@ -4524,7 +4598,7 @@ impl Interpreter {
                 Op::IteratorCloseStart => {
                     let iter_reg = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let iterator = *read_register(&stack[top_idx], iter_reg)?;
                     // §7.4.9 — record the handler depth so throw-unwind
                     // can tell whether a catching handler sits inside or
@@ -4541,7 +4615,7 @@ impl Interpreter {
                 Op::IteratorCloseEnd => {
                     let iter_reg = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let iterator = *read_register(&stack[top_idx], iter_reg)?;
                     if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx])
                         && let Some(pos) = cold
@@ -4568,16 +4642,16 @@ impl Interpreter {
                     }
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let obj_reg = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let name_idx = context
                         .exec_const_index(instr, 2)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let key = context
                         .property_atom(name_idx)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     self.run_load_property_reg(context, &mut *stack, top_idx, dst, obj_reg, key)?;
                     continue;
                 }
@@ -4588,7 +4662,7 @@ impl Interpreter {
                     }
                     let (dst, recv_reg, idx_reg) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_load_element_regs(context, frame, dst, recv_reg, idx_reg)?;
                     continue;
@@ -4596,16 +4670,16 @@ impl Interpreter {
                 Op::LoadSuperProperty => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let home_reg = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let name_idx = context
                         .exec_const_index(instr, 2)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let name = context
                         .property_atom(name_idx)
-                        .ok_or_else(|| VmError::InvalidOperand)?
+                        .ok_or(VmError::InvalidOperand)?
                         .name();
                     let home = *read_register(&stack[top_idx], home_reg)?;
                     self.run_load_super_property(
@@ -4621,7 +4695,7 @@ impl Interpreter {
                 Op::LoadSuperElement => {
                     let (dst, home_reg, key_reg) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let home = *read_register(&stack[top_idx], home_reg)?;
                     let key_raw = *read_register(&stack[top_idx], key_reg)?;
                     self.run_load_super_property(
@@ -4637,16 +4711,16 @@ impl Interpreter {
                 Op::SetSuperProperty => {
                     let home_reg = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let name_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let value_reg = context
                         .exec_register(instr, 2)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let name = context
                         .property_atom(name_idx)
-                        .ok_or_else(|| VmError::InvalidOperand)?
+                        .ok_or(VmError::InvalidOperand)?
                         .name();
                     let home = *read_register(&stack[top_idx], home_reg)?;
                     let value = *read_register(&stack[top_idx], value_reg)?;
@@ -4665,7 +4739,7 @@ impl Interpreter {
                 Op::SetSuperElement => {
                     let (home_reg, key_reg, value_reg) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let home = *read_register(&stack[top_idx], home_reg)?;
                     let key_raw = *read_register(&stack[top_idx], key_reg)?;
                     let value = *read_register(&stack[top_idx], value_reg)?;
@@ -4692,16 +4766,16 @@ impl Interpreter {
                     }
                     let obj_reg = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let name_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let src = context
                         .exec_register(instr, 2)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let key = context
                         .property_atom(name_idx)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     self.run_store_property_reg(context, &mut *stack, top_idx, obj_reg, key, src)?;
                     continue;
                 }
@@ -4712,13 +4786,13 @@ impl Interpreter {
                     }
                     let recv_reg = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let idx_reg = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let src_reg = context
                         .exec_register(instr, 2)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     self.run_store_element_regs(
                         context,
                         &mut *stack,
@@ -4736,7 +4810,7 @@ impl Interpreter {
                     }
                     let (dst, lhs, rhs) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_instanceof_legacy_regs(frame, dst, lhs, rhs)?;
                     continue;
@@ -4751,7 +4825,7 @@ impl Interpreter {
                     }
                     let (dst, lhs, rhs) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_has_property_regs(frame, context, dst, lhs, rhs)?;
                     continue;
@@ -4763,16 +4837,16 @@ impl Interpreter {
                     }
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let obj_reg = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let name_idx = context
                         .exec_const_index(instr, 2)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let key = context
                         .property_atom(name_idx)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let strict = context.function_is_strict(stack[top_idx].function_id);
                     // `delete` has an object fast path that bypasses the
                     // §28.3 MOP funnel; trigger deferred-namespace
@@ -4799,7 +4873,7 @@ impl Interpreter {
                     }
                     let (dst, obj_reg, idx_reg) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let strict = context.function_is_strict(stack[top_idx].function_id);
                     let receiver = *read_register(&stack[top_idx], obj_reg)?;
                     if receiver.as_object().is_some_and(|o| {
@@ -4827,10 +4901,10 @@ impl Interpreter {
                     }
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let src = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_get_prototype_regs(frame, dst, src)?;
                     continue;
@@ -4842,10 +4916,10 @@ impl Interpreter {
                     }
                     let obj_reg = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let proto_reg = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_set_prototype_regs(context, frame, obj_reg, proto_reg)?;
                     continue;
@@ -4874,14 +4948,11 @@ impl Interpreter {
                     // descriptor-backed arguments object.
                     let dst = register_operand(context.exec_operand(instr, 0))?;
                     let (elements, kind, mapped_entries, callee) = {
-                        let function_id = stack
-                            .last()
-                            .ok_or_else(|| VmError::InvalidOperand)?
-                            .function_id;
+                        let function_id = stack.last().ok_or(VmError::InvalidOperand)?.function_id;
                         let function = context
                             .exec_function(function_id)
-                            .ok_or_else(|| VmError::InvalidOperand)?;
-                        let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
+                            .ok_or(VmError::InvalidOperand)?;
+                        let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                         let elements: SmallVec<[Value; 4]> = self
                             .frame_cold_mut(frame)
                             .map(|c| std::mem::take(&mut c.incoming_args))
@@ -4985,7 +5056,7 @@ impl Interpreter {
                         );
                         obj
                     };
-                    let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
+                    let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                     write_register(frame, dst, Value::object(obj))?;
                     frame.advance_pc(self.current_byte_len)?;
                     continue;
@@ -4997,7 +5068,7 @@ impl Interpreter {
                 Op::LoadUndefined => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::undefined())?;
                     frame.advance_pc(self.current_byte_len)?;
@@ -5006,7 +5077,7 @@ impl Interpreter {
                 Op::LoadHole => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::hole())?;
                     frame.advance_pc(self.current_byte_len)?;
@@ -5015,7 +5086,7 @@ impl Interpreter {
                 Op::LoadTrue => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::boolean(true))?;
                     frame.advance_pc(self.current_byte_len)?;
@@ -5024,7 +5095,7 @@ impl Interpreter {
                 Op::LoadFalse => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::boolean(false))?;
                     frame.advance_pc(self.current_byte_len)?;
@@ -5033,7 +5104,7 @@ impl Interpreter {
                 Op::LoadNull => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::null())?;
                     frame.advance_pc(self.current_byte_len)?;
@@ -5042,10 +5113,10 @@ impl Interpreter {
                 Op::LoadInt32 => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let imm = context
                         .exec_imm32(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::number(NumberValue::Smi(imm)))?;
                     frame.advance_pc(self.current_byte_len)?;
@@ -5054,13 +5125,13 @@ impl Interpreter {
                 Op::LoadNumber => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let bits = context
                         .number_constant_bits(idx)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let value = NumberValue::from_f64(f64::from_bits(bits));
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::number(value))?;
@@ -5070,13 +5141,13 @@ impl Interpreter {
                 Op::LoadString => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let units = context
                         .string_constant_units(idx)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let s = JsString::from_utf16_units(units, self.gc_heap_mut())?;
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::string(s))?;
@@ -5086,14 +5157,14 @@ impl Interpreter {
                 Op::LoadLength => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let src = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     let s = read_register(frame, src)?
                         .as_string(&self.gc_heap)
-                        .ok_or_else(|| VmError::TypeMismatch)?;
+                        .ok_or(VmError::TypeMismatch)?;
                     let len = NumberValue::from_i32(s.len() as i32);
                     write_register(frame, dst, Value::number(len))?;
                     frame.advance_pc(self.current_byte_len)?;
@@ -5102,10 +5173,10 @@ impl Interpreter {
                 Op::LogicalNot => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let src = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     let truthy = read_register(frame, src)?.to_boolean(&self.gc_heap);
                     write_register(frame, dst, Value::boolean(!truthy))?;
@@ -5115,10 +5186,10 @@ impl Interpreter {
                 Op::ToBoolean => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let src = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     let truthy = read_register(frame, src)?.to_boolean(&self.gc_heap);
                     write_register(frame, dst, Value::boolean(truthy))?;
@@ -5128,7 +5199,7 @@ impl Interpreter {
                 Op::GetStringIndex => {
                     let (dst, recv, idx) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_get_string_index_regs(frame, dst, recv, idx)?;
                     continue;
@@ -5136,10 +5207,10 @@ impl Interpreter {
                 Op::TypeOf => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let src = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_typeof_regs(frame, dst, src)?;
                     continue;
@@ -5147,7 +5218,7 @@ impl Interpreter {
                 Op::LoadThis => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let mut value = stack[top_idx].this_value;
                     if value.is_hole() {
                         // §13.3.7.3 — an arrow's lexical `this` in a
@@ -5178,7 +5249,7 @@ impl Interpreter {
                 Op::LoadNewTarget => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_load_new_target_reg(frame, dst)?;
                     continue;
@@ -5186,7 +5257,7 @@ impl Interpreter {
                 Op::NewObject => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     self.run_new_object_reg(&mut *stack, top_idx, dst)?;
                     continue;
                 }
@@ -5198,10 +5269,10 @@ impl Interpreter {
                 Op::LoadRegExp => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_load_regexp_reg(context, frame, dst, idx)?;
                     continue;
@@ -5209,10 +5280,10 @@ impl Interpreter {
                 Op::LoadBigInt => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_load_bigint_reg(context, frame, dst, idx)?;
                     continue;
@@ -5220,10 +5291,10 @@ impl Interpreter {
                 Op::LoadUpvalue => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let idx = context
                         .exec_imm32(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_load_upvalue_reg(frame, dst, idx)?;
                     continue;
@@ -5231,7 +5302,7 @@ impl Interpreter {
                 Op::FreshUpvalue => {
                     let idx = context
                         .exec_imm32(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_fresh_upvalue_reg(frame, idx)?;
                     continue;
@@ -5239,10 +5310,10 @@ impl Interpreter {
                 Op::StoreUpvalue => {
                     let src = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let idx = context
                         .exec_imm32(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_store_upvalue_reg(frame, src, idx)?;
                     continue;
@@ -5250,10 +5321,10 @@ impl Interpreter {
                 Op::StoreUpvalueChecked => {
                     let src = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let idx = context
                         .exec_imm32(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_store_upvalue_checked_reg(frame, src, idx)?;
                     continue;
@@ -5261,17 +5332,17 @@ impl Interpreter {
                 Op::CollectRest => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     self.run_collect_rest_reg(&mut *stack, top_idx, dst)?;
                     continue;
                 }
                 Op::MakeFunction => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_make_function_reg(context, frame, dst, idx)?;
                     continue;
@@ -5279,16 +5350,16 @@ impl Interpreter {
                 Op::MakeClass => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let ctor_reg = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let proto_reg = context
                         .exec_register(instr, 2)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let statics_reg = context
                         .exec_register(instr, 3)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     // Operand 4 (parent class value) — absent in
                     // pre-existing bytecode; `undefined` = base class.
                     let parent_reg = context.exec_register(instr, 4);
@@ -5306,23 +5377,23 @@ impl Interpreter {
                 Op::NewError => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let msg_reg = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     self.run_new_error_regs(context, &mut *stack, top_idx, dst, msg_reg)?;
                     continue;
                 }
                 Op::NewBuiltinError => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let kind_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let msg_reg = context
                         .exec_register(instr, 2)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     self.run_new_builtin_error_regs(
                         context,
                         &mut *stack,
@@ -5336,10 +5407,10 @@ impl Interpreter {
                 Op::LoadBuiltinError => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let kind_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_load_builtin_error_reg(context, frame, dst, kind_idx)?;
                     continue;
@@ -5347,7 +5418,7 @@ impl Interpreter {
                 Op::LoadGlobalThis => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_load_global_this_reg(frame, dst)?;
                     continue;
@@ -5355,10 +5426,10 @@ impl Interpreter {
                 Op::LoadGlobalOrThrow => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let name_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_load_global_or_throw_reg(context, frame, dst, name_idx)?;
                     continue;
@@ -5366,10 +5437,10 @@ impl Interpreter {
                 Op::LoadGlobalOrUndefined => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let name_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_load_global_or_undefined_reg(context, frame, dst, name_idx)?;
                     continue;
@@ -5377,7 +5448,7 @@ impl Interpreter {
                 Op::DeclareGlobalVar => {
                     let name_idx = context
                         .exec_const_index(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let configurable = context.exec_imm32(instr, 1).unwrap_or(0) != 0;
                     let frame = &mut stack[top_idx];
                     self.run_declare_global_var_reg(context, frame, name_idx, configurable)?;
@@ -5388,10 +5459,10 @@ impl Interpreter {
                 Op::GetTemplateObject => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let site_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let key = (context.function_base(), site_idx);
                     let value = match self.template_objects.get(&key) {
                         Some(v) => *v,
@@ -5413,10 +5484,10 @@ impl Interpreter {
                 Op::LoadShadowedUpvalue => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let name_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let uv_idx = context.exec_imm32(instr, 2).unwrap_or(0) as usize;
                     let frame = &mut stack[top_idx];
                     if let Some(name) = context.string_constant_str(name_idx)
@@ -5435,7 +5506,7 @@ impl Interpreter {
                         .upvalues
                         .get(uv_idx)
                         .copied()
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let value = crate::read_upvalue(&self.gc_heap, cell);
                     write_register(frame, dst, value)?;
                     frame.advance_pc(self.current_byte_len)?;
@@ -5444,10 +5515,10 @@ impl Interpreter {
                 Op::LoadDynamic => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let name_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_load_dynamic_reg(context, frame, dst, name_idx)?;
                     continue;
@@ -5455,10 +5526,10 @@ impl Interpreter {
                 Op::StoreDynamic => {
                     let value_reg = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let name_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_store_dynamic_reg(context, frame, value_reg, name_idx)?;
                     continue;
@@ -5466,10 +5537,10 @@ impl Interpreter {
                 Op::TypeofDynamic => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let name_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_typeof_dynamic_reg(context, frame, dst, name_idx)?;
                     continue;
@@ -5477,10 +5548,10 @@ impl Interpreter {
                 Op::DeleteDynamic => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let name_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_delete_dynamic_reg(context, frame, dst, name_idx)?;
                     continue;
@@ -5491,13 +5562,13 @@ impl Interpreter {
                 Op::NewPrivateName => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let desc_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let desc = context
                         .string_constant_str(desc_idx)
-                        .ok_or_else(|| VmError::InvalidOperand)?
+                        .ok_or(VmError::InvalidOperand)?
                         .to_string();
                     let desc_str = JsString::from_str(&desc, &mut self.gc_heap)?;
                     let sym =
@@ -5510,10 +5581,10 @@ impl Interpreter {
                 Op::DefineGlobalFunction => {
                     let name_idx = context
                         .exec_const_index(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let value_reg = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let deletable = context.exec_imm32(instr, 2).unwrap_or(0) != 0;
                     let frame = &mut stack[top_idx];
                     self.run_define_global_function_reg(
@@ -5524,7 +5595,7 @@ impl Interpreter {
                 Op::DeclareGlobalLex => {
                     let name_idx = context
                         .exec_const_index(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let is_const = context.exec_imm32(instr, 1).unwrap_or(0) != 0;
                     let frame = &mut stack[top_idx];
                     self.run_declare_global_lex_reg(context, frame, name_idx, is_const)?;
@@ -5533,10 +5604,10 @@ impl Interpreter {
                 Op::StoreGlobalBinding => {
                     let value_reg = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let name_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let strict = context.exec_imm32(instr, 2).unwrap_or(0) != 0;
                     let frame = &mut stack[top_idx];
                     self.run_store_global_binding_reg(context, frame, value_reg, name_idx, strict)?;
@@ -5545,10 +5616,10 @@ impl Interpreter {
                 Op::InitGlobalLex => {
                     let value_reg = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let name_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_init_global_lex_reg(context, frame, value_reg, name_idx)?;
                     continue;
@@ -5559,7 +5630,7 @@ impl Interpreter {
                     let kind = context.exec_imm32(instr, 0).unwrap_or(0);
                     let reg = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let value = *read_register(&stack[top_idx], reg)?;
                     match kind {
                         0 => {
@@ -5595,7 +5666,7 @@ impl Interpreter {
                 Op::DefineDataProperty => {
                     let (obj_reg, key_reg, value_reg) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let target = *read_register(&stack[top_idx], obj_reg)?;
                     let key_value = *read_register(&stack[top_idx], key_reg)?;
                     let value = *read_register(&stack[top_idx], value_reg)?;
@@ -5639,13 +5710,13 @@ impl Interpreter {
                 Op::SetFunctionName => {
                     let fn_reg = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let key_reg = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let prefix_idx = context
                         .exec_const_index(instr, 2)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let callee = *read_register(&stack[top_idx], fn_reg)?;
                     let key_value = *read_register(&stack[top_idx], key_reg)?;
                     let prefix = context
@@ -5702,7 +5773,7 @@ impl Interpreter {
                 Op::PrivateGet => {
                     let (dst, obj_reg, key_reg) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let receiver = *read_register(&stack[top_idx], obj_reg)?;
                     let key = *read_register(&stack[top_idx], key_reg)?;
                     // A non-symbol key means the private-name binding
@@ -5753,7 +5824,7 @@ impl Interpreter {
                 Op::PrivateSet => {
                     let (obj_reg, key_reg, value_reg) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let receiver = *read_register(&stack[top_idx], obj_reg)?;
                     let key = *read_register(&stack[top_idx], key_reg)?;
                     let value = *read_register(&stack[top_idx], value_reg)?;
@@ -5817,10 +5888,10 @@ impl Interpreter {
                 Op::ToNumeric => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let src = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let value = *read_register(&stack[top_idx], src)?;
                     let result = if value.is_number() || value.is_big_int() {
                         value
@@ -5845,10 +5916,10 @@ impl Interpreter {
                 Op::ToObject => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let src = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let value = *read_register(&stack[top_idx], src)?;
                     if value.is_nullish() {
                         return Err(VmError::TypeMismatch);
@@ -5865,10 +5936,10 @@ impl Interpreter {
                 Op::ToPropertyKey => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let src = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let value = *read_register(&stack[top_idx], src)?;
                     let primitive = self.evaluate_to_primitive(
                         context,
@@ -5896,10 +5967,10 @@ impl Interpreter {
                 Op::PrivateBrandCheck => {
                     let obj_reg = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let brand_reg = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let receiver = *read_register(&stack[top_idx], obj_reg)?;
                     let brand = *read_register(&stack[top_idx], brand_reg)?;
                     let Some(sym) = brand.as_symbol(&self.gc_heap) else {
@@ -5941,10 +6012,10 @@ impl Interpreter {
                 Op::Increment => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let src = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let delta = context.exec_imm32(instr, 2).unwrap_or(1);
                     let value = *read_register(&stack[top_idx], src)?;
                     let primitive = self.evaluate_to_primitive(
@@ -5953,7 +6024,7 @@ impl Interpreter {
                         abstract_ops::ToPrimitiveHint::Number,
                     )?;
                     let kind = abstract_ops::to_numeric_kind(&primitive, &self.gc_heap)
-                        .ok_or_else(|| VmError::TypeMismatch)?;
+                        .ok_or(VmError::TypeMismatch)?;
                     let next = match kind {
                         abstract_ops::NumericKind::Num(n) => Value::number(
                             crate::number::NumberValue::from_f64(n.as_f64() + f64::from(delta)),
@@ -5974,7 +6045,7 @@ impl Interpreter {
                 Op::ValidateGlobalDecl => {
                     let name_idx = context
                         .exec_const_index(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let kind = context.exec_imm32(instr, 1).unwrap_or(0);
                     let frame = &mut stack[top_idx];
                     self.run_validate_global_decl_reg(context, frame, name_idx, kind)?;
@@ -5983,10 +6054,10 @@ impl Interpreter {
                 Op::DefineGlobalVar => {
                     let name_idx = context
                         .exec_const_index(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let value_reg = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_define_global_var_reg(context, frame, name_idx, value_reg)?;
                     continue;
@@ -5994,10 +6065,10 @@ impl Interpreter {
                 Op::ImportNamespace => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let spec_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_import_namespace_reg(context, frame, dst, spec_idx)?;
                     continue;
@@ -6005,10 +6076,10 @@ impl Interpreter {
                 Op::ImportNamespaceDeferred => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let spec_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_import_namespace_deferred_reg(context, frame, dst, spec_idx)?;
                     continue;
@@ -6016,10 +6087,10 @@ impl Interpreter {
                 Op::ModuleNamespaceObject => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let spec_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_module_namespace_object_reg(context, frame, dst, spec_idx)?;
                     continue;
@@ -6027,13 +6098,13 @@ impl Interpreter {
                 Op::LoadImportBinding => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let url_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let name_idx = context
                         .exec_const_index(instr, 2)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_load_import_binding_reg(context, frame, dst, url_idx, name_idx)?;
                     continue;
@@ -6041,10 +6112,10 @@ impl Interpreter {
                 Op::EvaluateModule => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let url_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_evaluate_module_const(context, frame, dst, url_idx)?;
                     continue;
@@ -6052,7 +6123,7 @@ impl Interpreter {
                 Op::MarkModuleEvaluated => {
                     let url_idx = context
                         .exec_const_index(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     if let Some(url) = context.string_constant_str(url_idx) {
                         let url_arc: std::sync::Arc<str> = std::sync::Arc::from(url);
                         self.module_record_mut(&url_arc).status =
@@ -6064,10 +6135,10 @@ impl Interpreter {
                 Op::ImportMetaResolve => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let spec_reg = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_import_meta_resolve_regs(context, frame, dst, spec_reg)?;
                     continue;
@@ -6075,40 +6146,40 @@ impl Interpreter {
                 Op::PromiseFulfilledOf => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let src = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     self.run_promise_fulfilled_of_regs(context, stack, top_idx, dst, src)?;
                     continue;
                 }
                 Op::ArrayPush => {
                     let arr_reg = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let value_reg = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     self.run_array_push_regs(&mut *stack, top_idx, arr_reg, value_reg)?;
                     continue;
                 }
                 Op::NewWeakRef => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let target_reg = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     self.run_new_weak_ref_regs(&mut *stack, top_idx, dst, target_reg)?;
                     continue;
                 }
                 Op::NewFinalizationRegistry => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let callback_reg = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     self.run_new_finalization_registry_regs(
                         context,
                         &mut *stack,
@@ -6121,13 +6192,13 @@ impl Interpreter {
                 Op::NewCollection => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let kind_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let iter_reg = context
                         .exec_register(instr, 2)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     self.run_new_collection_regs(
                         context,
                         &mut *stack,
@@ -6141,16 +6212,16 @@ impl Interpreter {
                 Op::NewIntl => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let class_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let locale_reg = context
                         .exec_register(instr, 2)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let options_reg = context
                         .exec_register(instr, 3)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_new_intl_regs(
                         context,
@@ -6165,10 +6236,10 @@ impl Interpreter {
                 Op::MathLoad => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let name_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_math_load_reg(context, frame, dst, name_idx)?;
                     continue;
@@ -6176,10 +6247,10 @@ impl Interpreter {
                 Op::SymbolLoad => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let name_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_symbol_load_reg(context, frame, dst, name_idx)?;
                     continue;
@@ -6187,10 +6258,10 @@ impl Interpreter {
                 Op::TemporalLoad => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let name_idx = context
                         .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_temporal_load_reg(context, frame, dst, name_idx)?;
                     continue;
@@ -6198,13 +6269,13 @@ impl Interpreter {
                 Op::EnterTry => {
                     let catch_off = context
                         .exec_imm32(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let finally_off = context
                         .exec_imm32(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let exc_register = context
                         .exec_register(instr, 2)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_enter_try_regs(frame, catch_off, finally_off, exc_register)?;
                     continue;
@@ -6219,11 +6290,10 @@ impl Interpreter {
                     // blocks: run them (down to `floor`), then jump.
                     let offset = context
                         .exec_imm32(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let floor = context
                         .exec_imm32(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?
-                        as u32;
+                        .ok_or(VmError::InvalidOperand)? as u32;
                     let next_pc = (stack[top_idx].pc as i64 + 1).saturating_add(offset as i64);
                     if !(0..=u32::MAX as i64).contains(&next_pc) {
                         return Err(VmError::InvalidOperand);
@@ -6240,7 +6310,7 @@ impl Interpreter {
                 Op::Jump => {
                     let offset = context
                         .exec_imm32(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     apply_branch(frame, offset, &self.interrupt)?;
                     continue;
@@ -6248,10 +6318,10 @@ impl Interpreter {
                 Op::JumpIfTrue => {
                     let offset = context
                         .exec_imm32(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let cond = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     if read_register(frame, cond)?.to_boolean(&self.gc_heap) {
                         apply_branch(frame, offset, &self.interrupt)?;
@@ -6263,10 +6333,10 @@ impl Interpreter {
                 Op::JumpIfFalse => {
                     let offset = context
                         .exec_imm32(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let cond = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     if !read_register(frame, cond)?.to_boolean(&self.gc_heap) {
                         apply_branch(frame, offset, &self.interrupt)?;
@@ -6278,10 +6348,10 @@ impl Interpreter {
                 Op::JumpIfNullish => {
                     let offset = context
                         .exec_imm32(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let cond = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     if read_register(frame, cond)?.is_nullish() {
                         apply_branch(frame, offset, &self.interrupt)?;
@@ -6293,10 +6363,10 @@ impl Interpreter {
                 Op::LoadLocal => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let idx = context
                         .exec_imm32(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     let value = *read_register(frame, idx as u16)?;
                     write_register(frame, dst, value)?;
@@ -6306,10 +6376,10 @@ impl Interpreter {
                 Op::StoreLocal => {
                     let src = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let idx = context
                         .exec_imm32(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     let value = *read_register(frame, src)?;
                     write_register(frame, idx as u16, value)?;
@@ -6319,14 +6389,14 @@ impl Interpreter {
                 Op::TdzError => {
                     let local_index = context
                         .exec_imm32(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?
+                        .ok_or(VmError::InvalidOperand)?
                         as u32;
                     return Err(VmError::TemporalDeadZone { local_index });
                 }
                 Op::Add => {
                     let (dst, lhs, rhs) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_add_regs(frame, dst, lhs, rhs)?;
                     continue;
@@ -6334,7 +6404,7 @@ impl Interpreter {
                 Op::Sub => {
                     let (dst, lhs, rhs) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_numeric_regs(frame, dst, lhs, rhs, number::sub, bigint_sub_op)?;
                     continue;
@@ -6342,7 +6412,7 @@ impl Interpreter {
                 Op::Mul => {
                     let (dst, lhs, rhs) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_numeric_regs(frame, dst, lhs, rhs, number::mul, bigint_mul_op)?;
                     continue;
@@ -6350,7 +6420,7 @@ impl Interpreter {
                 Op::Div => {
                     let (dst, lhs, rhs) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_numeric_regs(frame, dst, lhs, rhs, number::div, bigint::ops::div)?;
                     continue;
@@ -6358,7 +6428,7 @@ impl Interpreter {
                 Op::Rem => {
                     let (dst, lhs, rhs) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_numeric_regs(frame, dst, lhs, rhs, number::rem, bigint::ops::rem)?;
                     continue;
@@ -6366,7 +6436,7 @@ impl Interpreter {
                 Op::Pow => {
                     let (dst, lhs, rhs) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_numeric_regs(frame, dst, lhs, rhs, number::pow, bigint::ops::pow)?;
                     continue;
@@ -6374,7 +6444,7 @@ impl Interpreter {
                 Op::BitwiseAnd => {
                     let (dst, lhs, rhs) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_numeric_regs(
                         frame,
@@ -6389,7 +6459,7 @@ impl Interpreter {
                 Op::BitwiseOr => {
                     let (dst, lhs, rhs) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_numeric_regs(frame, dst, lhs, rhs, number::bitwise_or, bigint_or_op)?;
                     continue;
@@ -6397,7 +6467,7 @@ impl Interpreter {
                 Op::BitwiseXor => {
                     let (dst, lhs, rhs) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_numeric_regs(
                         frame,
@@ -6412,7 +6482,7 @@ impl Interpreter {
                 Op::Shl => {
                     let (dst, lhs, rhs) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_numeric_regs(frame, dst, lhs, rhs, number::shl, bigint::ops::shl)?;
                     continue;
@@ -6420,7 +6490,7 @@ impl Interpreter {
                 Op::Shr => {
                     let (dst, lhs, rhs) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_numeric_regs(
                         frame,
@@ -6435,7 +6505,7 @@ impl Interpreter {
                 Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
                     let (dst, lhs, rhs) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_compare_regs(frame, dst, lhs, rhs, op)?;
                     continue;
@@ -6443,7 +6513,7 @@ impl Interpreter {
                 Op::Ushr => {
                     let (dst, lhs, rhs) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_ushr_regs(frame, dst, lhs, rhs)?;
                     continue;
@@ -6451,10 +6521,10 @@ impl Interpreter {
                 Op::Neg => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let src = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_neg_regs(frame, dst, src)?;
                     continue;
@@ -6462,10 +6532,10 @@ impl Interpreter {
                 Op::BitwiseNot => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let src = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_bitwise_not_regs(frame, dst, src)?;
                     continue;
@@ -6473,7 +6543,7 @@ impl Interpreter {
                 Op::Equal | Op::NotEqual | Op::LooseEqual | Op::LooseNotEqual | Op::SameValue => {
                     let (dst, lhs, rhs) = context
                         .exec_register3(instr)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     match op {
                         Op::Equal => self.run_equal_regs(frame, dst, lhs, rhs, false)?,
@@ -6492,14 +6562,14 @@ impl Interpreter {
                 Op::ArrayLength => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let src = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     let arr = read_register(frame, src)?
                         .as_array()
-                        .ok_or_else(|| VmError::TypeMismatch)?;
+                        .ok_or(VmError::TypeMismatch)?;
                     let n = NumberValue::from_f64(crate::array::len(arr, &self.gc_heap) as f64);
                     write_register(frame, dst, Value::number(n))?;
                     frame.advance_pc(self.current_byte_len)?;
@@ -6508,10 +6578,10 @@ impl Interpreter {
                 Op::IsArray => {
                     let dst = context
                         .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let src = context
                         .exec_register(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     let value = *read_register(&stack[top_idx], src)?;
                     let mut result = abstract_ops::is_array(&self.gc_heap, &value)?;
                     if !result
@@ -6633,7 +6703,7 @@ impl Interpreter {
         stack: &mut SmallVec<[Frame; 8]>,
         value: Value,
     ) -> Result<Option<Value>, VmError> {
-        let mut popped = stack.pop().ok_or_else(|| VmError::InvalidOperand)?;
+        let mut popped = stack.pop().ok_or(VmError::InvalidOperand)?;
         let construct_target = self.frame_cold(&popped).and_then(|c| c.construct_target);
         let is_derived_ctor = self
             .frame_cold(&popped)
@@ -6690,7 +6760,7 @@ impl Interpreter {
         let Some(return_reg) = popped.return_register else {
             return Ok(Some(resolved));
         };
-        let caller = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
+        let caller = stack.last_mut().ok_or(VmError::InvalidOperand)?;
         write_register(caller, return_reg, resolved)?;
         // Caller's pc was set to the next instruction at call time;
         // nothing to advance here.
@@ -7101,14 +7171,14 @@ fn read_register(frame: &Frame, idx: u16) -> Result<&Value, VmError> {
     frame
         .registers
         .get(idx as usize)
-        .ok_or_else(|| VmError::InvalidOperand)
+        .ok_or(VmError::InvalidOperand)
 }
 
 fn write_register(frame: &mut Frame, idx: u16, value: Value) -> Result<(), VmError> {
     let slot = frame
         .registers
         .get_mut(idx as usize)
-        .ok_or_else(|| VmError::InvalidOperand)?;
+        .ok_or(VmError::InvalidOperand)?;
     *slot = value;
     Ok(())
 }

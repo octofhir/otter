@@ -46,6 +46,8 @@ use crate::CompiledCode;
 const TAG_INT32: u64 = 0x7FF9;
 /// NaN-box tag for special immediates (undefined/null/hole/boolean).
 const TAG_SPECIAL: u64 = 0x7FFA;
+/// `SPECIAL` payload for the internal array/`this` hole sentinel.
+const SPECIAL_HOLE: u64 = 2;
 /// `SPECIAL` payload for `false`.
 const SPECIAL_FALSE: u32 = 3;
 /// `SPECIAL` payload for `true`.
@@ -64,6 +66,9 @@ pub struct JitCtx {
     /// Boxed `Value` bits of this frame's SELF closure (the named-function self
     /// binding). Read directly by a `MakeFunction`-of-self at offset 8.
     self_closure: u64,
+    /// Boxed `Value` bits of this frame's `this` binding, read once at entry.
+    /// A `LoadThis` reads it directly at offset 16 (and bails on a hole).
+    this_value: u64,
     /// Erased back-pointer to the owning interpreter.
     vm: *mut Interpreter,
     /// The VM frame stack the executing frame lives on.
@@ -146,6 +151,56 @@ extern "C" fn jit_make_fn_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
     }
 }
 
+/// Bridge stub: perform a named `LoadProperty` from compiled code, delegating
+/// to the safe [`Interpreter::jit_runtime_load_property`]. Returns `0` on
+/// success, `1` when the read threw (error parked in `ctx`).
+extern "C" fn jit_load_prop_stub(ctx: *mut JitCtx, dst: u64, obj: u64, name_idx: u64) -> u64 {
+    // SAFETY: see `jit_call_stub`.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    match vm.jit_runtime_load_property(
+        context,
+        stack,
+        ctx.frame_index,
+        dst as u16,
+        obj as u16,
+        name_idx as u32,
+    ) {
+        Ok(()) => 0,
+        Err(err) => {
+            ctx.error = Some(err);
+            1
+        }
+    }
+}
+
+/// Bridge stub: perform a named `StoreProperty` from compiled code, delegating
+/// to the safe [`Interpreter::jit_runtime_store_property`]. Returns `0` on
+/// success, `1` when the write threw (error parked in `ctx`).
+extern "C" fn jit_store_prop_stub(ctx: *mut JitCtx, obj: u64, name_idx: u64, src: u64) -> u64 {
+    // SAFETY: see `jit_call_stub`.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    match vm.jit_runtime_store_property(
+        context,
+        stack,
+        ctx.frame_index,
+        obj as u16,
+        name_idx as u32,
+        src as u16,
+    ) {
+        Ok(()) => 0,
+        Err(err) => {
+            ctx.error = Some(err);
+            1
+        }
+    }
+}
+
 /// Why a function could not be baseline-compiled. Always maps to a silent
 /// interpreter fallback; never a JS-visible error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,9 +244,12 @@ impl JitFunctionCode for BaselineCode {
         // by a live `&mut` (the VM froze its borrows); read the self closure up
         // front so a `MakeFunction`-of-self needs no Rust round-trip.
         let self_closure = unsafe { (*vm).jit_frame_self_closure_bits(&*stack, ptrs.frame_index) };
+        // SAFETY: same validity/aliasing contract as `self_closure` above.
+        let this_value = unsafe { (*vm).jit_frame_this_bits(&*stack, ptrs.frame_index) };
         let mut ctx = JitCtx {
             regs,
             self_closure,
+            this_value,
             vm,
             stack,
             context: ptrs.context.cast::<ExecutionContext>(),
@@ -224,9 +282,9 @@ fn reg_offset(idx: u16) -> Result<u32, Unsupported> {
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
     use super::{
-        BaselineCode, MAX_INLINE_ARGS, Op, Operand, SPECIAL_FALSE, SPECIAL_TRUE, STATUS_BAILED,
-        STATUS_RETURNED, STATUS_THREW, TAG_INT32, TAG_SPECIAL, Unsupported, jit_call_stub,
-        jit_make_fn_stub, reg_offset,
+        BaselineCode, MAX_INLINE_ARGS, Op, Operand, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE,
+        STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_INT32, TAG_SPECIAL, Unsupported,
+        jit_call_stub, jit_load_prop_stub, jit_make_fn_stub, jit_store_prop_stub, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -410,6 +468,56 @@ mod arm64 {
                 }
                 Op::Call => {
                     emit_call(&mut ops, ops_ref, threw)?;
+                }
+                Op::LoadThis => {
+                    // `this` bits are precomputed in `JitCtx.this_value`
+                    // (offset 16 from x20). Bail on a hole — a derived-ctor
+                    // `this`-before-super, which the interpreter resolves.
+                    let dst = reg(ops_ref, 0)?;
+                    let hole = (TAG_SPECIAL << 48) | SPECIAL_HOLE;
+                    dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, #16]);
+                    emit_load_u64(&mut ops, 12, hole);
+                    dynasm!(ops ; .arch aarch64 ; cmp x9, x12 ; b.eq =>bail);
+                    store_reg(&mut ops, 9, dst)?;
+                }
+                Op::LoadProperty => {
+                    // jit_load_prop_stub(ctx=x20, dst, obj, name_idx) -> status.
+                    let dst = reg(ops_ref, 0)?;
+                    let obj = reg(ops_ref, 1)?;
+                    let name = const_index(ops_ref, 2)?;
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; mov x0, x20
+                        ; movz x1, dst as u32
+                        ; movz x2, obj as u32
+                    );
+                    emit_load_u64(&mut ops, 3, u64::from(name));
+                    emit_call_stub(&mut ops, jit_load_prop_stub as *const () as usize, threw);
+                }
+                Op::StoreProperty => {
+                    // Operands: obj, name_const, src, scratch_dst.
+                    // jit_store_prop_stub(ctx=x20, obj, name_idx, src) -> status.
+                    let obj = reg(ops_ref, 0)?;
+                    let name = const_index(ops_ref, 1)?;
+                    let src = reg(ops_ref, 2)?;
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; mov x0, x20
+                        ; movz x1, obj as u32
+                    );
+                    emit_load_u64(&mut ops, 2, u64::from(name));
+                    dynasm!(ops ; .arch aarch64 ; movz x3, src as u32);
+                    emit_call_stub(&mut ops, jit_store_prop_stub as *const () as usize, threw);
+                }
+                Op::BitwiseOr => {
+                    let (dst, lhs, rhs) = reg3(ops_ref)?;
+                    load_reg(&mut ops, 9, lhs)?;
+                    load_reg(&mut ops, 10, rhs)?;
+                    guard_int32!(ops, 9, bail);
+                    guard_int32!(ops, 10, bail);
+                    dynasm!(ops ; .arch aarch64 ; orr w13, w9, w10);
+                    box_low32!(ops, 13, 12, TAG_INT32);
+                    store_reg(&mut ops, 13, dst)?;
                 }
                 Op::Return | Op::ReturnValue => {
                     let src = reg(ops_ref, 0)?;
@@ -670,6 +778,7 @@ mod tests {
         let mut ctx = JitCtx {
             regs: regs.as_mut_ptr(),
             self_closure: 0,
+            this_value: 0,
             vm: std::ptr::null_mut(),
             stack: std::ptr::null_mut(),
             context: std::ptr::null(),

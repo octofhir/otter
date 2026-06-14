@@ -338,7 +338,7 @@ impl Interpreter {
                 }),
                 _ => None,
             });
-        let snapshot = snapshot.ok_or_else(|| VmError::TypeMismatch)?;
+        let snapshot = snapshot.ok_or(VmError::TypeMismatch)?;
         match snapshot {
             IteratorStateSnapshot::Generator(handle) => {
                 let result = self.resume_generator(

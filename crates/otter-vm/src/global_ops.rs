@@ -44,7 +44,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let name = context
             .string_constant_str(name_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         // §9.1.1.4 — the global declarative record (script lexicals)
         // shadows the object record.
         if let Some(value) = self.read_global_lexical(name)? {
@@ -79,7 +79,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let name = context
             .string_constant_str(name_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         // §13.5.3 — `typeof` still raises ReferenceError for a
         // lexical binding read inside its TDZ; only *unresolvable*
         // names yield `undefined`.
@@ -131,7 +131,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let name = context
             .string_constant_str(name_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         let value = *crate::read_register(frame, value_reg)?;
         // §9.1.1.4.18 SetMutableBinding shape — an existing own
         // property keeps its attributes (enumerability,
@@ -176,7 +176,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let name = context
             .string_constant_str(name_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         // §19.2.1.3 step 5 — a var-scoped name colliding with a
         // global *lexical* binding is a SyntaxError at declaration
         // time (script collisions are early errors; eval collisions
@@ -228,7 +228,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let name = context
             .string_constant_str(name_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         let value = *crate::read_register(frame, value_reg)?;
         let existing = object::get_own_descriptor(self.global_this, &self.gc_heap, name);
         let redefine = match &existing {
@@ -284,7 +284,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let name = context
             .string_constant_str(name_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         if let Some(cell) = self.frame_eval_var(frame, name) {
             let value = crate::read_upvalue(&self.gc_heap, cell);
             write_register(frame, dst, value)?;
@@ -307,7 +307,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let name = context
             .string_constant_str(name_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         let value = *crate::read_register(frame, value_reg)?;
         if let Some(cell) = self.frame_eval_var(frame, name) {
             crate::store_upvalue(&mut self.gc_heap, cell, value);
@@ -331,7 +331,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let name = context
             .string_constant_str(name_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         if let Some(cell) = self.frame_eval_var(frame, name) {
             let value = crate::read_upvalue(&self.gc_heap, cell);
             write_register(frame, dst, value)?;
@@ -356,7 +356,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let name = context
             .string_constant_str(name_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         let env = self.frame_cold(frame).and_then(|cold| cold.eval_env);
         let removed_local = self
             .frame_cold_mut(frame)
@@ -401,7 +401,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let name = context
             .string_constant_str(name_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         if self.global_lexicals.contains_key(name) {
             return Err(VmError::SyntaxError {
                 message: format!("Identifier '{name}' has already been declared"),
@@ -438,7 +438,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let name = context
             .string_constant_str(name_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         match kind {
             // Lexical: same checks as DeclareGlobalLex, minus the
             // cell creation.
@@ -504,13 +504,13 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let name = context
             .string_constant_str(name_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         let value = *crate::read_register(frame, value_reg)?;
         let cell = self
             .global_lexicals
             .get(name)
             .map(|(cell, _)| *cell)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         crate::store_upvalue(&mut self.gc_heap, cell, value);
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
@@ -529,7 +529,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let name = context
             .string_constant_str(name_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         let value = *crate::read_register(frame, value_reg)?;
         if let Some(&(cell, is_const)) = self.global_lexicals.get(name) {
             if is_const {

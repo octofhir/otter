@@ -68,8 +68,8 @@ impl Interpreter {
         match op {
             Op::BigIntCall => {
                 let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
-                let method = method_id::BigIntMethod::from_u32(method_idx)
-                    .ok_or_else(|| VmError::InvalidOperand)?;
+                let method =
+                    method_id::BigIntMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
                 // §7.1.13 ToBigInt step 4 — Array operands flow
                 // through `ToPrimitive(hint: number)`, which routes
                 // through `Array.prototype.toString` = `.join(",")`.
@@ -106,7 +106,7 @@ impl Interpreter {
             Op::DataViewCall => {
                 let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
                 let method = method_id::DataViewMethod::from_u32(method_idx)
-                    .ok_or_else(|| VmError::InvalidOperand)?;
+                    .ok_or(VmError::InvalidOperand)?;
                 let result = binary::dispatch::data_view_call(method, &args, &mut self.gc_heap)?;
                 finish_static_call(frame, dst, result, self.current_byte_len)
             }
@@ -127,8 +127,8 @@ impl Interpreter {
             let frame = &stack[top_idx];
             decode_static_call(frame, operands, 1, 2, 3)?
         };
-        let method = method_id::ArrayBufferMethod::from_u32(method_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+        let method =
+            method_id::ArrayBufferMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
         let roots = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
@@ -158,7 +158,7 @@ impl Interpreter {
             decode_static_call(frame, operands, 1, 2, 3)?
         };
         let method = method_id::SharedArrayBufferMethod::from_u32(method_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         let roots = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {

@@ -2985,14 +2985,14 @@ impl Interpreter {
         let name_idx = const_operand(operands.get(2))?;
         let atomized_key = context
             .property_atom(name_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         let name = atomized_key.name();
         let top_idx = stack.len() - 1;
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
         if let Some(obj) = receiver.as_object() {
             let site = context
                 .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
-                .ok_or_else(|| VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)?;
             let mut site_disabled = self.load_property_ics[site].is_megamorphic();
             let entries = self.load_property_ics[site].entries();
             let mut hit_value: Option<Value> = None;
@@ -3624,7 +3624,7 @@ impl Interpreter {
                                 let top_idx = stack.len() - 1;
                                 let pc = stack[top_idx].pc;
                                 stack[top_idx].pc =
-                                    pc.checked_add(1).ok_or_else(|| VmError::InvalidOperand)?;
+                                    pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                                 return Ok(true);
                             };
                             let top_idx = stack.len() - 1;
@@ -3895,7 +3895,7 @@ impl Interpreter {
                     kind: object::DescriptorKind::Accessor { setter, .. },
                     ..
                 }) => {
-                    let setter = setter.ok_or_else(|| VmError::TypeMismatch)?;
+                    let setter = setter.ok_or(VmError::TypeMismatch)?;
                     if !abstract_ops::is_callable(&setter) {
                         return Err(VmError::TypeMismatch);
                     }
@@ -3915,7 +3915,7 @@ impl Interpreter {
                         &self.gc_heap,
                         key,
                     ) {
-                        let setter = setter.ok_or_else(|| VmError::TypeMismatch)?;
+                        let setter = setter.ok_or(VmError::TypeMismatch)?;
                         if !abstract_ops::is_callable(&setter) {
                             return Err(VmError::TypeMismatch);
                         }
@@ -4299,7 +4299,7 @@ impl Interpreter {
         let scratch_reg = register_operand(operands.get(3))?;
         let atomized_key = context
             .property_atom(name_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         let name = atomized_key.name();
         let top_idx = stack.len() - 1;
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
@@ -4310,7 +4310,7 @@ impl Interpreter {
         {
             let site = context
                 .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
-                .ok_or_else(|| VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)?;
             let entries_len = self.store_property_ics[site].entry_count();
             let mut store_hit = false;
             for idx in 0..entries_len {
@@ -4447,7 +4447,7 @@ impl Interpreter {
                     kind: object::DescriptorKind::Accessor { setter, .. },
                     ..
                 }) => {
-                    let setter = setter.ok_or_else(|| VmError::TypeMismatch)?;
+                    let setter = setter.ok_or(VmError::TypeMismatch)?;
                     if !abstract_ops::is_callable(&setter) {
                         return Err(VmError::TypeMismatch);
                     }
@@ -4467,7 +4467,7 @@ impl Interpreter {
                         &self.gc_heap,
                         name,
                     ) {
-                        let setter = setter.ok_or_else(|| VmError::TypeMismatch)?;
+                        let setter = setter.ok_or(VmError::TypeMismatch)?;
                         if !abstract_ops::is_callable(&setter) {
                             return Err(VmError::TypeMismatch);
                         }
@@ -4648,7 +4648,7 @@ impl Interpreter {
                 if receiver.is_object() {
                     let site = context
                         .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)?;
                     if !self.store_property_ics[site].is_megamorphic()
                         && object::supports_fast_property_ic(obj, &self.gc_heap)
                     {
@@ -4737,7 +4737,7 @@ impl Interpreter {
         if let (Some(obj), Some(key_string)) = (rhs.as_object(), lhs.as_string(&self.gc_heap)) {
             let site = context
                 .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
-                .ok_or_else(|| VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)?;
             let mut site_disabled = self.has_property_ics[site].is_megamorphic();
             let entries_len = self.has_property_ics[site].entry_count();
             let mut probe_hit = false;
@@ -4813,7 +4813,7 @@ impl Interpreter {
         let name_idx = const_operand(operands.get(2))?;
         let atomized_key = context
             .property_atom(name_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         let top_idx = stack.len() - 1;
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
         let Some(proxy) = receiver.as_proxy() else {

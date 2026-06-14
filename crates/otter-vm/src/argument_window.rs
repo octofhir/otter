@@ -59,7 +59,7 @@ impl<'a> BytecodeArgumentWindow<'a> {
         let operand_index = self
             .first_arg_operand
             .checked_add(index)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         let register = register_operand(self.operands.get(operand_index))?;
         read_register(self.caller, register)
     }
@@ -69,9 +69,7 @@ impl<'a> BytecodeArgumentWindow<'a> {
             return Ok(Some(&self.caller.registers[0..0]));
         }
         let first = register_operand(self.operands.get(self.first_arg_operand))? as usize;
-        let end = first
-            .checked_add(self.len)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+        let end = first.checked_add(self.len).ok_or(VmError::InvalidOperand)?;
         if end > self.caller.registers.len() {
             return Err(VmError::InvalidOperand);
         }
@@ -79,7 +77,7 @@ impl<'a> BytecodeArgumentWindow<'a> {
             let operand_index = self
                 .first_arg_operand
                 .checked_add(index)
-                .ok_or_else(|| VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)?;
             let register = register_operand(self.operands.get(operand_index))? as usize;
             if register != first + index {
                 return Ok(None);
@@ -118,7 +116,7 @@ impl<'a> BytecodeArgumentWindow<'a> {
                 let slot = frame
                     .registers
                     .get_mut(index)
-                    .ok_or_else(|| VmError::InvalidOperand)?;
+                    .ok_or(VmError::InvalidOperand)?;
                 *slot = value;
             } else if function.has_rest {
                 rest_args.push(value);

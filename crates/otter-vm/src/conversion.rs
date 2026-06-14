@@ -229,9 +229,9 @@ impl Interpreter {
         let hint_idx = const_operand(operands.get(2))?;
         let hint_token = context
             .string_constant_str(hint_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
-        let hint = abstract_ops::ToPrimitiveHint::from_token(hint_token)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
+        let hint =
+            abstract_ops::ToPrimitiveHint::from_token(hint_token).ok_or(VmError::InvalidOperand)?;
 
         let top_idx = stack.len() - 1;
         let pc = stack[top_idx].pc;

@@ -93,7 +93,7 @@ pub fn pow(base: &BigInt, exponent: &BigInt) -> Result<BigInt, OpError> {
     if exponent.is_negative() {
         return Err(OpError::NegativeExponent);
     }
-    let exp_u32 = exponent.to_u32().ok_or_else(|| OpError::ShiftOutOfRange)?;
+    let exp_u32 = exponent.to_u32().ok_or(OpError::ShiftOutOfRange)?;
     Ok(base.pow(exp_u32))
 }
 
@@ -125,10 +125,10 @@ pub fn bitwise_not(value: &BigInt) -> BigInt {
 pub fn shl(lhs: &BigInt, rhs: &BigInt) -> Result<BigInt, OpError> {
     if rhs.is_negative() {
         let abs = -rhs;
-        let n = abs.to_u32().ok_or_else(|| OpError::ShiftOutOfRange)?;
+        let n = abs.to_u32().ok_or(OpError::ShiftOutOfRange)?;
         return Ok(lhs >> n);
     }
-    let n = rhs.to_u32().ok_or_else(|| OpError::ShiftOutOfRange)?;
+    let n = rhs.to_u32().ok_or(OpError::ShiftOutOfRange)?;
     Ok(lhs << n)
 }
 
@@ -138,10 +138,10 @@ pub fn shl(lhs: &BigInt, rhs: &BigInt) -> Result<BigInt, OpError> {
 pub fn shr(lhs: &BigInt, rhs: &BigInt) -> Result<BigInt, OpError> {
     if rhs.is_negative() {
         let abs = -rhs;
-        let n = abs.to_u32().ok_or_else(|| OpError::ShiftOutOfRange)?;
+        let n = abs.to_u32().ok_or(OpError::ShiftOutOfRange)?;
         return Ok(lhs << n);
     }
-    let n = rhs.to_u32().ok_or_else(|| OpError::ShiftOutOfRange)?;
+    let n = rhs.to_u32().ok_or(OpError::ShiftOutOfRange)?;
     Ok(lhs >> n)
 }
 

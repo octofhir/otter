@@ -513,11 +513,11 @@ impl Interpreter {
                 let slot = frame
                     .registers
                     .get_mut(handler.exc_register as usize)
-                    .ok_or_else(|| VmError::InvalidOperand)?;
+                    .ok_or(VmError::InvalidOperand)?;
                 *slot = payload;
                 return Ok(());
             }
-            let finally_pc = handler.finally_pc.ok_or_else(|| VmError::InvalidOperand)?;
+            let finally_pc = handler.finally_pc.ok_or(VmError::InvalidOperand)?;
             frame.pc = finally_pc;
             let cold = self.frame_ensure_cold(frame);
             let depth = cold.handlers.len() as u32;

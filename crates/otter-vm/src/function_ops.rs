@@ -48,7 +48,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let function_id = context
             .function_id_constant(idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         // §9.1 — a capture-free function created in a frame that carries a
         // direct-eval variable environment still needs the env handle (its
         // free identifiers resolve dynamically), so it materializes as a
@@ -99,7 +99,7 @@ impl Interpreter {
         let idx = const_operand(operands.get(1))?;
         let function_id = context
             .function_id_constant(idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         // §10.2 — a named function referencing its own binding inside its
         // body (`function_id` is the running function) must resolve to the
         // EXACT instance executing this frame, not a freshly minted one:
@@ -126,7 +126,7 @@ impl Interpreter {
             let cell = *frame
                 .upvalues
                 .get(parent_idx)
-                .ok_or_else(|| VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)?;
             cells.push(cell);
         }
         let upvalues = cells;
@@ -184,10 +184,10 @@ impl Interpreter {
         }
         let prototype = read_register(frame, proto_reg)?
             .as_object()
-            .ok_or_else(|| VmError::TypeMismatch)?;
+            .ok_or(VmError::TypeMismatch)?;
         let statics = read_register(frame, statics_reg)?
             .as_object()
-            .ok_or_else(|| VmError::TypeMismatch)?;
+            .ok_or(VmError::TypeMismatch)?;
         let roots = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
             for &slot in &roots {
@@ -278,7 +278,7 @@ impl Interpreter {
                     produced,
                 ),
                 PendingBindStage::Length => {
-                    let target_name = state.target_name.ok_or_else(|| VmError::InvalidOperand)?;
+                    let target_name = state.target_name.ok_or(VmError::InvalidOperand)?;
                     if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                         cold.pending_bind_function = None;
                     }
@@ -1476,7 +1476,7 @@ impl Interpreter {
                 let desc_obj = args
                     .get(2)
                     .and_then(|v| v.as_object())
-                    .ok_or_else(|| VmError::TypeMismatch)?;
+                    .ok_or(VmError::TypeMismatch)?;
                 let descriptor = object_statics::coerce_to_descriptor(&desc_obj, &self.gc_heap)?;
                 let completed = descriptor.complete_for_new_property();
                 let ok = match (function_id, &key) {

@@ -138,7 +138,7 @@ impl Interpreter {
                 stack,
             )?
         };
-        let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
+        let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
         write_register(frame, dst, result)?;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
@@ -250,13 +250,13 @@ impl Interpreter {
                         .upvalues
                         .get(*idx as usize)
                         .copied()
-                        .ok_or_else(|| VmError::InvalidOperand)?,
+                        .ok_or(VmError::InvalidOperand)?,
                     CallerCellSource::EvalVar(name) => cold_eval_vars
                         .and_then(|map| map.get(name))
                         .copied()
-                        .ok_or_else(|| VmError::InvalidOperand)?,
+                        .ok_or(VmError::InvalidOperand)?,
                 };
-                *upvalues.get_mut(i).ok_or_else(|| VmError::InvalidOperand)? = cell;
+                *upvalues.get_mut(i).ok_or(VmError::InvalidOperand)? = cell;
             }
         }
         // §19.2.1.3 step 16.b — the body's *new* var-scoped bindings
@@ -349,7 +349,7 @@ impl Interpreter {
             parts.push(self.function_constructor_arg_to_string(context, &value)?);
         }
         let result = self.build_function_constructor_from_parts(parts)?;
-        let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
+        let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
         write_register(frame, dst, result)?;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())

@@ -392,9 +392,7 @@ pub fn process_weak_refs_and_finalizers(heap: &mut otter_gc::GcHeap) -> Vec<Fina
 }
 
 fn weak_target_raw(value: &Value) -> Result<RawGc, crate::VmError> {
-    value
-        .as_raw_gc()
-        .ok_or_else(|| crate::VmError::TypeMismatch)
+    value.as_raw_gc().ok_or(crate::VmError::TypeMismatch)
 }
 
 fn raw_to_value(heap: &otter_gc::GcHeap, raw: RawGc) -> Option<Value> {

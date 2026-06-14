@@ -233,7 +233,7 @@ pub fn data_view_call(
             let buffer = args
                 .first()
                 .and_then(|v| v.as_array_buffer())
-                .ok_or_else(|| VmError::TypeMismatch)?;
+                .ok_or(VmError::TypeMismatch)?;
             if buffer.is_detached(gc_heap) {
                 return Err(VmError::TypeMismatch);
             }
@@ -241,7 +241,7 @@ pub fn data_view_call(
             let byte_offset = match args.get(1) {
                 None => 0u64,
                 Some(v) if v.is_undefined() => 0u64,
-                Some(v) => to_index(v, gc_heap).ok_or_else(|| VmError::TypeMismatch)?,
+                Some(v) => to_index(v, gc_heap).ok_or(VmError::TypeMismatch)?,
             } as usize;
             if byte_offset > buffer_byte_length {
                 return Err(VmError::TypeMismatch);
@@ -252,7 +252,7 @@ pub fn data_view_call(
                 None => buffer_byte_length - byte_offset,
                 Some(v) if v.is_undefined() => buffer_byte_length - byte_offset,
                 Some(v) => {
-                    let n = to_index(v, gc_heap).ok_or_else(|| VmError::TypeMismatch)? as usize;
+                    let n = to_index(v, gc_heap).ok_or(VmError::TypeMismatch)? as usize;
                     if byte_offset + n > buffer_byte_length {
                         return Err(VmError::TypeMismatch);
                     }
@@ -464,12 +464,12 @@ fn construct_typed_array_with_roots(
         return typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit);
     }
     if first.is_number() || first.is_boolean() || first.is_null() || first.is_string() {
-        let length = to_index(first, gc_heap).ok_or_else(|| VmError::TypeMismatch)? as usize;
+        let length = to_index(first, gc_heap).ok_or(VmError::TypeMismatch)? as usize;
         return new_zeroed_typed_array_with_roots(kind, length, gc_heap, external_visit);
     }
     if let Some(obj) = first.as_object() {
         let length_value = crate::object::get(obj, gc_heap, "length").unwrap_or(Value::undefined());
-        let len = to_index(&length_value, gc_heap).ok_or_else(|| VmError::TypeMismatch)? as usize;
+        let len = to_index(&length_value, gc_heap).ok_or(VmError::TypeMismatch)? as usize;
         if let Some(dense_values) = crate::object::with_properties(obj, gc_heap, |props| {
             props.dense_indexed_data_values(len)
         }) {
@@ -535,7 +535,7 @@ fn from_static_with_roots(
     }
     if let Some(obj) = source.as_object() {
         let len_value = crate::object::get(obj, gc_heap, "length").unwrap_or(Value::undefined());
-        let len = to_index(&len_value, gc_heap).ok_or_else(|| VmError::TypeMismatch)? as usize;
+        let len = to_index(&len_value, gc_heap).ok_or(VmError::TypeMismatch)? as usize;
         let mut values: Vec<Value> = Vec::with_capacity(len);
         for i in 0..len {
             let v = crate::object::get(obj, gc_heap, &i.to_string()).unwrap_or(Value::undefined());

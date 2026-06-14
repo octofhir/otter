@@ -729,7 +729,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let (pattern_utf16, flags) = context
             .regexp_constant(idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         // A regex literal evaluates to a fresh RegExp each time, but the
         // *compiled* program is a pure function of pattern + flags, so
         // resolve it through the per-isolate compile cache (a disjoint
@@ -759,7 +759,7 @@ impl Interpreter {
         let value = *read_register(frame, value_reg)?;
         let array = read_register(frame, arr_reg)?
             .as_array()
-            .ok_or_else(|| VmError::TypeMismatch)?;
+            .ok_or(VmError::TypeMismatch)?;
         let roots = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {

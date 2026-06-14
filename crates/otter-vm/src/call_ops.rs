@@ -149,10 +149,7 @@ impl Interpreter {
         let mut iter = args.into_iter();
         for i in 0..bind_count {
             let value = iter.next().expect("bind_count <= len");
-            let slot = frame
-                .registers
-                .get_mut(i)
-                .ok_or_else(|| VmError::InvalidOperand)?;
+            let slot = frame.registers.get_mut(i).ok_or(VmError::InvalidOperand)?;
             *slot = value;
         }
         let rest: Option<SmallVec<[Value; 4]>> =
@@ -244,7 +241,7 @@ impl Interpreter {
             Self::bytecode_construct_target_parts(current, &self.gc_heap)?;
         let function = context
             .exec_function(function_id)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         // §10.2.5 — only ordinary functions get a [[Construct]] slot;
         // async functions, generators, async generators, and
         // MethodDefinition bodies are not constructors.
@@ -305,7 +302,7 @@ impl Interpreter {
             Self::bytecode_construct_target_parts(current, &self.gc_heap)?;
         let function = context
             .exec_function(function_id)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         // §10.2.5 — async / generator functions and methods are not
         // constructors.
         if function.is_async || function.is_generator || function.is_method {
@@ -395,7 +392,7 @@ impl Interpreter {
         }
         let function = context
             .exec_function(function_id)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         // Async-call entry path (spec §27.7.5.1): synthesise a
         // fresh pending result promise, write it into the caller's
         // `dst` register *now* so the call expression's value is
@@ -463,7 +460,7 @@ impl Interpreter {
             gen_handle.install_owner_on_frame(&mut self.gc_heap);
             let (frame, cold) = gen_handle
                 .take_frame(&mut self.gc_heap)
-                .ok_or_else(|| VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)?;
             let mut frame = *frame;
             if let Some(cold) = cold {
                 self.frame_attach_cold(&mut frame, cold);
@@ -502,7 +499,7 @@ impl Interpreter {
     ) -> Result<PreparedBytecodeFrame, VmError> {
         let function = context
             .exec_function(function_id)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
         let this_for_callee =
@@ -588,7 +585,7 @@ impl Interpreter {
             gen_handle.install_owner_on_frame(&mut self.gc_heap);
             let (frame, cold) = gen_handle
                 .take_frame(&mut self.gc_heap)
-                .ok_or_else(|| VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)?;
             let mut frame = *frame;
             if let Some(cold) = cold {
                 self.frame_attach_cold(&mut frame, cold);
@@ -646,7 +643,7 @@ impl Interpreter {
         ) = Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
         let function = context
             .exec_function(function_id)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         self.record_runtime_bytecode_call();
         if stack.len() as u32 >= self.max_stack_depth {
             return Err(VmError::StackOverflow {
@@ -1467,7 +1464,7 @@ impl Interpreter {
         let this_value = *read_register(&stack[top_idx], this_reg)?;
         let args_array = read_register(&stack[top_idx], args_reg)?
             .as_array()
-            .ok_or_else(|| VmError::TypeMismatch)?;
+            .ok_or(VmError::TypeMismatch)?;
         let args: SmallVec<[Value; 8]> =
             crate::array::with_elements(args_array, &self.gc_heap, |elements| {
                 elements.iter().cloned().collect()
@@ -1683,7 +1680,7 @@ impl Interpreter {
         ) = Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
         let function = context
             .exec_function(function_id)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
         let this_for_callee = self.this_for_bytecode_call_runtime_rooted(
@@ -1735,7 +1732,7 @@ impl Interpreter {
             // never started and reports `done` on its first `next`.
             let (frame, cold) = gen_handle
                 .take_frame(&mut self.gc_heap)
-                .ok_or_else(|| VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)?;
             let mut frame = *frame;
             if let Some(cold) = cold {
                 self.frame_attach_cold(&mut frame, cold);

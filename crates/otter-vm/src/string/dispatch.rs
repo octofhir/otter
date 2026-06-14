@@ -34,10 +34,7 @@ pub fn call(
         M::FromCharCode => {
             let mut units: Vec<u16> = Vec::with_capacity(args.len());
             for arg in args {
-                let n = arg
-                    .as_number()
-                    .ok_or_else(|| VmError::TypeMismatch)?
-                    .as_f64();
+                let n = arg.as_number().ok_or(VmError::TypeMismatch)?.as_f64();
                 let truncated = if n.is_finite() {
                     (n as i64) as u16
                 } else {
@@ -53,10 +50,7 @@ pub fn call(
         M::FromCodePoint => {
             let mut units: Vec<u16> = Vec::with_capacity(args.len());
             for arg in args {
-                let n = arg
-                    .as_number()
-                    .ok_or_else(|| VmError::TypeMismatch)?
-                    .as_f64();
+                let n = arg.as_number().ok_or(VmError::TypeMismatch)?.as_f64();
                 if !n.is_finite() || n < 0.0 || n > 0x10FFFF as f64 || n.fract() != 0.0 {
                     return Err(VmError::TypeMismatch);
                 }

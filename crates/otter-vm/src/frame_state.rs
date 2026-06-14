@@ -257,7 +257,7 @@ impl Frame {
         self.pc = self
             .pc
             .checked_add(byte_len)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         Ok(())
     }
 

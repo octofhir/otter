@@ -180,7 +180,7 @@ fn symbol_key_for(interp: &mut Interpreter, args: &[Value]) -> Result<Value, Sym
     let sym = args
         .first()
         .and_then(|v| v.as_symbol(&interp.gc_heap))
-        .ok_or_else(|| SymbolError::BadArgument {
+        .ok_or(SymbolError::BadArgument {
             name: "keyFor",
             index: 0,
             reason: "must be a symbol",

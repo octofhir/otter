@@ -112,7 +112,7 @@ impl Interpreter {
         let dst = register_operand(operands.first())?;
         let method_idx = const_operand(operands.get(1))?;
         let method = otter_bytecode::method_id::PromiseMethod::from_u32(method_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         let top_idx = stack.len() - 1;
         let args = collect_variadic_args(&stack[top_idx], operands, 2, 3)?;
         stack[top_idx].advance_pc(self.current_byte_len)?;

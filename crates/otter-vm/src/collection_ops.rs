@@ -33,7 +33,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let kind = context
             .string_constant_str(kind_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)?;
         let frame = &stack[top_idx];
         let seed = *read_register(frame, iter_reg)?;
         let value = self.build_collection_with_stack_roots(kind, &seed, stack)?;
@@ -71,7 +71,7 @@ impl Interpreter {
                     &mut external_visit,
                 )?;
                 for entry in &seed_entries {
-                    let pair = entry.as_array().ok_or_else(|| VmError::TypeMismatch)?;
+                    let pair = entry.as_array().ok_or(VmError::TypeMismatch)?;
                     if crate::array::len(pair, &self.gc_heap) < 2 {
                         return Err(VmError::TypeMismatch);
                     }
@@ -126,7 +126,7 @@ impl Interpreter {
                     &mut external_visit,
                 )?;
                 for entry in &seed_entries {
-                    let pair = entry.as_array().ok_or_else(|| VmError::TypeMismatch)?;
+                    let pair = entry.as_array().ok_or(VmError::TypeMismatch)?;
                     if crate::array::len(pair, &self.gc_heap) < 2 {
                         return Err(VmError::TypeMismatch);
                     }
@@ -180,7 +180,7 @@ fn seed_is_present(v: &Value) -> bool {
 }
 
 fn seed_array(seed: &Value, gc_heap: &otter_gc::GcHeap) -> Result<Vec<Value>, VmError> {
-    let arr = seed.as_array().ok_or_else(|| VmError::TypeMismatch)?;
+    let arr = seed.as_array().ok_or(VmError::TypeMismatch)?;
     Ok(crate::array::with_elements(arr, gc_heap, |elements| {
         elements.to_vec()
     }))

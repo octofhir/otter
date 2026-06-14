@@ -94,10 +94,10 @@ impl Interpreter {
             let r_str = conversion::to_js_string_primitive(&rhs, self.gc_heap_mut())?;
             Value::string(JsString::concat(l_str, r_str, self.gc_heap_mut())?)
         } else {
-            let lk = abstract_ops::to_numeric_kind(&lhs, &self.gc_heap)
-                .ok_or_else(|| VmError::TypeMismatch)?;
-            let rk = abstract_ops::to_numeric_kind(&rhs, &self.gc_heap)
-                .ok_or_else(|| VmError::TypeMismatch)?;
+            let lk =
+                abstract_ops::to_numeric_kind(&lhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
+            let rk =
+                abstract_ops::to_numeric_kind(&rhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
             match (lk, rk) {
                 (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
                     Value::number(number::add(a, b))
@@ -150,10 +150,8 @@ impl Interpreter {
         rhs: u16,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
-        let lk = abstract_ops::to_numeric_kind(&lhs, &self.gc_heap)
-            .ok_or_else(|| VmError::TypeMismatch)?;
-        let rk = abstract_ops::to_numeric_kind(&rhs, &self.gc_heap)
-            .ok_or_else(|| VmError::TypeMismatch)?;
+        let lk = abstract_ops::to_numeric_kind(&lhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
+        let rk = abstract_ops::to_numeric_kind(&rhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
         let result = match (lk, rk) {
             (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
                 Value::number(number::shr_logical(a, b))
@@ -172,17 +170,16 @@ impl Interpreter {
         src: u16,
     ) -> Result<(), VmError> {
         let v = *read_register(frame, src)?;
-        let value = match abstract_ops::to_numeric_kind(&v, &self.gc_heap)
-            .ok_or_else(|| VmError::TypeMismatch)?
-        {
-            abstract_ops::NumericKind::Num(n) => Value::number(number::neg(n)),
-            abstract_ops::NumericKind::Big(b) => {
-                let neg = bigint::ops::neg(&b);
-                let handle =
-                    bigint::BigIntValue::from_inner(&mut self.gc_heap, neg).map_err(oom_to_vm)?;
-                Value::big_int(handle)
-            }
-        };
+        let value =
+            match abstract_ops::to_numeric_kind(&v, &self.gc_heap).ok_or(VmError::TypeMismatch)? {
+                abstract_ops::NumericKind::Num(n) => Value::number(number::neg(n)),
+                abstract_ops::NumericKind::Big(b) => {
+                    let neg = bigint::ops::neg(&b);
+                    let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, neg)
+                        .map_err(oom_to_vm)?;
+                    Value::big_int(handle)
+                }
+            };
         write_register(frame, dst, value)?;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
@@ -195,17 +192,16 @@ impl Interpreter {
         src: u16,
     ) -> Result<(), VmError> {
         let v = *read_register(frame, src)?;
-        let value = match abstract_ops::to_numeric_kind(&v, &self.gc_heap)
-            .ok_or_else(|| VmError::TypeMismatch)?
-        {
-            abstract_ops::NumericKind::Num(n) => Value::number(number::bitwise_not(n)),
-            abstract_ops::NumericKind::Big(b) => {
-                let notted = bigint::ops::bitwise_not(&b);
-                let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, notted)
-                    .map_err(oom_to_vm)?;
-                Value::big_int(handle)
-            }
-        };
+        let value =
+            match abstract_ops::to_numeric_kind(&v, &self.gc_heap).ok_or(VmError::TypeMismatch)? {
+                abstract_ops::NumericKind::Num(n) => Value::number(number::bitwise_not(n)),
+                abstract_ops::NumericKind::Big(b) => {
+                    let notted = bigint::ops::bitwise_not(&b);
+                    let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, notted)
+                        .map_err(oom_to_vm)?;
+                    Value::big_int(handle)
+                }
+            };
         write_register(frame, dst, value)?;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
@@ -324,8 +320,8 @@ fn run_numeric_values(
     bigint_op: BigIntBinop,
     byte_len: u32,
 ) -> Result<(), VmError> {
-    let lnum = abstract_ops::to_numeric_kind(&lhs, heap).ok_or_else(|| VmError::TypeMismatch)?;
-    let rnum = abstract_ops::to_numeric_kind(&rhs, heap).ok_or_else(|| VmError::TypeMismatch)?;
+    let lnum = abstract_ops::to_numeric_kind(&lhs, heap).ok_or(VmError::TypeMismatch)?;
+    let rnum = abstract_ops::to_numeric_kind(&rhs, heap).ok_or(VmError::TypeMismatch)?;
     let result = match (lnum, rnum) {
         (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
             Value::number(op(a, b))

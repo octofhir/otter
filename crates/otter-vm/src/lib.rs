@@ -174,8 +174,8 @@ pub use dynamic_import::{DynamicImportLoader, DynamicImportLoaderHandle, Dynamic
 pub use error_classes::{ErrorClassRegistry, ErrorKind};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
-    JitCompileError, JitCompileRequest, JitCompileStatus, JitCompilerHook, JitFunctionCode,
-    JitFunctionView, JitInstrView,
+    JitCompileError, JitCompileRequest, JitCompileStatus, JitCompilerHook, JitExecOutcome,
+    JitFunctionCode, JitFunctionView, JitInstrView,
 };
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,
@@ -437,7 +437,16 @@ pub struct Interpreter {
     property_ic_stats: property_ic::PropertyIcStats,
     /// Runtime-installed baseline JIT compiler hook. The hook lives behind a VM
     /// trait object so `otter-vm` never depends on executable-memory code.
+    /// `Some` is also the tier-up gate: with no hook installed, all tier-up
+    /// bookkeeping below stays untouched and execution is interpreter-only.
     jit_hook: Option<std::sync::Arc<dyn jit::JitCompilerHook>>,
+    /// Per-function call counter driving function-entry tier-up. Only mutated
+    /// when a JIT hook is installed.
+    jit_call_counts: rustc_hash::FxHashMap<u32, u32>,
+    /// Compiled-code cache keyed by global function id. `Some(code)` is an
+    /// installed baseline body; `None` records a function the emitter could not
+    /// compile (outside the supported subset), so it is never retried.
+    jit_code: std::collections::BTreeMap<u32, Option<std::sync::Arc<dyn jit::JitFunctionCode>>>,
     /// Optional per-turn resource policy. This slice records observations but
     /// does not yet yield or reject when a limit is exceeded.
     runtime_budget: RuntimeBudget,
@@ -994,6 +1003,8 @@ impl Interpreter {
             has_property_ics: Vec::new(),
             property_ic_stats: property_ic::PropertyIcStats::default(),
             jit_hook: None,
+            jit_call_counts: rustc_hash::FxHashMap::default(),
+            jit_code: std::collections::BTreeMap::new(),
             runtime_budget: RuntimeBudget::default(),
             runtime_budget_stats: RuntimeBudgetStats::default(),
             runtime_budget_depth: 0,
@@ -1122,6 +1133,95 @@ impl Interpreter {
     #[must_use]
     pub fn jit_compiler_installed(&self) -> bool {
         self.jit_hook.is_some()
+    }
+
+    /// Call-count at which a function body is offered to the JIT. Low enough
+    /// that genuinely hot functions tier up early, high enough that one-shot
+    /// calls never pay compile latency.
+    const JIT_TIER_UP_THRESHOLD: u32 = 50;
+
+    /// After a call pushed a fresh bytecode callee frame as the new top of
+    /// `stack`, try to run it as compiled baseline code instead of interpreting.
+    ///
+    /// Only invoked when a JIT hook is installed and a frame was actually
+    /// pushed (the caller checks `stack` grew). Returns `Ok(None)` to interpret
+    /// normally; `Ok(Some(popped))` when the JIT ran and the callee returned,
+    /// where `popped` mirrors [`Self::return_running_finally`] (`Some(v)` means
+    /// the return unwound the dispatch entry and the loop should yield `v`).
+    fn maybe_dispatch_jit(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+    ) -> Result<Option<Option<Value>>, VmError> {
+        let top_idx = stack.len() - 1;
+        // Only fresh, ordinary bytecode frames: at entry (pc == 0), not async,
+        // not a generator body. The compiled subset also excludes anything that
+        // would need those, but guard here so tier-up never targets a frame it
+        // cannot faithfully run.
+        {
+            let frame = &stack[top_idx];
+            if top_idx == 0
+                || frame.pc != 0
+                || frame.async_state.is_some()
+                || frame.generator_owner.is_some()
+            {
+                return Ok(None);
+            }
+        }
+        let fid = stack[top_idx].function_id;
+
+        // Resolve compiled code: cached decision, or compile once at threshold.
+        let code = match self.jit_code.get(&fid) {
+            Some(slot) => slot.clone(),
+            None => {
+                let count = {
+                    let counter = self.jit_call_counts.entry(fid).or_insert(0);
+                    *counter = counter.saturating_add(1);
+                    *counter
+                };
+                if count < Self::JIT_TIER_UP_THRESHOLD {
+                    return Ok(None);
+                }
+                let compiled = self.compile_jit_function(context, fid);
+                self.jit_code.insert(fid, compiled.clone());
+                compiled
+            }
+        };
+        let Some(code) = code else {
+            return Ok(None); // known-unsupported: interpret.
+        };
+
+        // Run on a scratch copy of the register window so a mid-body guard bail
+        // leaves the real frame pristine for the interpreter fallback.
+        let mut scratch: SmallVec<[Value; 8]> = stack[top_idx].registers.clone();
+        match code.run_entry(&mut scratch) {
+            jit::JitExecOutcome::Bailed => Ok(None),
+            jit::JitExecOutcome::Returned(value) => {
+                let popped = self.return_running_finally(stack, value)?;
+                Ok(Some(popped))
+            }
+        }
+    }
+
+    /// Build a compile request for `fid` and run the installed hook. Returns the
+    /// installed code, or `None` when the hook declines (unsupported subset or
+    /// executable memory unavailable) — either way execution stays correct on
+    /// the interpreter.
+    fn compile_jit_function(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+    ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
+        let view = context.jit_function_view(fid)?;
+        let hook = self.jit_hook.as_ref()?.clone();
+        let status = hook.compile_function(jit::JitCompileRequest { function: view });
+        if std::env::var_os("OTTER_JIT_TRACE").is_some() {
+            eprintln!("[jit] compile fid={fid} -> {status:?}");
+        }
+        match status {
+            Ok(jit::JitCompileStatus::Compiled { code }) => Some(code),
+            _ => None,
+        }
     }
 
     /// Return the current observational runtime budget policy.
@@ -3868,7 +3968,16 @@ impl Interpreter {
                 }
                 Op::Call => {
                     let operands = context.exec_operands(instr);
+                    let depth_before = stack.len();
                     self.do_call(stack, context, operands)?;
+                    // Tier-up hook: only when a bytecode callee frame was just
+                    // pushed and a JIT is installed. Cheap (one bool) when off.
+                    if self.jit_hook.is_some()
+                        && stack.len() > depth_before
+                        && let Some(Some(value)) = self.maybe_dispatch_jit(stack, context)?
+                    {
+                        return Ok(value);
+                    }
                     continue;
                 }
                 Op::CallWithThis => {

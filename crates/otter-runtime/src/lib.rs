@@ -1584,6 +1584,15 @@ impl Runtime {
                 .map_err(|e| format!("compile error: {e:?}"))
             });
         interp.set_eval_hook(Some(hook));
+        // Baseline JIT is opt-in via `OTTER_JIT=1` while the tier ramps up:
+        // `OTTER_JIT=1` enables it, `0` or unset keeps the engine
+        // interpreter-only (zero tier-up overhead) so default runs,
+        // conformance, and benchmarks are unaffected.
+        if std::env::var("OTTER_JIT").is_ok_and(|v| v == "1") {
+            interp.set_jit_compiler(Some(std::sync::Arc::new(
+                otter_jit::BaselineJitCompiler::new(),
+            )));
+        }
         if let Some(factory) = &config.tracer_factory {
             interp.set_tracer(Some(factory.build()));
         }

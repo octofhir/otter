@@ -46,7 +46,7 @@
 //! - [`crate::CompiledCode`] — the executable-memory owner this wraps.
 
 use otter_bytecode::{Op, Operand};
-use otter_vm::{JitFunctionCode, JitFunctionView};
+use otter_vm::{JitExecOutcome, JitFunctionCode, JitFunctionView, Value};
 
 use crate::CompiledCode;
 
@@ -108,6 +108,19 @@ impl std::fmt::Debug for BaselineCode {
 impl JitFunctionCode for BaselineCode {
     fn code_len(&self) -> usize {
         self.code.len()
+    }
+
+    fn run_entry(&self, registers: &mut [Value]) -> JitExecOutcome {
+        // `Value` is `#[repr(transparent)] u64`, so the register window is a
+        // run of `u64` NaN-boxed Values the compiled code reads/writes by
+        // index. SAFETY: the slice is valid and writable for the call; the
+        // compiled code only touches slots < the function's register_count,
+        // which the caller sized the window to.
+        let outcome = unsafe { self.run(registers.as_mut_ptr().cast::<u64>()) };
+        match outcome {
+            BaselineExit::Returned(bits) => JitExecOutcome::Returned(Value::from_bits(bits)),
+            BaselineExit::Bailed => JitExecOutcome::Bailed,
+        }
     }
 }
 
@@ -306,11 +319,26 @@ mod arm64 {
                         dynasm!(ops ; .arch aarch64 ; b.eq =>tgt);
                     }
                 }
-                Op::Return => {
+                // `ToPrimitive`/`ToNumeric` are identity on a number; emit a
+                // guarded move (int32 → copy, else bail). Non-number operands
+                // would run user-observable coercion, so bailing is correct.
+                Op::ToPrimitive | Op::ToNumeric => {
+                    let dst = reg(ops_ref, 0)?;
+                    let src = reg(ops_ref, 1)?;
+                    load_reg(&mut ops, 9, src)?;
+                    guard_int32!(ops, 9, bail);
+                    store_reg(&mut ops, 9, dst)?;
+                }
+                Op::Return | Op::ReturnValue => {
                     let src = reg(ops_ref, 0)?;
                     let off = reg_offset(src)?;
                     // bail flag already cleared in the prologue.
                     dynasm!(ops ; .arch aarch64 ; ldr x0, [x0, off] ; ret);
+                }
+                Op::ReturnUndefined => {
+                    let undef = TAG_SPECIAL << 48; // SPECIAL_UNDEFINED == 0
+                    emit_load_u64(&mut ops, 0, undef);
+                    dynasm!(ops ; .arch aarch64 ; ret);
                 }
                 other => return Err(Unsupported::Opcode(other)),
             }
@@ -435,8 +463,8 @@ mod tests {
     //! easy to compute (`rel = (target_idx - next_idx) * 4`).
 
     use super::{BaselineExit, SPECIAL_FALSE, TAG_INT32, TAG_SPECIAL, compile};
-    use otter_vm::{JitFunctionView, JitInstrView};
     use otter_bytecode::{Op, Operand};
+    use otter_vm::{JitFunctionView, JitInstrView};
 
     const STRIDE: u32 = 4;
 
@@ -490,7 +518,14 @@ mod tests {
     fn add_two_ints() {
         // r2 = r0 + r1; return r2
         let v = view(&[
-            (Op::Add, vec![Operand::Register(2), Operand::Register(0), Operand::Register(1)]),
+            (
+                Op::Add,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
             (Op::Return, vec![Operand::Register(2)]),
         ]);
         let mut regs = [box_i32(10), box_i32(20), 0, 0, 0, 0, 0, 0];
@@ -504,9 +539,22 @@ mod tests {
     fn immediate_load_and_sub() {
         // r0 = 100; r1 = 42; r2 = r0 - r1; return r2
         let v = view(&[
-            (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(100)]),
-            (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(42)]),
-            (Op::Sub, vec![Operand::Register(2), Operand::Register(0), Operand::Register(1)]),
+            (
+                Op::LoadInt32,
+                vec![Operand::Register(0), Operand::Imm32(100)],
+            ),
+            (
+                Op::LoadInt32,
+                vec![Operand::Register(1), Operand::Imm32(42)],
+            ),
+            (
+                Op::Sub,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
             (Op::Return, vec![Operand::Register(2)]),
         ]);
         let mut regs = [0u64; 8];
@@ -520,7 +568,10 @@ mod tests {
     fn negative_immediate_roundtrips() {
         // r0 = -7; return r0
         let v = view(&[
-            (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(-7)]),
+            (
+                Op::LoadInt32,
+                vec![Operand::Register(0), Operand::Imm32(-7)],
+            ),
             (Op::Return, vec![Operand::Register(0)]),
         ]);
         let mut regs = [0u64; 8];
@@ -546,10 +597,34 @@ mod tests {
             (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(0)]),
             (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(1)]),
             (Op::LoadInt32, vec![Operand::Register(4), Operand::Imm32(1)]),
-            (Op::LessEq, vec![Operand::Register(3), Operand::Register(2), Operand::Register(0)]),
-            (Op::JumpIfFalse, vec![Operand::Imm32(rel(4, 8)), Operand::Register(3)]),
-            (Op::Add, vec![Operand::Register(1), Operand::Register(1), Operand::Register(2)]),
-            (Op::Add, vec![Operand::Register(2), Operand::Register(2), Operand::Register(4)]),
+            (
+                Op::LessEq,
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(2),
+                    Operand::Register(0),
+                ],
+            ),
+            (
+                Op::JumpIfFalse,
+                vec![Operand::Imm32(rel(4, 8)), Operand::Register(3)],
+            ),
+            (
+                Op::Add,
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ],
+            ),
+            (
+                Op::Add,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(2),
+                    Operand::Register(4),
+                ],
+            ),
             (Op::Jump, vec![Operand::Imm32(rel(7, 3))]),
             (Op::Return, vec![Operand::Register(1)]),
         ]);
@@ -569,7 +644,14 @@ mod tests {
     fn less_than_produces_boolean() {
         // r2 = (r0 < r1); return r2
         let v = view(&[
-            (Op::LessThan, vec![Operand::Register(2), Operand::Register(0), Operand::Register(1)]),
+            (
+                Op::LessThan,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
             (Op::Return, vec![Operand::Register(2)]),
         ]);
         let true_bits = (TAG_SPECIAL << 48) | u64::from(SPECIAL_FALSE + 1);
@@ -585,7 +667,14 @@ mod tests {
     fn bails_on_non_int_operand() {
         // r2 = r0 + r1; return r2 — but r1 holds a non-int (undefined-ish tag).
         let v = view(&[
-            (Op::Add, vec![Operand::Register(2), Operand::Register(0), Operand::Register(1)]),
+            (
+                Op::Add,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
             (Op::Return, vec![Operand::Register(2)]),
         ]);
         // r1 = a double (top tag below TAG_INT32) → int32 guard fails → bail.
@@ -596,9 +685,14 @@ mod tests {
     #[test]
     fn unsupported_opcode_reports_not_bail() {
         // A call op is outside the subset → whole-function Unsupported.
-        let v = view(&[
-            (Op::Call, vec![Operand::Register(0), Operand::Register(1), Operand::Imm32(0)]),
-        ]);
+        let v = view(&[(
+            Op::Call,
+            vec![
+                Operand::Register(0),
+                Operand::Register(1),
+                Operand::Imm32(0),
+            ],
+        )]);
         assert!(compile(&v).is_err());
     }
 }

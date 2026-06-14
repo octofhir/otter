@@ -79,14 +79,38 @@ pub struct JitInstrView {
     pub operands: Vec<Operand>,
 }
 
+/// Outcome of executing compiled code for one function entry.
+///
+/// The compiled body runs over a register window the VM owns and roots. It
+/// either runs to a `Return` (carrying the completion Value) or hits a typed
+/// guard it cannot honor and bails, in which case the VM must run the function
+/// on the interpreter instead — semantics are identical either way.
+#[derive(Debug, Clone, Copy)]
+pub enum JitExecOutcome {
+    /// `Return`/`ReturnValue` reached; carries the completion Value.
+    Returned(crate::Value),
+    /// A typed guard failed; the VM must re-run this function on the
+    /// interpreter (the passed register window is left untouched on bail).
+    Bailed,
+}
+
 /// Type-erased compiled-code handle owned by the JIT implementation.
 ///
-/// The VM never transmutes or calls raw entry pointers directly. Later Phase 1
-/// execution wiring will extend this safe trait surface while keeping executable
-/// memory ownership and unsafe ABI calls inside `otter-jit`.
+/// The VM never transmutes or calls raw entry pointers directly: it hands the
+/// JIT a register window and receives a structured outcome, keeping executable
+/// memory ownership and the unsafe ABI call inside `otter-jit`.
 pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// Size in bytes of the finalized native code mapping.
     fn code_len(&self) -> usize;
+
+    /// Execute the compiled function over `registers` (the entry frame's
+    /// register window, params already in place).
+    ///
+    /// The current baseline subset is allocation- and call-free, so the call
+    /// is a leaf with no safepoint: the window is read/written in place and no
+    /// value is ever live across a GC move. Callers that need bail-safety pass
+    /// a scratch copy of the window (a failed guard leaves it partly written).
+    fn run_entry(&self, registers: &mut [crate::Value]) -> JitExecOutcome;
 }
 
 /// Result of a JIT compile attempt.

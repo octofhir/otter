@@ -22,7 +22,9 @@ on `prop-access` (97× node / 252× deno) and dispatch/arithmetic-bound loops
 **Strategy in three sentences.** First, fix the interpreter's self-inflicted
 dispatch tax (binary-search fetch, per-op accounting, no threading) — cheap,
 zero GC risk, 2–4× across the board. Second, add a **single baseline JIT tier**
-(Sparkplug-style, bytecode→machine code via **Cranelift**, no IR, no
+(Sparkplug-style, bytecode→machine code via a baseline backend **chosen by
+prototype, not yet committed** — copy-and-patch is the leading candidate over
+Cranelift for the baseline tier (§3.2); no IR, no
 speculation, no deopt) for hot functions, reusing the existing inline-cache
 feedback table and the existing precise `FrameRoots` rooting mechanism so the
 moving GC needs **no stack maps in v1**. Third — and only after the first two
@@ -58,6 +60,47 @@ Three project constraints shape this plan:
    not closed.
 
 ---
+
+## 1.5 Progress log (live)
+
+Newest first. Each entry is gated per §5 (test262 failing-set unchanged +
+benchmarks no-regression + GC stress clean). Benches are min-ms, 10 runs.
+
+- **Phase 0 step 1 — O(1) instruction fetch. DONE, verified.** Replaced the
+  per-op `binary_search_by_key` PC→instruction lookup with a dense
+  `byte_to_instr` map (`crates/otter-vm/src/executable.rs`). Also speeds
+  `property_ic_site` (same search, per property op). Apples-to-apples (10-run,
+  same binary rebuilt both sides): mandelbrot −48.7%, nbody −43.5%, typed-array
+  −39.9%, typescript −35.2%, string-ops −34.5%, fib −32.7%, prop-access −25.5%,
+  sort −19%, array-ops −10.6%; json/regex flat (allocation/separate-engine
+  bound). test262 `language/statements` identical (9140 pass / 35 fail / 0
+  crash) before and after. The single biggest interpreter win.
+- **Phase 0 step 2 — inline per-op metering + dead-code removal. DONE, verified.**
+  Collapsed three per-op method calls (`record_runtime_reductions`,
+  `observe_runtime_stack_depth`, unconditional budget checkpoint) into one
+  `#[inline]` `record_reductions` + an inlined monotonic stack-depth max + a
+  checkpoint gated on a hoisted `enforce_budget` flag (`crates/otter-vm/src/lib.rs`).
+  Deleted the now-dead `observe_stack_depth` and two Interpreter wrappers.
+  Exact semantics (budget-stats integration tests pass). Modest (fib −3.3%,
+  others ~1%): the int32/Smi value path and the funnels were already specialized
+  and inline under release thin-LTO, so the remaining envelope cost is the
+  reductions field-writes themselves — not worth a risky register-resident
+  accumulator (hundreds of `?`-exits make a guaranteed flush infeasible cleanly).
+- **Test-target repair. DONE.** Fixed a pre-existing compile break in
+  `bootstrap.rs` tests (`build_global_this*` signature drift; 3 call sites) and a
+  drifted startup ratchet (`MAX_DEFAULT_GC_ALLOCATIONS` 1650→1700, Intl.Locale
+  additions). `cargo test -p otter-vm --lib` now green (566 pass).
+
+**Measurement-driven course correction.** Profiling-by-reading showed the
+interpreter's int32 arithmetic is *already* Smi-specialized (`number::add`
+checked_add; `Value::number` prefers int32) and release builds inline the
+arithmetic funnels (thin-LTO, `codegen-units = 1`). So "add int32 fast paths" is
+largely redundant. The next interpreter wins are **simplification / tech-debt
+removal** (collapse redundant funnel layers, hoist per-op work that only changes
+on call/return, delete dead paths) — not new fast paths. Verified by test262.
+
+**Current gap vs Node after Phase 0:** mandelbrot 47→24×, nbody 42→24×, fib
+40→27×, typed-array 66→39×, typescript 36→23×, prop-access 97→71×.
 
 ## 2. Bottleneck profile (measured against code)
 
@@ -144,29 +187,56 @@ type-specialization and LICM/inlining on top, but only matters *after* the
 envelope is gone, and it is where all the GC-interaction risk concentrates.
 Sequence them; do not merge them.
 
-### 3.2 Backend — recommendation: **Cranelift**
+### 3.2 Backend — DECISION DEFERRED, split by tier, gated on a prototype
 
-| Option | Compile latency | Code quality | Multi-arch | GC stack maps | Deopt support | Verdict |
-|---|---|---|---|---|---|---|
-| **Cranelift** | Fast (designed for JIT/Wasmtime) | Good (regalloc, basic opts) | **arm64 + x64 free** | **User stack maps supported** | Build via metadata/traps | **Chosen.** |
-| Custom template assembler (Sparkplug/JSC-style) | Fastest | Hand-tuned ceiling | Must hand-write each arch | Hand-roll | Hand-roll | Rejected — dual-arch hand assembly is a team-sized burden; otter targets `darwin arm64` today and x64 elsewhere. |
-| LLVM (ORC/MCJIT) | **Terrible** (100×+ Cranelift) | Best | Yes | Statepoints exist but heavy | Heavy | Rejected — compile latency disqualifies it for any JIT tier short of a far-future top tier. |
+> **Status: not committed.** Earlier drafts named Cranelift as the single
+> backend "unambiguously." That was premature. The baseline tier and the
+> optimizing tier have different needs and should be decided separately, after a
+> throwaway prototype measures real compile latency and code quality against
+> otter's own bytecode. Do **not** add a Cranelift dependency until the baseline
+> backend is chosen by measurement (the §5 gate applies to infrastructure
+> choices too).
 
-**Why Cranelift, unambiguously.** It is Rust-native (no FFI/build friction in a
-Rust codebase), it gives **arm64 and x64 register allocation and relocation for
-free** — critical since the bench host is `darwin arm64`
-(`benchmarks/results/latest.md:5`) but production spans x64 — its compile
-latency is built for exactly this use case, and it supports **user-defined stack
-maps** (`ir::UserStackMap` declared at safepoint instructions), which is the
-mechanism the optimizing tier will need to keep live references in registers
-across a moving-GC safepoint. The `cranelift-jit` crate handles executable
-memory management.
+**Two backends, two questions.**
 
-**What Cranelift costs us.** Its compile time is higher than a pure template
-assembler, so we **only JIT hot functions** (counter-triggered, never eager) and
-we do **not** put Cranelift on the cold path. Deopt is not turnkey — we build it
-in tier 2 from our own side metadata plus Cranelift traps. Both are acceptable
-and addressed by phasing.
+The *baseline* tier wants the fastest possible compile (it runs on warm
+functions, latency is user-visible) and the simplest possible mapping from
+register bytecode to machine code. The *optimizing* tier wants good register
+allocation, SSA optimization, and stack-map support, and can tolerate slow
+compile (it runs rarely, on the hottest code).
+
+| Option | Compile latency | Code quality | Multi-arch | GC stack maps | Best fit |
+|---|---|---|---|---|---|
+| **Copy-and-patch** (stencils) | **Fastest** (memcpy + relocations, no regalloc) | Moderate; beats a switch-interpreter ~2–5× | Per-arch stencil set, generated at build from C/asm | Hand-roll via stencil holes | **Baseline tier (leading candidate)** |
+| Cranelift | Fast-ish (real regalloc pass) | Good | **arm64 + x64 free** | **User stack maps supported** | **Optimizing tier (leading candidate)** |
+| Custom template assembler | Fastest | Hand-tuned ceiling | Hand-write each arch | Hand-roll | Baseline, if we want full control |
+| LLVM (ORC/MCJIT) | Terrible (100×+) | Best | Yes | Heavy statepoints | Rejected for any near-term tier |
+
+**Copy-and-patch — the candidate to research first.** Copy-and-patch (Xu &
+Kjolstad, PLDI 2021; shipping in CPython 3.13's experimental JIT) precompiles a
+*stencil* of machine code per bytecode operation at build time, then at runtime
+emits code by `memcpy`-ing stencils and patching holes (constants, branch
+targets, IC addresses). It has the lowest possible compile latency (no IR, no
+register allocation at runtime), produces deterministic code that is easy to
+reason about for GC, and maps almost 1:1 onto otter's already-register-based
+bytecode. Its costs: a build-time stencil generator per architecture, and code
+quality below a real optimizer (acceptable for a baseline — the optimizing tier
+covers peak performance). For a *baseline* tier whose whole job is to delete the
+dispatch envelope, this is plausibly a better fit than Cranelift.
+
+**Cranelift — still the optimizing-tier candidate.** Rust-native, free
+arm64+x64 register allocation and relocation, and **user stack maps**
+(`ir::UserStackMap`) for keeping live references in registers across a
+moving-GC safepoint — exactly what the optimizing tier needs. Its higher compile
+latency is fine there (it runs on the hottest code only).
+
+**Decision gate (do this before any JIT code).** Build a throwaway prototype
+that compiles one hot function (e.g. `fib`) two ways — a copy-and-patch stencil
+path and a Cranelift path — and measure: (1) compile latency per function,
+(2) resulting ns/op vs the interpreter, (3) implementation complexity for the
+moving-GC rooting contract (§3.5). Pick the baseline backend from those numbers,
+record them here, and only then commit a dependency. Until then this section is
+explicitly open.
 
 ### 3.3 Inline caches in JIT — recommendation: **share the interpreter IC table, emit inline guards + shared miss handler**
 
@@ -356,47 +426,48 @@ Each phase lists: what is built, crates/modules touched, target bench + expected
 delta, risks, and a rollback checkpoint. **Gate rule for every phase: not closed
 until the target bench moves AND no other bench regresses** (§5).
 
-### Phase 0 — Interpreter dispatch surgery (cheapest, no GC risk)
+### Phase 0 — Interpreter dispatch surgery (cheapest, no GC risk) — IN PROGRESS
 
 **Build:**
-- Replace per-instruction `binary_search_by_key` fetch
-  (`executable.rs:181-186`) with O(1) access: precompute a `byte_pc → ExecInstr`
-  index, or store `current` instruction index alongside `pc` and advance it
-  directly. (Largest single win.) **VM rework is permitted here** — if the
-  variable-width encoding (`encoding.rs:102-112`) blocks O(1) fetch + cheap
-  decode, re-encode the bytecode to fixed-width (single binary, no external ABI
-  to preserve). This also pays off later: a JIT decodes fixed-width far cheaper.
-- Gate the per-op envelope: fold `record_runtime_reductions` +
-  `enforce_runtime_budget_checkpoint` + `observe_runtime_stack_depth`
-  (`lib.rs:3783-3785`) behind a single branch or batch them at back-edges/calls
-  instead of every op; compile out the tracer check (`lib.rs:3790`) when no
-  tracer is installed (feature/cfg or a fast/slow loop split).
-- Convert dispatch to **tail-call threaded** dispatch (one handler fn per op,
-  `become`/explicit tail calls) or a computed-goto-equivalent, replacing the
-  single `match op` (`lib.rs:3813`).
+- ✅ **DONE** — Replace per-instruction `binary_search_by_key` fetch with O(1)
+  `byte_to_instr` dense map (`executable.rs`). Largest single win (see §1.5).
+  Fixed-width re-encode was *not* needed — the VM already executes from a
+  pre-decoded `ExecInstr` array, so the search was pure overhead.
+- ✅ **DONE (partial)** — Per-op envelope: the three metering calls
+  (`lib.rs`) are inlined into one `#[inline]` accumulate + inlined depth-max +
+  a hoisted `enforce_budget`-gated checkpoint; dead helpers deleted. The tracer
+  `Option` check is left (one predicted branch; cheap). Full register-resident
+  batching was rejected — hundreds of `?`-exits make a guaranteed flush
+  infeasible without a large restructure, for ~5% on the best case.
+- ⏭️ **Threaded dispatch — DROPPED for now.** In stable Rust the `match op` over
+  the `#[repr(u8)]` opcode is *already a jump table*; true token-threading needs
+  unstable `become`/explicit tail calls. Limited upside, high cost/risk. Revisit
+  only if profiling shows dispatch misprediction dominates after simplification.
+- 🔜 **NEXT — simplification / tech-debt removal** (per the measurement-driven
+  correction in §1.5): hoist per-op work that only changes on call/return (the
+  context/function re-resolution at the loop top), collapse redundant funnel
+  layers, delete dead paths (e.g. `to_numeric_for_compare`). Verified by test262.
 
-**Touches:** `crates/otter-vm/src/lib.rs` (dispatch loop), `executable.rs`
-(fetch), `operand_decode.rs`, `runtime_budget.rs` (move accounting off hot path).
+**Touches:** `crates/otter-vm/src/lib.rs` (dispatch loop), `executable.rs`,
+`runtime_budget.rs`, `arithmetic_dispatch.rs`.
 
-**Target / delta:** all compute benches; `fib` 40×→~15×, `prop-access`
-97×→~35×, `mandelbrot` 47×→~20×. Whole-table 2–4×.
+**Achieved so far:** mandelbrot 47→24×, nbody 42→24×, fib 40→27×, typed-array
+66→39×, typescript 36→23×, prop-access 97→71× (§1.5).
 
-**Risks:** tail-call dispatch is unstable to express in Rust without care
-(stack growth, `become` availability) — fallback is computed-goto via a function
-table + loop. Budget-accounting relocation must preserve enforcement semantics.
+**Rollback checkpoint:** each change is an independent, verified commit; the
+pre-Phase-0 binary + `benchmarks/results/baseline-pre-phase0.md` are the
+regression oracle.
 
-**Rollback checkpoint:** each change is independently revertable; fetch-index
-and dispatch-threading are separate commits. Baseline captured before Phase 0
-(§5) is the regression oracle.
-
-### Phase 1 — Baseline JIT (Cranelift), function-entry tier-up
+### Phase 1 — Baseline JIT (backend TBD per §3.2), function-entry tier-up
 
 **Build:**
-- New crate `crates/otter-jit` (Cranelift + `cranelift-jit`), invoked from the
-  runtime integration layer. Depends on `otter-bytecode`, `otter-vm` types;
-  **no dependency from parked shims** (CLAUDE.md rule).
+- New crate `crates/otter-jit`, invoked from the runtime integration layer.
+  Backend chosen by the §3.2 prototype gate (copy-and-patch leading). Depends on
+  `otter-bytecode`, `otter-vm` types; **no dependency from parked shims**
+  (CLAUDE.md rule).
 - CFG reconstruction from bytecode (jump targets are recoverable: relative
-  byte-offset deltas, `encoding.rs:155-172`) → Cranelift IR per function.
+  byte-offset deltas, `encoding.rs:155-172`) → backend IR / stencil selection per
+  function.
 - Bytecode→Cranelift lowering for the hot opcode set: arithmetic with int32/f64
   guards (reusing `TAG_INT32`, `value/tag.rs`), comparisons, branches, register
   moves, calls (into the existing call path), and **inline IC guard/load/store
@@ -518,7 +589,7 @@ the full suite would average away.
 | First work | Interpreter dispatch surgery (Phase 0) | Jumping straight to JIT |
 | Tiers (now) | 2: interpreter + baseline | Single optimizing tier; 3+ tiers at once |
 | First JIT tier | Sparkplug-style baseline, no IR, no deopt | Speculative SSA first |
-| Backend | **Cranelift** | Custom template assembler; LLVM |
+| Backend | **Deferred, split by tier**: copy-and-patch leads for baseline, Cranelift for optimizing tier; commit only after a prototype bench (§3.2) | Committing one backend for both tiers up front; LLVM |
 | IC in JIT | Share interpreter `(fn,pc)` IC table; inline guards + shared miss handler | Separate JIT IC; new fast paths |
 | Speculation/deopt | Baseline never speculates; optimizing tier owns lazy-default deopt | Speculation in baseline |
 | OSR | Function-entry first; loop OSR in Phase 1.5 | Loop OSR in baseline |

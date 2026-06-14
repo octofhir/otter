@@ -267,7 +267,8 @@ fn process(value: &Value, depth: usize) -> Result<(), Error> {
 
 ## Current Work
 
-See `NATIVEFN_MIGRATION_REMAINING.md` for ongoing refactor to eliminate `InterceptionSignal` and unify native function callback handling.
+See `JIT_DESIGN.md` for the production-JIT plan and live progress log. Phase 0
+(interpreter dispatch surgery) is in progress on the active VM.
 
 ## Project References
 

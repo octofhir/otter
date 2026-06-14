@@ -27,6 +27,8 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-pattern-matching>
 
+use smallvec::{SmallVec, smallvec};
+
 use super::ExecConfig;
 use crate::casefold::{ascii_other_case, canonicalize, fold_unicode};
 use crate::classes::ClassSet;
@@ -35,7 +37,14 @@ use crate::error::ExecError;
 use crate::program::{Insn, Program};
 
 /// Capture slots: `Some(pos)` once written, `None` if the group is unset.
-type Caps = Vec<Option<usize>>;
+///
+/// The backtracker snapshots the full slot array onto its stack on every
+/// alternation / quantifier split (and clones it for each lookaround), so this
+/// is allocated and copied on the hottest path. Inlining the common case (a
+/// pattern with up to three capturing groups — `slot_count <= 8`) keeps those
+/// snapshots on the stack with no heap traffic; wider patterns spill to the
+/// heap exactly as a `Vec` would.
+type Caps = SmallVec<[Option<usize>; 8]>;
 
 /// Try to match `program` against `input` beginning exactly at code-unit offset
 /// `at`. Returns the filled capture slots on success.
@@ -51,7 +60,7 @@ pub(crate) fn attempt(
         steps: 0,
         step_limit: config.step_limit,
     };
-    let caps = vec![None; program.slot_count()];
+    let caps: Caps = smallvec![None; program.slot_count()];
     match m.run(0, at, None, false, caps)? {
         Some((_, caps)) => Ok(Some(caps)),
         None => Ok(None),

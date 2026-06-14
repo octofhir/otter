@@ -46,13 +46,33 @@ use crate::program::{Insn, Program};
 /// heap exactly as a `Vec` would.
 type Caps = SmallVec<[Option<usize>; 8]>;
 
+/// Reusable backtrack-stack buffer.
+///
+/// The top-level backtrack stack is the same shape for every match attempt, so
+/// a global search (`/g`) that probes many start offsets can keep one buffer and
+/// clear it per attempt instead of allocating a fresh `Vec` each time. Nested
+/// lookaround evaluation still uses its own transient stack.
+#[derive(Debug, Default)]
+pub(crate) struct Scratch {
+    stack: Vec<Frame>,
+}
+
+impl Scratch {
+    /// Fresh, empty scratch buffer.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Try to match `program` against `input` beginning exactly at code-unit offset
-/// `at`. Returns the filled capture slots on success.
+/// `at`. Returns the filled capture slots on success. `scratch` is reused across
+/// successive attempts on the same subject to avoid a per-attempt allocation.
 pub(crate) fn attempt(
     program: &Program,
     input: &Input<'_>,
     at: usize,
     config: ExecConfig,
+    scratch: &mut Scratch,
 ) -> Result<Option<Caps>, ExecError> {
     let mut m = Matcher {
         program,
@@ -61,7 +81,10 @@ pub(crate) fn attempt(
         step_limit: config.step_limit,
     };
     let caps: Caps = smallvec![None; program.slot_count()];
-    match m.run(0, at, None, false, caps)? {
+    let mut stack = core::mem::take(&mut scratch.stack);
+    let result = m.run(0, at, None, false, caps, &mut stack);
+    scratch.stack = stack;
+    match result? {
         Some((_, caps)) => Ok(Some(caps)),
         None => Ok(None),
     }
@@ -75,6 +98,7 @@ struct Matcher<'p, 't> {
 }
 
 /// A pending alternative on the backtrack stack.
+#[derive(Debug)]
 struct Frame {
     pc: usize,
     pos: usize,
@@ -108,12 +132,14 @@ impl Matcher<'_, '_> {
         end_anchor: Option<usize>,
         freeze_capture_saves: bool,
         caps0: Caps,
+        stack: &mut Vec<Frame>,
     ) -> Result<Option<(usize, Caps)>, ExecError> {
-        let mut stack = vec![Frame {
+        stack.clear();
+        stack.push(Frame {
             pc: entry,
             pos: start,
             caps: caps0,
-        }];
+        });
 
         while let Some(frame) = stack.pop() {
             let (mut pc, mut pos, mut caps) = (frame.pc, frame.pos, frame.caps);
@@ -270,17 +296,22 @@ impl Matcher<'_, '_> {
         pos: usize,
         caps: &Caps,
     ) -> Result<Option<Caps>, ExecError> {
+        // Lookaround bodies recurse into `run` while the caller's stack is live,
+        // so they evaluate on their own transient buffer.
+        let mut look_stack = Vec::new();
         let found = if behind {
             let mut hit = None;
             for s in 0..=pos {
-                if let Some((_, updated)) = self.run(entry, s, Some(pos), true, caps.clone())? {
+                if let Some((_, updated)) =
+                    self.run(entry, s, Some(pos), true, caps.clone(), &mut look_stack)?
+                {
                     hit = Some(updated);
                     break;
                 }
             }
             hit
         } else {
-            self.run(entry, pos, None, false, caps.clone())?
+            self.run(entry, pos, None, false, caps.clone(), &mut look_stack)?
                 .map(|(_, c)| c)
         };
 

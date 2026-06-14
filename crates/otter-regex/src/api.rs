@@ -97,6 +97,7 @@ impl Regex {
             next_start: start,
             config,
             done: false,
+            scratch: backtrack::Scratch::new(),
         }
     }
 
@@ -125,6 +126,7 @@ pub struct Matches<'r, 't> {
     next_start: usize,
     config: ExecConfig,
     done: bool,
+    scratch: backtrack::Scratch,
 }
 
 impl Iterator for Matches<'_, '_> {
@@ -153,7 +155,13 @@ impl Iterator for Matches<'_, '_> {
                 self.done = true;
                 return None;
             }
-            match backtrack::attempt(&self.regex.program, &input, pos, self.config) {
+            match backtrack::attempt(
+                &self.regex.program,
+                &input,
+                pos,
+                self.config,
+                &mut self.scratch,
+            ) {
                 Err(e) => {
                     self.done = true;
                     return Some(Err(e));

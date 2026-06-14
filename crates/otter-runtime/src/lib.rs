@@ -1584,11 +1584,12 @@ impl Runtime {
                 .map_err(|e| format!("compile error: {e:?}"))
             });
         interp.set_eval_hook(Some(hook));
-        // Baseline JIT is opt-in via `OTTER_JIT=1` while the tier ramps up:
-        // `OTTER_JIT=1` enables it, `0` or unset keeps the engine
-        // interpreter-only (zero tier-up overhead) so default runs,
-        // conformance, and benchmarks are unaffected.
-        if std::env::var("OTTER_JIT").is_ok_and(|v| v == "1") {
+        // Baseline JIT is on by default; `OTTER_JIT=0` disables it and keeps
+        // the engine interpreter-only. Its tier-up dispatch and compiled
+        // output are verified to leave behaviour identical (test262 failing
+        // set unchanged JIT on vs off), so default runs, conformance, and
+        // benchmarks all exercise the JIT unless explicitly opted out.
+        if !std::env::var("OTTER_JIT").is_ok_and(|v| v == "0") {
             interp.set_jit_compiler(Some(std::sync::Arc::new(
                 otter_jit::BaselineJitCompiler::new(),
             )));

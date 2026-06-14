@@ -422,11 +422,13 @@ impl Interpreter {
             this_for_callee,
             &[effective_args.as_slice()],
         )?;
-        let mut new_frame = Frame::with_exec_return_upvalues_and_this(
+        let registers = self.draw_registers(function.register_count as usize);
+        let mut new_frame = Frame::with_exec_registers(
             function,
             return_register,
             upvalues,
             this_for_callee,
+            registers,
         );
         new_frame.async_state = async_state;
         if let Some(new_target) = new_target_for_callee {
@@ -502,11 +504,13 @@ impl Interpreter {
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
         let this_for_callee =
             self.this_for_bytecode_call_stack_rooted(function, stack, this_for_callee, &[])?;
-        let mut frame = Frame::with_exec_return_upvalues_and_this(
+        let registers = self.draw_registers(function.register_count as usize);
+        let mut frame = Frame::with_exec_registers(
             function,
             return_register,
             upvalues,
             this_for_callee,
+            registers,
         );
         frame.async_state = async_state;
         let extras = args.bind_into(function, &mut frame)?;
@@ -1685,8 +1689,9 @@ impl Interpreter {
             &[effective_args.as_slice()],
         )?;
         let mut inner: SmallVec<[Frame; 8]> = SmallVec::new();
+        let registers = self.draw_registers(function.register_count as usize);
         let mut new_frame =
-            Frame::with_exec_return_upvalues_and_this(function, None, upvalues, this_for_callee);
+            Frame::with_exec_registers(function, None, upvalues, this_for_callee, registers);
         // A closure frame records its instance so the named-function SELF
         // binding inside the body resolves to it (per-instance `.prototype`).
         if let Some(closure) = current.as_closure(&self.gc_heap) {
@@ -1758,6 +1763,12 @@ impl Interpreter {
         // entry level would always interpret while only its sub-calls JIT. This
         // lets a hot recursion run compiled→compiled with no interpreted levels.
         if let Some(value) = self.dispatch_jit_sync_entry(&mut inner, context)? {
+            // The compiled entry frame ran to completion and is terminal
+            // (the integer subset cannot suspend or escape its frame), so
+            // return its spilled register window to the pool.
+            if let Some(mut done) = inner.pop() {
+                self.reclaim_registers(&mut done);
+            }
             return Ok(value);
         }
         self.dispatch_loop(context, &mut inner)

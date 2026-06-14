@@ -447,6 +447,13 @@ pub struct Interpreter {
     /// installed baseline body; `None` records a function the emitter could not
     /// compile (outside the supported subset), so it is never retried.
     jit_code: std::collections::BTreeMap<u32, Option<std::sync::Arc<dyn jit::JitFunctionCode>>>,
+    /// Free-list of spilled register-window backing buffers. Every bytecode
+    /// call frame whose `register_count` exceeds the inline `SmallVec` capacity
+    /// would otherwise `malloc`/`free` a fresh `Vec<Value>` per call — the hot
+    /// recursion / call-loop tax. Reclaimed buffers (cleared, so they hold no
+    /// traced `Value`s and never need GC visiting) are reused on the next frame
+    /// build. General to interpreter and JIT call paths alike.
+    reg_pool: Vec<Vec<Value>>,
     /// Optional per-turn resource policy. This slice records observations but
     /// does not yet yield or reject when a limit is exceeded.
     runtime_budget: RuntimeBudget,
@@ -1005,6 +1012,7 @@ impl Interpreter {
             jit_hook: None,
             jit_call_counts: rustc_hash::FxHashMap::default(),
             jit_code: std::collections::BTreeMap::new(),
+            reg_pool: Vec::new(),
             runtime_budget: RuntimeBudget::default(),
             runtime_budget_stats: RuntimeBudgetStats::default(),
             runtime_budget_depth: 0,
@@ -3237,6 +3245,47 @@ impl Interpreter {
     }
 
     /// Acquire a cold record for `frame` if it doesn't have one yet,
+    /// Build a `register_count`-wide register window, drawing a spilled
+    /// backing buffer from [`Self::reg_pool`] when one is available so a hot
+    /// call need not `malloc` a fresh `Vec` per frame. Windows that fit inline
+    /// (`<= 8`) never spill and never touch the pool.
+    #[inline]
+    pub(crate) fn draw_registers(&mut self, total: usize) -> SmallVec<[Value; 8]> {
+        if total > 8 {
+            while let Some(mut buf) = self.reg_pool.pop() {
+                // Defensive: only reuse buffers whose capacity is in a sane
+                // band, so one giant frame can't pin an oversized allocation.
+                if buf.capacity() <= Self::REG_POOL_MAX_CAP {
+                    buf.clear();
+                    buf.resize(total, Value::undefined());
+                    return SmallVec::from_vec(buf);
+                }
+            }
+        }
+        let mut regs: SmallVec<[Value; 8]> = SmallVec::with_capacity(total);
+        regs.resize(total, Value::undefined());
+        regs
+    }
+
+    /// Return a terminated frame's spilled register backing to the pool for
+    /// reuse. Inline windows (and a full pool) are dropped normally. The buffer
+    /// is cleared, so it carries no live `Value`s — the pool is never traced.
+    #[inline]
+    pub(crate) fn reclaim_registers(&mut self, frame: &mut Frame) {
+        if frame.registers.spilled() && self.reg_pool.len() < Self::REG_POOL_CAP {
+            let regs = std::mem::take(&mut frame.registers);
+            let mut buf = regs.into_vec();
+            buf.clear();
+            self.reg_pool.push(buf);
+        }
+    }
+
+    /// Maximum pooled register buffers retained at once.
+    const REG_POOL_CAP: usize = 256;
+    /// Largest pooled buffer capacity (in `Value`s) kept for reuse.
+    const REG_POOL_MAX_CAP: usize = 4096;
+
+    /// Acquire (or lazily create) this frame's cold side record and
     /// then return a mutable borrow.
     #[inline]
     pub(crate) fn frame_ensure_cold(&mut self, frame: &mut Frame) -> &mut cold_frame::ColdFrame {
@@ -6547,6 +6596,9 @@ impl Interpreter {
         // Release the cold slot now so the pool can reuse it; the
         // remaining cold-record reads above already happened.
         self.frame_release_cold(&mut popped);
+        // The frame is terminal — return its spilled register window to the
+        // pool. Nothing below reads `popped.registers`.
+        self.reclaim_registers(&mut popped);
         let resolved = if is_derived_ctor {
             // §10.2.2 derived-constructor return semantics. An object
             // return overrides the bound `this`; `undefined` yields

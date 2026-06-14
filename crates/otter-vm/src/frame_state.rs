@@ -406,6 +406,30 @@ impl Frame {
         let mut registers: SmallVec<[Value; 8]> =
             SmallVec::with_capacity(function.register_count as usize);
         registers.resize(function.register_count as usize, Value::undefined());
+        Self::with_exec_registers(function, return_register, upvalues, this_value, registers)
+    }
+
+    /// Same as [`Self::with_exec_return_upvalues_and_this`] but consumes a
+    /// caller-supplied register window. The hot call paths draw that window
+    /// from [`crate::Interpreter::reg_pool`] (see
+    /// [`crate::Interpreter::draw_registers`]) so a recursive / tight-loop call
+    /// reuses a spilled buffer instead of allocating one per frame.
+    ///
+    /// `registers` must already be sized to `function.register_count` and
+    /// zero-filled with `Value::undefined()`.
+    #[must_use]
+    pub(crate) fn with_exec_registers(
+        function: &ExecutableFunction,
+        return_register: Option<u16>,
+        upvalues: UpvalueSpine,
+        this_value: Value,
+        registers: SmallVec<[Value; 8]>,
+    ) -> Self {
+        debug_assert_eq!(
+            registers.len(),
+            function.register_count as usize,
+            "register window must match the function's register_count"
+        );
         debug_assert!(
             upvalues.len() >= function.own_upvalue_count as usize,
             "frame upvalues must include the function's own cells"

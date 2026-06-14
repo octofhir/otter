@@ -146,6 +146,16 @@ impl JsString {
     /// # Errors
     /// See [`Self::from_utf16_units`].
     pub fn from_str(s: &str, heap: &mut GcHeap) -> Result<Self, OutOfMemory> {
+        // ASCII (the overwhelmingly common case for identifiers, JSON keys,
+        // and most string literals) is valid Latin-1 verbatim: byte `i`
+        // equals UTF-16 code unit `i`. Take the compact 1-byte-per-char
+        // Latin-1 body directly from the bytes — no `Vec<u16>` round trip and
+        // half the heap of a Flat body. `hash_latin1` and `hash_utf16` agree
+        // on these code units, so the result interns/compares identically to
+        // the UTF-16 path.
+        if s.is_ascii() {
+            return Self::from_latin1(s.as_bytes(), heap);
+        }
         let units: Vec<u16> = s.encode_utf16().collect();
         Self::from_utf16_units(&units, heap)
     }
@@ -803,7 +813,12 @@ mod tests {
     #[test]
     fn slice_returns_view_for_flat_parent() {
         let mut heap = h();
-        let s = JsString::from_str("abcdef", &mut heap).unwrap();
+        // Build a Flat (UTF-16) parent explicitly: `from_str` now interns
+        // ASCII as a compact Latin-1 body, and slicing Latin-1 collapses into
+        // a fresh Latin-1 body (not a view), so it would not exercise the
+        // Sliced-over-Flat path this test targets.
+        let units: Vec<u16> = "abcdef".encode_utf16().collect();
+        let s = JsString::from_utf16_units(&units, &mut heap).unwrap();
         let sliced = s.slice(1, 3, &mut heap).unwrap();
         assert_eq!(sliced.len(), 3);
         assert_eq!(sliced.to_lossy_string(&heap), "bcd");

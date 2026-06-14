@@ -17,6 +17,13 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IntlIntrinsic {
     fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
         crate::intl::bootstrap::install(heap, global)
     }
+    fn install_well_knowns(
+        heap: &mut otter_gc::GcHeap,
+        global: JsObject,
+        well_known: &crate::symbol::WellKnownSymbols,
+    ) -> Result<(), JsSurfaceError> {
+        crate::intl::bootstrap::install_well_knowns(heap, global, well_known)
+    }
 }
 
 /// `Temporal` namespace is now installed by

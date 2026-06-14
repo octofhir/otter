@@ -109,6 +109,13 @@ pub fn construct(
             IntlPayload::DisplayNames(display_names::resolve(locale, options, gc_heap))
         }
         IntlKind::Segmenter => IntlPayload::Segmenter(segmenter::resolve(locale, options, gc_heap)),
+        // `Intl.Locale` / `Intl.DurationFormat` are constructed through
+        // their own `NativeCtx` path (they must fire option getters in
+        // spec order) and never reach this heap-only dispatcher.
+        IntlKind::Locale => return Err(IntlError::UnknownClass("Locale".to_string())),
+        IntlKind::DurationFormat => {
+            return Err(IntlError::UnknownClass("DurationFormat".to_string()));
+        }
     };
     Ok(Value::intl(JsIntl::new(gc_heap, payload).map_err(
         |_| IntlError::OutOfMemory {

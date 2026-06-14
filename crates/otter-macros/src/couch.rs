@@ -345,6 +345,12 @@ pub(crate) struct CouchInput {
     /// rows (e.g. legacy `RegExp` static accessors that need captures
     /// to bind the constructor identity).
     pub(crate) post_install: Option<Path>,
+    /// Optional `string_tag = "Intl.Locale"` — installs
+    /// `prototype[@@toStringTag]` (non-enumerable, configurable) at
+    /// construction time through
+    /// [`BuiltinIntrinsic::install_well_knowns`], avoiding a
+    /// post-bootstrap fixup pass.
+    pub(crate) string_tag: Option<LitStr>,
 }
 
 impl Parse for CouchInput {
@@ -363,6 +369,7 @@ impl Parse for CouchInput {
         let mut ctor_parent: Option<Path> = None;
         let mut install_on: Option<Path> = None;
         let mut post_install: Option<Path> = None;
+        let mut string_tag: Option<LitStr> = None;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -429,6 +436,9 @@ impl Parse for CouchInput {
                 "post_install" => {
                     post_install = Some(input.parse()?);
                 }
+                "string_tag" => {
+                    string_tag = Some(input.parse()?);
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -436,7 +446,7 @@ impl Parse for CouchInput {
                             "unknown `couch!` field `{other}` — expected `name`, `feature`, \
                              `spec`, `intrinsic`, `constructor`, `statics`, `static_method_specs`, \
                              `static_constants`, `prototype`, `no_prototype`, `ctor_parent`, \
-                             `install_on`, or `post_install`"
+                             `install_on`, `post_install`, or `string_tag`"
                         ),
                     ));
                 }
@@ -488,6 +498,7 @@ impl Parse for CouchInput {
             ctor_parent,
             install_on,
             post_install,
+            string_tag,
         })
     }
 }
@@ -509,6 +520,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         ctor_parent,
         install_on,
         post_install,
+        string_tag,
     } = input;
 
     let mut seen = BTreeSet::new();
@@ -829,6 +841,74 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         None => quote! {},
     };
 
+    // `string_tag = "..."` — install `prototype[@@toStringTag]` at
+    // construction time (no post-bootstrap fixup). Resolves the
+    // constructor off the same host as `install`, reads its prototype,
+    // and pins the tag as a non-enumerable, configurable data property.
+    let install_well_knowns_fn = match &string_tag {
+        Some(tag) => {
+            let host_expr = match &install_on {
+                Some(path) => quote! { #path(global, heap) },
+                None => quote! { global },
+            };
+            quote! {
+                fn install_well_knowns(
+                    heap: &mut ::otter_gc::GcHeap,
+                    global: ::otter_vm::JsObject,
+                    well_known: &::otter_vm::symbol::WellKnownSymbols,
+                ) -> ::core::result::Result<(), ::otter_vm::JsSurfaceError> {
+                    let host = #host_expr;
+                    let ::core::option::Option::Some(ctor) =
+                        ::otter_vm::object::get(host, heap, #name)
+                    else {
+                        return ::core::result::Result::Ok(());
+                    };
+                    let prototype = if let ::core::option::Option::Some(nf) =
+                        ctor.as_native_function()
+                    {
+                        nf.own_property_descriptor(heap, "prototype")
+                            .ok()
+                            .flatten()
+                            .and_then(|d| match d.kind {
+                                ::otter_vm::object::DescriptorKind::Data { value } => {
+                                    value.as_object()
+                                }
+                                _ => ::core::option::Option::None,
+                            })
+                    } else if let ::core::option::Option::Some(obj) = ctor.as_object() {
+                        ::otter_vm::object::get(obj, heap, "prototype")
+                            .and_then(|v| v.as_object())
+                    } else {
+                        ::core::option::Option::None
+                    };
+                    let ::core::option::Option::Some(prototype) = prototype else {
+                        return ::core::result::Result::Ok(());
+                    };
+                    let tag_sym =
+                        well_known.get(::otter_vm::symbol::WellKnown::ToStringTag);
+                    let value = ::otter_vm::string::JsString::from_str(#tag, heap)
+                        .map_err(|_| ::otter_vm::JsSurfaceError::OutOfMemory)?;
+                    ::otter_vm::object::define_own_symbol_property_partial(
+                        prototype,
+                        heap,
+                        tag_sym,
+                        ::otter_vm::object::PartialPropertyDescriptor {
+                            value: ::core::option::Option::Some(
+                                ::otter_vm::Value::string(value),
+                            ),
+                            writable: ::core::option::Option::Some(false),
+                            enumerable: ::core::option::Option::Some(false),
+                            configurable: ::core::option::Option::Some(true),
+                            ..::core::default::Default::default()
+                        },
+                    );
+                    ::core::result::Result::Ok(())
+                }
+            }
+        }
+        None => quote! {},
+    };
+
     let bind_call = match install_on {
         Some(path) => quote! {
             // §<chapter> — nested constructor lives on a host
@@ -1104,6 +1184,8 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                 #post_install_call
                 ::core::result::Result::Ok(())
             }
+
+            #install_well_knowns_fn
         }
     }
     .into()

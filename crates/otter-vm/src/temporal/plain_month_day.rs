@@ -252,4 +252,5 @@ otter_macros::couch! {
         ],
     },
     install_on = crate::temporal::native_dispatch::temporal_host,
+    string_tag = "Temporal.PlainMonthDay",
 }

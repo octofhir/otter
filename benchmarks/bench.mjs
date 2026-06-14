@@ -1,0 +1,211 @@
+#!/usr/bin/env node
+// Benchmark harness: runs each script in benchmarks/scripts/ across every
+// configured JS runtime, measures wall-clock, and prints a comparison table
+// normalized to Otter. Pure-JS workloads only (no fs/net/node APIs).
+//
+// Usage:
+//   node benchmarks/bench.mjs                 # all scripts, all runtimes
+//   node benchmarks/bench.mjs fib nbody       # only matching scripts
+//   node benchmarks/bench.mjs --runs 20       # override timed runs
+//   node benchmarks/bench.mjs --only otter,node
+//   node benchmarks/bench.mjs --json out.json # also write raw json
+//
+// Output: markdown table to stdout + results/latest.{json,md}.
+
+import { spawnSync, execSync } from "node:child_process";
+import { readdirSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join, resolve, extname } from "node:path";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const ROOT = resolve(HERE, "..");
+const SCRIPTS_DIR = join(HERE, "scripts");
+const RESULTS_DIR = join(HERE, "results");
+
+// ---- runtime registry -----------------------------------------------------
+// Each runtime: how to turn a script path into argv. `tsArgs` lets a runtime
+// run .ts files directly (node needs a flag; deno/bun are native).
+function otterBin() {
+  for (const p of [
+    join(ROOT, "target/release/otter"),
+    join(ROOT, "target/debug/otter"),
+  ]) {
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+
+const RUNTIMES = [
+  {
+    name: "otter",
+    bin: otterBin(),
+    argv: (f) => [otterBin(), ["run", f]],
+    ts: true, // otter parses TS via oxc natively
+  },
+  {
+    name: "node",
+    bin: "node",
+    argv: (f) =>
+      extname(f) === ".ts"
+        ? ["node", ["--experimental-strip-types", f]]
+        : ["node", [f]],
+    ts: true,
+  },
+  {
+    name: "deno",
+    bin: "deno",
+    argv: (f) => ["deno", ["run", "--quiet", "--allow-read", f]],
+    ts: true,
+  },
+  {
+    name: "bun",
+    bin: "bun",
+    argv: (f) => ["bun", ["run", f]],
+    ts: true,
+  },
+];
+
+// ---- arg parsing ----------------------------------------------------------
+const argv = process.argv.slice(2);
+let runs = 10;
+let warmup = 2;
+let timeout = 60000; // per-run kill switch (ms); a hung/slow runtime fails fast
+let onlyRuntimes = null;
+let jsonOut = null;
+const filters = [];
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (a === "--runs") runs = parseInt(argv[++i], 10);
+  else if (a === "--warmup") warmup = parseInt(argv[++i], 10);
+  else if (a === "--timeout") timeout = parseInt(argv[++i], 10);
+  else if (a === "--only") onlyRuntimes = argv[++i].split(",").map((s) => s.trim());
+  else if (a === "--json") jsonOut = argv[++i];
+  else if (a.startsWith("--")) {
+    console.error(`unknown flag: ${a}`);
+    process.exit(1);
+  } else filters.push(a);
+}
+
+// ---- runtime availability -------------------------------------------------
+function detect(rt) {
+  if (rt.name === "otter") return !!rt.bin;
+  try {
+    execSync(`command -v ${rt.bin}`, { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+let runtimes = RUNTIMES.filter(detect);
+if (onlyRuntimes) runtimes = runtimes.filter((r) => onlyRuntimes.includes(r.name));
+if (!runtimes.length) {
+  console.error("no runtimes available");
+  process.exit(1);
+}
+
+// ---- script discovery -----------------------------------------------------
+let scripts = readdirSync(SCRIPTS_DIR)
+  .filter((f) => /\.(js|mjs|ts)$/.test(f) && !f.startsWith("_"))
+  .sort();
+if (filters.length)
+  scripts = scripts.filter((s) => filters.some((f) => s.includes(f)));
+if (!scripts.length) {
+  console.error("no matching scripts");
+  process.exit(1);
+}
+
+// ---- timing ---------------------------------------------------------------
+function timeOnce(bin, args) {
+  const t0 = process.hrtime.bigint();
+  const r = spawnSync(bin, args, { encoding: "utf8", stdio: ["ignore", "ignore", "pipe"], timeout });
+  const t1 = process.hrtime.bigint();
+  if (r.signal === "SIGTERM") return { ok: false, ms: NaN, err: `timeout >${timeout}ms` };
+  if (r.status !== 0 || r.error) {
+    return { ok: false, ms: NaN, err: (r.error && r.error.message) || r.stderr || `exit ${r.status}` };
+  }
+  return { ok: true, ms: Number(t1 - t0) / 1e6 };
+}
+
+function measure(rt, file) {
+  const [bin, args] = rt.argv(file);
+  for (let i = 0; i < warmup; i++) {
+    const w = timeOnce(bin, args);
+    if (!w.ok) return { ok: false, err: w.err };
+  }
+  const samples = [];
+  for (let i = 0; i < runs; i++) {
+    const m = timeOnce(bin, args);
+    if (!m.ok) return { ok: false, err: m.err };
+    samples.push(m.ms);
+  }
+  samples.sort((a, b) => a - b);
+  const min = samples[0];
+  const mean = samples.reduce((a, b) => a + b, 0) / samples.length;
+  const median = samples[(samples.length / 2) | 0];
+  const sd = Math.sqrt(samples.reduce((a, b) => a + (b - mean) ** 2, 0) / samples.length);
+  return { ok: true, min, mean, median, sd, samples };
+}
+
+// ---- run ------------------------------------------------------------------
+console.error(
+  `runtimes: ${runtimes.map((r) => r.name).join(", ")} | runs=${runs} warmup=${warmup}\n`,
+);
+
+const results = {}; // script -> runtime -> result
+for (const s of scripts) {
+  const file = join(SCRIPTS_DIR, s);
+  results[s] = {};
+  process.stderr.write(`${s.padEnd(24)}`);
+  for (const rt of runtimes) {
+    const res = measure(rt, file);
+    results[s][rt.name] = res;
+    process.stderr.write(res.ok ? ` ${rt.name}=${res.min.toFixed(1)}ms` : ` ${rt.name}=FAIL`);
+  }
+  process.stderr.write("\n");
+}
+
+// ---- report ---------------------------------------------------------------
+const rtNames = runtimes.map((r) => r.name);
+const hasOtter = rtNames.includes("otter");
+
+function fmt(res) {
+  if (!res || !res.ok) return "FAIL";
+  return `${res.min.toFixed(1)}`;
+}
+// How many times slower otter (base) is than this runtime. >1 = otter slower.
+function ratio(res, base) {
+  if (!res || !res.ok || !base || !base.ok) return "";
+  return `${(base.min / res.min).toFixed(1)}×`;
+}
+
+let md = `# Benchmark results\n\n`;
+md += `Metric: **min wall-clock ms** over ${runs} runs (${warmup} warmup), lower is better. `;
+md += `Includes process startup. \`×\` = how many times **slower otter is** than that runtime (higher = otter worse).\n\n`;
+md += `Host: \`${process.platform} ${process.arch}\` · node harness \`${process.version}\`\n\n`;
+
+const header = ["script", ...rtNames.flatMap((n) => (hasOtter && n !== "otter" ? [n, `${n} ×`] : [n]))];
+md += `| ${header.join(" | ")} |\n`;
+md += `| ${header.map(() => "---").join(" | ")} |\n`;
+
+for (const s of scripts) {
+  const row = [s];
+  const base = results[s].otter;
+  for (const n of rtNames) {
+    const res = results[s][n];
+    row.push(fmt(res));
+    if (hasOtter && n !== "otter") row.push(ratio(res, base));
+  }
+  md += `| ${row.join(" | ")} |\n`;
+}
+
+md += `\n_Generated ${new Date().toISOString()}_\n`;
+
+console.log("\n" + md);
+
+mkdirSync(RESULTS_DIR, { recursive: true });
+writeFileSync(join(RESULTS_DIR, "latest.md"), md);
+const raw = { generatedAt: new Date().toISOString(), runs, warmup, platform: process.platform, arch: process.arch, results };
+writeFileSync(join(RESULTS_DIR, "latest.json"), JSON.stringify(raw, null, 2));
+if (jsonOut) writeFileSync(resolve(jsonOut), JSON.stringify(raw, null, 2));
+console.error(`\nwrote ${join("benchmarks/results", "latest.md")} + latest.json`);

@@ -92,11 +92,23 @@ pub struct BootstrapEntry {
     pub feature: BootstrapFeatures,
     /// Installer function.
     pub install: BootstrapInstall,
+    /// Companion installer for well-known-symbol properties; run right
+    /// after [`Self::install`] once the realm symbol table exists.
+    pub install_well_knowns: BootstrapWellKnownInstall,
 }
 
 /// Bootstrap installer function pointer.
 pub type BootstrapInstall =
     fn(&BootstrapEntry, &mut otter_gc::GcHeap, JsObject) -> Result<(), JsSurfaceError>;
+
+/// Well-known-symbol installer function pointer (see
+/// [`crate::intrinsic_install::BuiltinIntrinsic::install_well_knowns`]).
+pub type BootstrapWellKnownInstall = fn(
+    &BootstrapEntry,
+    &mut otter_gc::GcHeap,
+    JsObject,
+    &crate::symbol::WellKnownSymbols,
+) -> Result<(), JsSurfaceError>;
 
 /// One timed bootstrap phase captured by [`BootstrapTelemetry`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,8 +333,11 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
 ];
 
 /// Build `globalThis` with all default features.
-pub(crate) fn build_global_this(heap: &mut otter_gc::GcHeap) -> Result<JsObject, JsSurfaceError> {
-    build_global_this_with_features(heap, BootstrapFeatures::all())
+pub(crate) fn build_global_this(
+    heap: &mut otter_gc::GcHeap,
+    well_known: &crate::symbol::WellKnownSymbols,
+) -> Result<JsObject, JsSurfaceError> {
+    build_global_this_with_features(heap, BootstrapFeatures::all(), well_known)
 }
 
 /// Build `globalThis` with explicit feature gates.
@@ -332,8 +347,9 @@ pub(crate) fn build_global_this(heap: &mut otter_gc::GcHeap) -> Result<JsObject,
 pub fn build_global_this_with_features(
     heap: &mut otter_gc::GcHeap,
     features: BootstrapFeatures,
+    well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<JsObject, JsSurfaceError> {
-    build_global_this_impl(heap, features, None)
+    build_global_this_impl(heap, features, None, well_known)
 }
 
 /// Build `globalThis` while collecting opt-in startup telemetry.
@@ -345,14 +361,16 @@ pub fn build_global_this_with_telemetry(
     heap: &mut otter_gc::GcHeap,
     features: BootstrapFeatures,
     telemetry: &mut BootstrapTelemetry,
+    well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<JsObject, JsSurfaceError> {
-    build_global_this_impl(heap, features, Some(telemetry))
+    build_global_this_impl(heap, features, Some(telemetry), well_known)
 }
 
 fn build_global_this_impl(
     heap: &mut otter_gc::GcHeap,
     features: BootstrapFeatures,
     mut telemetry: Option<&mut BootstrapTelemetry>,
+    well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<JsObject, JsSurfaceError> {
     let before = telemetry.as_deref_mut().map(|t| {
         t.reset();
@@ -401,6 +419,7 @@ fn build_global_this_impl(
         if features.contains(entry.feature) {
             let start = telemetry.as_ref().map(|_| Instant::now());
             (entry.install)(entry, heap, global)?;
+            (entry.install_well_knowns)(entry, heap, global, well_known)?;
             if let Some(t) = telemetry.as_deref_mut() {
                 if let Some(start) = start {
                     t.push_phase(entry.name, start.elapsed());

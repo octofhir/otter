@@ -4376,7 +4376,7 @@ impl Interpreter {
     /// Resolve `Intl.<class_name>.prototype` by walking
     /// `globalThis.Intl.<class_name>.prototype`. Returns `null` when
     /// the namespace or constructor is missing.
-    fn intl_kind_prototype_value(&mut self, class_name: &str) -> Value {
+    pub(crate) fn intl_kind_prototype_value(&mut self, class_name: &str) -> Value {
         let Some(intl_ns) =
             object::get(self.global_this, &self.gc_heap, "Intl").and_then(|v| v.as_object())
         else {
@@ -4619,6 +4619,7 @@ impl Interpreter {
             || base.is_weak_ref()
             || base.is_finalization_registry()
             || base.is_temporal()
+            || base.is_intl()
         {
             let own = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
                 context,

@@ -351,19 +351,24 @@ impl Interpreter {
         args: &[Value],
     ) -> Result<Value, VmError> {
         let proto = args.first().cloned().unwrap_or(Value::undefined());
-        let proto_value = if proto.is_object_type() {
-            Some(proto)
-        } else if proto.is_null() {
-            None
-        } else {
+        // Validate the argument type up front, but DO NOT snapshot the
+        // prototype `Value` yet: the allocation below can trigger a
+        // scavenge that relocates `proto`. The alloc roots `&proto`, so
+        // the local is forwarded in place — but a copy taken before the
+        // alloc would dangle and be written as the object's prototype,
+        // corrupting the proto chain (observable only when the alloc
+        // happens to be the one that triggers the GC). Re-derive the
+        // prototype slot from the relocated `proto` *after* the alloc.
+        if !proto.is_object_type() && !proto.is_null() {
             return Err(VmError::TypeMismatch);
-        };
+        }
         let obj = match stack {
             Some(stack) => {
                 self.alloc_stack_rooted_object_with_value_roots(stack, &[&proto], args)?
             }
             None => self.alloc_runtime_rooted_object_with_roots(&[&proto], &[args])?,
         };
+        let proto_value = if proto.is_null() { None } else { Some(proto) };
         if !object::set_prototype_value(obj, &mut self.gc_heap, proto_value) {
             return Err(VmError::TypeError {
                 message: "Object.create failed".to_string(),

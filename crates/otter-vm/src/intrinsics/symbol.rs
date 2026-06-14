@@ -361,28 +361,14 @@ pub fn install_symbol_well_knowns_post_bootstrap(
         heap, global, well_known,
     )?;
     crate::bootstrap_promise::install_promise_well_knowns_post_bootstrap(heap, global, well_known)?;
-    crate::bootstrap_weak_refs::install_weak_well_knowns_post_bootstrap(heap, global, well_known)?;
-    crate::bootstrap_bigint::install_bigint_well_knowns_post_bootstrap(heap, global, well_known)?;
-    crate::bootstrap_data_view::install_data_view_well_knowns_post_bootstrap(
-        heap, global, well_known,
-    )?;
-    crate::temporal::intrinsic::install_temporal_well_knowns_post_bootstrap(
-        heap, global, well_known,
-    )?;
     crate::bootstrap_typed_array::install_typed_array_well_knowns_post_bootstrap(
         heap, global, well_known,
     )?;
     crate::array_prototype::install_array_well_knowns_post_bootstrap(heap, global, well_known)?;
     install_iterator_well_knowns_post_bootstrap(heap, global, well_known)?;
-    crate::bootstrap_array_buffer::install_array_buffer_well_knowns_post_bootstrap(
-        heap, global, well_known,
-    )?;
     crate::date::well_known::install_date_well_knowns_post_bootstrap(heap, global, well_known)?;
     crate::install_string_iterator_post_bootstrap(heap, global, well_known)?;
     crate::bootstrap_regexp::install_regexp_well_knowns_post_bootstrap(heap, global, well_known)?;
-    crate::bootstrap_array_buffer::install_shared_array_buffer_well_knowns_post_bootstrap(
-        heap, global, well_known,
-    )?;
     for ctor_name in [
         "Array",
         "Map",

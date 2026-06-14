@@ -42,6 +42,7 @@
 use crate::bootstrap::{BootstrapEntry, BootstrapFeatures};
 use crate::js_surface::JsSurfaceError;
 use crate::object::JsObject;
+use crate::symbol::WellKnownSymbols;
 
 /// One JavaScript built-in class' installation contract.
 ///
@@ -69,6 +70,22 @@ pub trait BuiltinIntrinsic {
     ///   surface OOM as [`JsSurfaceError::OutOfMemory`] rather than
     ///   panic.
     fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError>;
+
+    /// Install well-known-symbol properties (e.g. `@@toStringTag`) that
+    /// cannot be created during [`Self::install`] because the realm's
+    /// [`WellKnownSymbols`] table does not exist yet at that point.
+    ///
+    /// Called by the bootstrap loop immediately after [`Self::install`]
+    /// for the same entry, so the class' constructor and prototype are
+    /// already in place. The default is a no-op; `couch!` overrides it
+    /// when a `string_tag` is declared.
+    fn install_well_knowns(
+        _heap: &mut otter_gc::GcHeap,
+        _global: JsObject,
+        _well_known: &WellKnownSymbols,
+    ) -> Result<(), JsSurfaceError> {
+        Ok(())
+    }
 }
 
 /// Generic adapter that lets the bootstrap function-pointer table
@@ -83,6 +100,16 @@ pub(crate) fn bootstrap_install_thunk<T: BuiltinIntrinsic>(
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
     T::install(heap, global)
+}
+
+/// Companion thunk for [`BuiltinIntrinsic::install_well_knowns`].
+pub(crate) fn bootstrap_install_well_knowns_thunk<T: BuiltinIntrinsic>(
+    _entry: &BootstrapEntry,
+    heap: &mut otter_gc::GcHeap,
+    global: JsObject,
+    well_known: &WellKnownSymbols,
+) -> Result<(), JsSurfaceError> {
+    T::install_well_knowns(heap, global, well_known)
 }
 
 /// Build a [`crate::bootstrap::BootstrapEntry`] for a type
@@ -103,6 +130,9 @@ macro_rules! bootstrap_entry {
             name: <$intrinsic as $crate::intrinsic_install::BuiltinIntrinsic>::NAME,
             feature: <$intrinsic as $crate::intrinsic_install::BuiltinIntrinsic>::FEATURE,
             install: $crate::intrinsic_install::bootstrap_install_thunk::<$intrinsic>,
+            install_well_knowns: $crate::intrinsic_install::bootstrap_install_well_knowns_thunk::<
+                $intrinsic,
+            >,
         }
     };
 }

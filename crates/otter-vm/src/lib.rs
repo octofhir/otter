@@ -294,6 +294,17 @@ pub struct Interpreter {
     /// template-strings object per tagged-template site, keyed by
     /// `(chunk function_base, site index)`.
     template_objects: rustc_hash::FxHashMap<(u32, u32), Value>,
+    /// Scratch GC-root stack for native recursive algorithms (today:
+    /// `JSON.stringify`'s spec serializer) that must hold live `Value`s
+    /// across calls which allocate — e.g. key-name `JsString`s minted by
+    /// `[[OwnPropertyKeys]]`, user getters, `toJSON`, or a replacer. Each
+    /// entry is a stable slot the collector rewrites on a move, so the
+    /// serializer re-reads its container from the slot after every
+    /// allocating sub-call instead of dereferencing a stale copy. Traced
+    /// in [`crate::runtime_state::RuntimeState::trace_roots`]; pushed/read
+    /// back/popped as a strict stack so it is empty between top-level
+    /// native calls.
+    json_root_stack: Vec<Value>,
     /// Protector for the array element store fast path: flips to
     /// `true` once any accessor descriptor lands on an array-index
     /// key anywhere (e.g. `Array.prototype[1] = {set}`); array index
@@ -614,6 +625,39 @@ impl Interpreter {
         self.template_objects.values()
     }
 
+    /// Root-tracing view of the native serializer scratch root stack.
+    pub(crate) fn json_root_stack_for_trace(&self) -> impl Iterator<Item = &Value> {
+        self.json_root_stack.iter()
+    }
+
+    /// Push `value` onto the native serializer scratch root stack,
+    /// returning its stable index. The collector traces and rewrites
+    /// the slot on a move, so the caller re-reads the relocated value
+    /// via [`Self::json_root_get`] after any allocating sub-call.
+    pub(crate) fn json_root_push(&mut self, value: Value) -> usize {
+        let idx = self.json_root_stack.len();
+        self.json_root_stack.push(value);
+        idx
+    }
+
+    /// Read the (possibly relocated) value parked at `idx`.
+    pub(crate) fn json_root_get(&self, idx: usize) -> Value {
+        self.json_root_stack[idx]
+    }
+
+    /// Overwrite the parked value at `idx` (the serializer reassigns
+    /// `value` as `toJSON` / the replacer / wrapper unwrapping run).
+    pub(crate) fn json_root_set(&mut self, idx: usize, value: Value) {
+        self.json_root_stack[idx] = value;
+    }
+
+    /// Pop the scratch root stack back down to `idx` (the value that
+    /// [`Self::json_root_push`] returned), restoring the strict-stack
+    /// discipline after a serializer frame returns.
+    pub(crate) fn json_root_pop_to(&mut self, idx: usize) {
+        self.json_root_stack.truncate(idx);
+    }
+
     /// §13.2.8.4 GetTemplateObject steps 7-15 — build the frozen
     /// template-strings array with its frozen, non-enumerable `.raw`
     /// companion.
@@ -859,7 +903,7 @@ impl Interpreter {
         let error_classes = ErrorClassRegistry::new(&mut gc_heap)
             .expect("error class prototypes fit within any positive cap");
         startup_timer.mark("vm_error_classes");
-        let global_this = bootstrap::build_global_this(&mut gc_heap)
+        let global_this = bootstrap::build_global_this(&mut gc_heap, &well_known_symbols)
             .expect("global_this fits within any positive cap");
         startup_timer.mark("vm_global_this");
         // §20.4.2 — install well-known symbols on the realm's
@@ -914,6 +958,7 @@ impl Interpreter {
         startup_timer.mark("vm_shape_runtime");
         let mut interp = Self {
             template_objects: rustc_hash::FxHashMap::default(),
+            json_root_stack: Vec::new(),
             array_index_accessor_protector: false,
             interrupt: InterruptFlag::new(),
             current_byte_len: 1,
@@ -1697,6 +1742,9 @@ impl Interpreter {
                 .temporal_prototype_object(t.kind())
                 .map(Value::object)
                 .unwrap_or(Value::null()));
+        }
+        if let Some(intl) = value.as_intl(&self.gc_heap) {
+            return Ok(self.intl_kind_prototype_value(intl.kind().class_name()));
         }
         if let Some(generator) = value.as_generator() {
             if let Some(proto) = generator.prototype_override(&self.gc_heap) {

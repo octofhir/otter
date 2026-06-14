@@ -147,6 +147,37 @@ pub struct SegmenterPayload {
     pub granularity: String,
 }
 
+/// Resolved option bag for `Intl.DurationFormat`.
+#[derive(Debug, Clone)]
+pub struct DurationFormatPayload {
+    /// Spec-resolved BCP-47 locale tag.
+    pub locale: String,
+    /// Resolved `numberingSystem`.
+    pub numbering_system: String,
+    /// `style` option (`"long"` / `"short"` / `"narrow"` / `"digital"`).
+    pub style: String,
+    /// Per-unit `(style, display)` for the ten duration units in spec
+    /// order: years, months, weeks, days, hours, minutes, seconds,
+    /// milliseconds, microseconds, nanoseconds.
+    pub units: Vec<(String, String)>,
+    /// `fractionalDigits` option (absent → `None`).
+    pub fractional_digits: Option<u8>,
+}
+
+/// Resolved data for `Intl.Locale`.
+///
+/// Stores the canonical `[[Locale]]` BCP-47 string. Every getter
+/// (`language`, `script`, `calendar`, …) re-parses this string with
+/// `icu_locale` on demand — Locale instances are cold relative to
+/// formatters, so the re-parse cost is acceptable and avoids holding
+/// a non-`Copy` ICU `Locale` in the GC body.
+#[derive(Debug, Clone)]
+pub struct LocalePayload {
+    /// Canonical `[[Locale]]` string (language id + sorted Unicode
+    /// extension keywords).
+    pub locale: String,
+}
+
 /// One [`crate::Value::Intl`] instance.
 #[derive(Debug, Clone)]
 pub enum IntlPayload {
@@ -166,6 +197,10 @@ pub enum IntlPayload {
     DisplayNames(DisplayNamesPayload),
     /// `new Intl.Segmenter(...)` instance.
     Segmenter(SegmenterPayload),
+    /// `new Intl.Locale(...)` instance.
+    Locale(LocalePayload),
+    /// `new Intl.DurationFormat(...)` instance.
+    DurationFormat(DurationFormatPayload),
 }
 
 impl IntlPayload {
@@ -181,6 +216,8 @@ impl IntlPayload {
             IntlPayload::ListFormat(_) => IntlKind::ListFormat,
             IntlPayload::DisplayNames(_) => IntlKind::DisplayNames,
             IntlPayload::Segmenter(_) => IntlKind::Segmenter,
+            IntlPayload::Locale(_) => IntlKind::Locale,
+            IntlPayload::DurationFormat(_) => IntlKind::DurationFormat,
         }
     }
 }
@@ -205,6 +242,10 @@ pub enum IntlKind {
     DisplayNames,
     /// `Intl.Segmenter` instance.
     Segmenter,
+    /// `Intl.Locale` instance.
+    Locale,
+    /// `Intl.DurationFormat` instance.
+    DurationFormat,
 }
 
 impl IntlKind {
@@ -220,6 +261,8 @@ impl IntlKind {
             IntlKind::ListFormat => "ListFormat",
             IntlKind::DisplayNames => "DisplayNames",
             IntlKind::Segmenter => "Segmenter",
+            IntlKind::Locale => "Locale",
+            IntlKind::DurationFormat => "DurationFormat",
         }
     }
 
@@ -235,6 +278,8 @@ impl IntlKind {
             "ListFormat" => IntlKind::ListFormat,
             "DisplayNames" => IntlKind::DisplayNames,
             "Segmenter" => IntlKind::Segmenter,
+            "Locale" => IntlKind::Locale,
+            "DurationFormat" => IntlKind::DurationFormat,
             _ => return None,
         })
     }

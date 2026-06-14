@@ -30,8 +30,8 @@ Thumbs.db
 # Test262 output
 tests/test262-results/
 
-# Local/generated benchmark artifacts
-benchmarks/
+# Local/generated benchmark artifacts (harness + scripts are tracked)
+benchmarks/results/
 test262_results/
 scratch/
 *.cpuprofile

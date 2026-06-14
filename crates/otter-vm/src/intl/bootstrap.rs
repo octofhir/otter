@@ -56,6 +56,33 @@ pub fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSu
     ListFormatIntrinsic::install(heap, global)?;
     DisplayNamesIntrinsic::install(heap, global)?;
     SegmenterIntrinsic::install(heap, global)?;
+    LocaleIntrinsic::install(heap, global)?;
+    DurationFormatIntrinsic::install(heap, global)?;
+    Ok(())
+}
+
+/// Install the `@@toStringTag` on every `Intl.<Class>.prototype` at
+/// construction time (each `couch!` carries a `string_tag`). Fanned out
+/// by [`crate::intrinsics::placeholders::IntlIntrinsic::install_well_knowns`]
+/// because the per-class intrinsics are not standalone bootstrap
+/// entries.
+pub fn install_well_knowns(
+    heap: &mut otter_gc::GcHeap,
+    global: JsObject,
+    well_known: &crate::symbol::WellKnownSymbols,
+) -> Result<(), JsSurfaceError> {
+    use crate::intrinsic_install::BuiltinIntrinsic;
+
+    CollatorIntrinsic::install_well_knowns(heap, global, well_known)?;
+    NumberFormatIntrinsic::install_well_knowns(heap, global, well_known)?;
+    DateTimeFormatIntrinsic::install_well_knowns(heap, global, well_known)?;
+    PluralRulesIntrinsic::install_well_knowns(heap, global, well_known)?;
+    RelativeTimeFormatIntrinsic::install_well_knowns(heap, global, well_known)?;
+    ListFormatIntrinsic::install_well_knowns(heap, global, well_known)?;
+    DisplayNamesIntrinsic::install_well_knowns(heap, global, well_known)?;
+    SegmenterIntrinsic::install_well_knowns(heap, global, well_known)?;
+    LocaleIntrinsic::install_well_knowns(heap, global, well_known)?;
+    DurationFormatIntrinsic::install_well_knowns(heap, global, well_known)?;
     Ok(())
 }
 
@@ -135,6 +162,9 @@ otter_macros::couch! {
     feature = CORE,
     intrinsic = CollatorIntrinsic,
     constructor = (length = 0, call = collator_ctor),
+    statics = {
+        "supportedLocalesOf" / 1 => crate::intl::supported::supported_locales_of,
+    },
     prototype = {
         methods = {
             "compare"         / 2 => crate::intl::collator::collator_compare,
@@ -142,6 +172,7 @@ otter_macros::couch! {
         },
     },
     install_on = crate::intl::bootstrap::intl_host,
+    string_tag = "Intl.Collator",
 }
 
 // §11 NumberFormat.
@@ -150,6 +181,9 @@ otter_macros::couch! {
     feature = CORE,
     intrinsic = NumberFormatIntrinsic,
     constructor = (length = 0, call = number_format_ctor),
+    statics = {
+        "supportedLocalesOf" / 1 => crate::intl::supported::supported_locales_of,
+    },
     prototype = {
         methods = {
             "format"          / 1 => crate::intl::number_format::number_format_format,
@@ -157,6 +191,7 @@ otter_macros::couch! {
         },
     },
     install_on = crate::intl::bootstrap::intl_host,
+    string_tag = "Intl.NumberFormat",
 }
 
 // §12 DateTimeFormat.
@@ -165,6 +200,9 @@ otter_macros::couch! {
     feature = CORE,
     intrinsic = DateTimeFormatIntrinsic,
     constructor = (length = 0, call = date_time_format_ctor),
+    statics = {
+        "supportedLocalesOf" / 1 => crate::intl::supported::supported_locales_of,
+    },
     prototype = {
         methods = {
             "format"          / 1 => crate::intl::date_time_format::date_time_format_format,
@@ -172,6 +210,7 @@ otter_macros::couch! {
         },
     },
     install_on = crate::intl::bootstrap::intl_host,
+    string_tag = "Intl.DateTimeFormat",
 }
 
 // §16 PluralRules.
@@ -180,6 +219,9 @@ otter_macros::couch! {
     feature = CORE,
     intrinsic = PluralRulesIntrinsic,
     constructor = (length = 0, call = plural_rules_ctor),
+    statics = {
+        "supportedLocalesOf" / 1 => crate::intl::supported::supported_locales_of,
+    },
     prototype = {
         methods = {
             "select"          / 1 => crate::intl::plural_rules::plural_rules_select,
@@ -187,6 +229,7 @@ otter_macros::couch! {
         },
     },
     install_on = crate::intl::bootstrap::intl_host,
+    string_tag = "Intl.PluralRules",
 }
 
 // §18 RelativeTimeFormat.
@@ -195,6 +238,9 @@ otter_macros::couch! {
     feature = CORE,
     intrinsic = RelativeTimeFormatIntrinsic,
     constructor = (length = 0, call = relative_time_format_ctor),
+    statics = {
+        "supportedLocalesOf" / 1 => crate::intl::supported::supported_locales_of,
+    },
     prototype = {
         methods = {
             "format"          / 2 => crate::intl::relative_time_format::relative_time_format_format,
@@ -203,6 +249,7 @@ otter_macros::couch! {
         },
     },
     install_on = crate::intl::bootstrap::intl_host,
+    string_tag = "Intl.RelativeTimeFormat",
 }
 
 // §13 ListFormat.
@@ -211,6 +258,9 @@ otter_macros::couch! {
     feature = CORE,
     intrinsic = ListFormatIntrinsic,
     constructor = (length = 0, call = list_format_ctor),
+    statics = {
+        "supportedLocalesOf" / 1 => crate::intl::supported::supported_locales_of,
+    },
     prototype = {
         methods = {
             "format"          / 1 => crate::intl::list_format::list_format_format,
@@ -219,6 +269,7 @@ otter_macros::couch! {
         },
     },
     install_on = crate::intl::bootstrap::intl_host,
+    string_tag = "Intl.ListFormat",
 }
 
 // §14 DisplayNames.
@@ -227,6 +278,9 @@ otter_macros::couch! {
     feature = CORE,
     intrinsic = DisplayNamesIntrinsic,
     constructor = (length = 2, call = display_names_ctor),
+    statics = {
+        "supportedLocalesOf" / 1 => crate::intl::supported::supported_locales_of,
+    },
     prototype = {
         methods = {
             "of"              / 1 => crate::intl::display_names::display_names_of,
@@ -234,6 +288,7 @@ otter_macros::couch! {
         },
     },
     install_on = crate::intl::bootstrap::intl_host,
+    string_tag = "Intl.DisplayNames",
 }
 
 // §19 Segmenter.
@@ -242,6 +297,9 @@ otter_macros::couch! {
     feature = CORE,
     intrinsic = SegmenterIntrinsic,
     constructor = (length = 0, call = segmenter_ctor),
+    statics = {
+        "supportedLocalesOf" / 1 => crate::intl::supported::supported_locales_of,
+    },
     prototype = {
         methods = {
             "segment"         / 1 => crate::intl::segmenter::segmenter_segment,
@@ -249,4 +307,63 @@ otter_macros::couch! {
         },
     },
     install_on = crate::intl::bootstrap::intl_host,
+    string_tag = "Intl.Segmenter",
+}
+
+// §1 DurationFormat (Intl DurationFormat proposal).
+otter_macros::couch! {
+    name = "DurationFormat",
+    feature = CORE,
+    intrinsic = DurationFormatIntrinsic,
+    constructor = (length = 0, call = crate::intl::duration_format::duration_format_ctor),
+    statics = {
+        "supportedLocalesOf" / 1 => crate::intl::supported::supported_locales_of,
+    },
+    prototype = {
+        methods = {
+            "format"          / 1 => crate::intl::duration_format::format,
+            "formatToParts"   / 1 => crate::intl::duration_format::format_to_parts,
+            "resolvedOptions" / 0 => crate::intl::duration_format::resolved_options,
+        },
+    },
+    install_on = crate::intl::bootstrap::intl_host,
+    string_tag = "Intl.DurationFormat",
+}
+
+// §14 Locale.
+otter_macros::couch! {
+    name = "Locale",
+    feature = CORE,
+    intrinsic = LocaleIntrinsic,
+    constructor = (length = 1, call = crate::intl::locale::locale_ctor),
+    prototype = {
+        methods = {
+            "maximize" / 0 => crate::intl::locale::maximize,
+            "minimize" / 0 => crate::intl::locale::minimize,
+            "toString" / 0 => crate::intl::locale::to_string,
+            "getCalendars" / 0 => crate::intl::locale::get_calendars,
+            "getCollations" / 0 => crate::intl::locale::get_collations,
+            "getHourCycles" / 0 => crate::intl::locale::get_hour_cycles,
+            "getNumberingSystems" / 0 => crate::intl::locale::get_numbering_systems,
+            "getTimeZones" / 0 => crate::intl::locale::get_time_zones,
+            "getTextInfo" / 0 => crate::intl::locale::get_text_info,
+            "getWeekInfo" / 0 => crate::intl::locale::get_week_info,
+        },
+        accessors = [
+            ("baseName",        get = crate::intl::locale::get_base_name),
+            ("language",        get = crate::intl::locale::get_language),
+            ("script",          get = crate::intl::locale::get_script),
+            ("region",          get = crate::intl::locale::get_region),
+            ("variants",        get = crate::intl::locale::get_variants),
+            ("calendar",        get = crate::intl::locale::get_calendar),
+            ("firstDayOfWeek",  get = crate::intl::locale::get_first_day_of_week),
+            ("collation",       get = crate::intl::locale::get_collation),
+            ("hourCycle",       get = crate::intl::locale::get_hour_cycle),
+            ("caseFirst",       get = crate::intl::locale::get_case_first),
+            ("numeric",         get = crate::intl::locale::get_numeric),
+            ("numberingSystem", get = crate::intl::locale::get_numbering_system),
+        ],
+    },
+    install_on = crate::intl::bootstrap::intl_host,
+    string_tag = "Intl.Locale",
 }

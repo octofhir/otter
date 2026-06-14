@@ -9,19 +9,23 @@ use otter_vm::bootstrap::{
     BootstrapFeatures, BootstrapTelemetry, build_global_this_with_features,
     build_global_this_with_telemetry,
 };
+use otter_vm::symbol::WellKnownSymbols;
 
 fn build_default_global_this() {
     let mut heap = otter_gc::GcHeap::new().expect("heap");
-    let global = build_global_this_with_features(&mut heap, BootstrapFeatures::all())
+    let well_known = WellKnownSymbols::new(&mut heap).expect("well-known symbols");
+    let global = build_global_this_with_features(&mut heap, BootstrapFeatures::all(), &well_known)
         .expect("default globalThis");
     std::hint::black_box(global);
 }
 
 fn build_core_without_console() {
     let mut heap = otter_gc::GcHeap::new().expect("heap");
+    let well_known = WellKnownSymbols::new(&mut heap).expect("well-known symbols");
     let global = build_global_this_with_features(
         &mut heap,
         BootstrapFeatures::all().without(BootstrapFeatures::CONSOLE),
+        &well_known,
     )
     .expect("core globalThis");
     std::hint::black_box(global);
@@ -29,10 +33,15 @@ fn build_core_without_console() {
 
 fn build_default_global_this_with_telemetry() {
     let mut heap = otter_gc::GcHeap::new().expect("heap");
+    let well_known = WellKnownSymbols::new(&mut heap).expect("well-known symbols");
     let mut telemetry = BootstrapTelemetry::default();
-    let global =
-        build_global_this_with_telemetry(&mut heap, BootstrapFeatures::all(), &mut telemetry)
-            .expect("instrumented globalThis");
+    let global = build_global_this_with_telemetry(
+        &mut heap,
+        BootstrapFeatures::all(),
+        &mut telemetry,
+        &well_known,
+    )
+    .expect("instrumented globalThis");
     std::hint::black_box(global);
     std::hint::black_box(telemetry.gc_allocations());
     std::hint::black_box(telemetry.gc_allocated_bytes());

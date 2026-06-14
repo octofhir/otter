@@ -103,6 +103,10 @@ impl<'a> RuntimeState<'a> {
         for value in interp.template_objects_for_trace() {
             value.trace_value_slots(visitor);
         }
+        // 2b-quater) Native serializer scratch roots (`JSON.stringify`).
+        for value in interp.json_root_stack_for_trace() {
+            value.trace_value_slots(visitor);
+        }
         // 2c) Global declarative-record cells (§9.1.1.4 script
         // top-level lexical bindings).
         for slot in interp.global_lexicals_for_trace() {

@@ -568,19 +568,11 @@ impl Interpreter {
         context: &ExecutionContext,
         value: Value,
     ) -> Result<Value, VmError> {
-        for method in ["toString", "valueOf"] {
-            let callee = self.get_property_value_for_call(context, value, method)?;
-            if !self.is_callable_runtime(&callee) {
-                continue;
-            }
-            let result = self.run_callable_sync(context, &callee, value, SmallVec::new())?;
-            if abstract_ops::is_primitive(&result) {
-                return Ok(result);
-            }
-        }
-        Err(VmError::TypeError {
-            message: "Cannot convert object to primitive value".to_string(),
-        })
+        // §7.1.1 ToPrimitive with hint "string" — must first consult the
+        // `@@toPrimitive` method, then fall back to the
+        // OrdinaryToPrimitive `toString` / `valueOf` ladder. Delegate to
+        // the full implementation so both paths agree.
+        self.to_primitive_sync(context, value, abstract_ops::ToPrimitiveHint::String)
     }
 
     /// Helper — invoke the eval hook, mapping its error to a

@@ -2610,6 +2610,11 @@ impl Runtime {
         start: std::time::Instant,
     ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
         let context = self.interp.link_module(module);
+        // Arm GC-stress mode (no-op unless OTTER_GC_STRESS is set) now
+        // that bootstrap + module linking are done, so forced collections
+        // exercise user code and hot native paths, not the not-yet-
+        // hardened engine setup code.
+        self.interp.gc_heap_mut().arm_gc_stress();
         // Run the script first; the script error wins if both the
         // script and the drain fail. On script success we still
         // drain so any `queueMicrotask` registered during script

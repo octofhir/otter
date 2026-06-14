@@ -46,6 +46,7 @@ use crate::{NativeCtx, NativeError, Value, VmError};
 // §27.2.5.2.
 otter_macros::couch! {
     name = "Promise",
+    string_tag = "Promise",
     feature = CORE,
     constructor = (length = 1, call = promise_ctor_call),
     statics = {
@@ -110,30 +111,6 @@ pub fn install_promise_well_knowns_post_bootstrap(
         ));
     }
 
-    let descriptor = ctor
-        .own_property_descriptor(heap, "prototype")
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let prototype = match descriptor.and_then(|d| match d.kind {
-        crate::object::DescriptorKind::Data { value } => value.as_object(),
-        _ => None,
-    }) {
-        Some(p) => p,
-        None => return Ok(()),
-    };
-    let tag = crate::string::JsString::from_str("Promise", heap)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    object::define_own_symbol_property_partial(
-        prototype,
-        heap,
-        well_known.get(WellKnown::ToStringTag),
-        PartialPropertyDescriptor {
-            value: Some(Value::string(tag)),
-            writable: Some(false),
-            enumerable: Some(false),
-            configurable: Some(true),
-            ..Default::default()
-        },
-    );
     Ok(())
 }
 

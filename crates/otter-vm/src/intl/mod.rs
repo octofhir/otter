@@ -42,13 +42,16 @@ pub mod collator;
 pub mod date_time_format;
 pub mod dispatch;
 pub mod display_names;
+pub mod duration_format;
 pub mod helpers;
 pub mod list_format;
+pub mod locale;
 pub mod number_format;
 pub mod payload;
 pub mod plural_rules;
 pub mod relative_time_format;
 pub mod segmenter;
+pub mod supported;
 
 pub use dispatch::{IntlError, construct};
 pub use payload::{

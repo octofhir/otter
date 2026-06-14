@@ -49,9 +49,17 @@ impl NewSpace {
     /// Create a fresh new-space with `initial_pages` pages on
     /// each side.
     pub fn new(initial_pages: usize) -> Result<Self, OutOfMemory> {
-        let max_pages = initial_pages.clamp(DEFAULT_NEW_SPACE_PAGES, MAX_NEW_SPACE_PAGES);
-        let mut from = Vec::with_capacity(max_pages);
-        let mut to = Vec::with_capacity(max_pages);
+        // The nursery STARTS at `initial_pages` and GROWS up to
+        // `MAX_NEW_SPACE_PAGES`. The previous `clamp(initial, DEFAULT,
+        // MAX)` set the cap *equal to* the initial size (16), so the
+        // semispace could never grow — every nursery-sized live set
+        // deadlocked the copying scavenger (no room freed) and fell
+        // back to old-space overflow on every alloc. Cap at the real
+        // maximum; only the starting page count comes from the arg.
+        let max_pages = MAX_NEW_SPACE_PAGES;
+        let initial_pages = initial_pages.clamp(1, max_pages);
+        let mut from = Vec::with_capacity(initial_pages);
+        let mut to = Vec::with_capacity(initial_pages);
         for _ in 0..initial_pages {
             from.push(Page::new(SpaceKind::NewFrom).ok_or(OutOfMemory::CageExhausted)?);
             to.push(Page::new(SpaceKind::NewTo).ok_or(OutOfMemory::CageExhausted)?);

@@ -17,8 +17,6 @@ use otter_bytecode::method_id::{ArrayBufferMethod, SharedArrayBufferMethod};
 
 use crate::abstract_ops::{self, ToPrimitiveHint};
 use crate::binary::dispatch;
-use crate::js_surface::JsSurfaceError;
-use crate::object::{self, JsObject, PartialPropertyDescriptor};
 use crate::{NativeCtx, NativeError, Value, VmError, VmGetOutcome, VmPropertyKey};
 
 /// §7.1.5 `ToIntegerOrInfinity(value)` with an observable
@@ -93,6 +91,7 @@ fn coerce_index(
 // constructor back-pointer auto-installed.
 otter_macros::couch! {
     name = "ArrayBuffer",
+    string_tag = "ArrayBuffer",
     feature = CORE,
     intrinsic = ArrayBufferIntrinsic,
     constructor = (length = 1, call = ab_ctor_call),
@@ -121,6 +120,7 @@ otter_macros::couch! {
 // `transfer` / `transferToFixedLength` belong to ArrayBuffer only.
 otter_macros::couch! {
     name = "SharedArrayBuffer",
+    string_tag = "SharedArrayBuffer",
     feature = CORE,
     intrinsic = SharedArrayBufferIntrinsic,
     constructor = (length = 1, call = sab_ctor_call),
@@ -225,85 +225,6 @@ fn sab_growable(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
 fn sab_max_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let b = receiver_sab(ctx, "get SharedArrayBuffer.prototype.maxByteLength")?;
     Ok(Value::number_i32(b.max_byte_length(ctx.heap()) as i32))
-}
-
-/// Install `SharedArrayBuffer.prototype[@@toStringTag] = "SharedArrayBuffer"`.
-pub fn install_shared_array_buffer_well_knowns_post_bootstrap(
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-    well_known: &crate::symbol::WellKnownSymbols,
-) -> Result<(), JsSurfaceError> {
-    use crate::symbol::WellKnown;
-
-    let Some(ctor) =
-        object::get(global, heap, "SharedArrayBuffer").and_then(|v| v.as_native_function())
-    else {
-        return Ok(());
-    };
-    let descriptor = ctor
-        .own_property_descriptor(heap, "prototype")
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let prototype = match descriptor.and_then(|d| match d.kind {
-        crate::object::DescriptorKind::Data { value } => value.as_object(),
-        _ => None,
-    }) {
-        Some(p) => p,
-        None => return Ok(()),
-    };
-    let tag = crate::string::JsString::from_str("SharedArrayBuffer", heap)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    object::define_own_symbol_property_partial(
-        prototype,
-        heap,
-        well_known.get(WellKnown::ToStringTag),
-        PartialPropertyDescriptor {
-            value: Some(Value::string(tag)),
-            writable: Some(false),
-            enumerable: Some(false),
-            configurable: Some(true),
-            ..Default::default()
-        },
-    );
-    Ok(())
-}
-
-/// Install `ArrayBuffer.prototype[@@toStringTag] = "ArrayBuffer"`.
-pub fn install_array_buffer_well_knowns_post_bootstrap(
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-    well_known: &crate::symbol::WellKnownSymbols,
-) -> Result<(), JsSurfaceError> {
-    use crate::symbol::WellKnown;
-
-    let Some(ctor) = object::get(global, heap, "ArrayBuffer").and_then(|v| v.as_native_function())
-    else {
-        return Ok(());
-    };
-    let descriptor = ctor
-        .own_property_descriptor(heap, "prototype")
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let prototype = match descriptor.and_then(|d| match d.kind {
-        crate::object::DescriptorKind::Data { value } => value.as_object(),
-        _ => None,
-    }) {
-        Some(p) => p,
-        None => return Ok(()),
-    };
-    let tag = crate::string::JsString::from_str("ArrayBuffer", heap)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    object::define_own_symbol_property_partial(
-        prototype,
-        heap,
-        well_known.get(WellKnown::ToStringTag),
-        PartialPropertyDescriptor {
-            value: Some(Value::string(tag)),
-            writable: Some(false),
-            enumerable: Some(false),
-            configurable: Some(true),
-            ..Default::default()
-        },
-    );
-    Ok(())
 }
 
 // ---------------------------------------------------------------

@@ -57,8 +57,10 @@ struct JsonState {
     indent: String,
     /// `PropertyList` from an array replacer (§25.5.2.1 step 5).
     property_list: Option<Vec<String>>,
-    /// `ReplacerFunction` when the replacer is callable.
-    replacer_fn: Option<Value>,
+    /// Scratch-root index of the `ReplacerFunction` (when the replacer
+    /// is callable). Held on the interpreter's root stack rather than
+    /// inline so a scavenge during traversal can't strand it.
+    replacer_root: Option<usize>,
 }
 
 impl Interpreter {
@@ -77,10 +79,16 @@ impl Interpreter {
 
         let mut state = JsonState::default();
 
+        // Park the input value across replacer classification and gap
+        // derivation — both can allocate (and a property-list replacer
+        // or a `space` wrapper's `valueOf` can scavenge). `value_root`
+        // is the bottom of this call's scratch-root region.
+        let value_root = self.json_root_push(value);
+
         // §25.5.2.1 steps 4–5 — classify the replacer argument.
         if replacer.is_object_type() {
             if replacer.is_callable() {
-                state.replacer_fn = Some(replacer);
+                state.replacer_root = Some(self.json_root_push(replacer));
             } else if self.json_is_array(&replacer)? {
                 state.property_list = Some(self.json_build_property_list(context, &replacer)?);
             }
@@ -90,9 +98,15 @@ impl Interpreter {
         state.gap = self.json_gap(context, &space)?;
 
         // §25.5.2.1 step 10 — wrapper = { "": value }.
-        let wrapper = self.json_make_wrapper(value)?;
+        let rooted_value = self.json_root_get(value_root);
+        let wrapper = self.json_make_wrapper(rooted_value)?;
 
-        match self.serialize_json_property(context, &mut state, "", Value::object(wrapper))? {
+        let serialized =
+            self.serialize_json_property(context, &mut state, "", Value::object(wrapper))?;
+        // Release this call's scratch roots (value + any replacer).
+        self.json_root_pop_to(value_root);
+
+        match serialized {
             Some(text) => {
                 let s = JsString::from_str(&text, self.gc_heap_mut()).map_err(|_| {
                     VmError::TypeError {
@@ -244,24 +258,60 @@ impl Interpreter {
         holder: Value,
     ) -> Result<Option<String>, VmError> {
         // step 1 — value = ? Get(holder, key).
-        let mut value = self.get_property_value_for_call(context, holder, key)?;
+        // `holder` and the evolving `value` are parked on the scratch
+        // root stack so the JS-string allocations below (key arguments,
+        // `[[OwnPropertyKeys]]` names) — or a user getter / `toJSON` /
+        // replacer — can trigger a scavenge without leaving us
+        // dereferencing a moved object. Each step re-reads from the slot.
+        let holder_root = self.json_root_push(holder);
+        let value0 =
+            self.get_property_value_for_call(context, self.json_root_get(holder_root), key)?;
+        let value_root = self.json_root_push(value0);
 
+        let rendered =
+            self.serialize_json_property_rooted(context, state, key, holder_root, value_root);
+        // Restore the strict-stack invariant regardless of outcome.
+        self.json_root_pop_to(holder_root);
+        rendered
+    }
+
+    /// Body of SerializeJSONProperty once `holder` (`holder_root`) and
+    /// the step-1 value (`value_root`) are parked on the scratch root
+    /// stack. Reads both back through their slots after every call that
+    /// can allocate, so a mid-serialization scavenge never strands a
+    /// stale copy.
+    fn serialize_json_property_rooted(
+        &mut self,
+        context: &ExecutionContext,
+        state: &mut JsonState,
+        key: &str,
+        holder_root: usize,
+        value_root: usize,
+    ) -> Result<Option<String>, VmError> {
         // step 2 — invoke `toJSON` when present and callable.
+        let value = self.json_root_get(value_root);
         if value.is_object_type() || value.is_big_int() {
             let to_json = self.get_property_value_for_call(context, value, "toJSON")?;
             if to_json.is_callable() {
                 let key_arg = self.json_key_value(key)?;
                 let args: SmallVec<[Value; 8]> = smallvec![key_arg];
-                value = self.run_callable_sync(context, &to_json, value, args)?;
+                let receiver = self.json_root_get(value_root);
+                let next = self.run_callable_sync(context, &to_json, receiver, args)?;
+                self.json_root_set(value_root, next);
             }
         }
 
         // step 3 — apply the replacer function.
-        if let Some(replacer) = state.replacer_fn {
+        if let Some(replacer_root) = state.replacer_root {
             let key_arg = self.json_key_value(key)?;
-            let args: SmallVec<[Value; 8]> = smallvec![key_arg, value];
-            value = self.run_callable_sync(context, &replacer, holder, args)?;
+            let args: SmallVec<[Value; 8]> = smallvec![key_arg, self.json_root_get(value_root)];
+            let holder = self.json_root_get(holder_root);
+            let replacer = self.json_root_get(replacer_root);
+            let next = self.run_callable_sync(context, &replacer, holder, args)?;
+            self.json_root_set(value_root, next);
         }
+
+        let mut value = self.json_root_get(value_root);
 
         // step 4 — unwrap Number / String / Boolean / BigInt wrappers.
         // [[NumberData]] / [[StringData]] coerce through ToNumber /
@@ -347,10 +397,17 @@ impl Interpreter {
         value: Value,
     ) -> Result<String, VmError> {
         self.json_enter(state, &value)?;
+        // Park the container: `json_enumerable_string_keys` mints a
+        // `JsString` per key and each property may recurse, so a
+        // scavenge can move `value` mid-loop. Re-read from the slot.
+        let value_root = self.json_root_push(value);
 
         let keys = match &state.property_list {
             Some(list) => list.clone(),
-            None => self.json_enumerable_string_keys(context, &value)?,
+            None => {
+                let v = self.json_root_get(value_root);
+                self.json_enumerable_string_keys(context, &v)?
+            }
         };
 
         let stepback = state.indent.clone();
@@ -358,7 +415,8 @@ impl Interpreter {
 
         let mut members: Vec<String> = Vec::new();
         for key in &keys {
-            if let Some(serialized) = self.serialize_json_property(context, state, key, value)? {
+            let holder = self.json_root_get(value_root);
+            if let Some(serialized) = self.serialize_json_property(context, state, key, holder)? {
                 let mut member = quote_json_string_str(key);
                 member.push(':');
                 if !state.gap.is_empty() {
@@ -371,6 +429,7 @@ impl Interpreter {
 
         let result = wrap_members(&members, '{', '}', &state.gap, &state.indent, &stepback);
         state.indent = stepback;
+        self.json_root_pop_to(value_root);
         self.json_leave(state);
         Ok(result)
     }
@@ -383,15 +442,22 @@ impl Interpreter {
         value: Value,
     ) -> Result<String, VmError> {
         self.json_enter(state, &value)?;
+        // Park the container so per-index recursion (which allocates
+        // index-key strings and may scavenge) can't strand a stale copy.
+        let value_root = self.json_root_push(value);
 
-        let len = self.json_length(context, &value)?;
+        let len = {
+            let v = self.json_root_get(value_root);
+            self.json_length(context, &v)?
+        };
         let stepback = state.indent.clone();
         state.indent.push_str(&state.gap);
 
         let mut parts: Vec<String> = Vec::with_capacity(len.min(1024));
         for index in 0..len {
             let key = index.to_string();
-            match self.serialize_json_property(context, state, &key, value)? {
+            let holder = self.json_root_get(value_root);
+            match self.serialize_json_property(context, state, &key, holder)? {
                 Some(s) => parts.push(s),
                 None => parts.push("null".to_string()),
             }
@@ -399,6 +465,7 @@ impl Interpreter {
 
         let result = wrap_members(&parts, '[', ']', &state.gap, &state.indent, &stepback);
         state.indent = stepback;
+        self.json_root_pop_to(value_root);
         self.json_leave(state);
         Ok(result)
     }
@@ -488,13 +555,45 @@ impl Interpreter {
         context: &ExecutionContext,
         value: &Value,
     ) -> Result<Vec<String>, VmError> {
-        let keys = self.own_property_keys_value(context, value)?;
+        // Fast path — an ordinary object's enumerable own string keys
+        // are read straight from its property table as Rust strings, in
+        // ordinary own-key order. This skips both the per-key `JsString`
+        // allocation and the per-key `[[GetOwnProperty]]` lookup of the
+        // spec path; crucially it allocates nothing, so it can't trigger
+        // a scavenge that would strand the container mid-enumeration.
+        // Exotics with a custom `[[OwnPropertyKeys]]` / key order
+        // (proxy, typed array, module namespace, String wrapper) keep
+        // the spec path below.
+        if let Some(obj) = value.as_object()
+            && value.as_proxy().is_none()
+            && value.as_typed_array(self.gc_heap()).is_none()
+            && object::module_namespace_env(obj, self.gc_heap()).is_none()
+            && object::string_data(obj, self.gc_heap()).is_none()
+        {
+            let keys = object::with_properties(obj, self.gc_heap(), |p| {
+                p.enumerable_keys()
+                    .map(str::to_string)
+                    .collect::<Vec<String>>()
+            });
+            return Ok(keys);
+        }
+
+        // Spec path for exotic objects. `own_property_keys_value` mints a
+        // `JsString` per key (which can scavenge), so the container is
+        // parked and re-read from its root slot before each descriptor
+        // lookup instead of dereferencing a possibly-moved copy.
+        let value_root = self.json_root_push(*value);
+        let keys = {
+            let v = self.json_root_get(value_root);
+            self.own_property_keys_value(context, &v)?
+        };
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
             if key.is_symbol() {
                 continue;
             }
-            let desc = self.get_own_property_descriptor_for_value(context, *value, Some(&key))?;
+            let holder = self.json_root_get(value_root);
+            let desc = self.get_own_property_descriptor_for_value(context, holder, Some(&key))?;
             if desc.is_some_and(|d| d.enumerable()) {
                 let s = key
                     .as_string(self.gc_heap())
@@ -503,6 +602,7 @@ impl Interpreter {
                 out.push(s);
             }
         }
+        self.json_root_pop_to(value_root);
         Ok(out)
     }
 

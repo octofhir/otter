@@ -41,18 +41,29 @@ impl BuiltinIntrinsic for Intrinsic {
         object::set(temporal, heap, NOW_SPEC.name, Value::object(now));
         Ok(())
     }
+
+    fn install_well_knowns(
+        heap: &mut otter_gc::GcHeap,
+        global: JsObject,
+        well_known: &crate::symbol::WellKnownSymbols,
+    ) -> Result<(), JsSurfaceError> {
+        install_temporal_well_knowns(heap, global, well_known)
+    }
 }
 
-/// Post-bootstrap fixup: install `@@toStringTag` on the `Temporal`
-/// namespace, the `Temporal.Now` namespace, and every
-/// `Temporal.<Class>.prototype`. Each tag is `{ value: "Temporal.<X>",
-/// writable: false, enumerable: false, configurable: true }` per the
-/// proposal-temporal spec.
-pub fn install_temporal_well_knowns_post_bootstrap(
+/// Install `@@toStringTag` on the `Temporal` namespace, the
+/// `Temporal.Now` namespace, and every `Temporal.<Class>.prototype`.
+/// The per-class prototype tags are installed at construction time by
+/// each `couch!`'s `string_tag` (fanned out here); the two namespace
+/// objects are not `couch!` classes, so their tags are pinned here.
+/// Each tag is `{ value: "Temporal.<X>", writable: false, enumerable:
+/// false, configurable: true }` per the proposal-temporal spec.
+fn install_temporal_well_knowns(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
+    use crate::intrinsic_install::BuiltinIntrinsic;
     use crate::object::PartialPropertyDescriptor;
     use crate::symbol::WellKnown;
 
@@ -86,31 +97,22 @@ pub fn install_temporal_well_knowns_post_bootstrap(
         install(heap, now, "Temporal.Now")?;
     }
 
-    for class in [
-        "Instant",
-        "Duration",
-        "PlainDate",
-        "PlainTime",
-        "PlainDateTime",
-        "PlainYearMonth",
-        "PlainMonthDay",
-        "ZonedDateTime",
-    ] {
-        let Some(ctor) = object::get(temporal, heap, class).and_then(|v| v.as_native_function())
-        else {
-            continue;
-        };
-        let prototype = ctor
-            .own_property_descriptor(heap, "prototype")
-            .map_err(|_| JsSurfaceError::OutOfMemory)?
-            .and_then(|d| match d.kind {
-                crate::object::DescriptorKind::Data { value } => value.as_object(),
-                _ => None,
-            });
-        if let Some(prototype) = prototype {
-            install(heap, prototype, &format!("Temporal.{class}"))?;
-        }
-    }
+    crate::temporal::instant::InstantIntrinsic::install_well_knowns(heap, global, well_known)?;
+    crate::temporal::duration::DurationIntrinsic::install_well_knowns(heap, global, well_known)?;
+    crate::temporal::plain_date::PlainDateIntrinsic::install_well_knowns(heap, global, well_known)?;
+    crate::temporal::plain_time::PlainTimeIntrinsic::install_well_knowns(heap, global, well_known)?;
+    crate::temporal::plain_date_time::PlainDateTimeIntrinsic::install_well_knowns(
+        heap, global, well_known,
+    )?;
+    crate::temporal::plain_year_month::PlainYearMonthIntrinsic::install_well_knowns(
+        heap, global, well_known,
+    )?;
+    crate::temporal::plain_month_day::PlainMonthDayIntrinsic::install_well_knowns(
+        heap, global, well_known,
+    )?;
+    crate::temporal::zoned_date_time::ZonedDateTimeIntrinsic::install_well_knowns(
+        heap, global, well_known,
+    )?;
     Ok(())
 }
 

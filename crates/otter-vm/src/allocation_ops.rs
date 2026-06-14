@@ -679,9 +679,16 @@ impl Interpreter {
         top_idx: usize,
         dst: u16,
     ) -> Result<(), VmError> {
-        let proto = self.object_prototype_object_opt();
+        // Allocate first, THEN read `%Object.prototype%`. The allocation
+        // can trigger a scavenge that relocates the realm prototype while
+        // it is still young; reading the handle beforehand would capture a
+        // stale offset and install a dangling `[[Prototype]]` on the new
+        // object (corrupting the proto chain — only on the alloc that
+        // happens to drive the GC). `object_prototype_object_opt` reads it
+        // from the always-traced realm-intrinsic table, so post-alloc it
+        // yields the relocated handle.
         let obj = self.alloc_stack_rooted_object(stack)?;
-        if let Some(proto) = proto {
+        if let Some(proto) = self.object_prototype_object_opt() {
             crate::object::set_prototype(obj, &mut self.gc_heap, Some(proto));
         }
         let frame = &mut stack[top_idx];

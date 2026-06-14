@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::compressed::{Cage, Gc, RawGc, cage_base};
+use crate::compressed::{Cage, Gc, RawGc, cage_base, cage_size};
 use crate::ephemeron::EphemeronRegistry;
 use crate::external::{ExternalMemory, SharedExternalMemory, SharedExternalState};
 use crate::extra_roots::ExtraRoots;
@@ -66,6 +66,25 @@ pub type RootSlotVisitor<'a> = dyn FnMut(&mut dyn FnMut(*mut RawGc)) + 'a;
 pub fn empty() -> EmptyRoots {
     EmptyRoots
 }
+
+/// Growth-ratio major-GC trigger (used only when no hard cap is
+/// set). After a full GC the next trigger is `live × NUM / DEN`.
+/// `3/2` sits at the low end of the production band (V8 small-heap
+/// 1.3–2.0, Go 2.0) — appropriate for the small 256 MiB cage so a
+/// modest live set forces collection long before exhaustion.
+const MAJOR_GC_GROWTH_NUM: u64 = 3;
+const MAJOR_GC_GROWTH_DEN: u64 = 2;
+/// Don't run major GCs while the heap is tiny — let it warm up to
+/// this floor first (avoids GC thrash during startup).
+const MAJOR_GC_FLOOR_BYTES: u64 = 16 * 1024 * 1024;
+/// Near-cage hard ceiling on the major-GC threshold (numerator/256
+/// of the cage). The growth target is clamped to this so a cap-less
+/// heap always attempts a full GC before cage exhaustion, while a
+/// live set that legitimately approaches it settles just under
+/// rather than thrashing (the threshold — not occupancy — is what's
+/// clamped; see `maybe_major_gc`). ~92% leaves headroom for the
+/// young semispaces + per-page slack.
+const MAJOR_GC_CAGE_SOFTCAP_NUM: u64 = 236; // 236/256 ≈ 92% of cage
 
 /// Trivial empty-roots implementation; useful in tests where all
 /// reachable objects sit in handle scopes.
@@ -140,6 +159,41 @@ pub struct GcHeap {
     ephemerons: EphemeronRegistry,
     weak_finalization: WeakFinalizationRegistry,
     shared_external: Arc<SharedExternalState>,
+    /// Old-space byte high-water mark that triggers a major
+    /// (full) GC when no hard cap is configured. After every major
+    /// GC it is recomputed as `live × MAJOR_GC_GROWTH_NUM /
+    /// MAJOR_GC_GROWTH_DEN`, clamped to
+    /// `[MAJOR_GC_FLOOR_BYTES, soft cap]`. Without it, a cap-less
+    /// heap never runs a full GC (the cap path is the only other
+    /// caller of `collect_full`), so old space — fed by scavenge
+    /// promotion and the nursery-overflow path — grows unbounded
+    /// until the cage is exhausted even when most of it is garbage.
+    next_major_gc_bytes: u64,
+    /// Re-entrancy guard: `true` while a growth-triggered major GC
+    /// is running, so the minor scavenge it performs internally
+    /// cannot recursively trigger another one.
+    in_major_gc: bool,
+    /// GC-stress ("gc-zeal") stride: when non-zero, force a scavenge
+    /// every `gc_stress_stride` allocations. Moving every young object
+    /// that often makes any use-after-move bug — a `Value`/`Gc<T>`
+    /// held in a Rust local across an allocation without being rooted
+    /// — fail deterministically in tests instead of intermittently in
+    /// production. Off by default; enabled via `OTTER_GC_STRESS=<n>`
+    /// (and `=full` to also force a major GC each time). The runtime
+    /// counterpart to a static rooting-hazard lint.
+    gc_stress_stride: u32,
+    /// Also force a full GC (not just a scavenge) on each stress tick.
+    gc_stress_full: bool,
+    /// Allocations since the last stress-triggered collection.
+    gc_stress_counter: u32,
+    /// Stress fires only once armed. Engine bootstrap (global +
+    /// prototype setup) runs a large amount of native code that holds
+    /// freshly-allocated handles in Rust locals without rooting them —
+    /// not yet hardened against arbitrary GC — so forcing collections
+    /// there segfaults before user code runs. The runtime arms stress
+    /// after bootstrap completes, so the mode exercises user code and
+    /// the hot native paths (where the use-after-move bugs live).
+    gc_stress_armed: bool,
     stats: HeapStats,
     gc_stats: GcStats,
     /// Cooperative-cancellation flag; flipped to `true` when the
@@ -179,6 +233,27 @@ impl GcHeap {
     pub fn with_max_heap_bytes(cap: u64) -> Result<Self, OutOfMemory> {
         Cage::ensure_default().map_err(|_| OutOfMemory::CageExhausted)?;
         let new_space = NewSpace::new(crate::space::DEFAULT_NEW_SPACE_PAGES)?;
+        // GC-stress ("gc-zeal") config from the environment. `OTTER_GC_STRESS=1`
+        // scavenges every allocation (maximum use-after-move detection, very
+        // slow); `=<n>` every n allocations; append/set `=full` to also force a
+        // major GC each tick. Unset/`0` → disabled (the production default).
+        let (gc_stress_stride, gc_stress_full) = match std::env::var("OTTER_GC_STRESS") {
+            Ok(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                let full = v.contains("full");
+                let stride = if v == "full" || v.is_empty() {
+                    1
+                } else {
+                    v.trim_end_matches("full")
+                        .trim_end_matches(['=', ',', ':'])
+                        .trim()
+                        .parse::<u32>()
+                        .unwrap_or(1)
+                };
+                (stride, full)
+            }
+            Err(_) => (0, false),
+        };
         Ok(Self {
             new_space,
             old_space: OldSpace::new(),
@@ -197,6 +272,12 @@ impl GcHeap {
             max_heap_bytes: cap,
             tracked_bytes: 0,
             reserved_bytes: 0,
+            next_major_gc_bytes: MAJOR_GC_FLOOR_BYTES,
+            in_major_gc: false,
+            gc_stress_stride,
+            gc_stress_full,
+            gc_stress_counter: 0,
+            gc_stress_armed: false,
             oom_flag: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -722,12 +803,43 @@ impl GcHeap {
             }
         };
 
+        // GC-stress ("gc-zeal"): force a collection so any unrooted
+        // `Value`/`Gc<T>` held by the caller across this allocation reads
+        // a moved object and fails deterministically. Off unless
+        // `OTTER_GC_STRESS` is set. `allocation_roots` keeps the pending
+        // payload + caller's roots safe; everything else is meant to move.
+        if self.gc_stress_stride != 0 && self.gc_stress_armed && !self.in_major_gc {
+            self.gc_stress_counter = self.gc_stress_counter.saturating_add(1);
+            if self.gc_stress_counter >= self.gc_stress_stride {
+                self.gc_stress_counter = 0;
+                if self.gc_stress_full {
+                    self.in_major_gc = true;
+                    self.collect_full(&mut allocation_roots);
+                    self.in_major_gc = false;
+                } else {
+                    self.collect_minor_internal(&mut allocation_roots);
+                }
+            }
+        }
+
+        // Growth-ratio major GC bounds old-space occupancy before the
+        // cage exhausts — independent of (and complementary to) the byte
+        // cap, whose default equals the cage size and so never protects
+        // against page-level exhaustion. O(1) page-count check.
+        self.maybe_major_gc(&mut allocation_roots);
+
         if self.max_heap_bytes != 0 {
             self.account_or_collect_with_roots(aligned as u64, &mut allocation_roots)?;
         }
 
         let is_marking = self.marking.is_marking();
 
+        // `placed_in_old` records that this object was tenured straight
+        // into old-space (large object, or the nursery-deadlock overflow
+        // below). Its header must then be born old, not young, or the
+        // scavenger would try to evacuate an object sitting on an
+        // old-space page.
+        let mut placed_in_old = aligned > LARGE_OBJECT_THRESHOLD;
         let offset = if aligned > LARGE_OBJECT_THRESHOLD {
             self.large_space.alloc(aligned)?
         } else {
@@ -739,9 +851,24 @@ impl GcHeap {
                     // external roots; handle stack + globals are
                     // walked internally.
                     self.collect_minor_internal(&mut allocation_roots);
-                    self.new_space
-                        .alloc(aligned)
-                        .ok_or(OutOfMemory::CageExhausted)?
+                    match self.new_space.alloc(aligned) {
+                        Some(off) => off,
+                        // Young-gen deadlock: the live survivor set fills
+                        // the semispace, so a copying scavenge frees no
+                        // room for this allocation (it neither promotes —
+                        // survivors have not yet aged — nor leaves a free
+                        // slot). Rather than surface a spurious OOM while
+                        // the cage still has pages, overflow this object
+                        // straight into old-space. It is tenured a little
+                        // early; the next scavenge drains the rest of the
+                        // nursery normally. Guarantees forward progress
+                        // for workloads that retain a nursery-sized live
+                        // set (e.g. building a large array of objects).
+                        None => {
+                            placed_in_old = true;
+                            self.old_space.alloc(aligned)?
+                        }
+                    }
                 }
             }
         };
@@ -757,7 +884,7 @@ impl GcHeap {
         // region inside a page we own. The header and payload are
         // fully initialised below before any read.
         unsafe {
-            let header = if aligned > LARGE_OBJECT_THRESHOLD {
+            let header = if placed_in_old {
                 let h = GcHeader::new(T::TYPE_TAG, aligned as u32);
                 if is_marking {
                     h.set_mark_color(MarkColor::Black);
@@ -770,6 +897,19 @@ impl GcHeap {
             };
             std::ptr::write(header_ptr, header);
             std::ptr::write(payload_ptr, value);
+            // When this object was tenured straight into old-space (large
+            // object, or the nursery-deadlock overflow), the `ptr::write`
+            // bypassed the mutator write barrier. Any young children in the
+            // payload are old→young edges the next scavenge can only find
+            // via the card table, so barrier every edge now (mirrors
+            // `alloc_old_with_roots_inner`). Young allocations need no card
+            // — the scavenger walks them directly.
+            if placed_in_old {
+                let marking = &mut self.marking;
+                T::trace_slots(payload_ptr, &mut |slot| {
+                    crate::barrier::write_barrier(header_ptr, *slot, marking);
+                });
+            }
         }
         // Counter wiring inlined to keep the alloc fast path
         // tight. Only the per-tag row is touched (one cache
@@ -1057,6 +1197,71 @@ impl GcHeap {
         let pause_start = Instant::now();
         self.mark_phase(external_visit);
         self.sweep_phase_with_pause_start(pause_start);
+    }
+
+    /// Arm GC-stress mode (no-op unless `OTTER_GC_STRESS` was set).
+    ///
+    /// Called by the runtime once engine bootstrap is complete, so the
+    /// forced collections exercise user code and hot native paths rather
+    /// than the not-yet-hardened global-setup code. Idempotent.
+    pub fn arm_gc_stress(&mut self) {
+        self.gc_stress_armed = true;
+    }
+
+    /// Whether GC-stress mode is configured (env-enabled), regardless of
+    /// whether it is armed yet.
+    pub fn gc_stress_enabled(&self) -> bool {
+        self.gc_stress_stride != 0
+    }
+
+    /// Growth-ratio major-GC trigger for cap-less heaps.
+    ///
+    /// Called from the allocation slow path when no hard cap is set.
+    /// Runs a full GC once old+LOS occupancy reaches the recomputed
+    /// growth threshold (or the cage soft-cap backstop), then sets the
+    /// next threshold from the post-GC live size. This is what keeps a
+    /// cap-less heap from growing old space without bound — without it,
+    /// `collect_full` is only ever reached via the cap path. No-op when
+    /// a hard cap is configured (that path drives full GCs itself) or
+    /// while a major GC is already in flight.
+    fn maybe_major_gc(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
+        // Runs regardless of any byte cap: the default cap equals the
+        // cage size, so it can never fire before the cage physically
+        // exhausts (pages carry overhead the byte-cap doesn't see).
+        // This growth trigger is what actually bounds old-space.
+        if self.in_major_gc {
+            return;
+        }
+        // O(1) occupancy: page counts × page size (over-counts slack,
+        // which only makes the trigger fire slightly early — fine).
+        // Summing per-page allocated_bytes here would make every
+        // allocation O(pages).
+        let page_bytes = crate::page::PAGE_SIZE as u64;
+        let occupancy = (self.old_space.page_count() as u64)
+            .saturating_add(self.large_space.page_count() as u64)
+            .saturating_mul(page_bytes);
+        // `next_major_gc_bytes` is the only fire condition; it is itself
+        // clamped to a near-cage hard ceiling below. Using the ceiling as
+        // a *separate* fire condition would make GC fire on every alloc
+        // once a legitimate live set exceeds it (no reclaim possible →
+        // O(n²) thrash). Clamping the threshold instead lets a large live
+        // set settle just under the ceiling and stop collecting.
+        if occupancy < self.next_major_gc_bytes {
+            return;
+        }
+        self.in_major_gc = true;
+        self.collect_full(external_visit);
+        self.in_major_gc = false;
+        // Recompute the next trigger from the surviving live set
+        // (page-based, matching the occupancy metric above).
+        let live_pages = (self.old_space.page_count() as u64)
+            .saturating_add(self.large_space.page_count() as u64)
+            .saturating_mul(page_bytes);
+        let cage_hardcap = (cage_size() as u64) / 256 * MAJOR_GC_CAGE_SOFTCAP_NUM;
+        let target = live_pages
+            .saturating_mul(MAJOR_GC_GROWTH_NUM)
+            .saturating_div(MAJOR_GC_GROWTH_DEN);
+        self.next_major_gc_bytes = target.max(MAJOR_GC_FLOOR_BYTES).min(cage_hardcap);
     }
 
     /// Begin a full-GC mark phase and drain the ordinary root graph.

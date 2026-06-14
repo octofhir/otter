@@ -58,6 +58,7 @@ use crate::{
 
 otter_macros::couch! {
     name = "Map",
+    string_tag = "Map",
     feature = CORE,
     intrinsic = MapIntrinsic,
     constructor = (length = 0, call = map_ctor_call),
@@ -86,6 +87,7 @@ otter_macros::couch! {
 
 otter_macros::couch! {
     name = "Set",
+    string_tag = "Set",
     feature = CORE,
     intrinsic = SetIntrinsic,
     constructor = (length = 0, call = set_ctor_call),
@@ -115,6 +117,7 @@ otter_macros::couch! {
 
 otter_macros::couch! {
     name = "WeakMap",
+    string_tag = "WeakMap",
     feature = CORE,
     intrinsic = WeakMapIntrinsic,
     constructor = (length = 0, call = weak_map_ctor_call),
@@ -132,6 +135,7 @@ otter_macros::couch! {
 
 otter_macros::couch! {
     name = "WeakSet",
+    string_tag = "WeakSet",
     feature = CORE,
     intrinsic = WeakSetIntrinsic,
     constructor = (length = 0, call = weak_set_ctor_call),
@@ -161,7 +165,6 @@ pub fn install_collection_well_knowns_post_bootstrap(
 ) -> Result<(), JsSurfaceError> {
     use crate::symbol::WellKnown;
 
-    let to_string_tag = well_known.get(WellKnown::ToStringTag);
     let iterator_sym = well_known.get(WellKnown::Iterator);
 
     for (ctor_name, alias_method, alias_kind) in [
@@ -173,22 +176,6 @@ pub fn install_collection_well_knowns_post_bootstrap(
         let Some(prototype) = ctor_prototype(global, heap, ctor_name) else {
             continue;
         };
-        // §24.*.3.* — @@toStringTag = ctor_name, non-writable,
-        // non-enumerable, configurable.
-        let tag = crate::string::JsString::from_str(ctor_name, heap)
-            .map_err(|_| JsSurfaceError::OutOfMemory)?;
-        object::define_own_symbol_property_partial(
-            prototype,
-            heap,
-            to_string_tag,
-            PartialPropertyDescriptor {
-                value: Some(Value::string(tag)),
-                writable: Some(false),
-                enumerable: Some(false),
-                configurable: Some(true),
-                ..Default::default()
-            },
-        );
         // §24.1.3.12 / §24.2.3.11 — `@@iterator` aliases `entries`
         // (Map) or `values` (Set). Same NativeFunction value so
         // identity (`Map.prototype.entries === Map.prototype[@@iterator]`)

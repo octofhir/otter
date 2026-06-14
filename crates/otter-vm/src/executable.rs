@@ -310,7 +310,13 @@ impl ExecutableFunction {
             .enumerate()
             .map(|(idx, instr)| {
                 let property_ic_site = match instr.op {
-                    Op::LoadProperty | Op::StoreProperty | Op::HasProperty => {
+                    // `CallMethodValue` shares the load-IC table: a prototype
+                    // method is a data slot on the prototype, so its resolution
+                    // is cached by receiver shape exactly like a `LoadProperty`.
+                    Op::LoadProperty
+                    | Op::StoreProperty
+                    | Op::HasProperty
+                    | Op::CallMethodValue => {
                         let site = *next_property_ic_site;
                         *next_property_ic_site = next_property_ic_site
                             .checked_add(1)

@@ -31,7 +31,10 @@ use crate::{
     native_function::VmIntrinsicFunction,
     number,
     operand_decode::{const_operand, register_operand},
-    promise_dispatch, read_register, regexp_prototype, require_callable,
+    promise_dispatch,
+    property_atom::AtomizedPropertyKey,
+    property_ic::{LoadPropertyIc, PropertyIcKind},
+    read_register, regexp_prototype, require_callable,
     string::prototype as string_prototype,
     symbol_prototype, weak_refs, write_register,
 };
@@ -238,6 +241,25 @@ impl Interpreter {
             return Err(VmError::TypeError {
                 message: format!("Cannot read properties of {label}"),
             });
+        }
+
+        // Method-resolution inline cache. An ordinary object's method is a data
+        // slot on its own object or its prototype, so the receiver shape keys
+        // the resolved method exactly like a `LoadProperty`. On a hit (or a
+        // freshly installed monomorphic candidate) the per-call string `[[Get]]`
+        // walk — `has_plain_builtin_method` + `ordinary_get_value` + atom
+        // comparison up the chain — is skipped entirely. A non-cacheable
+        // shape (accessor method, deep prototype, absent) returns `None` and
+        // falls through to the full resolution below.
+        if let Some(obj) = recv_value.as_object()
+            && let Some(atomized_key) = context.property_atom(name_idx)
+            && let Some(site) =
+                context.property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
+            && let Some(method) = self.resolve_method_ic(obj, atomized_key, site)
+            && self.is_callable_runtime(&method)
+        {
+            stack[top_idx].advance_pc(caller_byte_len)?;
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
 
         if recv_value.is_set() && bootstrap_collections::is_set_method_name(name) {
@@ -768,6 +790,54 @@ impl Interpreter {
             return date::prototype::is_builtin_method(name);
         }
         false
+    }
+
+    /// Resolve a method by receiver shape through the call site's load IC.
+    ///
+    /// Returns the method value on an IC hit or a freshly installed
+    /// monomorphic data-slot candidate (own or direct-prototype), exactly the
+    /// values [`Self::drive_load_property`] caches. Returns `None` when the
+    /// property is not an IC-cacheable data slot — an accessor, a deeper
+    /// prototype hop, or absent — so the caller falls back to the full
+    /// `[[Get]]` method-resolution path that handles those cases.
+    fn resolve_method_ic(
+        &mut self,
+        obj: crate::object::JsObject,
+        key: AtomizedPropertyKey<'_>,
+        site: usize,
+    ) -> Option<Value> {
+        if site >= self.load_property_ics.len() || self.load_property_ics[site].is_megamorphic() {
+            return None;
+        }
+        let mut hit_value: Option<Value> = None;
+        for ic in self.load_property_ics[site].entries() {
+            if let Some(value) = ic.load(obj, &self.gc_heap, key) {
+                hit_value = Some(value);
+                break;
+            }
+        }
+        if let Some(value) = hit_value {
+            self.property_ic_stats.record_hit(PropertyIcKind::Load);
+            return Some(value);
+        }
+        if self.load_property_ics[site].entry_count() > 0 {
+            self.load_property_ics[site]
+                .record_guard_miss_with_stats(&mut self.property_ic_stats, PropertyIcKind::Load);
+        } else {
+            self.load_property_ics[site]
+                .record_uncached_miss_with_stats(&mut self.property_ic_stats, PropertyIcKind::Load);
+        }
+        if !self.load_property_ics[site].is_megamorphic()
+            && let Some((ic, value)) = LoadPropertyIc::install_candidate(obj, &self.gc_heap, key)
+        {
+            self.load_property_ics[site].install_with_stats(
+                &mut self.property_ic_stats,
+                PropertyIcKind::Load,
+                ic,
+            );
+            return Some(value);
+        }
+        None
     }
 
     fn callable_has_own_function_method_shadow(

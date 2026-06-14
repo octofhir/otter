@@ -2172,6 +2172,41 @@ impl Interpreter {
         }
     }
 
+    /// `CreateDataProperty(target, idx, value)` specialised for an integer
+    /// index, with a dense fast path.
+    ///
+    /// When `target` is an ordinary extensible array with no accessors, the
+    /// new own data property is written straight into the dense backing via
+    /// [`crate::array::define_index_value`] — no index stringification, no
+    /// descriptor, no property-protocol walk. This is the write half of the
+    /// `Array.prototype` callback fast path (`map` / `filter` building their
+    /// result). Any other target (Proxy, subclass via `@@species`, frozen, or
+    /// accessor-bearing array) falls back to the spec `[[DefineOwnProperty]]`.
+    pub(crate) fn create_data_property_array_index(
+        &mut self,
+        context: &ExecutionContext,
+        target: Value,
+        idx: usize,
+        value: Value,
+    ) -> Result<(), VmError> {
+        // The fast path is only sound for a genuinely fresh index: an extensible
+        // ordinary array, no accessors, and nothing already at `idx`. A
+        // pre-existing slot (e.g. an `@@species` result with a non-writable
+        // index property) must go through `[[DefineOwnProperty]]`, which rejects
+        // the redefinition exactly as `CreateDataProperty` requires.
+        if let Some(arr) = target.as_array()
+            && !crate::array::has_accessors(arr, self.gc_heap())
+            && crate::array::is_extensible(arr, self.gc_heap())
+            && !crate::array::has_own_element(arr, self.gc_heap(), idx)
+        {
+            crate::array::define_index_value(arr, self.gc_heap_mut(), idx, value)
+                .map_err(VmError::from)?;
+            return Ok(());
+        }
+        let key = format_index_key(idx as f64);
+        self.create_data_property_or_throw(context, target, &key, value)
+    }
+
     pub(crate) fn create_data_property_or_throw(
         &mut self,
         context: &ExecutionContext,
@@ -2961,40 +2996,54 @@ pub(crate) fn array_callback_native_dispatch(
                     None => (false, Value::undefined()),
                 }
             } else if let Some(arr) = receiver.as_array() {
-                // A present own element (data or accessor) reads through
-                // the ordinary `[[Get]]`. An absent index (hole / beyond
-                // the element store but `< len`) is not skipped outright:
-                // §10.4.2.4 [[Get]] walks the Array.prototype chain, so an
-                // inherited `Array.prototype[k]` is observed; a hole with
-                // no inherited value reads as absent.
-                let key = idx.to_string();
-                let present = crate::array::has_own_element(arr, interp.gc_heap(), idx)
-                    || crate::array::get_accessor(arr, interp.gc_heap(), &key).is_some()
-                    || interp
-                        .ordinary_has_property_value(
-                            &context,
-                            receiver,
-                            &crate::VmPropertyKey::String(&key),
-                            0,
-                        )
-                        .map_err(|err| {
-                            crate::native_function::vm_to_native_error(
-                                err,
-                                "Array.prototype callback",
-                            )
-                        })?;
-                if present {
-                    let v = interp
-                        .get_property_value_for_call(&context, receiver, &key)
-                        .map_err(|err| {
-                            crate::native_function::vm_to_native_error(
-                                err,
-                                "Array.prototype callback",
-                            )
-                        })?;
-                    (true, v)
+                // Fast path: a present own data element on an array that has
+                // no accessors reads straight from the dense backing. An own
+                // data property shadows the prototype and exposes no getter,
+                // so this is observably identical to the `[[Get]]` ladder
+                // below — without stringifying the index (a `String` alloc per
+                // element) or running the property protocol. The slow path
+                // still owns holes (inherited `Array.prototype[k]`), accessors,
+                // and sparse/exotic shapes.
+                if !crate::array::has_accessors(arr, interp.gc_heap())
+                    && crate::array::has_own_element(arr, interp.gc_heap(), idx)
+                {
+                    (true, crate::array::get(arr, interp.gc_heap(), idx))
                 } else {
-                    (false, Value::undefined())
+                    // A present own element (data or accessor) reads through
+                    // the ordinary `[[Get]]`. An absent index (hole / beyond
+                    // the element store but `< len`) is not skipped outright:
+                    // §10.4.2.4 [[Get]] walks the Array.prototype chain, so an
+                    // inherited `Array.prototype[k]` is observed; a hole with
+                    // no inherited value reads as absent.
+                    let key = idx.to_string();
+                    let present = crate::array::has_own_element(arr, interp.gc_heap(), idx)
+                        || crate::array::get_accessor(arr, interp.gc_heap(), &key).is_some()
+                        || interp
+                            .ordinary_has_property_value(
+                                &context,
+                                receiver,
+                                &crate::VmPropertyKey::String(&key),
+                                0,
+                            )
+                            .map_err(|err| {
+                                crate::native_function::vm_to_native_error(
+                                    err,
+                                    "Array.prototype callback",
+                                )
+                            })?;
+                    if present {
+                        let v = interp
+                            .get_property_value_for_call(&context, receiver, &key)
+                            .map_err(|err| {
+                                crate::native_function::vm_to_native_error(
+                                    err,
+                                    "Array.prototype callback",
+                                )
+                            })?;
+                        (true, v)
+                    } else {
+                        (false, Value::undefined())
+                    }
                 }
             } else {
                 let key = idx.to_string();
@@ -3061,9 +3110,8 @@ pub(crate) fn array_callback_native_dispatch(
                             reason: "missing output target".to_string(),
                         });
                     }
-                    let key = format_index_key(idx as f64);
                     interp
-                        .create_data_property_or_throw(&context, target, &key, result)
+                        .create_data_property_array_index(&context, target, idx, result)
                         .map_err(|err| crate::native_function::vm_to_native_error(err, "map"))?;
                 }
                 "filter" if result.to_boolean(interp.gc_heap()) => {
@@ -3074,9 +3122,8 @@ pub(crate) fn array_callback_native_dispatch(
                             reason: "missing output target".to_string(),
                         });
                     }
-                    let key = format_index_key(target_index as f64);
                     interp
-                        .create_data_property_or_throw(&context, target, &key, v)
+                        .create_data_property_array_index(&context, target, target_index, v)
                         .map_err(|err| crate::native_function::vm_to_native_error(err, "filter"))?;
                     target_index += 1;
                 }

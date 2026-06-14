@@ -403,8 +403,10 @@ fn set_index_value(
     value: Value,
     enforce_writable: bool,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    let key = idx.to_string();
-    if enforce_writable && !can_write_array_property(arr, heap, &key) {
+    // Only the writability gate needs the stringified index; the
+    // definition path (`define_index_value`) skips it, so don't pay the
+    // per-write `String` allocation there.
+    if enforce_writable && !can_write_array_property(arr, heap, &idx.to_string()) {
         return Ok(());
     }
     if !has_own_element(arr, heap, idx) && !is_extensible(arr, heap) {

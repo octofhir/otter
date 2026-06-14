@@ -154,7 +154,13 @@ extern "C" fn jit_make_fn_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
 /// Bridge stub: perform a named `LoadProperty` from compiled code, delegating
 /// to the safe [`Interpreter::jit_runtime_load_property`]. Returns `0` on
 /// success, `1` when the read threw (error parked in `ctx`).
-extern "C" fn jit_load_prop_stub(ctx: *mut JitCtx, dst: u64, obj: u64, name_idx: u64) -> u64 {
+extern "C" fn jit_load_prop_stub(
+    ctx: *mut JitCtx,
+    dst: u64,
+    obj: u64,
+    name_idx: u64,
+    site: u64,
+) -> u64 {
     // SAFETY: see `jit_call_stub`.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
@@ -167,6 +173,7 @@ extern "C" fn jit_load_prop_stub(ctx: *mut JitCtx, dst: u64, obj: u64, name_idx:
         dst as u16,
         obj as u16,
         name_idx as u32,
+        site as usize,
     ) {
         Ok(()) => 0,
         Err(err) => {
@@ -179,7 +186,13 @@ extern "C" fn jit_load_prop_stub(ctx: *mut JitCtx, dst: u64, obj: u64, name_idx:
 /// Bridge stub: perform a named `StoreProperty` from compiled code, delegating
 /// to the safe [`Interpreter::jit_runtime_store_property`]. Returns `0` on
 /// success, `1` when the write threw (error parked in `ctx`).
-extern "C" fn jit_store_prop_stub(ctx: *mut JitCtx, obj: u64, name_idx: u64, src: u64) -> u64 {
+extern "C" fn jit_store_prop_stub(
+    ctx: *mut JitCtx,
+    obj: u64,
+    name_idx: u64,
+    src: u64,
+    site: u64,
+) -> u64 {
     // SAFETY: see `jit_call_stub`.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
@@ -192,6 +205,7 @@ extern "C" fn jit_store_prop_stub(ctx: *mut JitCtx, obj: u64, name_idx: u64, src
         obj as u16,
         name_idx as u32,
         src as u16,
+        site as usize,
     ) {
         Ok(()) => 0,
         Err(err) => {
@@ -481,10 +495,14 @@ mod arm64 {
                     store_reg(&mut ops, 9, dst)?;
                 }
                 Op::LoadProperty => {
-                    // jit_load_prop_stub(ctx=x20, dst, obj, name_idx) -> status.
+                    // jit_load_prop_stub(ctx=x20, dst, obj, name_idx, site).
+                    // `site` is the dense IC index from the snapshot, used by
+                    // the bridge for the monomorphic fast path (PC-keyed lookup
+                    // is unavailable at PC 0); `usize::MAX` means "no site".
                     let dst = reg(ops_ref, 0)?;
                     let obj = reg(ops_ref, 1)?;
                     let name = const_index(ops_ref, 2)?;
+                    let site = instr.property_ic_site.unwrap_or(usize::MAX) as u64;
                     dynasm!(ops
                         ; .arch aarch64
                         ; mov x0, x20
@@ -492,6 +510,7 @@ mod arm64 {
                         ; movz x2, obj as u32
                     );
                     emit_load_u64(&mut ops, 3, u64::from(name));
+                    emit_load_u64(&mut ops, 4, site);
                     emit_call_stub(&mut ops, jit_load_prop_stub as *const () as usize, threw);
                 }
                 Op::StoreProperty => {
@@ -500,6 +519,7 @@ mod arm64 {
                     let obj = reg(ops_ref, 0)?;
                     let name = const_index(ops_ref, 1)?;
                     let src = reg(ops_ref, 2)?;
+                    let site = instr.property_ic_site.unwrap_or(usize::MAX) as u64;
                     dynasm!(ops
                         ; .arch aarch64
                         ; mov x0, x20
@@ -507,6 +527,7 @@ mod arm64 {
                     );
                     emit_load_u64(&mut ops, 2, u64::from(name));
                     dynasm!(ops ; .arch aarch64 ; movz x3, src as u32);
+                    emit_load_u64(&mut ops, 4, site);
                     emit_call_stub(&mut ops, jit_store_prop_stub as *const () as usize, threw);
                 }
                 Op::BitwiseOr => {

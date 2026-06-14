@@ -1320,66 +1320,6 @@ impl Interpreter {
         self.run_make_function_reg(context, frame, dst, idx)
     }
 
-    /// JIT bridge — perform a named `LoadProperty` from compiled code, reusing
-    /// the interpreter's full property-read path (inline cache + accessor
-    /// dispatch). Reads the receiver from register `obj_reg` of frame
-    /// `frame_index` and writes the result into register `dst`.
-    ///
-    /// The compiled tier owns its own control flow, so the frame PC is saved
-    /// and restored across the call: a later guard bail must re-run the whole
-    /// function from PC 0, which requires `frame.pc` to stay untouched here.
-    ///
-    /// # Errors
-    /// Propagates any error the read raises (e.g. a throwing getter), and
-    /// `InvalidOperand` for an unknown property-name index.
-    pub fn jit_runtime_load_property(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut jit::JitFrameStack,
-        frame_index: usize,
-        dst: u16,
-        obj_reg: u16,
-        name_idx: u32,
-    ) -> Result<(), VmError> {
-        let key = context
-            .property_atom(name_idx)
-            .ok_or(VmError::InvalidOperand)?;
-        let saved_pc = stack[frame_index].pc;
-        let result = self.run_load_property_reg(context, stack, frame_index, dst, obj_reg, key);
-        stack[frame_index].pc = saved_pc;
-        result
-    }
-
-    /// JIT bridge — perform a named `StoreProperty` from compiled code, reusing
-    /// the interpreter's full property-write path (shape transition + accessor
-    /// setters). Reads the receiver from register `obj_reg` and the value from
-    /// register `src` of frame `frame_index`.
-    ///
-    /// As with [`Self::jit_runtime_load_property`], the frame PC is saved and
-    /// restored: the store path advances the interpreter PC, which compiled
-    /// code must not observe (a later bail re-runs the function from PC 0).
-    ///
-    /// # Errors
-    /// Propagates write failures (read-only target in strict mode, throwing
-    /// setter) and `InvalidOperand` for an unknown property-name index.
-    pub fn jit_runtime_store_property(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut jit::JitFrameStack,
-        frame_index: usize,
-        obj_reg: u16,
-        name_idx: u32,
-        src: u16,
-    ) -> Result<(), VmError> {
-        let key = context
-            .property_atom(name_idx)
-            .ok_or(VmError::InvalidOperand)?;
-        let saved_pc = stack[frame_index].pc;
-        let result = self.run_store_property_reg(context, stack, frame_index, obj_reg, key, src);
-        stack[frame_index].pc = saved_pc;
-        result
-    }
-
     /// JIT bridge — boxed `Value` bits of frame `frame_index`'s `this` binding,
     /// read once at compiled-entry setup so a `LoadThis` is a direct `JitCtx`
     /// read. A hole (`this` not yet initialized in a derived constructor)

@@ -2953,6 +2953,121 @@ impl Interpreter {
             }
         }
     }
+    /// JIT bridge for a named `LoadProperty` from compiled code.
+    ///
+    /// Compiled frames run at PC 0, so the interpreter's `function_id`/`pc`
+    /// IC-site lookup cannot be used. The emitter instead passes the dense
+    /// `site` straight from the snapshot field `property_ic_site`, which is the
+    /// same index `drive_load_property` resolves. The hot path is the IC hit,
+    /// a shape guard plus slot read identical to the interpreter fast path.
+    /// By tier-up the site is already warm from interpreted calls, so an
+    /// ordinary-object read resolves here with no further property machinery.
+    /// A miss from a cold or polymorphic shape, an accessor, a prototype walk,
+    /// or a non-object receiver falls back to the full read. The frame PC is
+    /// saved and restored so a later guard bail still re-runs from PC 0.
+    ///
+    /// # Errors
+    /// Propagates read errors (throwing getter) and `InvalidOperand` for an
+    /// unknown property-name index.
+    pub fn jit_runtime_load_property(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut SmallVec<[Frame; 8]>,
+        frame_index: usize,
+        dst: u16,
+        obj_reg: u16,
+        name_idx: u32,
+        site: usize,
+    ) -> Result<(), VmError> {
+        let atomized_key = context
+            .property_atom(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        let receiver = *read_register(&stack[frame_index], obj_reg)?;
+        if let Some(obj) = receiver.as_object()
+            && site < self.load_property_ics.len()
+            && !self.load_property_ics[site].is_megamorphic()
+        {
+            let mut hit_value: Option<Value> = None;
+            for ic in self.load_property_ics[site].entries() {
+                if let Some(value) = ic.load(obj, &self.gc_heap, atomized_key) {
+                    hit_value = Some(value);
+                    break;
+                }
+            }
+            if let Some(value) = hit_value {
+                self.property_ic_stats.record_hit(PropertyIcKind::Load);
+                write_register(&mut stack[frame_index], dst, value)?;
+                return Ok(());
+            }
+        }
+        // Slow path: full `[[Get]]` (proto walk / accessor / non-object). It
+        // advances the interpreter PC, which compiled code must not observe.
+        let saved_pc = stack[frame_index].pc;
+        let result =
+            self.run_load_property_reg(context, stack, frame_index, dst, obj_reg, atomized_key);
+        stack[frame_index].pc = saved_pc;
+        result
+    }
+
+    /// JIT bridge for a named `StoreProperty` from compiled code. The store
+    /// analogue of [`Self::jit_runtime_load_property`]: the hot path is an IC
+    /// hit on an existing own data slot (the dense `site` comes from the
+    /// snapshot, since the compiled frame runs at PC 0). A miss — cold or
+    /// polymorphic shape, a property that must be added (shape transition), an
+    /// accessor setter, or a non-extensible / non-object receiver — falls back
+    /// to the full write, with the frame PC saved and restored so a later guard
+    /// bail still re-runs from PC 0.
+    ///
+    /// # Errors
+    /// Propagates write failures (read-only target in strict mode, throwing
+    /// setter) and `InvalidOperand` for an unknown property-name index.
+    pub fn jit_runtime_store_property(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut SmallVec<[Frame; 8]>,
+        frame_index: usize,
+        obj_reg: u16,
+        name_idx: u32,
+        src: u16,
+        site: usize,
+    ) -> Result<(), VmError> {
+        let atomized_key = context
+            .property_atom(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        let receiver = *read_register(&stack[frame_index], obj_reg)?;
+        let value = *read_register(&stack[frame_index], src)?;
+        if let Some(obj) = receiver.as_object()
+            && site < self.store_property_ics.len()
+            && object::supports_fast_property_ic(obj, &self.gc_heap)
+        {
+            let entries_len = self.store_property_ics[site].entry_count();
+            let mut store_hit = false;
+            for idx in 0..entries_len {
+                // Reborrow each iteration: `store` needs `&mut self.gc_heap`,
+                // which conflicts with a long-lived borrow of the entries slice.
+                let ic = self.store_property_ics[site].entries()[idx].clone();
+                if ic
+                    .store(obj, &mut self.gc_heap, atomized_key, &value)
+                    .is_some()
+                {
+                    store_hit = true;
+                    break;
+                }
+            }
+            if store_hit {
+                self.property_ic_stats.record_hit(PropertyIcKind::Store);
+                return Ok(());
+            }
+        }
+        // Slow path: full `[[Set]]` (transition / accessor / reject). It
+        // advances the interpreter PC, which compiled code must not observe.
+        let saved_pc = stack[frame_index].pc;
+        let result =
+            self.run_store_property_reg(context, stack, frame_index, obj_reg, atomized_key, src);
+        stack[frame_index].pc = saved_pc;
+        result
+    }
+
     /// Drive one tick of [`Op::LoadProperty`] when the receiver is
     /// an object and the resolved property is an accessor descriptor.
     /// Returns `Ok(true)` when an accessor was dispatched (frame

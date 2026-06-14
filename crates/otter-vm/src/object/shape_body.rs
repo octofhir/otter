@@ -29,7 +29,7 @@ use otter_gc::GcHeap;
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
 
-use crate::string::{JsStringHandle, to_utf16_vec};
+use crate::string::{JsStringHandle, eq_str};
 
 use super::{ShapeId, next_shape_id};
 
@@ -182,12 +182,11 @@ pub(crate) fn shape_offset_of_key(
 /// state without interning or mutating side tables.
 #[must_use]
 pub(crate) fn shape_offset_of_str(heap: &GcHeap, mut shape: ShapeHandle, key: &str) -> Option<u32> {
-    let wanted: Vec<u16> = key.encode_utf16().collect();
     while !shape.is_null() {
         let (parent, transition_key, own_offset) = heap.read_payload(shape, |body| {
             (body.parent(), body.transition_key(), body.own_offset())
         });
-        if !transition_key.is_null() && to_utf16_vec(heap, transition_key) == wanted {
+        if !transition_key.is_null() && eq_str(heap, transition_key, key) {
             return Some(own_offset);
         }
         shape = parent;
@@ -236,8 +235,7 @@ pub(crate) fn shape_key_matches_str(
     let Some(actual) = shape_key_at_offset(heap, shape, offset) else {
         return false;
     };
-    let wanted: Vec<u16> = key.encode_utf16().collect();
-    to_utf16_vec(heap, actual) == wanted
+    !actual.is_null() && eq_str(heap, actual, key)
 }
 
 /// Return transition keys in ordinary insertion order with their slot offsets.

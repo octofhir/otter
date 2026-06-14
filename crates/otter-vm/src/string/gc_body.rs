@@ -429,6 +429,63 @@ pub fn flatten_string_body(
     alloc_flat_string_body_with_roots(heap, JsStringId::new(0), &units, external_visit)
 }
 
+/// Compare a JS string against a UTF-8 `&str` for code-unit equality
+/// **without allocating** for the common single-segment case.
+///
+/// Property keys are overwhelmingly short, interned, single-segment
+/// `Latin1` or `Flat` bodies, so the hot path (shape-key validation in
+/// the property IC) compares in place against `key.encode_utf16()`.
+/// Only the rare `Cons` / `Sliced` rope shapes fall back to the
+/// allocating [`to_utf16_vec`] materialiser.
+#[must_use]
+pub fn eq_str(heap: &GcHeap, string: JsStringHandle, key: &str) -> bool {
+    enum Fast {
+        Mismatch,
+        Match,
+        Rope,
+    }
+    let fast = heap.read_payload(string, |b| match &b.repr {
+        JsStringBodyRepr::Latin1(bytes) => {
+            // Latin-1 byte values are Unicode scalar values 0..=255,
+            // so each zero-extends straight to a UTF-16 code unit.
+            let mut units = key.encode_utf16();
+            for &byte in bytes {
+                match units.next() {
+                    Some(u) if u == u16::from(byte) => {}
+                    _ => return Fast::Mismatch,
+                }
+            }
+            if units.next().is_none() {
+                Fast::Match
+            } else {
+                Fast::Mismatch
+            }
+        }
+        JsStringBodyRepr::Flat(code_units) => {
+            let mut units = key.encode_utf16();
+            for &unit in code_units {
+                match units.next() {
+                    Some(u) if u == unit => {}
+                    _ => return Fast::Mismatch,
+                }
+            }
+            if units.next().is_none() {
+                Fast::Match
+            } else {
+                Fast::Mismatch
+            }
+        }
+        JsStringBodyRepr::Cons { .. } | JsStringBodyRepr::Sliced { .. } => Fast::Rope,
+    });
+    match fast {
+        Fast::Match => true,
+        Fast::Mismatch => false,
+        Fast::Rope => to_utf16_vec(heap, string)
+            .into_iter()
+            .eq(key.encode_utf16()),
+    }
+}
+
 /// Materialise a string body into a fresh `Vec<u16>` of UTF-16 code
 /// units. Cold path: hot lookups should compare handles / ids.
 #[must_use]

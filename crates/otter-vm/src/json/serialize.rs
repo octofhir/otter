@@ -101,21 +101,26 @@ impl Interpreter {
         let rooted_value = self.json_root_get(value_root);
         let wrapper = self.json_make_wrapper(rooted_value)?;
 
-        let serialized =
-            self.serialize_json_property(context, &mut state, "", Value::object(wrapper))?;
+        let mut buffer = String::new();
+        let wrote = self.serialize_json_property_into(
+            context,
+            &mut state,
+            "",
+            Value::object(wrapper),
+            &mut buffer,
+        )?;
         // Release this call's scratch roots (value + any replacer).
         self.json_root_pop_to(value_root);
 
-        match serialized {
-            Some(text) => {
-                let s = JsString::from_str(&text, self.gc_heap_mut()).map_err(|_| {
-                    VmError::TypeError {
-                        message: "out of memory".to_string(),
-                    }
-                })?;
-                Ok(Value::string(s))
-            }
-            None => Ok(Value::undefined()),
+        if wrote {
+            let s = JsString::from_str(&buffer, self.gc_heap_mut()).map_err(|_| {
+                VmError::TypeError {
+                    message: "out of memory".to_string(),
+                }
+            })?;
+            Ok(Value::string(s))
+        } else {
+            Ok(Value::undefined())
         }
     }
 
@@ -250,13 +255,19 @@ impl Interpreter {
     }
 
     /// §25.5.2.2 SerializeJSONProperty(key, holder).
-    fn serialize_json_property(
+    /// SerializeJSONProperty, appending the rendered text directly into
+    /// `out` and returning whether anything was written (`false` =
+    /// undefined / function / symbol, i.e. the property is omitted). The
+    /// single shared `out` buffer replaces the previous per-node `String`
+    /// allocation + parent-level `join`, which dominated `JSON.stringify`.
+    fn serialize_json_property_into(
         &mut self,
         context: &ExecutionContext,
         state: &mut JsonState,
         key: &str,
         holder: Value,
-    ) -> Result<Option<String>, VmError> {
+        out: &mut String,
+    ) -> Result<bool, VmError> {
         // step 1 — value = ? Get(holder, key).
         // `holder` and the evolving `value` are parked on the scratch
         // root stack so the JS-string allocations below (key arguments,
@@ -268,8 +279,14 @@ impl Interpreter {
             self.get_property_value_for_call(context, self.json_root_get(holder_root), key)?;
         let value_root = self.json_root_push(value0);
 
-        let rendered =
-            self.serialize_json_property_rooted(context, state, key, holder_root, value_root);
+        let rendered = self.serialize_json_property_rooted_into(
+            context,
+            state,
+            key,
+            holder_root,
+            value_root,
+            out,
+        );
         // Restore the strict-stack invariant regardless of outcome.
         self.json_root_pop_to(holder_root);
         rendered
@@ -280,14 +297,15 @@ impl Interpreter {
     /// stack. Reads both back through their slots after every call that
     /// can allocate, so a mid-serialization scavenge never strands a
     /// stale copy.
-    fn serialize_json_property_rooted(
+    fn serialize_json_property_rooted_into(
         &mut self,
         context: &ExecutionContext,
         state: &mut JsonState,
         key: &str,
         holder_root: usize,
         value_root: usize,
-    ) -> Result<Option<String>, VmError> {
+        out: &mut String,
+    ) -> Result<bool, VmError> {
         // step 2 — invoke `toJSON` when present and callable.
         let value = self.json_root_get(value_root);
         if value.is_object_type() || value.is_big_int() {
@@ -356,22 +374,27 @@ impl Interpreter {
         {
             let raw = self.get_property_value_for_call(context, value, "rawJSON")?;
             if let Some(s) = raw.as_string(self.gc_heap()) {
-                return Ok(Some(s.to_lossy_string(self.gc_heap())));
+                out.push_str(&s.to_lossy_string(self.gc_heap()));
+                return Ok(true);
             }
         }
 
         // steps 5–12 — render by type.
         if value.is_null() {
-            return Ok(Some("null".to_string()));
+            out.push_str("null");
+            return Ok(true);
         }
         if let Some(b) = value.as_boolean() {
-            return Ok(Some(if b { "true" } else { "false" }.to_string()));
+            out.push_str(if b { "true" } else { "false" });
+            return Ok(true);
         }
         if let Some(s) = value.as_string(self.gc_heap()) {
-            return Ok(Some(quote_json_string(s, self.gc_heap())));
+            quote_json_string_into(s, self.gc_heap(), out);
+            return Ok(true);
         }
         if let Some(n) = value.as_number() {
-            return Ok(Some(render_number(n)));
+            out.push_str(&render_number(n));
+            return Ok(true);
         }
         if value.is_big_int() {
             return Err(VmError::TypeError {
@@ -381,21 +404,24 @@ impl Interpreter {
         // step 11 — Object that is not callable.
         if value.is_object_type() && !value.is_callable() {
             if self.json_is_array(&value)? {
-                return Ok(Some(self.serialize_json_array(context, state, value)?));
+                self.serialize_json_array_into(context, state, value, out)?;
+            } else {
+                self.serialize_json_object_into(context, state, value, out)?;
             }
-            return Ok(Some(self.serialize_json_object(context, state, value)?));
+            return Ok(true);
         }
         // undefined / function / symbol → omitted.
-        Ok(None)
+        Ok(false)
     }
 
-    /// §25.5.2.4 SerializeJSONObject(value).
-    fn serialize_json_object(
+    /// §25.5.2.4 SerializeJSONObject(value), appending into `out`.
+    fn serialize_json_object_into(
         &mut self,
         context: &ExecutionContext,
         state: &mut JsonState,
         value: Value,
-    ) -> Result<String, VmError> {
+        out: &mut String,
+    ) -> Result<(), VmError> {
         self.json_enter(state, &value)?;
         // Park the container: `json_enumerable_string_keys` mints a
         // `JsString` per key and each property may recurse, so a
@@ -413,34 +439,52 @@ impl Interpreter {
         let stepback = state.indent.clone();
         state.indent.push_str(&state.gap);
 
-        let mut members: Vec<String> = Vec::new();
+        out.push('{');
+        let mut any = false;
         for key in &keys {
             let holder = self.json_root_get(value_root);
-            if let Some(serialized) = self.serialize_json_property(context, state, key, holder)? {
-                let mut member = quote_json_string_str(key);
-                member.push(':');
-                if !state.gap.is_empty() {
-                    member.push(' ');
-                }
-                member.push_str(&serialized);
-                members.push(member);
+            // Tentatively write this member's separator + key prefix, then
+            // its value; if the property is omitted, rewind `out` to undo
+            // the prefix so no stray comma/key survives.
+            let mark = out.len();
+            if any {
+                out.push(',');
+            }
+            if !state.gap.is_empty() {
+                out.push('\n');
+                out.push_str(&state.indent);
+            }
+            quote_json_string_str_into(key, out);
+            out.push(':');
+            if !state.gap.is_empty() {
+                out.push(' ');
+            }
+            if self.serialize_json_property_into(context, state, key, holder, out)? {
+                any = true;
+            } else {
+                out.truncate(mark);
             }
         }
+        if any && !state.gap.is_empty() {
+            out.push('\n');
+            out.push_str(&stepback);
+        }
+        out.push('}');
 
-        let result = wrap_members(&members, '{', '}', &state.gap, &state.indent, &stepback);
         state.indent = stepback;
         self.json_root_pop_to(value_root);
         self.json_leave(state);
-        Ok(result)
+        Ok(())
     }
 
-    /// §25.5.2.5 SerializeJSONArray(value).
-    fn serialize_json_array(
+    /// §25.5.2.5 SerializeJSONArray(value), appending into `out`.
+    fn serialize_json_array_into(
         &mut self,
         context: &ExecutionContext,
         state: &mut JsonState,
         value: Value,
-    ) -> Result<String, VmError> {
+        out: &mut String,
+    ) -> Result<(), VmError> {
         self.json_enter(state, &value)?;
         // Park the container so per-index recursion (which allocates
         // index-key strings and may scavenge) can't strand a stale copy.
@@ -453,21 +497,32 @@ impl Interpreter {
         let stepback = state.indent.clone();
         state.indent.push_str(&state.gap);
 
-        let mut parts: Vec<String> = Vec::with_capacity(len.min(1024));
+        out.push('[');
         for index in 0..len {
+            if index > 0 {
+                out.push(',');
+            }
+            if !state.gap.is_empty() {
+                out.push('\n');
+                out.push_str(&state.indent);
+            }
             let key = index.to_string();
             let holder = self.json_root_get(value_root);
-            match self.serialize_json_property(context, state, &key, holder)? {
-                Some(s) => parts.push(s),
-                None => parts.push("null".to_string()),
+            // §25.5.2.5 — an omitted element serialises as `null`.
+            if !self.serialize_json_property_into(context, state, &key, holder, out)? {
+                out.push_str("null");
             }
         }
+        if len > 0 && !state.gap.is_empty() {
+            out.push('\n');
+            out.push_str(&stepback);
+        }
+        out.push(']');
 
-        let result = wrap_members(&parts, '[', ']', &state.gap, &state.indent, &stepback);
         state.indent = stepback;
         self.json_root_pop_to(value_root);
         self.json_leave(state);
-        Ok(result)
+        Ok(())
     }
 
     /// Push `value`'s identity onto the cycle stack, rejecting
@@ -725,21 +780,21 @@ impl Interpreter {
 
 /// §25.5.2.3 QuoteJSONString over UTF-16 code units so lone
 /// surrogates are escaped as `\uXXXX` (well-formed `JSON.stringify`).
-fn quote_json_string(s: JsString, heap: &otter_gc::GcHeap) -> String {
+fn quote_json_string_into(s: JsString, heap: &otter_gc::GcHeap, out: &mut String) {
     let units = s.to_utf16_vec(heap);
-    quote_units(&units)
+    quote_units_into(&units, out);
 }
 
 /// QuoteJSONString for a Rust `&str` member name (object keys are
 /// always well-formed UTF-8, so a code-unit round trip is moot).
-fn quote_json_string_str(s: &str) -> String {
+fn quote_json_string_str_into(s: &str, out: &mut String) {
     let units: Vec<u16> = s.encode_utf16().collect();
-    quote_units(&units)
+    quote_units_into(&units, out);
 }
 
-fn quote_units(units: &[u16]) -> String {
+fn quote_units_into(units: &[u16], out: &mut String) {
     use std::fmt::Write as _;
-    let mut out = String::with_capacity(units.len() + 2);
+    out.reserve(units.len() + 2);
     out.push('"');
     let mut i = 0;
     while i < units.len() {
@@ -780,7 +835,6 @@ fn quote_units(units: &[u16]) -> String {
         i += 1;
     }
     out.push('"');
-    out
 }
 
 /// ToString(Number) with the §25.5.2.2 non-finite → `null` rule.
@@ -799,36 +853,4 @@ fn render_number(n: NumberValue) -> String {
 /// `Infinity`/`NaN` simply ToString as themselves there).
 fn render_number_key(n: NumberValue) -> String {
     n.to_display_string()
-}
-
-/// Join serialized members with the gap-aware bracketing shared by
-/// SerializeJSONObject / SerializeJSONArray.
-fn wrap_members(
-    members: &[String],
-    open: char,
-    close: char,
-    gap: &str,
-    indent: &str,
-    stepback: &str,
-) -> String {
-    if members.is_empty() {
-        return format!("{open}{close}");
-    }
-    if gap.is_empty() {
-        let mut out = String::new();
-        out.push(open);
-        out.push_str(&members.join(","));
-        out.push(close);
-        return out;
-    }
-    let separator = format!(",\n{indent}");
-    let mut out = String::new();
-    out.push(open);
-    out.push('\n');
-    out.push_str(indent);
-    out.push_str(&members.join(&separator));
-    out.push('\n');
-    out.push_str(stepback);
-    out.push(close);
-    out
 }

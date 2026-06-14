@@ -175,7 +175,7 @@ pub use error_classes::{ErrorClassRegistry, ErrorKind};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
     JitCompileError, JitCompileRequest, JitCompileStatus, JitCompilerHook, JitExecOutcome,
-    JitFunctionCode, JitFunctionView, JitInstrView,
+    JitFrameStack, JitFunctionCode, JitFunctionView, JitInstrView, JitReentryPtrs,
 };
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,
@@ -1191,16 +1191,97 @@ impl Interpreter {
             return Ok(None); // known-unsupported: interpret.
         };
 
-        // Run on a scratch copy of the register window so a mid-body guard bail
-        // leaves the real frame pristine for the interpreter fallback.
-        let mut scratch: SmallVec<[Value; 8]> = stack[top_idx].registers.clone();
-        match code.run_entry(&mut scratch) {
+        // Run on the real frame's register window (kept rooted on `stack`) so a
+        // closure allocation or recursive call inside the body is GC-safe.
+        // SAFETY: the raw pointers are formed from this method's own live
+        // borrows (`self`, `stack`, `context`) and are valid for the duration
+        // of `run_entry`; the JIT does not retain them, and we do not touch
+        // those borrows again until `run_entry` returns.
+        let ptrs = jit::JitReentryPtrs {
+            vm: <*mut Interpreter>::cast(self),
+            stack: <*mut jit::JitFrameStack>::cast(stack),
+            context: <*const ExecutionContext>::cast(context),
+            frame_index: top_idx,
+        };
+        match code.run_entry(ptrs) {
             jit::JitExecOutcome::Bailed => Ok(None),
             jit::JitExecOutcome::Returned(value) => {
                 let popped = self.return_running_finally(stack, value)?;
                 Ok(Some(popped))
             }
+            jit::JitExecOutcome::Threw(err) => Err(err),
         }
+    }
+
+    /// JIT bridge — perform a `Call` from compiled code. Reads the callee and
+    /// argument Values from frame `frame_index`'s register window, runs the
+    /// callee synchronously (which may itself tier up), and writes the
+    /// completion into register `dst`. Safe: all raw-pointer handling stays in
+    /// the JIT crate; this side sees only ordinary references.
+    ///
+    /// # Errors
+    /// Propagates any error the callee raises, and `InvalidOperand` for an
+    /// out-of-range frame or register index.
+    pub fn jit_runtime_call(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut jit::JitFrameStack,
+        frame_index: usize,
+        dst: u16,
+        callee_reg: u16,
+        arg_regs: &[u16],
+    ) -> Result<(), VmError> {
+        let frame = stack.get(frame_index).ok_or(VmError::InvalidOperand)?;
+        let callee = *frame
+            .registers
+            .get(callee_reg as usize)
+            .ok_or(VmError::InvalidOperand)?;
+        let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(arg_regs.len());
+        for &r in arg_regs {
+            args.push(
+                *frame
+                    .registers
+                    .get(r as usize)
+                    .ok_or(VmError::InvalidOperand)?,
+            );
+        }
+        let result = self.run_callable_sync(context, &callee, Value::undefined(), args)?;
+        let frame = stack.get_mut(frame_index).ok_or(VmError::InvalidOperand)?;
+        *frame
+            .registers
+            .get_mut(dst as usize)
+            .ok_or(VmError::InvalidOperand)? = result;
+        Ok(())
+    }
+
+    /// JIT bridge — build the closure for a `MakeFunction` from compiled code,
+    /// writing it into register `dst` of frame `frame_index` (self-reference
+    /// capture and upvalue binding go through the normal interpreter path).
+    ///
+    /// # Errors
+    /// Propagates closure-construction errors and `InvalidOperand` for an
+    /// out-of-range frame index.
+    pub fn jit_runtime_make_function(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut jit::JitFrameStack,
+        frame_index: usize,
+        dst: u16,
+        idx: u32,
+    ) -> Result<(), VmError> {
+        // `self` and `stack` are disjoint, so the two `&mut` are non-aliasing.
+        let frame = stack.get_mut(frame_index).ok_or(VmError::InvalidOperand)?;
+        self.run_make_function_reg(context, frame, dst, idx)
+    }
+
+    /// JIT bridge — base pointer of frame `frame_index`'s register window, for
+    /// the compiled entry to address registers. The window is rooted on
+    /// `stack`, so the pointer is stable for the compiled call's duration
+    /// (recursive calls run on a separate internal stack and never grow this
+    /// one).
+    #[must_use]
+    pub fn jit_frame_regs_ptr(stack: &mut jit::JitFrameStack, frame_index: usize) -> *mut u64 {
+        stack[frame_index].registers.as_mut_ptr().cast::<u64>()
     }
 
     /// Build a compile request for `fid` and run the installed hook. Returns the

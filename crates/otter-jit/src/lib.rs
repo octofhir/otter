@@ -34,7 +34,7 @@
 mod baseline;
 mod code;
 
-pub use baseline::{BaselineCode, BaselineExit, JitEntry, Unsupported, compile};
+pub use baseline::{BaselineCode, Unsupported, compile};
 pub use code::CompiledCode;
 
 /// Baseline JIT compiler implementation wired into `otter-vm` through the

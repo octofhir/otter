@@ -1,52 +1,44 @@
-//! Sparkplug-style baseline emitter (arm64): the integer register-machine core.
+//! Sparkplug-style baseline emitter (arm64).
 //!
 //! Lowers a [`otter_vm::JitFunctionView`] to native arm64 with **no IR, no
 //! register allocation, and no deopt** — one linear pass, one emit routine per
 //! supported opcode, branch fixups via dynasm dynamic labels. Operands and
-//! results flow through the interpreter's own register window (a `*mut u64`
-//! handed in at call time *is* `Frame.registers.as_mut_ptr()`), so this tier
-//! reuses the precise `FrameRoots` rooting the interpreter already provides and
-//! needs **no GC stack maps**.
+//! results flow through the executing frame's register window; compiled code
+//! re-enters the VM for `Call` and `MakeFunction` through safe bridge methods
+//! on [`otter_vm::Interpreter`].
 //!
-//! This module compiles the **allocation-free integer subset** that the hot
-//! loops of `fib`/`mandelbrot` are built from: tagged-int32 arithmetic with an
-//! inline int32 guard, int32 comparisons producing boolean Values, register
-//! moves (`LoadLocal`/`StoreLocal`), inline-immediate int loads, and
-//! intra-function branches. There are **no safepoints** in this subset (no
-//! allocation, no `Call`), so no value is ever live across a move — the GC
-//! cannot observe this code. `Call`, property ICs, allocation, and
-//! reload-after-safepoint land in the next Phase 1 step on top of this core.
+//! # ABI
+//! Compiled functions are `extern "C" fn(*mut JitCtx) -> JitRet`. The entry
+//! loads the register base from `ctx.regs` into a callee-saved register and
+//! addresses all locals off it. A normal `Return` yields `JitRet{value, status:
+//! 0}`; a failed typed guard yields `status: 1` (the VM re-runs on the
+//! interpreter); a re-entered VM call that threw yields `status: 2` with the
+//! error parked in `ctx.error`.
 //!
-//! # Contents
-//! - [`compile`] — compile one function view, or report why it is unsupported.
-//! - [`BaselineCode`] — the [`otter_vm::JitFunctionCode`] handle wrapping the
-//!   finalized machine code.
-//! - [`JitEntry`] / [`BaselineExit`] — the C ABI of compiled code.
+//! # GC contract
+//! The register window stays rooted on the VM frame stack for the whole call
+//! (recursive calls run on a *separate* internal stack and never grow this one,
+//! so the register base is stable). Every op reads operands from and writes
+//! results to that rooted array — no JS value is ever live in a machine
+//! register across a `Call`/`MakeFunction` safepoint — so this tier needs **no
+//! GC stack maps**, matching the interpreter's precise `FrameRoots` rooting.
 //!
 //! # Invariants
-//! - **Whole-function opt-in.** Any opcode or operand shape outside the
-//!   supported subset aborts the whole compile with [`Unsupported`]; the VM then
-//!   silently runs the interpreter. Compiled code never executes a partial
-//!   function.
-//! - **No safepoints in this subset.** Every emitted op reads operands from and
-//!   writes results to the caller-owned register array and never allocates or
-//!   calls, so there is no point at which a live value sits in a machine
-//!   register across a GC move. The register array stays the single source of
-//!   truth, exactly as the interpreter frame does.
-//! - **Guard failure = bail, not deopt.** A typed fast-path guard that fails
-//!   (non-int32 operand, int32 overflow, non-boolean branch condition) sets the
-//!   ABI bail flag and returns; the caller re-runs the function on the
-//!   interpreter. Because every guard in this subset fires *before* its result
-//!   is stored, a bailed register array is never left partially mutated by the
-//!   failing op. (The optimizing direction — fall through to the shared runtime
-//!   arith slow path instead of bailing — arrives with the call ABI.)
+//! - **Whole-function opt-in.** Any opcode/operand shape outside the supported
+//!   subset aborts the compile with [`Unsupported`]; the VM runs the
+//!   interpreter. Compiled code never executes a partial function.
+//! - **Guard failure = bail, not deopt.** Non-int32 operands / int32 overflow /
+//!   non-boolean branch conditions set `status: 1` and return. Bailing re-runs
+//!   the whole function on the interpreter.
 //!
 //! # See also
 //! - `JIT_DESIGN.md` §3.2 (backend), §3.5 (GC contract), §4 Phase 1.
-//! - [`crate::CompiledCode`] — the executable-memory owner this wraps.
 
 use otter_bytecode::{Op, Operand};
-use otter_vm::{JitExecOutcome, JitFunctionCode, JitFunctionView, Value};
+use otter_vm::{
+    ExecutionContext, Interpreter, JitExecOutcome, JitFrameStack, JitFunctionCode, JitFunctionView,
+    JitReentryPtrs, Value, VmError,
+};
 
 use crate::CompiledCode;
 
@@ -58,31 +50,103 @@ const TAG_SPECIAL: u64 = 0x7FFA;
 const SPECIAL_FALSE: u32 = 3;
 /// `SPECIAL` payload for `true`.
 const SPECIAL_TRUE: u32 = 4;
+/// Largest argument count the `Call` emitter inlines (args passed in registers
+/// to the call stub). Functions called with more args fall back.
+const MAX_INLINE_ARGS: usize = 4;
 
-/// C ABI of compiled baseline code.
-///
-/// `regs` points at the function's register window (`Frame.registers`, a
-/// contiguous run of [`u64`] NaN-boxed Values). The compiled body reads and
-/// writes that array in place. On a normal `Return` it writes `0` through
-/// `bailed` and returns the boxed completion Value; on a guard failure it
-/// writes `1` through `bailed` and returns `0` (the caller must then run the
-/// interpreter). `bailed` is written exactly once per call.
-pub type JitEntry = extern "C" fn(regs: *mut u64, bailed: *mut u32) -> u64;
+/// Re-entry context handed to compiled code. Only `regs` (offset 0) is read by
+/// the machine code; the rest is used by the Rust call/make-function stubs.
+#[repr(C)]
+pub struct JitCtx {
+    /// Base of the executing frame's register window (`*mut u64` over Values).
+    regs: *mut u64,
+    /// Erased back-pointer to the owning interpreter.
+    vm: *mut Interpreter,
+    /// The VM frame stack the executing frame lives on.
+    stack: *mut JitFrameStack,
+    /// Execution context for bridge calls.
+    context: *const ExecutionContext,
+    /// Index of the executing frame within `stack`.
+    frame_index: usize,
+    /// Error parked by a bridge stub when a re-entered call threw.
+    error: Option<VmError>,
+}
 
-/// Outcome of running compiled baseline code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BaselineExit {
-    /// `Return` reached; carries the boxed completion Value.
-    Returned(u64),
-    /// A typed guard failed; the caller must re-run on the interpreter.
-    Bailed,
+/// Two-word return of compiled code (`x0`/`x1` on arm64).
+#[repr(C)]
+struct JitRet {
+    value: u64,
+    status: u64,
+}
+
+/// `status` discriminants in [`JitRet`].
+const STATUS_RETURNED: u64 = 0;
+const STATUS_BAILED: u64 = 1;
+const STATUS_THREW: u64 = 2;
+
+/// Compiled-code entry signature.
+type JitEntry = extern "C" fn(*mut JitCtx) -> JitRet;
+
+/// Bridge stub: perform a `Call` from compiled code. Reconstructs VM references
+/// from the context and delegates to the safe [`Interpreter::jit_runtime_call`].
+/// Returns `0` on success, `1` when the call threw (error parked in `ctx`).
+extern "C" fn jit_call_stub(
+    ctx: *mut JitCtx,
+    dst: u64,
+    callee: u64,
+    argc: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+) -> u64 {
+    // SAFETY: `ctx` is the live context passed by `run_entry`; its `vm`/`stack`/
+    // `context` pointers are valid for this call and non-aliased (the VM froze
+    // its own borrows for the call's duration).
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    let all = [a0 as u16, a1 as u16, a2 as u16, a3 as u16];
+    let argc = (argc as usize).min(MAX_INLINE_ARGS);
+    match vm.jit_runtime_call(
+        context,
+        stack,
+        ctx.frame_index,
+        dst as u16,
+        callee as u16,
+        &all[..argc],
+    ) {
+        Ok(()) => 0,
+        Err(err) => {
+            ctx.error = Some(err);
+            1
+        }
+    }
+}
+
+/// Bridge stub: build a `MakeFunction` closure from compiled code. Returns `0`
+/// on success, `1` when construction threw (error parked in `ctx`).
+extern "C" fn jit_make_fn_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
+    // SAFETY: see `jit_call_stub`.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    match vm.jit_runtime_make_function(context, stack, ctx.frame_index, dst as u16, idx as u32) {
+        Ok(()) => 0,
+        Err(err) => {
+            ctx.error = Some(err);
+            1
+        }
+    }
 }
 
 /// Why a function could not be baseline-compiled. Always maps to a silent
 /// interpreter fallback; never a JS-visible error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unsupported {
-    /// An opcode outside the supported integer subset.
+    /// An opcode outside the supported subset.
     Opcode(Op),
     /// An operand whose kind/shape the emitter does not handle here.
     OperandShape(&'static str),
@@ -90,6 +154,8 @@ pub enum Unsupported {
     BranchTarget(i64),
     /// A register index whose byte offset exceeds the inline load/store range.
     RegisterRange(u16),
+    /// A `Call` with more arguments than the emitter inlines.
+    ArgCount(usize),
 }
 
 /// Finalized baseline machine code for one function.
@@ -110,51 +176,25 @@ impl JitFunctionCode for BaselineCode {
         self.code.len()
     }
 
-    fn run_entry(&self, registers: &mut [Value]) -> JitExecOutcome {
-        // `Value` is `#[repr(transparent)] u64`, so the register window is a
-        // run of `u64` NaN-boxed Values the compiled code reads/writes by
-        // index. SAFETY: the slice is valid and writable for the call; the
-        // compiled code only touches slots < the function's register_count,
-        // which the caller sized the window to.
-        let outcome = unsafe { self.run(registers.as_mut_ptr().cast::<u64>()) };
-        match outcome {
-            BaselineExit::Returned(bits) => JitExecOutcome::Returned(Value::from_bits(bits)),
-            BaselineExit::Bailed => JitExecOutcome::Bailed,
-        }
-    }
-}
-
-impl BaselineCode {
-    /// Raw entry pointer for direct invocation by in-crate execution tests.
-    ///
-    /// # Safety
-    /// The caller transmutes this to [`JitEntry`] and must pass a `regs`
-    /// pointer to a register array at least as large as the function's
-    /// `register_count`, and a valid `bailed` out-pointer. The code must only
-    /// be called while `self` is alive.
-    #[must_use]
-    pub unsafe fn entry(&self) -> *const u8 {
-        // SAFETY: forwarding the documented contract to the owner.
-        unsafe { self.code.entry_ptr() }
-    }
-
-    /// Run the compiled code over `regs`, returning a structured exit.
-    ///
-    /// # Safety
-    /// `regs` must point at a writable register array with at least the
-    /// function's `register_count` `u64` slots.
-    #[must_use]
-    pub unsafe fn run(&self, regs: *mut u64) -> BaselineExit {
-        let mut bailed: u32 = 0;
-        // SAFETY: `entry` is the function start of this live mapping; the ABI is
-        // `JitEntry` by construction (see `emit_*`). `regs`/`&mut bailed` meet
-        // the documented contract.
-        let f: JitEntry = unsafe { std::mem::transmute(self.entry()) };
-        let ret = f(regs, &mut bailed);
-        if bailed == 0 {
-            BaselineExit::Returned(ret)
-        } else {
-            BaselineExit::Bailed
+    fn run_entry(&self, ptrs: JitReentryPtrs) -> JitExecOutcome {
+        let stack = ptrs.stack.cast::<JitFrameStack>();
+        // SAFETY: `ptrs.stack` is a valid `*mut JitFrameStack` for this call.
+        let regs = Interpreter::jit_frame_regs_ptr(unsafe { &mut *stack }, ptrs.frame_index);
+        let mut ctx = JitCtx {
+            regs,
+            vm: ptrs.vm.cast::<Interpreter>(),
+            stack,
+            context: ptrs.context.cast::<ExecutionContext>(),
+            frame_index: ptrs.frame_index,
+            error: None,
+        };
+        // SAFETY: the mapping is live and was emitted with the `JitEntry` ABI.
+        let entry: JitEntry = unsafe { std::mem::transmute(self.code.entry_ptr()) };
+        let ret = entry(&mut ctx);
+        match ret.status {
+            STATUS_RETURNED => JitExecOutcome::Returned(Value::from_bits(ret.value)),
+            STATUS_BAILED => JitExecOutcome::Bailed,
+            _ => JitExecOutcome::Threw(ctx.error.take().unwrap_or(VmError::InvalidOperand)),
         }
     }
 }
@@ -174,8 +214,9 @@ fn reg_offset(idx: u16) -> Result<u32, Unsupported> {
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
     use super::{
-        BaselineCode, Op, Operand, SPECIAL_FALSE, SPECIAL_TRUE, TAG_INT32, TAG_SPECIAL,
-        Unsupported, reg_offset,
+        BaselineCode, MAX_INLINE_ARGS, Op, Operand, SPECIAL_FALSE, SPECIAL_TRUE, STATUS_BAILED,
+        STATUS_RETURNED, STATUS_THREW, TAG_INT32, TAG_SPECIAL, Unsupported, jit_call_stub,
+        jit_make_fn_stub, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -192,10 +233,8 @@ mod arm64 {
         Ne,
     }
 
-    /// Emit `Xt = boxed(low32(Xt), tag)`: OR the NaN-box tag into the top 16
-    /// bits. The producing op must have written `Xt` through its `W` view, which
-    /// on AArch64 already zeroes bits [63:32]; only the tag OR remains. `t` and
-    /// `scratch` are x-register numbers.
+    /// Emit `Xt |= tag << 48`. The producing op wrote `Xt` through its `W` view,
+    /// which on AArch64 already zeroes bits [63:32]; only the tag OR remains.
     macro_rules! box_low32 {
         ($ops:expr, $t:literal, $scratch:literal, $tag:expr) => {
             dynasm!($ops
@@ -219,9 +258,21 @@ mod arm64 {
         };
     }
 
+    /// Emit the function epilogue (restore callee-saved + frame, return). `x0`
+    /// (value) and `x1` (status) must already be set.
+    fn emit_epilogue(ops: &mut Assembler) {
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldp x19, x20, [sp, #16]
+            ; ldp x29, x30, [sp], #32
+            ; ret
+        );
+    }
+
     pub(super) fn compile(view: &JitFunctionView) -> Result<BaselineCode, Unsupported> {
         let mut ops = Assembler::new().expect("assembler alloc");
         let bail = ops.new_dynamic_label();
+        let threw = ops.new_dynamic_label();
 
         // A dynamic label per instruction byte-PC, so branches resolve to exact
         // instruction boundaries. BTreeMap keeps emission deterministic.
@@ -237,11 +288,17 @@ mod arm64 {
         };
 
         let entry = ops.offset();
-        // Prologue: clear the bail flag once; Return leaves it cleared.
-        dynasm!(ops ; .arch aarch64 ; str wzr, [x1]);
+        // Prologue: save fp/lr + callee-saved bases; x20 = ctx, x19 = regs base.
+        dynasm!(ops
+            ; .arch aarch64
+            ; stp x29, x30, [sp, #-32]!
+            ; stp x19, x20, [sp, #16]
+            ; mov x29, sp
+            ; mov x20, x0
+            ; ldr x19, [x20]
+        );
 
         for instr in &view.instructions {
-            // Place this instruction's branch-target label.
             dynasm!(ops ; .arch aarch64 ; =>labels[&instr.byte_pc]);
             let ops_ref = instr.operands.as_slice();
             match instr.op {
@@ -254,15 +311,13 @@ mod arm64 {
                 }
                 Op::LoadLocal => {
                     let dst = reg(ops_ref, 0)?;
-                    let idx = u16::try_from(imm32(ops_ref, 1)?)
-                        .map_err(|_| Unsupported::OperandShape("LoadLocal idx"))?;
+                    let idx = local_index(ops_ref, 1)?;
                     load_reg(&mut ops, 9, idx)?;
                     store_reg(&mut ops, 9, dst)?;
                 }
                 Op::StoreLocal => {
                     let src = reg(ops_ref, 0)?;
-                    let idx = u16::try_from(imm32(ops_ref, 1)?)
-                        .map_err(|_| Unsupported::OperandShape("StoreLocal idx"))?;
+                    let idx = local_index(ops_ref, 1)?;
                     load_reg(&mut ops, 9, src)?;
                     store_reg(&mut ops, 9, idx)?;
                 }
@@ -292,17 +347,24 @@ mod arm64 {
                 Op::GreaterEq => emit_cmp(&mut ops, ops_ref, bail, Cmp::Ge)?,
                 Op::Equal => emit_cmp(&mut ops, ops_ref, bail, Cmp::Eq)?,
                 Op::NotEqual => emit_cmp(&mut ops, ops_ref, bail, Cmp::Ne)?,
+                // `ToPrimitive`/`ToNumeric` are identity on a number; emit a
+                // guarded move (int32 → copy, else bail).
+                Op::ToPrimitive | Op::ToNumeric => {
+                    let dst = reg(ops_ref, 0)?;
+                    let src = reg(ops_ref, 1)?;
+                    load_reg(&mut ops, 9, src)?;
+                    guard_int32!(ops, 9, bail);
+                    store_reg(&mut ops, 9, dst)?;
+                }
                 Op::Jump => {
                     let rel = imm32(ops_ref, 0)?;
-                    let next = next_byte_pc(instr);
-                    let tgt = target_label(next + i64::from(rel))?;
+                    let tgt = target_label(branch_target(instr, rel))?;
                     dynasm!(ops ; .arch aarch64 ; b =>tgt);
                 }
                 Op::JumpIfFalse | Op::JumpIfTrue => {
                     let rel = imm32(ops_ref, 0)?;
                     let cond = reg(ops_ref, 1)?;
-                    let next = next_byte_pc(instr);
-                    let tgt = target_label(next + i64::from(rel))?;
+                    let tgt = target_label(branch_target(instr, rel))?;
                     load_reg(&mut ops, 9, cond)?;
                     // Only boolean conditions are supported in this subset.
                     dynasm!(ops
@@ -319,45 +381,103 @@ mod arm64 {
                         dynasm!(ops ; .arch aarch64 ; b.eq =>tgt);
                     }
                 }
-                // `ToPrimitive`/`ToNumeric` are identity on a number; emit a
-                // guarded move (int32 → copy, else bail). Non-number operands
-                // would run user-observable coercion, so bailing is correct.
-                Op::ToPrimitive | Op::ToNumeric => {
+                Op::MakeFunction => {
                     let dst = reg(ops_ref, 0)?;
-                    let src = reg(ops_ref, 1)?;
-                    load_reg(&mut ops, 9, src)?;
-                    guard_int32!(ops, 9, bail);
-                    store_reg(&mut ops, 9, dst)?;
+                    let idx = const_index(ops_ref, 1)?;
+                    // jit_make_fn_stub(ctx=x20, dst, idx) -> status in x0.
+                    dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
+                    emit_load_u64(&mut ops, 2, u64::from(idx));
+                    emit_call_stub(&mut ops, jit_make_fn_stub as *const () as usize, threw);
+                }
+                Op::Call => {
+                    emit_call(&mut ops, ops_ref, threw)?;
                 }
                 Op::Return | Op::ReturnValue => {
                     let src = reg(ops_ref, 0)?;
                     let off = reg_offset(src)?;
-                    // bail flag already cleared in the prologue.
-                    dynasm!(ops ; .arch aarch64 ; ldr x0, [x0, off] ; ret);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr x0, [x19, off]
+                        ; movz x1, STATUS_RETURNED as u32
+                    );
+                    emit_epilogue(&mut ops);
                 }
                 Op::ReturnUndefined => {
                     let undef = TAG_SPECIAL << 48; // SPECIAL_UNDEFINED == 0
                     emit_load_u64(&mut ops, 0, undef);
-                    dynasm!(ops ; .arch aarch64 ; ret);
+                    dynasm!(ops ; .arch aarch64 ; movz x1, STATUS_RETURNED as u32);
+                    emit_epilogue(&mut ops);
                 }
                 other => return Err(Unsupported::Opcode(other)),
             }
         }
 
-        // Shared bail epilogue: set *bailed = 1, return 0.
+        // Shared bail epilogue: status = 1, value = 0.
         dynasm!(ops
             ; .arch aarch64
             ; =>bail
-            ; movz w9, #1
-            ; str w9, [x1]
             ; movz x0, #0
-            ; ret
+            ; movz x1, STATUS_BAILED as u32
         );
+        emit_epilogue(&mut ops);
+        // Shared throw epilogue: status = 2 (error parked in ctx by the stub).
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>threw
+            ; movz x0, #0
+            ; movz x1, STATUS_THREW as u32
+        );
+        emit_epilogue(&mut ops);
 
         let buf = ops.finalize().expect("finalize");
         Ok(BaselineCode {
             code: CompiledCode::new(buf, entry),
         })
+    }
+
+    /// Emit `blr` to a Rust stub at `addr` and branch to `threw` on nonzero
+    /// status. The stub's argument registers (`x0`..) must already be set.
+    fn emit_call_stub(ops: &mut Assembler, addr: usize, threw: DynamicLabel) {
+        emit_load_u64(ops, 16, addr as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; cbnz x0, =>threw
+        );
+    }
+
+    /// Emit a `Call`: gather operands, set the stub ABI registers, call.
+    fn emit_call(
+        ops: &mut Assembler,
+        operands: &[Operand],
+        threw: DynamicLabel,
+    ) -> Result<(), Unsupported> {
+        let dst = reg(operands, 0)?;
+        let callee = reg(operands, 1)?;
+        let argc = const_index(operands, 2)? as usize;
+        if argc > MAX_INLINE_ARGS {
+            return Err(Unsupported::ArgCount(argc));
+        }
+        // jit_call_stub(ctx, dst, callee, argc, a0, a1, a2, a3) -> status.
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov x0, x20
+            ; movz x1, dst as u32
+            ; movz x2, callee as u32
+            ; movz x3, argc as u32
+        );
+        for slot in 0..MAX_INLINE_ARGS {
+            let areg = if slot < argc {
+                reg(operands, 3 + slot)?
+            } else {
+                0
+            };
+            // arg registers map to x4..x7.
+            let xn = 4 + slot as u32;
+            dynasm!(ops ; .arch aarch64 ; movz X(xn), areg as u32);
+        }
+        emit_call_stub(ops, jit_call_stub as *const () as usize, threw);
+        Ok(())
     }
 
     fn emit_cmp(
@@ -388,17 +508,17 @@ mod arm64 {
         Ok(())
     }
 
-    /// `ldr X(t), [x0, #idx*8]`.
+    /// `ldr X(t), [x19, #idx*8]`.
     fn load_reg(ops: &mut Assembler, t: u32, idx: u16) -> Result<(), Unsupported> {
         let off = reg_offset(idx)?;
-        dynasm!(ops ; .arch aarch64 ; ldr X(t), [x0, off]);
+        dynasm!(ops ; .arch aarch64 ; ldr X(t), [x19, off]);
         Ok(())
     }
 
-    /// `str X(t), [x0, #idx*8]`.
+    /// `str X(t), [x19, #idx*8]`.
     fn store_reg(ops: &mut Assembler, t: u32, idx: u16) -> Result<(), Unsupported> {
         let off = reg_offset(idx)?;
-        dynasm!(ops ; .arch aarch64 ; str X(t), [x0, off]);
+        dynasm!(ops ; .arch aarch64 ; str X(t), [x19, off]);
         Ok(())
     }
 
@@ -416,8 +536,11 @@ mod arm64 {
         }
     }
 
-    fn next_byte_pc(instr: &otter_vm::JitInstrView) -> i64 {
-        i64::from(instr.byte_pc) + i64::from(instr.byte_len)
+    /// Target byte-PC of a relative branch. The interpreter computes
+    /// `frame.pc + 1 + offset` (relative to the byte after the branch opcode,
+    /// `operand_decode::apply_branch`), so byte_len is irrelevant here.
+    fn branch_target(instr: &otter_vm::JitInstrView, rel: i32) -> i64 {
+        i64::from(instr.byte_pc) + 1 + i64::from(rel)
     }
 
     fn reg(operands: &[Operand], i: usize) -> Result<u16, Unsupported> {
@@ -434,15 +557,25 @@ mod arm64 {
         }
     }
 
+    /// A local index encoded as an inline immediate (`LoadLocal`/`StoreLocal`).
+    fn local_index(operands: &[Operand], i: usize) -> Result<u16, Unsupported> {
+        u16::try_from(imm32(operands, i)?).map_err(|_| Unsupported::OperandShape("local index"))
+    }
+
+    /// A constant-pool index operand (`MakeFunction` body id, `Call` argc).
+    fn const_index(operands: &[Operand], i: usize) -> Result<u32, Unsupported> {
+        match operands.get(i) {
+            Some(Operand::ConstIndex(n)) => Ok(*n),
+            _ => Err(Unsupported::OperandShape("expected const index")),
+        }
+    }
+
     fn reg3(operands: &[Operand]) -> Result<(u16, u16, u16), Unsupported> {
         Ok((reg(operands, 0)?, reg(operands, 1)?, reg(operands, 2)?))
     }
 }
 
 /// Compile a function view to baseline arm64 code, or report why not.
-///
-/// On non-arm64 hosts this always reports [`Unsupported::Opcode`] for the first
-/// instruction (no emitter yet); the x86_64 emitter follows arm64.
 #[cfg(target_arch = "aarch64")]
 pub fn compile(view: &JitFunctionView) -> Result<BaselineCode, Unsupported> {
     arm64::compile(view)
@@ -457,16 +590,22 @@ pub fn compile(view: &JitFunctionView) -> Result<BaselineCode, Unsupported> {
 
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
-    //! Execution tests: build a [`JitFunctionView`] by hand, compile it, run the
-    //! native code over a register array, and check results against the tagged
-    //! Value layout. Fixed 4-byte instruction stride keeps branch byte-deltas
-    //! easy to compute (`rel = (target_idx - next_idx) * 4`).
+    //! Execution tests for the call-free integer subset. They drive compiled
+    //! code through a `JitCtx` whose `vm`/`stack`/`context` are null — valid
+    //! because these functions never reach a `Call`/`MakeFunction` stub — and a
+    //! `regs` pointer at a local register array. Fixed 4-byte instruction stride
+    //! keeps branch byte-deltas trivial (`rel = (target - next) * 4`).
 
-    use super::{BaselineExit, SPECIAL_FALSE, TAG_INT32, TAG_SPECIAL, compile};
+    use super::{JitCtx, JitEntry, JitRet, STATUS_RETURNED, TAG_INT32, TAG_SPECIAL, compile};
     use otter_bytecode::{Op, Operand};
     use otter_vm::{JitFunctionView, JitInstrView};
 
     const STRIDE: u32 = 4;
+
+    enum Exit {
+        Returned(u64),
+        Bailed,
+    }
 
     fn box_i32(v: i32) -> u64 {
         (TAG_INT32 << 48) | u64::from(v as u32)
@@ -475,8 +614,6 @@ mod tests {
         bits as u32 as i32
     }
 
-    /// Build a view from `(op, operands)` pairs, assigning a uniform 4-byte
-    /// stride so each instruction's `byte_pc = idx * 4`.
     fn view(instrs: &[(Op, Vec<Operand>)]) -> JitFunctionView {
         let instructions = instrs
             .iter()
@@ -502,21 +639,41 @@ mod tests {
         }
     }
 
-    /// `rel` operand placing a branch from instruction `from` to instruction
-    /// `to` under the uniform stride.
+    // Branch encoding: target = branch_byte_pc + 1 + rel (see `branch_target`),
+    // with branch_byte_pc = from*STRIDE and target = to*STRIDE.
     fn rel(from: usize, to: usize) -> i32 {
-        (to as i32 - (from as i32 + 1)) * STRIDE as i32
+        (to as i32 - from as i32) * STRIDE as i32 - 1
     }
 
-    fn run(view: &JitFunctionView, regs: &mut [u64]) -> BaselineExit {
+    fn run(view: &JitFunctionView, regs: &mut [u64]) -> Exit {
         let code = compile(view).expect("compiles");
-        // SAFETY: `regs` has `register_count` slots; code outlives the call.
-        unsafe { code.run(regs.as_mut_ptr()) }
+        let mut ctx = JitCtx {
+            regs: regs.as_mut_ptr(),
+            vm: std::ptr::null_mut(),
+            stack: std::ptr::null_mut(),
+            context: std::ptr::null(),
+            frame_index: 0,
+            error: None,
+        };
+        // SAFETY: integer-only function; never dereferences the null vm/stack.
+        let entry: JitEntry = unsafe { std::mem::transmute(code.code.entry_ptr()) };
+        let JitRet { value, status } = entry(&mut ctx);
+        if status == STATUS_RETURNED {
+            Exit::Returned(value)
+        } else {
+            Exit::Bailed
+        }
+    }
+
+    fn expect_int(view: &JitFunctionView, regs: &mut [u64], expected: i32) {
+        match run(view, regs) {
+            Exit::Returned(bits) => assert_eq!(unbox_i32(bits), expected),
+            Exit::Bailed => panic!("expected Returned({expected}), got Bailed"),
+        }
     }
 
     #[test]
     fn add_two_ints() {
-        // r2 = r0 + r1; return r2
         let v = view(&[
             (
                 Op::Add,
@@ -526,18 +683,14 @@ mod tests {
                     Operand::Register(1),
                 ],
             ),
-            (Op::Return, vec![Operand::Register(2)]),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
         ]);
         let mut regs = [box_i32(10), box_i32(20), 0, 0, 0, 0, 0, 0];
-        match run(&v, &mut regs) {
-            BaselineExit::Returned(bits) => assert_eq!(unbox_i32(bits), 30),
-            other => panic!("expected Returned, got {other:?}"),
-        }
+        expect_int(&v, &mut regs, 30);
     }
 
     #[test]
     fn immediate_load_and_sub() {
-        // r0 = 100; r1 = 42; r2 = r0 - r1; return r2
         let v = view(&[
             (
                 Op::LoadInt32,
@@ -555,44 +708,28 @@ mod tests {
                     Operand::Register(1),
                 ],
             ),
-            (Op::Return, vec![Operand::Register(2)]),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
         ]);
         let mut regs = [0u64; 8];
-        match run(&v, &mut regs) {
-            BaselineExit::Returned(bits) => assert_eq!(unbox_i32(bits), 58),
-            other => panic!("expected Returned, got {other:?}"),
-        }
+        expect_int(&v, &mut regs, 58);
     }
 
     #[test]
     fn negative_immediate_roundtrips() {
-        // r0 = -7; return r0
         let v = view(&[
             (
                 Op::LoadInt32,
                 vec![Operand::Register(0), Operand::Imm32(-7)],
             ),
-            (Op::Return, vec![Operand::Register(0)]),
+            (Op::ReturnValue, vec![Operand::Register(0)]),
         ]);
         let mut regs = [0u64; 8];
-        match run(&v, &mut regs) {
-            BaselineExit::Returned(bits) => assert_eq!(unbox_i32(bits), -7),
-            other => panic!("expected Returned, got {other:?}"),
-        }
+        expect_int(&v, &mut regs, -7);
     }
 
     #[test]
     fn counted_loop_sums_one_to_n() {
-        // r0 = n (input); sum=r1, i=r2, one=r4, cond=r3
-        // 0: r1 = 0
-        // 1: r2 = 1
-        // 2: r4 = 1
-        // 3: r3 = (r2 <= r0)     ; loop header
-        // 4: if !r3 goto 8       ; exit
-        // 5: r1 = r1 + r2
-        // 6: r2 = r2 + r4
-        // 7: goto 3
-        // 8: return r1
+        // r0=n; sum=r1, i=r2, one=r4, cond=r3
         let v = view(&[
             (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(0)]),
             (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(1)]),
@@ -626,23 +763,16 @@ mod tests {
                 ],
             ),
             (Op::Jump, vec![Operand::Imm32(rel(7, 3))]),
-            (Op::Return, vec![Operand::Register(1)]),
+            (Op::ReturnValue, vec![Operand::Register(1)]),
         ]);
-
         for (n, expected) in [(0, 0), (1, 1), (5, 15), (10, 55), (100, 5050)] {
             let mut regs = [box_i32(n), 0, 0, 0, 0, 0, 0, 0];
-            match run(&v, &mut regs) {
-                BaselineExit::Returned(bits) => {
-                    assert_eq!(unbox_i32(bits), expected, "sum 1..={n}");
-                }
-                other => panic!("n={n}: expected Returned, got {other:?}"),
-            }
+            expect_int(&v, &mut regs, expected);
         }
     }
 
     #[test]
     fn less_than_produces_boolean() {
-        // r2 = (r0 < r1); return r2
         let v = view(&[
             (
                 Op::LessThan,
@@ -652,20 +782,18 @@ mod tests {
                     Operand::Register(1),
                 ],
             ),
-            (Op::Return, vec![Operand::Register(2)]),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
         ]);
-        let true_bits = (TAG_SPECIAL << 48) | u64::from(SPECIAL_FALSE + 1);
-        let false_bits = (TAG_SPECIAL << 48) | u64::from(SPECIAL_FALSE);
-
+        let true_bits = (TAG_SPECIAL << 48) | u64::from(super::SPECIAL_TRUE);
+        let false_bits = (TAG_SPECIAL << 48) | u64::from(super::SPECIAL_FALSE);
         let mut regs = [box_i32(3), box_i32(9), 0, 0, 0, 0, 0, 0];
-        assert_eq!(run(&v, &mut regs), BaselineExit::Returned(true_bits));
+        assert!(matches!(run(&v, &mut regs), Exit::Returned(b) if b == true_bits));
         let mut regs = [box_i32(9), box_i32(3), 0, 0, 0, 0, 0, 0];
-        assert_eq!(run(&v, &mut regs), BaselineExit::Returned(false_bits));
+        assert!(matches!(run(&v, &mut regs), Exit::Returned(b) if b == false_bits));
     }
 
     #[test]
     fn bails_on_non_int_operand() {
-        // r2 = r0 + r1; return r2 — but r1 holds a non-int (undefined-ish tag).
         let v = view(&[
             (
                 Op::Add,
@@ -675,22 +803,22 @@ mod tests {
                     Operand::Register(1),
                 ],
             ),
-            (Op::Return, vec![Operand::Register(2)]),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
         ]);
-        // r1 = a double (top tag below TAG_INT32) → int32 guard fails → bail.
         let mut regs = [box_i32(10), 0x3FF0_0000_0000_0000, 0, 0, 0, 0, 0, 0];
-        assert_eq!(run(&v, &mut regs), BaselineExit::Bailed);
+        assert!(matches!(run(&v, &mut regs), Exit::Bailed));
     }
 
     #[test]
-    fn unsupported_opcode_reports_not_bail() {
-        // A call op is outside the subset → whole-function Unsupported.
+    fn unsupported_call_arg_overflow_reports_err() {
+        // argc beyond MAX_INLINE_ARGS → Unsupported (not a compile success).
         let v = view(&[(
             Op::Call,
             vec![
                 Operand::Register(0),
                 Operand::Register(1),
-                Operand::Imm32(0),
+                Operand::ConstIndex(8),
+                Operand::Register(2),
             ],
         )]);
         assert!(compile(&v).is_err());

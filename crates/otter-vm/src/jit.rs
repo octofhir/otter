@@ -79,38 +79,70 @@ pub struct JitInstrView {
     pub operands: Vec<Operand>,
 }
 
+/// Frame stack the interpreter dispatches over. Exposed so the JIT crate can
+/// hold a `*mut JitFrameStack` in its reentry context and hand it back to the
+/// VM-side bridge methods without naming the `SmallVec` shape itself.
+pub type JitFrameStack = smallvec::SmallVec<[crate::Frame; 8]>;
+
+/// Raw, type-erased pointers the VM hands the JIT so compiled code can re-enter
+/// the VM (recursive calls, closure allocation) through the safe bridge methods
+/// ([`crate::Interpreter::jit_runtime_call`],
+/// [`crate::Interpreter::jit_runtime_make_function`]).
+///
+/// # Invariants
+/// - Pointers are valid only for the duration of one
+///   [`JitFunctionCode::run_entry`] call; the JIT must not retain them.
+/// - `vm`/`stack`/`context` are `*mut Interpreter` / `*mut JitFrameStack` /
+///   `*const ExecutionContext` erased to avoid a naming dependency in the trait.
+///   The JIT casts them back. The VM guarantees no live `&mut` aliases them for
+///   the call's duration (it forms them from its own borrows and does not touch
+///   those borrows until the call returns).
+#[derive(Clone, Copy)]
+pub struct JitReentryPtrs {
+    /// Erased `*mut Interpreter`.
+    pub vm: *mut std::ffi::c_void,
+    /// Erased `*mut JitFrameStack`.
+    pub stack: *mut std::ffi::c_void,
+    /// Erased `*const ExecutionContext`.
+    pub context: *const std::ffi::c_void,
+    /// Index of the executing (compiled) frame within `stack`.
+    pub frame_index: usize,
+}
+
 /// Outcome of executing compiled code for one function entry.
 ///
-/// The compiled body runs over a register window the VM owns and roots. It
-/// either runs to a `Return` (carrying the completion Value) or hits a typed
-/// guard it cannot honor and bails, in which case the VM must run the function
-/// on the interpreter instead — semantics are identical either way.
-#[derive(Debug, Clone, Copy)]
+/// The compiled body runs over the entry frame's register window — which the
+/// VM keeps rooted on its frame stack, so closure allocation and recursive
+/// calls inside the body are GC-safe. It either runs to a `Return` (carrying
+/// the completion Value), hits a typed guard it cannot honor and bails (the VM
+/// re-runs on the interpreter), or a re-entered VM call threw.
+#[derive(Debug)]
 pub enum JitExecOutcome {
     /// `Return`/`ReturnValue` reached; carries the completion Value.
     Returned(crate::Value),
     /// A typed guard failed; the VM must re-run this function on the
-    /// interpreter (the passed register window is left untouched on bail).
+    /// interpreter.
     Bailed,
+    /// A re-entered VM operation (recursive call) raised; propagate the error.
+    Threw(crate::run_control::VmError),
 }
 
 /// Type-erased compiled-code handle owned by the JIT implementation.
 ///
 /// The VM never transmutes or calls raw entry pointers directly: it hands the
-/// JIT a register window and receives a structured outcome, keeping executable
-/// memory ownership and the unsafe ABI call inside `otter-jit`.
+/// JIT the reentry pointers and receives a structured outcome, keeping
+/// executable memory ownership and the unsafe ABI call inside `otter-jit`.
 pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// Size in bytes of the finalized native code mapping.
     fn code_len(&self) -> usize;
 
-    /// Execute the compiled function over `registers` (the entry frame's
-    /// register window, params already in place).
+    /// Execute the compiled function for the frame at `ptrs.frame_index`.
     ///
-    /// The current baseline subset is allocation- and call-free, so the call
-    /// is a leaf with no safepoint: the window is read/written in place and no
-    /// value is ever live across a GC move. Callers that need bail-safety pass
-    /// a scratch copy of the window (a failed guard leaves it partly written).
-    fn run_entry(&self, registers: &mut [crate::Value]) -> JitExecOutcome;
+    /// Compiled code reads/writes that frame's register window in place and,
+    /// for `Call`/`MakeFunction`, re-enters the VM through the safe bridge
+    /// methods reached via `ptrs`. The window stays rooted on the VM frame
+    /// stack throughout, so allocation/calls in the body are GC-safe.
+    fn run_entry(&self, ptrs: JitReentryPtrs) -> JitExecOutcome;
 }
 
 /// Result of a JIT compile attempt.

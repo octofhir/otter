@@ -41,6 +41,14 @@ const RUNTIMES = [
     bin: otterBin(),
     argv: (f) => [otterBin(), ["run", f]],
     ts: true, // otter parses TS via oxc natively
+    env: { OTTER_JIT: "0" }, // interpreter only (baseline)
+  },
+  {
+    name: "otter-jit",
+    bin: otterBin(),
+    argv: (f) => [otterBin(), ["run", f]],
+    ts: true,
+    env: { OTTER_JIT: "1" }, // baseline JIT enabled
   },
   {
     name: "node",
@@ -116,9 +124,14 @@ if (!scripts.length) {
 }
 
 // ---- timing ---------------------------------------------------------------
-function timeOnce(bin, args) {
+function timeOnce(bin, args, env) {
   const t0 = process.hrtime.bigint();
-  const r = spawnSync(bin, args, { encoding: "utf8", stdio: ["ignore", "ignore", "pipe"], timeout });
+  const r = spawnSync(bin, args, {
+    encoding: "utf8",
+    stdio: ["ignore", "ignore", "pipe"],
+    timeout,
+    env: env ? { ...process.env, ...env } : process.env,
+  });
   const t1 = process.hrtime.bigint();
   if (r.signal === "SIGTERM") return { ok: false, ms: NaN, err: `timeout >${timeout}ms` };
   if (r.status !== 0 || r.error) {
@@ -130,12 +143,12 @@ function timeOnce(bin, args) {
 function measure(rt, file) {
   const [bin, args] = rt.argv(file);
   for (let i = 0; i < warmup; i++) {
-    const w = timeOnce(bin, args);
+    const w = timeOnce(bin, args, rt.env);
     if (!w.ok) return { ok: false, err: w.err };
   }
   const samples = [];
   for (let i = 0; i < runs; i++) {
-    const m = timeOnce(bin, args);
+    const m = timeOnce(bin, args, rt.env);
     if (!m.ok) return { ok: false, err: m.err };
     samples.push(m.ms);
   }

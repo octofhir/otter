@@ -9,7 +9,37 @@
 //! - [`super`] — expression dispatch and shared helpers.
 
 use crate::*;
-use oxc_ast::ast::{BinaryExpression, LogicalExpression, PrivateInExpression};
+use oxc_ast::ast::{BinaryExpression, Expression, LogicalExpression, PrivateInExpression};
+
+/// `true` when `expr` provably evaluates to a primitive, so the
+/// `ToPrimitive` step a binary-op lowering would emit ahead of it is
+/// redundant. Conservative — only AST shapes whose result is *always* a
+/// primitive (number / string / boolean / bigint / undefined / null) qualify.
+/// A primitive's `ToPrimitive` has no observable side effect (no `valueOf` /
+/// `toString` / `[Symbol.toPrimitive]` call), so eliding the op is
+/// behavior-preserving; it only removes redundant coercion instructions.
+fn expr_is_primitive(expr: &Expression<'_>) -> bool {
+    matches!(
+        expr,
+        // Literals that are primitives (object literals/regexp excluded).
+        Expression::NumericLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::BigIntLiteral(_)
+            // A template literal always coerces its parts to a String.
+            | Expression::TemplateLiteral(_)
+            // Every binary operator yields a primitive: arith/bitwise/shift →
+            // number|bigint, `+` → string|number, compare/equality/`in`/
+            // `instanceof` → boolean.
+            | Expression::BinaryExpression(_)
+            // typeof→string, void→undefined, `!`→boolean, `-`/`+`/`~`→number|
+            // bigint, delete→boolean.
+            | Expression::UnaryExpression(_)
+            // `++`/`--` → number|bigint.
+            | Expression::UpdateExpression(_)
+    )
+}
 
 pub(crate) fn compile_logical(
     cx: &mut Compiler,
@@ -111,6 +141,8 @@ pub(crate) fn compile_binary(
 ) -> Result<u16, CompileError> {
     let _ = span;
     let span = (b.span.start, b.span.end);
+    let lhs_prim = expr_is_primitive(&b.left);
+    let rhs_prim = expr_is_primitive(&b.right);
     let lhs = compile_expr(cx, &b.left, span)?;
     let rhs = compile_expr(cx, &b.right, span)?;
     let op = match b.operator {
@@ -163,8 +195,16 @@ pub(crate) fn compile_binary(
     // <https://tc39.es/ecma262/#sec-abstract-relational-comparison>
     let (lhs_in, rhs_in) = match op {
         Op::Add => {
-            let l = emit_to_primitive(cx, lhs, "default", span);
-            let r = emit_to_primitive(cx, rhs, "default", span);
+            let l = if lhs_prim {
+                lhs
+            } else {
+                emit_to_primitive(cx, lhs, "default", span)
+            };
+            let r = if rhs_prim {
+                rhs
+            } else {
+                emit_to_primitive(cx, rhs, "default", span)
+            };
             (l, r)
         }
         // §7.2.13 IsLooselyEqual — do NOT pre-coerce object
@@ -176,8 +216,16 @@ pub(crate) fn compile_binary(
         // operand types.
         Op::LooseEqual | Op::LooseNotEqual => (lhs, rhs),
         Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
-            let l = emit_to_primitive(cx, lhs, "number", span);
-            let r = emit_to_primitive(cx, rhs, "number", span);
+            let l = if lhs_prim {
+                lhs
+            } else {
+                emit_to_primitive(cx, lhs, "number", span)
+            };
+            let r = if rhs_prim {
+                rhs
+            } else {
+                emit_to_primitive(cx, rhs, "number", span)
+            };
             (l, r)
         }
         // §13.15.3 ApplyStringOrNumericBinaryOperator —
@@ -198,14 +246,22 @@ pub(crate) fn compile_binary(
         | Op::Ushr => {
             // §13.15.3 — ToNumeric(lhs) completes (throwing on a
             // Symbol) before the right operand's ToPrimitive runs.
-            let l = emit_to_primitive(cx, lhs, "number", span);
+            let l = if lhs_prim {
+                lhs
+            } else {
+                emit_to_primitive(cx, lhs, "number", span)
+            };
             let l_num = cx.alloc_scratch();
             cx.emit(
                 Op::ToNumeric,
                 [Operand::Register(l_num), Operand::Register(l)],
                 span,
             );
-            let r = emit_to_primitive(cx, rhs, "number", span);
+            let r = if rhs_prim {
+                rhs
+            } else {
+                emit_to_primitive(cx, rhs, "number", span)
+            };
             let r_num = cx.alloc_scratch();
             cx.emit(
                 Op::ToNumeric,

@@ -1390,17 +1390,21 @@ fn weak_set_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
 // ---------------------------------------------------------------
 
 fn receiver_map(ctx: &NativeCtx<'_>, name: &'static str) -> Result<crate::JsMap, NativeError> {
-    ctx.this_value().as_map().ok_or(NativeError::TypeError {
-        name,
-        reason: "this is not a Map".to_string(),
-    })
+    ctx.this_value()
+        .as_map()
+        .ok_or_else(|| NativeError::TypeError {
+            name,
+            reason: "this is not a Map".to_string(),
+        })
 }
 
 fn receiver_set(ctx: &NativeCtx<'_>, name: &'static str) -> Result<crate::JsSet, NativeError> {
-    ctx.this_value().as_set().ok_or(NativeError::TypeError {
-        name,
-        reason: "this is not a Set".to_string(),
-    })
+    ctx.this_value()
+        .as_set()
+        .ok_or_else(|| NativeError::TypeError {
+            name,
+            reason: "this is not a Set".to_string(),
+        })
 }
 
 fn receiver_weak_map(
@@ -1409,7 +1413,7 @@ fn receiver_weak_map(
 ) -> Result<crate::JsWeakMap, NativeError> {
     ctx.this_value()
         .as_weak_map()
-        .ok_or(NativeError::TypeError {
+        .ok_or_else(|| NativeError::TypeError {
             name,
             reason: "this is not a WeakMap".to_string(),
         })
@@ -1421,7 +1425,7 @@ fn receiver_weak_set(
 ) -> Result<crate::JsWeakSet, NativeError> {
     ctx.this_value()
         .as_weak_set()
-        .ok_or(NativeError::TypeError {
+        .ok_or_else(|| NativeError::TypeError {
             name,
             reason: "this is not a WeakSet".to_string(),
         })

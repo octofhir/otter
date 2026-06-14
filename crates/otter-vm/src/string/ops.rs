@@ -42,7 +42,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let recv_s = read_register(frame, recv)?
             .as_string(&self.gc_heap)
-            .ok_or(VmError::TypeMismatch)?;
+            .ok_or_else(|| VmError::TypeMismatch)?;
         let idx_v = read_register(frame, idx)?;
         let idx = if let Some(n) = idx_v.as_number() {
             match n.as_smi() {

@@ -222,7 +222,7 @@ fn coerce_math_args(
     for slot in out.iter_mut() {
         if needs_to_primitive_for_math(slot) {
             let (interp, exec) = ctx.interp_mut_and_context();
-            let exec = exec.ok_or(NativeError::TypeError {
+            let exec = exec.ok_or_else(|| NativeError::TypeError {
                 name: "Math",
                 reason: "missing execution context".to_string(),
             })?;
@@ -661,7 +661,7 @@ fn native_sum_precise(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 
     let items = args.first().copied().unwrap_or_else(Value::undefined);
     let (interp, exec) = ctx.interp_mut_and_context();
-    let exec = exec.ok_or(NativeError::TypeError {
+    let exec = exec.ok_or_else(|| NativeError::TypeError {
         name: "Math.sumPrecise",
         reason: "missing execution context".to_string(),
     })?;

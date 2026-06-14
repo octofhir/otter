@@ -1508,7 +1508,10 @@ where
     T: HostObjectData,
 {
     heap.read_payload(obj, |body| {
-        let data = body.host_data.as_ref().ok_or(HostObjectError::Missing)?;
+        let data = body
+            .host_data
+            .as_ref()
+            .ok_or_else(|| HostObjectError::Missing)?;
         data.downcast_ref::<T>()
             .map(f)
             .ok_or_else(|| HostObjectError::TypeMismatch {
@@ -1531,7 +1534,10 @@ where
     T: HostObjectData,
 {
     heap.with_payload(obj, |body| {
-        let data = body.host_data.as_mut().ok_or(HostObjectError::Missing)?;
+        let data = body
+            .host_data
+            .as_mut()
+            .ok_or_else(|| HostObjectError::Missing)?;
         let typed = data
             .downcast_mut::<T>()
             .ok_or_else(|| HostObjectError::TypeMismatch {

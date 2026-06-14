@@ -257,9 +257,10 @@ pub(crate) fn to_big_int_or_throw(
     }
     if let Some(s) = primitive.as_string(&interp.gc_heap) {
         let text = s.to_lossy_string(&interp.gc_heap);
-        let parsed = abstract_ops::string_to_big_int(&text).ok_or(VmError::SyntaxError {
-            message: format!("Cannot convert {text:?} to a BigInt"),
-        })?;
+        let parsed =
+            abstract_ops::string_to_big_int(&text).ok_or_else(|| VmError::SyntaxError {
+                message: format!("Cannot convert {text:?} to a BigInt"),
+            })?;
         return BigIntValue::from_inner(&mut interp.gc_heap, parsed).map_err(crate::oom_to_vm);
     }
     if primitive.is_number() {

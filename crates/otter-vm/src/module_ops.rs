@@ -54,7 +54,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let specifier = context
             .string_constant_str(spec_idx)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or_else(|| VmError::InvalidOperand)?;
         let referrer: String = context
             .exec_function(frame.function_id)
             .map(|f| f.module_url.as_ref().to_string())
@@ -82,7 +82,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let specifier = context
             .string_constant_str(spec_idx)
-            .ok_or(VmError::InvalidOperand)?
+            .ok_or_else(|| VmError::InvalidOperand)?
             .to_string();
         let referrer: String = context
             .exec_function(frame.function_id)
@@ -114,11 +114,11 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let url = context
             .string_constant_str(url_idx)
-            .ok_or(VmError::InvalidOperand)?
+            .ok_or_else(|| VmError::InvalidOperand)?
             .to_string();
         let name = context
             .string_constant_str(name_idx)
-            .ok_or(VmError::InvalidOperand)?
+            .ok_or_else(|| VmError::InvalidOperand)?
             .to_string();
         let value = self
             .resolve_module_binding(&url, &name)
@@ -145,7 +145,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let specifier = context
             .string_constant_str(spec_idx)
-            .ok_or(VmError::InvalidOperand)?
+            .ok_or_else(|| VmError::InvalidOperand)?
             .to_string();
         let referrer: String = context
             .exec_function(frame.function_id)
@@ -178,7 +178,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let url = context
             .string_constant_str(url_idx)
-            .ok_or(VmError::InvalidOperand)?
+            .ok_or_else(|| VmError::InvalidOperand)?
             .to_string();
         let gate = self.evaluate_module(context, &url)?;
         let value = gate.map_or_else(Value::undefined, Value::promise);
@@ -1164,7 +1164,7 @@ impl Interpreter {
         let spec_value = *read_register(frame, spec_reg)?;
         let specifier = spec_value
             .as_string(&self.gc_heap)
-            .ok_or(VmError::TypeMismatch)?
+            .ok_or_else(|| VmError::TypeMismatch)?
             .to_lossy_string(&self.gc_heap);
         let referrer: Option<&str> = context
             .exec_function(frame.function_id)

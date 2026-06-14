@@ -99,7 +99,7 @@ fn string_raw(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     let context = ctx
         .execution_context()
         .cloned()
-        .ok_or(NativeError::TypeError {
+        .ok_or_else(|| NativeError::TypeError {
             name: "String.raw",
             reason: "no execution context available".to_string(),
         })?;
@@ -167,7 +167,7 @@ fn string_from_char_code(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
     let exec = ctx
         .execution_context()
         .cloned()
-        .ok_or(NativeError::TypeError {
+        .ok_or_else(|| NativeError::TypeError {
             name: "String.fromCharCode",
             reason: "no execution context available".to_string(),
         })?;
@@ -212,7 +212,7 @@ fn string_from_code_point(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
     let exec = ctx
         .execution_context()
         .cloned()
-        .ok_or(NativeError::TypeError {
+        .ok_or_else(|| NativeError::TypeError {
             name: "String.fromCodePoint",
             reason: "no execution context available".to_string(),
         })?;

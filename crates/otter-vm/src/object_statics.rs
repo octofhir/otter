@@ -1472,7 +1472,7 @@ pub fn call(
             if let Some(props_arg) = args.get(1)
                 && !props_arg.is_undefined()
             {
-                let props = props_arg.as_object().ok_or(VmError::TypeMismatch)?;
+                let props = props_arg.as_object().ok_or_else(|| VmError::TypeMismatch)?;
                 let entries: Vec<(String, Value)> =
                     crate::object::with_properties(props, gc_heap, |p| {
                         p.enumerable_data_iter()
@@ -1480,7 +1480,9 @@ pub fn call(
                             .collect()
                     });
                 for (key, desc_value) in entries {
-                    let desc_obj = desc_value.as_object().ok_or(VmError::TypeMismatch)?;
+                    let desc_obj = desc_value
+                        .as_object()
+                        .ok_or_else(|| VmError::TypeMismatch)?;
                     let descriptor = coerce_to_descriptor(&desc_obj, gc_heap)?;
                     if !crate::object::define_own_property_partial(obj, gc_heap, &key, descriptor) {
                         return Err(VmError::TypeMismatch);
@@ -1685,7 +1687,9 @@ pub fn call(
                         .collect()
                 });
             for (key, desc_value) in entries {
-                let desc_obj = desc_value.as_object().ok_or(VmError::TypeMismatch)?;
+                let desc_obj = desc_value
+                    .as_object()
+                    .ok_or_else(|| VmError::TypeMismatch)?;
                 let descriptor = coerce_to_descriptor(&desc_obj, gc_heap)?;
                 if !crate::object::define_own_property_partial(target, gc_heap, &key, descriptor) {
                     return Err(VmError::TypeMismatch);
@@ -2116,7 +2120,7 @@ pub fn call(
                     // Per spec, null/undefined sources are skipped.
                     continue;
                 }
-                let o = src.as_object().ok_or(VmError::TypeMismatch)?;
+                let o = src.as_object().ok_or_else(|| VmError::TypeMismatch)?;
                 let entries: Vec<(String, Value)> =
                     crate::object::with_properties(o, gc_heap, |p| {
                         p.enumerable_data_iter()
@@ -2459,7 +2463,8 @@ fn lookup_to_optional_value(lookup: &PropertyLookup) -> Result<Option<Value>, Vm
 }
 
 fn expect_object(arg: Option<&Value>) -> Result<JsObject, VmError> {
-    arg.and_then(|v| v.as_object()).ok_or(VmError::TypeMismatch)
+    arg.and_then(|v| v.as_object())
+        .ok_or_else(|| VmError::TypeMismatch)
 }
 
 fn expect_property_key(

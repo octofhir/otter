@@ -26,11 +26,12 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
         b.with_inner(ctx.heap(), |bi| bi.to_i128())
     } else if let Some(s) = raw.as_string(ctx.heap()) {
         let text = s.to_lossy_string(ctx.heap());
-        let parsed =
-            crate::abstract_ops::string_to_big_int(&text).ok_or(NativeError::SyntaxError {
+        let parsed = crate::abstract_ops::string_to_big_int(&text).ok_or_else(|| {
+            NativeError::SyntaxError {
                 name: CLASS,
                 reason: format!("cannot convert {text:?} to a BigInt"),
-            })?;
+            }
+        })?;
         parsed.to_i128()
     } else if let Some(b) = raw.as_boolean() {
         Some(i128::from(b))

@@ -45,7 +45,7 @@ impl Interpreter {
             _ => return Err(VmError::InvalidOperand),
         };
 
-        let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+        let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
         write_register(frame, dst, result)
     }
 

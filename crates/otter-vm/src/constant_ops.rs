@@ -27,9 +27,9 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let decimal = context
             .bigint_decimal_constant(idx)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or_else(|| VmError::InvalidOperand)?;
         let value = bigint::BigIntValue::from_decimal(&mut self.gc_heap, decimal)
-            .ok_or(VmError::InvalidOperand)?
+            .ok_or_else(|| VmError::InvalidOperand)?
             .map_err(crate::oom_to_vm)?;
         write_register(frame, dst, Value::big_int(value))?;
         frame.advance_pc(self.current_byte_len)?;

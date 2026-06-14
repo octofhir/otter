@@ -53,7 +53,7 @@ impl Interpreter {
         let cell = *frame
             .upvalues
             .get(idx as usize)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or_else(|| VmError::InvalidOperand)?;
         let value = read_upvalue(&self.gc_heap, cell);
         // §13.3.1 — a hole in an upvalue cell marks the Temporal Dead
         // Zone (`Op::FreshUpvalue` installs it for a per-iteration /
@@ -86,7 +86,7 @@ impl Interpreter {
         let slot = frame
             .upvalues
             .get_mut(idx as usize)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or_else(|| VmError::InvalidOperand)?;
         *slot = fresh;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
@@ -105,7 +105,7 @@ impl Interpreter {
         let cell = *frame
             .upvalues
             .get(idx as usize)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or_else(|| VmError::InvalidOperand)?;
         store_upvalue(&mut self.gc_heap, cell, value);
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
@@ -129,7 +129,7 @@ impl Interpreter {
         let cell = *frame
             .upvalues
             .get(idx as usize)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or_else(|| VmError::InvalidOperand)?;
         if read_upvalue(&self.gc_heap, cell).is_hole() {
             return Err(VmError::TemporalDeadZone {
                 local_index: idx as u32,
@@ -166,7 +166,10 @@ impl Interpreter {
         finally_off: i32,
         exc_register: u16,
     ) -> Result<(), VmError> {
-        let next_pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)? as i64;
+        let next_pc = frame
+            .pc
+            .checked_add(1)
+            .ok_or_else(|| VmError::InvalidOperand)? as i64;
         let resolve = |off: i32| -> Result<Option<u32>, VmError> {
             if off == crate::NO_HANDLER_OFFSET {
                 return Ok(None);

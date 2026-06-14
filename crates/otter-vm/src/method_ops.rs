@@ -220,7 +220,7 @@ impl Interpreter {
         };
         let name = context
             .string_constant_str(name_idx)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or_else(|| VmError::InvalidOperand)?;
         let caller_byte_len = self.current_byte_len;
         let top_idx = stack.len() - 1;
         let recv_value = *read_register(&stack[top_idx], recv_reg)?;
@@ -376,19 +376,19 @@ impl Interpreter {
                             ) {
                                 let resume = g
                                     .front_async_resume(&self.gc_heap)
-                                    .ok_or(VmError::InvalidOperand)?;
+                                    .ok_or_else(|| VmError::InvalidOperand)?;
                                 self.resume_generator(context, &g, resume)?;
                             }
                         }
                     }
-                    let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+                    let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
                     write_register(frame, dst, promise)?;
                     frame.advance_pc(caller_byte_len)?;
                     return Ok(());
                 }
                 match self.resume_generator(context, &g, kind) {
                     Ok(result) => {
-                        let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+                        let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
                         write_register(frame, dst, result)?;
                         frame.advance_pc(self.current_byte_len)?;
                         return Ok(());
@@ -1004,11 +1004,11 @@ impl Interpreter {
         use crate::string::JsString;
         let recv = receiver
             .as_string(&self.gc_heap)
-            .ok_or(VmError::TypeMismatch)?;
+            .ok_or_else(|| VmError::TypeMismatch)?;
         let needle = args
             .first()
             .and_then(|v| v.as_string(&self.gc_heap))
-            .ok_or(VmError::TypeMismatch)?;
+            .ok_or_else(|| VmError::TypeMismatch)?;
         let callback = args.get(1).cloned().unwrap_or(Value::undefined());
         let recv_units = recv.to_utf16_vec(&self.gc_heap);
         let needle_units = needle.to_utf16_vec(&self.gc_heap);

@@ -414,7 +414,10 @@ fn callable_name(ctx: &mut FunctionMetadataContext<'_>, callee: &Value) -> Resul
         if ordinary_function_metadata_deleted(ctx, fid, "name") {
             return Ok(String::new());
         }
-        let function = ctx.context.function(fid).ok_or(VmError::InvalidOperand)?;
+        let function = ctx
+            .context
+            .function(fid)
+            .ok_or_else(|| VmError::InvalidOperand)?;
         // §15.2.5 / §15.4.5 — an anonymous function / arrow / class with
         // no NamedEvaluation context has a `name` of `""`. The compiler
         // records an internal `<…>` placeholder for diagnostics; surface
@@ -471,7 +474,10 @@ fn callable_length(ctx: &mut FunctionMetadataContext<'_>, callee: &Value) -> Res
         if ordinary_function_metadata_deleted(ctx, fid, "length") {
             return Ok(0.0);
         }
-        let function = ctx.context.function(fid).ok_or(VmError::InvalidOperand)?;
+        let function = ctx
+            .context
+            .function(fid)
+            .ok_or_else(|| VmError::InvalidOperand)?;
         return Ok(f64::from(function.length));
     }
     if let Some(native) = callee.as_native_function() {

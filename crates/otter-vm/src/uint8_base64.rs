@@ -407,7 +407,7 @@ fn receiver_uint8(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsTypedArra
     let t = ctx
         .this_value()
         .as_typed_array(ctx.heap())
-        .ok_or(NativeError::TypeError {
+        .ok_or_else(|| NativeError::TypeError {
             name,
             reason: "receiver is not a Uint8Array".to_string(),
         })?;

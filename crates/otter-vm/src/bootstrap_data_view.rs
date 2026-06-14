@@ -78,7 +78,7 @@ fn ctor_to_index(ctx: &mut NativeCtx<'_>, value: Option<&Value>) -> Result<usize
     let exec = ctx
         .execution_context()
         .cloned()
-        .ok_or(NativeError::TypeError {
+        .ok_or_else(|| NativeError::TypeError {
             name: "DataView",
             reason: "missing execution context".to_string(),
         })?;
@@ -109,7 +109,7 @@ fn data_view_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     let buffer = args
         .first()
         .and_then(|v| v.as_array_buffer())
-        .ok_or(NativeError::TypeError {
+        .ok_or_else(|| NativeError::TypeError {
             name: "DataView",
             reason: "First argument to DataView constructor must be an ArrayBuffer".to_string(),
         })?;

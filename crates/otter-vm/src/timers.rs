@@ -271,16 +271,18 @@ fn schedule_timer_common(
     let extra: SmallVec<[Value; 4]> = args.iter().skip(2).cloned().collect();
     let context = ctx
         .execution_context()
-        .ok_or(NativeError::TypeError {
+        .ok_or_else(|| NativeError::TypeError {
             name: native_name,
             reason: "timer callback is missing its execution context".to_string(),
         })?
         .clone();
     let interp = ctx.interp_mut();
-    let scheduler = interp.timer_scheduler().ok_or(NativeError::TypeError {
-        name: native_name,
-        reason: "host runtime did not install a timer scheduler".to_string(),
-    })?;
+    let scheduler = interp
+        .timer_scheduler()
+        .ok_or_else(|| NativeError::TypeError {
+            name: native_name,
+            reason: "host runtime did not install a timer scheduler".to_string(),
+        })?;
     interp.record_runtime_host_op_enqueued();
     let token = scheduler.schedule(delay_ms, repeat.then_some(delay_ms));
     interp.timer_callbacks_mut().insert(
@@ -344,16 +346,18 @@ fn set_immediate_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
     let extra: SmallVec<[Value; 4]> = args.iter().skip(1).cloned().collect();
     let context = ctx
         .execution_context()
-        .ok_or(NativeError::TypeError {
+        .ok_or_else(|| NativeError::TypeError {
             name: "setImmediate",
             reason: "timer callback is missing its execution context".to_string(),
         })?
         .clone();
     let interp = ctx.interp_mut();
-    let scheduler = interp.timer_scheduler().ok_or(NativeError::TypeError {
-        name: "setImmediate",
-        reason: "host runtime did not install a timer scheduler".to_string(),
-    })?;
+    let scheduler = interp
+        .timer_scheduler()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "setImmediate",
+            reason: "host runtime did not install a timer scheduler".to_string(),
+        })?;
     interp.record_runtime_host_op_enqueued();
     let token = scheduler.schedule(0, None);
     interp.timer_callbacks_mut().insert(

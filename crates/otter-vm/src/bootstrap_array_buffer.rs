@@ -33,7 +33,7 @@ fn coerce_length_integer(
         *value
     } else {
         let (interp, exec) = ctx.interp_mut_and_context();
-        let exec = exec.ok_or(NativeError::TypeError {
+        let exec = exec.ok_or_else(|| NativeError::TypeError {
             name,
             reason: "missing execution context for ToPrimitive".to_string(),
         })?;
@@ -541,7 +541,7 @@ fn sab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
     let exec_ctx = ctx
         .execution_context()
         .cloned()
-        .ok_or(NativeError::TypeError {
+        .ok_or_else(|| NativeError::TypeError {
             name: NAME,
             reason: "missing execution context".to_string(),
         })?;
@@ -720,7 +720,7 @@ fn ab_transfer_inner(
     } else if resizable {
         let result = ctx
             .array_buffer_resizable_rooted(new_len, max, &[], &[args])?
-            .ok_or(NativeError::TypeError {
+            .ok_or_else(|| NativeError::TypeError {
                 name,
                 reason: "allocation failed".to_string(),
             })?;

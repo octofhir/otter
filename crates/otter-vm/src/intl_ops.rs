@@ -29,7 +29,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let class = context
             .string_constant_str(class_idx)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or_else(|| VmError::InvalidOperand)?;
         let locale = *read_register(frame, locale_reg)?;
         let options = *read_register(frame, options_reg)?;
         let value = intl::construct(class, &locale, &options, &mut self.gc_heap)

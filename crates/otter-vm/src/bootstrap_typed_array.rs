@@ -1158,7 +1158,7 @@ fn ta_species_dispatch(
         });
     };
     let (interp, ctx_opt) = ctx.interp_mut_and_context();
-    let context = ctx_opt.ok_or(NativeError::TypeError {
+    let context = ctx_opt.ok_or_else(|| NativeError::TypeError {
         name: method_name,
         reason: "missing execution context".to_string(),
     })?;
@@ -1183,7 +1183,7 @@ fn ta_callback_dispatch(
         });
     };
     let (interp, ctx_opt) = ctx.interp_mut_and_context();
-    let context = ctx_opt.ok_or(NativeError::TypeError {
+    let context = ctx_opt.ok_or_else(|| NativeError::TypeError {
         name: method_name,
         reason: "missing execution context".to_string(),
     })?;

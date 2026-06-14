@@ -611,7 +611,7 @@ fn invoke(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let (interp, context) = ctx.interp_mut_and_context();
-    let context = context.ok_or(NativeError::TypeError {
+    let context = context.ok_or_else(|| NativeError::TypeError {
         name: "Reflect",
         reason: "no active execution context".to_string(),
     })?;

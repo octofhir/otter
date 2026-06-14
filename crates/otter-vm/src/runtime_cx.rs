@@ -921,10 +921,13 @@ impl<'rt> NativeCtx<'rt> {
                 reason: "callback is not a function".to_string(),
             });
         }
-        let context = self.context.clone().ok_or(crate::NativeError::TypeError {
-            name: "NativeCtx::queue_microtask",
-            reason: "missing execution context".to_string(),
-        })?;
+        let context = self
+            .context
+            .clone()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name: "NativeCtx::queue_microtask",
+                reason: "missing execution context".to_string(),
+            })?;
         self.cx.interp.microtasks_mut().enqueue(crate::Microtask {
             callee,
             this_value: Value::undefined(),

@@ -211,7 +211,7 @@ fn to_iso_string_impl(
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
-    let s = to_iso_string(time).ok_or(NativeError::RangeError {
+    let s = to_iso_string(time).ok_or_else(|| NativeError::RangeError {
         name,
         reason: "Invalid Date".to_string(),
     })?;

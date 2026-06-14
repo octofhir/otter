@@ -2764,7 +2764,7 @@ pub(crate) fn array_callback_native_dispatch(
     let callback = args.first().cloned().unwrap_or(Value::undefined());
     let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
     let (interp, ctx_opt) = ctx.interp_mut_and_context();
-    let context = ctx_opt.ok_or(NativeError::TypeError {
+    let context = ctx_opt.ok_or_else(|| NativeError::TypeError {
         name: "Array.prototype callback",
         reason: "missing execution context".to_string(),
     })?;
@@ -3130,7 +3130,7 @@ pub(crate) fn array_callback_native_dispatch(
             }
             Ok(acc)
         }
-        "map" | "filter" | "flatMap" => output_target.ok_or(NativeError::TypeError {
+        "map" | "filter" | "flatMap" => output_target.ok_or_else(|| NativeError::TypeError {
             name: "Array.prototype callback",
             reason: "missing output target".to_string(),
         }),

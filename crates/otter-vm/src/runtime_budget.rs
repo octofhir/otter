@@ -197,6 +197,7 @@ impl RuntimeBudgetStats {
         self.current_external_bytes = end.external_reserved_bytes;
     }
 
+    #[inline]
     pub(crate) fn record_reductions(&mut self, units: u64) {
         self.reductions_executed = self.reductions_executed.saturating_add(units);
         self.current_turn_reductions = self.current_turn_reductions.saturating_add(units);
@@ -235,10 +236,6 @@ impl RuntimeBudgetStats {
         self.budget_rejections = self.budget_rejections.saturating_add(1);
     }
 
-    pub(crate) fn observe_stack_depth(&mut self, depth: usize) {
-        let depth = u32::try_from(depth).unwrap_or(u32::MAX);
-        self.max_stack_depth_observed = self.max_stack_depth_observed.max(depth);
-    }
 }
 
 /// Heap snapshot used for turn-boundary allocation deltas.

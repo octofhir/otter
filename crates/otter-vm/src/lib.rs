@@ -1152,10 +1152,6 @@ impl Interpreter {
         }
     }
 
-    fn record_runtime_reductions(&mut self, units: u64) {
-        self.runtime_budget_stats.record_reductions(units);
-    }
-
     fn enforce_runtime_budget_checkpoint(&mut self) -> Result<(), VmError> {
         if !self.runtime_budget.rejects_on_exceedance() {
             return Ok(());
@@ -1185,10 +1181,6 @@ impl Interpreter {
             });
         }
         Ok(())
-    }
-
-    fn observe_runtime_stack_depth(&mut self, depth: usize) {
-        self.runtime_budget_stats.observe_stack_depth(depth);
     }
 
     fn record_runtime_bytecode_call(&mut self) {
@@ -3732,6 +3724,10 @@ impl Interpreter {
         // foreign chunk so repeated foreign-frame ticks don't re-lock
         // the code-space registry.
         let mut foreign_context: Option<ExecutionContext> = None;
+        // Hoisted once per turn: the budget config does not change mid-turn,
+        // so the per-op checkpoint only needs to run when enforcement is on.
+        // In the default Observe mode this collapses to a not-taken branch.
+        let enforce_budget = self.runtime_budget.rejects_on_exceedance();
         loop {
             if self.interrupt.is_set() {
                 return Err(VmError::Interrupted);
@@ -3780,9 +3776,25 @@ impl Interpreter {
                 .ok_or(VmError::MissingReturn)?;
             let op = instr.op();
             self.current_byte_len = instr.byte_len();
-            self.record_runtime_reductions(runtime_budget::opcode_reductions(op));
-            self.enforce_runtime_budget_checkpoint()?;
-            self.observe_runtime_stack_depth(stack.len());
+            // Inlined runtime metering on the dispatch hot path. The three
+            // former per-op method calls collapse into `record_reductions`
+            // (`#[inline]`), an inlined monotonic stack-depth max, and a
+            // budget checkpoint gated on `enforce_budget`. Semantics are
+            // exact — reductions accumulate identically and max stack depth
+            // is unchanged; the checkpoint is skipped only in Observe mode
+            // (where it was already a cheap early return).
+            {
+                let units = runtime_budget::opcode_reductions(op);
+                let stats = &mut self.runtime_budget_stats;
+                stats.record_reductions(units);
+                let depth = u32::try_from(stack.len()).unwrap_or(u32::MAX);
+                if depth > stats.max_stack_depth_observed {
+                    stats.max_stack_depth_observed = depth;
+                }
+            }
+            if enforce_budget {
+                self.enforce_runtime_budget_checkpoint()?;
+            }
 
             // Step-trace hook. The hot path checks one `Option` slot
             // per instruction; the body only runs when an embedder

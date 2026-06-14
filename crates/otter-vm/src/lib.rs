@@ -1332,10 +1332,12 @@ impl Interpreter {
         fid: u32,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         let view = context.jit_function_view(fid)?;
+        let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
+        let (regs, params) = (view.register_count, view.param_count);
         let hook = self.jit_hook.as_ref()?.clone();
         let status = hook.compile_function(jit::JitCompileRequest { function: view });
-        if std::env::var_os("OTTER_JIT_TRACE").is_some() {
-            eprintln!("[jit] compile fid={fid} -> {status:?}");
+        if trace {
+            eprintln!("[jit] compile fid={fid} regs={regs} params={params} -> {status:?}");
         }
         match status {
             Ok(jit::JitCompileStatus::Compiled { code }) => Some(code),

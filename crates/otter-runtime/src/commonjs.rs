@@ -72,16 +72,46 @@ pub fn run_builtin_cjs_shim(
     source: &str,
     deps: &[(&str, Value)],
 ) -> Result<Value, String> {
+    // Allocate `module` / `exports`, then IMMEDIATELY root them on the
+    // GC-traced module-root stack — before any further allocation. A collection
+    // landing in an unrooted window (e.g. under `OTTER_GC_STRESS=full`) would
+    // otherwise reclaim these young objects and reuse their offsets, leaving the
+    // bare locals dangling. The module-root stack relocates its slots in place,
+    // so after every subsequent allocation we re-fetch the live handles from the
+    // slots instead of trusting the stale `module` / `exports` locals.
     let exports = ctx.alloc_object().map_err(|e| e.to_string())?;
     let module = ctx.alloc_object().map_err(|e| e.to_string())?;
     let exports_val = Value::object(exports);
+    let module_val = Value::object(module);
+
+    let root_base = ctx.interp_mut().module_root_depth();
+    let module_idx = ctx.interp_mut().push_module_root(module_val) - 1;
+    let exports_idx = ctx.interp_mut().push_module_root(exports_val) - 1;
+
+    // From here on, re-fetch the relocated `module` handle after each allocation.
+    let module = ctx
+        .interp_mut()
+        .module_root(module_idx)
+        .as_object()
+        .expect("module object survives module-root rooting");
+    let exports_val = ctx.interp_mut().module_root(exports_idx);
     object::set(module, ctx.heap_mut(), "exports", exports_val);
+
     let id_val = runtime_string_value(ctx, name).map_err(|e| e.to_string())?;
+    let module = ctx
+        .interp_mut()
+        .module_root(module_idx)
+        .as_object()
+        .expect("module object survives module-root rooting");
     object::set(module, ctx.heap_mut(), "id", id_val);
     object::set(module, ctx.heap_mut(), "loaded", Value::boolean(false));
-    let module_val = Value::object(module);
+
     let name_val = runtime_string_value(ctx, name).map_err(|e| e.to_string())?;
     let require_val = make_shim_require(ctx, deps)?;
+
+    // Re-fetch the relocated handles after the require/string allocations.
+    let module_val = ctx.interp_mut().module_root(module_idx);
+    let exports_val = ctx.interp_mut().module_root(exports_idx);
 
     let (interp, context) = ctx.interp_mut_and_context();
     let context = context.ok_or_else(|| "missing execution context for shim load".to_string())?;
@@ -90,13 +120,6 @@ pub fn run_builtin_cjs_shim(
         .map_err(|e| e.to_string())?;
     let call_args: SmallVec<[Value; 8]> =
         smallvec![exports_val, require_val, module_val, name_val, name_val,];
-
-    // See `cjs_instantiate_file`: park `module` / `exports` on the GC-traced
-    // module-root stack so a collection during the shim body does not leave
-    // these young-object handles dangling.
-    let root_base = interp.module_root_depth();
-    let module_idx = interp.push_module_root(module_val) - 1;
-    let exports_idx = interp.push_module_root(exports_val) - 1;
 
     let run = interp.run_callable_sync(&context, &wrapper, exports_val, call_args);
 
@@ -140,7 +163,10 @@ fn make_shim_require(ctx: &mut NativeCtx<'_>, deps: &[(&str, Value)]) -> Result<
             )),
         }
     };
-    otter_vm::native_value_with_captures(ctx.heap_mut(), "require", captures, closure)
+    // Use the root-aware `NativeCtx` method (not the free `native_value_with_captures`,
+    // which traces no roots): the closure allocation must keep the module-root
+    // stack reachable across the collection it may trigger.
+    ctx.native_value_with_captures("require", captures, &[], &[], closure)
         .map_err(|e| e.to_string())
 }
 
@@ -210,7 +236,11 @@ fn make_require(
         }
         cjs_load(ctx, &cfg, cache, &dir, &spec)
     };
-    otter_vm::native_value_with_captures(ctx.heap_mut(), "require", captures, closure).map_err(oom)
+    // Root-aware native allocation (see `make_shim_require`): the closure
+    // allocation traces the live RuntimeState roots — including the module-root
+    // stack — rather than `no_roots`.
+    ctx.native_value_with_captures("require", captures, &[], &[], closure)
+        .map_err(oom)
 }
 
 /// Resolve and load a module by specifier from `dir`. Returns the module's
@@ -280,25 +310,68 @@ pub(crate) fn cjs_instantiate_file(
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
 
-    // Build `module` + `exports`.
+    // Build `module` + `exports`, then IMMEDIATELY root them (and the cache) on
+    // the GC-traced module-root stack — before any further allocation
+    // (`runtime_string_value`, `make_require`'s closure, `object::set`). A
+    // collection landing in an unrooted window (e.g. under
+    // `OTTER_GC_STRESS=full`) would otherwise reclaim these young objects and
+    // reuse their offsets, leaving the bare locals dangling. The module-root
+    // stack relocates its slots in place, so after every subsequent allocation
+    // we re-fetch the live handle from the slot instead of trusting the stale
+    // `module` local.
     let exports = ctx.alloc_object().map_err(oom)?;
     let module = ctx.alloc_object().map_err(oom)?;
     let exports_val = Value::object(exports);
-    object::set(module, ctx.heap_mut(), "exports", exports_val);
-    let id_val = runtime_string_value(ctx, &id)?;
-    object::set(module, ctx.heap_mut(), "id", id_val);
-    let filename_val = runtime_string_value(ctx, &id)?;
-    object::set(module, ctx.heap_mut(), "filename", filename_val);
-    object::set(module, ctx.heap_mut(), "loaded", Value::boolean(false));
     let module_val = Value::object(module);
 
+    let root_base = ctx.interp_mut().module_root_depth();
+    let module_idx = ctx.interp_mut().push_module_root(module_val) - 1;
+    let cache_idx = ctx.interp_mut().push_module_root(Value::object(cache)) - 1;
+    let exports_idx = ctx.interp_mut().push_module_root(exports_val) - 1;
+
+    // From here on, re-fetch the relocated handles after each allocation.
+    let module = ctx
+        .interp_mut()
+        .module_root(module_idx)
+        .as_object()
+        .expect("module object survives module-root rooting");
+    let exports_val = ctx.interp_mut().module_root(exports_idx);
+    object::set(module, ctx.heap_mut(), "exports", exports_val);
+
+    let id_val = runtime_string_value(ctx, &id)?;
+    let module = ctx
+        .interp_mut()
+        .module_root(module_idx)
+        .as_object()
+        .expect("module object survives module-root rooting");
+    object::set(module, ctx.heap_mut(), "id", id_val);
+
+    let filename_val = runtime_string_value(ctx, &id)?;
+    let module = ctx
+        .interp_mut()
+        .module_root(module_idx)
+        .as_object()
+        .expect("module object survives module-root rooting");
+    object::set(module, ctx.heap_mut(), "filename", filename_val);
+    object::set(module, ctx.heap_mut(), "loaded", Value::boolean(false));
+
     // Circular-require guard: cache the partial exports before running.
+    let cache = ctx
+        .interp_mut()
+        .module_root(cache_idx)
+        .as_object()
+        .expect("require cache survives module-root rooting");
+    let exports_val = ctx.interp_mut().module_root(exports_idx);
     object::set(cache, ctx.heap_mut(), &id, exports_val);
 
     // Per-module bindings.
     let require_val = make_require(ctx, cfg.clone(), cache, dir.clone())?;
     let dirname_val = runtime_string_value(ctx, &dir.to_string_lossy())?;
     let filename_arg = runtime_string_value(ctx, &id)?;
+
+    // Re-fetch the relocated handles after the require/string allocations.
+    let module_val = ctx.interp_mut().module_root(module_idx);
+    let exports_val = ctx.interp_mut().module_root(exports_idx);
 
     // Compile the wrapper and run it.
     let (interp, context) = ctx.interp_mut_and_context();
@@ -314,38 +387,13 @@ pub(crate) fn cjs_instantiate_file(
         dirname_val,
     ];
     // `run_callable_sync` evaluates the whole module body, which can trigger any
-    // number of moving collections. `module` / `cache` / `exports` are young
-    // objects held only in these Rust locals, so park them on the GC-traced
-    // module-root stack (the collector rewrites the slots in place) and read the
-    // relocated handles back afterwards. Without this, a module whose body
-    // allocates enough to scavenge leaves these handles dangling and the
-    // post-run `module.exports` read dereferences a forwarded (moved) object.
-    let root_base = interp.module_root_depth();
-    let module_idx = interp.push_module_root(module_val) - 1;
-    let cache_idx = interp.push_module_root(Value::object(cache)) - 1;
-    let exports_idx = interp.push_module_root(exports_val) - 1;
-
-    eprintln!(
-        "[DBG file] BEFORE run: root_base={root_base} module_idx={module_idx} depth={} module_bits={:#018x} as_obj_some={} stress_armed={} stride={} extra_roots={} frame_providers={}",
-        interp.module_root_depth(),
-        interp.module_root(module_idx).to_bits(),
-        interp.module_root(module_idx).as_object().is_some(),
-        interp.gc_heap().dbg_stress_armed(),
-        interp.gc_heap().dbg_stress_stride(),
-        interp.gc_heap().dbg_extra_roots_len(),
-        interp.gc_heap().dbg_frame_providers_len(),
-    );
-
+    // number of moving collections. `module` / `cache` / `exports` are already
+    // parked on the GC-traced module-root stack (rooted right after allocation
+    // above); the collector rewrites the slots in place, so we read the relocated
+    // handles back afterwards. Without this, a module whose body allocates enough
+    // to scavenge would leave these handles dangling and the post-run
+    // `module.exports` read would dereference a forwarded (moved) object.
     let run = interp.run_callable_sync(&context, &wrapper, exports_val, call_args);
-
-    eprintln!(
-        "[DBG file] AFTER run: depth={} module_bits={:#018x} as_obj_some={} extra_roots={} frame_providers={}",
-        interp.module_root_depth(),
-        interp.module_root(module_idx).to_bits(),
-        interp.module_root(module_idx).as_object().is_some(),
-        interp.gc_heap().dbg_extra_roots_len(),
-        interp.gc_heap().dbg_frame_providers_len(),
-    );
 
     // Relocated handles (the collector may have moved them during the run).
     let module = interp

@@ -311,24 +311,6 @@ impl GcHeap {
         self.max_heap_bytes
     }
 
-    // DEBUG-INSTRUMENTATION
-    #[allow(missing_docs)]
-    pub fn dbg_extra_roots_len(&self) -> usize {
-        self.extra_roots.len()
-    }
-    #[allow(missing_docs)]
-    pub fn dbg_frame_providers_len(&self) -> usize {
-        self.frame_root_providers.len()
-    }
-    #[allow(missing_docs)]
-    pub fn dbg_stress_armed(&self) -> bool {
-        self.gc_stress_armed
-    }
-    #[allow(missing_docs)]
-    pub fn dbg_stress_stride(&self) -> u32 {
-        self.gc_stress_stride
-    }
-
     /// Bytes currently tracked against the cap (slot allocations
     /// + outstanding [`Self::reserve_bytes`] reservations).
     pub fn tracked_bytes(&self) -> u64 {

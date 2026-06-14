@@ -86,21 +86,24 @@ pub fn canonicalize_locale_list(
         seen.push(validate_and_canon(&tag)?);
         return Ok(seen);
     }
-    // Otherwise treat the argument as an array-like (ToObject). A
-    // primitive number / boolean wrapper has no `length` → empty list.
+    // §9.2.1 step 3.b — `O = ? ToObject(locales)`. `null` /
+    // `undefined` fail ToObject (undefined handled above), so `null`
+    // throws a TypeError. Other primitives (number / boolean / symbol /
+    // bigint) box to a wrapper with no `length`, yielding an empty list.
+    if locales.is_null() {
+        return Err(type_err("locales argument cannot be null"));
+    }
     if !locales.is_object_type() && locales.as_array().is_none() {
         return Ok(seen);
     }
     let len_v = get_option_value(ctx, locales, "length", CLASS)?;
-    let len = to_length(&len_v, ctx.heap());
+    let len = to_length(ctx, &len_v)?;
     for k in 0..len {
         let key = k.to_string();
         let kv = get_option_value(ctx, locales, &key, CLASS)?;
-        if kv.is_undefined() {
-            // Spec uses HasProperty; treat absent / hole elements as
-            // skipped. (Explicit `undefined` elements are rare.)
-            continue;
-        }
+        // §step 7.c.ii — `If Type(kValue) is not String or Object,
+        // throw a TypeError` (covers undefined / null / boolean /
+        // number / symbol).
         let tag = if let Some(intl) = kv.as_intl(ctx.heap()) {
             match intl.payload_clone(ctx.heap()) {
                 IntlPayload::Locale(p) => p.locale,
@@ -119,13 +122,16 @@ pub fn canonicalize_locale_list(
     Ok(seen)
 }
 
-/// §7.1.20 ToLength on an already-coerced `length` value.
-fn to_length(value: &Value, heap: &otter_gc::GcHeap) -> usize {
-    let n = crate::number::to_number_value(value, heap);
-    if n.is_nan() || n <= 0.0 {
-        return 0;
-    }
-    n.trunc().min(9_007_199_254_740_991.0) as usize
+/// §7.1.20 ToLength on `Get(O, "length")` — applies a proper `ToNumber`
+/// (firing `valueOf` / `toString` / `@@toPrimitive`, throwing on
+/// symbol / bigint).
+fn to_length(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<usize, NativeError> {
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| type_err("missing execution context"))?;
+    crate::coerce::to_length_or_throw(ctx.cx.interp, &exec, value)
+        .map_err(|e| crate::native_function::vm_to_native_error(e, CLASS))
 }
 
 /// A locale is "supported" iff ICU has likely-subtags data for its
@@ -157,6 +163,17 @@ fn string_array(ctx: &mut NativeCtx<'_>, items: &[String]) -> Result<Value, Nati
     };
     let arr = crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut visit)?;
     Ok(Value::array(arr))
+}
+
+/// `Intl.getCanonicalLocales(locales)` — §9.2.1 CanonicalizeLocaleList
+/// returned as a fresh, mutable `Array`.
+pub(crate) fn get_canonical_locales(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let locales = args.first().copied().unwrap_or_else(Value::undefined);
+    let list = canonicalize_locale_list(ctx, locales)?;
+    string_array(ctx, &list)
 }
 
 /// `Intl.<Class>.supportedLocalesOf(locales, options)` — shared by

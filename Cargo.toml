@@ -9,6 +9,7 @@ members = [
     "crates/otter-macros",
     "crates/otter-vm",
     "crates/otter-vm-codegen",
+    "crates/otter-jit",
     "crates/otter-runtime",
     "crates/otter-pm-manifest",
     "crates/otter-pm-lockfile",

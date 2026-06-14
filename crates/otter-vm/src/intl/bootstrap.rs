@@ -83,12 +83,13 @@ pub fn install_well_knowns(
     SegmenterIntrinsic::install_well_knowns(heap, global, well_known)?;
     LocaleIntrinsic::install_well_knowns(heap, global, well_known)?;
     DurationFormatIntrinsic::install_well_knowns(heap, global, well_known)?;
+    crate::intl::namespace::install_namespace_well_knowns(heap, global, well_known)?;
     Ok(())
 }
 
 const INTL_SPEC: NamespaceSpec = NamespaceSpec {
     name: "Intl",
-    methods: &[],
+    methods: crate::intl::namespace::INTL_NAMESPACE_METHODS,
     accessors: &[],
     constants: &[],
     attrs: Attr::global_binding(),
@@ -187,6 +188,7 @@ otter_macros::couch! {
     prototype = {
         methods = {
             "format"          / 1 => crate::intl::number_format::number_format_format,
+            "formatToParts"   / 1 => crate::intl::number_format::number_format_format_to_parts,
             "resolvedOptions" / 0 => crate::intl::number_format::number_format_resolved_options,
         },
     },

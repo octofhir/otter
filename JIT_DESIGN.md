@@ -23,9 +23,9 @@ on `prop-access` (97× node / 252× deno) and dispatch/arithmetic-bound loops
 dispatch tax (binary-search fetch, per-op accounting, no threading) — cheap,
 zero GC risk, 2–4× across the board. Second, add a **single baseline JIT tier**
 (Sparkplug-style, bytecode→machine code via a baseline backend **chosen by
-prototype, not yet committed** — copy-and-patch is the leading candidate over
-Cranelift for the baseline tier (§3.2); no IR, no
-speculation, no deopt) for hot functions, reusing the existing inline-cache
+prototype, not yet committed** — a Sparkplug-style template macro-assembler
+(dynasm-rs) is the recommended baseline backend over copy-and-patch and Cranelift
+(§3.2); no IR, no speculation, no deopt) for hot functions, reusing the existing inline-cache
 feedback table and the existing precise `FrameRoots` rooting mechanism so the
 moving GC needs **no stack maps in v1**. Third — and only after the first two
 land and hold — add an optimizing speculative tier (SSA IR, type feedback,
@@ -66,6 +66,21 @@ Three project constraints shape this plan:
 Newest first. Each entry is gated per §5 (test262 failing-set unchanged +
 benchmarks no-regression + GC stress clean). Benches are min-ms, 10 runs.
 
+- **Phase 0 step 3 — hoist per-op context/function re-resolution. TRIED,
+  REVERTED (negative result).** Cached the top frame's resolved
+  `(function_id, &ExecutableFunction)` and reused it while the top frame stayed
+  in the same function (so the per-op `covers_function` + `exec_function`
+  lookups, and even self-recursion like `fib`, became cache hits). Measured
+  (min of 10–12, same binary rebuilt both sides): **fib −2% only; mandelbrot,
+  prop-access, typed-array flat within noise; nbody +1.5% (run-to-run)** — net
+  wash. The added `match cached_frame` guard costs ~one branch/op, which cancels
+  the saved lookups: under release thin-LTO the `covers_function` (a
+  `checked_sub` + bounds compare) and `exec_function` (a bounds-checked slice
+  index, `execution_context.rs:137,220`) were **already cheap and inlined**, not
+  a real per-op cost. Reverted to keep the hottest loop minimal. **Conclusion:
+  interpreter micro-optimization is exhausted** — the remaining envelope is not
+  in frame resolution; the path to real wins is the baseline JIT (Phase 1), not
+  more dispatch-loop tuning. This closes Phase 0's interpreter-tuning work.
 - **Phase 0 step 1 — O(1) instruction fetch. DONE, verified.** Replaced the
   per-op `binary_search_by_key` PC→instruction lookup with a dense
   `byte_to_instr` map (`crates/otter-vm/src/executable.rs`). Also speeds
@@ -187,56 +202,268 @@ type-specialization and LICM/inlining on top, but only matters *after* the
 envelope is gone, and it is where all the GC-interaction risk concentrates.
 Sequence them; do not merge them.
 
-### 3.2 Backend — DECISION DEFERRED, split by tier, gated on a prototype
+### 3.2 Backend — RECOMMENDED, split by tier, confirmed against the GC contract
 
-> **Status: not committed.** Earlier drafts named Cranelift as the single
-> backend "unambiguously." That was premature. The baseline tier and the
-> optimizing tier have different needs and should be decided separately, after a
-> throwaway prototype measures real compile latency and code quality against
-> otter's own bytecode. Do **not** add a Cranelift dependency until the baseline
-> backend is chosen by measurement (the §5 gate applies to infrastructure
-> choices too).
+> **Status: recommendation committed; dependency not yet added.** Earlier drafts
+> deferred this, then briefly leaned copy-and-patch. Recon of the real GC
+> contract (§3.5) plus a 2026 survey of **what actually ships in production** make
+> the split decisive: **a Sparkplug-style template macro-assembler (dynasm-rs)
+> for the baseline tier, Cranelift for the optimizing tier.** Copy-and-patch was
+> evaluated and **rejected for the baseline** (rationale below). The
+> recommendation is firm; only the *dependency* is gated on the prototype (the §5
+> gate applies to infrastructure too). Do **not** add any backend crate until the
+> prototype gate confirms the numbers and the GC-stress contract.
 
-**Two backends, two questions.**
+**Two tiers, two different jobs.** The *baseline* tier wants the lowest possible
+compile latency (it runs on warm functions; latency is user-visible), the
+simplest mapping from register bytecode to machine code, and **the cleanest
+interaction with the moving GC**. The *optimizing* tier wants good register
+allocation, SSA optimization, and stack-map support, and tolerates slow compile
+(it runs rarely, on the hottest code). These pull in opposite directions; one
+backend cannot be optimal for both.
 
-The *baseline* tier wants the fastest possible compile (it runs on warm
-functions, latency is user-visible) and the simplest possible mapping from
-register bytecode to machine code. The *optimizing* tier wants good register
-allocation, SSA optimization, and stack-map support, and can tolerate slow
-compile (it runs rarely, on the hottest code).
-
-| Option | Compile latency | Code quality | Multi-arch | GC stack maps | Best fit |
+| Option | Compile latency | Code quality | Multi-arch | GC interop fit | Verdict |
 |---|---|---|---|---|---|
-| **Copy-and-patch** (stencils) | **Fastest** (memcpy + relocations, no regalloc) | Moderate; beats a switch-interpreter ~2–5× | Per-arch stencil set, generated at build from C/asm | Hand-roll via stencil holes | **Baseline tier (leading candidate)** |
-| Cranelift | Fast-ish (real regalloc pass) | Good | **arm64 + x64 free** | **User stack maps supported** | **Optimizing tier (leading candidate)** |
-| Custom template assembler | Fastest | Hand-tuned ceiling | Hand-write each arch | Hand-roll | Baseline, if we want full control |
-| LLVM (ORC/MCJIT) | Terrible (100×+) | Best | Yes | Heavy statepoints | Rejected for any near-term tier |
+| **Template assembler (dynasm-rs)** | **Lowest** — single linear pass, no IR/regalloc; "almost instantaneous" (V8 Sparkplug) | Hand-tuned; V8 Sparkplug +45% JetStream over interpreter | **Hand-write each arch** (x64 + aarch64); dynasm-rs supports both, ARMv8.4 | **Cleanest** — reuse the interpreter frame; no ptrs in regs across safepoints; **zero stack maps** | **Baseline — CHOSEN** |
+| Copy-and-patch (stencils) | Lowest — `memcpy` + patch | ~2–5× a switch-interpreter | Recompile C stencils per arch with clang | Same clean fit (memory-array) | **Rejected for baseline** — toolchain/artifact friction, no mature Rust crate, weak production track record |
+| Cranelift | ~150 µs/fn (real regalloc), ~10× faster than LLVM | Good (~14% slower than LLVM) | **arm64 + x64 free** | **Forces stack maps**: regalloc makes ptrs register-resident across safepoints → spill via `ir::UserStackMap` | **Optimizing tier — CHOSEN**; rejected for baseline |
+| LLVM (ORC/MCJIT) | **~2811 µs/fn** (~19× Cranelift) | Best | Yes | Heavy statepoints | **Rejected for any tier** |
 
-**Copy-and-patch — the candidate to research first.** Copy-and-patch (Xu &
-Kjolstad, PLDI 2021; shipping in CPython 3.13's experimental JIT) precompiles a
-*stencil* of machine code per bytecode operation at build time, then at runtime
-emits code by `memcpy`-ing stencils and patching holes (constants, branch
-targets, IC addresses). It has the lowest possible compile latency (no IR, no
-register allocation at runtime), produces deterministic code that is easy to
-reason about for GC, and maps almost 1:1 onto otter's already-register-based
-bytecode. Its costs: a build-time stencil generator per architecture, and code
-quality below a real optimizer (acceptable for a baseline — the optimizing tier
-covers peak performance). For a *baseline* tier whose whole job is to delete the
-dispatch envelope, this is plausibly a better fit than Cranelift.
+#### Why a template macro-assembler for the baseline (the decisive case)
 
-**Cranelift — still the optimizing-tier candidate.** Rust-native, free
-arm64+x64 register allocation and relocation, and **user stack maps**
-(`ir::UserStackMap`) for keeping live references in registers across a
-moving-GC safepoint — exactly what the optimizing tier needs. Its higher compile
-latency is fine there (it runs on the hottest code only).
+This is the **production-proven** baseline shape. V8's **Sparkplug** (the
+"Sparkplug-style baseline" this doc already invokes as its philosophy, §3.1) is,
+in its real implementation, a hand-written template macro-assembler: **no IR, no
+register allocation, a single linear pass over bytecode, reusing the
+interpreter's frame layout**, compiling "almost instantaneously" (+45% JetStream,
++41% Speedometer over the Ignition interpreter). JSC's Baseline JIT is the same
+shape. dynasm-rs is the mature Rust realization of this approach (x86/x64 +
+aarch64 to ARMv8.4, purpose-built for JITs, Wasmer-sponsored).
 
-**Decision gate (do this before any JIT code).** Build a throwaway prototype
-that compiles one hot function (e.g. `fib`) two ways — a copy-and-patch stencil
-path and a Cranelift path — and measure: (1) compile latency per function,
-(2) resulting ns/op vs the interpreter, (3) implementation complexity for the
-moving-GC rooting contract (§3.5). Pick the baseline backend from those numbers,
-record them here, and only then commit a dependency. Until then this section is
-explicitly open.
+1. **Lowest compile latency, by construction.** One linear pass emitting machine
+   code per bytecode op, **no IR, no regalloc** — the same "almost instantaneous"
+   property as Sparkplug. Cranelift runs a real regalloc pass (~150 µs/fn);
+   LLVM ~2811 µs/fn. For a *warm-function* baseline where tier-up latency is on
+   the user's critical path, this is the right axis to optimize.
+2. **Cleanest possible fit for the moving GC — the deciding factor, and it is
+   Sparkplug's own trick.** Emitted code reads operands from, and writes results
+   to, the JIT frame's **value array in memory** — which *is* the interpreter's
+   `Frame.registers` window (`frame_state.rs:46-96`), reused exactly as Sparkplug
+   reuses the Ignition frame. That array is already registered as a `FrameRoots`
+   provider (`frame_roots.rs:19-58`) and traced precisely
+   (`trace_frame_slots`, `frame_state.rs:428`), **so there are no live
+   `Gc`/`Value` pointers in machine registers across an allocation safepoint at
+   all.** The use-after-move hazard (`heap.rs:176-195`) cannot arise in v1
+   baseline code, and **no stack-map infrastructure is needed** (§3.5). 1:1 with
+   the rooting discipline the project already enforces.
+3. **Full control where the design needs it.** The IC inline guard/load/store
+   shapes (§3.3), the int32 guard + slow-path fall-through (§2.3), and the
+   header-granular write barrier (§3.5) are all emitted as exact instruction
+   sequences. A direct assembler expresses these precisely; copy-and-patch's
+   coarse "holes" make per-site IC/barrier shaping clumsier.
+4. **Near 1:1 with otter's bytecode.** Register-based ISA, pre-decoded
+   `ExecInstr` (`executable.rs:446-468`), recoverable jump targets
+   (`encoding.rs:155-172`) → one emit routine per hot opcode, branch fixups via
+   dynasm labels.
+5. **No build-time toolchain, no generated artifacts.** dynasm-rs assembles at
+   Rust **compile time** (proc-macro) into emit calls — no clang/LLVM at build,
+   no checked-in per-arch stencil tables, no Mach-O/ELF relocation-extraction
+   tooling. `cargo build` stays toolchain-clean for contributors.
+
+**Costs and risks (accepted, with mitigations):**
+
+- **Per-arch hand-asm.** The one real downside: the hot-opcode emitter is written
+  twice (x64 and aarch64), as V8/JSC do (they hand-maintain 4+ arches; otter needs
+  2). **Mitigation:** keep all control flow / IC / barrier *logic* arch-neutral;
+  only the final instruction emit is arch-specific. Start **arm64-only** (the dev
+  target is `darwin/arm64`), add x64 once the shape is proven — the §5 gate runs
+  per-arch.
+- **`unsafe` is mandatory** (mmap RWX/`mprotect` W^X, transmute bytes → fn ptr).
+  otter-vm **forbids** `unsafe` (`Cargo.toml` workspace `unsafe_code = "forbid"`);
+  only otter-gc lifts it. So the JIT **cannot live in otter-vm** — the new
+  `crates/otter-jit` crate must lift the ban exactly as otter-gc does (documented
+  `[lints.rust]` opt-out), keeping all `unsafe` (including dynasm's executable
+  buffers) encapsulated there behind a safe API to otter-vm.
+
+#### Why copy-and-patch was rejected for the baseline
+
+Copy-and-patch (Xu & Kjolstad, PLDI 2021) is technically elegant and has the same
+clean memory-array GC story. It loses to the template assembler on **risk and
+fit**, not on theory:
+
+- **Toolchain + artifact burden.** Stencils are generated by compiling C
+  templates with clang/LLVM at build time and extracting bytes + relocations.
+  Keeping `cargo build` clang-free means committing **generated per-arch stencil
+  tables** (CPython PEP 774's direction) plus a maintainer `xtask` and a
+  per-format (Mach-O vs ELF) relocation extractor. That is a standing maintenance
+  surface the template assembler simply does not have.
+- **No mature Rust implementation.** 2026 survey: `dynasmrt` is a template
+  assembler, not C&P; there is **no production copy-and-patch crate**. otter would
+  build the stencil generator + patcher from scratch.
+- **Weak production track record to date.** CPython 3.13/3.14's copy-and-patch
+  JIT delivered **0–5% (sometimes negative)** in practice and was described as "a
+  proof of concept dressed in a release"; Microsoft cut the Faster-CPython funding
+  in 2025. The technique's troubles there were largely frontend/economics-specific
+  (trace projection on stale monomorphic ICs; heavyweight refcounted ops leaving
+  little dispatch to remove) — *not* a refutation of the backend — but it is a
+  clear signal that copy-and-patch in practice has been finicky, while the
+  template-assembler baseline (V8/JSC) has shipped and performed for years.
+- **No `become` dependency either way.** (Rust lacks stable guaranteed tail
+  calls; neither chosen path needs them — copy-and-patch can concatenate
+  straight-line, and the template assembler emits ordinary branches.)
+
+Copy-and-patch stays on the table only as a **future codegen experiment** for the
+baseline if hand-asm maintenance ever becomes the bottleneck — not as v1.
+
+#### Why Cranelift for the optimizing tier (and why not the baseline)
+
+Cranelift is Rust-native, gives **free arm64 + x64 register allocation and
+relocation**, and ships **user stack maps** (`ir::UserStackMap`, stable since
+Wasmtime v25, 2024; in production for moving-GC wasm through 2026). Right
+optimizing-tier backend: its compile latency is irrelevant on the hottest code,
+and its regalloc + SSA optimization are exactly what tier 2 needs.
+
+**Cranelift is the wrong baseline backend, for a precise reason.** Its value
+*is* its register allocator — keeping JS values in machine registers across many
+ops. But under the moving GC, a `Gc` pointer held in a register across an
+allocation safepoint is a use-after-move bug. Cranelift's user stack maps solve
+this by **spilling every live GC reference to a stack slot at each safepoint**
+(confirmed: the frontend inserts spills/reloads; refs are *not* kept in registers
+across the safepoint — fitzgen, "New Stack Maps for Wasmtime", 2024). So using
+Cranelift *properly* at baseline drags the entire stack-map machinery — the
+tier-2 GC complexity, the project's single highest-risk surface — into the first
+JIT. The only alternative is to force all values into a memory array and not use
+Cranelift's regalloc, which **throws away its sole advantage while still paying
+its ~150 µs compile latency**. Both are strictly worse than the template
+assembler for a baseline. Hence the split.
+
+#### GC-interop risk, per backend (the §3.5 contract, made concrete)
+
+| Backend (as baseline) | Live ptr in regs across safepoint? | Stack maps needed in v1? | Net risk |
+|---|---|---|---|
+| **Template assembler (memory-array)** | **No** (operands read/written to traced frame array each op) | **No** | **Lowest** — Sparkplug's frame-reuse trick; matches `FrameRoots` 1:1 |
+| Copy-and-patch (memory-array) | No | No | Low GC risk, but toolchain/artifact + Rust-immaturity tax |
+| Cranelift (regalloc on) | **Yes** | **Yes** (`UserStackMap` spill at every safepoint) | **High** — pulls tier-2 GC surface into tier 1 |
+| Cranelift (regalloc neutered to array) | No | No | Pays Cranelift latency for interpreter-grade codegen — pointless |
+
+#### Prototype gate (do this before adding any backend dependency)
+
+A **throwaway** prototype (scratch branch, behind a `cfg`, never merged) that
+compiles **`fib`** — already a bench; exercises call + int32 arith + compare +
+back-edge branch + return, the canonical baseline target — via **two paths**, on
+**arm64 (the dev target) first**. `fib` needs only ~8 opcodes (`LoadImm`/move,
+`Add`/`Sub` with int32 guard + slow-path call, `LessThan`, `JumpIfFalse`, `Call`
+into the existing `call_ops.rs:789` `invoke` path, `Return`), so both paths are
+small.
+
+**Path A — template assembler (dynasm-rs, the leading candidate):** one emit
+routine per op into a dynasm `Assembler`; operands/results flow through the reused
+interpreter frame array registered as a `FrameRoots` provider; reload-after-
+safepoint on the `Call`/alloc sites; branch fixups via dynasm labels. Emit into an
+mmap'd buffer flipped W^X (RW→RX) before execution.
+
+**Path B — Cranelift (the optimizing-tier backend, sanity-checked at baseline):**
+lower the same ~8 ops to CLIF via `cranelift-jit`, live values in SSA registers,
+`UserStackMap`-marked so the frontend spills them at the `Call` safepoint.
+
+*(Copy-and-patch is not built in the gate — it was rejected on toolchain/risk
+grounds above, not on a number the prototype would produce. Revisit only if Path A
+hand-asm maintenance proves intolerable.)*
+
+**Measure (record the numbers back into this section):**
+1. **Compile latency** — wall-clock µs to produce executable code for `fib`'s
+   bytecode, each path. Expectation: template-asm ≤10 µs; Cranelift ~100–200 µs.
+2. **Steady-state ns/op** — `fib(32)`, compiled vs the current interpreter, each
+   path (§5 min-of-N methodology). Expectation: both crush the interpreter
+   (envelope gone); measure Cranelift's code-quality edge over template-asm here.
+3. **GC-rooting complexity & correctness** — implement each path's rooting, run
+   under **`OTTER_GC_STRESS=full`** (`heap.rs:236-256`). Record: did template-asm
+   pass with the reused-frame / traced-array model and **zero stack maps**? Did
+   Cranelift require stack maps to pass? LOC + `unsafe` surface of each.
+
+**Decision criteria (falsifiable, in priority order):**
+- **PRIMARY (GC simplicity).** If template-asm passes `OTTER_GC_STRESS=full` with
+  the reused-frame model and no stack maps, while Cranelift needs stack maps to
+  pass → **template-asm wins baseline.** This is the dominant risk axis (§3.5) and
+  the expected outcome.
+- **SECONDARY (compile latency).** If template-asm compiles ≥10× faster
+  (expected) → reinforces the choice for a warm-function tier.
+- **TERTIARY (code quality).** Only overrides if Cranelift's baseline ns/op beats
+  template-asm by **>2×** *and* its stack-map rooting passes stress cleanly —
+  unlikely, and even then the tier-2 GC surface in tier 1 is a poor trade.
+- **KILL SWITCH.** If hand-written dynasm emit for the hot-opcode set proves
+  unexpectedly costly on the *second* arch (x64), reconsider copy-and-patch
+  (clang generates the second arch) before considering Cranelift-everywhere — but
+  only with the toolchain/artifact cost above eyes-open.
+
+Only after this gate passes: add the chosen baseline backend (no dependency lands
+before it), record the measured numbers here, and begin Phase 1 (§4).
+
+#### Prototype gate — live results (recorded as milestones land)
+
+Throwaway crate `jit-proto/` (standalone, outside the workspace, **not merged**).
+Host: `darwin/arm64` (Apple Silicon), release build.
+
+- **Milestone 1 — Path A toolchain + compile latency + codegen ceiling. DONE.**
+  dynasm-rs 3.2.1 (`dynasmrt::aarch64`). Results:
+  - **Toolchain executes JIT code on Apple Silicon** — emit `ret 42` and a native
+    recursive `fib` both run correctly. dynasm-rs's `ExecutableBuffer` handles
+    `MAP_JIT` + `pthread_jit_write_protect_np` W^X; no manual unsafe mmap needed.
+    This clears the single biggest Path-A unknown. (Local unsigned binary; the
+    `allow-jit` entitlement is a *signed-distribution* concern only, §3.7.)
+  - **Compile latency: min 7.25 µs / median 9.17 µs** to assemble+finalize the
+    ~14-op fib body — and that *includes* a fresh `Assembler` allocation + mmap
+    each compile (production would reuse). ~15–20× under Cranelift's expected
+    ~150 µs/fn. Confirms the template-asm "lowest latency" premise.
+  - **Codegen ceiling: native fib 1.17 ns/call** vs **interpreter ~532 ns/call**
+    (otter `fib.js` 2328 ms min − 10 ms startup, over 4 356 617 calls). The
+    1.17 ns is pure-int native (no tagged Values / VM call / GC) — the absolute
+    floor, ~455× headroom; the realistic tagged baseline lands well above it but
+    far below the interpreter.
+- **Milestone 2 — tagged NaN-box codegen cost. DONE.** Re-emitted fib on tagged
+  `u64` Values (otter layout: `TAG_INT32 = 0x7FF9` in top 16 bits, payload in low
+  32, `value/tag.rs:46-86`): int32 guard on entry (`lsr`/`cmp`/predicted `b.ne`
+  to a trap stub), checked sub/add with re-boxing (`orr`), self-recursive
+  compiled→compiled calls. Result: **tagged-jit 1.18 ns/call ≈ native 1.17
+  ns/call — tag overhead vs native ≈ 1.0×.** The guard and box/unbox are absorbed
+  by the pipeline (the always-not-taken guard predicts perfectly). vs interpreter
+  ~532 ns/call = **~450× faster** on this path. **Key finding: NaN-box tagging is
+  not the cost — the dispatch envelope was.** Caveat: this models direct
+  compiled→compiled recursion (optimistic floor); real recursion through the VM
+  call path adds frame-setup cost on top (M2b/M3).
+  - *Pending:* **M3 (PRIMARY axis)** — frame value array as a `FrameRoots`
+    provider, reload-after-safepoint, correctness under `OTTER_GC_STRESS=full`
+    (links real `otter-gc`); then **Path B** (Cranelift) for the same, to settle
+    the tertiary code-quality comparison.
+
+**Provisional gate verdict (after M1+M2): template assembler CONFIRMED for the
+baseline, pending the M3 GC-stress check.**
+
+- **SECONDARY axis (compile latency) — measured, decisive.** Template-asm 3–9 µs
+  vs Cranelift's expected ~150 µs/fn — ~20–50× in template-asm's favor, exactly
+  as predicted for a warm-function tier.
+- **Codegen quality — measured, sufficient.** Tagged fib at ~native cost
+  (1.0× overhead) means a baseline template assembler already produces tight code
+  on the hot path; Cranelift's optimizer edge is a tier-2 concern, not a baseline
+  differentiator.
+- **PRIMARY axis (GC rooting) — answered structurally, M3 confirms.** The
+  template-asm baseline **reuses the interpreter's own frame array**, which is
+  already a `FrameRoots` provider (`frame_roots.rs`, `heap.rs:289`) that already
+  survives moving scavenge under `OTTER_GC_STRESS` in production. The JIT adds
+  **no new rooting mechanism** — only the "reload pointer from its slot after a
+  safepoint" codegen discipline, which is the same rule the project already
+  enforces by hand (memory: prototype-chain / CommonJS-loader use-after-move
+  fixes). Cranelift, by contrast, would force `UserStackMap` spills into the
+  baseline (§3.2). So the GC axis favors template-asm by construction; M3 is a
+  confirmation test, not an open question.
+- **Path B (Cranelift baseline) — deprioritized.** It cannot win the two
+  higher-priority axes for a baseline tier, so building it would only refine a
+  tertiary number. Cranelift remains the committed optimizing-tier backend.
+- **Where M3 belongs.** Re-cloning otter's `Value → *mut RawGc` tracer inside the
+  throwaway risks testing the clone, not the engine. The faithful GC-stress check
+  is **Phase 1 step 1** against the real `otter-vm` frame + real tracer, gated by
+  §5 (`OTTER_GC_STRESS=full`). The throwaway has served its purpose: toolchain,
+  latency, and codegen cost are all de-risked.
 
 ### 3.3 Inline caches in JIT — recommendation: **share the interpreter IC table, emit inline guards + shared miss handler**
 
@@ -418,6 +645,45 @@ All capability checks (`fs_read`/`net`/`env`/`subprocess`/`ffi`) live behind the
 same runtime entry points the JIT calls for any non-trivial operation; the JIT
 emits no syscall or capability-gated operation inline. No bypass is introduced.
 
+### 3.7 Why the JIT is mandatory, and the deployment constraint it carries
+
+**Mandatory for competitiveness.** After Phase 0, otter is still 24–71× slower
+than Node on compute (`benchmarks/results/latest.md`: mandelbrot 24×, nbody 24×,
+fib 27×, typed-array 39×, prop-access 71×), and Phase 0 is now exhausted (§1.5
+step 3: interpreter micro-opts measure as a wash). Every leading JS runtime is
+JIT-based — V8 (Sparkplug→Maglev→TurboFan), JSC (Baseline→DFG→FTL; Bun is JSC).
+An interpreter-only engine does not compete on compute; that gap is structural,
+not a tuning problem. The baseline JIT closes most of it (call/IC-heavy benches
+to single-digit ×); the optimizing tier (Phase 2) is what approaches parity on
+numeric kernels. JIT is therefore committed scope, not optional polish — for
+compute-bound workloads. (Startup/IO-bound work is already served by the
+interpreter + GC and does not need the JIT.)
+
+**Deployment constraint — executable memory, and the entitlement myth.**
+Executing JIT code needs writable→executable memory, which several platforms
+gate. This is **not** a user-facing permission prompt (no TCC dialog; users grant
+nothing), and it is **backend-independent** (a template assembler, copy-and-patch,
+and Cranelift all emit+execute machine code and all hit the same constraint — it
+does not affect the §3.2 choice). What it requires, by platform:
+
+- **macOS (desktop/server, the primary target):** the binary must be code-signed
+  with the `com.apple.security.cs.allow-jit` entitlement under hardened runtime;
+  this is a notarization-approved exception and is exactly how Node, Deno, and Bun
+  ship. It is a *build/signing* concern otter controls, invisible to users. On
+  Apple Silicon the JIT pages use `MAP_JIT` + `pthread_jit_write_protect_np` W^X
+  toggling (the dynasm-rs `ExecutableBuffer` handles this).
+- **Locked-down platforms (iOS, some sandboxes, SELinux/W^X-enforced containers):**
+  JIT may be forbidden outright.
+
+**Required design response — runtime-optional JIT with silent interpreter
+fallback.** otter is interpreter-complete today, so the JIT is purely additive.
+The engine must **detect at runtime whether executable memory can be obtained and
+fall back to the interpreter** when it cannot (missing entitlement, iOS, locked
+sandbox, the macOS 26 page-protection bug, etc.) — no hard failure, just slower.
+This makes the deployment constraint a non-blocker: the signed desktop/server
+build runs the JIT; everything else still runs correctly on the interpreter. The
+fallback path is the same code that exists now.
+
 ---
 
 ## 4. Implementation plan (ordered by ROI/risk)
@@ -443,10 +709,13 @@ until the target bench moves AND no other bench regresses** (§5).
   the `#[repr(u8)]` opcode is *already a jump table*; true token-threading needs
   unstable `become`/explicit tail calls. Limited upside, high cost/risk. Revisit
   only if profiling shows dispatch misprediction dominates after simplification.
-- 🔜 **NEXT — simplification / tech-debt removal** (per the measurement-driven
-  correction in §1.5): hoist per-op work that only changes on call/return (the
-  context/function re-resolution at the loop top), collapse redundant funnel
-  layers, delete dead paths (e.g. `to_numeric_for_compare`). Verified by test262.
+- ✅ **DONE (negative result) — frame-resolution hoist tried, reverted.** Caching
+  the top frame's `(function_id, &ExecutableFunction)` to skip the per-op
+  `covers_function`/`exec_function` lookups measured as a net wash (fib −2%,
+  others flat-to-+1.5% noise; §1.5 step 3). The lookups were already cheap and
+  inlined under release LTO. Reverted. **This closes Phase 0** — interpreter
+  micro-optimization is exhausted; the next real win is the baseline JIT (Phase 1
+  / §3.2 prototype gate), not more dispatch tuning.
 
 **Touches:** `crates/otter-vm/src/lib.rs` (dispatch loop), `executable.rs`,
 `runtime_budget.rs`, `arithmetic_dispatch.rs`.
@@ -462,7 +731,11 @@ regression oracle.
 
 **Build:**
 - New crate `crates/otter-jit`, invoked from the runtime integration layer.
-  Backend chosen by the §3.2 prototype gate (copy-and-patch leading). Depends on
+  Backend chosen by the §3.2 prototype gate (Sparkplug-style template
+  macro-assembler via dynasm-rs leading). The crate **lifts the workspace
+  `forbid(unsafe_code)`** like otter-gc (documented `[lints.rust]` opt-out),
+  encapsulating all `unsafe` (executable buffers, fn-ptr transmute) behind a safe
+  API — the JIT cannot live in otter-vm, which forbids `unsafe`. Depends on
   `otter-bytecode`, `otter-vm` types; **no dependency from parked shims**
   (CLAUDE.md rule).
 - CFG reconstruction from bytecode (jump targets are recoverable: relative
@@ -589,7 +862,7 @@ the full suite would average away.
 | First work | Interpreter dispatch surgery (Phase 0) | Jumping straight to JIT |
 | Tiers (now) | 2: interpreter + baseline | Single optimizing tier; 3+ tiers at once |
 | First JIT tier | Sparkplug-style baseline, no IR, no deopt | Speculative SSA first |
-| Backend | **Deferred, split by tier**: copy-and-patch leads for baseline, Cranelift for optimizing tier; commit only after a prototype bench (§3.2) | Committing one backend for both tiers up front; LLVM |
+| Backend | **Split by tier**: Sparkplug-style template assembler (dynasm-rs) for baseline, Cranelift for optimizing tier; commit dependency only after the §3.2 prototype gate | Copy-and-patch for baseline (toolchain/artifact friction, no mature Rust crate, weak track record); one backend for both tiers; LLVM |
 | IC in JIT | Share interpreter `(fn,pc)` IC table; inline guards + shared miss handler | Separate JIT IC; new fast paths |
 | Speculation/deopt | Baseline never speculates; optimizing tier owns lazy-default deopt | Speculation in baseline |
 | OSR | Function-entry first; loop OSR in Phase 1.5 | Loop OSR in baseline |
@@ -624,6 +897,9 @@ the full suite would average away.
 - Write barrier: `crates/otter-gc/src/barrier.rs:18-99,22-36`, `page.rs:62-64`
 - Inlinable bump alloc: `crates/otter-gc/src/page.rs:298-313`, `heap.rs:518-519`
 - Use-after-move oracle (GC stress): `crates/otter-gc/src/heap.rs:176-195,236-256`
+- `unsafe` policy (JIT crate must lift it like otter-gc): workspace `Cargo.toml`
+  `[workspace.lints.rust] unsafe_code = "forbid"`; `crates/otter-gc/Cargo.toml`
+  `[lints.rust]` opt-out + `crates/otter-gc/src/lib.rs:39-41`
 - Benchmarks: `benchmarks/results/latest.md`
 </content>
 </invoke>

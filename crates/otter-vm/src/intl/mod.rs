@@ -46,6 +46,7 @@ pub mod duration_format;
 pub mod helpers;
 pub mod list_format;
 pub mod locale;
+pub mod namespace;
 pub mod number_format;
 pub mod payload;
 pub mod plural_rules;

@@ -235,7 +235,6 @@ impl RuntimeBudgetStats {
     pub(crate) fn record_budget_rejection(&mut self) {
         self.budget_rejections = self.budget_rejections.saturating_add(1);
     }
-
 }
 
 /// Heap snapshot used for turn-boundary allocation deltas.

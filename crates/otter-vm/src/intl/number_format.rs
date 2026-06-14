@@ -1,10 +1,9 @@
 //! `Intl.NumberFormat` — locale-aware number formatting.
 //!
 //! Backed by [`icu_decimal::DecimalFormatter`] for the integer +
-//! fractional part. Currency / percent are layered on top via a
-//! small symbol table — the foundation prioritises the common
-//! `en-US` shape that tests target. Locales outside the table fall
-//! back to the bare ISO currency code (e.g. `"USD 1,234.50"`).
+//! fractional part. Currency formatting routes through ICU's
+//! CLDR-backed [`CurrencyFormatter`] (correct symbol + placement for
+//! every ISO-4217 code and locale); percent appends the sign.
 //!
 //! # See also
 //! - <https://tc39.es/ecma402/#sec-intl-numberformat-objects>
@@ -14,7 +13,13 @@ use std::str::FromStr;
 use fixed_decimal::Decimal;
 use icu_decimal::DecimalFormatter;
 use icu_decimal::options::{DecimalFormatterOptions, GroupingStrategy};
+use icu_experimental::dimension::currency::CurrencyCode;
+use icu_experimental::dimension::currency::formatter::{
+    CurrencyFormatter, CurrencyFormatterPreferences,
+};
+use icu_experimental::dimension::currency::options::CurrencyFormatterOptions;
 use icu_locale::Locale;
+use tinystr::TinyAsciiStr;
 
 use crate::intl::dispatch::IntlError;
 use crate::intl::helpers::{
@@ -24,6 +29,7 @@ use crate::intl::helpers::{
 use crate::intl::payload::{IntlPayload, NumberFormatPayload};
 use crate::string::JsString;
 use crate::{NativeCtx, NativeError, Value};
+use otter_gc::raw::RawGc;
 
 /// Resolve the `(locale, options)` argument pair to a payload.
 ///
@@ -106,17 +112,12 @@ fn require_number_format(
     }
 }
 
-/// §11.1.6 `Intl.NumberFormat.prototype.format(value)`.
-pub(crate) fn number_format_format(
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-) -> Result<Value, NativeError> {
-    let payload = require_number_format(ctx, "format")?;
-    let first = args.first();
-    let n = if let Some(num) = first.and_then(|v| v.as_number()) {
+fn coerce_format_arg(ctx: &NativeCtx<'_>, first: Option<&Value>) -> f64 {
+    if let Some(num) = first.and_then(|v| v.as_number()) {
         num.as_f64()
     } else if let Some(s) = first.and_then(|v| v.as_string(ctx.heap())) {
         s.to_lossy_string(ctx.heap())
+            .trim()
             .parse::<f64>()
             .unwrap_or(f64::NAN)
     } else if let Some(b) = first.and_then(|v| v.as_boolean()) {
@@ -125,12 +126,128 @@ pub(crate) fn number_format_format(
         0.0
     } else {
         f64::NAN
-    };
+    }
+}
+
+/// §11.1.6 `Intl.NumberFormat.prototype.format(value)`.
+pub(crate) fn number_format_format(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_number_format(ctx, "format")?;
+    let n = coerce_format_arg(ctx, args.first());
     let rendered = format_number(n, &payload);
     Ok(Value::string(JsString::from_str(
         &rendered,
         ctx.heap_mut(),
     )?))
+}
+
+/// §11.1.6 `Intl.NumberFormat.prototype.formatToParts(value)`.
+pub(crate) fn number_format_format_to_parts(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_number_format(ctx, "formatToParts")?;
+    let n = coerce_format_arg(ctx, args.first());
+    let parts = partition_number(n, &payload);
+    let type_lit = |t: &str, ctx: &mut NativeCtx<'_>| JsString::from_str(t, ctx.heap_mut());
+
+    let mut elements: Vec<Value> = Vec::with_capacity(parts.len());
+    for (ty, val) in &parts {
+        let ty_s = Value::string(type_lit(ty, ctx)?);
+        let val_s = Value::string(JsString::from_str(val, ctx.heap_mut())?);
+        let snapshot = elements.clone();
+        let obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s], &[&snapshot])?;
+        crate::object::set(obj, ctx.heap_mut(), "type", ty_s);
+        crate::object::set(obj, ctx.heap_mut(), "value", val_s);
+        elements.push(Value::object(obj));
+    }
+    let element_roots = elements.clone();
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        for v in &element_roots {
+            v.trace_value_slots(visitor);
+        }
+    };
+    let arr = crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut visit)?;
+    Ok(Value::array(arr))
+}
+
+/// Partition a formatted number into `{type, value}` components for
+/// `formatToParts`. Locale separators follow the en-style `,` group /
+/// `.` decimal that the resolved formatter targets.
+pub(crate) fn partition_number(
+    n: f64,
+    payload: &NumberFormatPayload,
+) -> Vec<(&'static str, String)> {
+    let mut parts: Vec<(&'static str, String)> = Vec::new();
+    if n.is_nan() {
+        parts.push(("nan", "NaN".to_string()));
+        return parts;
+    }
+
+    // Currency: render the full ICU string, then split off the symbol /
+    // affixes around the numeric core so the `currency` parts carry the
+    // CLDR-correct symbol (no hand-rolled table).
+    if payload.style == "currency" && n.is_finite() {
+        let full = currency_string(n, payload);
+        let core = format_decimal(n.abs(), payload);
+        if let Some(idx) = full.find(&core) {
+            let mut prefix = &full[..idx];
+            if let Some(rest) = prefix.strip_prefix('-') {
+                parts.push(("minusSign", "-".to_string()));
+                prefix = rest;
+            }
+            if !prefix.is_empty() {
+                parts.push(("currency", prefix.to_string()));
+            }
+            push_number_parts(&mut parts, &core);
+            let suffix = &full[idx + core.len()..];
+            if !suffix.is_empty() {
+                parts.push(("currency", suffix.to_string()));
+            }
+            return parts;
+        }
+        // Affix split failed — surface the whole string as a literal.
+        parts.push(("literal", full));
+        return parts;
+    }
+
+    if n.is_sign_negative() {
+        parts.push(("minusSign", "-".to_string()));
+    }
+    if n.is_infinite() {
+        parts.push(("infinity", "∞".to_string()));
+    } else {
+        let value = if payload.style == "percent" {
+            n.abs() * 100.0
+        } else {
+            n.abs()
+        };
+        push_number_parts(&mut parts, &format_decimal(value, payload));
+    }
+    if payload.style == "percent" {
+        parts.push(("percentSign", "%".to_string()));
+    }
+    parts
+}
+
+/// Split a formatted unsigned decimal core (`"1,234.50"`) into
+/// `integer` / `group` / `decimal` / `fraction` parts.
+fn push_number_parts(parts: &mut Vec<(&'static str, String)>, core: &str) {
+    let (int_part, frac_part) = core.split_once('.').unwrap_or((core, ""));
+    let mut first = true;
+    for seg in int_part.split(',') {
+        if !first {
+            parts.push(("group", ",".to_string()));
+        }
+        parts.push(("integer", seg.to_string()));
+        first = false;
+    }
+    if !frac_part.is_empty() {
+        parts.push(("decimal", ".".to_string()));
+        parts.push(("fraction", frac_part.to_string()));
+    }
 }
 
 /// §11.1.7 `Intl.NumberFormat.prototype.resolvedOptions()`.
@@ -176,7 +293,7 @@ pub(crate) fn number_format_resolved_options(
 }
 
 /// Render `n` per the resolved option bag.
-fn format_number(n: f64, payload: &NumberFormatPayload) -> String {
+pub(crate) fn format_number(n: f64, payload: &NumberFormatPayload) -> String {
     if n.is_nan() {
         return "NaN".to_string();
     }
@@ -184,16 +301,51 @@ fn format_number(n: f64, payload: &NumberFormatPayload) -> String {
         let sign = if n.is_sign_negative() { "-" } else { "" };
         return format!("{sign}∞");
     }
-    let value = match payload.style.as_str() {
-        "percent" => n * 100.0,
-        _ => n,
-    };
-    let core = format_decimal(value, payload);
     match payload.style.as_str() {
-        "currency" => format_currency(&core, payload, n.is_sign_negative()),
-        "percent" => format!("{core}%"),
-        _ => core,
+        "currency" => currency_string(n, payload),
+        "percent" => format!("{}%", format_decimal(n * 100.0, payload)),
+        _ => format_decimal(n, payload),
     }
+}
+
+/// Build a `fixed_decimal::Decimal` for `value` honouring the resolved
+/// min/max fraction digits.
+fn decimal_from(value: f64, payload: &NumberFormatPayload) -> Option<Decimal> {
+    let max = payload.maximum_fraction_digits as usize;
+    let formatted = format!("{value:.max$}");
+    let trimmed = trim_trailing_zero_fraction(&formatted, payload.minimum_fraction_digits as usize);
+    let mut dec = Decimal::from_str(&trimmed).ok()?;
+    dec.pad_end(-(payload.minimum_fraction_digits as i16));
+    Some(dec)
+}
+
+/// Format a currency value through ICU's CLDR-backed
+/// [`CurrencyFormatter`] (correct symbol + placement for every ISO-4217
+/// code and locale). Falls back to the ISO code prefix only when ICU
+/// data or the code itself is unavailable — never a hand-rolled symbol
+/// table.
+fn currency_string(n: f64, payload: &NumberFormatPayload) -> String {
+    let code = payload.currency.as_deref().unwrap_or("USD");
+    let locale = Locale::from_str(&payload.locale)
+        .or_else(|_| Locale::from_str(DEFAULT_LOCALE))
+        .expect("default locale parses");
+    if let (Ok(cc), Some(dec)) = (
+        TinyAsciiStr::<3>::try_from_str(code),
+        decimal_from(n, payload),
+    ) {
+        let prefs = CurrencyFormatterPreferences::from(&locale);
+        if let Ok(fmt) = CurrencyFormatter::try_new(prefs, CurrencyFormatterOptions::default()) {
+            let mut out = String::new();
+            let _ = writeable::Writeable::write_to(
+                &fmt.format_fixed_decimal(&dec, &CurrencyCode(cc)),
+                &mut out,
+            );
+            return out;
+        }
+    }
+    let core = format_decimal(n.abs(), payload);
+    let sign = if n.is_sign_negative() { "-" } else { "" };
+    format!("{sign}{code}\u{a0}{core}")
 }
 
 /// Format a number through ICU's `DecimalFormatter`. Falls back to
@@ -289,34 +441,4 @@ fn group_thousands(s: &str) -> String {
         out.push_str(frac_part);
     }
     out
-}
-
-/// Tack a currency symbol / code onto a formatted decimal core.
-/// Picks the symbol from a small built-in table (USD, EUR, GBP,
-/// JPY, RUB, CNY, INR) and falls back to the ISO code prefix.
-fn format_currency(core: &str, payload: &NumberFormatPayload, is_negative: bool) -> String {
-    let code = payload.currency.as_deref().unwrap_or("USD");
-    let symbol = match code {
-        "USD" => "$",
-        "EUR" => "€",
-        "GBP" => "£",
-        "JPY" => "¥",
-        "CNY" => "¥",
-        "RUB" => "₽",
-        "INR" => "₹",
-        other => {
-            return format!(
-                "{}{} {}",
-                if is_negative { "-" } else { "" },
-                other,
-                core.trim_start_matches('-')
-            );
-        }
-    };
-    let core_unsigned = core.trim_start_matches('-');
-    if is_negative {
-        format!("-{symbol}{core_unsigned}")
-    } else {
-        format!("{symbol}{core_unsigned}")
-    }
 }

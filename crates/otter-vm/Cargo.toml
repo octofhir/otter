@@ -33,6 +33,7 @@ icu_calendar = { workspace = true }
 icu_experimental = { workspace = true }
 fixed_decimal = { workspace = true }
 writeable = { workspace = true }
+tinystr = "0.8"
 static_assertions = "1.1"
 
 [dev-dependencies]

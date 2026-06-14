@@ -41,7 +41,7 @@ fn require_payload(
     }
 }
 
-fn join(items: &[String], payload: &ListFormatPayload) -> String {
+pub(crate) fn join(items: &[String], payload: &ListFormatPayload) -> String {
     let conjunction = match payload.kind.as_str() {
         "disjunction" => "or",
         "unit" => "",
@@ -118,27 +118,58 @@ pub(crate) fn list_format_format_to_parts(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let s = list_format_format(ctx, args)?;
-    let literal = Value::string(JsString::from_str("literal", ctx.heap_mut())?);
-    let part = ctx.alloc_object_with_roots(&[&literal, &s], &[])?;
-    crate::object::set(part, ctx.heap_mut(), "type", literal);
-    crate::object::set(part, ctx.heap_mut(), "value", s);
-    let elements = vec![Value::object(part)];
-    let roots = ctx.collect_native_roots();
-    let this_value = *ctx.this_value();
+    let payload = require_payload(ctx, "formatToParts")?;
+    let items = collect_items(args.first(), ctx.heap())?;
+    let parts = parts_layout(&items, &payload);
+
+    let mut elements: Vec<Value> = Vec::with_capacity(parts.len());
+    for (ty, val) in &parts {
+        let ty_s = Value::string(JsString::from_str(ty, ctx.heap_mut())?);
+        let val_s = Value::string(JsString::from_str(val, ctx.heap_mut())?);
+        let snapshot = elements.clone();
+        let obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s], &[&snapshot])?;
+        crate::object::set(obj, ctx.heap_mut(), "type", ty_s);
+        crate::object::set(obj, ctx.heap_mut(), "value", val_s);
+        elements.push(Value::object(obj));
+    }
     let element_roots = elements.clone();
-    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        for &slot in &roots {
-            visitor(slot);
-        }
-        this_value.trace_value_slots(visitor);
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         for v in &element_roots {
             v.trace_value_slots(visitor);
         }
     };
-    let arr =
-        crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut external_visit)?;
+    let arr = crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut visit)?;
     Ok(Value::array(arr))
+}
+
+/// Build the `element` / `literal` part layout matching [`join`].
+fn parts_layout(items: &[String], payload: &ListFormatPayload) -> Vec<(&'static str, String)> {
+    let conjunction = match payload.kind.as_str() {
+        "disjunction" => "or",
+        "unit" => "",
+        _ => "and",
+    };
+    let narrow = payload.style == "narrow";
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    let n = items.len();
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            let sep = if i == n - 1 {
+                if conjunction.is_empty() || (n == 2 && narrow) {
+                    ", ".to_string()
+                } else if n == 2 {
+                    format!(" {conjunction} ")
+                } else {
+                    format!(", {conjunction} ")
+                }
+            } else {
+                ", ".to_string()
+            };
+            out.push(("literal", sep));
+        }
+        out.push(("element", item.clone()));
+    }
+    out
 }
 
 /// §13.5.5 `Intl.ListFormat.prototype.resolvedOptions()`.

@@ -92,6 +92,7 @@ pub mod intrinsic_install;
 pub mod intrinsics;
 mod iterator_ops;
 pub mod iterator_state;
+pub mod jit;
 pub mod js_surface;
 pub mod json;
 pub mod math;
@@ -172,6 +173,10 @@ pub use console::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
 pub use dynamic_import::{DynamicImportLoader, DynamicImportLoaderHandle, DynamicImportRegistry};
 pub use error_classes::{ErrorClassRegistry, ErrorKind};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
+pub use jit::{
+    JitCompileError, JitCompileRequest, JitCompileStatus, JitCompilerHook, JitFunctionCode,
+    JitFunctionView, JitInstrView,
+};
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,
     ConstructorSpec, JsSurfaceError, MethodSpec, NamespaceBuilder, NamespaceSpec, ObjectBuilder,
@@ -430,6 +435,9 @@ pub struct Interpreter {
     has_property_ics: Vec<property_ic::PropertyIcEntry<property_ic::HasPropertyIc>>,
     /// Cheap aggregate counters for interpreter property IC behavior.
     property_ic_stats: property_ic::PropertyIcStats,
+    /// Runtime-installed baseline JIT compiler hook. The hook lives behind a VM
+    /// trait object so `otter-vm` never depends on executable-memory code.
+    jit_hook: Option<std::sync::Arc<dyn jit::JitCompilerHook>>,
     /// Optional per-turn resource policy. This slice records observations but
     /// does not yet yield or reject when a limit is exceeded.
     runtime_budget: RuntimeBudget,
@@ -606,6 +614,7 @@ impl std::fmt::Debug for Interpreter {
         f.debug_struct("Interpreter")
             .field("max_stack_depth", &self.max_stack_depth)
             .field("eval_hook_installed", &self.eval_hook.is_some())
+            .field("jit_hook_installed", &self.jit_hook.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -984,6 +993,7 @@ impl Interpreter {
             store_property_ics: Vec::new(),
             has_property_ics: Vec::new(),
             property_ic_stats: property_ic::PropertyIcStats::default(),
+            jit_hook: None,
             runtime_budget: RuntimeBudget::default(),
             runtime_budget_stats: RuntimeBudgetStats::default(),
             runtime_budget_depth: 0,
@@ -1097,6 +1107,21 @@ impl Interpreter {
     #[must_use]
     pub fn property_ic_stats(&self) -> property_ic::PropertyIcStats {
         self.property_ic_stats
+    }
+
+    /// Install or remove the runtime-owned JIT compiler hook.
+    ///
+    /// `None` keeps interpreter-only behavior. A hook returning
+    /// [`JitCompileStatus::Unavailable`] or [`JitCompileStatus::Unsupported`]
+    /// must also leave execution on the interpreter fallback path.
+    pub fn set_jit_compiler(&mut self, hook: Option<std::sync::Arc<dyn jit::JitCompilerHook>>) {
+        self.jit_hook = hook;
+    }
+
+    /// `true` when a JIT compiler hook has been installed.
+    #[must_use]
+    pub fn jit_compiler_installed(&self) -> bool {
+        self.jit_hook.is_some()
     }
 
     /// Return the current observational runtime budget policy.

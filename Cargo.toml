@@ -101,6 +101,7 @@ otter-bytecode  = { path = "crates/otter-bytecode" }
 otter-syntax    = { path = "crates/otter-syntax" }
 otter-compiler  = { path = "crates/otter-compiler" }
 otter-gc        = { path = "crates/otter-gc" }
+otter-jit       = { path = "crates/otter-jit" }
 otter-regex     = { path = "crates/otter-regex" }
 otter-macros    = { path = "crates/otter-macros" }
 otter-vm        = { path = "crates/otter-vm" }

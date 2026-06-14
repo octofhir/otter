@@ -166,6 +166,32 @@ impl ExecutableModule {
 }
 
 impl ExecutableFunction {
+    /// Build an owned JIT compile-input snapshot for this function.
+    #[must_use]
+    pub(crate) fn jit_view(&self) -> crate::jit::JitFunctionView {
+        crate::jit::JitFunctionView {
+            function_id: self.id,
+            param_count: self.param_count,
+            register_count: self.register_count,
+            code_byte_len: self.code_byte_len,
+            is_strict: self.is_strict,
+            is_async: self.is_async,
+            is_generator: self.is_generator,
+            is_async_generator: self.is_async_generator,
+            instructions: self
+                .code
+                .iter()
+                .map(|instr| crate::jit::JitInstrView {
+                    op: instr.op(),
+                    byte_pc: instr.byte_pc,
+                    byte_len: instr.byte_len(),
+                    property_ic_site: instr.property_ic_site(),
+                    operands: instr.operands().to_vec(),
+                })
+                .collect(),
+        }
+    }
+
     /// Byte-offset source-map entries, sorted by `pc`. Empty when the
     /// underlying [`Function::spans`] is empty.
     #[must_use]
@@ -656,6 +682,53 @@ mod tests {
         assert_eq!(executable.property_ic_site_end(), 2);
         assert_eq!(function.code[0].property_ic_site(), Some(0));
         assert_eq!(function.code[1].property_ic_site(), Some(1));
+    }
+
+    #[test]
+    fn jit_view_carries_bytecode_and_ic_metadata() {
+        let function = function(vec![
+            Instruction {
+                pc: 0,
+                op: Op::LoadProperty,
+                operands: vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::ConstIndex(7),
+                ]
+                .into(),
+            },
+            Instruction {
+                pc: 1,
+                op: Op::Add,
+                operands: vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(3),
+                ]
+                .into(),
+            },
+        ]);
+        let module = module(function);
+
+        let executable = ExecutableModule::from_bytecode(&module);
+        let view = executable.function(0).unwrap().jit_view();
+
+        assert_eq!(view.function_id, 0);
+        assert_eq!(view.instructions.len(), 2);
+        assert_eq!(view.instructions[0].op, Op::LoadProperty);
+        assert_eq!(view.instructions[0].byte_pc, 0);
+        assert!(view.instructions[0].byte_len > 0);
+        assert_eq!(view.instructions[0].property_ic_site, Some(0));
+        assert_eq!(
+            view.instructions[0].operands,
+            vec![
+                Operand::Register(0),
+                Operand::Register(1),
+                Operand::ConstIndex(7),
+            ]
+        );
+        assert_eq!(view.instructions[1].op, Op::Add);
+        assert_eq!(view.instructions[1].property_ic_site, None);
     }
 
     #[test]

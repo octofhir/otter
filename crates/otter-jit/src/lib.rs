@@ -35,6 +35,39 @@ mod code;
 
 pub use code::CompiledCode;
 
+/// Baseline JIT compiler implementation wired into `otter-vm` through the
+/// VM-owned [`otter_vm::JitCompilerHook`] trait.
+///
+/// Step 1 installs the dependency-inverted contract and compile-input DTOs.
+/// Real bytecode lowering lands in the following Phase 1 step, so this hook
+/// currently reports `Unsupported` and leaves execution on the interpreter
+/// fallback path.
+#[derive(Debug, Default)]
+pub struct BaselineJitCompiler;
+
+impl BaselineJitCompiler {
+    /// Construct a baseline JIT compiler hook.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl otter_vm::JitCompilerHook for BaselineJitCompiler {
+    fn compile_function(
+        &self,
+        request: otter_vm::JitCompileRequest,
+    ) -> Result<otter_vm::JitCompileStatus, otter_vm::JitCompileError> {
+        Ok(otter_vm::JitCompileStatus::Unsupported {
+            reason: format!(
+                "baseline emitter not implemented for function {} ({} instructions)",
+                request.function.function_id,
+                request.function.instructions.len()
+            ),
+        })
+    }
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
 mod toolchain_tests {
     //! In-workspace proof that the dynasm-rs arm64 toolchain emits and executes
@@ -43,7 +76,7 @@ mod toolchain_tests {
     //! the real workspace build.
 
     use crate::CompiledCode;
-    use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
+    use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
 
     fn assemble<F>(emit: F) -> CompiledCode
     where

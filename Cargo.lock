@@ -1945,6 +1945,7 @@ dependencies = [
  "dynasm",
  "dynasmrt",
  "otter-bytecode",
+ "otter-vm",
 ]
 
 [[package]]
@@ -2063,6 +2064,7 @@ dependencies = [
  "otter-bytecode",
  "otter-compiler",
  "otter-gc",
+ "otter-jit",
  "otter-pm-manifest",
  "otter-syntax",
  "otter-vm",

@@ -227,6 +227,17 @@ impl ExecutionContext {
             .function(function_id - tables.function_base)
     }
 
+    /// Build an owned JIT compile-input snapshot for a global VM function id.
+    ///
+    /// The returned DTO carries rewritten byte-PC branch deltas and dense
+    /// property-IC site ids, matching the interpreter's executable view without
+    /// exposing private [`ExecutableFunction`] / `ExecInstr` layout.
+    #[must_use]
+    pub fn jit_function_view(&self, function_id: u32) -> Option<crate::jit::JitFunctionView> {
+        self.exec_function(function_id)
+            .map(ExecutableFunction::jit_view)
+    }
+
     /// Return an executable instruction's operands in declaration order.
     #[must_use]
     pub(crate) fn exec_operands<'a>(&'a self, instr: &'a ExecInstr) -> &'a [Operand] {

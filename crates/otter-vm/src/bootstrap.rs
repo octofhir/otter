@@ -614,14 +614,23 @@ mod tests {
         // Bumped from 1500 → 1550 for newly wired conversion methods
         // (toZonedDateTime, toPlainYearMonth/MonthDay, fromEpochNanoseconds,
         // toZonedDateTimeISO, Duration.with) each adding a prototype fn.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1650;
+        // Bumped from 1650 → 1700 for the Intl.Locale bootstrap surface
+        // (constructor + accessor closures) added alongside the Temporal
+        // conformance work; this ratchet had drifted unenforced while the
+        // test module failed to compile.
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1700;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 560 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");
+        let well_known = crate::symbol::WellKnownSymbols::new(&mut heap).expect("well-known");
         let mut telemetry = BootstrapTelemetry::default();
-        let global =
-            build_global_this_with_telemetry(&mut heap, BootstrapFeatures::all(), &mut telemetry)
-                .expect("global");
+        let global = build_global_this_with_telemetry(
+            &mut heap,
+            BootstrapFeatures::all(),
+            &mut telemetry,
+            &well_known,
+        )
+        .expect("global");
 
         assert!(object::get(global, &heap, "Math").is_some());
         assert!(object::get(global, &heap, "Reflect").is_some());
@@ -667,9 +676,11 @@ mod tests {
     #[test]
     fn feature_gates_skip_console() {
         let mut heap = otter_gc::GcHeap::new().expect("heap");
+        let well_known = crate::symbol::WellKnownSymbols::new(&mut heap).expect("well-known");
         let global = build_global_this_with_features(
             &mut heap,
             BootstrapFeatures::all().without(BootstrapFeatures::CONSOLE),
+            &well_known,
         )
         .expect("global");
         assert!(object::get(global, &heap, "Math").is_some());
@@ -679,7 +690,8 @@ mod tests {
     #[test]
     fn math_installs_with_static_native_methods_and_attrs() {
         let mut heap = otter_gc::GcHeap::new().expect("heap");
-        let global = build_global_this(&mut heap).expect("global");
+        let well_known = crate::symbol::WellKnownSymbols::new(&mut heap).expect("well-known");
+        let global = build_global_this(&mut heap, &well_known).expect("global");
         let Some(math) = object::get(global, &heap, "Math")
             .expect("Math")
             .as_object()

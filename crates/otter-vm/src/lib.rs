@@ -1154,45 +1154,90 @@ impl Interpreter {
         context: &ExecutionContext,
     ) -> Result<Option<Option<Value>>, VmError> {
         let top_idx = stack.len() - 1;
-        // Only fresh, ordinary bytecode frames: at entry (pc == 0), not async,
-        // not a generator body. The compiled subset also excludes anything that
-        // would need those, but guard here so tier-up never targets a frame it
-        // cannot faithfully run.
-        {
-            let frame = &stack[top_idx];
-            if top_idx == 0
-                || frame.pc != 0
-                || frame.async_state.is_some()
-                || frame.generator_owner.is_some()
-            {
-                return Ok(None);
+        let Some(code) = self.resolve_jit_code(stack, context, top_idx) else {
+            return Ok(None);
+        };
+        match self.run_compiled_frame(stack, context, top_idx, &code) {
+            jit::JitExecOutcome::Bailed => Ok(None),
+            jit::JitExecOutcome::Returned(value) => {
+                let popped = self.return_running_finally(stack, value)?;
+                Ok(Some(popped))
             }
+            jit::JitExecOutcome::Threw(err) => Err(err),
         }
-        let fid = stack[top_idx].function_id;
+    }
 
-        // Resolve compiled code: cached decision, or compile once at threshold.
-        let code = match self.jit_code.get(&fid) {
-            Some(slot) => slot.clone(),
-            None => {
-                let count = {
-                    let counter = self.jit_call_counts.entry(fid).or_insert(0);
-                    *counter = counter.saturating_add(1);
-                    *counter
-                };
-                if count < Self::JIT_TIER_UP_THRESHOLD {
-                    return Ok(None);
-                }
-                let compiled = self.compile_jit_function(context, fid);
-                self.jit_code.insert(fid, compiled.clone());
-                compiled
-            }
+    /// Tier-up entry point for a synchronously-entered call frame (the
+    /// [`Self::run_callable_sync`] path), where the callee frame is the sole
+    /// entry on its own `stack`. Mirrors [`Self::maybe_dispatch_jit`] but, on a
+    /// successful compiled run, the completion *is* the call result (there is no
+    /// caller frame to unwind into).
+    ///
+    /// Returns `Ok(Some(v))` when compiled code ran the frame to completion, or
+    /// `Ok(None)` to interpret it normally.
+    pub(crate) fn dispatch_jit_sync_entry(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+    ) -> Result<Option<Value>, VmError> {
+        if self.jit_hook.is_none() {
+            return Ok(None);
+        }
+        let top_idx = stack.len() - 1;
+        let Some(code) = self.resolve_jit_code(stack, context, top_idx) else {
+            return Ok(None);
         };
-        let Some(code) = code else {
-            return Ok(None); // known-unsupported: interpret.
-        };
+        match self.run_compiled_frame(stack, context, top_idx, &code) {
+            jit::JitExecOutcome::Bailed => Ok(None),
+            jit::JitExecOutcome::Returned(value) => Ok(Some(value)),
+            jit::JitExecOutcome::Threw(err) => Err(err),
+        }
+    }
 
-        // Run on the real frame's register window (kept rooted on `stack`) so a
-        // closure allocation or recursive call inside the body is GC-safe.
+    /// Resolve installed compiled code for the bytecode frame at `top_idx`,
+    /// compiling once at the tier-up threshold. Returns `None` when the frame is
+    /// ineligible (not a fresh ordinary bytecode entry), still cold, or known to
+    /// be outside the compilable subset.
+    fn resolve_jit_code(
+        &mut self,
+        stack: &[Frame],
+        context: &ExecutionContext,
+        top_idx: usize,
+    ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
+        // Only fresh, ordinary bytecode frames: at entry (pc == 0), not async,
+        // not a generator body.
+        let frame = &stack[top_idx];
+        if frame.pc != 0 || frame.async_state.is_some() || frame.generator_owner.is_some() {
+            return None;
+        }
+        let fid = frame.function_id;
+        if let Some(slot) = self.jit_code.get(&fid) {
+            return slot.clone();
+        }
+        let count = {
+            let counter = self.jit_call_counts.entry(fid).or_insert(0);
+            *counter = counter.saturating_add(1);
+            *counter
+        };
+        if count < Self::JIT_TIER_UP_THRESHOLD {
+            return None;
+        }
+        let compiled = self.compile_jit_function(context, fid);
+        self.jit_code.insert(fid, compiled.clone());
+        compiled
+    }
+
+    /// Run compiled `code` over the rooted register window of frame `top_idx`.
+    ///
+    /// The window stays rooted on `stack` for the call, so closure allocation
+    /// and recursive calls inside the body are GC-safe.
+    fn run_compiled_frame(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        top_idx: usize,
+        code: &std::sync::Arc<dyn jit::JitFunctionCode>,
+    ) -> jit::JitExecOutcome {
         // SAFETY: the raw pointers are formed from this method's own live
         // borrows (`self`, `stack`, `context`) and are valid for the duration
         // of `run_entry`; the JIT does not retain them, and we do not touch
@@ -1203,14 +1248,7 @@ impl Interpreter {
             context: <*const ExecutionContext>::cast(context),
             frame_index: top_idx,
         };
-        match code.run_entry(ptrs) {
-            jit::JitExecOutcome::Bailed => Ok(None),
-            jit::JitExecOutcome::Returned(value) => {
-                let popped = self.return_running_finally(stack, value)?;
-                Ok(Some(popped))
-            }
-            jit::JitExecOutcome::Threw(err) => Err(err),
-        }
+        code.run_entry(ptrs)
     }
 
     /// JIT bridge — perform a `Call` from compiled code. Reads the callee and

@@ -325,7 +325,27 @@ pub(crate) fn cjs_instantiate_file(
     let cache_idx = interp.push_module_root(Value::object(cache)) - 1;
     let exports_idx = interp.push_module_root(exports_val) - 1;
 
+    eprintln!(
+        "[DBG file] BEFORE run: root_base={root_base} module_idx={module_idx} depth={} module_bits={:#018x} as_obj_some={} stress_armed={} stride={} extra_roots={} frame_providers={}",
+        interp.module_root_depth(),
+        interp.module_root(module_idx).to_bits(),
+        interp.module_root(module_idx).as_object().is_some(),
+        interp.gc_heap().dbg_stress_armed(),
+        interp.gc_heap().dbg_stress_stride(),
+        interp.gc_heap().dbg_extra_roots_len(),
+        interp.gc_heap().dbg_frame_providers_len(),
+    );
+
     let run = interp.run_callable_sync(&context, &wrapper, exports_val, call_args);
+
+    eprintln!(
+        "[DBG file] AFTER run: depth={} module_bits={:#018x} as_obj_some={} extra_roots={} frame_providers={}",
+        interp.module_root_depth(),
+        interp.module_root(module_idx).to_bits(),
+        interp.module_root(module_idx).as_object().is_some(),
+        interp.gc_heap().dbg_extra_roots_len(),
+        interp.gc_heap().dbg_frame_providers_len(),
+    );
 
     // Relocated handles (the collector may have moved them during the run).
     let module = interp

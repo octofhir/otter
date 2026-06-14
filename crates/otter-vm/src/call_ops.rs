@@ -1753,6 +1753,13 @@ impl Interpreter {
             return Ok(Value::generator(gen_handle));
         }
         inner.push(new_frame);
+        // Tier-up the entry frame itself: a synchronously-entered callee reaches
+        // `dispatch_loop` directly (no `Op::Call`), so without this hook the
+        // entry level would always interpret while only its sub-calls JIT. This
+        // lets a hot recursion run compiled→compiled with no interpreted levels.
+        if let Some(value) = self.dispatch_jit_sync_entry(&mut inner, context)? {
+            return Ok(value);
+        }
         self.dispatch_loop(context, &mut inner)
     }
 

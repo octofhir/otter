@@ -187,6 +187,9 @@ impl ExecutableFunction {
                     byte_len: instr.byte_len(),
                     property_ic_site: instr.property_ic_site(),
                     operands: instr.operands().to_vec(),
+                    // Resolved by `ExecutionContext::jit_function_view`, which
+                    // can map a `MakeFunction` constant index to its target id.
+                    make_self: false,
                 })
                 .collect(),
         }

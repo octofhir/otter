@@ -77,6 +77,11 @@ pub struct JitInstrView {
     /// Operands in declaration order. Branch immediates are already rewritten
     /// to byte-offset deltas in VM dispatch coordinates.
     pub operands: Vec<Operand>,
+    /// `true` for a `MakeFunction` whose target is the function being compiled
+    /// (the named-function SELF binding). The emitter materializes it as a
+    /// direct read of the frame's own closure (carried in `JitCtx`) instead of
+    /// a Rust round-trip through `jit_runtime_make_function`.
+    pub make_self: bool,
 }
 
 /// Frame stack the interpreter dispatches over. Exposed so the JIT crate can

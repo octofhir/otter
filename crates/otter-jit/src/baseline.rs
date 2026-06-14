@@ -54,12 +54,16 @@ const SPECIAL_TRUE: u32 = 4;
 /// to the call stub). Functions called with more args fall back.
 const MAX_INLINE_ARGS: usize = 4;
 
-/// Re-entry context handed to compiled code. Only `regs` (offset 0) is read by
-/// the machine code; the rest is used by the Rust call/make-function stubs.
+/// Re-entry context handed to compiled code. The machine code reads `regs`
+/// (offset 0) and `self_closure` (offset 8) directly by offset — keep those two
+/// first; the rest is used by the Rust call/make-function stubs.
 #[repr(C)]
 pub struct JitCtx {
     /// Base of the executing frame's register window (`*mut u64` over Values).
     regs: *mut u64,
+    /// Boxed `Value` bits of this frame's SELF closure (the named-function self
+    /// binding). Read directly by a `MakeFunction`-of-self at offset 8.
+    self_closure: u64,
     /// Erased back-pointer to the owning interpreter.
     vm: *mut Interpreter,
     /// The VM frame stack the executing frame lives on.
@@ -178,11 +182,17 @@ impl JitFunctionCode for BaselineCode {
 
     fn run_entry(&self, ptrs: JitReentryPtrs) -> JitExecOutcome {
         let stack = ptrs.stack.cast::<JitFrameStack>();
+        let vm = ptrs.vm.cast::<Interpreter>();
         // SAFETY: `ptrs.stack` is a valid `*mut JitFrameStack` for this call.
         let regs = Interpreter::jit_frame_regs_ptr(unsafe { &mut *stack }, ptrs.frame_index);
+        // SAFETY: `ptrs.vm`/`ptrs.stack` are valid for this call and not aliased
+        // by a live `&mut` (the VM froze its borrows); read the self closure up
+        // front so a `MakeFunction`-of-self needs no Rust round-trip.
+        let self_closure = unsafe { (*vm).jit_frame_self_closure_bits(&*stack, ptrs.frame_index) };
         let mut ctx = JitCtx {
             regs,
-            vm: ptrs.vm.cast::<Interpreter>(),
+            self_closure,
+            vm,
             stack,
             context: ptrs.context.cast::<ExecutionContext>(),
             frame_index: ptrs.frame_index,
@@ -380,6 +390,15 @@ mod arm64 {
                     } else {
                         dynasm!(ops ; .arch aarch64 ; b.eq =>tgt);
                     }
+                }
+                Op::MakeFunction if instr.make_self => {
+                    // SELF binding: the closure value is precomputed in
+                    // `JitCtx.self_closure` (offset 8 from x20), so read it
+                    // straight into `dst` — no Rust round-trip through
+                    // `jit_make_fn_stub`/`run_make_function_reg`.
+                    let dst = reg(ops_ref, 0)?;
+                    dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, #8]);
+                    store_reg(&mut ops, 9, dst)?;
                 }
                 Op::MakeFunction => {
                     let dst = reg(ops_ref, 0)?;
@@ -624,6 +643,7 @@ mod tests {
                 byte_len: STRIDE,
                 property_ic_site: None,
                 operands: operands.clone(),
+                make_self: false,
             })
             .collect();
         JitFunctionView {
@@ -649,6 +669,7 @@ mod tests {
         let code = compile(view).expect("compiles");
         let mut ctx = JitCtx {
             regs: regs.as_mut_ptr(),
+            self_closure: 0,
             vm: std::ptr::null_mut(),
             stack: std::ptr::null_mut(),
             context: std::ptr::null(),

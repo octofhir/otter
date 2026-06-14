@@ -234,8 +234,22 @@ impl ExecutionContext {
     /// exposing private [`ExecutableFunction`] / `ExecInstr` layout.
     #[must_use]
     pub fn jit_function_view(&self, function_id: u32) -> Option<crate::jit::JitFunctionView> {
-        self.exec_function(function_id)
-            .map(ExecutableFunction::jit_view)
+        let mut view = self
+            .exec_function(function_id)
+            .map(ExecutableFunction::jit_view)?;
+        // Mark each `MakeFunction` whose constant resolves to the function being
+        // compiled: it materializes the named-function SELF binding, which the
+        // emitter can read straight from the frame's own closure instead of a
+        // Rust round-trip. Operand 1 is the function-id constant index.
+        for instr in &mut view.instructions {
+            if instr.op == otter_bytecode::Op::MakeFunction
+                && let Some(&otter_bytecode::Operand::ConstIndex(idx)) = instr.operands.get(1)
+                && self.function_id_constant(idx) == Some(function_id)
+            {
+                instr.make_self = true;
+            }
+        }
+        Some(view)
     }
 
     /// Return an executable instruction's operands in declaration order.

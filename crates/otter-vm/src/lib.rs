@@ -1320,6 +1320,31 @@ impl Interpreter {
         self.run_make_function_reg(context, frame, dst, idx)
     }
 
+    /// JIT bridge — boxed `Value` bits of frame `frame_index`'s SELF closure,
+    /// computed once at compiled-entry setup. A `MakeFunction` of the running
+    /// function (the named-function self binding) resolves to exactly this
+    /// value, so the emitter reads it from `JitCtx` instead of crossing back
+    /// into Rust per call. Mirrors the self branch of
+    /// [`Self::run_make_function_reg`]: the frame's recorded closure instance
+    /// when present, else the bare interned function value.
+    #[must_use]
+    pub fn jit_frame_self_closure_bits(
+        &self,
+        stack: &jit::JitFrameStack,
+        frame_index: usize,
+    ) -> u64 {
+        let Some(frame) = stack.get(frame_index) else {
+            return Value::undefined().to_bits();
+        };
+        // A frame that never acquired cold state has no recorded closure
+        // instance, so the self binding is the bare interned function value.
+        let value = match self.frame_cold(frame).and_then(|cold| cold.callee_closure) {
+            Some(closure) => Value::closure(closure),
+            None => Value::function(frame.function_id),
+        };
+        value.to_bits()
+    }
+
     /// JIT bridge — base pointer of frame `frame_index`'s register window, for
     /// the compiled entry to address registers. The window is rooted on
     /// `stack`, so the pointer is stable for the compiled call's duration

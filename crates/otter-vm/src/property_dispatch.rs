@@ -3889,6 +3889,30 @@ impl Interpreter {
         let key_value_raw = *read_register(&stack[top_idx], key_reg)?;
         let key_value = self.coerce_property_key_value(context, key_value_raw)?;
         let value = *read_register(&stack[top_idx], src_reg)?;
+
+        // Fast path: an integer-keyed write of an already-Number value into a
+        // non-BigInt typed array is an IntegerIndexedElementSet (§10.4.5.5)
+        // with no observable coercion — `ToNumber(number)` is identity, never
+        // throws, and has no side effects, so the value conversion folds into
+        // the in-place element write with no index stringification and no
+        // expando (a canonical numeric index never creates one).
+        // `JsTypedArray::set` truncates per element kind and silently no-ops on
+        // a detached buffer or out-of-bounds index; a negative / fractional
+        // index has no valid integer index and is likewise a no-op. BigInt
+        // arrays, non-Number values, and observable coercions (which can throw
+        // or resize the buffer) fall through to the spec `[[Set]]` ladder.
+        if let Some(t) = receiver.as_typed_array(&self.gc_heap)
+            && value.is_number()
+            && !t.kind().is_bigint()
+            && let Some(n) = key_value.as_number()
+        {
+            if let Some(idx) = crate::array::index_from_number(n) {
+                t.set(&mut self.gc_heap, idx, &value);
+            }
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return Ok(true);
+        }
+
         let strict = Self::current_frame_is_strict(stack, context);
         enum ComputedPropertyKey {
             String(String),

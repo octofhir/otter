@@ -31,8 +31,10 @@
 //! - `otter-gc` — the moving collector, `FrameRoots`, and the W^X/rooting
 //!   contract this tier must honor.
 
+mod baseline;
 mod code;
 
+pub use baseline::{BaselineCode, BaselineExit, JitEntry, Unsupported, compile};
 pub use code::CompiledCode;
 
 /// Baseline JIT compiler implementation wired into `otter-vm` through the
@@ -58,13 +60,17 @@ impl otter_vm::JitCompilerHook for BaselineJitCompiler {
         &self,
         request: otter_vm::JitCompileRequest,
     ) -> Result<otter_vm::JitCompileStatus, otter_vm::JitCompileError> {
-        Ok(otter_vm::JitCompileStatus::Unsupported {
-            reason: format!(
-                "baseline emitter not implemented for function {} ({} instructions)",
-                request.function.function_id,
-                request.function.instructions.len()
-            ),
-        })
+        match baseline::compile(&request.function) {
+            Ok(code) => Ok(otter_vm::JitCompileStatus::Compiled {
+                code: std::sync::Arc::new(code),
+            }),
+            Err(reason) => Ok(otter_vm::JitCompileStatus::Unsupported {
+                reason: format!(
+                    "function {} not in baseline subset: {reason:?}",
+                    request.function.function_id
+                ),
+            }),
+        }
     }
 }
 

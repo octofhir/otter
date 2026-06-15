@@ -244,6 +244,25 @@ extern "C" fn jit_load_element_stub(ctx: *mut JitCtx, dst: u64, recv: u64, idx: 
     }
 }
 
+/// Bridge stub: perform a `LoadGlobalOrThrow` from compiled code, delegating to
+/// the safe [`Interpreter::jit_runtime_load_global`]. Returns `0` on success,
+/// `1` when the read threw (unbound identifier / throwing accessor; error
+/// parked in `ctx`).
+extern "C" fn jit_load_global_stub(ctx: *mut JitCtx, dst: u64, name_idx: u64) -> u64 {
+    // SAFETY: see `jit_call_stub`.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    match vm.jit_runtime_load_global(context, stack, ctx.frame_index, dst as u16, name_idx as u32) {
+        Ok(()) => 0,
+        Err(err) => {
+            ctx.error = Some(err);
+            1
+        }
+    }
+}
+
 /// Why a function could not be baseline-compiled. Always maps to a silent
 /// interpreter fallback; never a JS-visible error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,8 +346,8 @@ mod arm64 {
     use super::{
         BaselineCode, MAX_INLINE_ARGS, Op, Operand, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE,
         STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_INT32, TAG_NAN, TAG_SPECIAL, Unsupported,
-        jit_call_stub, jit_load_element_stub, jit_load_prop_stub, jit_make_fn_stub,
-        jit_store_prop_stub, reg_offset,
+        jit_call_stub, jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub,
+        jit_make_fn_stub, jit_store_prop_stub, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -595,6 +614,14 @@ mod arm64 {
                         ; movz x3, idx as u32
                     );
                     emit_call_stub(&mut ops, jit_load_element_stub as *const () as usize, threw);
+                }
+                // `dst = global[name]` or throw — delegate to the safe bridge.
+                Op::LoadGlobalOrThrow => {
+                    let dst = reg(ops_ref, 0)?;
+                    let name = const_index(ops_ref, 1)?;
+                    dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
+                    emit_load_u64(&mut ops, 2, u64::from(name));
+                    emit_call_stub(&mut ops, jit_load_global_stub as *const () as usize, threw);
                 }
                 // `dst = ToNumeric(src) + delta` (§13.4 UpdateExpression). Int32
                 // fast path with overflow → double; double path otherwise.

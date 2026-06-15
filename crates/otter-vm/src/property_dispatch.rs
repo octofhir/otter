@@ -3035,6 +3035,30 @@ impl Interpreter {
         result
     }
 
+    /// JIT bridge for `LoadGlobalOrThrow` from compiled code, delegating to the
+    /// full interpreter global read ([`Self::run_load_global_or_throw_reg`]):
+    /// resolves a free identifier through the global object, throwing a
+    /// `ReferenceError` when unbound. Frame PC is saved/restored so a later
+    /// guard bail re-runs the compiled frame from PC 0.
+    ///
+    /// # Errors
+    /// Propagates the `ReferenceError` for an unbound identifier (and any
+    /// throwing global accessor) plus `InvalidOperand`.
+    pub fn jit_runtime_load_global(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut SmallVec<[Frame; 8]>,
+        frame_index: usize,
+        dst: u16,
+        name_idx: u32,
+    ) -> Result<(), VmError> {
+        let saved_pc = stack[frame_index].pc;
+        let frame = &mut stack[frame_index];
+        let result = self.run_load_global_or_throw_reg(context, frame, dst, name_idx);
+        stack[frame_index].pc = saved_pc;
+        result
+    }
+
     /// JIT bridge for a named `StoreProperty` from compiled code. The store
     /// analogue of [`Self::jit_runtime_load_property`]: the hot path is an IC
     /// hit on an existing own data slot (the dense `site` comes from the

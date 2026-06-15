@@ -332,6 +332,12 @@ impl ShapeId {
 pub(crate) struct AtomOwnPropertyHit {
     /// Shape observed on the receiver object.
     pub(crate) shape_id: ShapeId,
+    /// GC handle of the observed shape. Carried so the JIT can bake the
+    /// shape's (stable) compressed offset into a monomorphic property guard.
+    /// Not traced: shapes are immortal (rooted forever by the transition
+    /// tables) and pinned in non-moving old space, so the handle never
+    /// dangles or relocates. `Gc::null()` in dictionary mode.
+    pub(crate) shape: ShapeHandle,
     /// Atomized named-property key from the executable context.
     pub(crate) atom_id: AtomId,
     /// String-keyed own-property slot offset.
@@ -1230,6 +1236,7 @@ pub(crate) fn lookup_own_atom(
             AtomPropertyLookup {
                 hit: Some(AtomOwnPropertyHit {
                     shape_id: body_shape_id(heap, body),
+                    shape: body.shape,
                     atom_id: key.atom().id(),
                     slot: offset,
                 }),
@@ -3267,6 +3274,9 @@ mod tests {
             hit.hit,
             Some(AtomOwnPropertyHit {
                 shape_id: shape,
+                // `set` of a new key moves the object to dictionary mode
+                // (null shape handle).
+                shape: ShapeHandle::null(),
                 atom_id: key.atom().id(),
                 slot: 0,
             })

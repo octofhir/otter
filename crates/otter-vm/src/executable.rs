@@ -178,6 +178,9 @@ impl ExecutableFunction {
             is_async: self.is_async,
             is_generator: self.is_generator,
             is_async_generator: self.is_async_generator,
+            // Baked by `Interpreter::compile_jit_function`, which holds the
+            // cage base and the live property-IC tables.
+            cage_base: 0,
             instructions: self
                 .code
                 .iter()
@@ -190,6 +193,9 @@ impl ExecutableFunction {
                     // Resolved by `ExecutionContext::jit_function_view`, which
                     // can map a `MakeFunction` constant index to its target id.
                     make_self: false,
+                    // Baked by `Interpreter::compile_jit_function` from a warm
+                    // monomorphic own-data IC.
+                    inline_load: None,
                 })
                 .collect(),
         }

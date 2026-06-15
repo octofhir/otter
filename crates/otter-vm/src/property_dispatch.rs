@@ -3139,7 +3139,9 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let fid = stack[frame_index].function_id;
         let func = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
-        let instr = func.instr_at_byte_pc(byte_pc).ok_or(VmError::InvalidOperand)?;
+        let instr = func
+            .instr_at_byte_pc(byte_pc)
+            .ok_or(VmError::InvalidOperand)?;
         let op = instr.op();
         let saved_pc = stack[frame_index].pc;
         stack[frame_index].pc = byte_pc;

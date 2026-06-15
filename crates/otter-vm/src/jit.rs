@@ -59,8 +59,31 @@ pub struct JitFunctionView {
     pub is_generator: bool,
     /// `true` when this function is an async generator.
     pub is_async_generator: bool,
+    /// GC cage base address (`otter_gc::cage_base()`), baked at compile time.
+    /// Stable for the isolate's life, so emitted inline property loads add it
+    /// to a compressed `Gc` offset to decompress an object pointer without a
+    /// runtime load. `0` when no inline access is baked.
+    pub cage_base: usize,
     /// Instruction stream in byte-PC order.
     pub instructions: Vec<JitInstrView>,
+}
+
+/// Baked monomorphic inline property-load plan for one `LoadProperty` site.
+///
+/// Computed VM-side from a warm own-data IC at tier-up: the emitter reads the
+/// receiver's shape handle at `[obj_ptr + shape_byte]`, compares it to
+/// `cached_shape_offset`, and on a hit loads the value at
+/// `[obj_ptr + value_byte]` — no interpreter round-trip. `obj_ptr` is the
+/// decompressed `Gc` pointer (`cage_base + offset`); `*_byte` already include
+/// the GC header. A guard miss falls through to the shared runtime stub.
+#[derive(Debug, Clone, Copy)]
+pub struct JitInlineLoad {
+    /// Cached shape handle compressed offset to compare against the receiver's.
+    pub cached_shape_offset: u32,
+    /// Byte offset from the decompressed object pointer to the shape handle.
+    pub shape_byte: u32,
+    /// Byte offset from the decompressed object pointer to the cached value.
+    pub value_byte: u32,
 }
 
 /// Owned snapshot of one executable instruction.
@@ -74,6 +97,10 @@ pub struct JitInstrView {
     pub byte_len: u32,
     /// Dense property-IC site id for named property ops.
     pub property_ic_site: Option<usize>,
+    /// Baked monomorphic inline-load plan for a `LoadProperty` whose IC was a
+    /// warm own-data hit on an in-object slot at tier-up. `None` → emit the
+    /// shared runtime stub (cold, polymorphic, accessor, dict, or overflow).
+    pub inline_load: Option<JitInlineLoad>,
     /// Operands in declaration order. Branch immediates are already rewritten
     /// to byte-offset deltas in VM dispatch coordinates.
     pub operands: Vec<Operand>,

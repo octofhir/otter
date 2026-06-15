@@ -50,6 +50,15 @@ const TAG_NAN: u64 = 0x7FF8;
 const TAG_INT32: u64 = 0x7FF9;
 /// NaN-box tag for special immediates (undefined/null/hole/boolean).
 const TAG_SPECIAL: u64 = 0x7FFA;
+/// NaN-box tag for object-class heap pointers (`value/tag.rs`). The low 32
+/// bits are a `Gc` offset; the body type is discriminated by the GC header
+/// tag, so inline property loads must also check [`OBJECT_BODY_TYPE_TAG`].
+const TAG_PTR_OBJECT: u64 = 0x7FFC;
+/// GC header type tag for an ordinary `ObjectBody` (mirrors
+/// `otter_vm::object::OBJECT_BODY_TYPE_TAG`). Guarded before an inline
+/// shape-slot read so a non-object body sharing `TAG_PTR_OBJECT` cannot be
+/// misread.
+const OBJECT_BODY_TYPE_TAG: u32 = 0x11;
 /// `SPECIAL` payload for the internal array/`this` hole sentinel.
 const SPECIAL_HOLE: u64 = 2;
 /// `SPECIAL` payload for `false`.
@@ -507,11 +516,12 @@ fn reg_offset(idx: u16) -> Result<u32, Unsupported> {
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
     use super::{
-        BaselineCode, MAX_INLINE_ARGS, Op, Operand, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE,
-        STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_INT32, TAG_NAN, TAG_SPECIAL, Unsupported,
-        jit_call_method_stub, jit_call_stub, jit_delegate_op_stub, jit_load_element_stub,
-        jit_load_global_stub, jit_load_prop_stub, jit_load_upvalue_stub, jit_make_fn_stub,
-        jit_store_element_stub, jit_store_prop_stub, jit_store_upvalue_stub, reg_offset,
+        BaselineCode, MAX_INLINE_ARGS, OBJECT_BODY_TYPE_TAG, Op, Operand, SPECIAL_FALSE,
+        SPECIAL_HOLE, SPECIAL_TRUE, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_INT32,
+        TAG_NAN, TAG_PTR_OBJECT, TAG_SPECIAL, Unsupported, jit_call_method_stub, jit_call_stub,
+        jit_delegate_op_stub, jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub,
+        jit_load_upvalue_stub, jit_make_fn_stub, jit_store_element_stub, jit_store_prop_stub,
+        jit_store_upvalue_stub, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -676,6 +686,9 @@ mod arm64 {
 
         let entry = ops.offset();
         emit_prologue(&mut ops);
+
+        // Stable GC cage base, baked for inline property-load decompression.
+        let cage_base = view.cage_base;
 
         for instr in &view.instructions {
             dynasm!(ops ; .arch aarch64 ; =>labels[&instr.byte_pc]);
@@ -941,7 +954,11 @@ mod arm64 {
                     let idx = imm32(ops_ref, 1)?;
                     dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, src as u32);
                     emit_load_u64(&mut ops, 2, u64::from(idx as u32));
-                    emit_call_stub(&mut ops, jit_store_upvalue_stub as *const () as usize, threw);
+                    emit_call_stub(
+                        &mut ops,
+                        jit_store_upvalue_stub as *const () as usize,
+                        threw,
+                    );
                 }
                 // `dst = ToNumeric(src) + delta` (§13.4 UpdateExpression). Int32
                 // fast path with overflow → double; double path otherwise.
@@ -991,6 +1008,51 @@ mod arm64 {
                     let obj = reg(ops_ref, 1)?;
                     let name = const_index(ops_ref, 2)?;
                     let site = instr.property_ic_site.unwrap_or(usize::MAX) as u64;
+
+                    let miss = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+
+                    // Inline monomorphic own-data load: guard tag + GC type tag
+                    // + shape handle, then read the in-object slot directly. No
+                    // allocation/call → no safepoint; the object pointer is
+                    // recomputed from the frame slot (rooted), never held across
+                    // one. Any guard miss falls through to the shared stub.
+                    if let Some(inl) = instr.inline_load {
+                        let obj_off = reg_offset(obj)?;
+                        let dst_off = reg_offset(dst)?;
+                        let shape_byte = inl.shape_byte;
+                        let value_byte = inl.value_byte;
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldr x9, [x19, obj_off]   // receiver Value
+                            ; lsr x10, x9, #48         // top-16 tag
+                            ; movz x11, TAG_PTR_OBJECT as u32
+                            ; cmp x10, x11
+                            ; b.ne =>miss
+                            ; mov w12, w9              // low-32 Gc offset (zero-ext)
+                        );
+                        emit_load_u64(&mut ops, 13, cage_base as u64);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; add x13, x13, x12        // x13 = GcHeader ptr
+                            ; ldrb w14, [x13]          // header type tag
+                            ; cmp w14, OBJECT_BODY_TYPE_TAG
+                            ; b.ne =>miss
+                            ; ldr w14, [x13, shape_byte] // receiver shape handle
+                        );
+                        emit_load_u64(&mut ops, 15, u64::from(inl.cached_shape_offset));
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; cmp w14, w15
+                            ; b.ne =>miss
+                            ; ldr x9, [x13, value_byte] // in-object slot value
+                            ; str x9, [x19, dst_off]
+                            ; b =>done
+                        );
+                    }
+
+                    // Miss / no inline plan: shared runtime IC + general path.
+                    dynasm!(ops ; .arch aarch64 ; =>miss);
                     dynasm!(ops
                         ; .arch aarch64
                         ; mov x0, x20
@@ -1000,6 +1062,7 @@ mod arm64 {
                     emit_load_u64(&mut ops, 3, u64::from(name));
                     emit_load_u64(&mut ops, 4, site);
                     emit_call_stub(&mut ops, jit_load_prop_stub as *const () as usize, threw);
+                    dynasm!(ops ; .arch aarch64 ; =>done);
                 }
                 Op::StoreProperty => {
                     // Operands: obj, name_const, src, scratch_dst.
@@ -1366,6 +1429,7 @@ mod tests {
                 property_ic_site: None,
                 operands: operands.clone(),
                 make_self: false,
+                inline_load: None,
             })
             .collect();
         JitFunctionView {
@@ -1377,6 +1441,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             is_async_generator: false,
+            cage_base: 0,
             instructions,
         }
     }

@@ -1513,7 +1513,8 @@ impl Interpreter {
         context: &ExecutionContext,
         fid: u32,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
-        let view = context.jit_function_view(fid)?;
+        let mut view = context.jit_function_view(fid)?;
+        self.bake_inline_property_loads(&mut view);
         let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
         let (regs, params) = (view.register_count, view.param_count);
         let hook = self.jit_hook.as_ref()?.clone();
@@ -1524,6 +1525,53 @@ impl Interpreter {
         match status {
             Ok(jit::JitCompileStatus::Compiled { code }) => Some(code),
             _ => None,
+        }
+    }
+
+    /// Bake monomorphic own-data property loads into the compile view from the
+    /// live IC tables so the emitter can read the in-object slot inline (shape
+    /// guard + direct load, no interpreter round-trip).
+    ///
+    /// Only a warm, single-entry `OwnData` IC whose slot lives in the fixed
+    /// in-object region (`slot < INLINE_VALUE_CAP`) and whose shape handle is
+    /// non-null (fast mode) qualifies. The shape handle's compressed offset is
+    /// a stable guard token because shapes are immortal and pinned in old
+    /// space. Everything else keeps the shared runtime stub.
+    fn bake_inline_property_loads(&self, view: &mut jit::JitFunctionView) {
+        const VALUE_SIZE: u32 = std::mem::size_of::<Value>() as u32;
+        let header = otter_gc::header::HEADER_SIZE as u32;
+        let shape_byte = header + crate::object::OBJECT_BODY_SHAPE_OFFSET as u32;
+        let mut baked_any = false;
+        for instr in &mut view.instructions {
+            if instr.op != otter_bytecode::Op::LoadProperty {
+                continue;
+            }
+            let Some(site) = instr.property_ic_site else {
+                continue;
+            };
+            let Some(entry) = self.load_property_ics.get(site) else {
+                continue;
+            };
+            if entry.entry_count() != 1 {
+                continue;
+            }
+            let property_ic::LoadPropertyIc::OwnData { hit } = &entry.entries()[0] else {
+                continue;
+            };
+            if hit.shape.is_null() || usize::from(hit.slot) >= crate::object::INLINE_VALUE_CAP {
+                continue;
+            }
+            instr.inline_load = Some(jit::JitInlineLoad {
+                cached_shape_offset: hit.shape.offset(),
+                shape_byte,
+                value_byte: header
+                    + crate::object::OBJECT_BODY_INLINE_VALUES_OFFSET as u32
+                    + u32::from(hit.slot) * VALUE_SIZE,
+            });
+            baked_any = true;
+        }
+        if baked_any {
+            view.cage_base = otter_gc::cage_base() as usize;
         }
     }
 

@@ -133,14 +133,22 @@ impl otter_gc::SafeTraceable for ShapeBody {
 }
 
 /// Allocate the root hidden-class node.
+///
+/// Shapes are allocated directly in non-moving old space: they are immortal
+/// (rooted forever by the shape-transition tables) and the JIT bakes a
+/// shape's handle offset into emitted monomorphic property guards, so the
+/// offset must stay stable for the life of the isolate. Old-space pinning
+/// guarantees that without a separate stability mechanism.
 pub(crate) fn alloc_root_shape_body_with_roots(
     heap: &mut GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
-    heap.alloc_with_roots(ShapeBody::root(next_shape_id()), external_visit)
+    heap.alloc_old_with_roots(ShapeBody::root(next_shape_id()), external_visit)
 }
 
 /// Allocate a child shape for adding `key` to `parent`.
+///
+/// Old-space pinned for the same reason as [`alloc_root_shape_body_with_roots`].
 pub(crate) fn alloc_child_shape_body_with_roots(
     heap: &mut GcHeap,
     parent: ShapeHandle,
@@ -148,7 +156,7 @@ pub(crate) fn alloc_child_shape_body_with_roots(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
     let parent_property_count = heap.read_payload(parent, ShapeBody::property_count);
-    heap.alloc_with_roots(
+    heap.alloc_old_with_roots(
         ShapeBody::child(parent, key, parent_property_count),
         external_visit,
     )

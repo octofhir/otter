@@ -263,6 +263,46 @@ extern "C" fn jit_load_global_stub(ctx: *mut JitCtx, dst: u64, name_idx: u64) ->
     }
 }
 
+/// Bridge stub: perform a `CallMethodValue` (`recv.name(args…)`) from compiled
+/// code, delegating to the safe [`Interpreter::jit_runtime_call_method`].
+/// Returns `0` on success, `1` when the call threw (error parked in `ctx`).
+/// At most [`MAX_INLINE_ARGS`] argument registers are passed (a0..a2 here,
+/// since `recv` and `name_idx` consume two of the eight ABI registers).
+#[allow(clippy::too_many_arguments)]
+extern "C" fn jit_call_method_stub(
+    ctx: *mut JitCtx,
+    dst: u64,
+    recv: u64,
+    name_idx: u64,
+    argc: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+) -> u64 {
+    // SAFETY: see `jit_call_stub`.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    let all = [a0 as u16, a1 as u16, a2 as u16];
+    let argc = (argc as usize).min(all.len());
+    match vm.jit_runtime_call_method(
+        context,
+        stack,
+        ctx.frame_index,
+        dst as u16,
+        recv as u16,
+        name_idx as u32,
+        &all[..argc],
+    ) {
+        Ok(()) => 0,
+        Err(err) => {
+            ctx.error = Some(err);
+            1
+        }
+    }
+}
+
 /// Why a function could not be baseline-compiled. Always maps to a silent
 /// interpreter fallback; never a JS-visible error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,8 +386,8 @@ mod arm64 {
     use super::{
         BaselineCode, MAX_INLINE_ARGS, Op, Operand, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE,
         STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_INT32, TAG_NAN, TAG_SPECIAL, Unsupported,
-        jit_call_stub, jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub,
-        jit_make_fn_stub, jit_store_prop_stub, reg_offset,
+        jit_call_method_stub, jit_call_stub, jit_load_element_stub, jit_load_global_stub,
+        jit_load_prop_stub, jit_make_fn_stub, jit_store_prop_stub, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -599,6 +639,38 @@ mod arm64 {
                 }
                 Op::Call => {
                     emit_call(&mut ops, ops_ref, threw)?;
+                }
+                // `recv.name(args…)` — resolve + invoke via the safe bridge.
+                // Operands: dst, recv, name-const, argc-const, then argc arg
+                // registers. `recv` and `name_idx` consume two ABI registers, so
+                // at most three inline args fit (x5..x7).
+                Op::CallMethodValue => {
+                    const MAX_METHOD_ARGS: usize = 3;
+                    let dst = reg(ops_ref, 0)?;
+                    let recv = reg(ops_ref, 1)?;
+                    let name = const_index(ops_ref, 2)?;
+                    let argc = const_index(ops_ref, 3)? as usize;
+                    if argc > MAX_METHOD_ARGS {
+                        return Err(Unsupported::ArgCount(argc));
+                    }
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; mov x0, x20
+                        ; movz x1, dst as u32
+                        ; movz x2, recv as u32
+                    );
+                    emit_load_u64(&mut ops, 3, u64::from(name));
+                    dynasm!(ops ; .arch aarch64 ; movz x4, argc as u32);
+                    for slot in 0..MAX_METHOD_ARGS {
+                        let areg = if slot < argc {
+                            reg(ops_ref, 4 + slot)?
+                        } else {
+                            0
+                        };
+                        let xn = 5 + slot as u32;
+                        dynasm!(ops ; .arch aarch64 ; movz X(xn), areg as u32);
+                    }
+                    emit_call_stub(&mut ops, jit_call_method_stub as *const () as usize, threw);
                 }
                 // `recv[idx]` — delegate to the safe element-load bridge (covers
                 // dense/sparse arrays, typed arrays, strings, object `[[Get]]`).

@@ -792,6 +792,56 @@ impl Interpreter {
         false
     }
 
+    /// JIT bridge for `CallMethodValue` (`recv.name(args…)`) from compiled code.
+    ///
+    /// Resolves the method through the full `[[Get]]` ladder
+    /// ([`Self::get_method_value_for_call`]) and invokes it synchronously with
+    /// `this` = `recv` via [`Self::run_callable_sync`] — the same primitive the
+    /// `Op::Call` bridge uses, so native and ordinary bytecode methods complete
+    /// inline and the result lands in `dst`. The frame PC is saved/restored so a
+    /// later guard bail re-runs the compiled frame from PC 0.
+    ///
+    /// # Errors
+    /// `TypeError` for a nullish receiver, `NotCallable` when the resolved
+    /// property is not callable, plus any error the method itself throws.
+    pub fn jit_runtime_call_method(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut SmallVec<[Frame; 8]>,
+        frame_index: usize,
+        dst: u16,
+        recv_reg: u16,
+        name_idx: u32,
+        arg_regs: &[u16],
+    ) -> Result<(), VmError> {
+        let recv = *read_register(&stack[frame_index], recv_reg)?;
+        if recv.is_nullish() {
+            let label = if recv.is_null() { "null" } else { "undefined" };
+            return Err(VmError::TypeError {
+                message: format!("Cannot read properties of {label}"),
+            });
+        }
+        let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(arg_regs.len());
+        for &r in arg_regs {
+            args.push(*read_register(&stack[frame_index], r)?);
+        }
+        let name = context
+            .string_constant_str(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        let saved_pc = stack[frame_index].pc;
+        let method = self
+            .get_method_value_for_call(context, stack, recv, name)?
+            .unwrap_or_else(Value::undefined);
+        if !self.is_callable_runtime(&method) {
+            stack[frame_index].pc = saved_pc;
+            return Err(VmError::NotCallable);
+        }
+        let result = self.run_callable_sync(context, &method, recv, args)?;
+        stack[frame_index].pc = saved_pc;
+        write_register(&mut stack[frame_index], dst, result)?;
+        Ok(())
+    }
+
     /// Resolve a method by receiver shape through the call site's load IC.
     ///
     /// Returns the method value on an IC hit or a freshly installed

@@ -140,6 +140,48 @@ impl Interpreter {
         Ok(())
     }
 
+    /// JIT bridge for `LoadUpvalue` from compiled code, delegating to
+    /// [`Self::run_load_upvalue_reg`] (captured-binding read with a TDZ-hole
+    /// check). Frame PC is saved/restored so the helper's `advance_pc` does not
+    /// disturb the compiled frame's program counter.
+    ///
+    /// # Errors
+    /// Propagates `ReferenceError` for a TDZ-hole cell and `InvalidOperand`.
+    pub fn jit_runtime_load_upvalue(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        frame_index: usize,
+        dst: u16,
+        idx: i32,
+    ) -> Result<(), VmError> {
+        let saved_pc = stack[frame_index].pc;
+        let frame = &mut stack[frame_index];
+        let result = self.run_load_upvalue_reg(frame, dst, idx);
+        stack[frame_index].pc = saved_pc;
+        result
+    }
+
+    /// JIT bridge for `StoreUpvalue` from compiled code, delegating to
+    /// [`Self::run_store_upvalue_reg`] (captured-binding write, including the
+    /// write barrier). Frame PC is saved/restored as in
+    /// [`Self::jit_runtime_load_upvalue`].
+    ///
+    /// # Errors
+    /// Propagates `InvalidOperand` for a negative or out-of-range index.
+    pub fn jit_runtime_store_upvalue(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        frame_index: usize,
+        src: u16,
+        idx: i32,
+    ) -> Result<(), VmError> {
+        let saved_pc = stack[frame_index].pc;
+        let frame = &mut stack[frame_index];
+        let result = self.run_store_upvalue_reg(frame, src, idx);
+        stack[frame_index].pc = saved_pc;
+        result
+    }
+
     pub(crate) fn run_collect_rest_reg(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,

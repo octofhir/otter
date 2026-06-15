@@ -263,6 +263,41 @@ extern "C" fn jit_load_global_stub(ctx: *mut JitCtx, dst: u64, name_idx: u64) ->
     }
 }
 
+/// Bridge stub: perform a `LoadUpvalue` (captured-binding read) from compiled
+/// code, delegating to [`Interpreter::jit_runtime_load_upvalue`]. `idx` carries
+/// the bytecode's signed upvalue index. Returns `0` on success, `1` on throw
+/// (TDZ `ReferenceError`, error parked in `ctx`).
+extern "C" fn jit_load_upvalue_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
+    // SAFETY: see `jit_call_stub`.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    match vm.jit_runtime_load_upvalue(stack, ctx.frame_index, dst as u16, idx as i32) {
+        Ok(()) => 0,
+        Err(err) => {
+            ctx.error = Some(err);
+            1
+        }
+    }
+}
+
+/// Bridge stub: perform a `StoreUpvalue` (captured-binding write) from compiled
+/// code, delegating to [`Interpreter::jit_runtime_store_upvalue`]. Returns `0`
+/// on success, `1` on throw (error parked in `ctx`).
+extern "C" fn jit_store_upvalue_stub(ctx: *mut JitCtx, src: u64, idx: u64) -> u64 {
+    // SAFETY: see `jit_call_stub`.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    match vm.jit_runtime_store_upvalue(stack, ctx.frame_index, src as u16, idx as i32) {
+        Ok(()) => 0,
+        Err(err) => {
+            ctx.error = Some(err);
+            1
+        }
+    }
+}
+
 /// Bridge stub: perform a `CallMethodValue` (`recv.name(args…)`) from compiled
 /// code, delegating to the safe [`Interpreter::jit_runtime_call_method`].
 /// Returns `0` on success, `1` when the call threw (error parked in `ctx`).
@@ -456,8 +491,8 @@ mod arm64 {
         BaselineCode, MAX_INLINE_ARGS, Op, Operand, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE,
         STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_INT32, TAG_NAN, TAG_SPECIAL, Unsupported,
         jit_call_method_stub, jit_call_stub, jit_load_element_stub, jit_load_global_stub,
-        jit_load_prop_stub, jit_make_fn_stub, jit_store_element_stub, jit_store_prop_stub,
-        reg_offset,
+        jit_load_prop_stub, jit_load_upvalue_stub, jit_make_fn_stub, jit_store_element_stub,
+        jit_store_prop_stub, jit_store_upvalue_stub, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -513,6 +548,46 @@ mod arm64 {
                 ; b.ls =>$bail                // high-16 in [0x7FFA, 0x7FFF] → non-number
             );
         };
+    }
+
+    /// Integer binary ops that share the int32 fast-path shape: guard both
+    /// operands int32, apply a single 32-bit instruction, re-box as int32.
+    enum IntBinOp {
+        Or,
+        And,
+        Xor,
+        Shl,
+        Shr,
+    }
+
+    /// Emit an int32 bitwise/shift op (`BitwiseOr`/`And`/`Xor`/`Shl`/`Shr`).
+    ///
+    /// Both operands must already be int32-tagged Values; a non-int32 operand
+    /// bails to the interpreter (which performs the full `ToInt32`/`ToUint32`
+    /// coercion). Result is int32, matching JS semantics: the AArch64 32-bit
+    /// `lsl`/`asr` mask the shift count to its low 5 bits exactly as JS masks
+    /// the right operand to `& 31`.
+    fn emit_int_binop(
+        ops: &mut Assembler,
+        operands: &[Operand],
+        bail: DynamicLabel,
+        kind: IntBinOp,
+    ) -> Result<(), Unsupported> {
+        let (dst, lhs, rhs) = reg3(operands)?;
+        load_reg(ops, 9, lhs)?;
+        load_reg(ops, 10, rhs)?;
+        guard_int32!(ops, 9, bail);
+        guard_int32!(ops, 10, bail);
+        match kind {
+            IntBinOp::Or => dynasm!(ops ; .arch aarch64 ; orr w13, w9, w10),
+            IntBinOp::And => dynasm!(ops ; .arch aarch64 ; and w13, w9, w10),
+            IntBinOp::Xor => dynasm!(ops ; .arch aarch64 ; eor w13, w9, w10),
+            IntBinOp::Shl => dynasm!(ops ; .arch aarch64 ; lsl w13, w9, w10),
+            IntBinOp::Shr => dynasm!(ops ; .arch aarch64 ; asr w13, w9, w10),
+        }
+        box_low32!(ops, 13, 12, TAG_INT32);
+        store_reg(ops, 13, dst)?;
+        Ok(())
     }
 
     /// Emit the function prologue: save fp/lr + callee-saved bases, then set
@@ -604,6 +679,12 @@ mod arm64 {
                     let dst = reg(ops_ref, 0)?;
                     // SPECIAL payload 0 == undefined.
                     emit_load_u64(&mut ops, 9, TAG_SPECIAL << 48);
+                    store_reg(&mut ops, 9, dst)?;
+                }
+                Op::LoadHole => {
+                    let dst = reg(ops_ref, 0)?;
+                    // SPECIAL payload `SPECIAL_HOLE` == the TDZ/uninitialized hole.
+                    emit_load_u64(&mut ops, 9, (TAG_SPECIAL << 48) | SPECIAL_HOLE);
                     store_reg(&mut ops, 9, dst)?;
                 }
                 Op::StoreLocal => {
@@ -814,6 +895,25 @@ mod arm64 {
                     emit_load_u64(&mut ops, 2, u64::from(name));
                     emit_call_stub(&mut ops, jit_load_global_stub as *const () as usize, threw);
                 }
+                // `dst = upvalue[idx]` (captured binding) — delegate to the safe
+                // bridge (TDZ-hole check inside). `idx` is the signed bytecode
+                // upvalue index, passed as its u32 bits and re-read as i32.
+                Op::LoadUpvalue => {
+                    let dst = reg(ops_ref, 0)?;
+                    let idx = imm32(ops_ref, 1)?;
+                    dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
+                    emit_load_u64(&mut ops, 2, u64::from(idx as u32));
+                    emit_call_stub(&mut ops, jit_load_upvalue_stub as *const () as usize, threw);
+                }
+                // `upvalue[idx] = src` (captured binding) — delegate to the safe
+                // bridge (write barrier inside).
+                Op::StoreUpvalue => {
+                    let src = reg(ops_ref, 0)?;
+                    let idx = imm32(ops_ref, 1)?;
+                    dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, src as u32);
+                    emit_load_u64(&mut ops, 2, u64::from(idx as u32));
+                    emit_call_stub(&mut ops, jit_store_upvalue_stub as *const () as usize, threw);
+                }
                 // `dst = ToNumeric(src) + delta` (§13.4 UpdateExpression). Int32
                 // fast path with overflow → double; double path otherwise.
                 Op::Increment => {
@@ -889,16 +989,11 @@ mod arm64 {
                     emit_load_u64(&mut ops, 4, site);
                     emit_call_stub(&mut ops, jit_store_prop_stub as *const () as usize, threw);
                 }
-                Op::BitwiseOr => {
-                    let (dst, lhs, rhs) = reg3(ops_ref)?;
-                    load_reg(&mut ops, 9, lhs)?;
-                    load_reg(&mut ops, 10, rhs)?;
-                    guard_int32!(ops, 9, bail);
-                    guard_int32!(ops, 10, bail);
-                    dynasm!(ops ; .arch aarch64 ; orr w13, w9, w10);
-                    box_low32!(ops, 13, 12, TAG_INT32);
-                    store_reg(&mut ops, 13, dst)?;
-                }
+                Op::BitwiseOr => emit_int_binop(&mut ops, ops_ref, bail, IntBinOp::Or)?,
+                Op::BitwiseAnd => emit_int_binop(&mut ops, ops_ref, bail, IntBinOp::And)?,
+                Op::BitwiseXor => emit_int_binop(&mut ops, ops_ref, bail, IntBinOp::Xor)?,
+                Op::Shl => emit_int_binop(&mut ops, ops_ref, bail, IntBinOp::Shl)?,
+                Op::Shr => emit_int_binop(&mut ops, ops_ref, bail, IntBinOp::Shr)?,
                 Op::Return | Op::ReturnValue => {
                     let src = reg(ops_ref, 0)?;
                     let off = reg_offset(src)?;

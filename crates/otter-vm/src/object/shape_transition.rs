@@ -30,9 +30,8 @@
 //! - [`crate::property_dispatch`]
 
 use super::{
-    AtomOwnPropertyHit, JsObject, ObjectBody, ObjectPrototype, PropertyLookup, PropertySlot,
-    ShapeHandle, ShapeId, has_writable_own_data_slot_atom, lookup_own_atom, prototype_value,
-    shape_id,
+    AtomOwnPropertyHit, JsObject, ObjectBody, ObjectPrototype, PropertyLookup, ShapeHandle,
+    ShapeId, SlotData, has_writable_own_data_slot_atom, lookup_own_atom, prototype_value, shape_id,
 };
 use crate::Value;
 use crate::property_atom::{AtomId, AtomizedPropertyKey};
@@ -114,7 +113,7 @@ pub(crate) fn capture_store_property_transition(
         body.dictionary_shape_id = to_shape_id;
         super::dict_push_key(body, key.name().to_owned());
         body.shape = super::ShapeHandle::null();
-        body.slots.push(PropertySlot::data_default(*value));
+        body.push_slot(SlotData::data_default(*value));
         Some(StorePropertyTransition {
             from_shape_id,
             atom_id: key.atom().id(),
@@ -152,7 +151,7 @@ pub(crate) fn capture_store_property_transition_with_shape(
         }
         let slot = u16::try_from(body.slots.len()).ok()?;
         body.shape = next_shape;
-        body.slots.push(PropertySlot::data_default(*value));
+        body.push_slot(SlotData::data_default(*value));
         Some(StorePropertyTransition {
             from_shape_id,
             atom_id: key.atom().id(),
@@ -212,7 +211,7 @@ pub(crate) fn replay_store_property_transition(
             debug_assert_eq!(to_shape_id, Some(transition.to_shape_id));
             body.shape = transition.to_shape;
         }
-        body.slots.push(PropertySlot::data_default(*value));
+        body.push_slot(SlotData::data_default(*value));
         true
     });
     if !success {

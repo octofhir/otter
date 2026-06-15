@@ -172,72 +172,135 @@ impl ObjectPrototype {
     }
 }
 
-// ---------- internal slot type --------------------------------------------
+// ---------- internal slot storage -----------------------------------------
 
-/// Slot stored alongside each shape key. Mirrors the public
-/// [`PropertyDescriptor`] layout.
+/// Number of in-object data-property values stored inline in a fast object
+/// before overflowing to [`ObjectBody::overflow_values`].
+///
+/// The inline array gives the JIT a fixed byte offset for monomorphic
+/// property loads: a string-keyed slot `i < INLINE_VALUE_CAP` lives at
+/// `OBJECT_BODY_INLINE_VALUES_OFFSET + i * size_of::<Value>()`.
+pub(crate) const INLINE_VALUE_CAP: usize = 6;
+
+/// `[[Get]]`/`[[Set]]` pair for an accessor property. Boxed off the hot
+/// metadata path so an ordinary data slot's [`SlotMeta`] stays small.
 #[derive(Debug, Clone)]
-struct PropertySlot {
+struct AccessorPair {
+    getter: Option<Value>,
+    setter: Option<Value>,
+}
+
+/// Property kind discriminant. The data **value** is stored out-of-line —
+/// in the object's flat value array for string-keyed slots, or in
+/// [`SlotData::value`] for symbol slots and descriptor interchange — so the
+/// JIT can read a monomorphic data property by fixed byte offset.
+#[derive(Debug, Clone)]
+enum SlotKind {
+    /// Data property; the value lives in the flat value array.
+    Data,
+    /// Accessor property; getter/setter boxed (cold path).
+    Accessor(Box<AccessorPair>),
+}
+
+impl SlotKind {
+    fn accessor(getter: Option<Value>, setter: Option<Value>) -> Self {
+        SlotKind::Accessor(Box::new(AccessorPair { getter, setter }))
+    }
+
+    fn is_data(&self) -> bool {
+        matches!(self, SlotKind::Data)
+    }
+}
+
+/// Per-slot metadata for a string-keyed own property. The matching data
+/// value lives at the same index in the object's flat value array
+/// ([`ObjectBody::data_value`]).
+#[derive(Debug, Clone)]
+struct SlotMeta {
     flags: PropertyFlags,
-    body: SlotBody,
+    kind: SlotKind,
 }
 
+/// Owned `(flags, kind, value)` triple. Used as the storage form for
+/// symbol-keyed own properties (never JIT-hot, so they keep the value
+/// inline) and as the interchange form for descriptor validation and
+/// merges. `value` is meaningful only when `kind` is [`SlotKind::Data`].
 #[derive(Debug, Clone)]
-enum SlotBody {
-    Data {
-        value: Value,
-    },
-    Accessor {
-        getter: Option<Value>,
-        setter: Option<Value>,
-    },
+struct SlotData {
+    flags: PropertyFlags,
+    kind: SlotKind,
+    value: Value,
 }
 
-impl PropertySlot {
+impl SlotData {
     fn data_default(value: Value) -> Self {
         Self {
             flags: PropertyFlags::data_default(),
-            body: SlotBody::Data { value },
+            kind: SlotKind::Data,
+            value,
         }
     }
 
     fn from_descriptor(desc: PropertyDescriptor) -> Self {
-        Self {
-            flags: desc.flags,
-            body: match desc.kind {
-                DescriptorKind::Data { value } => SlotBody::Data { value },
-                DescriptorKind::Accessor { getter, setter } => {
-                    SlotBody::Accessor { getter, setter }
-                }
+        match desc.kind {
+            DescriptorKind::Data { value } => Self {
+                flags: desc.flags,
+                kind: SlotKind::Data,
+                value,
+            },
+            DescriptorKind::Accessor { getter, setter } => Self {
+                flags: desc.flags,
+                kind: SlotKind::accessor(getter, setter),
+                value: Value::undefined(),
             },
         }
+    }
+
+    /// Split into index-aligned metadata + value for flat storage.
+    fn split(self) -> (SlotMeta, Value) {
+        (
+            SlotMeta {
+                flags: self.flags,
+                kind: self.kind,
+            },
+            self.value,
+        )
     }
 
     fn to_descriptor(&self) -> PropertyDescriptor {
-        PropertyDescriptor {
-            flags: self.flags,
-            kind: match &self.body {
-                SlotBody::Data { value } => DescriptorKind::Data { value: *value },
-                SlotBody::Accessor { getter, setter } => DescriptorKind::Accessor {
-                    getter: *getter,
-                    setter: *setter,
-                },
-            },
-        }
+        slot_descriptor(self.flags, &self.kind, self.value)
     }
 
     fn to_lookup(&self) -> PropertyLookup {
-        match &self.body {
-            SlotBody::Data { value } => PropertyLookup::Data {
-                value: *value,
-                flags: self.flags,
+        slot_lookup(self.flags, &self.kind, self.value)
+    }
+}
+
+/// Build a [`PropertyDescriptor`] from split slot parts (`value` ignored
+/// for accessors).
+fn slot_descriptor(flags: PropertyFlags, kind: &SlotKind, value: Value) -> PropertyDescriptor {
+    PropertyDescriptor {
+        flags,
+        kind: match kind {
+            SlotKind::Data => DescriptorKind::Data { value },
+            SlotKind::Accessor(pair) => DescriptorKind::Accessor {
+                getter: pair.getter,
+                setter: pair.setter,
             },
-            SlotBody::Accessor { getter, setter } => PropertyLookup::Accessor {
-                getter: *getter,
-                setter: *setter,
-                flags: self.flags,
-            },
-        }
+        },
+    }
+}
+
+/// Build a [`PropertyLookup`] from split slot parts (`value` ignored for
+/// accessors).
+fn slot_lookup(flags: PropertyFlags, kind: &SlotKind, value: Value) -> PropertyLookup {
+    match kind {
+        SlotKind::Data => PropertyLookup::Data { value, flags },
+        SlotKind::Accessor(pair) => PropertyLookup::Accessor {
+            getter: pair.getter,
+            setter: pair.setter,
+            flags,
+        },
     }
 }
 
@@ -316,9 +379,22 @@ pub const OBJECT_BODY_TYPE_TAG: u8 = 0x11;
 ///
 /// - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots>
 /// - <https://tc39.es/ecma262/#sec-ordinarypreventextensions>
+#[repr(C)]
 pub struct ObjectBody {
-    /// GC-managed hidden class for fast ordinary objects.
+    /// GC-managed hidden class for fast ordinary objects. First field so
+    /// the JIT can read the shape token at a fixed byte offset
+    /// ([`OBJECT_BODY_SHAPE_OFFSET`]) for monomorphic guard checks.
     shape: ShapeHandle,
+    /// Flat in-object data-property values for the first
+    /// [`INLINE_VALUE_CAP`] string-keyed slots, indexed by shape slot
+    /// offset. This is the **single source of truth** for fast-mode data
+    /// values (overflow spills to [`Self::overflow_values`]); a slot's
+    /// metadata (flags + data/accessor kind) lives in [`Self::slots`] at
+    /// the same index. Accessor slots store an unused `undefined` here.
+    inline_values: [Value; INLINE_VALUE_CAP],
+    /// Out-of-line data values for string-keyed slots with index
+    /// `>= INLINE_VALUE_CAP` (`overflow_values[i - INLINE_VALUE_CAP]`).
+    overflow_values: Vec<Value>,
     /// Fallback/dictionary identity used only when [`Self::shape`] is null.
     dictionary_shape_id: ShapeId,
     /// Fallback/dictionary string-key order used only when [`Self::shape`]
@@ -339,8 +415,10 @@ pub struct ObjectBody {
     /// [`ShapeCacheMode::DictionaryCompatible`] so future dictionary storage
     /// can keep the same invalidation contract without installing stale ICs.
     shape_cache_mode: ShapeCacheMode,
-    /// Slot table aligned with the GC shape chain or `dictionary_keys`.
-    slots: SmallVec<[PropertySlot; 4]>,
+    /// Per-slot metadata (flags + data/accessor kind) aligned with the GC
+    /// shape chain or `dictionary_keys`. The data value for slot `i` lives
+    /// out-of-line in the flat value array ([`Self::data_value`]).
+    slots: SmallVec<[SlotMeta; 4]>,
     /// `[[Prototype]]` — [`otter_gc::Gc::null()`] encodes JS
     /// `null` (no prototype). Stored as a bare `JsObject` rather
     /// than `Option<JsObject>` so the slot has a stable address
@@ -351,7 +429,7 @@ pub struct ObjectBody {
     /// Symbol-keyed own properties. Stored outside the string-keyed
     /// shape because symbols are identity keys, but values still use
     /// the same descriptor slot representation.
-    symbol_props: Vec<(JsSymbol, PropertySlot)>,
+    symbol_props: Vec<(JsSymbol, SlotData)>,
     /// Rust-owned payload for host-backed objects and VM-internal
     /// exotic side data.
     host_data: Option<Box<dyn Any>>,
@@ -399,6 +477,99 @@ pub struct ObjectBody {
     /// (`Object.prototype.toString.call(arguments)`) report the
     /// `"Arguments"` builtin tag per §20.1.3.6 step 14.b.
     is_arguments_object: bool,
+}
+
+/// Byte offset of the shape token within an [`ObjectBody`] payload. The
+/// JIT reads the shape handle here for the monomorphic IC guard.
+pub(crate) const OBJECT_BODY_SHAPE_OFFSET: usize = std::mem::offset_of!(ObjectBody, shape);
+
+/// Byte offset of the inline data-value array within an [`ObjectBody`]
+/// payload. The JIT reads slot `i < INLINE_VALUE_CAP` at
+/// `OBJECT_BODY_INLINE_VALUES_OFFSET + i * size_of::<Value>()`.
+pub(crate) const OBJECT_BODY_INLINE_VALUES_OFFSET: usize =
+    std::mem::offset_of!(ObjectBody, inline_values);
+
+// The JIT bakes these offsets into emitted property loads; pin them.
+const _: () = assert!(OBJECT_BODY_SHAPE_OFFSET == 0);
+const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET >= 8);
+const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET.is_multiple_of(8));
+
+impl ObjectBody {
+    /// Read the data value for string-keyed slot `i` from flat storage.
+    #[inline]
+    fn data_value(&self, i: usize) -> Value {
+        if i < INLINE_VALUE_CAP {
+            self.inline_values[i]
+        } else {
+            self.overflow_values[i - INLINE_VALUE_CAP]
+        }
+    }
+
+    /// Write the data value for string-keyed slot `i` into flat storage.
+    #[inline]
+    fn set_data_value(&mut self, i: usize, value: Value) {
+        if i < INLINE_VALUE_CAP {
+            self.inline_values[i] = value;
+        } else {
+            self.overflow_values[i - INLINE_VALUE_CAP] = value;
+        }
+    }
+
+    /// Append a new string-keyed own slot (metadata + value) at the next
+    /// index, keeping `slots` and the flat value array aligned.
+    fn push_slot(&mut self, data: SlotData) {
+        let (meta, value) = data.split();
+        let i = self.slots.len();
+        if i < INLINE_VALUE_CAP {
+            self.inline_values[i] = value;
+        } else {
+            self.overflow_values.push(value);
+        }
+        self.slots.push(meta);
+    }
+
+    /// Overwrite the string-keyed slot at `i` with new metadata + value.
+    fn set_slot(&mut self, i: usize, data: SlotData) {
+        let (meta, value) = data.split();
+        self.set_data_value(i, value);
+        self.slots[i] = meta;
+    }
+
+    /// Snapshot the string-keyed slot at `i` as an owned [`SlotData`].
+    fn slot_data(&self, i: usize) -> SlotData {
+        let meta = &self.slots[i];
+        SlotData {
+            flags: meta.flags,
+            kind: meta.kind.clone(),
+            value: self.data_value(i),
+        }
+    }
+
+    /// [`PropertyLookup`] for the string-keyed slot at `i`.
+    fn slot_lookup_at(&self, i: usize) -> PropertyLookup {
+        slot_lookup(self.slots[i].flags, &self.slots[i].kind, self.data_value(i))
+    }
+
+    /// [`PropertyDescriptor`] for the string-keyed slot at `i`.
+    fn slot_descriptor_at(&self, i: usize) -> PropertyDescriptor {
+        slot_descriptor(self.slots[i].flags, &self.slots[i].kind, self.data_value(i))
+    }
+
+    /// Remove the string-keyed slot at `i`, shifting later values down so
+    /// `slots` and the flat value array stay index-aligned.
+    fn remove_slot(&mut self, i: usize) {
+        let len = self.slots.len();
+        for j in i..len - 1 {
+            let next = self.data_value(j + 1);
+            self.set_data_value(j, next);
+        }
+        if len - 1 < INLINE_VALUE_CAP {
+            self.inline_values[len - 1] = Value::undefined();
+        } else {
+            self.overflow_values.pop();
+        }
+        self.slots.remove(i);
+    }
 }
 
 impl std::fmt::Debug for ObjectBody {
@@ -462,29 +633,44 @@ impl otter_gc::SafeTraceable for ObjectBody {
                 proxy.trace_value_slots(v);
             }
         }
-        // Property slots.
-        for slot in self.slots.iter() {
-            match &slot.body {
-                SlotBody::Data { value } => value.trace_value_slots(v),
-                SlotBody::Accessor { getter, setter } => {
-                    if let Some(g) = getter {
+        debug_assert_eq!(
+            self.overflow_values.len(),
+            self.slots.len().saturating_sub(INLINE_VALUE_CAP),
+            "flat value array desynced from slots (len {})",
+            self.slots.len()
+        );
+        // String-keyed property slots: data values from flat storage,
+        // accessor functions from the boxed metadata.
+        for (i, meta) in self.slots.iter().enumerate() {
+            match &meta.kind {
+                // Trace the stored value *in place* (by reference) so the
+                // moving scavenger rewrites the live slot, not a copy.
+                SlotKind::Data => {
+                    if i < INLINE_VALUE_CAP {
+                        self.inline_values[i].trace_value_slots(v);
+                    } else {
+                        self.overflow_values[i - INLINE_VALUE_CAP].trace_value_slots(v);
+                    }
+                }
+                SlotKind::Accessor(pair) => {
+                    if let Some(g) = &pair.getter {
                         g.trace_value_slots(v);
                     }
-                    if let Some(s) = setter {
+                    if let Some(s) = &pair.setter {
                         s.trace_value_slots(v);
                     }
                 }
             }
         }
-        // Symbol-keyed own properties.
+        // Symbol-keyed own properties (value inline in the slot).
         for (_sym, slot) in self.symbol_props.iter() {
-            match &slot.body {
-                SlotBody::Data { value } => value.trace_value_slots(v),
-                SlotBody::Accessor { getter, setter } => {
-                    if let Some(g) = getter {
+            match &slot.kind {
+                SlotKind::Data => slot.value.trace_value_slots(v),
+                SlotKind::Accessor(pair) => {
+                    if let Some(g) = &pair.getter {
                         g.trace_value_slots(v);
                     }
-                    if let Some(s) = setter {
+                    if let Some(s) = &pair.setter {
                         s.trace_value_slots(v);
                     }
                 }
@@ -528,6 +714,8 @@ pub const PROTO_CHAIN_HARD_CAP: usize = 1024;
 fn empty_object_body() -> ObjectBody {
     ObjectBody {
         shape: ShapeHandle::null(),
+        inline_values: [Value::undefined(); INLINE_VALUE_CAP],
+        overflow_values: Vec::new(),
         dictionary_shape_id: next_shape_id(),
         dictionary_keys: Vec::new(),
         dictionary_index: rustc_hash::FxHashMap::default(),
@@ -564,6 +752,17 @@ fn empty_object_body_with_shape(shape: ShapeHandle) -> ObjectBody {
 pub(crate) fn alloc_object_old_for_fixture(
     heap: &mut GcHeap,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
+    heap.alloc_old(empty_object_body())
+}
+
+/// Allocate an empty object directly in non-moving old space.
+///
+/// For permanent singleton roots — the realm global object — that live for
+/// the whole isolate. Pinning them in old space keeps every handle stable
+/// across young scavenges and avoids copying a large, long-lived object on
+/// every minor collection. The empty body holds no GC edges, so no caller
+/// roots are required across the allocation.
+pub(crate) fn alloc_object_old(heap: &mut GcHeap) -> Result<JsObject, otter_gc::OutOfMemory> {
     heap.alloc_old(empty_object_body())
 }
 
@@ -626,6 +825,8 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
     heap.alloc_with_roots(
         ObjectBody {
             shape: ShapeHandle::null(),
+            inline_values: [Value::undefined(); INLINE_VALUE_CAP],
+            overflow_values: Vec::new(),
             dictionary_shape_id: next_shape_id(),
             dictionary_keys: Vec::new(),
             dictionary_index: rustc_hash::FxHashMap::default(),
@@ -661,6 +862,8 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
     heap.alloc_with_roots(
         ObjectBody {
             shape,
+            inline_values: [Value::undefined(); INLINE_VALUE_CAP],
+            overflow_values: Vec::new(),
             dictionary_shape_id: next_shape_id(),
             dictionary_keys: Vec::new(),
             dictionary_index: rustc_hash::FxHashMap::default(),
@@ -785,10 +988,12 @@ fn apply_mapped_arguments_partial_define(
             let current = read_upvalue(heap, cell);
             if let Some(offset) = existing_offset {
                 heap.with_payload(obj, |body| {
-                    if let Some(slot) = body.slots.get_mut(offset as usize)
-                        && let SlotBody::Data { value } = &mut slot.body
+                    if body
+                        .slots
+                        .get(offset as usize)
+                        .is_some_and(|m| m.kind.is_data())
                     {
-                        *value = current;
+                        body.set_data_value(offset as usize, current);
                     }
                 });
                 heap.record_write(obj, &current);
@@ -929,9 +1134,13 @@ pub fn get_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Option<Valu
         if let Some(cell) = mapped_argument_cell(body, key) {
             return Some(read_upvalue(heap, cell));
         }
-        body_offset_of(heap, body, key).map(|offset| match &body.slots[offset as usize].body {
-            SlotBody::Data { value } => *value,
-            SlotBody::Accessor { .. } => Value::undefined(),
+        body_offset_of(heap, body, key).map(|offset| {
+            let i = offset as usize;
+            if body.slots[i].kind.is_data() {
+                body.data_value(i)
+            } else {
+                Value::undefined()
+            }
         })
     })
 }
@@ -964,7 +1173,7 @@ pub fn get(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Option<Value> {
 pub fn lookup_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> PropertyLookup {
     heap.read_payload(obj, |body| match body_offset_of(heap, body, key) {
         Some(offset) => {
-            let mut lookup = body.slots[offset as usize].to_lookup();
+            let mut lookup = body.slot_lookup_at(offset as usize);
             if let Some(cell) = mapped_argument_cell(body, key)
                 && let PropertyLookup::Data { value, .. } = &mut lookup
             {
@@ -985,7 +1194,7 @@ pub(crate) fn lookup_own_slot(
 ) -> (Option<OwnPropertySlotHit>, PropertyLookup) {
     heap.read_payload(obj, |body| match body_offset_of(heap, body, key) {
         Some(offset) => {
-            let mut lookup = body.slots[offset as usize].to_lookup();
+            let mut lookup = body.slot_lookup_at(offset as usize);
             if let Some(cell) = mapped_argument_cell(body, key)
                 && let PropertyLookup::Data { value, .. } = &mut lookup
             {
@@ -1012,7 +1221,7 @@ pub(crate) fn lookup_own_atom(
 ) -> AtomPropertyLookup {
     heap.read_payload(obj, |body| match body_offset_of(heap, body, key.name()) {
         Some(offset) => {
-            let mut lookup = body.slots[offset as usize].to_lookup();
+            let mut lookup = body.slot_lookup_at(offset as usize);
             if let Some(cell) = mapped_argument_cell(body, key.name())
                 && let PropertyLookup::Data { value, .. } = &mut lookup
             {
@@ -1069,9 +1278,11 @@ pub(crate) fn load_own_data_slot_atom(
         if let Some(cell) = mapped_argument_cell(body, key.name()) {
             return Some(read_upvalue(heap, cell));
         }
-        match &body.slots.get(offset)?.body {
-            SlotBody::Data { value } => Some(*value),
-            SlotBody::Accessor { .. } => None,
+        let meta = body.slots.get(offset)?;
+        if meta.kind.is_data() {
+            Some(body.data_value(offset))
+        } else {
+            None
         }
     })
 }
@@ -1097,16 +1308,13 @@ pub(crate) fn store_own_data_slot_atom(
         if current_shape_id != hit.shape_id || key.atom().id() != hit.atom_id || !key_matches {
             return false;
         }
-        let Some(slot) = body.slots.get_mut(offset) else {
+        let Some(slot) = body.slots.get(offset) else {
             return false;
         };
-        if !slot.flags.writable() {
+        if !slot.flags.writable() || !slot.kind.is_data() {
             return false;
         }
-        let SlotBody::Data { value: stored } = &mut slot.body else {
-            return false;
-        };
-        *stored = *value;
+        body.set_data_value(offset, *value);
         true
     });
     if !success {
@@ -1136,7 +1344,7 @@ fn has_writable_own_data_slot_atom(
         let Some(slot) = body.slots.get(offset) else {
             return false;
         };
-        slot.flags.writable() && matches!(slot.body, SlotBody::Data { .. })
+        slot.flags.writable() && slot.kind.is_data()
     })
 }
 
@@ -1183,7 +1391,7 @@ pub fn get_own_descriptor(
 ) -> Option<PropertyDescriptor> {
     heap.read_payload(obj, |body| {
         body_offset_of(heap, body, key).map(|offset| {
-            let mut descriptor = body.slots[offset as usize].to_descriptor();
+            let mut descriptor = body.slot_descriptor_at(offset as usize);
             if let Some(cell) = mapped_argument_cell(body, key)
                 && let DescriptorKind::Data { value } = &mut descriptor.kind
             {
@@ -1250,9 +1458,12 @@ pub fn get_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: JsSymbol) -> 
         body.symbol_props
             .iter()
             .find(|(k, _)| k.ptr_eq(key))
-            .map(|(_, slot)| match &slot.body {
-                SlotBody::Data { value } => *value,
-                SlotBody::Accessor { .. } => Value::undefined(),
+            .map(|(_, slot)| {
+                if slot.kind.is_data() {
+                    slot.value
+                } else {
+                    Value::undefined()
+                }
             })
     })
 }
@@ -1705,9 +1916,7 @@ pub fn is_frozen(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
             if slot.flags.configurable() {
                 return false;
             }
-            if let SlotBody::Data { .. } = slot.body
-                && slot.flags.writable()
-            {
+            if slot.kind.is_data() && slot.flags.writable() {
                 return false;
             }
         }
@@ -1741,14 +1950,15 @@ pub fn set(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) 
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
-            let slot = &mut body.slots[offset as usize];
-            slot.body = SlotBody::Data { value };
+            let i = offset as usize;
+            body.slots[i].kind = SlotKind::Data;
+            body.set_data_value(i, value);
             return;
         }
         body.dictionary_shape_id = next_shape_id();
         dict_push_key(body, key.to_owned());
         body.shape = ShapeHandle::null();
-        body.slots.push(PropertySlot::data_default(value));
+        body.push_slot(SlotData::data_default(value));
     });
     heap.record_write(obj, &barrier_value);
 }
@@ -1766,12 +1976,13 @@ pub(crate) fn set_with_shape(
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
-            let slot = &mut body.slots[offset as usize];
-            slot.body = SlotBody::Data { value };
+            let i = offset as usize;
+            body.slots[i].kind = SlotKind::Data;
+            body.set_data_value(i, value);
             return;
         }
         body.shape = next_shape;
-        body.slots.push(PropertySlot::data_default(value));
+        body.push_slot(SlotData::data_default(value));
     });
     heap.record_write(obj, &barrier_value);
     heap.record_write(obj, &next_shape);
@@ -1957,7 +2168,7 @@ pub fn delete(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
         if !body.slots[offset as usize].flags.configurable() {
             return false;
         }
-        body.slots.remove(offset as usize);
+        body.remove_slot(offset as usize);
         body.dictionary_shape_id = next_shape_id();
         dict_set_keys(body, replacement_keys);
         body.shape = ShapeHandle::null();
@@ -2042,7 +2253,7 @@ pub fn define_own_property_partial(
     // read both bodies through `heap`. Distinct GC handles holding
     // the same numeric value must compare equal per spec.
     let merged_for_existing = if let Some(offset) = existing_offset {
-        let existing = heap.read_payload(obj, |body| body.slots[offset as usize].clone());
+        let existing = heap.read_payload(obj, |body| body.slot_data(offset as usize));
         match descriptor_core::validate_and_apply_partial(&existing, &descriptor, heap) {
             Some(merged) => Some(merged),
             None => return false,
@@ -2052,7 +2263,7 @@ pub fn define_own_property_partial(
     };
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
-            body.slots[offset as usize] = merged_for_existing.unwrap();
+            body.set_slot(offset as usize, merged_for_existing.unwrap());
             true
         } else {
             if !body.extensible {
@@ -2064,8 +2275,7 @@ pub fn define_own_property_partial(
             }
             dict_push_key(body, key.to_owned());
             body.shape = ShapeHandle::null();
-            body.slots
-                .push(PropertySlot::from_descriptor(completed.clone()));
+            body.push_slot(SlotData::from_descriptor(completed.clone()));
             true
         }
     });
@@ -2087,7 +2297,7 @@ pub(crate) fn define_own_property_partial_with_shape(
     let barrier_descriptor = completed.clone();
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     let merged_for_existing = if let Some(offset) = existing_offset {
-        let existing = heap.read_payload(obj, |body| body.slots[offset as usize].clone());
+        let existing = heap.read_payload(obj, |body| body.slot_data(offset as usize));
         match descriptor_core::validate_and_apply_partial(&existing, &descriptor, heap) {
             Some(merged) => Some(merged),
             None => return false,
@@ -2097,15 +2307,14 @@ pub(crate) fn define_own_property_partial_with_shape(
     };
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
-            body.slots[offset as usize] = merged_for_existing.unwrap();
+            body.set_slot(offset as usize, merged_for_existing.unwrap());
             true
         } else {
             if !body.extensible {
                 return false;
             }
             body.shape = next_shape;
-            body.slots
-                .push(PropertySlot::from_descriptor(completed.clone()));
+            body.push_slot(SlotData::from_descriptor(completed.clone()));
             true
         }
     });
@@ -2150,7 +2359,7 @@ pub fn define_own_symbol_property_partial(
                 return false;
             }
             body.symbol_props
-                .push((key, PropertySlot::from_descriptor(completed.clone())));
+                .push((key, SlotData::from_descriptor(completed.clone())));
             true
         }
     });
@@ -2175,7 +2384,7 @@ pub fn define_own_property(
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     let dictionary_keys = dictionary_keys_for_shape_transition(heap, obj, existing_offset);
     let merged_for_existing = if let Some(offset) = existing_offset {
-        let existing = heap.read_payload(obj, |body| body.slots[offset as usize].clone());
+        let existing = heap.read_payload(obj, |body| body.slot_data(offset as usize));
         match descriptor_core::validate_and_apply(&existing, &descriptor, heap) {
             Some(merged) => Some(merged),
             None => return false,
@@ -2185,7 +2394,7 @@ pub fn define_own_property(
     };
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
-            body.slots[offset as usize] = merged_for_existing.unwrap();
+            body.set_slot(offset as usize, merged_for_existing.unwrap());
             true
         } else {
             if !body.extensible {
@@ -2197,7 +2406,7 @@ pub fn define_own_property(
             }
             dict_push_key(body, key.to_owned());
             body.shape = ShapeHandle::null();
-            body.slots.push(PropertySlot::from_descriptor(descriptor));
+            body.push_slot(SlotData::from_descriptor(descriptor));
             true
         }
     });
@@ -2253,7 +2462,7 @@ pub fn define_own_symbol_property(
                 return false;
             }
             body.symbol_props
-                .push((key, PropertySlot::from_descriptor(descriptor)));
+                .push((key, SlotData::from_descriptor(descriptor)));
             true
         }
     });
@@ -2487,13 +2696,13 @@ pub fn freeze(obj: JsObject, heap: &mut otter_gc::GcHeap) {
         body.extensible = false;
         for slot in body.slots.iter_mut() {
             slot.flags = slot.flags.with_configurable(false);
-            if matches!(slot.body, SlotBody::Data { .. }) {
+            if slot.kind.is_data() {
                 slot.flags = slot.flags.with_writable(false);
             }
         }
         for (_, slot) in body.symbol_props.iter_mut() {
             slot.flags = slot.flags.with_configurable(false);
-            if matches!(slot.body, SlotBody::Data { .. }) {
+            if slot.kind.is_data() {
                 slot.flags = slot.flags.with_writable(false);
             }
         }
@@ -2523,10 +2732,10 @@ impl<'a> Properties<'a> {
     /// directly.
     pub fn iter(&self) -> impl Iterator<Item = (&str, Value)> {
         self.string_keys.iter().map(|(key, idx)| {
-            let slot = &self.body.slots[*idx];
-            let value = match &slot.body {
-                SlotBody::Data { value } => *value,
-                SlotBody::Accessor { .. } => Value::undefined(),
+            let value = if self.body.slots[*idx].kind.is_data() {
+                self.body.data_value(*idx)
+            } else {
+                Value::undefined()
             };
             (key.as_str(), value)
         })
@@ -2553,9 +2762,10 @@ impl<'a> Properties<'a> {
             if !slot.flags.enumerable() {
                 return None;
             }
-            match &slot.body {
-                SlotBody::Data { value } => Some((key.as_str(), *value)),
-                SlotBody::Accessor { .. } => None,
+            if slot.kind.is_data() {
+                Some((key.as_str(), self.body.data_value(*idx)))
+            } else {
+                None
             }
         })
     }
@@ -2580,9 +2790,10 @@ impl<'a> Properties<'a> {
             if !slot.flags.enumerable() {
                 return None;
             }
-            match &slot.body {
-                SlotBody::Data { value } => Some((*sym, *value)),
-                SlotBody::Accessor { .. } => None,
+            if slot.kind.is_data() {
+                Some((*sym, slot.value))
+            } else {
+                None
             }
         })
     }
@@ -2605,14 +2816,13 @@ impl<'a> Properties<'a> {
             if index >= len {
                 continue;
             }
-            match &self.body.slots[*idx].body {
-                SlotBody::Data { value } => {
-                    if values[index].is_none() {
-                        seen += 1;
-                    }
-                    values[index] = Some(*value);
+            if self.body.slots[*idx].kind.is_data() {
+                if values[index].is_none() {
+                    seen += 1;
                 }
-                SlotBody::Accessor { .. } => return None,
+                values[index] = Some(self.body.data_value(*idx));
+            } else {
+                return None;
             }
         }
         if seen != len {

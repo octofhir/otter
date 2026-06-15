@@ -29,7 +29,7 @@ use crate::Value;
 
 use super::{
     DescriptorKind, JsObject, JsSymbol, PartialPropertyDescriptor, PropertyDescriptor,
-    PropertyFlags, PropertySlot, ShapeHandle, SlotBody, next_shape_id,
+    PropertyFlags, ShapeHandle, SlotData, SlotKind, next_shape_id,
 };
 
 pub(super) fn ordinary_set_data_property(
@@ -43,14 +43,12 @@ pub(super) fn ordinary_set_data_property(
     let dictionary_keys = super::dictionary_keys_for_shape_transition(heap, obj, existing_offset);
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
-            let slot = &mut body.slots[offset as usize];
-            if !slot.flags.writable() {
+            let i = offset as usize;
+            let slot = &body.slots[i];
+            if !slot.flags.writable() || !slot.kind.is_data() {
                 return false;
             }
-            let SlotBody::Data { value: stored } = &mut slot.body else {
-                return false;
-            };
-            *stored = value;
+            body.set_data_value(i, value);
             return true;
         }
 
@@ -63,7 +61,7 @@ pub(super) fn ordinary_set_data_property(
         }
         super::dict_push_key(body, key.to_owned());
         body.shape = ShapeHandle::null();
-        body.slots.push(PropertySlot::data_default(value));
+        body.push_slot(SlotData::data_default(value));
         true
     });
     if success {
@@ -83,14 +81,12 @@ pub(super) fn ordinary_set_data_property_with_shape(
     let existing_offset = heap.read_payload(obj, |body| super::body_offset_of(heap, body, key));
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
-            let slot = &mut body.slots[offset as usize];
-            if !slot.flags.writable() {
+            let i = offset as usize;
+            let slot = &body.slots[i];
+            if !slot.flags.writable() || !slot.kind.is_data() {
                 return false;
             }
-            let SlotBody::Data { value: stored } = &mut slot.body else {
-                return false;
-            };
-            *stored = value;
+            body.set_data_value(i, value);
             return true;
         }
 
@@ -98,7 +94,7 @@ pub(super) fn ordinary_set_data_property_with_shape(
             return false;
         }
         body.shape = next_shape;
-        body.slots.push(PropertySlot::data_default(value));
+        body.push_slot(SlotData::data_default(value));
         true
     });
     if success {
@@ -118,21 +114,17 @@ pub(super) fn ordinary_set_symbol_data_property(
     let success = heap.with_payload(obj, |body| {
         if let Some(pos) = body.symbol_props.iter().position(|(k, _)| k.ptr_eq(key)) {
             let slot = &mut body.symbol_props[pos].1;
-            if !slot.flags.writable() {
+            if !slot.flags.writable() || !slot.kind.is_data() {
                 return false;
             }
-            let SlotBody::Data { value: stored } = &mut slot.body else {
-                return false;
-            };
-            *stored = value;
+            slot.value = value;
             return true;
         }
 
         if !body.extensible {
             return false;
         }
-        body.symbol_props
-            .push((key, PropertySlot::data_default(value)));
+        body.symbol_props.push((key, SlotData::data_default(value)));
         true
     });
     if success {
@@ -145,11 +137,11 @@ pub(super) fn ordinary_set_symbol_data_property(
 /// slot. Field-presence aware: a missing field in `incoming` means
 /// "preserve existing", not "default to false".
 pub(super) fn validate_and_apply_partial(
-    existing: &PropertySlot,
+    existing: &SlotData,
     incoming: &PartialPropertyDescriptor,
     heap: &otter_gc::GcHeap,
-) -> Option<PropertySlot> {
-    let existing_is_data = matches!(existing.body, SlotBody::Data { .. });
+) -> Option<SlotData> {
+    let existing_is_data = existing.kind.is_data();
     let incoming_is_accessor = incoming.is_accessor();
     let incoming_is_data = incoming.is_data();
 
@@ -177,8 +169,8 @@ pub(super) fn validate_and_apply_partial(
             if matches!(incoming.writable, Some(true)) {
                 return None;
             }
-            if let (Some(in_v), SlotBody::Data { value: ex_v }) = (&incoming.value, &existing.body)
-                && !same_value(ex_v, in_v, heap)
+            if let Some(in_v) = &incoming.value
+                && !same_value(&existing.value, in_v, heap)
             {
                 return None;
             }
@@ -186,15 +178,12 @@ pub(super) fn validate_and_apply_partial(
         // Step 4.f: accessor — get/set cannot change.
         if !existing_is_data
             && incoming_is_accessor
-            && let SlotBody::Accessor {
-                getter: ex_get,
-                setter: ex_set,
-            } = &existing.body
+            && let SlotKind::Accessor(pair) = &existing.kind
         {
-            if incoming.get.is_some() && !optional_value_eq(ex_get, &incoming.get, heap) {
+            if incoming.get.is_some() && !optional_value_eq(&pair.getter, &incoming.get, heap) {
                 return None;
             }
-            if incoming.set.is_some() && !optional_value_eq(ex_set, &incoming.set, heap) {
+            if incoming.set.is_some() && !optional_value_eq(&pair.setter, &incoming.set, heap) {
                 return None;
             }
         }
@@ -212,9 +201,9 @@ pub(super) fn validate_and_apply_partial(
     }
     let kind = if incoming_is_accessor || (!incoming_is_data && !existing_is_data) {
         // Result is an accessor descriptor.
-        let (mut getter, mut setter) = match &existing.body {
-            SlotBody::Accessor { getter, setter } => (*getter, *setter),
-            SlotBody::Data { .. } => (None, None),
+        let (mut getter, mut setter) = match &existing.kind {
+            SlotKind::Accessor(pair) => (pair.getter, pair.setter),
+            SlotKind::Data => (None, None),
         };
         if let Some(g) = &incoming.get {
             getter = if g.is_undefined() { None } else { Some(*g) };
@@ -225,9 +214,10 @@ pub(super) fn validate_and_apply_partial(
         DescriptorKind::Accessor { getter, setter }
     } else {
         // Data descriptor.
-        let mut value = match &existing.body {
-            SlotBody::Data { value } => *value,
-            SlotBody::Accessor { .. } => Value::undefined(),
+        let mut value = if existing.kind.is_data() {
+            existing.value
+        } else {
+            Value::undefined()
         };
         if let Some(v) = &incoming.value {
             value = *v;
@@ -241,7 +231,7 @@ pub(super) fn validate_and_apply_partial(
         }
         DescriptorKind::Data { value }
     };
-    Some(PropertySlot::from_descriptor(PropertyDescriptor {
+    Some(SlotData::from_descriptor(PropertyDescriptor {
         kind,
         flags: PropertyFlags::new(writable, enumerable, configurable),
     }))
@@ -250,11 +240,11 @@ pub(super) fn validate_and_apply_partial(
 /// Backwards-compatible wrapper that takes a full
 /// [`PropertyDescriptor`]. Treats every field as present.
 pub(super) fn validate_and_apply(
-    existing: &PropertySlot,
+    existing: &SlotData,
     incoming: &PropertyDescriptor,
     heap: &otter_gc::GcHeap,
-) -> Option<PropertySlot> {
-    let existing_kind_is_data = matches!(existing.body, SlotBody::Data { .. });
+) -> Option<SlotData> {
+    let existing_kind_is_data = existing.kind.is_data();
     let incoming_kind_is_data = matches!(incoming.kind, DescriptorKind::Data { .. });
 
     // 4.a: every field of `incoming` is identical to `existing` →
@@ -280,8 +270,7 @@ pub(super) fn validate_and_apply(
                     return None;
                 }
                 if let DescriptorKind::Data { value: incoming_v } = &incoming.kind
-                    && let SlotBody::Data { value: existing_v } = &existing.body
-                    && !same_value(existing_v, incoming_v, heap)
+                    && !same_value(&existing.value, incoming_v, heap)
                 {
                     return None;
                 }
@@ -292,12 +281,9 @@ pub(super) fn validate_and_apply(
                 getter: in_get,
                 setter: in_set,
             } = &incoming.kind
-                && let SlotBody::Accessor {
-                    getter: ex_get,
-                    setter: ex_set,
-                } = &existing.body
-                && (!optional_value_eq(ex_get, in_get, heap)
-                    || !optional_value_eq(ex_set, in_set, heap))
+                && let SlotKind::Accessor(pair) = &existing.kind
+                && (!optional_value_eq(&pair.getter, in_get, heap)
+                    || !optional_value_eq(&pair.setter, in_set, heap))
             {
                 return None;
             }
@@ -305,7 +291,7 @@ pub(super) fn validate_and_apply(
     }
 
     // Build merged slot.
-    Some(PropertySlot::from_descriptor(PropertyDescriptor {
+    Some(SlotData::from_descriptor(PropertyDescriptor {
         flags: incoming.flags,
         kind: incoming.kind.clone(),
     }))
@@ -316,7 +302,7 @@ pub(super) fn validate_descriptor_update(
     incoming: &PropertyDescriptor,
     heap: &otter_gc::GcHeap,
 ) -> Option<PropertyDescriptor> {
-    let existing = PropertySlot::from_descriptor(existing.clone());
+    let existing = SlotData::from_descriptor(existing.clone());
     validate_and_apply(&existing, incoming, heap).map(|slot| slot.to_descriptor())
 }
 

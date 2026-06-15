@@ -37,13 +37,11 @@ use crate::{
 // Per-intrinsic installer helpers live in `crate::intrinsics::shared`;
 // re-exported here so per-intrinsic modules + bootstrap call sites can
 // import either path.
-pub(crate) use crate::intrinsics::shared::{
-    alloc_object_with_value_roots, install_placeholder, native_new_target_prototype,
-};
 pub use crate::intrinsics::shared::{
     alloc_object_with_value_roots_pub, define_global_value,
     native_constructor_static_with_value_roots, native_static_with_value_roots,
 };
+pub(crate) use crate::intrinsics::shared::{install_placeholder, native_new_target_prototype};
 
 /// Bootstrap feature/capability bitset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,7 +381,10 @@ fn build_global_this_impl(
         allocation_snapshot(heap)
     });
 
-    let global = alloc_object_with_value_roots(heap, &[])?;
+    // The realm global object is a permanent singleton root: pin it in
+    // non-moving old space so every handle to it stays stable across young
+    // scavenges and the large builtin-laden object is never copied.
+    let global = object::alloc_object_old(heap)?;
     object::set(global, heap, "globalThis", Value::object(global));
     // §19.1 — `NaN`, `Infinity`, `undefined` are own properties of
     // the global object with writable / enumerable / configurable

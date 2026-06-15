@@ -303,6 +303,39 @@ extern "C" fn jit_call_method_stub(
     }
 }
 
+/// Bridge stub: perform a computed `StoreElement` (`recv[idx] = src`) from
+/// compiled code, delegating to the safe
+/// [`Interpreter::jit_runtime_store_element`]. Returns `0` on success, `1` when
+/// the write threw (error parked in `ctx`).
+extern "C" fn jit_store_element_stub(
+    ctx: *mut JitCtx,
+    recv: u64,
+    idx: u64,
+    src: u64,
+    scratch: u64,
+) -> u64 {
+    // SAFETY: see `jit_call_stub`.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    match vm.jit_runtime_store_element(
+        context,
+        stack,
+        ctx.frame_index,
+        recv as u16,
+        idx as u16,
+        src as u16,
+        scratch as u16,
+    ) {
+        Ok(()) => 0,
+        Err(err) => {
+            ctx.error = Some(err);
+            1
+        }
+    }
+}
+
 /// Why a function could not be baseline-compiled. Always maps to a silent
 /// interpreter fallback; never a JS-visible error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,7 +420,8 @@ mod arm64 {
         BaselineCode, MAX_INLINE_ARGS, Op, Operand, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE,
         STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_INT32, TAG_NAN, TAG_SPECIAL, Unsupported,
         jit_call_method_stub, jit_call_stub, jit_load_element_stub, jit_load_global_stub,
-        jit_load_prop_stub, jit_make_fn_stub, jit_store_prop_stub, reg_offset,
+        jit_load_prop_stub, jit_make_fn_stub, jit_store_element_stub, jit_store_prop_stub,
+        reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -686,6 +720,27 @@ mod arm64 {
                         ; movz x3, idx as u32
                     );
                     emit_call_stub(&mut ops, jit_load_element_stub as *const () as usize, threw);
+                }
+                // `recv[idx] = src` — delegate to the safe element-store bridge.
+                // Operands: recv, idx, src, scratch.
+                Op::StoreElement => {
+                    let recv = reg(ops_ref, 0)?;
+                    let idx = reg(ops_ref, 1)?;
+                    let src = reg(ops_ref, 2)?;
+                    let scratch = reg(ops_ref, 3)?;
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; mov x0, x20
+                        ; movz x1, recv as u32
+                        ; movz x2, idx as u32
+                        ; movz x3, src as u32
+                        ; movz x4, scratch as u32
+                    );
+                    emit_call_stub(
+                        &mut ops,
+                        jit_store_element_stub as *const () as usize,
+                        threw,
+                    );
                 }
                 // `dst = global[name]` or throw — delegate to the safe bridge.
                 Op::LoadGlobalOrThrow => {

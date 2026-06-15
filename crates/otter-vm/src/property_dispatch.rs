@@ -3059,6 +3059,44 @@ impl Interpreter {
         result
     }
 
+    /// JIT bridge for a computed `StoreElement` (`recv[idx] = src`) from compiled
+    /// code. Mirrors the interpreter dispatch: the typed-array / dense-array fast
+    /// path ([`Self::drive_store_element`]) first, then the general
+    /// [`Self::run_store_element_regs`] (`[[Set]]` over arrays, objects, string
+    /// exotics). `scratch_reg` is the bytecode's scratch operand. Frame PC is
+    /// saved/restored so a later guard bail re-runs from PC 0.
+    ///
+    /// # Errors
+    /// Propagates a throwing setter, a read-only-target `TypeError` in strict
+    /// mode, and `InvalidOperand`.
+    pub fn jit_runtime_store_element(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut SmallVec<[Frame; 8]>,
+        frame_index: usize,
+        recv_reg: u16,
+        idx_reg: u16,
+        src_reg: u16,
+        scratch_reg: u16,
+    ) -> Result<(), VmError> {
+        let saved_pc = stack[frame_index].pc;
+        let operands = [
+            Operand::Register(recv_reg),
+            Operand::Register(idx_reg),
+            Operand::Register(src_reg),
+            Operand::Register(scratch_reg),
+        ];
+        let result = match self.drive_store_element(stack, context, &operands) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                self.run_store_element_regs(context, stack, frame_index, recv_reg, idx_reg, src_reg)
+            }
+            Err(err) => Err(err),
+        };
+        stack[frame_index].pc = saved_pc;
+        result
+    }
+
     /// JIT bridge for a named `StoreProperty` from compiled code. The store
     /// analogue of [`Self::jit_runtime_load_property`]: the hot path is an IC
     /// hit on an existing own data slot (the dense `site` comes from the

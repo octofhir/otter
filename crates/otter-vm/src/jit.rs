@@ -148,6 +148,18 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// methods reached via `ptrs`. The window stays rooted on the VM frame
     /// stack throughout, so allocation/calls in the body are GC-safe.
     fn run_entry(&self, ptrs: JitReentryPtrs) -> JitExecOutcome;
+
+    /// Enter compiled code mid-function at the loop header whose bytecode PC is
+    /// `byte_pc` (on-stack replacement). Returns `None` when this code has no
+    /// OSR entry for that PC (the VM keeps interpreting).
+    ///
+    /// The baseline keeps every live value in the frame register array at each
+    /// instruction boundary, so a loop header is a valid resume point: the
+    /// interpreter's live registers are exactly what the compiled code reads.
+    /// The default returns `None` for codes that do not support OSR.
+    fn osr_entry(&self, _ptrs: JitReentryPtrs, _byte_pc: u32) -> Option<JitExecOutcome> {
+        None
+    }
 }
 
 /// Result of a JIT compile attempt.

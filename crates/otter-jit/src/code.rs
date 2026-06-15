@@ -51,6 +51,21 @@ impl CompiledCode {
         self.buf.ptr(AssemblyOffset(self.entry))
     }
 
+    /// Raw pointer to an arbitrary byte `offset` within the compiled code.
+    ///
+    /// Used for alternate (OSR) entry points: a loop-header trampoline emitted
+    /// after the main body. `offset` must be an assembler offset into this
+    /// buffer.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::entry_ptr`]: the caller transmutes the pointer
+    /// to the emitted calling convention and invokes it only while `self` is
+    /// alive. `offset` must be in bounds of the finalized mapping.
+    #[must_use]
+    pub unsafe fn ptr_at(&self, offset: usize) -> *const u8 {
+        self.buf.ptr(AssemblyOffset(offset))
+    }
+
     /// Size in bytes of the finalized code mapping.
     #[must_use]
     pub fn len(&self) -> usize {

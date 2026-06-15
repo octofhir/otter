@@ -443,6 +443,25 @@ pub struct Interpreter {
     /// Per-function call counter driving function-entry tier-up. Only mutated
     /// when a JIT hook is installed.
     jit_call_counts: rustc_hash::FxHashMap<u32, u32>,
+    /// Functions for which an OSR attempt bailed or had no entry; OSR is not
+    /// retried for them. Consulted only at a threshold crossing (rare), so it
+    /// adds no per-iteration cost.
+    jit_osr_disabled: rustc_hash::FxHashSet<u32>,
+    /// Loop-OSR back-edge counter for the frame currently at the top of the
+    /// stack. Stored on the interpreter (not the size-capped `Frame`) and keyed
+    /// by [`Self::jit_osr_count_top`] as a cheap frame-identity proxy: a
+    /// different top frame resets the counter. The hot path is one compare +
+    /// one add; the hashmap/compile work runs only at the single crossing where
+    /// the count equals the threshold. Call-free hot loops (numeric kernels)
+    /// tier up here; loops whose bodies call out keep that counter churning and
+    /// instead rely on function-entry tier-up for the callees.
+    jit_osr_count: u32,
+    /// Top-of-stack frame index the [`Self::jit_osr_count`] counter belongs to.
+    jit_osr_count_top: usize,
+    /// Back-edge count at which a hot loop tiers up via OSR. Defaults to
+    /// [`Self::JIT_OSR_THRESHOLD`]; overridable via `OTTER_JIT_OSR_THRESHOLD`
+    /// for tuning and to force OSR coverage in conformance runs (set to 1).
+    jit_osr_threshold: u32,
     /// Compiled-code cache keyed by global function id. `Some(code)` is an
     /// installed baseline body; `None` records a function the emitter could not
     /// compile (outside the supported subset), so it is never retried.
@@ -1011,6 +1030,14 @@ impl Interpreter {
             property_ic_stats: property_ic::PropertyIcStats::default(),
             jit_hook: None,
             jit_call_counts: rustc_hash::FxHashMap::default(),
+            jit_osr_disabled: rustc_hash::FxHashSet::default(),
+            jit_osr_count: 0,
+            jit_osr_count_top: usize::MAX,
+            jit_osr_threshold: std::env::var("OTTER_JIT_OSR_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|&t| t > 0)
+                .unwrap_or(Self::JIT_OSR_THRESHOLD),
             jit_code: std::collections::BTreeMap::new(),
             reg_pool: Vec::new(),
             runtime_budget: RuntimeBudget::default(),
@@ -1148,6 +1175,11 @@ impl Interpreter {
     /// calls never pay compile latency.
     const JIT_TIER_UP_THRESHOLD: u32 = 50;
 
+    /// Back-edge count at which a hot loop tiers up via OSR. Higher than the
+    /// call-count threshold: a loop iterating this many times amortizes the
+    /// compile cost many times over, while short loops never pay it.
+    const JIT_OSR_THRESHOLD: u32 = 1000;
+
     /// After a call pushed a fresh bytecode callee frame as the new top of
     /// `stack`, try to run it as compiled baseline code instead of interpreting.
     ///
@@ -1172,6 +1204,110 @@ impl Interpreter {
                 Ok(Some(popped))
             }
             jit::JitExecOutcome::Threw(err) => Err(err),
+        }
+    }
+
+    /// Per-back-edge hook: bump this frame's loop counter and, on the single
+    /// iteration where it reaches the OSR threshold, attempt loop tier-up.
+    ///
+    /// The common path is one add + one compare on a frame field — no hashmap,
+    /// no allocation — so it adds negligible cost to the interpreter's hottest
+    /// loops. Only the exact threshold crossing calls into [`Self::maybe_osr`].
+    #[inline]
+    fn note_backedge_and_maybe_osr(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        top_idx: usize,
+    ) -> Result<Option<Option<Value>>, VmError> {
+        // Interpreter-only (no JIT installed): pay nothing beyond this branch —
+        // don't even run the counter.
+        if self.jit_hook.is_none() {
+            return Ok(None);
+        }
+        if self.jit_osr_count_top == top_idx {
+            self.jit_osr_count = self.jit_osr_count.wrapping_add(1);
+        } else {
+            // A different frame reached the top (a call returned into a sibling,
+            // or we recursed); restart the count for this frame.
+            self.jit_osr_count_top = top_idx;
+            self.jit_osr_count = 1;
+        }
+        // `==` (not `>=`) so OSR is attempted exactly once per hot run: after the
+        // crossing the count keeps climbing but never re-fires, so a frame whose
+        // loop cannot tier up keeps interpreting with no further hashmap work.
+        if self.jit_osr_count != self.jit_osr_threshold {
+            return Ok(None);
+        }
+        self.maybe_osr(stack, context, top_idx)
+    }
+
+    /// Loop-OSR tier-up. Called from [`Self::note_backedge_and_maybe_osr`] at
+    /// the threshold crossing (the top frame's `pc` is the loop header just
+    /// branched to). Compiles the function (if needed) and enters compiled code
+    /// at the header so the rest of the loop runs natively.
+    ///
+    /// Returns `Ok(None)` to keep interpreting (ineligible, no OSR entry for
+    /// this header, or the compiled body bailed); `Ok(Some(popped))` when
+    /// compiled code ran the frame to `Return` and unwound the dispatch entry
+    /// (mirrors [`Self::maybe_dispatch_jit`]).
+    fn maybe_osr(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        top_idx: usize,
+    ) -> Result<Option<Option<Value>>, VmError> {
+        let frame = &stack[top_idx];
+        // Only ordinary bytecode frames; async/generator bodies resume through
+        // their own machinery and must not be entered mid-loop.
+        if frame.async_state.is_some() || frame.generator_owner.is_some() {
+            return Ok(None);
+        }
+        let fid = frame.function_id;
+        if self.jit_osr_disabled.contains(&fid) {
+            return Ok(None);
+        }
+        let osr_pc = frame.pc;
+        // Resolve compiled code, compiling once and caching the result (shared
+        // with the function-entry path; `None` records an uncompilable body).
+        let code = match self.jit_code.get(&fid) {
+            Some(slot) => slot.clone(),
+            None => {
+                let compiled = self.compile_jit_function(context, fid);
+                self.jit_code.insert(fid, compiled.clone());
+                compiled
+            }
+        };
+        let Some(code) = code else {
+            // Uncompilable: never retry OSR for it.
+            self.jit_osr_disabled.insert(fid);
+            return Ok(None);
+        };
+        let ptrs = jit::JitReentryPtrs {
+            vm: <*mut Interpreter>::cast(self),
+            stack: <*mut jit::JitFrameStack>::cast(stack),
+            context: <*const ExecutionContext>::cast(context),
+            frame_index: top_idx,
+        };
+        match code.osr_entry(ptrs, osr_pc) {
+            // No trampoline for this header — keep interpreting, but don't keep
+            // re-counting/recompiling: this header is not an OSR target.
+            None => {
+                self.jit_osr_disabled.insert(fid);
+                Ok(None)
+            }
+            Some(jit::JitExecOutcome::Bailed) => {
+                // Compiled body hit a guard it could not honor. Resuming mid-loop
+                // on the interpreter is correct (pc is unchanged at the header);
+                // disable OSR so we don't thrash entering and re-bailing.
+                self.jit_osr_disabled.insert(fid);
+                Ok(None)
+            }
+            Some(jit::JitExecOutcome::Returned(value)) => {
+                let popped = self.return_running_finally(stack, value)?;
+                Ok(Some(popped))
+            }
+            Some(jit::JitExecOutcome::Threw(err)) => Err(err),
         }
     }
 
@@ -6267,8 +6403,13 @@ impl Interpreter {
                     let offset = context
                         .exec_imm32(instr, 0)
                         .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    apply_branch(frame, offset, &self.interrupt)?;
+                    apply_branch(&mut stack[top_idx], offset, &self.interrupt)?;
+                    if offset < 0
+                        && let Some(Some(value)) =
+                            self.note_backedge_and_maybe_osr(stack, context, top_idx)?
+                    {
+                        return Ok(value);
+                    }
                     continue;
                 }
                 Op::JumpIfTrue => {
@@ -6281,6 +6422,12 @@ impl Interpreter {
                     let frame = &mut stack[top_idx];
                     if read_register(frame, cond)?.to_boolean(&self.gc_heap) {
                         apply_branch(frame, offset, &self.interrupt)?;
+                        if offset < 0
+                            && let Some(Some(value)) =
+                                self.note_backedge_and_maybe_osr(stack, context, top_idx)?
+                        {
+                            return Ok(value);
+                        }
                     } else {
                         frame.advance_pc(self.current_byte_len)?;
                     }
@@ -6296,6 +6443,12 @@ impl Interpreter {
                     let frame = &mut stack[top_idx];
                     if !read_register(frame, cond)?.to_boolean(&self.gc_heap) {
                         apply_branch(frame, offset, &self.interrupt)?;
+                        if offset < 0
+                            && let Some(Some(value)) =
+                                self.note_backedge_and_maybe_osr(stack, context, top_idx)?
+                        {
+                            return Ok(value);
+                        }
                     } else {
                         frame.advance_pc(self.current_byte_len)?;
                     }

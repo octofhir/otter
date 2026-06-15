@@ -355,6 +355,10 @@ pub enum Unsupported {
 /// Finalized baseline machine code for one function.
 pub struct BaselineCode {
     code: CompiledCode,
+    /// Loop-header bytecode PC → assembler offset of its OSR-entry trampoline.
+    /// Each trampoline runs the standard prologue then branches to the header's
+    /// body label, so the VM can enter mid-loop with the live frame registers.
+    osr_entries: std::collections::BTreeMap<u32, usize>,
 }
 
 impl std::fmt::Debug for BaselineCode {
@@ -371,6 +375,37 @@ impl JitFunctionCode for BaselineCode {
     }
 
     fn run_entry(&self, ptrs: JitReentryPtrs) -> JitExecOutcome {
+        // SAFETY: the mapping is live and the main entry was emitted with the
+        // `JitEntry` ABI.
+        let entry = unsafe { self.code.entry_ptr() };
+        // SAFETY: `entry` points into the live mapping; `ptrs` upholds the
+        // reentry contract (valid, non-aliased for the call).
+        unsafe { self.enter_at(ptrs, entry) }
+    }
+
+    fn osr_entry(&self, ptrs: JitReentryPtrs, byte_pc: u32) -> Option<JitExecOutcome> {
+        let offset = *self.osr_entries.get(&byte_pc)?;
+        // SAFETY: `offset` is an assembler offset recorded for this buffer and
+        // points at a prologue trampoline emitted with the `JitEntry` ABI.
+        let entry = unsafe { self.code.ptr_at(offset) };
+        // SAFETY: same reentry contract as `run_entry`.
+        Some(unsafe { self.enter_at(ptrs, entry) })
+    }
+}
+
+impl BaselineCode {
+    /// Build the `JitCtx` for `ptrs` and invoke compiled code at `entry`.
+    ///
+    /// Shared by the function-entry path ([`Self::run_entry`]) and the
+    /// loop-header OSR path ([`Self::osr_entry`]); both ABIs are identical (the
+    /// trampoline runs the same prologue), differing only in which instruction
+    /// the prologue falls through / branches to.
+    ///
+    /// # Safety
+    /// `entry` must point at a prologue emitted with the [`JitEntry`] ABI inside
+    /// this code's live mapping, and `ptrs` must uphold the
+    /// [`JitReentryPtrs`](otter_vm::JitReentryPtrs) contract.
+    unsafe fn enter_at(&self, ptrs: JitReentryPtrs, entry: *const u8) -> JitExecOutcome {
         let stack = ptrs.stack.cast::<JitFrameStack>();
         let vm = ptrs.vm.cast::<Interpreter>();
         // SAFETY: `ptrs.stack` is a valid `*mut JitFrameStack` for this call.
@@ -391,8 +426,9 @@ impl JitFunctionCode for BaselineCode {
             frame_index: ptrs.frame_index,
             error: None,
         };
-        // SAFETY: the mapping is live and was emitted with the `JitEntry` ABI.
-        let entry: JitEntry = unsafe { std::mem::transmute(self.code.entry_ptr()) };
+        // SAFETY: the mapping is live and `entry` was emitted with the
+        // `JitEntry` ABI.
+        let entry: JitEntry = unsafe { std::mem::transmute(entry) };
         let ret = entry(&mut ctx);
         match ret.status {
             STATUS_RETURNED => JitExecOutcome::Returned(Value::from_bits(ret.value)),
@@ -479,6 +515,21 @@ mod arm64 {
         };
     }
 
+    /// Emit the function prologue: save fp/lr + callee-saved bases, then set
+    /// `x20 = ctx` (arg in `x0`) and `x19 = ctx.regs` (the frame register base).
+    /// Shared by the main entry and every OSR trampoline so both honor the same
+    /// [`JitEntry`] ABI.
+    fn emit_prologue(ops: &mut Assembler) {
+        dynasm!(ops
+            ; .arch aarch64
+            ; stp x29, x30, [sp, #-32]!
+            ; stp x19, x20, [sp, #16]
+            ; mov x29, sp
+            ; mov x20, x0
+            ; ldr x19, [x20]
+        );
+    }
+
     /// Emit the function epilogue (restore callee-saved + frame, return). `x0`
     /// (value) and `x1` (status) must already be set.
     fn emit_epilogue(ops: &mut Assembler) {
@@ -508,16 +559,29 @@ mod arm64 {
                 .ok_or(Unsupported::BranchTarget(byte_pc))
         };
 
+        // Loop headers = back-edge targets: the PCs an OSR entry can land on.
+        // A branch whose resolved target sits at or before its own PC closes a
+        // loop; that target is a basic-block boundary where the interpreter's
+        // live registers match what compiled code expects (the baseline keeps
+        // all live values in the frame array between ops). Collect them here so
+        // a trampoline is emitted for each after the body.
+        let mut loop_headers: BTreeMap<u32, ()> = BTreeMap::new();
+        for instr in &view.instructions {
+            if matches!(instr.op, Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue) {
+                let rel = imm32(instr.operands.as_slice(), 0)?;
+                let target = branch_target(instr, rel);
+                if target >= 0
+                    && target < i64::from(instr.byte_pc)
+                    && let Ok(pc) = u32::try_from(target)
+                    && labels.contains_key(&pc)
+                {
+                    loop_headers.insert(pc, ());
+                }
+            }
+        }
+
         let entry = ops.offset();
-        // Prologue: save fp/lr + callee-saved bases; x20 = ctx, x19 = regs base.
-        dynasm!(ops
-            ; .arch aarch64
-            ; stp x29, x30, [sp, #-32]!
-            ; stp x19, x20, [sp, #16]
-            ; mov x29, sp
-            ; mov x20, x0
-            ; ldr x19, [x20]
-        );
+        emit_prologue(&mut ops);
 
         for instr in &view.instructions {
             dynasm!(ops ; .arch aarch64 ; =>labels[&instr.byte_pc]);
@@ -872,9 +936,22 @@ mod arm64 {
         );
         emit_epilogue(&mut ops);
 
+        // OSR trampolines: one per loop header. Each runs the standard prologue
+        // (set up x19/x20 from the ctx arg) then branches to the header's body
+        // label, so the VM can re-enter mid-loop with the live frame registers.
+        let mut osr_entries: BTreeMap<u32, usize> = BTreeMap::new();
+        for (&pc, ()) in &loop_headers {
+            let off = ops.offset().0;
+            emit_prologue(&mut ops);
+            let tgt = labels[&pc];
+            dynasm!(ops ; .arch aarch64 ; b =>tgt);
+            osr_entries.insert(pc, off);
+        }
+
         let buf = ops.finalize().expect("finalize");
         Ok(BaselineCode {
             code: CompiledCode::new(buf, entry),
+            osr_entries,
         })
     }
 

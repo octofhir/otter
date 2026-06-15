@@ -932,9 +932,20 @@ mod arm64 {
         let (dst, lhs, rhs) = reg3(operands)?;
         load_reg(ops, 9, lhs)?;
         load_reg(ops, 10, rhs)?;
-        guard_int32!(ops, 9, bail);
-        guard_int32!(ops, 10, bail);
-        dynasm!(ops ; .arch aarch64 ; cmp w9, w10);
+        let float_path = ops.new_dynamic_label();
+        let have_bool = ops.new_dynamic_label();
+        // int32 fast path: both operands int32 → signed integer compare.
+        dynasm!(ops
+            ; .arch aarch64
+            ; lsr x14, x9, #48
+            ; movz x15, TAG_INT32 as u32
+            ; cmp x14, x15
+            ; b.ne =>float_path
+            ; lsr x14, x10, #48
+            ; cmp x14, x15
+            ; b.ne =>float_path
+            ; cmp w9, w10
+        );
         match cmp {
             Cmp::Lt => dynasm!(ops ; .arch aarch64 ; cset w13, lt),
             Cmp::Le => dynasm!(ops ; .arch aarch64 ; cset w13, le),
@@ -943,6 +954,23 @@ mod arm64 {
             Cmp::Eq => dynasm!(ops ; .arch aarch64 ; cset w13, eq),
             Cmp::Ne => dynasm!(ops ; .arch aarch64 ; cset w13, ne),
         }
+        dynasm!(ops ; .arch aarch64 ; b =>have_bool ; =>float_path);
+        // Double path: decode both to f64 and `fcmp`. The FP condition codes
+        // differ from the integer ones so an unordered (NaN) compare yields the
+        // ECMAScript result (every relational compare false, `!=` true):
+        // Lt→mi, Le→ls, Gt→gt, Ge→ge, Eq→eq, Ne→ne.
+        emit_num_to_double(ops, 9, 0, bail);
+        emit_num_to_double(ops, 10, 1, bail);
+        dynasm!(ops ; .arch aarch64 ; fcmp d0, d1);
+        match cmp {
+            Cmp::Lt => dynasm!(ops ; .arch aarch64 ; cset w13, mi),
+            Cmp::Le => dynasm!(ops ; .arch aarch64 ; cset w13, ls),
+            Cmp::Gt => dynasm!(ops ; .arch aarch64 ; cset w13, gt),
+            Cmp::Ge => dynasm!(ops ; .arch aarch64 ; cset w13, ge),
+            Cmp::Eq => dynasm!(ops ; .arch aarch64 ; cset w13, eq),
+            Cmp::Ne => dynasm!(ops ; .arch aarch64 ; cset w13, ne),
+        }
+        dynasm!(ops ; .arch aarch64 ; =>have_bool);
         // cset → {0,1}; map to SPECIAL_FALSE(3)/SPECIAL_TRUE(4).
         debug_assert_eq!(SPECIAL_FALSE + 1, SPECIAL_TRUE);
         dynasm!(ops ; .arch aarch64 ; add w13, w13, SPECIAL_FALSE);
@@ -1303,6 +1331,49 @@ mod tests {
             ),
             (Op::ReturnValue, vec![Operand::Register(2)]),
         ])
+    }
+
+    #[test]
+    fn float_comparisons_including_nan() {
+        let t = (TAG_SPECIAL << 48) | u64::from(super::SPECIAL_TRUE);
+        let f = (TAG_SPECIAL << 48) | u64::from(super::SPECIAL_FALSE);
+        let cmp_view = |op: Op| {
+            view(&[
+                (
+                    op,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ])
+        };
+        let run_cmp = |op: Op, a: u64, b: u64| {
+            let v = cmp_view(op);
+            let mut regs = [a, b, 0, 0, 0, 0, 0, 0];
+            match run(&v, &mut regs) {
+                Exit::Returned(bits) => bits,
+                Exit::Bailed => panic!("cmp bailed"),
+            }
+        };
+        // ordered doubles
+        assert_eq!(run_cmp(Op::LessThan, box_f64(1.5), box_f64(2.5)), t);
+        assert_eq!(run_cmp(Op::LessThan, box_f64(2.5), box_f64(1.5)), f);
+        assert_eq!(run_cmp(Op::LessEq, box_f64(2.5), box_f64(2.5)), t);
+        assert_eq!(run_cmp(Op::GreaterThan, box_f64(3.0), box_f64(2.0)), t);
+        assert_eq!(run_cmp(Op::Equal, box_f64(2.0), box_f64(2.0)), t);
+        // mixed int/double
+        assert_eq!(run_cmp(Op::LessThan, box_i32(1), box_f64(2.5)), t);
+        assert_eq!(run_cmp(Op::GreaterEq, box_f64(4.0), box_i32(4)), t);
+        // NaN: every relational compare is false, `!=` is true.
+        let nan = box_f64(f64::NAN);
+        assert_eq!(run_cmp(Op::LessThan, nan, box_f64(1.0)), f);
+        assert_eq!(run_cmp(Op::LessEq, nan, box_f64(1.0)), f);
+        assert_eq!(run_cmp(Op::GreaterThan, nan, box_f64(1.0)), f);
+        assert_eq!(run_cmp(Op::Equal, nan, nan), f);
+        assert_eq!(run_cmp(Op::NotEqual, nan, box_f64(1.0)), t);
     }
 
     #[test]

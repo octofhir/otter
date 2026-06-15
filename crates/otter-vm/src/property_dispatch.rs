@@ -1872,6 +1872,15 @@ impl Interpreter {
                 }
             } else if let Some(n) = idx_value.as_number() {
                 match crate::array::index_from_number(n) {
+                    Some(idx)
+                        if !crate::array::has_accessors(arr, &self.gc_heap)
+                            && crate::array::has_own_element(arr, &self.gc_heap, idx) =>
+                    {
+                        // Dense own element, no index accessors: read directly,
+                        // skipping the per-element `idx.to_string()` + accessor
+                        // lookup (the hot array element-load path).
+                        crate::array::get(arr, &self.gc_heap, idx)
+                    }
                     Some(idx) => {
                         let key = idx.to_string();
                         if let Some((getter, _setter)) =

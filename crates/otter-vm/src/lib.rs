@@ -5759,42 +5759,10 @@ impl Interpreter {
                     let (obj_reg, key_reg, value_reg) = context
                         .exec_register3(instr)
                         .ok_or(VmError::InvalidOperand)?;
-                    let target = *read_register(&stack[top_idx], obj_reg)?;
-                    let key_value = *read_register(&stack[top_idx], key_reg)?;
-                    let value = *read_register(&stack[top_idx], value_reg)?;
-                    let key = self.to_property_key_sync(context, key_value)?;
-                    // Fast path: a plain object receiver takes the
-                    // shape-friendly construction-time store (no
-                    // prototype consult — define semantics).
-                    if let Some(obj) = target.as_object() {
-                        match &key {
-                            VmPropertyKey::Symbol(sym) => {
-                                object::set_symbol(obj, &mut self.gc_heap, *sym, value);
-                            }
-                            _ => {
-                                let name = key
-                                    .string_name()
-                                    .expect("non-symbol key has string spelling")
-                                    .to_string();
-                                self.set_property(obj, &name, value)?;
-                            }
-                        }
-                    } else {
-                        let descriptor = object::PartialPropertyDescriptor {
-                            value: Some(value),
-                            writable: Some(true),
-                            enumerable: Some(true),
-                            configurable: Some(true),
-                            ..Default::default()
-                        };
-                        if !self.define_own_property_value(context, &target, &key, descriptor)? {
-                            return Err(VmError::TypeError {
-                                message: "Cannot define property on object literal".to_string(),
-                            });
-                        }
-                    }
-                    let frame = &mut stack[top_idx];
-                    frame.advance_pc(self.current_byte_len)?;
+                    self.run_define_data_property_regs(
+                        context, stack, top_idx, obj_reg, key_reg, value_reg,
+                    )?;
+                    stack[top_idx].advance_pc(self.current_byte_len)?;
                     continue;
                 }
                 // §10.2.10 SetFunctionName — names an anonymous

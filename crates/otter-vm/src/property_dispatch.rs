@@ -20,7 +20,7 @@
 
 use smallvec::SmallVec;
 
-use otter_bytecode::Operand;
+use otter_bytecode::{Op, Operand};
 use otter_gc::raw::RawGc;
 
 use crate::{
@@ -3055,6 +3055,215 @@ impl Interpreter {
         let saved_pc = stack[frame_index].pc;
         let frame = &mut stack[frame_index];
         let result = self.run_load_global_or_throw_reg(context, frame, dst, name_idx);
+        stack[frame_index].pc = saved_pc;
+        result
+    }
+
+    /// `Op::DefineDataProperty obj, key, value` — construction-time data-property
+    /// definition for object literals. Shared by the dispatch loop and the JIT
+    /// delegate bridge; does **not** advance the PC (the caller does).
+    ///
+    /// # Errors
+    /// Propagates a `TypeError` when the target rejects the definition, plus any
+    /// error from key coercion (`ToPropertyKey`).
+    pub(crate) fn run_define_data_property_regs(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut SmallVec<[Frame; 8]>,
+        top_idx: usize,
+        obj_reg: u16,
+        key_reg: u16,
+        value_reg: u16,
+    ) -> Result<(), VmError> {
+        let target = *read_register(&stack[top_idx], obj_reg)?;
+        let key_value = *read_register(&stack[top_idx], key_reg)?;
+        let value = *read_register(&stack[top_idx], value_reg)?;
+        let key = self.to_property_key_sync(context, key_value)?;
+        // Fast path: a plain object receiver takes the shape-friendly
+        // construction-time store (no prototype consult — define semantics).
+        if let Some(obj) = target.as_object() {
+            match &key {
+                VmPropertyKey::Symbol(sym) => {
+                    object::set_symbol(obj, &mut self.gc_heap, *sym, value);
+                }
+                _ => {
+                    let name = key
+                        .string_name()
+                        .expect("non-symbol key has string spelling")
+                        .to_string();
+                    self.set_property(obj, &name, value)?;
+                }
+            }
+        } else {
+            let descriptor = object::PartialPropertyDescriptor {
+                value: Some(value),
+                writable: Some(true),
+                enumerable: Some(true),
+                configurable: Some(true),
+                ..Default::default()
+            };
+            if !self.define_own_property_value(context, &target, &key, descriptor)? {
+                return Err(VmError::TypeError {
+                    message: "Cannot define property on object literal".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Generic JIT bridge: re-run one **synchronous, non-control-flow** opcode
+    /// (the instruction at `byte_pc`) through the interpreter's own handler.
+    ///
+    /// Used by the baseline emitter for opcodes whose operands are variable or
+    /// awkward to marshal through the C ABI (closure/array/object construction,
+    /// string constants, the checked upvalue store, remainder, unsigned shift).
+    /// The bridge fetches the `ExecInstr` at `byte_pc`, reads its operands from
+    /// `context`, and dispatches to the exact interpreter helper — so semantics
+    /// are identical to the interpreter by construction.
+    ///
+    /// Only ops that run to completion without pushing a frame or invoking user
+    /// JS are delegated here: a stub cannot drive the dispatch loop, so frame-
+    /// pushing ops (`New` of a user constructor, `ArrayFrom` with a user
+    /// iterator) are deliberately excluded and fall back to the interpreter.
+    /// Frame PC is saved/restored around the helper's `advance_pc`.
+    ///
+    /// # Errors
+    /// Propagates whatever the delegated handler raises, and `InvalidOperand`
+    /// for an unknown PC, operand shape, or a non-delegable opcode.
+    pub fn jit_runtime_delegate_op(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut SmallVec<[Frame; 8]>,
+        frame_index: usize,
+        byte_pc: u32,
+    ) -> Result<(), VmError> {
+        let fid = stack[frame_index].function_id;
+        let func = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
+        let instr = func.instr_at_byte_pc(byte_pc).ok_or(VmError::InvalidOperand)?;
+        let op = instr.op();
+        let saved_pc = stack[frame_index].pc;
+        stack[frame_index].pc = byte_pc;
+        let result = match op {
+            Op::MakeClosure => {
+                let operands = context.exec_operands(instr);
+                let frame = &mut stack[frame_index];
+                self.run_make_closure_operands(context, frame, operands)
+            }
+            Op::NewObject => {
+                let dst = context
+                    .exec_register(instr, 0)
+                    .ok_or(VmError::InvalidOperand)?;
+                self.run_new_object_reg(stack, frame_index, dst)
+            }
+            Op::NewArray => {
+                let operands = context.exec_operands(instr);
+                self.run_new_array_operands(stack, frame_index, operands)
+            }
+            Op::StoreUpvalueChecked => {
+                let src = context
+                    .exec_register(instr, 0)
+                    .ok_or(VmError::InvalidOperand)?;
+                let idx = context
+                    .exec_imm32(instr, 1)
+                    .ok_or(VmError::InvalidOperand)?;
+                let frame = &mut stack[frame_index];
+                self.run_store_upvalue_checked_reg(frame, src, idx)
+            }
+            Op::Rem => {
+                let (dst, lhs, rhs) = context
+                    .exec_register3(instr)
+                    .ok_or(VmError::InvalidOperand)?;
+                let frame = &mut stack[frame_index];
+                self.run_numeric_regs(
+                    frame,
+                    dst,
+                    lhs,
+                    rhs,
+                    crate::number::rem,
+                    crate::bigint::ops::rem,
+                )
+            }
+            Op::Ushr => {
+                let (dst, lhs, rhs) = context
+                    .exec_register3(instr)
+                    .ok_or(VmError::InvalidOperand)?;
+                let frame = &mut stack[frame_index];
+                self.run_ushr_regs(frame, dst, lhs, rhs)
+            }
+            Op::LoadString => {
+                let dst = context
+                    .exec_register(instr, 0)
+                    .ok_or(VmError::InvalidOperand)?;
+                let idx = context
+                    .exec_const_index(instr, 1)
+                    .ok_or(VmError::InvalidOperand)?;
+                let units = context
+                    .string_constant_units(idx)
+                    .ok_or(VmError::InvalidOperand)?;
+                let s = JsString::from_utf16_units(units, self.gc_heap_mut())?;
+                let frame = &mut stack[frame_index];
+                write_register(frame, dst, Value::string(s))
+            }
+            Op::LoadNumber => {
+                let dst = context
+                    .exec_register(instr, 0)
+                    .ok_or(VmError::InvalidOperand)?;
+                let idx = context
+                    .exec_const_index(instr, 1)
+                    .ok_or(VmError::InvalidOperand)?;
+                let bits = context
+                    .number_constant_bits(idx)
+                    .ok_or(VmError::InvalidOperand)?;
+                let value = crate::NumberValue::from_f64(f64::from_bits(bits));
+                let frame = &mut stack[frame_index];
+                write_register(frame, dst, Value::number(value))
+            }
+            Op::DefineDataProperty => {
+                let (obj_reg, key_reg, value_reg) = context
+                    .exec_register3(instr)
+                    .ok_or(VmError::InvalidOperand)?;
+                self.run_define_data_property_regs(
+                    context,
+                    stack,
+                    frame_index,
+                    obj_reg,
+                    key_reg,
+                    value_reg,
+                )
+            }
+            Op::FreshUpvalue => {
+                let idx = context
+                    .exec_imm32(instr, 0)
+                    .ok_or(VmError::InvalidOperand)?;
+                let frame = &mut stack[frame_index];
+                self.run_fresh_upvalue_reg(frame, idx)
+            }
+            Op::LoadBuiltinError => {
+                let dst = context
+                    .exec_register(instr, 0)
+                    .ok_or(VmError::InvalidOperand)?;
+                let kind_idx = context
+                    .exec_const_index(instr, 1)
+                    .ok_or(VmError::InvalidOperand)?;
+                let frame = &mut stack[frame_index];
+                self.run_load_builtin_error_reg(context, frame, dst, kind_idx)
+            }
+            Op::Neg => {
+                let dst = context
+                    .exec_register(instr, 0)
+                    .ok_or(VmError::InvalidOperand)?;
+                let src = context
+                    .exec_register(instr, 1)
+                    .ok_or(VmError::InvalidOperand)?;
+                let frame = &mut stack[frame_index];
+                self.run_neg_regs(frame, dst, src)
+            }
+            Op::DefineOwnProperty => {
+                let operands = context.exec_operands(instr);
+                self.run_define_own_property_operands(context, stack, operands)
+            }
+            _ => Err(VmError::InvalidOperand),
+        };
         stack[frame_index].pc = saved_pc;
         result
     }

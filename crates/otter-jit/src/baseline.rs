@@ -298,6 +298,25 @@ extern "C" fn jit_store_upvalue_stub(ctx: *mut JitCtx, src: u64, idx: u64) -> u6
     }
 }
 
+/// Bridge stub: re-run one synchronous opcode (closure/object/array
+/// construction, string constant, checked upvalue store, remainder, unsigned
+/// shift) at `byte_pc` through [`Interpreter::jit_runtime_delegate_op`]. Returns
+/// `0` on success, `1` on throw (error parked in `ctx`).
+extern "C" fn jit_delegate_op_stub(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
+    // SAFETY: see `jit_call_stub`.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    match vm.jit_runtime_delegate_op(context, stack, ctx.frame_index, byte_pc as u32) {
+        Ok(()) => 0,
+        Err(err) => {
+            ctx.error = Some(err);
+            1
+        }
+    }
+}
+
 /// Bridge stub: perform a `CallMethodValue` (`recv.name(args…)`) from compiled
 /// code, delegating to the safe [`Interpreter::jit_runtime_call_method`].
 /// Returns `0` on success, `1` when the call threw (error parked in `ctx`).
@@ -490,9 +509,9 @@ mod arm64 {
     use super::{
         BaselineCode, MAX_INLINE_ARGS, Op, Operand, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE,
         STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_INT32, TAG_NAN, TAG_SPECIAL, Unsupported,
-        jit_call_method_stub, jit_call_stub, jit_load_element_stub, jit_load_global_stub,
-        jit_load_prop_stub, jit_load_upvalue_stub, jit_make_fn_stub, jit_store_element_stub,
-        jit_store_prop_stub, jit_store_upvalue_stub, reg_offset,
+        jit_call_method_stub, jit_call_stub, jit_delegate_op_stub, jit_load_element_stub,
+        jit_load_global_stub, jit_load_prop_stub, jit_load_upvalue_stub, jit_make_fn_stub,
+        jit_store_element_stub, jit_store_prop_stub, jit_store_upvalue_stub, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -685,6 +704,16 @@ mod arm64 {
                     let dst = reg(ops_ref, 0)?;
                     // SPECIAL payload `SPECIAL_HOLE` == the TDZ/uninitialized hole.
                     emit_load_u64(&mut ops, 9, (TAG_SPECIAL << 48) | SPECIAL_HOLE);
+                    store_reg(&mut ops, 9, dst)?;
+                }
+                Op::LoadTrue => {
+                    let dst = reg(ops_ref, 0)?;
+                    emit_load_u64(&mut ops, 9, (TAG_SPECIAL << 48) | u64::from(SPECIAL_TRUE));
+                    store_reg(&mut ops, 9, dst)?;
+                }
+                Op::LoadFalse => {
+                    let dst = reg(ops_ref, 0)?;
+                    emit_load_u64(&mut ops, 9, (TAG_SPECIAL << 48) | u64::from(SPECIAL_FALSE));
                     store_reg(&mut ops, 9, dst)?;
                 }
                 Op::StoreLocal => {
@@ -1009,6 +1038,28 @@ mod arm64 {
                     emit_load_u64(&mut ops, 0, undef);
                     dynasm!(ops ; .arch aarch64 ; movz x1, STATUS_RETURNED as u32);
                     emit_epilogue(&mut ops);
+                }
+                // Synchronous opcodes with variable / awkward operands: re-run
+                // through the interpreter at this instruction's byte_pc via the
+                // generic delegate bridge (closure/object/array construction,
+                // string constants, checked upvalue store, remainder, unsigned
+                // shift). All run to completion without pushing a frame.
+                Op::MakeClosure
+                | Op::NewObject
+                | Op::NewArray
+                | Op::StoreUpvalueChecked
+                | Op::Rem
+                | Op::Ushr
+                | Op::LoadString
+                | Op::LoadNumber
+                | Op::DefineDataProperty
+                | Op::FreshUpvalue
+                | Op::LoadBuiltinError
+                | Op::Neg
+                | Op::DefineOwnProperty => {
+                    dynasm!(ops ; .arch aarch64 ; mov x0, x20);
+                    emit_load_u64(&mut ops, 1, u64::from(instr.byte_pc));
+                    emit_call_stub(&mut ops, jit_delegate_op_stub as *const () as usize, threw);
                 }
                 other => return Err(Unsupported::Opcode(other)),
             }

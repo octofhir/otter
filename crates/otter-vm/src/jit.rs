@@ -152,9 +152,10 @@ pub struct JitReentryPtrs {
 pub enum JitExecOutcome {
     /// `Return`/`ReturnValue` reached; carries the completion Value.
     Returned(crate::Value),
-    /// A typed guard failed; the VM must re-run this function on the
-    /// interpreter.
-    Bailed,
+    /// A typed guard (or an unsupported opcode emitted as a bail) was hit; the
+    /// VM resumes the interpreter at the carried byte-PC — the exact
+    /// instruction, so committed side effects are preserved.
+    Bailed(u32),
     /// A re-entered VM operation (recursive call) raised; propagate the error.
     Threw(crate::run_control::VmError),
 }
@@ -167,6 +168,14 @@ pub enum JitExecOutcome {
 pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// Size in bytes of the finalized native code mapping.
     fn code_len(&self) -> usize;
+
+    /// `true` when this code was compiled with unsupported opcodes emitted as
+    /// bail-to-interpreter, making it sound to enter only at a supported loop
+    /// header via OSR (not at function entry). The function-entry tier-up path
+    /// skips such code; loop OSR uses it. Default `false`.
+    fn osr_only(&self) -> bool {
+        false
+    }
 
     /// Execute the compiled function for the frame at `ptrs.frame_index`.
     ///

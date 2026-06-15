@@ -82,6 +82,13 @@ pub struct JitCtx {
     /// Boxed `Value` bits of this frame's `this` binding, read once at entry.
     /// A `LoadThis` reads it directly at offset 16 (and bails on a hole).
     this_value: u64,
+    /// Byte-PC of the instruction currently executing, written by compiled
+    /// code before each op (offset [`BAIL_PC_OFFSET`]). On a guard bail the
+    /// interpreter resumes here — the exact instruction, not the entry/loop
+    /// header — which is what makes bailing out of a loop body that has
+    /// already committed side effects (or out of an unsupported opcode)
+    /// correct. Read by `enter_at` on `STATUS_BAILED`.
+    bail_pc: u32,
     /// Erased back-pointer to the owning interpreter.
     vm: *mut Interpreter,
     /// The VM frame stack the executing frame lives on.
@@ -105,6 +112,10 @@ struct JitRet {
 const STATUS_RETURNED: u64 = 0;
 const STATUS_BAILED: u64 = 1;
 const STATUS_THREW: u64 = 2;
+
+/// Byte offset of [`JitCtx::bail_pc`] — where compiled code stamps the current
+/// instruction's byte-PC before each op so a bail resumes at the exact site.
+const BAIL_PC_OFFSET: u32 = std::mem::offset_of!(JitCtx, bail_pc) as u32;
 
 /// Compiled-code entry signature.
 type JitEntry = extern "C" fn(*mut JitCtx) -> JitRet;
@@ -422,6 +433,12 @@ pub struct BaselineCode {
     /// Each trampoline runs the standard prologue then branches to the header's
     /// body label, so the VM can enter mid-loop with the live frame registers.
     osr_entries: std::collections::BTreeMap<u32, usize>,
+    /// `true` when at least one opcode outside the supported subset was emitted
+    /// as a bail-to-interpreter (not a hard compile failure). Such code is only
+    /// sound to enter at a supported loop header via OSR — entering at function
+    /// entry would just bail immediately. The function-entry path skips it; only
+    /// loop OSR uses it.
+    osr_only: bool,
 }
 
 impl std::fmt::Debug for BaselineCode {
@@ -435,6 +452,10 @@ impl std::fmt::Debug for BaselineCode {
 impl JitFunctionCode for BaselineCode {
     fn code_len(&self) -> usize {
         self.code.len()
+    }
+
+    fn osr_only(&self) -> bool {
+        self.osr_only
     }
 
     fn run_entry(&self, ptrs: JitReentryPtrs) -> JitExecOutcome {
@@ -487,6 +508,7 @@ impl BaselineCode {
             stack,
             context: ptrs.context.cast::<ExecutionContext>(),
             frame_index: ptrs.frame_index,
+            bail_pc: 0,
             error: None,
         };
         // SAFETY: the mapping is live and `entry` was emitted with the
@@ -495,7 +517,7 @@ impl BaselineCode {
         let ret = entry(&mut ctx);
         match ret.status {
             STATUS_RETURNED => JitExecOutcome::Returned(Value::from_bits(ret.value)),
-            STATUS_BAILED => JitExecOutcome::Bailed,
+            STATUS_BAILED => JitExecOutcome::Bailed(ctx.bail_pc),
             _ => JitExecOutcome::Threw(ctx.error.take().unwrap_or(VmError::InvalidOperand)),
         }
     }
@@ -516,12 +538,12 @@ fn reg_offset(idx: u16) -> Result<u32, Unsupported> {
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
     use super::{
-        BaselineCode, MAX_INLINE_ARGS, OBJECT_BODY_TYPE_TAG, Op, Operand, SPECIAL_FALSE,
-        SPECIAL_HOLE, SPECIAL_TRUE, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_INT32,
-        TAG_NAN, TAG_PTR_OBJECT, TAG_SPECIAL, Unsupported, jit_call_method_stub, jit_call_stub,
-        jit_delegate_op_stub, jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub,
-        jit_load_upvalue_stub, jit_make_fn_stub, jit_store_element_stub, jit_store_prop_stub,
-        jit_store_upvalue_stub, reg_offset,
+        BAIL_PC_OFFSET, BaselineCode, MAX_INLINE_ARGS, OBJECT_BODY_TYPE_TAG, Op, Operand,
+        SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
+        TAG_INT32, TAG_NAN, TAG_PTR_OBJECT, TAG_SPECIAL, Unsupported, jit_call_method_stub,
+        jit_call_stub, jit_delegate_op_stub, jit_load_element_stub, jit_load_global_stub,
+        jit_load_prop_stub, jit_load_upvalue_stub, jit_make_fn_stub, jit_store_element_stub,
+        jit_store_prop_stub, jit_store_upvalue_stub, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -663,6 +685,10 @@ mod arm64 {
                 .ok_or(Unsupported::BranchTarget(byte_pc))
         };
 
+        // Set when an unsupported opcode is emitted as a bail (see the catch-all
+        // arm); such code is OSR-only.
+        let mut osr_only = false;
+
         // Loop headers = back-edge targets: the PCs an OSR entry can land on.
         // A branch whose resolved target sits at or before its own PC closes a
         // loop; that target is a basic-block boundary where the interpreter's
@@ -692,6 +718,11 @@ mod arm64 {
 
         for instr in &view.instructions {
             dynasm!(ops ; .arch aarch64 ; =>labels[&instr.byte_pc]);
+            // Stamp this op's byte-PC into the context so any bail (guard
+            // failure or unsupported opcode) resumes the interpreter at the
+            // exact instruction, preserving committed side effects.
+            emit_load_u64(&mut ops, 9, u64::from(instr.byte_pc));
+            dynasm!(ops ; .arch aarch64 ; str w9, [x20, BAIL_PC_OFFSET]);
             let ops_ref = instr.operands.as_slice();
             match instr.op {
                 Op::LoadInt32 => {
@@ -1124,7 +1155,17 @@ mod arm64 {
                     emit_load_u64(&mut ops, 1, u64::from(instr.byte_pc));
                     emit_call_stub(&mut ops, jit_delegate_op_stub as *const () as usize, threw);
                 }
-                other => return Err(Unsupported::Opcode(other)),
+                _other => {
+                    // Opcode outside the subset: bail to the interpreter at this
+                    // exact PC (stamped above) instead of failing the whole
+                    // compile. This lets a function with a hot, fully-supported
+                    // loop tier up via OSR even when its non-loop body uses
+                    // unsupported opcodes (class definition, `new`, globals,
+                    // etc.). Marked `osr_only` so the function-entry path skips
+                    // it (entering at PC 0 would bail immediately).
+                    osr_only = true;
+                    dynasm!(ops ; .arch aarch64 ; b =>bail);
+                }
             }
         }
 
@@ -1161,6 +1202,7 @@ mod arm64 {
         Ok(BaselineCode {
             code: CompiledCode::new(buf, entry),
             osr_entries,
+            osr_only,
         })
     }
 
@@ -1462,6 +1504,7 @@ mod tests {
             stack: std::ptr::null_mut(),
             context: std::ptr::null(),
             frame_index: 0,
+            bail_pc: 0,
             error: None,
         };
         // SAFETY: integer-only function; never dereferences the null vm/stack.

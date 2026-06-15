@@ -1363,10 +1363,18 @@ impl Interpreter {
                 }
             }
         } else {
-            return Err(VmError::TypeMismatchAt {
-                op: "property read",
-                kind: value_kind_name(&receiver),
-            });
+            // Proxy and any other receiver not special-cased above resolve
+            // through the generic, proxy-aware value-level `[[Get]]` funnel.
+            // The interpreter opcode reaches this via `drive_load_property`'s
+            // proxy pre-handling; the JIT bridge calls here directly, so this
+            // fallback must cover proxies too.
+            let key = VmPropertyKey::String(name);
+            match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
+                VmGetOutcome::Value(v) => v,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
+                }
+            }
         };
         let frame = &mut stack[top_idx];
         write_register(frame, dst, value)?;

@@ -1198,7 +1198,10 @@ impl Interpreter {
             return Ok(None);
         };
         match self.run_compiled_frame(stack, context, top_idx, &code) {
-            jit::JitExecOutcome::Bailed => Ok(None),
+            jit::JitExecOutcome::Bailed(pc) => {
+                stack[top_idx].pc = pc;
+                Ok(None)
+            }
             jit::JitExecOutcome::Returned(value) => {
                 let popped = self.return_running_finally(stack, value)?;
                 Ok(Some(popped))
@@ -1296,10 +1299,11 @@ impl Interpreter {
                 self.jit_osr_disabled.insert(fid);
                 Ok(None)
             }
-            Some(jit::JitExecOutcome::Bailed) => {
-                // Compiled body hit a guard it could not honor. Resuming mid-loop
-                // on the interpreter is correct (pc is unchanged at the header);
-                // disable OSR so we don't thrash entering and re-bailing.
+            Some(jit::JitExecOutcome::Bailed(pc)) => {
+                // Compiled body hit a guard or unsupported opcode. Resume the
+                // interpreter at the exact bail PC (committed side effects are
+                // preserved); disable OSR so we don't thrash entering/re-bailing.
+                stack[top_idx].pc = pc;
                 self.jit_osr_disabled.insert(fid);
                 Ok(None)
             }
@@ -1332,7 +1336,10 @@ impl Interpreter {
             return Ok(None);
         };
         match self.run_compiled_frame(stack, context, top_idx, &code) {
-            jit::JitExecOutcome::Bailed => Ok(None),
+            jit::JitExecOutcome::Bailed(pc) => {
+                stack[top_idx].pc = pc;
+                Ok(None)
+            }
             jit::JitExecOutcome::Returned(value) => Ok(Some(value)),
             jit::JitExecOutcome::Threw(err) => Err(err),
         }
@@ -1355,20 +1362,25 @@ impl Interpreter {
             return None;
         }
         let fid = frame.function_id;
-        if let Some(slot) = self.jit_code.get(&fid) {
-            return slot.clone();
-        }
-        let count = {
-            let counter = self.jit_call_counts.entry(fid).or_insert(0);
-            *counter = counter.saturating_add(1);
-            *counter
+        let code = if let Some(slot) = self.jit_code.get(&fid) {
+            slot.clone()
+        } else {
+            let count = {
+                let counter = self.jit_call_counts.entry(fid).or_insert(0);
+                *counter = counter.saturating_add(1);
+                *counter
+            };
+            if count < Self::JIT_TIER_UP_THRESHOLD {
+                return None;
+            }
+            let compiled = self.compile_jit_function(context, fid);
+            self.jit_code.insert(fid, compiled.clone());
+            compiled
         };
-        if count < Self::JIT_TIER_UP_THRESHOLD {
-            return None;
-        }
-        let compiled = self.compile_jit_function(context, fid);
-        self.jit_code.insert(fid, compiled.clone());
-        compiled
+        // The function-entry path never runs OSR-only code (compiled with
+        // unsupported opcodes emitted as bails); only loop OSR enters it, at a
+        // supported loop header. The code stays cached for that OSR path.
+        code.filter(|c| !c.osr_only())
     }
 
     /// Run compiled `code` over the rooted register window of frame `top_idx`.

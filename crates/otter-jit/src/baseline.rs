@@ -42,6 +42,10 @@ use otter_vm::{
 
 use crate::CompiledCode;
 
+/// NaN-box high-16 for the canonical quiet NaN double (`value/tag.rs`).
+/// A non-int double result whose own bits land in the tagged range is
+/// canonicalised to this so it stays a valid `Number(NaN)`.
+const TAG_NAN: u64 = 0x7FF8;
 /// NaN-box tag for a 32-bit signed integer immediate (`value/tag.rs`).
 const TAG_INT32: u64 = 0x7FF9;
 /// NaN-box tag for special immediates (undefined/null/hole/boolean).
@@ -297,7 +301,7 @@ fn reg_offset(idx: u16) -> Result<u32, Unsupported> {
 mod arm64 {
     use super::{
         BaselineCode, MAX_INLINE_ARGS, Op, Operand, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE,
-        STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_INT32, TAG_SPECIAL, Unsupported,
+        STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_INT32, TAG_NAN, TAG_SPECIAL, Unsupported,
         jit_call_stub, jit_load_prop_stub, jit_make_fn_stub, jit_store_prop_stub, reg_offset,
     };
     use crate::CompiledCode;
@@ -407,21 +411,53 @@ mod arm64 {
                     let (dst, lhs, rhs) = reg3(ops_ref)?;
                     load_reg(&mut ops, 9, lhs)?;
                     load_reg(&mut ops, 10, rhs)?;
-                    guard_int32!(ops, 9, bail);
-                    guard_int32!(ops, 10, bail);
+                    let float_path = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+                    // int32 fast path: take it only when both operands are int32.
+                    // Any non-int32 operand — or an int32 result that overflows —
+                    // falls through to the double path (numbers are f64; an
+                    // overflowing integer product is just its exact f64 value),
+                    // never to `bail`.
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; lsr x14, x9, #48
+                        ; movz x15, TAG_INT32 as u32
+                        ; cmp x14, x15
+                        ; b.ne =>float_path
+                        ; lsr x14, x10, #48
+                        ; cmp x14, x15
+                        ; b.ne =>float_path
+                    );
                     match instr.op {
-                        Op::Add => dynasm!(ops ; .arch aarch64 ; adds w13, w9, w10 ; b.vs =>bail),
-                        Op::Sub => dynasm!(ops ; .arch aarch64 ; subs w13, w9, w10 ; b.vs =>bail),
+                        Op::Add => {
+                            dynasm!(ops ; .arch aarch64 ; adds w13, w9, w10 ; b.vs =>float_path)
+                        }
+                        Op::Sub => {
+                            dynasm!(ops ; .arch aarch64 ; subs w13, w9, w10 ; b.vs =>float_path)
+                        }
                         Op::Mul => dynasm!(ops
                             ; .arch aarch64
                             ; smull x13, w9, w10
                             ; cmp x13, w13, sxtw
-                            ; b.ne =>bail
+                            ; b.ne =>float_path
                         ),
                         _ => unreachable!(),
                     }
                     box_low32!(ops, 13, 12, TAG_INT32);
                     store_reg(&mut ops, 13, dst)?;
+                    dynasm!(ops ; .arch aarch64 ; b =>done ; =>float_path);
+                    // Double path: decode both operands to f64, compute, rebox.
+                    emit_num_to_double(&mut ops, 9, 0, bail);
+                    emit_num_to_double(&mut ops, 10, 1, bail);
+                    match instr.op {
+                        Op::Add => dynasm!(ops ; .arch aarch64 ; fadd d2, d0, d1),
+                        Op::Sub => dynasm!(ops ; .arch aarch64 ; fsub d2, d0, d1),
+                        Op::Mul => dynasm!(ops ; .arch aarch64 ; fmul d2, d0, d1),
+                        _ => unreachable!(),
+                    }
+                    emit_box_double(&mut ops, 2, 13);
+                    store_reg(&mut ops, 13, dst)?;
+                    dynasm!(ops ; .arch aarch64 ; =>done);
                 }
                 Op::LessThan => emit_cmp(&mut ops, ops_ref, bail, Cmp::Lt)?,
                 Op::LessEq => emit_cmp(&mut ops, ops_ref, bail, Cmp::Le)?,
@@ -684,6 +720,53 @@ mod arm64 {
         }
     }
 
+    /// Decode the `Number` in x-register `src_x` into f64 register `dst_d`.
+    ///
+    /// `int32` payloads sign-convert (`scvtf`); any non-tagged bit pattern is a
+    /// double used verbatim (`fmov`); a tagged non-number (special / pointer /
+    /// function-id, high-16 in `0x7FFA..=0x7FFF`) bails to the interpreter.
+    /// Uses scratch GPRs x14/x15.
+    fn emit_num_to_double(ops: &mut Assembler, src_x: u32, dst_d: u32, bail: DynamicLabel) {
+        let is_non_int = ops.new_dynamic_label();
+        let done = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch aarch64
+            ; lsr x14, X(src_x), #48
+            ; movz x15, TAG_INT32 as u32
+            ; cmp x14, x15
+            ; b.ne =>is_non_int
+            ; scvtf D(dst_d), W(src_x)          // int32: signed 32-bit → f64
+            ; b =>done
+            ; =>is_non_int
+            // Double iff high-16 ∉ [0x7FF9, 0x7FFF]; we already know it is not
+            // 0x7FF9. `x14 - 0x7FF9` lands in 1..=6 (unsigned) for the tagged
+            // non-number range 0x7FFA..=0x7FFF; everything else (incl. the NaN
+            // tag 0x7FF8, which wraps high) is a real double.
+            ; sub x14, x14, x15
+            ; cmp x14, #6
+            ; b.ls =>bail
+            ; fmov D(dst_d), X(src_x)
+            ; =>done
+        );
+    }
+
+    /// Box the f64 in register `src_d` into x-register `dst_x` as a `Value`.
+    ///
+    /// A non-NaN double's bits are a valid `Value` verbatim; a NaN result is
+    /// canonicalised to the single quiet-NaN pattern so it never aliases a tag.
+    /// Uses no scratch GPRs beyond `dst_x`.
+    fn emit_box_double(ops: &mut Assembler, src_d: u32, dst_x: u32) {
+        let ready = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch aarch64
+            ; fmov X(dst_x), D(src_d)
+            ; fcmp D(src_d), D(src_d)
+            ; b.vc =>ready                       // ordered (not NaN) → keep bits
+            ; movz X(dst_x), TAG_NAN as u32, lsl #48
+            ; =>ready
+        );
+    }
+
     /// Target byte-PC of a relative branch. The interpreter computes
     /// `frame.pc + 1 + offset` (relative to the byte after the branch opcode,
     /// `operand_decode::apply_branch`), so byte_len is irrelevant here.
@@ -943,9 +1026,14 @@ mod tests {
         assert!(matches!(run(&v, &mut regs), Exit::Returned(b) if b == false_bits));
     }
 
-    #[test]
-    fn bails_on_non_int_operand() {
-        let v = view(&[
+    fn box_f64(v: f64) -> u64 {
+        v.to_bits()
+    }
+    fn unbox_f64(bits: u64) -> f64 {
+        f64::from_bits(bits)
+    }
+    fn add_view() -> JitFunctionView {
+        view(&[
             (
                 Op::Add,
                 vec![
@@ -955,9 +1043,59 @@ mod tests {
                 ],
             ),
             (Op::ReturnValue, vec![Operand::Register(2)]),
-        ]);
-        let mut regs = [box_i32(10), 0x3FF0_0000_0000_0000, 0, 0, 0, 0, 0, 0];
+        ])
+    }
+
+    #[test]
+    fn bails_on_non_number_operand() {
+        // A tagged non-number (undefined = TAG_SPECIAL, payload 0) must bail to
+        // the interpreter — only int32 and doubles take the compiled arith path.
+        let v = add_view();
+        let mut regs = [box_i32(10), TAG_SPECIAL << 48, 0, 0, 0, 0, 0, 0];
         assert!(matches!(run(&v, &mut regs), Exit::Bailed));
+    }
+
+    #[test]
+    fn adds_two_doubles() {
+        let v = add_view();
+        let mut regs = [box_f64(1.5), box_f64(2.25), 0, 0, 0, 0, 0, 0];
+        match run(&v, &mut regs) {
+            Exit::Returned(bits) => assert_eq!(unbox_f64(bits), 3.75),
+            Exit::Bailed => panic!("expected 3.75, bailed"),
+        }
+    }
+
+    #[test]
+    fn mixes_int_and_double() {
+        // int32(10) + double(2.5) → double(12.5): the int operand sign-converts.
+        let v = add_view();
+        let mut regs = [box_i32(10), box_f64(2.5), 0, 0, 0, 0, 0, 0];
+        match run(&v, &mut regs) {
+            Exit::Returned(bits) => assert_eq!(unbox_f64(bits), 12.5),
+            Exit::Bailed => panic!("expected 12.5, bailed"),
+        }
+    }
+
+    #[test]
+    fn int_multiply_overflow_promotes_to_double() {
+        // 100000 * 100000 = 1e10 overflows i32; the result is its exact f64
+        // value via the double path, not a bail.
+        let v = view(&[
+            (
+                Op::Mul,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
+        ]);
+        let mut regs = [box_i32(100_000), box_i32(100_000), 0, 0, 0, 0, 0, 0];
+        match run(&v, &mut regs) {
+            Exit::Returned(bits) => assert_eq!(unbox_f64(bits), 1e10),
+            Exit::Bailed => panic!("expected 1e10, bailed"),
+        }
     }
 
     #[test]

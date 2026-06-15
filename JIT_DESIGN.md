@@ -1,41 +1,40 @@
 # Otter JIT Design
 
-> Status: design proposal (no implementation). Read-only recon grounded in real
-> `file:line` citations against the current tree. All recommendations are
-> single-choice with rationale and rejected alternatives, per the brief.
->
-> Author note: written in English to match existing repo design docs
-> (`ES_CONFORMANCE.md`, `OTTER_VM_PLAN.md`, `NODE_COMMONJS_DESIGN.md`).
+> Status: **living plan — implementation in progress.** Phase 0 (interpreter
+> dispatch surgery), Phase 1 (baseline arm64 JIT), and Phase 1.5 (loop OSR) have
+> shipped; the optimizing tier (Phase 2) is not started. §1.2 is the current
+> status; §1.3 is the prioritized forward plan; §2–§7 are the standing
+> architecture rationale and verification contract. Benchmark numbers live in
+> `benchmarks/results/latest.md` (source of truth); numbers quoted here are
+> directional and may lag a node version bump.
 
 ---
 
 ## 1. Executive summary
 
-Otter today runs **only an interpreter** with a plain `match op` dispatch loop
-that performs an **O(log n) binary search to fetch every instruction**
-(`crates/otter-vm/src/executable.rs:181-186`) and runs four bookkeeping calls
-per opcode before the work even starts (`crates/otter-vm/src/lib.rs:3778-3809`).
-It is 29–252× slower than Node/Deno/Bun (`benchmarks/results/latest.md`), worst
-on `prop-access` (97× node / 252× deno) and dispatch/arithmetic-bound loops
-(`fib` 40×, `mandelbrot` 47×, `nbody` 42×, `typed-array` 66×).
+Otter runs a register bytecode **interpreter** plus a **single-tier baseline
+JIT** (Sparkplug-style: bytecode→arm64 machine code via a dynasm-rs template
+macro-assembler — one linear pass, no IR, no register allocation, no
+speculation, no deopt; §3). The baseline is on by default (`OTTER_JIT=0`
+disables it) and shares the interpreter's frame register array as its precise GC
+root set, so the moving collector needs **no stack maps**. Two tier-up triggers
+exist: **function-entry** (call-count threshold) for hot *called* functions, and
+**loop OSR** (back-edge threshold) for hot loops in functions entered once.
 
-**Strategy in three sentences.** First, fix the interpreter's self-inflicted
-dispatch tax (binary-search fetch, per-op accounting, no threading) — cheap,
-zero GC risk, 2–4× across the board. Second, add a **single baseline JIT tier**
-(Sparkplug-style, bytecode→machine code via a baseline backend **chosen by
-prototype, not yet committed** — a Sparkplug-style template macro-assembler
-(dynasm-rs) is the recommended baseline backend over copy-and-patch and Cranelift
-(§3.2); no IR, no speculation, no deopt) for hot functions, reusing the existing inline-cache
-feedback table and the existing precise `FrameRoots` rooting mechanism so the
-moving GC needs **no stack maps in v1**. Third — and only after the first two
-land and hold — add an optimizing speculative tier (SSA IR, type feedback,
-deopt, register promotion across safepoints) to close the residual gap.
+The remaining gap is concentrated and structural. Against node (see
+`benchmarks/results/latest.md`): the JIT has pulled call/loop-bound numeric
+kernels close — `mandelbrot` to ~1.6× of node (our nearest compute bench),
+`nbody` ~7×, `fib` ~9× — while benches still bottlenecked on the *interpreter*
+(property loads through a stub, allocation, the separate regex engine) remain
+13–75×: `prop-access` ~50×, `typed-array` ~75× (its loop body uses an
+unimplemented opcode), `regex` ~67× (separate engine), `sort`/`array-ops` ~20×.
 
-**Target.** Phase 0 → worst case from ~250× to ~80×. Phase 1 (baseline JIT)
-→ call-heavy benches (`fib`, `prop-access`, `array-ops`) to single-digit ×.
-Phase 1.5 (loop OSR) → loop-bound benches (`mandelbrot`, `nbody`,
-`typed-array`) to single-digit ×. Phase 2 (optimizer) → approach 2–4× of Node
-on numeric kernels.
+**Strategy.** The dispatch envelope (the original dominant cost) is gone for
+compiled code. The path forward is (a) **widen the baseline opcode subset** so
+more hot loops compile at all (the cheapest remaining wins), (b) **inline the
+property IC** so `prop-access` stops paying a stub call per load, then (c) a
+**speculative optimizing tier** (Phase 2: SSA, type feedback, deopt, Cranelift +
+stack maps) for true numeric parity. §1.3 is the ordered plan.
 
 ### Scope: VM rework and GC are in scope; nothing is cut
 
@@ -61,95 +60,88 @@ Three project constraints shape this plan:
 
 ---
 
-## 1.5 Progress log (live)
+## 1.2 Status — what has shipped
 
-Newest first. Each entry is gated per §5 (test262 failing-set unchanged +
-benchmarks no-regression + GC stress clean). Benches are min-ms, 10 runs.
+Gated per §5 (test262 failing-set unchanged JIT-on vs interpreter + no bench
+regression + `OTTER_GC_STRESS` clean). Full iteration history is out of this
+doc by design; this is the standing summary.
 
-- **Phase 1 step 2 — baseline arm64 emitter, integer core. DONE, unit-verified
-  (not yet bench-visible).** Sparkplug-style template emitter in
-  `crates/otter-jit/src/baseline.rs` (dynasm-rs, arm64): one linear pass, one
-  emit routine per opcode, no IR/regalloc/deopt. Lowers a `JitFunctionView` to
-  native code for the **allocation-free integer subset**: `LoadInt32`(imm),
-  `LoadLocal`/`StoreLocal` moves, `Add`/`Sub`/`Mul` with inline int32 guard +
-  overflow→bail, the six int comparisons → boolean Value, `Jump`/`JumpIfFalse`/
-  `JumpIfTrue` with CFG resolved from byte-offset branch deltas via per-instr
-  dynasm dynamic labels, `Return`. Whole-function opt-in: any other opcode/
-  operand shape → `Unsupported` → silent interpreter fallback. **GC-trivial by
-  construction:** operands/results flow through the caller-owned register array
-  (`*mut u64` = `Frame.registers.as_mut_ptr()`); the subset has no allocation and
-  no `Call`, so no safepoint and no value is ever live in a register across a GC
-  move — reuses the interpreter's precise `FrameRoots`, no stack maps. ABI
-  `extern "C" fn(regs, bailed) -> u64`; failed typed guard sets `bailed` and
-  returns so the caller re-runs on the interpreter (every guard fires *before*
-  its result store, so a bailed register array is never partially mutated).
-  9 in-crate execution tests pass, incl. a real counted loop computing
-  `sum(1..=100)=5050` through emitted branches. `BaselineJitCompiler` now drives
-  the emitter and returns `Compiled{code}`. **Still runtime-inert in the VM** (no
-  tier-up dispatch wired), so no bench/test262/GC-surface change yet — the bench
-  number arrives with the call ABI + function-entry tier-up (next).
-- **Phase 1 step 1 — dependency-inverted JIT compile hook. DONE.** New
-  `crates/otter-vm/src/jit.rs`: `JitCompilerHook` trait + borrow-free owned
-  compile-input DTOs (`JitFunctionView`/`JitInstrView`) snapshotting the frozen
-  executable stream (`Op` + `Operand` + `byte_pc` + `byte_len` +
-  `property_ic_site`; branch immediates already byte-offset deltas).
-  **Bytecode source decided here:** snapshot the already-decoded `ExecInstr`
-  view (`ExecutableFunction::jit_view`, `ExecutionContext::jit_function_view`),
-  not a re-decode of raw `otter-bytecode` and not an `ExecInstr` layout leak.
-  `Interpreter` holds `Option<Arc<dyn JitCompilerHook>>` (`set_jit_compiler`),
-  defaulting to `None` → surface is runtime-inert until a compiler installs.
-  No `otter-vm → otter-jit` dependency (no cycle); `otter-jit` depends on
-  `otter-vm`, `otter-runtime` will wire the two.
-- **Phase 0 step 3 — hoist per-op context/function re-resolution. TRIED,
-  REVERTED (negative result).** Cached the top frame's resolved
-  `(function_id, &ExecutableFunction)` and reused it while the top frame stayed
-  in the same function (so the per-op `covers_function` + `exec_function`
-  lookups, and even self-recursion like `fib`, became cache hits). Measured
-  (min of 10–12, same binary rebuilt both sides): **fib −2% only; mandelbrot,
-  prop-access, typed-array flat within noise; nbody +1.5% (run-to-run)** — net
-  wash. The added `match cached_frame` guard costs ~one branch/op, which cancels
-  the saved lookups: under release thin-LTO the `covers_function` (a
-  `checked_sub` + bounds compare) and `exec_function` (a bounds-checked slice
-  index, `execution_context.rs:137,220`) were **already cheap and inlined**, not
-  a real per-op cost. Reverted to keep the hottest loop minimal. **Conclusion:
-  interpreter micro-optimization is exhausted** — the remaining envelope is not
-  in frame resolution; the path to real wins is the baseline JIT (Phase 1), not
-  more dispatch-loop tuning. This closes Phase 0's interpreter-tuning work.
-- **Phase 0 step 1 — O(1) instruction fetch. DONE, verified.** Replaced the
-  per-op `binary_search_by_key` PC→instruction lookup with a dense
-  `byte_to_instr` map (`crates/otter-vm/src/executable.rs`). Also speeds
-  `property_ic_site` (same search, per property op). Apples-to-apples (10-run,
-  same binary rebuilt both sides): mandelbrot −48.7%, nbody −43.5%, typed-array
-  −39.9%, typescript −35.2%, string-ops −34.5%, fib −32.7%, prop-access −25.5%,
-  sort −19%, array-ops −10.6%; json/regex flat (allocation/separate-engine
-  bound). test262 `language/statements` identical (9140 pass / 35 fail / 0
-  crash) before and after. The single biggest interpreter win.
-- **Phase 0 step 2 — inline per-op metering + dead-code removal. DONE, verified.**
-  Collapsed three per-op method calls (`record_runtime_reductions`,
-  `observe_runtime_stack_depth`, unconditional budget checkpoint) into one
-  `#[inline]` `record_reductions` + an inlined monotonic stack-depth max + a
-  checkpoint gated on a hoisted `enforce_budget` flag (`crates/otter-vm/src/lib.rs`).
-  Deleted the now-dead `observe_stack_depth` and two Interpreter wrappers.
-  Exact semantics (budget-stats integration tests pass). Modest (fib −3.3%,
-  others ~1%): the int32/Smi value path and the funnels were already specialized
-  and inline under release thin-LTO, so the remaining envelope cost is the
-  reductions field-writes themselves — not worth a risky register-resident
-  accumulator (hundreds of `?`-exits make a guaranteed flush infeasible cleanly).
-- **Test-target repair. DONE.** Fixed a pre-existing compile break in
-  `bootstrap.rs` tests (`build_global_this*` signature drift; 3 call sites) and a
-  drifted startup ratchet (`MAX_DEFAULT_GC_ALLOCATIONS` 1650→1700, Intl.Locale
-  additions). `cargo test -p otter-vm --lib` now green (566 pass).
+**Phase 0 — interpreter dispatch surgery. DONE.** O(1) instruction fetch
+replaced the per-op `binary_search_by_key` (`executable.rs`); the single biggest
+interpreter win. Per-op metering collapsed into one inlined accumulate. Threaded
+dispatch was dropped (stable Rust already lowers `match op` to a jump table) and
+a frame-resolution hoist was tried and reverted (measured wash). Conclusion:
+interpreter micro-optimization is exhausted — the remaining envelope is
+structural and only the JIT removes it.
 
-**Measurement-driven course correction.** Profiling-by-reading showed the
-interpreter's int32 arithmetic is *already* Smi-specialized (`number::add`
-checked_add; `Value::number` prefers int32) and release builds inline the
-arithmetic funnels (thin-LTO, `codegen-units = 1`). So "add int32 fast paths" is
-largely redundant. The next interpreter wins are **simplification / tech-debt
-removal** (collapse redundant funnel layers, hoist per-op work that only changes
-on call/return, delete dead paths) — not new fast paths. Verified by test262.
+**Phase 1 — baseline arm64 JIT + function-entry tier-up. DONE.** New
+`crates/otter-jit` (lifts the workspace `forbid(unsafe_code)` like `otter-gc`,
+encapsulating dynasm executable buffers + fn-ptr transmute behind a safe API).
+The emitter lowers a `JitFunctionView` in one linear pass; operands/results flow
+through the interpreter's `Frame.registers` window (already a `FrameRoots`
+provider) so there are no GC pointers in machine registers across a safepoint.
+Supported opcode subset: int32 + **float (f64)** arithmetic (`Add`/`Sub`/`Mul`/
+`Div`) with guard + slow-path, the comparisons incl. **double compare**,
+`Increment`, branches, register moves, `Return`; `Call`/`CallMethodValue`/
+`MakeFunction`/`LoadElement`/`StoreElement`/`LoadGlobalOrThrow`/`LoadProperty`/
+`StoreProperty` via safe re-entry stubs that reload from frame slots after the
+call (the moving-GC discipline). Whole-function opt-in: any unsupported opcode →
+silent interpreter fallback. Tier-up at function entry on a call-count
+threshold. This tiered up `nbody.advance()` (−82%) and `fib`.
 
-**Current gap vs Node after Phase 0:** mandelbrot 47→24×, nbody 42→24×, fib
-40→27×, typed-array 66→39×, typescript 36→23×, prop-access 97→71×.
+**Phase 1.5 — loop OSR (on-stack replacement at back-edges). DONE.** A function
+entered once but looping heavily never reached the call-count threshold, so its
+loop ran entirely on the interpreter. OSR fixes this: a back-edge counter tiers
+the function up mid-loop and **enters compiled code at the loop-header PC**, not
+at PC 0. The emitter emits one prologue **trampoline per loop header** (back-edge
+target) that branches to the header's body label; `JitFunctionCode::osr_entry`
+enters there. Correct by construction: the baseline keeps every live value in the
+frame array at each instruction boundary, and a loop header is a basic-block
+boundary, so the interpreter's live registers are exactly what compiled code
+reads — no frame reconstruction, no stack maps. The per-back-edge cost is one
+branch + add + compare on an interpreter-resident counter (not the `Frame`, which
+is cache-line-capped with no slack), `==`-gated so a frame that cannot tier
+attempts OSR exactly once. Result: `mandelbrot` ~19×→~1.6× of node, `prop-access`
+/`array-ops`/`sort` improved; verified failing-set-identical to the interpreter
+with OSR forced (`OTTER_JIT_OSR_THRESHOLD=1`).
+
+## 1.3 Forward plan (prioritized)
+
+Ordered by ROI/risk. Each item is gated by §5 before it closes.
+
+1. **Widen the baseline opcode subset — cheapest wins, unblocks whole functions.**
+   A whole-function opt-in means one unsupported opcode disables the entire body.
+   - **`Shl`/`Shr`/`UShr`/`Mod` (int32).** `typed-array.js` (~75× — our worst
+     compute bench) is flat purely because its loop body uses `Shl`; the function
+     never compiles. Mirror the existing `BitwiseOr` emit (guard_int32 ×2 →
+     `lsl`/`asr`/`lsr`/`sdiv`+`msub` → box int32). Highest single ROI right now.
+   - Sweep `OTTER_JIT_TRACE=1` over each compute bench, fix the first reported
+     `Unsupported(op)` per hot function, repeat until it compiles.
+2. **Inline the monomorphic property IC (§3.3).** `prop-access` (~50×) loops over
+   property loads that currently each make a stub call into the interpreter IC.
+   Emit the inline shape-guard + slot-load (up to 4 polymorphic entries) sharing
+   the interpreter's `(fn,pc)` IC table, falling to the shared miss handler. This
+   is the highest-leverage feature for `prop-access` and helps every property-
+   heavy body.
+3. **Inline allocation + write barrier (Track G2/G3, §3.6).** Replace the
+   out-of-line allocator/barrier calls in compiled code with the inlined bump
+   path + header-granular card-mark. Helps allocation-bound JIT bodies once (1)
+   and (2) expose them.
+4. **Loop OSR for call-containing loops.** The current back-edge counter uses a
+   top-frame-index proxy that resets on intervening calls, so loops whose bodies
+   call out (`sort` comparator, `array-ops` callbacks) do not OSR — their callees
+   rely on function-entry tier-up instead. Revisit with a cheaper per-frame
+   identity if (1)/(2) leave these benches as the bottleneck.
+5. **Phase 2 — optimizing tier.** Only after the baseline subset is wide and the
+   IC is inlined. SSA IR + type feedback + speculation + deopt on the Cranelift
+   backend with user stack maps (§3.4, §4 Phase 2). This is what approaches 2–4×
+   of node on numeric kernels; it is also the project's highest-risk surface
+   (deopt × moving GC × stack maps), so it is sequenced last.
+
+**Standing constraints (unchanged):** VM internals are fully reworkable (single
+binary, no ABI); the GC is improvable scope, not a fixed constraint (Track G,
+§3.6); nothing is cut, only sequenced; stability is a co-equal gate with perf on
+every phase (§5).
 
 ## 2. Bottleneck profile (measured against code)
 
@@ -721,6 +713,11 @@ fallback path is the same code that exists now.
 ---
 
 ## 4. Implementation plan (ordered by ROI/risk)
+
+> The current status and ordered next work are §1.2 / §1.3 — those are
+> authoritative. This section is the **original per-phase detail** (build list,
+> modules touched, risks, rollback) kept as reference; Phases 0, 1, and 1.5 have
+> shipped, Phase 2 has not.
 
 Each phase lists: what is built, crates/modules touched, target bench + expected
 delta, risks, and a rollback checkpoint. **Gate rule for every phase: not closed

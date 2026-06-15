@@ -203,28 +203,35 @@ function fmt(res) {
   if (!res || !res.ok) return "FAIL";
   return `${res.min.toFixed(1)}`;
 }
-// How many times slower otter (base) is than this runtime. >1 = otter slower.
+// How many times slower the reference engine (base) is than this runtime.
+// >1 = base slower than the runtime; <1 = base FASTER than the runtime.
 function ratio(res, base) {
   if (!res || !res.ok || !base || !base.ok) return "";
-  return `${(base.min / res.min).toFixed(1)}×`;
+  return `${(base.min / res.min).toFixed(2)}×`;
 }
+
+// The shipping engine is `otter-jit` (the baseline JIT is on by default);
+// anchor every ratio to it so the table surfaces "our engine vs node" — the
+// number that matters — instead of the interpreter-only baseline.
+const refName = rtNames.includes("otter-jit") ? "otter-jit" : "otter";
 
 let md = `# Benchmark results\n\n`;
 md += `Metric: **min wall-clock ms** over ${runs} runs (${warmup} warmup), lower is better. `;
-md += `Includes process startup. \`×\` = how many times **slower otter is** than that runtime (higher = otter worse).\n\n`;
+md += `Includes process startup. \`×\` = how many times **slower \`${refName}\` is** than that runtime — `;
+md += `**\`<1.00×\` means \`${refName}\` is faster.**\n\n`;
 md += `Host: \`${process.platform} ${process.arch}\` · node harness \`${process.version}\`\n\n`;
 
-const header = ["script", ...rtNames.flatMap((n) => (hasOtter && n !== "otter" ? [n, `${n} ×`] : [n]))];
+const header = ["script", ...rtNames.flatMap((n) => (n !== refName ? [n, `${n} ×`] : [n]))];
 md += `| ${header.join(" | ")} |\n`;
 md += `| ${header.map(() => "---").join(" | ")} |\n`;
 
 for (const s of scripts) {
   const row = [s];
-  const base = results[s].otter;
+  const base = results[s][refName];
   for (const n of rtNames) {
     const res = results[s][n];
     row.push(fmt(res));
-    if (hasOtter && n !== "otter") row.push(ratio(res, base));
+    if (n !== refName) row.push(ratio(res, base));
   }
   md += `| ${row.join(" | ")} |\n`;
 }

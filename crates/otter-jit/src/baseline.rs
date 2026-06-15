@@ -219,6 +219,31 @@ extern "C" fn jit_store_prop_stub(
     }
 }
 
+/// Bridge stub: perform a computed `LoadElement` (`recv[idx]`) from compiled
+/// code, delegating to the safe [`Interpreter::jit_runtime_load_element`].
+/// Returns `0` on success, `1` when the read threw (error parked in `ctx`).
+extern "C" fn jit_load_element_stub(ctx: *mut JitCtx, dst: u64, recv: u64, idx: u64) -> u64 {
+    // SAFETY: see `jit_call_stub`.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    match vm.jit_runtime_load_element(
+        context,
+        stack,
+        ctx.frame_index,
+        dst as u16,
+        recv as u16,
+        idx as u16,
+    ) {
+        Ok(()) => 0,
+        Err(err) => {
+            ctx.error = Some(err);
+            1
+        }
+    }
+}
+
 /// Why a function could not be baseline-compiled. Always maps to a silent
 /// interpreter fallback; never a JS-visible error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,7 +327,8 @@ mod arm64 {
     use super::{
         BaselineCode, MAX_INLINE_ARGS, Op, Operand, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE,
         STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_INT32, TAG_NAN, TAG_SPECIAL, Unsupported,
-        jit_call_stub, jit_load_prop_stub, jit_make_fn_stub, jit_store_prop_stub, reg_offset,
+        jit_call_stub, jit_load_element_stub, jit_load_prop_stub, jit_make_fn_stub,
+        jit_store_prop_stub, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -415,6 +441,12 @@ mod arm64 {
                     let dst = reg(ops_ref, 0)?;
                     let idx = local_index(ops_ref, 1)?;
                     load_reg(&mut ops, 9, idx)?;
+                    store_reg(&mut ops, 9, dst)?;
+                }
+                Op::LoadUndefined => {
+                    let dst = reg(ops_ref, 0)?;
+                    // SPECIAL payload 0 == undefined.
+                    emit_load_u64(&mut ops, 9, TAG_SPECIAL << 48);
                     store_reg(&mut ops, 9, dst)?;
                 }
                 Op::StoreLocal => {
@@ -548,6 +580,49 @@ mod arm64 {
                 }
                 Op::Call => {
                     emit_call(&mut ops, ops_ref, threw)?;
+                }
+                // `recv[idx]` — delegate to the safe element-load bridge (covers
+                // dense/sparse arrays, typed arrays, strings, object `[[Get]]`).
+                Op::LoadElement => {
+                    let dst = reg(ops_ref, 0)?;
+                    let recv = reg(ops_ref, 1)?;
+                    let idx = reg(ops_ref, 2)?;
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; mov x0, x20
+                        ; movz x1, dst as u32
+                        ; movz x2, recv as u32
+                        ; movz x3, idx as u32
+                    );
+                    emit_call_stub(&mut ops, jit_load_element_stub as *const () as usize, threw);
+                }
+                // `dst = ToNumeric(src) + delta` (§13.4 UpdateExpression). Int32
+                // fast path with overflow → double; double path otherwise.
+                Op::Increment => {
+                    let dst = reg(ops_ref, 0)?;
+                    let src = reg(ops_ref, 1)?;
+                    let delta = imm32(ops_ref, 2)?;
+                    load_reg(&mut ops, 9, src)?;
+                    emit_load_u64(&mut ops, 12, u64::from(delta as u32));
+                    let float_path = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; lsr x14, x9, #48
+                        ; movz x15, TAG_INT32 as u32
+                        ; cmp x14, x15
+                        ; b.ne =>float_path
+                        ; adds w13, w9, w12
+                        ; b.vs =>float_path
+                    );
+                    box_low32!(ops, 13, 11, TAG_INT32);
+                    store_reg(&mut ops, 13, dst)?;
+                    dynasm!(ops ; .arch aarch64 ; b =>done ; =>float_path);
+                    emit_num_to_double(&mut ops, 9, 0, bail);
+                    dynasm!(ops ; .arch aarch64 ; scvtf d1, w12 ; fadd d2, d0, d1);
+                    emit_box_double(&mut ops, 2, 13);
+                    store_reg(&mut ops, 13, dst)?;
+                    dynasm!(ops ; .arch aarch64 ; =>done);
                 }
                 Op::LoadThis => {
                     // `this` bits are precomputed in `JitCtx.this_value`
@@ -1149,6 +1224,50 @@ mod tests {
         // A non-number (undefined) still bails.
         let mut regs = [TAG_SPECIAL << 48, 0, 0, 0, 0, 0, 0, 0];
         assert!(matches!(run(&v, &mut regs), Exit::Bailed));
+    }
+
+    #[test]
+    fn increment_int_double_and_overflow() {
+        let v = view(&[
+            (
+                Op::Increment,
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::Imm32(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(1)]),
+        ]);
+        // int + 1 stays int32.
+        let mut regs = [box_i32(41), 0, 0, 0, 0, 0, 0, 0];
+        expect_int(&v, &mut regs, 42);
+        // double + 1 stays double.
+        let mut regs = [box_f64(2.5), 0, 0, 0, 0, 0, 0, 0];
+        match run(&v, &mut regs) {
+            Exit::Returned(bits) => assert_eq!(unbox_f64(bits), 3.5),
+            Exit::Bailed => panic!("expected 3.5, bailed"),
+        }
+        // i32::MAX + 1 overflows → exact double.
+        let mut regs = [box_i32(i32::MAX), 0, 0, 0, 0, 0, 0, 0];
+        match run(&v, &mut regs) {
+            Exit::Returned(bits) => assert_eq!(unbox_f64(bits), i32::MAX as f64 + 1.0),
+            Exit::Bailed => panic!("expected overflow→double, bailed"),
+        }
+        // Decrement (delta = -1).
+        let vd = view(&[
+            (
+                Op::Increment,
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::Imm32(-1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(1)]),
+        ]);
+        let mut regs = [box_i32(10), 0, 0, 0, 0, 0, 0, 0];
+        expect_int(&vd, &mut regs, 9);
     }
 
     #[test]

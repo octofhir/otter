@@ -3009,6 +3009,32 @@ impl Interpreter {
         result
     }
 
+    /// JIT bridge for a computed `LoadElement` (`recv[idx]`) from compiled code.
+    /// Delegates to the full interpreter element read
+    /// ([`Self::run_load_element_regs`]), which covers dense / sparse array
+    /// elements, typed arrays, string indices, and the ordinary `[[Get]]`
+    /// fallback for object receivers. The frame PC is saved and restored so a
+    /// later guard bail still re-runs the compiled frame from PC 0.
+    ///
+    /// # Errors
+    /// Propagates a throwing getter, a `null`/`undefined` receiver `TypeError`,
+    /// or `InvalidOperand`.
+    pub fn jit_runtime_load_element(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut SmallVec<[Frame; 8]>,
+        frame_index: usize,
+        dst: u16,
+        recv_reg: u16,
+        idx_reg: u16,
+    ) -> Result<(), VmError> {
+        let saved_pc = stack[frame_index].pc;
+        let frame = &mut stack[frame_index];
+        let result = self.run_load_element_regs(context, frame, dst, recv_reg, idx_reg);
+        stack[frame_index].pc = saved_pc;
+        result
+    }
+
     /// JIT bridge for a named `StoreProperty` from compiled code. The store
     /// analogue of [`Self::jit_runtime_load_property`]: the hot path is an IC
     /// hit on an existing own data slot (the dense `site` comes from the

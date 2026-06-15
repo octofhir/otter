@@ -344,6 +344,22 @@ mod arm64 {
         };
     }
 
+    /// Emit a "value is a Number" guard on x-register `r`: bail unless the
+    /// high-16 is `int32` (`0x7FF9`) or any double pattern. Non-numbers
+    /// (special / pointer / function-id, high-16 in `0x7FFA..=0x7FFF`) bail.
+    macro_rules! guard_number {
+        ($ops:expr, $r:literal, $bail:expr) => {
+            dynasm!($ops
+                ; .arch aarch64
+                ; lsr x14, X($r), #48
+                ; movz x15, 0x7FFA
+                ; sub x14, x14, x15
+                ; cmp x14, #5                 // 0x7FFF - 0x7FFA
+                ; b.ls =>$bail                // high-16 in [0x7FFA, 0x7FFF] → non-number
+            );
+        };
+    }
+
     /// Emit the function epilogue (restore callee-saved + frame, return). `x0`
     /// (value) and `x1` (status) must already be set.
     fn emit_epilogue(ops: &mut Assembler) {
@@ -459,19 +475,33 @@ mod arm64 {
                     store_reg(&mut ops, 13, dst)?;
                     dynasm!(ops ; .arch aarch64 ; =>done);
                 }
+                // Division always yields a Number (f64) in ECMAScript — even
+                // `6 / 2` is the Number `3`, equal to int32 `3` — so there is no
+                // int fast path; decode both operands to f64 and `fdiv`.
+                Op::Div => {
+                    let (dst, lhs, rhs) = reg3(ops_ref)?;
+                    load_reg(&mut ops, 9, lhs)?;
+                    load_reg(&mut ops, 10, rhs)?;
+                    emit_num_to_double(&mut ops, 9, 0, bail);
+                    emit_num_to_double(&mut ops, 10, 1, bail);
+                    dynasm!(ops ; .arch aarch64 ; fdiv d2, d0, d1);
+                    emit_box_double(&mut ops, 2, 13);
+                    store_reg(&mut ops, 13, dst)?;
+                }
                 Op::LessThan => emit_cmp(&mut ops, ops_ref, bail, Cmp::Lt)?,
                 Op::LessEq => emit_cmp(&mut ops, ops_ref, bail, Cmp::Le)?,
                 Op::GreaterThan => emit_cmp(&mut ops, ops_ref, bail, Cmp::Gt)?,
                 Op::GreaterEq => emit_cmp(&mut ops, ops_ref, bail, Cmp::Ge)?,
                 Op::Equal => emit_cmp(&mut ops, ops_ref, bail, Cmp::Eq)?,
                 Op::NotEqual => emit_cmp(&mut ops, ops_ref, bail, Cmp::Ne)?,
-                // `ToPrimitive`/`ToNumeric` are identity on a number; emit a
-                // guarded move (int32 → copy, else bail).
+                // `ToPrimitive`/`ToNumeric` are identity on a number (int32 or
+                // double); emit a guarded move. Non-numbers (objects needing
+                // `valueOf`, strings, etc.) bail to the interpreter.
                 Op::ToPrimitive | Op::ToNumeric => {
                     let dst = reg(ops_ref, 0)?;
                     let src = reg(ops_ref, 1)?;
                     load_reg(&mut ops, 9, src)?;
-                    guard_int32!(ops, 9, bail);
+                    guard_number!(ops, 9, bail);
                     store_reg(&mut ops, 9, dst)?;
                 }
                 Op::Jump => {
@@ -1074,6 +1104,51 @@ mod tests {
             Exit::Returned(bits) => assert_eq!(unbox_f64(bits), 12.5),
             Exit::Bailed => panic!("expected 12.5, bailed"),
         }
+    }
+
+    #[test]
+    fn divides_doubles_and_ints() {
+        let v = view(&[
+            (
+                Op::Div,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
+        ]);
+        let mut regs = [box_f64(7.0), box_f64(2.0), 0, 0, 0, 0, 0, 0];
+        match run(&v, &mut regs) {
+            Exit::Returned(bits) => assert_eq!(unbox_f64(bits), 3.5),
+            Exit::Bailed => panic!("expected 3.5, bailed"),
+        }
+        // 6 / 2 yields the Number 3 (an f64), not an int32.
+        let mut regs = [box_i32(6), box_i32(2), 0, 0, 0, 0, 0, 0];
+        match run(&v, &mut regs) {
+            Exit::Returned(bits) => assert_eq!(unbox_f64(bits), 3.0),
+            Exit::Bailed => panic!("expected 3.0, bailed"),
+        }
+    }
+
+    #[test]
+    fn to_numeric_passes_double_through() {
+        let v = view(&[
+            (
+                Op::ToNumeric,
+                vec![Operand::Register(1), Operand::Register(0)],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(1)]),
+        ]);
+        let mut regs = [box_f64(2.5), 0, 0, 0, 0, 0, 0, 0];
+        match run(&v, &mut regs) {
+            Exit::Returned(bits) => assert_eq!(unbox_f64(bits), 2.5),
+            Exit::Bailed => panic!("expected 2.5, bailed"),
+        }
+        // A non-number (undefined) still bails.
+        let mut regs = [TAG_SPECIAL << 48, 0, 0, 0, 0, 0, 0, 0];
+        assert!(matches!(run(&v, &mut regs), Exit::Bailed));
     }
 
     #[test]

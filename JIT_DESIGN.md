@@ -105,43 +105,72 @@ attempts OSR exactly once. Result: `mandelbrot` ~19×→~1.6× of node, `prop-ac
 /`array-ops`/`sort` improved; verified failing-set-identical to the interpreter
 with OSR forced (`OTTER_JIT_OSR_THRESHOLD=1`).
 
-## 1.3 Forward plan (prioritized)
+## 1.3 The fundamental ceiling, and the forward plan
 
-Ordered by ROI/risk. Each item is gated by §5 before it closes.
+**Measured root cause (2026-06-16).** After Phase 1/1.5 + a wide baseline opcode
+subset, the compute benches barely moved beyond what loop-OSR bought
+(`mandelbrot` ~1.5×, `array-ops` −23%; `prop-access` ~49×, `typed-array` ~75×,
+`string-ops`/`json` flat). The reason is structural, not incremental: **the
+baseline removes the dispatch envelope only for arithmetic, branches, and local
+moves. Every property load/store, method call, and element access still
+round-trips into the interpreter through a Rust stub** — and that round-trip
+*is* the entire workload of property/OOP/typed-array code.
 
-1. **Widen the baseline opcode subset — cheapest wins, unblocks whole functions.**
-   A whole-function opt-in means one unsupported opcode disables the entire body.
-   - **`Shl`/`Shr`/`UShr`/`Mod` (int32).** `typed-array.js` (~75× — our worst
-     compute bench) is flat purely because its loop body uses `Shl`; the function
-     never compiles. Mirror the existing `BitwiseOr` emit (guard_int32 ×2 →
-     `lsl`/`asr`/`lsr`/`sdiv`+`msub` → box int32). Highest single ROI right now.
-   - Sweep `OTTER_JIT_TRACE=1` over each compute bench, fix the first reported
-     `Unsupported(op)` per hot function, repeat until it compiles.
-2. **Inline the monomorphic property IC (§3.3).** `prop-access` (~50×) loops over
-   property loads that currently each make a stub call into the interpreter IC.
-   Emit the inline shape-guard + slot-load (up to 4 polymorphic entries) sharing
-   the interpreter's `(fn,pc)` IC table, falling to the shared miss handler. This
-   is the highest-leverage feature for `prop-access` and helps every property-
-   heavy body.
-3. **Inline allocation + write barrier (Track G2/G3, §3.6).** Replace the
-   out-of-line allocator/barrier calls in compiled code with the inlined bump
-   path + header-granular card-mark. Helps allocation-bound JIT bodies once (1)
-   and (2) expose them.
-4. **Loop OSR for call-containing loops.** The current back-edge counter uses a
-   top-frame-index proxy that resets on intervening calls, so loops whose bodies
-   call out (`sort` comparator, `array-ops` callbacks) do not OSR — their callees
-   rely on function-entry tier-up instead. Revisit with a cheaper per-frame
-   identity if (1)/(2) leave these benches as the bottleneck.
-5. **Phase 2 — optimizing tier.** Only after the baseline subset is wide and the
-   IC is inlined. SSA IR + type feedback + speculation + deopt on the Cranelift
-   backend with user stack maps (§3.4, §4 Phase 2). This is what approaches 2–4×
-   of node on numeric kernels; it is also the project's highest-risk surface
-   (deopt × moving GC × stack maps), so it is sequenced last.
+The deeper reason the JIT *must* use stubs there: **the hot GC heap bodies are
+`#[repr(Rust)]`, so they have no layout the JIT can read by fixed offset.**
+Confirmed: `ObjectBody` (`object.rs:319`, `#[derive(Debug, Clone)]`, slots are a
+`SmallVec<[PropertySlot; 4]>` of tagged enums — not a flat fixed-offset slot
+array), `PropertySlot`/`SlotBody` (`object.rs:180,186`), and the typed-array /
+array buffer bodies likewise. The value tagging is already fine (NaN-box,
+`TAG_PTR_OBJECT` low-32 = `Gc` offset, type via `GcHeader::type_tag`,
+`value/tag.rs:64`) — the ceiling is purely the **heap body layouts**. No amount
+of opcode-stubbing breaks it; a stub call per property access is the wall.
 
-**Standing constraints (unchanged):** VM internals are fully reworkable (single
-binary, no ABI); the GC is improvable scope, not a fixed constraint (Track G,
-§3.6); nothing is cut, only sequenced; stability is a co-equal gate with perf on
-every phase (§5).
+**The rework that lifts the ceiling (now the top priority).** Give the hot heap
+bodies JIT-stable `#[repr(C)]` layouts so compiled code reads them directly:
+
+0. **Object-model JIT-readability rework (THE unlock).** Re-lay the fast-path
+   object as a `#[repr(C)]` header with: a shape token (or shape-id) at a fixed
+   offset, and **flat in-object data slots (`Value`) at fixed byte offsets
+   assigned by the shape**, replacing the `SmallVec<[PropertySlot; 4]>`-of-enums
+   for the monomorphic data-property case. Dictionary mode / accessors stay as a
+   cold fallback off the fast header. Shape transitions assign slot offsets; the
+   IC caches the byte offset. Then the JIT emits a real monomorphic load:
+   `tag-guard → decompress (cage_base+offset) → load shape @fixed → cmp cached →
+   load slot @cached_offset`, no stub. Touches allocation, shapes, GC tracing,
+   every property op — large and gated hard by §5 (test262 failing-set
+   unchanged), but it is the change that makes `prop-access` and all OOP code
+   competitive. Execute in slices: (a) `#[repr(C)]` fast header + flat slots
+   behind the existing API with the SmallVec path as fallback; (b) shape→offset
+   assignment + IC offset caching; (c) JIT inline load; (d) JIT inline store +
+   write barrier; (e) extend to method-call IC.
+0b. **Typed-array bodies `#[repr(C)]` + inline element access.** `typed-array`
+   (~75×, worst) is pure `Float64Array`/`Int32Array` element load/store. Give
+   the typed-array body a fixed-offset `{ data_ptr, length, kind }` header and
+   emit inline `bounds-check → ldr/str [data_ptr + i*elem]` for the monomorphic
+   element ops (currently `jit_*_element_stub`). More contained than the object
+   rework; also needs synchronous-`New` of a native constructor so the module
+   function compiles.
+
+**Then (unchanged, after the ceiling is lifted):**
+1. Inline allocation + write barrier (Track G2/G3, §3.6) for allocation-bound
+   JIT bodies.
+2. Loop OSR for call-containing loops (current back-edge counter resets on an
+   intervening call via its top-frame-index proxy; `sort`/`array-ops` callbacks
+   rely on function-entry tier-up instead).
+3. Phase 2 optimizing tier — SSA IR + type feedback + speculation + deopt on
+   Cranelift with user stack maps (§3.4, §4). Numeric parity; highest risk; last.
+
+**Done this far:** Phase 0 (dispatch surgery), Phase 1 (baseline arm64 emitter +
+function-entry tier-up), Phase 1.5 (loop OSR), wide baseline opcode subset (int
+arithmetic + float arithmetic + comparisons incl. double + shifts/bitwise +
+upvalues + a generic by-PC delegate bridge for synchronous closure/object/array/
+string ops). `nbody` ~7×, `fib` ~9×, `mandelbrot` ~1.5×, `array-ops` −23×%.
+
+**Standing constraints:** VM internals are fully reworkable (single binary, no
+ABI) — the object-model rework is explicitly in scope. The GC is improvable
+scope (Track G, §3.6). Nothing is cut, only sequenced; stability is a co-equal
+gate with perf on every phase (§5).
 
 ## 2. Bottleneck profile (measured against code)
 

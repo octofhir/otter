@@ -15,7 +15,7 @@ Order follows the plan's *minimal implementation sequence* (§5). Each slice is 
 | 0 | Engine Lab — measurement, differential testing, progress scaffold | `OtterLab` | **done** (commit `98f460b3`) | — |
 | 1 | Stable VM stack & frame descriptors | `HoltStack` | **done** (1b; 1e folds into Slice 2) | Slice 0 green ✓ |
 | 2 | PupJIT direct calls + machine-code frame build | `PupJIT Calls` | **next** | HoltStack stable ✓ |
-| 3 | Unified feedback vectors + complete ICs | `WhiskerIC` | **in progress** (3a load + 3b store + 3c method ICs done) | PupJIT direct calls |
+| 3 | Unified feedback vectors + complete ICs | `WhiskerIC` | **in progress** (3a load + 3b store + 3c method + 3d upvalue ICs done) | PupJIT direct calls |
 | 4 | Hot heap layouts (Array/TypedArray/String/Closure) | `KelpHeap` | not started | WhiskerIC load/store/method/element |
 | 5 | Production GC + precise safepoint stack maps | `TideGC` / `StoneMaps` / `ShellAlloc` | not started | KelpHeap; PupJIT direct calls shipped |
 | 6 | Optimized builtin intrinsics | `ShellBuiltins` | not started | KelpHeap |
@@ -375,10 +375,42 @@ failing-set identical JIT-off vs JIT-on on `language/expressions/call` (83/92),
 `expressions/super` (93/94), `statements/try` (200/206),
 `object/method-definition` (303/303), `Array/prototype/map` (214/216).
 
-### 3d — next (not started)
-- Direct-prototype `LoadProperty` inline (currently only own-data inlines; the
-  cell could also cache a proto-data hit for inherited data properties).
-- Element IC widening / megamorphic stubs; global-load IC; binary-op feedback.
+### 3d — Inline upvalue (captured-binding) load/store. Done.
+
+`LoadUpvalue` / `StoreUpvalue` were the last broad always-stub class (every
+captured-variable read/write re-entered Rust). Now inlined: a new `JitCtx`
+`upvalues_ptr` (the frame's `Box<[UpvalueCell]>` data base, set in `enter_at` and
+plumbed through the direct-call path via `JitPreparedDirectCall::upvalues_ptr` →
+`ctx.direct_upvalues_ptr` → callee ctx) lets emitted code read the 4-byte cell
+handle at `[upvalues_ptr + idx*4]`, decompress (cells are **old-space, immobile**
+— GC-trivial), and access the cell's single `Value`. Load misses to the stub on
+a TDZ hole or a `0` base; store inlines only the **primitive** case (a non-pointer
+value into an old cell needs no write barrier) and misses pointer values to the
+barriered stub — same value-tag gate as 3b.
+
+**Measured.** Closure-counter micro (`sum += x; n += 1` captured): upvalue stubs
+**~80,000,000 → 2**, −7.5% wall-clock. `array-ops` `jitRuntimePropertyStubs`
+**2,599,037 → 199,050** (−92%; the residual is the deferred dense-array
+`StoreElement`). Tracked benches otherwise neutral — they are callback-dispatch /
+builtin bound, not upvalue bound (this is broad cleanup, not a headline bench
+win). diff 11/11 identical.
+
+**Gates.** Unit tests (otter-jit 17, otter-vm 574) pass; clippy/fmt clean; test262
+failing-set identical JIT-off vs JIT-on on `arrow-function` (343/343),
+`statements/let` (145/145), `const` (138/138, TDZ), `generators` (289/290),
+`for-of` (742/752, per-iteration bindings). Primitive-upvalue closure
+bit-identical under `OTTER_GC_STRESS=32/64`. (A pointer-upvalue alloc-storm under
+`OTTER_GC_STRESS=32` SIGSEGVs in **both interp and JIT** — pre-existing GC-stress
+fragility in heavy young-allocation / commonjs load, unrelated to this slice.)
+
+### 3e — next (not started)
+- Direct-prototype `LoadProperty` inline (cell caches a proto-data hit for
+  inherited data properties; currently only own-data inlines).
+- Bigger levers now are KelpHeap/ShellBuiltins: array-ops/sort are bound by the
+  **native builtin → JS callback per-element dispatch** (`run_callable_sync` per
+  element), json/string by native serializer/charCodeAt throughput, regex by the
+  separate engine. Element-`StoreElement` dense inline was investigated + deferred
+  (length/dirty/sparse/frozen semantics).
 
 ## Verification contract
 

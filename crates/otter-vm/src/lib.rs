@@ -1649,6 +1649,7 @@ impl Interpreter {
             self_closure: self.jit_frame_self_closure_bits(stack, frame_index),
             this_value: self.jit_frame_this_bits(stack, frame_index),
             frame_index,
+            upvalues_ptr: Self::jit_frame_upvalues_ptr(stack, frame_index),
         })
     }
 
@@ -2114,6 +2115,23 @@ impl Interpreter {
     #[must_use]
     pub fn jit_frame_regs_ptr(stack: &mut jit::JitFrameStack, frame_index: usize) -> *mut u64 {
         stack[frame_index].registers.as_mut_ptr().cast::<u64>()
+    }
+
+    /// Raw base of frame `frame_index`'s upvalue spine (`Box<[UpvalueCell]>`
+    /// data, each a 4-byte compressed `Gc<UpvalueCellBody>` handle), or `0`
+    /// when the frame captures nothing. Emitted `LoadUpvalue`/`StoreUpvalue`
+    /// read the cell handle at `base + idx*4`, decompress it, and access the
+    /// cell body's single `Value`. The spine `Box` is owned by the frame and
+    /// stays put for the frame's life (the cells themselves are old-space, so
+    /// they never move); a `0` base routes the op to the runtime stub.
+    #[must_use]
+    pub fn jit_frame_upvalues_ptr(stack: &jit::JitFrameStack, frame_index: usize) -> usize {
+        let upvalues = &stack[frame_index].upvalues;
+        if upvalues.is_empty() {
+            0
+        } else {
+            upvalues.as_ptr() as usize
+        }
     }
 
     /// Build a compile request for `fid` and run the installed hook. Returns the

@@ -115,6 +115,10 @@ pub struct JitPreparedDirectCall {
     pub this_value: u64,
     /// Callee frame index in the active stack.
     pub frame_index: usize,
+    /// Base of the callee frame's upvalue spine (`Box<[UpvalueCell]>` data), or
+    /// `0` when it captures nothing — lets emitted upvalue ops in the direct
+    /// callee read its cells inline instead of routing through the stub.
+    pub upvalues_ptr: usize,
 }
 
 /// Ready-to-use byte offsets and tags for the JIT's inline typed-array

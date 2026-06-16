@@ -98,6 +98,12 @@ pub struct JitCtx {
     context: *const ExecutionContext,
     /// Index of the executing frame within `stack`.
     frame_index: usize,
+    /// Base of this frame's upvalue spine (`Box<[UpvalueCell]>` data; each a
+    /// 4-byte compressed cell handle), or `0` when the frame captures nothing
+    /// or the ctx was built on the direct-call path (which leaves it `0` so
+    /// upvalue ops fall back to the runtime stub). Inline `LoadUpvalue` /
+    /// `StoreUpvalue` read `[upvalues_ptr + idx*4]`.
+    upvalues_ptr: usize,
     /// Error slot shared by direct callees and bridge stubs when a re-entered
     /// operation throws. Pointer form keeps `JitCtx` constructible by emitted
     /// code; assembly never initializes a Rust enum in place.
@@ -112,6 +118,10 @@ pub struct JitCtx {
     direct_this_value: u64,
     /// Prepared direct-call callee frame index.
     direct_frame_index: usize,
+    /// Prepared direct-call callee upvalue-spine base (staged from
+    /// [`otter_vm::JitPreparedDirectCall::upvalues_ptr`]); the dispatch tail
+    /// copies it into the callee `JitCtx.upvalues_ptr`.
+    direct_upvalues_ptr: usize,
 }
 
 /// Two-word return of compiled code (`x0`/`x1` on arm64).
@@ -136,11 +146,19 @@ const VM_OFFSET: u32 = std::mem::offset_of!(JitCtx, vm) as u32;
 const STACK_OFFSET: u32 = std::mem::offset_of!(JitCtx, stack) as u32;
 const CONTEXT_OFFSET: u32 = std::mem::offset_of!(JitCtx, context) as u32;
 const FRAME_INDEX_OFFSET: u32 = std::mem::offset_of!(JitCtx, frame_index) as u32;
+/// Byte offset of [`JitCtx::upvalues_ptr`] for inline upvalue access.
+const UPVALUES_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, upvalues_ptr) as u32;
+/// Size of one `UpvalueCell` (a 4-byte compressed `Gc<UpvalueCellBody>`).
+const UPVALUE_CELL_SIZE: u32 = 4;
+/// Byte offset of the single `Value` inside an `UpvalueCellBody` from its
+/// decompressed pointer (just past the 8-byte `GcHeader`).
+const UPVALUE_VALUE_OFFSET: u32 = 8;
 const DIRECT_ENTRY_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_entry_addr) as u32;
 const DIRECT_REGS_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_regs) as u32;
 const DIRECT_SELF_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_self_closure) as u32;
 const DIRECT_THIS_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_this_value) as u32;
 const DIRECT_FRAME_INDEX_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_frame_index) as u32;
+const DIRECT_UPVALUES_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_upvalues_ptr) as u32;
 const JIT_CTX_STACK_SIZE: u32 = ((std::mem::size_of::<JitCtx>() + 15) & !15) as u32;
 
 /// Compiled-code entry signature.
@@ -182,6 +200,7 @@ extern "C" fn jit_prepare_direct_call_stub(
             ctx.direct_self_closure = prepared.self_closure;
             ctx.direct_this_value = prepared.this_value;
             ctx.direct_frame_index = prepared.frame_index;
+            ctx.direct_upvalues_ptr = prepared.upvalues_ptr;
             0
         }
         Ok(None) => 2,
@@ -230,6 +249,7 @@ extern "C" fn jit_prepare_direct_method_call_stub(
             ctx.direct_self_closure = prepared.self_closure;
             ctx.direct_this_value = prepared.this_value;
             ctx.direct_frame_index = prepared.frame_index;
+            ctx.direct_upvalues_ptr = prepared.upvalues_ptr;
             0
         }
         Ok(None) => 2,
@@ -728,6 +748,10 @@ impl BaselineCode {
         let self_closure = unsafe { (*vm).jit_frame_self_closure_bits(&*stack, ptrs.frame_index) };
         // SAFETY: same validity/aliasing contract as `self_closure` above.
         let this_value = unsafe { (*vm).jit_frame_this_bits(&*stack, ptrs.frame_index) };
+        // SAFETY: same validity/aliasing contract; the spine `Box` outlives this
+        // entry (frame-owned), and the cells it holds are old-space (immobile).
+        let upvalues_ptr =
+            Interpreter::jit_frame_upvalues_ptr(unsafe { &*stack }, ptrs.frame_index);
         let mut error = None;
         let mut ctx = JitCtx {
             regs,
@@ -737,6 +761,7 @@ impl BaselineCode {
             stack,
             context: ptrs.context.cast::<ExecutionContext>(),
             frame_index: ptrs.frame_index,
+            upvalues_ptr,
             bail_pc: 0,
             error: &mut error,
             direct_entry_addr: 0,
@@ -744,6 +769,7 @@ impl BaselineCode {
             direct_self_closure: 0,
             direct_this_value: 0,
             direct_frame_index: 0,
+            direct_upvalues_ptr: 0,
         };
         // SAFETY: the mapping is live and `entry` was emitted with the
         // `JitEntry` ABI.
@@ -774,10 +800,11 @@ mod arm64 {
     use super::{
         BAIL_PC_OFFSET, BaselineCode, CONTEXT_OFFSET, DIRECT_ENTRY_OFFSET,
         DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET,
-        ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET, JIT_CTX_STACK_SIZE, MAX_INLINE_ARGS,
-        OBJECT_BODY_TYPE_TAG, Op, Operand, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE, STACK_OFFSET,
-        STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_INT32, TAG_NAN, TAG_PTR_OBJECT,
-        TAG_SPECIAL, Unsupported, VM_OFFSET, WhiskerIcCell, jit_abort_direct_call_stub,
+        DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET, JIT_CTX_STACK_SIZE,
+        MAX_INLINE_ARGS, OBJECT_BODY_TYPE_TAG, Op, Operand, SPECIAL_FALSE, SPECIAL_HOLE,
+        SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_INT32,
+        TAG_NAN, TAG_PTR_OBJECT, TAG_SPECIAL, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET,
+        UPVALUES_PTR_OFFSET, Unsupported, VM_OFFSET, WhiskerIcCell, jit_abort_direct_call_stub,
         jit_call_method_stub, jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
         jit_finish_direct_call_returned_stub, jit_load_element_stub, jit_load_global_stub,
         jit_load_prop_stub, jit_load_upvalue_stub, jit_make_fn_stub, jit_prepare_direct_call_stub,
@@ -1286,28 +1313,89 @@ mod arm64 {
                     emit_load_u64(&mut ops, 2, u64::from(name));
                     emit_call_stub(&mut ops, jit_load_global_stub as *const () as usize, threw);
                 }
-                // `dst = upvalue[idx]` (captured binding) — delegate to the safe
-                // bridge (TDZ-hole check inside). `idx` is the signed bytecode
-                // upvalue index, passed as its u32 bits and re-read as i32.
+                // `dst = upvalue[idx]` (captured binding). Inline: read the cell
+                // handle from the frame's upvalue spine, decompress (cells are
+                // old-space, immobile), load the captured Value. A TDZ hole or a
+                // `0` spine base (no upvalues / direct-call ctx) misses to the
+                // bridge stub, which raises the `ReferenceError`. `idx` is the
+                // signed bytecode index, passed as u32 bits and re-read as i32.
                 Op::LoadUpvalue => {
                     let dst = reg(ops_ref, 0)?;
                     let idx = imm32(ops_ref, 1)?;
-                    dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
+                    let up_miss = ops.new_dynamic_label();
+                    let up_done = ops.new_dynamic_label();
+
+                    if cage_base != 0 && idx >= 0 {
+                        let dst_off = reg_offset(dst)?;
+                        let idx_off = (idx as u32) * UPVALUE_CELL_SIZE;
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldr x9, [x20, UPVALUES_PTR_OFFSET] // spine base
+                            ; cbz x9, =>up_miss
+                            ; ldr w10, [x9, idx_off]             // 4-byte cell handle
+                        );
+                        emit_load_u64(&mut ops, 13, cage_base as u64);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; add x13, x13, x10                  // cell body ptr
+                            ; ldr x9, [x13, UPVALUE_VALUE_OFFSET] // captured Value
+                        );
+                        emit_load_u64(&mut ops, 11, (TAG_SPECIAL << 48) | SPECIAL_HOLE);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; cmp x9, x11                        // TDZ hole?
+                            ; b.eq =>up_miss
+                            ; str x9, [x19, dst_off]
+                            ; b =>up_done
+                        );
+                    }
+
+                    dynasm!(ops ; .arch aarch64 ; =>up_miss ; mov x0, x20 ; movz x1, dst as u32);
                     emit_load_u64(&mut ops, 2, u64::from(idx as u32));
                     emit_call_stub(&mut ops, jit_load_upvalue_stub as *const () as usize, threw);
+                    dynasm!(ops ; .arch aarch64 ; =>up_done);
                 }
-                // `upvalue[idx] = src` (captured binding) — delegate to the safe
-                // bridge (write barrier inside).
+                // `upvalue[idx] = src` (captured binding). Inline the primitive
+                // store: a non-pointer value written into the (old-space) cell
+                // needs no write barrier. A pointer value or `0` spine base
+                // misses to the bridge stub, which performs the barriered store.
                 Op::StoreUpvalue => {
                     let src = reg(ops_ref, 0)?;
                     let idx = imm32(ops_ref, 1)?;
-                    dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, src as u32);
+                    let up_miss = ops.new_dynamic_label();
+                    let up_done = ops.new_dynamic_label();
+
+                    if cage_base != 0 && idx >= 0 {
+                        let src_off = reg_offset(src)?;
+                        let idx_off = (idx as u32) * UPVALUE_CELL_SIZE;
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldr x9, [x20, UPVALUES_PTR_OFFSET] // spine base
+                            ; cbz x9, =>up_miss
+                            ; ldr x12, [x19, src_off]            // value to store
+                            ; lsr x10, x12, #48                  // tag
+                            ; movz x11, TAG_PTR_OBJECT as u32
+                            ; cmp x10, x11
+                            ; b.hs =>up_miss                     // pointer → barriered stub
+                            ; ldr w10, [x9, idx_off]             // 4-byte cell handle
+                        );
+                        emit_load_u64(&mut ops, 13, cage_base as u64);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; add x13, x13, x10                  // cell body ptr
+                            ; str x12, [x13, UPVALUE_VALUE_OFFSET]
+                            ; b =>up_done
+                        );
+                    }
+
+                    dynasm!(ops ; .arch aarch64 ; =>up_miss ; mov x0, x20 ; movz x1, src as u32);
                     emit_load_u64(&mut ops, 2, u64::from(idx as u32));
                     emit_call_stub(
                         &mut ops,
                         jit_store_upvalue_stub as *const () as usize,
                         threw,
                     );
+                    dynasm!(ops ; .arch aarch64 ; =>up_done);
                 }
                 // `dst = ToNumeric(src) + delta` (§13.4 UpdateExpression). Int32
                 // fast path with overflow → double; double path otherwise.
@@ -1708,6 +1796,10 @@ mod arm64 {
             ; str x9, [sp, FRAME_INDEX_OFFSET]
             ; ldr x9, [x20, ERROR_SLOT_OFFSET]
             ; str x9, [sp, ERROR_SLOT_OFFSET]
+            // Copy the prepared callee upvalue-spine base so inline upvalue ops
+            // in the direct callee read its cells without the stub.
+            ; ldr x9, [x20, DIRECT_UPVALUES_OFFSET]
+            ; str x9, [sp, UPVALUES_PTR_OFFSET]
             ; mov x0, sp
             ; ldr x16, [x20, DIRECT_ENTRY_OFFSET]
             ; blr x16
@@ -2379,6 +2471,7 @@ mod tests {
             stack: std::ptr::null_mut(),
             context: std::ptr::null(),
             frame_index: 0,
+            upvalues_ptr: 0,
             bail_pc: 0,
             error: &mut error,
             direct_entry_addr: 0,
@@ -2386,6 +2479,7 @@ mod tests {
             direct_self_closure: 0,
             direct_this_value: 0,
             direct_frame_index: 0,
+            direct_upvalues_ptr: 0,
         };
         // SAFETY: integer-only function; never dereferences the null vm/stack.
         let entry: JitEntry = unsafe { std::mem::transmute(code.code.entry_ptr()) };

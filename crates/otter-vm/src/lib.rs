@@ -1241,12 +1241,16 @@ impl Interpreter {
             self.jit_osr_count_top = top_idx;
             self.jit_osr_count = 1;
         }
-        // `==` (not `>=`) so OSR is attempted exactly once per hot run: after the
-        // crossing the count keeps climbing but never re-fires, so a frame whose
-        // loop cannot tier up keeps interpreting with no further hashmap work.
-        if self.jit_osr_count != self.jit_osr_threshold {
+        if self.jit_osr_count < self.jit_osr_threshold {
             return Ok(None);
         }
+        // Threshold reached: attempt OSR for whatever loop is hot right now, then
+        // reset the counter so the *next* distinct hot loop gets its own shot.
+        // A single global counter that only ever fires once would let an early
+        // builtin/setup loop consume the one attempt and permanently starve the
+        // real kernel loop that runs afterward (the per-header disabled set keeps
+        // un-tierable headers from being retried, so re-arming is cheap).
+        self.jit_osr_count = 0;
         self.maybe_osr(stack, context, top_idx)
     }
 
@@ -1277,11 +1281,10 @@ impl Interpreter {
             return Ok(None);
         }
         let osr_pc = frame.pc;
-        // This specific loop header can't OSR (bailed / no trampoline). Re-arm
-        // the counter so a *different* hot loop in the same function still gets
-        // a tier-up shot instead of the single global crossing being spent here.
+        // This specific loop header already proved un-tierable (bailed / no
+        // trampoline). The caller re-arms the counter, so a different hot loop
+        // in the same function still gets a tier-up shot.
         if self.jit_osr_disabled.contains(&(fid, osr_pc)) {
-            self.jit_osr_count = 0;
             return Ok(None);
         }
         // Resolve compiled code, compiling once and caching the result (shared
@@ -1310,19 +1313,16 @@ impl Interpreter {
             // just this header and re-arm so another header can still tier up.
             None => {
                 self.jit_osr_disabled.insert((fid, osr_pc));
-                self.jit_osr_count = 0;
                 Ok(None)
             }
             Some(jit::JitExecOutcome::Bailed(pc)) => {
                 // Compiled body hit a guard or unsupported opcode. Resume the
                 // interpreter at the exact bail PC (committed side effects are
                 // preserved). Disable only this loop header (not the whole
-                // function) and re-arm: a different hot loop in the same body
-                // (e.g. the real kernel after a one-off setup loop that bails)
-                // can still tier up.
+                // function): a different hot loop in the same body (e.g. the real
+                // kernel after a one-off setup loop that bails) can still tier up.
                 stack[top_idx].pc = pc;
                 self.jit_osr_disabled.insert((fid, osr_pc));
-                self.jit_osr_count = 0;
                 Ok(None)
             }
             Some(jit::JitExecOutcome::Returned(value)) => {

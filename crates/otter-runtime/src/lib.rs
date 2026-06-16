@@ -110,7 +110,9 @@ pub use otter_vm::{
     MethodSpec, NativeCall, ObjectBuilder, Value, bootstrap, intrinsic_install, object,
 };
 pub use otter_vm::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
-pub use otter_vm::{RuntimeBudget, RuntimeBudgetExceededAction, RuntimeBudgetStats};
+pub use otter_vm::{
+    JitRuntimeStats, RuntimeBudget, RuntimeBudgetExceededAction, RuntimeBudgetStats,
+};
 pub use promise_registry::{HostSettleOutcome, PromiseId};
 pub use structured_clone::{
     StructuredCloneError, StructuredCloneMapEntry, StructuredCloneNumber, StructuredCloneOptions,
@@ -551,6 +553,8 @@ pub struct ExecutionResult {
     exit_code: u8,
     /// Wall-clock duration.
     pub duration: Duration,
+    /// Diagnostic counter snapshot sampled after the run completed.
+    stats: Box<RuntimeExecutionStats>,
 }
 
 impl ExecutionResult {
@@ -565,6 +569,7 @@ impl ExecutionResult {
             completion: completion.display_string(heap),
             exit_code: 0,
             duration,
+            stats: Box::default(),
         }
     }
 
@@ -575,7 +580,13 @@ impl ExecutionResult {
             completion: "undefined".to_string(),
             exit_code: code,
             duration,
+            stats: Box::default(),
         }
+    }
+
+    fn with_stats(mut self, stats: RuntimeExecutionStats) -> Self {
+        self.stats = Box::new(stats);
+        self
     }
 
     #[must_use]
@@ -595,6 +606,82 @@ impl ExecutionResult {
     pub fn exit_code(&self) -> u8 {
         self.exit_code
     }
+
+    /// Diagnostic counter snapshot sampled after the run completed.
+    #[must_use]
+    pub fn stats(&self) -> RuntimeExecutionStats {
+        *self.stats
+    }
+}
+
+/// Machine-readable diagnostic counter snapshot sampled at the end of a run.
+///
+/// These counters reflect the current `Runtime` state at sampling time. A reused
+/// runtime reports cumulative counters unless the caller resets the relevant VM
+/// budget counters between runs.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeExecutionStats {
+    /// `LoadProperty` IC fast-path hits.
+    pub property_load_hits: u64,
+    /// `LoadProperty` IC misses or absent entries.
+    pub property_load_misses: u64,
+    /// `LoadProperty` IC installs.
+    pub property_load_installs: u64,
+    /// `LoadProperty` IC disables / megamorphic transitions.
+    pub property_load_disables: u64,
+    /// `StoreProperty` IC fast-path hits.
+    pub property_store_hits: u64,
+    /// `StoreProperty` IC misses or absent entries.
+    pub property_store_misses: u64,
+    /// `StoreProperty` IC installs.
+    pub property_store_installs: u64,
+    /// `StoreProperty` IC disables / megamorphic transitions.
+    pub property_store_disables: u64,
+    /// `HasProperty` IC fast-path hits.
+    pub property_has_hits: u64,
+    /// `HasProperty` IC misses or absent entries.
+    pub property_has_misses: u64,
+    /// `HasProperty` IC installs.
+    pub property_has_installs: u64,
+    /// `HasProperty` IC disables / megamorphic transitions.
+    pub property_has_disables: u64,
+    /// Runtime reduction units executed.
+    pub reductions_executed: u64,
+    /// Bytecode calls observed by runtime budget stats.
+    pub bytecode_calls: u64,
+    /// Native calls observed by runtime budget stats.
+    pub native_calls: u64,
+    /// Construct calls observed by runtime budget stats.
+    pub construct_calls: u64,
+    /// Max frame-stack depth observed.
+    pub max_stack_depth_observed: u32,
+    /// Bytes allocated in the largest observed root turn.
+    pub max_turn_allocated_bytes: u64,
+    /// Longest observed root turn, in nanoseconds.
+    pub max_turn_nanos: u64,
+    /// Compiled `Op::Call` bridge invocations.
+    pub jit_runtime_calls: u64,
+    /// Compiled-to-compiled fast-call hits.
+    pub jit_direct_calls: u64,
+    /// Compiled calls that fell back to the Rust callable path.
+    pub jit_rust_call_fallbacks: u64,
+    /// Function-entry compile attempts.
+    pub jit_compile_attempts: u64,
+    /// Loop-OSR threshold attempts.
+    pub jit_osr_attempts: u64,
+    /// JIT property/method/element/global/upvalue runtime stub calls.
+    pub jit_runtime_property_stubs: u64,
+    /// Total GC-cell bytes allocated since heap creation.
+    pub gc_alloc_bytes_total: u64,
+    /// Live heap objects after the last stats reconciliation.
+    pub gc_live_objects: usize,
+    /// Live heap bytes after the last stats reconciliation.
+    pub gc_live_bytes: usize,
+    /// Full GC cycles executed.
+    pub gc_cycles: u64,
+    /// Most recent full-GC pause in milliseconds.
+    pub gc_last_pause_ms: f32,
 }
 
 /// Deno-inspired, UX-first capability set.
@@ -2466,6 +2553,51 @@ impl Runtime {
         self.interp.runtime_budget_stats()
     }
 
+    /// Snapshot the compact end-of-run diagnostics used by `OTTER_STATS=1`.
+    pub fn execution_stats(&mut self) -> RuntimeExecutionStats {
+        let ic = self.interp.property_ic_stats();
+        let budget = self.interp.runtime_budget_stats();
+        let jit = self.interp.jit_runtime_stats();
+        let gc = self.interp.gc_heap_mut().gc_stats().clone();
+        RuntimeExecutionStats {
+            property_load_hits: ic.load_hits,
+            property_load_misses: ic.load_misses,
+            property_load_installs: ic.load_installs,
+            property_load_disables: ic.load_disables,
+            property_store_hits: ic.store_hits,
+            property_store_misses: ic.store_misses,
+            property_store_installs: ic.store_installs,
+            property_store_disables: ic.store_disables,
+            property_has_hits: ic.has_hits,
+            property_has_misses: ic.has_misses,
+            property_has_installs: ic.has_installs,
+            property_has_disables: ic.has_disables,
+            reductions_executed: budget.reductions_executed,
+            bytecode_calls: budget.bytecode_calls,
+            native_calls: budget.native_calls,
+            construct_calls: budget.construct_calls,
+            max_stack_depth_observed: budget.max_stack_depth_observed,
+            max_turn_allocated_bytes: budget.max_turn_allocated_bytes,
+            max_turn_nanos: budget.max_turn_nanos,
+            jit_runtime_calls: jit.runtime_calls,
+            jit_direct_calls: jit.direct_calls,
+            jit_rust_call_fallbacks: jit.rust_call_fallbacks,
+            jit_compile_attempts: jit.compile_attempts,
+            jit_osr_attempts: jit.osr_attempts,
+            jit_runtime_property_stubs: jit.runtime_property_stubs,
+            gc_alloc_bytes_total: gc.alloc_bytes_total,
+            gc_live_objects: gc.live_objects,
+            gc_live_bytes: gc.live_bytes,
+            gc_cycles: gc.gc_cycles,
+            gc_last_pause_ms: gc.last_gc_pause_ms,
+        }
+    }
+
+    fn attach_execution_stats(&mut self, result: ExecutionResult) -> ExecutionResult {
+        let stats = self.execution_stats();
+        result.with_stats(stats)
+    }
+
     /// Reset VM runtime budget/resource counters.
     pub fn reset_runtime_budget_stats(&mut self) {
         self.interp.reset_runtime_budget_stats();
@@ -2647,7 +2779,7 @@ impl Runtime {
                 }),
             ) => {
                 let result = ExecutionResult::from_exit_code(code, start.elapsed());
-                return Ok((result, context));
+                return Ok((self.attach_execution_stats(result), context));
             }
             (Err(script_err), _) => {
                 return Err(enrich_runtime_diagnostic_with_cause(
@@ -2667,6 +2799,7 @@ impl Runtime {
         let result =
             ExecutionResult::from_vm_value(value, start.elapsed(), self.interp.gc_heap_mut())
                 .with_exit_code(process::exit_code(&self.interp));
+        let result = self.attach_execution_stats(result);
         Ok((result, context))
     }
 
@@ -2922,7 +3055,7 @@ impl Runtime {
             ) => {
                 self.module_records.mark_evaluated();
                 let result = ExecutionResult::from_exit_code(code, start.elapsed());
-                return Ok((result, context));
+                return Ok((self.attach_execution_stats(result), context));
             }
             (Err(script_err), _) => {
                 self.module_records.mark_errored();
@@ -2945,6 +3078,7 @@ impl Runtime {
         let result =
             ExecutionResult::from_vm_value(value, start.elapsed(), self.interp.gc_heap_mut())
                 .with_exit_code(process::exit_code(&self.interp));
+        let result = self.attach_execution_stats(result);
         Ok((result, context))
     }
 
@@ -3131,7 +3265,7 @@ impl Runtime {
             // exit code instead of wrapping it as a COMMONJS_LOAD error.
             if let otter_vm::NativeError::Exit { code } = err {
                 let result = ExecutionResult::from_exit_code(code, start.elapsed());
-                return Ok((result, context));
+                return Ok((self.attach_execution_stats(result), context));
             }
             return Err(commonjs_native_to_error(err));
         }
@@ -3145,6 +3279,7 @@ impl Runtime {
             self.interp.gc_heap_mut(),
         )
         .with_exit_code(process::exit_code(&self.interp));
+        let result = self.attach_execution_stats(result);
         Ok((result, context))
     }
 }
@@ -4007,14 +4142,14 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
             DiagnosticCode::Uncaught,
             format!("uncaught exception: {value}"),
         ),
-        VmError::JsonError { code, message } => {
+        VmError::JsonError(payload) => {
             // `code` is `&'static str` from the VM JSON path (every
             // value is one of the `JSON_*` codes in the closed
             // [`DiagnosticCode`] set). Parse it back through
             // `DiagnosticCode::parse` so the diagnostic still
             // carries a typed code in the closed set.
-            let typed = DiagnosticCode::parse(code).unwrap_or(DiagnosticCode::JsonBadArg);
-            runtime_diagnostic(DiagnosticKind::Type, typed, message)
+            let typed = DiagnosticCode::parse(payload.code).unwrap_or(DiagnosticCode::JsonBadArg);
+            runtime_diagnostic(DiagnosticKind::Type, typed, payload.message)
         }
         VmError::InvalidRegExp { message } => runtime_diagnostic(
             DiagnosticKind::Syntax,

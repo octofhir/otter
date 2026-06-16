@@ -66,6 +66,22 @@ fn runtime_budget_stats_include_microtasks_and_heap_observations() {
 }
 
 #[test]
+fn execution_result_carries_compact_stats_snapshot() {
+    let mut rt = Runtime::builder().build().expect("runtime");
+    let result = rt
+        .run_script(
+            SourceInput::from_javascript("function f(x) { return x + 1; } f(1);"),
+            "<execution-stats>",
+        )
+        .expect("script ran");
+
+    let stats = result.stats();
+    assert!(stats.reductions_executed > 0);
+    assert!(stats.bytecode_calls >= 1);
+    assert!(stats.gc_alloc_bytes_total > 0);
+}
+
+#[test]
 fn runtime_budget_can_reject_script_execution() {
     let mut rt = Runtime::builder().build().expect("runtime");
     rt.set_runtime_budget(RuntimeBudget {

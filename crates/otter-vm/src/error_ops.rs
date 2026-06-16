@@ -173,21 +173,20 @@ impl Interpreter {
         // Node-style `.code` to stamp on the instance after it is built.
         let mut node_code: Option<&'static str> = None;
         let (kind, message) = match err {
-            VmError::Coded {
-                kind,
-                code,
-                message,
-            } => {
-                node_code = Some(code);
-                dynamic_message = message.clone();
-                (*kind, dynamic_message.as_str())
+            VmError::Coded(payload) => {
+                node_code = Some(payload.code);
+                dynamic_message = payload.message.clone();
+                (payload.kind, dynamic_message.as_str())
             }
             VmError::TypeMismatch => (
                 error_classes::ErrorKind::TypeError,
                 "type mismatch: this operation does not accept a value of this type",
             ),
-            VmError::TypeMismatchAt { op, kind } => {
-                dynamic_message = format!("{op}: cannot operate on a value of type {kind}");
+            VmError::TypeMismatchAt(payload) => {
+                dynamic_message = format!(
+                    "{}: cannot operate on a value of type {}",
+                    payload.op, payload.kind
+                );
                 (
                     error_classes::ErrorKind::TypeError,
                     dynamic_message.as_str(),
@@ -255,9 +254,9 @@ impl Interpreter {
             // exception classes:
             //   parse failures → SyntaxError (§25.5.1.1 step 2),
             //   cyclic / BigInt / depth / bad-arg → TypeError.
-            VmError::JsonError { code, message } => {
-                dynamic_message = message.clone();
-                let kind = if *code == "JSON_PARSE" {
+            VmError::JsonError(payload) => {
+                dynamic_message = payload.message.clone();
+                let kind = if payload.code == "JSON_PARSE" {
                     error_classes::ErrorKind::SyntaxError
                 } else {
                     error_classes::ErrorKind::TypeError
@@ -405,11 +404,11 @@ pub(crate) fn native_to_vm_error(err: NativeError) -> VmError {
             kind,
             code,
             message,
-        } => VmError::Coded {
+        } => VmError::Coded(Box::new(crate::run_control::VmCodedError {
             kind,
             code,
             message,
-        },
+        })),
         NativeError::TypeError { name, reason } => VmError::TypeError {
             message: format!("{name}: {reason}"),
         },

@@ -29,6 +29,10 @@
 //!
 //! # Contents
 //! - [`HoltStack`] — the frame stack and its stack-discipline API.
+//! - [`HoltCallReservation`] — unpublished frame owner for two-phase call-frame
+//!   construction.
+//! - [`HoltFrameDesc`] / [`HoltValueSlots`] — stable frame index and value-slot
+//!   pointer metadata consumed by JIT call-entry work.
 //!
 //! # Invariants
 //! - A [`HoltStack`] never exceeds its reserved capacity (the VM's
@@ -43,7 +47,110 @@
 
 use smallvec::SmallVec;
 
-use crate::frame_state::Frame;
+use crate::{Value, frame_state::Frame};
+
+/// Raw metadata for a frame's traced value slots.
+///
+/// This is intentionally just pointer + length. Safe Rust code should continue
+/// indexing through [`HoltStack`]; emitted code and VM-side JIT ABI helpers use
+/// this descriptor to address the register window without learning the Rust
+/// `Frame` layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoltValueSlots {
+    ptr: *mut Value,
+    len: usize,
+}
+
+impl HoltValueSlots {
+    /// Raw pointer to the first value slot.
+    #[inline]
+    #[must_use]
+    pub fn as_mut_ptr(self) -> *mut Value {
+        self.ptr
+    }
+
+    /// Number of value slots in this frame window.
+    #[inline]
+    #[must_use]
+    pub fn len(self) -> usize {
+        self.len
+    }
+
+    /// `true` when the frame has no value slots.
+    #[inline]
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Published frame descriptor for a live frame on a [`HoltStack`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoltFrameDesc {
+    index: usize,
+    value_slots: HoltValueSlots,
+}
+
+impl HoltFrameDesc {
+    /// Frame index in the owning [`HoltStack`].
+    #[inline]
+    #[must_use]
+    pub fn index(self) -> usize {
+        self.index
+    }
+
+    /// Raw value-slot metadata for the frame's register window.
+    #[inline]
+    #[must_use]
+    pub fn value_slots(self) -> HoltValueSlots {
+        self.value_slots
+    }
+}
+
+/// Unpublished call-frame reservation.
+///
+/// The frame is fully owned here and is not visible to GC frame-root tracing
+/// until [`Self::publish`] moves it onto a [`HoltStack`]. This is the substrate
+/// direct JIT calls need: Rust initializes header/cold/upvalue state first,
+/// then emitted code can fill value slots through a descriptor only after the
+/// VM publishes a fully initialized frame shape.
+#[derive(Debug)]
+pub struct HoltCallReservation {
+    frame: Frame,
+}
+
+impl HoltCallReservation {
+    /// Create a reservation around a fully allocated but unpublished frame.
+    #[inline]
+    #[must_use]
+    pub fn from_frame(frame: Frame) -> Self {
+        Self { frame }
+    }
+
+    /// Mutate the unpublished frame before it becomes GC-visible.
+    #[inline]
+    #[must_use]
+    pub fn frame_mut(&mut self) -> &mut Frame {
+        &mut self.frame
+    }
+
+    /// Raw metadata for the unpublished frame's value slots.
+    #[inline]
+    #[must_use]
+    pub fn value_slots(&mut self) -> HoltValueSlots {
+        HoltValueSlots {
+            ptr: self.frame.registers.as_mut_ptr(),
+            len: self.frame.registers.len(),
+        }
+    }
+
+    /// Publish the frame onto `stack`, returning the stable descriptor for the
+    /// now-live frame.
+    #[inline]
+    pub fn publish(self, stack: &mut HoltStack) -> HoltFrameDesc {
+        stack.publish_call_reservation(self)
+    }
+}
 
 /// `SmallVec` inline threshold. Immaterial to behavior — every `HoltStack`
 /// reserves [`crate::DEFAULT_MAX_STACK_DEPTH`] up front, so storage always lives
@@ -135,6 +242,33 @@ impl HoltStack {
     #[inline]
     pub fn push(&mut self, frame: Frame) {
         self.frames.push(frame);
+    }
+
+    /// Publish a fully initialized call-frame reservation onto the stack.
+    ///
+    /// The returned descriptor is valid until the frame is popped/truncated.
+    /// Because every `HoltStack` is pre-reserved to the VM stack-depth limit,
+    /// publishing the frame cannot reallocate and cannot move older frames.
+    #[inline]
+    pub fn publish_call_reservation(&mut self, reservation: HoltCallReservation) -> HoltFrameDesc {
+        let index = self.frames.len();
+        self.frames.push(reservation.frame);
+        self.frame_desc(index)
+            .expect("published frame descriptor must exist")
+    }
+
+    /// Descriptor for a live frame at `index`.
+    #[inline]
+    #[must_use]
+    pub fn frame_desc(&mut self, index: usize) -> Option<HoltFrameDesc> {
+        let frame = self.frames.get_mut(index)?;
+        Some(HoltFrameDesc {
+            index,
+            value_slots: HoltValueSlots {
+                ptr: frame.registers.as_mut_ptr(),
+                len: frame.registers.len(),
+            },
+        })
     }
 
     /// Pop and return the top frame, or `None` when empty.
@@ -309,6 +443,40 @@ mod tests {
             assert_eq!(now, addr, "frame {i} moved within the reserved capacity");
             assert_eq!(stack[i].registers[0], Value::number_i32(i as i32));
         }
+    }
+
+    #[test]
+    fn call_reservation_is_unpublished_until_publish() {
+        let module = one_register_module();
+        let f = &module.functions[0];
+        let mut stack = HoltStack::new();
+        let mut reservation = HoltCallReservation::from_frame(tagged_frame(f, 7));
+
+        assert_eq!(stack.len(), 0);
+        assert_eq!(reservation.value_slots().len(), 1);
+        reservation.frame_mut().registers[0] = Value::number_i32(11);
+
+        let desc = reservation.publish(&mut stack);
+        assert_eq!(desc.index(), 0);
+        assert_eq!(desc.value_slots().len(), 1);
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack[0].registers[0], Value::number_i32(11));
+    }
+
+    #[test]
+    fn published_frame_desc_matches_register_window() {
+        let module = one_register_module();
+        let f = &module.functions[0];
+        let mut stack = HoltStack::new();
+
+        let desc = HoltCallReservation::from_frame(tagged_frame(f, 3)).publish(&mut stack);
+        let frame = stack.get_mut(desc.index()).unwrap();
+
+        assert_eq!(
+            desc.value_slots().as_mut_ptr(),
+            frame.registers.as_mut_ptr()
+        );
+        assert_eq!(desc.value_slots().len(), frame.registers.len());
     }
 
     #[test]

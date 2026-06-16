@@ -815,6 +815,7 @@ impl Interpreter {
         name_idx: u32,
         arg_regs: &[u16],
     ) -> Result<(), VmError> {
+        self.record_jit_runtime_property_stub();
         let recv = *read_register(&stack[frame_index], recv_reg)?;
         if recv.is_nullish() {
             let label = if recv.is_null() { "null" } else { "undefined" };

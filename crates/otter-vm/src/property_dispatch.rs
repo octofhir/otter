@@ -2996,7 +2996,8 @@ impl Interpreter {
         obj_reg: u16,
         name_idx: u32,
         site: usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<u64, VmError> {
+        self.record_jit_runtime_property_stub();
         let atomized_key = context
             .property_atom(name_idx)
             .ok_or(VmError::InvalidOperand)?;
@@ -3015,7 +3016,13 @@ impl Interpreter {
             if let Some(value) = hit_value {
                 self.property_ic_stats.record_hit(PropertyIcKind::Load);
                 write_register(&mut stack[frame_index], dst, value)?;
-                return Ok(());
+                // Report a monomorphic own-data inline-slot fill so the
+                // emitted site can self-patch its WhiskerIC cell and inline
+                // subsequent loads without re-entering this stub. Mirrors the
+                // (former) compile-time bake, but resolved at runtime so a site
+                // that was cold when its function tiered up (OSR off an earlier
+                // loop) still inlines once warm.
+                return Ok(self.whisker_load_cell_fill(site));
             }
         }
         // Slow path: full `[[Get]]` (proto walk / accessor / non-object). It
@@ -3024,7 +3031,33 @@ impl Interpreter {
         let result =
             self.run_load_property_reg(context, stack, frame_index, dst, obj_reg, atomized_key);
         stack[frame_index].pc = saved_pc;
-        result
+        result.map(|()| 0)
+    }
+
+    /// Packed WhiskerIC inline-load cell fill for `site`, or `0` for "no inline".
+    ///
+    /// Low 32 bits = the cached shape-handle compressed offset (a stable guard
+    /// token — shapes are immortal and pinned in old space, and a fast-mode
+    /// shape is never the null offset `0`). High 32 bits = the byte offset from
+    /// the decompressed object pointer to the in-object value slot. Only a warm,
+    /// single-entry `OwnData` IC on a fixed in-object slot qualifies; everything
+    /// else returns `0`, leaving the emitted site permanently on the stub.
+    fn whisker_load_cell_fill(&self, site: usize) -> u64 {
+        let entry = &self.load_property_ics[site];
+        if entry.entry_count() != 1 {
+            return 0;
+        }
+        let LoadPropertyIc::OwnData { hit } = &entry.entries()[0] else {
+            return 0;
+        };
+        if hit.shape.is_null() || usize::from(hit.slot) >= crate::object::INLINE_VALUE_CAP {
+            return 0;
+        }
+        let header = otter_gc::header::HEADER_SIZE as u32;
+        let value_byte = header
+            + crate::object::OBJECT_BODY_INLINE_VALUES_OFFSET as u32
+            + u32::from(hit.slot) * std::mem::size_of::<Value>() as u32;
+        (u64::from(value_byte) << 32) | u64::from(hit.shape.offset())
     }
 
     /// JIT bridge for a computed `LoadElement` (`recv[idx]`) from compiled code.
@@ -3046,6 +3079,7 @@ impl Interpreter {
         recv_reg: u16,
         idx_reg: u16,
     ) -> Result<(), VmError> {
+        self.record_jit_runtime_property_stub();
         let saved_pc = stack[frame_index].pc;
         let frame = &mut stack[frame_index];
         let result = self.run_load_element_regs(context, frame, dst, recv_reg, idx_reg);
@@ -3070,6 +3104,7 @@ impl Interpreter {
         dst: u16,
         name_idx: u32,
     ) -> Result<(), VmError> {
+        self.record_jit_runtime_property_stub();
         let saved_pc = stack[frame_index].pc;
         let frame = &mut stack[frame_index];
         let result = self.run_load_global_or_throw_reg(context, frame, dst, name_idx);
@@ -3308,6 +3343,7 @@ impl Interpreter {
         src_reg: u16,
         scratch_reg: u16,
     ) -> Result<(), VmError> {
+        self.record_jit_runtime_property_stub();
         let saved_pc = stack[frame_index].pc;
         let operands = [
             Operand::Register(recv_reg),
@@ -3347,7 +3383,8 @@ impl Interpreter {
         name_idx: u32,
         src: u16,
         site: usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<u64, VmError> {
+        self.record_jit_runtime_property_stub();
         let atomized_key = context
             .property_atom(name_idx)
             .ok_or(VmError::InvalidOperand)?;
@@ -3373,7 +3410,11 @@ impl Interpreter {
             }
             if store_hit {
                 self.property_ic_stats.record_hit(PropertyIcKind::Store);
-                return Ok(());
+                // Report a monomorphic existing-own-data inline-slot fill so the
+                // emitted site can self-patch its WhiskerIC cell and inline
+                // subsequent stores (shape guard + slot write + value-gated
+                // barrier) without re-entering this stub.
+                return Ok(self.whisker_store_cell_fill(site));
             }
         }
         // Slow path: full `[[Set]]` (transition / accessor / reject). It
@@ -3382,7 +3423,58 @@ impl Interpreter {
         let result =
             self.run_store_property_reg(context, stack, frame_index, obj_reg, atomized_key, src);
         stack[frame_index].pc = saved_pc;
-        result
+        result.map(|()| 0)
+    }
+
+    /// Packed WhiskerIC inline-store cell fill for `site`, or `0` for "no
+    /// inline". Same encoding as [`Self::whisker_load_cell_fill`]: low 32 =
+    /// cached shape-handle offset (non-zero validity token), high 32 = value
+    /// byte offset. Only a warm, single-entry `ExistingOwnDataStore` IC on a
+    /// fixed in-object slot qualifies — an add-transition store mutates the
+    /// shape (grows/relays the object) and can never be a flat slot write, so
+    /// it stays on the stub. The shape guard the emitted site keeps also
+    /// guarantees the slot is the writable data slot the IC captured (a shape
+    /// encodes per-slot flags and key), so the inline write is sound.
+    fn whisker_store_cell_fill(&self, site: usize) -> u64 {
+        let entry = &self.store_property_ics[site];
+        if entry.entry_count() != 1 {
+            return 0;
+        }
+        let StorePropertyIc::ExistingOwnDataStore { hit } = &entry.entries()[0] else {
+            return 0;
+        };
+        if hit.shape.is_null() || usize::from(hit.slot) >= crate::object::INLINE_VALUE_CAP {
+            return 0;
+        }
+        let header = otter_gc::header::HEADER_SIZE as u32;
+        let value_byte = header
+            + crate::object::OBJECT_BODY_INLINE_VALUES_OFFSET as u32
+            + u32::from(hit.slot) * std::mem::size_of::<Value>() as u32;
+        (u64::from(value_byte) << 32) | u64::from(hit.shape.offset())
+    }
+
+    /// JIT bridge: run the GC write barrier after an inline `StoreProperty`
+    /// wrote a heap-pointer value into `obj_reg`'s in-object slot. The emitted
+    /// fast path already performed the slot store and only calls here when the
+    /// stored value is a pointer (primitive stores need no barrier), so this
+    /// just marks the parent object's card for the old→young edge.
+    pub fn jit_runtime_write_barrier(
+        &mut self,
+        stack: &HoltStack,
+        frame_index: usize,
+        obj_reg: u16,
+        src: u16,
+    ) {
+        let Ok(receiver) = read_register(&stack[frame_index], obj_reg) else {
+            return;
+        };
+        let Some(obj) = receiver.as_object() else {
+            return;
+        };
+        let Ok(value) = read_register(&stack[frame_index], src) else {
+            return;
+        };
+        self.gc_heap.record_write(obj, value);
     }
 
     /// Drive one tick of [`Op::LoadProperty`] when the receiver is

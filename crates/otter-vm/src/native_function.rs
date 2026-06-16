@@ -1288,14 +1288,10 @@ pub fn vm_to_native_error(err: crate::VmError, name: &'static str) -> NativeErro
             name,
             message: value,
         },
-        crate::VmError::Coded {
-            kind,
-            code,
-            message,
-        } => NativeError::Coded {
-            kind,
-            code,
-            message,
+        crate::VmError::Coded(payload) => NativeError::Coded {
+            kind: payload.kind,
+            code: payload.code,
+            message: payload.message,
         },
         crate::VmError::TypeError { message } => NativeError::TypeError {
             name,

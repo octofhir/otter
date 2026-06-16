@@ -70,8 +70,51 @@ pub struct JitFunctionView {
     /// `StoreElement` for monomorphic `Float64Array` / `Int32Array` receivers
     /// only when [`cage_base`](Self::cage_base) is non-zero (baked).
     pub ta_layout: JitTypedArrayLayout,
+    /// Byte offset from a decompressed object pointer to its shape handle
+    /// (`HEADER_SIZE + OBJECT_BODY_SHAPE_OFFSET`). A `#[repr(C)]` constant; the
+    /// emitter reads `[obj_ptr + object_shape_byte]` for the WhiskerIC
+    /// `LoadProperty` cell guard, staying layout-agnostic.
+    pub object_shape_byte: u32,
     /// Instruction stream in byte-PC order.
     pub instructions: Vec<JitInstrView>,
+}
+
+/// VM-resolved direct-call target for one eligible compiled callee.
+///
+/// This is metadata only: frame reservation/rooting stays VM-owned, while the
+/// backend consumes `entry_addr` once it can emit the matching frame build and
+/// call/return sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitDirectCallPlan {
+    /// Callee function id in the executable module.
+    pub function_id: u32,
+    /// Raw compiled entry address.
+    pub entry_addr: usize,
+    /// Number of formal parameter registers.
+    pub param_count: u16,
+    /// Total callee register-window length.
+    pub register_count: u16,
+}
+
+/// Prepared direct-call entry state returned by the VM to emitted code.
+///
+/// The frame has already been published onto the active [`JitFrameStack`], so
+/// its value slots are visible to precise GC tracing. Emitted code uses this to
+/// construct the callee `JitCtx` and branch to `entry_addr` without the generic
+/// call bridge.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct JitPreparedDirectCall {
+    /// Raw compiled entry address.
+    pub entry_addr: usize,
+    /// Callee register-window base.
+    pub regs: *mut u64,
+    /// Boxed SELF closure bits for the callee context.
+    pub self_closure: u64,
+    /// Boxed `this` bits for the callee context.
+    pub this_value: u64,
+    /// Callee frame index in the active stack.
+    pub frame_index: usize,
 }
 
 /// Ready-to-use byte offsets and tags for the JIT's inline typed-array
@@ -122,24 +165,6 @@ pub struct JitTypedArrayLayout {
     pub array_elements_byte: u32,
 }
 
-/// Baked monomorphic inline property-load plan for one `LoadProperty` site.
-///
-/// Computed VM-side from a warm own-data IC at tier-up: the emitter reads the
-/// receiver's shape handle at `[obj_ptr + shape_byte]`, compares it to
-/// `cached_shape_offset`, and on a hit loads the value at
-/// `[obj_ptr + value_byte]` — no interpreter round-trip. `obj_ptr` is the
-/// decompressed `Gc` pointer (`cage_base + offset`); `*_byte` already include
-/// the GC header. A guard miss falls through to the shared runtime stub.
-#[derive(Debug, Clone, Copy)]
-pub struct JitInlineLoad {
-    /// Cached shape handle compressed offset to compare against the receiver's.
-    pub cached_shape_offset: u32,
-    /// Byte offset from the decompressed object pointer to the shape handle.
-    pub shape_byte: u32,
-    /// Byte offset from the decompressed object pointer to the cached value.
-    pub value_byte: u32,
-}
-
 /// Owned snapshot of one executable instruction.
 #[derive(Debug, Clone)]
 pub struct JitInstrView {
@@ -151,10 +176,6 @@ pub struct JitInstrView {
     pub byte_len: u32,
     /// Dense property-IC site id for named property ops.
     pub property_ic_site: Option<usize>,
-    /// Baked monomorphic inline-load plan for a `LoadProperty` whose IC was a
-    /// warm own-data hit on an in-object slot at tier-up. `None` → emit the
-    /// shared runtime stub (cold, polymorphic, accessor, dict, or overflow).
-    pub inline_load: Option<JitInlineLoad>,
     /// Operands in declaration order. Branch immediates are already rewritten
     /// to byte-offset deltas in VM dispatch coordinates.
     pub operands: Vec<Operand>,
@@ -219,9 +240,10 @@ pub enum JitExecOutcome {
 
 /// Type-erased compiled-code handle owned by the JIT implementation.
 ///
-/// The VM never transmutes or calls raw entry pointers directly: it hands the
-/// JIT the reentry pointers and receives a structured outcome, keeping
-/// executable memory ownership and the unsafe ABI call inside `otter-jit`.
+/// The JIT implementation owns executable memory and the unsafe ABI calls. The
+/// VM still needs raw entry metadata for compiled-to-compiled direct branches:
+/// emitted callers can branch to an already-installed callee without routing
+/// through the generic runtime call bridge.
 pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// Size in bytes of the finalized native code mapping.
     fn code_len(&self) -> usize;
@@ -232,6 +254,14 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// skips such code; loop OSR uses it. Default `false`.
     fn osr_only(&self) -> bool {
         false
+    }
+
+    /// Raw function-entry address for emitted direct calls.
+    ///
+    /// The pointer is owned by this code object and remains valid while the
+    /// object is installed in the VM JIT code table.
+    fn entry_addr(&self) -> Option<usize> {
+        None
     }
 
     /// Execute the compiled function for the frame at `ptrs.frame_index`.

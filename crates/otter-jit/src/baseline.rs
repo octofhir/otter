@@ -17,9 +17,9 @@
 //!
 //! # GC contract
 //! The register window stays rooted on the VM frame stack for the whole call
-//! (recursive calls run on a *separate* internal stack and never grow this one,
-//! so the register base is stable). Every op reads operands from and writes
-//! results to that rooted array — no JS value is ever live in a machine
+//! (recursive compiled calls append frames to the same reservation-stable
+//! HoltStack, so the register base is stable). Every op reads operands from and
+//! writes results to that rooted array — no JS value is ever live in a machine
 //! register across a `Call`/`MakeFunction` safepoint — so this tier needs **no
 //! GC stack maps**, matching the interpreter's precise `FrameRoots` rooting.
 //!
@@ -71,7 +71,8 @@ const MAX_INLINE_ARGS: usize = 4;
 
 /// Re-entry context handed to compiled code. The machine code reads `regs`
 /// (offset 0) and `self_closure` (offset 8) directly by offset — keep those two
-/// first; the rest is used by the Rust call/make-function stubs.
+/// first. The full struct is machine-constructible: nested direct calls copy
+/// plain pointers/scalars and share the caller's initialized `error` slot.
 #[repr(C)]
 pub struct JitCtx {
     /// Base of the executing frame's register window (`*mut u64` over Values).
@@ -97,8 +98,20 @@ pub struct JitCtx {
     context: *const ExecutionContext,
     /// Index of the executing frame within `stack`.
     frame_index: usize,
-    /// Error parked by a bridge stub when a re-entered call threw.
-    error: Option<VmError>,
+    /// Error slot shared by direct callees and bridge stubs when a re-entered
+    /// operation throws. Pointer form keeps `JitCtx` constructible by emitted
+    /// code; assembly never initializes a Rust enum in place.
+    error: *mut Option<VmError>,
+    /// Prepared direct-call callee entry address.
+    direct_entry_addr: usize,
+    /// Prepared direct-call callee register base.
+    direct_regs: *mut u64,
+    /// Prepared direct-call callee SELF bits.
+    direct_self_closure: u64,
+    /// Prepared direct-call callee `this` bits.
+    direct_this_value: u64,
+    /// Prepared direct-call callee frame index.
+    direct_frame_index: usize,
 }
 
 /// Two-word return of compiled code (`x0`/`x1` on arm64).
@@ -116,16 +129,38 @@ const STATUS_THREW: u64 = 2;
 /// Byte offset of [`JitCtx::bail_pc`] — where compiled code stamps the current
 /// instruction's byte-PC before each op so a bail resumes at the exact site.
 const BAIL_PC_OFFSET: u32 = std::mem::offset_of!(JitCtx, bail_pc) as u32;
+/// Byte offset of [`JitCtx::error`] for nested direct-call context construction.
+#[allow(dead_code)]
+const ERROR_SLOT_OFFSET: u32 = std::mem::offset_of!(JitCtx, error) as u32;
+const VM_OFFSET: u32 = std::mem::offset_of!(JitCtx, vm) as u32;
+const STACK_OFFSET: u32 = std::mem::offset_of!(JitCtx, stack) as u32;
+const CONTEXT_OFFSET: u32 = std::mem::offset_of!(JitCtx, context) as u32;
+const FRAME_INDEX_OFFSET: u32 = std::mem::offset_of!(JitCtx, frame_index) as u32;
+const DIRECT_ENTRY_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_entry_addr) as u32;
+const DIRECT_REGS_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_regs) as u32;
+const DIRECT_SELF_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_self_closure) as u32;
+const DIRECT_THIS_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_this_value) as u32;
+const DIRECT_FRAME_INDEX_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_frame_index) as u32;
+const JIT_CTX_STACK_SIZE: u32 = ((std::mem::size_of::<JitCtx>() + 15) & !15) as u32;
 
 /// Compiled-code entry signature.
 type JitEntry = extern "C" fn(*mut JitCtx) -> JitRet;
 
-/// Bridge stub: perform a `Call` from compiled code. Reconstructs VM references
-/// from the context and delegates to the safe [`Interpreter::jit_runtime_call`].
-/// Returns `0` on success, `1` when the call threw (error parked in `ctx`).
-extern "C" fn jit_call_stub(
+fn park_jit_error(ctx: &mut JitCtx, err: VmError) {
+    // SAFETY: every `JitCtx` is built with an initialized error slot that lives
+    // for the compiled entry's dynamic extent; nested direct-call contexts copy
+    // the same pointer.
+    unsafe {
+        *ctx.error = Some(err);
+    }
+}
+
+/// Prepare a direct compiled call. Returns:
+/// - `0`: direct target prepared in `ctx.direct_*`.
+/// - `1`: throw, error parked in `ctx.error`.
+/// - `2`: ineligible/cold callee; caller should bail to the interpreter.
+extern "C" fn jit_prepare_direct_call_stub(
     ctx: *mut JitCtx,
-    dst: u64,
     callee: u64,
     argc: u64,
     a0: u64,
@@ -133,35 +168,95 @@ extern "C" fn jit_call_stub(
     a2: u64,
     a3: u64,
 ) -> u64 {
-    // SAFETY: `ctx` is the live context passed by `run_entry`; its `vm`/`stack`/
-    // `context` pointers are valid for this call and non-aliased (the VM froze
-    // its own borrows for the call's duration).
+    // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
     let context = unsafe { &*ctx.context };
     let all = [a0 as u16, a1 as u16, a2 as u16, a3 as u16];
     let argc = (argc as usize).min(MAX_INLINE_ARGS);
-    match vm.jit_runtime_call(
-        context,
-        stack,
-        ctx.frame_index,
-        dst as u16,
-        callee as u16,
-        &all[..argc],
-    ) {
-        Ok(()) => 0,
+    match vm.jit_prepare_direct_call(context, stack, ctx.frame_index, callee as u16, &all[..argc]) {
+        Ok(Some(prepared)) => {
+            ctx.direct_entry_addr = prepared.entry_addr;
+            ctx.direct_regs = prepared.regs;
+            ctx.direct_self_closure = prepared.self_closure;
+            ctx.direct_this_value = prepared.this_value;
+            ctx.direct_frame_index = prepared.frame_index;
+            0
+        }
+        Ok(None) => 2,
         Err(err) => {
-            ctx.error = Some(err);
+            park_jit_error(ctx, err);
             1
         }
     }
 }
 
+extern "C" fn jit_finish_direct_call_returned_stub(
+    ctx: *mut JitCtx,
+    dst: u64,
+    callee_frame_index: u64,
+    value: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    match vm.jit_finish_direct_call_returned(
+        stack,
+        ctx.frame_index,
+        callee_frame_index as usize,
+        dst as u16,
+        Value::from_bits(value),
+    ) {
+        Ok(()) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
+extern "C" fn jit_finish_direct_call_bailed_stub(
+    ctx: *mut JitCtx,
+    dst: u64,
+    callee_frame_index: u64,
+    bail_pc: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    match vm.jit_finish_direct_call_bailed(
+        context,
+        stack,
+        ctx.frame_index,
+        callee_frame_index as usize,
+        dst as u16,
+        bail_pc as u32,
+    ) {
+        Ok(()) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
+extern "C" fn jit_abort_direct_call_stub(ctx: *mut JitCtx, callee_frame_index: u64) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    vm.jit_abort_direct_call(stack, callee_frame_index as usize);
+    0
+}
+
 /// Bridge stub: build a `MakeFunction` closure from compiled code. Returns `0`
 /// on success, `1` when construction threw (error parked in `ctx`).
 extern "C" fn jit_make_fn_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
-    // SAFETY: see `jit_call_stub`.
+    // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
@@ -169,23 +264,44 @@ extern "C" fn jit_make_fn_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
     match vm.jit_runtime_make_function(context, stack, ctx.frame_index, dst as u16, idx as u32) {
         Ok(()) => 0,
         Err(err) => {
-            ctx.error = Some(err);
+            park_jit_error(ctx, err);
             1
         }
     }
 }
 
+/// WhiskerIC self-patching cell for one named-property site (one per
+/// `LoadProperty` / `StoreProperty` op in the compiled function). Emitted code
+/// reads `shape` (offset 0); `0` means "empty — always miss to the stub". On a
+/// monomorphic own-data inline-slot hit the stub fills `value_byte` then
+/// `shape`, so the next execution inlines the access (shape guard +
+/// fixed-offset slot read/write, no VM round-trip). The cell holds only
+/// compressed offsets (no GC pointers), so it needs no tracing, and a shape
+/// offset is a stable token (shapes are immortal and pinned in old space).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct WhiskerIcCell {
+    /// Cached receiver shape-handle compressed offset; `0` == empty.
+    shape: u32,
+    /// Byte offset from the decompressed object pointer to the value slot.
+    value_byte: u32,
+}
+
 /// Bridge stub: perform a named `LoadProperty` from compiled code, delegating
 /// to the safe [`Interpreter::jit_runtime_load_property`]. Returns `0` on
-/// success, `1` when the read threw (error parked in `ctx`).
+/// success, `1` when the read threw (error parked in `ctx`). `cell` is this
+/// site's [`WhiskerIcCell`] address (or `0`): on a monomorphic own-data
+/// inline-slot hit the VM returns a packed fill which this stub writes into the
+/// cell so the next load inlines.
 extern "C" fn jit_load_prop_stub(
     ctx: *mut JitCtx,
     dst: u64,
     obj: u64,
     name_idx: u64,
     site: u64,
+    cell: u64,
 ) -> u64 {
-    // SAFETY: see `jit_call_stub`.
+    // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
@@ -199,9 +315,24 @@ extern "C" fn jit_load_prop_stub(
         name_idx as u32,
         site as usize,
     ) {
-        Ok(()) => 0,
+        Ok(fill) => {
+            // Low 32 = cached shape offset (non-zero validity flag), high 32 =
+            // value byte offset. Write `value_byte` before `shape` so the
+            // inline guard never observes a live shape with a stale offset.
+            if cell != 0 && fill != 0 {
+                let cell = cell as *mut WhiskerIcCell;
+                // SAFETY: `cell` is a stable address baked into this site's
+                // emitted code from the owning `BaselineCode::load_ic_cells`
+                // slice, which outlives every execution of this code.
+                unsafe {
+                    (*cell).value_byte = (fill >> 32) as u32;
+                    (*cell).shape = fill as u32;
+                }
+            }
+            0
+        }
         Err(err) => {
-            ctx.error = Some(err);
+            park_jit_error(ctx, err);
             1
         }
     }
@@ -209,15 +340,19 @@ extern "C" fn jit_load_prop_stub(
 
 /// Bridge stub: perform a named `StoreProperty` from compiled code, delegating
 /// to the safe [`Interpreter::jit_runtime_store_property`]. Returns `0` on
-/// success, `1` when the write threw (error parked in `ctx`).
+/// success, `1` when the write threw (error parked in `ctx`). `cell` is this
+/// site's [`WhiskerIcCell`]: on a monomorphic existing-own-data inline-slot hit
+/// the VM returns a packed fill which this stub writes so the next store
+/// inlines (shape guard + slot write + value-gated barrier, no round-trip).
 extern "C" fn jit_store_prop_stub(
     ctx: *mut JitCtx,
     obj: u64,
     name_idx: u64,
     src: u64,
     site: u64,
+    cell: u64,
 ) -> u64 {
-    // SAFETY: see `jit_call_stub`.
+    // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
@@ -231,19 +366,46 @@ extern "C" fn jit_store_prop_stub(
         src as u16,
         site as usize,
     ) {
-        Ok(()) => 0,
+        Ok(fill) => {
+            // Same packing as the load cell: low 32 = shape (validity flag),
+            // high 32 = value byte offset. Write `value_byte` before `shape`.
+            if cell != 0 && fill != 0 {
+                let cell = cell as *mut WhiskerIcCell;
+                // SAFETY: `cell` is a stable address baked into this site's
+                // emitted code from `BaselineCode::store_ic_cells`, which
+                // outlives every execution of this code.
+                unsafe {
+                    (*cell).value_byte = (fill >> 32) as u32;
+                    (*cell).shape = fill as u32;
+                }
+            }
+            0
+        }
         Err(err) => {
-            ctx.error = Some(err);
+            park_jit_error(ctx, err);
             1
         }
     }
+}
+
+/// Bridge stub: run the GC write barrier for an inline `StoreProperty` whose
+/// stored value is a heap pointer. The emitted fast path skips this for
+/// primitive values (the common case); a pointer store calls here so an
+/// old→young edge marks the parent object's card. Always returns `0`.
+extern "C" fn jit_write_barrier_stub(ctx: *mut JitCtx, obj: u64, src: u64) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    vm.jit_runtime_write_barrier(stack, ctx.frame_index, obj as u16, src as u16);
+    0
 }
 
 /// Bridge stub: perform a computed `LoadElement` (`recv[idx]`) from compiled
 /// code, delegating to the safe [`Interpreter::jit_runtime_load_element`].
 /// Returns `0` on success, `1` when the read threw (error parked in `ctx`).
 extern "C" fn jit_load_element_stub(ctx: *mut JitCtx, dst: u64, recv: u64, idx: u64) -> u64 {
-    // SAFETY: see `jit_call_stub`.
+    // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
@@ -258,7 +420,7 @@ extern "C" fn jit_load_element_stub(ctx: *mut JitCtx, dst: u64, recv: u64, idx: 
     ) {
         Ok(()) => 0,
         Err(err) => {
-            ctx.error = Some(err);
+            park_jit_error(ctx, err);
             1
         }
     }
@@ -269,7 +431,7 @@ extern "C" fn jit_load_element_stub(ctx: *mut JitCtx, dst: u64, recv: u64, idx: 
 /// `1` when the read threw (unbound identifier / throwing accessor; error
 /// parked in `ctx`).
 extern "C" fn jit_load_global_stub(ctx: *mut JitCtx, dst: u64, name_idx: u64) -> u64 {
-    // SAFETY: see `jit_call_stub`.
+    // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
@@ -277,7 +439,7 @@ extern "C" fn jit_load_global_stub(ctx: *mut JitCtx, dst: u64, name_idx: u64) ->
     match vm.jit_runtime_load_global(context, stack, ctx.frame_index, dst as u16, name_idx as u32) {
         Ok(()) => 0,
         Err(err) => {
-            ctx.error = Some(err);
+            park_jit_error(ctx, err);
             1
         }
     }
@@ -288,14 +450,14 @@ extern "C" fn jit_load_global_stub(ctx: *mut JitCtx, dst: u64, name_idx: u64) ->
 /// the bytecode's signed upvalue index. Returns `0` on success, `1` on throw
 /// (TDZ `ReferenceError`, error parked in `ctx`).
 extern "C" fn jit_load_upvalue_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
-    // SAFETY: see `jit_call_stub`.
+    // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
     match vm.jit_runtime_load_upvalue(stack, ctx.frame_index, dst as u16, idx as i32) {
         Ok(()) => 0,
         Err(err) => {
-            ctx.error = Some(err);
+            park_jit_error(ctx, err);
             1
         }
     }
@@ -305,14 +467,14 @@ extern "C" fn jit_load_upvalue_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64
 /// code, delegating to [`Interpreter::jit_runtime_store_upvalue`]. Returns `0`
 /// on success, `1` on throw (error parked in `ctx`).
 extern "C" fn jit_store_upvalue_stub(ctx: *mut JitCtx, src: u64, idx: u64) -> u64 {
-    // SAFETY: see `jit_call_stub`.
+    // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
     match vm.jit_runtime_store_upvalue(stack, ctx.frame_index, src as u16, idx as i32) {
         Ok(()) => 0,
         Err(err) => {
-            ctx.error = Some(err);
+            park_jit_error(ctx, err);
             1
         }
     }
@@ -323,7 +485,7 @@ extern "C" fn jit_store_upvalue_stub(ctx: *mut JitCtx, src: u64, idx: u64) -> u6
 /// shift) at `byte_pc` through [`Interpreter::jit_runtime_delegate_op`]. Returns
 /// `0` on success, `1` on throw (error parked in `ctx`).
 extern "C" fn jit_delegate_op_stub(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
-    // SAFETY: see `jit_call_stub`.
+    // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
@@ -331,7 +493,7 @@ extern "C" fn jit_delegate_op_stub(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
     match vm.jit_runtime_delegate_op(context, stack, ctx.frame_index, byte_pc as u32) {
         Ok(()) => 0,
         Err(err) => {
-            ctx.error = Some(err);
+            park_jit_error(ctx, err);
             1
         }
     }
@@ -353,7 +515,7 @@ extern "C" fn jit_call_method_stub(
     a1: u64,
     a2: u64,
 ) -> u64 {
-    // SAFETY: see `jit_call_stub`.
+    // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
@@ -371,7 +533,7 @@ extern "C" fn jit_call_method_stub(
     ) {
         Ok(()) => 0,
         Err(err) => {
-            ctx.error = Some(err);
+            park_jit_error(ctx, err);
             1
         }
     }
@@ -388,7 +550,7 @@ extern "C" fn jit_store_element_stub(
     src: u64,
     scratch: u64,
 ) -> u64 {
-    // SAFETY: see `jit_call_stub`.
+    // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
@@ -404,7 +566,7 @@ extern "C" fn jit_store_element_stub(
     ) {
         Ok(()) => 0,
         Err(err) => {
-            ctx.error = Some(err);
+            park_jit_error(ctx, err);
             1
         }
     }
@@ -439,6 +601,18 @@ pub struct BaselineCode {
     /// entry would just bail immediately. The function-entry path skips it; only
     /// loop OSR uses it.
     osr_only: bool,
+    /// Stable backing store for the WhiskerIC `LoadProperty` cells — one per
+    /// `LoadProperty` op, self-patched by [`jit_load_prop_stub`]. Emitted code
+    /// holds raw addresses into this slice, so it must never be moved out or
+    /// cloned after `compile` returns (the code object is only ever shared by
+    /// `Arc`, never cloned by value). Boxed so the buffer address is fixed.
+    #[allow(dead_code)]
+    load_ic_cells: Box<[WhiskerIcCell]>,
+    /// Stable backing store for the WhiskerIC `StoreProperty` cells — one per
+    /// `StoreProperty` op, self-patched by [`jit_store_prop_stub`]. Same
+    /// ownership / stability contract as [`Self::load_ic_cells`].
+    #[allow(dead_code)]
+    store_ic_cells: Box<[WhiskerIcCell]>,
 }
 
 impl std::fmt::Debug for BaselineCode {
@@ -456,6 +630,12 @@ impl JitFunctionCode for BaselineCode {
 
     fn osr_only(&self) -> bool {
         self.osr_only
+    }
+
+    fn entry_addr(&self) -> Option<usize> {
+        // SAFETY: the mapping is live for `self`; callers must keep the owning
+        // code object installed while using this address.
+        Some(unsafe { self.code.entry_ptr() as usize })
     }
 
     fn run_entry(&self, ptrs: JitReentryPtrs) -> JitExecOutcome {
@@ -500,6 +680,7 @@ impl BaselineCode {
         let self_closure = unsafe { (*vm).jit_frame_self_closure_bits(&*stack, ptrs.frame_index) };
         // SAFETY: same validity/aliasing contract as `self_closure` above.
         let this_value = unsafe { (*vm).jit_frame_this_bits(&*stack, ptrs.frame_index) };
+        let mut error = None;
         let mut ctx = JitCtx {
             regs,
             self_closure,
@@ -509,7 +690,12 @@ impl BaselineCode {
             context: ptrs.context.cast::<ExecutionContext>(),
             frame_index: ptrs.frame_index,
             bail_pc: 0,
-            error: None,
+            error: &mut error,
+            direct_entry_addr: 0,
+            direct_regs: std::ptr::null_mut(),
+            direct_self_closure: 0,
+            direct_this_value: 0,
+            direct_frame_index: 0,
         };
         // SAFETY: the mapping is live and `entry` was emitted with the
         // `JitEntry` ABI.
@@ -518,7 +704,7 @@ impl BaselineCode {
         match ret.status {
             STATUS_RETURNED => JitExecOutcome::Returned(Value::from_bits(ret.value)),
             STATUS_BAILED => JitExecOutcome::Bailed(ctx.bail_pc),
-            _ => JitExecOutcome::Threw(ctx.error.take().unwrap_or(VmError::InvalidOperand)),
+            _ => JitExecOutcome::Threw(error.take().unwrap_or(VmError::InvalidOperand)),
         }
     }
 }
@@ -538,12 +724,17 @@ fn reg_offset(idx: u16) -> Result<u32, Unsupported> {
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
     use super::{
-        BAIL_PC_OFFSET, BaselineCode, MAX_INLINE_ARGS, OBJECT_BODY_TYPE_TAG, Op, Operand,
-        SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
-        TAG_INT32, TAG_NAN, TAG_PTR_OBJECT, TAG_SPECIAL, Unsupported, jit_call_method_stub,
-        jit_call_stub, jit_delegate_op_stub, jit_load_element_stub, jit_load_global_stub,
-        jit_load_prop_stub, jit_load_upvalue_stub, jit_make_fn_stub, jit_store_element_stub,
-        jit_store_prop_stub, jit_store_upvalue_stub, reg_offset,
+        BAIL_PC_OFFSET, BaselineCode, CONTEXT_OFFSET, DIRECT_ENTRY_OFFSET,
+        DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET,
+        ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET, JIT_CTX_STACK_SIZE, MAX_INLINE_ARGS,
+        OBJECT_BODY_TYPE_TAG, Op, Operand, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE, STACK_OFFSET,
+        STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_INT32, TAG_NAN, TAG_PTR_OBJECT,
+        TAG_SPECIAL, Unsupported, VM_OFFSET, WhiskerIcCell, jit_abort_direct_call_stub,
+        jit_call_method_stub, jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
+        jit_finish_direct_call_returned_stub, jit_load_element_stub, jit_load_global_stub,
+        jit_load_prop_stub, jit_load_upvalue_stub, jit_make_fn_stub, jit_prepare_direct_call_stub,
+        jit_store_element_stub, jit_store_prop_stub, jit_store_upvalue_stub,
+        jit_write_barrier_stub, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -709,6 +900,34 @@ mod arm64 {
                 }
             }
         }
+
+        // One self-patching WhiskerIC cell per `LoadProperty` op. Allocated up
+        // front (stable boxed buffer) so each site can bake its cell address;
+        // filled at runtime by `jit_load_prop_stub` on a monomorphic own-data
+        // inline-slot hit. `as_mut_ptr` gives a write-provenance base that
+        // outlives every execution (the buffer is owned by the returned
+        // `BaselineCode` and never re-formed as a `&[_]` slice).
+        let load_property_count = view
+            .instructions
+            .iter()
+            .filter(|i| i.op == Op::LoadProperty)
+            .count();
+        let mut load_ic_cells: Box<[WhiskerIcCell]> =
+            vec![WhiskerIcCell::default(); load_property_count].into_boxed_slice();
+        let cell_base = load_ic_cells.as_mut_ptr() as usize;
+        let mut load_ic_idx: usize = 0;
+
+        // One self-patching WhiskerIC cell per `StoreProperty` op, same scheme
+        // as the load cells above.
+        let store_property_count = view
+            .instructions
+            .iter()
+            .filter(|i| i.op == Op::StoreProperty)
+            .count();
+        let mut store_ic_cells: Box<[WhiskerIcCell]> =
+            vec![WhiskerIcCell::default(); store_property_count].into_boxed_slice();
+        let store_cell_base = store_ic_cells.as_mut_ptr() as usize;
+        let mut store_ic_idx: usize = 0;
 
         let entry = ops.offset();
         emit_prologue(&mut ops);
@@ -893,7 +1112,7 @@ mod arm64 {
                     emit_call_stub(&mut ops, jit_make_fn_stub as *const () as usize, threw);
                 }
                 Op::Call => {
-                    emit_call(&mut ops, ops_ref, threw)?;
+                    emit_call(&mut ops, ops_ref, bail, threw)?;
                 }
                 // `recv.name(args…)` — resolve + invoke via the safe bridge.
                 // Operands: dst, recv, name-const, argc-const, then argc arg
@@ -1107,28 +1326,36 @@ mod arm64 {
                     store_reg(&mut ops, 9, dst)?;
                 }
                 Op::LoadProperty => {
-                    // jit_load_prop_stub(ctx=x20, dst, obj, name_idx, site).
+                    // jit_load_prop_stub(ctx=x20, dst, obj, name_idx, site, cell).
                     // `site` is the dense IC index from the snapshot, used by
                     // the bridge for the monomorphic fast path (PC-keyed lookup
                     // is unavailable at PC 0); `usize::MAX` means "no site".
+                    // `cell` is this site's self-patching WhiskerIC cell.
                     let dst = reg(ops_ref, 0)?;
                     let obj = reg(ops_ref, 1)?;
                     let name = const_index(ops_ref, 2)?;
                     let site = instr.property_ic_site.unwrap_or(usize::MAX) as u64;
 
+                    // This site's WhiskerIC cell address (stable for the code's
+                    // life). Filled by the stub on a monomorphic own-data hit.
+                    let cell_addr = cell_base + load_ic_idx * std::mem::size_of::<WhiskerIcCell>();
+                    load_ic_idx += 1;
+
                     let miss = ops.new_dynamic_label();
                     let done = ops.new_dynamic_label();
 
-                    // Inline monomorphic own-data load: guard tag + GC type tag
-                    // + shape handle, then read the in-object slot directly. No
-                    // allocation/call → no safepoint; the object pointer is
-                    // recomputed from the frame slot (rooted), never held across
-                    // one. Any guard miss falls through to the shared stub.
-                    if let Some(inl) = instr.inline_load {
+                    // Inline guarded own-data load through the self-patching
+                    // cell: guard tag + GC type tag + cell shape, then read the
+                    // in-object slot at the cell's byte offset. No allocation /
+                    // call → no safepoint; the object pointer is recomputed from
+                    // the (rooted) frame slot each time, never held across one.
+                    // An empty cell (`shape == 0`) or any guard miss falls
+                    // through to the shared stub, which fills the cell once the
+                    // site is warm + monomorphic.
+                    if cage_base != 0 {
                         let obj_off = reg_offset(obj)?;
                         let dst_off = reg_offset(dst)?;
-                        let shape_byte = inl.shape_byte;
-                        let value_byte = inl.value_byte;
+                        let shape_byte = view.object_shape_byte;
                         dynasm!(ops
                             ; .arch aarch64
                             ; ldr x9, [x19, obj_off]   // receiver Value
@@ -1147,18 +1374,22 @@ mod arm64 {
                             ; b.ne =>miss
                             ; ldr w14, [x13, shape_byte] // receiver shape handle
                         );
-                        emit_load_u64(&mut ops, 15, u64::from(inl.cached_shape_offset));
+                        emit_load_u64(&mut ops, 15, cell_addr as u64);
                         dynasm!(ops
                             ; .arch aarch64
-                            ; cmp w14, w15
+                            ; ldr w16, [x15]           // cached shape (0 = empty)
+                            ; cbz w16, =>miss
+                            ; cmp w14, w16
                             ; b.ne =>miss
-                            ; ldr x9, [x13, value_byte] // in-object slot value
+                            ; ldr w17, [x15, #4]       // cached value byte offset
+                            ; ldr x9, [x13, x17]       // in-object slot value
                             ; str x9, [x19, dst_off]
                             ; b =>done
                         );
                     }
 
-                    // Miss / no inline plan: shared runtime IC + general path.
+                    // Miss / no cage base: shared runtime IC + general path,
+                    // passing the cell so the stub can self-patch it.
                     dynasm!(ops ; .arch aarch64 ; =>miss);
                     dynasm!(ops
                         ; .arch aarch64
@@ -1168,16 +1399,87 @@ mod arm64 {
                     );
                     emit_load_u64(&mut ops, 3, u64::from(name));
                     emit_load_u64(&mut ops, 4, site);
+                    emit_load_u64(&mut ops, 5, cell_addr as u64);
                     emit_call_stub(&mut ops, jit_load_prop_stub as *const () as usize, threw);
                     dynasm!(ops ; .arch aarch64 ; =>done);
                 }
                 Op::StoreProperty => {
                     // Operands: obj, name_const, src, scratch_dst.
-                    // jit_store_prop_stub(ctx=x20, obj, name_idx, src) -> status.
+                    // jit_store_prop_stub(ctx=x20, obj, name_idx, src, site, cell).
                     let obj = reg(ops_ref, 0)?;
                     let name = const_index(ops_ref, 1)?;
                     let src = reg(ops_ref, 2)?;
                     let site = instr.property_ic_site.unwrap_or(usize::MAX) as u64;
+
+                    let cell_addr =
+                        store_cell_base + store_ic_idx * std::mem::size_of::<WhiskerIcCell>();
+                    store_ic_idx += 1;
+
+                    let miss = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+
+                    // Inline guarded existing-own-data store through the
+                    // self-patching cell: guard tag + GC type tag + cell shape,
+                    // write the value into the in-object slot, then a
+                    // value-tag-gated write barrier (primitive stores skip it).
+                    // No allocation → no safepoint; the object pointer is
+                    // recomputed from the (rooted) frame slot, never held
+                    // across one. Empty cell / guard miss → shared stub.
+                    if cage_base != 0 {
+                        let obj_off = reg_offset(obj)?;
+                        let src_off = reg_offset(src)?;
+                        let shape_byte = view.object_shape_byte;
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldr x9, [x19, obj_off]   // receiver Value
+                            ; lsr x10, x9, #48
+                            ; movz x11, TAG_PTR_OBJECT as u32
+                            ; cmp x10, x11
+                            ; b.ne =>miss
+                            ; mov w12, w9              // low-32 Gc offset
+                        );
+                        emit_load_u64(&mut ops, 13, cage_base as u64);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; add x13, x13, x12        // x13 = GcHeader ptr
+                            ; ldrb w14, [x13]
+                            ; cmp w14, OBJECT_BODY_TYPE_TAG
+                            ; b.ne =>miss
+                            ; ldr w14, [x13, shape_byte] // receiver shape handle
+                        );
+                        emit_load_u64(&mut ops, 15, cell_addr as u64);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldr w16, [x15]           // cached shape (0 = empty)
+                            ; cbz w16, =>miss
+                            ; cmp w14, w16
+                            ; b.ne =>miss
+                            ; ldr w17, [x15, #4]       // cached value byte offset
+                            ; ldr x9, [x19, src_off]   // value to store
+                            ; str x9, [x13, x17]       // write in-object slot
+                            ; lsr x10, x9, #48         // value tag
+                            ; movz x11, TAG_PTR_OBJECT as u32
+                            ; cmp x10, x11
+                            ; b.lo =>done              // primitive → no barrier
+                        );
+                        // Pointer value: card-mark the parent header.
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; mov x0, x20
+                            ; movz x1, obj as u32
+                            ; movz x2, src as u32
+                        );
+                        emit_call_stub(
+                            &mut ops,
+                            jit_write_barrier_stub as *const () as usize,
+                            threw,
+                        );
+                        dynasm!(ops ; .arch aarch64 ; b =>done);
+                    }
+
+                    // Miss / no cage base: shared runtime store path, passing
+                    // the cell so the stub can self-patch it.
+                    dynasm!(ops ; .arch aarch64 ; =>miss);
                     dynasm!(ops
                         ; .arch aarch64
                         ; mov x0, x20
@@ -1186,7 +1488,9 @@ mod arm64 {
                     emit_load_u64(&mut ops, 2, u64::from(name));
                     dynasm!(ops ; .arch aarch64 ; movz x3, src as u32);
                     emit_load_u64(&mut ops, 4, site);
+                    emit_load_u64(&mut ops, 5, cell_addr as u64);
                     emit_call_stub(&mut ops, jit_store_prop_stub as *const () as usize, threw);
+                    dynasm!(ops ; .arch aarch64 ; =>done);
                 }
                 Op::BitwiseOr => emit_int_binop(&mut ops, ops_ref, bail, IntBinOp::Or)?,
                 Op::BitwiseAnd => emit_int_binop(&mut ops, ops_ref, bail, IntBinOp::And)?,
@@ -1279,6 +1583,8 @@ mod arm64 {
             code: CompiledCode::new(buf, entry),
             osr_entries,
             osr_only,
+            load_ic_cells,
+            store_ic_cells,
         })
     }
 
@@ -1293,10 +1599,15 @@ mod arm64 {
         );
     }
 
-    /// Emit a `Call`: gather operands, set the stub ABI registers, call.
+    /// Emit a direct `Call`: ask the VM to publish an eligible callee frame,
+    /// build the callee `JitCtx` on the native stack, branch to the compiled
+    /// entry, then finish/pop/store through the narrow direct-call ABI. Cold or
+    /// ineligible calls bail to the interpreter instead of using the generic
+    /// runtime call bridge.
     fn emit_call(
         ops: &mut Assembler,
         operands: &[Operand],
+        bail: DynamicLabel,
         threw: DynamicLabel,
     ) -> Result<(), Unsupported> {
         let dst = reg(operands, 0)?;
@@ -1305,13 +1616,18 @@ mod arm64 {
         if argc > MAX_INLINE_ARGS {
             return Err(Unsupported::ArgCount(argc));
         }
-        // jit_call_stub(ctx, dst, callee, argc, a0, a1, a2, a3) -> status.
+        let direct_returned = ops.new_dynamic_label();
+        let direct_bailed = ops.new_dynamic_label();
+        let direct_threw = ops.new_dynamic_label();
+        let direct_done = ops.new_dynamic_label();
+
+        // jit_prepare_direct_call_stub(ctx, callee, argc, a0..a3) -> status.
+        // 0 = direct prepared, 1 = throw, 2 = cold/ineligible → interpreter.
         dynasm!(ops
             ; .arch aarch64
             ; mov x0, x20
-            ; movz x1, dst as u32
-            ; movz x2, callee as u32
-            ; movz x3, argc as u32
+            ; movz x1, callee as u32
+            ; movz x2, argc as u32
         );
         for slot in 0..MAX_INLINE_ARGS {
             let areg = if slot < argc {
@@ -1319,11 +1635,88 @@ mod arm64 {
             } else {
                 0
             };
-            // arg registers map to x4..x7.
-            let xn = 4 + slot as u32;
+            // arg registers map to x3..x6.
+            let xn = 3 + slot as u32;
             dynasm!(ops ; .arch aarch64 ; movz X(xn), areg as u32);
         }
-        emit_call_stub(ops, jit_call_stub as *const () as usize, threw);
+        emit_load_u64(ops, 16, jit_prepare_direct_call_stub as *const () as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; cmp x0, #1
+            ; b.eq =>threw
+            ; cmp x0, #2
+            ; b.eq =>bail
+        );
+
+        // Construct callee JitCtx on stack.
+        dynasm!(ops
+            ; .arch aarch64
+            ; sub sp, sp, JIT_CTX_STACK_SIZE
+            ; ldr x9, [x20, DIRECT_REGS_OFFSET]
+            ; str x9, [sp]
+            ; ldr x9, [x20, DIRECT_SELF_OFFSET]
+            ; str x9, [sp, #8]
+            ; ldr x9, [x20, DIRECT_THIS_OFFSET]
+            ; str x9, [sp, #16]
+            ; str wzr, [sp, BAIL_PC_OFFSET]
+            ; ldr x9, [x20, VM_OFFSET]
+            ; str x9, [sp, VM_OFFSET]
+            ; ldr x9, [x20, STACK_OFFSET]
+            ; str x9, [sp, STACK_OFFSET]
+            ; ldr x9, [x20, CONTEXT_OFFSET]
+            ; str x9, [sp, CONTEXT_OFFSET]
+            ; ldr x9, [x20, DIRECT_FRAME_INDEX_OFFSET]
+            ; str x9, [sp, FRAME_INDEX_OFFSET]
+            ; ldr x9, [x20, ERROR_SLOT_OFFSET]
+            ; str x9, [sp, ERROR_SLOT_OFFSET]
+            ; mov x0, sp
+            ; ldr x16, [x20, DIRECT_ENTRY_OFFSET]
+            ; blr x16
+            ; cmp x1, STATUS_RETURNED as u32
+            ; b.eq =>direct_returned
+            ; cmp x1, STATUS_BAILED as u32
+            ; b.eq =>direct_bailed
+            ; b =>direct_threw
+            ; =>direct_returned
+            ; mov x3, x0
+            ; ldr x2, [x20, DIRECT_FRAME_INDEX_OFFSET]
+            ; add sp, sp, JIT_CTX_STACK_SIZE
+            ; mov x0, x20
+            ; movz x1, dst as u32
+        );
+        emit_call_stub(
+            ops,
+            jit_finish_direct_call_returned_stub as *const () as usize,
+            threw,
+        );
+        dynasm!(ops ; .arch aarch64 ; b =>direct_done);
+
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>direct_bailed
+            ; ldr w3, [sp, BAIL_PC_OFFSET]
+            ; ldr x2, [x20, DIRECT_FRAME_INDEX_OFFSET]
+            ; add sp, sp, JIT_CTX_STACK_SIZE
+            ; mov x0, x20
+            ; movz x1, dst as u32
+        );
+        emit_call_stub(
+            ops,
+            jit_finish_direct_call_bailed_stub as *const () as usize,
+            threw,
+        );
+        dynasm!(ops ; .arch aarch64 ; b =>direct_done);
+
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>direct_threw
+            ; ldr x1, [x20, DIRECT_FRAME_INDEX_OFFSET]
+            ; add sp, sp, JIT_CTX_STACK_SIZE
+            ; mov x0, x20
+        );
+        emit_call_stub(ops, jit_abort_direct_call_stub as *const () as usize, threw);
+        dynasm!(ops ; .arch aarch64 ; b =>threw ; =>direct_done);
         Ok(())
     }
 
@@ -1807,7 +2200,6 @@ mod tests {
                 property_ic_site: None,
                 operands: operands.clone(),
                 make_self: false,
-                inline_load: None,
             })
             .collect();
         JitFunctionView {
@@ -1821,6 +2213,7 @@ mod tests {
             is_async_generator: false,
             cage_base: 0,
             ta_layout: otter_vm::JitTypedArrayLayout::default(),
+            object_shape_byte: 8,
             instructions,
         }
     }
@@ -1855,6 +2248,7 @@ mod tests {
 
     fn run(view: &JitFunctionView, regs: &mut [u64]) -> Exit {
         let code = compile(view).expect("compiles");
+        let mut error = None;
         let mut ctx = JitCtx {
             regs: regs.as_mut_ptr(),
             self_closure: 0,
@@ -1864,7 +2258,12 @@ mod tests {
             context: std::ptr::null(),
             frame_index: 0,
             bail_pc: 0,
-            error: None,
+            error: &mut error,
+            direct_entry_addr: 0,
+            direct_regs: std::ptr::null_mut(),
+            direct_self_closure: 0,
+            direct_this_value: 0,
+            direct_frame_index: 0,
         };
         // SAFETY: integer-only function; never dereferences the null vm/stack.
         let entry: JitEntry = unsafe { std::mem::transmute(code.code.entry_ptr()) };

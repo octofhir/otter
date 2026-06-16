@@ -599,6 +599,7 @@ async fn run_file_with_cwd(
     startup_timer.mark("runtime_build");
     let result = otter.run_file(path).await?;
     startup_timer.mark("runtime_run_file");
+    emit_otter_stats_if_requested(&result);
     if json {
         println!(
             "{}",
@@ -609,6 +610,19 @@ async fn run_file_with_cwd(
         );
     }
     Ok(ExitCode::from(result.exit_code()))
+}
+
+fn emit_otter_stats_if_requested(result: &otter_runtime::ExecutionResult) {
+    if std::env::var_os("OTTER_STATS").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
+    let payload = serde_json::json!({
+        "schema": "otter.stats.v1",
+        "durationMs": result.duration.as_secs_f64() * 1000.0,
+        "exitCode": result.exit_code(),
+        "stats": result.stats(),
+    });
+    eprintln!("{payload}");
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

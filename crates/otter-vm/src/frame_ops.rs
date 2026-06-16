@@ -155,6 +155,7 @@ impl Interpreter {
         dst: u16,
         idx: i32,
     ) -> Result<(), VmError> {
+        self.record_jit_runtime_property_stub();
         let saved_pc = stack[frame_index].pc;
         let frame = &mut stack[frame_index];
         let result = self.run_load_upvalue_reg(frame, dst, idx);
@@ -176,6 +177,7 @@ impl Interpreter {
         src: u16,
         idx: i32,
     ) -> Result<(), VmError> {
+        self.record_jit_runtime_property_stub();
         let saved_pc = stack[frame_index].pc;
         let frame = &mut stack[frame_index];
         let result = self.run_store_upvalue_reg(frame, src, idx);

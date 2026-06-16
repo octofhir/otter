@@ -30,6 +30,35 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+/// Boxed JSON failure payload kept out of the hot [`VmError`] enum body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VmJsonError {
+    /// Stable identifier (e.g. `"JSON_CYCLIC"`).
+    pub code: &'static str,
+    /// Human-readable diagnostic. Includes the byte position for `JSON_PARSE`.
+    pub message: String,
+}
+
+/// Boxed Node-style coded failure payload kept out of [`VmError`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VmCodedError {
+    /// JS error class for the thrown instance.
+    pub kind: crate::error_classes::ErrorKind,
+    /// Stable Node error code (`"ERR_*"`).
+    pub code: &'static str,
+    /// Human-readable message.
+    pub message: String,
+}
+
+/// Boxed type-mismatch payload kept out of [`VmError`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VmTypeMismatchAt {
+    /// Operation that rejected the value.
+    pub op: String,
+    /// Rejected value-kind name.
+    pub kind: String,
+}
+
 /// Cooperative cancellation flag.
 ///
 /// Cheap, cloneable, `Send + Sync`. The interpreter polls this flag
@@ -63,7 +92,7 @@ impl InterruptFlag {
 }
 
 /// Runtime errors raised by the interpreter.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub enum VmError {
     /// The program counter walked off the end of `code` without a
@@ -82,14 +111,7 @@ pub enum VmError {
     /// `<op>: cannot operate on <kind>` so the user can read which
     /// site rejected which kind without learning the engine
     /// internals.
-    TypeMismatchAt {
-        /// Operation that rejected the value (e.g.
-        /// `"Object.getPrototypeOf"`, `"Op::LoadProperty"`).
-        op: &'static str,
-        /// Value-kind name from `value_kind_name` (e.g. `"Symbol"`,
-        /// `"BigInt"`, `"TypedArray"`).
-        kind: &'static str,
-    },
+    TypeMismatchAt(Box<VmTypeMismatchAt>),
     /// User-visible `TypeError` with operation context.
     TypeError {
         /// Human-readable diagnostic.
@@ -190,26 +212,13 @@ pub enum VmError {
     /// surface a precise diagnostic (`JSON.stringify cannot
     /// serialize cyclic structures.`, `JSON Parse error: <reason>
     /// at byte N`, …) instead of the generic `TYPE_MISMATCH`.
-    JsonError {
-        /// Stable identifier (e.g. `"JSON_CYCLIC"`).
-        code: &'static str,
-        /// Human-readable diagnostic. Includes the byte position
-        /// for `JSON_PARSE`.
-        message: String,
-    },
+    JsonError(Box<VmJsonError>),
     /// A JS error carrying a Node-style `.code` (e.g.
     /// `ERR_INVALID_ARG_TYPE`). `kind` selects the error class; `code` is set
     /// as an own non-enumerable property on the thrown instance. Lets native
     /// modules surface structured `error.code` without folding it into the
     /// message string.
-    Coded {
-        /// JS error class for the thrown instance.
-        kind: crate::error_classes::ErrorKind,
-        /// Stable Node error code (`"ERR_*"`).
-        code: &'static str,
-        /// Human-readable message.
-        message: String,
-    },
+    Coded(Box<VmCodedError>),
     /// Host-visible termination requested by a native such as
     /// `process.exit(code)`. This is not a JS exception and is not
     /// routed through catch/finally handlers.
@@ -228,8 +237,12 @@ impl std::fmt::Display for VmError {
                 f,
                 "type mismatch: this operation does not accept a value of this type"
             ),
-            VmError::TypeMismatchAt { op, kind } => {
-                write!(f, "{op}: cannot operate on a value of type {kind}")
+            VmError::TypeMismatchAt(payload) => {
+                write!(
+                    f,
+                    "{}: cannot operate on a value of type {}",
+                    payload.op, payload.kind
+                )
             }
             VmError::TypeError { message } => write!(f, "{message}"),
             VmError::RangeError { message } => write!(f, "{message}"),
@@ -256,8 +269,8 @@ impl std::fmt::Display for VmError {
             VmError::UndefinedIdentifier { name } => write!(f, "{name} is not defined"),
             VmError::Uncaught { value } => write!(f, "uncaught exception: {value}"),
             VmError::InvalidRegExp { message } => write!(f, "{message}"),
-            VmError::JsonError { message, .. } => write!(f, "{message}"),
-            VmError::Coded { message, .. } => write!(f, "{message}"),
+            VmError::JsonError(payload) => write!(f, "{}", payload.message),
+            VmError::Coded(payload) => write!(f, "{}", payload.message),
             VmError::Exit { code } => write!(f, "process exited with code {code}"),
         }
     }

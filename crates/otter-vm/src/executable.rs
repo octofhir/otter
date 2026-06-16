@@ -185,6 +185,10 @@ impl ExecutableFunction {
             // all-zero default is never read because the emitter gates inline
             // element access on `cage_base != 0`.
             ta_layout: crate::jit::JitTypedArrayLayout::default(),
+            // `#[repr(C)]` constant: offset from the decompressed object
+            // pointer to its shape handle, for the WhiskerIC load-cell guard.
+            object_shape_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::OBJECT_BODY_SHAPE_OFFSET as u32,
             instructions: self
                 .code
                 .iter()
@@ -197,9 +201,6 @@ impl ExecutableFunction {
                     // Resolved by `ExecutionContext::jit_function_view`, which
                     // can map a `MakeFunction` constant index to its target id.
                     make_self: false,
-                    // Baked by `Interpreter::compile_jit_function` from a warm
-                    // monomorphic own-data IC.
-                    inline_load: None,
                 })
                 .collect(),
         }

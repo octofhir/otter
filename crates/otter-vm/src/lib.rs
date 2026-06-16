@@ -153,7 +153,7 @@ pub use run_control::{
     RunError, StackFrameSnapshot, VmError,
 };
 
-use crate::holt_stack::HoltStack;
+use crate::holt_stack::{HoltCallReservation, HoltStack};
 use otter_bytecode::{ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Op};
 use smallvec::SmallVec;
 
@@ -292,6 +292,23 @@ pub fn oom_to_vm(err: otter_gc::OutOfMemory) -> VmError {
         requested_bytes: err.requested_bytes(),
         heap_limit_bytes: err.heap_limit_bytes(),
     }
+}
+
+/// Aggregate baseline-JIT runtime counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JitRuntimeStats {
+    /// Compiled `Op::Call` bridge invocations.
+    pub runtime_calls: u64,
+    /// Bridge calls that stayed on the compiled-to-compiled fast path.
+    pub direct_calls: u64,
+    /// Bridge calls that fell back to the generic Rust callable path.
+    pub rust_call_fallbacks: u64,
+    /// Function-entry compile attempts.
+    pub compile_attempts: u64,
+    /// Loop-OSR compile/entry attempts at threshold crossings.
+    pub osr_attempts: u64,
+    /// JIT property/method/element/global/upvalue runtime stub calls.
+    pub runtime_property_stubs: u64,
 }
 
 /// Match-based dispatch loop. The harness baseline; slice tasks may
@@ -479,6 +496,8 @@ pub struct Interpreter {
     /// repeated call to the same callee skips the map probe entirely. Cleared
     /// whenever a new entry is inserted into `jit_code`.
     jit_code_cache: Option<(u32, std::sync::Arc<dyn jit::JitFunctionCode>)>,
+    /// Lightweight JIT bridge/tiering counters for OtterLab diagnostics.
+    jit_runtime_stats: JitRuntimeStats,
     /// Free-list of spilled register-window backing buffers. Every bytecode
     /// call frame whose `register_count` exceeds the inline `SmallVec` capacity
     /// would otherwise `malloc`/`free` a fresh `Vec<Value>` per call — the hot
@@ -1063,6 +1082,7 @@ impl Interpreter {
                 .unwrap_or(Self::JIT_OSR_THRESHOLD),
             jit_code: rustc_hash::FxHashMap::default(),
             jit_code_cache: None,
+            jit_runtime_stats: JitRuntimeStats::default(),
             reg_pool: Vec::new(),
             holt_pool: Vec::new(),
             runtime_budget: RuntimeBudget::default(),
@@ -1195,6 +1215,12 @@ impl Interpreter {
         self.jit_hook.is_some()
     }
 
+    /// Return aggregate baseline-JIT runtime counters.
+    #[must_use]
+    pub fn jit_runtime_stats(&self) -> JitRuntimeStats {
+        self.jit_runtime_stats
+    }
+
     /// Call-count at which a function body is offered to the JIT. Low enough
     /// that genuinely hot functions tier up early, high enough that one-shot
     /// calls never pay compile latency.
@@ -1270,6 +1296,7 @@ impl Interpreter {
         // builtin/setup loop consume the one attempt and permanently starve the
         // real kernel loop that runs afterward (the per-header disabled set keeps
         // un-tierable headers from being retried, so re-arming is cheap).
+        self.jit_runtime_stats.osr_attempts = self.jit_runtime_stats.osr_attempts.saturating_add(1);
         self.jit_osr_count = 0;
         self.maybe_osr(stack, context, top_idx)
     }
@@ -1413,6 +1440,8 @@ impl Interpreter {
                 return None;
             }
             let compiled = self.compile_jit_function(context, fid);
+            self.jit_runtime_stats.compile_attempts =
+                self.jit_runtime_stats.compile_attempts.saturating_add(1);
             self.jit_code.insert(fid, compiled.clone());
             self.jit_code_cache = None;
             compiled
@@ -1465,6 +1494,8 @@ impl Interpreter {
         callee_reg: u16,
         arg_regs: &[u16],
     ) -> Result<(), VmError> {
+        self.jit_runtime_stats.runtime_calls =
+            self.jit_runtime_stats.runtime_calls.saturating_add(1);
         let frame = stack.get(frame_index).ok_or(VmError::InvalidOperand)?;
         let callee = *frame
             .registers
@@ -1481,6 +1512,8 @@ impl Interpreter {
         if let Some(result) =
             self.try_jit_fast_call(context, stack, frame_index, callee, callee_reg, arg_regs)?
         {
+            self.jit_runtime_stats.direct_calls =
+                self.jit_runtime_stats.direct_calls.saturating_add(1);
             let frame = stack.get_mut(frame_index).ok_or(VmError::InvalidOperand)?;
             *frame
                 .registers
@@ -1489,6 +1522,8 @@ impl Interpreter {
             return Ok(());
         }
 
+        self.jit_runtime_stats.rust_call_fallbacks =
+            self.jit_runtime_stats.rust_call_fallbacks.saturating_add(1);
         let frame = stack.get(frame_index).ok_or(VmError::InvalidOperand)?;
         let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(arg_regs.len());
         for &r in arg_regs {
@@ -1530,6 +1565,236 @@ impl Interpreter {
         }
         self.jit_code_cache = Some((fid, code.clone()));
         Some(code)
+    }
+
+    fn jit_direct_call_plan_for(
+        function: &crate::executable::ExecutableFunction,
+        code: &dyn jit::JitFunctionCode,
+    ) -> Option<jit::JitDirectCallPlan> {
+        Some(jit::JitDirectCallPlan {
+            function_id: function.id,
+            entry_addr: code.entry_addr()?,
+            param_count: function.param_count,
+            register_count: function.register_count,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_jit_direct_call_frame(
+        &mut self,
+        _context: &ExecutionContext,
+        stack: &mut jit::JitFrameStack,
+        frame_index: usize,
+        function: &crate::executable::ExecutableFunction,
+        parent_upvalues: crate::frame_state::UpvalueSpine,
+        this0: Value,
+        plan: jit::JitDirectCallPlan,
+        callee_reg: u16,
+        arg_regs: &[u16],
+    ) -> Result<jit::JitPreparedDirectCall, VmError> {
+        let upvalues =
+            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
+        let this_for_callee = self.this_for_bytecode_call_runtime_rooted(function, this0, &[])?;
+        let registers = self.draw_registers(usize::from(plan.register_count));
+        let mut callee_frame = HoltCallReservation::from_frame(Frame::with_exec_registers(
+            function,
+            None,
+            upvalues,
+            this_for_callee,
+            registers,
+        ));
+
+        let bind_count = usize::from(plan.param_count).min(arg_regs.len());
+        let callee_now = {
+            let caller = stack.get(frame_index).ok_or(VmError::InvalidOperand)?;
+            for (dst_slot, &src) in callee_frame
+                .frame_mut()
+                .registers
+                .iter_mut()
+                .zip(arg_regs.iter())
+                .take(bind_count)
+            {
+                *dst_slot = *caller
+                    .registers
+                    .get(src as usize)
+                    .ok_or(VmError::InvalidOperand)?;
+            }
+            *caller
+                .registers
+                .get(callee_reg as usize)
+                .ok_or(VmError::InvalidOperand)?
+        };
+        if function.makes_function
+            && let Some(closure) = callee_now.as_closure(&self.gc_heap)
+        {
+            self.frame_ensure_cold(callee_frame.frame_mut())
+                .callee_closure = Some(closure);
+        }
+
+        let frame_desc = callee_frame.publish(stack);
+        let frame_index = frame_desc.index();
+        Ok(jit::JitPreparedDirectCall {
+            entry_addr: plan.entry_addr,
+            regs: frame_desc.value_slots().as_mut_ptr().cast::<u64>(),
+            self_closure: self.jit_frame_self_closure_bits(stack, frame_index),
+            this_value: self.jit_frame_this_bits(stack, frame_index),
+            frame_index,
+        })
+    }
+
+    /// Prepare an eligible compiled callee for direct machine-code entry.
+    ///
+    /// Returns `Ok(None)` for cold/ineligible callees; the caller can then bail
+    /// or take a non-direct fallback. On `Ok(Some(_))`, the callee frame is
+    /// published and the sync-reentry guard is held until the caller invokes one
+    /// of the direct-call finish/abort helpers.
+    pub fn jit_prepare_direct_call(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut jit::JitFrameStack,
+        frame_index: usize,
+        callee_reg: u16,
+        arg_regs: &[u16],
+    ) -> Result<Option<jit::JitPreparedDirectCall>, VmError> {
+        self.jit_runtime_stats.runtime_calls =
+            self.jit_runtime_stats.runtime_calls.saturating_add(1);
+        let frame = stack.get(frame_index).ok_or(VmError::InvalidOperand)?;
+        let callee = *frame
+            .registers
+            .get(callee_reg as usize)
+            .ok_or(VmError::InvalidOperand)?;
+        let Ok((function_id, parent_upvalues, this0, new_target, derived_this, eval_env)) =
+            Self::bytecode_call_target_parts(callee, Value::undefined(), &self.gc_heap)
+        else {
+            return Ok(None);
+        };
+        if new_target.is_some() || derived_this.is_some() || eval_env.is_some() {
+            return Ok(None);
+        }
+        let Some(function) = context.exec_function(function_id) else {
+            return Ok(None);
+        };
+        if function.is_generator
+            || function.is_async
+            || function.is_async_generator
+            || function.needs_arguments
+            || function.has_rest
+            || function.contains_direct_eval
+            || function.is_derived_constructor
+        {
+            return Ok(None);
+        }
+        let Some(code) = self.jit_resolve_compiled_cached(function_id) else {
+            return Ok(None);
+        };
+        let Some(plan) = Self::jit_direct_call_plan_for(function, code.as_ref()) else {
+            return Ok(None);
+        };
+
+        self.enter_sync_reentry()?;
+        match self.prepare_jit_direct_call_frame(
+            context,
+            stack,
+            frame_index,
+            function,
+            parent_upvalues,
+            this0,
+            plan,
+            callee_reg,
+            arg_regs,
+        ) {
+            Ok(prepared) => {
+                self.jit_runtime_stats.direct_calls =
+                    self.jit_runtime_stats.direct_calls.saturating_add(1);
+                Ok(Some(prepared))
+            }
+            Err(err) => {
+                self.leave_sync_reentry();
+                Err(err)
+            }
+        }
+    }
+
+    /// Finish a direct compiled call that returned normally.
+    ///
+    /// Pops and reclaims the published callee frame, stores `value` into the
+    /// caller destination register, and releases the sync-reentry guard held by
+    /// [`Self::jit_prepare_direct_call`].
+    pub fn jit_finish_direct_call_returned(
+        &mut self,
+        stack: &mut jit::JitFrameStack,
+        caller_frame_index: usize,
+        callee_frame_index: usize,
+        dst: u16,
+        value: Value,
+    ) -> Result<(), VmError> {
+        if stack.len() != callee_frame_index + 1 {
+            self.leave_sync_reentry();
+            return Err(VmError::InvalidOperand);
+        }
+        if let Some(mut done) = stack.pop() {
+            self.reclaim_registers(&mut done);
+        }
+        let caller = stack
+            .get_mut(caller_frame_index)
+            .ok_or(VmError::InvalidOperand)?;
+        *caller
+            .registers
+            .get_mut(dst as usize)
+            .ok_or(VmError::InvalidOperand)? = value;
+        self.leave_sync_reentry();
+        Ok(())
+    }
+
+    /// Finish a direct compiled call whose callee bailed to the interpreter.
+    ///
+    /// Resumes the interpreter at `bail_pc` inside the already-published callee
+    /// frame, stores the resulting completion into the caller destination, and
+    /// releases the sync-reentry guard.
+    pub fn jit_finish_direct_call_bailed(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut jit::JitFrameStack,
+        caller_frame_index: usize,
+        callee_frame_index: usize,
+        dst: u16,
+        bail_pc: u32,
+    ) -> Result<(), VmError> {
+        if callee_frame_index >= stack.len() {
+            self.leave_sync_reentry();
+            return Err(VmError::InvalidOperand);
+        }
+        stack[callee_frame_index].pc = bail_pc;
+        match self.dispatch_loop(context, stack) {
+            Ok(value) => {
+                let caller = stack
+                    .get_mut(caller_frame_index)
+                    .ok_or(VmError::InvalidOperand)?;
+                *caller
+                    .registers
+                    .get_mut(dst as usize)
+                    .ok_or(VmError::InvalidOperand)? = value;
+                self.leave_sync_reentry();
+                Ok(())
+            }
+            Err(err) => {
+                self.leave_sync_reentry();
+                Err(err)
+            }
+        }
+    }
+
+    /// Abort a prepared direct call before normal return completion.
+    ///
+    /// Used by direct-call throw/bail paths: drops the callee frame and any
+    /// nested frames above it, then releases the sync-reentry guard.
+    pub fn jit_abort_direct_call(
+        &mut self,
+        stack: &mut jit::JitFrameStack,
+        callee_frame_index: usize,
+    ) {
+        stack.truncate(callee_frame_index);
+        self.leave_sync_reentry();
     }
 
     /// Attempt the fast compiled→compiled call. Returns `Ok(Some(value))` when
@@ -1583,6 +1848,9 @@ impl Interpreter {
         let Some(code) = self.jit_resolve_compiled_cached(function_id) else {
             return Ok(None);
         };
+        let Some(direct_plan) = Self::jit_direct_call_plan_for(function, code.as_ref()) else {
+            return Ok(None);
+        };
 
         // Committed: this consumes native stack like any nested call, so it is
         // bounded by the same synchronous-re-entry guard.
@@ -1594,6 +1862,7 @@ impl Interpreter {
             function,
             parent_upvalues,
             this0,
+            direct_plan,
             &code,
             callee_reg,
             arg_regs,
@@ -1615,44 +1884,11 @@ impl Interpreter {
         function: &crate::executable::ExecutableFunction,
         parent_upvalues: crate::frame_state::UpvalueSpine,
         this0: Value,
+        direct_plan: jit::JitDirectCallPlan,
         code: &std::sync::Arc<dyn jit::JitFunctionCode>,
         callee_reg: u16,
         arg_regs: &[u16],
     ) -> Result<Value, VmError> {
-        let upvalues =
-            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
-        let this_for_callee = self.this_for_bytecode_call_runtime_rooted(function, this0, &[])?;
-        let registers = self.draw_registers(function.register_count as usize);
-        let mut new_frame =
-            Frame::with_exec_registers(function, None, upvalues, this_for_callee, registers);
-
-        // Bind formals directly from the rooted caller window, and re-read the
-        // callee value from that same (GC-updated) slot for the SELF binding.
-        let bind_count = (function.param_count as usize).min(arg_regs.len());
-        let callee_now = {
-            let caller = stack.get(frame_index).ok_or(VmError::InvalidOperand)?;
-            for (dst_slot, &src) in new_frame
-                .registers
-                .iter_mut()
-                .zip(arg_regs.iter())
-                .take(bind_count)
-            {
-                *dst_slot = *caller
-                    .registers
-                    .get(src as usize)
-                    .ok_or(VmError::InvalidOperand)?;
-            }
-            *caller
-                .registers
-                .get(callee_reg as usize)
-                .ok_or(VmError::InvalidOperand)?
-        };
-        if function.makes_function
-            && let Some(closure) = callee_now.as_closure(&self.gc_heap)
-        {
-            self.frame_ensure_cold(&mut new_frame).callee_closure = Some(closure);
-        }
-
         // Run the callee on the caller's own stack, in place. Every `HoltStack`
         // is reservation-stable (reserves `DEFAULT_MAX_STACK_DEPTH`; the
         // stack-overflow guard — already entered above via `enter_sync_reentry` —
@@ -1665,8 +1901,18 @@ impl Interpreter {
         // appended frame is covered by the enclosing `dispatch_loop`'s
         // `trace_active_frame_roots` provider, which `run_compiled_frame` alone
         // does not install.
-        let idx = stack.len();
-        stack.push(new_frame);
+        let prepared = self.prepare_jit_direct_call_frame(
+            context,
+            stack,
+            frame_index,
+            function,
+            parent_upvalues,
+            this0,
+            direct_plan,
+            callee_reg,
+            arg_regs,
+        )?;
+        let idx = prepared.frame_index;
         match self.run_compiled_frame(stack, context, idx, code) {
             jit::JitExecOutcome::Returned(value) => {
                 if let Some(mut done) = stack.pop() {
@@ -1753,8 +1999,8 @@ impl Interpreter {
     /// JIT bridge — base pointer of frame `frame_index`'s register window, for
     /// the compiled entry to address registers. The window is rooted on
     /// `stack`, so the pointer is stable for the compiled call's duration
-    /// (recursive calls run on a separate internal stack and never grow this
-    /// one).
+    /// (recursive compiled calls append frames to this reservation-stable
+    /// HoltStack, whose buffer does not reallocate before the stack-depth guard).
     #[must_use]
     pub fn jit_frame_regs_ptr(stack: &mut jit::JitFrameStack, frame_index: usize) -> *mut u64 {
         stack[frame_index].registers.as_mut_ptr().cast::<u64>()
@@ -1770,7 +2016,6 @@ impl Interpreter {
         fid: u32,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         let mut view = context.jit_function_view(fid)?;
-        self.bake_inline_property_loads(&mut view);
         Self::bake_typed_array_layout(&mut view);
         let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
         let (regs, params) = (view.register_count, view.param_count);
@@ -1782,53 +2027,6 @@ impl Interpreter {
         match status {
             Ok(jit::JitCompileStatus::Compiled { code }) => Some(code),
             _ => None,
-        }
-    }
-
-    /// Bake monomorphic own-data property loads into the compile view from the
-    /// live IC tables so the emitter can read the in-object slot inline (shape
-    /// guard + direct load, no interpreter round-trip).
-    ///
-    /// Only a warm, single-entry `OwnData` IC whose slot lives in the fixed
-    /// in-object region (`slot < INLINE_VALUE_CAP`) and whose shape handle is
-    /// non-null (fast mode) qualifies. The shape handle's compressed offset is
-    /// a stable guard token because shapes are immortal and pinned in old
-    /// space. Everything else keeps the shared runtime stub.
-    fn bake_inline_property_loads(&self, view: &mut jit::JitFunctionView) {
-        const VALUE_SIZE: u32 = std::mem::size_of::<Value>() as u32;
-        let header = otter_gc::header::HEADER_SIZE as u32;
-        let shape_byte = header + crate::object::OBJECT_BODY_SHAPE_OFFSET as u32;
-        let mut baked_any = false;
-        for instr in &mut view.instructions {
-            if instr.op != otter_bytecode::Op::LoadProperty {
-                continue;
-            }
-            let Some(site) = instr.property_ic_site else {
-                continue;
-            };
-            let Some(entry) = self.load_property_ics.get(site) else {
-                continue;
-            };
-            if entry.entry_count() != 1 {
-                continue;
-            }
-            let property_ic::LoadPropertyIc::OwnData { hit } = &entry.entries()[0] else {
-                continue;
-            };
-            if hit.shape.is_null() || usize::from(hit.slot) >= crate::object::INLINE_VALUE_CAP {
-                continue;
-            }
-            instr.inline_load = Some(jit::JitInlineLoad {
-                cached_shape_offset: hit.shape.offset(),
-                shape_byte,
-                value_byte: header
-                    + crate::object::OBJECT_BODY_INLINE_VALUES_OFFSET as u32
-                    + u32::from(hit.slot) * VALUE_SIZE,
-            });
-            baked_any = true;
-        }
-        if baked_any {
-            view.cage_base = otter_gc::cage_base() as usize;
         }
     }
 
@@ -1960,6 +2158,13 @@ impl Interpreter {
 
     pub(crate) fn record_runtime_host_op_enqueued(&mut self) {
         self.runtime_budget_stats.record_host_op_enqueued();
+    }
+
+    pub(crate) fn record_jit_runtime_property_stub(&mut self) {
+        self.jit_runtime_stats.runtime_property_stubs = self
+            .jit_runtime_stats
+            .runtime_property_stubs
+            .saturating_add(1);
     }
 
     fn record_runtime_microtask_drain_started(&mut self) {
@@ -2520,10 +2725,12 @@ impl Interpreter {
         {
             return Ok(intrinsic_or_null(self, value));
         }
-        Err(VmError::TypeMismatchAt {
-            op: "Object.getPrototypeOf",
-            kind: value_kind_name(value),
-        })
+        Err(VmError::TypeMismatchAt(Box::new(
+            run_control::VmTypeMismatchAt {
+                op: "Object.getPrototypeOf".to_string(),
+                kind: value_kind_name(value).to_string(),
+            },
+        )))
     }
 
     pub(crate) fn object_prototype_object_opt(&self) -> Option<JsObject> {
@@ -4053,7 +4260,7 @@ impl Interpreter {
                 if iters >= microtask::MAX_DRAIN_ITERS {
                     self.microtasks.end_drain();
                     return Err(RunError {
-                        error: VmError::JsonError {
+                        error: VmError::JsonError(Box::new(run_control::VmJsonError {
                             // Reusing the structured-error channel
                             // until task 34 introduces a real
                             // microtask-error code.
@@ -4062,7 +4269,7 @@ impl Interpreter {
                                 "microtask drain exceeded {} iterations",
                                 microtask::MAX_DRAIN_ITERS
                             ),
-                        },
+                        })),
                         frames: Vec::new(),
                     });
                 }
@@ -4523,7 +4730,7 @@ impl Interpreter {
                         {
                             let uncaught = if matches!(
                                 err,
-                                VmError::OutOfMemory { .. } | VmError::JsonError { .. }
+                                VmError::OutOfMemory { .. } | VmError::JsonError(_)
                             ) {
                                 Some(err.clone())
                             } else {

@@ -15,7 +15,7 @@
 use std::mem::{align_of, size_of};
 
 use otter_bytecode::{Function, Instruction, Op, Operand};
-use otter_vm::{Frame, Value};
+use otter_vm::{Frame, Value, VmError};
 
 #[test]
 fn print_hot_struct_layouts() {
@@ -28,6 +28,11 @@ fn print_hot_struct_layouts() {
         "otter_vm::Frame: size={} align={}",
         size_of::<Frame>(),
         align_of::<Frame>()
+    );
+    eprintln!(
+        "otter_vm::VmError: size={} align={}",
+        size_of::<VmError>(),
+        align_of::<VmError>()
     );
     eprintln!(
         "otter_bytecode::Instruction: size={} align={}",

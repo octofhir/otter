@@ -15,7 +15,7 @@ Order follows the plan's *minimal implementation sequence* (§5). Each slice is 
 | 0 | Engine Lab — measurement, differential testing, progress scaffold | `OtterLab` | **done** (commit `98f460b3`) | — |
 | 1 | Stable VM stack & frame descriptors | `HoltStack` | **done** (1b; 1e folds into Slice 2) | Slice 0 green ✓ |
 | 2 | PupJIT direct calls + machine-code frame build | `PupJIT Calls` | **next** | HoltStack stable ✓ |
-| 3 | Unified feedback vectors + complete ICs | `WhiskerIC` | **in progress** (3a load + 3b store + 3c method + 3d upvalue ICs done) | PupJIT direct calls |
+| 3 | Unified feedback vectors + complete ICs | `WhiskerIC` | **in progress** (3a load + 3b store + 3c method + 3d upvalue + 3e checked-upvalue/callback-trim done) | PupJIT direct calls |
 | 4 | Hot heap layouts (Array/TypedArray/String/Closure) | `KelpHeap` | not started | WhiskerIC load/store/method/element |
 | 5 | Production GC + precise safepoint stack maps | `TideGC` / `StoneMaps` / `ShellAlloc` | not started | KelpHeap; PupJIT direct calls shipped |
 | 6 | Optimized builtin intrinsics | `ShellBuiltins` | not started | KelpHeap |
@@ -403,14 +403,43 @@ bit-identical under `OTTER_GC_STRESS=32/64`. (A pointer-upvalue alloc-storm unde
 `OTTER_GC_STRESS=32` SIGSEGVs in **both interp and JIT** — pre-existing GC-stress
 fragility in heavy young-allocation / commonjs load, unrelated to this slice.)
 
-### 3e — next (not started)
-- Direct-prototype `LoadProperty` inline (cell caches a proto-data hit for
-  inherited data properties; currently only own-data inlines).
-- Bigger levers now are KelpHeap/ShellBuiltins: array-ops/sort are bound by the
-  **native builtin → JS callback per-element dispatch** (`run_callable_sync` per
-  element), json/string by native serializer/charCodeAt throughput, regex by the
-  separate engine. Element-`StoreElement` dense inline was investigated + deferred
-  (length/dirty/sparse/frozen semantics).
+### 3e — Callback-dispatch trim + inline `StoreUpvalueChecked`. Done.
+
+Profiling the `forEach` callback (`sample`) showed the per-element cost is the
+`run_callable_sync` frame build (dominant) plus the arrow's captured-`let` store
+(`s += x`) hitting `StoreUpvalueChecked` through the `jit_delegate_op` bridge
+(with eager `VmError` drops on the success path). Two bounded fixes:
+- **Array callback loop → `run_callable_sync_already_rooted`** (`array_prototype.rs`
+  `array_callback_native_dispatch`): the loop always runs nested under the
+  forEach/map/… native, which already pushed an `ExtraRoots`, so the per-element
+  duplicate push/truncate is dead weight (the heap's `same_source` walk skips it
+  anyway). Drops one `Vec` push/truncate per element.
+- **Inline `StoreUpvalueChecked`** (the TDZ-checked captured-binding store): like
+  the 3d `StoreUpvalue` inline but reads the cell first and misses to the
+  delegate bridge on a hole (→ `ReferenceError`); inlines only the primitive
+  store (no barrier into the old-space cell), pointer values → bridge. Completes
+  the upvalue inline coverage (plain + checked).
+
+**Measured.** `array-ops.js` `otter-jit` **1287 → ~1203 ms (−6.5%)** (repeat runs
+1.18–1.20 s); `sort` neutral (it uses a different call site — comparator at
+`array_prototype.rs:1312`, no captured-`let`); other benches neutral; diff 11/11.
+
+**Gates.** Unit tests green; clippy/fmt clean; test262 failing-set identical
+JIT-off vs JIT-on on `Array/prototype/{forEach 190/190, map 214/216, filter
+240/242, reduce 520/520}`, `statements/let` (145/145), `assignment` (804/818).
+Captured-`let`-store closure bit-identical interp vs JIT (a GC-stress alloc-storm
+SIGSEGVs in **both** — pre-existing).
+
+### 3f — next (not started)
+- **The real array-ops/sort lever remains untouched**: `run_callable_sync` builds
+  a fresh callee frame (incl. a per-call upvalue-spine clone in
+  `bytecode_call_target_parts`) for every element — ~136 ns/call overhead
+  (forEach 1.79 s vs an inline plain loop 0.16 s for the same 12M iterations). A
+  lean per-element invocation that reuses the callee frame/stack across iterations
+  is the headline win (hits map/filter/reduce/forEach/sort); larger + higher-risk
+  (frame-reuse correctness), so scoped as its own slice.
+- Direct-prototype `LoadProperty` inline; dense `StoreElement` inline (deferred —
+  length/dirty/sparse/frozen semantics).
 
 ## Verification contract
 

@@ -3093,8 +3093,14 @@ pub(crate) fn array_callback_native_dispatch(
             };
             let callback = interp.iteration_anchor(anchor_base + A_CALLBACK);
             let cb_this = interp.iteration_anchor(anchor_base + A_CB_THIS);
+            // This loop always runs nested under the forEach/map/... native,
+            // which `run_callable_sync` reached after pushing its own
+            // `ExtraRoots` — so the per-element runtime-global root set is
+            // already live. Use the already-rooted re-entry to drop a redundant
+            // `ExtraRoots` Vec push/truncate per element (the duplicate the
+            // heap's `same_source` walk would skip anyway).
             let result = interp
-                .run_callable_sync(&context, &callback, cb_this, cb_args)
+                .run_callable_sync_already_rooted(&context, &callback, cb_this, cb_args)
                 .map_err(|err| {
                     crate::native_function::vm_to_native_error(err, "Array.prototype callback")
                 })?;

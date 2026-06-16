@@ -1397,6 +1397,49 @@ mod arm64 {
                     );
                     dynasm!(ops ; .arch aarch64 ; =>up_done);
                 }
+                // `upvalue[idx] = src` with a TDZ guard (assignment to a captured
+                // `let`/`const`). Like `StoreUpvalue` but reads the cell first and
+                // misses to the delegate bridge on a hole (raising the
+                // `ReferenceError`). Inlines only the primitive store; a pointer
+                // value misses to the bridge (barriered store inside).
+                Op::StoreUpvalueChecked => {
+                    let src = reg(ops_ref, 0)?;
+                    let idx = imm32(ops_ref, 1)?;
+                    let up_miss = ops.new_dynamic_label();
+                    let up_done = ops.new_dynamic_label();
+
+                    if cage_base != 0 && idx >= 0 {
+                        let src_off = reg_offset(src)?;
+                        let idx_off = (idx as u32) * UPVALUE_CELL_SIZE;
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldr x9, [x20, UPVALUES_PTR_OFFSET] // spine base
+                            ; cbz x9, =>up_miss
+                            ; ldr x12, [x19, src_off]            // value to store
+                            ; lsr x10, x12, #48                  // tag
+                            ; movz x11, TAG_PTR_OBJECT as u32
+                            ; cmp x10, x11
+                            ; b.hs =>up_miss                     // pointer → barriered bridge
+                            ; ldr w10, [x9, idx_off]             // 4-byte cell handle
+                        );
+                        emit_load_u64(&mut ops, 13, cage_base as u64);
+                        emit_load_u64(&mut ops, 11, (TAG_SPECIAL << 48) | SPECIAL_HOLE);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; add x13, x13, x10                  // cell body ptr
+                            ; ldr x14, [x13, UPVALUE_VALUE_OFFSET] // current value
+                            ; cmp x14, x11                       // TDZ hole?
+                            ; b.eq =>up_miss
+                            ; str x12, [x13, UPVALUE_VALUE_OFFSET]
+                            ; b =>up_done
+                        );
+                    }
+
+                    dynasm!(ops ; .arch aarch64 ; =>up_miss ; mov x0, x20);
+                    emit_load_u64(&mut ops, 1, u64::from(instr.byte_pc));
+                    emit_call_stub(&mut ops, jit_delegate_op_stub as *const () as usize, threw);
+                    dynasm!(ops ; .arch aarch64 ; =>up_done);
+                }
                 // `dst = ToNumeric(src) + delta` (§13.4 UpdateExpression). Int32
                 // fast path with overflow → double; double path otherwise.
                 Op::Increment => {
@@ -1632,7 +1675,6 @@ mod arm64 {
                 Op::MakeClosure
                 | Op::NewObject
                 | Op::NewArray
-                | Op::StoreUpvalueChecked
                 | Op::Rem
                 | Op::Ushr
                 | Op::LoadString

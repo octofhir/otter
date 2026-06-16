@@ -483,14 +483,21 @@ driving full GCs (30k keys/parse × 40). Cumulative JSON (stringify + this):
 multibyte-UTF8/`__proto__`/lone-surrogate) match node except the lone-surrogate
 lossy case, which is the **unchanged escape path** (pre-existing). JIT-independent.
 
-### Larger JSON.parse finding (deferred — needs object/shape-core work)
-`object::set` (used by `finish_builder`) sets `body.shape = null` → **JSON-parsed
-objects are dictionary-mode** (per-object `dictionary_keys` Vec + key-String
+### Larger JSON.parse finding — dict-mode fix TRIED + REVERTED (negative result)
+`object::set` (used by `finish_builder`) sets `body.shape = null` → JSON-parsed
+objects are **dictionary-mode** (per-object `dictionary_keys` Vec + key-String
 clone, no shape sharing) unlike class instances which tier into fast shapes.
-Building parsed objects fast-shaped (share one shape across same-shaped records)
-needs `shape_runtime.child_with_roots` threaded through the parser + the
-root-shape model understood — medium-large, risky to rush. Left for an attended
-session.
+Building parsed objects fast-shaped was **fully implemented** (a
+`object::push_parsed_data_property` helper building shapes via
+`ShapeRuntime::child_with_roots`, threaded `Option<&mut ShapeRuntime>` through the
+parser + a `NativeCtx::heap_and_shapes_mut` disjoint-borrow accessor) — **correct
+(diff 11/11) but a throughput regression**: json.js **1629 → 1785 ms (+9.6%)**,
+parse micro +10%. The per-key shape-transition compute (`child_if_cached` hash
+lookups + double `body_offset_of` + `set_with_shape`) exceeds the
+dict-allocation savings; fast shapes help *downstream property access* on parsed
+objects, which json.js never exercises (it only reads `back.length`). **Reverted.**
+Lesson: dict-mode is not a parse-throughput win — only helps access-heavy
+consumers of parsed JSON, which no current bench measures.
 
 ### 3f — next (not started)
 - **The real array-ops/sort lever remains untouched**: `run_callable_sync` builds

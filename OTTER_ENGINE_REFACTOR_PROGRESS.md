@@ -458,6 +458,40 @@ toJSON-mutates-holder, replacer array + function, integer-key order,
 non-enumerable skip, indent) byte-match node. JIT-independent change (native
 serializer), so JIT-off ≡ JIT-on.
 
+## Slice 6 (early) — `ShellBuiltins`: JSON.parse object-key allocation cut. Done.
+
+`sample` of `JSON.parse` showed it is **allocation + GC bound** (alloc ~496,
+scavenger/collect_full/marking/sweep ~150 of ~700 leaf samples); `finish_builder`
+/ `object::set` is only ~22. Confirmed every object/array/string allocates via
+**`alloc_old`** (old-gen from birth — a TideGC/Slice-5 limitation), so a parse's
+5000 short-lived records fill old space and trigger full GCs.
+
+Bounded fix landed: `read_object_key` minted a GC `JsString` (via `read_string`)
+only to `to_lossy_string` it into a Rust `String` and drop it — a wasted old-gen
+allocation per key. The escape-free common case (`"id"`, `"name"`, …) now builds
+the `String` straight from the input slice (SWAR escape scan + `from_utf8`),
+skipping the `JsString`. Escape/control/error keys defer to the unchanged
+`read_string` path (identical decoding + lossy-surrogate behaviour).
+
+**Measured.** `json.js` `otter-jit` **1911 → 1629 ms (−14.8%)** — far above the
+raw key-alloc cost, because each skipped `JsString` was an old-gen allocation
+driving full GCs (30k keys/parse × 40). Cumulative JSON (stringify + this):
+**2009 → 1629 ms (−19%)**. diff 11/11.
+
+**Gates.** Unit tests green; clippy/fmt clean; test262 `built-ins/JSON` 163/165
+**0-failed**; 9 hand key edge-cases (`\n`/`\uXXXX`/surrogate-pair/empty/duplicate/
+multibyte-UTF8/`__proto__`/lone-surrogate) match node except the lone-surrogate
+lossy case, which is the **unchanged escape path** (pre-existing). JIT-independent.
+
+### Larger JSON.parse finding (deferred — needs object/shape-core work)
+`object::set` (used by `finish_builder`) sets `body.shape = null` → **JSON-parsed
+objects are dictionary-mode** (per-object `dictionary_keys` Vec + key-String
+clone, no shape sharing) unlike class instances which tier into fast shapes.
+Building parsed objects fast-shaped (share one shape across same-shaped records)
+needs `shape_runtime.child_with_roots` threaded through the parser + the
+root-shape model understood — medium-large, risky to rush. Left for an attended
+session.
+
 ### 3f — next (not started)
 - **The real array-ops/sort lever remains untouched**: `run_callable_sync` builds
   a fresh callee frame (incl. a per-call upvalue-spine clone in

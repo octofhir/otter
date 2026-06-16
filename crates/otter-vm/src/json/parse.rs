@@ -711,6 +711,21 @@ fn read_object_key(
             "expected '\"' starting object key",
         ));
     }
+    // Fast path — an escape-free key is the overwhelming common case
+    // (`"id"`, `"name"`, …). Build the Rust `String` straight from the
+    // input slice, skipping the GC `JsString` allocation that the general
+    // `read_string` path would mint only to immediately stringify and drop.
+    let key_start = cursor.pos + 1;
+    let next = super::scan::find_first_escape_pub(cursor.bytes, key_start);
+    if next < cursor.bytes.len() && cursor.bytes[next] == b'"' {
+        let slice = &cursor.bytes[key_start..next];
+        let text = std::str::from_utf8(slice)
+            .map_err(|_| ParseError::at(key_start, "invalid utf-8 in object key"))?;
+        cursor.pos = next + 1;
+        return Ok(text.to_string());
+    }
+    // Escape / control / unterminated: defer to the full string reader,
+    // which decodes escapes (and reports the precise error) identically.
     let s = read_string(cursor, heap)?;
     Ok(s.to_lossy_string(heap))
 }

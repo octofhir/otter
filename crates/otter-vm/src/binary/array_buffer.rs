@@ -182,7 +182,11 @@ pub fn alloc_shared_array_buffer(
 /// Cheap-to-copy `ArrayBuffer` / `SharedArrayBuffer` handle.
 ///
 /// Backed by a tagged pair of 4-byte GC handles; `Copy`/`Eq`/`Hash`.
+/// `#[repr(transparent)]` so the embedded [`BufferStorage`] sits at
+/// offset 0 — the baseline JIT reads the storage discriminant + handle
+/// through a `TypedArrayBodyGc.buffer` field at fixed offsets.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[repr(transparent)]
 pub struct JsArrayBuffer {
     storage: BufferStorage,
 }

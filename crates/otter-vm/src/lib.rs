@@ -176,6 +176,7 @@ pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
     JitCompileError, JitCompileRequest, JitCompileStatus, JitCompilerHook, JitExecOutcome,
     JitFrameStack, JitFunctionCode, JitFunctionView, JitInstrView, JitReentryPtrs,
+    JitTypedArrayLayout,
 };
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,
@@ -443,10 +444,14 @@ pub struct Interpreter {
     /// Per-function call counter driving function-entry tier-up. Only mutated
     /// when a JIT hook is installed.
     jit_call_counts: rustc_hash::FxHashMap<u32, u32>,
-    /// Functions for which an OSR attempt bailed or had no entry; OSR is not
-    /// retried for them. Consulted only at a threshold crossing (rare), so it
-    /// adds no per-iteration cost.
-    jit_osr_disabled: rustc_hash::FxHashSet<u32>,
+    /// OSR targets that bailed, had no trampoline, or whose function is
+    /// uncompilable; OSR is not retried for them. Keyed by `(function_id,
+    /// loop_header_pc)` so a bail in one loop disables only *that* loop header,
+    /// not the whole function — a later, genuinely-hot loop in the same function
+    /// can still tier up. A `(fid, u32::MAX)` entry disables the whole function
+    /// (its body did not compile at all). Consulted only at a threshold crossing
+    /// (rare), so it adds no per-iteration cost.
+    jit_osr_disabled: rustc_hash::FxHashSet<(u32, u32)>,
     /// Loop-OSR back-edge counter for the frame currently at the top of the
     /// stack. Stored on the interpreter (not the size-capped `Frame`) and keyed
     /// by [`Self::jit_osr_count_top`] as a cheap frame-identity proxy: a
@@ -1267,10 +1272,18 @@ impl Interpreter {
             return Ok(None);
         }
         let fid = frame.function_id;
-        if self.jit_osr_disabled.contains(&fid) {
+        // Whole function uncompilable → never retry, never re-arm.
+        if self.jit_osr_disabled.contains(&(fid, u32::MAX)) {
             return Ok(None);
         }
         let osr_pc = frame.pc;
+        // This specific loop header can't OSR (bailed / no trampoline). Re-arm
+        // the counter so a *different* hot loop in the same function still gets
+        // a tier-up shot instead of the single global crossing being spent here.
+        if self.jit_osr_disabled.contains(&(fid, osr_pc)) {
+            self.jit_osr_count = 0;
+            return Ok(None);
+        }
         // Resolve compiled code, compiling once and caching the result (shared
         // with the function-entry path; `None` records an uncompilable body).
         let code = match self.jit_code.get(&fid) {
@@ -1282,8 +1295,8 @@ impl Interpreter {
             }
         };
         let Some(code) = code else {
-            // Uncompilable: never retry OSR for it.
-            self.jit_osr_disabled.insert(fid);
+            // Uncompilable body: never retry OSR for any header of it.
+            self.jit_osr_disabled.insert((fid, u32::MAX));
             return Ok(None);
         };
         let ptrs = jit::JitReentryPtrs {
@@ -1293,18 +1306,23 @@ impl Interpreter {
             frame_index: top_idx,
         };
         match code.osr_entry(ptrs, osr_pc) {
-            // No trampoline for this header — keep interpreting, but don't keep
-            // re-counting/recompiling: this header is not an OSR target.
+            // No trampoline for this header — it's not an OSR target. Disable
+            // just this header and re-arm so another header can still tier up.
             None => {
-                self.jit_osr_disabled.insert(fid);
+                self.jit_osr_disabled.insert((fid, osr_pc));
+                self.jit_osr_count = 0;
                 Ok(None)
             }
             Some(jit::JitExecOutcome::Bailed(pc)) => {
                 // Compiled body hit a guard or unsupported opcode. Resume the
                 // interpreter at the exact bail PC (committed side effects are
-                // preserved); disable OSR so we don't thrash entering/re-bailing.
+                // preserved). Disable only this loop header (not the whole
+                // function) and re-arm: a different hot loop in the same body
+                // (e.g. the real kernel after a one-off setup loop that bails)
+                // can still tier up.
                 stack[top_idx].pc = pc;
-                self.jit_osr_disabled.insert(fid);
+                self.jit_osr_disabled.insert((fid, osr_pc));
+                self.jit_osr_count = 0;
                 Ok(None)
             }
             Some(jit::JitExecOutcome::Returned(value)) => {
@@ -1527,6 +1545,7 @@ impl Interpreter {
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         let mut view = context.jit_function_view(fid)?;
         self.bake_inline_property_loads(&mut view);
+        Self::bake_typed_array_layout(&mut view);
         let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
         let (regs, params) = (view.register_count, view.param_count);
         let hook = self.jit_hook.as_ref()?.clone();
@@ -1585,6 +1604,34 @@ impl Interpreter {
         if baked_any {
             view.cage_base = otter_gc::cage_base() as usize;
         }
+    }
+
+    /// Bake the static heap-layout offsets for the JIT's inline typed-array
+    /// element fast path, and ensure `cage_base` is set so the emitter enables
+    /// inline `LoadElement`/`StoreElement` (the offsets are isolate-independent
+    /// `#[repr(C)]` constants, but inline access still needs the cage base to
+    /// decompress receiver / buffer pointers).
+    fn bake_typed_array_layout(view: &mut jit::JitFunctionView) {
+        use crate::binary::array_buffer as ab;
+        use crate::binary::typed_array as ta;
+        let header = otter_gc::header::HEADER_SIZE as u32;
+        let buffer_base = header + ta::TYPED_ARRAY_BODY_BUFFER_OFFSET as u32;
+        view.ta_layout = jit::JitTypedArrayLayout {
+            ta_type_tag: ta::TYPED_ARRAY_BODY_TYPE_TAG,
+            local_buffer_type_tag: ab::LOCAL_ARRAY_BUFFER_BODY_TYPE_TAG,
+            kind_float64: ta::TypedArrayKind::Float64 as u32,
+            kind_int32: ta::TypedArrayKind::Int32 as u32,
+            buffer_local_tag: ab::BUFFER_STORAGE_LOCAL_TAG,
+            ta_kind_byte: header + ta::TYPED_ARRAY_BODY_KIND_OFFSET as u32,
+            ta_byte_offset_byte: header + ta::TYPED_ARRAY_BODY_BYTE_OFFSET_OFFSET as u32,
+            ta_length_byte: header + ta::TYPED_ARRAY_BODY_LENGTH_OFFSET as u32,
+            ta_length_tracking_byte: header + ta::TYPED_ARRAY_BODY_LENGTH_TRACKING_OFFSET as u32,
+            buffer_disc_byte: buffer_base + ab::BUFFER_STORAGE_DISCRIMINANT_OFFSET as u32,
+            buffer_handle_byte: buffer_base + ab::BUFFER_STORAGE_HANDLE_OFFSET as u32,
+            // Vec<u8> base; otter-jit adds the probed ptr/len word sub-offsets.
+            buf_bytes_byte: header + ab::LOCAL_ARRAY_BUFFER_BODY_BYTES_OFFSET as u32,
+        };
+        view.cage_base = otter_gc::cage_base() as usize;
     }
 
     /// Return the current observational runtime budget policy.

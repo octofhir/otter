@@ -64,8 +64,53 @@ pub struct JitFunctionView {
     /// to a compressed `Gc` offset to decompress an object pointer without a
     /// runtime load. `0` when no inline access is baked.
     pub cage_base: usize,
+    /// Static heap-layout offsets for inline typed-array element access. Baked
+    /// once at compile time from `otter-vm`'s `#[repr(C)]` body layouts so the
+    /// emitter stays layout-agnostic. The emitter inlines `LoadElement` /
+    /// `StoreElement` for monomorphic `Float64Array` / `Int32Array` receivers
+    /// only when [`cage_base`](Self::cage_base) is non-zero (baked).
+    pub ta_layout: JitTypedArrayLayout,
     /// Instruction stream in byte-PC order.
     pub instructions: Vec<JitInstrView>,
+}
+
+/// Ready-to-use byte offsets and tags for the JIT's inline typed-array
+/// element fast path, baked from `otter-vm`'s `#[repr(C)]` body layouts.
+///
+/// All `*_byte` fields are offsets **from the decompressed GC pointer**
+/// (i.e. they already include the GC header), so the emitter adds them straight
+/// to `cage_base + compressed_offset`. The chain a `LoadElement`/`StoreElement`
+/// walks: receiver `Value` → typed-array body (`ta_*`) → embedded buffer handle
+/// (`buffer_*`) → local array-buffer body (`buf_*`) → `Vec<u8>` data pointer.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JitTypedArrayLayout {
+    /// `GcHeader::type_tag` of a `TypedArrayBodyGc` (guarded at byte 0).
+    pub ta_type_tag: u8,
+    /// `GcHeader::type_tag` of a `LocalArrayBufferBodyGc` (guarded at byte 0).
+    pub local_buffer_type_tag: u8,
+    /// `TypedArrayKind` discriminant for `Float64Array` (inlined kind).
+    pub kind_float64: u32,
+    /// `TypedArrayKind` discriminant for `Int32Array` (inlined kind).
+    pub kind_int32: u32,
+    /// `BufferStorage` discriminant value selecting the `Local` variant.
+    pub buffer_local_tag: u32,
+    /// Offset to the `TypedArrayBodyGc.kind` `u32`.
+    pub ta_kind_byte: u32,
+    /// Offset to the `TypedArrayBodyGc.byte_offset` `usize`.
+    pub ta_byte_offset_byte: u32,
+    /// Offset to the `TypedArrayBodyGc.length` `usize` (element count).
+    pub ta_length_byte: u32,
+    /// Offset to the `TypedArrayBodyGc.length_tracking` `bool`.
+    pub ta_length_tracking_byte: u32,
+    /// Offset to the `BufferStorage` discriminant inside the embedded buffer.
+    pub buffer_disc_byte: u32,
+    /// Offset to the `BufferStorage` 4-byte compressed handle payload.
+    pub buffer_handle_byte: u32,
+    /// Offset to the `LocalArrayBufferBodyGc.bytes` `Vec<u8>` itself (its first
+    /// word). The emitter adds the probed `Vec<u8>` data-pointer and length
+    /// sub-offsets to this — the std `Vec` field order is not guaranteed, so
+    /// `otter-jit` discovers it by value-identity rather than hardcoding it.
+    pub buf_bytes_byte: u32,
 }
 
 /// Baked monomorphic inline property-load plan for one `LoadProperty` site.

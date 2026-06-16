@@ -181,6 +181,10 @@ impl ExecutableFunction {
             // Baked by `Interpreter::compile_jit_function`, which holds the
             // cage base and the live property-IC tables.
             cage_base: 0,
+            // Baked alongside `cage_base` by `compile_jit_function`; the
+            // all-zero default is never read because the emitter gates inline
+            // element access on `cage_base != 0`.
+            ta_layout: crate::jit::JitTypedArrayLayout::default(),
             instructions: self
                 .code
                 .iter()

@@ -499,6 +499,38 @@ objects, which json.js never exercises (it only reads `back.length`). **Reverted
 Lesson: dict-mode is not a parse-throughput win — only helps access-heavy
 consumers of parsed JSON, which no current bench measures.
 
+### Array/sort callback per-element cost — profiled (2026-06-17), fix is an attended slice
+
+`sample` of a hot `forEach(x=>{s+=x})` (after 3d/3e inlined the upvalue ops) shows
+the per-element cost is no longer property stubs but **frame teardown /
+allocation**: `Interpreter::return_stack` ~106 self-samples, `alloc` ~18,
+`call_ops` ~32, `build_upvalues_for_count` ~3. The callback **does** compile (fid
+tiers up) and runs through `dispatch_jit_sync_entry`'s fast terminal path
+(`inner.pop()` → `reclaim_registers` → `return_stack`). With `regs ≤ 8` the
+registers are inline (nothing to reclaim), so the dominant repeated cost is the
+**per-call upvalue-spine `Box<[UpvalueCell]>`**: allocated by the
+`body.upvalues.clone().into_boxed_slice()` in `bytecode_call_target_parts`
+(`call_ops.rs`) and freed when the terminated frame drops. 12M calls × (alloc +
+free) of a tiny capturing-closure spine.
+
+**Fix options (all touch the hot call path — do attended, gate with benches +
+test262 call/closure/generator dirs + GC stress, revert on any regression):**
+1. **Length-keyed spine pool** (lowest type-churn): pool `Box<[UpvalueCell]>` by
+   length; `reclaim_upvalue_spine(frame)` nulls + pools it, the build site pops a
+   same-length box and overwrites its cells (no `into_boxed_slice` realloc).
+   Friction: the clone is inside a `heap.read_payload` closure and the pool draw
+   needs `&mut self` — restructure `bytecode_call_target_parts` into a
+   `&mut self` method (3 callers: `run_callable_sync_inner`,
+   `jit_prepare_direct_call`, `jit_prepare_direct_method_call`), reading the spine
+   length first then filling a pre-drawn box.
+2. **`Rc<[UpvalueCell]>` spine** shared between the closure body and the frame —
+   the clone becomes a refcount bump (no alloc). Cleanest steady-state but changes
+   `UpvalueSpine` (~20 sites) + the closure body field + GC tracing.
+3. **Per-element frame reuse** in the array builtins (the earlier-deferred lever).
+
+`run_callable_sync_already_rooted` is already used by the array loop (Slice 3e);
+the extra-roots push/pop is no longer the cost — the spine churn is.
+
 ### 3f — next (not started)
 - **The real array-ops/sort lever remains untouched**: `run_callable_sync` builds
   a fresh callee frame (incl. a per-call upvalue-spine clone in

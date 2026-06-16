@@ -1559,6 +1559,33 @@ impl Interpreter {
         result
     }
 
+    /// Synchronous callable re-entry for callers that already hold a live
+    /// [`otter_gc::ExtraRoots`] registration for this interpreter on the heap's
+    /// LIFO stack — specifically the JIT call bridge ([`Interpreter::jit_runtime_call`]).
+    ///
+    /// Compiled code only ever runs under an enclosing `dispatch_loop`
+    /// (loop-OSR / function-entry tier-up) or under [`Self::run_callable_sync`]
+    /// itself, both of which push `ExtraRoots::new(self as &Interpreter)` before
+    /// entering compiled code. That registration traces runtime-global roots
+    /// (shape tables, `globalThis`, module envs, the microtask queue) which are
+    /// frame-independent, so a second push for the nested call is a pure
+    /// duplicate the heap's `same_source` walk already skips. Eliding it removes
+    /// a `Vec` push/truncate per JIT→VM call without changing the traced root
+    /// set. The stack-overflow guard (`enter_sync_reentry`) is retained because
+    /// each level still consumes native stack.
+    pub(crate) fn run_callable_sync_already_rooted(
+        &mut self,
+        context: &ExecutionContext,
+        callee: &Value,
+        this_value: Value,
+        args: SmallVec<[Value; 8]>,
+    ) -> Result<Value, VmError> {
+        self.enter_sync_reentry()?;
+        let result = self.run_callable_sync_inner(context, callee, this_value, args);
+        self.leave_sync_reentry();
+        result
+    }
+
     fn run_callable_sync_inner(
         &mut self,
         context: &ExecutionContext,

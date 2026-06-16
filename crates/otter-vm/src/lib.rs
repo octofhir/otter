@@ -470,7 +470,13 @@ pub struct Interpreter {
     /// Compiled-code cache keyed by global function id. `Some(code)` is an
     /// installed baseline body; `None` records a function the emitter could not
     /// compile (outside the supported subset), so it is never retried.
-    jit_code: std::collections::BTreeMap<u32, Option<std::sync::Arc<dyn jit::JitFunctionCode>>>,
+    jit_code: rustc_hash::FxHashMap<u32, Option<std::sync::Arc<dyn jit::JitFunctionCode>>>,
+    /// Single-entry monomorphic cache over [`Self::jit_code`] for the hot
+    /// compiled→compiled call bridge ([`Self::jit_runtime_call`]). Records the
+    /// last function id whose installed body is a non-OSR baseline body, so a
+    /// repeated call to the same callee skips the map probe entirely. Cleared
+    /// whenever a new entry is inserted into `jit_code`.
+    jit_code_cache: Option<(u32, std::sync::Arc<dyn jit::JitFunctionCode>)>,
     /// Free-list of spilled register-window backing buffers. Every bytecode
     /// call frame whose `register_count` exceeds the inline `SmallVec` capacity
     /// would otherwise `malloc`/`free` a fresh `Vec<Value>` per call — the hot
@@ -1043,7 +1049,8 @@ impl Interpreter {
                 .and_then(|v| v.parse::<u32>().ok())
                 .filter(|&t| t > 0)
                 .unwrap_or(Self::JIT_OSR_THRESHOLD),
-            jit_code: std::collections::BTreeMap::new(),
+            jit_code: rustc_hash::FxHashMap::default(),
+            jit_code_cache: None,
             reg_pool: Vec::new(),
             runtime_budget: RuntimeBudget::default(),
             runtime_budget_stats: RuntimeBudgetStats::default(),
@@ -1294,6 +1301,7 @@ impl Interpreter {
             None => {
                 let compiled = self.compile_jit_function(context, fid);
                 self.jit_code.insert(fid, compiled.clone());
+                self.jit_code_cache = None;
                 compiled
             }
         };
@@ -1393,6 +1401,7 @@ impl Interpreter {
             }
             let compiled = self.compile_jit_function(context, fid);
             self.jit_code.insert(fid, compiled.clone());
+            self.jit_code_cache = None;
             compiled
         };
         // The function-entry path never runs OSR-only code (compiled with
@@ -1448,6 +1457,26 @@ impl Interpreter {
             .registers
             .get(callee_reg as usize)
             .ok_or(VmError::InvalidOperand)?;
+
+        // Fast monomorphic compiled→compiled path: a plain bytecode closure /
+        // function with a simple signature whose baseline body is already
+        // installed is entered directly, binding arguments straight from the
+        // (rooted) caller window into a freshly drawn callee window — no generic
+        // re-entry preamble, no intermediate argument `SmallVec`, no per-call
+        // compiled-code map probe. Anything outside that shape returns `None` and
+        // takes the full synchronous re-entry below (which also drives tier-up).
+        if let Some(result) =
+            self.try_jit_fast_call(context, stack, frame_index, callee, callee_reg, arg_regs)?
+        {
+            let frame = stack.get_mut(frame_index).ok_or(VmError::InvalidOperand)?;
+            *frame
+                .registers
+                .get_mut(dst as usize)
+                .ok_or(VmError::InvalidOperand)? = result;
+            return Ok(());
+        }
+
+        let frame = stack.get(frame_index).ok_or(VmError::InvalidOperand)?;
         let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(arg_regs.len());
         for &r in arg_regs {
             args.push(
@@ -1457,13 +1486,173 @@ impl Interpreter {
                     .ok_or(VmError::InvalidOperand)?,
             );
         }
-        let result = self.run_callable_sync(context, &callee, Value::undefined(), args)?;
+        let result =
+            self.run_callable_sync_already_rooted(context, &callee, Value::undefined(), args)?;
         let frame = stack.get_mut(frame_index).ok_or(VmError::InvalidOperand)?;
         *frame
             .registers
             .get_mut(dst as usize)
             .ok_or(VmError::InvalidOperand)? = result;
         Ok(())
+    }
+
+    /// Resolve `fid`'s installed non-OSR baseline body through the single-entry
+    /// monomorphic cache, falling back to the [`Self::jit_code`] map probe and
+    /// refreshing the cache on a hit. Returns `None` when no compiled body is
+    /// installed yet, the body is OSR-only, or the function was marked
+    /// uncompilable — every such case defers to the full re-entry path so the
+    /// normal tier-up counter keeps advancing.
+    fn jit_resolve_compiled_cached(
+        &mut self,
+        fid: u32,
+    ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
+        if let Some((cached_fid, code)) = &self.jit_code_cache
+            && *cached_fid == fid
+        {
+            return Some(code.clone());
+        }
+        let code = self.jit_code.get(&fid)?.clone()?;
+        if code.osr_only() {
+            return None;
+        }
+        self.jit_code_cache = Some((fid, code.clone()));
+        Some(code)
+    }
+
+    /// Attempt the fast compiled→compiled call. Returns `Ok(Some(value))` when
+    /// the callee was a simple, already-compiled bytecode target and ran to
+    /// completion; `Ok(None)` when the callee falls outside the fast shape (the
+    /// caller then takes the generic re-entry path); `Err` on a callee throw or
+    /// a synchronous-re-entry stack-depth overflow.
+    ///
+    /// GC discipline mirrors [`Self::run_callable_sync_inner`]'s bytecode
+    /// branch exactly — upvalue spine built, sloppy-`this` coercion (which never
+    /// allocates here because the JIT call binding is always `undefined`), then
+    /// the register window drawn — and re-reads the closure handle from the
+    /// rooted caller slot when recording the per-instance SELF binding, so an
+    /// allocation in between cannot leave it dangling.
+    fn try_jit_fast_call(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut jit::JitFrameStack,
+        frame_index: usize,
+        callee: Value,
+        callee_reg: u16,
+        arg_regs: &[u16],
+    ) -> Result<Option<Value>, VmError> {
+        // Plain bytecode target only — bound functions, proxies, class
+        // constructors, and natives carry distinct Value tags and miss here.
+        let Ok((function_id, parent_upvalues, this0, new_target, derived_this, eval_env)) =
+            Self::bytecode_call_target_parts(callee, Value::undefined(), &self.gc_heap)
+        else {
+            return Ok(None);
+        };
+        // No captured new.target / derived-this cell / inherited eval env.
+        if new_target.is_some() || derived_this.is_some() || eval_env.is_some() {
+            return Ok(None);
+        }
+        let Some(function) = context.exec_function(function_id) else {
+            return Ok(None);
+        };
+        // Simple signature only: generators / async suspend, `arguments` / rest
+        // need the cold-frame machinery, direct eval needs an eval env, and a
+        // class constructor must reject [[Call]] through the generic path.
+        if function.is_generator
+            || function.is_async
+            || function.is_async_generator
+            || function.needs_arguments
+            || function.has_rest
+            || function.contains_direct_eval
+            || function.is_derived_constructor
+        {
+            return Ok(None);
+        }
+        let Some(code) = self.jit_resolve_compiled_cached(function_id) else {
+            return Ok(None);
+        };
+
+        // Committed: this consumes native stack like any nested call, so it is
+        // bounded by the same synchronous-re-entry guard.
+        self.enter_sync_reentry()?;
+        let outcome = self.run_jit_fast_call_committed(
+            context,
+            stack,
+            frame_index,
+            function,
+            parent_upvalues,
+            this0,
+            &code,
+            callee_reg,
+            arg_regs,
+        );
+        self.leave_sync_reentry();
+        outcome.map(Some)
+    }
+
+    /// Build the callee frame for the fast call and run its compiled body,
+    /// continuing on the interpreter if it bails. Split out so the
+    /// synchronous-re-entry guard in [`Self::try_jit_fast_call`] brackets exactly
+    /// this work.
+    #[allow(clippy::too_many_arguments)]
+    fn run_jit_fast_call_committed(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut jit::JitFrameStack,
+        frame_index: usize,
+        function: &crate::executable::ExecutableFunction,
+        parent_upvalues: crate::frame_state::UpvalueSpine,
+        this0: Value,
+        code: &std::sync::Arc<dyn jit::JitFunctionCode>,
+        callee_reg: u16,
+        arg_regs: &[u16],
+    ) -> Result<Value, VmError> {
+        let upvalues =
+            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
+        let this_for_callee = self.this_for_bytecode_call_runtime_rooted(function, this0, &[])?;
+        let registers = self.draw_registers(function.register_count as usize);
+        let mut new_frame =
+            Frame::with_exec_registers(function, None, upvalues, this_for_callee, registers);
+
+        // Bind formals directly from the rooted caller window, and re-read the
+        // callee value from that same (GC-updated) slot for the SELF binding.
+        let bind_count = (function.param_count as usize).min(arg_regs.len());
+        let callee_now = {
+            let caller = stack.get(frame_index).ok_or(VmError::InvalidOperand)?;
+            for (dst_slot, &src) in new_frame
+                .registers
+                .iter_mut()
+                .zip(arg_regs.iter())
+                .take(bind_count)
+            {
+                *dst_slot = *caller
+                    .registers
+                    .get(src as usize)
+                    .ok_or(VmError::InvalidOperand)?;
+            }
+            *caller
+                .registers
+                .get(callee_reg as usize)
+                .ok_or(VmError::InvalidOperand)?
+        };
+        if let Some(closure) = callee_now.as_closure(&self.gc_heap) {
+            self.frame_ensure_cold(&mut new_frame).callee_closure = Some(closure);
+        }
+
+        let mut inner: SmallVec<[Frame; 8]> = SmallVec::new();
+        inner.push(new_frame);
+        match self.run_compiled_frame(&mut inner, context, 0, code) {
+            jit::JitExecOutcome::Returned(value) => {
+                if let Some(mut done) = inner.pop() {
+                    self.reclaim_registers(&mut done);
+                }
+                Ok(value)
+            }
+            jit::JitExecOutcome::Threw(err) => Err(err),
+            jit::JitExecOutcome::Bailed(pc) => {
+                inner[0].pc = pc;
+                self.dispatch_loop(context, &mut inner)
+            }
+        }
     }
 
     /// JIT bridge — build the closure for a `MakeFunction` from compiled code,

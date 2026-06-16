@@ -150,8 +150,8 @@ pub fn with_program_goal<R>(
             ..Default::default()
         });
     let ret = parser.parse();
-    if !ret.errors.is_empty() {
-        return Err(SyntaxError::from_oxc(&ret.errors));
+    if !ret.diagnostics.is_empty() {
+        return Err(SyntaxError::from_oxc(&ret.diagnostics));
     }
     Ok(f(&ret.program))
 }

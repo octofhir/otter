@@ -33,17 +33,17 @@ impl SyntaxDiagnostic {
     /// Build a diagnostic from an OXC parser diagnostic.
     #[must_use]
     pub fn from_oxc(diagnostic: &OxcDiagnostic) -> Self {
-        let range = diagnostic.labels.as_ref().and_then(|labels| {
-            labels
-                .iter()
-                .find(|label| label.primary())
-                .or_else(|| labels.first())
-                .map(|label| {
-                    let start = usize_to_u32(label.offset());
-                    let end = usize_to_u32(label.offset().saturating_add(label.len()));
-                    (start, end)
-                })
-        });
+        let labels = diagnostic.labels.as_slice();
+        let range = labels
+            .iter()
+            .find(|label| label.primary())
+            .or_else(|| labels.first())
+            .map(|label| {
+                // miette ≥3.0 reports byte offsets/lengths as `u32` directly.
+                let start = label.offset();
+                let end = start.saturating_add(label.len());
+                (start, end)
+            });
         Self {
             code: "SYNTAX_ERROR".to_string(),
             message: diagnostic.to_string(),
@@ -101,8 +101,4 @@ impl SyntaxError {
             diagnostics,
         }
     }
-}
-
-fn usize_to_u32(value: usize) -> u32 {
-    u32::try_from(value).unwrap_or(u32::MAX)
 }

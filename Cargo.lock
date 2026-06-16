@@ -2190,9 +2190,9 @@ checksum = "9c6901729fa79e91a0913333229e9ca5dc725089d1c363b2f4b4760709dc4a52"
 
 [[package]]
 name = "oxc-miette"
-version = "2.7.1"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4356a61f2ed4c9b3610245215fbf48970eb277126919f87db9d0efa93a74245c"
+checksum = "b776084bf11ad750806cb63f9ed2606a12ab374cf458f36a7731eba1f5d753fc"
 dependencies = [
  "cfg-if",
  "owo-colors",
@@ -2205,9 +2205,9 @@ dependencies = [
 
 [[package]]
 name = "oxc-miette-derive"
-version = "2.7.1"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b237422b014f8f8fff75bb9379e697d13f8d57551a22c88bebb39f073c1bf696"
+checksum = "66e0bafc397eee2f94c5bf89bb5a82ba6d522d1b79e2924c8169f053febb433f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2216,9 +2216,9 @@ dependencies = [
 
 [[package]]
 name = "oxc_allocator"
-version = "0.129.0"
+version = "0.136.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ae84cda3381ab6f90bcab6325d1874ac4bbd71232f2200dc6e866123c8cc4ef"
+checksum = "2ff1abde02d06e45daee3f095b633c30bb9ad38607c6d9f22cce70c2ff38d62c"
 dependencies = [
  "allocator-api2",
  "hashbrown 0.17.0",
@@ -2228,9 +2228,9 @@ dependencies = [
 
 [[package]]
 name = "oxc_ast"
-version = "0.129.0"
+version = "0.136.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4104077919ef54c3ae15f8923a0e44f636c2721dfc11cf168404804af2b726e"
+checksum = "9d5b4c5dbe671c26ebba9e81d8632a8c4288b507f1b69210db87961fa6dc042a"
 dependencies = [
  "bitflags",
  "oxc_allocator",
@@ -2246,9 +2246,9 @@ dependencies = [
 
 [[package]]
 name = "oxc_ast_macros"
-version = "0.129.0"
+version = "0.136.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8004e158aa037d7e14ea85fccbcf4a320c3412ad9da9a3df5df85c52ee5585f"
+checksum = "2a241ebde1bbe9328fb134abe933176f09b89decb6aa6047200436c241505c74"
 dependencies = [
  "phf",
  "proc-macro2",
@@ -2258,9 +2258,9 @@ dependencies = [
 
 [[package]]
 name = "oxc_ast_visit"
-version = "0.129.0"
+version = "0.136.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97735a9e890873bf1b13a5a98f0b4d5ba1ab604259cf4d5950704bbfdb51bc5b"
+checksum = "2ca2672d986140e9c03c473203cdb4630f6cc704cddfd6cb753ea770284944bc"
 dependencies = [
  "oxc_allocator",
  "oxc_ast",
@@ -2270,15 +2270,15 @@ dependencies = [
 
 [[package]]
 name = "oxc_data_structures"
-version = "0.129.0"
+version = "0.136.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0df39892508c04e3d44ccbf7e384fb35bac3750f39984f7cef47949dc321571a"
+checksum = "0701d254926331257e9be93d6d2937390b93f5bbdf6243f73e3128b0d2bb8f54"
 
 [[package]]
 name = "oxc_diagnostics"
-version = "0.129.0"
+version = "0.136.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4312c021972d746e1bb06051d1e887b80ad2b98f772b7b2aec204ddf585779c"
+checksum = "2daf5f7aede9a68b8d9ea28907632f860e284aca9862f2fee0deff288d16aff5"
 dependencies = [
  "cow-utils",
  "oxc-miette",
@@ -2287,9 +2287,9 @@ dependencies = [
 
 [[package]]
 name = "oxc_ecmascript"
-version = "0.129.0"
+version = "0.136.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9db328a0a6163105e188e2ff4620fb4a065daf2001e4a7318b3342605bacaa9e"
+checksum = "1cb2763772878505ba1d0bcc2931adc4161374791933105e095f917c34230f5f"
 dependencies = [
  "cow-utils",
  "num-bigint",
@@ -2303,15 +2303,15 @@ dependencies = [
 
 [[package]]
 name = "oxc_estree"
-version = "0.129.0"
+version = "0.136.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db4f0258b3b9994f27bb11e1bc8fdedd6a22281307e53148ac76d72e61c93481"
+checksum = "d972254295a3200aabef1fc7dd382694e1664afadd6962a3d0e1f82550310d9a"
 
 [[package]]
 name = "oxc_index"
-version = "4.1.0"
+version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb3e6120999627ec9703025eab7c9f410ebb7e95557632a8902ca48210416c2b"
+checksum = "191884bee6c3744909a51acc7d78d4ae370d817b25875b10642f632327b6296e"
 dependencies = [
  "nonmax",
  "serde",
@@ -2319,9 +2319,9 @@ dependencies = [
 
 [[package]]
 name = "oxc_parser"
-version = "0.129.0"
+version = "0.136.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fcb901b425989d315e1c536f561d6f92260731a1e1c1418c1ba4cc203167124"
+checksum = "fbc60cb7bd0571a91d4b887bbc4ffc47bc662cb8ae3ff1025679690572072968"
 dependencies = [
  "bitflags",
  "cow-utils",
@@ -2343,9 +2343,9 @@ dependencies = [
 
 [[package]]
 name = "oxc_regular_expression"
-version = "0.129.0"
+version = "0.136.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2825d55dd483df5d641087ab515547bee282639ecff26a32e66356cd273b40d"
+checksum = "c5b0cc5a451ebfe951a680ca2407e9ca9fcb2c827be1d94291dcd07ceaf0c539"
 dependencies = [
  "bitflags",
  "oxc_allocator",
@@ -2387,9 +2387,9 @@ dependencies = [
 
 [[package]]
 name = "oxc_span"
-version = "0.129.0"
+version = "0.136.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dff4df78f3fd004daf1dd0301cac40b34451c42e56dd46f7a7dcefd0cc582ef3"
+checksum = "189ad3c3c0b7bd7f4710f8efbfb277565e1f171c1ebc0298ec5d530c0d1a1fbb"
 dependencies = [
  "compact_str",
  "oxc-miette",
@@ -2401,9 +2401,9 @@ dependencies = [
 
 [[package]]
 name = "oxc_str"
-version = "0.129.0"
+version = "0.136.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0273521fbd4655da9c5b2f659f4cc7f2e5370a573b54d37a4456c336c7bc8af6"
+checksum = "7b77bc4ed1133165825c5408e9f469c0bebb500b7dedda4225246c5111906ceb"
 dependencies = [
  "compact_str",
  "hashbrown 0.17.0",
@@ -2413,9 +2413,9 @@ dependencies = [
 
 [[package]]
 name = "oxc_syntax"
-version = "0.129.0"
+version = "0.136.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0dcdc65090dfc024c9f0d156ff0e1f9b139b7954552cd6c8de02bd6d2362679f"
+checksum = "c1a3c4fabd8698f647082094643d4e467453b1ea14bab059173b14f48630f5b4"
 dependencies = [
  "bitflags",
  "cow-utils",

@@ -47,6 +47,22 @@ run *args:
 clean:
     cargo clean
 
+# === OtterLab benchmark / differential harness (Phase 0) ===
+
+# Collect cross-runtime benchmark timings → benchmarks/results/latest.{md,json}.
+# Requires the release binary: `just release` first. Pass scripts/flags through.
+bench *args:
+    node benchmarks/bench.mjs {{args}}
+
+# Same, including the forced-early-OSR Otter tier alongside interp + jit.
+bench-osr *args:
+    node benchmarks/bench.mjs --only otter,otter-jit,otter-jit-osr {{args}}
+
+# Prove every benchmarks/scripts/* is output-identical across Otter tiers
+# (interp = oracle vs jit vs forced-OSR). Non-zero exit on any mismatch.
+bench-diff *args:
+    node benchmarks/diff.mjs {{args}}
+
 # === Examples ===
 
 # Run a JavaScript example

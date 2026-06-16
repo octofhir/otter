@@ -66,6 +66,17 @@ const RUNTIMES = [
     env: { OTTER_JIT: "1" }, // baseline JIT enabled
   },
   {
+    name: "otter-jit-osr",
+    bin: otterBin(),
+    argv: (f) => [otterBin(), ["run", f]],
+    ts: true,
+    // Forced early loop OSR: tier up on the first back-edge so the OSR/compiled
+    // loop path is exercised even on short workloads. Opt-in (see --only); not
+    // in the default set so the headline table stays interp vs jit vs externals.
+    env: { OTTER_JIT: "1", OTTER_JIT_OSR_THRESHOLD: "1" },
+    optIn: true,
+  },
+  {
     name: "node",
     bin: "node",
     // Node strips TypeScript types by default from v23.6 (and v22.18 LTS).
@@ -124,6 +135,7 @@ function detect(rt) {
 
 let runtimes = RUNTIMES.filter(detect);
 if (onlyRuntimes) runtimes = runtimes.filter((r) => onlyRuntimes.includes(r.name));
+else runtimes = runtimes.filter((r) => !r.optIn); // opt-in tiers (forced OSR) only via --only
 if (!runtimes.length) {
   console.error("no runtimes available");
   process.exit(1);

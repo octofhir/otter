@@ -64,8 +64,8 @@ fn render_human_diagnostic(diagnostic: &Diagnostic) -> Option<String> {
     if let Some(range) = diagnostic.range.or(diagnostic.span) {
         report = report.with_label(LabeledSpan::new_primary_with_span(
             Some(diagnostic.code.clone()),
-            usize::try_from(range.0).unwrap_or(usize::MAX)
-                ..usize::try_from(range.1).unwrap_or(usize::MAX),
+            // miette ≥3.0 spans are `u32` byte offsets; `range` is already `(u32, u32)`.
+            range.0..range.1,
         ));
     }
 

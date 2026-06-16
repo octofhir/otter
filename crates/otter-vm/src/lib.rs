@@ -1589,7 +1589,12 @@ impl Interpreter {
         parent_upvalues: crate::frame_state::UpvalueSpine,
         this0: Value,
         plan: jit::JitDirectCallPlan,
-        callee_reg: u16,
+        // `Some(reg)` for `Op::Call` (the callee closure lives in a caller
+        // register and is re-read post-allocation for the named-function SELF
+        // binding). `None` for the method-call path, where the callee is the
+        // IC-resolved method value, not a caller register — that path bails
+        // eligibility on `makes_function`, so no SELF re-read is needed.
+        callee_reg: Option<u16>,
         arg_regs: &[u16],
     ) -> Result<jit::JitPreparedDirectCall, VmError> {
         let upvalues =
@@ -1619,13 +1624,18 @@ impl Interpreter {
                     .get(src as usize)
                     .ok_or(VmError::InvalidOperand)?;
             }
-            *caller
-                .registers
-                .get(callee_reg as usize)
-                .ok_or(VmError::InvalidOperand)?
+            match callee_reg {
+                Some(reg) => Some(
+                    *caller
+                        .registers
+                        .get(reg as usize)
+                        .ok_or(VmError::InvalidOperand)?,
+                ),
+                None => None,
+            }
         };
         if function.makes_function
-            && let Some(closure) = callee_now.as_closure(&self.gc_heap)
+            && let Some(closure) = callee_now.and_then(|v| v.as_closure(&self.gc_heap))
         {
             self.frame_ensure_cold(callee_frame.frame_mut())
                 .callee_closure = Some(closure);
@@ -1700,7 +1710,107 @@ impl Interpreter {
             parent_upvalues,
             this0,
             plan,
-            callee_reg,
+            Some(callee_reg),
+            arg_regs,
+        ) {
+            Ok(prepared) => {
+                self.jit_runtime_stats.direct_calls =
+                    self.jit_runtime_stats.direct_calls.saturating_add(1);
+                Ok(Some(prepared))
+            }
+            Err(err) => {
+                self.leave_sync_reentry();
+                Err(err)
+            }
+        }
+    }
+
+    /// Prepare an eligible compiled **method** callee (`recv.name(args…)`) for
+    /// direct machine-code entry, the `CallMethodValue` analogue of
+    /// [`Self::jit_prepare_direct_call`].
+    ///
+    /// Resolves the method through the call site's monomorphic load IC (only the
+    /// IC-cacheable own/direct-prototype data-slot case; anything else returns
+    /// `Ok(None)`), then publishes a callee frame bound with `this = recv`.
+    /// Returns `Ok(None)` for any cold / ineligible / non-object-receiver case so
+    /// the emitted site falls back to the in-place full method-call stub (not a
+    /// bail — a native/polymorphic method in a hot loop must keep running
+    /// compiled). On `Ok(Some(_))` the callee frame is published and the
+    /// sync-reentry guard is held until a direct-call finish/abort helper runs.
+    ///
+    /// # Errors
+    /// Propagates a sync-reentry stack-depth overflow or a frame-build failure.
+    pub fn jit_prepare_direct_method_call(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut jit::JitFrameStack,
+        frame_index: usize,
+        recv_reg: u16,
+        name_idx: u32,
+        site: usize,
+        arg_regs: &[u16],
+    ) -> Result<Option<jit::JitPreparedDirectCall>, VmError> {
+        self.jit_runtime_stats.runtime_calls =
+            self.jit_runtime_stats.runtime_calls.saturating_add(1);
+        let recv = *stack
+            .get(frame_index)
+            .ok_or(VmError::InvalidOperand)?
+            .registers
+            .get(recv_reg as usize)
+            .ok_or(VmError::InvalidOperand)?;
+        let Some(obj) = recv.as_object() else {
+            return Ok(None);
+        };
+        let Some(key) = context.property_atom(name_idx) else {
+            return Ok(None);
+        };
+        // Monomorphic IC-resolved data-slot method only; misses (accessor, deep
+        // proto, polymorphic, absent) return None → in-place fallback.
+        let Some(method) = self.resolve_method_ic(obj, key, site) else {
+            return Ok(None);
+        };
+        let Ok((function_id, parent_upvalues, this0, new_target, derived_this, eval_env)) =
+            Self::bytecode_call_target_parts(method, recv, &self.gc_heap)
+        else {
+            return Ok(None);
+        };
+        if new_target.is_some() || derived_this.is_some() || eval_env.is_some() {
+            return Ok(None);
+        }
+        let Some(function) = context.exec_function(function_id) else {
+            return Ok(None);
+        };
+        if function.is_generator
+            || function.is_async
+            || function.is_async_generator
+            || function.needs_arguments
+            || function.has_rest
+            || function.contains_direct_eval
+            || function.is_derived_constructor
+            // The method path carries no caller register for the callee, so it
+            // cannot re-root the closure post-allocation for a named-function
+            // SELF binding; bail those to the in-place fallback.
+            || function.makes_function
+        {
+            return Ok(None);
+        }
+        let Some(code) = self.jit_resolve_compiled_cached(function_id) else {
+            return Ok(None);
+        };
+        let Some(plan) = Self::jit_direct_call_plan_for(function, code.as_ref()) else {
+            return Ok(None);
+        };
+
+        self.enter_sync_reentry()?;
+        match self.prepare_jit_direct_call_frame(
+            context,
+            stack,
+            frame_index,
+            function,
+            parent_upvalues,
+            this0,
+            plan,
+            None,
             arg_regs,
         ) {
             Ok(prepared) => {
@@ -1909,7 +2019,7 @@ impl Interpreter {
             parent_upvalues,
             this0,
             direct_plan,
-            callee_reg,
+            Some(callee_reg),
             arg_regs,
         )?;
         let idx = prepared.frame_index;

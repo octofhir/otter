@@ -192,6 +192,54 @@ extern "C" fn jit_prepare_direct_call_stub(
     }
 }
 
+/// Prepare a direct compiled **method** call (`recv.name(args…)`). Same
+/// `ctx.direct_*` / status contract as [`jit_prepare_direct_call_stub`], but
+/// status `2` means "ineligible — use the in-place full method-call stub"
+/// rather than "bail to the interpreter" (a native/polymorphic method in a hot
+/// loop must keep running compiled).
+#[allow(clippy::too_many_arguments)]
+extern "C" fn jit_prepare_direct_method_call_stub(
+    ctx: *mut JitCtx,
+    recv: u64,
+    name_idx: u64,
+    site: u64,
+    argc: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    let all = [a0 as u16, a1 as u16, a2 as u16];
+    let argc = (argc as usize).min(all.len());
+    match vm.jit_prepare_direct_method_call(
+        context,
+        stack,
+        ctx.frame_index,
+        recv as u16,
+        name_idx as u32,
+        site as usize,
+        &all[..argc],
+    ) {
+        Ok(Some(prepared)) => {
+            ctx.direct_entry_addr = prepared.entry_addr;
+            ctx.direct_regs = prepared.regs;
+            ctx.direct_self_closure = prepared.self_closure;
+            ctx.direct_this_value = prepared.this_value;
+            ctx.direct_frame_index = prepared.frame_index;
+            0
+        }
+        Ok(None) => 2,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
 extern "C" fn jit_finish_direct_call_returned_stub(
     ctx: *mut JitCtx,
     dst: u64,
@@ -733,8 +781,8 @@ mod arm64 {
         jit_call_method_stub, jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
         jit_finish_direct_call_returned_stub, jit_load_element_stub, jit_load_global_stub,
         jit_load_prop_stub, jit_load_upvalue_stub, jit_make_fn_stub, jit_prepare_direct_call_stub,
-        jit_store_element_stub, jit_store_prop_stub, jit_store_upvalue_stub,
-        jit_write_barrier_stub, reg_offset,
+        jit_prepare_direct_method_call_stub, jit_store_element_stub, jit_store_prop_stub,
+        jit_store_upvalue_stub, jit_write_barrier_stub, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -1114,37 +1162,12 @@ mod arm64 {
                 Op::Call => {
                     emit_call(&mut ops, ops_ref, bail, threw)?;
                 }
-                // `recv.name(args…)` — resolve + invoke via the safe bridge.
-                // Operands: dst, recv, name-const, argc-const, then argc arg
-                // registers. `recv` and `name_idx` consume two ABI registers, so
-                // at most three inline args fit (x5..x7).
+                // `recv.name(args…)` — IC-resolve the method + direct-branch to
+                // its compiled entry (WhiskerIC method call), falling back to the
+                // in-place full method-call stub when ineligible.
                 Op::CallMethodValue => {
-                    const MAX_METHOD_ARGS: usize = 3;
-                    let dst = reg(ops_ref, 0)?;
-                    let recv = reg(ops_ref, 1)?;
-                    let name = const_index(ops_ref, 2)?;
-                    let argc = const_index(ops_ref, 3)? as usize;
-                    if argc > MAX_METHOD_ARGS {
-                        return Err(Unsupported::ArgCount(argc));
-                    }
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; mov x0, x20
-                        ; movz x1, dst as u32
-                        ; movz x2, recv as u32
-                    );
-                    emit_load_u64(&mut ops, 3, u64::from(name));
-                    dynasm!(ops ; .arch aarch64 ; movz x4, argc as u32);
-                    for slot in 0..MAX_METHOD_ARGS {
-                        let areg = if slot < argc {
-                            reg(ops_ref, 4 + slot)?
-                        } else {
-                            0
-                        };
-                        let xn = 5 + slot as u32;
-                        dynasm!(ops ; .arch aarch64 ; movz X(xn), areg as u32);
-                    }
-                    emit_call_stub(&mut ops, jit_call_method_stub as *const () as usize, threw);
+                    let site = instr.property_ic_site.unwrap_or(usize::MAX) as u64;
+                    emit_method_call(&mut ops, ops_ref, site, threw)?;
                 }
                 // `recv[idx]` — inline dense-`Array` (raw `Value`) and
                 // `Float64Array`/`Int32Array` element load (guarded, no
@@ -1616,9 +1639,6 @@ mod arm64 {
         if argc > MAX_INLINE_ARGS {
             return Err(Unsupported::ArgCount(argc));
         }
-        let direct_returned = ops.new_dynamic_label();
-        let direct_bailed = ops.new_dynamic_label();
-        let direct_threw = ops.new_dynamic_label();
         let direct_done = ops.new_dynamic_label();
 
         // jit_prepare_direct_call_stub(ctx, callee, argc, a0..a3) -> status.
@@ -1649,7 +1669,25 @@ mod arm64 {
             ; b.eq =>bail
         );
 
-        // Construct callee JitCtx on stack.
+        // Direct prepared (status 0): build the callee ctx, branch, finish.
+        emit_direct_call_tail(ops, dst, threw, direct_done);
+        dynasm!(ops ; .arch aarch64 ; =>direct_done);
+        Ok(())
+    }
+
+    /// Shared direct-call dispatch tail used after a prepare stub returned
+    /// status 0 (callee frame published in `ctx.direct_*`). Builds the callee
+    /// `JitCtx` on the native stack, branches to the compiled entry, and runs
+    /// the returned / bailed / threw finish helpers, landing at `done`.
+    fn emit_direct_call_tail(
+        ops: &mut Assembler,
+        dst: u16,
+        threw: DynamicLabel,
+        done: DynamicLabel,
+    ) {
+        let direct_returned = ops.new_dynamic_label();
+        let direct_bailed = ops.new_dynamic_label();
+        let direct_threw = ops.new_dynamic_label();
         dynasm!(ops
             ; .arch aarch64
             ; sub sp, sp, JIT_CTX_STACK_SIZE
@@ -1690,7 +1728,7 @@ mod arm64 {
             jit_finish_direct_call_returned_stub as *const () as usize,
             threw,
         );
-        dynasm!(ops ; .arch aarch64 ; b =>direct_done);
+        dynasm!(ops ; .arch aarch64 ; b =>done);
 
         dynasm!(ops
             ; .arch aarch64
@@ -1706,7 +1744,7 @@ mod arm64 {
             jit_finish_direct_call_bailed_stub as *const () as usize,
             threw,
         );
-        dynasm!(ops ; .arch aarch64 ; b =>direct_done);
+        dynasm!(ops ; .arch aarch64 ; b =>done);
 
         dynasm!(ops
             ; .arch aarch64
@@ -1716,7 +1754,91 @@ mod arm64 {
             ; mov x0, x20
         );
         emit_call_stub(ops, jit_abort_direct_call_stub as *const () as usize, threw);
-        dynasm!(ops ; .arch aarch64 ; b =>threw ; =>direct_done);
+        // The caller places `done` (once) after any trailing fallback code.
+        dynasm!(ops ; .arch aarch64 ; b =>threw);
+    }
+
+    /// Emit a direct `CallMethodValue`: resolve the method through the call
+    /// site's monomorphic IC and direct-branch to its compiled entry, exactly
+    /// like [`emit_call`]; on an ineligible resolution fall back to the in-place
+    /// full method-call stub (not a bail) so cold / native / polymorphic methods
+    /// keep running compiled.
+    fn emit_method_call(
+        ops: &mut Assembler,
+        operands: &[Operand],
+        site: u64,
+        threw: DynamicLabel,
+    ) -> Result<(), Unsupported> {
+        const MAX_METHOD_ARGS: usize = 3;
+        let dst = reg(operands, 0)?;
+        let recv = reg(operands, 1)?;
+        let name = const_index(operands, 2)?;
+        let argc = const_index(operands, 3)? as usize;
+        if argc > MAX_METHOD_ARGS {
+            return Err(Unsupported::ArgCount(argc));
+        }
+
+        let fallback = ops.new_dynamic_label();
+        let done = ops.new_dynamic_label();
+
+        // jit_prepare_direct_method_call_stub(ctx, recv, name, site, argc, a0..a2)
+        // -> 0 = direct prepared, 1 = throw, 2 = ineligible → in-place fallback.
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov x0, x20
+            ; movz x1, recv as u32
+        );
+        emit_load_u64(ops, 2, u64::from(name));
+        emit_load_u64(ops, 3, site);
+        dynasm!(ops ; .arch aarch64 ; movz x4, argc as u32);
+        for slot in 0..MAX_METHOD_ARGS {
+            let areg = if slot < argc {
+                reg(operands, 4 + slot)?
+            } else {
+                0
+            };
+            let xn = 5 + slot as u32;
+            dynasm!(ops ; .arch aarch64 ; movz X(xn), areg as u32);
+        }
+        emit_load_u64(
+            ops,
+            16,
+            jit_prepare_direct_method_call_stub as *const () as u64,
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; cmp x0, #1
+            ; b.eq =>threw
+            ; cmp x0, #2
+            ; b.eq =>fallback
+        );
+
+        // Direct prepared (status 0): same dispatch tail as Op::Call.
+        emit_direct_call_tail(ops, dst, threw, done);
+
+        // Ineligible (status 2): in-place full method call, returns to compiled
+        // code (the receiver method may be native / polymorphic / accessor).
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>fallback
+            ; mov x0, x20
+            ; movz x1, dst as u32
+            ; movz x2, recv as u32
+        );
+        emit_load_u64(ops, 3, u64::from(name));
+        dynasm!(ops ; .arch aarch64 ; movz x4, argc as u32);
+        for slot in 0..MAX_METHOD_ARGS {
+            let areg = if slot < argc {
+                reg(operands, 4 + slot)?
+            } else {
+                0
+            };
+            let xn = 5 + slot as u32;
+            dynasm!(ops ; .arch aarch64 ; movz X(xn), areg as u32);
+        }
+        emit_call_stub(ops, jit_call_method_stub as *const () as usize, threw);
+        dynasm!(ops ; .arch aarch64 ; =>done);
         Ok(())
     }
 

@@ -15,7 +15,7 @@ Order follows the plan's *minimal implementation sequence* (§5). Each slice is 
 | 0 | Engine Lab — measurement, differential testing, progress scaffold | `OtterLab` | **done** (commit `98f460b3`) | — |
 | 1 | Stable VM stack & frame descriptors | `HoltStack` | **done** (1b; 1e folds into Slice 2) | Slice 0 green ✓ |
 | 2 | PupJIT direct calls + machine-code frame build | `PupJIT Calls` | **next** | HoltStack stable ✓ |
-| 3 | Unified feedback vectors + complete ICs | `WhiskerIC` | **in progress** (3a load + 3b store ICs done; 3c method IC next) | PupJIT direct calls |
+| 3 | Unified feedback vectors + complete ICs | `WhiskerIC` | **in progress** (3a load + 3b store + 3c method ICs done) | PupJIT direct calls |
 | 4 | Hot heap layouts (Array/TypedArray/String/Closure) | `KelpHeap` | not started | WhiskerIC load/store/method/element |
 | 5 | Production GC + precise safepoint stack maps | `TideGC` / `StoneMaps` / `ShellAlloc` | not started | KelpHeap; PupJIT direct calls shipped |
 | 6 | Optimized builtin intrinsics | `ShellBuiltins` | not started | KelpHeap |
@@ -340,11 +340,45 @@ children and corrupt the result. `prop-access` itself also stays correct under
 (804/818, fails pre-existing + identical both tiers),
 `class/elements/private-methods` (5/5).
 
-### 3c — next (not started)
-- **3c — method-call IC (`CallMethodValue`).** The ~2 remaining stubs/iter on
-  `prop-access` are `p.bump()` / `p.dist2()` (≈3.0M, now the dominant category).
-  Load the method via a monomorphic proto-data cell, guard, then reuse the
-  Slice-2b direct-call path.
+### 3c — Direct method calls (`CallMethodValue` → IC-resolve + direct branch). Done.
+
+`p.bump()` / `p.dist2()` were the dominant remaining `prop-access` cost (~3.0M/run
+through `jit_call_method_stub` → full `run_callable_sync` re-entry). Now a method
+call IC-resolves the callee (`resolve_method_ic` — the same monomorphic load-IC
+the interpreter method path uses, site shared via `property_ic_site`) and
+**direct-branches to its compiled entry**, reusing the entire Slice-2b ABI:
+`jit_prepare_direct_method_call` publishes a callee frame bound `this = recv`
+(via `bytecode_call_target_parts(method, recv, …)`), and the emitted
+`emit_method_call` runs the **same dispatch tail** as `Op::Call`
+(`emit_direct_call_tail`, factored out of `emit_call`) — build callee `JitCtx`,
+`blr` entry, finish/bail/abort.
+
+Key difference from `Op::Call`: an ineligible resolution (status 2) falls back to
+the **in-place** full method-call stub (`jit_call_method_stub`), *not* a bail — a
+native / polymorphic / accessor method in a hot loop must keep running compiled
+rather than deopt the whole frame to the interpreter. Eligibility is the Op::Call
+set plus `makes_function` (the method path carries no caller register to re-root a
+named-function SELF closure post-allocation, so those use the fallback).
+`prepare_jit_direct_call_frame` took `callee_reg: Option<u16>` (`None` on the
+method path); GC rooting is identical to the proven Op::Call frame build.
+
+**Measured (release).** `prop-access.js`: `jitDirectCalls` 0 → **2,998,000**
+(the 2 method calls/iter now direct-call); `jitRuntimePropertyStubs`
+**2,998,011 → 11**; `otter-jit` **805 → 525 ms**. Cumulative across 3a+3b+3c:
+**prop-access entry-baseline 932.8 → ~525–540 ms (−42 to −44%)**;
+`jitRuntimePropertyStubs` **8,994,953 → 11**. fib and all other scripts neutral.
+
+**Gates.** Unit tests (otter-jit 17, otter-vm 574) pass; clippy/fmt clean;
+`diff.mjs` 11/11 identical across interp/jit/jit-osr; `prop-access` and the
+method+barrier workload bit-identical under `OTTER_GC_STRESS=32/64/128`; test262
+failing-set identical JIT-off vs JIT-on on `language/expressions/call` (83/92),
+`expressions/super` (93/94), `statements/try` (200/206),
+`object/method-definition` (303/303), `Array/prototype/map` (214/216).
+
+### 3d — next (not started)
+- Direct-prototype `LoadProperty` inline (currently only own-data inlines; the
+  cell could also cache a proto-data hit for inherited data properties).
+- Element IC widening / megamorphic stubs; global-load IC; binary-op feedback.
 
 ## Verification contract
 

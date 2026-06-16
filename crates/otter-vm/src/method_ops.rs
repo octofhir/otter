@@ -852,7 +852,7 @@ impl Interpreter {
     /// property is not an IC-cacheable data slot — an accessor, a deeper
     /// prototype hop, or absent — so the caller falls back to the full
     /// `[[Get]]` method-resolution path that handles those cases.
-    fn resolve_method_ic(
+    pub(crate) fn resolve_method_ic(
         &mut self,
         obj: crate::object::JsObject,
         key: AtomizedPropertyKey<'_>,

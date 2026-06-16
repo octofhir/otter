@@ -513,23 +513,31 @@ registers are inline (nothing to reclaim), so the dominant repeated cost is the
 (`call_ops.rs`) and freed when the terminated frame drops. 12M calls × (alloc +
 free) of a tiny capturing-closure spine.
 
-**Fix options (all touch the hot call path — do attended, gate with benches +
-test262 call/closure/generator dirs + GC stress, revert on any regression):**
-1. **Length-keyed spine pool** (lowest type-churn): pool `Box<[UpvalueCell]>` by
-   length; `reclaim_upvalue_spine(frame)` nulls + pools it, the build site pops a
-   same-length box and overwrites its cells (no `into_boxed_slice` realloc).
-   Friction: the clone is inside a `heap.read_payload` closure and the pool draw
-   needs `&mut self` — restructure `bytecode_call_target_parts` into a
-   `&mut self` method (3 callers: `run_callable_sync_inner`,
-   `jit_prepare_direct_call`, `jit_prepare_direct_method_call`), reading the spine
-   length first then filling a pre-drawn box.
-2. **`Rc<[UpvalueCell]>` spine** shared between the closure body and the frame —
-   the clone becomes a refcount bump (no alloc). Cleanest steady-state but changes
-   `UpvalueSpine` (~20 sites) + the closure body field + GC tracing.
-3. **Per-element frame reuse** in the array builtins (the earlier-deferred lever).
+**Option 1 (length-keyed spine pool) TRIED + REVERTED (2026-06-17): NEUTRAL, no
+win.** Fully implemented cleanly: `upvalue_spine_pool: Vec<UpvalueSpine>` + a
+static `draw_upvalue_spine(pool, len)` (pops a same-length box / allocs
+`vec![null; len]`) + `reclaim_upvalue_spine` (nulls cells, pools) called at all 4
+`reclaim_registers` sites + `bytecode_call_target_parts` given a `&mut pool` param
+(no `&mut self` needed — disjoint from `&self.gc_heap`; all 8 callers + the
+disjoint borrows compiled clean). Tests/diff green. But **array-ops 1170→1187,
+sort 2189→2184, fib 266→280 — neutral-to-slightly-worse, zero improvement.** The
+pool cycles (build draws, fast-path reclaim fills), so the per-call upvalue-spine
+`Box` alloc is **not** the real cost — the earlier `return_stack ~106` attribution
+was misread. Reverted per the gate ("must improve array-ops/sort or revert").
 
-`run_callable_sync_already_rooted` is already used by the array loop (Slice 3e);
-the extra-roots push/pop is no longer the cost — the spine churn is.
+**Corrected understanding:** the per-element callback cost is **diffuse frame /
+re-entry management** (draw_stack/push/dispatch/pop/return_stack per element +
+`this`-coercion + arg-bind), not a single hot allocation. Two profile-guided
+single-allocation fixes (dict-mode shapes, spine pool) both failed to move the
+benches — the cost is spread across the `run_callable_sync` per-element setup, so
+only a structural change captures it:
+- **Per-element frame reuse** in the array builtins (build the callee frame ONCE,
+  rebind args + reset pc per element) — the genuinely-impactful but high-risk
+  lever (frame-reuse correctness on the most-used builtins, mid-loop tier-up,
+  throw, recursion). Needs an attended, heavily-gated slice. This is now the ONLY
+  remaining array-ops/sort lever; the cheap single-alloc cuts are exhausted.
+- `Rc<[UpvalueCell]>` spine (clone→refcount) is also still possible but, given the
+  spine pool was neutral, unlikely to pay off either — the spine isn't the cost.
 
 ### 3f — next (not started)
 - **The real array-ops/sort lever remains untouched**: `run_callable_sync` builds

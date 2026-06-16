@@ -20,6 +20,7 @@
 //! - [`crate::microtask`]
 //! - [`crate::promise_dispatch`]
 
+use crate::holt_stack::HoltStack;
 use smallvec::SmallVec;
 
 use crate::promise::JsPromise;
@@ -38,7 +39,7 @@ impl Interpreter {
     fn await_promise_resolve(
         &mut self,
         context: &ExecutionContext,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         value: Value,
     ) -> Result<crate::promise::JsPromiseHandle, VmError> {
         if let Some(p) = value.as_promise() {
@@ -96,7 +97,7 @@ impl Interpreter {
     ///   frame.
     pub(crate) fn do_await(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         dst: u16,
         awaited: Value,
@@ -149,7 +150,7 @@ impl Interpreter {
     /// subsequent `Op::Yield`, completion, or further `Op::Await`.
     fn do_await_async_gen(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         dst: u16,
         awaited: Value,
@@ -210,7 +211,7 @@ impl Interpreter {
                 });
             }
         }
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         stack.push(*frame);
         owner.set_async_state(
             &mut self.gc_heap,
@@ -224,7 +225,7 @@ impl Interpreter {
         let anchor_depth = self.push_iteration_anchor(value);
         self.push_iteration_anchor(Value::generator(owner));
         let frame_roots = otter_gc::RawFrameRoots::new(
-            &stack as *const SmallVec<[Frame; 8]>,
+            &stack as *const HoltStack,
             &self.cold_frames as *const crate::cold_frame::ColdFramePool,
             crate::trace_active_frame_roots,
         );
@@ -355,7 +356,7 @@ impl Interpreter {
                 });
             }
         }
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         stack.push(*frame);
         // The resumed frame and the settlement value must be GC
         // roots *before* `dispatch_loop` registers its own provider:
@@ -364,7 +365,7 @@ impl Interpreter {
         // lives on this local stack.
         let anchor_depth = self.push_iteration_anchor(value);
         let frame_roots = otter_gc::RawFrameRoots::new(
-            &stack as *const SmallVec<[Frame; 8]>,
+            &stack as *const HoltStack,
             &self.cold_frames as *const crate::cold_frame::ColdFramePool,
             crate::trace_active_frame_roots,
         );
@@ -429,7 +430,7 @@ impl Interpreter {
     pub(crate) fn unwind_throw(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         value: Value,
     ) -> Result<(), VmError> {
         self.unwind_throw_with_uncaught(context, stack, value, None)
@@ -444,7 +445,7 @@ impl Interpreter {
     pub(crate) fn unwind_throw_with_uncaught(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         value: Value,
         mut uncaught_error: Option<VmError>,
     ) -> Result<(), VmError> {

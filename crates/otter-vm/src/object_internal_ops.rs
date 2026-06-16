@@ -21,14 +21,15 @@
 //! - [`crate::property_dispatch`]
 //! - [`crate::object`]
 
+use crate::holt_stack::HoltStack;
 use std::collections::BTreeSet;
 
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Frame, Interpreter, JsObject, JsString, Value, VmError, VmGetOutcome,
-    VmPropertyKey, abstract_ops, array, descriptor_value, function_metadata, object, proxy,
-    regexp_prototype, string, symbol, to_length,
+    ExecutionContext, Interpreter, JsObject, JsString, Value, VmError, VmGetOutcome, VmPropertyKey,
+    abstract_ops, array, descriptor_value, function_metadata, object, proxy, regexp_prototype,
+    string, symbol, to_length,
 };
 
 #[derive(Clone, Copy)]
@@ -163,7 +164,7 @@ enum DescriptorAllocationRoots<'a> {
         value_roots: &'a [&'a Value],
         slice_roots: &'a [&'a [Value]],
     },
-    Stack(&'a SmallVec<[Frame; 8]>),
+    Stack(&'a HoltStack),
 }
 
 fn partial_descriptor_value_roots(descriptor: &object::PartialPropertyDescriptor) -> Vec<Value> {
@@ -458,7 +459,7 @@ impl Interpreter {
     pub(crate) fn ordinary_get_own_property_descriptor_value_stack_rooted(
         &mut self,
         context: &ExecutionContext,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         target: Value,
         key: &VmPropertyKey,
         hops: usize,
@@ -3429,7 +3430,7 @@ impl Interpreter {
     pub(crate) fn instanceof_target_prototype_stack_rooted(
         &mut self,
         context: &ExecutionContext,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         rhs: &Value,
     ) -> Result<Option<Value>, VmError> {
         if rhs.is_object() || rhs.is_proxy() {
@@ -4682,7 +4683,7 @@ impl Interpreter {
     pub(crate) fn try_proxy_object_static_call(
         &mut self,
         context: &ExecutionContext,
-        stack_roots: Option<&SmallVec<[Frame; 8]>>,
+        stack_roots: Option<&HoltStack>,
         method: otter_bytecode::method_id::ObjectMethod,
         args: &[Value],
     ) -> Result<Option<Value>, VmError> {

@@ -19,6 +19,7 @@
 //! - [`crate::object`]
 //! - [`crate::executable`]
 
+use crate::holt_stack::HoltStack;
 use otter_bytecode::Operand;
 use otter_gc::raw::RawGc;
 use smallvec::SmallVec;
@@ -33,7 +34,7 @@ use crate::{
 };
 
 impl Interpreter {
-    pub(crate) fn collect_allocation_roots(&self, stack: &SmallVec<[Frame; 8]>) -> Vec<*mut RawGc> {
+    pub(crate) fn collect_allocation_roots(&self, stack: &HoltStack) -> Vec<*mut RawGc> {
         // Fast path: when the dispatch loop has registered its frame-roots
         // and extra-roots providers, an allocation-triggered collection walks
         // both of them *internally* — see `GcHeap::collect_minor_internal`
@@ -54,7 +55,7 @@ impl Interpreter {
         let mut roots = Vec::new();
         RuntimeState::new(self).trace_roots(&mut |slot| roots.push(slot));
         let pool = self.cold_frames();
-        for frame in stack {
+        for frame in stack.iter() {
             frame.trace_frame_slots(&mut |slot| roots.push(slot));
             if let Some(idx) = frame.cold {
                 pool.get(idx).trace_cold_slots(&mut |slot| roots.push(slot));
@@ -476,14 +477,14 @@ impl Interpreter {
 
     pub(crate) fn alloc_stack_rooted_object(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
     ) -> Result<crate::object::JsObject, VmError> {
         self.alloc_stack_rooted_object_with_extra_roots(stack, &[])
     }
 
     pub(crate) fn alloc_stack_rooted_object_with_extra_roots(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         extra_roots: &[&Value],
     ) -> Result<crate::object::JsObject, VmError> {
         self.alloc_stack_rooted_object_with_value_roots(stack, extra_roots, &[])
@@ -491,7 +492,7 @@ impl Interpreter {
 
     pub(crate) fn alloc_stack_rooted_object_with_value_roots(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         value_roots: &[&Value],
         slice_roots: &[Value],
     ) -> Result<crate::object::JsObject, VmError> {
@@ -504,7 +505,7 @@ impl Interpreter {
 
     pub(crate) fn alloc_stack_rooted_object_with_value_roots_and_slices(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, VmError> {
@@ -533,7 +534,7 @@ impl Interpreter {
 
     pub(crate) fn alloc_stack_rooted_object_with_proto(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         proto: crate::object::JsObject,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
@@ -567,7 +568,7 @@ impl Interpreter {
 
     pub(crate) fn alloc_stack_rooted_array(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<crate::array::JsArray, VmError> {
@@ -591,7 +592,7 @@ impl Interpreter {
 
     pub(crate) fn alloc_stack_rooted_array_from_values<I>(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         elements: I,
         value_roots: &[&Value],
         slice_roots: &[Value],
@@ -609,7 +610,7 @@ impl Interpreter {
 
     pub(crate) fn alloc_stack_rooted_array_from_values_with_root_slices<I>(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         elements: I,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
@@ -638,7 +639,7 @@ impl Interpreter {
 
     pub(crate) fn alloc_stack_rooted_iterator_state(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         state: IteratorState,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
@@ -667,7 +668,7 @@ impl Interpreter {
 
     fn alloc_stack_rooted_array_from_elements(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         elements: SmallVec<[Value; 4]>,
     ) -> Result<crate::array::JsArray, VmError> {
         self.alloc_stack_rooted_array_from_values(stack, elements, &[], &[])
@@ -675,7 +676,7 @@ impl Interpreter {
 
     pub(crate) fn run_new_object_reg(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         top_idx: usize,
         dst: u16,
     ) -> Result<(), VmError> {
@@ -699,7 +700,7 @@ impl Interpreter {
 
     pub(crate) fn run_new_array_operands(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         top_idx: usize,
         operands: &[Operand],
     ) -> Result<(), VmError> {
@@ -750,7 +751,7 @@ impl Interpreter {
 
     pub(crate) fn run_array_push_regs(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         top_idx: usize,
         arr_reg: u16,
         value_reg: u16,
@@ -774,7 +775,7 @@ impl Interpreter {
 
     pub(crate) fn run_new_weak_ref_regs(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         top_idx: usize,
         dst: u16,
         target_reg: u16,
@@ -801,7 +802,7 @@ impl Interpreter {
     pub(crate) fn run_new_finalization_registry_regs(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         top_idx: usize,
         dst: u16,
         callback_reg: u16,

@@ -153,6 +153,7 @@ pub use run_control::{
     RunError, StackFrameSnapshot, VmError,
 };
 
+use crate::holt_stack::HoltStack;
 use otter_bytecode::{ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Op};
 use smallvec::SmallVec;
 
@@ -720,7 +721,7 @@ impl Interpreter {
     fn build_template_object(
         &mut self,
         context: &ExecutionContext,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         site_idx: u32,
     ) -> Result<Value, VmError> {
         let site = context
@@ -803,11 +804,11 @@ impl otter_gc::ExtraRootSource for Interpreter {
 }
 
 pub(crate) fn trace_active_frame_roots(
-    stack: &SmallVec<[Frame; 8]>,
+    stack: &HoltStack,
     pool: &cold_frame::ColdFramePool,
     visitor: &mut dyn FnMut(*mut RawGc),
 ) {
-    for frame in stack {
+    for frame in stack.iter() {
         frame.trace_frame_slots(visitor);
         if let Some(idx) = frame.cold {
             pool.get(idx).trace_cold_slots(visitor);
@@ -1203,7 +1204,7 @@ impl Interpreter {
     /// the return unwound the dispatch entry and the loop should yield `v`).
     fn maybe_dispatch_jit(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
     ) -> Result<Option<Option<Value>>, VmError> {
         let top_idx = stack.len() - 1;
@@ -1232,7 +1233,7 @@ impl Interpreter {
     #[inline]
     fn note_backedge_and_maybe_osr(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         top_idx: usize,
     ) -> Result<Option<Option<Value>>, VmError> {
@@ -1273,7 +1274,7 @@ impl Interpreter {
     /// (mirrors [`Self::maybe_dispatch_jit`]).
     fn maybe_osr(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         top_idx: usize,
     ) -> Result<Option<Option<Value>>, VmError> {
@@ -1352,7 +1353,7 @@ impl Interpreter {
     /// `Ok(None)` to interpret it normally.
     pub(crate) fn dispatch_jit_sync_entry(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
     ) -> Result<Option<Value>, VmError> {
         if self.jit_hook.is_none() {
@@ -1378,7 +1379,7 @@ impl Interpreter {
     /// be outside the compilable subset.
     fn resolve_jit_code(
         &mut self,
-        stack: &[Frame],
+        stack: &HoltStack,
         context: &ExecutionContext,
         top_idx: usize,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
@@ -1417,7 +1418,7 @@ impl Interpreter {
     /// and recursive calls inside the body are GC-safe.
     fn run_compiled_frame(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         top_idx: usize,
         code: &std::sync::Arc<dyn jit::JitFunctionCode>,
@@ -1641,7 +1642,7 @@ impl Interpreter {
             self.frame_ensure_cold(&mut new_frame).callee_closure = Some(closure);
         }
 
-        let mut inner: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut inner: HoltStack = HoltStack::new();
         inner.push(new_frame);
         match self.run_compiled_frame(&mut inner, context, 0, code) {
             jit::JitExecOutcome::Returned(value) => {
@@ -2136,7 +2137,7 @@ impl Interpreter {
         let args: SmallVec<[Value; 8]> =
             smallvec::smallvec![env, import_meta, Value::boolean(hoist_phase)];
         self.bind_bytecode_call_arguments(function, &mut frame, args)?;
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::with_dispatch_capacity();
         stack.push(frame);
         let init_promise = if function.is_async {
             let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
@@ -3029,7 +3030,7 @@ impl Interpreter {
 
     fn box_sloppy_this_primitive_stack_rooted(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         this_value: Value,
         slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {
@@ -3091,7 +3092,7 @@ impl Interpreter {
 
     fn object_for_primitive_property_base_stack_rooted(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         value: &Value,
     ) -> Result<Option<JsObject>, VmError> {
         let object = if let Some(v) = value.as_boolean() {
@@ -3139,7 +3140,7 @@ impl Interpreter {
     fn this_for_bytecode_call_stack_rooted(
         &mut self,
         function: &ExecutableFunction,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         this_value: Value,
         slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {
@@ -4252,7 +4253,7 @@ impl Interpreter {
                 error,
                 frames: Vec::new(),
             })?;
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::with_dispatch_capacity();
         stack.push(new_frame);
         match self.dispatch_loop(context, &mut stack) {
             Ok(value) => {
@@ -4324,7 +4325,7 @@ impl Interpreter {
         context: &ExecutionContext,
     ) -> Result<Value, (VmError, Vec<StackFrameSnapshot>)> {
         let main = context.exec_main();
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::with_dispatch_capacity();
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, main, Frame::empty_upvalues())
                 .map_err(|oom| (VmError::from(oom), Vec::new()))?;
@@ -4407,12 +4408,12 @@ impl Interpreter {
     fn dispatch_loop(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
     ) -> Result<Value, VmError> {
         self.ensure_property_ic_capacity(context);
         self.begin_runtime_budget_turn();
         let frame_roots = otter_gc::RawFrameRoots::new(
-            stack as *const SmallVec<[Frame; 8]>,
+            stack as *const HoltStack,
             &self.cold_frames as *const cold_frame::ColdFramePool,
             trace_active_frame_roots,
         );
@@ -4500,7 +4501,7 @@ impl Interpreter {
     fn dispatch_loop_inner(
         &mut self,
         entry_context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
     ) -> Result<Value, VmError> {
         // One stack can interleave frames from several code chunks
         // (closures escaped from `eval` / `new Function` / sibling
@@ -7076,11 +7077,7 @@ impl Interpreter {
     /// # Errors
     /// - [`VmError::InvalidOperand`] when the stack is empty or
     ///   the caller's return register is out of bounds.
-    fn pop_frame(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        value: Value,
-    ) -> Result<Option<Value>, VmError> {
+    fn pop_frame(&mut self, stack: &mut HoltStack, value: Value) -> Result<Option<Value>, VmError> {
         let mut popped = stack.pop().ok_or(VmError::InvalidOperand)?;
         let construct_target = self.frame_cold(&popped).and_then(|c| c.construct_target);
         let is_derived_ctor = self
@@ -7154,7 +7151,7 @@ impl Interpreter {
     /// a `Jump` sets the target pc and a `Return` pops the frame.
     fn unwind_abrupt(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         completion: crate::cold_frame::AbruptKind,
         floor: u32,
     ) -> Result<Option<Value>, VmError> {
@@ -7217,7 +7214,7 @@ impl Interpreter {
     /// when no `finally` handler is active.
     fn return_running_finally(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         value: Value,
     ) -> Result<Option<Value>, VmError> {
         let top_idx = stack.len() - 1;
@@ -8620,7 +8617,7 @@ mod tests {
         let module = module_with(Vec::new(), 4);
         let context = ExecutionContext::from_module(module.clone());
         let mut interp = Interpreter::new();
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::function(1);
         stack.push(frame);
@@ -8685,7 +8682,7 @@ mod tests {
         let context = ExecutionContext::from_module(module.clone());
         let mut interp = Interpreter::new();
         let lhs = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("lhs");
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[1] = Value::object(lhs);
         frame.registers[2] = Value::function(1);
@@ -8785,7 +8782,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::map(map);
         stack.push(frame);
@@ -8822,7 +8819,7 @@ mod tests {
         let mut interp = Interpreter::new();
         let iterator_obj = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
 
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.pc = 0;
         interp.frame_ensure_cold(&mut frame).pending_get_iterator =
@@ -8880,7 +8877,7 @@ mod tests {
             native_value_static(interp.gc_heap_mut(), "identityMapper", 1, identity_mapper)
                 .unwrap();
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::array(source);
         frame.registers[1] = mapper;
@@ -8930,7 +8927,7 @@ mod tests {
         };
         let mut interp = Interpreter::new();
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::undefined();
         stack.push(frame);
@@ -8969,7 +8966,7 @@ mod tests {
         };
         let mut interp = Interpreter::new();
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::number_i32(1);
         stack.push(frame);
@@ -9013,7 +9010,7 @@ mod tests {
         let recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = recv;
         stack.push(frame);
@@ -9061,7 +9058,7 @@ mod tests {
         );
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::number_i32(7);
         stack.push(frame);
@@ -9104,7 +9101,7 @@ mod tests {
         object::set(proto, interp.gc_heap_mut(), "valueOf", Value::number_i32(1));
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::boolean(true);
         stack.push(frame);
@@ -9154,7 +9151,7 @@ mod tests {
             .expect("bigint allocation");
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::big_int(bigint);
         stack.push(frame);
@@ -9198,7 +9195,7 @@ mod tests {
         let symbol = JsSymbol::new(interp.gc_heap_mut(), None).expect("symbol allocation");
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::symbol(symbol);
         stack.push(frame);
@@ -9247,7 +9244,7 @@ mod tests {
             crate::test_support::alloc_weak_ref(interp.gc_heap_mut(), &target).expect("weak ref");
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::weak_ref(weak_ref);
         stack.push(frame);
@@ -9304,7 +9301,7 @@ mod tests {
                 .expect("registry");
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::finalization_registry(registry);
         stack.push(frame);
@@ -9347,7 +9344,7 @@ mod tests {
         object::set(bag, interp.gc_heap_mut(), "then", Value::number_i32(1));
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::promise(promise);
         stack.push(frame);
@@ -9391,7 +9388,7 @@ mod tests {
         object::set(proto, interp.gc_heap_mut(), "then", Value::number_i32(1));
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::promise(promise);
         stack.push(frame);
@@ -9435,7 +9432,7 @@ mod tests {
             .expect("array expando property");
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::array(array);
         stack.push(frame);
@@ -9477,7 +9474,7 @@ mod tests {
         object::set(bag, interp.gc_heap_mut(), "exec", Value::number_i32(1));
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::regexp(regexp);
         stack.push(frame);
@@ -9522,7 +9519,7 @@ mod tests {
         let regexp = JsRegExp::compile(interp.gc_heap_mut(), &units, "").expect("regexp");
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::regexp(regexp);
         stack.push(frame);
@@ -9569,7 +9566,7 @@ mod tests {
         object::set_date_data(date, interp.gc_heap_mut(), 0.0);
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::object(date);
         stack.push(frame);
@@ -9616,7 +9613,7 @@ mod tests {
         object::set_date_data(date, interp.gc_heap_mut(), 0.0);
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::object(date);
         stack.push(frame);
@@ -9669,7 +9666,7 @@ mod tests {
         object::set(bag, interp.gc_heap_mut(), "map", Value::number_i32(1));
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::typed_array(typed_array);
         stack.push(frame);
@@ -9724,7 +9721,7 @@ mod tests {
         .expect("typed array");
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::typed_array(typed_array);
         stack.push(frame);
@@ -9779,7 +9776,7 @@ mod tests {
         .expect("typed array");
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::typed_array(typed_array);
         stack.push(frame);
@@ -9827,7 +9824,7 @@ mod tests {
         .expect("source array");
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::array(source);
         stack.push(frame);
@@ -9875,7 +9872,7 @@ mod tests {
         let map = crate::collections::alloc_map(interp.gc_heap_mut()).expect("map");
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::map(map);
         stack.push(frame);
@@ -9919,7 +9916,7 @@ mod tests {
         let set = crate::collections::alloc_set(interp.gc_heap_mut()).expect("set");
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::set(set);
         stack.push(frame);
@@ -9963,7 +9960,7 @@ mod tests {
         let map = crate::collections::alloc_map(interp.gc_heap_mut()).expect("map");
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::map(map);
         stack.push(frame);
@@ -10007,7 +10004,7 @@ mod tests {
         let set = crate::collections::alloc_set(interp.gc_heap_mut()).expect("set");
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::set(set);
         stack.push(frame);
@@ -10051,7 +10048,7 @@ mod tests {
         let weak_map = crate::collections::alloc_weak_map(interp.gc_heap_mut()).expect("weak map");
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::weak_map(weak_map);
         stack.push(frame);
@@ -10095,7 +10092,7 @@ mod tests {
         let weak_set = crate::collections::alloc_weak_set(interp.gc_heap_mut()).expect("weak set");
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::weak_set(weak_set);
         stack.push(frame);
@@ -10142,7 +10139,7 @@ mod tests {
         let buffer = crate::binary::JsArrayBuffer::from_local_handle(buffer);
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::array_buffer(buffer);
         stack.push(frame);
@@ -10196,7 +10193,7 @@ mod tests {
             crate::binary::JsDataView::new(interp.gc_heap_mut(), buffer, 0, 1).expect("data view");
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::data_view(view);
         stack.push(frame);
@@ -10240,7 +10237,7 @@ mod tests {
         let set = crate::collections::alloc_set(interp.gc_heap_mut()).expect("set");
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::set(set);
         stack.push(frame);
@@ -10276,7 +10273,7 @@ mod tests {
         };
         let mut interp = Interpreter::new();
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::function(1);
         stack.push(frame);
@@ -10317,7 +10314,7 @@ mod tests {
         };
         let mut interp = Interpreter::new();
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::function(1);
         stack.push(frame);
@@ -10366,7 +10363,7 @@ mod tests {
         object::set_prototype(obj, interp.gc_heap_mut(), None);
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::object(obj);
         stack.push(frame);
@@ -10419,7 +10416,7 @@ mod tests {
         let native = native_value_static(interp.gc_heap_mut(), "target", 0, noop).expect("native");
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = native;
         stack.push(frame);
@@ -10469,7 +10466,7 @@ mod tests {
         );
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::number_i32(1);
         stack.push(frame);
@@ -10526,7 +10523,7 @@ mod tests {
             native_value_static(interp.gc_heap_mut(), "replacement", 1, replacement).expect("repl");
 
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::object(obj);
         frame.registers[1] = search;
@@ -10678,7 +10675,7 @@ mod tests {
             module_inits: Vec::new(),
         };
         let context = ExecutionContext::from_module(module.clone());
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[1] = Value::array(seed);
         stack.push(frame);
@@ -10752,7 +10749,7 @@ mod tests {
     fn vm_error_throwable_uses_stack_rooted_allocation() {
         let module = module_with(Vec::new(), 1);
         let mut interp = Interpreter::new();
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         stack.push(Frame::for_function(&module.functions[0]));
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
@@ -10779,7 +10776,7 @@ mod tests {
     fn oom_throwable_uses_range_error_prototype() {
         let module = module_with(Vec::new(), 1);
         let mut interp = Interpreter::new();
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         stack.push(Frame::for_function(&module.functions[0]));
 
         let error = interp
@@ -11006,7 +11003,7 @@ mod tests {
         let generator =
             crate::generator::JsGenerator::new(interp.gc_heap_mut(), body_frame).expect("gen");
         generator.set_async(interp.gc_heap_mut(), true);
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&main);
         frame.registers[0] = Value::generator(generator);
         stack.push(frame);
@@ -11048,7 +11045,7 @@ mod tests {
         };
         let context = ExecutionContext::from_module(module);
         let mut interp = Interpreter::new();
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         stack.push(Frame::for_function(&main));
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
@@ -11187,7 +11184,7 @@ mod tests {
         };
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.async_state = Some(AsyncFrameState { result_promise });
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         stack.push(frame);
         let context = ExecutionContext::from_module(module);
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -11220,7 +11217,7 @@ mod tests {
         let mut interp = Interpreter::new();
         let executor_value =
             native_value_static(interp.gc_heap_mut(), "executor", 2, executor).expect("executor");
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[1] = executor_value;
         stack.push(frame);
@@ -11248,7 +11245,7 @@ mod tests {
         let module = module_with(Vec::new(), 2);
         let context = ExecutionContext::from_module(module.clone());
         let mut interp = Interpreter::new();
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[1] = Value::number(NumberValue::Smi(12));
         stack.push(frame);
@@ -11903,7 +11900,7 @@ mod tests {
                 span: (0, 0),
             }],
         };
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         stack.push(Frame::for_function(&main));
         // Push a second frame on top — should be popped during
         // unwinding and not absorb the throw.
@@ -11966,7 +11963,7 @@ mod tests {
             }],
         };
         let mut interp = Interpreter::new();
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&main);
         interp
             .frame_ensure_cold(&mut frame)
@@ -12033,7 +12030,7 @@ mod tests {
         let receiver = Value::object(
             crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap(),
         );
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         stack.push(Frame::for_function(&module.functions[0]));
         let context = ExecutionContext::from_module(module.clone());
 
@@ -12066,7 +12063,7 @@ mod tests {
         let mut interp = Interpreter::new();
         let callee =
             native_value_static(interp.gc_heap_mut(), "sum", 2, sum_smi_args).expect("native");
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = callee;
         frame.registers[1] = Value::number(NumberValue::Smi(8));
@@ -12108,7 +12105,7 @@ mod tests {
                 .unwrap(),
         );
 
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = proxy;
         frame.registers[1] = Value::number(NumberValue::Smi(7));
@@ -12191,7 +12188,7 @@ mod tests {
             .unwrap(),
         );
 
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[1] = proxy;
         stack.push(frame);
@@ -12491,7 +12488,7 @@ mod tests {
         )
         .expect("closure alloc");
         let closure = Value::closure(closure_handle);
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         stack.push(Frame::for_function(&module.functions[0]));
         let context = ExecutionContext::from_module(module.clone());
         // Reserve a scratch slot in <main> to receive the result.

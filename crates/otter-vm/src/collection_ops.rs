@@ -18,14 +18,14 @@
 //! - [`crate::collections`]
 //! - [`crate::executable`]
 
-use crate::{ExecutionContext, Frame, Interpreter, Value, VmError, read_register, write_register};
-use smallvec::SmallVec;
+use crate::holt_stack::HoltStack;
+use crate::{ExecutionContext, Interpreter, Value, VmError, read_register, write_register};
 
 impl Interpreter {
     pub(crate) fn run_new_collection_regs(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         top_idx: usize,
         dst: u16,
         kind_idx: u32,
@@ -47,7 +47,7 @@ impl Interpreter {
         &mut self,
         kind: &str,
         seed: &Value,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
     ) -> Result<Value, VmError> {
         let roots = self.collect_allocation_roots(stack);
         let seed_entries = if seed_is_present(seed) {

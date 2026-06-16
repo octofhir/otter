@@ -20,6 +20,7 @@
 //! - [`crate::executable`]
 //! - [`crate::IteratorState`]
 
+use crate::holt_stack::HoltStack;
 use smallvec::SmallVec;
 
 use otter_bytecode::Operand;
@@ -93,7 +94,7 @@ enum IteratorStateSnapshot {
 impl Interpreter {
     pub(crate) fn run_get_iterator_regs(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         top_idx: usize,
         dst: u16,
         src: u16,
@@ -150,7 +151,7 @@ impl Interpreter {
     pub(crate) fn run_get_async_iterator_regs(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         top_idx: usize,
         dst: u16,
         src: u16,
@@ -1195,7 +1196,7 @@ impl Interpreter {
             if is_async {
                 handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::Executing);
             }
-            let mut sub_stack: SmallVec<[Frame; 8]> = SmallVec::new();
+            let mut sub_stack: HoltStack = HoltStack::new();
             sub_stack.push(*frame);
             return self.finish_generator_dispatch(context, handle, sub_stack, is_async);
         }
@@ -1240,7 +1241,7 @@ impl Interpreter {
                 throw_value = Some(*reason);
             }
         }
-        let mut sub_stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut sub_stack: HoltStack = HoltStack::new();
         sub_stack.push(*frame);
         if let Some(arg) = return_value {
             // Drive the parked frame's `finally` blocks via the abrupt
@@ -1294,7 +1295,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         handle: &crate::generator::JsGenerator,
-        mut sub_stack: SmallVec<[Frame; 8]>,
+        mut sub_stack: HoltStack,
         is_async: bool,
     ) -> Result<Value, VmError> {
         let outcome = self.dispatch_loop(context, &mut sub_stack);
@@ -1399,7 +1400,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-getiterator>
     pub(crate) fn drive_get_iterator(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
@@ -1610,7 +1611,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-iteratorvalue>
     pub(crate) fn drive_iterator_next(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {

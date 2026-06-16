@@ -1,100 +1,99 @@
-//! HoltStack — segmented, stable-address execution-frame stack.
+//! HoltStack — contiguous, reservation-stable execution-frame stack.
 //!
-//! The interpreter today holds its call frames in a `SmallVec<[Frame; 8]>`.
-//! That works for a pure interpreter but is the wrong substrate for
-//! machine-code calls and optimizer deopt: a growable contiguous buffer
-//! **reallocates and moves every live frame** when it outgrows its capacity.
-//! Compiled callees need their caller's frame — and the register slots inside
-//! it — to keep a stable address for the whole lifetime of the call.
+//! Before this slice the interpreter held its call frames in a
+//! `SmallVec<[Frame; 8]>`. That works for a pure interpreter but is the wrong
+//! substrate for machine-code calls and optimizer deopt: a buffer that
+//! **reallocates and moves every live frame** when it outgrows its capacity is
+//! unusable once a compiled callee holds a raw pointer to its caller's frame —
+//! and to the register slots inside it — across a re-entrant call.
 //!
-//! `HoltStack` is that substrate. Frames live in fixed-capacity
-//! [`HoltSegment`]s. A segment's backing buffer is reserved once to
-//! [`SEGMENT_CAP`] and is **never** grown past it, so the buffer never
-//! reallocates and every `&Frame` / `&mut Frame` it hands out stays valid
-//! until that frame is popped. Growth appends a *new* segment; the outer
-//! `Vec<HoltSegment>` may reallocate, but that only moves segment *headers*
-//! (a pointer/len/cap triple) — never the heap frame buffers the headers
-//! point at. Index math stays O(1) because every segment except the last is
-//! kept exactly full.
+//! `HoltStack` is that substrate. It is a single contiguous `Vec<Frame>`, so
+//! frame access is one indirection and `stack[i]` is O(1) — exactly the cost
+//! the legacy `SmallVec` paid. Stability comes from **reservation, not
+//! segmentation**: the dispatch stack is built with
+//! [`HoltStack::with_dispatch_capacity`], which reserves
+//! [`crate::DEFAULT_MAX_STACK_DEPTH`] frames up front. The VM throws a catchable
+//! stack-overflow before the live frame count could exceed that bound, so the
+//! backing buffer never reallocates and every `&Frame` it has handed out stays
+//! put for the program's lifetime. Short-lived re-entry stacks use
+//! [`HoltStack::new`] and grow on demand; nothing pins their frame addresses
+//! across pushes, so a growth-time move there is harmless.
 //!
-//! This module is the additive, isolated substrate (HoltStack slice 1a). It
-//! is **not yet wired into the dispatcher** — the live path still uses
-//! `SmallVec<[Frame; 8]>`. Wiring it (behind `OTTER_HOLT_STACK`) is a later
-//! sub-slice that must carry the call/frame/generator/async test262 gates.
+//! This **is** the interpreter execution stack: slice 1b replaced
+//! `SmallVec<[Frame; 8]>` with `HoltStack` at every call site and rewired the
+//! GC frame-roots provider (`trace_active_frame_roots`) onto it. There is no
+//! legacy fallback.
 //!
 //! # Contents
-//! - [`HoltStack`] — the segmented frame stack and its stack-discipline API.
-//! - [`HoltSegment`] — one fixed-capacity, non-reallocating frame buffer.
-//! - [`SEGMENT_CAP`] — frames per segment.
+//! - [`HoltStack`] — the frame stack and its stack-discipline API.
 //!
 //! # Invariants
-//! - A segment's `frames` buffer is reserved to `SEGMENT_CAP` and `len` never
-//!   exceeds it, so the buffer address is stable for the segment's lifetime.
-//! - Every segment except the last is exactly `SEGMENT_CAP` full; the last
-//!   holds `1..=SEGMENT_CAP` frames (there are no empty or partial interior
-//!   segments). This is what makes `index = (i / CAP, i % CAP)` correct.
-//! - A frame's address is stable from `push` until the matching `pop`.
+//! - A stack built with [`HoltStack::with_dispatch_capacity`] never exceeds its
+//!   reserved capacity (the VM's stack-overflow guard fires first), so its
+//!   buffer never reallocates and live-frame addresses are stable.
 //! - GC tracing visits every live frame exactly once, in push order.
 //!
 //! # See also
 //! - [`crate::frame_state::Frame`] — the frame payload and `trace_frame_slots`.
 //! - [`crate::cold_frame`] — cold side records, traced separately by the
-//!   integration just as they are for the `SmallVec` stack today.
+//!   integration just as they were for the `SmallVec` stack.
 
-// Slice 1a lands the substrate without wiring it into the dispatcher, so its
-// API has no in-crate callers yet. The integration sub-slice (behind
-// `OTTER_HOLT_STACK`) removes this allowance as the call sites adopt it.
-#![allow(dead_code)]
-
-use otter_gc::raw::SlotVisitor;
+use smallvec::SmallVec;
 
 use crate::frame_state::Frame;
 
-/// Frames per [`HoltSegment`]. Sized so a segment buffer stays a few pages
-/// (each [`Frame`] is ≤128 B, so 64 frames ≤ 8 KiB) while comfortably
-/// covering typical JS call depth before a second segment is needed.
-pub(crate) const SEGMENT_CAP: usize = 64;
+/// Inline frame capacity. Short-lived re-entry sub-stacks (Array callbacks,
+/// eval prologues) hold one or a few frames entirely inline, so they cost zero
+/// heap allocation — the property the legacy `SmallVec<[Frame; 8]>` stack had
+/// and which a plain `Vec` would lose.
+const INLINE_FRAMES: usize = 8;
 
-/// One fixed-capacity frame buffer. `frames` is reserved to [`SEGMENT_CAP`]
-/// at construction and never pushed past it, so its heap buffer never
-/// reallocates and the addresses of the frames it holds are stable.
-#[derive(Debug)]
-struct HoltSegment {
-    frames: Vec<Frame>,
-}
-
-impl HoltSegment {
-    fn new() -> Self {
-        Self {
-            frames: Vec::with_capacity(SEGMENT_CAP),
-        }
-    }
-
-    #[inline]
-    fn is_full(&self) -> bool {
-        self.frames.len() == SEGMENT_CAP
-    }
-}
-
-/// Segmented, stable-address stack of interpreter call [`Frame`]s.
+/// Reservation-stable stack of interpreter call [`Frame`]s.
 ///
-/// Drop-in for the legacy `SmallVec<[Frame; 8]>`: it offers the same
-/// stack-discipline surface (`push` / `pop` / `last` / `last_mut` / `len` /
-/// `is_empty` / `get` / `get_mut` / `truncate` / `iter` / `iter_mut`) plus
-/// `Index` / `IndexMut`, but never moves a live frame.
+/// Storage is an inline-8 `SmallVec`, so frame access is one indirection and
+/// `stack[i]` is O(1) — exactly the cost the legacy `SmallVec<[Frame; 8]>` paid,
+/// and small re-entry stacks stay inline with no allocation. Stability comes
+/// from **reservation**: a dispatch stack built with
+/// [`Self::with_dispatch_capacity`] reserves [`crate::DEFAULT_MAX_STACK_DEPTH`]
+/// frames in one heap buffer up front, and the VM throws a catchable
+/// stack-overflow before the live frame count could exceed it — so that buffer
+/// never reallocates and every `&Frame` it hands out stays put.
+///
+/// Same stack-discipline surface as the legacy stack (`push` / `pop` / `last` /
+/// `last_mut` / `len` / `is_empty` / `get` / `get_mut` / `truncate` / `iter` /
+/// `iter_mut`) plus `Index` / `IndexMut`.
+///
+/// `#[repr(transparent)]` over the `SmallVec`: `HoltStack` has identical layout
+/// and ABI to its storage, so the JIT reentry bridge's
+/// `<*mut JitFrameStack>::cast(stack)` is a sound, zero-cost reinterpret and the
+/// optimizer treats the newtype exactly as the bare `SmallVec` it once was.
+#[repr(transparent)]
 #[derive(Debug, Default)]
 pub struct HoltStack {
-    segments: Vec<HoltSegment>,
-    len: usize,
+    frames: SmallVec<[Frame; INLINE_FRAMES]>,
 }
 
 impl HoltStack {
-    /// A new, empty stack. No allocation until the first [`push`](Self::push).
+    /// A new, empty stack. Holds its first [`INLINE_FRAMES`] frames inline with
+    /// no heap allocation — use for short-lived re-entry sub-stacks (Array
+    /// callbacks, eval, generator prologues), which do not need stable frame
+    /// addresses.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            segments: Vec::new(),
-            len: 0,
+            frames: SmallVec::new(),
+        }
+    }
+
+    /// A new, empty stack pre-reserved for a full dispatch run. Reserving the
+    /// VM's maximum call-stack depth up front spills storage to a single heap
+    /// buffer that never reallocates while dispatching (the stack-overflow guard
+    /// fires before the reservation is exhausted), so every live frame keeps a
+    /// stable address — the property compiled callees rely on.
+    #[must_use]
+    pub fn with_dispatch_capacity() -> Self {
+        Self {
+            frames: SmallVec::with_capacity(crate::DEFAULT_MAX_STACK_DEPTH as usize),
         }
     }
 
@@ -102,146 +101,84 @@ impl HoltStack {
     #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
-        self.len
+        self.frames.len()
     }
 
     /// `true` when no frames are live.
     #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.frames.is_empty()
     }
 
-    /// Push `frame` and return a stable `&mut` to it. The reference stays
-    /// valid until the matching [`pop`](Self::pop) / [`truncate`](Self::truncate).
+    /// Push `frame` onto the stack.
     ///
-    /// The frame is fully constructed before it is published here (its
-    /// register window is already `Value::undefined()`-filled by
-    /// [`Frame::with_exec_registers`] and friends), so the published frame is
-    /// never visible to GC in a partially-initialized state.
-    pub fn push(&mut self, frame: Frame) -> &mut Frame {
-        if self.segments.last().is_none_or(HoltSegment::is_full) {
-            self.segments.push(HoltSegment::new());
-        }
-        let seg = self
-            .segments
-            .last_mut()
-            .expect("just ensured a non-full last segment exists");
-        seg.frames.push(frame);
-        self.len += 1;
-        seg.frames
-            .last_mut()
-            .expect("just pushed a frame into this segment")
+    /// The frame is fully constructed before it is published (its register
+    /// window is already `Value::undefined()`-filled by
+    /// [`Frame::with_exec_registers`] and friends), so it is never visible to
+    /// GC in a partially-initialized state. Callers that need the pushed frame
+    /// read it back with [`last_mut`](Self::last_mut); on a
+    /// [`with_dispatch_capacity`](Self::with_dispatch_capacity) stack that
+    /// reference stays valid until the matching [`pop`](Self::pop) /
+    /// [`truncate`](Self::truncate).
+    #[inline]
+    pub fn push(&mut self, frame: Frame) {
+        self.frames.push(frame);
     }
 
-    /// Pop and return the top frame, or `None` when empty. Dropping the
-    /// now-empty trailing segment keeps the "interior segments are full"
-    /// invariant and frees the buffer; frames in other segments are untouched.
+    /// Pop and return the top frame, or `None` when empty.
+    #[inline]
     pub fn pop(&mut self) -> Option<Frame> {
-        let seg = self.segments.last_mut()?;
-        let frame = seg.frames.pop();
-        if frame.is_some() {
-            self.len -= 1;
-            if seg.frames.is_empty() {
-                self.segments.pop();
-            }
-        }
-        frame
+        self.frames.pop()
     }
 
     /// Shared reference to the top frame.
     #[inline]
     #[must_use]
     pub fn last(&self) -> Option<&Frame> {
-        self.segments.last().and_then(|s| s.frames.last())
+        self.frames.last()
     }
 
     /// Mutable reference to the top frame.
     #[inline]
     #[must_use]
     pub fn last_mut(&mut self) -> Option<&mut Frame> {
-        self.segments.last_mut().and_then(|s| s.frames.last_mut())
+        self.frames.last_mut()
     }
 
-    /// Shared reference to the frame at global index `i` (`0` is the bottom
-    /// `<main>` frame), or `None` if out of range.
+    /// Shared reference to the frame at index `i` (`0` is the bottom `<main>`
+    /// frame), or `None` if out of range.
     #[inline]
     #[must_use]
     pub fn get(&self, i: usize) -> Option<&Frame> {
-        if i >= self.len {
-            return None;
-        }
-        let (seg, off) = (i / SEGMENT_CAP, i % SEGMENT_CAP);
-        Some(&self.segments[seg].frames[off])
+        self.frames.get(i)
     }
 
-    /// Mutable reference to the frame at global index `i`, or `None`.
+    /// Mutable reference to the frame at index `i`, or `None`.
     #[inline]
     #[must_use]
     pub fn get_mut(&mut self, i: usize) -> Option<&mut Frame> {
-        if i >= self.len {
-            return None;
-        }
-        let (seg, off) = (i / SEGMENT_CAP, i % SEGMENT_CAP);
-        Some(&mut self.segments[seg].frames[off])
+        self.frames.get_mut(i)
     }
 
     /// Drop frames until exactly `new_len` remain. No-op if already shorter.
-    /// Each removed [`Frame`] is dropped (running `Frame`'s `Drop`), matching
-    /// `Vec::truncate` semantics on the legacy stack.
+    /// Each removed [`Frame`] is dropped, matching `Vec::truncate`.
+    #[inline]
     pub fn truncate(&mut self, new_len: usize) {
-        while self.len > new_len {
-            if self.pop().is_none() {
-                break;
-            }
-        }
+        self.frames.truncate(new_len);
     }
 
-    /// Iterate live frames bottom-to-top (push order).
-    pub fn iter(&self) -> impl Iterator<Item = &Frame> {
-        self.segments.iter().flat_map(|s| s.frames.iter())
+    /// Iterate live frames bottom-to-top (push order). Double-ended so callers
+    /// (e.g. backtrace snapshotting) can walk it innermost-first with `.rev()`.
+    #[inline]
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Frame> {
+        self.frames.iter()
     }
 
     /// Mutably iterate live frames bottom-to-top.
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Frame> {
-        self.segments.iter_mut().flat_map(|s| s.frames.iter_mut())
-    }
-
-    /// Trace the GC roots held by every live frame — register window,
-    /// upvalue cells, `this`, async result promise, and nested
-    /// generator/async state — via [`Frame::trace_frame_slots`].
-    ///
-    /// Cold-record slots (pending ToPrimitive/bind/iterator ladders) are
-    /// traced separately by the integration through the cold-frame pool,
-    /// exactly as for the `SmallVec` stack today; this method intentionally
-    /// mirrors `trace_frame_slots` only.
-    pub(crate) fn trace_frames(&self, visitor: &mut SlotVisitor<'_>) {
-        for frame in self.iter() {
-            frame.trace_frame_slots(visitor);
-        }
-    }
-
-    /// Debug-only structural check of the segment invariant: every segment but
-    /// the last is exactly full, the last is non-empty, and the segment frame
-    /// counts sum to `len`.
-    #[cfg(test)]
-    fn assert_invariants(&self) {
-        let mut total = 0;
-        for (i, seg) in self.segments.iter().enumerate() {
-            let n = seg.frames.len();
-            assert!(n <= SEGMENT_CAP, "segment over capacity");
-            if i + 1 < self.segments.len() {
-                assert_eq!(n, SEGMENT_CAP, "interior segment {i} must be full");
-            } else {
-                assert!(n > 0, "trailing segment must be non-empty");
-            }
-            assert!(
-                seg.frames.capacity() >= SEGMENT_CAP,
-                "buffer must stay reserved"
-            );
-            total += n;
-        }
-        assert_eq!(total, self.len, "segment counts must sum to len");
+    #[inline]
+    pub fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut Frame> {
+        self.frames.iter_mut()
     }
 }
 
@@ -250,14 +187,14 @@ impl std::ops::Index<usize> for HoltStack {
 
     #[inline]
     fn index(&self, i: usize) -> &Frame {
-        self.get(i).expect("HoltStack index out of bounds")
+        &self.frames[i]
     }
 }
 
 impl std::ops::IndexMut<usize> for HoltStack {
     #[inline]
     fn index_mut(&mut self, i: usize) -> &mut Frame {
-        self.get_mut(i).expect("HoltStack index out of bounds")
+        &mut self.frames[i]
     }
 }
 
@@ -269,9 +206,9 @@ mod tests {
         BytecodeModule, Function, Instruction, SourceKind as BcSourceKind, SpanEntry,
     };
 
-    /// Minimal single-function module whose `<main>` has one scratch
-    /// register, so `Frame::for_function` yields a 1-register frame we can
-    /// stamp with an identity tag.
+    /// Minimal single-function module whose `<main>` has one scratch register,
+    /// so `Frame::for_function` yields a 1-register frame we can stamp with an
+    /// identity tag.
     fn one_register_module() -> BytecodeModule {
         BytecodeModule {
             module: "holt-stack-test.ts".to_string(),
@@ -312,8 +249,7 @@ mod tests {
         }
     }
 
-    /// A frame whose single register holds `tag`, so we can verify identity
-    /// after the stack grows.
+    /// A frame whose single register holds `tag`.
     fn tagged_frame(function: &Function, tag: i32) -> Frame {
         let mut frame = Frame::for_function(function);
         frame.registers[0] = Value::number_i32(tag);
@@ -331,9 +267,7 @@ mod tests {
             stack.push(tagged_frame(f, tag));
         }
         assert_eq!(stack.len(), 5);
-        stack.assert_invariants();
 
-        // Bottom-to-top order via index and iter.
         for (i, frame) in stack.iter().enumerate() {
             assert_eq!(frame.registers[0], Value::number_i32(i as i32));
             assert_eq!(stack[i].registers[0], Value::number_i32(i as i32));
@@ -343,59 +277,48 @@ mod tests {
         let popped = stack.pop().unwrap();
         assert_eq!(popped.registers[0], Value::number_i32(4));
         assert_eq!(stack.len(), 4);
-        stack.assert_invariants();
     }
 
     #[test]
-    fn frame_addresses_are_stable_across_segment_growth() {
+    fn dispatch_capacity_keeps_frame_addresses_stable() {
         let module = one_register_module();
         let f = &module.functions[0];
-        let mut stack = HoltStack::new();
+        // A dispatch stack reserves the max call depth, so pushing up to that
+        // bound never reallocates and never moves a previously-pushed frame.
+        let mut stack = HoltStack::with_dispatch_capacity();
+        let n = crate::DEFAULT_MAX_STACK_DEPTH as usize;
 
-        // Fill well past one segment so the outer Vec<HoltSegment> reallocates
-        // and several segments are allocated.
-        let n = SEGMENT_CAP * 3 + 7;
         let mut addrs = Vec::with_capacity(n);
         for tag in 0..n {
-            let frame_ref = stack.push(tagged_frame(f, tag as i32));
-            addrs.push(frame_ref as *const Frame as usize);
+            stack.push(tagged_frame(f, tag as i32));
+            addrs.push(stack.last().unwrap() as *const Frame as usize);
         }
-        stack.assert_invariants();
-        assert!(stack.segments.len() >= 4, "expected multiple segments");
-
-        // Every previously-handed-out frame address must be unchanged, and the
-        // frame contents uncorrupted, after all the growth.
         for (i, &addr) in addrs.iter().enumerate() {
             let now = &stack[i] as *const Frame as usize;
-            assert_eq!(now, addr, "frame {i} moved across segment growth");
+            assert_eq!(now, addr, "frame {i} moved within the reserved capacity");
             assert_eq!(stack[i].registers[0], Value::number_i32(i as i32));
         }
     }
 
     #[test]
-    fn truncate_drops_to_target_and_keeps_invariant() {
+    fn truncate_drops_to_target() {
         let module = one_register_module();
         let f = &module.functions[0];
         let mut stack = HoltStack::new();
-        for tag in 0..(SEGMENT_CAP * 2 + 5) as i32 {
+        for tag in 0..100 {
             stack.push(tagged_frame(f, tag));
         }
 
-        stack.truncate(SEGMENT_CAP + 2);
-        assert_eq!(stack.len(), SEGMENT_CAP + 2);
-        stack.assert_invariants();
-        assert_eq!(
-            stack.last().unwrap().registers[0],
-            Value::number_i32((SEGMENT_CAP + 1) as i32),
-        );
+        stack.truncate(40);
+        assert_eq!(stack.len(), 40);
+        assert_eq!(stack.last().unwrap().registers[0], Value::number_i32(39));
 
         // Truncate longer-than-len is a no-op.
         stack.truncate(10_000);
-        assert_eq!(stack.len(), SEGMENT_CAP + 2);
+        assert_eq!(stack.len(), 40);
 
         stack.truncate(0);
         assert!(stack.is_empty());
-        stack.assert_invariants();
     }
 
     #[test]
@@ -413,26 +336,28 @@ mod tests {
     }
 
     #[test]
-    fn trace_visits_every_live_register_slot() {
+    fn iter_traces_every_live_frame() {
         let module = one_register_module();
         let f = &module.functions[0];
         let mut stack = HoltStack::new();
-        let n = SEGMENT_CAP + 3;
+        let n = 200;
         for tag in 0..n as i32 {
             stack.push(tagged_frame(f, tag));
         }
 
-        // `SlotVisitor` is an alias for `dyn FnMut(*mut RawGc)`. number_i32
-        // registers carry no GC pointer, so a correct trace over a
-        // multi-segment stack visits zero raw-GC slots and, crucially,
-        // completes without panicking (reaching every live frame). The closure
-        // is scoped so its borrow of `visited_slots` releases before the assert.
+        // Mirrors how `trace_active_frame_roots` walks the live stack for GC:
+        // iterate every frame and trace its slots. number_i32 registers carry
+        // no GC pointer, so a correct walk visits zero raw-GC slots and reaches
+        // every live frame without panicking. The closure is scoped so its
+        // borrow of `visited_slots` releases before the assert.
         let mut visited_slots = 0usize;
         {
             let mut visitor = |_p: *mut otter_gc::raw::RawGc| {
                 visited_slots += 1;
             };
-            stack.trace_frames(&mut visitor);
+            for frame in stack.iter() {
+                frame.trace_frame_slots(&mut visitor);
+            }
         }
         assert_eq!(visited_slots, 0);
         assert_eq!(stack.len(), n);

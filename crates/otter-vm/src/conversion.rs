@@ -20,6 +20,7 @@
 //! - [`crate::number`]
 //! - [`crate::string::dispatch`]
 
+use crate::holt_stack::HoltStack;
 use otter_bytecode::Operand;
 use smallvec::SmallVec;
 
@@ -162,7 +163,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-ordinarytoprimitive>
     pub(crate) fn try_to_primitive_dispatch(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<Option<()>, VmError> {
@@ -220,7 +221,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-ordinarytoprimitive>
     pub(crate) fn drive_to_primitive(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
@@ -549,7 +550,7 @@ impl Interpreter {
     /// a primitive result.
     fn drive_to_primitive_stage(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         dst: u16,
         obj: Value,
@@ -727,7 +728,7 @@ impl Interpreter {
     #[allow(clippy::too_many_arguments)]
     fn push_to_primitive_call(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         dst: u16,
         obj: Value,

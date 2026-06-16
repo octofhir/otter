@@ -17,6 +17,7 @@
 //! - [`crate::array_statics`]
 //! - [`crate::executable`]
 
+use crate::holt_stack::HoltStack;
 use otter_bytecode::{Op, Operand};
 use smallvec::SmallVec;
 
@@ -30,7 +31,7 @@ impl Interpreter {
         &mut self,
         op: Op,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
@@ -52,7 +53,7 @@ impl Interpreter {
     /// §23.1.1.1 `Array(...values)`.
     fn array_construct_stack_rooted(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         args: &[Value],
     ) -> Result<Value, VmError> {
         if args.len() == 1
@@ -95,7 +96,7 @@ impl Interpreter {
     /// §23.1.2.3 `Array.of(...items)`.
     fn array_of_stack_rooted(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         args: &[Value],
     ) -> Result<Value, VmError> {
         Ok(Value::array(
@@ -542,7 +543,7 @@ mod tests {
     fn array_of_uses_stack_rooted_result_allocation() {
         let mut interp = Interpreter::new();
         let module = empty_module();
-        let mut stack: smallvec::SmallVec<[Frame; 8]> = smallvec::SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         stack.push(Frame::for_function(&module.functions[0]));
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
@@ -565,7 +566,7 @@ mod tests {
     fn array_construct_length_uses_stack_rooted_shell_and_growth() {
         let mut interp = Interpreter::new();
         let module = empty_module();
-        let mut stack: smallvec::SmallVec<[Frame; 8]> = smallvec::SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         stack.push(Frame::for_function(&module.functions[0]));
         let before_alloc = interp.gc_heap().stats().new_allocated_bytes;
         let before_reserved = interp.gc_heap().stats().reserved_bytes;

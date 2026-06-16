@@ -11,6 +11,7 @@
 
 use crate::Value;
 use crate::bootstrap::native_static_with_value_roots;
+use crate::holt_stack::HoltStack;
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject};
 
@@ -1629,7 +1630,7 @@ fn async_generator_validate(
     };
     let reason = interp
         .make_type_error_with_stack_roots(
-            &smallvec::SmallVec::new(),
+            &HoltStack::new(),
             "receiver is not an async generator object",
         )
         .map_err(|_| crate::NativeError::TypeError {
@@ -1669,10 +1670,7 @@ fn async_generator_resumption(
             let reason = match interp.take_pending_uncaught_throw() {
                 Some(thrown) => thrown,
                 None => interp
-                    .make_type_error_with_stack_roots(
-                        &smallvec::SmallVec::new(),
-                        &format!("{err:?}"),
-                    )
+                    .make_type_error_with_stack_roots(&HoltStack::new(), &format!("{err:?}"))
                     .map_err(|_| err)?,
             };
             let promise = crate::promise_dispatch::PromiseBuilder::with_context(exec_ctx)

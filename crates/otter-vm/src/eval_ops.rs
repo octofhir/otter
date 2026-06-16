@@ -22,8 +22,8 @@
 //! - [`crate::code_space`]
 //! - [`crate::ExecutionContext`]
 
+use crate::holt_stack::HoltStack;
 use otter_bytecode::{BytecodeModule, Operand};
-use smallvec::SmallVec;
 
 use crate::promise::JsPromise;
 use crate::{
@@ -75,7 +75,7 @@ impl Interpreter {
     pub(crate) fn run_eval_operands(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
@@ -209,7 +209,7 @@ impl Interpreter {
         options: EvalCompileOptions,
         cell_sources: &[CallerCellSource],
         new_target_suppressed: bool,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
     ) -> Result<Value, VmError> {
         let Some(s) = value.as_string(&self.gc_heap) else {
             // §19.2.1.1 step 2 — non-string operands are returned
@@ -320,7 +320,7 @@ impl Interpreter {
         if caller_new_target.is_some() {
             self.frame_ensure_cold(&mut entry).new_target = caller_new_target;
         }
-        let mut sub_stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut sub_stack: HoltStack = HoltStack::new();
         sub_stack.push(entry);
         self.dispatch_loop(&context, &mut sub_stack)
     }
@@ -328,7 +328,7 @@ impl Interpreter {
     pub(crate) fn run_new_function_operands(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
@@ -397,7 +397,7 @@ impl Interpreter {
         // eval stay callable from any later frame.
         let context = self.link_module(module);
         let main = context.exec_main();
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, main, Frame::empty_upvalues())?;
         let entry_this = if main.is_module || main.is_strict {
@@ -530,7 +530,7 @@ impl Interpreter {
         // Running the synthesised module's `<main>` returns the
         // function value (the parenthesised expression is the
         // program's completion).
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut stack: HoltStack = HoltStack::new();
         stack.push(Frame::for_function_with_heap(
             context.main(),
             &mut self.gc_heap,

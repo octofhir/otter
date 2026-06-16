@@ -17,6 +17,7 @@
 //! # See also
 //! - [`crate::executable`]
 
+use crate::holt_stack::HoltStack;
 use otter_bytecode::{Op, Operand, method_id};
 use otter_gc::raw::RawGc;
 use smallvec::SmallVec;
@@ -119,7 +120,7 @@ impl Interpreter {
 
     pub(crate) fn run_array_buffer_static_call_operands(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
@@ -149,7 +150,7 @@ impl Interpreter {
 
     pub(crate) fn run_shared_array_buffer_static_call_operands(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
@@ -186,7 +187,7 @@ impl Interpreter {
     pub(crate) fn run_for_in_keys_operands(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
@@ -223,7 +224,7 @@ impl Interpreter {
     pub(crate) fn run_copy_data_properties_operands(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
@@ -254,7 +255,7 @@ impl Interpreter {
     pub(crate) fn run_star_reexport_operands(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
@@ -294,7 +295,7 @@ impl Interpreter {
     pub(crate) fn run_define_own_property_operands(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
@@ -347,7 +348,7 @@ impl Interpreter {
     pub(crate) fn do_object_create_with_descriptors(
         &mut self,
         context: &ExecutionContext,
-        stack: Option<&SmallVec<[Frame; 8]>>,
+        stack: Option<&HoltStack>,
         args: &[Value],
     ) -> Result<Value, VmError> {
         let proto = args.first().cloned().unwrap_or(Value::undefined());
@@ -426,7 +427,7 @@ impl Interpreter {
     pub(crate) fn do_object_define_properties(
         &mut self,
         context: &ExecutionContext,
-        _stack: Option<&SmallVec<[Frame; 8]>>,
+        _stack: Option<&HoltStack>,
         args: &[Value],
     ) -> Result<Value, VmError> {
         let target_value = args.first().cloned().unwrap_or(Value::undefined());
@@ -500,7 +501,7 @@ impl Interpreter {
     pub(crate) fn do_object_assign(
         &mut self,
         context: &ExecutionContext,
-        stack: Option<&SmallVec<[Frame; 8]>>,
+        stack: Option<&HoltStack>,
         args: &[Value],
     ) -> Result<Value, VmError> {
         let target_input = args.first().cloned().unwrap_or(Value::undefined());
@@ -580,14 +581,14 @@ impl Interpreter {
         method: method_id::ObjectMethod,
         args: &[Value],
     ) -> Result<Option<Value>, VmError> {
-        let stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let stack: HoltStack = HoltStack::new();
         self.object_static_call_stack_rooted(context, &stack, method, args)
     }
 
     pub(crate) fn object_static_call_stack_rooted(
         &mut self,
         context: &ExecutionContext,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         method: method_id::ObjectMethod,
         args: &[Value],
     ) -> Result<Option<Value>, VmError> {
@@ -1194,7 +1195,7 @@ impl Interpreter {
     fn do_object_group_by(
         &mut self,
         context: &ExecutionContext,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         args: &[Value],
     ) -> Result<Value, VmError> {
         let items = args.first().cloned().unwrap_or(Value::undefined());
@@ -1295,7 +1296,7 @@ impl Interpreter {
 
     fn descriptor_to_object_stack_rooted(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         desc: &object::PropertyDescriptor,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],

@@ -13,8 +13,8 @@ Order follows the plan's *minimal implementation sequence* (§5). Each slice is 
 | # | Slice | Codename | Status | Entry blocked on |
 |---|-------|----------|--------|------------------|
 | 0 | Engine Lab — measurement, differential testing, progress scaffold | `OtterLab` | **done** (commit `98f460b3`) | — |
-| 1 | Stable VM stack & frame descriptors | `HoltStack` | **in progress** (1a done) | Slice 0 green ✓ |
-| 2 | PupJIT direct calls + machine-code frame build | `PupJIT Calls` | not started | HoltStack stable |
+| 1 | Stable VM stack & frame descriptors | `HoltStack` | **done** (1b; 1e folds into Slice 2) | Slice 0 green ✓ |
+| 2 | PupJIT direct calls + machine-code frame build | `PupJIT Calls` | **next** | HoltStack stable ✓ |
 | 3 | Unified feedback vectors + complete ICs | `WhiskerIC` | not started | PupJIT direct calls |
 | 4 | Hot heap layouts (Array/TypedArray/String/Closure) | `KelpHeap` | not started | WhiskerIC load/store/method/element |
 | 5 | Production GC + precise safepoint stack maps | `TideGC` / `StoneMaps` / `ShellAlloc` | not started | KelpHeap; PupJIT direct calls shipped |
@@ -36,20 +36,30 @@ Order follows the plan's *minimal implementation sequence* (§5). Each slice is 
 - [x] Progress scaffold (this file) with slice ladder, verification commands, baselines, rollback, code anchors, next-slice design note.
 - [ ] *(deferred to a follow-up Slice-0 commit, not required for done)* per-run engine counters surfaced to the CLI (IC hit/miss, direct-call hit/miss, Rust-stub calls, alloc/GC time, deopts, code size, compile latency). Accessors already exist in-VM (`Interpreter::property_ic_stats`, `Interpreter::runtime_budget_stats`, GC `ScavengeStats`) but are not yet plumbed to a `run`-time dump. Tracked in [Counters](#counters-status).
 
-### Slice 1 — HoltStack sub-slice ladder
+### Slice 1 — HoltStack
 
-The execution stack is the concrete type `SmallVec<[Frame; 8]>`, threaded as an explicit `stack` parameter through **230 sites across 21 files** (`lib.rs` 75, `property_dispatch.rs` 27, `call_ops.rs` 22, `allocation_ops.rs` 16, …). The operations performed are pure stack discipline (`push`/`pop`/`len`/`is_empty`/`last`/`last_mut`/`get`/`get_mut`/`truncate`/`iter`) plus O(1) indexing `stack[i]` (`stack[top_idx]` ×26, `stack[0]` ×20, …). The defect `HoltStack` removes: `SmallVec` **reallocates and moves every live frame** when it outgrows inline-8 capacity — fatal once a compiled callee holds its caller's frame/register address. The big risk lives in the wiring (generator parking, sync reentry, GC-root registration, exception unwind), so the swap is decomposed:
+The execution stack was the concrete type `SmallVec<[Frame; 8]>`, threaded as an explicit `stack` parameter through **230 sites across 21 files** plus the JIT ABI alias `JitFrameStack` and the GC frame-roots provider. Pure stack discipline (`push`/`pop`/`len`/`is_empty`/`last`/`last_mut`/`get`/`get_mut`/`truncate`/`iter`) + O(1) indexing `stack[i]`. The defect `HoltStack` removes: a contiguous buffer **reallocates and moves every live frame** when it grows — fatal once a compiled callee holds its caller's frame/register address (Slice 2).
 
-| Sub | Scope | Risk | Flag | Gates | Status |
-|---|---|---|---|---|---|
-| **1a** | Additive `holt_stack` module: segmented, stable-address `HoltStack` with the full op surface (`push/pop/len/is_empty/last/last_mut/get/get_mut/truncate/iter/iter_mut`, `Index`/`IndexMut`, `trace_frames`). Not wired. | none (isolated, unit-tested) | — | `cargo test -p otter-vm holt_stack`; clippy clean | **done** |
-| 1b | Swap the stack type at definition + the ~12 construction sites to `HoltStack`; migrate the 230 annotation/index sites (`SmallVec<[Frame; 8]>` → `HoltStack`, behaviour-identical via the matching API). Single global stack still; legacy path retained behind `OTTER_HOLT_STACK=0`. | medium (mechanical breadth) | `OTTER_HOLT_STACK` | full `cargo test --all`; `bench-diff` 11/11; test262 call/frame/generator/async parity interp vs JIT and flag on/off | next |
-| 1c | Register `HoltStack` as the `FrameRoots` provider (replace the `SmallVec`-window provider); two-phase publish + debug initialized-slot bitmap; cold-record tracing layered exactly as today. | high (GC correctness) | `OTTER_HOLT_STACK` | `OTTER_GC_STRESS=64/128` `bench-diff`; Array safe runner | planned |
-| 1d | Generator/async parking & sync reentry over `HoltStack` (`HoltParkedSnapshot`); exception/finally unwind via cold frames. | high (parking/unwind) | `OTTER_HOLT_STACK` | generator/async/try test262 dirs; await/yield | planned |
-| 1e | `HoltFrameHeader` / `HoltFrameDesc` separation (header vs value slots) — the descriptor substrate Slice 2 (PupJIT direct calls) and Slices 8–9 (deopt) consume. | medium | `OTTER_HOLT_STACK` | as 1b–1d | planned |
-| 1f | Remove the legacy `SmallVec` stack + `OTTER_HOLT_STACK` flag once on-path is stress- and parity-clean. | low (deletion) | — | full suite green for ≥1 cycle | planned |
+| Sub | Scope | Status |
+|---|---|---|
+| **1a** | Additive `holt_stack` module substrate, not wired. | **superseded by 1b** |
+| **1b** | Full swap: `SmallVec<[Frame; 8]>` → `HoltStack` at all 230 sites, the `JitFrameStack` alias, the `trace_active_frame_roots` GC root provider, `resolve_jit_code`/`snapshot_frames` signatures. No fallback flag. | **done** |
+| 1d | `HoltParkedSnapshot` for generator/async parking over `HoltStack` (currently parking still uses `Box<Frame>` as before — unchanged and correct). | deferred |
+| 1e | `HoltFrameHeader` / `HoltFrameDesc` header↔value-slot split — the descriptor substrate Slice 2 (PupJIT direct calls) consumes. | planned (with Slice 2) |
 
-**Slice 1a — done.** `crates/otter-vm/src/holt_stack.rs` (+ `mod holt_stack;` in `lib.rs`). Segments are `Vec<Frame>` reserved once to `SEGMENT_CAP=64` and never grown past it ⇒ frame buffers never reallocate ⇒ stable `&Frame`/`&mut Frame` for a frame's whole life; the outer `Vec<HoltSegment>` may reallocate but only moves segment headers, not the heap frame buffers. Interior segments are kept exactly full so `stack[i]` is `(i/CAP, i%CAP)` O(1). Tests: push/pop/order, **stable-address-across-3+-segment-growth** (records every frame pointer, forces outer-Vec realloc, asserts no frame moved and no register corruption), truncate+invariant, get/get_mut bounds, multi-segment `trace_frames`. 5/5 pass; clippy `-D warnings` clean. Unwired — `#![allow(dead_code)]` until 1b adopts it.
+**Design decision (no flag, no dual-mode).** An `OTTER_HOLT_STACK` runtime flag was rejected: a runtime toggle over a deeply-threaded *type* needs a dual-mode storage enum, which is a compatibility crutch the program forbids. `HoltStack` is the only stack; rollback is `git revert`.
+
+**Storage: `#[repr(transparent)]` over `SmallVec<[Frame; 8]>`.** Explored and rejected two alternatives by measurement:
+- *Segmented `Vec<HoltSegment>`* (stable across growth via segments): the per-access `segments[i/CAP].frames[i%CAP]` double-indirection regressed the interpreter hot path badly (fib-jit +110%, array-ops +85%). Wrong tradeoff.
+- *Plain `Vec<Frame>`*: one-deref indexing fixed the interp path, but lost `SmallVec`'s inline-8 zero-alloc, so every ephemeral re-entry stack (Array callbacks, per-call JIT reentry) heap-allocated (controlled A/B: fib +31%, array-ops +27%).
+
+`#[repr(transparent)]` over `SmallVec<[Frame; 8]>` keeps inline-8 zero-alloc for ephemeral re-entry stacks **and** is ABI/layout-identical to the bare `SmallVec` the JIT `<*mut JitFrameStack>::cast` reinterprets — so the wrapper is genuinely zero-cost. **Stability comes from reservation, not segmentation:** the three top-level dispatch stacks (`run_inner`, `run_module_init_inner`, `invoke_microtask`) are built with `HoltStack::with_dispatch_capacity()`, reserving `DEFAULT_MAX_STACK_DEPTH` (1024) frames in one heap buffer up front; the VM's stack-overflow guard fires before that is exhausted, so the buffer never reallocates and live-frame addresses are stable for Slice 2. Ephemeral re-entry stacks use `HoltStack::new()` (inline, may move — they hold no pinned addresses yet).
+
+**Verification (2026-06-16, controlled).** `cargo test -p otter-vm -p otter-jit` 594 passed / 0 failed. `cargo clippy -D warnings` clean. `bench-diff` 11/11 identical across interp/jit/jit-osr. test262 interp-vs-JIT **zero failing-set delta**: `language/statements/function` 452/452, `generators` 266/266, `expressions/await` 22/22, `statements/try` 200p/6f (6 pre-existing, identical in both).
+
+**Known perf regression (accepted, Slice-2 territory).** Controlled interleaved A/B (noise floor ±0.5% via A/A) vs the pre-swap SmallVec binary:
+- **Interpreter (`OTTER_JIT=0`): neutral** — fib −1.9%; this is what Slice 1 is about.
+- **JIT (`OTTER_JIT=1`): regression confined to the compiled-*call* bridge** — fib +31%, array-ops +27%, sort +14%, prop-access +13%. Compute-only JIT (mandelbrot/nbody/typed-array/json/string) is **neutral**, so compiled straight-line code is unaffected; only `jit_runtime_call` / `try_jit_fast_call`'s per-call re-entry path is slower. **Slice 2 (PupJIT direct calls) replaces exactly that bridge** with machine-code frame-build/direct-call, so the cost is erased there rather than papered over now. Tracked as the entry baseline for Slice 2.
 
 ---
 

@@ -177,7 +177,7 @@ impl<'a> RuntimeState<'a> {
         }
         // 9) Active call frames are NOT enumerated here. The
         //    frame stack lives on the call stack of
-        //    `Interpreter::run_inner` (`SmallVec<[Frame; 8]>`),
+        //    `Interpreter::run_inner` (`HoltStack`),
         //    not on the [`Interpreter`] struct itself, so an
         //    out-of-band GC triggered through `RuntimeState`
         //    has no frame stack to walk. When the interpreter
@@ -185,7 +185,7 @@ impl<'a> RuntimeState<'a> {
         //    (task 76+), it will pass an additional
         //    `external_visit` closure to
         //    `GcHeap::collect_full` that walks the live
-        //    `&mut SmallVec<[Frame; 8]>` directly. This
+        //    `&mut HoltStack` directly. This
         //    `RuntimeState` walker stays as-is.
     }
 }

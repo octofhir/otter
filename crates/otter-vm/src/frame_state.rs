@@ -41,7 +41,7 @@ const _: () = assert!(
 
 /// One call frame. Compact and cache-conscious per foundation
 /// plan §M7. Slice 13 promotes the interpreter to a real frame
-/// stack (`SmallVec<[Frame; 8]>` inside the dispatcher) so
+/// stack (`HoltStack` inside the dispatcher) so
 /// function calls push and pop without per-call `Vec` allocation.
 #[derive(Debug, Clone)]
 pub struct Frame {

@@ -19,6 +19,7 @@
 //! - [`crate::Frame`]
 //! - [`crate::executable`]
 
+use crate::holt_stack::HoltStack;
 use smallvec::SmallVec;
 
 use crate::{
@@ -149,7 +150,7 @@ impl Interpreter {
     /// Propagates `ReferenceError` for a TDZ-hole cell and `InvalidOperand`.
     pub fn jit_runtime_load_upvalue(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         frame_index: usize,
         dst: u16,
         idx: i32,
@@ -170,7 +171,7 @@ impl Interpreter {
     /// Propagates `InvalidOperand` for a negative or out-of-range index.
     pub fn jit_runtime_store_upvalue(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         frame_index: usize,
         src: u16,
         idx: i32,
@@ -184,7 +185,7 @@ impl Interpreter {
 
     pub(crate) fn run_collect_rest_reg(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         top_idx: usize,
         dst: u16,
     ) -> Result<(), VmError> {

@@ -21,6 +21,7 @@
 //! - [`crate::Frame`]
 //! - [`crate::executable`]
 
+use crate::holt_stack::HoltStack;
 use otter_bytecode::Operand;
 use otter_gc::raw::RawGc;
 use smallvec::SmallVec;
@@ -373,7 +374,7 @@ impl Interpreter {
     #[allow(clippy::too_many_arguments)]
     fn push_bytecode_call_frame(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         function_id: u32,
         parent_upvalues: UpvalueSpine,
@@ -465,7 +466,7 @@ impl Interpreter {
             if let Some(cold) = cold {
                 self.frame_attach_cold(&mut frame, cold);
             }
-            let mut prologue_stack: SmallVec<[Frame; 8]> = SmallVec::new();
+            let mut prologue_stack: HoltStack = HoltStack::new();
             prologue_stack.push(frame);
             self.dispatch_loop(context, &mut prologue_stack)?;
             self.resolve_generator_prototype_stack_rooted(
@@ -486,7 +487,7 @@ impl Interpreter {
     fn prepare_bytecode_call_frame_from_window(
         &mut self,
         context: &ExecutionContext,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         function_id: u32,
         parent_upvalues: UpvalueSpine,
         this_for_callee: Value,
@@ -543,7 +544,7 @@ impl Interpreter {
     fn resolve_generator_prototype_stack_rooted(
         &mut self,
         context: &ExecutionContext,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         function_id: u32,
         gen_handle: &crate::generator::JsGenerator,
     ) -> Result<(), VmError> {
@@ -566,7 +567,7 @@ impl Interpreter {
 
     fn push_prepared_bytecode_call_frame(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         dst: u16,
         prepared: PreparedBytecodeFrame,
@@ -590,7 +591,7 @@ impl Interpreter {
             if let Some(cold) = cold {
                 self.frame_attach_cold(&mut frame, cold);
             }
-            let mut prologue_stack: SmallVec<[Frame; 8]> = SmallVec::new();
+            let mut prologue_stack: HoltStack = HoltStack::new();
             prologue_stack.push(frame);
             self.dispatch_loop(context, &mut prologue_stack)?;
             self.resolve_generator_prototype_stack_rooted(
@@ -609,7 +610,7 @@ impl Interpreter {
 
     fn try_push_bytecode_call_frame_from_window(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         callee: &Value,
         this_value: Value,
@@ -683,7 +684,7 @@ impl Interpreter {
 
     fn try_invoke_native_call_from_window(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         callee: &Value,
         this_value: Value,
@@ -737,7 +738,7 @@ impl Interpreter {
     /// to `Value::undefined()` (foundation strict default).
     pub(crate) fn do_call(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<(), VmError> {
@@ -792,7 +793,7 @@ impl Interpreter {
     /// dispatch resumes after the originating instruction.
     pub(crate) fn invoke(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         callee: &Value,
         this_value: Value,
@@ -963,7 +964,7 @@ impl Interpreter {
     /// that swap so the unwind path is uniform across call shapes.
     pub(crate) fn do_construct(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<(), VmError> {
@@ -997,7 +998,7 @@ impl Interpreter {
 
     fn try_dispatch_construct_from_window(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         callee: Value,
         operands: &[Operand],
@@ -1047,7 +1048,7 @@ impl Interpreter {
 
     pub(crate) fn do_construct_spread(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<(), VmError> {
@@ -1073,7 +1074,7 @@ impl Interpreter {
 
     pub(crate) fn do_super_construct_spread(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<(), VmError> {
@@ -1103,7 +1104,7 @@ impl Interpreter {
 
     pub(crate) fn dispatch_construct(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         callee: Value,
         args: SmallVec<[Value; 8]>,
@@ -1114,7 +1115,7 @@ impl Interpreter {
 
     fn dispatch_construct_with_new_target(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         callee: Value,
         new_target: Value,
@@ -1301,7 +1302,7 @@ impl Interpreter {
     pub(crate) fn construct_prototype_for_callee_stack_rooted(
         &mut self,
         context: &ExecutionContext,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         callee: &Value,
     ) -> Result<Option<Value>, VmError> {
         let function_id = callee.as_function().or_else(|| {
@@ -1451,7 +1452,7 @@ impl Interpreter {
     /// calls with `this = undefined`).
     pub(crate) fn do_call_spread(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<(), VmError> {
@@ -1479,7 +1480,7 @@ impl Interpreter {
     /// path of `Function.prototype.apply`.
     pub(crate) fn do_call_with_this(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<(), VmError> {
@@ -1715,7 +1716,7 @@ impl Interpreter {
             this_for_callee,
             &[effective_args.as_slice()],
         )?;
-        let mut inner: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut inner: HoltStack = HoltStack::new();
         let registers = self.draw_registers(function.register_count as usize);
         let mut new_frame =
             Frame::with_exec_registers(function, None, upvalues, this_for_callee, registers);
@@ -1768,7 +1769,7 @@ impl Interpreter {
             if let Some(cold) = cold {
                 self.frame_attach_cold(&mut frame, cold);
             }
-            let mut prologue_stack: SmallVec<[Frame; 8]> = SmallVec::new();
+            let mut prologue_stack: HoltStack = HoltStack::new();
             prologue_stack.push(frame);
             self.dispatch_loop(context, &mut prologue_stack)?;
             // §27.5.1 step 3 — resolve [[Prototype]] after the
@@ -2027,7 +2028,7 @@ impl Interpreter {
             effective_args,
             None,
         )?;
-        let mut inner: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut inner: HoltStack = HoltStack::new();
         inner.push(new_frame);
         self.dispatch_loop(context, &mut inner)
     }

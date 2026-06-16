@@ -18,6 +18,7 @@
 //! - [`crate::executable`]
 //! - [`crate::object`]
 
+use crate::holt_stack::HoltStack;
 use smallvec::SmallVec;
 
 use otter_bytecode::{Op, Operand};
@@ -66,7 +67,7 @@ impl Interpreter {
 
     fn capture_store_property_transition_with_stack_roots(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         mut obj: JsObject,
         key: AtomizedPropertyKey<'_>,
         value: &Value,
@@ -183,7 +184,7 @@ impl Interpreter {
 
     fn function_user_bag_with_stack_roots(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         value_roots: &[&Value],
@@ -664,7 +665,7 @@ impl Interpreter {
     pub(crate) fn run_load_super_property(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         top_idx: usize,
         dst: u16,
         home: Value,
@@ -720,7 +721,7 @@ impl Interpreter {
     pub(crate) fn run_store_super_property(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         top_idx: usize,
         home: Value,
         key: SuperReadKey<'_>,
@@ -917,7 +918,7 @@ impl Interpreter {
     pub(crate) fn run_load_property_reg(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         top_idx: usize,
         dst: u16,
         obj_reg: u16,
@@ -1385,7 +1386,7 @@ impl Interpreter {
     pub(crate) fn run_store_property_reg(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         top_idx: usize,
         obj_reg: u16,
         key: AtomizedPropertyKey<'_>,
@@ -2348,7 +2349,7 @@ impl Interpreter {
     pub(crate) fn run_store_element_regs(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         top_idx: usize,
         recv_reg: u16,
         idx_reg: u16,
@@ -2989,7 +2990,7 @@ impl Interpreter {
     pub fn jit_runtime_load_property(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         frame_index: usize,
         dst: u16,
         obj_reg: u16,
@@ -3039,7 +3040,7 @@ impl Interpreter {
     pub fn jit_runtime_load_element(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         frame_index: usize,
         dst: u16,
         recv_reg: u16,
@@ -3064,7 +3065,7 @@ impl Interpreter {
     pub fn jit_runtime_load_global(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         frame_index: usize,
         dst: u16,
         name_idx: u32,
@@ -3086,7 +3087,7 @@ impl Interpreter {
     pub(crate) fn run_define_data_property_regs(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         top_idx: usize,
         obj_reg: u16,
         key_reg: u16,
@@ -3150,7 +3151,7 @@ impl Interpreter {
     pub fn jit_runtime_delegate_op(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         frame_index: usize,
         byte_pc: u32,
     ) -> Result<(), VmError> {
@@ -3300,7 +3301,7 @@ impl Interpreter {
     pub fn jit_runtime_store_element(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         frame_index: usize,
         recv_reg: u16,
         idx_reg: u16,
@@ -3340,7 +3341,7 @@ impl Interpreter {
     pub fn jit_runtime_store_property(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         frame_index: usize,
         obj_reg: u16,
         name_idx: u32,
@@ -3407,7 +3408,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-ordinaryget>
     pub(crate) fn drive_load_property(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
@@ -3718,7 +3719,7 @@ impl Interpreter {
     /// fast path's prototype-walk fallback.
     pub(crate) fn drive_instanceof(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
@@ -3738,7 +3739,7 @@ impl Interpreter {
     /// object/proxy reads whose resolved descriptor is an accessor.
     pub(crate) fn drive_load_element(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
@@ -3909,7 +3910,7 @@ impl Interpreter {
         context.function_is_strict(function_id)
     }
 
-    fn current_frame_is_strict(stack: &SmallVec<[Frame; 8]>, context: &ExecutionContext) -> bool {
+    fn current_frame_is_strict(stack: &HoltStack, context: &ExecutionContext) -> bool {
         stack
             .last()
             .is_some_and(|frame| Self::function_is_strict(context, frame.function_id))
@@ -3953,7 +3954,7 @@ impl Interpreter {
     }
 
     fn finish_failed_set(
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         message: impl Into<String>,
         byte_len: u32,
@@ -3994,7 +3995,7 @@ impl Interpreter {
 
     fn store_to_primitive_base(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         receiver: Value,
         key: VmPropertyKey,
@@ -4192,7 +4193,7 @@ impl Interpreter {
     /// object/proxy must obey §10.1.9 OrdinarySet.
     pub(crate) fn drive_store_element(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
@@ -4744,7 +4745,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-ordinarysetwithowndescriptor>
     pub(crate) fn drive_store_property(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
@@ -5162,7 +5163,7 @@ impl Interpreter {
     /// the trap-aware walk instead of delegating to `object::lookup`.
     pub(crate) fn drive_has_property_proxy(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
@@ -5259,7 +5260,7 @@ impl Interpreter {
     /// trap when the receiver of `delete obj.x` is a Proxy.
     pub(crate) fn drive_delete_property_proxy(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
@@ -5297,7 +5298,7 @@ impl Interpreter {
     /// same trap-aware path as `delete obj.x`.
     pub(crate) fn drive_delete_element_proxy(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
@@ -5327,7 +5328,7 @@ impl Interpreter {
     /// `getPrototypeOf` trap when the source is a Proxy.
     pub(crate) fn drive_get_prototype_proxy(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
@@ -5348,7 +5349,7 @@ impl Interpreter {
     /// `setPrototypeOf` trap when the receiver is a Proxy.
     pub(crate) fn drive_set_prototype_proxy(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {

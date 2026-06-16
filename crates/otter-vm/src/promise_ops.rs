@@ -21,6 +21,7 @@
 //! # See also
 //! - [`crate::promise_dispatch`]
 
+use crate::holt_stack::HoltStack;
 use otter_bytecode::Operand;
 use smallvec::SmallVec;
 
@@ -34,7 +35,7 @@ impl Interpreter {
     pub(crate) fn run_promise_fulfilled_of_regs(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         top_idx: usize,
         dst: u16,
         src: u16,
@@ -74,7 +75,7 @@ impl Interpreter {
     pub(crate) fn run_promise_new_operands(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
@@ -106,7 +107,7 @@ impl Interpreter {
     pub(crate) fn run_promise_call_operands(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;

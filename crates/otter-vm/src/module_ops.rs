@@ -29,6 +29,7 @@
 //! - [`crate::module_records`]
 //! - [`crate::execution_context`]
 
+use crate::holt_stack::HoltStack;
 use crate::{
     ExecutionContext, Frame, Interpreter, JsString, Value, VmError, module_records::ModuleStatus,
     operand_decode::register_operand, promise_dispatch, read_register, resolve_relative_url,
@@ -751,7 +752,7 @@ impl Interpreter {
                 if let Err(err) = self.execute_async_module(context, &module) {
                     let message = format!("module evaluation failed: {err}");
                     let reason = self
-                        .make_type_error_with_stack_roots(&SmallVec::new(), &message)
+                        .make_type_error_with_stack_roots(&HoltStack::new(), &message)
                         .unwrap_or_else(|_| Value::undefined());
                     self.async_module_execution_rejected(&module, reason);
                 }
@@ -774,7 +775,7 @@ impl Interpreter {
                     Err(err) => {
                         let message = format!("module evaluation failed: {err}");
                         let reason = self
-                            .make_type_error_with_stack_roots(&SmallVec::new(), &message)
+                            .make_type_error_with_stack_roots(&HoltStack::new(), &message)
                             .unwrap_or_else(|_| Value::undefined());
                         self.async_module_execution_rejected(&module, reason);
                     }
@@ -1180,7 +1181,7 @@ impl Interpreter {
     pub(crate) fn run_import_namespace_dynamic_operands(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         top_idx: usize,
         operands: &[Operand],
     ) -> Result<(), VmError> {

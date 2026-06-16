@@ -19,6 +19,7 @@
 //! - [`crate::executable`]
 //! - [`crate::Frame`]
 
+use crate::holt_stack::HoltStack;
 use otter_bytecode::Operand;
 use smallvec::SmallVec;
 
@@ -169,7 +170,7 @@ impl Interpreter {
 
     pub(crate) fn run_make_class_regs(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         frame_idx: usize,
         dst: u16,
         ctor_reg: u16,
@@ -253,7 +254,7 @@ impl Interpreter {
 
     pub(crate) fn drive_bind_function(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<(), VmError> {
@@ -339,7 +340,7 @@ impl Interpreter {
 
     fn continue_bind_function_after_name(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         dst: u16,
         target: Value,
@@ -382,7 +383,7 @@ impl Interpreter {
 
     fn finish_bind_function(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         dst: u16,
         target: Value,
         bound_this: Value,
@@ -564,7 +565,7 @@ impl Interpreter {
     pub(crate) fn ordinary_has_instance_stack_rooted(
         &mut self,
         context: &ExecutionContext,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         c: &Value,
         o: &Value,
     ) -> Result<bool, VmError> {
@@ -644,7 +645,7 @@ impl Interpreter {
     pub(crate) fn instanceof_operator_stack_rooted(
         &mut self,
         context: &ExecutionContext,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         v: &Value,
         target: &Value,
     ) -> Result<bool, VmError> {
@@ -921,7 +922,7 @@ impl Interpreter {
 
     pub(crate) fn function_user_bag_stack_rooted(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         value_roots: &[&Value],
@@ -1184,7 +1185,7 @@ impl Interpreter {
         key: &str,
         desc_obj: Option<JsObject>,
         descriptor: object::PropertyDescriptor,
-        stack_roots: Option<&SmallVec<[Frame; 8]>>,
+        stack_roots: Option<&HoltStack>,
         value_roots: &[&Value],
     ) -> Result<bool, VmError> {
         let descriptor = match self.ordinary_function_own_property_descriptor(
@@ -1288,7 +1289,7 @@ impl Interpreter {
     pub(crate) fn try_function_object_static_call(
         &mut self,
         context: Option<&ExecutionContext>,
-        stack_roots: Option<&SmallVec<[Frame; 8]>>,
+        stack_roots: Option<&HoltStack>,
         method: otter_bytecode::method_id::ObjectMethod,
         args: &[Value],
     ) -> Result<Option<Value>, VmError> {
@@ -1682,7 +1683,7 @@ impl Interpreter {
 
     fn function_static_array_from_values(
         &mut self,
-        stack_roots: Option<&SmallVec<[Frame; 8]>>,
+        stack_roots: Option<&HoltStack>,
         values: Vec<Value>,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
@@ -1700,7 +1701,7 @@ impl Interpreter {
 
     fn function_static_descriptor_to_object(
         &mut self,
-        stack_roots: Option<&SmallVec<[Frame; 8]>>,
+        stack_roots: Option<&HoltStack>,
         desc: &object::PropertyDescriptor,
         value_roots: &[&Value],
         slice_roots: &[Value],
@@ -1824,7 +1825,7 @@ impl Interpreter {
     pub(crate) fn function_property_get_stack_rooted(
         &mut self,
         context: &ExecutionContext,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         name: &str,
@@ -1848,7 +1849,7 @@ impl Interpreter {
     pub(crate) fn function_property_get_stack_rooted_with_receiver(
         &mut self,
         context: &ExecutionContext,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         receiver: Option<Value>,

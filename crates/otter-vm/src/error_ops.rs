@@ -17,6 +17,7 @@
 //! - [`crate::error_classes`]
 //! - [`crate::executable`]
 
+use crate::holt_stack::HoltStack;
 use smallvec::SmallVec;
 
 use crate::{
@@ -28,7 +29,7 @@ impl Interpreter {
     pub(crate) fn run_new_error_regs(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         top_idx: usize,
         dst: u16,
         msg_reg: u16,
@@ -51,7 +52,7 @@ impl Interpreter {
     pub(crate) fn run_new_builtin_error_regs(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         top_idx: usize,
         dst: u16,
         kind_idx: u32,
@@ -89,7 +90,7 @@ impl Interpreter {
 
     fn make_error_instance_with_stack_roots(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         kind: ErrorKind,
         message: Option<String>,
         message_value: &Value,
@@ -147,7 +148,7 @@ impl Interpreter {
     /// but skips the `VmError` wrapping.
     pub(crate) fn make_type_error_with_stack_roots(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         message: &str,
     ) -> Result<Value, VmError> {
         let message_root = Value::undefined();
@@ -164,7 +165,7 @@ impl Interpreter {
     /// keep propagating as host errors (StackOverflow, etc.).
     pub(crate) fn vm_error_to_throwable_with_stack_roots(
         &mut self,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: &HoltStack,
         err: &VmError,
     ) -> Option<Value> {
         let dynamic_message: String;
@@ -342,7 +343,7 @@ impl Interpreter {
 /// (`<entry>`).
 pub(crate) fn snapshot_frames(
     context: &ExecutionContext,
-    stack: &[Frame],
+    stack: &HoltStack,
 ) -> Vec<StackFrameSnapshot> {
     stack
         .iter()

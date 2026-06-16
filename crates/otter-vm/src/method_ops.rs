@@ -19,12 +19,13 @@
 //! - [`crate::call_ops`]
 //! - [`crate::executable`]
 
+use crate::holt_stack::HoltStack;
 use otter_bytecode::Operand;
 use smallvec::SmallVec;
 
 use crate::{
-    BoundFunction, ExecutionContext, Frame, GeneratorResumeKind, Interpreter, JsString,
-    NumberValue, Value, VmError, VmGetOutcome, VmPropertyKey, bigint,
+    BoundFunction, ExecutionContext, GeneratorResumeKind, Interpreter, JsString, NumberValue,
+    Value, VmError, VmGetOutcome, VmPropertyKey, bigint,
     boolean::prototype as boolean_prototype,
     bootstrap_collections, build_array_cb_args, collections_prototype, date, descriptor_value,
     function_metadata,
@@ -210,7 +211,7 @@ impl Interpreter {
     ///   else surfaces as `UnknownIntrinsic`.
     pub(crate) fn do_call_method_value(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<(), VmError> {
@@ -807,7 +808,7 @@ impl Interpreter {
     pub fn jit_runtime_call_method(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         frame_index: usize,
         dst: u16,
         recv_reg: u16,
@@ -977,7 +978,7 @@ impl Interpreter {
     fn get_method_value_for_call(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         recv_value: Value,
         name: &str,
     ) -> Result<Option<Value>, VmError> {
@@ -1640,7 +1641,7 @@ impl Interpreter {
 
     fn dispatch_function_method(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
+        stack: &mut HoltStack,
         context: &ExecutionContext,
         callee: &Value,
         name: &str,

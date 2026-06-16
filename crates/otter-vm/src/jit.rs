@@ -167,8 +167,11 @@ pub struct JitInstrView {
 
 /// Frame stack the interpreter dispatches over. Exposed so the JIT crate can
 /// hold a `*mut JitFrameStack` in its reentry context and hand it back to the
-/// VM-side bridge methods without naming the `SmallVec` shape itself.
-pub type JitFrameStack = smallvec::SmallVec<[crate::Frame; 8]>;
+/// VM-side bridge methods without naming the concrete stack shape itself. This
+/// is the segmented, stable-address [`crate::holt_stack::HoltStack`] — the
+/// stability is exactly what lets compiled code keep a frame/register pointer
+/// across a re-entrant call.
+pub type JitFrameStack = crate::holt_stack::HoltStack;
 
 /// Raw, type-erased pointers the VM hands the JIT so compiled code can re-enter
 /// the VM (recursive calls, closure allocation) through the safe bridge methods

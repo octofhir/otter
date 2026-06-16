@@ -61,9 +61,17 @@ pub const SHARED_ARRAY_BUFFER_BODY_TYPE_TAG: u8 = 0x2d;
 ///
 /// Mutators flip every field through [`otter_gc::GcHeap::with_payload`]
 /// (no interior mutability in GC bodies).
+///
+/// `#[repr(C)]` with `bytes` first so the baseline JIT can read the
+/// `Vec<u8>` data pointer (the Vec's first word) and the `detached`
+/// flag at fixed byte offsets ([`LOCAL_ARRAY_BUFFER_BODY_BYTES_OFFSET`]
+/// / [`LOCAL_ARRAY_BUFFER_BODY_DETACHED_OFFSET`]) for inline typed-array
+/// element access — no interpreter round-trip.
 #[derive(Debug)]
+#[repr(C)]
 pub struct LocalArrayBufferBodyGc {
-    /// Raw bytes. Empty when detached.
+    /// Raw bytes. Empty when detached. `#[repr(C)]` keeps this first so
+    /// the JIT reads the data pointer at the body's first word.
     pub bytes: Vec<u8>,
     /// `true` after detach / transfer; once set, stays set per spec.
     pub detached: bool,
@@ -76,6 +84,18 @@ pub struct LocalArrayBufferBodyGc {
     /// (`ab.constructor = C` for the species protocol, `ab.x = 1`).
     pub expando: Option<crate::object::JsObject>,
 }
+
+/// Byte offset of [`LocalArrayBufferBodyGc::bytes`] from the body start
+/// (after the GC header). The first word at this offset is the
+/// `Vec<u8>` data pointer the baseline JIT loads for inline element
+/// access. `0` by construction (`bytes` is the first field), exported
+/// via `offset_of!` so it stays correct under any reorder.
+pub const LOCAL_ARRAY_BUFFER_BODY_BYTES_OFFSET: usize =
+    std::mem::offset_of!(LocalArrayBufferBodyGc, bytes);
+/// Byte offset of [`LocalArrayBufferBodyGc::detached`] from the body
+/// start. The JIT bails inline access when this flag is set.
+pub const LOCAL_ARRAY_BUFFER_BODY_DETACHED_OFFSET: usize =
+    std::mem::offset_of!(LocalArrayBufferBodyGc, detached);
 
 impl otter_gc::SafeTraceable for LocalArrayBufferBodyGc {
     const TYPE_TAG: u8 = LOCAL_ARRAY_BUFFER_BODY_TYPE_TAG;
@@ -170,7 +190,19 @@ pub struct JsArrayBuffer {
 /// Storage discriminator. `Local` is the single-isolate
 /// `ArrayBuffer` path; `Shared` is the cross-thread
 /// `SharedArrayBuffer` path.
+///
+/// `#[repr(C)]` forces a stable `{ tag: u32, handle: u32 }`-shaped
+/// layout (8 bytes) so the baseline JIT can read the discriminant and,
+/// for the `Local` variant, the compressed buffer handle at fixed byte
+/// offsets ([`BUFFER_STORAGE_DISCRIMINANT_OFFSET`] /
+/// [`BUFFER_STORAGE_HANDLE_OFFSET`]). Without an explicit repr the
+/// layout (and even the field/tag offsets) would be unspecified. The
+/// `Gc` payload is `repr(transparent)` over `u32`, so the union is
+/// 4-byte and the handle sits immediately after the 4-byte tag.
+/// Declaration order fixes the tag values: `Local == 0`, `Shared == 1`
+/// ([`BUFFER_STORAGE_LOCAL_TAG`] / [`BUFFER_STORAGE_SHARED_TAG`]).
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[repr(C)]
 pub enum BufferStorage {
     /// Non-shared backing — GC body holds the inline `Vec<u8>`.
     Local(LocalArrayBufferHandle),
@@ -178,6 +210,24 @@ pub enum BufferStorage {
     /// real `Mutex<Vec<u8>>` and a process-unique id.
     Shared(SharedArrayBufferHandle),
 }
+
+/// Discriminant tag of [`BufferStorage::Local`] (declaration order 0).
+pub const BUFFER_STORAGE_LOCAL_TAG: u32 = 0;
+/// Discriminant tag of [`BufferStorage::Shared`] (declaration order 1).
+pub const BUFFER_STORAGE_SHARED_TAG: u32 = 1;
+/// Byte offset of the `#[repr(C)]` discriminant within [`BufferStorage`]
+/// (0 — the tag leads the layout).
+pub const BUFFER_STORAGE_DISCRIMINANT_OFFSET: usize = 0;
+/// Byte offset of the compressed handle payload within [`BufferStorage`]
+/// (4 — immediately after the 4-byte tag, both variants share it).
+pub const BUFFER_STORAGE_HANDLE_OFFSET: usize = 4;
+
+// The JIT inline element path depends on this exact layout. Lock it.
+const _: () = {
+    assert!(std::mem::size_of::<BufferStorage>() == 8);
+    assert!(std::mem::align_of::<BufferStorage>() == 4);
+    assert!(std::mem::size_of::<LocalArrayBufferHandle>() == 4);
+};
 
 /// Storage for a `SharedArrayBuffer`. Lives behind `Arc` so the
 /// substrate can ship across host threads.

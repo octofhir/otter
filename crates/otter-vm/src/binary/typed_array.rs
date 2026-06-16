@@ -479,7 +479,15 @@ pub const TYPED_ARRAY_BODY_TYPE_TAG: u8 = 0x2b;
 ///
 /// Mutators flip `expando` through [`otter_gc::GcHeap::with_payload`]
 /// (no interior mutability in GC bodies).
+///
+/// `#[repr(C)]` so the baseline JIT can read `kind`, `byte_offset`,
+/// `length`, and the embedded `buffer` handle at fixed byte offsets
+/// ([`TYPED_ARRAY_BODY_KIND_OFFSET`] etc.) for inline element access —
+/// no interpreter round-trip. Field order is load-bearing; the offset
+/// constants below are `offset_of!`-derived so they stay correct if it
+/// changes, and the JIT bakes them at compile time.
 #[derive(Debug)]
+#[repr(C)]
 pub struct TypedArrayBodyGc {
     /// Backing buffer.
     pub buffer: JsArrayBuffer,
@@ -499,6 +507,29 @@ pub struct TypedArrayBodyGc {
     /// the buffer's current byte length.
     pub length_tracking: bool,
 }
+
+/// Byte offset of [`TypedArrayBodyGc::buffer`] from the body start
+/// (i.e. from the GC payload base, *after* the header). The baseline
+/// JIT reads the embedded [`JsArrayBuffer`] storage discriminant +
+/// handle through this when inlining element access.
+pub const TYPED_ARRAY_BODY_BUFFER_OFFSET: usize = std::mem::offset_of!(TypedArrayBodyGc, buffer);
+/// Byte offset of [`TypedArrayBodyGc::kind`] (a `#[repr(u32)]`
+/// [`TypedArrayKind`]) from the body start. Guarded by the JIT against
+/// the element-access kind it specialized for.
+pub const TYPED_ARRAY_BODY_KIND_OFFSET: usize = std::mem::offset_of!(TypedArrayBodyGc, kind);
+/// Byte offset of [`TypedArrayBodyGc::byte_offset`] from the body
+/// start. Added to the buffer data pointer when the JIT addresses an
+/// element.
+pub const TYPED_ARRAY_BODY_BYTE_OFFSET_OFFSET: usize =
+    std::mem::offset_of!(TypedArrayBodyGc, byte_offset);
+/// Byte offset of [`TypedArrayBodyGc::length`] (element count) from the
+/// body start. The JIT bounds-checks the index against this.
+pub const TYPED_ARRAY_BODY_LENGTH_OFFSET: usize = std::mem::offset_of!(TypedArrayBodyGc, length);
+/// Byte offset of [`TypedArrayBodyGc::length_tracking`] from the body
+/// start. The JIT bails inline access when this flag is set (the cached
+/// `length` is then stale and the live byte length must be recomputed).
+pub const TYPED_ARRAY_BODY_LENGTH_TRACKING_OFFSET: usize =
+    std::mem::offset_of!(TypedArrayBodyGc, length_tracking);
 
 impl otter_gc::SafeTraceable for TypedArrayBodyGc {
     const TYPE_TAG: u8 = TYPED_ARRAY_BODY_TYPE_TAG;

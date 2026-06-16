@@ -77,9 +77,9 @@ impl otter_vm::JitCompilerHook for BaselineJitCompiler {
 #[cfg(all(test, target_arch = "aarch64"))]
 mod toolchain_tests {
     //! In-workspace proof that the dynasm-rs arm64 toolchain emits and executes
-    //! JIT code under this crate's unsafe-lift (mirrors `jit-proto` M1/M2). These
-    //! are the §3.2 gate's toolchain + tagged-codegen checks, now running inside
-    //! the real workspace build.
+    //! JIT code under this crate's unsafe-lift. These are the §3.2 gate's
+    //! toolchain + tagged-codegen checks, running inside the real workspace
+    //! build.
 
     use crate::CompiledCode;
     use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};

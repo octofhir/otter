@@ -486,6 +486,16 @@ pub struct Interpreter {
     /// traced `Value`s and never need GC visiting) are reused on the next frame
     /// build. General to interpreter and JIT call paths alike.
     reg_pool: Vec<Vec<Value>>,
+    /// Pool of reservation-stable [`HoltStack`]s reused for synchronous callable
+    /// re-entry (Array / collection callbacks, comparators, sync `@@iterator`
+    /// drives). Every re-entry needs a stack whose frames never move, so a
+    /// compiled callee can append its frame directly onto it and re-enter without
+    /// dangling the caller's in-register frame pointer. Each stack reserves
+    /// `DEFAULT_MAX_STACK_DEPTH` frames, which would `malloc` that reservation per
+    /// re-entry; recycling cleared stacks here makes the hot callback path
+    /// allocation-free. Drawn by [`Self::draw_stack`], returned by
+    /// [`Self::return_stack`].
+    holt_pool: Vec<HoltStack>,
     /// Optional per-turn resource policy. This slice records observations but
     /// does not yet yield or reject when a limit is exceeded.
     runtime_budget: RuntimeBudget,
@@ -1054,6 +1064,7 @@ impl Interpreter {
             jit_code: rustc_hash::FxHashMap::default(),
             jit_code_cache: None,
             reg_pool: Vec::new(),
+            holt_pool: Vec::new(),
             runtime_budget: RuntimeBudget::default(),
             runtime_budget_stats: RuntimeBudgetStats::default(),
             runtime_budget_depth: 0,
@@ -1642,19 +1653,41 @@ impl Interpreter {
             self.frame_ensure_cold(&mut new_frame).callee_closure = Some(closure);
         }
 
-        let mut inner: HoltStack = HoltStack::new();
-        inner.push(new_frame);
-        match self.run_compiled_frame(&mut inner, context, 0, code) {
+        // Run the callee on the caller's own stack, in place. Every `HoltStack`
+        // is reservation-stable (reserves `DEFAULT_MAX_STACK_DEPTH`; the
+        // stack-overflow guard — already entered above via `enter_sync_reentry` —
+        // fires before the reservation is exhausted), so appending the callee
+        // frame never reallocates and the compiled caller's in-register frame
+        // pointer stays valid across the re-entry. The compiled caller is the top
+        // frame, so the callee lands directly above it at `idx`. This is the only
+        // path: no private re-entry stack, no fallback. It also keeps the callee's
+        // register window a precise GC root throughout its compiled body — the
+        // appended frame is covered by the enclosing `dispatch_loop`'s
+        // `trace_active_frame_roots` provider, which `run_compiled_frame` alone
+        // does not install.
+        let idx = stack.len();
+        stack.push(new_frame);
+        match self.run_compiled_frame(stack, context, idx, code) {
             jit::JitExecOutcome::Returned(value) => {
-                if let Some(mut done) = inner.pop() {
+                if let Some(mut done) = stack.pop() {
                     self.reclaim_registers(&mut done);
                 }
                 Ok(value)
             }
-            jit::JitExecOutcome::Threw(err) => Err(err),
+            // The compiled body returned with its frame (and any nested callee
+            // frames) still appended; drop back to the caller before propagating
+            // so the stack is left exactly as found.
+            jit::JitExecOutcome::Threw(err) => {
+                stack.truncate(idx);
+                Err(err)
+            }
+            // `new_frame` carries `return_register = None`, so resuming the
+            // interpreter pops it (and returns its completion) when it finishes —
+            // bounded to this appended frame, never unwinding the caller frames
+            // below it.
             jit::JitExecOutcome::Bailed(pc) => {
-                inner[0].pc = pc;
-                self.dispatch_loop(context, &mut inner)
+                stack[idx].pc = pc;
+                self.dispatch_loop(context, stack)
             }
         }
     }
@@ -2137,7 +2170,7 @@ impl Interpreter {
         let args: SmallVec<[Value; 8]> =
             smallvec::smallvec![env, import_meta, Value::boolean(hoist_phase)];
         self.bind_bytecode_call_arguments(function, &mut frame, args)?;
-        let mut stack: HoltStack = HoltStack::with_dispatch_capacity();
+        let mut stack: HoltStack = HoltStack::new();
         stack.push(frame);
         let init_promise = if function.is_async {
             let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
@@ -3772,6 +3805,28 @@ impl Interpreter {
         }
     }
 
+    /// Draw a reservation-stable [`HoltStack`] for a synchronous re-entry,
+    /// reusing a pooled buffer when one is free so the per-stack reservation is
+    /// not re-`malloc`ed on the hot callback path.
+    #[inline]
+    pub(crate) fn draw_stack(&mut self) -> HoltStack {
+        self.holt_pool.pop().unwrap_or_default()
+    }
+
+    /// Return a drained re-entry stack to the pool for reuse. The stack is
+    /// cleared (it holds no live frames, so the pool is never GC-traced); a full
+    /// pool drops the stack instead.
+    #[inline]
+    pub(crate) fn return_stack(&mut self, mut stack: HoltStack) {
+        if self.holt_pool.len() < Self::HOLT_POOL_CAP {
+            stack.clear();
+            self.holt_pool.push(stack);
+        }
+    }
+
+    /// Maximum pooled re-entry stacks retained at once.
+    const HOLT_POOL_CAP: usize = 64;
+
     /// Maximum pooled register buffers retained at once.
     const REG_POOL_CAP: usize = 256;
     /// Largest pooled buffer capacity (in `Value`s) kept for reuse.
@@ -4253,7 +4308,7 @@ impl Interpreter {
                 error,
                 frames: Vec::new(),
             })?;
-        let mut stack: HoltStack = HoltStack::with_dispatch_capacity();
+        let mut stack: HoltStack = HoltStack::new();
         stack.push(new_frame);
         match self.dispatch_loop(context, &mut stack) {
             Ok(value) => {
@@ -4325,7 +4380,7 @@ impl Interpreter {
         context: &ExecutionContext,
     ) -> Result<Value, (VmError, Vec<StackFrameSnapshot>)> {
         let main = context.exec_main();
-        let mut stack: HoltStack = HoltStack::with_dispatch_capacity();
+        let mut stack: HoltStack = HoltStack::new();
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, main, Frame::empty_upvalues())
                 .map_err(|oom| (VmError::from(oom), Vec::new()))?;

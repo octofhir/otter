@@ -7,17 +7,20 @@
 //! unusable once a compiled callee holds a raw pointer to its caller's frame —
 //! and to the register slots inside it — across a re-entrant call.
 //!
-//! `HoltStack` is that substrate. It is a single contiguous `Vec<Frame>`, so
-//! frame access is one indirection and `stack[i]` is O(1) — exactly the cost
-//! the legacy `SmallVec` paid. Stability comes from **reservation, not
-//! segmentation**: the dispatch stack is built with
-//! [`HoltStack::with_dispatch_capacity`], which reserves
-//! [`crate::DEFAULT_MAX_STACK_DEPTH`] frames up front. The VM throws a catchable
-//! stack-overflow before the live frame count could exceed that bound, so the
-//! backing buffer never reallocates and every `&Frame` it has handed out stays
-//! put for the program's lifetime. Short-lived re-entry stacks use
-//! [`HoltStack::new`] and grow on demand; nothing pins their frame addresses
-//! across pushes, so a growth-time move there is harmless.
+//! `HoltStack` is that substrate. It is a single contiguous buffer, so frame
+//! access is one indirection and `stack[i]` is O(1) — exactly the cost the
+//! legacy `SmallVec` paid. Stability comes from **reservation, not
+//! segmentation**: *every* `HoltStack` reserves [`crate::DEFAULT_MAX_STACK_DEPTH`]
+//! frames up front ([`HoltStack::new`]). The VM throws a catchable stack-overflow
+//! before the live frame count could exceed that bound, so the backing buffer
+//! never reallocates and every `&Frame` it has handed out stays put for the
+//! stack's lifetime. There is one stable behavior — no inline / non-reserved
+//! mode. Short-lived re-entry stacks (Array callbacks, eval, generator
+//! prologues) are recycled through the interpreter's stack pool
+//! (`Interpreter::draw_stack` / `return_stack`) so they cost no per-call
+//! reallocation, and a compiled callee can append its frame directly onto the
+//! caller's stack and re-enter without the caller's in-register frame pointer
+//! ever moving.
 //!
 //! This **is** the interpreter execution stack: slice 1b replaced
 //! `SmallVec<[Frame; 8]>` with `HoltStack` at every call site and rewired the
@@ -28,9 +31,9 @@
 //! - [`HoltStack`] — the frame stack and its stack-discipline API.
 //!
 //! # Invariants
-//! - A stack built with [`HoltStack::with_dispatch_capacity`] never exceeds its
-//!   reserved capacity (the VM's stack-overflow guard fires first), so its
-//!   buffer never reallocates and live-frame addresses are stable.
+//! - A [`HoltStack`] never exceeds its reserved capacity (the VM's
+//!   stack-overflow guard fires first), so its buffer never reallocates and
+//!   live-frame addresses are stable.
 //! - GC tracing visits every live frame exactly once, in push order.
 //!
 //! # See also
@@ -42,59 +45,68 @@ use smallvec::SmallVec;
 
 use crate::frame_state::Frame;
 
-/// Inline frame capacity. Short-lived re-entry sub-stacks (Array callbacks,
-/// eval prologues) hold one or a few frames entirely inline, so they cost zero
-/// heap allocation — the property the legacy `SmallVec<[Frame; 8]>` stack had
-/// and which a plain `Vec` would lose.
+/// `SmallVec` inline threshold. Immaterial to behavior — every `HoltStack`
+/// reserves [`crate::DEFAULT_MAX_STACK_DEPTH`] up front, so storage always lives
+/// in the heap buffer; this only fixes the `SmallVec`'s spilled layout, which the
+/// JIT reentry bridge's `<*mut JitFrameStack>::cast` reinterprets.
 const INLINE_FRAMES: usize = 8;
 
 /// Reservation-stable stack of interpreter call [`Frame`]s.
 ///
-/// Storage is an inline-8 `SmallVec`, so frame access is one indirection and
-/// `stack[i]` is O(1) — exactly the cost the legacy `SmallVec<[Frame; 8]>` paid,
-/// and small re-entry stacks stay inline with no allocation. Stability comes
-/// from **reservation**: a dispatch stack built with
-/// [`Self::with_dispatch_capacity`] reserves [`crate::DEFAULT_MAX_STACK_DEPTH`]
-/// frames in one heap buffer up front, and the VM throws a catchable
-/// stack-overflow before the live frame count could exceed it — so that buffer
-/// never reallocates and every `&Frame` it hands out stays put.
+/// Frame access is one indirection and `stack[i]` is O(1) — exactly the cost the
+/// legacy `SmallVec<[Frame; 8]>` paid. Stability comes from **reservation**:
+/// every stack reserves [`crate::DEFAULT_MAX_STACK_DEPTH`] frames in one heap
+/// buffer up front ([`Self::new`]), and the VM throws a catchable stack-overflow
+/// before the live frame count could exceed it — so that buffer never
+/// reallocates and every `&Frame` it hands out stays put. There is no inline /
+/// non-reserved mode; short-lived re-entry stacks are pooled and reused.
 ///
 /// Same stack-discipline surface as the legacy stack (`push` / `pop` / `last` /
-/// `last_mut` / `len` / `is_empty` / `get` / `get_mut` / `truncate` / `iter` /
-/// `iter_mut`) plus `Index` / `IndexMut`.
+/// `last_mut` / `len` / `is_empty` / `get` / `get_mut` / `truncate` / `clear` /
+/// `iter` / `iter_mut`) plus `Index` / `IndexMut`.
 ///
 /// `#[repr(transparent)]` over the `SmallVec`: `HoltStack` has identical layout
 /// and ABI to its storage, so the JIT reentry bridge's
 /// `<*mut JitFrameStack>::cast(stack)` is a sound, zero-cost reinterpret and the
 /// optimizer treats the newtype exactly as the bare `SmallVec` it once was.
 #[repr(transparent)]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct HoltStack {
     frames: SmallVec<[Frame; INLINE_FRAMES]>,
 }
 
+impl Default for HoltStack {
+    /// Reserved, like [`Self::new`] — the only behavior, so a defaulted stack is
+    /// stable too.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HoltStack {
-    /// A new, empty stack. Holds its first [`INLINE_FRAMES`] frames inline with
-    /// no heap allocation — use for short-lived re-entry sub-stacks (Array
-    /// callbacks, eval, generator prologues), which do not need stable frame
-    /// addresses.
+    /// A new, empty stack pre-reserved for a full dispatch run.
+    ///
+    /// Every `HoltStack` reserves [`crate::DEFAULT_MAX_STACK_DEPTH`] frames up
+    /// front, spilling storage to a single heap buffer. The VM throws a catchable
+    /// stack-overflow before the live frame count could exceed that bound, so the
+    /// buffer never reallocates and every `&Frame` it hands out keeps a stable
+    /// address — the property compiled callees rely on to append a callee frame
+    /// onto the caller's own stack and re-enter without dangling the caller's
+    /// in-register frame pointer. There is no inline / non-reserved mode: one
+    /// stable behavior, with short-lived re-entry stacks recycled through the
+    /// interpreter's stack pool rather than reallocated per call.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            frames: SmallVec::new(),
+            frames: SmallVec::with_capacity(crate::DEFAULT_MAX_STACK_DEPTH as usize),
         }
     }
 
-    /// A new, empty stack pre-reserved for a full dispatch run. Reserving the
-    /// VM's maximum call-stack depth up front spills storage to a single heap
-    /// buffer that never reallocates while dispatching (the stack-overflow guard
-    /// fires before the reservation is exhausted), so every live frame keeps a
-    /// stable address — the property compiled callees rely on.
-    #[must_use]
-    pub fn with_dispatch_capacity() -> Self {
-        Self {
-            frames: SmallVec::with_capacity(crate::DEFAULT_MAX_STACK_DEPTH as usize),
-        }
+    /// Drop all frames but keep the reserved capacity, so the buffer can be
+    /// returned to the interpreter's stack pool and reused without reallocating.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.frames.clear();
     }
 
     /// Total number of live frames.
@@ -117,10 +129,9 @@ impl HoltStack {
     /// window is already `Value::undefined()`-filled by
     /// [`Frame::with_exec_registers`] and friends), so it is never visible to
     /// GC in a partially-initialized state. Callers that need the pushed frame
-    /// read it back with [`last_mut`](Self::last_mut); on a
-    /// [`with_dispatch_capacity`](Self::with_dispatch_capacity) stack that
-    /// reference stays valid until the matching [`pop`](Self::pop) /
-    /// [`truncate`](Self::truncate).
+    /// read it back with [`last_mut`](Self::last_mut); that reference stays valid
+    /// until the matching [`pop`](Self::pop) / [`truncate`](Self::truncate),
+    /// because the reserved buffer never reallocates.
     #[inline]
     pub fn push(&mut self, frame: Frame) {
         self.frames.push(frame);
@@ -285,7 +296,7 @@ mod tests {
         let f = &module.functions[0];
         // A dispatch stack reserves the max call depth, so pushing up to that
         // bound never reallocates and never moves a previously-pushed frame.
-        let mut stack = HoltStack::with_dispatch_capacity();
+        let mut stack = HoltStack::new();
         let n = crate::DEFAULT_MAX_STACK_DEPTH as usize;
 
         let mut addrs = Vec::with_capacity(n);

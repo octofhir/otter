@@ -1716,7 +1716,6 @@ impl Interpreter {
             this_for_callee,
             &[effective_args.as_slice()],
         )?;
-        let mut inner: HoltStack = HoltStack::new();
         let registers = self.draw_registers(function.register_count as usize);
         let mut new_frame =
             Frame::with_exec_registers(function, None, upvalues, this_for_callee, registers);
@@ -1789,6 +1788,12 @@ impl Interpreter {
             );
             return Ok(Value::generator(gen_handle));
         }
+        // Draw a reservation-stable stack from the pool: the entry frame may
+        // tier up and run compiled, and a compiled callee appends its frame
+        // directly onto this stack, so it must never reallocate. Recycled on
+        // every completion path so the hot callback re-entry stays
+        // allocation-free.
+        let mut inner = self.draw_stack();
         inner.push(new_frame);
         // Tier-up the entry frame itself: a synchronously-entered callee reaches
         // `dispatch_loop` directly (no `Op::Call`), so without this hook the
@@ -1801,9 +1806,12 @@ impl Interpreter {
             if let Some(mut done) = inner.pop() {
                 self.reclaim_registers(&mut done);
             }
+            self.return_stack(inner);
             return Ok(value);
         }
-        self.dispatch_loop(context, &mut inner)
+        let result = self.dispatch_loop(context, &mut inner);
+        self.return_stack(inner);
+        result
     }
 
     /// Synchronously perform `Construct(target, args, newTarget)`.

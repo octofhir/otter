@@ -63,6 +63,125 @@ The execution stack was the concrete type `SmallVec<[Frame; 8]>`, threaded as an
 
 ---
 
+## Slice 2 — `PupJIT Calls` subplan
+
+> Active. Removes the per-JS-call Rust-bridge floor introduced as accepted regression by Slice 1b.
+
+### Entry baseline (measured 2026-06-16, darwin arm64, 8 runs / 2 warmup, fresh release binary)
+
+| script | otter-jit (ms) | Slice-2 target |
+|---|---|---|
+| fib.js | **277.2** | ~213 (erase the +31% bridge regression) |
+| array-ops.js | 792.0 | recover toward pre-1b |
+| prop-access.js | 668.1 | recover toward pre-1b |
+| sort.js | 1476.3 | recover toward pre-1b |
+
+`fib.js` is the headline probe: a pure-integer self-recursive call with zero allocation in the
+callee body, so its cost is *entirely* the call bridge — the cleanest signal for direct-call work.
+Compute-only scripts (mandelbrot/nbody/typed-array) stay the neutral control set.
+
+### Current compiled-call path (the floor being removed)
+
+Per `Op::Call` in compiled code (`baseline.rs::emit_call` → `jit_call_stub` →
+`Interpreter::jit_runtime_call` lib.rs:1448):
+1. machine→Rust extern-C hop (`blr` into `jit_call_stub`);
+2. eligibility checks (`try_jit_fast_call` lib.rs:1536): bytecode target, simple signature, compiled
+   body installed (cached resolve);
+3. `enter_sync_reentry` depth guard;
+4. `run_jit_fast_call_committed` (lib.rs:1599): build upvalue spine, coerce `this`, `draw_registers`,
+   **construct a fresh `inner = HoltStack::new()` + push the callee frame**, bind args from the rooted
+   caller window, `run_compiled_frame` → `enter_at` **rebuilds a fresh `JitCtx`** (reads regs-ptr /
+   self-closure / this) → `transmute` entry → machine code; on return pop + `reclaim_registers`,
+   write completion to `dst`.
+
+### Two findings from inspection that shape the decomposition
+
+1. **Latent GC rooting gap on the fast path (correctness, not just perf).** `dispatch_loop`
+   (lib.rs:4408) registers a `trace_active_frame_roots` provider for *the stack it is handed* and
+   traces every frame on it; `run_compiled_frame` registers **nothing**. The compiled-fast-call
+   callee runs on a private `inner` stack that no provider covers, so during the callee's compiled
+   body its own register window is **not a GC root**. Harmless for `fib` (no allocation) but a
+   use-after-free risk for any allocating compiled callee that triggers a scavenge while a young
+   pointer lives only in an `inner`-frame register. The slow path does not have this gap — it runs on
+   the shared, already-registered stack via `run_callable_sync_already_rooted`.
+
+2. **Same-stack push needs a reservation-stable host stack.** A compiled caller holds `x19` =
+   pointer into its own frame's register array on its host stack. Pushing the callee frame onto that
+   same stack is only sound if the stack never reallocates (which would move the caller's frame and
+   dangle `x19`). The top dispatch stacks are built with `with_dispatch_capacity()` (1024 reserved,
+   overflow guard fires first) and are stable; **ephemeral reentry stacks** (`run_callable_sync_inner`,
+   `array_ops`/`async_ops` helpers) are `HoltStack::new()` (inline-8) and may spill/move. Compiled
+   code runs on **both** kinds (tier-up/OSR happens inside whichever `dispatch_loop` is active), so a
+   same-stack call path must guarantee the host stack is reservation-stable everywhere it can fire.
+
+### Decomposition (one sub-slice = one commit, each independently revertible + measurable)
+
+- **2a — Same-stack compiled callee on the reservation-stable dispatch stack (Rust-only, no arm64). Implemented; held uncommitted to land with 2b.**
+  Runs the fast compiled→compiled callee **on the caller's stack in place** when that stack is
+  reservation-stable (`HoltStack::capacity() >= max_stack_depth`, so the overflow guard fires before a
+  reallocation could move the caller's in-register frame pointer): push the callee frame at the top,
+  `run_compiled_frame` at the new index, pop on return; `Threw` truncates back to the caller; `Bailed`
+  resumes the interpreter on the appended frame (its `return_register = None` bounds the resume to that
+  frame, never unwinding the caller). An inline (non-stable) re-entry host stack falls back to a
+  private stack, now **registered as a frame-root provider** for the compiled body. Effects:
+  - **Closes a latent GC rooting gap** (correctness): `run_compiled_frame` installs no root provider;
+    the old private `inner` stack was traced by nothing during the callee's compiled body, so an
+    allocating compiled callee that triggered a scavenge could free a young pointer living only in an
+    `inner`-frame register. The same-stack callee is now covered by the enclosing `dispatch_loop`'s
+    provider; the fallback path registers its own.
+  - **Establishes the substrate 2b requires**: machine-code frame-build can only append callee frames
+    to a stack it knows will not reallocate — it cannot allocate a fresh `inner` stack in emitted code.
+  - **Measured (controlled A/B, runs=12, A/A noise floor 0.0 ms): fib-jit 277.0 → 283.3 (+2.3%)**;
+    array-ops / prop-access / sort neutral; compute-only set neutral; diff 11/11. The +2.3% is a
+    cache-locality cost of threading recursion through one deep reserved buffer instead of fresh inline
+    re-entry stacks, with **no perf upside on its own** — the bridge's dominating cost (extern-C hop +
+    per-call Rust frame-build + `JitCtx` rebuild) is untouched by 2a and is exactly what 2b removes.
+    By the **slice-1b precedent** (a documented substrate regression accepted ahead of its payoff), 2a
+    is **held in the working tree and committed together with 2b** as one net-positive `Slice 2`
+    commit, rather than shipped as a standalone regression.
+
+- **2b — Machine-code frame build + direct branch to the callee's compiled entry (arm64).** The
+  sub-slice that erases the extern-C hop and recovers fib past baseline. Prereq surfaced during 2a
+  inspection: a `Frame` is a Rust struct (register `SmallVec`, `UpvalueSpine`, `this_value`, cold idx,
+  async/generator fields) that **cannot be allocated/initialized in emitted machine code as-is** — 2b
+  needs the **slice-1e frame-descriptor split** (`HoltFrameHeader` / `HoltValueSlots` / `HoltFrameDesc`)
+  so the caller can reserve a frame and fill its value slots from emitted code while the Rust-managed
+  header fields are set through a thin reservation helper. Emission plan (after 1e lands): guard callee
+  kind + cached resolved code-ptr (monomorphic inline cache on the call site), reserve the callee frame
+  on the `HoltStack`, init value slots to `undefined` then publish (two-phase, no allocation while a
+  partial frame is GC-visible), bind args/receiver, branch to the callee's compiled entry; on return
+  write the result to `dst` and pop. Cold/ineligible callees keep the Rust bridge. **GC Stage A:** every
+  live GC-bearing `Value` is spilled to its frame slot before any safepoint; the result lives in a
+  register only between the callee's return and the `dst` store (no safepoint in that window). Do
+  **not** start arm64 emission until the 1e frame descriptor + the appended-frame ABI are pinned.
+
+- **2c — Eligibility widening + tail/argc shapes.** Extend the direct path to the remaining
+  fast-binding argc shapes and (if measured to pay) a self-tail-call loopback, keeping cold cases on
+  the bridge. Gate: full call/closure/generator/async/super/try parity + bench set.
+
+### Eligibility (conservative, unchanged from the bridge's `try_jit_fast_call` gate)
+
+Ordinary bytecode function/closure; PupJIT code installed; not async/generator/async-generator; no
+`arguments`/rest; no direct eval; not a derived constructor; no captured `new.target`/derived-`this`/
+inherited eval env; no host/native/capability callee; argc within the fast-binding shape; no active
+protected/finally region on the caller frame.
+
+### Files in scope
+
+`crates/otter-vm/src/{lib.rs, call_ops.rs, holt_stack.rs, jit.rs}` (2a — pool + same-stack),
+`crates/otter-jit/src/baseline.rs` + `crates/otter-vm/src/jit.rs` ABI (2b — emission). Naming for new
+pieces stays in the Otter vocabulary (e.g. `HoltStackPool` / `holt_pool`).
+
+### Primary risks
+
+Dangling caller register pointer on stack growth (mitigated by the reservation-stable invariant +
+overflow guard); GC tracing a partially-initialized appended frame (two-phase publish, debug
+initialized-slot assertion); bail-path PC/unwind bounded to the appended frame, not the caller;
+generator/async callees must continue to miss the fast path. Rollback = `git revert` of the sub-slice
+commit (no flag).
+
+---
+
 ## Verification contract
 
 Run as much of this as practical for a slice; record results in the slice's commit / this file.

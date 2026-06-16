@@ -264,6 +264,12 @@ pub(crate) struct ExecutableFunction {
     /// `this` is bound by `super(...)` (§10.2.2). Frame setup starts
     /// it in the TDZ.
     pub(crate) is_derived_constructor: bool,
+    /// `true` when this function body contains an `Op::MakeFunction` or
+    /// `Op::MakeClosure`. The per-instance SELF binding (cold-frame
+    /// `callee_closure`) is read only by those opcodes, so the call dispatcher
+    /// records the closure (and acquires a cold frame for it) only when this is
+    /// set — leaf functions and most callbacks skip it entirely.
+    pub(crate) makes_function: bool,
     /// `true` when this function body needs an `arguments` object.
     pub(crate) needs_arguments: bool,
     /// Arguments object shape requested by the compiler.
@@ -378,8 +384,20 @@ impl ExecutableFunction {
         let byte_spans =
             translate_spans_to_byte_pcs(&function.spans, &instr_to_byte_pc, code_byte_len)
                 .into_boxed_slice();
+        // The per-instance SELF binding (`callee_closure` in the cold frame) is
+        // consumed *only* by `Op::MakeFunction` / `Op::MakeClosure` resolving the
+        // running function id. A body with neither opcode can never read it, so
+        // the call dispatcher skips recording the closure — and thus the cold
+        // frame acquire/release entirely — for such functions. Conservative: a
+        // body that makes *any* closure keeps it (self-reference can't be ruled
+        // out without resolving operands), which is the rare case in hot code.
+        let makes_function = function
+            .code
+            .iter()
+            .any(|instr| matches!(instr.op, Op::MakeFunction | Op::MakeClosure));
         Self {
             id: function.id,
+            makes_function,
             param_count: function.param_count,
             register_count,
             own_upvalue_count: function.own_upvalue_count,

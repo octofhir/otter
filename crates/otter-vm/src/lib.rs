@@ -1634,7 +1634,9 @@ impl Interpreter {
                 .get(callee_reg as usize)
                 .ok_or(VmError::InvalidOperand)?
         };
-        if let Some(closure) = callee_now.as_closure(&self.gc_heap) {
+        if function.makes_function
+            && let Some(closure) = callee_now.as_closure(&self.gc_heap)
+        {
             self.frame_ensure_cold(&mut new_frame).callee_closure = Some(closure);
         }
 

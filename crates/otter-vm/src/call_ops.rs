@@ -1721,7 +1721,11 @@ impl Interpreter {
             Frame::with_exec_registers(function, None, upvalues, this_for_callee, registers);
         // A closure frame records its instance so the named-function SELF
         // binding inside the body resolves to it (per-instance `.prototype`).
-        if let Some(closure) = current.as_closure(&self.gc_heap) {
+        // Only bodies that actually create a closure can read this back, so a
+        // leaf callee skips both the record and the cold-frame acquire.
+        if function.makes_function
+            && let Some(closure) = current.as_closure(&self.gc_heap)
+        {
             self.frame_ensure_cold(&mut new_frame).callee_closure = Some(closure);
         }
         if let Some(new_target) = new_target_for_callee {

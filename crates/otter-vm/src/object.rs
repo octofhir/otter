@@ -1033,6 +1033,21 @@ pub(crate) fn shape_id(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeId {
     heap.read_payload(obj, |body| body_shape_id(heap, body))
 }
 
+/// Read the own data value at flat slot index `slot` (inline or overflow
+/// storage). The caller must guarantee `slot` indexes a live data slot under
+/// the object's current shape — JSON.stringify's fast path obtains the index
+/// from [`Properties::enumerable_string_data_offsets`] and re-validates the
+/// shape id per key before calling, so a structural mutation can never make
+/// this read a stale slot.
+pub(crate) fn data_value_at(obj: JsObject, heap: &otter_gc::GcHeap, slot: u16) -> Value {
+    heap.read_payload(obj, |body| {
+        body.slots
+            .get(slot as usize)
+            .filter(|s| s.kind.is_data())
+            .map_or(Value::undefined(), |_| body.data_value(slot as usize))
+    })
+}
+
 fn body_shape_id(heap: &otter_gc::GcHeap, body: &ObjectBody) -> ShapeId {
     if !body.shape.is_null() {
         return heap.read_payload(body.shape, shape_body::ShapeBody::id);
@@ -2775,6 +2790,30 @@ impl<'a> Properties<'a> {
                 None
             }
         })
+    }
+
+    /// `(key, flat slot index)` for every enumerable own **string-keyed
+    /// data** property, in ordinary own-key order — or `None` if any
+    /// enumerable own string property is an accessor.
+    ///
+    /// JSON.stringify's fast object path uses this to read each value
+    /// directly by slot offset (re-validated against the live shape per
+    /// key) instead of re-resolving the key through `[[Get]]`. `None`
+    /// forces the observable `[[Get]]` path, since an enumerable getter
+    /// has side effects the fast path must not skip.
+    pub fn enumerable_string_data_offsets(&self) -> Option<Vec<(String, u16)>> {
+        let mut out = Vec::with_capacity(self.string_keys.len());
+        for (key, idx) in &self.string_keys {
+            let slot = &self.body.slots[*idx];
+            if !slot.flags.enumerable() {
+                continue;
+            }
+            if !slot.kind.is_data() {
+                return None;
+            }
+            out.push((key.clone(), u16::try_from(*idx).ok()?));
+        }
+        Some(out)
     }
 
     /// Iterate enumerable own-key names (string-keyed only) in

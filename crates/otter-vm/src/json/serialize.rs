@@ -292,6 +292,34 @@ impl Interpreter {
         rendered
     }
 
+    /// Fast-path SerializeJSONProperty when the step-1 value is already in
+    /// hand (read directly from the holder's data slot under a validated
+    /// shape), skipping the `Get(holder, key)`. `holder_root` is the holder's
+    /// scratch-root index (used only if a replacer is active — never on this
+    /// path, but threaded for parity). Behaviour is otherwise identical to
+    /// [`Self::serialize_json_property_into`].
+    fn serialize_json_known_value_into(
+        &mut self,
+        context: &ExecutionContext,
+        state: &mut JsonState,
+        key: &str,
+        holder_root: usize,
+        value: Value,
+        out: &mut String,
+    ) -> Result<bool, VmError> {
+        let value_root = self.json_root_push(value);
+        let rendered = self.serialize_json_property_rooted_into(
+            context,
+            state,
+            key,
+            holder_root,
+            value_root,
+            out,
+        );
+        self.json_root_pop_to(value_root);
+        rendered
+    }
+
     /// Body of SerializeJSONProperty once `holder` (`holder_root`) and
     /// the step-1 value (`value_root`) are parked on the scratch root
     /// stack. Reads both back through their slots after every call that
@@ -428,20 +456,50 @@ impl Interpreter {
         // scavenge can move `value` mid-loop. Re-read from the slot.
         let value_root = self.json_root_push(value);
 
-        let keys = match &state.property_list {
-            Some(list) => list.clone(),
-            None => {
-                let v = self.json_root_get(value_root);
-                self.json_enumerable_string_keys(context, &v)?
-            }
-        };
+        // Each entry is `(key, Some(slot))` for the fast path (read the value
+        // straight from its flat data slot, re-validating the shape per key) or
+        // `(key, None)` for the observable `[[Get]]` path. The fast path applies
+        // only to an ordinary object with a replacer-free key list and no
+        // enumerable accessors; everything else (replacer property list, proxy /
+        // typed array / module namespace / String wrapper, any enumerable
+        // getter) keeps the spec `[[Get]]` per key.
+        let (entries, fast_shape): (Vec<(String, Option<u16>)>, Option<object::ShapeId>) =
+            match &state.property_list {
+                Some(list) => (list.iter().map(|k| (k.clone(), None)).collect(), None),
+                None => {
+                    let v = self.json_root_get(value_root);
+                    let heap = self.gc_heap();
+                    let fast = v.as_object().filter(|obj| {
+                        v.as_proxy().is_none()
+                            && v.as_typed_array(heap).is_none()
+                            && object::module_namespace_env(*obj, heap).is_none()
+                            && object::string_data(*obj, heap).is_none()
+                    });
+                    match fast.and_then(|obj| {
+                        object::with_properties(obj, heap, |p| p.enumerable_string_data_offsets())
+                            .map(|offs| (obj, offs))
+                    }) {
+                        Some((obj, offs)) => {
+                            let sid = object::shape_id(obj, heap);
+                            (
+                                offs.into_iter().map(|(k, o)| (k, Some(o))).collect(),
+                                Some(sid),
+                            )
+                        }
+                        None => {
+                            let keys = self.json_enumerable_string_keys(context, &v)?;
+                            (keys.into_iter().map(|k| (k, None)).collect(), None)
+                        }
+                    }
+                }
+            };
 
         let stepback = state.indent.clone();
         state.indent.push_str(&state.gap);
 
         out.push('{');
         let mut any = false;
-        for key in &keys {
+        for (key, fast_slot) in &entries {
             let holder = self.json_root_get(value_root);
             // Tentatively write this member's separator + key prefix, then
             // its value; if the property is omitted, rewind `out` to undo
@@ -459,7 +517,24 @@ impl Interpreter {
             if !state.gap.is_empty() {
                 out.push(' ');
             }
-            if self.serialize_json_property_into(context, state, key, holder, out)? {
+            // Fast path: read the value directly from its data slot, but only
+            // while the holder's live shape still matches the one enumerated
+            // above (a nested `toJSON` could have mutated the holder). On any
+            // mismatch fall back to the observable `[[Get]]`, so behaviour is
+            // identical to the spec path.
+            let fast_value = match fast_slot {
+                Some(slot) => holder
+                    .as_object()
+                    .filter(|o| Some(object::shape_id(*o, self.gc_heap())) == fast_shape)
+                    .map(|o| object::data_value_at(o, self.gc_heap(), *slot)),
+                None => None,
+            };
+            let rendered = match fast_value {
+                Some(value) => self
+                    .serialize_json_known_value_into(context, state, key, value_root, value, out)?,
+                None => self.serialize_json_property_into(context, state, key, holder, out)?,
+            };
+            if rendered {
                 any = true;
             } else {
                 out.truncate(mark);

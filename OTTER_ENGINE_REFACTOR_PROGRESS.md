@@ -430,6 +430,34 @@ JIT-off vs JIT-on on `Array/prototype/{forEach 190/190, map 214/216, filter
 Captured-`let`-store closure bit-identical interp vs JIT (a GC-stress alloc-storm
 SIGSEGVs in **both** — pre-existing).
 
+## Slice 6 (early) — `ShellBuiltins`: JSON.stringify fast object path. Done.
+
+`sample` of `JSON.stringify` (json 2009ms, JIT≈interp — native-bound) showed
+~47% of stringify in object key enumeration + per-key value resolution:
+`ordinary_string_key_entries` (42), `lookup_own` (23), `body_offset_of` (22),
+`key_order` (22). The serializer enumerated keys (with their slot offsets) then
+**threw the offsets away** and re-resolved each key through `[[Get]]`
+(`lookup_own` + `body_offset_of` — key hash + shape walk) per property per object
+— redundant across the 5000 identically-shaped records.
+
+Fix: `serialize_json_object_into` now collects `(key, Some(slot))` for an ordinary
+object with no replacer list and **no enumerable accessors**
+(`Properties::enumerable_string_data_offsets` → `None` bails to `[[Get]]` on any
+accessor), and reads each value straight from its flat data slot
+(`object::data_value_at`) — **re-validating the holder's live shape-id per key**
+so a nested `toJSON` that mutates the holder falls back to the observable
+`[[Get]]` (behaviourally identical to spec). Replacer / proxy / typed-array /
+module-namespace / String-wrapper keep the `[[Get]]` path.
+
+**Measured.** `json.js` `otter-jit` **2009 → 1911 ms (−4.9%)** (min/5); stringify
+micro −~12%. diff 11/11.
+
+**Gates.** Unit tests green; clippy/fmt clean; test262 `built-ins/JSON` 163/165,
+**0 failed** (no regression possible); 6 hand edge-cases (getter runs,
+toJSON-mutates-holder, replacer array + function, integer-key order,
+non-enumerable skip, indent) byte-match node. JIT-independent change (native
+serializer), so JIT-off ≡ JIT-on.
+
 ### 3f — next (not started)
 - **The real array-ops/sort lever remains untouched**: `run_callable_sync` builds
   a fresh callee frame (incl. a per-call upvalue-spine clone in

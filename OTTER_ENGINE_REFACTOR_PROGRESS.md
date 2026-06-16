@@ -12,8 +12,8 @@ Order follows the plan's *minimal implementation sequence* (§5). Each slice is 
 
 | # | Slice | Codename | Status | Entry blocked on |
 |---|-------|----------|--------|------------------|
-| 0 | Engine Lab — measurement, differential testing, progress scaffold | `OtterLab` | **in progress** | — |
-| 1 | Stable VM stack & frame descriptors | `HoltStack` | not started | Slice 0 green |
+| 0 | Engine Lab — measurement, differential testing, progress scaffold | `OtterLab` | **done** (commit `98f460b3`) | — |
+| 1 | Stable VM stack & frame descriptors | `HoltStack` | **in progress** (1a done) | Slice 0 green ✓ |
 | 2 | PupJIT direct calls + machine-code frame build | `PupJIT Calls` | not started | HoltStack stable |
 | 3 | Unified feedback vectors + complete ICs | `WhiskerIC` | not started | PupJIT direct calls |
 | 4 | Hot heap layouts (Array/TypedArray/String/Closure) | `KelpHeap` | not started | WhiskerIC load/store/method/element |
@@ -35,6 +35,21 @@ Order follows the plan's *minimal implementation sequence* (§5). Each slice is 
 - [x] `just` recipes: `bench`, `bench-osr`, `bench-diff`.
 - [x] Progress scaffold (this file) with slice ladder, verification commands, baselines, rollback, code anchors, next-slice design note.
 - [ ] *(deferred to a follow-up Slice-0 commit, not required for done)* per-run engine counters surfaced to the CLI (IC hit/miss, direct-call hit/miss, Rust-stub calls, alloc/GC time, deopts, code size, compile latency). Accessors already exist in-VM (`Interpreter::property_ic_stats`, `Interpreter::runtime_budget_stats`, GC `ScavengeStats`) but are not yet plumbed to a `run`-time dump. Tracked in [Counters](#counters-status).
+
+### Slice 1 — HoltStack sub-slice ladder
+
+The execution stack is the concrete type `SmallVec<[Frame; 8]>`, threaded as an explicit `stack` parameter through **230 sites across 21 files** (`lib.rs` 75, `property_dispatch.rs` 27, `call_ops.rs` 22, `allocation_ops.rs` 16, …). The operations performed are pure stack discipline (`push`/`pop`/`len`/`is_empty`/`last`/`last_mut`/`get`/`get_mut`/`truncate`/`iter`) plus O(1) indexing `stack[i]` (`stack[top_idx]` ×26, `stack[0]` ×20, …). The defect `HoltStack` removes: `SmallVec` **reallocates and moves every live frame** when it outgrows inline-8 capacity — fatal once a compiled callee holds its caller's frame/register address. The big risk lives in the wiring (generator parking, sync reentry, GC-root registration, exception unwind), so the swap is decomposed:
+
+| Sub | Scope | Risk | Flag | Gates | Status |
+|---|---|---|---|---|---|
+| **1a** | Additive `holt_stack` module: segmented, stable-address `HoltStack` with the full op surface (`push/pop/len/is_empty/last/last_mut/get/get_mut/truncate/iter/iter_mut`, `Index`/`IndexMut`, `trace_frames`). Not wired. | none (isolated, unit-tested) | — | `cargo test -p otter-vm holt_stack`; clippy clean | **done** |
+| 1b | Swap the stack type at definition + the ~12 construction sites to `HoltStack`; migrate the 230 annotation/index sites (`SmallVec<[Frame; 8]>` → `HoltStack`, behaviour-identical via the matching API). Single global stack still; legacy path retained behind `OTTER_HOLT_STACK=0`. | medium (mechanical breadth) | `OTTER_HOLT_STACK` | full `cargo test --all`; `bench-diff` 11/11; test262 call/frame/generator/async parity interp vs JIT and flag on/off | next |
+| 1c | Register `HoltStack` as the `FrameRoots` provider (replace the `SmallVec`-window provider); two-phase publish + debug initialized-slot bitmap; cold-record tracing layered exactly as today. | high (GC correctness) | `OTTER_HOLT_STACK` | `OTTER_GC_STRESS=64/128` `bench-diff`; Array safe runner | planned |
+| 1d | Generator/async parking & sync reentry over `HoltStack` (`HoltParkedSnapshot`); exception/finally unwind via cold frames. | high (parking/unwind) | `OTTER_HOLT_STACK` | generator/async/try test262 dirs; await/yield | planned |
+| 1e | `HoltFrameHeader` / `HoltFrameDesc` separation (header vs value slots) — the descriptor substrate Slice 2 (PupJIT direct calls) and Slices 8–9 (deopt) consume. | medium | `OTTER_HOLT_STACK` | as 1b–1d | planned |
+| 1f | Remove the legacy `SmallVec` stack + `OTTER_HOLT_STACK` flag once on-path is stress- and parity-clean. | low (deletion) | — | full suite green for ≥1 cycle | planned |
+
+**Slice 1a — done.** `crates/otter-vm/src/holt_stack.rs` (+ `mod holt_stack;` in `lib.rs`). Segments are `Vec<Frame>` reserved once to `SEGMENT_CAP=64` and never grown past it ⇒ frame buffers never reallocate ⇒ stable `&Frame`/`&mut Frame` for a frame's whole life; the outer `Vec<HoltSegment>` may reallocate but only moves segment headers, not the heap frame buffers. Interior segments are kept exactly full so `stack[i]` is `(i/CAP, i%CAP)` O(1). Tests: push/pop/order, **stable-address-across-3+-segment-growth** (records every frame pointer, forces outer-Vec realloc, asserts no frame moved and no register corruption), truncate+invariant, get/get_mut bounds, multi-segment `trace_frames`. 5/5 pass; clippy `-D warnings` clean. Unwired — `#![allow(dead_code)]` until 1b adopts it.
 
 ---
 

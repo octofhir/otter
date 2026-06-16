@@ -85,6 +85,7 @@ pub mod generator;
 pub mod global_functions;
 mod global_ops;
 pub mod groom;
+mod holt_stack;
 pub mod inspect;
 pub mod intl;
 mod intl_ops;

@@ -1630,6 +1630,8 @@ impl Interpreter {
             buffer_handle_byte: buffer_base + ab::BUFFER_STORAGE_HANDLE_OFFSET as u32,
             // Vec<u8> base; otter-jit adds the probed ptr/len word sub-offsets.
             buf_bytes_byte: header + ab::LOCAL_ARRAY_BUFFER_BODY_BYTES_OFFSET as u32,
+            array_type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
+            array_elements_byte: header + crate::array::ARRAY_BODY_ELEMENTS_OFFSET as u32,
         };
         view.cage_base = otter_gc::cage_base() as usize;
     }

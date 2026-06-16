@@ -927,10 +927,11 @@ mod arm64 {
                     }
                     emit_call_stub(&mut ops, jit_call_method_stub as *const () as usize, threw);
                 }
-                // `recv[idx]` — inline `Float64Array`/`Int32Array` element load
-                // (guarded, no safepoint); every other case (dense/sparse arrays,
-                // strings, object `[[Get]]`, polymorphic/detached/OOB) misses to
-                // the safe element-load bridge.
+                // `recv[idx]` — inline dense-`Array` (raw `Value`) and
+                // `Float64Array`/`Int32Array` element load (guarded, no
+                // safepoint); every other case (sparse/hole, strings, object
+                // `[[Get]]`, polymorphic/detached/OOB) misses to the safe
+                // element-load bridge, which owns the spec-correct semantics.
                 Op::LoadElement => {
                     let dst = reg(ops_ref, 0)?;
                     let recv = reg(ops_ref, 1)?;
@@ -942,45 +943,9 @@ mod arm64 {
                         let recv_off = reg_offset(recv)?;
                         let idx_off = reg_offset(idx)?;
                         let dst_off = reg_offset(dst)?;
-                        let f64_path = ops.new_dynamic_label();
-                        let i32_path = ops.new_dynamic_label();
-                        emit_ta_guard_chain(
-                            &mut ops, &ta_layout, cage_base, recv_off, idx_off, el_miss, f64_path,
-                            i32_path,
-                        );
-                        // Float64Array: load the f64 element, box (canonicalising
-                        // a NaN element so it never aliases a tag), store to dst.
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; =>f64_path
-                            ; lsl x14, x12, #3             // index * 8
-                            ; add x14, x14, x16            // + byte_offset
-                            ; add x15, x14, #8             // + element size (bound)
-                            ; cmp x15, x17
-                            ; b.hi =>el_miss               // out of live bytes
-                            ; add x14, x13, x14            // element address
-                            ; ldr d0, [x14]
-                        );
-                        emit_box_double(&mut ops, 0, 15);
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; str x15, [x19, dst_off]
-                            ; b =>el_done
-                            // Int32Array: load the signed 32-bit element, tag it.
-                            ; =>i32_path
-                            ; lsl x14, x12, #2             // index * 4
-                            ; add x14, x14, x16            // + byte_offset
-                            ; add x15, x14, #4             // + element size (bound)
-                            ; cmp x15, x17
-                            ; b.hi =>el_miss
-                            ; add x14, x13, x14            // element address
-                            ; ldr w13, [x14]               // signed int32 (low-32)
-                        );
-                        box_low32!(ops, 13, 15, TAG_INT32);
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; str x13, [x19, dst_off]
-                            ; b =>el_done
+                        emit_element_load(
+                            &mut ops, &ta_layout, cage_base, recv_off, idx_off, dst_off, el_miss,
+                            el_done,
                         );
                     }
 
@@ -1533,38 +1498,64 @@ mod arm64 {
         })
     }
 
-    /// Emit the inline typed-array element guard chain shared by `LoadElement`
-    /// and `StoreElement`. On success, control falls through to `f64_path` or
-    /// `i32_path` with the following live registers set up for the element
-    /// address computation; any guard miss branches to `el_miss` (the shared
-    /// runtime element stub, which handles every non-fast case correctly):
-    ///
-    /// - `x12` = element index (zero-extended `u32`, already bounds-checked
-    ///   against the typed-array's cached element length),
-    /// - `x13` = backing `Vec<u8>` data pointer,
-    /// - `x16` = `byte_offset` of the view into the buffer,
-    /// - `x17` = live `Vec<u8>` byte length (the memory-safety bound used by
-    ///   each kind path against detach / resize).
-    ///
-    /// No allocation or call occurs, so there is no safepoint: the receiver and
-    /// buffer pointers are recomputed from the rooted frame slot each time and
-    /// never held across a move. Guards, in order: receiver is a pointer-object
-    /// → typed-array body type tag → not length-tracking → index is int32 in
-    /// `[0, length)` → backing storage is `Local` (non-shared) → local buffer
-    /// body type tag → finally a kind dispatch to `Float64Array` / `Int32Array`
-    /// (any other kind misses).
-    #[allow(clippy::too_many_arguments)]
-    fn emit_ta_guard_chain(
+    /// Shared element-access prelude: load the receiver `Value` from its frame
+    /// slot, guard the pointer-object tag, decompress to its GC body pointer,
+    /// and read its header type tag. Leaves `x9` = body pointer, `x11` =
+    /// cage base, `w10` = header type tag. A non-pointer receiver misses to
+    /// `el_miss`. No safepoint, so the pointer is recomputed from the rooted
+    /// frame slot every time and never held across a move.
+    fn emit_recv_decompress(
         ops: &mut Assembler,
-        ta: &JitTypedArrayLayout,
         cage_base: usize,
         recv_off: u32,
-        idx_off: u32,
+        el_miss: DynamicLabel,
+    ) {
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x9, [x19, recv_off]      // receiver Value
+            ; lsr x14, x9, #48
+            ; movz x15, TAG_PTR_OBJECT as u32
+            ; cmp x14, x15
+            ; b.ne =>el_miss
+            ; mov w12, w9                  // low-32 Gc offset (zero-ext, scratch)
+        );
+        emit_load_u64(ops, 11, cage_base as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x9, x11, x12             // x9 = body GcHeader ptr
+            ; ldrb w10, [x9]               // w10 = header type tag
+        );
+    }
+
+    /// Shared element-access prelude: load the index `Value`, guard it is an
+    /// int32, and leave the zero-extended `u32` payload in `x12`. A non-int32
+    /// index misses to `el_miss`.
+    fn emit_idx_int32(ops: &mut Assembler, idx_off: u32, el_miss: DynamicLabel) {
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x12, [x19, idx_off]      // index Value
+            ; lsr x14, x12, #48
+            ; movz x15, TAG_INT32 as u32
+            ; cmp x14, x15
+            ; b.ne =>el_miss               // non-int32 index → stub
+            ; and x12, x12, #0xffffffff    // index = zero-extended u32 payload
+        );
+    }
+
+    /// Typed-array backing resolution. Assumes the prelude already set `x9` =
+    /// typed-array body ptr, `x11` = cage base, `x12` = int32 index. Guards
+    /// not-length-tracking → index in `[0, cached length)` → `Local`
+    /// (non-shared) backing → local buffer body tag, then dispatches on element
+    /// kind to `f64_path` / `i32_path` leaving `x13` = buffer data pointer,
+    /// `x16` = view byte offset, `x17` = live `Vec<u8>` byte length (the
+    /// detach/resize memory-safety bound). Any miss → `el_miss`.
+    fn emit_ta_backing(
+        ops: &mut Assembler,
+        ta: &JitTypedArrayLayout,
         el_miss: DynamicLabel,
         f64_path: DynamicLabel,
         i32_path: DynamicLabel,
     ) {
-        let ta_type_tag = u32::from(ta.ta_type_tag);
         let local_buf_type_tag = u32::from(ta.local_buffer_type_tag);
         let local_tag = ta.buffer_local_tag;
         let kind_f64 = ta.kind_float64;
@@ -1574,38 +1565,17 @@ mod arm64 {
         let byte_offset_byte = ta.ta_byte_offset_byte;
         let buffer_disc_byte = ta.buffer_disc_byte;
         let buffer_handle_byte = ta.buffer_handle_byte;
-        // The std `Vec<u8>` field order is not guaranteed, so the buffer body
+        // The std `Vec` field order is not guaranteed, so the buffer body
         // carries only the Vec base; add the probed data-pointer / length word
         // sub-offsets here.
         let (ptr_word, len_word) = vec_layout_offsets();
         let bytes_ptr_byte = ta.buf_bytes_byte + ptr_word;
         let bytes_len_byte = ta.buf_bytes_byte + len_word;
         let kind_byte = ta.ta_kind_byte;
-
         dynasm!(ops
             ; .arch aarch64
-            ; ldr x9, [x19, recv_off]      // receiver Value
-            ; lsr x14, x9, #48
-            ; movz x15, TAG_PTR_OBJECT as u32
-            ; cmp x14, x15
-            ; b.ne =>el_miss
-            ; mov w12, w9                  // low-32 Gc offset (zero-ext)
-        );
-        emit_load_u64(ops, 11, cage_base as u64);
-        dynasm!(ops
-            ; .arch aarch64
-            ; add x9, x11, x12             // x9 = typed-array GcHeader ptr
-            ; ldrb w14, [x9]               // header type tag
-            ; cmp w14, ta_type_tag
-            ; b.ne =>el_miss
             ; ldrb w14, [x9, length_tracking_byte]
             ; cbnz w14, =>el_miss          // length-tracking view → stub
-            ; ldr x12, [x19, idx_off]      // index Value
-            ; lsr x14, x12, #48
-            ; movz x15, TAG_INT32 as u32
-            ; cmp x14, x15
-            ; b.ne =>el_miss               // non-int32 index → stub
-            ; and x12, x12, #0xffffffff    // index = zero-extended u32 payload
             ; ldr x14, [x9, length_byte]   // cached element length
             ; cmp x12, x14
             ; b.hs =>el_miss               // index >= length (unsigned) → stub
@@ -1626,6 +1596,125 @@ mod arm64 {
             ; cmp w14, kind_i32
             ; b.eq =>i32_path
             ; b =>el_miss                  // other kinds → stub
+        );
+    }
+
+    /// Typed-array store guard chain (the store path is typed-array only for
+    /// now): prelude + `Float64Array`/`Int32Array` backing dispatch.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_ta_guard_chain(
+        ops: &mut Assembler,
+        ta: &JitTypedArrayLayout,
+        cage_base: usize,
+        recv_off: u32,
+        idx_off: u32,
+        el_miss: DynamicLabel,
+        f64_path: DynamicLabel,
+        i32_path: DynamicLabel,
+    ) {
+        let ta_type_tag = u32::from(ta.ta_type_tag);
+        emit_recv_decompress(ops, cage_base, recv_off, el_miss);
+        dynasm!(ops ; .arch aarch64 ; cmp w10, ta_type_tag ; b.ne =>el_miss);
+        emit_idx_int32(ops, idx_off, el_miss);
+        emit_ta_backing(ops, ta, el_miss, f64_path, i32_path);
+    }
+
+    /// Unified inline `LoadElement`: one receiver decompress + one index guard,
+    /// then a header-type-tag dispatch to the dense-`Array` path (raw `Value`
+    /// with a hole-sentinel guard) or the typed-array path (`Float64Array` /
+    /// `Int32Array`, box/unbox). Anything else — other kinds, a hole, an
+    /// out-of-bounds or non-int32 index, a non-array/typed-array receiver —
+    /// misses to `el_miss` (the runtime stub, which owns the spec-correct
+    /// prototype / sparse / accessor / string semantics). No safepoint.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_element_load(
+        ops: &mut Assembler,
+        layout: &JitTypedArrayLayout,
+        cage_base: usize,
+        recv_off: u32,
+        idx_off: u32,
+        dst_off: u32,
+        el_miss: DynamicLabel,
+        el_done: DynamicLabel,
+    ) {
+        let array_tag = u32::from(layout.array_type_tag);
+        let ta_tag = u32::from(layout.ta_type_tag);
+        let (ptr_word, len_word) = vec_layout_offsets();
+        let arr_ptr_byte = layout.array_elements_byte + ptr_word;
+        let arr_len_byte = layout.array_elements_byte + len_word;
+        let hole_bits = (TAG_SPECIAL << 48) | SPECIAL_HOLE;
+        let array_path = ops.new_dynamic_label();
+        let ta_path = ops.new_dynamic_label();
+        let f64_path = ops.new_dynamic_label();
+        let i32_path = ops.new_dynamic_label();
+
+        emit_recv_decompress(ops, cage_base, recv_off, el_miss);
+        emit_idx_int32(ops, idx_off, el_miss);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp w10, array_tag
+            ; b.eq =>array_path
+            ; cmp w10, ta_tag
+            ; b.eq =>ta_path
+            ; b =>el_miss
+        );
+
+        // Dense Array: element is a raw 8-byte Value. Bounds-check against the
+        // live `elements` Vec length, then a hole sentinel → stub (the stub
+        // walks the prototype / sparse / accessor, all spec-owned there).
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>array_path
+            ; ldr x17, [x9, arr_len_byte]      // elements Vec length
+            ; cmp x12, x17
+            ; b.hs =>el_miss                   // index >= length → stub
+            ; ldr x13, [x9, arr_ptr_byte]      // elements Vec data pointer
+            ; lsl x14, x12, #3                 // index * sizeof(Value)
+            ; add x14, x13, x14                // element address
+            ; ldr x13, [x14]                   // the Value
+        );
+        emit_load_u64(ops, 15, hole_bits);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp x13, x15
+            ; b.eq =>el_miss                   // hole → stub
+            ; str x13, [x19, dst_off]
+            ; b =>el_done
+        );
+
+        // Typed array: resolve backing, then per-kind load + box.
+        dynasm!(ops ; .arch aarch64 ; =>ta_path);
+        emit_ta_backing(ops, layout, el_miss, f64_path, i32_path);
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>f64_path
+            ; lsl x14, x12, #3                 // index * 8
+            ; add x14, x14, x16                // + byte_offset
+            ; add x15, x14, #8                 // + element size (bound)
+            ; cmp x15, x17
+            ; b.hi =>el_miss
+            ; add x14, x13, x14                // element address
+            ; ldr d0, [x14]
+        );
+        emit_box_double(ops, 0, 15);
+        dynasm!(ops
+            ; .arch aarch64
+            ; str x15, [x19, dst_off]
+            ; b =>el_done
+            ; =>i32_path
+            ; lsl x14, x12, #2                 // index * 4
+            ; add x14, x14, x16                // + byte_offset
+            ; add x15, x14, #4                 // + element size (bound)
+            ; cmp x15, x17
+            ; b.hi =>el_miss
+            ; add x14, x13, x14                // element address
+            ; ldr w13, [x14]                   // signed int32 (low-32)
+        );
+        box_low32!(ops, 13, 15, TAG_INT32);
+        dynasm!(ops
+            ; .arch aarch64
+            ; str x13, [x19, dst_off]
+            ; b =>el_done
         );
     }
 

@@ -111,6 +111,15 @@ pub struct JitTypedArrayLayout {
     /// sub-offsets to this — the std `Vec` field order is not guaranteed, so
     /// `otter-jit` discovers it by value-identity rather than hardcoding it.
     pub buf_bytes_byte: u32,
+    /// `GcHeader::type_tag` of an ordinary `ArrayBody` (guarded at byte 0 for
+    /// the inline dense-array element fast path).
+    pub array_type_tag: u8,
+    /// Offset to the `ArrayBody.elements` `Vec<Value>` itself (its first word).
+    /// The emitter adds the probed `Vec` data-pointer / length sub-offsets;
+    /// each element is a raw 8-byte `Value` (no box/unbox). A hole-sentinel
+    /// element or an out-of-bounds index falls through to the runtime stub,
+    /// which owns the spec-correct prototype / sparse / accessor handling.
+    pub array_elements_byte: u32,
 }
 
 /// Baked monomorphic inline property-load plan for one `LoadProperty` site.

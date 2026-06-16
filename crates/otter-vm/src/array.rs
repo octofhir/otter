@@ -47,7 +47,12 @@ pub type JsArray = otter_gc::Gc<ArrayBody>;
 pub struct ArrayBody {
     /// Dense element storage. Crate-internal callers must go through
     /// this module's helpers so growth is heap-accounted.
-    pub(crate) elements: SmallVec<[Value; 4]>,
+    ///
+    /// A plain `Vec<Value>` (not `SmallVec`) so the baseline JIT can read
+    /// the backing data pointer and length at a stable, probe-discovered
+    /// layout — the same mechanism it uses for typed-array buffers — and
+    /// inline dense element loads without re-entering the interpreter.
+    pub(crate) elements: Vec<Value>,
     /// Logical `length` property. This may be larger than dense
     /// storage when `length` is assigned directly or when sparse
     /// elements are written.
@@ -115,6 +120,13 @@ pub struct ArrayBody {
     /// this unset and resolve to the realm `%Array.prototype%`.
     pub(crate) prototype_override: Option<Value>,
 }
+
+/// Byte offset of [`ArrayBody::elements`] from the body start (after the GC
+/// header). `offset_of!`-derived, so it reflects the actual `repr(Rust)`
+/// placement; the baseline JIT adds the GC header size and the probed
+/// `Vec<Value>` data-pointer / length sub-offsets to read dense elements
+/// inline.
+pub const ARRAY_BODY_ELEMENTS_OFFSET: usize = std::mem::offset_of!(ArrayBody, elements);
 
 /// Trace helper for symbol-keyed own properties: only `Value` parts
 /// of each `(JsSymbol, Value)` pair carry GC slots — the `JsSymbol`
@@ -1428,7 +1440,7 @@ pub fn with_elements<R>(arr: JsArray, heap: &otter_gc::GcHeap, f: impl FnOnce(&[
 pub(crate) fn with_elements_mut<R>(
     arr: JsArray,
     heap: &mut otter_gc::GcHeap,
-    f: impl FnOnce(&mut SmallVec<[Value; 4]>) -> R,
+    f: impl FnOnce(&mut Vec<Value>) -> R,
 ) -> R {
     let (out, children) = heap.with_payload(arr, |body| {
         let out = f(&mut body.elements);

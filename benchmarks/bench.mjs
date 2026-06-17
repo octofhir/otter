@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Benchmark harness: runs each script in benchmarks/scripts/ across every
 // configured JS runtime, measures wall-clock, and prints a comparison table
-// normalized to Otter. Pure-JS workloads only (no fs/net/node APIs).
+// normalized to otter-jit. Pure-JS workloads only (no fs/net/node APIs).
 //
 // Usage:
 //   node benchmarks/bench.mjs                 # all scripts, all runtimes
@@ -52,13 +52,6 @@ function nodeStripsTypesByDefault() {
 
 const RUNTIMES = [
   {
-    name: "otter",
-    bin: otterBin(),
-    argv: (f) => [otterBin(), ["run", f]],
-    ts: true, // otter parses TS via oxc natively
-    env: { OTTER_JIT: "0" }, // interpreter only (baseline)
-  },
-  {
     name: "otter-jit",
     bin: otterBin(),
     argv: (f) => [otterBin(), ["run", f]],
@@ -72,7 +65,7 @@ const RUNTIMES = [
     ts: true,
     // Forced early loop OSR: tier up on the first back-edge so the OSR/compiled
     // loop path is exercised even on short workloads. Opt-in (see --only); not
-    // in the default set so the headline table stays interp vs jit vs externals.
+    // in the default set so the headline table stays otter-jit vs externals.
     env: { OTTER_JIT: "1", OTTER_JIT_OSR_THRESHOLD: "1" },
     optIn: true,
   },
@@ -124,7 +117,7 @@ for (let i = 0; i < argv.length; i++) {
 
 // ---- runtime availability -------------------------------------------------
 function detect(rt) {
-  if (rt.name === "otter") return !!rt.bin;
+  if (rt.name.startsWith("otter")) return !!rt.bin;
   try {
     execSync(`command -v ${rt.bin}`, { stdio: "ignore" });
     return true;
@@ -209,7 +202,7 @@ for (const s of scripts) {
 
 // ---- report ---------------------------------------------------------------
 const rtNames = runtimes.map((r) => r.name);
-const hasOtter = rtNames.includes("otter");
+const hasOtter = rtNames.includes("otter-jit");
 
 function fmt(res) {
   if (!res || !res.ok) return "FAIL";

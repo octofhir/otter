@@ -3004,34 +3004,7 @@ pub(crate) fn array_callback_native_dispatch(
     // callbacks keep the general per-element `run_callable_sync_already_rooted`
     // path. `function_id` is shape-stable, so resolving eligibility once on the
     // pre-loop callback handle is valid for the whole walk.
-    let lean_eligible = {
-        let fid = callback
-            .as_closure(interp.gc_heap())
-            .map(|c| c.function_id())
-            .or_else(|| callback.as_function());
-        fid.and_then(|fid| context.exec_function(fid))
-            .is_some_and(|f| {
-                !f.is_generator
-                    && !f.is_async
-                    && !f.is_async_generator
-                    && !f.needs_arguments
-                    && !f.has_rest
-                    && !f.makes_function
-                    && !f.contains_direct_eval
-                    && !f.is_derived_constructor
-            })
-    };
-    // `Some` only when the reentry guard was entered (must be left after the
-    // walk); a depth-limit `Err` falls back to the per-call path, which
-    // re-checks depth itself.
-    let mut lean_inner: Option<crate::holt_stack::HoltStack> = if lean_eligible {
-        match interp.enter_sync_reentry() {
-            Ok(()) => Some(interp.draw_stack()),
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
+    let mut lean_inner = interp.acquire_lean_callback_stack(&context, callback);
     // Run the walk inside a closure so the matching
     // `pop_iteration_anchors_to` always runs — on normal completion and
     // on every `?` error — without threading a manual cleanup through
@@ -3232,10 +3205,7 @@ pub(crate) fn array_callback_native_dispatch(
     })();
     // Release the lean-path stack + reentry guard on every completion path
     // (mirrors the anchor pop below), regardless of `walk` success/error.
-    if let Some(inner) = lean_inner.take() {
-        interp.return_stack(inner);
-        interp.leave_sync_reentry();
-    }
+    interp.release_lean_callback_stack(lean_inner.take());
     // Read the (possibly relocated) output target and accumulator back
     // before releasing the anchors so the final result returns a live
     // handle. `map`/`filter`/`flatMap` keep their target identity; other

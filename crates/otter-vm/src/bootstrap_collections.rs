@@ -832,22 +832,36 @@ fn map_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             reason: "no active execution context".to_string(),
         })?;
     let map_value = Value::map(m);
+    // Lean per-entry callback invocation (same mechanism as Array iteration):
+    // one reservation-stable stack + one reentry-guard entry for the whole
+    // walk. The error is captured so the release runs on the throw path too.
+    let mut lean = ctx
+        .interp_mut()
+        .acquire_lean_callback_stack(&context, callback);
     let mut index = 0;
+    let mut err: Option<VmError> = None;
     while index < collections::map_raw_len(m, ctx.heap()) {
         let Some((k, v)) = collections::map_entry_at(m, ctx.heap(), index) else {
             index += 1;
             continue;
         };
         index += 1;
+        let cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![v, k, map_value];
         let interp = ctx.interp_mut();
-        interp
-            .run_callable_sync(
-                &context,
-                &callback,
-                this_arg,
-                smallvec::smallvec![v, k, map_value],
-            )
-            .map_err(|e| vm_to_native(e, "Map.prototype.forEach"))?;
+        let outcome = match lean {
+            Some(ref mut inner) => {
+                interp.run_bytecode_callable_committed(inner, &context, callback, this_arg, cb_args)
+            }
+            None => interp.run_callable_sync(&context, &callback, this_arg, cb_args),
+        };
+        if let Err(e) = outcome {
+            err = Some(e);
+            break;
+        }
+    }
+    ctx.interp_mut().release_lean_callback_stack(lean);
+    if let Some(e) = err {
+        return Err(vm_to_native(e, "Map.prototype.forEach"));
     }
     Ok(Value::undefined())
 }
@@ -950,22 +964,34 @@ fn set_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             reason: "no active execution context".to_string(),
         })?;
     let set_value = Value::set(s);
+    // Lean per-element callback invocation (see `map_proto_for_each`).
+    let mut lean = ctx
+        .interp_mut()
+        .acquire_lean_callback_stack(&context, callback);
     let mut index = 0;
+    let mut err: Option<VmError> = None;
     while index < collections::set_raw_len(s, ctx.heap()) {
         let Some(v) = collections::set_value_at(s, ctx.heap(), index) else {
             index += 1;
             continue;
         };
         index += 1;
+        let cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![v, v, set_value];
         let interp = ctx.interp_mut();
-        interp
-            .run_callable_sync(
-                &context,
-                &callback,
-                this_arg,
-                smallvec::smallvec![v, v, set_value],
-            )
-            .map_err(|e| vm_to_native(e, "Set.prototype.forEach"))?;
+        let outcome = match lean {
+            Some(ref mut inner) => {
+                interp.run_bytecode_callable_committed(inner, &context, callback, this_arg, cb_args)
+            }
+            None => interp.run_callable_sync(&context, &callback, this_arg, cb_args),
+        };
+        if let Err(e) = outcome {
+            err = Some(e);
+            break;
+        }
+    }
+    ctx.interp_mut().release_lean_callback_stack(lean);
+    if let Some(e) = err {
+        return Err(vm_to_native(e, "Set.prototype.forEach"));
     }
     Ok(Value::undefined())
 }

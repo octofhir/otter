@@ -6,6 +6,27 @@
 
 ---
 
+## STRATEGIC VERDICT 2026-06-17 — baseline JIT is mature; remaining gap = inlining
+
+Evidence (prop-access, 13.6× node, 510ms): load IC **3,003,243 hits / 13 miss**, ALL
+functions compile (`Ok(Compiled)`), OSR fires, 3M direct calls, store/method ICs all
+present in main. The baseline tier is feature-complete (ICs load+store, direct calls,
+loop-OSR, float arith, element load/store). I kept picking "next slices" (inline store
+IC, method IC, callback lean-dispatch) that turned out ALREADY LANDED — memory was stale.
+
+Where the 5-14× gaps actually live (prop-access/sort/array-ops/string): **per-call
+overhead (~95ns/call) + NO inlining + no type speculation.** prop-access = 1.5M iters ×
+2 tiny method calls (`bump`/`dist2`); each pays ~95ns; node inlines them to ~0. Same
+root as sort/array-ops callbacks. The baseline JIT cannot inline or speculate.
+
+**The one real remaining lever = INLINING hot tiny callees** (leaf methods / monomorphic
+callbacks): either narrow (baseline leaf-inline: splice a monomorphic tiny compiled
+callee into the call site under a shape/code guard, eliminating the per-call bridge) or
+broad (an optimizing tier: SSA + type feedback + speculative inline + deopt). This is a
+large dedicated structural project, NOT an autonomous-tick slice. Compute-bound benches
+(mandelbrot 1.7×, nbody 3.8×) are already competitive — they don't need it; call/property-
+bound code does. Incremental baseline tuning is exhausted; do not keep mining it.
+
 ## Phase 2 — status update 2026-06-17 (Slice 2c REDUNDANT; call path at baseline floor)
 
 Slice 2c (native-callback lean dispatch) was farmed to a worktree agent — it built a

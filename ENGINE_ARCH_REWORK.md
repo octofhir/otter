@@ -199,21 +199,21 @@ pointer — it cannot express "deref the overflow Vec, then index." So **every
 own property past the 6th is permanently on the stub + key hash + double
 indirection.**
 
-### Breaking redesign
-**Uniform, shape-sized, contiguous own-data value array.** Replace the
-`inline_values: [Value; 6]` + `overflow_values: Vec<Value>` split with a single
-flat slab whose length is the shape's field count, allocated inline with the
-object body (variable-size GC allocation) or as one right-sized block. Then:
-- `value_byte(slot) = header + values_offset + slot*8` for **any** slot — the
-  WhiskerIC inline load works unchanged for slot 6, 60, or 600.
-- One allocation, one cache line stride, no Vec pointer-chase.
-- Shape transitions still append; growing the slab on transition is the same
-  cost class as growing the Vec, but the steady-state read is a single load.
+### Landed redesign
+**Uniform contiguous own-data value slab.** The
+`inline_values: [Value; 6]` + boxed `overflow_values: Vec<Value>` split is gone.
+`ObjectBody` now owns one flat string-keyed value slab plus a cached slab base
+pointer at a fixed `#[repr(C)]` offset:
+- The IC cell encodes `slot * size_of::<Value>()`, with no inline-cap check.
+- Emitted WhiskerIC code guards the receiver shape, reads the current slab
+  pointer from the object body, and loads/stores `slab_base + slot_byte`.
+- Shape transitions still append to the same logical slab, so slots 6, 60, and
+  600 are IC-eligible instead of permanently falling back to the property stub.
 
-This is the "flat object layout / StoneMap" direction. It removes R2 entirely
-and makes R1's inline path apply universally. Combined with R1, **all
-monomorphic own-property access becomes shape-guard + one load**, no hash, no
-stub, for objects of any size.
+This keeps object identity stable on the current fixed-size GC cell model while
+removing the 7th-property cliff from the inline-cache policy. A future
+variable-size GC cell pass can fold the slab into the object allocation itself;
+the visible object/value-slot contract is already flat.
 
 ---
 

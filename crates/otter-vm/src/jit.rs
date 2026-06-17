@@ -75,6 +75,11 @@ pub struct JitFunctionView {
     /// emitter reads `[obj_ptr + object_shape_byte]` for the WhiskerIC
     /// `LoadProperty` cell guard, staying layout-agnostic.
     pub object_shape_byte: u32,
+    /// Byte offset from a decompressed object pointer to its cached
+    /// string-keyed value slab pointer (`HEADER_SIZE +
+    /// OBJECT_BODY_VALUES_PTR_OFFSET`). The emitter reads this pointer after a
+    /// shape guard and applies the cached slot-byte offset inside the slab.
+    pub object_values_ptr_byte: u32,
     /// Byte offset from a decompressed object pointer to its flat
     /// `[[Prototype]]` mirror (`HEADER_SIZE + OBJECT_BODY_JIT_PROTO_OFFSET`). A
     /// `#[repr(C)]` constant; the method-inline guard reads
@@ -143,9 +148,8 @@ pub struct JitInlineMethod {
     /// Receiver prototype shape-handle compressed offset the inline identity
     /// guard requires (the shape of the object holding the method slot).
     pub proto_shape: u32,
-    /// Byte offset from the decompressed prototype pointer to the method's
-    /// inline value slot (`HEADER_SIZE + OBJECT_BODY_INLINE_VALUES_OFFSET +
-    /// slot * size_of::<Value>()`), baked from the prototype shape.
+    /// Byte offset inside the prototype object's value slab for the method
+    /// slot, baked from the prototype shape.
     pub method_value_byte: u32,
     /// Method formal parameter count (excluding `this`); must equal argc.
     pub param_count: u16,
@@ -154,8 +158,8 @@ pub struct JitInlineMethod {
     pub register_count: u16,
     /// Method instruction stream, emitted inline.
     pub instructions: Vec<JitInstrView>,
-    /// Body `LoadProperty`/`StoreProperty` byte-PC → value byte offset from the
-    /// decompressed receiver pointer, baked from the receiver shape.
+    /// Body `LoadProperty`/`StoreProperty` byte-PC → value slab byte offset,
+    /// baked from the receiver shape.
     pub prop_offsets: rustc_hash::FxHashMap<u32, u32>,
 }
 

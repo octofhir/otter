@@ -189,6 +189,8 @@ impl ExecutableFunction {
             // pointer to its shape handle, for the WhiskerIC load-cell guard.
             object_shape_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_SHAPE_OFFSET as u32,
+            object_values_ptr_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::OBJECT_BODY_VALUES_PTR_OFFSET as u32,
             jit_proto_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_JIT_PROTO_OFFSET as u32,
             closure_fid_byte: otter_gc::header::HEADER_SIZE as u32

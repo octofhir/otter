@@ -66,7 +66,6 @@
 use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-
 use crate::bigint::BigIntValue;
 use crate::number::NumberValue;
 use crate::property_atom::{AtomId, AtomizedPropertyKey};
@@ -172,14 +171,6 @@ impl ObjectPrototype {
 }
 
 // ---------- internal slot storage -----------------------------------------
-
-/// Number of in-object data-property values stored inline in a fast object
-/// before overflowing to [`ObjectBody::overflow_values`].
-///
-/// The inline array gives the JIT a fixed byte offset for monomorphic
-/// property loads: a string-keyed slot `i < INLINE_VALUE_CAP` lives at
-/// `OBJECT_BODY_INLINE_VALUES_OFFSET + i * size_of::<Value>()`.
-pub(crate) const INLINE_VALUE_CAP: usize = 6;
 
 /// `[[Get]]`/`[[Set]]` pair for an accessor property. The owned form used
 /// by descriptor interchange and symbol-keyed slots; string-keyed accessor
@@ -489,14 +480,18 @@ pub struct ObjectBody {
     /// the JIT can read the shape token at a fixed byte offset
     /// ([`OBJECT_BODY_SHAPE_OFFSET`]) for monomorphic guard checks.
     shape: ShapeHandle,
-    /// Flat in-object values for the first [`INLINE_VALUE_CAP`] string-keyed
-    /// slots, indexed by shape slot offset. This is the **single source of
-    /// truth** for fast-mode values (overflow spills to
-    /// [`Self::overflow_values`]); a slot's flags + data/accessor
-    /// discriminator live in [`Self::slots`] at the same index. A data slot
-    /// stores its `[[Value]]` here; an accessor slot stores a handle to its
-    /// [`AccessorCellBody`].
-    inline_values: [Value; INLINE_VALUE_CAP],
+    /// Cached base pointer for the contiguous string-keyed value slab. The JIT
+    /// reads this field after the shape guard and indexes it by slot byte
+    /// offset, so every own data slot has the same inline path regardless of
+    /// slot number. `null` means the object currently has no string-keyed
+    /// slots.
+    values_ptr: *mut Value,
+    /// Contiguous string-keyed own-property values, indexed by shape slot
+    /// offset. A data slot stores its `[[Value]]` directly; an accessor slot
+    /// stores a handle to its [`AccessorCellBody`]. Slot flags and data/accessor
+    /// kind live in the shape for ordinary shaped objects, or in materialized
+    /// metadata for dictionary/attribute-overridden objects.
+    values: Vec<Value>,
     /// Fallback/dictionary identity used only when [`Self::shape`] is null.
     dictionary_shape_id: ShapeId,
     /// Whether string-keyed shape assumptions are IC-compatible.
@@ -555,10 +550,6 @@ struct ExoticSlots {
     /// common Null / ordinary-object prototype, which is encoded entirely by
     /// `ObjectBody::jit_proto` (null handle == `null` prototype).
     proto_override: Option<ObjectPrototype>,
-    /// Out-of-line data values for string-keyed slots with index
-    /// `>= INLINE_VALUE_CAP`. Empty/absent for objects with few properties;
-    /// allocated on the first spill past the inline value array.
-    overflow_values: Vec<Value>,
     /// Dictionary (slow-mode) string-key order — only present when the object
     /// has left fast-shape mode (delete-shaped objects, raw fixtures, failed
     /// transitions). Fast-shape objects never allocate it.
@@ -606,11 +597,11 @@ struct ExoticSlots {
 /// JIT reads the shape handle here for the monomorphic IC guard.
 pub(crate) const OBJECT_BODY_SHAPE_OFFSET: usize = std::mem::offset_of!(ObjectBody, shape);
 
-/// Byte offset of the inline data-value array within an [`ObjectBody`]
-/// payload. The JIT reads slot `i < INLINE_VALUE_CAP` at
-/// `OBJECT_BODY_INLINE_VALUES_OFFSET + i * size_of::<Value>()`.
-pub(crate) const OBJECT_BODY_INLINE_VALUES_OFFSET: usize =
-    std::mem::offset_of!(ObjectBody, inline_values);
+/// Byte offset of the string-keyed value slab pointer within an [`ObjectBody`]
+/// payload. The JIT reads this pointer after its shape guard and then indexes
+/// the contiguous slab by `slot * size_of::<Value>()`.
+pub(crate) const OBJECT_BODY_VALUES_PTR_OFFSET: usize =
+    std::mem::offset_of!(ObjectBody, values_ptr);
 
 /// Byte offset of the flat [`ObjectBody::jit_proto`] mirror within an
 /// [`ObjectBody`] payload. The method-inline guard reads the receiver's
@@ -619,42 +610,27 @@ pub(crate) const OBJECT_BODY_JIT_PROTO_OFFSET: usize = std::mem::offset_of!(Obje
 
 // The JIT bakes these offsets into emitted property loads; pin them.
 const _: () = assert!(OBJECT_BODY_SHAPE_OFFSET == 0);
-const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET >= 8);
-const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET.is_multiple_of(8));
+const _: () = assert!(OBJECT_BODY_VALUES_PTR_OFFSET >= 8);
+const _: () = assert!(OBJECT_BODY_VALUES_PTR_OFFSET.is_multiple_of(8));
 const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET >= 8);
 const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET.is_multiple_of(4));
 
-// Pin the hot object footprint. Per-slot metadata no longer lives inline:
-// the common shaped object derives attributes from the hidden class and the
-// rare dictionary-mode / attribute-overridden case materializes a
-// `Vec<SlotMeta>` inside the boxed `ExoticSlots`. Dropping the inline `slots`
-// SmallVec shrinks the body to a single flat value array plus the shape,
-// prototype, dictionary identity, and flag bytes.
-const _: () = assert!(std::mem::size_of::<ObjectBody>() == 88);
+// Pin the hot object footprint. Per-slot metadata lives out of line only for
+// dictionary-mode / attribute-overridden objects, while string-keyed values use
+// one contiguous slab addressed from a cached pointer.
+const _: () = assert!(std::mem::size_of::<ObjectBody>() == 72);
 
 impl ObjectBody {
     /// Read the data value for string-keyed slot `i` from flat storage.
-    /// Slots `>= INLINE_VALUE_CAP` live in the boxed overflow array, which only
-    /// exists once a slot has spilled there (so the index is always valid).
     #[inline]
     fn data_value(&self, i: usize) -> Value {
-        if i < INLINE_VALUE_CAP {
-            self.inline_values[i]
-        } else {
-            self.exotic()
-                .expect("overflow slot read without overflow storage")
-                .overflow_values[i - INLINE_VALUE_CAP]
-        }
+        self.values[i]
     }
 
     /// Write the data value for string-keyed slot `i` into flat storage.
     #[inline]
     fn set_data_value(&mut self, i: usize, value: Value) {
-        if i < INLINE_VALUE_CAP {
-            self.inline_values[i] = value;
-        } else {
-            self.exotic_mut().overflow_values[i - INLINE_VALUE_CAP] = value;
-        }
+        self.values[i] = value;
     }
 
     /// Append a new string-keyed own slot at flat index `index` (the pre-append
@@ -665,11 +641,9 @@ impl ObjectBody {
     /// index-aligned with the value array. For an accessor slot `value` is the
     /// [`AccessorCellBody`] handle produced by [`SlotData::into_flat`].
     fn push_slot(&mut self, index: usize, meta: SlotMeta, value: Value) {
-        if index < INLINE_VALUE_CAP {
-            self.inline_values[index] = value;
-        } else {
-            self.exotic_mut().overflow_values.push(value);
-        }
+        debug_assert_eq!(self.values.len(), index, "value slab append desynced");
+        self.values.push(value);
+        self.refresh_values_ptr();
         if self.slots_materialized() {
             debug_assert_eq!(self.slots().len(), index, "materialized slots desynced");
             self.slots_mut().push(meta);
@@ -688,7 +662,13 @@ impl ObjectBody {
     /// paths without a shape runtime — keeps the materialized metadata
     /// authoritative; the caller must have materialized it first
     /// ([`materialize_slots`]).
-    fn set_slot(&mut self, i: usize, meta: SlotMeta, value: Value, attr_shape: Option<ShapeHandle>) {
+    fn set_slot(
+        &mut self,
+        i: usize,
+        meta: SlotMeta,
+        value: Value,
+        attr_shape: Option<ShapeHandle>,
+    ) {
         self.set_data_value(i, value);
         match attr_shape {
             Some(shape) => {
@@ -704,7 +684,10 @@ impl ObjectBody {
                 if !self.shape.is_null() {
                     self.slot_attrs_overridden = true;
                 }
-                debug_assert!(self.slots_materialized(), "set_slot(None) needs materialized slots");
+                debug_assert!(
+                    self.slots_materialized(),
+                    "set_slot(None) needs materialized slots"
+                );
                 self.slots_mut()[i] = meta;
             }
         }
@@ -790,16 +773,21 @@ impl ObjectBody {
     /// materializing per-slot metadata first), so `slots()` is authoritative.
     fn remove_slot(&mut self, i: usize) {
         let len = self.slots().len();
-        for j in i..len - 1 {
-            let next = self.data_value(j + 1);
-            self.set_data_value(j, next);
-        }
-        if len - 1 < INLINE_VALUE_CAP {
-            self.inline_values[len - 1] = Value::undefined();
-        } else {
-            self.exotic_mut().overflow_values.pop();
-        }
+        debug_assert_eq!(self.values.len(), len, "value slab metadata desynced");
+        self.values.remove(i);
+        self.refresh_values_ptr();
         self.slots_mut().remove(i);
+    }
+
+    /// Refresh the cached slab pointer after any operation that may reallocate
+    /// or empty the value vector.
+    #[inline]
+    fn refresh_values_ptr(&mut self) {
+        self.values_ptr = if self.values.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            self.values.as_mut_ptr()
+        };
     }
 
     // --- Lazily-boxed exotic slots -----------------------------------------
@@ -989,23 +977,17 @@ impl otter_gc::SafeTraceable for ObjectBody {
             let p = &self.jit_proto as *const JsObject as *mut RawGc;
             v(p);
         }
-        // String-keyed property slots: the flat value array holds each slot's
-        // data value, or — for an accessor slot — a handle to its
-        // `AccessorCellBody`. Trace every inline cell *in place* (by reference)
-        // so the moving scavenger rewrites the live slot, not a copy; an
-        // accessor cell traces its own getter/setter through its `Traceable`
-        // impl. Slots past the current property count hold `undefined` (cleared
-        // on append/remove), which traces to nothing, so the count is not
-        // needed here — the overflow array carries its own length below.
-        for value in self.inline_values.iter() {
+        // String-keyed property slots: the value slab holds each slot's data
+        // value, or — for an accessor slot — a handle to its `AccessorCellBody`.
+        // Trace cells in place so the moving scavenger rewrites the live slot,
+        // not a copy; an accessor cell traces its own getter/setter through its
+        // `Traceable` impl.
+        for value in self.values.iter() {
             value.trace_value_slots(v);
         }
         // Boxed exotic slots holding GC edges. Traced in place through the box
         // reference so the moving collector rewrites the live slots, not a copy.
         if let Some(exotic) = self.exotic.as_ref() {
-            for value in exotic.overflow_values.iter() {
-                value.trace_value_slots(v);
-            }
             // Non-ordinary prototype (Value / Proxy), traced in place.
             match &exotic.proto_override {
                 None | Some(ObjectPrototype::Null) | Some(ObjectPrototype::Object(_)) => {}
@@ -1065,7 +1047,8 @@ pub const PROTO_CHAIN_HARD_CAP: usize = 1024;
 fn empty_object_body() -> ObjectBody {
     ObjectBody {
         shape: ShapeHandle::null(),
-        inline_values: [Value::undefined(); INLINE_VALUE_CAP],
+        values_ptr: std::ptr::null_mut(),
+        values: Vec::new(),
         dictionary_shape_id: next_shape_id(),
         shape_cache_mode: ShapeCacheMode::Fast,
         jit_proto: otter_gc::Gc::null(),
@@ -1161,7 +1144,8 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
     heap.alloc_with_roots(
         ObjectBody {
             shape: ShapeHandle::null(),
-            inline_values: [Value::undefined(); INLINE_VALUE_CAP],
+            values_ptr: std::ptr::null_mut(),
+            values: Vec::new(),
             dictionary_shape_id: next_shape_id(),
             shape_cache_mode: ShapeCacheMode::Fast,
             jit_proto: otter_gc::Gc::null(),
@@ -1186,7 +1170,8 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
     heap.alloc_with_roots(
         ObjectBody {
             shape,
-            inline_values: [Value::undefined(); INLINE_VALUE_CAP],
+            values_ptr: std::ptr::null_mut(),
+            values: Vec::new(),
             dictionary_shape_id: next_shape_id(),
             shape_cache_mode: ShapeCacheMode::Fast,
             jit_proto: otter_gc::Gc::null(),
@@ -3242,7 +3227,11 @@ pub fn freeze(obj: JsObject, heap: &mut otter_gc::GcHeap) {
 /// non-overridden shaped object stores no per-slot metadata (the shape
 /// transition records the change); a previously overridden object keeps its
 /// materialized metadata current. Symbol-keyed slots mutate in place.
-pub(crate) fn freeze_with_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, new_shape: ShapeHandle) {
+pub(crate) fn freeze_with_shape(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    new_shape: ShapeHandle,
+) {
     heap.with_payload(obj, |body| {
         body.extensible = false;
         body.shape = new_shape;

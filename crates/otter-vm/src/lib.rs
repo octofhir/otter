@@ -340,7 +340,7 @@ pub(crate) enum MethodCallFeedback {
     ///
     /// `proto_shape` is the shape of the prototype object that holds the
     /// method slot, and `method_value_byte` is that slot's byte offset within
-    /// the prototype body — both captured at record time from the live
+    /// the prototype value slab — both captured at record time from the live
     /// receiver so the baseline can bake a fully-inline identity guard (read
     /// the receiver's flat prototype, guard its shape, load the slot, compare
     /// the closure's `function_id`) with no per-call resolve bridge.
@@ -366,7 +366,7 @@ pub(crate) struct MethodSite {
     recv_shape: object::ShapeHandle,
     /// Shape of the prototype object holding the method slot (immortal).
     proto_shape: object::ShapeHandle,
-    /// Byte offset of the method's inline value slot within the prototype body.
+    /// Byte offset of the method slot within the prototype value slab.
     method_value_byte: u32,
 }
 
@@ -2465,7 +2465,6 @@ impl Interpreter {
             // byte offset in the receiver shape; bail out of inlining the site if
             // any property is absent, an accessor, or spills past the inline value
             // capacity. Loads carry the name at operand 2, stores at operand 1.
-            let header = otter_gc::header::HEADER_SIZE as u32;
             let mut prop_offsets: rustc_hash::FxHashMap<u32, u32> =
                 rustc_hash::FxHashMap::default();
             let mut ok = true;
@@ -2486,10 +2485,8 @@ impl Interpreter {
                     break;
                 };
                 match self.shape_offset_of(recv_shape, key.name()) {
-                    Some(slot) if (slot as usize) < crate::object::INLINE_VALUE_CAP => {
-                        let value_byte = header
-                            + crate::object::OBJECT_BODY_INLINE_VALUES_OFFSET as u32
-                            + slot * std::mem::size_of::<Value>() as u32;
+                    Some(slot) => {
+                        let value_byte = slot * std::mem::size_of::<Value>() as u32;
                         prop_offsets.insert(instr.byte_pc, value_byte);
                     }
                     _ => {
@@ -5549,16 +5546,10 @@ impl Interpreter {
                         match (shapes, name) {
                             (Some((recv_shape, proto_shape)), Some(name)) => self
                                 .shape_offset_of(proto_shape, name.name())
-                                .filter(|&slot| (slot as usize) < crate::object::INLINE_VALUE_CAP)
-                                .map(|slot| {
-                                    let method_value_byte = otter_gc::header::HEADER_SIZE as u32
-                                        + crate::object::OBJECT_BODY_INLINE_VALUES_OFFSET as u32
-                                        + slot * std::mem::size_of::<Value>() as u32;
-                                    MethodSite {
-                                        recv_shape,
-                                        proto_shape,
-                                        method_value_byte,
-                                    }
+                                .map(|slot| MethodSite {
+                                    recv_shape,
+                                    proto_shape,
+                                    method_value_byte: slot * std::mem::size_of::<Value>() as u32,
                                 }),
                             _ => None,
                         }

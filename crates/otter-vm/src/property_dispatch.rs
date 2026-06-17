@@ -3045,10 +3045,10 @@ impl Interpreter {
     ///
     /// Low 32 bits = the cached shape-handle compressed offset (a stable guard
     /// token — shapes are immortal and pinned in old space, and a fast-mode
-    /// shape is never the null offset `0`). High 32 bits = the byte offset from
-    /// the decompressed object pointer to the in-object value slot. Only a warm,
-    /// single-entry `OwnData` IC on a fixed in-object slot qualifies; everything
-    /// else returns `0`, leaving the emitted site permanently on the stub.
+    /// shape is never the null offset `0`). High 32 bits = the byte offset
+    /// inside the object's contiguous value slab. Only a warm, single-entry
+    /// `OwnData` IC qualifies; everything else returns `0`, leaving the emitted
+    /// site on the stub.
     fn whisker_load_cell_fill(&self, site: usize) -> u64 {
         let entry = &self.load_property_ics[site];
         if entry.entry_count() != 1 {
@@ -3057,13 +3057,10 @@ impl Interpreter {
         let LoadPropertyIc::OwnData { hit } = &entry.entries()[0] else {
             return 0;
         };
-        if hit.shape.is_null() || usize::from(hit.slot) >= crate::object::INLINE_VALUE_CAP {
+        if hit.shape.is_null() {
             return 0;
         }
-        let header = otter_gc::header::HEADER_SIZE as u32;
-        let value_byte = header
-            + crate::object::OBJECT_BODY_INLINE_VALUES_OFFSET as u32
-            + u32::from(hit.slot) * std::mem::size_of::<Value>() as u32;
+        let value_byte = u32::from(hit.slot) * std::mem::size_of::<Value>() as u32;
         (u64::from(value_byte) << 32) | u64::from(hit.shape.offset())
     }
 
@@ -3436,12 +3433,11 @@ impl Interpreter {
     /// Packed WhiskerIC inline-store cell fill for `site`, or `0` for "no
     /// inline". Same encoding as [`Self::whisker_load_cell_fill`]: low 32 =
     /// cached shape-handle offset (non-zero validity token), high 32 = value
-    /// byte offset. Only a warm, single-entry `ExistingOwnDataStore` IC on a
-    /// fixed in-object slot qualifies — an add-transition store mutates the
-    /// shape (grows/relays the object) and can never be a flat slot write, so
-    /// it stays on the stub. The shape guard the emitted site keeps also
-    /// guarantees the slot is the writable data slot the IC captured (a shape
-    /// encodes per-slot flags and key), so the inline write is sound.
+    /// slab byte offset. Only a warm, single-entry `ExistingOwnDataStore` IC
+    /// qualifies — an add-transition store mutates the shape and grows the
+    /// value slab, so it stays on the stub. The shape guard the emitted site
+    /// keeps also guarantees the slot is the writable data slot the IC captured
+    /// (a shape encodes per-slot flags and key), so the inline write is sound.
     fn whisker_store_cell_fill(&self, site: usize) -> u64 {
         let entry = &self.store_property_ics[site];
         if entry.entry_count() != 1 {
@@ -3450,18 +3446,15 @@ impl Interpreter {
         let StorePropertyIc::ExistingOwnDataStore { hit } = &entry.entries()[0] else {
             return 0;
         };
-        if hit.shape.is_null() || usize::from(hit.slot) >= crate::object::INLINE_VALUE_CAP {
+        if hit.shape.is_null() {
             return 0;
         }
-        let header = otter_gc::header::HEADER_SIZE as u32;
-        let value_byte = header
-            + crate::object::OBJECT_BODY_INLINE_VALUES_OFFSET as u32
-            + u32::from(hit.slot) * std::mem::size_of::<Value>() as u32;
+        let value_byte = u32::from(hit.slot) * std::mem::size_of::<Value>() as u32;
         (u64::from(value_byte) << 32) | u64::from(hit.shape.offset())
     }
 
     /// JIT bridge: run the GC write barrier after an inline `StoreProperty`
-    /// wrote a heap-pointer value into `obj_reg`'s in-object slot. The emitted
+    /// wrote a heap-pointer value into `obj_reg`'s value slab. The emitted
     /// fast path already performed the slot store and only calls here when the
     /// stored value is a pointer (primitive stores need no barrier), so this
     /// just marks the parent object's card for the old→young edge.

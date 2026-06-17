@@ -365,7 +365,7 @@ extern "C" fn jit_make_fn_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
 struct WhiskerIcCell {
     /// Cached receiver shape-handle compressed offset; `0` == empty.
     shape: u32,
-    /// Byte offset from the decompressed object pointer to the value slot.
+    /// Byte offset from the value slab pointer to the value slot.
     value_byte: u32,
 }
 
@@ -1241,6 +1241,7 @@ mod arm64 {
                             site,
                             cage_base,
                             view.object_shape_byte,
+                            view.object_values_ptr_byte,
                             view.jit_proto_byte,
                             view.closure_fid_byte,
                             bail,
@@ -1556,7 +1557,7 @@ mod arm64 {
 
                     // Inline guarded own-data load through the self-patching
                     // cell: guard tag + GC type tag + cell shape, then read the
-                    // in-object slot at the cell's byte offset. No allocation /
+                    // value slab slot at the cell's byte offset. No allocation /
                     // call → no safepoint; the object pointer is recomputed from
                     // the (rooted) frame slot each time, never held across one.
                     // An empty cell (`shape == 0`) or any guard miss falls
@@ -1566,6 +1567,7 @@ mod arm64 {
                         let obj_off = reg_offset(obj)?;
                         let dst_off = reg_offset(dst)?;
                         let shape_byte = view.object_shape_byte;
+                        let values_ptr_byte = view.object_values_ptr_byte;
                         dynasm!(ops
                             ; .arch aarch64
                             ; ldr x9, [x19, obj_off]   // receiver Value
@@ -1592,7 +1594,9 @@ mod arm64 {
                             ; cmp w14, w16
                             ; b.ne =>miss
                             ; ldr w17, [x15, #4]       // cached value byte offset
-                            ; ldr x9, [x13, x17]       // in-object slot value
+                            ; ldr x13, [x13, values_ptr_byte] // value slab base
+                            ; cbz x13, =>miss
+                            ; ldr x9, [x13, x17]       // slab slot value
                             ; str x9, [x19, dst_off]
                             ; b =>done
                         );
@@ -1630,7 +1634,7 @@ mod arm64 {
 
                     // Inline guarded existing-own-data store through the
                     // self-patching cell: guard tag + GC type tag + cell shape,
-                    // write the value into the in-object slot, then a
+                    // write the value into the value slab slot, then a
                     // value-tag-gated write barrier (primitive stores skip it).
                     // No allocation → no safepoint; the object pointer is
                     // recomputed from the (rooted) frame slot, never held
@@ -1639,6 +1643,7 @@ mod arm64 {
                         let obj_off = reg_offset(obj)?;
                         let src_off = reg_offset(src)?;
                         let shape_byte = view.object_shape_byte;
+                        let values_ptr_byte = view.object_values_ptr_byte;
                         dynasm!(ops
                             ; .arch aarch64
                             ; ldr x9, [x19, obj_off]   // receiver Value
@@ -1666,7 +1671,9 @@ mod arm64 {
                             ; b.ne =>miss
                             ; ldr w17, [x15, #4]       // cached value byte offset
                             ; ldr x9, [x19, src_off]   // value to store
-                            ; str x9, [x13, x17]       // write in-object slot
+                            ; ldr x13, [x13, values_ptr_byte] // value slab base
+                            ; cbz x13, =>miss
+                            ; str x9, [x13, x17]       // write slab slot
                             ; lsr x10, x9, #48         // value tag
                             ; movz x11, TAG_PTR_OBJECT as u32
                             ; cmp x10, x11
@@ -2105,9 +2112,9 @@ mod arm64 {
 
     /// Emit one op of an inlined method body. `this_slot` is the scratch slot
     /// holding the receiver; `prop_offsets` maps a body `LoadProperty` /
-    /// `StoreProperty` byte-PC to the baked value byte offset from the
-    /// decompressed receiver. `LoadThis`, `LoadProperty`, and `StoreProperty`
-    /// are handled here; every other op routes to [`emit_inline_pure_op`].
+    /// `StoreProperty` byte-PC to the baked value slab byte offset.
+    /// `LoadThis`, `LoadProperty`, and `StoreProperty` are handled here; every
+    /// other op routes to [`emit_inline_pure_op`].
     #[allow(clippy::too_many_arguments)]
     fn emit_inline_method_op(
         ops: &mut Assembler,
@@ -2117,6 +2124,7 @@ mod arm64 {
         cage_base: usize,
         recv_shape: u32,
         object_shape_byte: u32,
+        object_values_ptr_byte: u32,
         bail: DynamicLabel,
         inline_done: DynamicLabel,
         clabels: &BTreeMap<u32, DynamicLabel>,
@@ -2148,13 +2156,15 @@ mod arm64 {
                 dynasm!(ops
                     ; .arch aarch64
                     ; add x13, x13, x12
+                    ; ldr x13, [x13, object_values_ptr_byte]
+                    ; cbz x13, =>bail
                     ; ldr x9, [x13, off]
                 );
                 store_reg(ops, 9, dst)?;
                 Ok(())
             }
             Op::StoreProperty => {
-                // Sealed in-object store `recv.<prop> = src`. The receiver shape
+                // Sealed value-slab store `recv.<prop> = src`. The receiver shape
                 // is re-guarded (the baked offset is only valid for it) and the
                 // value is required to be a non-`Gc` primitive — a pointer value
                 // would need a generational write barrier that cannot run in the
@@ -2206,6 +2216,8 @@ mod arm64 {
                     ; b.hs =>store_ok
                     ; b =>bail
                     ; =>store_ok
+                    ; ldr x13, [x13, object_values_ptr_byte]
+                    ; cbz x13, =>bail
                     ; str x9, [x13, off]
                 );
                 Ok(())
@@ -2237,6 +2249,7 @@ mod arm64 {
         site: u64,
         cage_base: usize,
         object_shape_byte: u32,
+        object_values_ptr_byte: u32,
         jit_proto_byte: u32,
         closure_fid_byte: u32,
         bail: DynamicLabel,
@@ -2333,11 +2346,14 @@ mod arm64 {
             ; movk w15, (method.proto_shape >> 16) & 0xffff, lsl #16
             ; cmp w14, w15
             ; b.ne =>fallback
-            // Method slot: load the 64-bit Value. A resolved method is either a
-            // closure-less bytecode reference (`TAG_FUNCTION_ID`, fid in the low
-            // 32 bits) or a closure pointer (`TAG_PTR_FUNCTION` → `JsClosureBody`,
-            // fid read from its body). Decode the function id into w14 either way,
-            // then compare to the baked id; anything else falls back.
+            // Method slot: load the 64-bit Value from the prototype's value
+            // slab. A resolved method is either a closure-less bytecode
+            // reference (`TAG_FUNCTION_ID`, fid in the low 32 bits) or a
+            // closure pointer (`TAG_PTR_FUNCTION` → `JsClosureBody`, fid read
+            // from its body). Decode the function id into w14 either way, then
+            // compare to the baked id; anything else falls back.
+            ; ldr x13, [x13, object_values_ptr_byte]
+            ; cbz x13, =>fallback
             ; ldr x9, [x13, method.method_value_byte]
             ; lsr x10, x9, #48
             ; movz x11, TAG_FUNCTION_ID as u32
@@ -2395,6 +2411,7 @@ mod arm64 {
                 cage_base,
                 method.recv_shape,
                 object_shape_byte,
+                object_values_ptr_byte,
                 inline_bail,
                 inline_done,
                 &clabels,
@@ -3138,6 +3155,7 @@ mod tests {
             cage_base: 0,
             ta_layout: otter_vm::JitTypedArrayLayout::default(),
             object_shape_byte: 8,
+            object_values_ptr_byte: 16,
             jit_proto_byte: 12,
             closure_fid_byte: 8,
             instructions,

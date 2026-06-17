@@ -259,8 +259,14 @@ pub(crate) fn compile_unary(
     // `valueOf` / `toString`. LogicalNot and TypeOf do
     // not coerce; they take their argument as-is.
     // <https://tc39.es/ecma262/#sec-unary-operators>
+    // A provably-primitive operand skips ToPrimitive (no observable
+    // valueOf / [Symbol.toPrimitive]); the op's own ToNumeric still runs.
     let inner_in = match op {
-        Op::Neg | Op::ToNumber | Op::BitwiseNot => emit_to_primitive(cx, inner, "number", span),
+        Op::Neg | Op::ToNumber | Op::BitwiseNot
+            if !crate::expr::binary::expr_is_primitive(&u.argument) =>
+        {
+            emit_to_primitive(cx, inner, "number", span)
+        }
         _ => inner,
     };
     cx.emit(

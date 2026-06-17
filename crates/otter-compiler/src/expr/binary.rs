@@ -18,7 +18,11 @@ use oxc_ast::ast::{BinaryExpression, Expression, LogicalExpression, PrivateInExp
 /// A primitive's `ToPrimitive` has no observable side effect (no `valueOf` /
 /// `toString` / `[Symbol.toPrimitive]` call), so eliding the op is
 /// behavior-preserving; it only removes redundant coercion instructions.
-fn expr_is_primitive(expr: &Expression<'_>) -> bool {
+pub(crate) fn expr_is_primitive(expr: &Expression<'_>) -> bool {
+    // `(expr)` is transparent — recurse through the parens.
+    if let Expression::ParenthesizedExpression(p) = expr {
+        return expr_is_primitive(&p.expression);
+    }
     matches!(
         expr,
         // Literals that are primitives (object literals/regexp excluded).

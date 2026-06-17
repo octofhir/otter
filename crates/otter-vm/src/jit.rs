@@ -251,6 +251,8 @@ pub struct JitTypedArrayLayout {
     /// element or an out-of-bounds index falls through to the runtime stub,
     /// which owns the spec-correct prototype / sparse / accessor handling.
     pub array_elements_byte: u32,
+    /// Offset to `ArrayBody.length`, the logical `length` property.
+    pub array_length_byte: u32,
 }
 
 /// Owned snapshot of one executable instruction.
@@ -272,6 +274,10 @@ pub struct JitInstrView {
     /// direct read of the frame's own closure (carried in `JitCtx`) instead of
     /// a Rust round-trip through `jit_runtime_make_function`.
     pub make_self: bool,
+    /// `true` when this instruction is a named-property read of literal
+    /// `"length"`. The emitter uses it to try the Array exotic length fast
+    /// path before falling back to ordinary property semantics.
+    pub load_array_length: bool,
 }
 
 /// Frame stack the interpreter dispatches over. Exposed so the JIT crate can

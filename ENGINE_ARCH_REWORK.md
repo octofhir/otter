@@ -233,16 +233,22 @@ missing mechanisms: (a) no inline fast path that reads the array length directly
 from the array header in compiled code; (b) no **LICM** to hoist the
 loop-invariant load out of the loop (node does both).
 
-### Breaking redesign
-1. **Inline `.length` for array/typed-array receivers**: emit a tag + body-type
-   guard then a direct header-field load of the length, no stub, no key. Same
-   shape as the property WhiskerIC but keyed on "receiver is array" rather than a
-   shape slot.
-2. **LICM in the (future) optimizing tier**: hoist provably loop-invariant
-   loads (`arr.length` where `arr` is not reassigned, invariant field reads).
-   Until the optimizing tier exists, (1) alone removes the 10M stubs.
+### Landed redesign
+**Inline ordinary Array `.length` in the baseline JIT.** `LoadProperty` sites
+whose constant key is literal `"length"` carry a compile-time metadata bit in
+the VM→JIT snapshot. The arm64 emitter tries a receiver tag + `ArrayBody` type
+tag guard before the normal property IC path; on a hit it reads
+`ArrayBody.length` directly and boxes it as an int32. Lengths outside the int32
+range miss back to the existing runtime property path, which preserves the
+general numeric semantics.
 
-Pervasive: essentially every array-iterating loop pays this today.
+This removes the array-length bridge-stub tax for ordinary hot loops while
+leaving prototype/sparse/accessor semantics owned by the existing runtime
+fallback. Typed-array `.length` and real LICM remain future work: typed arrays
+need their own receiver kind guard, and loop-invariant hoisting belongs in an
+optimizing tier rather than the current linear baseline emitter.
+
+Pervasive: before this change, essentially every array-iterating loop paid this.
 
 ---
 

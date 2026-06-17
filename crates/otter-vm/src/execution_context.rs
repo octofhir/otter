@@ -248,6 +248,15 @@ impl ExecutionContext {
             {
                 instr.make_self = true;
             }
+            if instr.op == otter_bytecode::Op::LoadProperty
+                && let Some(&otter_bytecode::Operand::ConstIndex(idx)) = instr.operands.get(2)
+                && self
+                    .atoms
+                    .string_constant_str(idx)
+                    .is_some_and(|name| name == "length")
+            {
+                instr.load_array_length = true;
+            }
         }
         Some(view)
     }
@@ -539,6 +548,39 @@ mod tests {
             .expect("string constant is atomized");
         assert_eq!(key.name(), "foo");
         assert!(context.property_atom(1).is_none());
+    }
+
+    #[test]
+    fn jit_view_marks_array_length_loads() {
+        let context = ExecutionContext::from_module(module_with(
+            vec![
+                instr(
+                    0,
+                    Op::LoadProperty,
+                    [
+                        Operand::Register(0),
+                        Operand::Register(1),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                instr(
+                    1,
+                    Op::LoadProperty,
+                    [
+                        Operand::Register(2),
+                        Operand::Register(1),
+                        Operand::ConstIndex(1),
+                    ],
+                ),
+            ],
+            vec![string_constant("length"), string_constant("value")],
+            3,
+        ));
+
+        let view = context.jit_function_view(0).expect("function exists");
+
+        assert!(view.instructions[0].load_array_length);
+        assert!(!view.instructions[1].load_array_length);
     }
 
     #[test]

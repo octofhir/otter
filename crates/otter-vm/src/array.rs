@@ -127,6 +127,10 @@ pub struct ArrayBody {
 /// `Vec<Value>` data-pointer / length sub-offsets to read dense elements
 /// inline.
 pub const ARRAY_BODY_ELEMENTS_OFFSET: usize = std::mem::offset_of!(ArrayBody, elements);
+/// Byte offset of [`ArrayBody::length`] from the body start (after the GC
+/// header). The baseline JIT reads this for the `arr.length` fast path after
+/// guarding the receiver body tag.
+pub const ARRAY_BODY_LENGTH_OFFSET: usize = std::mem::offset_of!(ArrayBody, length);
 
 /// Trace helper for symbol-keyed own properties: only `Value` parts
 /// of each `(JsSymbol, Value)` pair carry GC slots — the `JsSymbol`

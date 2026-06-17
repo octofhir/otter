@@ -1555,6 +1555,43 @@ mod arm64 {
                     let miss = ops.new_dynamic_label();
                     let done = ops.new_dynamic_label();
 
+                    if cage_base != 0 && instr.load_array_length {
+                        let obj_off = reg_offset(obj)?;
+                        let dst_off = reg_offset(dst)?;
+                        let array_tag = u32::from(view.ta_layout.array_type_tag);
+                        let length_byte = view.ta_layout.array_length_byte;
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldr x9, [x19, obj_off]   // receiver Value
+                            ; lsr x10, x9, #48
+                            ; movz x11, TAG_PTR_OBJECT as u32
+                            ; cmp x10, x11
+                            ; b.ne =>miss
+                            ; mov w12, w9              // low-32 Gc offset
+                        );
+                        emit_load_u64(&mut ops, 13, cage_base as u64);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; add x13, x13, x12        // x13 = GcHeader ptr
+                            ; ldrb w14, [x13]
+                            ; cmp w14, array_tag
+                            ; b.ne =>miss
+                            ; ldr x9, [x13, length_byte]
+                        );
+                        emit_load_u64(&mut ops, 12, i32::MAX as u64);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; cmp x9, x12
+                            ; b.hi =>miss
+                        );
+                        box_low32!(ops, 9, 12, TAG_INT32);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; str x9, [x19, dst_off]
+                            ; b =>done
+                        );
+                    }
+
                     // Inline guarded own-data load through the self-patching
                     // cell: guard tag + GC type tag + cell shape, then read the
                     // value slab slot at the cell's byte offset. No allocation /
@@ -3141,6 +3178,7 @@ mod tests {
                 property_ic_site: None,
                 operands: operands.clone(),
                 make_self: false,
+                load_array_length: false,
             })
             .collect();
         JitFunctionView {

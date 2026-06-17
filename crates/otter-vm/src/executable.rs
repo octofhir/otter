@@ -207,6 +207,10 @@ impl ExecutableFunction {
                     // Resolved by `ExecutionContext::jit_function_view`, which
                     // can map a `MakeFunction` constant index to its target id.
                     make_self: false,
+                    // Resolved by `ExecutionContext::jit_function_view`, which
+                    // can inspect constant strings without exposing them to the
+                    // external JIT crate.
+                    load_array_length: false,
                 })
                 .collect(),
             // Baked by `Interpreter::bake_inline_callees` (it holds the live

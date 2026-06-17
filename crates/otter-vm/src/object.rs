@@ -398,9 +398,6 @@ pub struct ObjectBody {
     /// metadata (flags + data/accessor kind) lives in [`Self::slots`] at
     /// the same index. Accessor slots store an unused `undefined` here.
     inline_values: [Value; INLINE_VALUE_CAP],
-    /// Out-of-line data values for string-keyed slots with index
-    /// `>= INLINE_VALUE_CAP` (`overflow_values[i - INLINE_VALUE_CAP]`).
-    overflow_values: Vec<Value>,
     /// Fallback/dictionary identity used only when [`Self::shape`] is null.
     dictionary_shape_id: ShapeId,
     /// Whether string-keyed shape assumptions are IC-compatible.
@@ -450,6 +447,10 @@ pub struct ObjectBody {
 /// constructor builtin, Date, Error, raw-JSON, or arguments exotic.
 #[derive(Default)]
 struct ExoticSlots {
+    /// Out-of-line data values for string-keyed slots with index
+    /// `>= INLINE_VALUE_CAP`. Empty/absent for objects with few properties;
+    /// allocated on the first spill past the inline value array.
+    overflow_values: Vec<Value>,
     /// Dictionary (slow-mode) string-key order — only present when the object
     /// has left fast-shape mode (delete-shaped objects, raw fixtures, failed
     /// transitions). Fast-shape objects never allocate it.
@@ -510,12 +511,16 @@ const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET.is_multiple_of(4));
 
 impl ObjectBody {
     /// Read the data value for string-keyed slot `i` from flat storage.
+    /// Slots `>= INLINE_VALUE_CAP` live in the boxed overflow array, which only
+    /// exists once a slot has spilled there (so the index is always valid).
     #[inline]
     fn data_value(&self, i: usize) -> Value {
         if i < INLINE_VALUE_CAP {
             self.inline_values[i]
         } else {
-            self.overflow_values[i - INLINE_VALUE_CAP]
+            self.exotic()
+                .expect("overflow slot read without overflow storage")
+                .overflow_values[i - INLINE_VALUE_CAP]
         }
     }
 
@@ -525,7 +530,7 @@ impl ObjectBody {
         if i < INLINE_VALUE_CAP {
             self.inline_values[i] = value;
         } else {
-            self.overflow_values[i - INLINE_VALUE_CAP] = value;
+            self.exotic_mut().overflow_values[i - INLINE_VALUE_CAP] = value;
         }
     }
 
@@ -537,7 +542,7 @@ impl ObjectBody {
         if i < INLINE_VALUE_CAP {
             self.inline_values[i] = value;
         } else {
-            self.overflow_values.push(value);
+            self.exotic_mut().overflow_values.push(value);
         }
         self.slots.push(meta);
     }
@@ -580,7 +585,7 @@ impl ObjectBody {
         if len - 1 < INLINE_VALUE_CAP {
             self.inline_values[len - 1] = Value::undefined();
         } else {
-            self.overflow_values.pop();
+            self.exotic_mut().overflow_values.pop();
         }
         self.slots.remove(i);
     }
@@ -739,7 +744,7 @@ impl otter_gc::SafeTraceable for ObjectBody {
             v(p);
         }
         debug_assert_eq!(
-            self.overflow_values.len(),
+            self.exotic().map_or(0, |e| e.overflow_values.len()),
             self.slots.len().saturating_sub(INLINE_VALUE_CAP),
             "flat value array desynced from slots (len {})",
             self.slots.len()
@@ -754,7 +759,11 @@ impl otter_gc::SafeTraceable for ObjectBody {
                     if i < INLINE_VALUE_CAP {
                         self.inline_values[i].trace_value_slots(v);
                     } else {
-                        self.overflow_values[i - INLINE_VALUE_CAP].trace_value_slots(v);
+                        self.exotic
+                            .as_ref()
+                            .expect("overflow slot traced without overflow storage")
+                            .overflow_values[i - INLINE_VALUE_CAP]
+                            .trace_value_slots(v);
                     }
                 }
                 SlotKind::Accessor(pair) => {
@@ -824,7 +833,6 @@ fn empty_object_body() -> ObjectBody {
     ObjectBody {
         shape: ShapeHandle::null(),
         inline_values: [Value::undefined(); INLINE_VALUE_CAP],
-        overflow_values: Vec::new(),
         dictionary_shape_id: next_shape_id(),
         shape_cache_mode: ShapeCacheMode::Fast,
         slots: SmallVec::new(),
@@ -922,8 +930,7 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
         ObjectBody {
             shape: ShapeHandle::null(),
             inline_values: [Value::undefined(); INLINE_VALUE_CAP],
-            overflow_values: Vec::new(),
-            dictionary_shape_id: next_shape_id(),
+                dictionary_shape_id: next_shape_id(),
             shape_cache_mode: ShapeCacheMode::Fast,
             slots: SmallVec::new(),
             prototype: ObjectPrototype::Null,
@@ -949,8 +956,7 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
         ObjectBody {
             shape,
             inline_values: [Value::undefined(); INLINE_VALUE_CAP],
-            overflow_values: Vec::new(),
-            dictionary_shape_id: next_shape_id(),
+                dictionary_shape_id: next_shape_id(),
             shape_cache_mode: ShapeCacheMode::Fast,
             slots: SmallVec::new(),
             prototype: ObjectPrototype::Null,
@@ -3926,5 +3932,6 @@ mod tests {
         assert!(delete_symbol(o, &mut heap, sym));
     }
 }
+
 
 

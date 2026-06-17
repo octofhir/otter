@@ -271,8 +271,10 @@ is monomorphic and tiny.
 - **Register-window calling convention**: lay caller and callee register windows
   contiguously so arguments are passed in place; skip `bind`/`draw`/`reclaim` on
   the monomorphic fast path.
-- **No-upvalue fast path**: skip `build_upvalues_for_count` for callees that
-  capture nothing (the common case).
+- **No-upvalue fast path — LANDED (direct-call frame setup).** Compiled→compiled
+  direct calls now bypass the generic upvalue builder when the callee has no own
+  captures, carrying the already-resolved parent spine straight into the callee
+  frame. Capturing callees keep the old allocation path.
 - **Inline builtin callbacks**: splice a monomorphic JS callback body into
   `Array.map/filter/forEach/reduce/sort`'s native iteration so there is no
   per-element re-entry (kills the sort 2.4× / array-ops 2.7× ceiling).

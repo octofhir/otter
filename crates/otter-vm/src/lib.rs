@@ -1687,8 +1687,11 @@ impl Interpreter {
         callee_reg: Option<u16>,
         arg_regs: &[u16],
     ) -> Result<jit::JitPreparedDirectCall, VmError> {
-        let upvalues =
-            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
+        let upvalues = if function.own_upvalue_count == 0 {
+            parent_upvalues
+        } else {
+            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?
+        };
         let this_for_callee = self.this_for_bytecode_call_runtime_rooted(function, this0, &[])?;
         let registers = self.draw_registers(usize::from(plan.register_count));
         let mut callee_frame = HoltCallReservation::from_frame(Frame::with_exec_registers(

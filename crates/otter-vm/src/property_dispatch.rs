@@ -3277,6 +3277,10 @@ impl Interpreter {
                 let frame = &mut stack[frame_index];
                 write_register(frame, dst, Value::number(value))
             }
+            Op::MathCall => {
+                let operands = context.exec_operands(instr);
+                self.do_math_call(stack, context, operands)
+            }
             Op::DefineDataProperty => {
                 let (obj_reg, key_reg, value_reg) = context
                     .exec_register3(instr)

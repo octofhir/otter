@@ -1779,6 +1779,7 @@ mod arm64 {
                 | Op::Ushr
                 | Op::LoadString
                 | Op::LoadNumber
+                | Op::MathCall
                 | Op::DefineDataProperty
                 | Op::FreshUpvalue
                 | Op::LoadBuiltinError

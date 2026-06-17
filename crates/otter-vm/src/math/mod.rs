@@ -19,7 +19,9 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-math-object>
 
+use crate::native_function::NativeFastFn;
 use crate::number::{NumberValue, bitwise};
+use crate::object::{self, JsObject};
 use crate::{NativeCtx, NativeError, Value};
 
 /// Foundation `Math` constants per ECMA-262 §21.3.1. Each constant
@@ -188,6 +190,66 @@ pub fn call(
         M::Trunc => impl_trunc(&nums),
     };
     Ok(Value::number(value))
+}
+
+/// Return the original realm `Math` object when `Math.<method>` still points at
+/// the bootstrap native function for `method`.
+pub(crate) fn original_method_receiver(
+    global: JsObject,
+    heap: &otter_gc::GcHeap,
+    method: otter_bytecode::method_id::MathMethod,
+) -> Option<JsObject> {
+    let math = object::get(global, heap, "Math")?.as_object()?;
+    let native = object::get(math, heap, method.name())?.as_native_function()?;
+    native
+        .is_static_fn(heap, original_native_fn(method))
+        .then_some(math)
+}
+
+/// `true` when direct [`call`] can run without observable `ToPrimitive`.
+pub(crate) fn args_skip_to_primitive(args: &[Value]) -> bool {
+    args.iter().all(|value| !needs_to_primitive_for_math(value))
+}
+
+fn original_native_fn(method: otter_bytecode::method_id::MathMethod) -> NativeFastFn {
+    use otter_bytecode::method_id::MathMethod as M;
+    match method {
+        M::Abs => native_abs,
+        M::Acos => native_acos,
+        M::Acosh => native_acosh,
+        M::Asin => native_asin,
+        M::Asinh => native_asinh,
+        M::Atan => native_atan,
+        M::Atan2 => native_atan2,
+        M::Atanh => native_atanh,
+        M::Cbrt => native_cbrt,
+        M::Ceil => native_ceil,
+        M::Clz32 => native_clz32,
+        M::Cos => native_cos,
+        M::Cosh => native_cosh,
+        M::Exp => native_exp,
+        M::Expm1 => native_expm1,
+        M::Floor => native_floor,
+        M::Fround => native_fround,
+        M::Hypot => native_hypot,
+        M::Imul => native_imul,
+        M::Log => native_log,
+        M::Log10 => native_log10,
+        M::Log1p => native_log1p,
+        M::Log2 => native_log2,
+        M::Max => native_max,
+        M::Min => native_min,
+        M::Pow => native_pow,
+        M::Random => native_random,
+        M::Round => native_round,
+        M::Sign => native_sign,
+        M::Sin => native_sin,
+        M::Sinh => native_sinh,
+        M::Sqrt => native_sqrt,
+        M::Tan => native_tan,
+        M::Tanh => native_tanh,
+        M::Trunc => native_trunc,
+    }
 }
 
 fn native_call(

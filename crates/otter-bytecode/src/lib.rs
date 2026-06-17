@@ -430,6 +430,13 @@ pub enum Op {
     /// when it sees `Math.PI` / `Math.E` / `Math.<known>` outside
     /// a call expression.
     MathLoad,
+    /// Guarded `Math.<method>(args...)` intrinsic call. Operands:
+    /// `Register(dst), ConstIndex(method_id), ConstIndex(argc),
+    /// Register(arg0)..`. The VM/JIT may use the typed method id for
+    /// direct numeric dispatch when the global `Math` method still
+    /// points at the bootstrap native; otherwise it falls back to the
+    /// ordinary method-call semantics so user shadows remain visible.
+    MathCall,
     /// `r<dst> = trailing-args-as-array`. Operand: `Register(dst)`.
     /// Reads the call's overflow argument list (the values past
     /// the declared `param_count`) that the dispatcher stashed on
@@ -1299,6 +1306,7 @@ impl Op {
             Op::MakeClass => "MAKE_CLASS",
             Op::CollectRest => "COLLECT_REST",
             Op::MathLoad => "MATH_LOAD",
+            Op::MathCall => "MATH_CALL",
             Op::Add => "ADD",
             Op::Sub => "SUB",
             Op::Mul => "MUL",
@@ -1422,10 +1430,9 @@ impl Op {
         }
     }
 
-    /// Declared operand arity. `CallMethodValue` is variadic; the
-    /// instruction stream stores `dst, recv, name_const, argc`
-    /// followed by `argc` register operands, so the actual operand
-    /// count is `4 + argc`. `operand_count` returns the **prefix**
+    /// Declared operand arity. Some call opcodes are variadic; the
+    /// instruction stream stores a fixed prefix followed by `argc`
+    /// register operands. `operand_count` returns the **prefix**
     /// length; consumers walk the variadic tail by reading `argc`.
     /// `CallWithThis` and `BindFunction` follow the same convention
     /// with an extra `this` register before `argc`.
@@ -1572,6 +1579,7 @@ impl Op {
             // recv, key, src, scratch_dst for accessor setters.
             Op::StoreElement => 4,
             Op::CallMethodValue => 4,    // dst, recv, name_const, argc
+            Op::MathCall => 3,           // dst, method_id, argc — args follow
             Op::ForInKeys => 2,          // dst, obj
             Op::CopyDataProperties => 2, // target, src
             Op::StarReexport => 2,       // target_env, src_env

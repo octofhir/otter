@@ -403,19 +403,23 @@ mod tests {
     }
 
     #[test]
-    fn math_namespace_inlines_constants_but_dispatches_methods_dynamically() {
+    fn math_namespace_inlines_constants_and_guards_methods() {
         // `Math.PI` keeps its dedicated [`Op::MathLoad`] inlining,
-        // while `Math.<method>(...)` calls now go through ordinary
-        // property-call dispatch so user shadows are observable.
+        // while `Math.<method>(...)` calls use guarded [`Op::MathCall`]
+        // dispatch so runtime user shadows remain observable.
         let module = compile_script_src("Math.PI; Math.abs(-1); Math.max(1, 2, 3);");
         let main = module.main();
         assert!(main.code.iter().any(|i| i.op == Op::MathLoad));
-        let calls = main
-            .code
-            .iter()
-            .filter(|i| i.op == Op::CallMethodValue)
-            .count();
+        let calls = main.code.iter().filter(|i| i.op == Op::MathCall).count();
         assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn lexical_math_shadow_keeps_ordinary_call() {
+        let module = compile_script_src("let Math = { sqrt() { return 7; } }; Math.sqrt(4);");
+        let main = module.main();
+        assert!(!main.code.iter().any(|i| i.op == Op::MathCall));
+        assert!(main.code.iter().any(|i| i.op == Op::CallMethodValue));
     }
 
     #[test]

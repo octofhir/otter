@@ -595,6 +595,7 @@ pub const OP_BYTE_TABLE: &[(Op, u8)] = &[
     (Op::GetTemplateObject, 0xA4),
     (Op::DeleteDynamic, 0xA5),
     (Op::NewPrivateName, 0xA6),
+    (Op::MathCall, 0xA7),
 ];
 
 #[cfg(test)]
@@ -958,7 +959,7 @@ mod tests {
         // Catches accidental opcode additions that forget to wire
         // through OP_BYTE_TABLE. If this fires, append the missing
         // opcode at the next unused byte.
-        const EXPECTED_OPCODE_COUNT: usize = 167;
+        const EXPECTED_OPCODE_COUNT: usize = 168;
         assert_eq!(
             OP_BYTE_TABLE.len(),
             EXPECTED_OPCODE_COUNT,

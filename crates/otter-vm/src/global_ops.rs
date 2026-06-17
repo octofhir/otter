@@ -107,7 +107,7 @@ impl Interpreter {
     /// Read a binding from the global declarative record. `Ok(None)`
     /// when the name has no global lexical binding;
     /// `Err(ReferenceError)` when the binding is still in its TDZ.
-    fn read_global_lexical(&self, name: &str) -> Result<Option<Value>, VmError> {
+    pub(crate) fn read_global_lexical(&self, name: &str) -> Result<Option<Value>, VmError> {
         let Some((cell, _)) = self.global_lexicals.get(name) else {
             return Ok(None);
         };

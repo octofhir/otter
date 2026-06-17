@@ -370,11 +370,28 @@ benchmarks/micro/sqrt.js   10M Math.sqrt   →  otter 1748 ms   node ~5 ms compu
 ~175 ns per `Math.sqrt` call. It is dispatched as a normal method/global call →
 native function → `libsystem_m` (libm). nbody and mandelbrot lean on `sqrt`.
 
-### Breaking redesign
-Recognize `Math.{sqrt,abs,floor,ceil,round,min,max,…}` as **intrinsics** at
-compile time and emit the native instruction inline (`fsqrt`, `fabs`,
-`frintm`, …) under a "Math is the original global" guard — no call, no libm.
-Cheap, isolated, and directly lifts the float benches.
+### Landed redesign
+**Guarded `Math.<method>(...)` intrinsic opcode.** Direct calls to known
+`Math` methods lower to `Op::MathCall` when `Math` is not lexically shadowed.
+At runtime the opcode checks that the realm global still points at the
+bootstrap `Math` object and that the selected method still points at the
+original native function. Primitive arguments run through the numeric dispatch
+table directly; object-like arguments fall back to the ordinary method-call path
+so user `@@toPrimitive` / `valueOf` / `toString` hooks remain observable.
+
+The baseline JIT delegates `Op::MathCall` through the runtime opcode bridge,
+which is deliberately conservative: it removes the hot property/method/native
+call bridge while preserving global replacement, method overwrite, lexical
+shadowing, and object coercion semantics. A future machine-code `fsqrt`/`fabs`
+fast path can build on the same guard contract rather than speculating
+unconditionally.
+
+Measured on `benchmarks/micro/sqrt.js` with `OTTER_STATS=1` against clean
+pre-change HEAD `8e4e02f96c9ebbc710b4d67df90205de68daaaf0`:
+- JIT on: **1713 ms → 698 ms**, `nativeCalls` **10,000,182 → 184**,
+  `jitRuntimePropertyStubs` **19,995,996 → 0**.
+- `OTTER_JIT=0`: **3915 ms → 2987 ms**, `nativeCalls`
+  **10,000,182 → 184**.
 
 ## D5 — Codegen is 100% memory-bound: no CPU register allocation
 
@@ -404,7 +421,7 @@ measurable against a committed reproducer.
 |---|---|---|---|---|
 | 1 | **R1** self-priming property IC | JIT stub + IC fill | 5–9× on top-level code | de-risks all IC work |
 | 2 | **VmError shrink** (audit A) | mechanical, Box payloads | 5–15% broad | cleaner profiles |
-| 3 | **D4** Math.* intrinsics → native `fsqrt`/… | compiler + emit | float benches | cheap, isolated |
+| 3 | **D4** Math.* intrinsics — LANDED guarded opcode | compiler + VM/JIT delegate | float benches | safe guard contract for native emit |
 | 4 | **R3** inline array `.length` | emit + array header | kills per-iter length stub | every array loop |
 | 5 | **D1+R2** object-model rewrite: split god-struct + flat slab | ObjectBody, GC tracing, body offsets | ~13× alloc, ≈7–10× smaller objects, fewer GC cycles | json/prop/array/OO |
 | 6 | **D2** inline bump-alloc in JIT | emit + nursery cursor | per-`new` floor gone | pairs with D1 |

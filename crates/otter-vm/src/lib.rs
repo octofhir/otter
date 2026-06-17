@@ -7519,6 +7519,11 @@ impl Interpreter {
                     self.run_math_load_reg(context, frame, dst, name_idx)?;
                     continue;
                 }
+                Op::MathCall => {
+                    let operands = context.exec_operands(instr);
+                    self.do_math_call(stack, context, operands)?;
+                    continue;
+                }
                 Op::SymbolLoad => {
                     let dst = context
                         .exec_register(instr, 0)

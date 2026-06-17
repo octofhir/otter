@@ -310,10 +310,25 @@ pub(crate) fn compile_method_call(
                 return Ok(dst);
             }
         }
-        // `Math.<name>(args)` flows through the real `NativeFunction`
-        // entries installed by the `Math` namespace bootstrap, so the
-        // dedicated `Op::MathCall` shortcut is no longer emitted.
-        // User shadowing of `Math.<method>` is therefore observable.
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "Math"
+            && cx.lookup_binding("Math").is_none()
+            && !cx.script_global_lexicals.contains("Math")
+            && find_module_import_binding(cx, "Math").is_none()
+            && let Some(method) =
+                otter_bytecode::method_id::MathMethod::from_str(member.property.name.as_str())
+        {
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            check_call_arity(arg_regs.len(), "Op::MathCall", span)?;
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(method.as_u32()));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::MathCall, operands, span);
+            return Ok(dst);
+        }
         // `JSON.<name>(args)` flows through the real `NativeFunction`
         // installed by the `JSON` namespace bootstrap, so the dedicated
         // `Op::JsonCall` shortcut is no longer emitted. User shadowing

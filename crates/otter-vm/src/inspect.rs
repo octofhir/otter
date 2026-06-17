@@ -882,6 +882,7 @@ mod tests {
         Op::JumpViaFinally,
         Op::MakeClass,
         Op::MathLoad,
+        Op::MathCall,
         Op::CollectRest,
         Op::ReturnValue,
         Op::ReturnUndefined,

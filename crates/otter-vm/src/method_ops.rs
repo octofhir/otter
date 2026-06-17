@@ -28,7 +28,7 @@ use crate::{
     Value, VmError, VmGetOutcome, VmPropertyKey, bigint,
     boolean::prototype as boolean_prototype,
     bootstrap_collections, build_array_cb_args, collections_prototype, date, descriptor_value,
-    function_metadata,
+    function_metadata, math,
     native_function::VmIntrinsicFunction,
     number,
     operand_decode::{const_operand, register_operand},
@@ -110,6 +110,86 @@ fn is_function_prototype_intrinsic_value(
 }
 
 impl Interpreter {
+    /// Handle guarded `Math.<method>(args...)` intrinsic calls.
+    pub(crate) fn do_math_call(
+        &mut self,
+        stack: &mut HoltStack,
+        context: &ExecutionContext,
+        operands: &[Operand],
+    ) -> Result<(), VmError> {
+        let dst = register_operand(operands.first())?;
+        let method_id = const_operand(operands.get(1))?;
+        let method = otter_bytecode::method_id::MathMethod::from_u32(method_id)
+            .ok_or(VmError::InvalidOperand)?;
+        let argc = match operands.get(2) {
+            Some(&Operand::ConstIndex(n)) => n as usize,
+            _ => return Err(VmError::InvalidOperand),
+        };
+        let caller_byte_len = self.current_byte_len;
+        let top_idx = stack.len() - 1;
+        let mut arg_values: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc);
+        for i in 0..argc {
+            let r = register_operand(operands.get(3 + i))?;
+            arg_values.push(*read_register(&stack[top_idx], r)?);
+        }
+
+        let lexical_math = self.read_global_lexical("Math")?;
+        if lexical_math.is_none()
+            && let Some(_math_obj) =
+                math::original_method_receiver(self.global_this, &self.gc_heap, method)
+            && math::args_skip_to_primitive(&arg_values)
+        {
+            let value =
+                math::call(method, &arg_values, &self.gc_heap).map_err(|err| match err {
+                    math::MathError::UnknownMember(member) => VmError::UnknownIntrinsic {
+                        name: format!("Math.{member}"),
+                    },
+                    math::MathError::BadArgument { reason, .. } => VmError::TypeError {
+                        message: format!("Math.{} {reason}", method.name()),
+                    },
+                })?;
+            write_register(&mut stack[top_idx], dst, value)?;
+            stack[top_idx].advance_pc(caller_byte_len)?;
+            return Ok(());
+        }
+
+        let math_value = if let Some(value) = lexical_math {
+            value
+        } else {
+            let receiver = Value::object(self.global_this);
+            let key = VmPropertyKey::String("Math");
+            if !self.ordinary_has_property_value(context, receiver, &key, 0)? {
+                return Err(VmError::UndefinedIdentifier {
+                    name: "Math".to_string(),
+                });
+            }
+            match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
+                VmGetOutcome::Value(value) => value,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
+                }
+            }
+        };
+        if math_value.is_nullish() {
+            let label = if math_value.is_null() {
+                "null"
+            } else {
+                "undefined"
+            };
+            return Err(VmError::TypeError {
+                message: format!("Cannot read properties of {label}"),
+            });
+        }
+        let callee = self
+            .get_method_value_for_call(context, stack, math_value, method.name())?
+            .unwrap_or_else(Value::undefined);
+        if !self.is_callable_runtime(&callee) {
+            return Err(VmError::NotCallable);
+        }
+        stack[top_idx].advance_pc(caller_byte_len)?;
+        self.invoke(stack, context, &callee, math_value, arg_values, dst)
+    }
+
     /// §22.1.3 — pre-coerce the arguments of a `String.prototype`
     /// method in place: index-like operands run full `ToNumber`
     /// (`ToIntegerOrInfinity`'s first step, so Symbol / BigInt raise

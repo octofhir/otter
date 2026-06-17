@@ -552,6 +552,34 @@ registers are inline (nothing to reclaim), so the dominant repeated cost is the
 (`call_ops.rs`) and freed when the terminated frame drops. 12M calls × (alloc +
 free) of a tiny capturing-closure spine.
 
+**WIN landed (commit 32ebd28f): resolve_jit_code single-entry cache** — the
+sync-reentry resolver did a `jit_code` FxHashMap lookup + `Arc` clone per call;
+added the `jit_code_cache` fast path the 2b direct path uses. array-ops
+1170→1135 (−3%), sort 2189→2094 (−4.3%), forEach micro 3.19→2.95. Found by
+**controlled isolation** (same closure: manual `for(i) g(a[i])` [Op::Call/2b] =
+1.99s vs `a.forEach(g)` = 2.90s now / 3.19 before, over 24M).
+
+**Remaining gap ≈ 38 ns/call (forEach 2.90 vs floor 1.99) is genuinely diffuse.**
+Verified the candidates are individually small: `enter/leave_sync_reentry` is a
+counter (~1ns); `draw_stack`/`return_stack` are pooled (cheap after warmup, no
+1024-frame realloc); the cost is spread across the per-call frame build + the
+`run_callable_sync_inner` wrapper checks (bound/proxy/class/native — a few tag
+checks + a `call_native` payload read per call) + the Rust `run_compiled_frame`
+JitCtx build (vs 2b's machine-code JitCtx). **No single >15ns piece** — 2b is
+faster because it is *emitted/lean*, not because it reuses frames (2b builds a
+fresh frame per call too, so frame-reuse is NOT the lever). Capturing the rest
+needs a **lean-invoke restructure**: pre-check the callback once as a plain
+bytecode closure, then per element invoke it on ONE persistent inner stack via a
+lean path that skips the wrapper checks + per-call enter/leave + draw/return —
+i.e. a faithful replica of `run_callable_sync_inner`'s bytecode arm, integrated
+into the shared spec loop (`array_callback_native_dispatch`, used by map/filter/
+reduce/forEach/find/every/some). Partial win (~−2-3% array-ops); the *full* fix
+is callback inlining in the optimizing tier (Phase 8). The lean-invoke is an
+attended slice (the shared closure-based loop + bytecode-path-replica correctness
+need careful iteration); two single-piece attempts on this lever already failed.
+
+---
+
 **Option 1 (length-keyed spine pool) TRIED + REVERTED (2026-06-17): NEUTRAL, no
 win.** Fully implemented cleanly: `upvalue_spine_pool: Vec<UpvalueSpine>` + a
 static `draw_upvalue_spine(pool, len)` (pops a same-length box / allocs

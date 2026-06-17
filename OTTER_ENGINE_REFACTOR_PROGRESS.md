@@ -8,6 +8,18 @@
 
 ## Session state — 2026-06-17 (verified)
 
+**Map/Set O(n²) → O(n) (commit 420fbfcf).** MapBody/SetBody scanned `entries`
+linearly per op; bulk build was O(n²) (set-build 10k→40k: 134→1675ms, 3.7×/
+doubling). Added `#[pelt(skip)] FxHashMap<u64, SmallVec<[u32;2]>>` index (key
+hash → live entry indices) to both bodies. Indexable GC-stable keys (number /
+string-by-content / bool / null / undefined) probe the index + verify via
+`key_matches`; symbol/object-identity keys keep linear scan (their `Gc` hash
+moves under GC). `entries` stays append+tombstone so indices are stable; index
+holds no `Gc` (collector never traces it, memcpy-relocates with body). Micro now
+~2×/doubling: set 34→145ms, map-string 50→180ms. Gates: cargo test green; diff
+11/11; test262 Map/Set/WeakMap/WeakSet identical JIT-off vs on (214/393/140/84,
+0 fail); OTTER_GC_STRESS=32/64 mixed obj+int+string churn — zero corruption.
+
 **Shipped this session (13 commits):** WhiskerIC inline ICs 3a–3e (LoadProperty /
 StoreProperty + write barrier / direct method calls / upvalue load+store /
 StoreUpvalueChecked + array-callback already-rooted), JSON.stringify fast object

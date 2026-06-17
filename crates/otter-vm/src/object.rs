@@ -411,23 +411,16 @@ pub struct ObjectBody {
     /// shape chain or `dictionary_keys`. The data value for slot `i` lives
     /// out-of-line in the flat value array ([`Self::data_value`]).
     slots: SmallVec<[SlotMeta; 4]>,
-    /// `[[Prototype]]` — [`otter_gc::Gc::null()`] encodes JS
-    /// `null` (no prototype). Stored as a bare `JsObject` rather
-    /// than `Option<JsObject>` so the slot has a stable address
-    /// the GC can yield to its scavenger / marker (`Option<u32>`
-    /// has no niche and the discriminant offset would not give a
-    /// `RawGc`-aligned slot).
-    prototype: ObjectPrototype,
-    /// Flat `[[Prototype]]` mirror for the JIT: the ordinary-object
-    /// prototype as a bare [`JsObject`], or [`otter_gc::Gc::null()`] when
-    /// [`Self::prototype`] is `Null`, a non-object `Value`, or a `Proxy`.
-    /// The [`ObjectPrototype`] enum cannot be read inline from machine code
-    /// (its variant lives behind a discriminant), so the method-inline guard
-    /// loads this fixed-offset compressed handle, decompresses it, and reads
-    /// the prototype's shape to verify the resolved method identity without a
-    /// per-call resolve bridge. Maintained in lockstep with `prototype` (the
-    /// sole writer is [`set_prototype_value`]); traced as a distinct GC slot
-    /// so the moving collector forwards it independently of the enum field.
+    /// `[[Prototype]]` — the single source of truth for the common Null /
+    /// ordinary-object case: a bare [`JsObject`] handle, or
+    /// [`otter_gc::Gc::null()`] for a `null` prototype. A non-ordinary
+    /// prototype (`Value` / `Proxy`) sets this to null and stores the real
+    /// prototype in [`ExoticSlots::proto_override`]; [`ObjectBody::prototype`]
+    /// reconstructs the full [`ObjectPrototype`]. The fixed offset
+    /// ([`OBJECT_BODY_JIT_PROTO_OFFSET`]) lets the method-inline guard read the
+    /// handle from machine code and chase the prototype's shape without a
+    /// per-call resolve bridge. Sole writer is [`set_prototype_value`]; traced
+    /// as a distinct GC slot.
     jit_proto: JsObject,
     /// `[[Extensible]]` internal slot. New keys are rejected when
     /// this is `false`.
@@ -447,6 +440,10 @@ pub struct ObjectBody {
 /// constructor builtin, Date, Error, raw-JSON, or arguments exotic.
 #[derive(Default)]
 struct ExoticSlots {
+    /// Non-ordinary `[[Prototype]]` (a `Value` or `Proxy`). `None` for the
+    /// common Null / ordinary-object prototype, which is encoded entirely by
+    /// `ObjectBody::jit_proto` (null handle == `null` prototype).
+    proto_override: Option<ObjectPrototype>,
     /// Out-of-line data values for string-keyed slots with index
     /// `>= INLINE_VALUE_CAP`. Empty/absent for objects with few properties;
     /// allocated on the first spill past the inline value array.
@@ -594,6 +591,20 @@ impl ObjectBody {
     // Reads return the field's default when no `ExoticSlots` is allocated;
     // mutators allocate the box on first write. Plain objects never touch it.
 
+    /// Reconstruct the `[[Prototype]]`. Common case (Null / ordinary object)
+    /// reads only `jit_proto`; a boxed `proto_override` covers Value / Proxy.
+    #[inline]
+    fn prototype(&self) -> ObjectPrototype {
+        if let Some(over) = self.exotic().and_then(|e| e.proto_override.as_ref()) {
+            return over.clone();
+        }
+        if self.jit_proto.is_null() {
+            ObjectPrototype::Null
+        } else {
+            ObjectPrototype::Object(self.jit_proto)
+        }
+    }
+
     /// Shared ref to the boxed exotic slots, if any.
     #[inline]
     fn exotic(&self) -> Option<&ExoticSlots> {
@@ -685,7 +696,7 @@ impl std::fmt::Debug for ObjectBody {
             .field("slot_count", &self.slots.len())
             .field(
                 "has_prototype",
-                &!matches!(self.prototype, ObjectPrototype::Null),
+                &!matches!(self.prototype(), ObjectPrototype::Null),
             )
             .field("symbol_props", &self.symbol_props().len())
             .field("has_host_data", &self.host_data_ref().is_some())
@@ -723,22 +734,11 @@ impl otter_gc::SafeTraceable for ObjectBody {
             let p = &self.shape as *const ShapeHandle as *mut RawGc;
             v(p);
         }
-        match &self.prototype {
-            ObjectPrototype::Null => {}
-            ObjectPrototype::Object(proto) => {
-                let p = proto as *const JsObject as *mut RawGc;
-                v(p);
-            }
-            ObjectPrototype::Value(value) => {
-                value.trace_value_slots(v);
-            }
-            ObjectPrototype::Proxy(proxy) => {
-                proxy.trace_value_slots(v);
-            }
-        }
-        // The flat JIT prototype mirror is a distinct slot from the enum's
-        // `Object` variant handle; the moving collector must forward it on its
-        // own so a baked inline guard never decompresses a stale offset.
+        // The ordinary-object / null prototype lives solely in the flat
+        // `jit_proto` handle (null == `[[Prototype]]` null); the moving collector
+        // forwards it here so a baked inline guard never decompresses a stale
+        // offset. Non-ordinary (Value / Proxy) prototypes live in the boxed
+        // `proto_override` and are traced in the exotic block below.
         if !self.jit_proto.is_null() {
             let p = &self.jit_proto as *const JsObject as *mut RawGc;
             v(p);
@@ -779,6 +779,12 @@ impl otter_gc::SafeTraceable for ObjectBody {
         // Boxed exotic slots holding GC edges. Traced in place through the box
         // reference so the moving collector rewrites the live slots, not a copy.
         if let Some(exotic) = self.exotic.as_ref() {
+            // Non-ordinary prototype (Value / Proxy), traced in place.
+            match &exotic.proto_override {
+                None | Some(ObjectPrototype::Null) | Some(ObjectPrototype::Object(_)) => {}
+                Some(ObjectPrototype::Value(value)) => value.trace_value_slots(v),
+                Some(ObjectPrototype::Proxy(proxy)) => proxy.trace_value_slots(v),
+            }
             // Symbol-keyed own properties (value inline in the slot).
             for (_sym, slot) in exotic.symbol_props.iter() {
                 match &slot.kind {
@@ -836,7 +842,6 @@ fn empty_object_body() -> ObjectBody {
         dictionary_shape_id: next_shape_id(),
         shape_cache_mode: ShapeCacheMode::Fast,
         slots: SmallVec::new(),
-        prototype: ObjectPrototype::Null,
         jit_proto: otter_gc::Gc::null(),
         extensible: true,
         exotic: None,
@@ -933,8 +938,7 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
                 dictionary_shape_id: next_shape_id(),
             shape_cache_mode: ShapeCacheMode::Fast,
             slots: SmallVec::new(),
-            prototype: ObjectPrototype::Null,
-            jit_proto: otter_gc::Gc::null(),
+                jit_proto: otter_gc::Gc::null(),
             extensible: true,
             exotic: Some(Box::new(ExoticSlots {
                 host_data: Some(Box::new(data)),
@@ -959,8 +963,7 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
                 dictionary_shape_id: next_shape_id(),
             shape_cache_mode: ShapeCacheMode::Fast,
             slots: SmallVec::new(),
-            prototype: ObjectPrototype::Null,
-            jit_proto: otter_gc::Gc::null(),
+                jit_proto: otter_gc::Gc::null(),
             extensible: true,
             exotic: Some(Box::new(ExoticSlots {
                 host_data: Some(Box::new(data)),
@@ -1509,7 +1512,7 @@ pub fn get_own_descriptor(
 /// (the in-payload encoding for JS `null`).
 #[must_use]
 pub fn prototype(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<JsObject> {
-    heap.read_payload(obj, |body| match &body.prototype {
+    heap.read_payload(obj, |body| match &body.prototype() {
         ObjectPrototype::Object(proto) => Some(*proto),
         ObjectPrototype::Null | ObjectPrototype::Value(_) | ObjectPrototype::Proxy(_) => None,
     })
@@ -1518,7 +1521,7 @@ pub fn prototype(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<JsObject> {
 /// Borrow the current prototype as a JS value, if any.
 #[must_use]
 pub fn prototype_value(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<Value> {
-    heap.read_payload(obj, |body| body.prototype.as_value())
+    heap.read_payload(obj, |body| body.prototype().as_value())
 }
 
 /// `true` when `obj` has `target` somewhere in its prototype chain.
@@ -2164,7 +2167,7 @@ pub fn set_prototype_value(
         ObjectPrototype::Null
     };
     // §10.1.2.1 step 4 — `SameValue(V, current) is true → return true`.
-    let current = heap.read_payload(obj, |body| body.prototype.clone());
+    let current = heap.read_payload(obj, |body| body.prototype());
     if prototype_same(&current, &new_proto) {
         return true;
     }
@@ -2192,7 +2195,7 @@ pub fn set_prototype_value(
                     return false;
                 }
                 hops += 1;
-                cursor = heap.read_payload(p, |body| body.prototype.clone());
+                cursor = heap.read_payload(p, |body| body.prototype());
             }
             ObjectPrototype::Proxy(_) | ObjectPrototype::Value(_) => break,
         }
@@ -2205,8 +2208,20 @@ pub fn set_prototype_value(
         }
     };
     heap.with_payload(obj, |body| {
-        body.prototype = new_proto;
         body.jit_proto = jit_proto;
+        match &new_proto {
+            // Common case: encoded entirely by `jit_proto`; drop any stale
+            // non-ordinary override so the object carries no exotic box for it.
+            ObjectPrototype::Null | ObjectPrototype::Object(_) => {
+                if let Some(exotic) = body.exotic.as_deref_mut() {
+                    exotic.proto_override = None;
+                }
+            }
+            // Non-ordinary prototype: store it in the boxed override.
+            ObjectPrototype::Value(_) | ObjectPrototype::Proxy(_) => {
+                body.exotic_mut().proto_override = Some(new_proto.clone());
+            }
+        }
     });
     if let Some(value) = &barrier_value {
         heap.record_write(obj, value);
@@ -3932,6 +3947,7 @@ mod tests {
         assert!(delete_symbol(o, &mut heap, sym));
     }
 }
+
 
 
 

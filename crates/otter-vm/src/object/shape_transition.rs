@@ -231,7 +231,7 @@ fn transition_kind(
 ) -> Option<StorePropertyTransitionKind> {
     match heap.read_payload(obj, |body| {
         if is_fast_shape_body(body) {
-            Some(body.prototype.clone())
+            Some(body.prototype())
         } else {
             None
         }
@@ -267,7 +267,7 @@ fn transition_kind_matches(
 ) -> bool {
     let prototype = heap.read_payload(obj, |body| {
         if is_fast_shape_body(body) {
-            Some(body.prototype.clone())
+            Some(body.prototype())
         } else {
             None
         }
@@ -298,7 +298,7 @@ fn transition_kind_matches_receiver_body(
     kind: &StorePropertyTransitionKind,
 ) -> bool {
     matches!(
-        (kind, &body.prototype),
+        (kind, &body.prototype()),
         (StorePropertyTransitionKind::OwnAdd, ObjectPrototype::Null)
             | (
                 StorePropertyTransitionKind::DirectPrototypeMissing { .. }

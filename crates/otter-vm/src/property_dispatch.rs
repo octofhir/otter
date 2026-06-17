@@ -3331,6 +3331,25 @@ impl Interpreter {
         result
     }
 
+    /// JIT bridge for `NewObject` from compiled code. This bypasses the generic
+    /// opcode delegate but still uses the shared stack-rooted allocator, so a
+    /// young-generation scavenge can rewrite live frame registers before the
+    /// object handle is published back into `dst`.
+    ///
+    /// # Errors
+    /// Propagates allocation failures.
+    pub fn jit_runtime_new_object(
+        &mut self,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        dst: u16,
+    ) -> Result<(), VmError> {
+        let saved_pc = stack[frame_index].pc;
+        let result = self.run_new_object_reg(stack, frame_index, dst);
+        stack[frame_index].pc = saved_pc;
+        result
+    }
+
     /// JIT bridge for a computed `StoreElement` (`recv[idx] = src`) from compiled
     /// code. Mirrors the interpreter dispatch: the typed-array / dense-array fast
     /// path ([`Self::drive_store_element`]) first, then the general

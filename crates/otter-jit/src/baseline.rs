@@ -581,6 +581,23 @@ extern "C" fn jit_delegate_op_stub(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
     }
 }
 
+/// Bridge stub: allocate an ordinary object for `NewObject` from compiled code.
+/// Uses the VM's stack-rooted allocator so moving young-GC semantics match the
+/// interpreter path.
+extern "C" fn jit_new_object_stub(ctx: *mut JitCtx, dst: u64) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    match vm.jit_runtime_new_object(stack, ctx.frame_index, dst as u16) {
+        Ok(()) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
 /// Bridge stub: perform a `CallMethodValue` (`recv.name(args…)`) from compiled
 /// code, delegating to the safe [`Interpreter::jit_runtime_call_method`].
 /// Returns `0` on success, `1` when the call threw (error parked in `ctx`).
@@ -822,9 +839,10 @@ mod arm64 {
         VM_OFFSET, WhiskerIcCell, jit_abort_direct_call_stub, jit_call_method_stub,
         jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
         jit_finish_direct_call_returned_stub, jit_load_element_stub, jit_load_global_stub,
-        jit_load_prop_stub, jit_load_upvalue_stub, jit_make_fn_stub, jit_prepare_direct_call_stub,
-        jit_prepare_direct_method_call_stub, jit_store_element_stub, jit_store_prop_stub,
-        jit_store_upvalue_stub, jit_write_barrier_stub, reg_offset,
+        jit_load_prop_stub, jit_load_upvalue_stub, jit_make_fn_stub, jit_new_object_stub,
+        jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub,
+        jit_store_element_stub, jit_store_prop_stub, jit_store_upvalue_stub,
+        jit_write_barrier_stub, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -1212,6 +1230,11 @@ mod arm64 {
                     dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
                     emit_load_u64(&mut ops, 2, u64::from(idx));
                     emit_call_stub(&mut ops, jit_make_fn_stub as *const () as usize, threw);
+                }
+                Op::NewObject => {
+                    let dst = reg(ops_ref, 0)?;
+                    dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
+                    emit_call_stub(&mut ops, jit_new_object_stub as *const () as usize, threw);
                 }
                 Op::Call => {
                     // Splice a tiny monomorphic leaf callee inline under an
@@ -1773,7 +1796,6 @@ mod arm64 {
                 // string constants, checked upvalue store, remainder, unsigned
                 // shift). All run to completion without pushing a frame.
                 Op::MakeClosure
-                | Op::NewObject
                 | Op::NewArray
                 | Op::Rem
                 | Op::Ushr

@@ -343,6 +343,21 @@ no VM round-trip. The nursery already *is* a bump allocator
 (`heap.rs:129`, `compressed.rs:409`); expose its cursor/limit to emitted code.
 Pairs with D1 (small fixed body = easy inline alloc).
 
+### Current status
+A first safe JIT allocation slice landed after the `MathCall` work:
+`Op::NewObject` now uses a dedicated compiled-code bridge into the VM's
+stack-rooted object allocator instead of the generic opcode delegate. This
+keeps moving young-GC semantics identical to the interpreter path and removes
+the decode/dispatch envelope around object allocation, but it intentionally does
+not expose raw nursery cursor/limit state to machine code yet.
+
+Measured on `benchmarks/micro/alloc.js` with `OTTER_STATS=1` against clean
+pre-change commit `e131c2e8`: **1691 ms → 1722 ms** (noise/regression within
+the same allocation/GC envelope), with unchanged `gcAllocBytesTotal`
+`576425280` and `gcCycles=22`. The remaining D2 work is the actual inline
+nursery allocation path; this bridge slice mainly prepares a narrower allocation
+stub boundary.
+
 ## D3 — Variable-size payloads are malloc'd `Vec`s, not GC-inline storage
 
 ### Evidence
@@ -424,7 +439,7 @@ measurable against a committed reproducer.
 | 3 | **D4** Math.* intrinsics — LANDED guarded opcode | compiler + VM/JIT delegate | float benches | safe guard contract for native emit |
 | 4 | **R3** inline array `.length` | emit + array header | kills per-iter length stub | every array loop |
 | 5 | **D1+R2** object-model rewrite: split god-struct + flat slab | ObjectBody, GC tracing, body offsets | ~13× alloc, ≈7–10× smaller objects, fewer GC cycles | json/prop/array/OO |
-| 6 | **D2** inline bump-alloc in JIT | emit + nursery cursor | per-`new` floor gone | pairs with D1 |
+| 6 | **D2** inline bump-alloc in JIT — in progress | emit + nursery cursor | per-`new` floor gone | direct stub landed; raw bump remains |
 | 7 | **D3** variable-size GC cells (inline string/array storage) | GC + string/array bodies | kills json's 43% malloc | alloc-heavy |
 | 8 | **R4** register-window calling conv + builtin-callback inlining | call path | 2–4× call-bound (fib/sort/array) | — |
 | 9 | **D5 / optimizing tier** — regalloc + unboxed SSA + speculative inline + LICM + bounds-elim + deopt | new tier | 2–5× numeric/OO, the residual ceiling | umbrella |

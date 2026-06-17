@@ -1263,9 +1263,21 @@ impl GcHeap {
             .saturating_add(self.large_space.page_count() as u64)
             .saturating_mul(page_bytes);
         let cage_hardcap = (cage_size() as u64) / 256 * MAJOR_GC_CAGE_SOFTCAP_NUM;
-        let target = live_pages
-            .saturating_mul(MAJOR_GC_GROWTH_NUM)
-            .saturating_div(MAJOR_GC_GROWTH_DEN);
+        // Adaptive growth. A collection that reclaims little means the heap is
+        // mostly live: re-marking it again after only the tight `3/2` growth
+        // would re-scan nearly the whole live set every 50% of growth, which is
+        // O(n²) total mark work for a steadily-growing, mostly-live heap (e.g.
+        // building a large array of objects). When survivors occupy most of the
+        // pre-GC heap, back off to a wider growth band so the next collection is
+        // amortized over far more allocation; productive collections (lots of
+        // short-lived garbage) keep the tight band for prompt reclamation.
+        let (num, den) = if live_pages.saturating_mul(4) >= occupancy.saturating_mul(3) {
+            // <25% reclaimed — unproductive, grow ~3x.
+            (3, 1)
+        } else {
+            (MAJOR_GC_GROWTH_NUM, MAJOR_GC_GROWTH_DEN)
+        };
+        let target = live_pages.saturating_mul(num).saturating_div(den);
         self.next_major_gc_bytes = target.max(MAJOR_GC_FLOOR_BYTES).min(cage_hardcap);
     }
 

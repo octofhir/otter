@@ -403,17 +403,6 @@ pub struct ObjectBody {
     overflow_values: Vec<Value>,
     /// Fallback/dictionary identity used only when [`Self::shape`] is null.
     dictionary_shape_id: ShapeId,
-    /// Fallback/dictionary string-key order used only when [`Self::shape`]
-    /// is null, for raw heap fixtures and delete-shaped objects.
-    dictionary_keys: Vec<String>,
-    /// O(1) `key → slot offset` index mirroring [`Self::dictionary_keys`]
-    /// in dictionary mode. Without it, property lookup on a
-    /// many-property object is a linear scan, making bulk property
-    /// addition O(n²). Maintained in lockstep with `dictionary_keys`
-    /// through [`Self::dict_push_key`] / [`Self::dict_set_keys`] /
-    /// [`Self::dict_clear_keys`]. Holds only owned `String` keys (no
-    /// GC references), so it needs no tracing.
-    dictionary_index: rustc_hash::FxHashMap<String, u16>,
     /// Whether string-keyed shape assumptions are IC-compatible.
     ///
     /// Ordinary shape transitions stay in [`ShapeCacheMode::Fast`].
@@ -461,6 +450,13 @@ pub struct ObjectBody {
 /// constructor builtin, Date, Error, raw-JSON, or arguments exotic.
 #[derive(Default)]
 struct ExoticSlots {
+    /// Dictionary (slow-mode) string-key order — only present when the object
+    /// has left fast-shape mode (delete-shaped objects, raw fixtures, failed
+    /// transitions). Fast-shape objects never allocate it.
+    dictionary_keys: Vec<String>,
+    /// O(1) `key → slot offset` index mirroring `dictionary_keys` in dictionary
+    /// mode. Owned `String` keys only (no GC refs) → no tracing.
+    dictionary_index: rustc_hash::FxHashMap<String, u16>,
     /// Symbol-keyed own properties (descriptor slot representation).
     symbol_props: Vec<(JsSymbol, SlotData)>,
     /// Rust-owned payload for host-backed objects and VM-internal side data.
@@ -663,13 +659,23 @@ impl ObjectBody {
     fn symbol_props(&self) -> &[(JsSymbol, SlotData)] {
         self.exotic().map_or(&[], |e| e.symbol_props.as_slice())
     }
+    /// Dictionary-mode string keys as a slice (`&[]` when no box / fast-shape).
+    #[inline]
+    fn dictionary_keys(&self) -> &[String] {
+        self.exotic().map_or(&[], |e| e.dictionary_keys.as_slice())
+    }
+    /// Dictionary-mode `key → slot offset`, or `None`.
+    #[inline]
+    fn dictionary_index_get(&self, key: &str) -> Option<u16> {
+        self.exotic().and_then(|e| e.dictionary_index.get(key).copied())
+    }
 }
 
 impl std::fmt::Debug for ObjectBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ObjectBody")
             .field("has_shape", &!self.shape.is_null())
-            .field("dictionary_len", &self.dictionary_keys.len())
+            .field("dictionary_len", &self.dictionary_keys().len())
             .field("shape_cache_mode", &self.shape_cache_mode)
             .field("slot_count", &self.slots.len())
             .field(
@@ -820,8 +826,6 @@ fn empty_object_body() -> ObjectBody {
         inline_values: [Value::undefined(); INLINE_VALUE_CAP],
         overflow_values: Vec::new(),
         dictionary_shape_id: next_shape_id(),
-        dictionary_keys: Vec::new(),
-        dictionary_index: rustc_hash::FxHashMap::default(),
         shape_cache_mode: ShapeCacheMode::Fast,
         slots: SmallVec::new(),
         prototype: ObjectPrototype::Null,
@@ -920,8 +924,6 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
             inline_values: [Value::undefined(); INLINE_VALUE_CAP],
             overflow_values: Vec::new(),
             dictionary_shape_id: next_shape_id(),
-            dictionary_keys: Vec::new(),
-            dictionary_index: rustc_hash::FxHashMap::default(),
             shape_cache_mode: ShapeCacheMode::Fast,
             slots: SmallVec::new(),
             prototype: ObjectPrototype::Null,
@@ -949,8 +951,6 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
             inline_values: [Value::undefined(); INLINE_VALUE_CAP],
             overflow_values: Vec::new(),
             dictionary_shape_id: next_shape_id(),
-            dictionary_keys: Vec::new(),
-            dictionary_index: rustc_hash::FxHashMap::default(),
             shape_cache_mode: ShapeCacheMode::Fast,
             slots: SmallVec::new(),
             prototype: ObjectPrototype::Null,
@@ -1128,7 +1128,7 @@ fn body_property_count(heap: &otter_gc::GcHeap, body: &ObjectBody) -> usize {
     if !body.shape.is_null() {
         return shape_body::shape_property_count(heap, body.shape) as usize;
     }
-    body.dictionary_keys.len()
+    body.dictionary_keys().len()
 }
 
 pub(super) fn body_offset_of(heap: &otter_gc::GcHeap, body: &ObjectBody, key: &str) -> Option<u16> {
@@ -1138,7 +1138,7 @@ pub(super) fn body_offset_of(heap: &otter_gc::GcHeap, body: &ObjectBody, key: &s
     }
     // O(1) dictionary lookup via the maintained index — a linear scan
     // here makes bulk property addition O(n²).
-    body.dictionary_index.get(key).copied()
+    body.dictionary_index_get(key)
 }
 
 /// Number of own string-keyed properties recorded in a fast-mode
@@ -1163,27 +1163,31 @@ pub(crate) const MAX_FAST_PROPERTIES: u32 = 128;
 /// in lockstep. The caller pushes the matching slot separately; the
 /// new offset is the pre-push length (slots and keys stay aligned).
 pub(super) fn dict_push_key(body: &mut ObjectBody, key: String) {
-    let offset = body.dictionary_keys.len() as u16;
-    body.dictionary_index.insert(key.clone(), offset);
-    body.dictionary_keys.push(key);
+    let exotic = body.exotic_mut();
+    let offset = exotic.dictionary_keys.len() as u16;
+    exotic.dictionary_index.insert(key.clone(), offset);
+    exotic.dictionary_keys.push(key);
 }
 
 /// Replace the whole dictionary key order (shape→dictionary transition
 /// or post-delete compaction) and rebuild the index from scratch.
 pub(super) fn dict_set_keys(body: &mut ObjectBody, keys: Vec<String>) {
-    body.dictionary_index.clear();
-    body.dictionary_index.reserve(keys.len());
+    let exotic = body.exotic_mut();
+    exotic.dictionary_index.clear();
+    exotic.dictionary_index.reserve(keys.len());
     for (offset, key) in keys.iter().enumerate() {
-        body.dictionary_index.insert(key.clone(), offset as u16);
+        exotic.dictionary_index.insert(key.clone(), offset as u16);
     }
-    body.dictionary_keys = keys;
+    exotic.dictionary_keys = keys;
 }
 
 /// Clear all dictionary keys and the index together.
 #[cfg(test)]
 pub(super) fn dict_clear_keys(body: &mut ObjectBody) {
-    body.dictionary_keys.clear();
-    body.dictionary_index.clear();
+    if let Some(exotic) = body.exotic.as_deref_mut() {
+        exotic.dictionary_keys.clear();
+        exotic.dictionary_index.clear();
+    }
 }
 
 fn body_has_key_at(heap: &otter_gc::GcHeap, body: &ObjectBody, offset: usize) -> bool {
@@ -1193,7 +1197,7 @@ fn body_has_key_at(heap: &otter_gc::GcHeap, body: &ObjectBody, offset: usize) ->
             .and_then(|offset| shape_body::shape_key_at_offset(heap, body.shape, offset))
             .is_some();
     }
-    body.dictionary_keys.get(offset).is_some()
+    body.dictionary_keys().get(offset).is_some()
 }
 
 fn body_key_matches(heap: &otter_gc::GcHeap, body: &ObjectBody, offset: usize, key: &str) -> bool {
@@ -1202,7 +1206,7 @@ fn body_key_matches(heap: &otter_gc::GcHeap, body: &ObjectBody, offset: usize, k
             shape_body::shape_key_matches_str(heap, body.shape, offset, key)
         });
     }
-    matches!(body.dictionary_keys.get(offset), Some(name) if name == key)
+    matches!(body.dictionary_keys().get(offset), Some(name) if name == key)
 }
 
 /// `true` when hidden-class ICs may cache this object's string-keyed slots.
@@ -2967,7 +2971,7 @@ fn ordinary_string_key_entries(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Ve
             })
             .collect()
     } else {
-        body.dictionary_keys
+        body.dictionary_keys()
             .iter()
             .enumerate()
             .map(|(slot, key)| (key.to_string(), slot))
@@ -2984,7 +2988,7 @@ fn string_keys_in_shape_order(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Vec
             .map(|(key, _)| String::from_utf16_lossy(&to_utf16_vec(heap, key)))
             .collect();
     }
-    body.dictionary_keys.clone()
+    body.dictionary_keys().to_vec()
 }
 
 fn dictionary_keys_for_shape_transition(
@@ -3084,7 +3088,7 @@ mod tests {
         assert_eq!(
             interp
                 .gc_heap()
-                .read_payload(o, |body| body.dictionary_keys.len()),
+                .read_payload(o, |body| body.dictionary_keys().len()),
             0
         );
     }
@@ -3109,7 +3113,7 @@ mod tests {
         assert_eq!(
             interp
                 .gc_heap()
-                .read_payload(o, |body| body.dictionary_keys.len()),
+                .read_payload(o, |body| body.dictionary_keys().len()),
             0
         );
     }
@@ -3202,7 +3206,7 @@ mod tests {
         assert_eq!(
             interp
                 .gc_heap()
-                .read_payload(o, |body| body.dictionary_keys.len()),
+                .read_payload(o, |body| body.dictionary_keys().len()),
             0
         );
     }
@@ -3922,4 +3926,5 @@ mod tests {
         assert!(delete_symbol(o, &mut heap, sym));
     }
 }
+
 

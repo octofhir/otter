@@ -82,7 +82,62 @@ code, which includes most real scripts and several benchmarks here.
 
 ---
 
-## R2 — Split inline[6] + overflow `Vec` object storage → the 7th property cliff
+## R2 EXECUTION PLAN — slots → shape (full attribute-encoding shapes)
+
+Status: D1a-d landed (ObjectBody 424B → 160B, −62%). Remaining fat: `slots:
+SmallVec<[SlotMeta;4]>` (72B) + `inline_values[6]` (48B). This is the plan to
+remove `slots` (−72B → ~88B) by making the **shape** own per-slot attributes,
+V8-style. High regression risk (touches all property/descriptor/accessor/
+enumeration/freeze semantics) — every stage gated by a FULL test262 run with
+failing-set diff vs the pre-stage baseline.
+
+Current architecture (confirmed):
+- `ShapeBody` (object/shape_body.rs) = `{id, parent, transition_key,
+  property_count, own_offset}`. Each node = one append transition. NO attributes.
+- `shape_runtime.rs` `child_with_roots` = transition cache keyed by **key only**
+  → returns/creates the child shape for appending `key`.
+- Per-object `slots: SmallVec<[SlotMeta;4]>`; `SlotMeta = {flags:
+  PropertyFlags, kind: Data | Accessor(Box<AccessorPair>)}`. Sole holder of
+  attributes + accessor getter/setter. Kept in lockstep with the value array
+  (debug_assert in trace). 37 access sites (object.rs 32, descriptor_core 2,
+  shape_transition 3).
+- Value array: `inline_values[6]` + boxed `overflow_values` (in ExoticSlots).
+  Accessor slots store `undefined` in the value array; getter/setter live in
+  `SlotMeta.kind`.
+
+Stages (each: implement → `just test262` full → diff failing-set → commit):
+- **A. Shape carries attributes.** Add `own_flags: PropertyFlags` +
+  `own_is_accessor: bool` to `ShapeBody::child`. Key the transition cache by
+  `(key, flags, is_accessor)` so the same key with different attributes is a
+  distinct transition (this is what invalidates ICs correctly). Add
+  `shape_slot_attrs(shape, offset) -> (PropertyFlags, bool)` chain-walk reader
+  (mirror `shape_offset_of_key`). Dual-write: keep `slots` authoritative; shape
+  records redundantly. Assert shape-attrs == slots-attrs in debug. No behavior
+  change, no size change — proves the machinery.
+- **B. Flip reads to the shape.** Route `slot_lookup_at` / `slot_descriptor_at`
+  / enumeration flag reads / `is_data` checks to read flags+kind from the shape
+  for shaped objects (dict mode still uses slots). Accessor getter/setter still
+  in `slots` for now.
+- **C. Migrate accessor storage to the value slot.** A shaped accessor slot
+  stores an `AccessorPair` GC cell handle in the value array; shape's
+  `own_is_accessor` marks it. Remove `kind` from per-object storage.
+- **D. defineProperty / freeze / seal as attribute transitions.** Changing
+  w/e/c or data↔accessor transitions the object to the attribute-encoding
+  shape instead of mutating `slots[i].flags`. Freeze/seal → bulk transition.
+- **E. Remove `slots` from shaped objects.** `slots` becomes dict-mode-only;
+  move it into `ExoticSlots` (like `dictionary_keys`). Shaped objects (the
+  common case) carry no `slots`. **ObjectBody → ~88B.**
+
+Gotchas: transition-cache blow-up if attrs over-specialize (mitigate: only
+non-default attrs create attr-transitions; default w+e+c data is the fast
+spine). Symbol-keyed props keep `SlotData` in `ExoticSlots.symbol_props`
+(unaffected). The JIT WhiskerIC already guards on shape id, so attr-transitions
+auto-invalidate it.
+
+Best executed as a dedicated session per stage — not interleaved with other
+work — because of the conformance-gating cadence.
+
+## R2b (later) — Split inline[6] + overflow `Vec` object storage → the 7th property cliff
 
 ### Evidence
 ```

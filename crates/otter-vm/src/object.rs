@@ -182,12 +182,75 @@ impl ObjectPrototype {
 /// `OBJECT_BODY_INLINE_VALUES_OFFSET + i * size_of::<Value>()`.
 pub(crate) const INLINE_VALUE_CAP: usize = 6;
 
-/// `[[Get]]`/`[[Set]]` pair for an accessor property. Boxed off the hot
-/// metadata path so an ordinary data slot's [`SlotMeta`] stays small.
+/// `[[Get]]`/`[[Set]]` pair for an accessor property. The owned form used
+/// by descriptor interchange and symbol-keyed slots; string-keyed accessor
+/// slots store the pair as an [`AccessorCellBody`] GC cell in the flat value
+/// array instead (see [`alloc_accessor_cell`]).
 #[derive(Debug, Clone)]
 struct AccessorPair {
     getter: Option<Value>,
     setter: Option<Value>,
+}
+
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`AccessorCellBody`].
+///
+/// Next free tag after `EVAL_ENV_BODY_TYPE_TAG = 0x2E`; distinct from every
+/// other GC body so the `type_tag → trace` table dispatch stays unambiguous.
+pub const ACCESSOR_CELL_TYPE_TAG: u8 = 0x2F;
+
+/// GC-allocated `([[Get]], [[Set]])` pair for a string-keyed accessor slot.
+///
+/// A string-keyed accessor slot stores a handle to this cell in the object's
+/// flat value array (the same place a data slot stores its value), so
+/// per-object slot metadata ([`SlotMeta`]) carries only a `is_accessor`
+/// discriminator and never the getter/setter payload. `undefined` encodes an
+/// absent getter/setter — an accessor descriptor cannot carry an `undefined`
+/// function, so the sentinel is unambiguous.
+#[derive(otter_macros::Pelt)]
+#[pelt(tag = ACCESSOR_CELL_TYPE_TAG)]
+pub struct AccessorCellBody {
+    /// `[[Get]]` — a callable, or `undefined` when absent.
+    pub getter: Value,
+    /// `[[Set]]` — a callable, or `undefined` when absent.
+    pub setter: Value,
+}
+
+/// Allocate an [`AccessorCellBody`] for an accessor pair and return a
+/// pointer-tagged [`Value`] referencing it, suitable for the flat value
+/// array. `obj` is rooted across the allocation: the cell alloc is a GC
+/// safepoint that can relocate young objects, so the receiver handle is
+/// yielded as a rewriteable root and read back relocated.
+fn alloc_accessor_cell(
+    heap: &mut GcHeap,
+    obj: &mut JsObject,
+    getter: Option<Value>,
+    setter: Option<Value>,
+) -> Result<Value, otter_gc::OutOfMemory> {
+    let body = AccessorCellBody {
+        getter: getter.unwrap_or(Value::undefined()),
+        setter: setter.unwrap_or(Value::undefined()),
+    };
+    let mut roots = |visit: &mut dyn FnMut(*mut RawGc)| {
+        visit(obj as *mut JsObject as *mut RawGc);
+    };
+    let cell = heap.alloc_with_roots(body, &mut roots)?;
+    Ok(Value::from_object_gc(cell.raw()))
+}
+
+/// Read the `(getter, setter)` pair from an accessor slot's flat value,
+/// mapping the `undefined` sentinel back to `None`.
+fn read_accessor_cell(heap: &GcHeap, cell_value: Value) -> (Option<Value>, Option<Value>) {
+    let Some(cell) = cell_value
+        .as_raw_gc()
+        .and_then(|raw| raw.checked_cast::<AccessorCellBody>())
+    else {
+        return (None, None);
+    };
+    heap.read_payload(cell, |body| {
+        let getter = (!body.getter.is_undefined()).then_some(body.getter);
+        let setter = (!body.setter.is_undefined()).then_some(body.setter);
+        (getter, setter)
+    })
 }
 
 /// Property kind discriminant. The data **value** is stored out-of-line —
@@ -212,13 +275,30 @@ impl SlotKind {
     }
 }
 
-/// Per-slot metadata for a string-keyed own property. The matching data
-/// value lives at the same index in the object's flat value array
-/// ([`ObjectBody::data_value`]).
-#[derive(Debug, Clone)]
+/// Per-slot metadata for a string-keyed own property. The matching value
+/// lives at the same index in the object's flat value array
+/// ([`ObjectBody::data_value`]): a data property's `[[Value]]`, or a handle
+/// to the slot's [`AccessorCellBody`] when `is_accessor` is set.
+#[derive(Debug, Clone, Copy)]
 struct SlotMeta {
     flags: PropertyFlags,
-    kind: SlotKind,
+    /// `true` when the flat value at this index is an [`AccessorCellBody`]
+    /// handle rather than a data value. The hidden class records the same
+    /// discriminator (`own_is_accessor`); this per-slot copy is the
+    /// authoritative source for attribute-overridden and dictionary-mode
+    /// objects whose slots have diverged from the shape.
+    is_accessor: bool,
+}
+
+impl SlotMeta {
+    /// Metadata for a default-attributes data slot
+    /// (`writable / enumerable / configurable` all `true`).
+    fn data_default() -> Self {
+        Self {
+            flags: PropertyFlags::data_default(),
+            is_accessor: false,
+        }
+    }
 }
 
 /// Owned `(flags, kind, value)` triple. Used as the storage form for
@@ -256,15 +336,34 @@ impl SlotData {
         }
     }
 
-    /// Split into index-aligned metadata + value for flat storage.
-    fn split(self) -> (SlotMeta, Value) {
-        (
-            SlotMeta {
-                flags: self.flags,
-                kind: self.kind,
-            },
-            self.value,
-        )
+    /// Lower into index-aligned `(metadata, flat value)` for storage in the
+    /// object's `slots` + value array. A data slot stores its `[[Value]]`
+    /// directly; an accessor slot allocates an [`AccessorCellBody`] and
+    /// stores the cell handle, rooting `obj` across the allocation.
+    fn into_flat(
+        self,
+        heap: &mut GcHeap,
+        obj: &mut JsObject,
+    ) -> Result<(SlotMeta, Value), otter_gc::OutOfMemory> {
+        match self.kind {
+            SlotKind::Data => Ok((
+                SlotMeta {
+                    flags: self.flags,
+                    is_accessor: false,
+                },
+                self.value,
+            )),
+            SlotKind::Accessor(pair) => {
+                let cell = alloc_accessor_cell(heap, obj, pair.getter, pair.setter)?;
+                Ok((
+                    SlotMeta {
+                        flags: self.flags,
+                        is_accessor: true,
+                    },
+                    cell,
+                ))
+            }
+        }
     }
 
     fn to_descriptor(&self) -> PropertyDescriptor {
@@ -391,12 +490,13 @@ pub struct ObjectBody {
     /// the JIT can read the shape token at a fixed byte offset
     /// ([`OBJECT_BODY_SHAPE_OFFSET`]) for monomorphic guard checks.
     shape: ShapeHandle,
-    /// Flat in-object data-property values for the first
-    /// [`INLINE_VALUE_CAP`] string-keyed slots, indexed by shape slot
-    /// offset. This is the **single source of truth** for fast-mode data
-    /// values (overflow spills to [`Self::overflow_values`]); a slot's
-    /// metadata (flags + data/accessor kind) lives in [`Self::slots`] at
-    /// the same index. Accessor slots store an unused `undefined` here.
+    /// Flat in-object values for the first [`INLINE_VALUE_CAP`] string-keyed
+    /// slots, indexed by shape slot offset. This is the **single source of
+    /// truth** for fast-mode values (overflow spills to
+    /// [`Self::overflow_values`]); a slot's flags + data/accessor
+    /// discriminator live in [`Self::slots`] at the same index. A data slot
+    /// stores its `[[Value]]` here; an accessor slot stores a handle to its
+    /// [`AccessorCellBody`].
     inline_values: [Value; INLINE_VALUE_CAP],
     /// Fallback/dictionary identity used only when [`Self::shape`] is null.
     dictionary_shape_id: ShapeId,
@@ -407,9 +507,10 @@ pub struct ObjectBody {
     /// [`ShapeCacheMode::DictionaryCompatible`] so future dictionary storage
     /// can keep the same invalidation contract without installing stale ICs.
     shape_cache_mode: ShapeCacheMode,
-    /// Per-slot metadata (flags + data/accessor kind) aligned with the GC
-    /// shape chain or `dictionary_keys`. The data value for slot `i` lives
-    /// out-of-line in the flat value array ([`Self::data_value`]).
+    /// Per-slot metadata (flags + `is_accessor` discriminator) aligned with
+    /// the GC shape chain or `dictionary_keys`. The slot's value — a data
+    /// `[[Value]]` or an [`AccessorCellBody`] handle — lives out-of-line in
+    /// the flat value array ([`Self::data_value`]) at the same index.
     slots: SmallVec<[SlotMeta; 4]>,
     /// `[[Prototype]]` — the single source of truth for the common Null /
     /// ordinary-object case: a bare [`JsObject`] handle, or
@@ -517,9 +618,12 @@ const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET.is_multiple_of(8));
 const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET >= 8);
 const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET.is_multiple_of(4));
 
-// Pin the hot object footprint. The `slot_attrs_overridden` byte rides in the
-// padding beside `extensible`, so it must not grow the body.
-const _: () = assert!(std::mem::size_of::<ObjectBody>() == 160);
+// Pin the hot object footprint. Moving the accessor getter/setter pair out of
+// per-slot metadata into the flat value array shrinks `SlotMeta` to two bytes,
+// so the inline `slots` SmallVec — and the body — shrink with it. The
+// `slot_attrs_overridden` byte rides in the padding beside `extensible`, so it
+// adds no size.
+const _: () = assert!(std::mem::size_of::<ObjectBody>() == 112);
 
 impl ObjectBody {
     /// Read the data value for string-keyed slot `i` from flat storage.
@@ -546,10 +650,11 @@ impl ObjectBody {
         }
     }
 
-    /// Append a new string-keyed own slot (metadata + value) at the next
-    /// index, keeping `slots` and the flat value array aligned.
-    fn push_slot(&mut self, data: SlotData) {
-        let (meta, value) = data.split();
+    /// Append a new string-keyed own slot (metadata + flat value) at the next
+    /// index, keeping `slots` and the flat value array aligned. For an
+    /// accessor slot `value` is the [`AccessorCellBody`] handle produced by
+    /// [`SlotData::into_flat`].
+    fn push_slot(&mut self, meta: SlotMeta, value: Value) {
         let i = self.slots.len();
         if i < INLINE_VALUE_CAP {
             self.inline_values[i] = value;
@@ -559,17 +664,16 @@ impl ObjectBody {
         self.slots.push(meta);
     }
 
-    /// Overwrite the string-keyed slot at `i` with new metadata + value.
+    /// Overwrite the string-keyed slot at `i` with new metadata + flat value.
     ///
     /// Used only by the `defineProperty`-on-existing merge paths, which can
     /// change a shaped slot's attributes in place without transitioning the
     /// hidden class. Flag the object so attribute reads stop trusting the
     /// shape and fall back to `slots`.
-    fn set_slot(&mut self, i: usize, data: SlotData) {
+    fn set_slot(&mut self, i: usize, meta: SlotMeta, value: Value) {
         if !self.shape.is_null() {
             self.slot_attrs_overridden = true;
         }
-        let (meta, value) = data.split();
         self.set_data_value(i, value);
         self.slots[i] = meta;
     }
@@ -590,28 +694,37 @@ impl ObjectBody {
             return attrs;
         }
         let meta = &self.slots[i];
-        (meta.flags, !meta.kind.is_data())
+        (meta.flags, meta.is_accessor)
     }
 
-    /// Snapshot the string-keyed slot at `i` as an owned [`SlotData`].
+    /// Snapshot the string-keyed slot at `i` as an owned [`SlotData`],
+    /// reconstructing the getter/setter pair from the accessor cell.
     fn slot_data(&self, heap: &otter_gc::GcHeap, i: usize) -> SlotData {
-        let (flags, _) = self.slot_attrs(heap, i);
-        SlotData {
-            flags,
-            kind: self.slots[i].kind.clone(),
-            value: self.data_value(i),
+        let (flags, is_accessor) = self.slot_attrs(heap, i);
+        if is_accessor {
+            let (getter, setter) = read_accessor_cell(heap, self.data_value(i));
+            SlotData {
+                flags,
+                kind: SlotKind::accessor(getter, setter),
+                value: Value::undefined(),
+            }
+        } else {
+            SlotData {
+                flags,
+                kind: SlotKind::Data,
+                value: self.data_value(i),
+            }
         }
     }
 
     /// [`PropertyLookup`] for the string-keyed slot at `i`.
     fn slot_lookup_at(&self, heap: &otter_gc::GcHeap, i: usize) -> PropertyLookup {
         let (flags, is_accessor) = self.slot_attrs(heap, i);
-        // The getter/setter pair still lives in `slots` until accessor storage
-        // migrates to the value array.
-        if is_accessor && let SlotKind::Accessor(pair) = &self.slots[i].kind {
+        if is_accessor {
+            let (getter, setter) = read_accessor_cell(heap, self.data_value(i));
             return PropertyLookup::Accessor {
-                getter: pair.getter,
-                setter: pair.setter,
+                getter,
+                setter,
                 flags,
             };
         }
@@ -624,13 +737,11 @@ impl ObjectBody {
     /// [`PropertyDescriptor`] for the string-keyed slot at `i`.
     fn slot_descriptor_at(&self, heap: &otter_gc::GcHeap, i: usize) -> PropertyDescriptor {
         let (flags, is_accessor) = self.slot_attrs(heap, i);
-        if is_accessor && let SlotKind::Accessor(pair) = &self.slots[i].kind {
+        if is_accessor {
+            let (getter, setter) = read_accessor_cell(heap, self.data_value(i));
             return PropertyDescriptor {
                 flags,
-                kind: DescriptorKind::Accessor {
-                    getter: pair.getter,
-                    setter: pair.setter,
-                },
+                kind: DescriptorKind::Accessor { getter, setter },
             };
         }
         PropertyDescriptor {
@@ -826,31 +937,20 @@ impl otter_gc::SafeTraceable for ObjectBody {
             "flat value array desynced from slots (len {})",
             self.slots.len()
         );
-        // String-keyed property slots: data values from flat storage,
-        // accessor functions from the boxed metadata.
-        for (i, meta) in self.slots.iter().enumerate() {
-            match &meta.kind {
-                // Trace the stored value *in place* (by reference) so the
-                // moving scavenger rewrites the live slot, not a copy.
-                SlotKind::Data => {
-                    if i < INLINE_VALUE_CAP {
-                        self.inline_values[i].trace_value_slots(v);
-                    } else {
-                        self.exotic
-                            .as_ref()
-                            .expect("overflow slot traced without overflow storage")
-                            .overflow_values[i - INLINE_VALUE_CAP]
-                            .trace_value_slots(v);
-                    }
-                }
-                SlotKind::Accessor(pair) => {
-                    if let Some(g) = &pair.getter {
-                        g.trace_value_slots(v);
-                    }
-                    if let Some(s) = &pair.setter {
-                        s.trace_value_slots(v);
-                    }
-                }
+        // String-keyed property slots: the flat value array holds each slot's
+        // data value, or — for an accessor slot — a handle to its
+        // `AccessorCellBody`. Trace each value *in place* (by reference) so the
+        // moving scavenger rewrites the live slot, not a copy; an accessor
+        // cell traces its own getter/setter through its `Traceable` impl.
+        for i in 0..self.slots.len() {
+            if i < INLINE_VALUE_CAP {
+                self.inline_values[i].trace_value_slots(v);
+            } else {
+                self.exotic
+                    .as_ref()
+                    .expect("overflow slot traced without overflow storage")
+                    .overflow_values[i - INLINE_VALUE_CAP]
+                    .trace_value_slots(v);
             }
         }
         // Boxed exotic slots holding GC edges. Traced in place through the box
@@ -1155,7 +1255,7 @@ fn apply_mapped_arguments_partial_define(
                     if body
                         .slots
                         .get(offset as usize)
-                        .is_some_and(|m| m.kind.is_data())
+                        .is_some_and(|m| !m.is_accessor)
                     {
                         body.set_data_value(offset as usize, current);
                     }
@@ -1201,7 +1301,7 @@ pub(crate) fn data_value_at(obj: JsObject, heap: &otter_gc::GcHeap, slot: u16) -
     heap.read_payload(obj, |body| {
         body.slots
             .get(slot as usize)
-            .filter(|s| s.kind.is_data())
+            .filter(|s| !s.is_accessor)
             .map_or(Value::undefined(), |_| body.data_value(slot as usize))
     })
 }
@@ -1319,7 +1419,7 @@ pub fn get_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Option<Valu
         }
         body_offset_of(heap, body, key).map(|offset| {
             let i = offset as usize;
-            if body.slots[i].kind.is_data() {
+            if !body.slots[i].is_accessor {
                 body.data_value(i)
             } else {
                 Value::undefined()
@@ -1463,7 +1563,7 @@ pub(crate) fn load_own_data_slot_atom(
             return Some(read_upvalue(heap, cell));
         }
         let meta = body.slots.get(offset)?;
-        if meta.kind.is_data() {
+        if !meta.is_accessor {
             Some(body.data_value(offset))
         } else {
             None
@@ -1495,7 +1595,7 @@ pub(crate) fn store_own_data_slot_atom(
         let Some(slot) = body.slots.get(offset) else {
             return false;
         };
-        if !slot.flags.writable() || !slot.kind.is_data() {
+        if !slot.flags.writable() || slot.is_accessor {
             return false;
         }
         body.set_data_value(offset, *value);
@@ -1528,7 +1628,7 @@ fn has_writable_own_data_slot_atom(
         let Some(slot) = body.slots.get(offset) else {
             return false;
         };
-        slot.flags.writable() && slot.kind.is_data()
+        slot.flags.writable() && !slot.is_accessor
     })
 }
 
@@ -2080,8 +2180,7 @@ pub(crate) fn debug_assert_appended_shape_slot(obj: JsObject, heap: &otter_gc::G
         };
         debug_assert_eq!(flags, meta.flags, "shape/slot flags mismatch at slot {i}");
         debug_assert_eq!(
-            is_accessor,
-            !meta.kind.is_data(),
+            is_accessor, meta.is_accessor,
             "shape/slot kind mismatch at slot {i}"
         );
     });
@@ -2130,7 +2229,7 @@ pub fn is_frozen(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
             if slot.flags.configurable() {
                 return false;
             }
-            if slot.kind.is_data() && slot.flags.writable() {
+            if !slot.is_accessor && slot.flags.writable() {
                 return false;
             }
         }
@@ -2165,14 +2264,20 @@ pub fn set(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) 
     heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
             let i = offset as usize;
-            body.slots[i].kind = SlotKind::Data;
+            // Overwriting an accessor slot with a data value diverges this slot
+            // from its hidden class (which still records the accessor) without a
+            // shape transition, so attribute reads must stop trusting the shape.
+            if body.slots[i].is_accessor && !body.shape.is_null() {
+                body.slot_attrs_overridden = true;
+            }
+            body.slots[i].is_accessor = false;
             body.set_data_value(i, value);
             return;
         }
         body.dictionary_shape_id = next_shape_id();
         dict_push_key(body, key.to_owned());
         body.shape = ShapeHandle::null();
-        body.push_slot(SlotData::data_default(value));
+        body.push_slot(SlotMeta::data_default(), value);
     });
     heap.record_write(obj, &barrier_value);
 }
@@ -2191,12 +2296,18 @@ pub(crate) fn set_with_shape(
     heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
             let i = offset as usize;
-            body.slots[i].kind = SlotKind::Data;
+            // Overwriting an accessor slot with a data value diverges this slot
+            // from its hidden class (which still records the accessor) without a
+            // shape transition, so attribute reads must stop trusting the shape.
+            if body.slots[i].is_accessor && !body.shape.is_null() {
+                body.slot_attrs_overridden = true;
+            }
+            body.slots[i].is_accessor = false;
             body.set_data_value(i, value);
             return;
         }
         body.shape = next_shape;
-        body.push_slot(SlotData::data_default(value));
+        body.push_slot(SlotMeta::data_default(), value);
     });
     heap.record_write(obj, &barrier_value);
     heap.record_write(obj, &next_shape);
@@ -2483,8 +2594,8 @@ pub fn define_own_property_partial(
     key: &str,
     descriptor: PartialPropertyDescriptor,
 ) -> bool {
+    let mut obj = obj;
     let completed = descriptor.complete_for_new_property();
-    let barrier_descriptor = completed.clone();
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     let dictionary_keys = dictionary_keys_for_shape_transition(heap, obj, existing_offset);
     // §10.1.6.3 ValidateAndApplyPropertyDescriptor runs outside the
@@ -2500,9 +2611,20 @@ pub fn define_own_property_partial(
     } else {
         None
     };
+    // Lower the slot to its flat `(meta, value)` form before taking the body
+    // borrow: an accessor allocates its cell here (rooting `obj`), so the
+    // mutation closure never allocates.
+    let slot_source = match merged_for_existing {
+        Some(merged) => merged,
+        None => SlotData::from_descriptor(completed),
+    };
+    let (meta, stored) = match slot_source.into_flat(heap, &mut obj) {
+        Ok(parts) => parts,
+        Err(_) => return false,
+    };
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
-            body.set_slot(offset as usize, merged_for_existing.unwrap());
+            body.set_slot(offset as usize, meta, stored);
             true
         } else {
             if !body.extensible {
@@ -2514,13 +2636,13 @@ pub fn define_own_property_partial(
             }
             dict_push_key(body, key.to_owned());
             body.shape = ShapeHandle::null();
-            body.push_slot(SlotData::from_descriptor(completed.clone()));
+            body.push_slot(meta, stored);
             true
         }
     });
     if success {
         apply_mapped_arguments_partial_define(obj, heap, key, descriptor, existing_offset);
-        heap.record_write(obj, &barrier_descriptor);
+        heap.record_write(obj, &stored);
     }
     success
 }
@@ -2532,8 +2654,8 @@ pub(crate) fn define_own_property_partial_with_shape(
     descriptor: PartialPropertyDescriptor,
     next_shape: ShapeHandle,
 ) -> bool {
+    let mut obj = obj;
     let completed = descriptor.complete_for_new_property();
-    let barrier_descriptor = completed.clone();
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     let merged_for_existing = if let Some(offset) = existing_offset {
         let existing = heap.read_payload(obj, |body| body.slot_data(heap, offset as usize));
@@ -2544,22 +2666,30 @@ pub(crate) fn define_own_property_partial_with_shape(
     } else {
         None
     };
+    let slot_source = match merged_for_existing {
+        Some(merged) => merged,
+        None => SlotData::from_descriptor(completed),
+    };
+    let (meta, stored) = match slot_source.into_flat(heap, &mut obj) {
+        Ok(parts) => parts,
+        Err(_) => return false,
+    };
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
-            body.set_slot(offset as usize, merged_for_existing.unwrap());
+            body.set_slot(offset as usize, meta, stored);
             true
         } else {
             if !body.extensible {
                 return false;
             }
             body.shape = next_shape;
-            body.push_slot(SlotData::from_descriptor(completed.clone()));
+            body.push_slot(meta, stored);
             true
         }
     });
     if success {
         apply_mapped_arguments_partial_define(obj, heap, key, descriptor, existing_offset);
-        heap.record_write(obj, &barrier_descriptor);
+        heap.record_write(obj, &stored);
         heap.record_write(obj, &next_shape);
         #[cfg(debug_assertions)]
         if existing_offset.is_none() {
@@ -2623,7 +2753,7 @@ pub fn define_own_property(
     key: &str,
     descriptor: PropertyDescriptor,
 ) -> bool {
-    let barrier_descriptor = descriptor.clone();
+    let mut obj = obj;
     let map_descriptor = descriptor.clone();
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     let dictionary_keys = dictionary_keys_for_shape_transition(heap, obj, existing_offset);
@@ -2636,9 +2766,17 @@ pub fn define_own_property(
     } else {
         None
     };
+    let slot_source = match merged_for_existing {
+        Some(merged) => merged,
+        None => SlotData::from_descriptor(descriptor),
+    };
+    let (meta, stored) = match slot_source.into_flat(heap, &mut obj) {
+        Ok(parts) => parts,
+        Err(_) => return false,
+    };
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
-            body.set_slot(offset as usize, merged_for_existing.unwrap());
+            body.set_slot(offset as usize, meta, stored);
             true
         } else {
             if !body.extensible {
@@ -2650,7 +2788,7 @@ pub fn define_own_property(
             }
             dict_push_key(body, key.to_owned());
             body.shape = ShapeHandle::null();
-            body.push_slot(SlotData::from_descriptor(descriptor));
+            body.push_slot(meta, stored);
             true
         }
     });
@@ -2669,7 +2807,7 @@ pub fn define_own_property(
                 }
             }
         }
-        heap.record_write(obj, &barrier_descriptor);
+        heap.record_write(obj, &stored);
     }
     success
 }
@@ -2949,7 +3087,7 @@ pub fn freeze(obj: JsObject, heap: &mut otter_gc::GcHeap) {
         }
         for slot in body.slots.iter_mut() {
             slot.flags = slot.flags.with_configurable(false);
-            if slot.kind.is_data() {
+            if !slot.is_accessor {
                 slot.flags = slot.flags.with_writable(false);
             }
         }
@@ -2987,7 +3125,7 @@ impl<'a> Properties<'a> {
     /// directly.
     pub fn iter(&self) -> impl Iterator<Item = (&str, Value)> {
         self.string_keys.iter().map(|(key, idx)| {
-            let value = if self.body.slots[*idx].kind.is_data() {
+            let value = if !self.body.slots[*idx].is_accessor {
                 self.body.data_value(*idx)
             } else {
                 Value::undefined()
@@ -3017,7 +3155,7 @@ impl<'a> Properties<'a> {
             if !slot.flags.enumerable() {
                 return None;
             }
-            if slot.kind.is_data() {
+            if !slot.is_accessor {
                 Some((key.as_str(), self.body.data_value(*idx)))
             } else {
                 None
@@ -3041,7 +3179,7 @@ impl<'a> Properties<'a> {
             if !slot.flags.enumerable() {
                 continue;
             }
-            if !slot.kind.is_data() {
+            if slot.is_accessor {
                 return None;
             }
             out.push((key.clone(), u16::try_from(*idx).ok()?));
@@ -3095,7 +3233,7 @@ impl<'a> Properties<'a> {
             if index >= len {
                 continue;
             }
-            if self.body.slots[*idx].kind.is_data() {
+            if !self.body.slots[*idx].is_accessor {
                 if values[index].is_none() {
                     seen += 1;
                 }

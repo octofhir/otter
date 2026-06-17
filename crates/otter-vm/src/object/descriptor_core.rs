@@ -29,7 +29,7 @@ use crate::Value;
 
 use super::{
     DescriptorKind, JsObject, JsSymbol, PartialPropertyDescriptor, PropertyDescriptor,
-    PropertyFlags, ShapeHandle, SlotData, SlotKind, next_shape_id,
+    PropertyFlags, ShapeHandle, SlotData, SlotKind, SlotMeta, next_shape_id,
 };
 
 pub(super) fn ordinary_set_data_property(
@@ -45,7 +45,7 @@ pub(super) fn ordinary_set_data_property(
         if let Some(offset) = existing_offset {
             let i = offset as usize;
             let slot = &body.slots[i];
-            if !slot.flags.writable() || !slot.kind.is_data() {
+            if !slot.flags.writable() || slot.is_accessor {
                 return false;
             }
             body.set_data_value(i, value);
@@ -61,7 +61,7 @@ pub(super) fn ordinary_set_data_property(
         }
         super::dict_push_key(body, key.to_owned());
         body.shape = ShapeHandle::null();
-        body.push_slot(SlotData::data_default(value));
+        body.push_slot(SlotMeta::data_default(), value);
         true
     });
     if success {
@@ -83,7 +83,7 @@ pub(super) fn ordinary_set_data_property_with_shape(
         if let Some(offset) = existing_offset {
             let i = offset as usize;
             let slot = &body.slots[i];
-            if !slot.flags.writable() || !slot.kind.is_data() {
+            if !slot.flags.writable() || slot.is_accessor {
                 return false;
             }
             body.set_data_value(i, value);
@@ -94,7 +94,7 @@ pub(super) fn ordinary_set_data_property_with_shape(
             return false;
         }
         body.shape = next_shape;
-        body.push_slot(SlotData::data_default(value));
+        body.push_slot(SlotMeta::data_default(), value);
         true
     });
     if success {

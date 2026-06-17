@@ -619,7 +619,11 @@ mod tests {
         // (constructor + accessor closures) added alongside the Temporal
         // conformance work; this ratchet had drifted unenforced while the
         // test module failed to compile.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1700;
+        // Bumped from 1700 → 1900 when string-keyed accessor storage moved
+        // into the flat value array: each bootstrap accessor property now
+        // allocates one GC-managed `AccessorCellBody` for its getter/setter
+        // pair where it previously lived in a non-GC box.
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1900;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 560 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");

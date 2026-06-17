@@ -443,56 +443,50 @@ pub struct ObjectBody {
     /// sole writer is [`set_prototype_value`]); traced as a distinct GC slot
     /// so the moving collector forwards it independently of the enum field.
     jit_proto: JsObject,
-    /// Symbol-keyed own properties. Stored outside the string-keyed
-    /// shape because symbols are identity keys, but values still use
-    /// the same descriptor slot representation.
-    symbol_props: Vec<(JsSymbol, SlotData)>,
-    /// Rust-owned payload for host-backed objects and VM-internal
-    /// exotic side data.
-    host_data: Option<Box<dyn Any>>,
-    /// Native `[[Call]]` implementation for builtin ordinary
-    /// objects that are callable without using a `Value::NativeFunction`
-    /// as their public representation.
-    call_native: Option<Value>,
-    /// Native `[[Construct]]` implementation for constructor-shaped
-    /// builtin objects such as `Number` and `Boolean`.
-    constructor_native: Option<Value>,
-    /// `[[BooleanData]]` internal slot for Boolean wrapper objects.
-    boolean_data: Option<bool>,
-    /// `[[NumberData]]` internal slot for Number wrapper objects.
-    number_data: Option<NumberValue>,
-    /// `[[StringData]]` internal slot for String wrapper objects.
-    string_data: Option<JsString>,
-    /// `[[SymbolData]]` internal slot for Symbol wrapper objects.
-    symbol_data: Option<crate::symbol::JsSymbol>,
-    /// `[[BigIntData]]` internal slot for BigInt wrapper objects.
-    bigint_data: Option<BigIntValue>,
-    /// `[[IsRawJSON]]` internal slot for objects produced by
-    /// `JSON.rawJSON` (ECMA-262 §25.5.3). The raw text lives in the
-    /// object's own `"rawJSON"` data property; this flag tags the
-    /// object so `JSON.isRawJSON` / `JSON.stringify` recognise it.
-    is_raw_json: bool,
-    /// `[[DateValue]]` internal slot for Date instances per
-    /// ECMA-262 §21.4.5. Holds the time value as UTC epoch
-    /// milliseconds (or `NaN` for an Invalid Date). Mutation goes
-    /// through [`set_date_data`] which applies TimeClip
-    /// (§21.4.1.6).
-    date_data: Option<f64>,
-    /// `[[ErrorData]]` internal slot presence marker (§20.5). Set only
-    /// on instances produced by an error constructor, so a plain
-    /// `Object.create(Error.prototype)` is correctly distinguished from
-    /// a real error (e.g. by `get Error.prototype.stack`).
-    error_data: bool,
     /// `[[Extensible]]` internal slot. New keys are rejected when
     /// this is `false`.
     extensible: bool,
-    /// `[[ParameterMap]]` presence marker for ECMA-262 §10.4.4
-    /// arguments-exotic objects. The mapping data itself lives in
-    /// `host_data` (`MappedArgumentsData`) when the function uses
-    /// sloppy parameter aliasing; this flag is set for both sloppy
-    /// and strict arguments objects so reflective probes
-    /// (`Object.prototype.toString.call(arguments)`) report the
-    /// `"Arguments"` builtin tag per §20.1.3.6 step 14.b.
+    /// Lazily-allocated rare/exotic slots — symbol-keyed properties, host
+    /// data, native `[[Call]]`/`[[Construct]]`, primitive-wrapper internal
+    /// slots, and the Date/Error/raw-JSON/arguments markers. `None` for plain
+    /// objects and class instances (the overwhelming common case), so an
+    /// ordinary object never pays for these ~140 bytes. Allocated on first
+    /// write through [`ObjectBody::exotic_mut`].
+    exotic: Option<Box<ExoticSlots>>,
+}
+
+/// Rarely-used `ObjectBody` slots, boxed out of the hot object so plain
+/// objects stay small. Every field here is absent on a plain `{}` / class
+/// instance; presence implies a wrapper object, host object, callable/
+/// constructor builtin, Date, Error, raw-JSON, or arguments exotic.
+#[derive(Default)]
+struct ExoticSlots {
+    /// Symbol-keyed own properties (descriptor slot representation).
+    symbol_props: Vec<(JsSymbol, SlotData)>,
+    /// Rust-owned payload for host-backed objects and VM-internal side data.
+    host_data: Option<Box<dyn Any>>,
+    /// Native `[[Call]]` for builtin callable ordinary objects.
+    call_native: Option<Value>,
+    /// Native `[[Construct]]` for constructor-shaped builtins (`Number`, …).
+    constructor_native: Option<Value>,
+    /// `[[BooleanData]]` for Boolean wrapper objects.
+    boolean_data: Option<bool>,
+    /// `[[NumberData]]` for Number wrapper objects.
+    number_data: Option<NumberValue>,
+    /// `[[StringData]]` for String wrapper objects.
+    string_data: Option<JsString>,
+    /// `[[SymbolData]]` for Symbol wrapper objects.
+    symbol_data: Option<crate::symbol::JsSymbol>,
+    /// `[[BigIntData]]` for BigInt wrapper objects.
+    bigint_data: Option<BigIntValue>,
+    /// `[[IsRawJSON]]` marker (`JSON.rawJSON`, ECMA-262 §25.5.3).
+    is_raw_json: bool,
+    /// `[[DateValue]]` for Date instances (UTC epoch ms, or NaN). §21.4.5.
+    date_data: Option<f64>,
+    /// `[[ErrorData]]` presence marker (§20.5).
+    error_data: bool,
+    /// `[[ParameterMap]]` presence marker for arguments-exotic objects
+    /// (§10.4.4); mapping data itself lives in `host_data`.
     is_arguments_object: bool,
 }
 
@@ -594,6 +588,81 @@ impl ObjectBody {
         }
         self.slots.remove(i);
     }
+
+    // --- Lazily-boxed exotic slots -----------------------------------------
+    // Reads return the field's default when no `ExoticSlots` is allocated;
+    // mutators allocate the box on first write. Plain objects never touch it.
+
+    /// Shared ref to the boxed exotic slots, if any.
+    #[inline]
+    fn exotic(&self) -> Option<&ExoticSlots> {
+        self.exotic.as_deref()
+    }
+
+    /// Exclusive ref to the boxed exotic slots, allocating an empty box on
+    /// first use.
+    #[inline]
+    fn exotic_mut(&mut self) -> &mut ExoticSlots {
+        self.exotic.get_or_insert_with(|| Box::new(ExoticSlots::default()))
+    }
+
+    #[inline]
+    fn host_data_ref(&self) -> Option<&Box<dyn Any>> {
+        self.exotic().and_then(|e| e.host_data.as_ref())
+    }
+    #[inline]
+    fn host_data_mut_opt(&mut self) -> Option<&mut Box<dyn Any>> {
+        self.exotic.as_deref_mut().and_then(|e| e.host_data.as_mut())
+    }
+    #[inline]
+    fn boolean_data(&self) -> Option<bool> {
+        self.exotic().and_then(|e| e.boolean_data)
+    }
+    #[inline]
+    fn number_data(&self) -> Option<NumberValue> {
+        self.exotic().and_then(|e| e.number_data)
+    }
+    #[inline]
+    fn string_data(&self) -> Option<JsString> {
+        self.exotic().and_then(|e| e.string_data)
+    }
+    #[inline]
+    fn symbol_data(&self) -> Option<crate::symbol::JsSymbol> {
+        self.exotic().and_then(|e| e.symbol_data)
+    }
+    #[inline]
+    fn bigint_data(&self) -> Option<BigIntValue> {
+        self.exotic().and_then(|e| e.bigint_data.clone())
+    }
+    #[inline]
+    fn date_data(&self) -> Option<f64> {
+        self.exotic().and_then(|e| e.date_data)
+    }
+    #[inline]
+    fn is_raw_json(&self) -> bool {
+        self.exotic().is_some_and(|e| e.is_raw_json)
+    }
+    #[inline]
+    fn error_data(&self) -> bool {
+        self.exotic().is_some_and(|e| e.error_data)
+    }
+    #[inline]
+    fn is_arguments_object(&self) -> bool {
+        self.exotic().is_some_and(|e| e.is_arguments_object)
+    }
+    #[inline]
+    fn call_native(&self) -> Option<Value> {
+        self.exotic().and_then(|e| e.call_native)
+    }
+    #[inline]
+    fn constructor_native(&self) -> Option<Value> {
+        self.exotic().and_then(|e| e.constructor_native)
+    }
+    /// Symbol-keyed own props as a slice (`&[]` when no box).
+    #[inline]
+    fn symbol_props(&self) -> &[(JsSymbol, SlotData)] {
+        self.exotic().map_or(&[], |e| e.symbol_props.as_slice())
+    }
 }
 
 impl std::fmt::Debug for ObjectBody {
@@ -607,23 +676,22 @@ impl std::fmt::Debug for ObjectBody {
                 "has_prototype",
                 &!matches!(self.prototype, ObjectPrototype::Null),
             )
-            .field("symbol_props", &self.symbol_props.len())
-            .field("has_host_data", &self.host_data.is_some())
+            .field("symbol_props", &self.symbol_props().len())
+            .field("has_host_data", &self.host_data_ref().is_some())
             .field(
                 "mapped_arguments",
                 &self
-                    .host_data
-                    .as_ref()
+                    .host_data_ref()
                     .and_then(|data| data.downcast_ref::<MappedArgumentsData>())
                     .map_or(0, |data| data.entries.len()),
             )
-            .field("has_call_native", &self.call_native.is_some())
-            .field("has_constructor_native", &self.constructor_native.is_some())
-            .field("has_boolean_data", &self.boolean_data.is_some())
-            .field("has_number_data", &self.number_data.is_some())
-            .field("has_string_data", &self.string_data.is_some())
-            .field("has_symbol_data", &self.symbol_data.is_some())
-            .field("has_date_data", &self.date_data.is_some())
+            .field("has_call_native", &self.call_native().is_some())
+            .field("has_constructor_native", &self.constructor_native().is_some())
+            .field("has_boolean_data", &self.boolean_data().is_some())
+            .field("has_number_data", &self.number_data().is_some())
+            .field("has_string_data", &self.string_data().is_some())
+            .field("has_symbol_data", &self.symbol_data().is_some())
+            .field("has_date_data", &self.date_data().is_some())
             .field("extensible", &self.extensible)
             .finish()
     }
@@ -693,34 +761,38 @@ impl otter_gc::SafeTraceable for ObjectBody {
                 }
             }
         }
-        // Symbol-keyed own properties (value inline in the slot).
-        for (_sym, slot) in self.symbol_props.iter() {
-            match &slot.kind {
-                SlotKind::Data => slot.value.trace_value_slots(v),
-                SlotKind::Accessor(pair) => {
-                    if let Some(g) = &pair.getter {
-                        g.trace_value_slots(v);
-                    }
-                    if let Some(s) = &pair.setter {
-                        s.trace_value_slots(v);
+        // Boxed exotic slots holding GC edges. Traced in place through the box
+        // reference so the moving collector rewrites the live slots, not a copy.
+        if let Some(exotic) = self.exotic.as_ref() {
+            // Symbol-keyed own properties (value inline in the slot).
+            for (_sym, slot) in exotic.symbol_props.iter() {
+                match &slot.kind {
+                    SlotKind::Data => slot.value.trace_value_slots(v),
+                    SlotKind::Accessor(pair) => {
+                        if let Some(g) = &pair.getter {
+                            g.trace_value_slots(v);
+                        }
+                        if let Some(s) = &pair.setter {
+                            s.trace_value_slots(v);
+                        }
                     }
                 }
             }
-        }
-        if let Some(native) = &self.call_native {
-            native.trace_value_slots(v);
-        }
-        if let Some(native) = &self.constructor_native {
-            native.trace_value_slots(v);
-        }
-        if let Some(data) = self
-            .host_data
-            .as_ref()
-            .and_then(|data| data.downcast_ref::<MappedArgumentsData>())
-        {
-            for entry in data.entries.iter() {
-                let p = &entry.cell as *const UpvalueCell as *mut RawGc;
-                v(p);
+            if let Some(native) = &exotic.call_native {
+                native.trace_value_slots(v);
+            }
+            if let Some(native) = &exotic.constructor_native {
+                native.trace_value_slots(v);
+            }
+            if let Some(data) = exotic
+                .host_data
+                .as_ref()
+                .and_then(|data| data.downcast_ref::<MappedArgumentsData>())
+            {
+                for entry in data.entries.iter() {
+                    let p = &entry.cell as *const UpvalueCell as *mut RawGc;
+                    v(p);
+                }
             }
         }
     }
@@ -754,20 +826,8 @@ fn empty_object_body() -> ObjectBody {
         slots: SmallVec::new(),
         prototype: ObjectPrototype::Null,
         jit_proto: otter_gc::Gc::null(),
-        symbol_props: Vec::new(),
-        host_data: None,
-        call_native: None,
-        constructor_native: None,
-        boolean_data: None,
-        number_data: None,
-        string_data: None,
-        symbol_data: None,
-        bigint_data: None,
-        is_raw_json: false,
-        date_data: None,
-        error_data: false,
         extensible: true,
-        is_arguments_object: false,
+        exotic: None,
     }
 }
 
@@ -866,20 +926,11 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
             slots: SmallVec::new(),
             prototype: ObjectPrototype::Null,
             jit_proto: otter_gc::Gc::null(),
-            symbol_props: Vec::new(),
-            host_data: Some(Box::new(data)),
-            call_native: None,
-            constructor_native: None,
-            boolean_data: None,
-            number_data: None,
-            string_data: None,
-            symbol_data: None,
-            bigint_data: None,
-            is_raw_json: false,
-            date_data: None,
-            error_data: false,
             extensible: true,
-            is_arguments_object: false,
+            exotic: Some(Box::new(ExoticSlots {
+                host_data: Some(Box::new(data)),
+                ..ExoticSlots::default()
+            })),
         },
         external_visit,
     )
@@ -904,20 +955,11 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
             slots: SmallVec::new(),
             prototype: ObjectPrototype::Null,
             jit_proto: otter_gc::Gc::null(),
-            symbol_props: Vec::new(),
-            host_data: Some(Box::new(data)),
-            call_native: None,
-            constructor_native: None,
-            boolean_data: None,
-            number_data: None,
-            string_data: None,
-            symbol_data: None,
-            bigint_data: None,
-            is_raw_json: false,
-            date_data: None,
-            error_data: false,
             extensible: true,
-            is_arguments_object: false,
+            exotic: Some(Box::new(ExoticSlots {
+                host_data: Some(Box::new(data)),
+                ..ExoticSlots::default()
+            })),
         },
         external_visit,
     )
@@ -930,7 +972,7 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
 /// the body's slot table is set up.
 pub fn mark_as_arguments_object(obj: JsObject, heap: &mut otter_gc::GcHeap) {
     heap.with_payload(obj, |body| {
-        body.is_arguments_object = true;
+        body.exotic_mut().is_arguments_object = true;
     });
 }
 
@@ -940,7 +982,7 @@ pub fn mark_as_arguments_object(obj: JsObject, heap: &mut otter_gc::GcHeap) {
 /// [`ObjectBody`]'s internals.
 #[must_use]
 pub fn is_arguments_object(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
-    heap.read_payload(obj, |body| body.is_arguments_object)
+    heap.read_payload(obj, |body| body.is_arguments_object())
 }
 
 pub(crate) fn install_mapped_arguments(
@@ -950,7 +992,7 @@ pub(crate) fn install_mapped_arguments(
 ) {
     heap.with_payload(obj, |body| {
         if !entries.is_empty() {
-            body.host_data = Some(Box::new(MappedArgumentsData {
+            body.exotic_mut().host_data = Some(Box::new(MappedArgumentsData {
                 entries: entries.into_boxed_slice(),
             }));
         }
@@ -958,8 +1000,7 @@ pub(crate) fn install_mapped_arguments(
 }
 
 fn mapped_argument_cell(body: &ObjectBody, key: &str) -> Option<UpvalueCell> {
-    body.host_data
-        .as_ref()?
+    body.host_data_ref()?
         .downcast_ref::<MappedArgumentsData>()?
         .entries
         .iter()
@@ -968,7 +1009,7 @@ fn mapped_argument_cell(body: &ObjectBody, key: &str) -> Option<UpvalueCell> {
 }
 
 fn remove_mapped_argument(body: &mut ObjectBody, key: &str) {
-    let Some(data) = body.host_data.take() else {
+    let Some(data) = body.exotic.as_deref_mut().and_then(|e| e.host_data.take()) else {
         return;
     };
     match data.downcast::<MappedArgumentsData>() {
@@ -980,13 +1021,13 @@ fn remove_mapped_argument(body: &mut ObjectBody, key: &str) {
                 .filter(|entry| entry.key != key)
                 .collect();
             if !retained.is_empty() {
-                body.host_data = Some(Box::new(MappedArgumentsData {
+                body.exotic_mut().host_data = Some(Box::new(MappedArgumentsData {
                     entries: retained.into_boxed_slice(),
                 }));
             }
         }
         Err(other) => {
-            body.host_data = Some(other);
+            body.exotic_mut().host_data = Some(other);
         }
     }
 }
@@ -1505,7 +1546,7 @@ pub fn get_jsstring(obj: JsObject, heap: &otter_gc::GcHeap, key: JsString) -> Op
 #[must_use]
 pub fn get_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: JsSymbol) -> Option<Value> {
     heap.read_payload(obj, |body| {
-        body.symbol_props
+        body.symbol_props()
             .iter()
             .find(|(k, _)| k.ptr_eq(key))
             .map(|(_, slot)| {
@@ -1522,7 +1563,7 @@ pub fn get_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: JsSymbol) -> 
 #[must_use]
 pub fn lookup_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: JsSymbol) -> PropertyLookup {
     heap.read_payload(obj, |body| {
-        body.symbol_props
+        body.symbol_props()
             .iter()
             .find(|(k, _)| k.ptr_eq(key))
             .map_or(PropertyLookup::Absent, |(_, slot)| slot.to_lookup())
@@ -1591,7 +1632,7 @@ pub fn get_own_symbol_descriptor(
     key: JsSymbol,
 ) -> Option<PropertyDescriptor> {
     heap.read_payload(obj, |body| {
-        body.symbol_props
+        body.symbol_props()
             .iter()
             .find(|(k, _)| k.ptr_eq(key))
             .map(|(_, slot)| slot.to_descriptor())
@@ -1602,7 +1643,7 @@ pub fn get_own_symbol_descriptor(
 /// objects.
 pub fn set_call_native(obj: JsObject, heap: &mut otter_gc::GcHeap, native: Value) {
     heap.with_payload(obj, |body| {
-        body.call_native = Some(native);
+        body.exotic_mut().call_native = Some(native);
     });
     heap.record_write(obj, &native);
 }
@@ -1610,7 +1651,7 @@ pub fn set_call_native(obj: JsObject, heap: &mut otter_gc::GcHeap, native: Value
 /// Read the internal native `[[Call]]` slot.
 #[must_use]
 pub fn call_native(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<Value> {
-    heap.read_payload(obj, |body| body.call_native)
+    heap.read_payload(obj, |body| body.call_native())
 }
 
 /// Store the internal native `[[Construct]]` slot for constructor-shaped
@@ -1618,8 +1659,8 @@ pub fn call_native(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<Value> {
 /// too, so this also installs the same callback as `[[Call]]`.
 pub fn set_constructor_native(obj: JsObject, heap: &mut otter_gc::GcHeap, native: Value) {
     heap.with_payload(obj, |body| {
-        body.call_native = Some(native);
-        body.constructor_native = Some(native);
+        body.exotic_mut().call_native = Some(native);
+        body.exotic_mut().constructor_native = Some(native);
     });
     heap.record_write(obj, &native);
 }
@@ -1627,72 +1668,72 @@ pub fn set_constructor_native(obj: JsObject, heap: &mut otter_gc::GcHeap, native
 /// Read the internal native `[[Construct]]` slot.
 #[must_use]
 pub fn constructor_native(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<Value> {
-    heap.read_payload(obj, |body| body.constructor_native)
+    heap.read_payload(obj, |body| body.constructor_native())
 }
 
 /// Store the `[[BooleanData]]` internal slot for a Boolean wrapper.
 pub fn set_boolean_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: bool) {
     heap.with_payload(obj, |body| {
-        body.boolean_data = Some(value);
+        body.exotic_mut().boolean_data = Some(value);
     });
 }
 
 /// Read the `[[BooleanData]]` internal slot for a Boolean wrapper.
 #[must_use]
 pub fn boolean_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<bool> {
-    heap.read_payload(obj, |body| body.boolean_data)
+    heap.read_payload(obj, |body| body.boolean_data())
 }
 
 /// Store the `[[NumberData]]` internal slot for a Number wrapper.
 pub fn set_number_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: NumberValue) {
     heap.with_payload(obj, |body| {
-        body.number_data = Some(value);
+        body.exotic_mut().number_data = Some(value);
     });
 }
 
 /// Read the `[[NumberData]]` internal slot for a Number wrapper.
 #[must_use]
 pub fn number_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<NumberValue> {
-    heap.read_payload(obj, |body| body.number_data)
+    heap.read_payload(obj, |body| body.number_data())
 }
 
 /// Store the `[[StringData]]` internal slot for a String wrapper.
 pub fn set_string_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: JsString) {
     heap.with_payload(obj, |body| {
-        body.string_data = Some(value);
+        body.exotic_mut().string_data = Some(value);
     });
 }
 
 /// Read the `[[StringData]]` internal slot for a String wrapper.
 #[must_use]
 pub fn string_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<JsString> {
-    heap.read_payload(obj, |body| body.string_data)
+    heap.read_payload(obj, |body| body.string_data())
 }
 
 /// Store the `[[SymbolData]]` internal slot for a Symbol wrapper.
 pub fn set_symbol_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: crate::symbol::JsSymbol) {
     heap.with_payload(obj, |body| {
-        body.symbol_data = Some(value);
+        body.exotic_mut().symbol_data = Some(value);
     });
 }
 
 /// Read the `[[SymbolData]]` internal slot for a Symbol wrapper.
 #[must_use]
 pub fn symbol_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<crate::symbol::JsSymbol> {
-    heap.read_payload(obj, |body| body.symbol_data)
+    heap.read_payload(obj, |body| body.symbol_data())
 }
 
 /// Store the `[[BigIntData]]` internal slot for a BigInt wrapper.
 pub fn set_bigint_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: BigIntValue) {
     heap.with_payload(obj, |body| {
-        body.bigint_data = Some(value);
+        body.exotic_mut().bigint_data = Some(value);
     });
 }
 
 /// Read the `[[BigIntData]]` internal slot for a BigInt wrapper.
 #[must_use]
 pub fn bigint_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<BigIntValue> {
-    heap.read_payload(obj, |body| body.bigint_data)
+    heap.read_payload(obj, |body| body.bigint_data())
 }
 
 /// §21.4.1.6 TimeClip — every store into a `[[DateValue]]` internal
@@ -1714,7 +1755,7 @@ pub fn clip_date_value(ms: f64) -> f64 {
 pub fn set_date_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: f64) {
     let clipped = clip_date_value(value);
     heap.with_payload(obj, |body| {
-        body.date_data = Some(clipped);
+        body.exotic_mut().date_data = Some(clipped);
     });
 }
 
@@ -1723,14 +1764,14 @@ pub fn set_date_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: f64) {
 /// receiver-brand mismatch (§21.4.1.1 `thisTimeValue` step 3).
 #[must_use]
 pub fn date_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<f64> {
-    heap.read_payload(obj, |body| body.date_data)
+    heap.read_payload(obj, |body| body.date_data())
 }
 
 /// Mark an object as carrying the `[[ErrorData]]` internal slot
 /// (§20.5) — set when an error constructor produces the instance.
 pub fn set_error_data(obj: JsObject, heap: &mut otter_gc::GcHeap) {
     heap.with_payload(obj, |body| {
-        body.error_data = true;
+        body.exotic_mut().error_data = true;
     });
 }
 
@@ -1739,21 +1780,21 @@ pub fn set_error_data(obj: JsObject, heap: &mut otter_gc::GcHeap) {
 /// returns `false`.
 #[must_use]
 pub fn has_error_data(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
-    heap.read_payload(obj, |body| body.error_data)
+    heap.read_payload(obj, |body| body.error_data())
 }
 
 /// Tag an object as carrying the `[[IsRawJSON]]` internal slot
 /// (§25.5.3 `JSON.rawJSON`).
 pub fn set_is_raw_json(obj: JsObject, heap: &mut otter_gc::GcHeap, value: bool) {
     heap.with_payload(obj, |body| {
-        body.is_raw_json = value;
+        body.exotic_mut().is_raw_json = value;
     });
 }
 
 /// `true` when `obj` carries the `[[IsRawJSON]]` internal slot.
 #[must_use]
 pub fn is_raw_json(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
-    heap.read_payload(obj, |body| body.is_raw_json)
+    heap.read_payload(obj, |body| body.is_raw_json())
 }
 
 /// Borrow typed host data attached to `obj`.
@@ -1769,7 +1810,7 @@ where
     T: HostObjectData,
 {
     heap.read_payload(obj, |body| {
-        let data = body.host_data.as_ref().ok_or(HostObjectError::Missing)?;
+        let data = body.host_data_ref().ok_or(HostObjectError::Missing)?;
         data.downcast_ref::<T>()
             .map(f)
             .ok_or_else(|| HostObjectError::TypeMismatch {
@@ -1792,7 +1833,7 @@ where
     T: HostObjectData,
 {
     heap.with_payload(obj, |body| {
-        let data = body.host_data.as_mut().ok_or(HostObjectError::Missing)?;
+        let data = body.host_data_mut_opt().ok_or(HostObjectError::Missing)?;
         let typed = data
             .downcast_mut::<T>()
             .ok_or_else(|| HostObjectError::TypeMismatch {
@@ -1841,8 +1882,7 @@ pub(crate) struct ModuleNamespaceData {
 #[must_use]
 pub(crate) fn module_namespace_env(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<JsObject> {
     heap.read_payload(obj, |body| {
-        body.host_data
-            .as_ref()
+        body.host_data_ref()
             .and_then(|d| d.downcast_ref::<ModuleNamespaceData>())
             .map(|d| d.env)
     })
@@ -1856,8 +1896,7 @@ pub(crate) fn module_namespace_url(
     heap: &otter_gc::GcHeap,
 ) -> Option<std::sync::Arc<str>> {
     heap.read_payload(obj, |body| {
-        body.host_data
-            .as_ref()
+        body.host_data_ref()
             .and_then(|d| d.downcast_ref::<ModuleNamespaceData>())
             .map(|d| d.module_url.clone())
     })
@@ -1885,8 +1924,7 @@ pub(crate) fn deferred_namespace_target(
     heap: &otter_gc::GcHeap,
 ) -> Option<std::sync::Arc<str>> {
     heap.read_payload(obj, |body| {
-        body.host_data
-            .as_ref()
+        body.host_data_ref()
             .and_then(|d| d.downcast_ref::<DeferredNamespaceData>())
             .map(|d| d.target_url.clone())
     })
@@ -1897,8 +1935,7 @@ pub(crate) fn deferred_namespace_target(
 #[must_use]
 pub(crate) fn deferred_namespace_is_populated(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
     heap.read_payload(obj, |body| {
-        body.host_data
-            .as_ref()
+        body.host_data_ref()
             .and_then(|d| d.downcast_ref::<DeferredNamespaceData>())
             .is_some_and(|d| d.populated.get())
     })
@@ -1908,8 +1945,7 @@ pub(crate) fn deferred_namespace_is_populated(obj: JsObject, heap: &otter_gc::Gc
 pub(crate) fn set_deferred_namespace_populated(obj: JsObject, heap: &otter_gc::GcHeap) {
     heap.read_payload(obj, |body| {
         if let Some(d) = body
-            .host_data
-            .as_ref()
+            .host_data_ref()
             .and_then(|d| d.downcast_ref::<DeferredNamespaceData>())
         {
             d.populated.set(true);
@@ -2250,11 +2286,11 @@ pub fn set_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: JsSymbol, val
 /// Remove a symbol-keyed own property.
 pub fn delete_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: JsSymbol) -> bool {
     heap.with_payload(obj, |body| {
-        if let Some(pos) = body.symbol_props.iter().position(|(k, _)| k.ptr_eq(key)) {
-            if !body.symbol_props[pos].1.flags.configurable() {
+        if let Some(pos) = body.symbol_props().iter().position(|(k, _)| k.ptr_eq(key)) {
+            if !body.symbol_props()[pos].1.flags.configurable() {
                 return false;
             }
-            body.symbol_props.remove(pos);
+            body.exotic_mut().symbol_props.remove(pos);
             true
         } else {
             true
@@ -2393,10 +2429,10 @@ pub fn define_own_symbol_property_partial(
     let completed = descriptor.complete_for_new_property();
     let barrier_descriptor = completed.clone();
     let existing_pos_and_slot = heap.read_payload(obj, |body| {
-        body.symbol_props
+        body.symbol_props()
             .iter()
             .position(|(k, _)| k.ptr_eq(key))
-            .map(|pos| (pos, body.symbol_props[pos].1.clone()))
+            .map(|pos| (pos, body.symbol_props()[pos].1.clone()))
     });
     let merged_for_existing = if let Some((_, ref existing)) = existing_pos_and_slot {
         match descriptor_core::validate_and_apply_partial(existing, &descriptor, heap) {
@@ -2409,13 +2445,14 @@ pub fn define_own_symbol_property_partial(
     let existing_pos = existing_pos_and_slot.as_ref().map(|(p, _)| *p);
     let success = heap.with_payload(obj, |body| {
         if let Some(pos) = existing_pos {
-            body.symbol_props[pos].1 = merged_for_existing.unwrap();
+            body.exotic_mut().symbol_props[pos].1 = merged_for_existing.unwrap();
             true
         } else {
             if !body.extensible {
                 return false;
             }
-            body.symbol_props
+            body.exotic_mut()
+                .symbol_props
                 .push((key, SlotData::from_descriptor(completed.clone())));
             true
         }
@@ -2496,10 +2533,10 @@ pub fn define_own_symbol_property(
 ) -> bool {
     let barrier_descriptor = descriptor.clone();
     let existing_pos_and_slot = heap.read_payload(obj, |body| {
-        body.symbol_props
+        body.symbol_props()
             .iter()
             .position(|(k, _)| k.ptr_eq(key))
-            .map(|pos| (pos, body.symbol_props[pos].1.clone()))
+            .map(|pos| (pos, body.symbol_props()[pos].1.clone()))
     });
     let merged_for_existing = if let Some((_, ref existing)) = existing_pos_and_slot {
         match descriptor_core::validate_and_apply(existing, &descriptor, heap) {
@@ -2512,13 +2549,14 @@ pub fn define_own_symbol_property(
     let existing_pos = existing_pos_and_slot.as_ref().map(|(p, _)| *p);
     let success = heap.with_payload(obj, |body| {
         if let Some(pos) = existing_pos {
-            body.symbol_props[pos].1 = merged_for_existing.unwrap();
+            body.exotic_mut().symbol_props[pos].1 = merged_for_existing.unwrap();
             true
         } else {
             if !body.extensible {
                 return false;
             }
-            body.symbol_props
+            body.exotic_mut()
+                .symbol_props
                 .push((key, SlotData::from_descriptor(descriptor)));
             true
         }
@@ -2736,8 +2774,10 @@ pub fn seal(obj: JsObject, heap: &mut otter_gc::GcHeap) {
         for slot in body.slots.iter_mut() {
             slot.flags = slot.flags.with_configurable(false);
         }
-        for (_, slot) in body.symbol_props.iter_mut() {
-            slot.flags = slot.flags.with_configurable(false);
+        if let Some(exotic) = body.exotic.as_deref_mut() {
+            for (_, slot) in exotic.symbol_props.iter_mut() {
+                slot.flags = slot.flags.with_configurable(false);
+            }
         }
     });
 }
@@ -2757,10 +2797,12 @@ pub fn freeze(obj: JsObject, heap: &mut otter_gc::GcHeap) {
                 slot.flags = slot.flags.with_writable(false);
             }
         }
-        for (_, slot) in body.symbol_props.iter_mut() {
-            slot.flags = slot.flags.with_configurable(false);
-            if slot.kind.is_data() {
-                slot.flags = slot.flags.with_writable(false);
+        if let Some(exotic) = body.exotic.as_deref_mut() {
+            for (_, slot) in exotic.symbol_props.iter_mut() {
+                slot.flags = slot.flags.with_configurable(false);
+                if slot.kind.is_data() {
+                    slot.flags = slot.flags.with_writable(false);
+                }
             }
         }
     });
@@ -2807,7 +2849,7 @@ impl<'a> Properties<'a> {
     /// Used by `Object.getOwnPropertySymbols` (§20.1.2.13) and
     /// `Reflect.ownKeys` (§28.1.16) to surface symbol keys.
     pub fn symbol_keys(&self) -> impl Iterator<Item = JsSymbol> + '_ {
-        self.body.symbol_props.iter().map(|(k, _)| *k)
+        self.body.symbol_props().iter().map(|(k, _)| *k)
     }
 
     /// Iterate `(key, data-value)` pairs in ordinary own-key order,
@@ -2867,7 +2909,7 @@ impl<'a> Properties<'a> {
     /// `Object.assign` (§20.1.2.1 step 4.c.ii) which copies every
     /// enumerable own string *and* symbol key from the source.
     pub fn enumerable_symbol_data_iter(&self) -> impl Iterator<Item = (JsSymbol, Value)> + '_ {
-        self.body.symbol_props.iter().filter_map(|(sym, slot)| {
+        self.body.symbol_props().iter().filter_map(|(sym, slot)| {
             if !slot.flags.enumerable() {
                 return None;
             }
@@ -3880,3 +3922,4 @@ mod tests {
         assert!(delete_symbol(o, &mut heap, sym));
     }
 }
+

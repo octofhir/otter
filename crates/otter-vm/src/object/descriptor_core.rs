@@ -112,8 +112,8 @@ pub(super) fn ordinary_set_symbol_data_property(
 ) -> bool {
     let barrier_value = value;
     let success = heap.with_payload(obj, |body| {
-        if let Some(pos) = body.symbol_props.iter().position(|(k, _)| k.ptr_eq(key)) {
-            let slot = &mut body.symbol_props[pos].1;
+        if let Some(pos) = body.symbol_props().iter().position(|(k, _)| k.ptr_eq(key)) {
+            let slot = &mut body.exotic_mut().symbol_props[pos].1;
             if !slot.flags.writable() || !slot.kind.is_data() {
                 return false;
             }
@@ -124,7 +124,9 @@ pub(super) fn ordinary_set_symbol_data_property(
         if !body.extensible {
             return false;
         }
-        body.symbol_props.push((key, SlotData::data_default(value)));
+        body.exotic_mut()
+            .symbol_props
+            .push((key, SlotData::data_default(value)));
         true
     });
     if success {

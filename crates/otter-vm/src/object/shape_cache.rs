@@ -46,8 +46,8 @@ pub(crate) enum ShapeCacheInvalidation {
 
 /// Common IC eligibility predicate for ordinary object receivers/prototypes.
 #[must_use]
-pub(super) const fn supports_fast_property_ic(body: &ObjectBody) -> bool {
-    matches!(body.shape_cache_mode, ShapeCacheMode::Fast) && body.string_data.is_none()
+pub(super) fn supports_fast_property_ic(body: &ObjectBody) -> bool {
+    matches!(body.shape_cache_mode, ShapeCacheMode::Fast) && body.string_data().is_none()
 }
 
 /// Mark the object as no longer valid for hidden-class IC assumptions.

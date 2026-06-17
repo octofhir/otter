@@ -229,25 +229,28 @@ impl Interpreter {
         {
             object::set_prototype(statics, &mut self.gc_heap, Some(function_prototype));
         }
+        // Publish the constructor to its destination register first: the
+        // shape-advancing `constructor` install below may scavenge while
+        // allocating a hidden-class child, and the register slot is GC-rooted
+        // (the bare `class` local is not), so it is forwarded across the move.
+        write_register(&mut stack[frame_idx], dst, Value::class_constructor(class))?;
         // §15.7.10 ClassDefinitionEvaluation step 24 — install
         // `C.prototype.constructor = C` so reflective probes
         // (`new Sub(...).constructor === Sub`) walk to the
         // class constructor itself rather than to the inherited
-        // parent class's `constructor` slot.
-        let constructor_desc = object::PropertyDescriptor::data(
-            Value::class_constructor(class),
-            /* writable */ true,
-            /* enumerable */ false,
-            /* configurable */ true,
-        );
-        let _ = object::define_own_property(
-            prototype,
-            &mut self.gc_heap,
-            "constructor",
-            constructor_desc,
-        );
+        // parent class's `constructor` slot. Routed through the
+        // hidden-class-advancing define (not the dictionary-mode
+        // `object::define_own_property`) so the prototype keeps a fast shape
+        // and instance method calls stay inline-guardable.
+        let constructor_desc = object::PartialPropertyDescriptor {
+            value: Some(Value::class_constructor(class)),
+            writable: Some(true),
+            enumerable: Some(false),
+            configurable: Some(true),
+            ..Default::default()
+        };
+        let _ = self.define_own_property_partial(prototype, "constructor", constructor_desc)?;
         let frame = &mut stack[frame_idx];
-        write_register(frame, dst, Value::class_constructor(class))?;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }

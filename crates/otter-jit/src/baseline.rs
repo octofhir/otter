@@ -59,11 +59,20 @@ const TAG_FUNCTION_ID: u64 = 0x7FFB;
 /// bits are a `Gc` offset; the body type is discriminated by the GC header
 /// tag, so inline property loads must also check [`OBJECT_BODY_TYPE_TAG`].
 const TAG_PTR_OBJECT: u64 = 0x7FFC;
+/// NaN-box tag for callable heap pointers (`value/tag.rs` `TAG_PTR_FUNCTION`).
+/// A prototype method slot holds one of these; the low 32 bits are a `Gc`
+/// offset to the callable body, discriminated by the GC header tag.
+const TAG_PTR_FUNCTION: u64 = 0x7FFE;
 /// GC header type tag for an ordinary `ObjectBody` (mirrors
 /// `otter_vm::object::OBJECT_BODY_TYPE_TAG`). Guarded before an inline
 /// shape-slot read so a non-object body sharing `TAG_PTR_OBJECT` cannot be
 /// misread.
 const OBJECT_BODY_TYPE_TAG: u32 = 0x11;
+/// GC header type tag for a `JsClosureBody` (mirrors
+/// `otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG`). Guarded before reading a
+/// resolved method's `function_id` so a native callable sharing
+/// [`TAG_PTR_FUNCTION`] is never misread as a bytecode closure.
+const JS_CLOSURE_BODY_TYPE_TAG: u32 = 0x23;
 /// `SPECIAL` payload for the internal array/`this` hole sentinel.
 const SPECIAL_HOLE: u64 = 2;
 /// `SPECIAL` payload for `false`.
@@ -612,32 +621,6 @@ extern "C" fn jit_call_method_stub(
     }
 }
 
-/// Resolve the current method function id for an inlined `CallMethodValue`
-/// site. Returns the method's bytecode function id, or `u32::MAX` for any
-/// non-object receiver / IC miss / non-bytecode method. Cannot throw, so the
-/// caller branches on the returned id rather than a status. Re-resolving each
-/// call makes a prototype-method reassignment fall back to the full call.
-extern "C" fn jit_resolve_inline_method_stub(
-    ctx: *mut JitCtx,
-    recv_reg: u64,
-    name_idx: u64,
-    site: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &*ctx.stack };
-    let context = unsafe { &*ctx.context };
-    u64::from(vm.jit_resolve_inline_method_fid(
-        context,
-        stack,
-        ctx.frame_index,
-        recv_reg as u16,
-        name_idx as u32,
-        site as usize,
-    ))
-}
-
 /// Bridge stub: perform a computed `StoreElement` (`recv[idx] = src`) from
 /// compiled code, delegating to the safe
 /// [`Interpreter::jit_runtime_store_element`]. Returns `0` on success, `1` when
@@ -832,16 +815,16 @@ mod arm64 {
         BAIL_PC_OFFSET, BaselineCode, CONTEXT_OFFSET, DIRECT_ENTRY_OFFSET,
         DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET,
         DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET, JIT_CTX_STACK_SIZE,
-        MAX_INLINE_ARGS, OBJECT_BODY_TYPE_TAG, Op, Operand, SPECIAL_FALSE, SPECIAL_HOLE,
-        SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_FUNCTION_ID,
-        TAG_INT32, TAG_NAN, TAG_PTR_OBJECT, TAG_SPECIAL, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET,
-        UPVALUES_PTR_OFFSET, Unsupported, VM_OFFSET, WhiskerIcCell, jit_abort_direct_call_stub,
-        jit_call_method_stub, jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
+        JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS, OBJECT_BODY_TYPE_TAG, Op, Operand,
+        SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED,
+        STATUS_THREW, TAG_FUNCTION_ID, TAG_INT32, TAG_NAN, TAG_PTR_FUNCTION, TAG_PTR_OBJECT,
+        TAG_SPECIAL, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, Unsupported,
+        VM_OFFSET, WhiskerIcCell, jit_abort_direct_call_stub, jit_call_method_stub,
+        jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
         jit_finish_direct_call_returned_stub, jit_load_element_stub, jit_load_global_stub,
         jit_load_prop_stub, jit_load_upvalue_stub, jit_make_fn_stub, jit_prepare_direct_call_stub,
-        jit_prepare_direct_method_call_stub, jit_resolve_inline_method_stub,
-        jit_store_element_stub, jit_store_prop_stub, jit_store_upvalue_stub,
-        jit_write_barrier_stub, reg_offset,
+        jit_prepare_direct_method_call_stub, jit_store_element_stub, jit_store_prop_stub,
+        jit_store_upvalue_stub, jit_write_barrier_stub, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -1258,6 +1241,8 @@ mod arm64 {
                             site,
                             cage_base,
                             view.object_shape_byte,
+                            view.jit_proto_byte,
+                            view.closure_fid_byte,
                             bail,
                             threw,
                         )?,
@@ -2093,14 +2078,36 @@ mod arm64 {
     /// other op — notably a property/element store — aborts the inline attempt,
     /// so a method with a side effect keeps using the full method call.
     fn is_inline_method_op(op: Op) -> bool {
-        is_inline_pure_op(op) || matches!(op, Op::LoadThis | Op::LoadProperty)
+        is_inline_pure_op(op) || matches!(op, Op::LoadThis | Op::LoadProperty | Op::StoreProperty)
+    }
+
+    /// Ops that cannot bail once emitted, so they are safe to run *after* an
+    /// inline `StoreProperty` has already mutated the receiver (a bail there
+    /// would re-run the whole method in the interpreter and double-apply the
+    /// store). Loads of immediates/locals and `Return*` qualify; anything that
+    /// can guard-and-bail (property access, arithmetic, coercions) does not.
+    fn is_nonbailing_after_store(op: Op) -> bool {
+        matches!(
+            op,
+            Op::LoadThis
+                | Op::LoadInt32
+                | Op::LoadLocal
+                | Op::LoadUndefined
+                | Op::LoadHole
+                | Op::LoadTrue
+                | Op::LoadFalse
+                | Op::StoreLocal
+                | Op::Return
+                | Op::ReturnValue
+                | Op::ReturnUndefined
+        )
     }
 
     /// Emit one op of an inlined method body. `this_slot` is the scratch slot
-    /// holding the receiver; `prop_offsets` maps a body `LoadProperty` byte-PC to
-    /// the baked value byte offset from the decompressed receiver. `LoadThis`
-    /// and `LoadProperty` are handled here; every other op routes to
-    /// [`emit_inline_pure_op`].
+    /// holding the receiver; `prop_offsets` maps a body `LoadProperty` /
+    /// `StoreProperty` byte-PC to the baked value byte offset from the
+    /// decompressed receiver. `LoadThis`, `LoadProperty`, and `StoreProperty`
+    /// are handled here; every other op routes to [`emit_inline_pure_op`].
     #[allow(clippy::too_many_arguments)]
     fn emit_inline_method_op(
         ops: &mut Assembler,
@@ -2108,6 +2115,8 @@ mod arm64 {
         this_slot: u16,
         prop_offsets: &rustc_hash::FxHashMap<u32, u32>,
         cage_base: usize,
+        recv_shape: u32,
+        object_shape_byte: u32,
         bail: DynamicLabel,
         inline_done: DynamicLabel,
         clabels: &BTreeMap<u32, DynamicLabel>,
@@ -2144,23 +2153,82 @@ mod arm64 {
                 store_reg(ops, 9, dst)?;
                 Ok(())
             }
+            Op::StoreProperty => {
+                // Sealed in-object store `recv.<prop> = src`. The receiver shape
+                // is re-guarded (the baked offset is only valid for it) and the
+                // value is required to be a non-`Gc` primitive — a pointer value
+                // would need a generational write barrier that cannot run in the
+                // remapped scratch window, so it bails *before* writing and the
+                // interpreter re-runs the store with the barrier. Every guard
+                // here bails ahead of the `str`, so no mutation is lost on a
+                // fallback; the site emitter forbids any later bailing op.
+                let obj = reg(ops_ref, 0)?;
+                let src = reg(ops_ref, 2)?;
+                let off = *prop_offsets
+                    .get(&instr.byte_pc)
+                    .ok_or(Unsupported::ArgCount(0))?;
+                load_reg(ops, 9, obj)?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; lsr x10, x9, #48
+                    ; movz x11, TAG_PTR_OBJECT as u32
+                    ; cmp x10, x11
+                    ; b.ne =>bail
+                    ; mov w12, w9
+                );
+                emit_load_u64(ops, 13, cage_base as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; add x13, x13, x12
+                    ; ldrb w14, [x13]
+                    ; cmp w14, OBJECT_BODY_TYPE_TAG
+                    ; b.ne =>bail
+                    ; ldr w14, [x13, object_shape_byte]
+                    ; movz w15, recv_shape & 0xffff
+                    ; movk w15, (recv_shape >> 16) & 0xffff, lsl #16
+                    ; cmp w14, w15
+                    ; b.ne =>bail
+                );
+                let store_ok = ops.new_dynamic_label();
+                load_reg(ops, 9, src)?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    // Gc-pointer tags are exactly 0x7FFC..=0x7FFF; bail on any of
+                    // them so only barrier-free primitive stores are inlined.
+                    // Tags below 0x7FFC (doubles/int/special/function-id) and at
+                    // or above 0x8000 (negative doubles) are non-`Gc`.
+                    ; lsr x10, x9, #48
+                    ; movz x11, TAG_PTR_OBJECT as u32
+                    ; cmp x10, x11
+                    ; b.lo =>store_ok
+                    ; movz x11, 0x8000
+                    ; cmp x10, x11
+                    ; b.hs =>store_ok
+                    ; b =>bail
+                    ; =>store_ok
+                    ; str x9, [x13, off]
+                );
+                Ok(())
+            }
             _ => emit_inline_pure_op(ops, instr, bail, inline_done, clabels),
         }
     }
 
     /// Try to splice `method`'s body into the current `Op::CallMethodValue` site
     /// instead of building a callee frame. Returns `Ok(true)` when inlined,
-    /// `Ok(false)` when the method fails the read-only / size / arity test (the
+    /// `Ok(false)` when the method fails the op-allowlist / size / arity test (the
     /// caller then emits the normal method-call bridge).
     ///
-    /// Soundness: the body runs only after (a) the call site still resolves to
-    /// the speculated method id — re-checked every call through the IC, so a
-    /// prototype-method reassignment falls back — and (b) the receiver shape
-    /// matches the one the sealed loads were baked against. Both misses jump to
-    /// the in-place full method call (not a bail). The receiver is the only heap
-    /// value the body touches and it is read-only, so the spliced body has no GC
-    /// point; it runs in a native-stack scratch window with `x19` repointed,
-    /// restored on every exit.
+    /// Soundness: the body runs only after the inline identity guard confirms (a)
+    /// the receiver shape matches the baked one, and (b) the receiver's flat
+    /// prototype still resolves the method slot to the baked `function_id` — both
+    /// re-read every call, so a prototype-method reassignment falls back to the
+    /// in-place full method call (not a bail). The body touches only the
+    /// receiver and performs no allocation, so it has no GC point; it runs in a
+    /// native-stack scratch window with `x19` repointed, restored on every exit.
+    /// A body `StoreProperty` mutates the receiver in place: every store guard
+    /// bails *before* the write, and the emitter rejects any bailing op after a
+    /// store, so a fallback never double-applies a mutation.
     #[allow(clippy::too_many_arguments)]
     fn try_emit_inline_method_call(
         ops: &mut Assembler,
@@ -2169,12 +2237,13 @@ mod arm64 {
         site: u64,
         cage_base: usize,
         object_shape_byte: u32,
+        jit_proto_byte: u32,
+        closure_fid_byte: u32,
         bail: DynamicLabel,
         threw: DynamicLabel,
     ) -> Result<bool, Unsupported> {
         let dst = reg(call_operands, 0)?;
         let recv_reg = reg(call_operands, 1)?;
-        let name = const_index(call_operands, 2)?;
         let argc = const_index(call_operands, 3)? as usize;
 
         if cage_base == 0
@@ -2190,6 +2259,19 @@ mod arm64 {
             return Ok(false);
         }
 
+        // An inline `StoreProperty` mutates the receiver in place; a later bail
+        // would re-run the whole method in the interpreter and double-apply the
+        // store. Refuse to inline any body where a bailing op can follow a store.
+        let mut store_seen = false;
+        for i in &method.instructions {
+            if store_seen && !is_nonbailing_after_store(i.op) {
+                return Ok(false);
+            }
+            if i.op == Op::StoreProperty {
+                store_seen = true;
+            }
+        }
+
         let mut clabels: BTreeMap<u32, DynamicLabel> = BTreeMap::new();
         for i in &method.instructions {
             clabels.insert(i.byte_pc, ops.new_dynamic_label());
@@ -2198,31 +2280,20 @@ mod arm64 {
         let inline_bail = ops.new_dynamic_label();
         let fallback = ops.new_dynamic_label();
         let after = ops.new_dynamic_label();
+        let fid_immediate = ops.new_dynamic_label();
+        let fid_compare = ops.new_dynamic_label();
         // One extra slot past the method register window holds `this`.
         let this_slot = method.register_count;
         let scratch_regs = u32::from(method.register_count) + 1;
         let scratch_bytes = (scratch_regs * 8).next_multiple_of(16);
 
-        // Identity guard: re-resolve the method id and compare to the baked one.
-        // `jit_resolve_inline_method_stub(ctx, recv_reg, name, site) -> fid`.
-        dynasm!(ops
-            ; .arch aarch64
-            ; mov x0, x20
-            ; movz x1, recv_reg as u32
-        );
-        emit_load_u64(ops, 2, u64::from(name));
-        emit_load_u64(ops, 3, site);
-        emit_load_u64(ops, 16, jit_resolve_inline_method_stub as *const () as u64);
-        emit_load_u64(ops, 17, u64::from(method.method_fid));
-        dynasm!(ops
-            ; .arch aarch64
-            ; blr x16
-            ; cmp x0, x17
-            ; b.ne =>fallback
-        );
-
-        // Receiver shape guard (x19 = caller frame base): decompress the receiver
-        // and require its shape to match the baked one, else fall back.
+        // Inline identity guard, no per-call resolve bridge. Decompress the
+        // receiver (x19 = caller frame base), require its shape to match the
+        // baked one, then chase its flat prototype, guard the prototype's shape,
+        // read the method slot, and compare the resolved closure's `function_id`
+        // to the baked method id. Re-reading the prototype slot every call keeps
+        // this sound against prototype-method reassignment: any mismatch (shape,
+        // tag, slot tag, or id) lands on the in-place full method call.
         let recv_off = reg_offset(recv_reg)?;
         dynasm!(ops
             ; .arch aarch64
@@ -2243,6 +2314,56 @@ mod arm64 {
             ; ldr w14, [x13, object_shape_byte]
             ; movz w15, method.recv_shape & 0xffff
             ; movk w15, (method.recv_shape >> 16) & 0xffff, lsl #16
+            ; cmp w14, w15
+            ; b.ne =>fallback
+            // Flat prototype: load the compressed handle, bail on null, then
+            // decompress and guard the prototype object's shape.
+            ; ldr w9, [x13, jit_proto_byte]
+            ; cbz w9, =>fallback
+        );
+        emit_load_u64(ops, 12, cage_base as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x13, x12, x9
+            ; ldrb w14, [x13]
+            ; cmp w14, OBJECT_BODY_TYPE_TAG
+            ; b.ne =>fallback
+            ; ldr w14, [x13, object_shape_byte]
+            ; movz w15, method.proto_shape & 0xffff
+            ; movk w15, (method.proto_shape >> 16) & 0xffff, lsl #16
+            ; cmp w14, w15
+            ; b.ne =>fallback
+            // Method slot: load the 64-bit Value. A resolved method is either a
+            // closure-less bytecode reference (`TAG_FUNCTION_ID`, fid in the low
+            // 32 bits) or a closure pointer (`TAG_PTR_FUNCTION` → `JsClosureBody`,
+            // fid read from its body). Decode the function id into w14 either way,
+            // then compare to the baked id; anything else falls back.
+            ; ldr x9, [x13, method.method_value_byte]
+            ; lsr x10, x9, #48
+            ; movz x11, TAG_FUNCTION_ID as u32
+            ; cmp x10, x11
+            ; b.eq =>fid_immediate
+            ; movz x11, TAG_PTR_FUNCTION as u32
+            ; cmp x10, x11
+            ; b.ne =>fallback
+            ; mov w12, w9
+        );
+        emit_load_u64(ops, 11, cage_base as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x11, x11, x12
+            // Require a closure body (a native method shares TAG_PTR_FUNCTION but
+            // has no bytecode id at this offset), then read `function_id`.
+            ; ldrb w14, [x11]
+            ; cmp w14, JS_CLOSURE_BODY_TYPE_TAG
+            ; b.ne =>fallback
+            ; ldr w14, [x11, closure_fid_byte]
+            ; b =>fid_compare
+            ; =>fid_immediate
+            ; mov w14, w9
+            ; =>fid_compare
+            ; movz w15, method.method_fid & 0xffff
+            ; movk w15, (method.method_fid >> 16) & 0xffff, lsl #16
             ; cmp w14, w15
             ; b.ne =>fallback
         );
@@ -2272,6 +2393,8 @@ mod arm64 {
                 this_slot,
                 &method.prop_offsets,
                 cage_base,
+                method.recv_shape,
+                object_shape_byte,
                 inline_bail,
                 inline_done,
                 &clabels,
@@ -3015,6 +3138,8 @@ mod tests {
             cage_base: 0,
             ta_layout: otter_vm::JitTypedArrayLayout::default(),
             object_shape_byte: 8,
+            jit_proto_byte: 12,
+            closure_fid_byte: 8,
             instructions,
             inline_callees: Default::default(),
             inline_methods: Default::default(),

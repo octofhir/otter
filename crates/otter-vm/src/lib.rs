@@ -164,7 +164,7 @@ pub(crate) use error_ops::{
     native_to_vm_error, snapshot_frames, symbol_to_vm_error, vm_err_to_value,
 };
 use executable::ExecutableFunction;
-use operand_decode::{apply_branch, register_operand};
+use operand_decode::{apply_branch, const_operand, register_operand};
 
 pub use array::JsArray;
 pub use closure::{
@@ -337,12 +337,37 @@ pub(crate) enum CallTargetFeedback {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MethodCallFeedback {
     /// One method function id and one receiver shape observed so far.
+    ///
+    /// `proto_shape` is the shape of the prototype object that holds the
+    /// method slot, and `method_value_byte` is that slot's byte offset within
+    /// the prototype body — both captured at record time from the live
+    /// receiver so the baseline can bake a fully-inline identity guard (read
+    /// the receiver's flat prototype, guard its shape, load the slot, compare
+    /// the closure's `function_id`) with no per-call resolve bridge.
     Mono {
         method_fid: u32,
         recv_shape: object::ShapeHandle,
+        proto_shape: object::ShapeHandle,
+        method_value_byte: u32,
     },
-    /// Receiver shape or resolved method varied; not inlinable.
+    /// Receiver shape, prototype shape, method slot, or resolved method
+    /// varied; not inlinable.
     Poly,
+}
+
+/// Receiver/prototype layout snapshot for one observed `Op::CallMethodValue`,
+/// captured from the live receiver *before* the call (the receiver handle may
+/// move during the call, so its prototype shape and method slot offset are
+/// resolved while it is still valid). Folded into [`MethodCallFeedback`] once
+/// the resolved method id is known.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MethodSite {
+    /// Receiver hidden-class handle (immortal).
+    recv_shape: object::ShapeHandle,
+    /// Shape of the prototype object holding the method slot (immortal).
+    proto_shape: object::ShapeHandle,
+    /// Byte offset of the method's inline value slot within the prototype body.
+    method_value_byte: u32,
 }
 
 /// Match-based dispatch loop. The harness baseline; slice tasks may
@@ -1891,47 +1916,6 @@ impl Interpreter {
         }
     }
 
-    /// Resolve the current method function id for an inlined `CallMethodValue`
-    /// site, so emitted code can confirm the receiver still resolves `name` to
-    /// the speculated method before running a spliced body. Re-reads the method
-    /// through the call site's load IC every call, so a prototype method
-    /// reassignment (which leaves the receiver shape unchanged) is observed and
-    /// makes the inline guard fall back to the full method call. Returns the
-    /// method's bytecode function id, or `u32::MAX` for any non-object receiver,
-    /// IC miss, or non-bytecode method.
-    pub fn jit_resolve_inline_method_fid(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &jit::JitFrameStack,
-        frame_index: usize,
-        recv_reg: u16,
-        name_idx: u32,
-        site: usize,
-    ) -> u32 {
-        let Some(recv) = stack
-            .get(frame_index)
-            .and_then(|f| f.registers.get(recv_reg as usize).copied())
-        else {
-            return u32::MAX;
-        };
-        let Some(obj) = recv.as_object() else {
-            return u32::MAX;
-        };
-        let Some(key) = context.property_atom(name_idx) else {
-            return u32::MAX;
-        };
-        let Some(method) = self.resolve_method_ic(obj, key, site) else {
-            return u32::MAX;
-        };
-        if let Some(fid) = method.as_function() {
-            fid
-        } else if let Some(c) = method.as_closure(&self.gc_heap) {
-            c.function_id()
-        } else {
-            u32::MAX
-        }
-    }
-
     /// Finish a direct compiled call that returned normally.
     ///
     /// Pops and reclaims the published callee frame, stores `value` into the
@@ -2335,7 +2319,7 @@ impl Interpreter {
         caller_fid: u32,
         call_byte_pc: u32,
         method_fid: u32,
-        recv_shape: object::ShapeHandle,
+        site: MethodSite,
     ) {
         use std::collections::hash_map::Entry;
         let newly_mono = match self
@@ -2345,7 +2329,9 @@ impl Interpreter {
             Entry::Vacant(slot) => {
                 slot.insert(MethodCallFeedback::Mono {
                     method_fid,
-                    recv_shape,
+                    recv_shape: site.recv_shape,
+                    proto_shape: site.proto_shape,
+                    method_value_byte: site.method_value_byte,
                 });
                 true
             }
@@ -2353,8 +2339,13 @@ impl Interpreter {
                 if let MethodCallFeedback::Mono {
                     method_fid: seen_fid,
                     recv_shape: seen_shape,
+                    proto_shape: seen_proto_shape,
+                    method_value_byte: seen_value_byte,
                 } = *slot.get()
-                    && (seen_fid != method_fid || seen_shape.offset() != recv_shape.offset())
+                    && (seen_fid != method_fid
+                        || seen_shape.offset() != site.recv_shape.offset()
+                        || seen_proto_shape.offset() != site.proto_shape.offset()
+                        || seen_value_byte != site.method_value_byte)
                 {
                     slot.insert(MethodCallFeedback::Poly);
                 }
@@ -2433,18 +2424,26 @@ impl Interpreter {
         // Method-call sites: snapshot the monomorphic ones first so the per-site
         // `shape_offset_of` (which needs `&mut self`) does not alias the feedback
         // map borrow.
-        let method_sites: Vec<(u32, u32, object::ShapeHandle)> = self
+        let method_sites: Vec<(u32, u32, object::ShapeHandle, object::ShapeHandle, u32)> = self
             .jit_method_site_feedback
             .iter()
             .filter_map(|(&(caller_fid, byte_pc), state)| match *state {
                 MethodCallFeedback::Mono {
                     method_fid,
                     recv_shape,
-                } if caller_fid == fid => Some((byte_pc, method_fid, recv_shape)),
+                    proto_shape,
+                    method_value_byte,
+                } if caller_fid == fid => Some((
+                    byte_pc,
+                    method_fid,
+                    recv_shape,
+                    proto_shape,
+                    method_value_byte,
+                )),
                 _ => None,
             })
             .collect();
-        for (byte_pc, method_fid, recv_shape) in method_sites {
+        for (byte_pc, method_fid, recv_shape, proto_shape, method_value_byte) in method_sites {
             let Some(method) = context.exec_function(method_fid) else {
                 continue;
             };
@@ -2462,19 +2461,22 @@ impl Interpreter {
             let Some(method_view) = context.jit_function_view(method_fid) else {
                 continue;
             };
-            // Resolve every body `LoadProperty` to a sealed value byte offset in
-            // the receiver shape; bail out of inlining the site if any property
-            // is absent, an accessor, or spills past the inline value capacity.
+            // Resolve every body `LoadProperty`/`StoreProperty` to a sealed value
+            // byte offset in the receiver shape; bail out of inlining the site if
+            // any property is absent, an accessor, or spills past the inline value
+            // capacity. Loads carry the name at operand 2, stores at operand 1.
             let header = otter_gc::header::HEADER_SIZE as u32;
             let mut prop_offsets: rustc_hash::FxHashMap<u32, u32> =
                 rustc_hash::FxHashMap::default();
             let mut ok = true;
             for instr in &method_view.instructions {
-                if instr.op != Op::LoadProperty {
-                    continue;
-                }
+                let name_operand = match instr.op {
+                    Op::LoadProperty => 2,
+                    Op::StoreProperty => 1,
+                    _ => continue,
+                };
                 let Some(otter_bytecode::Operand::ConstIndex(name_idx)) =
-                    instr.operands.get(2).copied()
+                    instr.operands.get(name_operand).copied()
                 else {
                     ok = false;
                     break;
@@ -2504,6 +2506,8 @@ impl Interpreter {
                 jit::JitInlineMethod {
                     method_fid,
                     recv_shape: recv_shape.offset(),
+                    proto_shape: proto_shape.offset(),
+                    method_value_byte,
                     param_count: method_view.param_count,
                     register_count: method_view.register_count,
                     instructions: method_view.instructions,
@@ -5369,12 +5373,14 @@ impl Interpreter {
                 Op::CallMethodValue => {
                     let operands = context.exec_operands(instr);
                     let depth_before = stack.len();
-                    // Capture the receiver shape before the call for method-inline
-                    // feedback (the receiver register lives in the caller frame,
-                    // which `do_call_method_value` leaves in place under the new
-                    // callee frame).
-                    let recv_shape = if self.jit_hook.is_some() {
-                        register_operand(context.exec_operand(instr, 1))
+                    // Capture the receiver/prototype layout before the call for
+                    // method-inline feedback (the receiver register lives in the
+                    // caller frame, which `do_call_method_value` leaves in place
+                    // under the new callee frame; the receiver handle may move
+                    // during the call, so the prototype shape and method slot are
+                    // resolved here while it is still valid).
+                    let method_site = if self.jit_hook.is_some() {
+                        let shapes = register_operand(context.exec_operand(instr, 1))
                             .ok()
                             .and_then(|r| {
                                 stack
@@ -5382,8 +5388,37 @@ impl Interpreter {
                                     .and_then(|f| f.registers.get(r as usize).copied())
                             })
                             .and_then(|v| v.as_object())
-                            .map(|obj| crate::object::shape(obj, &self.gc_heap))
-                            .filter(|s| !s.is_null())
+                            .and_then(|recv| {
+                                let recv_shape = crate::object::shape(recv, &self.gc_heap);
+                                if recv_shape.is_null() {
+                                    return None;
+                                }
+                                let proto = crate::object::prototype(recv, &self.gc_heap)?;
+                                let proto_shape = crate::object::shape(proto, &self.gc_heap);
+                                if proto_shape.is_null() {
+                                    return None;
+                                }
+                                Some((recv_shape, proto_shape))
+                            });
+                        let name = const_operand(context.exec_operand(instr, 2))
+                            .ok()
+                            .and_then(|idx| context.property_atom(idx));
+                        match (shapes, name) {
+                            (Some((recv_shape, proto_shape)), Some(name)) => self
+                                .shape_offset_of(proto_shape, name.name())
+                                .filter(|&slot| (slot as usize) < crate::object::INLINE_VALUE_CAP)
+                                .map(|slot| {
+                                    let method_value_byte = otter_gc::header::HEADER_SIZE as u32
+                                        + crate::object::OBJECT_BODY_INLINE_VALUES_OFFSET as u32
+                                        + slot * std::mem::size_of::<Value>() as u32;
+                                    MethodSite {
+                                        recv_shape,
+                                        proto_shape,
+                                        method_value_byte,
+                                    }
+                                }),
+                            _ => None,
+                        }
                     } else {
                         None
                     };
@@ -5392,8 +5427,8 @@ impl Interpreter {
                     // callee pushed via `invoke` lands as a fresh pc==0 frame.
                     if self.jit_hook.is_some() && stack.len() > depth_before {
                         let method_fid = stack[stack.len() - 1].function_id;
-                        if let Some(shape) = recv_shape {
-                            self.note_method_target(function_id, pc, method_fid, shape);
+                        if let Some(site) = method_site {
+                            self.note_method_target(function_id, pc, method_fid, site);
                         }
                         if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context)? {
                             return Ok(value);

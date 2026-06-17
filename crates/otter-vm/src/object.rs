@@ -432,6 +432,17 @@ pub struct ObjectBody {
     /// has no niche and the discriminant offset would not give a
     /// `RawGc`-aligned slot).
     prototype: ObjectPrototype,
+    /// Flat `[[Prototype]]` mirror for the JIT: the ordinary-object
+    /// prototype as a bare [`JsObject`], or [`otter_gc::Gc::null()`] when
+    /// [`Self::prototype`] is `Null`, a non-object `Value`, or a `Proxy`.
+    /// The [`ObjectPrototype`] enum cannot be read inline from machine code
+    /// (its variant lives behind a discriminant), so the method-inline guard
+    /// loads this fixed-offset compressed handle, decompresses it, and reads
+    /// the prototype's shape to verify the resolved method identity without a
+    /// per-call resolve bridge. Maintained in lockstep with `prototype` (the
+    /// sole writer is [`set_prototype_value`]); traced as a distinct GC slot
+    /// so the moving collector forwards it independently of the enum field.
+    jit_proto: JsObject,
     /// Symbol-keyed own properties. Stored outside the string-keyed
     /// shape because symbols are identity keys, but values still use
     /// the same descriptor slot representation.
@@ -495,10 +506,17 @@ pub(crate) const OBJECT_BODY_SHAPE_OFFSET: usize = std::mem::offset_of!(ObjectBo
 pub(crate) const OBJECT_BODY_INLINE_VALUES_OFFSET: usize =
     std::mem::offset_of!(ObjectBody, inline_values);
 
+/// Byte offset of the flat [`ObjectBody::jit_proto`] mirror within an
+/// [`ObjectBody`] payload. The method-inline guard reads the receiver's
+/// prototype handle here to chase the prototype chain in machine code.
+pub(crate) const OBJECT_BODY_JIT_PROTO_OFFSET: usize = std::mem::offset_of!(ObjectBody, jit_proto);
+
 // The JIT bakes these offsets into emitted property loads; pin them.
 const _: () = assert!(OBJECT_BODY_SHAPE_OFFSET == 0);
 const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET >= 8);
 const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET.is_multiple_of(8));
+const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET >= 8);
+const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET.is_multiple_of(4));
 
 impl ObjectBody {
     /// Read the data value for string-keyed slot `i` from flat storage.
@@ -639,6 +657,13 @@ impl otter_gc::SafeTraceable for ObjectBody {
                 proxy.trace_value_slots(v);
             }
         }
+        // The flat JIT prototype mirror is a distinct slot from the enum's
+        // `Object` variant handle; the moving collector must forward it on its
+        // own so a baked inline guard never decompresses a stale offset.
+        if !self.jit_proto.is_null() {
+            let p = &self.jit_proto as *const JsObject as *mut RawGc;
+            v(p);
+        }
         debug_assert_eq!(
             self.overflow_values.len(),
             self.slots.len().saturating_sub(INLINE_VALUE_CAP),
@@ -728,6 +753,7 @@ fn empty_object_body() -> ObjectBody {
         shape_cache_mode: ShapeCacheMode::Fast,
         slots: SmallVec::new(),
         prototype: ObjectPrototype::Null,
+        jit_proto: otter_gc::Gc::null(),
         symbol_props: Vec::new(),
         host_data: None,
         call_native: None,
@@ -839,6 +865,7 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
             shape_cache_mode: ShapeCacheMode::Fast,
             slots: SmallVec::new(),
             prototype: ObjectPrototype::Null,
+            jit_proto: otter_gc::Gc::null(),
             symbol_props: Vec::new(),
             host_data: Some(Box::new(data)),
             call_native: None,
@@ -876,6 +903,7 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
             shape_cache_mode: ShapeCacheMode::Fast,
             slots: SmallVec::new(),
             prototype: ObjectPrototype::Null,
+            jit_proto: otter_gc::Gc::null(),
             symbol_props: Vec::new(),
             host_data: Some(Box::new(data)),
             call_native: None,
@@ -2124,8 +2152,15 @@ pub fn set_prototype_value(
         }
     }
     let barrier_value = new_proto.as_value();
+    let jit_proto = match &new_proto {
+        ObjectPrototype::Object(o) => *o,
+        ObjectPrototype::Null | ObjectPrototype::Value(_) | ObjectPrototype::Proxy(_) => {
+            otter_gc::Gc::null()
+        }
+    };
     heap.with_payload(obj, |body| {
         body.prototype = new_proto;
+        body.jit_proto = jit_proto;
     });
     if let Some(value) = &barrier_value {
         heap.record_write(obj, value);

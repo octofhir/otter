@@ -75,6 +75,17 @@ pub struct JitFunctionView {
     /// emitter reads `[obj_ptr + object_shape_byte]` for the WhiskerIC
     /// `LoadProperty` cell guard, staying layout-agnostic.
     pub object_shape_byte: u32,
+    /// Byte offset from a decompressed object pointer to its flat
+    /// `[[Prototype]]` mirror (`HEADER_SIZE + OBJECT_BODY_JIT_PROTO_OFFSET`). A
+    /// `#[repr(C)]` constant; the method-inline guard reads
+    /// `[recv_ptr + jit_proto_byte]` to chase the receiver's prototype chain
+    /// in machine code without a resolve bridge.
+    pub jit_proto_byte: u32,
+    /// Byte offset from a decompressed closure pointer to its `function_id`
+    /// (`HEADER_SIZE + offset_of!(JsClosureBody, function_id)`). The
+    /// method-inline guard reads `[closure_ptr + closure_fid_byte]` to compare
+    /// a resolved prototype method against the baked target id.
+    pub closure_fid_byte: u32,
     /// Instruction stream in byte-PC order.
     pub instructions: Vec<JitInstrView>,
     /// Inline-candidate callees for baseline leaf-inlining, keyed by the
@@ -88,7 +99,8 @@ pub struct JitFunctionView {
     pub inline_callees: rustc_hash::FxHashMap<u32, JitInlineCallee>,
     /// Inline-candidate methods for `Op::CallMethodValue` sites, keyed by the
     /// caller's call byte-PC. Populated for monomorphic method sites whose method
-    /// is a tiny read-only body; baked by `Interpreter::bake_inline_callees`.
+    /// is a tiny body of sealed property loads/stores and pure ops; baked by
+    /// `Interpreter::bake_inline_callees`.
     pub inline_methods: rustc_hash::FxHashMap<u32, JitInlineMethod>,
 }
 
@@ -112,16 +124,29 @@ pub struct JitInlineCallee {
 
 /// A method the baseline may splice into a caller's `Op::CallMethodValue` site.
 /// Carries the method's body plus the data to guard it: the receiver shape the
-/// body's sealed property loads are baked against, and, per body `LoadProperty`
-/// byte-PC, the value byte offset to load from the decompressed receiver.
-/// Method identity is verified at run time by re-resolving through the call
-/// site's IC (so a prototype-method reassignment falls back), not baked here.
+/// body's sealed property loads/stores are baked against, and, per body
+/// `LoadProperty`/`StoreProperty` byte-PC, the value byte offset within the
+/// decompressed receiver.
+/// Method identity is verified inline every call: the emitter loads the
+/// receiver's flat prototype handle, guards the prototype's shape against
+/// [`proto_shape`](Self::proto_shape), reads the method slot at
+/// [`method_value_byte`](Self::method_value_byte), and compares the resolved
+/// closure's `function_id` to [`method_fid`](Self::method_fid). A
+/// prototype-method reassignment or shape change falls back to the in-place
+/// method call — no per-call resolve bridge.
 #[derive(Debug, Clone)]
 pub struct JitInlineMethod {
     /// Method function id the call-site identity check is keyed on.
     pub method_fid: u32,
     /// Receiver shape-handle compressed offset the sealed loads are baked for.
     pub recv_shape: u32,
+    /// Receiver prototype shape-handle compressed offset the inline identity
+    /// guard requires (the shape of the object holding the method slot).
+    pub proto_shape: u32,
+    /// Byte offset from the decompressed prototype pointer to the method's
+    /// inline value slot (`HEADER_SIZE + OBJECT_BODY_INLINE_VALUES_OFFSET +
+    /// slot * size_of::<Value>()`), baked from the prototype shape.
+    pub method_value_byte: u32,
     /// Method formal parameter count (excluding `this`); must equal argc.
     pub param_count: u16,
     /// Method register-window length; the body runs in a scratch block of this
@@ -129,8 +154,8 @@ pub struct JitInlineMethod {
     pub register_count: u16,
     /// Method instruction stream, emitted inline.
     pub instructions: Vec<JitInstrView>,
-    /// Body `LoadProperty` byte-PC → value byte offset from the decompressed
-    /// receiver pointer, baked from the receiver shape.
+    /// Body `LoadProperty`/`StoreProperty` byte-PC → value byte offset from the
+    /// decompressed receiver pointer, baked from the receiver shape.
     pub prop_offsets: rustc_hash::FxHashMap<u32, u32>,
 }
 

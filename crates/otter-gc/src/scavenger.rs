@@ -510,7 +510,12 @@ unsafe fn scan_old_dirty_cards(ctx: &mut ScavCtx) {
             page_header.clear_cards();
             if any_dirty {
                 let header_ptr = base.add(PAGE_HEADER_SIZE) as *mut GcHeader;
-                if (*header_ptr).size_bytes() != 0 {
+                // Skip swept corpses: a full-GC sweep drops dead old/large
+                // objects in place (freeing their payload buffers, e.g. a
+                // string `Vec<u16>`) but leaves the header walkable. Tracing
+                // such a corpse would read its freed — and possibly reused —
+                // backing as live GC slots (use-after-free).
+                if (*header_ptr).size_bytes() != 0 && !(*header_ptr).is_swept() {
                     trace_one(ctx, header_ptr);
                 }
             }
@@ -543,7 +548,13 @@ unsafe fn scan_old_dirty_cards(ctx: &mut ScavCtx) {
                 let overlaps = dirty
                     .iter()
                     .any(|&card_off| body_start < card_off + CARD_SIZE && body_end > card_off);
-                if overlaps {
+                // Skip swept corpses: a full-GC sweep drops dead old objects
+                // in place (freeing payload buffers like a string `Vec<u16>`)
+                // but leaves the header on the page for stride-walking. Tracing
+                // a corpse reads its freed/reused backing as live GC slots — the
+                // use-after-free that surfaced as "ab" string units appearing in
+                // a closure's upvalue `Gc` slot during dirty-card scan.
+                if overlaps && !(*header_ptr).is_swept() {
                     trace_one(ctx, header_ptr);
                 }
                 hoff = body_end;

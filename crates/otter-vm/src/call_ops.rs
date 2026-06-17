@@ -1723,6 +1723,52 @@ impl Interpreter {
     /// completion path (the callee frame is popped), so it is immediately
     /// reusable for the next call. A generator callee consumes the frame into a
     /// generator object and leaves `inner` untouched.
+    /// If `callback` is a plain bytecode function/closure eligible for the lean
+    /// per-element invoke path (not native/bound/proxy/generator/async/…), enter
+    /// the sync-reentry guard once and draw ONE reservation-stable stack for the
+    /// whole callback-driving loop; otherwise `None`. The caller then invokes
+    /// the callback via [`Self::run_bytecode_callable_committed`] on the returned
+    /// stack per element, and MUST pass the result to
+    /// [`Self::release_lean_callback_stack`] on every completion path.
+    /// `function_id` is shape-stable, so resolving eligibility once is valid for
+    /// the whole loop.
+    pub(crate) fn acquire_lean_callback_stack(
+        &mut self,
+        context: &ExecutionContext,
+        callback: Value,
+    ) -> Option<HoltStack> {
+        let fid = callback
+            .as_closure(&self.gc_heap)
+            .map(|c| c.function_id())
+            .or_else(|| callback.as_function());
+        let eligible = fid
+            .and_then(|fid| context.exec_function(fid))
+            .is_some_and(|f| {
+                !f.is_generator
+                    && !f.is_async
+                    && !f.is_async_generator
+                    && !f.needs_arguments
+                    && !f.has_rest
+                    && !f.makes_function
+                    && !f.contains_direct_eval
+                    && !f.is_derived_constructor
+            });
+        if eligible && self.enter_sync_reentry().is_ok() {
+            Some(self.draw_stack())
+        } else {
+            None
+        }
+    }
+
+    /// Return the lean-path stack to the pool and leave the sync-reentry guard
+    /// entered by [`Self::acquire_lean_callback_stack`]. No-op for `None`.
+    pub(crate) fn release_lean_callback_stack(&mut self, stack: Option<HoltStack>) {
+        if let Some(stack) = stack {
+            self.return_stack(stack);
+            self.leave_sync_reentry();
+        }
+    }
+
     pub(crate) fn run_bytecode_callable_committed(
         &mut self,
         inner: &mut HoltStack,

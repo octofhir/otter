@@ -1294,6 +1294,7 @@ impl Interpreter {
         x: Value,
         y: Value,
         comparefn: Value,
+        lean_inner: Option<&mut crate::holt_stack::HoltStack>,
     ) -> Result<std::cmp::Ordering, VmError> {
         use std::cmp::Ordering;
         let x_undef = x.is_undefined();
@@ -1309,7 +1310,16 @@ impl Interpreter {
         }
         if !comparefn.is_undefined() {
             let args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![x, y];
-            let r = self.run_callable_sync(context, &comparefn, Value::undefined(), args)?;
+            let r = match lean_inner {
+                Some(inner) => self.run_bytecode_callable_committed(
+                    inner,
+                    context,
+                    comparefn,
+                    Value::undefined(),
+                    args,
+                ),
+                None => self.run_callable_sync(context, &comparefn, Value::undefined(), args),
+            }?;
             let n = self.coerce_to_number(context, &r)?;
             let f = n.as_f64();
             return Ok(if f.is_nan() {
@@ -1334,6 +1344,7 @@ impl Interpreter {
         context: &ExecutionContext,
         items: Vec<Value>,
         comparefn: Value,
+        mut lean_inner: Option<&mut crate::holt_stack::HoltStack>,
     ) -> Result<Vec<Value>, VmError> {
         use std::cmp::Ordering;
         let n = items.len();
@@ -1343,13 +1354,20 @@ impl Interpreter {
         let mid = n / 2;
         let mut left = items;
         let right = left.split_off(mid);
-        let left = self.sort_merge(context, left, comparefn)?;
-        let right = self.sort_merge(context, right, comparefn)?;
+        let left = self.sort_merge(context, left, comparefn, lean_inner.as_deref_mut())?;
+        let right = self.sort_merge(context, right, comparefn, lean_inner.as_deref_mut())?;
         let mut out = Vec::with_capacity(n);
         let (mut i, mut j) = (0usize, 0usize);
         while i < left.len() && j < right.len() {
             // Stable: keep the left element on a tie.
-            if self.sort_compare(context, left[i], right[j], comparefn)? != Ordering::Greater {
+            if self.sort_compare(
+                context,
+                left[i],
+                right[j],
+                comparefn,
+                lean_inner.as_deref_mut(),
+            )? != Ordering::Greater
+            {
                 out.push(left[i]);
                 i += 1;
             } else {
@@ -1397,7 +1415,15 @@ impl Interpreter {
             }
         }
         let item_count = items.len();
-        let sorted = self.sort_merge(context, items, comparefn)?;
+        // Lean comparator invocation: when the comparator is a plain bytecode
+        // closure, drive every `sort_compare` call through the committed
+        // bytecode tail on ONE reservation-stable stack (see
+        // `acquire_lean_callback_stack`). The `?` below cannot early-return
+        // before release: capture the result and release on both paths.
+        let mut lean = self.acquire_lean_callback_stack(context, comparefn);
+        let sorted = self.sort_merge(context, items, comparefn, lean.as_mut());
+        self.release_lean_callback_stack(lean);
+        let sorted = sorted?;
         // §23.1.3.30 steps 8-9 — write the sorted prefix back with
         // `Set(O, j, v, true)` (so an own / inherited accessor setter
         // fires and a failed write throws), then `DeletePropertyOrThrow`
@@ -2611,7 +2637,10 @@ impl Interpreter {
         for k in 0..len {
             items.push(self.array_method_get_property(context, o, &format_index_key(k as f64))?);
         }
-        let sorted = self.sort_merge(context, items, comparefn)?;
+        let mut lean = self.acquire_lean_callback_stack(context, comparefn);
+        let sorted = self.sort_merge(context, items, comparefn, lean.as_mut());
+        self.release_lean_callback_stack(lean);
+        let sorted = sorted?;
         self.array_create_from_dense_values(sorted)
     }
 

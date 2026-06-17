@@ -41,6 +41,47 @@ fn expr_is_primitive(expr: &Expression<'_>) -> bool {
     )
 }
 
+/// `true` when `expr` provably evaluates to a Number or BigInt, so the
+/// `ToNumeric` (and the preceding `ToPrimitive(number)`) a non-additive
+/// numeric/bitwise binary lowering would emit ahead of it are redundant.
+///
+/// `ToNumeric` over a Number/BigInt is the identity with no observable side
+/// effect (no `valueOf` / `[Symbol.toPrimitive]` call, no Symbol-throw), so
+/// eliding it is behavior-preserving; it only removes redundant coercion
+/// instructions on the hot arithmetic path (e.g. the `7` in `i % 7`, or a
+/// nested `x * x`). Conservative — only AST shapes whose result is *always*
+/// numeric qualify; `+` (string|number), comparisons/equality/`in`/
+/// `instanceof` (boolean), `typeof`/`void`/`!`/`delete`, and template
+/// literals (string) are deliberately excluded.
+fn expr_is_numeric(expr: &Expression<'_>) -> bool {
+    use oxc_ast::ast::{BinaryOperator as B, UnaryOperator as U};
+    match expr {
+        // `(expr)` is transparent — recurse through the parens.
+        Expression::ParenthesizedExpression(p) => expr_is_numeric(&p.expression),
+        Expression::NumericLiteral(_) | Expression::BigIntLiteral(_) => true,
+        // ++/-- always yield a Number or BigInt.
+        Expression::UpdateExpression(_) => true,
+        Expression::BinaryExpression(b) => matches!(
+            b.operator,
+            B::Subtraction
+                | B::Multiplication
+                | B::Division
+                | B::Remainder
+                | B::Exponential
+                | B::BitwiseAnd
+                | B::BitwiseOR
+                | B::BitwiseXOR
+                | B::ShiftLeft
+                | B::ShiftRight
+                | B::ShiftRightZeroFill
+        ),
+        Expression::UnaryExpression(u) => {
+            matches!(u.operator, U::UnaryNegation | U::UnaryPlus | U::BitwiseNot)
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn compile_logical(
     cx: &mut Compiler,
     l: &LogicalExpression<'_>,
@@ -143,6 +184,8 @@ pub(crate) fn compile_binary(
     let span = (b.span.start, b.span.end);
     let lhs_prim = expr_is_primitive(&b.left);
     let rhs_prim = expr_is_primitive(&b.right);
+    let lhs_num = expr_is_numeric(&b.left);
+    let rhs_num = expr_is_numeric(&b.right);
     let lhs = compile_expr(cx, &b.left, span)?;
     let rhs = compile_expr(cx, &b.right, span)?;
     let op = match b.operator {
@@ -246,28 +289,42 @@ pub(crate) fn compile_binary(
         | Op::Ushr => {
             // §13.15.3 — ToNumeric(lhs) completes (throwing on a
             // Symbol) before the right operand's ToPrimitive runs.
-            let l = if lhs_prim {
+            // A provably-numeric operand skips both ToPrimitive and
+            // ToNumeric (both are identity / side-effect-free on a
+            // Number or BigInt); order of observable coercions is
+            // unchanged because elided operands run no user code.
+            let l_num = if lhs_num {
                 lhs
             } else {
-                emit_to_primitive(cx, lhs, "number", span)
+                let l = if lhs_prim {
+                    lhs
+                } else {
+                    emit_to_primitive(cx, lhs, "number", span)
+                };
+                let l_num = cx.alloc_scratch();
+                cx.emit(
+                    Op::ToNumeric,
+                    [Operand::Register(l_num), Operand::Register(l)],
+                    span,
+                );
+                l_num
             };
-            let l_num = cx.alloc_scratch();
-            cx.emit(
-                Op::ToNumeric,
-                [Operand::Register(l_num), Operand::Register(l)],
-                span,
-            );
-            let r = if rhs_prim {
+            let r_num = if rhs_num {
                 rhs
             } else {
-                emit_to_primitive(cx, rhs, "number", span)
+                let r = if rhs_prim {
+                    rhs
+                } else {
+                    emit_to_primitive(cx, rhs, "number", span)
+                };
+                let r_num = cx.alloc_scratch();
+                cx.emit(
+                    Op::ToNumeric,
+                    [Operand::Register(r_num), Operand::Register(r)],
+                    span,
+                );
+                r_num
             };
-            let r_num = cx.alloc_scratch();
-            cx.emit(
-                Op::ToNumeric,
-                [Operand::Register(r_num), Operand::Register(r)],
-                span,
-            );
             (l_num, r_num)
         }
         _ => (lhs, rhs),

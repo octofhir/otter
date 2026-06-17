@@ -66,7 +66,6 @@
 use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use smallvec::SmallVec;
 
 use crate::bigint::BigIntValue;
 use crate::number::NumberValue;
@@ -507,11 +506,6 @@ pub struct ObjectBody {
     /// [`ShapeCacheMode::DictionaryCompatible`] so future dictionary storage
     /// can keep the same invalidation contract without installing stale ICs.
     shape_cache_mode: ShapeCacheMode,
-    /// Per-slot metadata (flags + `is_accessor` discriminator) aligned with
-    /// the GC shape chain or `dictionary_keys`. The slot's value — a data
-    /// `[[Value]]` or an [`AccessorCellBody`] handle — lives out-of-line in
-    /// the flat value array ([`Self::data_value`]) at the same index.
-    slots: SmallVec<[SlotMeta; 4]>,
     /// `[[Prototype]]` — the single source of truth for the common Null /
     /// ordinary-object case: a bare [`JsObject`] handle, or
     /// [`otter_gc::Gc::null()`] for a `null` prototype. A non-ordinary
@@ -536,6 +530,11 @@ pub struct ObjectBody {
     /// fall back to it. Always `false` for dictionary-mode objects (their
     /// shape is null and reads use `slots` regardless). Lives in the byte of
     /// padding beside [`Self::extensible`], so it adds no object size.
+    ///
+    /// When `true` (or in dictionary mode) the per-slot metadata is
+    /// *materialized* in [`ExoticSlots::slots`]; the common shaped object
+    /// carries no per-slot metadata at all and derives everything from the
+    /// hidden class.
     slot_attrs_overridden: bool,
     /// Lazily-allocated rare/exotic slots — symbol-keyed properties, host
     /// data, native `[[Call]]`/`[[Construct]]`, primitive-wrapper internal
@@ -567,6 +566,13 @@ struct ExoticSlots {
     /// O(1) `key → slot offset` index mirroring `dictionary_keys` in dictionary
     /// mode. Owned `String` keys only (no GC refs) → no tracing.
     dictionary_index: rustc_hash::FxHashMap<String, u16>,
+    /// Materialized per-slot metadata (flags + `is_accessor` discriminator),
+    /// index-aligned with the flat value array. Present and authoritative only
+    /// for dictionary-mode objects (null shape) and attribute-overridden
+    /// objects (`ObjectBody::slot_attrs_overridden`). Empty for the common
+    /// shaped object, which derives per-slot attributes from the hidden class.
+    /// Holds no GC handles, so it needs no tracing.
+    slots: Vec<SlotMeta>,
     /// Symbol-keyed own properties (descriptor slot representation).
     symbol_props: Vec<(JsSymbol, SlotData)>,
     /// Rust-owned payload for host-backed objects and VM-internal side data.
@@ -618,12 +624,13 @@ const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET.is_multiple_of(8));
 const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET >= 8);
 const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET.is_multiple_of(4));
 
-// Pin the hot object footprint. Moving the accessor getter/setter pair out of
-// per-slot metadata into the flat value array shrinks `SlotMeta` to two bytes,
-// so the inline `slots` SmallVec — and the body — shrink with it. The
-// `slot_attrs_overridden` byte rides in the padding beside `extensible`, so it
-// adds no size.
-const _: () = assert!(std::mem::size_of::<ObjectBody>() == 112);
+// Pin the hot object footprint. Per-slot metadata no longer lives inline:
+// the common shaped object derives attributes from the hidden class and the
+// rare dictionary-mode / attribute-overridden case materializes a
+// `Vec<SlotMeta>` inside the boxed `ExoticSlots`. Dropping the inline `slots`
+// SmallVec shrinks the body to a single flat value array plus the shape,
+// prototype, dictionary identity, and flag bytes.
+const _: () = assert!(std::mem::size_of::<ObjectBody>() == 88);
 
 impl ObjectBody {
     /// Read the data value for string-keyed slot `i` from flat storage.
@@ -650,18 +657,23 @@ impl ObjectBody {
         }
     }
 
-    /// Append a new string-keyed own slot (metadata + flat value) at the next
-    /// index, keeping `slots` and the flat value array aligned. For an
-    /// accessor slot `value` is the [`AccessorCellBody`] handle produced by
-    /// [`SlotData::into_flat`].
-    fn push_slot(&mut self, meta: SlotMeta, value: Value) {
-        let i = self.slots.len();
-        if i < INLINE_VALUE_CAP {
-            self.inline_values[i] = value;
+    /// Append a new string-keyed own slot at flat index `index` (the pre-append
+    /// property count). For a shaped, non-overridden object the hidden class
+    /// already records the slot's attributes, so only the flat value is
+    /// written; a materialized object (dictionary-mode or attribute-overridden)
+    /// also pushes `meta` onto its per-slot metadata vector so it stays
+    /// index-aligned with the value array. For an accessor slot `value` is the
+    /// [`AccessorCellBody`] handle produced by [`SlotData::into_flat`].
+    fn push_slot(&mut self, index: usize, meta: SlotMeta, value: Value) {
+        if index < INLINE_VALUE_CAP {
+            self.inline_values[index] = value;
         } else {
             self.exotic_mut().overflow_values.push(value);
         }
-        self.slots.push(meta);
+        if self.slots_materialized() {
+            debug_assert_eq!(self.slots().len(), index, "materialized slots desynced");
+            self.slots_mut().push(meta);
+        }
     }
 
     /// Overwrite the string-keyed slot at `i` with new metadata + flat value.
@@ -669,21 +681,31 @@ impl ObjectBody {
     /// Used by the `defineProperty`-on-existing merge paths, which change a
     /// slot's attributes or data↔accessor kind. `attr_shape` is the
     /// attribute-encoding hidden class the object transitions to so the shape
-    /// keeps recording the slot's attributes (the common, fast case);
-    /// `slots` is dual-written so integrity-level reads stay consistent until
-    /// the shape becomes the sole attribute source. `None` — only for
-    /// dictionary-mode (null shape) or internal construction paths without a
-    /// shape runtime — falls back to flagging the object so reads consult
-    /// `slots`.
+    /// keeps recording the slot's attributes (the common, fast case): a shaped,
+    /// non-overridden object stores nothing per-slot. A previously
+    /// attribute-overridden object keeps its materialized metadata in lockstep.
+    /// `None` — only for dictionary-mode (null shape) or internal construction
+    /// paths without a shape runtime — keeps the materialized metadata
+    /// authoritative; the caller must have materialized it first
+    /// ([`materialize_slots`]).
     fn set_slot(&mut self, i: usize, meta: SlotMeta, value: Value, attr_shape: Option<ShapeHandle>) {
         self.set_data_value(i, value);
-        self.slots[i] = meta;
         match attr_shape {
-            Some(shape) => self.shape = shape,
+            Some(shape) => {
+                self.shape = shape;
+                // A previously overridden object keeps reading from its
+                // materialized metadata, so keep that entry current; a
+                // non-overridden object reads the rebuilt shape and stores none.
+                if self.slot_attrs_overridden {
+                    self.slots_mut()[i] = meta;
+                }
+            }
             None => {
                 if !self.shape.is_null() {
                     self.slot_attrs_overridden = true;
                 }
+                debug_assert!(self.slots_materialized(), "set_slot(None) needs materialized slots");
+                self.slots_mut()[i] = meta;
             }
         }
     }
@@ -693,8 +715,8 @@ impl ObjectBody {
     /// Reads from the hidden class for a shaped object whose attributes have
     /// not diverged (the common case — every shaped slot recorded its
     /// attributes on the transition that created it), and falls back to the
-    /// authoritative `slots` array for dictionary-mode or attribute-overridden
-    /// objects.
+    /// authoritative materialized metadata for dictionary-mode or
+    /// attribute-overridden objects.
     #[inline]
     fn slot_attrs(&self, heap: &otter_gc::GcHeap, i: usize) -> (PropertyFlags, bool) {
         if !self.shape.is_null()
@@ -703,7 +725,7 @@ impl ObjectBody {
         {
             return attrs;
         }
-        let meta = &self.slots[i];
+        let meta = &self.slots()[i];
         (meta.flags, meta.is_accessor)
     }
 
@@ -762,10 +784,12 @@ impl ObjectBody {
         }
     }
 
-    /// Remove the string-keyed slot at `i`, shifting later values down so
-    /// `slots` and the flat value array stay index-aligned.
+    /// Remove the string-keyed slot at `i`, shifting later values down so the
+    /// materialized metadata and the flat value array stay index-aligned. Only
+    /// reached on a materialized object (delete normalizes to dictionary mode,
+    /// materializing per-slot metadata first), so `slots()` is authoritative.
     fn remove_slot(&mut self, i: usize) {
-        let len = self.slots.len();
+        let len = self.slots().len();
         for j in i..len - 1 {
             let next = self.data_value(j + 1);
             self.set_data_value(j, next);
@@ -775,7 +799,7 @@ impl ObjectBody {
         } else {
             self.exotic_mut().overflow_values.pop();
         }
-        self.slots.remove(i);
+        self.slots_mut().remove(i);
     }
 
     // --- Lazily-boxed exotic slots -----------------------------------------
@@ -880,6 +904,30 @@ impl ObjectBody {
         self.exotic()
             .and_then(|e| e.dictionary_index.get(key).copied())
     }
+
+    /// `true` when per-slot metadata is materialized in [`ExoticSlots::slots`]
+    /// and is the authoritative attribute source. Dictionary-mode (null shape)
+    /// and attribute-overridden objects materialize; the common shaped object
+    /// derives attributes from the hidden class and carries none.
+    #[inline]
+    fn slots_materialized(&self) -> bool {
+        self.shape.is_null() || self.slot_attrs_overridden
+    }
+
+    /// Materialized per-slot metadata as a slice (`&[]` when the shape is the
+    /// authoritative source).
+    #[inline]
+    fn slots(&self) -> &[SlotMeta] {
+        self.exotic().map_or(&[], |e| e.slots.as_slice())
+    }
+
+    /// Exclusive ref to the materialized per-slot metadata vector, allocating
+    /// the exotic box on first use. Callers must only reach this on a
+    /// materialized object (dictionary-mode or attribute-overridden).
+    #[inline]
+    fn slots_mut(&mut self) -> &mut Vec<SlotMeta> {
+        &mut self.exotic_mut().slots
+    }
 }
 
 impl std::fmt::Debug for ObjectBody {
@@ -888,7 +936,7 @@ impl std::fmt::Debug for ObjectBody {
             .field("has_shape", &!self.shape.is_null())
             .field("dictionary_len", &self.dictionary_keys().len())
             .field("shape_cache_mode", &self.shape_cache_mode)
-            .field("slot_count", &self.slots.len())
+            .field("slot_count", &self.slots().len())
             .field(
                 "has_prototype",
                 &!matches!(self.prototype(), ObjectPrototype::Null),
@@ -941,31 +989,23 @@ impl otter_gc::SafeTraceable for ObjectBody {
             let p = &self.jit_proto as *const JsObject as *mut RawGc;
             v(p);
         }
-        debug_assert_eq!(
-            self.exotic().map_or(0, |e| e.overflow_values.len()),
-            self.slots.len().saturating_sub(INLINE_VALUE_CAP),
-            "flat value array desynced from slots (len {})",
-            self.slots.len()
-        );
         // String-keyed property slots: the flat value array holds each slot's
         // data value, or — for an accessor slot — a handle to its
-        // `AccessorCellBody`. Trace each value *in place* (by reference) so the
-        // moving scavenger rewrites the live slot, not a copy; an accessor
-        // cell traces its own getter/setter through its `Traceable` impl.
-        for i in 0..self.slots.len() {
-            if i < INLINE_VALUE_CAP {
-                self.inline_values[i].trace_value_slots(v);
-            } else {
-                self.exotic
-                    .as_ref()
-                    .expect("overflow slot traced without overflow storage")
-                    .overflow_values[i - INLINE_VALUE_CAP]
-                    .trace_value_slots(v);
-            }
+        // `AccessorCellBody`. Trace every inline cell *in place* (by reference)
+        // so the moving scavenger rewrites the live slot, not a copy; an
+        // accessor cell traces its own getter/setter through its `Traceable`
+        // impl. Slots past the current property count hold `undefined` (cleared
+        // on append/remove), which traces to nothing, so the count is not
+        // needed here — the overflow array carries its own length below.
+        for value in self.inline_values.iter() {
+            value.trace_value_slots(v);
         }
         // Boxed exotic slots holding GC edges. Traced in place through the box
         // reference so the moving collector rewrites the live slots, not a copy.
         if let Some(exotic) = self.exotic.as_ref() {
+            for value in exotic.overflow_values.iter() {
+                value.trace_value_slots(v);
+            }
             // Non-ordinary prototype (Value / Proxy), traced in place.
             match &exotic.proto_override {
                 None | Some(ObjectPrototype::Null) | Some(ObjectPrototype::Object(_)) => {}
@@ -1028,7 +1068,6 @@ fn empty_object_body() -> ObjectBody {
         inline_values: [Value::undefined(); INLINE_VALUE_CAP],
         dictionary_shape_id: next_shape_id(),
         shape_cache_mode: ShapeCacheMode::Fast,
-        slots: SmallVec::new(),
         jit_proto: otter_gc::Gc::null(),
         extensible: true,
         slot_attrs_overridden: false,
@@ -1125,7 +1164,6 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
             inline_values: [Value::undefined(); INLINE_VALUE_CAP],
             dictionary_shape_id: next_shape_id(),
             shape_cache_mode: ShapeCacheMode::Fast,
-            slots: SmallVec::new(),
             jit_proto: otter_gc::Gc::null(),
             extensible: true,
             slot_attrs_overridden: false,
@@ -1151,7 +1189,6 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
             inline_values: [Value::undefined(); INLINE_VALUE_CAP],
             dictionary_shape_id: next_shape_id(),
             shape_cache_mode: ShapeCacheMode::Fast,
-            slots: SmallVec::new(),
             jit_proto: otter_gc::Gc::null(),
             extensible: true,
             slot_attrs_overridden: false,
@@ -1261,16 +1298,16 @@ fn apply_mapped_arguments_partial_define(
         if descriptor.value.is_none() {
             let current = read_upvalue(heap, cell);
             if let Some(offset) = existing_offset {
-                heap.with_payload(obj, |body| {
-                    if body
-                        .slots
-                        .get(offset as usize)
-                        .is_some_and(|m| !m.is_accessor)
-                    {
-                        body.set_data_value(offset as usize, current);
-                    }
+                let is_data_slot = heap.read_payload(obj, |body| {
+                    (usize::from(offset) < body_property_count(heap, body))
+                        && !body.slot_attrs(heap, offset as usize).1
                 });
-                heap.record_write(obj, &current);
+                if is_data_slot {
+                    heap.with_payload(obj, |body| {
+                        body.set_data_value(offset as usize, current);
+                    });
+                    heap.record_write(obj, &current);
+                }
             }
         }
         heap.with_payload(obj, |body| remove_mapped_argument(body, key));
@@ -1309,10 +1346,12 @@ pub(crate) fn shape_id(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeId {
 /// this read a stale slot.
 pub(crate) fn data_value_at(obj: JsObject, heap: &otter_gc::GcHeap, slot: u16) -> Value {
     heap.read_payload(obj, |body| {
-        body.slots
-            .get(slot as usize)
-            .filter(|s| !s.is_accessor)
-            .map_or(Value::undefined(), |_| body.data_value(slot as usize))
+        let i = slot as usize;
+        if i < body_property_count(heap, body) && !body.slot_attrs(heap, i).1 {
+            body.data_value(i)
+        } else {
+            Value::undefined()
+        }
     })
 }
 
@@ -1429,7 +1468,7 @@ pub fn get_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Option<Valu
         }
         body_offset_of(heap, body, key).map(|offset| {
             let i = offset as usize;
-            if !body.slots[i].is_accessor {
+            if !body.slot_attrs(heap, i).1 {
                 body.data_value(i)
             } else {
                 Value::undefined()
@@ -1549,7 +1588,7 @@ pub(crate) fn has_own_slot(
             return false;
         }
         let offset = hit.slot as usize;
-        body_has_key_at(heap, body, offset) && body.slots.get(offset).is_some()
+        body_has_key_at(heap, body, offset) && offset < body_property_count(heap, body)
     })
 }
 
@@ -1572,8 +1611,10 @@ pub(crate) fn load_own_data_slot_atom(
         if let Some(cell) = mapped_argument_cell(body, key.name()) {
             return Some(read_upvalue(heap, cell));
         }
-        let meta = body.slots.get(offset)?;
-        if !meta.is_accessor {
+        if offset >= body_property_count(heap, body) {
+            return None;
+        }
+        if !body.slot_attrs(heap, offset).1 {
             Some(body.data_value(offset))
         } else {
             None
@@ -1597,15 +1638,22 @@ pub(crate) fn store_own_data_slot_atom(
     let key_matches = heap.read_payload(obj, |body| {
         body_key_matches(heap, body, hit.slot as usize, key.name())
     });
+    // The per-slot attributes are read under the same shape that the guards
+    // below revalidate, so `with_payload` (which cannot reborrow the heap to
+    // walk the hidden class) sees a consistent `(writable, is_accessor)` pair.
+    let slot_attrs = heap.read_payload(obj, |body| {
+        let offset = hit.slot as usize;
+        (offset < body_property_count(heap, body)).then(|| body.slot_attrs(heap, offset))
+    });
     let success = heap.with_payload(obj, |body| {
         let offset = hit.slot as usize;
         if current_shape_id != hit.shape_id || key.atom().id() != hit.atom_id || !key_matches {
             return false;
         }
-        let Some(slot) = body.slots.get(offset) else {
+        let Some((flags, is_accessor)) = slot_attrs else {
             return false;
         };
-        if !slot.flags.writable() || slot.is_accessor {
+        if !flags.writable() || is_accessor {
             return false;
         }
         body.set_data_value(offset, *value);
@@ -1635,10 +1683,11 @@ fn has_writable_own_data_slot_atom(
         if !body_has_key_at(heap, body, offset) {
             return false;
         }
-        let Some(slot) = body.slots.get(offset) else {
+        if offset >= body_property_count(heap, body) {
             return false;
-        };
-        slot.flags.writable() && !slot.is_accessor
+        }
+        let (flags, is_accessor) = body.slot_attrs(heap, offset);
+        flags.writable() && !is_accessor
     })
 }
 
@@ -2162,18 +2211,11 @@ pub(crate) fn shape(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeHandle {
     heap.read_payload(obj, |body| body.shape)
 }
 
-/// Dual-write invariant check: the most recently appended own slot's stored
-/// `(flags, is_accessor)` must match what the shape records at that offset.
-/// Called right after a shape-advancing append, so the last slot is the
-/// freshly transitioned one. `slots` stays authoritative; the shape carries
-/// the same attributes redundantly.
-///
-/// Only the appended slot is checked — not the whole object — because
-/// `defineProperty`/`freeze`/`seal` still mutate existing slot attributes *in
-/// place* without transitioning the shape (the object's
-/// `slot_attrs_overridden` bit then marks the divergence), so older slots may
-/// legitimately differ from the shape. Dictionary-mode objects (null shape)
-/// are skipped. Debug-only.
+/// Invariant check after a shape-advancing append: the hidden class must
+/// record `(flags, is_accessor)` for the freshly appended slot at the new last
+/// offset. A shaped object carries no per-slot metadata of its own, so the
+/// shape is the sole attribute source and must own that offset. Dictionary-mode
+/// objects (null shape) are skipped. Debug-only.
 #[cfg(debug_assertions)]
 pub(crate) fn debug_assert_appended_shape_slot(obj: JsObject, heap: &otter_gc::GcHeap) {
     let shape = shape(obj, heap);
@@ -2181,18 +2223,12 @@ pub(crate) fn debug_assert_appended_shape_slot(obj: JsObject, heap: &otter_gc::G
         return;
     }
     heap.read_payload(obj, |body| {
-        let Some(i) = body.slots.len().checked_sub(1) else {
+        let Some(i) = body_property_count(heap, body).checked_sub(1) else {
             return;
         };
-        let meta = &body.slots[i];
-        let Some((flags, is_accessor)) = shape_body::shape_slot_attrs(heap, shape, i as u32) else {
+        if shape_body::shape_slot_attrs(heap, shape, i as u32).is_none() {
             panic!("shape missing attrs for appended slot {i}");
-        };
-        debug_assert_eq!(flags, meta.flags, "shape/slot flags mismatch at slot {i}");
-        debug_assert_eq!(
-            is_accessor, meta.is_accessor,
-            "shape/slot kind mismatch at slot {i}"
-        );
+        }
     });
 }
 
@@ -2219,7 +2255,7 @@ pub fn is_sealed(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
         if body.extensible {
             return false;
         }
-        body.slots.iter().all(|s| !s.flags.configurable())
+        (0..body_property_count(heap, body)).all(|i| !body.slot_attrs(heap, i).0.configurable())
     })
 }
 
@@ -2235,11 +2271,12 @@ pub fn is_frozen(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
         if body.extensible {
             return false;
         }
-        for slot in body.slots.iter() {
-            if slot.flags.configurable() {
+        for i in 0..body_property_count(heap, body) {
+            let (flags, is_accessor) = body.slot_attrs(heap, i);
+            if flags.configurable() {
                 return false;
             }
-            if !slot.is_accessor && slot.flags.writable() {
+            if !is_accessor && flags.writable() {
                 return false;
             }
         }
@@ -2271,23 +2308,31 @@ pub fn is_frozen(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 pub fn set(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) {
     let barrier_value = value;
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
-    heap.with_payload(obj, |body| {
-        if let Some(offset) = existing_offset {
-            let i = offset as usize;
-            // Overwriting an accessor slot with a data value diverges this slot
-            // from its hidden class (which still records the accessor) without a
-            // shape transition, so attribute reads must stop trusting the shape.
-            if body.slots[i].is_accessor && !body.shape.is_null() {
-                body.slot_attrs_overridden = true;
-            }
-            body.slots[i].is_accessor = false;
-            body.set_data_value(i, value);
-            return;
+    if let Some(offset) = existing_offset {
+        let i = offset as usize;
+        // Overwriting an accessor slot with a data value diverges this slot
+        // from its hidden class (which still records the accessor) without a
+        // shape transition, so per-slot metadata must be materialized and the
+        // shape can no longer be trusted for attribute reads.
+        let is_accessor = heap.read_payload(obj, |body| body.slot_attrs(heap, i).1);
+        if is_accessor {
+            materialize_slots(obj, heap);
         }
+        heap.with_payload(obj, |body| {
+            if is_accessor {
+                body.slots_mut()[i].is_accessor = false;
+            }
+            body.set_data_value(i, value);
+        });
+        heap.record_write(obj, &barrier_value);
+        return;
+    }
+    let index = heap.read_payload(obj, |body| body_property_count(heap, body));
+    heap.with_payload(obj, |body| {
         body.dictionary_shape_id = next_shape_id();
         dict_push_key(body, key.to_owned());
         body.shape = ShapeHandle::null();
-        body.push_slot(SlotMeta::data_default(), value);
+        body.push_slot(index, SlotMeta::data_default(), value);
     });
     heap.record_write(obj, &barrier_value);
 }
@@ -2303,21 +2348,29 @@ pub(crate) fn set_with_shape(
 ) {
     let barrier_value = value;
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
-    heap.with_payload(obj, |body| {
-        if let Some(offset) = existing_offset {
-            let i = offset as usize;
-            // Overwriting an accessor slot with a data value diverges this slot
-            // from its hidden class (which still records the accessor) without a
-            // shape transition, so attribute reads must stop trusting the shape.
-            if body.slots[i].is_accessor && !body.shape.is_null() {
-                body.slot_attrs_overridden = true;
-            }
-            body.slots[i].is_accessor = false;
-            body.set_data_value(i, value);
-            return;
+    if let Some(offset) = existing_offset {
+        let i = offset as usize;
+        // Overwriting an accessor slot with a data value diverges this slot
+        // from its hidden class (which still records the accessor) without a
+        // shape transition, so per-slot metadata must be materialized and the
+        // shape can no longer be trusted for attribute reads.
+        let is_accessor = heap.read_payload(obj, |body| body.slot_attrs(heap, i).1);
+        if is_accessor {
+            materialize_slots(obj, heap);
         }
+        heap.with_payload(obj, |body| {
+            if is_accessor {
+                body.slots_mut()[i].is_accessor = false;
+            }
+            body.set_data_value(i, value);
+        });
+        heap.record_write(obj, &barrier_value);
+        return;
+    }
+    let index = shape_body::shape_property_count(heap, next_shape) as usize - 1;
+    heap.with_payload(obj, |body| {
         body.shape = next_shape;
-        body.push_slot(SlotMeta::data_default(), value);
+        body.push_slot(index, SlotMeta::data_default(), value);
     });
     heap.record_write(obj, &barrier_value);
     heap.record_write(obj, &next_shape);
@@ -2520,12 +2573,19 @@ pub fn delete(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
         }
         keys
     });
+    // Delete normalizes to dictionary storage, which keeps per-slot metadata
+    // materialized; snapshot the shaped object's attributes from the hidden
+    // class before the in-place removal so the configurability check and the
+    // value-array shift operate on a populated metadata vector.
+    if existing_offset.is_some() {
+        materialize_slots(obj, heap);
+    }
     heap.with_payload(obj, |body| {
         let Some(offset) = existing_offset else {
             // Spec step 2: missing → true.
             return true;
         };
-        if !body.slots[offset as usize].flags.configurable() {
+        if !body.slots()[offset as usize].flags.configurable() {
             return false;
         }
         body.remove_slot(offset as usize);
@@ -2608,6 +2668,8 @@ pub fn define_own_property_partial(
     let completed = descriptor.complete_for_new_property();
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     let dictionary_keys = dictionary_keys_for_shape_transition(heap, obj, existing_offset);
+    let slot_metas = slot_metas_for_shape_transition(heap, obj, existing_offset);
+    let append_index = heap.read_payload(obj, |body| body_property_count(heap, body));
     // §10.1.6.3 ValidateAndApplyPropertyDescriptor runs outside the
     // mutable body borrow so the BigInt-BigInt SameValue arm can
     // read both bodies through `heap`. Distinct GC handles holding
@@ -2621,6 +2683,12 @@ pub fn define_own_property_partial(
     } else {
         None
     };
+    // Redefining an existing shaped slot without a shape transition diverges
+    // its attributes from the hidden class, so materialize per-slot metadata
+    // first (no-op when already dictionary-mode/overridden).
+    if existing_offset.is_some() {
+        materialize_slots(obj, heap);
+    }
     // Lower the slot to its flat `(meta, value)` form before taking the body
     // borrow: an accessor allocates its cell here (rooting `obj`), so the
     // mutation closure never allocates.
@@ -2644,9 +2712,12 @@ pub fn define_own_property_partial(
             if let Some(dictionary_keys) = dictionary_keys {
                 dict_set_keys(body, dictionary_keys);
             }
+            if let Some(slot_metas) = slot_metas {
+                body.exotic_mut().slots = slot_metas;
+            }
             dict_push_key(body, key.to_owned());
             body.shape = ShapeHandle::null();
-            body.push_slot(meta, stored);
+            body.push_slot(append_index, meta, stored);
             true
         }
     });
@@ -2684,6 +2755,8 @@ pub(crate) fn define_own_property_partial_with_shape(
         Ok(parts) => parts,
         Err(_) => return false,
     };
+    // The appended slot's flat index is the new shape's last offset.
+    let append_index = shape_body::shape_property_count(heap, next_shape) as usize - 1;
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
             // Redefine: `next_shape` is the attribute-encoding class that
@@ -2695,7 +2768,7 @@ pub(crate) fn define_own_property_partial_with_shape(
                 return false;
             }
             body.shape = next_shape;
-            body.push_slot(meta, stored);
+            body.push_slot(append_index, meta, stored);
             true
         }
     });
@@ -2769,6 +2842,8 @@ pub fn define_own_property(
     let map_descriptor = descriptor.clone();
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     let dictionary_keys = dictionary_keys_for_shape_transition(heap, obj, existing_offset);
+    let slot_metas = slot_metas_for_shape_transition(heap, obj, existing_offset);
+    let append_index = heap.read_payload(obj, |body| body_property_count(heap, body));
     let merged_for_existing = if let Some(offset) = existing_offset {
         let existing = heap.read_payload(obj, |body| body.slot_data(heap, offset as usize));
         match descriptor_core::validate_and_apply(&existing, &descriptor, heap) {
@@ -2778,6 +2853,12 @@ pub fn define_own_property(
     } else {
         None
     };
+    // Redefining an existing shaped slot without a shape transition diverges
+    // its attributes from the hidden class, so materialize per-slot metadata
+    // first (no-op when already dictionary-mode/overridden).
+    if existing_offset.is_some() {
+        materialize_slots(obj, heap);
+    }
     let slot_source = match merged_for_existing {
         Some(merged) => merged,
         None => SlotData::from_descriptor(descriptor),
@@ -2798,9 +2879,12 @@ pub fn define_own_property(
             if let Some(dictionary_keys) = dictionary_keys {
                 dict_set_keys(body, dictionary_keys);
             }
+            if let Some(slot_metas) = slot_metas {
+                body.exotic_mut().slots = slot_metas;
+            }
             dict_push_key(body, key.to_owned());
             body.shape = ShapeHandle::null();
-            body.push_slot(meta, stored);
+            body.push_slot(append_index, meta, stored);
             true
         }
     });
@@ -3069,15 +3153,16 @@ pub fn prevent_extensions(obj: JsObject, heap: &mut otter_gc::GcHeap) {
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-setintegritylevel>
 pub fn seal(obj: JsObject, heap: &mut otter_gc::GcHeap) {
+    // In-place fallback (dictionary mode, or callers without a shape runtime):
+    // materialize per-slot metadata so the attribute change is recorded on a
+    // populated vector instead of diverging silently from the hidden class.
+    materialize_slots(obj, heap);
     heap.with_payload(obj, |body| {
         body.extensible = false;
-        if !body.shape.is_null() {
-            body.slot_attrs_overridden = true;
-        }
-        for slot in body.slots.iter_mut() {
-            slot.flags = slot.flags.with_configurable(false);
-        }
         if let Some(exotic) = body.exotic.as_deref_mut() {
+            for slot in exotic.slots.iter_mut() {
+                slot.flags = slot.flags.with_configurable(false);
+            }
             for (_, slot) in exotic.symbol_props.iter_mut() {
                 slot.flags = slot.flags.with_configurable(false);
             }
@@ -3087,18 +3172,19 @@ pub fn seal(obj: JsObject, heap: &mut otter_gc::GcHeap) {
 
 /// `Object.seal` for a shaped object, transitioning to `new_shape` — the
 /// attribute-encoding hidden class that records every slot as
-/// non-configurable. The string-keyed `slots` flags are dual-written so
-/// integrity-level reads stay consistent until the shape becomes the sole
-/// attribute source; symbol-keyed slots (not part of the shape) mutate in
-/// place. No override flag: the shape now matches `slots`.
+/// non-configurable. A non-overridden shaped object stores no per-slot
+/// metadata, so the shape transition alone records the change; a previously
+/// overridden object keeps reading from its materialized metadata, which is
+/// updated in lockstep. Symbol-keyed slots (not part of the shape) mutate in
+/// place.
 pub(crate) fn seal_with_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, new_shape: ShapeHandle) {
     heap.with_payload(obj, |body| {
         body.extensible = false;
         body.shape = new_shape;
-        for slot in body.slots.iter_mut() {
-            slot.flags = slot.flags.with_configurable(false);
-        }
         if let Some(exotic) = body.exotic.as_deref_mut() {
+            for slot in exotic.slots.iter_mut() {
+                slot.flags = slot.flags.with_configurable(false);
+            }
             for (_, slot) in exotic.symbol_props.iter_mut() {
                 slot.flags = slot.flags.with_configurable(false);
             }
@@ -3114,18 +3200,17 @@ pub(crate) fn seal_with_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, new_sh
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-setintegritylevel>
 pub fn freeze(obj: JsObject, heap: &mut otter_gc::GcHeap) {
+    // In-place fallback: materialize per-slot metadata first (see [`seal`]).
+    materialize_slots(obj, heap);
     heap.with_payload(obj, |body| {
         body.extensible = false;
-        if !body.shape.is_null() {
-            body.slot_attrs_overridden = true;
-        }
-        for slot in body.slots.iter_mut() {
-            slot.flags = slot.flags.with_configurable(false);
-            if !slot.is_accessor {
-                slot.flags = slot.flags.with_writable(false);
-            }
-        }
         if let Some(exotic) = body.exotic.as_deref_mut() {
+            for slot in exotic.slots.iter_mut() {
+                slot.flags = slot.flags.with_configurable(false);
+                if !slot.is_accessor {
+                    slot.flags = slot.flags.with_writable(false);
+                }
+            }
             for (_, slot) in exotic.symbol_props.iter_mut() {
                 slot.flags = slot.flags.with_configurable(false);
                 if slot.kind.is_data() {
@@ -3138,20 +3223,21 @@ pub fn freeze(obj: JsObject, heap: &mut otter_gc::GcHeap) {
 
 /// `Object.freeze` for a shaped object, transitioning to `new_shape` — the
 /// attribute-encoding hidden class that records data slots as
-/// non-writable/non-configurable and accessor slots as non-configurable.
-/// Dual-writes the string-keyed `slots` flags (see [`seal_with_shape`]);
-/// symbol-keyed slots mutate in place.
+/// non-writable/non-configurable and accessor slots as non-configurable. A
+/// non-overridden shaped object stores no per-slot metadata (the shape
+/// transition records the change); a previously overridden object keeps its
+/// materialized metadata current. Symbol-keyed slots mutate in place.
 pub(crate) fn freeze_with_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, new_shape: ShapeHandle) {
     heap.with_payload(obj, |body| {
         body.extensible = false;
         body.shape = new_shape;
-        for slot in body.slots.iter_mut() {
-            slot.flags = slot.flags.with_configurable(false);
-            if !slot.is_accessor {
-                slot.flags = slot.flags.with_writable(false);
-            }
-        }
         if let Some(exotic) = body.exotic.as_deref_mut() {
+            for slot in exotic.slots.iter_mut() {
+                slot.flags = slot.flags.with_configurable(false);
+                if !slot.is_accessor {
+                    slot.flags = slot.flags.with_writable(false);
+                }
+            }
             for (_, slot) in exotic.symbol_props.iter_mut() {
                 slot.flags = slot.flags.with_configurable(false);
                 if slot.kind.is_data() {
@@ -3175,7 +3261,11 @@ pub(crate) fn freeze_with_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, new_
 /// outlive the closure scope.
 pub struct Properties<'a> {
     body: &'a ObjectBody,
-    string_keys: Vec<(String, usize)>,
+    /// `(key, flat slot index, flags, is_accessor)` in ordinary own-key order.
+    /// Per-slot attributes are captured at build time (where the hidden class
+    /// is reachable through the heap) so iteration needs no further shape walk
+    /// and the common shaped object carries no per-slot metadata.
+    string_keys: Vec<(String, usize, PropertyFlags, bool)>,
 }
 
 impl<'a> Properties<'a> {
@@ -3185,8 +3275,8 @@ impl<'a> Properties<'a> {
     /// need accessor fidelity must consult [`get_own_descriptor`]
     /// directly.
     pub fn iter(&self) -> impl Iterator<Item = (&str, Value)> {
-        self.string_keys.iter().map(|(key, idx)| {
-            let value = if !self.body.slots[*idx].is_accessor {
+        self.string_keys.iter().map(|(key, idx, _, is_accessor)| {
+            let value = if !*is_accessor {
                 self.body.data_value(*idx)
             } else {
                 Value::undefined()
@@ -3197,7 +3287,7 @@ impl<'a> Properties<'a> {
 
     /// Iterate string keys in ordinary own-key order.
     pub fn keys(&self) -> impl Iterator<Item = &str> {
-        self.string_keys.iter().map(|(key, _)| key.as_str())
+        self.string_keys.iter().map(|(key, _, _, _)| key.as_str())
     }
 
     /// Iterate symbol-keyed own properties in insertion order.
@@ -3211,17 +3301,18 @@ impl<'a> Properties<'a> {
     /// skipping accessor and non-enumerable slots. Used by
     /// JSON.stringify and `for…in` once it lands.
     pub fn enumerable_data_iter(&self) -> impl Iterator<Item = (&str, Value)> {
-        self.string_keys.iter().filter_map(|(key, idx)| {
-            let slot = &self.body.slots[*idx];
-            if !slot.flags.enumerable() {
-                return None;
-            }
-            if !slot.is_accessor {
-                Some((key.as_str(), self.body.data_value(*idx)))
-            } else {
-                None
-            }
-        })
+        self.string_keys
+            .iter()
+            .filter_map(|(key, idx, flags, is_accessor)| {
+                if !flags.enumerable() {
+                    return None;
+                }
+                if !*is_accessor {
+                    Some((key.as_str(), self.body.data_value(*idx)))
+                } else {
+                    None
+                }
+            })
     }
 
     /// `(key, flat slot index)` for every enumerable own **string-keyed
@@ -3235,12 +3326,11 @@ impl<'a> Properties<'a> {
     /// has side effects the fast path must not skip.
     pub fn enumerable_string_data_offsets(&self) -> Option<Vec<(String, u16)>> {
         let mut out = Vec::with_capacity(self.string_keys.len());
-        for (key, idx) in &self.string_keys {
-            let slot = &self.body.slots[*idx];
-            if !slot.flags.enumerable() {
+        for (key, idx, flags, is_accessor) in &self.string_keys {
+            if !flags.enumerable() {
                 continue;
             }
-            if slot.is_accessor {
+            if *is_accessor {
                 return None;
             }
             out.push((key.clone(), u16::try_from(*idx).ok()?));
@@ -3251,12 +3341,9 @@ impl<'a> Properties<'a> {
     /// Iterate enumerable own-key names (string-keyed only) in
     /// ordinary own-key order.
     pub fn enumerable_keys(&self) -> impl Iterator<Item = &str> {
-        self.string_keys.iter().filter_map(|(key, idx)| {
-            self.body.slots[*idx]
-                .flags
-                .enumerable()
-                .then_some(key.as_str())
-        })
+        self.string_keys
+            .iter()
+            .filter_map(|(key, _, flags, _)| flags.enumerable().then_some(key.as_str()))
     }
 
     /// Iterate `(symbol, data-value)` pairs over enumerable
@@ -3284,7 +3371,7 @@ impl<'a> Properties<'a> {
     pub fn dense_indexed_data_values(&self, len: usize) -> Option<Vec<Value>> {
         let mut values = vec![None; len];
         let mut seen = 0usize;
-        for (key, idx) in &self.string_keys {
+        for (key, idx, _, is_accessor) in &self.string_keys {
             let Some(array_index) = key_order::array_index_property_name(key) else {
                 continue;
             };
@@ -3294,7 +3381,7 @@ impl<'a> Properties<'a> {
             if index >= len {
                 continue;
             }
-            if !self.body.slots[*idx].is_accessor {
+            if !*is_accessor {
                 if values[index].is_none() {
                     seen += 1;
                 }
@@ -3401,6 +3488,59 @@ fn dictionary_keys_for_shape_transition(
     })
 }
 
+/// Materialize the existing slots' metadata from the hidden class for an append
+/// that normalizes a shaped object to dictionary storage. Returns `Some` only
+/// when appending (`existing_offset` is `None`) to a shaped object; dictionary
+/// objects already carry materialized metadata and shaped redefines use a shape
+/// transition instead. The returned vector is installed into
+/// [`ExoticSlots::slots`] before the new slot is pushed so the dictionary-mode
+/// object's per-slot metadata stays index-aligned with its value array.
+fn slot_metas_for_shape_transition(
+    heap: &otter_gc::GcHeap,
+    obj: JsObject,
+    existing_offset: Option<u16>,
+) -> Option<Vec<SlotMeta>> {
+    if existing_offset.is_some() {
+        return None;
+    }
+    heap.read_payload(obj, |body| {
+        (!body.shape.is_null()).then(|| materialized_slot_metas(heap, body))
+    })
+}
+
+/// Read every current slot's `(flags, is_accessor)` from the authoritative
+/// source into an index-aligned [`SlotMeta`] vector.
+fn materialized_slot_metas(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Vec<SlotMeta> {
+    let count = body_property_count(heap, body);
+    (0..count)
+        .map(|i| {
+            let (flags, is_accessor) = body.slot_attrs(heap, i);
+            SlotMeta { flags, is_accessor }
+        })
+        .collect()
+}
+
+/// Ensure per-slot metadata is materialized in [`ExoticSlots::slots`] and the
+/// object reads attributes from it (sets `slot_attrs_overridden`).
+///
+/// No-op when the object is already materialized — dictionary mode (null
+/// shape) or a prior override. Otherwise it snapshots the shaped object's
+/// per-slot attributes from the hidden class, so it must run *before* an
+/// in-place attribute mutation that does not transition the class
+/// (construction accessor→data overwrite, the no-shape `defineProperty` /
+/// `freeze` / `seal` fallbacks, `delete`).
+fn materialize_slots(obj: JsObject, heap: &mut otter_gc::GcHeap) {
+    let metas = heap.read_payload(obj, |body| {
+        (!body.slots_materialized()).then(|| materialized_slot_metas(heap, body))
+    });
+    if let Some(metas) = metas {
+        heap.with_payload(obj, |body| {
+            body.exotic_mut().slots = metas;
+            body.slot_attrs_overridden = true;
+        });
+    }
+}
+
 fn order_string_key_entries(entries: Vec<(String, usize)>) -> Vec<(String, usize)> {
     let mut integer_indices = Vec::new();
     let mut string_keys = Vec::new();
@@ -3434,7 +3574,13 @@ pub fn with_properties<R>(
     f: impl FnOnce(Properties<'_>) -> R,
 ) -> R {
     heap.read_payload(obj, |body| {
-        let string_keys = ordinary_string_key_entries(heap, body);
+        let string_keys = ordinary_string_key_entries(heap, body)
+            .into_iter()
+            .map(|(key, idx)| {
+                let (flags, is_accessor) = body.slot_attrs(heap, idx);
+                (key, idx, flags, is_accessor)
+            })
+            .collect();
         f(Properties { body, string_keys })
     })
 }
@@ -3575,7 +3721,10 @@ mod tests {
             get_own(o, interp.gc_heap(), "x"),
             Some(Value::boolean(false))
         );
-        assert_eq!(interp.gc_heap().read_payload(o, |body| body.slots.len()), 1);
+        // The object stays shaped (its hidden class is the count/attribute
+        // source), so it carries no materialized per-slot metadata; the own
+        // property count comes from the shape.
+        assert_eq!(len(o, interp.gc_heap()), 1);
     }
 
     #[test]

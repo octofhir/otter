@@ -98,6 +98,8 @@ pub(crate) fn capture_store_property_transition(
     let from_shape_id = super::shape_id(obj, heap);
     let existing_offset =
         heap.read_payload(obj, |body| super::body_offset_of(heap, body, key.name()));
+    let index = heap.read_payload(obj, |body| super::body_property_count(heap, body));
+    let slot = u16::try_from(index).ok()?;
     let transition = heap.with_payload(obj, |body| {
         if !is_fast_shape_body(body)
             || !body.extensible
@@ -108,12 +110,11 @@ pub(crate) fn capture_store_property_transition(
         if existing_offset.is_some() {
             return None;
         }
-        let slot = u16::try_from(body.slots.len()).ok()?;
         let to_shape_id = super::next_shape_id();
         body.dictionary_shape_id = to_shape_id;
         super::dict_push_key(body, key.name().to_owned());
         body.shape = super::ShapeHandle::null();
-        body.push_slot(SlotMeta::data_default(), *value);
+        body.push_slot(index, SlotMeta::data_default(), *value);
         Some(StorePropertyTransition {
             from_shape_id,
             atom_id: key.atom().id(),
@@ -136,9 +137,14 @@ pub(crate) fn capture_store_property_transition_with_shape(
 ) -> Option<StorePropertyTransition> {
     let kind = transition_kind(obj, heap, key)?;
     let from_shape_id = super::shape_id(obj, heap);
-    let to_shape_id = heap.read_payload(next_shape, super::shape_body::ShapeBody::id);
+    let (to_shape_id, to_shape_count) = heap.read_payload(next_shape, |s| {
+        (s.id(), s.property_count())
+    });
     let existing_offset =
         heap.read_payload(obj, |body| super::body_offset_of(heap, body, key.name()));
+    // The appended slot's flat index is the new shape's last offset.
+    let index = to_shape_count as usize - 1;
+    let slot = u16::try_from(index).ok()?;
     let transition = heap.with_payload(obj, |body| {
         if !is_fast_shape_body(body)
             || !body.extensible
@@ -149,9 +155,8 @@ pub(crate) fn capture_store_property_transition_with_shape(
         if existing_offset.is_some() {
             return None;
         }
-        let slot = u16::try_from(body.slots.len()).ok()?;
         body.shape = next_shape;
-        body.push_slot(SlotMeta::data_default(), *value);
+        body.push_slot(index, SlotMeta::data_default(), *value);
         Some(StorePropertyTransition {
             from_shape_id,
             atom_id: key.atom().id(),
@@ -189,6 +194,7 @@ pub(crate) fn replay_store_property_transition(
     };
     let existing_offset =
         heap.read_payload(obj, |body| super::body_offset_of(heap, body, key.name()));
+    let current_count = heap.read_payload(obj, |body| super::body_property_count(heap, body));
     let success = heap.with_payload(obj, |body| {
         if !is_fast_shape_body(body)
             || current_shape_id != transition.from_shape_id
@@ -200,7 +206,7 @@ pub(crate) fn replay_store_property_transition(
         }
         let offset = usize::from(transition.slot);
         debug_assert_eq!(existing_offset, None);
-        if body.slots.len() != offset {
+        if current_count != offset {
             return false;
         }
         if transition.to_shape.is_null() {
@@ -211,7 +217,7 @@ pub(crate) fn replay_store_property_transition(
             debug_assert_eq!(to_shape_id, Some(transition.to_shape_id));
             body.shape = transition.to_shape;
         }
-        body.push_slot(SlotMeta::data_default(), *value);
+        body.push_slot(offset, SlotMeta::data_default(), *value);
         true
     });
     if !success {

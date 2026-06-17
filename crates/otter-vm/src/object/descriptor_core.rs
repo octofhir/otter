@@ -41,11 +41,18 @@ pub(super) fn ordinary_set_data_property(
     let barrier_value = value;
     let existing_offset = heap.read_payload(obj, |body| super::body_offset_of(heap, body, key));
     let dictionary_keys = super::dictionary_keys_for_shape_transition(heap, obj, existing_offset);
+    let slot_metas = super::slot_metas_for_shape_transition(heap, obj, existing_offset);
+    let append_index = heap.read_payload(obj, |body| super::body_property_count(heap, body));
+    // The writable/accessor gate reads the slot's attributes through the shape,
+    // which `with_payload` cannot walk, so resolve it under a read borrow first.
+    let existing_attrs = existing_offset.map(|offset| {
+        heap.read_payload(obj, |body| body.slot_attrs(heap, offset as usize))
+    });
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
             let i = offset as usize;
-            let slot = &body.slots[i];
-            if !slot.flags.writable() || slot.is_accessor {
+            let (flags, is_accessor) = existing_attrs.expect("attrs read for existing slot");
+            if !flags.writable() || is_accessor {
                 return false;
             }
             body.set_data_value(i, value);
@@ -59,9 +66,12 @@ pub(super) fn ordinary_set_data_property(
         if let Some(dictionary_keys) = dictionary_keys {
             super::dict_set_keys(body, dictionary_keys);
         }
+        if let Some(slot_metas) = slot_metas {
+            body.exotic_mut().slots = slot_metas;
+        }
         super::dict_push_key(body, key.to_owned());
         body.shape = ShapeHandle::null();
-        body.push_slot(SlotMeta::data_default(), value);
+        body.push_slot(append_index, SlotMeta::data_default(), value);
         true
     });
     if success {
@@ -79,11 +89,16 @@ pub(super) fn ordinary_set_data_property_with_shape(
 ) -> bool {
     let barrier_value = value;
     let existing_offset = heap.read_payload(obj, |body| super::body_offset_of(heap, body, key));
+    let existing_attrs = existing_offset.map(|offset| {
+        heap.read_payload(obj, |body| body.slot_attrs(heap, offset as usize))
+    });
+    // The appended slot's flat index is the new shape's last offset.
+    let append_index = super::shape_property_count(next_shape, heap) as usize - 1;
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
             let i = offset as usize;
-            let slot = &body.slots[i];
-            if !slot.flags.writable() || slot.is_accessor {
+            let (flags, is_accessor) = existing_attrs.expect("attrs read for existing slot");
+            if !flags.writable() || is_accessor {
                 return false;
             }
             body.set_data_value(i, value);
@@ -94,7 +109,7 @@ pub(super) fn ordinary_set_data_property_with_shape(
             return false;
         }
         body.shape = next_shape;
-        body.push_slot(SlotMeta::data_default(), value);
+        body.push_slot(append_index, SlotMeta::data_default(), value);
         true
     });
     if success {

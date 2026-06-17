@@ -205,6 +205,15 @@ pub struct MapBody {
     /// objects, so `m.x = 1` / `Object.defineProperty(m, …)` install here
     /// (the `[[MapData]]` entries are NOT own properties).
     expando: Option<crate::object::JsObject>,
+    /// Hash index: structural-key hash → live entry indices, turning
+    /// `get`/`has`/`set`/`delete` from O(n) linear scans into ~O(1).
+    /// Only hashable, GC-stable keys are indexed (number / string-by-
+    /// content / bool / null / undefined); symbol & object-identity keys
+    /// fall back to a linear scan because their hash moves under GC.
+    /// `#[pelt(skip)]`: holds no `Gc` slot (only `u64` hashes + `u32`
+    /// entry indices), so the collector never traces it.
+    #[pelt(skip)]
+    index: rustc_hash::FxHashMap<u64, smallvec::SmallVec<[u32; 2]>>,
 }
 
 #[derive(Debug)]
@@ -253,6 +262,77 @@ impl MapEntry {
         self.key_hash = None;
         self.key = None;
         self.value = None;
+    }
+}
+
+/// Structural hash of an indexable [`MapKey`], or `None` when the key is
+/// identity-based (symbol / object) and therefore not GC-stable enough to
+/// index — those keys fall back to a linear scan.
+///
+/// `NaN` collapses to a single canonical hash so all `NaN` keys land in the
+/// same bucket (SameValueZero treats them equal); `-0`/`+0` were already
+/// collapsed in [`MapKey::from_value`]. Strings use the heap-free content
+/// [`JsString::cached_hash`]. Heap-independent by construction.
+fn map_key_hash(key: &MapKey) -> Option<u64> {
+    use core::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    match key {
+        MapKey::Undefined => 0u8.hash(&mut h),
+        MapKey::Null => 1u8.hash(&mut h),
+        MapKey::Boolean(b) => {
+            2u8.hash(&mut h);
+            b.hash(&mut h);
+        }
+        MapKey::Number(f) => {
+            3u8.hash(&mut h);
+            let bits = if f.is_nan() { f64::NAN.to_bits() } else { f.to_bits() };
+            bits.hash(&mut h);
+        }
+        MapKey::String(s) => {
+            4u8.hash(&mut h);
+            s.cached_hash().hash(&mut h);
+        }
+        MapKey::BigInt(_) | MapKey::Symbol(_) | MapKey::ObjectValue(_) => return None,
+    }
+    Some(h.finish())
+}
+
+/// Locate the live entry index for `key` in `body`.
+///
+/// Indexable keys probe the hash index then verify the real key via
+/// [`MapEntry::key_matches`] (so hash collisions stay correct); identity
+/// keys fall back to the linear scan. Returns the index into `body.entries`
+/// (which is append-plus-tombstone, so indices are stable for the life of
+/// the entry).
+fn map_find_entry(body: &MapBody, key: &MapKey, heap: &otter_gc::GcHeap) -> Option<usize> {
+    if let Some(hash) = map_key_hash(key) {
+        let bucket = body.index.get(&hash)?;
+        bucket
+            .iter()
+            .map(|&i| i as usize)
+            .find(|&i| body.entries.get(i).is_some_and(|e| e.key_matches(key, heap)))
+    } else {
+        body.entries.iter().position(|e| e.key_matches(key, heap))
+    }
+}
+
+/// Add a freshly-appended entry index to the hash index (no-op for
+/// non-indexable keys).
+fn map_index_insert(body: &mut MapBody, key: &MapKey, entry_idx: usize) {
+    if let Some(hash) = map_key_hash(key) {
+        body.index.entry(hash).or_default().push(entry_idx as u32);
+    }
+}
+
+/// Drop a now-tombstoned entry index from the hash index.
+fn map_index_remove(body: &mut MapBody, key: &MapKey, entry_idx: usize) {
+    if let Some(hash) = map_key_hash(key) {
+        if let Some(bucket) = body.index.get_mut(&hash) {
+            bucket.retain(|i| *i as usize != entry_idx);
+            if bucket.is_empty() {
+                body.index.remove(&hash);
+            }
+        }
     }
 }
 
@@ -324,10 +404,7 @@ pub fn map_is_empty(map: JsMap, heap: &otter_gc::GcHeap) -> bool {
 pub fn map_get(map: JsMap, heap: &otter_gc::GcHeap, key: &Value) -> Option<Value> {
     let k = MapKey::from_value(key, heap);
     heap.read_payload(map, |body| {
-        body.entries
-            .iter()
-            .find(|entry| entry.key_matches(&k, heap))
-            .and_then(|entry| entry.value)
+        map_find_entry(body, &k, heap).and_then(|idx| body.entries[idx].value)
     })
 }
 
@@ -335,9 +412,7 @@ pub fn map_get(map: JsMap, heap: &otter_gc::GcHeap, key: &Value) -> Option<Value
 #[must_use]
 pub fn map_has(map: JsMap, heap: &otter_gc::GcHeap, key: &Value) -> bool {
     let k = MapKey::from_value(key, heap);
-    heap.read_payload(map, |body| {
-        body.entries.iter().any(|entry| entry.key_matches(&k, heap))
-    })
+    heap.read_payload(map, |body| map_find_entry(body, &k, heap).is_some())
 }
 
 /// `Map.prototype.set` — Spec §24.1.3.9. Updates in place
@@ -351,11 +426,7 @@ pub fn map_set(
     let barrier_key = key;
     let barrier_value = value;
     let k = MapKey::from_value(&key, heap);
-    let existing_idx = heap.read_payload(map, |body| {
-        body.entries
-            .iter()
-            .position(|entry| entry.key_matches(&k, heap))
-    });
+    let existing_idx = heap.read_payload(map, |body| map_find_entry(body, &k, heap));
     if existing_idx.is_none() {
         let target_len = heap.read_payload(map, |body| body.entries.len().saturating_add(1));
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -367,7 +438,11 @@ pub fn map_set(
     let exists = existing_idx.is_some();
     heap.with_payload(map, |body| match existing_idx {
         Some(idx) => body.entries[idx].value = Some(value),
-        None => body.entries.push(MapEntry::live(k, key, value)),
+        None => {
+            let new_idx = body.entries.len();
+            map_index_insert(body, &k, new_idx);
+            body.entries.push(MapEntry::live(k, key, value));
+        }
     });
     if !exists {
         heap.record_write(map, &barrier_key);
@@ -387,11 +462,7 @@ pub(crate) fn map_set_with_roots(
     let barrier_key = key;
     let barrier_value = value;
     let k = MapKey::from_value(&key, heap);
-    let existing_idx = heap.read_payload(*map, |body| {
-        body.entries
-            .iter()
-            .position(|entry| entry.key_matches(&k, heap))
-    });
+    let existing_idx = heap.read_payload(*map, |body| map_find_entry(body, &k, heap));
     if existing_idx.is_none() {
         let target_len = heap.read_payload(*map, |body| body.entries.len().saturating_add(1));
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -404,7 +475,11 @@ pub(crate) fn map_set_with_roots(
     let exists = existing_idx.is_some();
     heap.with_payload(*map, |body| match existing_idx {
         Some(idx) => body.entries[idx].value = Some(value),
-        None => body.entries.push(MapEntry::live(k, key, value)),
+        None => {
+            let new_idx = body.entries.len();
+            map_index_insert(body, &k, new_idx);
+            body.entries.push(MapEntry::live(k, key, value));
+        }
     });
     if !exists {
         heap.record_write(*map, &barrier_key);
@@ -417,14 +492,13 @@ pub(crate) fn map_set_with_roots(
 /// the entry existed.
 pub fn map_delete(map: JsMap, heap: &mut otter_gc::GcHeap, key: &Value) -> bool {
     let k = MapKey::from_value(key, heap);
-    let idx = heap.read_payload(map, |body| {
-        body.entries
-            .iter()
-            .position(|entry| entry.key_matches(&k, heap))
-    });
+    let idx = heap.read_payload(map, |body| map_find_entry(body, &k, heap));
     match idx {
         Some(idx) => {
-            heap.with_payload(map, |body| body.entries[idx].clear());
+            heap.with_payload(map, |body| {
+                map_index_remove(body, &k, idx);
+                body.entries[idx].clear();
+            });
             true
         }
         None => false,
@@ -437,6 +511,7 @@ pub fn map_clear(map: JsMap, heap: &mut otter_gc::GcHeap) {
         for entry in &mut body.entries {
             entry.clear();
         }
+        body.index.clear();
     });
 }
 
@@ -503,6 +578,10 @@ pub struct SetBody {
     prototype_override: Option<Value>,
     /// Lazy ordinary own-property bag (see [`MapBody::expando`]).
     expando: Option<crate::object::JsObject>,
+    /// Hash index: structural-key hash → live entry indices (see
+    /// [`MapBody::index`]). `#[pelt(skip)]`: holds no `Gc` slot.
+    #[pelt(skip)]
+    index: rustc_hash::FxHashMap<u64, smallvec::SmallVec<[u32; 2]>>,
 }
 
 #[derive(Debug)]
@@ -541,6 +620,37 @@ impl SetEntry {
     fn clear(&mut self) {
         self.key_hash = None;
         self.value = None;
+    }
+}
+
+/// Set analogue of [`map_find_entry`] — hash-index probe with linear
+/// fallback for identity keys.
+fn set_find_entry(body: &SetBody, key: &MapKey, heap: &otter_gc::GcHeap) -> Option<usize> {
+    if let Some(hash) = map_key_hash(key) {
+        let bucket = body.index.get(&hash)?;
+        bucket
+            .iter()
+            .map(|&i| i as usize)
+            .find(|&i| body.entries.get(i).is_some_and(|e| e.key_matches(key, heap)))
+    } else {
+        body.entries.iter().position(|e| e.key_matches(key, heap))
+    }
+}
+
+fn set_index_insert(body: &mut SetBody, key: &MapKey, entry_idx: usize) {
+    if let Some(hash) = map_key_hash(key) {
+        body.index.entry(hash).or_default().push(entry_idx as u32);
+    }
+}
+
+fn set_index_remove(body: &mut SetBody, key: &MapKey, entry_idx: usize) {
+    if let Some(hash) = map_key_hash(key) {
+        if let Some(bucket) = body.index.get_mut(&hash) {
+            bucket.retain(|i| *i as usize != entry_idx);
+            if bucket.is_empty() {
+                body.index.remove(&hash);
+            }
+        }
     }
 }
 
@@ -611,9 +721,7 @@ pub fn set_is_empty(set: JsSet, heap: &otter_gc::GcHeap) -> bool {
 #[must_use]
 pub fn set_has(set: JsSet, heap: &otter_gc::GcHeap, value: &Value) -> bool {
     let k = MapKey::from_value(value, heap);
-    heap.read_payload(set, |body| {
-        body.entries.iter().any(|entry| entry.key_matches(&k, heap))
-    })
+    heap.read_payload(set, |body| set_find_entry(body, &k, heap).is_some())
 }
 
 /// `Set.prototype.add` — Spec §24.2.3.1.
@@ -624,9 +732,7 @@ pub fn set_add(
 ) -> Result<(), otter_gc::OutOfMemory> {
     let barrier_value = value;
     let k = MapKey::from_value(&value, heap);
-    let exists = heap.read_payload(set, |body| {
-        body.entries.iter().any(|entry| entry.key_matches(&k, heap))
-    });
+    let exists = heap.read_payload(set, |body| set_find_entry(body, &k, heap).is_some());
     if !exists {
         let target_len = heap.read_payload(set, |body| body.entries.len().saturating_add(1));
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -635,7 +741,11 @@ pub fn set_add(
         reserve_set_for_target_len_with_roots(&mut set, heap, target_len, &mut reserve_roots)?;
     }
     if !exists {
-        heap.with_payload(set, |body| body.entries.push(SetEntry::live(k, value)));
+        heap.with_payload(set, |body| {
+            let new_idx = body.entries.len();
+            set_index_insert(body, &k, new_idx);
+            body.entries.push(SetEntry::live(k, value));
+        });
         heap.record_write(set, &barrier_value);
     }
     Ok(())
@@ -650,9 +760,7 @@ pub(crate) fn set_add_with_roots(
 ) -> Result<(), otter_gc::OutOfMemory> {
     let barrier_value = value;
     let k = MapKey::from_value(&value, heap);
-    let exists = heap.read_payload(*set, |body| {
-        body.entries.iter().any(|entry| entry.key_matches(&k, heap))
-    });
+    let exists = heap.read_payload(*set, |body| set_find_entry(body, &k, heap).is_some());
     if !exists {
         let target_len = heap.read_payload(*set, |body| body.entries.len().saturating_add(1));
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -662,7 +770,11 @@ pub(crate) fn set_add_with_roots(
         reserve_set_for_target_len_with_roots(set, heap, target_len, &mut reserve_roots)?;
     }
     if !exists {
-        heap.with_payload(*set, |body| body.entries.push(SetEntry::live(k, value)));
+        heap.with_payload(*set, |body| {
+            let new_idx = body.entries.len();
+            set_index_insert(body, &k, new_idx);
+            body.entries.push(SetEntry::live(k, value));
+        });
         heap.record_write(*set, &barrier_value);
     }
     Ok(())
@@ -671,14 +783,13 @@ pub(crate) fn set_add_with_roots(
 /// `Set.prototype.delete` — Spec §24.2.3.4.
 pub fn set_delete(set: JsSet, heap: &mut otter_gc::GcHeap, value: &Value) -> bool {
     let k = MapKey::from_value(value, heap);
-    let idx = heap.read_payload(set, |body| {
-        body.entries
-            .iter()
-            .position(|entry| entry.key_matches(&k, heap))
-    });
+    let idx = heap.read_payload(set, |body| set_find_entry(body, &k, heap));
     match idx {
         Some(idx) => {
-            heap.with_payload(set, |body| body.entries[idx].clear());
+            heap.with_payload(set, |body| {
+                set_index_remove(body, &k, idx);
+                body.entries[idx].clear();
+            });
             true
         }
         None => false,
@@ -691,6 +802,7 @@ pub fn set_clear(set: JsSet, heap: &mut otter_gc::GcHeap) {
         for entry in &mut body.entries {
             entry.clear();
         }
+        body.index.clear();
     });
 }
 

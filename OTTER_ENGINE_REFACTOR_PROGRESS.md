@@ -8,6 +8,19 @@
 
 ## Session state — 2026-06-17 (verified)
 
+**ToNumeric elision on provably-numeric operands (commit 76ee8805).** Non-additive
+numeric/bitwise binary ops (`- * / % ** & | ^ << >> >>>`) emitted
+`ToPrimitive(number)+ToNumeric` per operand; `ToNumeric` over a Number/BigInt is
+identity with no side effect. New `expr_is_numeric` (compiler/expr/binary.rs,
+mirrors `expr_is_primitive`) elides both ops when the operand AST is provably
+numeric (numeric/bigint literal, `++`/`--`, nested non-additive arith/bitwise,
+unary `-`/`+`/`~`, through parens). Coercion-heavy interp micro 19→7 ToNumeric/
+iter, ~5460→4190ms (−23%). Conformance-neutral: test262 coercion dirs +Number
++BigInt failing-set byte-identical to baseline (stash+rebuild+diff); diff 11/11;
+574 vm tests. Loop-OSR (Phase 1.5) confirmed already working (top-level loop JIT
+off 2291→on 346ms, 6.6×) — earlier "never tiers" note was stale. FOLLOWUP:
+`unary.rs:482/610` ToNumeric elidable by the same rule.
+
 **Map/Set O(n²) → O(n) (commit 420fbfcf).** MapBody/SetBody scanned `entries`
 linearly per op; bulk build was O(n²) (set-build 10k→40k: 134→1675ms, 3.7×/
 doubling). Added `#[pelt(skip)] FxHashMap<u64, SmallVec<[u32;2]>>` index (key

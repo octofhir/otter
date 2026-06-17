@@ -6,6 +6,45 @@
 
 ---
 
+## Session state — 2026-06-17 (verified)
+
+**Shipped this session (13 commits):** WhiskerIC inline ICs 3a–3e (LoadProperty /
+StoreProperty + write barrier / direct method calls / upvalue load+store /
+StoreUpvalueChecked + array-callback already-rooted), JSON.stringify fast object
+path, JSON.parse escape-free key alloc cut. Two larger fixes tried + reverted
+(documented): JSON dict-mode fast-shapes (regression), upvalue-spine pool
+(neutral).
+
+**otter-jit vs node (min/4 runs, 2026-06-17):** mandelbrot 1.6×, nbody 3.8×,
+typescript 3.2×, typed-array 5.4×, fib 6.2×, json 6.8× (8×→ this session),
+prop-access 11.3× (**19× → 11×** this session — WhiskerIC), array-ops 12.4×,
+sort 13.5×, string-ops 13.7×, regex 37× (worst). Correctness floor held: diff
+11/11 identical across interp/jit/jit-osr; test262 failing-set identical JIT-off
+vs JIT-on on every touched dir (function/arrow/Array.map/JSON/call all parity).
+
+**Bounded-win phase is complete.** The cheap, low-risk per-op/per-alloc cuts are
+exhausted. Reliable controlled profiling (not `sample`, which misattributed
+twice) confirms the remaining tracked-bench gaps are **structural**:
+- **array-ops (12×) / sort (13.5×)** — per-element callback is ~60 ns of *diffuse*
+  function-call overhead (frame build + JIT dispatch + teardown via
+  `run_callable_sync`), measured as forEach-empty 2.53 s vs plain-loop 1.10 s over
+  24M iters; the body and element-read are cheap and the spine alloc is tiny (the
+  pool was neutral). No single hotspot — only **per-element frame reuse** (build
+  the callee frame once, rebind args + reset pc per element) or the optimizing
+  tier captures it. Frame reuse is tractable (each `array_callback_native_dispatch`
+  invocation owns its frame, so no re-entry aliasing) but the per-iteration frame
+  *reset* correctness (registers→undefined except args, pc=0, cold state cleared)
+  is subtle — a focused **attended** slice, gated on array-ops AND sort improving.
+- **string-ops (14×)** — `charCodeAt` loop; needs KelpHeap string-body layout
+  (Slice 4) to read code units by offset / inline the intrinsic.
+- **json (6.8×)** — allocation/GC bound (`alloc_old` from birth); needs TideGC
+  young-gen for short-lived parse results (Slice 5), not a ShellBuiltins tweak.
+- **regex (37×, worst)** — separate engine; RippleRegex (Slice 7).
+
+**Remaining levers are all large attended slices** (frame reuse / KelpHeap string /
+TideGC young-gen / RippleRegex / the DiveJIT optimizing tier), each needing
+careful iteration + hard gating. The autonomous bounded-cut loop has converged.
+
 ## Slice ladder
 
 Order follows the plan's *minimal implementation sequence* (§5). Each slice is gated by the [verification contract](#verification-contract).

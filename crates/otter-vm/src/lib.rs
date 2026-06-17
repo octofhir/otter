@@ -1428,6 +1428,17 @@ impl Interpreter {
             return None;
         }
         let fid = frame.function_id;
+        // Single-entry compiled-code cache. A hot synchronous re-entry (Array
+        // callbacks, comparators, `@@iterator` drives) resolves the SAME callee
+        // every call; this skips the `jit_code` FxHashMap lookup + `Arc` clone
+        // churn when the last resolve matched. The cache only ever holds
+        // non-`osr_only` code (populated below + by `jit_resolve_compiled_cached`),
+        // so it needs no further filtering.
+        if let Some((cached_fid, code)) = &self.jit_code_cache
+            && *cached_fid == fid
+        {
+            return Some(code.clone());
+        }
         let code = if let Some(slot) = self.jit_code.get(&fid) {
             slot.clone()
         } else {
@@ -1449,7 +1460,11 @@ impl Interpreter {
         // The function-entry path never runs OSR-only code (compiled with
         // unsupported opcodes emitted as bails); only loop OSR enters it, at a
         // supported loop header. The code stays cached for that OSR path.
-        code.filter(|c| !c.osr_only())
+        let code = code.filter(|c| !c.osr_only());
+        if let Some(c) = &code {
+            self.jit_code_cache = Some((fid, c.clone()));
+        }
+        code
     }
 
     /// Run compiled `code` over the rooted register window of frame `top_idx`.

@@ -137,6 +137,28 @@ auto-invalidate it.
 Best executed as a dedicated session per stage — not interleaved with other
 work — because of the conformance-gating cadence.
 
+### Critical findings (scoped before implementation)
+- **Shaped objects are NOT always all-default-data.** `o.x = v` appends a
+  default-data slot and keeps the shape. But `Object.defineProperty` on an
+  *existing* property modifies `slots[i]` in place via `set_slot`
+  **without nulling the shape** (object.rs:2384 / 2428 / 2516), and
+  `freeze`/`seal` flip `configurable`/`writable` on `slots` in place
+  (object.rs:2800-2829) — both on shaped objects. So a shaped object CAN carry
+  non-default flags / accessor kind. ⇒ the trivial "lazy-slots = derive
+  default-data from shape count" shortcut is UNSOUND as-is; those mutation
+  paths must first transition to an attribute-encoding shape (stage D) or
+  materialize a per-object slots override.
+- **`slots.len()` is the load-bearing property COUNT source** during
+  transitions (`push_slot` uses `self.slots.len()` as the next slot index;
+  shape_transition replays against it). Removing `slots` requires the shape
+  (or dict keys) to become the authoritative count everywhere first — this is
+  entangled with the transition replay machinery, not a local edit.
+- Net: R2 is a genuine multi-file rewrite of the shape/transition core, not a
+  mechanical field move like D1a-d. Execute stages A→E fresh, each with a full
+  `just test262` failing-set diff. Lazy-slots can be folded in as an
+  optimization within stage E (a shaped object with only default-data slots
+  stores no override) once the shape owns count + attributes.
+
 ## R2b (later) — Split inline[6] + overflow `Vec` object storage → the 7th property cliff
 
 ### Evidence

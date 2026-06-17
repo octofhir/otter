@@ -3171,7 +3171,7 @@ impl Interpreter {
         };
     }
 
-    fn enter_sync_reentry(&mut self) -> Result<(), VmError> {
+    pub(crate) fn enter_sync_reentry(&mut self) -> Result<(), VmError> {
         let limit = self.max_stack_depth.min(DEFAULT_MAX_SYNC_REENTRY_DEPTH);
         if self.sync_reentry_depth >= limit {
             return Err(VmError::StackOverflow { limit });
@@ -3180,7 +3180,7 @@ impl Interpreter {
         Ok(())
     }
 
-    fn leave_sync_reentry(&mut self) {
+    pub(crate) fn leave_sync_reentry(&mut self) {
         debug_assert!(self.sync_reentry_depth > 0);
         self.sync_reentry_depth = self.sync_reentry_depth.saturating_sub(1);
     }

@@ -2966,6 +2966,43 @@ pub(crate) fn array_callback_native_dispatch(
     interp.push_iteration_anchor(string_data.map_or_else(Value::undefined, Value::string));
     interp.push_iteration_anchor(acc);
     interp.push_iteration_anchor(Value::undefined());
+    // Lean per-element callback invocation. When the callback is a plain
+    // bytecode function/closure (not native/bound/proxy/generator/async/…), we
+    // draw ONE reservation-stable stack + enter the sync-reentry guard once for
+    // the whole loop, then invoke the callback directly through the committed
+    // bytecode tail per element — skipping `run_callable_sync`'s per-call
+    // bound/proxy/native dispatch checks and stack draw/return. Ineligible
+    // callbacks keep the general per-element `run_callable_sync_already_rooted`
+    // path. `function_id` is shape-stable, so resolving eligibility once on the
+    // pre-loop callback handle is valid for the whole walk.
+    let lean_eligible = {
+        let fid = callback
+            .as_closure(interp.gc_heap())
+            .map(|c| c.function_id())
+            .or_else(|| callback.as_function());
+        fid.and_then(|fid| context.exec_function(fid))
+            .is_some_and(|f| {
+                !f.is_generator
+                    && !f.is_async
+                    && !f.is_async_generator
+                    && !f.needs_arguments
+                    && !f.has_rest
+                    && !f.makes_function
+                    && !f.contains_direct_eval
+                    && !f.is_derived_constructor
+            })
+    };
+    // `Some` only when the reentry guard was entered (must be left after the
+    // walk); a depth-limit `Err` falls back to the per-call path, which
+    // re-checks depth itself.
+    let mut lean_inner: Option<crate::holt_stack::HoltStack> = if lean_eligible {
+        match interp.enter_sync_reentry() {
+            Ok(()) => Some(interp.draw_stack()),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
     // Run the walk inside a closure so the matching
     // `pop_iteration_anchors_to` always runs — on normal completion and
     // on every `?` error — without threading a manual cleanup through
@@ -3099,11 +3136,16 @@ pub(crate) fn array_callback_native_dispatch(
             // already live. Use the already-rooted re-entry to drop a redundant
             // `ExtraRoots` Vec push/truncate per element (the duplicate the
             // heap's `same_source` walk would skip anyway).
-            let result = interp
-                .run_callable_sync_already_rooted(&context, &callback, cb_this, cb_args)
-                .map_err(|err| {
-                    crate::native_function::vm_to_native_error(err, "Array.prototype callback")
-                })?;
+            let result = match lean_inner {
+                Some(ref mut inner) => interp
+                    .run_bytecode_callable_committed(inner, &context, callback, cb_this, cb_args),
+                None => {
+                    interp.run_callable_sync_already_rooted(&context, &callback, cb_this, cb_args)
+                }
+            }
+            .map_err(|err| {
+                crate::native_function::vm_to_native_error(err, "Array.prototype callback")
+            })?;
             // The callback may have moved the element / output target.
             let v = interp.iteration_anchor(anchor_base + A_ELEM);
             match name {
@@ -3159,6 +3201,12 @@ pub(crate) fn array_callback_native_dispatch(
         }
         Ok(())
     })();
+    // Release the lean-path stack + reentry guard on every completion path
+    // (mirrors the anchor pop below), regardless of `walk` success/error.
+    if let Some(inner) = lean_inner.take() {
+        interp.return_stack(inner);
+        interp.leave_sync_reentry();
+    }
     // Read the (possibly relocated) output target and accumulator back
     // before releasing the anchors so the final result returns a live
     // handle. `map`/`filter`/`flatMap` keep their target identity; other

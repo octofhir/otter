@@ -1698,6 +1698,39 @@ impl Interpreter {
                 effective_args.as_slice(),
             );
         }
+        let mut inner = self.draw_stack();
+        let result = self.run_bytecode_callable_committed(
+            &mut inner,
+            context,
+            current,
+            effective_this,
+            effective_args,
+        );
+        self.return_stack(inner);
+        result
+    }
+
+    /// Build and run the bytecode-callable frame for `current` on `inner` — the
+    /// committed tail of [`Self::run_callable_sync_inner`] once the
+    /// bound/proxy/native dispatch loop has resolved to a plain bytecode
+    /// function/closure.
+    ///
+    /// Extracted (not duplicated) so a hot native callback loop (Array
+    /// iteration) can reuse ONE persistent reservation-stable stack across
+    /// elements instead of drawing/returning a pooled stack per call, and skip
+    /// the per-call bound/proxy/native wrapper checks. The caller owns `inner`
+    /// (draws it + returns it to the pool); this method leaves it empty on every
+    /// completion path (the callee frame is popped), so it is immediately
+    /// reusable for the next call. A generator callee consumes the frame into a
+    /// generator object and leaves `inner` untouched.
+    pub(crate) fn run_bytecode_callable_committed(
+        &mut self,
+        inner: &mut HoltStack,
+        context: &ExecutionContext,
+        current: Value,
+        effective_this: Value,
+        effective_args: SmallVec<[Value; 8]>,
+    ) -> Result<Value, VmError> {
         let (
             function_id,
             parent_upvalues,
@@ -1788,30 +1821,25 @@ impl Interpreter {
             );
             return Ok(Value::generator(gen_handle));
         }
-        // Draw a reservation-stable stack from the pool: the entry frame may
-        // tier up and run compiled, and a compiled callee appends its frame
-        // directly onto this stack, so it must never reallocate. Recycled on
-        // every completion path so the hot callback re-entry stays
-        // allocation-free.
-        let mut inner = self.draw_stack();
+        // The caller owns `inner` (a reservation-stable pooled stack): the entry
+        // frame may tier up and run compiled, and a compiled callee appends its
+        // frame directly onto this stack, so it must never reallocate. The frame
+        // is popped on every completion path, leaving `inner` empty + reusable.
         inner.push(new_frame);
         // Tier-up the entry frame itself: a synchronously-entered callee reaches
         // `dispatch_loop` directly (no `Op::Call`), so without this hook the
         // entry level would always interpret while only its sub-calls JIT. This
         // lets a hot recursion run compiled→compiled with no interpreted levels.
-        if let Some(value) = self.dispatch_jit_sync_entry(&mut inner, context)? {
+        if let Some(value) = self.dispatch_jit_sync_entry(inner, context)? {
             // The compiled entry frame ran to completion and is terminal
             // (the integer subset cannot suspend or escape its frame), so
             // return its spilled register window to the pool.
             if let Some(mut done) = inner.pop() {
                 self.reclaim_registers(&mut done);
             }
-            self.return_stack(inner);
             return Ok(value);
         }
-        let result = self.dispatch_loop(context, &mut inner);
-        self.return_stack(inner);
-        result
+        self.dispatch_loop(context, inner)
     }
 
     /// Synchronously perform `Construct(target, args, newTarget)`.

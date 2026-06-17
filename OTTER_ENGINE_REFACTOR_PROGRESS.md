@@ -8,6 +8,16 @@
 
 ## Session state — 2026-06-17 (verified)
 
+**ToPrimitive elision through parens + unary numeric ops (commit 10d79987).**
+`expr_is_primitive` now recurses through `ParenthesizedExpression`, so a
+parenthesized primitive operand of `+`/`==`/`<`/`<=`/`>`/`>=` (e.g. `(i*2)+(i*3)`)
+skips its ToPrimitive; also applied at the unary `-`/`+`/`~` lowering (operand's
+own ToNumeric still runs). Paren-heavy interp micro 18→14 coercion ops/iter,
+~3920→3580ms (−8.7%). Conformance-neutral (24 expression dirs + Number + BigInt
+failing-set byte-identical, stash+rebuild+diff; diff 11/11). Coercion-elision
+lever now thoroughly mined. Remaining big levers: regex (67× node, worst bench),
+string-ops (14.5×) — larger/riskier, warrant fresh context.
+
 **ToNumeric elision on provably-numeric operands (commit 76ee8805).** Non-additive
 numeric/bitwise binary ops (`- * / % ** & | ^ << >> >>>`) emitted
 `ToPrimitive(number)+ToNumeric` per operand; `ToNumeric` over a Number/BigInt is

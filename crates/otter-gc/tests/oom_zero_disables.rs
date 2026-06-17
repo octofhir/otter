@@ -44,9 +44,12 @@ fn cap_zero_allows_100mb_of_allocations() {
     // tracked_bytes is reserved for cap enforcement and is not
     // updated on the disabled-cap fast path; embedders observe
     // live bytes via stats() instead. Verify spaces saw the load
-    // through the regular accounting.
+    // through the regular accounting: currently-live bytes plus the
+    // cumulative full-GC reclaim must cover the total ever allocated
+    // (the dead `Big`s may be reclaimed by repeated full GCs along
+    // the way, so the per-GC `last_full_reclaimed` alone undercounts).
     let stats = heap.stats();
-    assert!(stats.allocated_bytes + stats.last_full_reclaimed >= target_bytes as usize);
+    assert!(stats.allocated_bytes + stats.total_full_reclaimed >= target_bytes as usize);
     // oom_flag is never set when the cap is disabled.
     assert!(!heap.oom_flag().load(std::sync::atomic::Ordering::Relaxed));
 }

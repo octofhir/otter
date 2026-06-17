@@ -105,6 +105,11 @@ pub struct HeapStats {
     pub last_scavenge: ScavengeStats,
     /// Bytes reclaimed by the most recent full GC.
     pub last_full_reclaimed: usize,
+    /// Bytes reclaimed across every full GC since the heap was created.
+    /// Cumulative, so `allocated_bytes + total_full_reclaimed` is a lower
+    /// bound on the bytes ever allocated even when repeated full GCs reclaim
+    /// short-lived objects between two stats snapshots.
+    pub total_full_reclaimed: usize,
     /// Bytes currently tracked against the configured cap (sum
     /// of slot allocations + outstanding [`GcHeap::reserve_bytes`]
     /// reservations). `0` until the first allocation.
@@ -1602,6 +1607,7 @@ impl GcHeap {
 
         self.marking.finish_cycle();
         self.stats.last_full_reclaimed = reclaimed;
+        self.stats.total_full_reclaimed = self.stats.total_full_reclaimed.saturating_add(reclaimed);
         self.gc_stats.last_gc_reclaimed_bytes = reclaimed;
         self.gc_stats.gc_cycles = self.gc_stats.gc_cycles.saturating_add(1);
         let elapsed = pause_start.elapsed();

@@ -152,11 +152,17 @@ mod tests {
     }
 
     fn compile_module_src_err(src: &str, host: &ModuleHostInfo) -> CompileError {
-        with_program(src, SyntaxSourceKind::TypeScript, |program| {
+        // A module early error can surface either at parse time (`with_program`
+        // returns a `SyntaxError`, e.g. a top-level `new.target`) or during
+        // lowering (`compile_module_program` returns a `CompileError`). Fold the
+        // parse-level case into `CompileError::Syntax` so both are reported the
+        // same way, matching the script entry points.
+        match with_program(src, SyntaxSourceKind::TypeScript, |program| {
             compile_module_program(program, SyntaxSourceKind::TypeScript, host)
-        })
-        .unwrap()
-        .unwrap_err()
+        }) {
+            Ok(result) => result.unwrap_err(),
+            Err(syntax) => CompileError::from(syntax),
+        }
     }
 
     fn compile_script_src(src: &str) -> BytecodeModule {

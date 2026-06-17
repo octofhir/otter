@@ -86,6 +86,10 @@ pub struct JitFunctionView {
     /// here, or one whose candidate fails the test — emits the normal
     /// direct-call bridge.
     pub inline_callees: rustc_hash::FxHashMap<u32, JitInlineCallee>,
+    /// Inline-candidate methods for `Op::CallMethodValue` sites, keyed by the
+    /// caller's call byte-PC. Populated for monomorphic method sites whose method
+    /// is a tiny read-only body; baked by `Interpreter::bake_inline_callees`.
+    pub inline_methods: rustc_hash::FxHashMap<u32, JitInlineMethod>,
 }
 
 /// A callee the baseline may splice into a caller's `Op::Call` site instead of
@@ -104,6 +108,30 @@ pub struct JitInlineCallee {
     pub register_count: u16,
     /// Callee instruction stream in byte-PC order, emitted inline.
     pub instructions: Vec<JitInstrView>,
+}
+
+/// A method the baseline may splice into a caller's `Op::CallMethodValue` site.
+/// Carries the method's body plus the data to guard it: the receiver shape the
+/// body's sealed property loads are baked against, and, per body `LoadProperty`
+/// byte-PC, the value byte offset to load from the decompressed receiver.
+/// Method identity is verified at run time by re-resolving through the call
+/// site's IC (so a prototype-method reassignment falls back), not baked here.
+#[derive(Debug, Clone)]
+pub struct JitInlineMethod {
+    /// Method function id the call-site identity check is keyed on.
+    pub method_fid: u32,
+    /// Receiver shape-handle compressed offset the sealed loads are baked for.
+    pub recv_shape: u32,
+    /// Method formal parameter count (excluding `this`); must equal argc.
+    pub param_count: u16,
+    /// Method register-window length; the body runs in a scratch block of this
+    /// many slots plus one for `this`.
+    pub register_count: u16,
+    /// Method instruction stream, emitted inline.
+    pub instructions: Vec<JitInstrView>,
+    /// Body `LoadProperty` byte-PC → value byte offset from the decompressed
+    /// receiver pointer, baked from the receiver shape.
+    pub prop_offsets: rustc_hash::FxHashMap<u32, u32>,
 }
 
 /// VM-resolved direct-call target for one eligible compiled callee.

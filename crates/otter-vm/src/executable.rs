@@ -207,6 +207,7 @@ impl ExecutableFunction {
             // per-site feedback and can resolve callee bodies); the raw snapshot
             // carries none.
             inline_callees: rustc_hash::FxHashMap::default(),
+            inline_methods: rustc_hash::FxHashMap::default(),
         }
     }
 

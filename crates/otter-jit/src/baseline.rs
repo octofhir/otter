@@ -612,6 +612,32 @@ extern "C" fn jit_call_method_stub(
     }
 }
 
+/// Resolve the current method function id for an inlined `CallMethodValue`
+/// site. Returns the method's bytecode function id, or `u32::MAX` for any
+/// non-object receiver / IC miss / non-bytecode method. Cannot throw, so the
+/// caller branches on the returned id rather than a status. Re-resolving each
+/// call makes a prototype-method reassignment fall back to the full call.
+extern "C" fn jit_resolve_inline_method_stub(
+    ctx: *mut JitCtx,
+    recv_reg: u64,
+    name_idx: u64,
+    site: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &*ctx.stack };
+    let context = unsafe { &*ctx.context };
+    u64::from(vm.jit_resolve_inline_method_fid(
+        context,
+        stack,
+        ctx.frame_index,
+        recv_reg as u16,
+        name_idx as u32,
+        site as usize,
+    ))
+}
+
 /// Bridge stub: perform a computed `StoreElement` (`recv[idx] = src`) from
 /// compiled code, delegating to the safe
 /// [`Interpreter::jit_runtime_store_element`]. Returns `0` on success, `1` when
@@ -813,12 +839,13 @@ mod arm64 {
         jit_call_method_stub, jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
         jit_finish_direct_call_returned_stub, jit_load_element_stub, jit_load_global_stub,
         jit_load_prop_stub, jit_load_upvalue_stub, jit_make_fn_stub, jit_prepare_direct_call_stub,
-        jit_prepare_direct_method_call_stub, jit_store_element_stub, jit_store_prop_stub,
-        jit_store_upvalue_stub, jit_write_barrier_stub, reg_offset,
+        jit_prepare_direct_method_call_stub, jit_resolve_inline_method_stub,
+        jit_store_element_stub, jit_store_prop_stub, jit_store_upvalue_stub,
+        jit_write_barrier_stub, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
-    use otter_vm::{JitFunctionView, JitInlineCallee, JitTypedArrayLayout};
+    use otter_vm::{JitFunctionView, JitInlineCallee, JitInlineMethod, JitTypedArrayLayout};
     use std::collections::BTreeMap;
 
     /// Comparison flavors that emit a `cset` from integer `cmp` flags.
@@ -1220,7 +1247,25 @@ mod arm64 {
                 // in-place full method-call stub when ineligible.
                 Op::CallMethodValue => {
                     let site = instr.property_ic_site.unwrap_or(usize::MAX) as u64;
-                    emit_method_call(&mut ops, ops_ref, site, threw)?;
+                    // Splice a tiny monomorphic read-only method inline under an
+                    // identity + receiver-shape guard; fall back to the method
+                    // bridge for absent / ineligible sites.
+                    let inlined = match view.inline_methods.get(&instr.byte_pc) {
+                        Some(method) => try_emit_inline_method_call(
+                            &mut ops,
+                            method,
+                            ops_ref,
+                            site,
+                            cage_base,
+                            view.object_shape_byte,
+                            bail,
+                            threw,
+                        )?,
+                        None => false,
+                    };
+                    if !inlined {
+                        emit_method_call(&mut ops, ops_ref, site, threw)?;
+                    }
                 }
                 // `recv[idx]` — inline dense-`Array` (raw `Value`) and
                 // `Float64Array`/`Int32Array` element load (guarded, no
@@ -2042,6 +2087,216 @@ mod arm64 {
         Ok(true)
     }
 
+    /// Whether an op may appear in an inlined read-only method body: the pure
+    /// leaf set plus `LoadThis` (reads the spliced receiver slot) and
+    /// `LoadProperty` (a sealed load from the receiver at a baked offset). Any
+    /// other op — notably a property/element store — aborts the inline attempt,
+    /// so a method with a side effect keeps using the full method call.
+    fn is_inline_method_op(op: Op) -> bool {
+        is_inline_pure_op(op) || matches!(op, Op::LoadThis | Op::LoadProperty)
+    }
+
+    /// Emit one op of an inlined method body. `this_slot` is the scratch slot
+    /// holding the receiver; `prop_offsets` maps a body `LoadProperty` byte-PC to
+    /// the baked value byte offset from the decompressed receiver. `LoadThis`
+    /// and `LoadProperty` are handled here; every other op routes to
+    /// [`emit_inline_pure_op`].
+    #[allow(clippy::too_many_arguments)]
+    fn emit_inline_method_op(
+        ops: &mut Assembler,
+        instr: &otter_vm::JitInstrView,
+        this_slot: u16,
+        prop_offsets: &rustc_hash::FxHashMap<u32, u32>,
+        cage_base: usize,
+        bail: DynamicLabel,
+        inline_done: DynamicLabel,
+        clabels: &BTreeMap<u32, DynamicLabel>,
+    ) -> Result<(), Unsupported> {
+        let ops_ref = instr.operands.as_slice();
+        match instr.op {
+            Op::LoadThis => {
+                let dst = reg(ops_ref, 0)?;
+                load_reg(ops, 9, this_slot)?;
+                store_reg(ops, 9, dst)?;
+                Ok(())
+            }
+            Op::LoadProperty => {
+                let dst = reg(ops_ref, 0)?;
+                let obj = reg(ops_ref, 1)?;
+                let off = *prop_offsets
+                    .get(&instr.byte_pc)
+                    .ok_or(Unsupported::ArgCount(0))?;
+                load_reg(ops, 9, obj)?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; lsr x10, x9, #48
+                    ; movz x11, TAG_PTR_OBJECT as u32
+                    ; cmp x10, x11
+                    ; b.ne =>bail
+                    ; mov w12, w9
+                );
+                emit_load_u64(ops, 13, cage_base as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; add x13, x13, x12
+                    ; ldr x9, [x13, off]
+                );
+                store_reg(ops, 9, dst)?;
+                Ok(())
+            }
+            _ => emit_inline_pure_op(ops, instr, bail, inline_done, clabels),
+        }
+    }
+
+    /// Try to splice `method`'s body into the current `Op::CallMethodValue` site
+    /// instead of building a callee frame. Returns `Ok(true)` when inlined,
+    /// `Ok(false)` when the method fails the read-only / size / arity test (the
+    /// caller then emits the normal method-call bridge).
+    ///
+    /// Soundness: the body runs only after (a) the call site still resolves to
+    /// the speculated method id — re-checked every call through the IC, so a
+    /// prototype-method reassignment falls back — and (b) the receiver shape
+    /// matches the one the sealed loads were baked against. Both misses jump to
+    /// the in-place full method call (not a bail). The receiver is the only heap
+    /// value the body touches and it is read-only, so the spliced body has no GC
+    /// point; it runs in a native-stack scratch window with `x19` repointed,
+    /// restored on every exit.
+    #[allow(clippy::too_many_arguments)]
+    fn try_emit_inline_method_call(
+        ops: &mut Assembler,
+        method: &JitInlineMethod,
+        call_operands: &[Operand],
+        site: u64,
+        cage_base: usize,
+        object_shape_byte: u32,
+        bail: DynamicLabel,
+        threw: DynamicLabel,
+    ) -> Result<bool, Unsupported> {
+        let dst = reg(call_operands, 0)?;
+        let recv_reg = reg(call_operands, 1)?;
+        let name = const_index(call_operands, 2)?;
+        let argc = const_index(call_operands, 3)? as usize;
+
+        if cage_base == 0
+            || argc != usize::from(method.param_count)
+            || argc > INLINE_MAX_ARGS
+            || method.register_count >= INLINE_MAX_REGS
+            || method.instructions.len() > INLINE_MAX_INSTRS
+            || !method
+                .instructions
+                .iter()
+                .all(|i| is_inline_method_op(i.op))
+        {
+            return Ok(false);
+        }
+
+        let mut clabels: BTreeMap<u32, DynamicLabel> = BTreeMap::new();
+        for i in &method.instructions {
+            clabels.insert(i.byte_pc, ops.new_dynamic_label());
+        }
+        let inline_done = ops.new_dynamic_label();
+        let inline_bail = ops.new_dynamic_label();
+        let fallback = ops.new_dynamic_label();
+        let after = ops.new_dynamic_label();
+        // One extra slot past the method register window holds `this`.
+        let this_slot = method.register_count;
+        let scratch_regs = u32::from(method.register_count) + 1;
+        let scratch_bytes = (scratch_regs * 8).next_multiple_of(16);
+
+        // Identity guard: re-resolve the method id and compare to the baked one.
+        // `jit_resolve_inline_method_stub(ctx, recv_reg, name, site) -> fid`.
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov x0, x20
+            ; movz x1, recv_reg as u32
+        );
+        emit_load_u64(ops, 2, u64::from(name));
+        emit_load_u64(ops, 3, site);
+        emit_load_u64(ops, 16, jit_resolve_inline_method_stub as *const () as u64);
+        emit_load_u64(ops, 17, u64::from(method.method_fid));
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; cmp x0, x17
+            ; b.ne =>fallback
+        );
+
+        // Receiver shape guard (x19 = caller frame base): decompress the receiver
+        // and require its shape to match the baked one, else fall back.
+        let recv_off = reg_offset(recv_reg)?;
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x9, [x19, recv_off]
+            ; lsr x10, x9, #48
+            ; movz x11, TAG_PTR_OBJECT as u32
+            ; cmp x10, x11
+            ; b.ne =>fallback
+            ; mov w12, w9
+        );
+        emit_load_u64(ops, 13, cage_base as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x13, x13, x12
+            ; ldrb w14, [x13]
+            ; cmp w14, OBJECT_BODY_TYPE_TAG
+            ; b.ne =>fallback
+            ; ldr w14, [x13, object_shape_byte]
+            ; movz w15, method.recv_shape & 0xffff
+            ; movk w15, (method.recv_shape >> 16) & 0xffff, lsl #16
+            ; cmp w14, w15
+            ; b.ne =>fallback
+        );
+
+        // Reserve scratch, copy method args into param slots, the receiver into
+        // the `this` slot (all read via caller base x19), zero remaining slots to
+        // undefined, then repoint x19 at the scratch base for the body.
+        dynasm!(ops ; .arch aarch64 ; sub sp, sp, scratch_bytes);
+        for slot in 0..argc {
+            let areg = reg(call_operands, 4 + slot)?;
+            load_reg(ops, 9, areg)?;
+            dynasm!(ops ; .arch aarch64 ; str x9, [sp, (slot as u32) * 8]);
+        }
+        load_reg(ops, 9, recv_reg)?;
+        dynasm!(ops ; .arch aarch64 ; str x9, [sp, u32::from(this_slot) * 8]);
+        emit_load_u64(ops, 9, TAG_SPECIAL << 48);
+        for slot in argc..usize::from(method.register_count) {
+            dynasm!(ops ; .arch aarch64 ; str x9, [sp, (slot as u32) * 8]);
+        }
+        dynasm!(ops ; .arch aarch64 ; add x19, sp, #0);
+
+        for i in &method.instructions {
+            dynasm!(ops ; .arch aarch64 ; =>clabels[&i.byte_pc]);
+            emit_inline_method_op(
+                ops,
+                i,
+                this_slot,
+                &method.prop_offsets,
+                cage_base,
+                inline_bail,
+                inline_done,
+                &clabels,
+            )?;
+        }
+
+        // Normal completion: result in x9, unwind scratch, restore caller base.
+        dynasm!(ops ; .arch aarch64 ; =>inline_done);
+        dynasm!(ops ; .arch aarch64 ; add sp, sp, scratch_bytes);
+        dynasm!(ops ; .arch aarch64 ; ldr x19, [x20]);
+        store_reg(ops, 9, dst)?;
+        dynasm!(ops ; .arch aarch64 ; b =>after);
+
+        // Body bail: unwind scratch, then the shared interpreter bail.
+        dynasm!(ops ; .arch aarch64 ; =>inline_bail);
+        dynasm!(ops ; .arch aarch64 ; add sp, sp, scratch_bytes ; b =>bail);
+
+        // Ineligible at run time (method changed / shape mismatch): the full
+        // in-place method call, which restores nothing (sp untouched here).
+        dynasm!(ops ; .arch aarch64 ; =>fallback);
+        emit_method_call(ops, call_operands, site, threw)?;
+        dynasm!(ops ; .arch aarch64 ; =>after);
+        Ok(true)
+    }
+
     /// Emit a direct `Call`: ask the VM to publish an eligible callee frame,
     /// build the callee `JitCtx` on the native stack, branch to the compiled
     /// entry, then finish/pop/store through the narrow direct-call ABI. Cold or
@@ -2762,6 +3017,7 @@ mod tests {
             object_shape_byte: 8,
             instructions,
             inline_callees: Default::default(),
+            inline_methods: Default::default(),
         }
     }
 

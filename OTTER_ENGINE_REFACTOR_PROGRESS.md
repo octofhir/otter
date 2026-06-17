@@ -15,12 +15,28 @@ path, JSON.parse escape-free key alloc cut. Two larger fixes tried + reverted
 (documented): JSON dict-mode fast-shapes (regression), upvalue-spine pool
 (neutral).
 
-**otter-jit vs node (min/4 runs, 2026-06-17):** mandelbrot 1.6×, nbody 3.8×,
-typescript 3.2×, typed-array 5.4×, fib 6.2×, json 6.8× (8×→ this session),
-prop-access 11.3× (**19× → 11×** this session — WhiskerIC), array-ops 12.4×,
-sort 13.5×, string-ops 13.7×, regex 37× (worst). Correctness floor held: diff
-11/11 identical across interp/jit/jit-osr; test262 failing-set identical JIT-off
-vs JIT-on on every touched dir (function/arrow/Array.map/JSON/call all parity).
+**otter-jit vs node (min/5 runs, updated 2026-06-17):** mandelbrot 1.7×, nbody
+3.8×, typescript 3.2×, typed-array 5.6×, fib 6.5×, json 6.9×, **array-ops 7.8×
+(12.4× → 7.8× — lean callback invoke)**, **sort 9.3× (13.5× → 9.3× — lean
+comparator invoke)**, prop-access 13.6×, string-ops 14.5×, regex 67× (worst).
+Session deltas: prop-access **932.8→534ms (−43%)**, json **2009→1642ms (−18%)**,
+array-ops **1287→740ms (−43%)**, sort **2189→1530ms (−30%)**. Correctness floor
+held throughout: diff 11/11 identical across interp/jit/jit-osr; test262
+failing-set identical JIT-off vs JIT-on on every touched dir.
+
+**Breakthrough — lean callback/comparator invoke (commits bb7d9fd8, c83238da).**
+After the resolve_jit_code cache (32ebd28f), controlled isolation showed the
+array-callback per-element cost is `run_callable_sync`'s wrapper + per-call stack
+draw/return vs the lean Op::Call path. Extracted `run_callable_sync_inner`'s
+committed bytecode tail into `run_bytecode_callable_committed(inner, …)` (takes
+the re-entry stack instead of drawing one); the Array iteration loop
+(map/filter/reduce/forEach/find/every/some) and sort/toSorted now, when the
+callback is a plain bytecode closure, draw ONE reservation-stable stack + enter
+the reentry guard once for the whole loop and invoke the callback directly per
+element — skipping the per-call bound/proxy/native dispatch + draw/return. Each
+invocation owns its stack (nested callbacks use a separate one). −35% array-ops,
+−25% sort; far above the ~−2-3% estimate (the wrapper + draw/return were the bulk
+of the diffuse gap). The methodology lesson: controlled isolation, not `sample`.
 
 **Bounded-win phase is complete.** The cheap, low-risk per-op/per-alloc cuts are
 exhausted. Reliable controlled profiling (not `sample`, which misattributed

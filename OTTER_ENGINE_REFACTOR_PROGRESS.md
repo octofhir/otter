@@ -14,13 +14,19 @@ baseline.rs:1760; eligibility = ordinary bytecode, compiled, no async/gen/rest/
 arguments/eval/derived-ctor, argc≤MAX_INLINE_ARGS). `jitDirectCalls` counts these.
 fib/`cmp(a,b)` direct loops hit it (185ms, 3M direct calls).
 
-**THE GAP (the run_callable_sync bottleneck the user names):** native methods
-(Array sort/map/filter/forEach/reduce) calling a JS callback do NOT use the direct
-path. They go through `run_bytecode_callable_committed` (call_ops.rs:~1750) which
-builds a full Rust `Frame` (register-window draw + arg bind + frame init) PER CALL,
-then `dispatch_jit_sync_entry`. sort = 30M such builds → 1444ms (9.3× node) vs the
-SAME comparator in a compiled loop = 185ms. string-ops: emitter can't compile its
-body (jitCompileAttempts=0) → loop bails → 25M interp reductions.
+**THE GAP (measured 2026-06-17, corrected):** the sort comparator DOES tier up +
+run compiled on the committed path (`sortonly` JIT=1 = **32961 reductions**, was 159M
+interp). So the floor is NOT "doesn't tier" — it's the **per-call Rust bridge itself**:
+`run_bytecode_callable_committed` builds a full Rust `Frame` (register-window draw +
+arg bind) PER CALL, + `dispatch_jit_sync_entry` re-resolves, + `run_compiled_frame`
+entry/exit, + (sort) coerce_to_number. Measured per-call: committed-path compiled
+callback ≈ **95ns**, compiled-caller direct call ≈ **61ns**, node ≈ ~5ns. sortonly
+1461ms @ ~15.4M calls. So 2c (cut redundant per-call bridge: eligibility + target-
+parts + frame built ONCE then reused) ceiling ≈ 95→~40ns ≈ **~1.5-2.5× on sort/
+array-ops** — real but moderate. The MULTI-× lever to reach node is **Slice 2d**
+(machine-code frame reserve+arg-bind+direct branch, kill the Rust stub: 61→~8ns).
+string-ops separately: emitter can't compile its body (jitCompileAttempts=0) → bails
+to interp — that's Phase 3/4 coverage, not Phase 2.
 
 **SLICE 2c (first, highest-ROI, tractable Rust — NOT machine code):** native-callback
 batched direct dispatch.

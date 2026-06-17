@@ -425,6 +425,17 @@ pub struct ObjectBody {
     /// `[[Extensible]]` internal slot. New keys are rejected when
     /// this is `false`.
     extensible: bool,
+    /// `true` once an in-place attribute mutation (defineProperty on an
+    /// existing slot, `seal`, `freeze`) has changed a shaped slot's
+    /// flags/kind without transitioning the hidden class. While `false`, a
+    /// shaped object's per-slot attributes are guaranteed to match the shape
+    /// (every shaped slot reached the object via an attribute-recording
+    /// transition), so attribute reads short-circuit to the shape. Once
+    /// `true`, `slots` is the only authoritative attribute source and reads
+    /// fall back to it. Always `false` for dictionary-mode objects (their
+    /// shape is null and reads use `slots` regardless). Lives in the byte of
+    /// padding beside [`Self::extensible`], so it adds no object size.
+    slot_attrs_overridden: bool,
     /// Lazily-allocated rare/exotic slots — symbol-keyed properties, host
     /// data, native `[[Call]]`/`[[Construct]]`, primitive-wrapper internal
     /// slots, and the Date/Error/raw-JSON/arguments markers. `None` for plain
@@ -506,6 +517,10 @@ const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET.is_multiple_of(8));
 const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET >= 8);
 const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET.is_multiple_of(4));
 
+// Pin the hot object footprint. The `slot_attrs_overridden` byte rides in the
+// padding beside `extensible`, so it must not grow the body.
+const _: () = assert!(std::mem::size_of::<ObjectBody>() == 160);
+
 impl ObjectBody {
     /// Read the data value for string-keyed slot `i` from flat storage.
     /// Slots `>= INLINE_VALUE_CAP` live in the boxed overflow array, which only
@@ -545,30 +560,85 @@ impl ObjectBody {
     }
 
     /// Overwrite the string-keyed slot at `i` with new metadata + value.
+    ///
+    /// Used only by the `defineProperty`-on-existing merge paths, which can
+    /// change a shaped slot's attributes in place without transitioning the
+    /// hidden class. Flag the object so attribute reads stop trusting the
+    /// shape and fall back to `slots`.
     fn set_slot(&mut self, i: usize, data: SlotData) {
+        if !self.shape.is_null() {
+            self.slot_attrs_overridden = true;
+        }
         let (meta, value) = data.split();
         self.set_data_value(i, value);
         self.slots[i] = meta;
     }
 
-    /// Snapshot the string-keyed slot at `i` as an owned [`SlotData`].
-    fn slot_data(&self, i: usize) -> SlotData {
+    /// Per-slot `(flags, is_accessor)` for the string-keyed slot at `i`.
+    ///
+    /// Reads from the hidden class for a shaped object whose attributes have
+    /// not diverged (the common case — every shaped slot recorded its
+    /// attributes on the transition that created it), and falls back to the
+    /// authoritative `slots` array for dictionary-mode or attribute-overridden
+    /// objects.
+    #[inline]
+    fn slot_attrs(&self, heap: &otter_gc::GcHeap, i: usize) -> (PropertyFlags, bool) {
+        if !self.shape.is_null()
+            && !self.slot_attrs_overridden
+            && let Some(attrs) = shape_body::shape_slot_attrs(heap, self.shape, i as u32)
+        {
+            return attrs;
+        }
         let meta = &self.slots[i];
+        (meta.flags, !meta.kind.is_data())
+    }
+
+    /// Snapshot the string-keyed slot at `i` as an owned [`SlotData`].
+    fn slot_data(&self, heap: &otter_gc::GcHeap, i: usize) -> SlotData {
+        let (flags, _) = self.slot_attrs(heap, i);
         SlotData {
-            flags: meta.flags,
-            kind: meta.kind.clone(),
+            flags,
+            kind: self.slots[i].kind.clone(),
             value: self.data_value(i),
         }
     }
 
     /// [`PropertyLookup`] for the string-keyed slot at `i`.
-    fn slot_lookup_at(&self, i: usize) -> PropertyLookup {
-        slot_lookup(self.slots[i].flags, &self.slots[i].kind, self.data_value(i))
+    fn slot_lookup_at(&self, heap: &otter_gc::GcHeap, i: usize) -> PropertyLookup {
+        let (flags, is_accessor) = self.slot_attrs(heap, i);
+        // The getter/setter pair still lives in `slots` until accessor storage
+        // migrates to the value array.
+        if is_accessor && let SlotKind::Accessor(pair) = &self.slots[i].kind {
+            return PropertyLookup::Accessor {
+                getter: pair.getter,
+                setter: pair.setter,
+                flags,
+            };
+        }
+        PropertyLookup::Data {
+            value: self.data_value(i),
+            flags,
+        }
     }
 
     /// [`PropertyDescriptor`] for the string-keyed slot at `i`.
-    fn slot_descriptor_at(&self, i: usize) -> PropertyDescriptor {
-        slot_descriptor(self.slots[i].flags, &self.slots[i].kind, self.data_value(i))
+    fn slot_descriptor_at(&self, heap: &otter_gc::GcHeap, i: usize) -> PropertyDescriptor {
+        let (flags, is_accessor) = self.slot_attrs(heap, i);
+        if is_accessor && let SlotKind::Accessor(pair) = &self.slots[i].kind {
+            return PropertyDescriptor {
+                flags,
+                kind: DescriptorKind::Accessor {
+                    getter: pair.getter,
+                    setter: pair.setter,
+                },
+            };
+        }
+        PropertyDescriptor {
+            flags,
+            kind: DescriptorKind::Data {
+                value: self.data_value(i),
+            },
+        }
     }
 
     /// Remove the string-keyed slot at `i`, shifting later values down so
@@ -851,6 +921,7 @@ fn empty_object_body() -> ObjectBody {
         slots: SmallVec::new(),
         jit_proto: otter_gc::Gc::null(),
         extensible: true,
+        slot_attrs_overridden: false,
         exotic: None,
     }
 }
@@ -947,6 +1018,7 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
             slots: SmallVec::new(),
             jit_proto: otter_gc::Gc::null(),
             extensible: true,
+            slot_attrs_overridden: false,
             exotic: Some(Box::new(ExoticSlots {
                 host_data: Some(Box::new(data)),
                 ..ExoticSlots::default()
@@ -972,6 +1044,7 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
             slots: SmallVec::new(),
             jit_proto: otter_gc::Gc::null(),
             extensible: true,
+            slot_attrs_overridden: false,
             exotic: Some(Box::new(ExoticSlots {
                 host_data: Some(Box::new(data)),
                 ..ExoticSlots::default()
@@ -1283,7 +1356,7 @@ pub fn get(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Option<Value> {
 pub fn lookup_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> PropertyLookup {
     heap.read_payload(obj, |body| match body_offset_of(heap, body, key) {
         Some(offset) => {
-            let mut lookup = body.slot_lookup_at(offset as usize);
+            let mut lookup = body.slot_lookup_at(heap, offset as usize);
             if let Some(cell) = mapped_argument_cell(body, key)
                 && let PropertyLookup::Data { value, .. } = &mut lookup
             {
@@ -1304,7 +1377,7 @@ pub(crate) fn lookup_own_slot(
 ) -> (Option<OwnPropertySlotHit>, PropertyLookup) {
     heap.read_payload(obj, |body| match body_offset_of(heap, body, key) {
         Some(offset) => {
-            let mut lookup = body.slot_lookup_at(offset as usize);
+            let mut lookup = body.slot_lookup_at(heap, offset as usize);
             if let Some(cell) = mapped_argument_cell(body, key)
                 && let PropertyLookup::Data { value, .. } = &mut lookup
             {
@@ -1331,7 +1404,7 @@ pub(crate) fn lookup_own_atom(
 ) -> AtomPropertyLookup {
     heap.read_payload(obj, |body| match body_offset_of(heap, body, key.name()) {
         Some(offset) => {
-            let mut lookup = body.slot_lookup_at(offset as usize);
+            let mut lookup = body.slot_lookup_at(heap, offset as usize);
             if let Some(cell) = mapped_argument_cell(body, key.name())
                 && let PropertyLookup::Data { value, .. } = &mut lookup
             {
@@ -1502,7 +1575,7 @@ pub fn get_own_descriptor(
 ) -> Option<PropertyDescriptor> {
     heap.read_payload(obj, |body| {
         body_offset_of(heap, body, key).map(|offset| {
-            let mut descriptor = body.slot_descriptor_at(offset as usize);
+            let mut descriptor = body.slot_descriptor_at(heap, offset as usize);
             if let Some(cell) = mapped_argument_cell(body, key)
                 && let DescriptorKind::Data { value } = &mut descriptor.kind
             {
@@ -2419,7 +2492,7 @@ pub fn define_own_property_partial(
     // read both bodies through `heap`. Distinct GC handles holding
     // the same numeric value must compare equal per spec.
     let merged_for_existing = if let Some(offset) = existing_offset {
-        let existing = heap.read_payload(obj, |body| body.slot_data(offset as usize));
+        let existing = heap.read_payload(obj, |body| body.slot_data(heap, offset as usize));
         match descriptor_core::validate_and_apply_partial(&existing, &descriptor, heap) {
             Some(merged) => Some(merged),
             None => return false,
@@ -2463,7 +2536,7 @@ pub(crate) fn define_own_property_partial_with_shape(
     let barrier_descriptor = completed.clone();
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     let merged_for_existing = if let Some(offset) = existing_offset {
-        let existing = heap.read_payload(obj, |body| body.slot_data(offset as usize));
+        let existing = heap.read_payload(obj, |body| body.slot_data(heap, offset as usize));
         match descriptor_core::validate_and_apply_partial(&existing, &descriptor, heap) {
             Some(merged) => Some(merged),
             None => return false,
@@ -2555,7 +2628,7 @@ pub fn define_own_property(
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     let dictionary_keys = dictionary_keys_for_shape_transition(heap, obj, existing_offset);
     let merged_for_existing = if let Some(offset) = existing_offset {
-        let existing = heap.read_payload(obj, |body| body.slot_data(offset as usize));
+        let existing = heap.read_payload(obj, |body| body.slot_data(heap, offset as usize));
         match descriptor_core::validate_and_apply(&existing, &descriptor, heap) {
             Some(merged) => Some(merged),
             None => return false,
@@ -2848,6 +2921,9 @@ pub fn prevent_extensions(obj: JsObject, heap: &mut otter_gc::GcHeap) {
 pub fn seal(obj: JsObject, heap: &mut otter_gc::GcHeap) {
     heap.with_payload(obj, |body| {
         body.extensible = false;
+        if !body.shape.is_null() {
+            body.slot_attrs_overridden = true;
+        }
         for slot in body.slots.iter_mut() {
             slot.flags = slot.flags.with_configurable(false);
         }
@@ -2868,6 +2944,9 @@ pub fn seal(obj: JsObject, heap: &mut otter_gc::GcHeap) {
 pub fn freeze(obj: JsObject, heap: &mut otter_gc::GcHeap) {
     heap.with_payload(obj, |body| {
         body.extensible = false;
+        if !body.shape.is_null() {
+            body.slot_attrs_overridden = true;
+        }
         for slot in body.slots.iter_mut() {
             slot.flags = slot.flags.with_configurable(false);
             if slot.kind.is_data() {

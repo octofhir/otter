@@ -63,11 +63,9 @@ pub struct ShapeBody {
     ///
     /// Read only by the debug dual-write assert until stage B routes shaped
     /// attribute reads through the shape.
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     own_flags: PropertyFlags,
     /// `true` when the slot added by this transition is an accessor rather
     /// than a data property. Meaningless for the root.
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     own_is_accessor: bool,
 }
 
@@ -136,14 +134,12 @@ impl ShapeBody {
 
     /// Attribute bits of the slot added by this transition.
     #[must_use]
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) const fn own_flags(&self) -> PropertyFlags {
         self.own_flags
     }
 
     /// `true` when the slot added by this transition is an accessor.
     #[must_use]
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) const fn own_is_accessor(&self) -> bool {
         self.own_is_accessor
     }
@@ -286,7 +282,6 @@ pub(crate) fn shape_key_at_offset(
 /// slots→shape migration. Reads are O(chain depth); hot paths should prefer a
 /// flattened cache once the shape becomes the authoritative attribute source.
 #[must_use]
-#[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub(crate) fn shape_slot_attrs(
     heap: &GcHeap,
     mut shape: ShapeHandle,

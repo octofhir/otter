@@ -120,10 +120,22 @@ Stages (each: implement → `just test262` full → diff failing-set → commit)
   them in release. No behavior change, no `ObjectBody` size change. Gate: full
   test262 (Atomics excluded — timeout-grind, orthogonal) failing-set diff vs
   HEAD = **0 regressions** (52783 tests, 1373 fail; ±2 staging/sm flake only).
-- **B. Flip reads to the shape.** Route `slot_lookup_at` / `slot_descriptor_at`
-  / enumeration flag reads / `is_data` checks to read flags+kind from the shape
-  for shaped objects (dict mode still uses slots). Accessor getter/setter still
-  in `slots` for now.
+- **B. Flip reads to the shape. — LANDED (partial, spec-visible readers).**
+  Added a per-object `slot_attrs_overridden` bit (rides in the padding beside
+  `extensible` — `ObjectBody` stays 160B, asserted). The bit is set when an
+  in-place attribute mutation (`defineProperty` on an existing slot via
+  `set_slot`, `seal`, `freeze`) changes a shaped slot without transitioning the
+  class. New `ObjectBody::slot_attrs(heap, i)` reads `(flags, is_accessor)` from
+  the shape for a shaped, non-overridden object and falls back to `slots`
+  otherwise; the three spec-visible readers (`slot_lookup_at`,
+  `slot_descriptor_at`, `slot_data`) route through it. Accessor getter/setter
+  pair still read from `slots` (migrates in C). Behavior-identical: for
+  non-overridden objects shape attrs == slots (stage A invariant), for
+  overridden it's the old slots path. Gate: full test262 vs stage A = **0
+  regressions** (±2 staging/sm flake, confirmed identical in isolation on both).
+  REMAINING for B: the scattered mutation-internal `.kind.is_data()` /
+  `.flags.*` reads (is_sealed, integrity loops, enumeration) still read `slots`
+  — correct (slots authoritative), to flip before E can drop `slots`.
 - **C. Migrate accessor storage to the value slot.** A shaped accessor slot
   stores an `AccessorPair` GC cell handle in the value array; shape's
   `own_is_accessor` marks it. Remove `kind` from per-object storage.

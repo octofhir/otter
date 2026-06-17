@@ -59,10 +59,9 @@ pub struct ShapeBody {
     /// Attribute bits (`writable`/`enumerable`/`configurable`) of the slot
     /// added by this transition. Default-data for ordinary appends; carries
     /// non-default attributes when the transition was created by a
-    /// descriptor/define path. Meaningless for the root.
-    ///
-    /// Read only by the debug dual-write assert until stage B routes shaped
-    /// attribute reads through the shape.
+    /// descriptor/define path. The source of truth for a shaped object's
+    /// per-slot attributes unless the object has overridden them in place.
+    /// Meaningless for the root.
     own_flags: PropertyFlags,
     /// `true` when the slot added by this transition is an accessor rather
     /// than a data property. Meaningless for the root.
@@ -278,9 +277,9 @@ pub(crate) fn shape_key_at_offset(
 /// `offset`: its `(flags, is_accessor)` pair. `None` when no transition in
 /// the chain owns that offset (e.g. the root, or an out-of-range offset).
 ///
-/// Mirror of [`shape_key_at_offset`] for the attribute payload added in the
-/// slots→shape migration. Reads are O(chain depth); hot paths should prefer a
-/// flattened cache once the shape becomes the authoritative attribute source.
+/// Mirror of [`shape_key_at_offset`] for the per-slot attribute payload. Reads
+/// are O(chain depth); hot paths should prefer a flattened cache once the shape
+/// becomes the authoritative attribute source.
 #[must_use]
 pub(crate) fn shape_slot_attrs(
     heap: &GcHeap,

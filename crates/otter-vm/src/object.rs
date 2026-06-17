@@ -2052,18 +2052,18 @@ pub(crate) fn shape(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeHandle {
     heap.read_payload(obj, |body| body.shape)
 }
 
-/// Dual-write invariant check for the slots→shape migration: the most
-/// recently appended own slot's stored `(flags, is_accessor)` must match what
-/// the shape records at that offset. Called right after a shape-advancing
-/// append, so the last slot is the freshly transitioned one. `slots` stays
-/// authoritative; the shape carries the same attributes redundantly.
+/// Dual-write invariant check: the most recently appended own slot's stored
+/// `(flags, is_accessor)` must match what the shape records at that offset.
+/// Called right after a shape-advancing append, so the last slot is the
+/// freshly transitioned one. `slots` stays authoritative; the shape carries
+/// the same attributes redundantly.
 ///
-/// Only the appended slot is checked — not the whole object — because in
-/// stage A `defineProperty`/`freeze`/`seal` still mutate existing slot
-/// attributes *in place* without transitioning the shape, so older slots may
-/// legitimately diverge until stage D routes those mutations through
-/// attribute transitions. Dictionary-mode objects (null shape) are skipped.
-/// Debug-only.
+/// Only the appended slot is checked — not the whole object — because
+/// `defineProperty`/`freeze`/`seal` still mutate existing slot attributes *in
+/// place* without transitioning the shape (the object's
+/// `slot_attrs_overridden` bit then marks the divergence), so older slots may
+/// legitimately differ from the shape. Dictionary-mode objects (null shape)
+/// are skipped. Debug-only.
 #[cfg(debug_assertions)]
 pub(crate) fn debug_assert_appended_shape_slot(obj: JsObject, heap: &otter_gc::GcHeap) {
     let shape = shape(obj, heap);

@@ -285,7 +285,11 @@ fn map_key_hash(key: &MapKey) -> Option<u64> {
         }
         MapKey::Number(f) => {
             3u8.hash(&mut h);
-            let bits = if f.is_nan() { f64::NAN.to_bits() } else { f.to_bits() };
+            let bits = if f.is_nan() {
+                f64::NAN.to_bits()
+            } else {
+                f.to_bits()
+            };
             bits.hash(&mut h);
         }
         MapKey::String(s) => {
@@ -307,10 +311,11 @@ fn map_key_hash(key: &MapKey) -> Option<u64> {
 fn map_find_entry(body: &MapBody, key: &MapKey, heap: &otter_gc::GcHeap) -> Option<usize> {
     if let Some(hash) = map_key_hash(key) {
         let bucket = body.index.get(&hash)?;
-        bucket
-            .iter()
-            .map(|&i| i as usize)
-            .find(|&i| body.entries.get(i).is_some_and(|e| e.key_matches(key, heap)))
+        bucket.iter().map(|&i| i as usize).find(|&i| {
+            body.entries
+                .get(i)
+                .is_some_and(|e| e.key_matches(key, heap))
+        })
     } else {
         body.entries.iter().position(|e| e.key_matches(key, heap))
     }
@@ -326,12 +331,12 @@ fn map_index_insert(body: &mut MapBody, key: &MapKey, entry_idx: usize) {
 
 /// Drop a now-tombstoned entry index from the hash index.
 fn map_index_remove(body: &mut MapBody, key: &MapKey, entry_idx: usize) {
-    if let Some(hash) = map_key_hash(key) {
-        if let Some(bucket) = body.index.get_mut(&hash) {
-            bucket.retain(|i| *i as usize != entry_idx);
-            if bucket.is_empty() {
-                body.index.remove(&hash);
-            }
+    if let Some(hash) = map_key_hash(key)
+        && let Some(bucket) = body.index.get_mut(&hash)
+    {
+        bucket.retain(|i| *i as usize != entry_idx);
+        if bucket.is_empty() {
+            body.index.remove(&hash);
         }
     }
 }
@@ -628,10 +633,11 @@ impl SetEntry {
 fn set_find_entry(body: &SetBody, key: &MapKey, heap: &otter_gc::GcHeap) -> Option<usize> {
     if let Some(hash) = map_key_hash(key) {
         let bucket = body.index.get(&hash)?;
-        bucket
-            .iter()
-            .map(|&i| i as usize)
-            .find(|&i| body.entries.get(i).is_some_and(|e| e.key_matches(key, heap)))
+        bucket.iter().map(|&i| i as usize).find(|&i| {
+            body.entries
+                .get(i)
+                .is_some_and(|e| e.key_matches(key, heap))
+        })
     } else {
         body.entries.iter().position(|e| e.key_matches(key, heap))
     }
@@ -644,12 +650,12 @@ fn set_index_insert(body: &mut SetBody, key: &MapKey, entry_idx: usize) {
 }
 
 fn set_index_remove(body: &mut SetBody, key: &MapKey, entry_idx: usize) {
-    if let Some(hash) = map_key_hash(key) {
-        if let Some(bucket) = body.index.get_mut(&hash) {
-            bucket.retain(|i| *i as usize != entry_idx);
-            if bucket.is_empty() {
-                body.index.remove(&hash);
-            }
+    if let Some(hash) = map_key_hash(key)
+        && let Some(bucket) = body.index.get_mut(&hash)
+    {
+        bucket.retain(|i| *i as usize != entry_idx);
+        if bucket.is_empty() {
+            body.index.remove(&hash);
         }
     }
 }

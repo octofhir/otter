@@ -77,6 +77,13 @@ pub struct JitFunctionView {
     pub object_shape_byte: u32,
     /// Instruction stream in byte-PC order.
     pub instructions: Vec<JitInstrView>,
+    /// Monomorphic call-site targets driving baseline leaf-inlining:
+    /// `call_byte_pc → callee_function_id`. Populated only for `Op::Call` sites
+    /// the interpreter observed resolving to a single bytecode callee; baked by
+    /// `Interpreter::bake_call_site_feedback`. Empty in the raw `jit_view()`
+    /// snapshot. A site absent here (polymorphic or unobserved) emits the normal
+    /// direct-call bridge.
+    pub call_site_targets: rustc_hash::FxHashMap<u32, u32>,
 }
 
 /// VM-resolved direct-call target for one eligible compiled callee.

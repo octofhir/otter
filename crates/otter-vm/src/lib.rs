@@ -311,6 +311,21 @@ pub struct JitRuntimeStats {
     pub runtime_property_stubs: u64,
 }
 
+/// Observed-callee state for one bytecode `Op::Call` site, the feedback the
+/// baseline reads to decide whether to inline a tiny leaf callee.
+///
+/// Absence from the feedback map means *unobserved*. `Mono(fid)` means every
+/// observed call resolved to the same bytecode callee — the inlinable case.
+/// `Poly` means two or more distinct callees were seen; such a site is never
+/// inlined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallTargetFeedback {
+    /// Exactly one callee function id observed so far.
+    Mono(u32),
+    /// More than one distinct callee observed; not inlinable.
+    Poly,
+}
+
 /// Match-based dispatch loop. The harness baseline; slice tasks may
 /// later switch to threaded dispatch after benchmark-driven review
 /// (foundation plan §"Interpreter requirements").
@@ -463,6 +478,13 @@ pub struct Interpreter {
     /// Per-function call counter driving function-entry tier-up. Only mutated
     /// when a JIT hook is installed.
     jit_call_counts: rustc_hash::FxHashMap<u32, u32>,
+    /// Per-call-site monomorphic-callee feedback driving baseline leaf-inlining.
+    /// Keyed `(caller_fid, call_byte_pc)`; recorded by the interpreter
+    /// `Op::Call` arm during the warmup interpreter runs that precede tier-up,
+    /// and read at compile time (`bake_call_site_feedback`) so the baseline
+    /// knows which sites have a single observed callee. Only mutated when a JIT
+    /// hook is installed.
+    jit_call_site_feedback: rustc_hash::FxHashMap<(u32, u32), CallTargetFeedback>,
     /// OSR targets that bailed, had no trampoline, or whose function is
     /// uncompilable; OSR is not retried for them. Keyed by `(function_id,
     /// loop_header_pc)` so a bail in one loop disables only *that* loop header,
@@ -1072,6 +1094,7 @@ impl Interpreter {
             property_ic_stats: property_ic::PropertyIcStats::default(),
             jit_hook: None,
             jit_call_counts: rustc_hash::FxHashMap::default(),
+            jit_call_site_feedback: rustc_hash::FxHashMap::default(),
             jit_osr_disabled: rustc_hash::FxHashSet::default(),
             jit_osr_count: 0,
             jit_osr_count_top: usize::MAX,
@@ -2160,6 +2183,7 @@ impl Interpreter {
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         let mut view = context.jit_function_view(fid)?;
         Self::bake_typed_array_layout(&mut view);
+        self.bake_call_site_feedback(&mut view, fid);
         let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
         let (regs, params) = (view.register_count, view.param_count);
         let hook = self.jit_hook.as_ref()?.clone();
@@ -2201,6 +2225,45 @@ impl Interpreter {
             array_elements_byte: header + crate::array::ARRAY_BODY_ELEMENTS_OFFSET as u32,
         };
         view.cage_base = otter_gc::cage_base() as usize;
+    }
+
+    /// Record a `Mono`/`Poly` observation for one `Op::Call` site, the feedback
+    /// the baseline reads to decide whether to inline a tiny leaf callee. First
+    /// sighting at a site is `Mono(callee)`; a later sighting of the *same*
+    /// callee is a no-op; any *different* callee promotes the site to `Poly`
+    /// permanently. Only reached when a JIT hook is installed (the `Op::Call`
+    /// arm gates it), so interpreter-only execution pays nothing.
+    fn note_call_target(&mut self, caller_fid: u32, call_byte_pc: u32, callee_fid: u32) {
+        use std::collections::hash_map::Entry;
+        match self
+            .jit_call_site_feedback
+            .entry((caller_fid, call_byte_pc))
+        {
+            Entry::Vacant(slot) => {
+                slot.insert(CallTargetFeedback::Mono(callee_fid));
+            }
+            Entry::Occupied(mut slot) => {
+                if let CallTargetFeedback::Mono(seen) = *slot.get()
+                    && seen != callee_fid
+                {
+                    slot.insert(CallTargetFeedback::Poly);
+                }
+            }
+        }
+    }
+
+    /// Bake the monomorphic call-site targets for `fid` into `view` so the
+    /// baseline emitter can inline a tiny leaf callee at a `Mono` site without a
+    /// runtime callee resolution. Only `Mono` sites are surfaced; `Poly` and
+    /// unobserved sites are absent and emit the normal direct-call bridge.
+    fn bake_call_site_feedback(&self, view: &mut jit::JitFunctionView, fid: u32) {
+        for (&(caller_fid, byte_pc), state) in &self.jit_call_site_feedback {
+            if caller_fid == fid
+                && let CallTargetFeedback::Mono(callee_fid) = *state
+            {
+                view.call_site_targets.insert(byte_pc, callee_fid);
+            }
+        }
     }
 
     /// Return the current observational runtime budget policy.
@@ -5039,11 +5102,15 @@ impl Interpreter {
                     self.do_call(stack, context, operands)?;
                     // Tier-up hook: only when a bytecode callee frame was just
                     // pushed and a JIT is installed. Cheap (one bool) when off.
-                    if self.jit_hook.is_some()
-                        && stack.len() > depth_before
-                        && let Some(Some(value)) = self.maybe_dispatch_jit(stack, context)?
-                    {
-                        return Ok(value);
+                    if self.jit_hook.is_some() && stack.len() > depth_before {
+                        // Record the observed callee for leaf-inlining feedback
+                        // before the tier-up hook may consume the freshly pushed
+                        // frame.
+                        let callee_fid = stack[stack.len() - 1].function_id;
+                        self.note_call_target(function_id, pc, callee_fid);
+                        if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context)? {
+                            return Ok(value);
+                        }
                     }
                     continue;
                 }
@@ -12965,6 +13032,51 @@ mod tests {
         assert_eq!(
             interp.run(&context).unwrap_err().error,
             VmError::Interrupted
+        );
+    }
+
+    #[test]
+    fn call_target_feedback_tracks_mono_then_poly() {
+        let mut interp = Interpreter::new();
+        // Two distinct call sites in caller fid 7.
+        let site_a = 12u32;
+        let site_b = 40u32;
+
+        // Site A only ever sees callee 3 → stays Mono(3).
+        interp.note_call_target(7, site_a, 3);
+        interp.note_call_target(7, site_a, 3);
+        interp.note_call_target(7, site_a, 3);
+        assert_eq!(
+            interp.jit_call_site_feedback.get(&(7, site_a)),
+            Some(&CallTargetFeedback::Mono(3))
+        );
+
+        // Site B sees 3 then 9 → promotes to Poly and stays there.
+        interp.note_call_target(7, site_b, 3);
+        assert_eq!(
+            interp.jit_call_site_feedback.get(&(7, site_b)),
+            Some(&CallTargetFeedback::Mono(3))
+        );
+        interp.note_call_target(7, site_b, 9);
+        assert_eq!(
+            interp.jit_call_site_feedback.get(&(7, site_b)),
+            Some(&CallTargetFeedback::Poly)
+        );
+        interp.note_call_target(7, site_b, 3);
+        assert_eq!(
+            interp.jit_call_site_feedback.get(&(7, site_b)),
+            Some(&CallTargetFeedback::Poly)
+        );
+
+        // Same site PC under a different caller is independent.
+        interp.note_call_target(99, site_a, 5);
+        assert_eq!(
+            interp.jit_call_site_feedback.get(&(99, site_a)),
+            Some(&CallTargetFeedback::Mono(5))
+        );
+        assert_eq!(
+            interp.jit_call_site_feedback.get(&(7, site_a)),
+            Some(&CallTargetFeedback::Mono(3))
         );
     }
 }

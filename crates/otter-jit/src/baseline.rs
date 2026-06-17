@@ -2471,6 +2471,7 @@ mod tests {
             ta_layout: otter_vm::JitTypedArrayLayout::default(),
             object_shape_byte: 8,
             instructions,
+            call_site_targets: Default::default(),
         }
     }
 

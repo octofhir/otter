@@ -853,6 +853,66 @@ is the oracle.
 **Rollback checkpoint:** OSR trigger is a separate flag from Phase 1 entry
 tier-up; disabling reverts to entry-only tier-up.
 
+### Phase 1.6 — Baseline leaf-inlining (kill the per-call bridge) — IN PROGRESS
+
+The mature baseline already does compiled→compiled *direct calls*, but each one
+still pays two Rust-bridge crossings (`jit_prepare_direct_call_stub` builds a
+callee frame + enters sync-reentry; `jit_finish_direct_call_returned_stub` pops
+it) — the ~95ns/call floor. For a tiny monomorphic leaf callee (a comparator
+`(a,b)=>a-b`, a `map`/`filter` body, `dist2`) the callee body is cheaper than
+its own call bridge. Splice it into the caller under a guard, the way V8
+Sparkplug/Maglev and JSC baseline do (call-target IC → speculative inline →
+PC-accurate deopt).
+
+**Why it is tractable here (the three substrates already exist):**
+- *Deopt is free.* Every emitted op stamps its byte-PC into `JitCtx.bail_pc`
+  before executing; a guard bail returns `STATUS_BAILED(bail_pc)` and the
+  interpreter resumes at that exact PC with live registers in the frame array.
+  An inlined body that does **not** restamp keeps the *Call's* `bail_pc`, so any
+  guard failure re-runs the whole call in the interpreter — sound iff the body
+  committed no observable side effect before the bail (hence the pure-leaf
+  whitelist below).
+- *No frame resize, no extra rooting.* Register access is centralized in
+  `load_reg`/`store_reg` over base `x19` (= `ctx.regs`). Emit the inlined body
+  with `x19` repointed at a native-stack scratch block (`sub sp`), restored
+  (`ldr x19,[x20]`) after. A pure leaf has **no GC point**, so its temporaries
+  never need tracing — they live and die in scratch.
+
+**Tick 1 (foundation — call-target feedback):** the baseline compiles a caller
+*once*, so the monomorphic callee must be known at compile time. Add a
+per-call-site target IC recorded by the interpreter `Op::Call` arm
+(`(caller_fid, call_byte_pc) → Mono(callee_fid) | Poly`); warmup iterations
+before tier-up/OSR populate it. Surface `Mono` sites on `JitFunctionView`
+(`call_site_targets: byte_pc→callee_fid`), baked in `compile_jit_function` like
+`cage_base`. Verified by a unit test (a comparator call site goes `Mono`). No
+perf change yet; gate = zero regression.
+
+**Tick 2 (the splice):** in `compile()`'s `Op::Call` arm, when the site is
+`Mono(fid)` and the callee passes the eligibility whitelist, emit: identity
+guard (callee reg is a closure with `function_id == fid`, else `=>bail`) →
+`sub sp` scratch → copy caller arg regs into scratch param slots → `mov x19,
+scratch_base` → emit callee body via a **sub-emitter** (private label map, no
+byte-PC restamp, `Return` → result to scratch reg + branch to `inline_done`) →
+`inline_done`: restore `x19`, store result to `dst`, `add sp`. Requires
+factoring the per-op match into a reusable body-emit pass.
+
+**Eligibility whitelist (v1, pure non-allocating leaf):** all ops in
+{param/local/const loads, int/float arith, comparisons, moves, `Return`}; **no**
+`Call`/`New` (leaf), no upvalue access, no `this` (free function — methods are a
+later step), no property/element/global store, no `MakeFunction`, no allocation;
+`param_count == call argc`; `register_count ≤ cap`. These guarantee the body is
+pure → bail-and-rerun is idempotent and scratch needs no rooting.
+
+**Target / delta:** `sort` (comparator), `array-ops` (`map`/`filter`),
+`prop-access` (tiny accessor methods, once the method path lands). Ratio to node
+**and** bun must drop on those classes or revert.
+
+**Risks:** the sub-emitter must not restamp byte-PC (else a mid-body bail
+resumes the interpreter inside a callee PC that the caller frame can't honor);
+scratch must stay 16-byte aligned; the identity guard must reject the closure
+*before* any arg copy with side effects (there are none in v1). Stress mode +
+the GC-crash repro guard are the oracles.
+
 ### Phase 2 — Optimizing tier (speculative SSA, deopt, register-resident roots)
 
 **Build:**

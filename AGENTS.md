@@ -213,7 +213,7 @@ fn stringify(value: &Value, depth: usize) -> Result<String, Error> {
 ```bash
 # Build
 cargo build                          # Debug build
-cargo build --release -p otterjs     # Release CLI binary
+cargo build --release -p otter-cli     # Release CLI binary
 
 # Test
 cargo test --all --all-features      # Run all tests
@@ -223,8 +223,8 @@ cargo fmt --all                      # Format code
 cargo clippy --all-targets --all-features -- -D warnings
 
 # Run scripts
-cargo run -p otterjs -- run <file>   # Run a script
-cargo run -p otterjs -- check <file> # Type check with tsgo
+cargo run -p otter-cli -- run <file>   # Run a script
+cargo run -p otter-cli -- check <file> # Type check with tsgo
 
 # Quick local loop
 just fmt && just lint && just test
@@ -242,7 +242,7 @@ Fast iteration tips:
 ### Crate Hierarchy (bottom to top)
 
 ```
-otterjs (CLI -> `otter`)
+otter-cli (CLI -> `otter`)
     ↓
     host/runtime integration layer
     ↓
@@ -304,34 +304,34 @@ Pure Rust implementation - no external JavaScript engine dependencies.
 
 ## Debugging
 
-- Logs: CLI uses `tracing`; try `RUST_LOG=debug cargo run -p otterjs -- run examples/basic.ts`.
+- Logs: CLI uses `tracing`; try `RUST_LOG=debug cargo run -p otter-cli -- run examples/basic.ts`.
 - Long-running scripts/servers: use `--timeout 0` (disables the timeout).
 - When editing embedded JS shims: they are compiled in via `include_str!` and passed through `CString::new(...)` (no `\0` bytes).
 - VM instruction trace for a script (full trace to file):
-  - `cargo run -p otterjs -- run <file> --trace --trace-file otter-trace.txt`
+  - `cargo run -p otter-cli -- run <file> --trace --trace-file otter-trace.txt`
   - Optional: `--trace-filter "<regex>" --trace-timing`
   - Use `.json` extension for Chrome Trace format: `--trace-file otter-trace.json`
-  - CI/E2E compatibility check: `cargo test -p otterjs trace_e2e_generates_chrome_perfetto_compatible_json`
+  - CI/E2E compatibility check: `cargo test -p otter-cli trace_e2e_generates_chrome_perfetto_compatible_json`
 - CPU profile + folded flamegraph stacks:
-  - `cargo run -p otterjs -- run <file> --cpu-prof --cpu-prof-dir /tmp/otter-prof`
+  - `cargo run -p otter-cli -- run <file> --cpu-prof --cpu-prof-dir /tmp/otter-prof`
   - Optional: `--cpu-prof-interval 1000 --cpu-prof-name my-run.cpuprofile`
   - Produces both `.cpuprofile` (DevTools/Speedscope) and `.folded` (inferno/flamegraph.pl).
   - Stack samples are captured from `VmContext::capture_profiler_stack()` (via runtime debug snapshot), so function/file/line metadata should come from VM frames, not CLI-only reconstruction.
   - Baseline overhead sanity check (`cpu-prof` should stay opt-in): compare `/usr/bin/time -p target/debug/otter --timeout 0 run <file>` vs `/usr/bin/time -p target/debug/otter --timeout 0 --cpu-prof --cpu-prof-dir /tmp/otter-prof run <file>` and watch `real` delta.
-  - Script args are forwarded to `process.argv`: `cargo run -p otterjs -- run benchmarks/cpu/flamegraph.ts math 2`
-  - Shorthand mode also forwards args: `cargo run -p otterjs -- benchmarks/cpu/flamegraph.ts json 1`
+  - Script args are forwarded to `process.argv`: `cargo run -p otter-cli -- run benchmarks/cpu/flamegraph.ts math 2`
+  - Shorthand mode also forwards args: `cargo run -p otter-cli -- benchmarks/cpu/flamegraph.ts json 1`
 - Async/op trace (Chrome/Perfetto compatible):
-  - `cargo run -p otterjs -- run <file> --async-trace --async-trace-file /tmp/otter-prof/run.trace.json`
+  - `cargo run -p otter-cli -- run <file> --async-trace --async-trace-file /tmp/otter-prof/run.trace.json`
   - Produces `.trace.json` with `traceEvents` and categories (`timers`, `fetch`, `fs`, `net`, `jobs`, `modules`, `ops`).
   - Async op hops are linked via `args.parentId`/`args.spanId` (dispatch span on VM thread, worker span on async task).
 - Combined profiling run (CPU + async trace):
-  - `cargo run -p otterjs -- run <file> --timeout 0 --cpu-prof --cpu-prof-dir /tmp/otter-prof --async-trace --async-trace-file /tmp/otter-prof/run.trace.json`
+  - `cargo run -p otter-cli -- run <file> --timeout 0 --cpu-prof --cpu-prof-dir /tmp/otter-prof --async-trace --async-trace-file /tmp/otter-prof/run.trace.json`
   - Use `--timeout 0` for long benchmarks to avoid default CLI timeout truncating profiles.
 - Timeout-focused debug dump (ring buffer snapshot):
-  - `cargo run -p otterjs -- run <file> --timeout 20 --dump-on-timeout --dump-file timeout-dump.txt --dump-buffer-size 100`
+  - `cargo run -p otter-cli -- run <file> --timeout 20 --dump-on-timeout --dump-file timeout-dump.txt --dump-buffer-size 100`
   - For heavy JSON/object workloads, start with `--dump-buffer-size 10` to keep timeout diagnostics responsive.
   - Trace modified-register values are preview-capped (160 chars) to avoid oversized timeout dumps.
-  - Reproducibility guard (stable opcode sequence across repeated interrupted runs): `cargo test -p otterjs timeout_dump_is_reproducible_for_immediate_interrupt`
+  - Reproducibility guard (stable opcode sequence across repeated interrupted runs): `cargo test -p otter-cli timeout_dump_is_reproducible_for_immediate_interrupt`
 - Test262 trace workflow:
   - Full trace: `cargo run -p otter-test262 -- run --filter "<pattern>" --trace`
   - Save trace only on failures: `cargo run -p otter-test262 -- run --filter "<pattern>" --trace --trace-failures-only`
@@ -350,16 +350,16 @@ Pure Rust implementation - no external JavaScript engine dependencies.
 ### Debug Workflows (engine improvement)
 
 - Timeout/hang triage:
-  - First run timeout dump: `cargo run -p otterjs -- run <file> --timeout 20 --dump-on-timeout --dump-file timeout-dump.txt --dump-buffer-size 100`
+  - First run timeout dump: `cargo run -p otter-cli -- run <file> --timeout 20 --dump-on-timeout --dump-file timeout-dump.txt --dump-buffer-size 100`
   - If workload includes large JSON/string values, retry with `--dump-buffer-size 10` before increasing it.
-  - Then narrow with filtered full trace: `cargo run -p otterjs -- run <file> --trace --trace-file otter-trace.json --trace-filter "<module|function>"`
+  - Then narrow with filtered full trace: `cargo run -p otter-cli -- run <file> --trace --trace-file otter-trace.json --trace-filter "<module|function>"`
   - Focus on `pc`, `instruction`, and `module_url` to identify VM loop vs extension/bootstrap lockup.
 - CPU hotspot triage:
-  - Capture profile: `cargo run -p otterjs -- run benchmarks/cpu/flamegraph.ts <mode> <scale> --timeout 0 --cpu-prof --cpu-prof-dir /tmp/otter-prof`
+  - Capture profile: `cargo run -p otter-cli -- run benchmarks/cpu/flamegraph.ts <mode> <scale> --timeout 0 --cpu-prof --cpu-prof-dir /tmp/otter-prof`
   - Inspect `.cpuprofile` (DevTools/Speedscope) and `.folded` (inferno/flamegraph).
   - Compare hottest frames before/after optimization patches; do not rely only on total runtime.
 - Async latency/scheduling triage:
-  - Capture async trace: `cargo run -p otterjs -- run <file> --timeout 0 --async-trace --async-trace-file /tmp/otter-prof/run.trace.json`
+  - Capture async trace: `cargo run -p otter-cli -- run <file> --timeout 0 --async-trace --async-trace-file /tmp/otter-prof/run.trace.json`
   - Validate category distribution (`timers`, `jobs`, `fs`, `net`, `fetch`, `modules`, `ops`) and span closure behavior.
   - Use combined run (`--cpu-prof` + `--async-trace`) when stall source is unclear.
 
@@ -404,10 +404,10 @@ Practical rules when adding/altering APIs:
 
 - Default config file search: `otter.toml`, `otter.config.toml`, `.otterrc.toml` (walks up parent dirs).
 - Permissions flags are additive/overriding: `--allow-read/--allow-write/--allow-net/--allow-env`, plus `--allow-run` and `--allow-all`.
-- Direct run is supported: `cargo run -p otterjs -- path/to/script.ts` (no `run` subcommand).
+- Direct run is supported: `cargo run -p otter-cli -- path/to/script.ts` (no `run` subcommand).
 - Script argv forwarding is supported in both forms:
-  - `cargo run -p otterjs -- run path/to/script.ts arg1 arg2`
-  - `cargo run -p otterjs -- path/to/script.ts arg1 arg2`
+  - `cargo run -p otter-cli -- run path/to/script.ts arg1 arg2`
+  - `cargo run -p otter-cli -- path/to/script.ts arg1 arg2`
 
 ## Benchmarks
 

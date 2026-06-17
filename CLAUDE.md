@@ -10,7 +10,7 @@ See [AGENTS.md](./AGENTS.md) for detailed coding agent instructions.
 ```bash
 # Build
 cargo build                              # Debug build
-cargo build --release -p otterjs         # Release CLI binary
+cargo build --release -p otter-cli         # Release CLI binary
 
 # Test
 cargo test --all --all-features          # All tests
@@ -22,8 +22,8 @@ cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 
 # Run scripts
-cargo run -p otterjs -- run examples/basic.ts
-cargo run -p otterjs -- examples/basic.ts    # Shorthand
+cargo run -p otter-cli -- run examples/basic.ts
+cargo run -p otter-cli -- examples/basic.ts    # Shorthand
 
 # Using justfile (recommended)
 just fmt && just lint && just test
@@ -51,7 +51,7 @@ Compatibility rules:
 ### Crate Layering (bottom-up)
 
 ```
-otterjs (CLI)
+otter-cli (CLI)
     ↓
     host/runtime integration layer
     ↓
@@ -175,7 +175,7 @@ just test262-filter "JSON" 2>&1 | tail -5  # After — compare pass rates
 
 ### Logging
 ```bash
-RUST_LOG=debug cargo run -p otterjs -- run script.ts
+RUST_LOG=debug cargo run -p otter-cli -- run script.ts
 ```
 
 ### Test262 Watchdog (for hangs)
@@ -189,7 +189,7 @@ On timeout, dumps: `stack_depth`, `pc`, `instruction`, `function_name`, `module_
 
 ### Profiling
 ```bash
-cargo build --release -p otterjs
+cargo build --release -p otter-cli
 # Profile with your preferred tool (perf, flamegraph, etc.)
 ```
 

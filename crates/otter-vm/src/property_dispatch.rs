@@ -96,7 +96,14 @@ impl Interpreter {
         };
         let next_shape = self
             .shape_runtime
-            .child_with_roots(&mut self.gc_heap, parent, key.name(), &mut external_visit)
+            .child_with_roots(
+                &mut self.gc_heap,
+                parent,
+                key.name(),
+                object::PropertyFlags::data_default(),
+                false,
+                &mut external_visit,
+            )
             .map_err(VmError::from)?;
         Ok(object::capture_store_property_transition_with_shape(
             obj,

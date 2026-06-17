@@ -106,14 +106,20 @@ Current architecture (confirmed):
   `SlotMeta.kind`.
 
 Stages (each: implement → `just test262` full → diff failing-set → commit):
-- **A. Shape carries attributes.** Add `own_flags: PropertyFlags` +
-  `own_is_accessor: bool` to `ShapeBody::child`. Key the transition cache by
-  `(key, flags, is_accessor)` so the same key with different attributes is a
-  distinct transition (this is what invalidates ICs correctly). Add
-  `shape_slot_attrs(shape, offset) -> (PropertyFlags, bool)` chain-walk reader
-  (mirror `shape_offset_of_key`). Dual-write: keep `slots` authoritative; shape
-  records redundantly. Assert shape-attrs == slots-attrs in debug. No behavior
-  change, no size change — proves the machinery.
+- **A. Shape carries attributes. — LANDED.** Added `own_flags: PropertyFlags`
+  + `own_is_accessor: bool` to `ShapeBody`; transition cache now keyed by
+  `(parent, key, flags, is_accessor)` so the same key with different attributes
+  is a distinct transition (correct IC invalidation). `shape_slot_attrs(shape,
+  offset) -> (PropertyFlags, bool)` chain-walk reader added. Dual-write: `slots`
+  stays authoritative; shape records redundantly. Debug assert
+  (`debug_assert_appended_shape_slot`) checks the freshly appended slot matches
+  the shape — scoped to the append, not the whole object, because
+  defineProperty/freeze/seal still mutate slot flags in place until stage D, so
+  older slots may legitimately diverge. Attr accessors are
+  `#[cfg_attr(not(debug_assertions), allow(dead_code))]` until stage B reads
+  them in release. No behavior change, no `ObjectBody` size change. Gate: full
+  test262 (Atomics excluded — timeout-grind, orthogonal) failing-set diff vs
+  HEAD = **0 regressions** (52783 tests, 1373 fail; ±2 staging/sm flake only).
 - **B. Flip reads to the shape.** Route `slot_lookup_at` / `slot_descriptor_at`
   / enumeration flag reads / `is_data` checks to read flags+kind from the shape
   for shaped objects (dict mode still uses slots). Accessor getter/setter still

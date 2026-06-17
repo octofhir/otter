@@ -34,6 +34,7 @@ use crate::inspect::{ShapeTransitionEvent, ShapeTransitionObserver};
 use crate::string::{JsStringBody, JsStringHandle, JsStringId, alloc_flat_string_body_with_roots};
 
 use super::ShapeId;
+use super::descriptor::PropertyFlags;
 use super::shape_body::{
     ShapeBody, ShapeHandle, alloc_child_shape_body_with_roots, alloc_root_shape_body_with_roots,
     shape_keys_ordered,
@@ -43,6 +44,14 @@ use super::shape_body::{
 struct TransitionKey {
     parent: ShapeId,
     key: JsStringId,
+    /// Attribute bits of the appended slot. Keying transitions by attributes
+    /// (not just the key) keeps a `define`-with-non-default-attributes append
+    /// on a distinct shape from an ordinary default-data append of the same
+    /// key, so shape-id IC guards invalidate correctly.
+    flags: PropertyFlags,
+    /// Data vs accessor for the appended slot — part of the transition
+    /// identity for the same reason as [`Self::flags`].
+    is_accessor: bool,
 }
 
 /// Mutable side tables for GC-managed hidden classes.
@@ -171,6 +180,8 @@ impl ShapeRuntime {
         heap: &GcHeap,
         parent: ShapeHandle,
         key: &str,
+        flags: PropertyFlags,
+        is_accessor: bool,
     ) -> Option<ShapeHandle> {
         let key_handle = *self.interned_keys.get(key)?;
         let parent_id = heap.read_payload(parent, ShapeBody::id);
@@ -178,6 +189,8 @@ impl ShapeRuntime {
         let transition_key = TransitionKey {
             parent: parent_id,
             key: key_id,
+            flags,
+            is_accessor,
         };
         let child = *self.transitions.get(&transition_key)?;
         self.notify_observer(heap, parent_id, child, key, true);
@@ -190,6 +203,8 @@ impl ShapeRuntime {
         heap: &mut GcHeap,
         mut parent: ShapeHandle,
         key: &str,
+        flags: PropertyFlags,
+        is_accessor: bool,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
         let mut visit_parent = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -203,6 +218,8 @@ impl ShapeRuntime {
         let transition_key = TransitionKey {
             parent: parent_id,
             key: key_id,
+            flags,
+            is_accessor,
         };
         if let Some(existing) = self.transitions.get(&transition_key) {
             let child = *existing;
@@ -214,8 +231,14 @@ impl ShapeRuntime {
             self.trace_roots(visitor);
             external_visit(visitor);
         };
-        let child =
-            alloc_child_shape_body_with_roots(heap, parent, key_handle, &mut visit_child_roots)?;
+        let child = alloc_child_shape_body_with_roots(
+            heap,
+            parent,
+            key_handle,
+            flags,
+            is_accessor,
+            &mut visit_child_roots,
+        )?;
         self.transitions.insert(transition_key, child);
         self.notify_observer(heap, parent_id, child, key, false);
         Ok(child)
@@ -286,11 +309,12 @@ mod tests {
         let mut runtime = ShapeRuntime::new(&mut heap).expect("runtime");
         let mut roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
 
+        let flags = PropertyFlags::data_default();
         let first = runtime
-            .child_with_roots(&mut heap, runtime.root(), "x", &mut roots)
+            .child_with_roots(&mut heap, runtime.root(), "x", flags, false, &mut roots)
             .expect("first child");
         let second = runtime
-            .child_with_roots(&mut heap, runtime.root(), "x", &mut roots)
+            .child_with_roots(&mut heap, runtime.root(), "x", flags, false, &mut roots)
             .expect("second child");
 
         assert_eq!(first, second);

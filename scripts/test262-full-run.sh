@@ -65,6 +65,23 @@ done
 [ -d "$TEST_DIR/staging" ] && DIRS+=("staging/")
 [ -d "$TEST_DIR/intl402" ] && DIRS+=("intl402/")
 
+# Optional space-separated list of directory batches to skip (exact match
+# against the "built-ins/Name/" entries), e.g.
+#   EXCLUDE_DIRS="built-ins/Atomics/" bash scripts/test262-full-run.sh
+# Used to drop timeout-grinding subtrees (Atomics agent/wait tests) from a
+# conformance-gating run without losing the rest of the suite.
+if [ -n "${EXCLUDE_DIRS:-}" ]; then
+    FILTERED=()
+    for d in "${DIRS[@]}"; do
+        skip=0
+        for ex in $EXCLUDE_DIRS; do
+            [ "$d" = "$ex" ] && skip=1 && break
+        done
+        [ "$skip" -eq 0 ] && FILTERED+=("$d")
+    done
+    DIRS=("${FILTERED[@]}")
+fi
+
 TOTAL=${#DIRS[@]}
 echo "Found $TOTAL directory batches"
 echo ""

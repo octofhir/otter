@@ -615,7 +615,8 @@ impl ObjectBody {
     /// first use.
     #[inline]
     fn exotic_mut(&mut self) -> &mut ExoticSlots {
-        self.exotic.get_or_insert_with(|| Box::new(ExoticSlots::default()))
+        self.exotic
+            .get_or_insert_with(|| Box::new(ExoticSlots::default()))
     }
 
     #[inline]
@@ -624,7 +625,9 @@ impl ObjectBody {
     }
     #[inline]
     fn host_data_mut_opt(&mut self) -> Option<&mut Box<dyn Any>> {
-        self.exotic.as_deref_mut().and_then(|e| e.host_data.as_mut())
+        self.exotic
+            .as_deref_mut()
+            .and_then(|e| e.host_data.as_mut())
     }
     #[inline]
     fn boolean_data(&self) -> Option<bool> {
@@ -644,7 +647,7 @@ impl ObjectBody {
     }
     #[inline]
     fn bigint_data(&self) -> Option<BigIntValue> {
-        self.exotic().and_then(|e| e.bigint_data.clone())
+        self.exotic().and_then(|e| e.bigint_data)
     }
     #[inline]
     fn date_data(&self) -> Option<f64> {
@@ -683,7 +686,8 @@ impl ObjectBody {
     /// Dictionary-mode `key → slot offset`, or `None`.
     #[inline]
     fn dictionary_index_get(&self, key: &str) -> Option<u16> {
-        self.exotic().and_then(|e| e.dictionary_index.get(key).copied())
+        self.exotic()
+            .and_then(|e| e.dictionary_index.get(key).copied())
     }
 }
 
@@ -708,7 +712,10 @@ impl std::fmt::Debug for ObjectBody {
                     .map_or(0, |data| data.entries.len()),
             )
             .field("has_call_native", &self.call_native().is_some())
-            .field("has_constructor_native", &self.constructor_native().is_some())
+            .field(
+                "has_constructor_native",
+                &self.constructor_native().is_some(),
+            )
             .field("has_boolean_data", &self.boolean_data().is_some())
             .field("has_number_data", &self.number_data().is_some())
             .field("has_string_data", &self.string_data().is_some())
@@ -935,10 +942,10 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
         ObjectBody {
             shape: ShapeHandle::null(),
             inline_values: [Value::undefined(); INLINE_VALUE_CAP],
-                dictionary_shape_id: next_shape_id(),
+            dictionary_shape_id: next_shape_id(),
             shape_cache_mode: ShapeCacheMode::Fast,
             slots: SmallVec::new(),
-                jit_proto: otter_gc::Gc::null(),
+            jit_proto: otter_gc::Gc::null(),
             extensible: true,
             exotic: Some(Box::new(ExoticSlots {
                 host_data: Some(Box::new(data)),
@@ -960,10 +967,10 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
         ObjectBody {
             shape,
             inline_values: [Value::undefined(); INLINE_VALUE_CAP],
-                dictionary_shape_id: next_shape_id(),
+            dictionary_shape_id: next_shape_id(),
             shape_cache_mode: ShapeCacheMode::Fast,
             slots: SmallVec::new(),
-                jit_proto: otter_gc::Gc::null(),
+            jit_proto: otter_gc::Gc::null(),
             extensible: true,
             exotic: Some(Box::new(ExoticSlots {
                 host_data: Some(Box::new(data)),
@@ -1972,6 +1979,41 @@ pub(crate) fn shape(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeHandle {
     heap.read_payload(obj, |body| body.shape)
 }
 
+/// Dual-write invariant check for the slots→shape migration: the most
+/// recently appended own slot's stored `(flags, is_accessor)` must match what
+/// the shape records at that offset. Called right after a shape-advancing
+/// append, so the last slot is the freshly transitioned one. `slots` stays
+/// authoritative; the shape carries the same attributes redundantly.
+///
+/// Only the appended slot is checked — not the whole object — because in
+/// stage A `defineProperty`/`freeze`/`seal` still mutate existing slot
+/// attributes *in place* without transitioning the shape, so older slots may
+/// legitimately diverge until stage D routes those mutations through
+/// attribute transitions. Dictionary-mode objects (null shape) are skipped.
+/// Debug-only.
+#[cfg(debug_assertions)]
+pub(crate) fn debug_assert_appended_shape_slot(obj: JsObject, heap: &otter_gc::GcHeap) {
+    let shape = shape(obj, heap);
+    if shape.is_null() {
+        return;
+    }
+    heap.read_payload(obj, |body| {
+        let Some(i) = body.slots.len().checked_sub(1) else {
+            return;
+        };
+        let meta = &body.slots[i];
+        let Some((flags, is_accessor)) = shape_body::shape_slot_attrs(heap, shape, i as u32) else {
+            panic!("shape missing attrs for appended slot {i}");
+        };
+        debug_assert_eq!(flags, meta.flags, "shape/slot flags mismatch at slot {i}");
+        debug_assert_eq!(
+            is_accessor,
+            !meta.kind.is_data(),
+            "shape/slot kind mismatch at slot {i}"
+        );
+    });
+}
+
 /// `[[IsExtensible]]` — `false` after [`prevent_extensions`] /
 /// [`seal`] / [`freeze`].
 ///
@@ -2085,6 +2127,8 @@ pub(crate) fn set_with_shape(
     });
     heap.record_write(obj, &barrier_value);
     heap.record_write(obj, &next_shape);
+    #[cfg(debug_assertions)]
+    debug_assert_appended_shape_slot(obj, heap);
 }
 
 /// Apply the data-write half of ordinary `[[Set]]` after
@@ -2129,6 +2173,10 @@ pub(crate) fn ordinary_set_data_property_with_shape(
         descriptor_core::ordinary_set_data_property_with_shape(obj, heap, key, value, next_shape);
     if success && let Some(cell) = mapped_cell {
         store_upvalue(heap, cell, value);
+    }
+    #[cfg(debug_assertions)]
+    if success {
+        debug_assert_appended_shape_slot(obj, heap);
     }
     success
 }
@@ -2440,6 +2488,10 @@ pub(crate) fn define_own_property_partial_with_shape(
         apply_mapped_arguments_partial_define(obj, heap, key, descriptor, existing_offset);
         heap.record_write(obj, &barrier_descriptor);
         heap.record_write(obj, &next_shape);
+        #[cfg(debug_assertions)]
+        if existing_offset.is_none() {
+            debug_assert_appended_shape_slot(obj, heap);
+        }
     }
     success
 }
@@ -3947,7 +3999,3 @@ mod tests {
         assert!(delete_symbol(o, &mut heap, sym));
     }
 }
-
-
-
-

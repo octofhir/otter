@@ -4041,7 +4041,14 @@ impl Interpreter {
             }
         };
         self.shape_runtime
-            .child_with_roots(&mut self.gc_heap, parent, key, &mut external_visit)
+            .child_with_roots(
+                &mut self.gc_heap,
+                parent,
+                key,
+                object::PropertyFlags::data_default(),
+                false,
+                &mut external_visit,
+            )
             .map_err(VmError::from)
     }
 
@@ -4074,10 +4081,13 @@ impl Interpreter {
         // allocation, so it needs no rooting. Building an object whose layout
         // already exists (every object after the first of its class) lands
         // here and skips the full runtime-root walk below.
-        if let Some(child) = self
-            .shape_runtime
-            .child_if_cached(&self.gc_heap, parent, key)
-        {
+        if let Some(child) = self.shape_runtime.child_if_cached(
+            &self.gc_heap,
+            parent,
+            key,
+            object::PropertyFlags::data_default(),
+            false,
+        ) {
             return Ok(child);
         }
         let roots = self.collect_runtime_roots_without_shape_runtime();
@@ -4091,7 +4101,14 @@ impl Interpreter {
             value.trace_value_slots(visitor);
         };
         self.shape_runtime
-            .child_with_roots(&mut self.gc_heap, parent, key, &mut external_visit)
+            .child_with_roots(
+                &mut self.gc_heap,
+                parent,
+                key,
+                object::PropertyFlags::data_default(),
+                false,
+                &mut external_visit,
+            )
             .map_err(VmError::from)
     }
 
@@ -4102,9 +4119,11 @@ impl Interpreter {
         obj: &mut object::JsObject,
         descriptor: &object::PropertyDescriptor,
     ) -> Result<object::ShapeHandle, VmError> {
-        if let Some(child) = self
-            .shape_runtime
-            .child_if_cached(&self.gc_heap, parent, key)
+        let flags = descriptor.flags;
+        let is_accessor = matches!(descriptor.kind, object::DescriptorKind::Accessor { .. });
+        if let Some(child) =
+            self.shape_runtime
+                .child_if_cached(&self.gc_heap, parent, key, flags, is_accessor)
         {
             return Ok(child);
         }
@@ -4128,7 +4147,14 @@ impl Interpreter {
             }
         };
         self.shape_runtime
-            .child_with_roots(&mut self.gc_heap, parent, key, &mut external_visit)
+            .child_with_roots(
+                &mut self.gc_heap,
+                parent,
+                key,
+                flags,
+                is_accessor,
+                &mut external_visit,
+            )
             .map_err(VmError::from)
     }
 

@@ -31,6 +31,7 @@ use otter_gc::raw::{RawGc, SlotVisitor};
 
 use crate::string::{JsStringHandle, eq_str};
 
+use super::descriptor::PropertyFlags;
 use super::{ShapeId, next_shape_id};
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`ShapeBody`].
@@ -55,6 +56,19 @@ pub struct ShapeBody {
     property_count: u32,
     /// Slot assigned to [`Self::transition_key`]. Zero for root.
     own_offset: u32,
+    /// Attribute bits (`writable`/`enumerable`/`configurable`) of the slot
+    /// added by this transition. Default-data for ordinary appends; carries
+    /// non-default attributes when the transition was created by a
+    /// descriptor/define path. Meaningless for the root.
+    ///
+    /// Read only by the debug dual-write assert until stage B routes shaped
+    /// attribute reads through the shape.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    own_flags: PropertyFlags,
+    /// `true` when the slot added by this transition is an accessor rather
+    /// than a data property. Meaningless for the root.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    own_is_accessor: bool,
 }
 
 impl ShapeBody {
@@ -66,17 +80,27 @@ impl ShapeBody {
             transition_key: JsStringHandle::null(),
             property_count: 0,
             own_offset: 0,
+            own_flags: PropertyFlags::data_default(),
+            own_is_accessor: false,
         }
     }
 
     #[must_use]
-    fn child(parent: ShapeHandle, key: JsStringHandle, parent_property_count: u32) -> Self {
+    fn child(
+        parent: ShapeHandle,
+        key: JsStringHandle,
+        parent_property_count: u32,
+        own_flags: PropertyFlags,
+        own_is_accessor: bool,
+    ) -> Self {
         Self {
             id: next_shape_id(),
             parent,
             transition_key: key,
             property_count: parent_property_count + 1,
             own_offset: parent_property_count,
+            own_flags,
+            own_is_accessor,
         }
     }
 
@@ -108,6 +132,20 @@ impl ShapeBody {
     #[must_use]
     pub(crate) const fn own_offset(&self) -> u32 {
         self.own_offset
+    }
+
+    /// Attribute bits of the slot added by this transition.
+    #[must_use]
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    pub(crate) const fn own_flags(&self) -> PropertyFlags {
+        self.own_flags
+    }
+
+    /// `true` when the slot added by this transition is an accessor.
+    #[must_use]
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    pub(crate) const fn own_is_accessor(&self) -> bool {
+        self.own_is_accessor
     }
 
     /// `true` for the root shape.
@@ -153,11 +191,19 @@ pub(crate) fn alloc_child_shape_body_with_roots(
     heap: &mut GcHeap,
     parent: ShapeHandle,
     key: JsStringHandle,
+    own_flags: PropertyFlags,
+    own_is_accessor: bool,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
     let parent_property_count = heap.read_payload(parent, ShapeBody::property_count);
     heap.alloc_old_with_roots(
-        ShapeBody::child(parent, key, parent_property_count),
+        ShapeBody::child(
+            parent,
+            key,
+            parent_property_count,
+            own_flags,
+            own_is_accessor,
+        ),
         external_visit,
     )
 }
@@ -226,6 +272,39 @@ pub(crate) fn shape_key_at_offset(
         });
         if !is_root && own_offset == offset {
             return Some(transition_key);
+        }
+        shape = parent;
+    }
+    None
+}
+
+/// Walk `shape`'s parent chain and return the attributes of the slot at
+/// `offset`: its `(flags, is_accessor)` pair. `None` when no transition in
+/// the chain owns that offset (e.g. the root, or an out-of-range offset).
+///
+/// Mirror of [`shape_key_at_offset`] for the attribute payload added in the
+/// slots→shape migration. Reads are O(chain depth); hot paths should prefer a
+/// flattened cache once the shape becomes the authoritative attribute source.
+#[must_use]
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+pub(crate) fn shape_slot_attrs(
+    heap: &GcHeap,
+    mut shape: ShapeHandle,
+    offset: u32,
+) -> Option<(PropertyFlags, bool)> {
+    while !shape.is_null() {
+        let (parent, own_offset, own_flags, own_is_accessor, is_root) =
+            heap.read_payload(shape, |body| {
+                (
+                    body.parent(),
+                    body.own_offset(),
+                    body.own_flags(),
+                    body.own_is_accessor(),
+                    body.is_root(),
+                )
+            });
+        if !is_root && own_offset == offset {
+            return Some((own_flags, own_is_accessor));
         }
         shape = parent;
     }
@@ -305,8 +384,11 @@ mod tests {
         let x = alloc_key(&mut heap, 1, "x");
         let y = alloc_key(&mut heap, 2, "y");
 
-        let sx = alloc_child_shape_body_with_roots(&mut heap, root, x, &mut roots).expect("sx");
-        let sxy = alloc_child_shape_body_with_roots(&mut heap, sx, y, &mut roots).expect("sxy");
+        let flags = PropertyFlags::data_default();
+        let sx = alloc_child_shape_body_with_roots(&mut heap, root, x, flags, false, &mut roots)
+            .expect("sx");
+        let sxy = alloc_child_shape_body_with_roots(&mut heap, sx, y, flags, false, &mut roots)
+            .expect("sxy");
 
         assert_eq!(shape_offset_of_key(&heap, sxy, x), Some(0));
         assert_eq!(shape_offset_of_key(&heap, sxy, y), Some(1));

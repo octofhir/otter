@@ -6,6 +6,31 @@
 
 ---
 
+## Phase 2 — status update 2026-06-17 (Slice 2c REDUNDANT; call path at baseline floor)
+
+Slice 2c (native-callback lean dispatch) was farmed to a worktree agent — it built a
+clean `LeanCallbackStack` and measured sort 2128→1472ms (−31%), array-ops 1239→695ms
+(−44%). BUT its worktree was based on `origin/main` (ccf93ac2) which LACKS main's
+already-committed lean-invoke machinery (`acquire_lean_callback_stack` +
+`run_bytecode_callable_committed`, which already reach `dispatch_jit_sync_entry` and
+run the compiled callback). Measured main-current (cb54ca4f): **sort 1456ms, array-ops
+723ms** — i.e. main is ALREADY at the agent's "after" numbers. The agent merely caught
+its stale base UP to main. Net delta of porting ≈ 0 (sort) / ~4% noise (array-ops).
+**Discarded the agent commit f9450214.** Lesson: worktree agents base on origin/main,
+not local HEAD — measure main-current before farming a perf slice.
+
+Call path (sort/array callbacks) is now at the BASELINE-JIT lean floor (~95ns/call:
+run_compiled_frame entry/exit + per-call Rust setup; node ~5ns inlines the comparator).
+Beating ~95ns needs either Slice 2d (machine-code frame-build, kills the Rust stub —
+helps compiled→compiled, NOT native→JS callbacks whose caller is Rust) or an
+optimizing/inlining tier (Phase 2+ / far). NOT a quick win.
+
+Object model already partially flat (ObjectBody repr(C) + flat value array + SlotMeta;
+KelpHeap slice (a) 405e1280 + JIT inline property LOAD 7c0517b0 landed). Remaining
+high-leverage bounded structural slices that build on landed work: **JIT inline property
+STORE + write barrier**, **method-call IC inline** (Phase 3 d/e) — target prop-access
+(13.6× node). These extend existing machine-code IC, not greenfield.
+
 ## Phase 2 execution — PupJIT direct calls (LOCKED 2026-06-17, user-directed)
 
 **Verified current state:** compiled→compiled direct calls ALREADY exist

@@ -203,9 +203,10 @@ impl ExecutableFunction {
                     make_self: false,
                 })
                 .collect(),
-            // Baked by `Interpreter::bake_call_site_feedback` (it holds the
-            // live per-site feedback); the raw snapshot carries none.
-            call_site_targets: rustc_hash::FxHashMap::default(),
+            // Baked by `Interpreter::bake_inline_callees` (it holds the live
+            // per-site feedback and can resolve callee bodies); the raw snapshot
+            // carries none.
+            inline_callees: rustc_hash::FxHashMap::default(),
         }
     }
 

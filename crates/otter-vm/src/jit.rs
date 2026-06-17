@@ -77,13 +77,33 @@ pub struct JitFunctionView {
     pub object_shape_byte: u32,
     /// Instruction stream in byte-PC order.
     pub instructions: Vec<JitInstrView>,
-    /// Monomorphic call-site targets driving baseline leaf-inlining:
-    /// `call_byte_pc → callee_function_id`. Populated only for `Op::Call` sites
-    /// the interpreter observed resolving to a single bytecode callee; baked by
-    /// `Interpreter::bake_call_site_feedback`. Empty in the raw `jit_view()`
-    /// snapshot. A site absent here (polymorphic or unobserved) emits the normal
+    /// Inline-candidate callees for baseline leaf-inlining, keyed by the
+    /// caller's `Op::Call` byte-PC. Populated only for sites the interpreter
+    /// observed resolving to a single plain synchronous bytecode callee; baked
+    /// by `Interpreter::bake_inline_callees`. Empty in the raw `jit_view()`
+    /// snapshot. The emitter applies the final pure-leaf / size / arity test and
+    /// either splices the body under an identity guard or — for a site absent
+    /// here, or one whose candidate fails the test — emits the normal
     /// direct-call bridge.
-    pub call_site_targets: rustc_hash::FxHashMap<u32, u32>,
+    pub inline_callees: rustc_hash::FxHashMap<u32, JitInlineCallee>,
+}
+
+/// A callee the baseline may splice into a caller's `Op::Call` site instead of
+/// emitting the per-call bridge. Carries the callee's own bytecode (the body to
+/// inline) plus the identity it is guarded against: a runtime closure whose bits
+/// do not match this `function_id` makes the guard bail to the interpreter.
+#[derive(Debug, Clone)]
+pub struct JitInlineCallee {
+    /// Callee function id the call-site identity guard is keyed on.
+    pub function_id: u32,
+    /// Callee formal parameter count; must equal the call's argument count for
+    /// the site to inline.
+    pub param_count: u16,
+    /// Callee register-window length; the spliced body runs in a scratch block
+    /// of this many slots.
+    pub register_count: u16,
+    /// Callee instruction stream in byte-PC order, emitted inline.
+    pub instructions: Vec<JitInstrView>,
 }
 
 /// VM-resolved direct-call target for one eligible compiled callee.

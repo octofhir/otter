@@ -50,6 +50,11 @@ const TAG_NAN: u64 = 0x7FF8;
 const TAG_INT32: u64 = 0x7FF9;
 /// NaN-box tag for special immediates (undefined/null/hole/boolean).
 const TAG_SPECIAL: u64 = 0x7FFA;
+/// NaN-box tag for a closure-less bytecode function reference (`value/tag.rs`
+/// `TAG_FUNCTION_ID`). The low 32 bits are the function id; the whole Value is
+/// `(TAG_FUNCTION_ID << 48) | fid`, so an inlined call site guards identity by
+/// comparing the callee register to that exact immediate.
+const TAG_FUNCTION_ID: u64 = 0x7FFB;
 /// NaN-box tag for object-class heap pointers (`value/tag.rs`). The low 32
 /// bits are a `Gc` offset; the body type is discriminated by the GC header
 /// tag, so inline property loads must also check [`OBJECT_BODY_TYPE_TAG`].
@@ -802,8 +807,8 @@ mod arm64 {
         DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET,
         DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET, JIT_CTX_STACK_SIZE,
         MAX_INLINE_ARGS, OBJECT_BODY_TYPE_TAG, Op, Operand, SPECIAL_FALSE, SPECIAL_HOLE,
-        SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_INT32,
-        TAG_NAN, TAG_PTR_OBJECT, TAG_SPECIAL, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET,
+        SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_FUNCTION_ID,
+        TAG_INT32, TAG_NAN, TAG_PTR_OBJECT, TAG_SPECIAL, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET,
         UPVALUES_PTR_OFFSET, Unsupported, VM_OFFSET, WhiskerIcCell, jit_abort_direct_call_stub,
         jit_call_method_stub, jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
         jit_finish_direct_call_returned_stub, jit_load_element_stub, jit_load_global_stub,
@@ -813,7 +818,7 @@ mod arm64 {
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
-    use otter_vm::{JitFunctionView, JitTypedArrayLayout};
+    use otter_vm::{JitFunctionView, JitInlineCallee, JitTypedArrayLayout};
     use std::collections::BTreeMap;
 
     /// Comparison flavors that emit a `cset` from integer `cmp` flags.
@@ -875,6 +880,79 @@ mod arm64 {
         Xor,
         Shl,
         Shr,
+    }
+
+    /// Emit `Add`/`Sub`/`Mul`: an int32 fast path that falls through to the
+    /// f64 path on a non-int32 operand or an overflowing int32 result (never to
+    /// `bail` — an overflowing integer product is just its exact f64 value). The
+    /// double path decodes both operands to f64, computes, and reboxes; a
+    /// non-number operand on that path bails to `bail`.
+    fn emit_add_sub_mul(
+        ops: &mut Assembler,
+        operands: &[Operand],
+        bail: DynamicLabel,
+        op: Op,
+    ) -> Result<(), Unsupported> {
+        let (dst, lhs, rhs) = reg3(operands)?;
+        load_reg(ops, 9, lhs)?;
+        load_reg(ops, 10, rhs)?;
+        let float_path = ops.new_dynamic_label();
+        let done = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch aarch64
+            ; lsr x14, x9, #48
+            ; movz x15, TAG_INT32 as u32
+            ; cmp x14, x15
+            ; b.ne =>float_path
+            ; lsr x14, x10, #48
+            ; cmp x14, x15
+            ; b.ne =>float_path
+        );
+        match op {
+            Op::Add => dynasm!(ops ; .arch aarch64 ; adds w13, w9, w10 ; b.vs =>float_path),
+            Op::Sub => dynasm!(ops ; .arch aarch64 ; subs w13, w9, w10 ; b.vs =>float_path),
+            Op::Mul => dynasm!(ops
+                ; .arch aarch64
+                ; smull x13, w9, w10
+                ; cmp x13, w13, sxtw
+                ; b.ne =>float_path
+            ),
+            _ => return Err(Unsupported::ArgCount(0)),
+        }
+        box_low32!(ops, 13, 12, TAG_INT32);
+        store_reg(ops, 13, dst)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done ; =>float_path);
+        emit_num_to_double(ops, 9, 0, bail);
+        emit_num_to_double(ops, 10, 1, bail);
+        match op {
+            Op::Add => dynasm!(ops ; .arch aarch64 ; fadd d2, d0, d1),
+            Op::Sub => dynasm!(ops ; .arch aarch64 ; fsub d2, d0, d1),
+            Op::Mul => dynasm!(ops ; .arch aarch64 ; fmul d2, d0, d1),
+            _ => return Err(Unsupported::ArgCount(0)),
+        }
+        emit_box_double(ops, 2, 13);
+        store_reg(ops, 13, dst)?;
+        dynasm!(ops ; .arch aarch64 ; =>done);
+        Ok(())
+    }
+
+    /// Emit `Div`: division always yields a Number (f64) in ECMAScript — even
+    /// `6 / 2` is the Number `3` — so there is no int fast path; decode both
+    /// operands to f64 and `fdiv`. A non-number operand bails to `bail`.
+    fn emit_div(
+        ops: &mut Assembler,
+        operands: &[Operand],
+        bail: DynamicLabel,
+    ) -> Result<(), Unsupported> {
+        let (dst, lhs, rhs) = reg3(operands)?;
+        load_reg(ops, 9, lhs)?;
+        load_reg(ops, 10, rhs)?;
+        emit_num_to_double(ops, 9, 0, bail);
+        emit_num_to_double(ops, 10, 1, bail);
+        dynasm!(ops ; .arch aarch64 ; fdiv d2, d0, d1);
+        emit_box_double(ops, 2, 13);
+        store_reg(ops, 13, dst)?;
+        Ok(())
     }
 
     /// Emit an int32 bitwise/shift op (`BitwiseOr`/`And`/`Xor`/`Shl`/`Shr`).
@@ -1064,70 +1142,9 @@ mod arm64 {
                     store_reg(&mut ops, 9, idx)?;
                 }
                 Op::Add | Op::Sub | Op::Mul => {
-                    let (dst, lhs, rhs) = reg3(ops_ref)?;
-                    load_reg(&mut ops, 9, lhs)?;
-                    load_reg(&mut ops, 10, rhs)?;
-                    let float_path = ops.new_dynamic_label();
-                    let done = ops.new_dynamic_label();
-                    // int32 fast path: take it only when both operands are int32.
-                    // Any non-int32 operand — or an int32 result that overflows —
-                    // falls through to the double path (numbers are f64; an
-                    // overflowing integer product is just its exact f64 value),
-                    // never to `bail`.
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; lsr x14, x9, #48
-                        ; movz x15, TAG_INT32 as u32
-                        ; cmp x14, x15
-                        ; b.ne =>float_path
-                        ; lsr x14, x10, #48
-                        ; cmp x14, x15
-                        ; b.ne =>float_path
-                    );
-                    match instr.op {
-                        Op::Add => {
-                            dynasm!(ops ; .arch aarch64 ; adds w13, w9, w10 ; b.vs =>float_path)
-                        }
-                        Op::Sub => {
-                            dynasm!(ops ; .arch aarch64 ; subs w13, w9, w10 ; b.vs =>float_path)
-                        }
-                        Op::Mul => dynasm!(ops
-                            ; .arch aarch64
-                            ; smull x13, w9, w10
-                            ; cmp x13, w13, sxtw
-                            ; b.ne =>float_path
-                        ),
-                        _ => unreachable!(),
-                    }
-                    box_low32!(ops, 13, 12, TAG_INT32);
-                    store_reg(&mut ops, 13, dst)?;
-                    dynasm!(ops ; .arch aarch64 ; b =>done ; =>float_path);
-                    // Double path: decode both operands to f64, compute, rebox.
-                    emit_num_to_double(&mut ops, 9, 0, bail);
-                    emit_num_to_double(&mut ops, 10, 1, bail);
-                    match instr.op {
-                        Op::Add => dynasm!(ops ; .arch aarch64 ; fadd d2, d0, d1),
-                        Op::Sub => dynasm!(ops ; .arch aarch64 ; fsub d2, d0, d1),
-                        Op::Mul => dynasm!(ops ; .arch aarch64 ; fmul d2, d0, d1),
-                        _ => unreachable!(),
-                    }
-                    emit_box_double(&mut ops, 2, 13);
-                    store_reg(&mut ops, 13, dst)?;
-                    dynasm!(ops ; .arch aarch64 ; =>done);
+                    emit_add_sub_mul(&mut ops, ops_ref, bail, instr.op)?;
                 }
-                // Division always yields a Number (f64) in ECMAScript — even
-                // `6 / 2` is the Number `3`, equal to int32 `3` — so there is no
-                // int fast path; decode both operands to f64 and `fdiv`.
-                Op::Div => {
-                    let (dst, lhs, rhs) = reg3(ops_ref)?;
-                    load_reg(&mut ops, 9, lhs)?;
-                    load_reg(&mut ops, 10, rhs)?;
-                    emit_num_to_double(&mut ops, 9, 0, bail);
-                    emit_num_to_double(&mut ops, 10, 1, bail);
-                    dynasm!(ops ; .arch aarch64 ; fdiv d2, d0, d1);
-                    emit_box_double(&mut ops, 2, 13);
-                    store_reg(&mut ops, 13, dst)?;
-                }
+                Op::Div => emit_div(&mut ops, ops_ref, bail)?,
                 Op::LessThan => emit_cmp(&mut ops, ops_ref, bail, Cmp::Lt)?,
                 Op::LessEq => emit_cmp(&mut ops, ops_ref, bail, Cmp::Le)?,
                 Op::GreaterThan => emit_cmp(&mut ops, ops_ref, bail, Cmp::Gt)?,
@@ -1187,7 +1204,16 @@ mod arm64 {
                     emit_call_stub(&mut ops, jit_make_fn_stub as *const () as usize, threw);
                 }
                 Op::Call => {
-                    emit_call(&mut ops, ops_ref, bail, threw)?;
+                    // Splice a tiny monomorphic leaf callee inline under an
+                    // identity guard (no per-call bridge); fall back to the
+                    // direct-call bridge for absent / ineligible sites.
+                    let inlined = match view.inline_callees.get(&instr.byte_pc) {
+                        Some(callee) => try_emit_inline_call(&mut ops, callee, ops_ref, bail)?,
+                        None => false,
+                    };
+                    if !inlined {
+                        emit_call(&mut ops, ops_ref, bail, threw)?;
+                    }
                 }
                 // `recv.name(args…)` — IC-resolve the method + direct-branch to
                 // its compiled entry (WhiskerIC method call), falling back to the
@@ -1750,6 +1776,270 @@ mod arm64 {
             ; blr x16
             ; cbnz x0, =>threw
         );
+    }
+
+    /// Largest callee register window the inliner accepts. Bounds the per-site
+    /// scratch reservation and keeps a spliced body "tiny".
+    const INLINE_MAX_REGS: u16 = 24;
+    /// Largest callee instruction count the inliner accepts.
+    const INLINE_MAX_INSTRS: usize = 48;
+    /// Largest argument count an inlined call accepts.
+    const INLINE_MAX_ARGS: usize = 8;
+
+    /// Whether an op may appear in an inlined leaf callee: a pure, non-allocating
+    /// operation with no `this`/upvalue/global/heap access and no further call,
+    /// so the spliced body has no GC point and commits nothing observable before
+    /// it can bail. Any op outside this set aborts the inline attempt.
+    fn is_inline_pure_op(op: Op) -> bool {
+        matches!(
+            op,
+            Op::LoadInt32
+                | Op::LoadLocal
+                | Op::LoadUndefined
+                | Op::LoadHole
+                | Op::LoadTrue
+                | Op::LoadFalse
+                | Op::StoreLocal
+                | Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::BitwiseOr
+                | Op::BitwiseAnd
+                | Op::BitwiseXor
+                | Op::Shl
+                | Op::Shr
+                | Op::LessThan
+                | Op::LessEq
+                | Op::GreaterThan
+                | Op::GreaterEq
+                | Op::Equal
+                | Op::NotEqual
+                | Op::ToPrimitive
+                | Op::ToNumeric
+                | Op::Jump
+                | Op::JumpIfFalse
+                | Op::JumpIfTrue
+                | Op::Return
+                | Op::ReturnValue
+                | Op::ReturnUndefined
+        )
+    }
+
+    /// Emit one op of an inlined callee body. The frame-register base `x19`
+    /// already points at the callee scratch window, so `load_reg`/`store_reg`
+    /// address callee registers. Bails route to `bail` (the site's scratch-aware
+    /// bail) without restamping `bail_pc`, so a bail re-runs the whole call in
+    /// the interpreter. `Return*` leaves the result in `x9` and branches to
+    /// `inline_done`. Internal branches resolve through `clabels` (one private
+    /// label per callee byte-PC).
+    fn emit_inline_pure_op(
+        ops: &mut Assembler,
+        instr: &otter_vm::JitInstrView,
+        bail: DynamicLabel,
+        inline_done: DynamicLabel,
+        clabels: &BTreeMap<u32, DynamicLabel>,
+    ) -> Result<(), Unsupported> {
+        let ops_ref = instr.operands.as_slice();
+        let ctarget = |rel: i32| -> Result<DynamicLabel, Unsupported> {
+            let t = branch_target(instr, rel);
+            u32::try_from(t)
+                .ok()
+                .and_then(|pc| clabels.get(&pc).copied())
+                .ok_or(Unsupported::BranchTarget(t))
+        };
+        match instr.op {
+            Op::LoadInt32 => {
+                let dst = reg(ops_ref, 0)?;
+                let v = imm32(ops_ref, 1)?;
+                emit_load_u64(ops, 9, (TAG_INT32 << 48) | u64::from(v as u32));
+                store_reg(ops, 9, dst)?;
+            }
+            Op::LoadLocal => {
+                let dst = reg(ops_ref, 0)?;
+                let idx = local_index(ops_ref, 1)?;
+                load_reg(ops, 9, idx)?;
+                store_reg(ops, 9, dst)?;
+            }
+            Op::LoadUndefined => {
+                let dst = reg(ops_ref, 0)?;
+                emit_load_u64(ops, 9, TAG_SPECIAL << 48);
+                store_reg(ops, 9, dst)?;
+            }
+            Op::LoadHole => {
+                let dst = reg(ops_ref, 0)?;
+                emit_load_u64(ops, 9, (TAG_SPECIAL << 48) | SPECIAL_HOLE);
+                store_reg(ops, 9, dst)?;
+            }
+            Op::LoadTrue => {
+                let dst = reg(ops_ref, 0)?;
+                emit_load_u64(ops, 9, (TAG_SPECIAL << 48) | u64::from(SPECIAL_TRUE));
+                store_reg(ops, 9, dst)?;
+            }
+            Op::LoadFalse => {
+                let dst = reg(ops_ref, 0)?;
+                emit_load_u64(ops, 9, (TAG_SPECIAL << 48) | u64::from(SPECIAL_FALSE));
+                store_reg(ops, 9, dst)?;
+            }
+            Op::StoreLocal => {
+                let src = reg(ops_ref, 0)?;
+                let idx = local_index(ops_ref, 1)?;
+                load_reg(ops, 9, src)?;
+                store_reg(ops, 9, idx)?;
+            }
+            Op::Add | Op::Sub | Op::Mul => emit_add_sub_mul(ops, ops_ref, bail, instr.op)?,
+            Op::Div => emit_div(ops, ops_ref, bail)?,
+            Op::BitwiseOr => emit_int_binop(ops, ops_ref, bail, IntBinOp::Or)?,
+            Op::BitwiseAnd => emit_int_binop(ops, ops_ref, bail, IntBinOp::And)?,
+            Op::BitwiseXor => emit_int_binop(ops, ops_ref, bail, IntBinOp::Xor)?,
+            Op::Shl => emit_int_binop(ops, ops_ref, bail, IntBinOp::Shl)?,
+            Op::Shr => emit_int_binop(ops, ops_ref, bail, IntBinOp::Shr)?,
+            Op::LessThan => emit_cmp(ops, ops_ref, bail, Cmp::Lt)?,
+            Op::LessEq => emit_cmp(ops, ops_ref, bail, Cmp::Le)?,
+            Op::GreaterThan => emit_cmp(ops, ops_ref, bail, Cmp::Gt)?,
+            Op::GreaterEq => emit_cmp(ops, ops_ref, bail, Cmp::Ge)?,
+            Op::Equal => emit_cmp(ops, ops_ref, bail, Cmp::Eq)?,
+            Op::NotEqual => emit_cmp(ops, ops_ref, bail, Cmp::Ne)?,
+            Op::ToPrimitive | Op::ToNumeric => {
+                let dst = reg(ops_ref, 0)?;
+                let src = reg(ops_ref, 1)?;
+                load_reg(ops, 9, src)?;
+                guard_number!(ops, 9, bail);
+                store_reg(ops, 9, dst)?;
+            }
+            Op::Jump => {
+                let rel = imm32(ops_ref, 0)?;
+                let tgt = ctarget(rel)?;
+                dynasm!(ops ; .arch aarch64 ; b =>tgt);
+            }
+            Op::JumpIfFalse | Op::JumpIfTrue => {
+                let rel = imm32(ops_ref, 0)?;
+                let cond = reg(ops_ref, 1)?;
+                let tgt = ctarget(rel)?;
+                load_reg(ops, 9, cond)?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; lsr x14, x9, #48
+                    ; movz x15, TAG_SPECIAL as u32
+                    ; cmp x14, x15
+                    ; b.ne =>bail
+                    ; cmp w9, SPECIAL_TRUE
+                );
+                if matches!(instr.op, Op::JumpIfFalse) {
+                    dynasm!(ops ; .arch aarch64 ; b.ne =>tgt);
+                } else {
+                    dynasm!(ops ; .arch aarch64 ; b.eq =>tgt);
+                }
+            }
+            Op::Return | Op::ReturnValue => {
+                let src = reg(ops_ref, 0)?;
+                load_reg(ops, 9, src)?;
+                dynasm!(ops ; .arch aarch64 ; b =>inline_done);
+            }
+            Op::ReturnUndefined => {
+                emit_load_u64(ops, 9, TAG_SPECIAL << 48);
+                dynasm!(ops ; .arch aarch64 ; b =>inline_done);
+            }
+            // Pre-scanned by `is_inline_pure_op`; unreachable in practice.
+            _ => return Err(Unsupported::ArgCount(0)),
+        }
+        Ok(())
+    }
+
+    /// Try to splice `callee`'s body into the current `Op::Call` site instead of
+    /// emitting the per-call bridge. Returns `Ok(true)` when inlined, `Ok(false)`
+    /// when the callee fails the pure-leaf / size / arity test (the caller then
+    /// emits the normal direct-call bridge).
+    ///
+    /// The body runs only after a guard confirms the callee register holds
+    /// exactly the speculated closure-less function value. It runs in a fresh
+    /// native-stack scratch window the frame-register base `x19` is repointed at;
+    /// `x19` (from the ctx) and `sp` are restored on every exit, including the
+    /// bail path. Because the body has no GC point and commits nothing
+    /// observable before a possible bail — and never restamps `bail_pc` — a guard
+    /// or body bail re-runs the whole call in the interpreter, idempotently.
+    fn try_emit_inline_call(
+        ops: &mut Assembler,
+        callee: &JitInlineCallee,
+        call_operands: &[Operand],
+        bail: DynamicLabel,
+    ) -> Result<bool, Unsupported> {
+        let dst = reg(call_operands, 0)?;
+        let callee_reg = reg(call_operands, 1)?;
+        let argc = const_index(call_operands, 2)? as usize;
+
+        if argc != usize::from(callee.param_count)
+            || argc > INLINE_MAX_ARGS
+            || callee.register_count > INLINE_MAX_REGS
+            || callee.instructions.len() > INLINE_MAX_INSTRS
+            || !callee.instructions.iter().all(|i| is_inline_pure_op(i.op))
+        {
+            return Ok(false);
+        }
+
+        // One private label per callee byte-PC for internal branches.
+        let mut clabels: BTreeMap<u32, DynamicLabel> = BTreeMap::new();
+        for i in &callee.instructions {
+            clabels.insert(i.byte_pc, ops.new_dynamic_label());
+        }
+        let inline_done = ops.new_dynamic_label();
+        let inline_bail = ops.new_dynamic_label();
+        let after = ops.new_dynamic_label();
+        let scratch_bytes = (u32::from(callee.register_count) * 8).next_multiple_of(16);
+
+        // Identity guard (x19 = caller frame base, sp not yet moved): the callee
+        // register must be exactly the speculated function value, else bail.
+        load_reg(ops, 9, callee_reg)?;
+        emit_load_u64(
+            ops,
+            10,
+            (TAG_FUNCTION_ID << 48) | u64::from(callee.function_id),
+        );
+        dynasm!(ops ; .arch aarch64 ; cmp x9, x10 ; b.ne =>bail);
+
+        // Reserve scratch, copy args into param slots (read via caller base x19),
+        // zero the remaining slots to undefined (a fresh frame's register state),
+        // then repoint x19 at the scratch base for the body.
+        if scratch_bytes > 0 {
+            dynasm!(ops ; .arch aarch64 ; sub sp, sp, scratch_bytes);
+        }
+        for slot in 0..argc {
+            let areg = reg(call_operands, 3 + slot)?;
+            load_reg(ops, 9, areg)?;
+            dynasm!(ops ; .arch aarch64 ; str x9, [sp, (slot as u32) * 8]);
+        }
+        emit_load_u64(ops, 9, TAG_SPECIAL << 48);
+        for slot in argc..usize::from(callee.register_count) {
+            dynasm!(ops ; .arch aarch64 ; str x9, [sp, (slot as u32) * 8]);
+        }
+        dynasm!(ops ; .arch aarch64 ; add x19, sp, #0);
+
+        for i in &callee.instructions {
+            dynasm!(ops ; .arch aarch64 ; =>clabels[&i.byte_pc]);
+            emit_inline_pure_op(ops, i, inline_bail, inline_done, &clabels)?;
+        }
+
+        // Normal completion: result in x9, unwind scratch, restore caller base,
+        // store to dst.
+        dynasm!(ops ; .arch aarch64 ; =>inline_done);
+        if scratch_bytes > 0 {
+            dynasm!(ops ; .arch aarch64 ; add sp, sp, scratch_bytes);
+        }
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x19, [x20]
+        );
+        store_reg(ops, 9, dst)?;
+        dynasm!(ops ; .arch aarch64 ; b =>after);
+
+        // Bail path: unwind scratch so the shared bail epilogue sees the frame
+        // base sp (it reloads x19/x20 from the stack), then jump to it.
+        dynasm!(ops ; .arch aarch64 ; =>inline_bail);
+        if scratch_bytes > 0 {
+            dynasm!(ops ; .arch aarch64 ; add sp, sp, scratch_bytes);
+        }
+        dynasm!(ops ; .arch aarch64 ; b =>bail ; =>after);
+        Ok(true)
     }
 
     /// Emit a direct `Call`: ask the VM to publish an eligible callee frame,
@@ -2471,7 +2761,7 @@ mod tests {
             ta_layout: otter_vm::JitTypedArrayLayout::default(),
             object_shape_byte: 8,
             instructions,
-            call_site_targets: Default::default(),
+            inline_callees: Default::default(),
         }
     }
 

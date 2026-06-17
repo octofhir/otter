@@ -177,7 +177,7 @@ pub use error_classes::{ErrorClassRegistry, ErrorKind};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
     JitCompileError, JitCompileRequest, JitCompileStatus, JitCompilerHook, JitExecOutcome,
-    JitFrameStack, JitFunctionCode, JitFunctionView, JitInstrView, JitReentryPtrs,
+    JitFrameStack, JitFunctionCode, JitFunctionView, JitInlineCallee, JitInstrView, JitReentryPtrs,
     JitTypedArrayLayout,
 };
 pub use js_surface::{
@@ -481,9 +481,9 @@ pub struct Interpreter {
     /// Per-call-site monomorphic-callee feedback driving baseline leaf-inlining.
     /// Keyed `(caller_fid, call_byte_pc)`; recorded by the interpreter
     /// `Op::Call` arm during the warmup interpreter runs that precede tier-up,
-    /// and read at compile time (`bake_call_site_feedback`) so the baseline
-    /// knows which sites have a single observed callee. Only mutated when a JIT
-    /// hook is installed.
+    /// and read at compile time (`bake_inline_callees`) so the baseline knows
+    /// which sites have a single observed callee. Only mutated when a JIT hook
+    /// is installed.
     jit_call_site_feedback: rustc_hash::FxHashMap<(u32, u32), CallTargetFeedback>,
     /// OSR targets that bailed, had no trampoline, or whose function is
     /// uncompilable; OSR is not retried for them. Keyed by `(function_id,
@@ -2183,7 +2183,7 @@ impl Interpreter {
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         let mut view = context.jit_function_view(fid)?;
         Self::bake_typed_array_layout(&mut view);
-        self.bake_call_site_feedback(&mut view, fid);
+        self.bake_inline_callees(&mut view, context, fid);
         let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
         let (regs, params) = (view.register_count, view.param_count);
         let hook = self.jit_hook.as_ref()?.clone();
@@ -2252,17 +2252,54 @@ impl Interpreter {
         }
     }
 
-    /// Bake the monomorphic call-site targets for `fid` into `view` so the
-    /// baseline emitter can inline a tiny leaf callee at a `Mono` site without a
-    /// runtime callee resolution. Only `Mono` sites are surfaced; `Poly` and
-    /// unobserved sites are absent and emit the normal direct-call bridge.
-    fn bake_call_site_feedback(&self, view: &mut jit::JitFunctionView, fid: u32) {
+    /// Bake inline-candidate callee bodies for `fid`'s monomorphic `Op::Call`
+    /// sites into `view`, so the baseline can splice a tiny leaf callee under an
+    /// identity guard instead of emitting the per-call bridge.
+    ///
+    /// A site is a candidate only when (a) it observed a single callee (`Mono`),
+    /// and (b) that callee is a plain synchronous bytecode function — the same
+    /// shape the direct-call bridge accepts. The emitter applies the final
+    /// pure-leaf / size / arity test; `Poly`, unobserved, and disqualified-shape
+    /// sites are left out and emit the normal bridge.
+    fn bake_inline_callees(
+        &self,
+        view: &mut jit::JitFunctionView,
+        context: &ExecutionContext,
+        fid: u32,
+    ) {
         for (&(caller_fid, byte_pc), state) in &self.jit_call_site_feedback {
-            if caller_fid == fid
-                && let CallTargetFeedback::Mono(callee_fid) = *state
-            {
-                view.call_site_targets.insert(byte_pc, callee_fid);
+            if caller_fid != fid {
+                continue;
             }
+            let CallTargetFeedback::Mono(callee_fid) = *state else {
+                continue;
+            };
+            let Some(callee) = context.exec_function(callee_fid) else {
+                continue;
+            };
+            if callee.is_generator
+                || callee.is_async
+                || callee.is_async_generator
+                || callee.needs_arguments
+                || callee.has_rest
+                || callee.contains_direct_eval
+                || callee.is_derived_constructor
+                || callee.makes_function
+            {
+                continue;
+            }
+            let Some(callee_view) = context.jit_function_view(callee_fid) else {
+                continue;
+            };
+            view.inline_callees.insert(
+                byte_pc,
+                jit::JitInlineCallee {
+                    function_id: callee_fid,
+                    param_count: callee_view.param_count,
+                    register_count: callee_view.register_count,
+                    instructions: callee_view.instructions,
+                },
+            );
         }
     }
 

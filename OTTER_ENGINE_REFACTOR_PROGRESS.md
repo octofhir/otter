@@ -6,6 +6,50 @@
 
 ---
 
+## Phase 2 execution — PupJIT direct calls (LOCKED 2026-06-17, user-directed)
+
+**Verified current state:** compiled→compiled direct calls ALREADY exist
+(`jit_prepare_direct_call` lib.rs:1677 + `emit_call`/`emit_direct_call_tail`
+baseline.rs:1760; eligibility = ordinary bytecode, compiled, no async/gen/rest/
+arguments/eval/derived-ctor, argc≤MAX_INLINE_ARGS). `jitDirectCalls` counts these.
+fib/`cmp(a,b)` direct loops hit it (185ms, 3M direct calls).
+
+**THE GAP (the run_callable_sync bottleneck the user names):** native methods
+(Array sort/map/filter/forEach/reduce) calling a JS callback do NOT use the direct
+path. They go through `run_bytecode_callable_committed` (call_ops.rs:~1750) which
+builds a full Rust `Frame` (register-window draw + arg bind + frame init) PER CALL,
+then `dispatch_jit_sync_entry`. sort = 30M such builds → 1444ms (9.3× node) vs the
+SAME comparator in a compiled loop = 185ms. string-ops: emitter can't compile its
+body (jitCompileAttempts=0) → loop bails → 25M interp reductions.
+
+**SLICE 2c (first, highest-ROI, tractable Rust — NOT machine code):** native-callback
+batched direct dispatch.
+- New `Interpreter::run_compiled_callback_batched(context, callee, recv, &mut |emit_args| ...)`
+  OR a reusable-frame handle: prepare the callee frame ONCE (eligibility =
+  jit_prepare_direct_call's checks + compiled non-osr_only code), then per element:
+  overwrite the arg registers + reset pc=0 + `run_compiled_frame`, skipping the
+  per-call Frame rebuild. Fall back to `run_bytecode_callable_committed` per-call
+  when callee ineligible OR a compiled run Bails (interp the body).
+- Wire into sort_compare (array_prototype.rs:1291) first, then map/filter/forEach/
+  reduce (the `array_callback_native_dispatch` site).
+- GC safety (Stage A): the reused frame lives on the lean HoltStack (traced via
+  FrameRoots); args written into frame registers before any safepoint; no GC-bearing
+  value in a machine reg across a safepoint. Reclaim register window once at loop end.
+- KILL SWITCH: `OTTER_PUP_DIRECT_CALLS=0` forces the current committed path. Default
+  must stay correct; flip the batched path ON only after gates pass.
+- GATES: cargo test otter-vm/otter-jit; diff.mjs 11/11; test262 built-ins/Array/**
+  (sort/map/filter/forEach/reduce/find/every/some) + language/.../call failing-set
+  identical JIT-off vs on vs flag-off; OTTER_GC_STRESS=32/64 on a sort+callback
+  workload; **the open string-concat GC crash repro must not regress** (see
+  [[bug_string_concat_gc_crash]]); measure sort/array-ops min-of-5 vs baseline.
+- WHY split this from machine-code frame-build: Slice 2c is pure Rust (low risk,
+  big benches), proves the lever; the machine-code emit of frame reserve+arg bind
+  (eliminate the prepare-stub too) is Slice 2d, after 2c lands + a fresh context.
+
+**NOTE:** open correctness blocker — heavy string concat in a called fn segfaults
+([[bug_string_concat_gc_crash]], deterministic debug repro). A competitive engine
+can't segfault on string building; fold its repro into every Phase-2 gate.
+
 ## Session state — 2026-06-17 (verified)
 
 **ToPrimitive elision through parens + unary numeric ops (commit 10d79987).**

@@ -1,0 +1,27 @@
+total samples: 1593  (otter 74%, dylib 26%)
+   pct    self  function
+  22.7     361  [dylib] (anon/jit)
+  18.6     296  otter_vm::Interpreter::prepare_jit_direct_call_frame
+  14.6     233  otter_vm::Interpreter::jit_prepare_direct_call
+   8.5     136  otter_vm::Interpreter::jit_finish_direct_call_returned
+   6.9     110  core::ptr::drop_in_place<otter_vm::run_control::VmError>
+   4.6      74  otter_vm::Interpreter::draw_registers
+   3.0      48  otter_jit::baseline::jit_prepare_direct_call_stub
+   2.7      43  [dylib] libsystem_platform.dylib «memcpy/memset»
+   2.5      40  otter_vm::frame_state::Frame::build_upvalues_for_count
+   2.3      37  otter_vm::call_ops::_<impl otter_vm::Interpreter>::bytecode_call_target_parts
+   2.1      33  otter_jit::baseline::jit_finish_direct_call_returned_stub
+   1.9      30  _<otter_jit::baseline::BaselineCode as otter_vm::jit::JitFunctionCode>::entry_addr
+   1.4      22  otter_vm::Interpreter::jit_resolve_compiled_cached
+   0.8      13  0x0000000100b225bc
+   0.8      13  [dylib] libsystem_malloc.dylib «malloc/free»
+   0.3       4  otter_bytecode::encoding::encode_function
+   0.2       3  otter_vm::object::body_offset_of
+   0.2       3  oxc_parser::lexer::byte_handlers::QOS
+   0.2       3  oxc_ast_visit::generated::visit::walk::walk_statement
+   0.2       3  otter_vm::Interpreter::dispatch_loop_inner
+   0.1       2  otter_vm::Interpreter::with_string_heap_cap
+   0.1       2  hashbrown::map::HashMap<K,V,S,A>::insert
+   0.1       2  oxc_ast_visit::generated::visit::walk::walk_declaration
+   0.1       2  _<core::hash::sip::Hasher<S> as core::hash::Hasher>::write
+   0.1       2  otter_vm::call_ops::_<impl otter_vm::Interpreter>::try_push_bytecode_call_frame_from_window

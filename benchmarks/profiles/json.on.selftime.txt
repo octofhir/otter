@@ -1,0 +1,27 @@
+total samples: 8253  (otter 57%, dylib 43%)
+   pct    self  function
+  36.6    3017  [dylib] libsystem_malloc.dylib «malloc/free»
+   6.4     530  [dylib] libsystem_platform.dylib «memcpy/memset»
+   5.4     449  _<alloc::string::String as core::iter::traits::collect::FromIterator<char>>::from_iter
+   4.8     397  otter_gc::heap::GcHeap::start_incremental_mark_phase
+   3.3     274  otter_gc::scavenger::process_slot
+   3.0     245  otter_gc::heap::GcHeap::sweep_phase_with_pause_start
+   2.6     218  otter_vm::string::JsString::from_str
+   2.6     218  otter_vm::string::gc_body::alloc_latin1_string_body_with_roots
+   2.3     187  otter_vm::json::serialize::quote_units_into
+   1.7     139  _RNvNtNtCs6sq8b9ugfBC_4core3str8converts9from_utf8
+   1.6     134  otter_vm::object::ordinary_string_key_entries
+   1.5     123  otter_vm::json::serialize::_<impl otter_vm::Interpreter>::serialize_json_property_rooted_into
+   1.4     117  otter_vm::string::gc_body::to_utf16_vec
+   1.4     116  otter_vm::json::serialize::_<impl otter_vm::Interpreter>::serialize_json_object_into
+   1.3     111  otter_gc::marking::MarkingState::process_one::_{{closure}}
+   1.2     103  otter_vm::json::parse::read_step
+   1.2      96  otter_vm::object_internal_ops::_<impl otter_vm::Interpreter>::ordinary_get_value
+   1.2      95  otter_vm::json::parse::parse_with_roots
+   1.1      90  otter_vm::object::key_order::array_index_property_name
+   0.9      72  alloc::raw_vec::RawVecInner<A>::finish_grow
+   0.9      71  hashbrown::map::HashMap<K,V,S,A>::insert
+   0.9      71  otter_vm::object::body_offset_of
+   0.8      66  _<otter_vm::object::ObjectBody as otter_gc::trace::SafeTraceable>::trace_slots_safe
+   0.7      61  otter_vm::object::set
+   0.7      59  0x0000000100b22574

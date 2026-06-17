@@ -1,0 +1,27 @@
+total samples: 13876  (otter 98%, dylib 2%)
+   pct    self  function
+  59.3    8226  otter_vm::Interpreter::dispatch_loop_inner
+  15.3    2129  core::ptr::drop_in_place<otter_vm::run_control::VmError>
+   2.2     303  otter_vm::object::load_own_data_slot_atom
+   2.0     272  otter_vm::string::gc_body::eq_str
+   1.3     184  otter_vm::execution_context::ExecutionContext::property_ic_site
+   1.3     174  otter_vm::abstract_ops::to_numeric_kind
+   1.1     155  otter_vm::arithmetic_dispatch::_<impl otter_vm::Interpreter>::run_numeric_regs
+   1.0     142  [dylib] libsystem_malloc.dylib «malloc/free»
+   1.0     137  otter_vm::property_dispatch::_<impl otter_vm::Interpreter>::finish_property_fast_path_value
+   1.0     136  otter_vm::method_ops::_<impl otter_vm::Interpreter>::do_call_method_value
+   1.0     135  otter_vm::Interpreter::pop_frame
+   0.9     122  otter_vm::call_ops::_<impl otter_vm::Interpreter>::push_bytecode_call_frame
+   0.8     115  otter_vm::property_dispatch::_<impl otter_vm::Interpreter>::drive_store_property
+   0.8     111  otter_vm::read_register
+   0.8     110  [dylib] libsystem_platform.dylib «memcpy/memset»
+   0.8     106  otter_vm::call_ops::_<impl otter_vm::Interpreter>::bind_bytecode_call_arguments
+   0.7      93  otter_vm::call_ops::_<impl otter_vm::Interpreter>::invoke
+   0.6      87  otter_vm::property_ic::LoadPropertyIc::load
+   0.5      67  otter_vm::call_ops::_<impl otter_vm::Interpreter>::bytecode_call_target_parts
+   0.4      57  core::hash::BuildHasher::hash_one
+   0.4      56  otter_vm::method_ops::_<impl otter_vm::Interpreter>::resolve_method_ic
+   0.4      56  otter_vm::property_dispatch::_<impl otter_vm::Interpreter>::run_load_element_regs
+   0.4      51  _<core::hash::sip::Hasher<S> as core::hash::Hasher>::write
+   0.4      50  otter_vm::property_ic::StorePropertyIc::store
+   0.4      50  otter_vm::holt_stack::HoltStack::push

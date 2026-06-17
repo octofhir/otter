@@ -1,0 +1,27 @@
+total samples: 459  (otter 17%, dylib 83%)
+   pct    self  function
+  74.9     344  [dylib] (anon/jit)
+   4.8      22  [dylib] libsystem_malloc.dylib «malloc/free»
+   2.4      11  otter_vm::Interpreter::dispatch_loop_inner
+   2.4      11  [dylib] libsystem_platform.dylib «memcpy/memset»
+   1.7       8  core::ptr::drop_in_place<otter_vm::run_control::VmError>
+   1.3       6  [dylib] libsystem_kernel.dylib
+   1.1       5  otter_bytecode::encoding::encode_function
+   0.9       4  _<core::hash::sip::Hasher<S> as core::hash::Hasher>::write
+   0.7       3  oxc_ast_visit::generated::visit::walk::walk_expression
+   0.7       3  otter_compiler::function_context::FunctionContext::intern_utf16_string_constant
+   0.4       2  oxc_parser::js::expression::_<impl oxc_parser::ParserImpl<C>>::parse_member_expression_rest
+   0.4       2  oxc_ast_visit::generated::visit::Visit::visit_expression
+   0.4       2  oxc_ast_visit::generated::visit::walk::walk_statement
+   0.4       2  core::hash::BuildHasher::hash_one
+   0.4       2  otter_vm::runtime_state::RuntimeState::trace_roots_inner
+   0.4       2  hashbrown::map::HashMap<K,V,S,A>::insert
+   0.2       1  hashbrown::raw::RawTableInner::fallible_with_capacity
+   0.2       1  _<otter_vm::bootstrap_array_buffer::ArrayBufferIntrinsic as otter_vm::intrinsic_install::BuiltinIntrinsic>::install
+   0.2       1  otter_gc::heap::GcHeap::alloc_with_roots
+   0.2       1  <deduplicated_symbol> + 24
+   0.2       1  oxc_parser::js::expression::_<impl oxc_parser::ParserImpl<C>>::parse_primary_expression
+   0.2       1  core::ptr::drop_in_place<oxc_parser::lexer::Lexer<oxc_parser::config::NoTokensLexerConfig>>
+   0.2       1  std::thread::local::LocalKey<T>::with
+   0.2       1  otter_compiler::hoist::collect_lexical_var_names
+   0.2       1  otter_compiler::function_context::FunctionContext::lookup_in_current_scope

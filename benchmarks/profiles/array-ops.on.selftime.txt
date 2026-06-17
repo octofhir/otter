@@ -1,0 +1,27 @@
+total samples: 3282  (otter 70%, dylib 30%)
+   pct    self  function
+  14.9     490  [dylib] libsystem_m.dylib «libm: sin/cos/sqrt»
+  11.8     387  otter_vm::call_ops::_<impl otter_vm::Interpreter>::run_bytecode_callable_committed
+   8.8     290  [dylib] libsystem_malloc.dylib «malloc/free»
+   6.6     218  otter_vm::array_prototype::array_callback_native_dispatch
+   5.5     181  otter_vm::call_ops::_<impl otter_vm::Interpreter>::bytecode_call_target_parts
+   5.2     171  [dylib] (anon/jit)
+   5.1     167  otter_vm::call_ops::_<impl otter_vm::Interpreter>::bind_bytecode_call_arguments
+   3.7     120  otter_vm::Interpreter::reclaim_registers
+   3.7     120  otter_jit::baseline::BaselineCode::enter_at
+   3.2     106  otter_vm::Interpreter::draw_registers
+   3.2     106  otter_vm::Interpreter::dispatch_jit_sync_entry
+   3.2     104  core::ptr::drop_in_place<otter_vm::run_control::VmError>
+   2.8      91  otter_vm::Interpreter::resolve_jit_code
+   2.5      83  otter_vm::holt_stack::HoltStack::push
+   2.2      73  otter_vm::arithmetic_dispatch::_<impl otter_vm::Interpreter>::run_numeric_regs
+   2.1      68  otter_vm::property_dispatch::_<impl otter_vm::Interpreter>::jit_runtime_delegate_op
+   1.8      59  otter_vm::array::set_index_value
+   1.4      45  [dylib] libsystem_platform.dylib «memcpy/memset»
+   1.2      39  otter_vm::array_prototype::_<impl otter_vm::Interpreter>::create_data_property_array_index
+   1.1      37  otter_vm::frame_state::Frame::build_upvalues_for_count
+   0.9      30  otter_vm::call_ops::_<impl otter_vm::Interpreter>::stash_frame_eval_env
+   0.8      26  core::ptr::drop_in_place<otter_vm::frame_state::Frame>
+   0.7      23  otter_vm::abstract_ops::to_numeric_kind
+   0.7      23  otter_vm::number::arith::rem
+   0.6      20  otter_vm::array::set_length

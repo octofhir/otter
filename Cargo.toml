@@ -142,6 +142,8 @@ codegen-units = 1
 strip = false
 panic = "unwind"
 opt-level = 3
+debug = 1
+force-frame-pointers = true
 
 # Fast release for development iteration.
 [profile.release-fast]

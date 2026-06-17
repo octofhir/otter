@@ -1,0 +1,27 @@
+total samples: 7432  (otter 83%, dylib 17%)
+   pct    self  function
+  18.2    1353  otter_vm::Interpreter::dispatch_loop_inner
+  10.6     791  [dylib] libsystem_malloc.dylib «malloc/free»
+   8.7     648  otter_vm::array_prototype::_<impl otter_vm::Interpreter>::sort_merge
+   8.4     623  otter_vm::call_ops::_<impl otter_vm::Interpreter>::run_bytecode_callable_committed
+   7.4     552  core::ptr::drop_in_place<otter_vm::run_control::VmError>
+   5.2     386  otter_vm::call_ops::_<impl otter_vm::Interpreter>::bind_bytecode_call_arguments
+   4.0     298  [dylib] (anon/jit)
+   2.7     198  [dylib] libsystem_platform.dylib «memcpy/memset»
+   2.6     192  otter_vm::Interpreter::reclaim_registers
+   2.2     164  otter_jit::baseline::BaselineCode::enter_at
+   2.1     155  otter_vm::Interpreter::dispatch_jit_sync_entry
+   2.0     150  otter_vm::Interpreter::draw_registers
+   1.8     133  otter_vm::coerce::to_number_or_throw
+   1.7     129  otter_vm::Interpreter::resolve_jit_code
+   1.6     119  otter_vm::call_ops::_<impl otter_vm::Interpreter>::bytecode_call_target_parts
+   1.5     111  otter_vm::holt_stack::HoltStack::push
+   1.0      78  otter_vm::call_ops::_<impl otter_vm::Interpreter>::stash_frame_eval_env
+   1.0      75  otter_vm::frame_state::Frame::build_upvalues_for_count
+   1.0      71  otter_vm::call_ops::_<impl otter_vm::Interpreter>::try_push_bytecode_call_frame_from_window
+   0.8      62  otter_vm::property_dispatch::_<impl otter_vm::Interpreter>::jit_runtime_delegate_op
+   0.8      58  otter_vm::object::key_order::array_index_property_name
+   0.7      55  otter_vm::property_dispatch::_<impl otter_vm::Interpreter>::drive_store_element
+   0.7      53  otter_vm::abstract_ops::to_numeric_kind
+   0.7      53  otter_vm::property_dispatch::_<impl otter_vm::Interpreter>::run_store_element_regs
+   0.6      48  otter_vm::array::set_with_roots

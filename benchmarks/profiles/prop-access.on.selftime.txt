@@ -1,0 +1,27 @@
+total samples: 1477  (otter 61%, dylib 39%)
+   pct    self  function
+  30.5     451  [dylib] (anon/jit)
+  17.1     253  otter_vm::Interpreter::dispatch_loop_inner
+   5.3      79  core::ptr::drop_in_place<otter_vm::run_control::VmError>
+   3.9      57  core::hash::BuildHasher::hash_one
+   3.9      57  [dylib] libsystem_platform.dylib «memcpy/memset»
+   3.7      54  [dylib] libsystem_malloc.dylib «malloc/free»
+   3.2      47  otter_vm::object::lookup_own
+   2.8      41  otter_vm::object::body_offset_of
+   2.3      34  _<core::hash::sip::Hasher<S> as core::hash::Hasher>::write
+   2.3      34  otter_vm::string::gc_body::eq_str
+   2.0      29  otter_gc::scavenger::process_slot
+   1.8      27  otter_gc::heap::GcHeap::sweep_phase_with_pause_start
+   1.7      25  otter_vm::call_ops::_<impl otter_vm::Interpreter>::try_dispatch_construct_from_window
+   1.7      25  otter_vm::property_dispatch::_<impl otter_vm::Interpreter>::drive_store_property
+   1.5      22  otter_gc::heap::GcHeap::start_incremental_mark_phase
+   0.9      14  otter_vm::object::shape_runtime::ShapeRuntime::child_with_roots
+   0.9      13  otter_vm::arithmetic_dispatch::_<impl otter_vm::Interpreter>::run_numeric_regs
+   0.7      11  otter_vm::Interpreter::ordinary_set_data_property
+   0.7      10  otter_vm::property_dispatch::_<impl otter_vm::Interpreter>::drive_store_element
+   0.7      10  otter_vm::object::resolve_set
+   0.7      10  otter_vm::property_dispatch::_<impl otter_vm::Interpreter>::capture_store_property_transition_with_stack_roots
+   0.7      10  [dylib] libsystem_m.dylib «libm: sin/cos/sqrt»
+   0.6       9  otter_vm::argument_window::BytecodeArgumentWindow::bind_into
+   0.5       8  otter_gc::heap::GcHeap::alloc_with_roots
+   0.5       8  otter_vm::Interpreter::shape_offset_of

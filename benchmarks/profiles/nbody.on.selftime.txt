@@ -1,0 +1,27 @@
+total samples: 667  (otter 60%, dylib 40%)
+   pct    self  function
+  33.6     224  [dylib] (anon/jit)
+   9.4      63  otter_vm::property_dispatch::_<impl otter_vm::Interpreter>::jit_runtime_load_property
+   4.8      32  core::ptr::drop_in_place<otter_vm::run_control::VmError>
+   3.9      26  otter_vm::object::load_own_data_slot_atom
+   3.9      26  otter_vm::method_ops::_<impl otter_vm::Interpreter>::jit_runtime_call_method
+   3.9      26  [dylib] libsystem_malloc.dylib «malloc/free»
+   2.7      18  otter_vm::string::gc_body::eq_str
+   2.5      17  otter_vm::property_dispatch::_<impl otter_vm::Interpreter>::jit_runtime_write_barrier
+   2.2      15  otter_vm::Interpreter::dispatch_loop_inner
+   1.9      13  _<smallvec::SmallVec<A> as core::iter::traits::collect::FromIterator<<A as smallvec::Array>::Item>>::from_iter
+   1.9      13  [dylib] libsystem_platform.dylib «memcpy/memset»
+   1.6      11  otter_vm::object_internal_ops::_<impl otter_vm::Interpreter>::ordinary_get_value
+   1.6      11  otter_vm::object::lookup_own
+   1.5      10  otter_vm::math::coerce_math_args
+   1.3       9  otter_vm::object::body_offset_of
+   1.3       9  otter_vm::method_ops::_<impl otter_vm::Interpreter>::get_method_value_for_call
+   1.2       8  otter_vm::object::ObjectBody::data_value
+   1.2       8  otter_vm::math::coerce_all
+   1.2       8  otter_vm::call_ops::invoke_native_call_with_roots
+   1.2       8  otter_vm::object_internal_ops::_<impl otter_vm::Interpreter>::ordinary_has_property_value
+   1.2       8  otter_vm::global_ops::_<impl otter_vm::Interpreter>::run_load_global_or_throw_reg
+   1.2       8  otter_vm::module_ops::_<impl otter_vm::Interpreter>::ensure_deferred_namespace_ready
+   1.0       7  otter_jit::baseline::jit_load_prop_stub
+   1.0       7  otter_vm::property_dispatch::_<impl otter_vm::Interpreter>::whisker_load_cell_fill
+   0.9       6  otter_vm::Interpreter::jit_prepare_direct_method_call

@@ -1,0 +1,27 @@
+total samples: 885  (otter 62%, dylib 38%)
+   pct    self  function
+  33.1     293  [dylib] (anon/jit)
+  20.3     180  otter_vm::Interpreter::dispatch_loop_inner
+  14.1     125  otter_vm::property_dispatch::_<impl otter_vm::Interpreter>::jit_runtime_delegate_op
+  12.5     111  core::ptr::drop_in_place<otter_vm::run_control::VmError>
+   2.7      24  [dylib] libsystem_malloc.dylib «malloc/free»
+   2.4      21  otter_jit::baseline::jit_delegate_op_stub
+   1.0       9  otter_vm::binary::typed_array::JsTypedArray::set
+   1.0       9  otter_vm::method_ops::_<impl otter_vm::Interpreter>::do_call_method_value
+   0.8       7  otter_vm::arithmetic_dispatch::_<impl otter_vm::Interpreter>::run_numeric_regs
+   0.8       7  [dylib] libsystem_platform.dylib «memcpy/memset»
+   0.8       7  [dylib] libsystem_m.dylib «libm: sin/cos/sqrt»
+   0.6       5  otter_vm::call_ops::invoke_native_call_with_roots
+   0.6       5  otter_vm::object_internal_ops::_<impl otter_vm::Interpreter>::ordinary_get_value
+   0.5       4  otter_vm::read_register
+   0.5       4  otter_vm::call_ops::_<impl otter_vm::Interpreter>::invoke
+   0.5       4  otter_vm::object_internal_ops::_<impl otter_vm::Interpreter>::ordinary_has_property_value
+   0.5       4  otter_vm::global_ops::_<impl otter_vm::Interpreter>::run_load_global_or_throw_reg
+   0.5       4  [dylib] libsystem_kernel.dylib
+   0.3       3  otter_bytecode::encoding::encode_function
+   0.3       3  otter_vm::property_dispatch::_<impl otter_vm::Interpreter>::drive_store_element
+   0.3       3  otter_vm::math::coerce_all
+   0.3       3  _<smallvec::SmallVec<A> as core::iter::traits::collect::FromIterator<<A as smallvec::Array>::Item>>::from_iter
+   0.2       2  oxc_ast_visit::generated::visit::walk::walk_statement
+   0.2       2  otter_vm::number::arith::mul
+   0.2       2  otter_vm::math::native_cos

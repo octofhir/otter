@@ -194,6 +194,11 @@ pub(crate) fn replay_store_property_transition(
     };
     let existing_offset =
         heap.read_payload(obj, |body| super::body_offset_of(heap, body, key.name()));
+    // The shape-id guard below already pins the property count: a receiver whose
+    // current shape equals `from_shape_id` has exactly that shape's count of own
+    // properties, which is the appended slot's offset. Verifying it costs a
+    // shape walk, so confirm the invariant in debug builds only.
+    #[cfg(debug_assertions)]
     let current_count = heap.read_payload(obj, |body| super::body_property_count(heap, body));
     let success = heap.with_payload(obj, |body| {
         if !is_fast_shape_body(body)
@@ -206,9 +211,8 @@ pub(crate) fn replay_store_property_transition(
         }
         let offset = usize::from(transition.slot);
         debug_assert_eq!(existing_offset, None);
-        if current_count != offset {
-            return false;
-        }
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(current_count, offset, "replay count diverged from slot offset");
         if transition.to_shape.is_null() {
             body.dictionary_shape_id = transition.to_shape_id;
             super::dict_push_key(body, key.name().to_owned());

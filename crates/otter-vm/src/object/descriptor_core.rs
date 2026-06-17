@@ -86,14 +86,20 @@ pub(super) fn ordinary_set_data_property_with_shape(
     key: &str,
     value: Value,
     next_shape: ShapeHandle,
+    append_index: usize,
 ) -> bool {
     let barrier_value = value;
     let existing_offset = heap.read_payload(obj, |body| super::body_offset_of(heap, body, key));
     let existing_attrs = existing_offset.map(|offset| {
         heap.read_payload(obj, |body| body.slot_attrs(heap, offset as usize))
     });
-    // The appended slot's flat index is the new shape's last offset.
-    let append_index = super::shape_property_count(next_shape, heap) as usize - 1;
+    // `append_index` (the slot the new property occupies) is supplied by the
+    // caller from the shape it transitioned from, so the hot path adds no shape
+    // read; verify the invariant in debug builds.
+    debug_assert_eq!(
+        append_index,
+        super::shape_property_count(next_shape, heap) as usize - 1
+    );
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
             let i = offset as usize;

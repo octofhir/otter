@@ -2338,13 +2338,17 @@ pub fn set(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) 
 }
 
 /// Construction-time data store for callers that already allocated the next
-/// GC-managed hidden class.
+/// GC-managed hidden class. `append_index` is the slot the new property
+/// occupies — the object's property count before the append, which the caller
+/// already knows from the shape it transitioned from — so the hot append path
+/// performs no extra shape read.
 pub(crate) fn set_with_shape(
     obj: JsObject,
     heap: &mut otter_gc::GcHeap,
     key: &str,
     value: Value,
     next_shape: ShapeHandle,
+    append_index: usize,
 ) {
     let barrier_value = value;
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
@@ -2367,7 +2371,11 @@ pub(crate) fn set_with_shape(
         heap.record_write(obj, &barrier_value);
         return;
     }
-    let index = shape_body::shape_property_count(heap, next_shape) as usize - 1;
+    let index = append_index;
+    debug_assert_eq!(
+        index,
+        shape_body::shape_property_count(heap, next_shape) as usize - 1
+    );
     heap.with_payload(obj, |body| {
         body.shape = next_shape;
         body.push_slot(index, SlotMeta::data_default(), value);
@@ -2414,10 +2422,17 @@ pub(crate) fn ordinary_set_data_property_with_shape(
     key: &str,
     value: Value,
     next_shape: ShapeHandle,
+    append_index: usize,
 ) -> bool {
     let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
-    let success =
-        descriptor_core::ordinary_set_data_property_with_shape(obj, heap, key, value, next_shape);
+    let success = descriptor_core::ordinary_set_data_property_with_shape(
+        obj,
+        heap,
+        key,
+        value,
+        next_shape,
+        append_index,
+    );
     if success && let Some(cell) = mapped_cell {
         store_upvalue(heap, cell, value);
     }

@@ -1946,6 +1946,7 @@ dependencies = [
  "dynasmrt",
  "otter-bytecode",
  "otter-vm",
+ "rustc-hash",
 ]
 
 [[package]]

@@ -517,17 +517,15 @@ pub struct Interpreter {
     /// (its body did not compile at all). Consulted only at a threshold crossing
     /// (rare), so it adds no per-iteration cost.
     jit_osr_disabled: rustc_hash::FxHashSet<(u32, u32)>,
-    /// Loop-OSR back-edge counter for the frame currently at the top of the
-    /// stack. Stored on the interpreter (not the size-capped `Frame`) and keyed
-    /// by [`Self::jit_osr_count_top`] as a cheap frame-identity proxy: a
-    /// different top frame resets the counter. The hot path is one compare +
-    /// one add; the hashmap/compile work runs only at the single crossing where
-    /// the count equals the threshold. Call-free hot loops (numeric kernels)
-    /// tier up here; loops whose bodies call out keep that counter churning and
-    /// instead rely on function-entry tier-up for the callees.
-    jit_osr_count: u32,
-    /// Top-of-stack frame index the [`Self::jit_osr_count`] counter belongs to.
-    jit_osr_count_top: usize,
+    /// Per-`(function_id, loop_header_pc)` back-edge counters driving loop-OSR
+    /// tier-up. A single shared counter let a frequently-back-edging callee
+    /// (e.g. a hot builtin loop) monopolize the count and starve a hot script
+    /// loop that calls out — that loop then never tiered up. An independent
+    /// counter per loop header lets every hot loop reach the threshold on its
+    /// own. Only mutated when a JIT hook is installed; an entry is removed once
+    /// its header tiers up (or is recorded disabled), so the map holds only the
+    /// handful of loop headers currently warming up.
+    jit_osr_counts: rustc_hash::FxHashMap<(u32, u32), u32>,
     /// Back-edge count at which a hot loop tiers up via OSR. Defaults to
     /// [`Self::JIT_OSR_THRESHOLD`]; overridable via `OTTER_JIT_OSR_THRESHOLD`
     /// for tuning and to force OSR coverage in conformance runs (set to 1).
@@ -1121,8 +1119,7 @@ impl Interpreter {
             jit_call_site_feedback: rustc_hash::FxHashMap::default(),
             jit_method_site_feedback: rustc_hash::FxHashMap::default(),
             jit_osr_disabled: rustc_hash::FxHashSet::default(),
-            jit_osr_count: 0,
-            jit_osr_count_top: usize::MAX,
+            jit_osr_counts: rustc_hash::FxHashMap::default(),
             jit_osr_threshold: std::env::var("OTTER_JIT_OSR_THRESHOLD")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
@@ -1309,12 +1306,15 @@ impl Interpreter {
         }
     }
 
-    /// Per-back-edge hook: bump this frame's loop counter and, on the single
+    /// Per-back-edge hook: bump the counter for *this loop header* and, on the
     /// iteration where it reaches the OSR threshold, attempt loop tier-up.
     ///
-    /// The common path is one add + one compare on a frame field — no hashmap,
-    /// no allocation — so it adds negligible cost to the interpreter's hottest
-    /// loops. Only the exact threshold crossing calls into [`Self::maybe_osr`].
+    /// The counter is keyed by `(function_id, loop_header_pc)` so each hot loop
+    /// warms up independently — a frequently-back-edging callee can no longer
+    /// monopolize a single shared counter and starve a hot script loop that
+    /// calls out. The hot path is one hashmap bump; the lookup runs only while a
+    /// JIT hook is installed and only until the header tiers up (after which the
+    /// loop runs compiled and stops hitting this interpreter hook).
     #[inline]
     fn note_backedge_and_maybe_osr(
         &mut self,
@@ -1322,30 +1322,32 @@ impl Interpreter {
         context: &ExecutionContext,
         top_idx: usize,
     ) -> Result<Option<Option<Value>>, VmError> {
-        // Interpreter-only (no JIT installed): pay nothing beyond this branch —
-        // don't even run the counter.
+        // Interpreter-only (no JIT installed): pay nothing beyond this branch.
         if self.jit_hook.is_none() {
             return Ok(None);
         }
-        if self.jit_osr_count_top == top_idx {
-            self.jit_osr_count = self.jit_osr_count.wrapping_add(1);
-        } else {
-            // A different frame reached the top (a call returned into a sibling,
-            // or we recursed); restart the count for this frame.
-            self.jit_osr_count_top = top_idx;
-            self.jit_osr_count = 1;
-        }
-        if self.jit_osr_count < self.jit_osr_threshold {
+        let frame = &stack[top_idx];
+        let key = (frame.function_id, frame.pc);
+        // A header that already proved un-tierable, or a whole uncompilable
+        // function, never counts again.
+        if self.jit_osr_disabled.contains(&key)
+            || self.jit_osr_disabled.contains(&(key.0, u32::MAX))
+        {
             return Ok(None);
         }
-        // Threshold reached: attempt OSR for whatever loop is hot right now, then
-        // reset the counter so the *next* distinct hot loop gets its own shot.
-        // A single global counter that only ever fires once would let an early
-        // builtin/setup loop consume the one attempt and permanently starve the
-        // real kernel loop that runs afterward (the per-header disabled set keeps
-        // un-tierable headers from being retried, so re-arming is cheap).
+        let count = {
+            let c = self.jit_osr_counts.entry(key).or_insert(0);
+            *c = c.saturating_add(1);
+            *c
+        };
+        if count < self.jit_osr_threshold {
+            return Ok(None);
+        }
+        // Threshold reached: drop this header's counter (it tiers up now or is
+        // marked disabled by `maybe_osr`, so it should not keep counting) and
+        // attempt OSR.
         self.jit_runtime_stats.osr_attempts = self.jit_runtime_stats.osr_attempts.saturating_add(1);
-        self.jit_osr_count = 0;
+        self.jit_osr_counts.remove(&key);
         self.maybe_osr(stack, context, top_idx)
     }
 
@@ -2301,12 +2303,13 @@ impl Interpreter {
     /// arm gates it), so interpreter-only execution pays nothing.
     fn note_call_target(&mut self, caller_fid: u32, call_byte_pc: u32, callee_fid: u32) {
         use std::collections::hash_map::Entry;
-        match self
+        let newly_mono = match self
             .jit_call_site_feedback
             .entry((caller_fid, call_byte_pc))
         {
             Entry::Vacant(slot) => {
                 slot.insert(CallTargetFeedback::Mono(callee_fid));
+                true
             }
             Entry::Occupied(mut slot) => {
                 if let CallTargetFeedback::Mono(seen) = *slot.get()
@@ -2314,7 +2317,11 @@ impl Interpreter {
                 {
                     slot.insert(CallTargetFeedback::Poly);
                 }
+                false
             }
+        };
+        if newly_mono {
+            self.evict_compiled_for_reopt(caller_fid);
         }
     }
 
@@ -2331,7 +2338,7 @@ impl Interpreter {
         recv_shape: object::ShapeHandle,
     ) {
         use std::collections::hash_map::Entry;
-        match self
+        let newly_mono = match self
             .jit_method_site_feedback
             .entry((caller_fid, call_byte_pc))
         {
@@ -2340,6 +2347,7 @@ impl Interpreter {
                     method_fid,
                     recv_shape,
                 });
+                true
             }
             Entry::Occupied(mut slot) => {
                 if let MethodCallFeedback::Mono {
@@ -2350,7 +2358,25 @@ impl Interpreter {
                 {
                     slot.insert(MethodCallFeedback::Poly);
                 }
+                false
             }
+        };
+        if newly_mono {
+            self.evict_compiled_for_reopt(caller_fid);
+        }
+    }
+
+    /// Drop any compiled body for `fid` (and re-arm its OSR headers) so the next
+    /// tier-up recompiles it. Called when call/method feedback for one of its
+    /// sites first matures: a function whose hot loop calls out is often compiled
+    /// by an *earlier* loop in the same body, before the callee feedback exists,
+    /// so its inline sites baked nothing. Recompiling once the feedback is warm
+    /// lets those sites inline. The currently-running body, if any, stays alive
+    /// through its `Arc` until the frame returns.
+    fn evict_compiled_for_reopt(&mut self, fid: u32) {
+        if self.jit_code.remove(&fid).is_some() {
+            self.jit_code_cache = None;
+            self.jit_osr_disabled.retain(|&(f, _)| f != fid);
         }
     }
 

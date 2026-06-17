@@ -181,22 +181,141 @@ work stands alone and is cheaper.
 
 ---
 
-## Recommended sequencing (breaking, bankable in order)
+---
 
-1. **R1 self-priming property IC** — smallest change, 5–9× on top-level code,
-   de-risks everything else. *Contained to the JIT stub + IC fill.*
-2. **VmError shrink** (audit Lever A) — mechanical, 5–15% broad.
-3. **R2 flat object storage** — removes the 6-field cliff; makes R1 universal.
-   *Breaks ObjectBody layout, GC tracing, every body offset constant.*
-4. **R3 inline `.length`** — removes the per-iteration array-length stub.
-5. **R4 calling convention + builtin-callback inlining** — call-bound benches.
-6. **Optimizing tier** (audit Lever B) — the umbrella: unboxed type-specialized
-   SSA + speculative inline + LICM + bounds-elim + deopt. Subsumes the residual
-   box/unbox tax and the LICM half of R3. Large, multi-month; R1–R5 are the
-   high-ROI down-payment that makes its job smaller.
+# Deep tier — the structural ceilings under the cliffs
 
-R1–R4 are each a few-hundred-line, well-scoped, **independently measurable**
-change with a committed reproducer — not "rewrite the engine." They target the
-cliffs that the optimizing tier would otherwise have to paper over.
+R1–R4 are *cliffs* (common cases falling off a fast path). The levers below are
+*ceilings*: even when everything works, these caps the engine at multiples
+of node. Each is a breaking redesign. Reproducers in `benchmarks/micro/`.
+
+## D1 — `ObjectBody` is a ~519-byte god-struct (the allocation ceiling)
+
+### Evidence
+```
+benchmarks/micro/alloc.js   3M × {a:i,b:i+1}   →  otter 1733 ms / 1557 MB / 24 GC cycles
+                                                   node  ~130 ms compute
+```
+**519 bytes allocated per two-field object** (1557 MB ÷ 3M), **~578 ns per
+allocation** vs node ~40 ns → **~13×**. `propStubs=2`: the `a`/`b` reads inline
+fine; the entire cost is *allocation + GC of bloated objects*.
+
+### Root cause
+`ObjectBody` (`object.rs:389`) carries ~25 fields **inline in every ordinary
+object**, almost all for rare/exotic cases that 99% of objects never use:
+`inline_values:[Value;6]` (48 B), `overflow_values: Vec`, `dictionary_keys:
+Vec<String>`, `dictionary_index: FxHashMap<String,u16>` (~48 B), `slots:
+SmallVec<[SlotMeta;4]>`, `symbol_props: Vec`, `host_data: Option<Box<dyn Any>>`,
+`call_native`, `constructor_native`, and `boolean_data` / `number_data` /
+`string_data` / `symbol_data` / `bigint_data` / `date_data` / `error_data` /
+`is_raw_json` / `is_arguments_object` / `extensible` … A `{a,b}` literal
+allocates and zero-inits all of it.
+
+### Breaking redesign
+**Split the god-struct.** Minimal hot core: `{ shape, proto/jit_proto,
+flags, values[] }` (the flat slab from R2). Move every wrapper/exotic slot
+(Date, Error, Boolean/Number/String/Symbol/BigInt data, arguments map, host
+data, native call/construct, dictionary mode) behind a single lazily-allocated
+`Option<Box<ExoticData>>` or separate body type tags. Target ~48–80 B for a
+plain object (≈7–10× smaller). Direct effects: less malloc, far fewer GC
+cycles (json's 387 MB / 10 cycles collapses), better cache density on every
+property access, faster zero-init. This is the **single biggest allocation
+lever** and underpins json (6.5×), prop-access (8.6×), array-ops (7.9×), and
+every OO workload.
+
+## D2 — No inline allocation: `new` / object & array literals bridge to the interpreter
+
+### Evidence
+`alloc.js` above: 578 ns/object even though `{a,b}` needs no overflow, no
+exotic slots. `Op::NewObject` / `Op::NewArray` fall through the generic
+`jit_delegate_op_stub` (`baseline.rs:1728-1733`) into the full interpreter
+allocation path (shape resolve + GC alloc + init) per object.
+
+### Breaking redesign
+Emit an **inline bump-allocation fast path** in compiled code for
+fixed-shape object/array literals and monomorphic `new`: reserve N bytes from
+the nursery bump cursor (compare against limit, branch to a slow stub only on
+nursery-full), stamp the header + known shape, store the field values inline —
+no VM round-trip. The nursery already *is* a bump allocator
+(`heap.rs:129`, `compressed.rs:409`); expose its cursor/limit to emitted code.
+Pairs with D1 (small fixed body = easy inline alloc).
+
+## D3 — Variable-size payloads are malloc'd `Vec`s, not GC-inline storage
+
+### Evidence
+json self-time: **36.6% `libsystem_malloc` + 6.4% memcpy** (audit §2). The GC
+*cells* bump-allocate, but a string's code units (`Vec<u16>`/`Vec<u8>`,
+`string/gc_body.rs`), an array's elements (`ArrayBody` Vec), and an object's
+overflow values (`object.rs:403`) are **separate malloc'd `Vec`s** hanging off
+the cell — one malloc/free per string/array, plus a pointer-chase per access,
+plus special-cased GC tracing of malloc-owned slots (`barrier.rs:31`).
+
+### Breaking redesign
+**Variable-size GC cells with inline trailing storage** (bump-allocated,
+movable): store small string bytes / array elements / overflow values in a
+flexible-array tail of the cell instead of a side `Vec`. Removes the malloc/free
+tax (json's 43%), the indirection, and the malloc-owned-slot barrier special
+case. Large GC change but it is the other half (with D1) of "stop calling
+malloc on the hot path."
+
+## D4 — `Math.sqrt`/`sin`/`cos` bridge to libm instead of a native instruction
+
+### Evidence
+```
+benchmarks/micro/sqrt.js   10M Math.sqrt   →  otter 1748 ms   node ~5 ms compute  (~100×+)
+```
+~175 ns per `Math.sqrt` call. It is dispatched as a normal method/global call →
+native function → `libsystem_m` (libm). nbody and mandelbrot lean on `sqrt`.
+
+### Breaking redesign
+Recognize `Math.{sqrt,abs,floor,ceil,round,min,max,…}` as **intrinsics** at
+compile time and emit the native instruction inline (`fsqrt`, `fabs`,
+`frintm`, …) under a "Math is the original global" guard — no call, no libm.
+Cheap, isolated, and directly lifts the float benches.
+
+## D5 — Codegen is 100% memory-bound: no CPU register allocation
+
+### Evidence
+mandelbrot is **74.9% in its own compiled loop** yet still ~7× node on compute
+(audit §2). Every operand is `ldr x9,[x19,off]` and every result `str
+x9,[x19,off]` (`baseline.rs:1322/1404/…`) — the baseline JIT, by design (*"no
+register allocation"*), round-trips **every value through the in-memory frame
+window every op**. mandelbrot's `x,y` are reloaded from memory on each use; node
+keeps them in FP registers across the loop body.
+
+### Breaking redesign
+This is the core of the **optimizing tier**: a real (even linear-scan)
+register allocator that keeps loop-body live values in CPU/FP registers and
+spills only at boundaries, plus unboxed `f64`/`i32` SSA values (box only at tier
+edges), LICM, and bounds/guard-check elimination. This is the umbrella lever
+from the audit; D1–D4 are the down-payments that shrink what it must cover.
+
+---
+
+# Recommended sequencing (breaking, bankable in order)
+
+Ordered by gain ÷ effort, dependencies respected. Each row is independently
+measurable against a committed reproducer.
+
+| step | lever | scope | expected | unlocks |
+|---|---|---|---|---|
+| 1 | **R1** self-priming property IC | JIT stub + IC fill | 5–9× on top-level code | de-risks all IC work |
+| 2 | **VmError shrink** (audit A) | mechanical, Box payloads | 5–15% broad | cleaner profiles |
+| 3 | **D4** Math.* intrinsics → native `fsqrt`/… | compiler + emit | float benches | cheap, isolated |
+| 4 | **R3** inline array `.length` | emit + array header | kills per-iter length stub | every array loop |
+| 5 | **D1+R2** object-model rewrite: split god-struct + flat slab | ObjectBody, GC tracing, body offsets | ~13× alloc, ≈7–10× smaller objects, fewer GC cycles | json/prop/array/OO |
+| 6 | **D2** inline bump-alloc in JIT | emit + nursery cursor | per-`new` floor gone | pairs with D1 |
+| 7 | **D3** variable-size GC cells (inline string/array storage) | GC + string/array bodies | kills json's 43% malloc | alloc-heavy |
+| 8 | **R4** register-window calling conv + builtin-callback inlining | call path | 2–4× call-bound (fib/sort/array) | — |
+| 9 | **D5 / optimizing tier** — regalloc + unboxed SSA + speculative inline + LICM + bounds-elim + deopt | new tier | 2–5× numeric/OO, the residual ceiling | umbrella |
+
+**Strategy.** Steps 1–4 are each a few-hundred-line, contained, independently
+measurable change — the high-ROI down-payment. Steps 5–7 are the **object &
+memory rework** (the biggest single win for allocation-bound code: json,
+prop-access, array-ops) and the place where breaking layout/GC freedom pays off
+most. Steps 8–9 are the codegen ceiling. The optimizing tier (9) is last by
+design: R1–D3 remove the cliffs and most of the allocation tax first, so the
+optimizing tier has a much smaller surface to cover and a clean base to
+speculate on. Regex stays out until the core lands.
 
 _Generated 2026-06-17. Reproducers: `benchmarks/micro/`. Profiles: `benchmarks/profiles/`._

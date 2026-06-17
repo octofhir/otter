@@ -266,6 +266,25 @@ fn native_call(
         return Ok(result);
     }
 
+    // Ordinary-object integrity levels run through the interpreter so the
+    // attribute change is recorded as a hidden-class transition (the operands
+    // dispatcher above already handled proxy / namespace / typed-array exotics
+    // and returned `None` for ordinary objects). Arrays and non-objects fall
+    // through to the context-less path.
+    use otter_bytecode::method_id::ObjectMethod as M;
+    if matches!(method, M::Freeze | M::Seal) {
+        let arg = args.first().cloned().unwrap_or(Value::undefined());
+        if let Some(obj) = arg.as_object() {
+            let result = if matches!(method, M::Freeze) {
+                ctx.cx.interp.freeze_object(obj)
+            } else {
+                ctx.cx.interp.seal_object(obj)
+            };
+            result.map_err(|err| object_native_error(method.name(), err))?;
+            return Ok(arg);
+        }
+    }
+
     call(method, args, ctx.heap_mut()).map_err(|err| object_native_error(method.name(), err))
 }
 

@@ -4303,26 +4303,139 @@ impl Interpreter {
     ) -> Result<bool, VmError> {
         let completed = descriptor.complete_for_new_property();
         let shape = object::shape(obj, &self.gc_heap);
-        let should_add_shape = self.should_add_property(obj, key)
-            && object::shape_property_count(shape, &self.gc_heap) < object::MAX_FAST_PROPERTIES;
-        let next_shape = if should_add_shape {
-            Some(self.shape_child_rooting_object_descriptor(shape, key, &mut obj, &completed)?)
-        } else {
-            None
-        };
-
-        let ok = if let Some(next_shape) = next_shape {
-            object::define_own_property_partial_with_shape(
+        // Append a brand-new own property: extend the transition chain.
+        if self.should_add_property(obj, key)
+            && object::shape_property_count(shape, &self.gc_heap) < object::MAX_FAST_PROPERTIES
+        {
+            let next_shape =
+                self.shape_child_rooting_object_descriptor(shape, key, &mut obj, &completed)?;
+            return Ok(object::define_own_property_partial_with_shape(
                 obj,
                 &mut self.gc_heap,
                 key,
                 descriptor,
                 next_shape,
-            )
-        } else {
-            object::define_own_property_partial(obj, &mut self.gc_heap, key, descriptor)
-        };
-        Ok(ok)
+            ));
+        }
+        // Redefine an existing slot on a shaped object: rebuild the hidden
+        // class with the merged attributes so the shape keeps recording them
+        // instead of flagging a per-object override.
+        if !shape.is_null()
+            && let Some((flags, is_accessor, offset)) =
+                object::redefine_merged_attrs(obj, &self.gc_heap, key, &descriptor)
+        {
+            let mut ordered = object::shape_ordered_slot_attrs(&self.gc_heap, shape);
+            if let Some(slot) = ordered.get_mut(offset as usize) {
+                slot.1 = flags;
+                slot.2 = is_accessor;
+            }
+            let redefine_shape = {
+                let mut root_descriptor = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                    if let Some(value) = descriptor.value.as_ref() {
+                        value.trace_value_slots(visitor);
+                    }
+                    if let Some(getter) = descriptor.get.as_ref() {
+                        getter.trace_value_slots(visitor);
+                    }
+                    if let Some(setter) = descriptor.set.as_ref() {
+                        setter.trace_value_slots(visitor);
+                    }
+                };
+                self.rebuild_shape_from_slots(&mut obj, &ordered, &mut root_descriptor)?
+            };
+            return Ok(object::define_own_property_partial_with_shape(
+                obj,
+                &mut self.gc_heap,
+                key,
+                descriptor,
+                redefine_shape,
+            ));
+        }
+        Ok(object::define_own_property_partial(
+            obj,
+            &mut self.gc_heap,
+            key,
+            descriptor,
+        ))
+    }
+
+    /// Replay `ordered` `(key, flags, is_accessor)` slots from the empty root,
+    /// returning the attribute-encoding hidden class they describe. The replay
+    /// reuses shared transitions, so objects modified the same way (frozen,
+    /// sealed, redefined) converge on one class and keep ICs monomorphic.
+    /// `obj` is rooted across every transition allocation.
+    fn rebuild_shape_from_slots(
+        &mut self,
+        obj: &mut object::JsObject,
+        ordered: &[(String, object::PropertyFlags, bool)],
+        extra_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+    ) -> Result<object::ShapeHandle, VmError> {
+        let roots = self.collect_runtime_roots_without_shape_runtime();
+        let mut shape = self.shape_runtime.root();
+        for (key, flags, is_accessor) in ordered {
+            let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                for &slot in &roots {
+                    visitor(slot);
+                }
+                let p = obj as *mut object::JsObject as *mut RawGc;
+                visitor(p);
+                extra_visit(visitor);
+            };
+            shape = self
+                .shape_runtime
+                .child_with_roots(
+                    &mut self.gc_heap,
+                    shape,
+                    key,
+                    *flags,
+                    *is_accessor,
+                    &mut external_visit,
+                )
+                .map_err(VmError::from)?;
+        }
+        Ok(shape)
+    }
+
+    /// `Object.freeze` core: for a shaped object, transition to the
+    /// attribute-encoding class recording every data slot as
+    /// non-writable/non-configurable and accessor slots as non-configurable;
+    /// dictionary-mode objects fall back to the in-place path.
+    pub(crate) fn freeze_object(&mut self, mut obj: object::JsObject) -> Result<(), VmError> {
+        let shape = object::shape(obj, &self.gc_heap);
+        if shape.is_null() {
+            object::freeze(obj, &mut self.gc_heap);
+            return Ok(());
+        }
+        let mut ordered = object::shape_ordered_slot_attrs(&self.gc_heap, shape);
+        for (_, flags, is_accessor) in ordered.iter_mut() {
+            *flags = flags.with_configurable(false);
+            if !*is_accessor {
+                *flags = flags.with_writable(false);
+            }
+        }
+        let mut no_extra = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+        let new_shape = self.rebuild_shape_from_slots(&mut obj, &ordered, &mut no_extra)?;
+        object::freeze_with_shape(obj, &mut self.gc_heap, new_shape);
+        Ok(())
+    }
+
+    /// `Object.seal` core: for a shaped object, transition to the
+    /// attribute-encoding class recording every slot as non-configurable;
+    /// dictionary-mode objects fall back to the in-place path.
+    pub(crate) fn seal_object(&mut self, mut obj: object::JsObject) -> Result<(), VmError> {
+        let shape = object::shape(obj, &self.gc_heap);
+        if shape.is_null() {
+            object::seal(obj, &mut self.gc_heap);
+            return Ok(());
+        }
+        let mut ordered = object::shape_ordered_slot_attrs(&self.gc_heap, shape);
+        for (_, flags, _) in ordered.iter_mut() {
+            *flags = flags.with_configurable(false);
+        }
+        let mut no_extra = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+        let new_shape = self.rebuild_shape_from_slots(&mut obj, &ordered, &mut no_extra)?;
+        object::seal_with_shape(obj, &mut self.gc_heap, new_shape);
+        Ok(())
     }
 
     /// Look up a property slot in a GC-managed hidden-class shape.

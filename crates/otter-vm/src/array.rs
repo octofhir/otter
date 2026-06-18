@@ -374,12 +374,26 @@ pub(crate) fn from_vec_with_roots(
     collected: Vec<Value>,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
-    let mut body = ArrayBody {
+    let body = ArrayBody {
         length: collected.len(),
         elements: collected,
         ..Default::default()
     };
+    alloc_body_with_adopted_elements(heap, body, external_visit)
+}
 
+/// Allocate an [`ArrayBody`] whose dense element vector has already been
+/// materialized and moved into the body.
+///
+/// The vector's backing store is accounted exactly once. When there is no hard
+/// heap cap, the common path reserves those bytes without a safepoint and tries
+/// a no-collect young allocation for the array shell. Any miss falls back to
+/// the rooted allocator, which traces the pending body and its dense elements.
+fn alloc_body_with_adopted_elements(
+    heap: &mut GcHeap,
+    mut body: ArrayBody,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsArray, otter_gc::OutOfMemory> {
     let element_bytes = spilled_capacity_bytes(body.elements.capacity());
     let can_reserve_without_collect = heap.max_heap_bytes() == 0;
     let elements_reserved = element_bytes == 0
@@ -448,26 +462,16 @@ pub(crate) fn from_elements_with_source_and_roots(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
     let collected: Vec<Value> = values.into_iter().collect();
-    let mut body = ArrayBody {
+    let body = ArrayBody {
         length: collected.len(),
+        elements: collected,
         exotic: Some(Box::new(ArrayExoticSlots {
             source_bytes: Some(source_bytes),
             dirty: false,
             ..ArrayExoticSlots::default()
         })),
-        ..Default::default()
     };
-    {
-        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            external_visit(visitor);
-            for value in &collected {
-                value.trace_value_slots(visitor);
-            }
-        };
-        reserve_elements_for_len_with_roots(&mut body, heap, collected.len(), &mut reserve_roots)?;
-    }
-    body.elements.extend(collected);
-    heap.alloc_with_roots(body, external_visit)
+    alloc_body_with_adopted_elements(heap, body, external_visit)
 }
 
 /// Length in elements (O(1)).
@@ -1780,26 +1784,6 @@ fn reserve_elements_for_len(
     let after = spilled_capacity_bytes(target_len);
     if after > before {
         heap.reserve_bytes_no_collect((after - before) as u64)?;
-    }
-    body.elements
-        .reserve_exact(target_len.saturating_sub(body.elements.len()));
-    Ok(())
-}
-
-fn reserve_elements_for_len_with_roots(
-    body: &mut ArrayBody,
-    heap: &mut otter_gc::GcHeap,
-    target_len: usize,
-    external_visit: &mut RootSlotVisitor<'_>,
-) -> Result<(), otter_gc::OutOfMemory> {
-    if target_len <= body.elements.capacity() {
-        return Ok(());
-    }
-
-    let before = spilled_capacity_bytes(body.elements.capacity());
-    let after = spilled_capacity_bytes(target_len);
-    if after > before {
-        heap.reserve_bytes_with_roots((after - before) as u64, external_visit)?;
     }
     body.elements
         .reserve_exact(target_len.saturating_sub(body.elements.len()));

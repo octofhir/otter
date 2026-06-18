@@ -405,6 +405,14 @@ ordinary objects and falls back to the existing rooted allocator on any miss.
 This preserves every collector/rooting invariant while carving out the exact
 fast/slow split the machine-code bump path needs.
 
+The array literal boundary now mirrors the object side: compiled `NewArray`
+calls a dedicated allocation bridge instead of the generic opcode delegate, and
+the VM collects literal source registers directly into the final dense
+`Vec<Value>` handed to the rooted array allocator. This does not expose raw
+nursery cursor state yet, but it removes the extra transient argument container
+and leaves a narrower fixed-shape/array-literal slow path for the eventual bump
+emitter.
+
 ## D3 — Variable-size payloads are malloc'd `Vec`s, not GC-inline storage
 
 ### Evidence

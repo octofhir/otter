@@ -598,6 +598,24 @@ extern "C" fn jit_new_object_stub(ctx: *mut JitCtx, dst: u64) -> u64 {
     }
 }
 
+/// Bridge stub: allocate an array literal for `NewArray` from compiled code.
+/// The VM decodes the variable source-register list at `byte_pc` and uses the
+/// stack-rooted array allocator, matching interpreter GC semantics.
+extern "C" fn jit_new_array_stub(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    match vm.jit_runtime_new_array(context, stack, ctx.frame_index, byte_pc as u32) {
+        Ok(()) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
 /// Bridge stub: perform a `CallMethodValue` (`recv.name(args…)`) from compiled
 /// code, delegating to the safe [`Interpreter::jit_runtime_call_method`].
 /// Returns `0` on success, `1` when the call threw (error parked in `ctx`).
@@ -839,8 +857,8 @@ mod arm64 {
         VM_OFFSET, WhiskerIcCell, jit_abort_direct_call_stub, jit_call_method_stub,
         jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
         jit_finish_direct_call_returned_stub, jit_load_element_stub, jit_load_global_stub,
-        jit_load_prop_stub, jit_load_upvalue_stub, jit_make_fn_stub, jit_new_object_stub,
-        jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub,
+        jit_load_prop_stub, jit_load_upvalue_stub, jit_make_fn_stub, jit_new_array_stub,
+        jit_new_object_stub, jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub,
         jit_store_element_stub, jit_store_prop_stub, jit_store_upvalue_stub,
         jit_write_barrier_stub, reg_offset,
     };
@@ -1235,6 +1253,11 @@ mod arm64 {
                     let dst = reg(ops_ref, 0)?;
                     dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
                     emit_call_stub(&mut ops, jit_new_object_stub as *const () as usize, threw);
+                }
+                Op::NewArray => {
+                    dynasm!(ops ; .arch aarch64 ; mov x0, x20);
+                    emit_load_u64(&mut ops, 1, instr.byte_pc as u64);
+                    emit_call_stub(&mut ops, jit_new_array_stub as *const () as usize, threw);
                 }
                 Op::Call => {
                     // Splice a tiny monomorphic leaf callee inline under an
@@ -1792,11 +1815,11 @@ mod arm64 {
                 }
                 // Synchronous opcodes with variable / awkward operands: re-run
                 // through the interpreter at this instruction's byte_pc via the
-                // generic delegate bridge (closure/object/array construction,
-                // string constants, checked upvalue store, remainder, unsigned
-                // shift). All run to completion without pushing a frame.
+                // generic delegate bridge (closure construction, string/number
+                // constants, checked upvalue store, arithmetic tails, and
+                // descriptor writes). All run to completion without pushing a
+                // frame.
                 Op::MakeClosure
-                | Op::NewArray
                 | Op::Rem
                 | Op::Ushr
                 | Op::LoadString

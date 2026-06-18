@@ -20,10 +20,6 @@
 //! - [`crate::executable`]
 
 use crate::holt_stack::HoltStack;
-use otter_bytecode::Operand;
-use otter_gc::raw::RawGc;
-use smallvec::SmallVec;
-
 use crate::{
     ExecutionContext, Frame, Interpreter, IteratorHandle, IteratorState, NativeCall, NativeFastFn,
     NativeFunction, Value, VmError,
@@ -32,6 +28,8 @@ use crate::{
     runtime_state::RuntimeState,
     write_register,
 };
+use otter_bytecode::Operand;
+use otter_gc::raw::RawGc;
 
 impl Interpreter {
     pub(crate) fn collect_allocation_roots(&self, stack: &HoltStack) -> Vec<*mut RawGc> {
@@ -284,7 +282,7 @@ impl Interpreter {
                 }
             }
         };
-        crate::array::from_elements_with_roots(&mut self.gc_heap, elements, &mut external_visit)
+        crate::array::from_vec_with_roots(&mut self.gc_heap, elements, &mut external_visit)
             .map_err(VmError::from)
     }
 
@@ -318,7 +316,7 @@ impl Interpreter {
                 }
             }
         };
-        crate::array::from_elements_with_roots(&mut self.gc_heap, elements, &mut external_visit)
+        crate::array::from_vec_with_roots(&mut self.gc_heap, elements, &mut external_visit)
     }
 
     /// Allocate a host-created static native function while exposing
@@ -633,7 +631,7 @@ impl Interpreter {
                 }
             }
         };
-        crate::array::from_elements_with_roots(&mut self.gc_heap, elements, &mut external_visit)
+        crate::array::from_vec_with_roots(&mut self.gc_heap, elements, &mut external_visit)
             .map_err(VmError::from)
     }
 
@@ -666,12 +664,19 @@ impl Interpreter {
             .map_err(VmError::from)
     }
 
-    fn alloc_stack_rooted_array_from_elements(
+    fn alloc_stack_rooted_array_from_vec(
         &mut self,
         stack: &HoltStack,
-        elements: SmallVec<[Value; 4]>,
+        elements: Vec<Value>,
     ) -> Result<crate::array::JsArray, VmError> {
-        self.alloc_stack_rooted_array_from_values(stack, elements, &[], &[])
+        let roots = self.collect_allocation_roots(stack);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+        };
+        crate::array::from_vec_with_roots(&mut self.gc_heap, elements, &mut external_visit)
+            .map_err(VmError::from)
     }
 
     pub(crate) fn run_new_object_reg(
@@ -713,7 +718,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let count = const_operand(operands.get(1))? as usize;
-        let mut elements: SmallVec<[Value; 4]> = SmallVec::with_capacity(count);
+        let mut elements: Vec<Value> = Vec::with_capacity(count);
         {
             let frame = &stack[top_idx];
             for i in 0..count {
@@ -721,7 +726,7 @@ impl Interpreter {
                 elements.push(*read_register(frame, r)?);
             }
         }
-        let array = self.alloc_stack_rooted_array_from_elements(stack, elements)?;
+        let array = self.alloc_stack_rooted_array_from_vec(stack, elements)?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::array(array))?;
         frame.advance_pc(self.current_byte_len)?;

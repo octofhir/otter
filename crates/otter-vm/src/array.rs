@@ -360,6 +360,20 @@ pub(crate) fn from_elements_with_roots(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
     let collected: Vec<Value> = values.into_iter().collect();
+    from_vec_with_roots(heap, collected, external_visit)
+}
+
+/// Construct an array from an already materialized element vector through the
+/// young-generation allocation path.
+///
+/// This is the array-literal fast boundary: bytecode/JIT callers have already
+/// copied source registers into owned storage, so taking the vector directly
+/// avoids a second transient argument container before the GC allocation.
+pub(crate) fn from_vec_with_roots(
+    heap: &mut GcHeap,
+    collected: Vec<Value>,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsArray, otter_gc::OutOfMemory> {
     let mut body = ArrayBody {
         length: collected.len(),
         ..Default::default()

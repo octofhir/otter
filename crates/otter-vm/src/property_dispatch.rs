@@ -3380,6 +3380,35 @@ impl Interpreter {
         result
     }
 
+    /// JIT bridge for `NewArray` from compiled code. This keeps array literal
+    /// allocation on the shared stack-rooted path while bypassing the generic
+    /// opcode delegate envelope; the bytecode operands still define the exact
+    /// source-register list.
+    ///
+    /// # Errors
+    /// Propagates invalid operands and allocation failures.
+    pub fn jit_runtime_new_array(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        byte_pc: u32,
+    ) -> Result<(), VmError> {
+        let fid = stack[frame_index].function_id;
+        let func = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
+        let instr = func
+            .instr_at_byte_pc(byte_pc)
+            .ok_or(VmError::InvalidOperand)?;
+        if instr.op() != Op::NewArray {
+            return Err(VmError::InvalidOperand);
+        }
+        let operands = context.exec_operands(instr);
+        let saved_pc = stack[frame_index].pc;
+        let result = self.run_new_array_operands(stack, frame_index, operands);
+        stack[frame_index].pc = saved_pc;
+        result
+    }
+
     /// JIT bridge for a computed `StoreElement` (`recv[idx] = src`) from compiled
     /// code. Mirrors the interpreter dispatch: the typed-array / dense-array fast
     /// path ([`Self::drive_store_element`]) first, then the general

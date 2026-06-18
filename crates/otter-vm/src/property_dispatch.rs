@@ -2984,11 +2984,11 @@ impl Interpreter {
     /// IC-site lookup cannot be used. The emitter instead passes the dense
     /// `site` straight from the snapshot field `property_ic_site`, which is the
     /// same index `drive_load_property` resolves. The hot path is the IC hit,
-    /// a shape guard plus slot read identical to the interpreter fast path.
-    /// By tier-up the site is already warm from interpreted calls, so an
-    /// ordinary-object read resolves here with no further property machinery.
-    /// A miss from a cold or polymorphic shape, an accessor, a prototype walk,
-    /// or a non-object receiver falls back to the full read. The frame PC is
+    /// a shape guard plus slot read identical to the interpreter fast path. A
+    /// cold own-data or direct-prototype data observation installs the IC here
+    /// too, so compiled top-level/OSR code does not depend on interpreter
+    /// pre-warming. Accessors, uncached prototype walks, polymorphic overflow,
+    /// and non-object receivers fall back to the full read. The frame PC is
     /// saved and restored so a later guard bail still re-runs from PC 0.
     ///
     /// # Errors
@@ -3029,6 +3029,29 @@ impl Interpreter {
                 // (former) compile-time bake, but resolved at runtime so a site
                 // that was cold when its function tiered up (OSR off an earlier
                 // loop) still inlines once warm.
+                return Ok(self.whisker_load_cell_fill(site));
+            }
+            if self.load_property_ics[site].entry_count() > 0 {
+                self.load_property_ics[site].record_guard_miss_with_stats(
+                    &mut self.property_ic_stats,
+                    PropertyIcKind::Load,
+                );
+            } else {
+                self.load_property_ics[site].record_uncached_miss_with_stats(
+                    &mut self.property_ic_stats,
+                    PropertyIcKind::Load,
+                );
+            }
+            if !self.load_property_ics[site].is_megamorphic()
+                && let Some((ic, value)) =
+                    LoadPropertyIc::install_candidate(obj, &self.gc_heap, atomized_key)
+            {
+                self.load_property_ics[site].install_with_stats(
+                    &mut self.property_ic_stats,
+                    PropertyIcKind::Load,
+                    ic,
+                );
+                write_register(&mut stack[frame_index], dst, value)?;
                 return Ok(self.whisker_load_cell_fill(site));
             }
         }
@@ -3441,6 +3464,32 @@ impl Interpreter {
                 // emitted site can self-patch its WhiskerIC cell and inline
                 // subsequent stores (shape guard + slot write + value-gated
                 // barrier) without re-entering this stub.
+                return Ok(self.whisker_store_cell_fill(site));
+            }
+            if entries_len > 0 {
+                self.store_property_ics[site].record_guard_miss_with_stats(
+                    &mut self.property_ic_stats,
+                    PropertyIcKind::Store,
+                );
+            } else {
+                self.store_property_ics[site].record_uncached_miss_with_stats(
+                    &mut self.property_ic_stats,
+                    PropertyIcKind::Store,
+                );
+            }
+            if !self.store_property_ics[site].is_megamorphic()
+                && let Some(ic) = StorePropertyIc::existing_own_data_install_candidate(
+                    obj,
+                    &self.gc_heap,
+                    atomized_key,
+                )
+                && ic.store(obj, &mut self.gc_heap, atomized_key, &value).is_some()
+            {
+                self.store_property_ics[site].install_with_stats(
+                    &mut self.property_ic_stats,
+                    PropertyIcKind::Store,
+                    ic,
+                );
                 return Ok(self.whisker_store_cell_fill(site));
             }
         }

@@ -62,23 +62,25 @@ cache is parasitic on how much the interpreter ran the site before tier-up —
 which depends on OSR timing in a way that has a dead zone at the default
 threshold.
 
-### Breaking redesign
-**Make the JIT property stub self-priming.** On a monomorphic own-data hit, the
-stub should install/update the IC entry *and* fill the WhiskerIC cell directly,
-independent of any prior interpreter warming. Concretely:
-- `jit_runtime_load_property`/`store_property`: on a successful own-data read,
-  always compute the `(shape, slot)` and return the cell fill, even when
-  `load_property_ics[site]` was empty — and populate that entry too.
-- Decouple cell-fill eligibility from `entry_count()==1` pre-warming; base it on
-  the *observed* receiver this call plus a one-slot shape check next call (the
-  inline guard already re-checks the shape, so a wrong fill simply misses).
-- Audit the OSR-compile path to confirm module-top-level functions emit the
-  same WhiskerIC sites as nested functions (they get IC sites — `executable.rs:338`
-  — so the gap is fill, not emit).
+### Landed redesign
+**JIT property stubs are self-priming.** A compiled `LoadProperty` bridge now
+probes any installed PIC entries, records miss accounting, and when the observed
+receiver/key pair is cacheable, installs a `LoadPropertyIc` directly from the
+compiled stub. If the new entry is monomorphic own-data, the stub returns the
+packed WhiskerIC cell fill immediately, so the next compiled iteration runs the
+inline shape/value-slab load even when the interpreter never warmed that site.
+Direct-prototype data installs too, but still returns no Whisker fill because
+the current inline load cell only models own data slots.
 
-Impact: lifts **every top-level hot loop** (and any code that tiers up before
-the interpreter warms it) onto the inline path. 5–9× on the affected shape of
-code, which includes most real scripts and several benchmarks here.
+`StoreProperty` mirrors this for existing own writable data slots: the compiled
+stub installs and replays an existing-own-data store candidate directly, then
+returns the Whisker store fill when the site is monomorphic. Shape-growing store
+transitions still go through the ordinary slow path because transition capture
+mutates the object shape.
+
+Impact: top-level/default-OSR code no longer depends on interpreter pre-warming
+to leave the property bridge stub. The OSR path already emitted WhiskerIC sites;
+the missing piece was runtime fill.
 
 ---
 
@@ -484,7 +486,7 @@ measurable against a committed reproducer.
 
 | step | lever | scope | expected | unlocks |
 |---|---|---|---|---|
-| 1 | **R1** self-priming property IC | JIT stub + IC fill | 5–9× on top-level code | de-risks all IC work |
+| 1 | **R1** self-priming property IC — LANDED | JIT stub + IC fill | 5–9× on top-level code | de-risks all IC work |
 | 2 | **VmError shrink** (audit A) | mechanical, Box payloads | 5–15% broad | cleaner profiles |
 | 3 | **D4** Math.* intrinsics — LANDED guarded opcode | compiler + VM/JIT delegate | float benches | safe guard contract for native emit |
 | 4 | **R3** inline array `.length` | emit + array header | kills per-iter length stub | every array loop |

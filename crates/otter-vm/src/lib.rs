@@ -1567,7 +1567,19 @@ impl Interpreter {
         if frame.pc != 0 || frame.async_state.is_some() || frame.generator_owner.is_some() {
             return None;
         }
-        let fid = frame.function_id;
+        self.resolve_jit_code_for_fid(context, frame.function_id)
+    }
+
+    /// Resolve (and compile-once at the tier-up threshold) the installed non-OSR
+    /// baseline body for `fid`, independent of any stack frame. The lean
+    /// callback loop uses this to tier up its callee without synthesizing a
+    /// frame, then enters the cached body directly; [`Self::resolve_jit_code`]
+    /// wraps it for the frame-entry path after its freshness checks.
+    pub(crate) fn resolve_jit_code_for_fid(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+    ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         // Single-entry compiled-code cache. A hot synchronous re-entry (Array
         // callbacks, comparators, `@@iterator` drives) resolves the SAME callee
         // every call; this skips the `jit_code` FxHashMap lookup + `Arc` clone
@@ -1611,7 +1623,7 @@ impl Interpreter {
     ///
     /// The window stays rooted on `stack` for the call, so closure allocation
     /// and recursive calls inside the body are GC-safe.
-    fn run_compiled_frame(
+    pub(crate) fn run_compiled_frame(
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,

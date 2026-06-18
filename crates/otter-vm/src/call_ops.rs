@@ -186,6 +186,28 @@ pub(crate) struct LeanCallbackState {
     stack: HoltStack,
     root_index: usize,
     function_id: u32,
+    /// Callee register-window length, read once from the executable function.
+    register_count: usize,
+    /// True when the callback carries no bound `new.target`, derived-`this`
+    /// cell, or captured eval environment — i.e. the per-element frame needs no
+    /// pooled cold record. The hot Array/Map/Set/TypedArray callbacks (plain
+    /// functions and arrows) all qualify, so they take the prepared-frame fast
+    /// path; anything else falls to the general per-element build.
+    fast_reuse: bool,
+    /// Installed baseline body for the callback, resolved once on the first
+    /// element that tiers up and reused for the rest of the loop. The lean
+    /// state lives only for a single builtin invocation, so no mid-loop
+    /// recompilation can stale this handle.
+    compiled: Option<std::sync::Arc<dyn crate::jit::JitFunctionCode>>,
+    /// Recycled callee frame for the prepared fast path: its register window,
+    /// upvalue spine box, and frame shell are reused across elements instead of
+    /// being drawn, built, and dropped per element. `None` until the first
+    /// fast-path call builds it, and whenever a bail consumes it mid-loop.
+    reuse_frame: Option<Frame>,
+    /// Cached `(input this, coerced this)` pair. The builtin passes a constant
+    /// receiver for the whole loop, so the §10.2 sloppy-`this` coercion runs
+    /// once; a changed input recomputes it.
+    cached_this: Option<(Value, Value)>,
 }
 
 impl Interpreter {
@@ -1833,17 +1855,26 @@ impl Interpreter {
         callback: Value,
     ) -> Option<LeanCallbackState> {
         let root = LeanCallbackRoot::from_callback(callback, &self.gc_heap)?;
-        let eligible = context.exec_function(root.function_id).is_some_and(|f| {
-            !f.is_generator
-                && !f.is_async
-                && !f.is_async_generator
-                && !f.needs_arguments
-                && !f.has_rest
-                && !f.makes_function
-                && !f.contains_direct_eval
-                && !f.is_derived_constructor
-        });
-        if eligible && self.enter_sync_reentry().is_ok() {
+        let register_count = context
+            .exec_function(root.function_id)
+            .filter(|f| {
+                !f.is_generator
+                    && !f.is_async
+                    && !f.is_async_generator
+                    && !f.needs_arguments
+                    && !f.has_rest
+                    && !f.makes_function
+                    && !f.contains_direct_eval
+                    && !f.is_derived_constructor
+            })
+            .map(|f| f.register_count as usize)?;
+        // A callback with no bound `new.target` / derived-`this` cell / captured
+        // eval environment needs no pooled cold record, so its per-element frame
+        // is a flat register window the prepared fast path can recycle in place.
+        let fast_reuse = root.bound_new_target.is_none()
+            && root.bound_derived_this.is_none()
+            && root.eval_env.is_none();
+        if self.enter_sync_reentry().is_ok() {
             let stack = self.draw_stack();
             let root_index = self.lean_callback_roots.len();
             let function_id = root.function_id;
@@ -1852,6 +1883,11 @@ impl Interpreter {
                 stack,
                 root_index,
                 function_id,
+                register_count,
+                fast_reuse,
+                compiled: None,
+                reuse_frame: None,
+                cached_this: None,
             })
         } else {
             None
@@ -1861,7 +1897,13 @@ impl Interpreter {
     /// Return the lean-path stack to the pool and leave the sync-reentry guard
     /// entered by [`Self::acquire_lean_callback_stack`]. No-op for `None`.
     pub(crate) fn release_lean_callback_stack(&mut self, state: Option<LeanCallbackState>) {
-        if let Some(state) = state {
+        if let Some(mut state) = state {
+            // Return the recycled frame's spilled register backing to the pool;
+            // an inline window is dropped with the frame.
+            if let Some(mut frame) = state.reuse_frame.take() {
+                self.frame_release_cold(&mut frame);
+                self.reclaim_registers(&mut frame);
+            }
             self.return_stack(state.stack);
             let root = self
                 .lean_callback_roots
@@ -2001,6 +2043,129 @@ impl Interpreter {
         effective_this: Value,
         effective_args: &[Value],
     ) -> Result<Value, VmError> {
+        // Prepared fast path: a callback that needs no pooled cold record
+        // resolves its compiled body once and then re-enters that body with a
+        // recycled frame, so per element only the receiver coercion (cached),
+        // the upvalue refresh, the register reset, and the argument bind run —
+        // no per-element frame allocation, register draw, tier probe, or
+        // dispatch envelope.
+        if state.fast_reuse {
+            if state.compiled.is_none() {
+                state.compiled = self.resolve_jit_code_for_fid(context, state.function_id);
+            }
+            if let Some(code) = state.compiled.clone() {
+                return self
+                    .invoke_prepared_lean(state, context, &code, effective_this, effective_args);
+            }
+            // Still cold (below the tier-up threshold). The probe above already
+            // advanced the counter, so interpret this element directly without
+            // re-probing through the synchronous-entry path.
+            return self.invoke_cold_lean(state, context, effective_this, effective_args, false);
+        }
+        // Callback carries a bound `new.target` / derived-`this` cell / captured
+        // eval environment: build a fresh frame per element and tier up through
+        // the synchronous-entry path as before.
+        self.invoke_cold_lean(state, context, effective_this, effective_args, true)
+    }
+
+    /// Re-enter the callback's already-compiled body with the recycled frame
+    /// held in `state`. See [`Self::run_bytecode_callable_committed_lean_args`].
+    fn invoke_prepared_lean(
+        &mut self,
+        state: &mut LeanCallbackState,
+        context: &ExecutionContext,
+        code: &std::sync::Arc<dyn crate::jit::JitFunctionCode>,
+        effective_this: Value,
+        effective_args: &[Value],
+    ) -> Result<Value, VmError> {
+        let function = context
+            .exec_function(state.function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        // Refresh the GC-live inputs from the traced root every element: the
+        // recycled frame is held off-stack between calls and is not itself
+        // traced, so its captured upvalues / receiver could be relocated by a
+        // moving collection the builtin triggers between elements. Reading them
+        // back from `lean_callback_roots` (which IS traced) keeps them current.
+        let (bound_this, parent_upvalues) = {
+            let root = self
+                .lean_callback_roots
+                .get(state.root_index)
+                .ok_or(VmError::InvalidOperand)?;
+            (
+                root.bound_this.unwrap_or(effective_this),
+                root.parent_upvalues.clone(),
+            )
+        };
+        // The builtin passes a constant receiver across the whole loop, so the
+        // §10.2 sloppy-`this` coercion is computed once and reused.
+        let this_for_callee = match state.cached_this {
+            Some((input, coerced)) if input == bound_this => coerced,
+            _ => {
+                let coerced = self.this_for_bytecode_call_runtime_rooted(
+                    function,
+                    bound_this,
+                    &[effective_args],
+                )?;
+                state.cached_this = Some((bound_this, coerced));
+                coerced
+            }
+        };
+        let register_count = state.register_count;
+        let mut frame = match state.reuse_frame.take() {
+            Some(mut frame) => {
+                debug_assert_eq!(frame.registers.len(), register_count);
+                frame.pc = 0;
+                frame.return_register = None;
+                frame.this_value = this_for_callee;
+                frame.upvalues = parent_upvalues;
+                for slot in frame.registers.iter_mut() {
+                    *slot = Value::undefined();
+                }
+                frame
+            }
+            None => {
+                let registers = self.draw_registers(register_count);
+                Frame::with_exec_registers(
+                    function,
+                    None,
+                    parent_upvalues,
+                    this_for_callee,
+                    registers,
+                )
+            }
+        };
+        Self::bind_lean_bytecode_call_arguments(function, &mut frame, effective_args)?;
+        state.stack.push(frame);
+        let top_idx = state.stack.len() - 1;
+        match self.run_compiled_frame(&mut state.stack, context, top_idx, code) {
+            crate::jit::JitExecOutcome::Returned(value) => {
+                // The body ran to completion and left its frame on the stack;
+                // recycle that frame (window + shell) for the next element.
+                state.reuse_frame = state.stack.pop();
+                Ok(value)
+            }
+            crate::jit::JitExecOutcome::Bailed(pc) => {
+                // Finish the partially-run frame in the interpreter, which pops
+                // it on return; the next element rebuilds a fresh recycled frame.
+                state.stack[top_idx].pc = pc;
+                self.dispatch_loop(context, &mut state.stack)
+            }
+            crate::jit::JitExecOutcome::Threw(err) => Err(err),
+        }
+    }
+
+    /// Build a fresh callee frame for one lean-callback element. `probe` drives
+    /// tier-up through the synchronous-entry path (for callbacks not eligible
+    /// for the prepared fast path); when `false` the element is interpreted
+    /// directly because the caller already advanced the tier-up counter.
+    fn invoke_cold_lean(
+        &mut self,
+        state: &mut LeanCallbackState,
+        context: &ExecutionContext,
+        effective_this: Value,
+        effective_args: &[Value],
+        probe: bool,
+    ) -> Result<Value, VmError> {
         let (
             function_id,
             parent_upvalues,
@@ -2057,7 +2222,9 @@ impl Interpreter {
         self.stash_frame_eval_env(function, &mut new_frame, callee_eval_env)?;
         Self::bind_lean_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
         state.stack.push(new_frame);
-        if let Some(value) = self.dispatch_jit_sync_entry(&mut state.stack, context)? {
+        if probe
+            && let Some(value) = self.dispatch_jit_sync_entry(&mut state.stack, context)?
+        {
             if let Some(mut done) = state.stack.pop() {
                 self.reclaim_registers(&mut done);
             }

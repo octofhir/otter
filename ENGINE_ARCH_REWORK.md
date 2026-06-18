@@ -424,6 +424,12 @@ malloc for short property names, atoms, literal strings, and substring results
 that fit the inline caps while leaving cons/sliced tracing and long-string
 storage unchanged.
 
+The Latin-1 policy now applies to every constructor that can prove the code
+units fit in one byte: `from_str`, rooted `from_str_with_roots`, and
+`from_utf16_units[_with_roots]`. ASCII still uses the borrowed byte slice
+directly; non-ASCII Latin-1 and UTF-16-unit callers compact through a temporary
+byte vector so the persistent GC payload stays Latin-1.
+
 Dense arrays still use a `Vec<Value>` because the current baseline JIT reads
 that vector's probed pointer/length layout for inline dense element access, but
 the array shell no longer pays for sparse/named/accessor/symbol/source/prototype

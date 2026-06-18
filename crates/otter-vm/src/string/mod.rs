@@ -92,6 +92,29 @@ const fn hash_to_u32(h: u64) -> u32 {
     ((h ^ (h >> 32)) & 0xFFFF_FFFF) as u32
 }
 
+fn latin1_bytes_from_utf16(units: &[u16]) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(units.len());
+    for &unit in units {
+        if unit > u8::MAX as u16 {
+            return None;
+        }
+        bytes.push(unit as u8);
+    }
+    Some(bytes)
+}
+
+fn latin1_bytes_from_str(s: &str) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(s.len());
+    for ch in s.chars() {
+        let code = ch as u32;
+        if code > u8::MAX as u32 {
+            return None;
+        }
+        bytes.push(code as u8);
+    }
+    Some(bytes)
+}
+
 impl JsString {
     fn from_handle(handle: JsStringHandle, heap: &GcHeap) -> Self {
         let (cached_len, cached_hash) = heap.read_payload(handle, |b| (b.len, hash_to_u32(b.hash)));
@@ -127,6 +150,9 @@ impl JsString {
         heap: &mut GcHeap,
         external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<Self, OutOfMemory> {
+        if let Some(bytes) = latin1_bytes_from_utf16(units) {
+            return Self::from_latin1_with_roots(&bytes, heap, external_visit);
+        }
         let handle = gc_body::alloc_flat_string_body_with_roots(
             heap,
             JsStringId::new(0),
@@ -141,20 +167,18 @@ impl JsString {
         })
     }
 
-    /// Construct from a Rust `&str` — encodes once into WTF-16.
+    /// Construct from a Rust `&str`.
     ///
     /// # Errors
     /// See [`Self::from_utf16_units`].
     pub fn from_str(s: &str, heap: &mut GcHeap) -> Result<Self, OutOfMemory> {
-        // ASCII (the overwhelmingly common case for identifiers, JSON keys,
-        // and most string literals) is valid Latin-1 verbatim: byte `i`
-        // equals UTF-16 code unit `i`. Take the compact 1-byte-per-char
-        // Latin-1 body directly from the bytes — no `Vec<u16>` round trip and
-        // half the heap of a Flat body. `hash_latin1` and `hash_utf16` agree
-        // on these code units, so the result interns/compares identically to
-        // the UTF-16 path.
+        // ASCII is valid Latin-1 verbatim: byte `i` equals UTF-16 code unit
+        // `i`. Take the compact body directly from the UTF-8 bytes.
         if s.is_ascii() {
             return Self::from_latin1(s.as_bytes(), heap);
+        }
+        if let Some(bytes) = latin1_bytes_from_str(s) {
+            return Self::from_latin1(&bytes, heap);
         }
         let units: Vec<u16> = s.encode_utf16().collect();
         Self::from_utf16_units(&units, heap)
@@ -169,6 +193,12 @@ impl JsString {
         heap: &mut GcHeap,
         external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<Self, OutOfMemory> {
+        if s.is_ascii() {
+            return Self::from_latin1_with_roots(s.as_bytes(), heap, external_visit);
+        }
+        if let Some(bytes) = latin1_bytes_from_str(s) {
+            return Self::from_latin1_with_roots(&bytes, heap, external_visit);
+        }
         let units: Vec<u16> = s.encode_utf16().collect();
         Self::from_utf16_units_with_roots(&units, heap, external_visit)
     }
@@ -180,11 +210,23 @@ impl JsString {
     /// Surfaces [`OutOfMemory`] verbatim.
     pub fn from_latin1(bytes: &[u8], heap: &mut GcHeap) -> Result<Self, OutOfMemory> {
         let mut roots = no_extra_roots;
+        Self::from_latin1_with_roots(bytes, heap, &mut roots)
+    }
+
+    /// Construct from a Latin-1 / ASCII byte slice while exposing caller roots.
+    ///
+    /// # Errors
+    /// Surfaces [`OutOfMemory`] verbatim.
+    pub(crate) fn from_latin1_with_roots(
+        bytes: &[u8],
+        heap: &mut GcHeap,
+        external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+    ) -> Result<Self, OutOfMemory> {
         let handle = gc_body::alloc_latin1_string_body_with_roots(
             heap,
             JsStringId::new(0),
             bytes,
-            &mut roots,
+            external_visit,
         )?;
         let cached_hash = hash_to_u32(gc_body::hash_latin1(bytes));
         Ok(Self {
@@ -742,6 +784,44 @@ mod tests {
     }
 
     #[test]
+    fn from_str_latin1_supplement_uses_latin1_body() {
+        let mut heap = h();
+        let s = JsString::from_str("éÿ", &mut heap).unwrap();
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.to_lossy_string(&heap), "éÿ");
+        heap.read_payload(s.handle, |body| match &body.repr {
+            JsStringBodyRepr::InlineLatin1(bytes) => assert_eq!(&bytes[..2], &[0xe9, 0xff]),
+            other => panic!("expected inline latin1 body, got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn from_utf16_units_compacts_latin1_body() {
+        let mut heap = h();
+        let s = JsString::from_utf16_units(&[0x41, 0x00ff], &mut heap).unwrap();
+        assert_eq!(s.to_utf16_vec(&heap), vec![0x41, 0x00ff]);
+        heap.read_payload(s.handle, |body| match &body.repr {
+            JsStringBodyRepr::InlineLatin1(bytes) => assert_eq!(&bytes[..2], &[0x41, 0xff]),
+            other => panic!("expected inline latin1 body, got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn long_utf16_latin1_units_use_byte_storage() {
+        let mut heap = h();
+        let units = vec![0x00e9; 64];
+        let s = JsString::from_utf16_units(&units, &mut heap).unwrap();
+        assert_eq!(s.to_utf16_vec(&heap), units);
+        heap.read_payload(s.handle, |body| match &body.repr {
+            JsStringBodyRepr::Latin1(bytes) => {
+                assert_eq!(bytes.len(), 64);
+                assert!(bytes.iter().all(|&b| b == 0xe9));
+            }
+            other => panic!("expected latin1 byte storage, got {other:?}"),
+        });
+    }
+
+    #[test]
     fn to_gc_handle_round_trips_through_real_heap() {
         let mut gc = GcHeap::new().expect("gc heap");
         let original = JsString::from_str("hello world", &mut gc).unwrap();
@@ -820,15 +900,14 @@ mod tests {
     #[test]
     fn slice_returns_view_for_flat_parent() {
         let mut heap = h();
-        // Build a Flat (UTF-16) parent explicitly: `from_str` now interns
-        // ASCII as a compact Latin-1 body, and slicing Latin-1 collapses into
-        // a fresh Latin-1 body (not a view), so it would not exercise the
-        // Sliced-over-Flat path this test targets.
-        let units: Vec<u16> = "abcdef".encode_utf16().collect();
+        // Include one non-Latin-1 code unit so the constructor must keep a
+        // Flat UTF-16 parent; slicing Latin-1 collapses into a fresh compact
+        // body and would not exercise the Sliced-over-Flat path.
+        let units = vec![0x0100, b'a' as u16, b'b' as u16, b'c' as u16, b'd' as u16];
         let s = JsString::from_utf16_units(&units, &mut heap).unwrap();
         let sliced = s.slice(1, 3, &mut heap).unwrap();
         assert_eq!(sliced.len(), 3);
-        assert_eq!(sliced.to_lossy_string(&heap), "bcd");
+        assert_eq!(sliced.to_lossy_string(&heap), "abc");
         heap.read_payload(sliced.handle(), |body| {
             assert!(matches!(body.repr, JsStringBodyRepr::Sliced { .. }));
         });

@@ -307,7 +307,7 @@ pub(crate) fn render_error_to_string_spec(
         }
         if value.is_symbol() {
             return Err(crate::VmError::TypeError {
-                message: format!("Cannot convert a Symbol value to a string ('{key}')"),
+                message: (format!("Cannot convert a Symbol value to a string ('{key}')")).into(),
             });
         }
         if let Some(s) = value.as_string(interp.gc_heap()) {
@@ -323,7 +323,7 @@ pub(crate) fn render_error_to_string_spec(
         )?;
         if primitive.is_symbol() {
             return Err(crate::VmError::TypeError {
-                message: format!("Cannot convert a Symbol value to a string ('{key}')"),
+                message: (format!("Cannot convert a Symbol value to a string ('{key}')")).into(),
             });
         }
         if let Some(s) = primitive.as_string(interp.gc_heap()) {
@@ -476,7 +476,7 @@ impl ErrorClassRegistry {
                 |err| match err {
                     crate::VmError::Uncaught { value } => NativeError::Thrown {
                         name: "Error.prototype.toString",
-                        message: value,
+                        message: value.into(),
                     },
                     other => NativeError::TypeError {
                         name: "Error.prototype.toString",
@@ -584,7 +584,7 @@ impl ErrorClassRegistry {
             let map_err = |err: crate::VmError| match err {
                 crate::VmError::Uncaught { value } => NativeError::Thrown {
                     name: "set Error.prototype.stack",
-                    message: value,
+                    message: value.into(),
                 },
                 other => NativeError::TypeError {
                     name: "set Error.prototype.stack",
@@ -705,7 +705,7 @@ impl ErrorClassRegistry {
             let map_vm_err = |err: crate::VmError| match err {
                 crate::VmError::Uncaught { value } => NativeError::Thrown {
                     name: kind.class_name(),
-                    message: value,
+                    message: value.into(),
                 },
                 other => NativeError::TypeError {
                     name: kind.class_name(),
@@ -841,7 +841,7 @@ impl ErrorClassRegistry {
             let map_vm_err = |err: crate::VmError| match err {
                 crate::VmError::Uncaught { value } => NativeError::Thrown {
                     name: "AggregateError",
-                    message: value,
+                    message: value.into(),
                 },
                 other => NativeError::TypeError {
                     name: "AggregateError",
@@ -916,7 +916,7 @@ impl ErrorClassRegistry {
             let map_err = |err: crate::VmError| match err {
                 crate::VmError::Uncaught { value } => NativeError::Thrown {
                     name: "AggregateError",
-                    message: value,
+                    message: value.into(),
                 },
                 other => NativeError::TypeError {
                     name: "AggregateError",

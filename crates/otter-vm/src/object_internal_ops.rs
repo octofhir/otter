@@ -80,7 +80,7 @@ fn property_key_value_to_vm_key(
         return Ok(VmPropertyKey::Symbol(sym));
     }
     Err(VmError::TypeError {
-        message: "property key must be a string or symbol".to_string(),
+        message: ("property key must be a string or symbol".to_string()).into(),
     })
 }
 
@@ -300,8 +300,10 @@ impl Interpreter {
             (Some(target_desc), None) => {
                 if !target_desc.configurable() || self.target_is_non_extensible_object(target) {
                     return Err(VmError::TypeError {
-                        message: "Proxy getOwnPropertyDescriptor trap cannot hide target property"
-                            .to_string(),
+                        message:
+                            ("Proxy getOwnPropertyDescriptor trap cannot hide target property"
+                                .to_string())
+                            .into(),
                     });
                 }
             }
@@ -309,20 +311,21 @@ impl Interpreter {
                 if self.target_is_non_extensible_object(target) || !trap_desc.configurable() {
                     return Err(VmError::TypeError {
                         message:
-                            "Proxy getOwnPropertyDescriptor trap reported incompatible property"
-                                .to_string(),
+                            ("Proxy getOwnPropertyDescriptor trap reported incompatible property"
+                                .to_string())
+                            .into(),
                     });
                 }
             }
             (Some(target_desc), Some(trap_desc)) => {
                 if !target_desc.configurable() && trap_desc.configurable() {
                     return Err(VmError::TypeError {
-                        message: "Proxy getOwnPropertyDescriptor trap reported configurable descriptor for non-configurable target property".to_string(),
+                        message:( "Proxy getOwnPropertyDescriptor trap reported configurable descriptor for non-configurable target property".to_string()).into(),
                     });
                 }
                 if !trap_desc.configurable() && target_desc.configurable() {
                     return Err(VmError::TypeError {
-                        message: "Proxy getOwnPropertyDescriptor trap reported non-configurable descriptor for configurable target property".to_string(),
+                        message:( "Proxy getOwnPropertyDescriptor trap reported non-configurable descriptor for configurable target property".to_string()).into(),
                     });
                 }
                 if !trap_desc.configurable()
@@ -337,7 +340,7 @@ impl Interpreter {
                     && !trap_desc.writable()
                 {
                     return Err(VmError::TypeError {
-                        message: "Proxy getOwnPropertyDescriptor trap reported non-writable descriptor for writable target property".to_string(),
+                        message:( "Proxy getOwnPropertyDescriptor trap reported non-writable descriptor for writable target property".to_string()).into(),
                     });
                 }
             }
@@ -377,16 +380,16 @@ impl Interpreter {
                     && !abstract_ops::same_value(trap_result, &value, &self.gc_heap) =>
             {
                 return Err(VmError::TypeError {
-                        message: "Proxy get trap returned incompatible value for non-writable non-configurable property".to_string(),
+                        message:( "Proxy get trap returned incompatible value for non-writable non-configurable property".to_string()).into(),
                     });
             }
             object::DescriptorKind::Accessor { getter: None, .. }
                 if !desc.configurable() && !trap_result.is_undefined() =>
             {
                 return Err(VmError::TypeError {
-                    message:
+                    message:(
                         "Proxy get trap returned value for non-configurable accessor without getter"
-                            .to_string(),
+                            .to_string()).into(),
                 });
             }
             _ => {}
@@ -522,7 +525,7 @@ impl Interpreter {
                 // §10.4.6.5 step 7 — an uninitialized binding's
                 // descriptor query is a ReferenceError (TDZ).
                 Some(v) if v.is_hole() => Err(VmError::ThisUninitialized {
-                    message: format!("Cannot access '{name}' before initialization"),
+                    message: (format!("Cannot access '{name}' before initialization")).into(),
                 }),
                 Some(v) => Ok(Some(object::PropertyDescriptor::data(v, true, true, false))),
                 None => Ok(None),
@@ -574,8 +577,9 @@ impl Interpreter {
                     Ok(Some(desc))
                 }
                 Some(_) => Err(VmError::TypeError {
-                    message: "Proxy getOwnPropertyDescriptor trap returned non-object descriptor"
-                        .to_string(),
+                    message: ("Proxy getOwnPropertyDescriptor trap returned non-object descriptor"
+                        .to_string())
+                    .into(),
                 }),
                 None => self.ordinary_get_own_property_descriptor_value_with_roots(
                     context,
@@ -934,7 +938,8 @@ impl Interpreter {
                 Some(result) => {
                     if !Self::proxy_get_prototype_result_is_object_or_null(&result) {
                         return Err(VmError::TypeError {
-                            message: "Proxy getPrototypeOf trap returned non-object".to_string(),
+                            message: ("Proxy getPrototypeOf trap returned non-object".to_string())
+                                .into(),
                         });
                     }
                     if let Some(target_proto) = self.proxy_get_prototype_invariant_target_proto(
@@ -943,8 +948,9 @@ impl Interpreter {
                     )? && !abstract_ops::same_value(&result, &target_proto, &self.gc_heap)
                     {
                         return Err(VmError::TypeError {
-                            message: "Proxy getPrototypeOf trap returned incompatible prototype"
-                                .to_string(),
+                            message: ("Proxy getPrototypeOf trap returned incompatible prototype"
+                                .to_string())
+                            .into(),
                         });
                     }
                     Ok(result)
@@ -994,8 +1000,9 @@ impl Interpreter {
         if let Some(proxy) = value.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {
-                    message: "Cannot perform 'isExtensible' on a proxy that has been revoked"
-                        .to_string(),
+                    message: ("Cannot perform 'isExtensible' on a proxy that has been revoked"
+                        .to_string())
+                    .into(),
                 });
             }
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
@@ -1007,8 +1014,9 @@ impl Interpreter {
                     if trap != target_ext {
                         return Err(VmError::TypeError {
                             message:
-                                "Proxy isExtensible trap returned value inconsistent with target"
-                                    .to_string(),
+                                ("Proxy isExtensible trap returned value inconsistent with target"
+                                    .to_string())
+                                .into(),
                         });
                     }
                     Ok(trap)
@@ -1077,7 +1085,7 @@ impl Interpreter {
             return crate::property_dispatch::set_ensure_expando_pub(&mut self.gc_heap, s);
         }
         Err(VmError::TypeError {
-            message: "collection_ensure_expando on non-collection value".to_string(),
+            message: ("collection_ensure_expando on non-collection value".to_string()).into(),
         })
     }
 
@@ -1324,7 +1332,8 @@ impl Interpreter {
                 && crate::object::get_symbol(obj, &self.gc_heap, *sym).is_none()
             {
                 return Err(VmError::TypeError {
-                    message: "Cannot define private field on a non-extensible object".to_string(),
+                    message: ("Cannot define private field on a non-extensible object".to_string())
+                        .into(),
                 });
             }
         }
@@ -1373,8 +1382,9 @@ impl Interpreter {
         if let Some(proxy) = target.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {
-                    message: "Cannot perform 'defineProperty' on a proxy that has been revoked"
-                        .to_string(),
+                    message: ("Cannot perform 'defineProperty' on a proxy that has been revoked"
+                        .to_string())
+                    .into(),
                 });
             }
             let key_value = self.vm_property_key_to_value(key)?;
@@ -1414,16 +1424,16 @@ impl Interpreter {
                         None => {
                             if !extensible {
                                 return Err(VmError::TypeError {
-                                        message:
+                                        message:(
                                             "Proxy defineProperty trap added a property on a non-extensible target"
-                                                .to_string(),
+                                                .to_string()).into(),
                                     });
                             }
                             if setting_config_false {
                                 return Err(VmError::TypeError {
-                                        message:
+                                        message:(
                                             "Proxy defineProperty trap added a non-configurable property absent on the target"
-                                                .to_string(),
+                                                .to_string()).into(),
                                     });
                             }
                         }
@@ -1432,17 +1442,17 @@ impl Interpreter {
                             if !target_configurable && matches!(descriptor.configurable, Some(true))
                             {
                                 return Err(VmError::TypeError {
-                                        message:
+                                        message:(
                                             "Proxy defineProperty trap relaxed a non-configurable target descriptor"
-                                                .to_string(),
+                                                .to_string()).into(),
                                     });
                             }
                             if target_configurable && matches!(descriptor.configurable, Some(false))
                             {
                                 return Err(VmError::TypeError {
-                                        message:
+                                        message:(
                                             "Proxy defineProperty trap demoted a configurable target descriptor"
-                                                .to_string(),
+                                                .to_string()).into(),
                                     });
                             }
                             if !target_configurable
@@ -1451,9 +1461,9 @@ impl Interpreter {
                                 && matches!(descriptor.writable, Some(false))
                             {
                                 return Err(VmError::TypeError {
-                                        message:
+                                        message:(
                                             "Proxy defineProperty trap narrowed writable on a non-configurable data target"
-                                                .to_string(),
+                                                .to_string()).into(),
                                     });
                             }
                             if !is_compatible_partial_descriptor(
@@ -1462,9 +1472,9 @@ impl Interpreter {
                                 &self.gc_heap,
                             ) {
                                 return Err(VmError::TypeError {
-                                    message:
+                                    message:(
                                         "Proxy defineProperty trap returned incompatible descriptor"
-                                            .to_string(),
+                                            .to_string()).into(),
                                 });
                             }
                         }
@@ -1717,7 +1727,7 @@ impl Interpreter {
                     let number_len = crate::coerce::to_number_or_throw(self, context, &v)?;
                     if (new_len as f64) != number_len.as_f64() {
                         return Err(VmError::RangeError {
-                            message: "Invalid array length".to_string(),
+                            message: ("Invalid array length".to_string()).into(),
                         });
                     }
                     Some(new_len as usize)
@@ -1915,7 +1925,8 @@ impl Interpreter {
             // non-writable, so `[[DefineOwnProperty]]` returns false.
             if !self.define_own_property_value(context, target, &key, descriptor)? {
                 return Err(VmError::TypeError {
-                    message: "Cannot redefine property during SetIntegrityLevel".to_string(),
+                    message: ("Cannot redefine property during SetIntegrityLevel".to_string())
+                        .into(),
                 });
             }
         }
@@ -2393,7 +2404,7 @@ impl Interpreter {
         if !exotic.is_nullish() {
             if !self.is_callable_runtime(&exotic) {
                 return Err(VmError::TypeError {
-                    message: "Symbol.toPrimitive method is not callable".to_string(),
+                    message: ("Symbol.toPrimitive method is not callable".to_string()).into(),
                 });
             }
             let hint_str = JsString::from_str(hint.as_token(), &mut self.gc_heap)?;
@@ -2404,7 +2415,7 @@ impl Interpreter {
                 return Ok(result);
             }
             return Err(VmError::TypeError {
-                message: "Symbol.toPrimitive returned a non-primitive".to_string(),
+                message: ("Symbol.toPrimitive returned a non-primitive".to_string()).into(),
             });
         }
         self.evaluate_ordinary_to_primitive(context, input, hint)
@@ -2453,7 +2464,8 @@ impl Interpreter {
             }
         }
         Err(VmError::TypeError {
-            message: "OrdinaryToPrimitive could not convert object to primitive".to_string(),
+            message: ("OrdinaryToPrimitive could not convert object to primitive".to_string())
+                .into(),
         })
     }
 
@@ -2476,7 +2488,7 @@ impl Interpreter {
         // proxies / exotic value kinds.
         if !attributes.is_object_type() {
             return Err(VmError::TypeError {
-                message: "ToPropertyDescriptor argument must be an Object".to_string(),
+                message: ("ToPropertyDescriptor argument must be an Object".to_string()).into(),
             });
         }
 
@@ -2516,7 +2528,7 @@ impl Interpreter {
         if let Some(v) = read_field(self, "get")? {
             if !v.is_undefined() && !self.is_callable_runtime(&v) {
                 return Err(VmError::TypeError {
-                    message: "Property descriptor `get` is not callable".to_string(),
+                    message: ("Property descriptor `get` is not callable".to_string()).into(),
                 });
             }
             descriptor.get = Some(v);
@@ -2525,7 +2537,7 @@ impl Interpreter {
         if let Some(v) = read_field(self, "set")? {
             if !v.is_undefined() && !self.is_callable_runtime(&v) {
                 return Err(VmError::TypeError {
-                    message: "Property descriptor `set` is not callable".to_string(),
+                    message: ("Property descriptor `set` is not callable".to_string()).into(),
                 });
             }
             descriptor.set = Some(v);
@@ -2533,7 +2545,7 @@ impl Interpreter {
         // step 9 — cannot mix accessor + data fields.
         if descriptor.is_accessor() && descriptor.is_data() {
             return Err(VmError::TypeError {
-                message: "Property descriptor mixes accessor + data fields".to_string(),
+                message: ("Property descriptor mixes accessor + data fields".to_string()).into(),
             });
         }
         Ok(descriptor)
@@ -2601,8 +2613,9 @@ impl Interpreter {
         if let Some(proxy) = target.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {
-                    message: "Cannot perform 'ownKeys' on a proxy that has been revoked"
-                        .to_string(),
+                    message: ("Cannot perform 'ownKeys' on a proxy that has been revoked"
+                        .to_string())
+                    .into(),
                 });
             }
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
@@ -2884,7 +2897,7 @@ impl Interpreter {
     ) -> Result<Vec<Value>, VmError> {
         if !(list_value.is_object() || list_value.is_array() || list_value.is_proxy()) {
             return Err(VmError::TypeError {
-                message: "Proxy ownKeys trap result is not an Object".to_string(),
+                message: ("Proxy ownKeys trap result is not an Object".to_string()).into(),
             });
         }
         let len_value = match self.ordinary_get_value(
@@ -2913,8 +2926,9 @@ impl Interpreter {
             };
             if !(element.is_string() || element.is_symbol()) {
                 return Err(VmError::TypeError {
-                    message: "Proxy ownKeys trap result contains a non-property-key entry"
-                        .to_string(),
+                    message: ("Proxy ownKeys trap result contains a non-property-key entry"
+                        .to_string())
+                    .into(),
                 });
             }
             out.push(element);
@@ -2951,8 +2965,9 @@ impl Interpreter {
                     Some(name) => {
                         if !seen.insert(name.as_str()) {
                             return Err(VmError::TypeError {
-                                message: "Proxy ownKeys trap result contains duplicate entries"
-                                    .to_string(),
+                                message: ("Proxy ownKeys trap result contains duplicate entries"
+                                    .to_string())
+                                .into(),
                             });
                         }
                     }
@@ -2967,8 +2982,9 @@ impl Interpreter {
                         &self.gc_heap,
                     ) {
                         return Err(VmError::TypeError {
-                            message: "Proxy ownKeys trap result contains duplicate entries"
-                                .to_string(),
+                            message: ("Proxy ownKeys trap result contains duplicate entries"
+                                .to_string())
+                            .into(),
                         });
                     }
                 }
@@ -3042,8 +3058,9 @@ impl Interpreter {
         for key in &target_nonconfigurable {
             if !consume(key, &mut consumed, &mut remaining, &self.gc_heap) {
                 return Err(VmError::TypeError {
-                    message: "Proxy ownKeys trap result omits a non-configurable target own key"
-                        .to_string(),
+                    message: ("Proxy ownKeys trap result omits a non-configurable target own key"
+                        .to_string())
+                    .into(),
                 });
             }
         }
@@ -3053,17 +3070,18 @@ impl Interpreter {
         for key in &target_configurable {
             if !consume(key, &mut consumed, &mut remaining, &self.gc_heap) {
                 return Err(VmError::TypeError {
-                    message:
+                    message:(
                         "Proxy ownKeys trap result omits a target own key while target is non-extensible"
-                            .to_string(),
+                            .to_string()).into(),
                 });
             }
         }
         if remaining != 0 {
             return Err(VmError::TypeError {
                 message:
-                    "Proxy ownKeys trap result includes extra keys while target is non-extensible"
-                        .to_string(),
+                    ("Proxy ownKeys trap result includes extra keys while target is non-extensible"
+                        .to_string())
+                    .into(),
             });
         }
         Ok(trap_result)
@@ -3090,8 +3108,9 @@ impl Interpreter {
         if let Some(proxy) = target.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {
-                    message: "Cannot perform 'setPrototypeOf' on a proxy that has been revoked"
-                        .to_string(),
+                    message: ("Cannot perform 'setPrototypeOf' on a proxy that has been revoked"
+                        .to_string())
+                    .into(),
                 });
             }
             let trap_args: SmallVec<[Value; 8]> =
@@ -3109,9 +3128,9 @@ impl Interpreter {
                             self.ordinary_get_prototype_value(context, target_value, 0)?;
                         if !abstract_ops::same_value(proto, &target_proto, &self.gc_heap) {
                             return Err(VmError::TypeError {
-                                message:
+                                message:(
                                     "Proxy setPrototypeOf invariant violated: target is non-extensible and prototypes differ"
-                                        .to_string(),
+                                        .to_string()).into(),
                             });
                         }
                     }
@@ -3244,8 +3263,10 @@ impl Interpreter {
         if let Some(proxy) = value.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {
-                    message: "Cannot perform 'preventExtensions' on a proxy that has been revoked"
-                        .to_string(),
+                    message:
+                        ("Cannot perform 'preventExtensions' on a proxy that has been revoked"
+                            .to_string())
+                        .into(),
                 });
             }
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
@@ -3254,9 +3275,9 @@ impl Interpreter {
                     let ok = result.to_boolean(&self.gc_heap);
                     if ok && self.is_extensible_value(context, &proxy.target(&self.gc_heap))? {
                         return Err(VmError::TypeError {
-                            message:
+                            message:(
                                 "Proxy preventExtensions trap succeeded but target is still extensible"
-                                    .to_string(),
+                                    .to_string()).into(),
                         });
                     }
                     Ok(ok)
@@ -3335,7 +3356,7 @@ impl Interpreter {
                     Ok(Some(value))
                 }
                 VmGetOutcome::Value(_) => Err(VmError::TypeError {
-                    message: "instanceof prototype is not an object".to_string(),
+                    message: ("instanceof prototype is not an object".to_string()).into(),
                 }),
                 VmGetOutcome::InvokeGetter { getter } => {
                     let args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -3344,7 +3365,7 @@ impl Interpreter {
                         Ok(Some(value))
                     } else {
                         Err(VmError::TypeError {
-                            message: "instanceof prototype is not an object".to_string(),
+                            message: ("instanceof prototype is not an object".to_string()).into(),
                         })
                     }
                 }
@@ -3360,7 +3381,7 @@ impl Interpreter {
                 Ok(Some(value))
             } else {
                 Err(VmError::TypeError {
-                    message: "instanceof prototype is not an object".to_string(),
+                    message: ("instanceof prototype is not an object".to_string()).into(),
                 })
             };
         }
@@ -3392,7 +3413,7 @@ impl Interpreter {
                 Ok(Some(value))
             } else {
                 Err(VmError::TypeError {
-                    message: "instanceof prototype is not an object".to_string(),
+                    message: ("instanceof prototype is not an object".to_string()).into(),
                 })
             };
         }
@@ -3413,7 +3434,7 @@ impl Interpreter {
                     Ok(Some(value))
                 }
                 VmGetOutcome::Value(_) => Err(VmError::TypeError {
-                    message: "instanceof prototype is not an object".to_string(),
+                    message: ("instanceof prototype is not an object".to_string()).into(),
                 }),
                 VmGetOutcome::InvokeGetter { getter } => {
                     let args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -3422,7 +3443,7 @@ impl Interpreter {
                         Ok(Some(value))
                     } else {
                         Err(VmError::TypeError {
-                            message: "instanceof prototype is not an object".to_string(),
+                            message: ("instanceof prototype is not an object".to_string()).into(),
                         })
                     }
                 }
@@ -3444,7 +3465,7 @@ impl Interpreter {
                 Ok(Some(value))
             } else {
                 Err(VmError::TypeError {
-                    message: "instanceof prototype is not an object".to_string(),
+                    message: ("instanceof prototype is not an object".to_string()).into(),
                 })
             };
         }
@@ -3476,7 +3497,7 @@ impl Interpreter {
                 Ok(Some(value))
             } else {
                 Err(VmError::TypeError {
-                    message: "instanceof prototype is not an object".to_string(),
+                    message: ("instanceof prototype is not an object".to_string()).into(),
                 })
             };
         }
@@ -3547,7 +3568,7 @@ impl Interpreter {
                     // step 9 — reading an export still in its TDZ
                     // (uninitialized binding slot) is a ReferenceError.
                     Some(value) if value.is_hole() => Err(VmError::ThisUninitialized {
-                        message: format!("Cannot access '{name}' before initialization"),
+                        message: (format!("Cannot access '{name}' before initialization")).into(),
                     }),
                     Some(value) => Ok(VmGetOutcome::Value(value)),
                     None => Ok(VmGetOutcome::Value(Value::undefined())),
@@ -4437,18 +4458,18 @@ impl Interpreter {
                         if let Some(desc) = target_desc {
                             if !desc.configurable() {
                                 return Err(VmError::TypeError {
-                                    message:
+                                    message:(
                                         "Proxy has trap returned false but target has the property as non-configurable"
-                                            .to_string(),
+                                            .to_string()).into(),
                                 });
                             }
                             let target_extensible =
                                 self.is_extensible_value(context, &target_value)?;
                             if !target_extensible {
                                 return Err(VmError::TypeError {
-                                    message:
+                                    message:(
                                         "Proxy has trap returned false but target has the property and is non-extensible"
-                                            .to_string(),
+                                            .to_string()).into(),
                                 });
                             }
                         }
@@ -4674,7 +4695,7 @@ impl Interpreter {
             let ok = self.define_own_property_value(context, target, &key, descriptor)?;
             if !ok {
                 return Err(VmError::TypeError {
-                    message: "Cannot define property".to_string(),
+                    message: ("Cannot define property".to_string()).into(),
                 });
             }
             return Ok(Some(*target));
@@ -4714,7 +4735,7 @@ impl Interpreter {
             M::Freeze => {
                 if !self.set_integrity_level_value(context, target, ObjectIntegrityLevel::Frozen)? {
                     return Err(VmError::TypeError {
-                        message: "Object.freeze failed".to_string(),
+                        message: ("Object.freeze failed".to_string()).into(),
                     });
                 }
                 Ok(Some(*target))
@@ -4722,7 +4743,7 @@ impl Interpreter {
             M::Seal => {
                 if !self.set_integrity_level_value(context, target, ObjectIntegrityLevel::Sealed)? {
                     return Err(VmError::TypeError {
-                        message: "Object.seal failed".to_string(),
+                        message: ("Object.seal failed".to_string()).into(),
                     });
                 }
                 Ok(Some(*target))
@@ -4747,7 +4768,7 @@ impl Interpreter {
                 // underlying `[[PreventExtensions]]` returns false.
                 if !ok {
                     return Err(VmError::TypeError {
-                        message: "Object.preventExtensions failed".to_string(),
+                        message: ("Object.preventExtensions failed".to_string()).into(),
                     });
                 }
                 Ok(Some(*target))
@@ -4764,7 +4785,7 @@ impl Interpreter {
                 let ok = self.define_own_property_value(context, target, &key, descriptor)?;
                 if !ok {
                     return Err(VmError::TypeError {
-                        message: "Object.defineProperty failed".to_string(),
+                        message: ("Object.defineProperty failed".to_string()).into(),
                     });
                 }
                 Ok(Some(*target))
@@ -4889,7 +4910,7 @@ impl Interpreter {
                 return Ok(result);
             }
             return Err(VmError::TypeError {
-                message: "Cannot convert object to primitive value".to_string(),
+                message: ("Cannot convert object to primitive value".to_string()).into(),
             });
         }
         let order: [&str; 2] = match hint {
@@ -4909,7 +4930,7 @@ impl Interpreter {
             }
         }
         Err(VmError::TypeError {
-            message: "Cannot convert object to primitive value".to_string(),
+            message: ("Cannot convert object to primitive value".to_string()).into(),
         })
     }
 
@@ -4937,7 +4958,7 @@ impl Interpreter {
                     );
                 }
                 return Err(VmError::TypeError {
-                    message: "Proxy ownKeys trap returned non-array".to_string(),
+                    message: ("Proxy ownKeys trap returned non-array".to_string()).into(),
                 });
             } else {
                 return self.enumerable_own_string_keys_for_value(
@@ -5226,17 +5247,17 @@ impl Interpreter {
                     if let Some(desc) = target_desc {
                         if !desc.configurable() {
                             return Err(VmError::TypeError {
-                                message:
+                                message:(
                                     "Proxy deleteProperty trap returned true but target has the property as non-configurable"
-                                        .to_string(),
+                                        .to_string()).into(),
                             });
                         }
                         let target_extensible = self.is_extensible_value(context, &target_value)?;
                         if !target_extensible {
                             return Err(VmError::TypeError {
-                                message:
+                                message:(
                                     "Proxy deleteProperty trap returned true but target is non-extensible"
-                                        .to_string(),
+                                        .to_string()).into(),
                             });
                         }
                     }
@@ -5484,7 +5505,8 @@ impl Interpreter {
         if let Some(proxy) = target.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {
-                    message: "Cannot perform 'set' on a proxy that has been revoked".to_string(),
+                    message: ("Cannot perform 'set' on a proxy that has been revoked".to_string())
+                        .into(),
                 });
             }
             let key_value = self.vm_property_key_to_value(key)?;
@@ -5519,16 +5541,16 @@ impl Interpreter {
                                     ) =>
                             {
                                 return Err(VmError::TypeError {
-                                    message:
+                                    message:(
                                         "Proxy set trap reported success but target is non-configurable non-writable with a different value"
-                                            .to_string(),
+                                            .to_string()).into(),
                                 });
                             }
                             object::DescriptorKind::Accessor { setter: None, .. } => {
                                 return Err(VmError::TypeError {
-                                    message:
+                                    message:(
                                         "Proxy set trap reported success but target is a non-configurable accessor without a setter"
-                                            .to_string(),
+                                            .to_string()).into(),
                                 });
                             }
                             _ => {}

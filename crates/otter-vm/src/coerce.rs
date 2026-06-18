@@ -117,7 +117,7 @@ pub(crate) fn to_string_or_throw(
     };
     if primitive.is_symbol() {
         return Err(VmError::TypeError {
-            message: "Cannot convert a Symbol value to a string".to_string(),
+            message: ("Cannot convert a Symbol value to a string".to_string()).into(),
         });
     }
     if let Some(s) = primitive.as_string(&interp.gc_heap) {
@@ -156,12 +156,12 @@ pub(crate) fn to_number_or_throw(
     };
     if primitive.is_symbol() {
         return Err(VmError::TypeError {
-            message: "Cannot convert a Symbol value to a number".to_string(),
+            message: ("Cannot convert a Symbol value to a number".to_string()).into(),
         });
     }
     if primitive.is_big_int() {
         return Err(VmError::TypeError {
-            message: "Cannot convert a BigInt value to a number".to_string(),
+            message: ("Cannot convert a BigInt value to a number".to_string()).into(),
         });
     }
     Ok(NumberValue::from_f64(
@@ -180,7 +180,7 @@ pub(crate) fn to_number_for_number_ctor(
 ) -> Result<NumberValue, VmError> {
     if input.is_symbol() {
         return Err(VmError::TypeError {
-            message: "Cannot convert a Symbol value to a number".to_string(),
+            message: ("Cannot convert a Symbol value to a number".to_string()).into(),
         });
     }
     if let Some(b) = input.as_big_int() {
@@ -197,7 +197,7 @@ pub(crate) fn to_number_for_number_ctor(
     };
     if primitive.is_symbol() {
         return Err(VmError::TypeError {
-            message: "Cannot convert a Symbol value to a number".to_string(),
+            message: ("Cannot convert a Symbol value to a number".to_string()).into(),
         });
     }
     if let Some(b) = primitive.as_big_int() {
@@ -259,21 +259,21 @@ pub(crate) fn to_big_int_or_throw(
         let text = s.to_lossy_string(&interp.gc_heap);
         let parsed =
             abstract_ops::string_to_big_int(&text).ok_or_else(|| VmError::SyntaxError {
-                message: format!("Cannot convert {text:?} to a BigInt"),
+                message: (format!("Cannot convert {text:?} to a BigInt")).into(),
             })?;
         return BigIntValue::from_inner(&mut interp.gc_heap, parsed).map_err(crate::oom_to_vm);
     }
     if primitive.is_number() {
         return Err(VmError::TypeError {
-            message: "Cannot convert a Number to a BigInt".to_string(),
+            message: ("Cannot convert a Number to a BigInt".to_string()).into(),
         });
     }
     if primitive.is_symbol() {
         return Err(VmError::TypeError {
-            message: "Cannot convert a Symbol value to a BigInt".to_string(),
+            message: ("Cannot convert a Symbol value to a BigInt".to_string()).into(),
         });
     }
     Err(VmError::TypeError {
-        message: "Cannot convert value to a BigInt".to_string(),
+        message: ("Cannot convert value to a BigInt".to_string()).into(),
     })
 }

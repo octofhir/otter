@@ -28,11 +28,11 @@ use super::typed_array::{JsTypedArray, TypedArrayKind};
 fn to_index_error(value: &Value, what: &str) -> VmError {
     if value.is_symbol() || value.is_big_int() {
         VmError::TypeError {
-            message: format!("Cannot convert {what} to a number"),
+            message: (format!("Cannot convert {what} to a number")).into(),
         }
     } else {
         VmError::RangeError {
-            message: format!("Invalid {what}"),
+            message: (format!("Invalid {what}")).into(),
         }
     }
 }
@@ -54,7 +54,7 @@ pub fn array_buffer_call(
     use otter_bytecode::method_id::ArrayBufferMethod as M;
     match method {
         M::Construct => Err(VmError::TypeError {
-            message: "ArrayBuffer construction requires rooted dispatch".to_string(),
+            message: ("ArrayBuffer construction requires rooted dispatch".to_string()).into(),
         }),
         // §25.1.3.1 ArrayBuffer.isView(arg) — returns `true` when
         // arg is a TypedArray or DataView.
@@ -107,24 +107,27 @@ pub fn array_buffer_call_with_roots(
                     let max = max as usize;
                     if max < len {
                         return Err(VmError::RangeError {
-                            message: "ArrayBuffer maxByteLength is smaller than byteLength"
-                                .to_string(),
+                            message: ("ArrayBuffer maxByteLength is smaller than byteLength"
+                                .to_string())
+                            .into(),
                         });
                     }
                     JsArrayBuffer::new_resizable_with_roots(len, max, gc_heap, external_visit)
                         .map_err(oom_to_vm)?
                         .ok_or_else(|| VmError::RangeError {
-                            message: format!(
+                            message: (format!(
                                 "ArrayBuffer allocation of {max} bytes exceeds the available heap"
-                            ),
+                            ))
+                            .into(),
                         })?
                 }
                 None => JsArrayBuffer::try_new_with_roots(len, gc_heap, external_visit)
                     .map_err(oom_to_vm)?
                     .ok_or_else(|| VmError::RangeError {
-                        message: format!(
+                        message: (format!(
                             "ArrayBuffer allocation of {len} bytes exceeds the available heap"
-                        ),
+                        ))
+                        .into(),
                     })?,
             };
             Ok(Value::array_buffer(buf))
@@ -183,29 +186,28 @@ pub fn shared_array_buffer_call_with_roots(
                     let max = max as usize;
                     if max < len {
                         return Err(VmError::RangeError {
-                            message: "SharedArrayBuffer maxByteLength is smaller than byteLength"
-                                .to_string(),
+                            message: ("SharedArrayBuffer maxByteLength is smaller than byteLength"
+                                .to_string())
+                            .into(),
                         });
                     }
-                    JsArrayBuffer::new_shared_growable_with_roots(
-                        len,
-                        max,
-                        gc_heap,
-                        external_visit,
-                    )
-                    .map_err(oom_to_vm)?
-                    .ok_or_else(|| VmError::RangeError {
-                        message: format!(
+                    JsArrayBuffer::new_shared_growable_with_roots(len, max, gc_heap, external_visit)
+                        .map_err(oom_to_vm)?
+                        .ok_or_else(|| {
+                            VmError::RangeError {
+                        message:( format!(
                             "SharedArrayBuffer allocation of {max} bytes exceeds the available heap"
-                        ),
-                    })?
+                        )).into(),
+                    }
+                        })?
                 }
                 None => JsArrayBuffer::try_new_shared_with_roots(len, gc_heap, external_visit)
                     .map_err(oom_to_vm)?
                     .ok_or_else(|| VmError::RangeError {
-                        message: format!(
+                        message: (format!(
                             "SharedArrayBuffer allocation of {len} bytes exceeds the available heap"
-                        ),
+                        ))
+                        .into(),
                     })?,
             };
             Ok(Value::array_buffer(buf))
@@ -302,7 +304,7 @@ fn oom_to_vm(err: otter_gc::OutOfMemory) -> VmError {
 
 fn typed_array_byte_len(len: usize, bpe: usize) -> Result<usize, VmError> {
     len.checked_mul(bpe).ok_or_else(|| VmError::RangeError {
-        message: "TypedArray byte length overflow".to_string(),
+        message: ("TypedArray byte length overflow".to_string()).into(),
     })
 }
 
@@ -323,9 +325,10 @@ pub(crate) fn typed_array_from_values_with_roots(
     let new_buf = JsArrayBuffer::try_new_with_roots(byte_len, gc_heap, &mut buffer_roots)
         .map_err(oom_to_vm)?
         .ok_or_else(|| VmError::RangeError {
-            message: format!(
+            message: (format!(
                 "TypedArray allocation of {byte_len} bytes exceeds the available heap"
-            ),
+            ))
+            .into(),
         })?;
     let view = JsTypedArray::new(gc_heap, new_buf, kind, 0, values.len()).map_err(oom_to_vm)?;
     let mut encoded = vec![0u8; byte_len];
@@ -346,9 +349,10 @@ fn new_zeroed_typed_array_with_roots(
     let new_buf = JsArrayBuffer::try_new_with_roots(byte_len, gc_heap, external_visit)
         .map_err(oom_to_vm)?
         .ok_or_else(|| VmError::RangeError {
-            message: format!(
+            message: (format!(
                 "TypedArray allocation of {byte_len} bytes exceeds the available heap"
-            ),
+            ))
+            .into(),
         })?;
     let view = JsTypedArray::new(gc_heap, new_buf, kind, 0, len).map_err(oom_to_vm)?;
     Ok(Value::typed_array(view))
@@ -382,13 +386,13 @@ fn construct_typed_array_with_roots(
         } as usize;
         if !byte_offset.is_multiple_of(bpe) {
             return Err(VmError::RangeError {
-                message: format!("start offset must be a multiple of {bpe}"),
+                message: (format!("start offset must be a multiple of {bpe}")).into(),
             });
         }
         let buf_len = buf.byte_length(gc_heap);
         if byte_offset > buf_len {
             return Err(VmError::RangeError {
-                message: "start offset is outside the bounds of the buffer".to_string(),
+                message: ("start offset is outside the bounds of the buffer".to_string()).into(),
             });
         }
         let length = match args.get(2) {
@@ -400,9 +404,10 @@ fn construct_typed_array_with_roots(
                 // floors (bytesAvailable / elementSize).
                 if !buf.is_resizable(gc_heap) && !remaining.is_multiple_of(bpe) {
                     return Err(VmError::RangeError {
-                        message: format!(
+                        message: (format!(
                             "buffer length minus the offset must be a multiple of {bpe}"
-                        ),
+                        ))
+                        .into(),
                     });
                 }
                 remaining / bpe
@@ -415,9 +420,10 @@ fn construct_typed_array_with_roots(
                 // floors (bytesAvailable / elementSize).
                 if !buf.is_resizable(gc_heap) && !remaining.is_multiple_of(bpe) {
                     return Err(VmError::RangeError {
-                        message: format!(
+                        message: (format!(
                             "buffer length minus the offset must be a multiple of {bpe}"
-                        ),
+                        ))
+                        .into(),
                     });
                 }
                 remaining / bpe
@@ -426,7 +432,7 @@ fn construct_typed_array_with_roots(
                 let n = to_index(v, gc_heap).ok_or_else(|| to_index_error(v, "length"))? as usize;
                 if byte_offset + n * bpe > buf_len {
                     return Err(VmError::RangeError {
-                        message: "invalid typed array length".to_string(),
+                        message: ("invalid typed array length".to_string()).into(),
                     });
                 }
                 n

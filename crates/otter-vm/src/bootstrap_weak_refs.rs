@@ -222,7 +222,7 @@ fn vm_to_native(err: crate::VmError, name: &'static str) -> NativeError {
     match err {
         crate::VmError::TypeError { message } => NativeError::TypeError {
             name,
-            reason: message,
+            reason: message.into(),
         },
         crate::VmError::NotCallable => NativeError::TypeError {
             name,
@@ -230,7 +230,7 @@ fn vm_to_native(err: crate::VmError, name: &'static str) -> NativeError {
         },
         crate::VmError::Uncaught { value } => NativeError::Thrown {
             name,
-            message: value,
+            message: value.into(),
         },
         other => NativeError::TypeError {
             name,

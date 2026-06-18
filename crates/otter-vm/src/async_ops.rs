@@ -456,9 +456,9 @@ impl Interpreter {
                 if uncaught_error.is_none() {
                     self.pending_uncaught_throw = Some(payload);
                 }
-                return Err(uncaught_error
-                    .take()
-                    .unwrap_or(VmError::Uncaught { value: display }));
+                return Err(uncaught_error.take().unwrap_or(VmError::Uncaught {
+                    value: (display).into(),
+                }));
             }
             let popped_handler = {
                 let frame = stack.last_mut().expect("frame present");

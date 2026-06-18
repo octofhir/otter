@@ -334,7 +334,7 @@ fn uri_decode(input: &str, _component: bool) -> Result<String, VmError> {
 
 fn uri_error() -> VmError {
     VmError::URIError {
-        message: "URI malformed".to_string(),
+        message: ("URI malformed".to_string()).into(),
     }
 }
 

@@ -56,7 +56,7 @@ impl Interpreter {
         let key = VmPropertyKey::String(name);
         if !self.ordinary_has_property_value(context, receiver, &key, 0)? {
             return Err(VmError::UndefinedIdentifier {
-                name: name.to_string(),
+                name: (name.to_string()).into(),
             });
         }
         let value = match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
@@ -116,7 +116,7 @@ impl Interpreter {
             // `ThisUninitialized` is the engine's named-TDZ
             // `ReferenceError` vehicle (same as module bindings).
             return Err(VmError::ThisUninitialized {
-                message: format!("Cannot access '{name}' before initialization"),
+                message: (format!("Cannot access '{name}' before initialization")).into(),
             });
         }
         Ok(Some(value))
@@ -157,7 +157,7 @@ impl Interpreter {
             descriptor,
         ) {
             return Err(VmError::TypeError {
-                message: format!("Cannot declare global var '{name}'"),
+                message: (format!("Cannot declare global var '{name}'")).into(),
             });
         }
         frame.advance_pc(self.current_byte_len)?;
@@ -183,7 +183,7 @@ impl Interpreter {
         // surface here).
         if self.global_lexicals.contains_key(name) {
             return Err(VmError::SyntaxError {
-                message: format!("Identifier '{name}' has already been declared"),
+                message: (format!("Identifier '{name}' has already been declared")).into(),
             });
         }
         if object::get_own_descriptor(self.global_this, &self.gc_heap, name).is_none() {
@@ -203,7 +203,7 @@ impl Interpreter {
                 descriptor,
             ) {
                 return Err(VmError::TypeError {
-                    message: format!("Cannot declare global variable '{name}'"),
+                    message: (format!("Cannot declare global variable '{name}'")).into(),
                 });
             }
         }
@@ -250,7 +250,7 @@ impl Interpreter {
                 descriptor,
             ) {
                 return Err(VmError::TypeError {
-                    message: format!("Cannot declare global function '{name}'"),
+                    message: (format!("Cannot declare global function '{name}'")).into(),
                 });
             }
         } else {
@@ -261,7 +261,7 @@ impl Interpreter {
             });
             if !permitted {
                 return Err(VmError::TypeError {
-                    message: format!("Cannot declare global function '{name}'"),
+                    message: (format!("Cannot declare global function '{name}'")).into(),
                 });
             }
             object::set(self.global_this, &mut self.gc_heap, name, value);
@@ -404,7 +404,7 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         if self.global_lexicals.contains_key(name) {
             return Err(VmError::SyntaxError {
-                message: format!("Identifier '{name}' has already been declared"),
+                message: (format!("Identifier '{name}' has already been declared")).into(),
             });
         }
         // §9.1.1.4.14 HasRestrictedGlobalProperty — an existing
@@ -417,7 +417,7 @@ impl Interpreter {
             && !descriptor.flags.configurable()
         {
             return Err(VmError::SyntaxError {
-                message: format!("Identifier '{name}' has already been declared"),
+                message: (format!("Identifier '{name}' has already been declared")).into(),
             });
         }
         let cell = crate::alloc_upvalue(&mut self.gc_heap, Value::hole())?;
@@ -445,7 +445,7 @@ impl Interpreter {
             0 => {
                 if self.global_lexicals.contains_key(name) {
                     return Err(VmError::SyntaxError {
-                        message: format!("Identifier '{name}' has already been declared"),
+                        message: (format!("Identifier '{name}' has already been declared")).into(),
                     });
                 }
                 if let Some(descriptor) =
@@ -453,7 +453,7 @@ impl Interpreter {
                     && !descriptor.flags.configurable()
                 {
                     return Err(VmError::SyntaxError {
-                        message: format!("Identifier '{name}' has already been declared"),
+                        message: (format!("Identifier '{name}' has already been declared")).into(),
                     });
                 }
             }
@@ -462,7 +462,7 @@ impl Interpreter {
             1 => {
                 if self.global_lexicals.contains_key(name) {
                     return Err(VmError::SyntaxError {
-                        message: format!("Identifier '{name}' has already been declared"),
+                        message: (format!("Identifier '{name}' has already been declared")).into(),
                     });
                 }
             }
@@ -471,7 +471,7 @@ impl Interpreter {
             _ => {
                 if self.global_lexicals.contains_key(name) {
                     return Err(VmError::SyntaxError {
-                        message: format!("Identifier '{name}' has already been declared"),
+                        message: (format!("Identifier '{name}' has already been declared")).into(),
                     });
                 }
                 if let Some(descriptor) =
@@ -483,7 +483,7 @@ impl Interpreter {
                         && descriptor.flags.enumerable();
                     if !permitted {
                         return Err(VmError::TypeError {
-                            message: format!("Cannot declare global function '{name}'"),
+                            message: (format!("Cannot declare global function '{name}'")).into(),
                         });
                     }
                 }
@@ -534,12 +534,12 @@ impl Interpreter {
         if let Some(&(cell, is_const)) = self.global_lexicals.get(name) {
             if is_const {
                 return Err(VmError::TypeError {
-                    message: format!("Assignment to constant variable `{name}`"),
+                    message: (format!("Assignment to constant variable `{name}`")).into(),
                 });
             }
             if crate::read_upvalue(&self.gc_heap, cell).is_hole() {
                 return Err(VmError::ThisUninitialized {
-                    message: format!("Cannot access '{name}' before initialization"),
+                    message: (format!("Cannot access '{name}' before initialization")).into(),
                 });
             }
             crate::store_upvalue(&mut self.gc_heap, cell, value);
@@ -553,7 +553,7 @@ impl Interpreter {
             && crate::object::get(self.global_this, &self.gc_heap, name).is_none()
         {
             return Err(VmError::UndefinedIdentifier {
-                name: name.to_string(),
+                name: (name.to_string()).into(),
             });
         }
         self.run_define_global_var_reg(context, frame, name_idx, value_reg)

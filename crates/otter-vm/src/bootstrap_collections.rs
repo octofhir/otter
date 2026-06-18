@@ -364,7 +364,7 @@ fn map_group_by_vm_error(err: crate::VmError) -> NativeError {
     match err {
         crate::VmError::Uncaught { value } => NativeError::Thrown {
             name: "Map.groupBy",
-            message: value,
+            message: value.into(),
         },
         other => NativeError::TypeError {
             name: "Map.groupBy",
@@ -1876,7 +1876,7 @@ fn vm_to_native(err: VmError, name: &'static str) -> NativeError {
     match err {
         VmError::TypeError { message } => NativeError::TypeError {
             name,
-            reason: message,
+            reason: message.into(),
         },
         VmError::TypeMismatch => NativeError::TypeError {
             name,
@@ -1884,11 +1884,11 @@ fn vm_to_native(err: VmError, name: &'static str) -> NativeError {
         },
         VmError::SyntaxError { message } => NativeError::SyntaxError {
             name,
-            reason: message,
+            reason: message.into(),
         },
         VmError::RangeError { message } => NativeError::RangeError {
             name,
-            reason: message,
+            reason: message.into(),
         },
         VmError::NotCallable => NativeError::TypeError {
             name,
@@ -1896,7 +1896,7 @@ fn vm_to_native(err: VmError, name: &'static str) -> NativeError {
         },
         VmError::Uncaught { value } => NativeError::Thrown {
             name,
-            message: value,
+            message: value.into(),
         },
         VmError::OutOfMemory { .. } => NativeError::TypeError {
             name,

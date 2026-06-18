@@ -431,7 +431,7 @@ impl Interpreter {
                 crate::promise::PromiseState::Fulfilled(v) => v,
                 crate::promise::PromiseState::Rejected(reason) => {
                     return Err(VmError::Uncaught {
-                        value: self.render_thrown(&reason),
+                        value: (self.render_thrown(&reason)).into(),
                     });
                 }
                 crate::promise::PromiseState::Pending => Value::undefined(),
@@ -553,7 +553,7 @@ impl Interpreter {
         }
         if primitive.is_symbol() {
             return Err(VmError::TypeError {
-                message: "Cannot convert a Symbol value to a string".to_string(),
+                message: ("Cannot convert a Symbol value to a string".to_string()).into(),
             });
         }
         Ok(primitive.display_string(&self.gc_heap))
@@ -587,9 +587,12 @@ impl Interpreter {
             .eval_hook
             .as_ref()
             .ok_or_else(|| VmError::SyntaxError {
-                message: "eval / new Function are disabled (no compiler hook installed)"
-                    .to_string(),
+                message: ("eval / new Function are disabled (no compiler hook installed)"
+                    .to_string())
+                .into(),
             })?;
-        hook(source, options).map_err(|message| VmError::SyntaxError { message })
+        hook(source, options).map_err(|message| VmError::SyntaxError {
+            message: message.into(),
+        })
     }
 }

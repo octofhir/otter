@@ -45,9 +45,8 @@ pub(super) fn ordinary_set_data_property(
     let append_index = heap.read_payload(obj, |body| super::body_property_count(heap, body));
     // The writable/accessor gate reads the slot's attributes through the shape,
     // which `with_payload` cannot walk, so resolve it under a read borrow first.
-    let existing_attrs = existing_offset.map(|offset| {
-        heap.read_payload(obj, |body| body.slot_attrs(heap, offset as usize))
-    });
+    let existing_attrs = existing_offset
+        .map(|offset| heap.read_payload(obj, |body| body.slot_attrs(heap, offset as usize)));
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
             let i = offset as usize;
@@ -90,9 +89,8 @@ pub(super) fn ordinary_set_data_property_with_shape(
 ) -> bool {
     let barrier_value = value;
     let existing_offset = heap.read_payload(obj, |body| super::body_offset_of(heap, body, key));
-    let existing_attrs = existing_offset.map(|offset| {
-        heap.read_payload(obj, |body| body.slot_attrs(heap, offset as usize))
-    });
+    let existing_attrs = existing_offset
+        .map(|offset| heap.read_payload(obj, |body| body.slot_attrs(heap, offset as usize)));
     // `append_index` (the slot the new property occupies) is supplied by the
     // caller from the shape it transitioned from, so the hot path adds no shape
     // read; verify the invariant in debug builds.

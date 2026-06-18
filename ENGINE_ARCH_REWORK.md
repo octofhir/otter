@@ -28,9 +28,11 @@ breaking redesign:
 | R3 | Array **`.length`** read goes through the property stub; **no LICM** hoists it | every `for(i<arr.length)` loop | **1.7×** (471 ms vs 279 ms; 10M stubs vs 0) |
 | R4 | Per-call **frame build** dominates compiled calls | every non-inlined call | **fib 56%** of self-time in call setup |
 
-Plus the cross-cutting **VmError fat-enum drop** (5–15% everywhere, audit §4)
-and the umbrella **no-optimizing-tier** box/unbox tax (mandelbrot's 75%-compiled
-loop still ~7× node on compute).
+Plus the umbrella **no-optimizing-tier** box/unbox tax (mandelbrot's
+75%-compiled loop still ~7× node on compute). The cross-cutting
+**VmError fat-enum drop** from the audit has landed: user-facing string
+payloads now live behind boxed `str`s, keeping `VmError` size-guarded at 24B
+while preserving structured error classes.
 
 ---
 
@@ -487,7 +489,7 @@ measurable against a committed reproducer.
 | step | lever | scope | expected | unlocks |
 |---|---|---|---|---|
 | 1 | **R1** self-priming property IC — LANDED | JIT stub + IC fill | 5–9× on top-level code | de-risks all IC work |
-| 2 | **VmError shrink** (audit A) | mechanical, Box payloads | 5–15% broad | cleaner profiles |
+| 2 | **VmError shrink** — LANDED | boxed string payloads + 24B guard | 5–15% broad | cleaner profiles |
 | 3 | **D4** Math.* intrinsics — LANDED guarded opcode | compiler + VM/JIT delegate | float benches | safe guard contract for native emit |
 | 4 | **R3** inline array `.length` | emit + array header | kills per-iter length stub | every array loop |
 | 5 | **D1+R2** object-model rewrite: split god-struct + flat slab | ObjectBody, GC tracing, body offsets | ~13× alloc, ≈7–10× smaller objects, fewer GC cycles | json/prop/array/OO |

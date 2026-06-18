@@ -248,7 +248,7 @@ impl Interpreter {
         // MethodDefinition bodies are not constructors.
         if function.is_async || function.is_generator || function.is_method {
             return Err(VmError::TypeError {
-                message: "function is not a constructor".to_string(),
+                message: ("function is not a constructor".to_string()).into(),
             });
         }
         let upvalues =
@@ -308,7 +308,7 @@ impl Interpreter {
         // constructors.
         if function.is_async || function.is_generator || function.is_method {
             return Err(VmError::TypeError {
-                message: "function is not a constructor".to_string(),
+                message: ("function is not a constructor".to_string()).into(),
             });
         }
         let upvalues =
@@ -625,7 +625,7 @@ impl Interpreter {
             // §10.3.1 — a class constructor's [[Call]] always
             // throws; only [[Construct]] may enter it.
             return Err(VmError::TypeError {
-                message: "Class constructor cannot be invoked without 'new'".to_string(),
+                message: ("Class constructor cannot be invoked without 'new'".to_string()).into(),
             });
         }
         if current.is_bound_function() {
@@ -834,7 +834,8 @@ impl Interpreter {
                 // bound-function wrapper or Reflect/Function call
                 // forwarding. Only [[Construct]] may enter it.
                 return Err(VmError::TypeError {
-                    message: "Class constructor cannot be invoked without 'new'".to_string(),
+                    message: ("Class constructor cannot be invoked without 'new'".to_string())
+                        .into(),
                 });
             }
             break;
@@ -1166,7 +1167,8 @@ impl Interpreter {
                     // primitive returns surface as TypeError.
                     if !v.is_object_type() {
                         return Err(VmError::TypeError {
-                            message: "Proxy construct trap returned non-object".to_string(),
+                            message: ("Proxy construct trap returned non-object".to_string())
+                                .into(),
                         });
                     }
                     v
@@ -1428,7 +1430,7 @@ impl Interpreter {
         };
         if !proto.is_object_type() && proxy.is_some_and(|proxy| proxy.is_revoked(&self.gc_heap)) {
             return Err(VmError::TypeError {
-                message: "Cannot get prototype from a revoked proxy".to_string(),
+                message: ("Cannot get prototype from a revoked proxy".to_string()).into(),
             });
         }
         Ok(proto.is_object_type().then_some(proto))
@@ -1617,7 +1619,8 @@ impl Interpreter {
             } else if current.as_class_constructor().is_some() {
                 // §10.3.1 — class constructors reject [[Call]].
                 return Err(VmError::TypeError {
-                    message: "Class constructor cannot be invoked without 'new'".to_string(),
+                    message: ("Class constructor cannot be invoked without 'new'".to_string())
+                        .into(),
                 });
             } else if let Some(proxy) = current.as_proxy() {
                 // §10.5.12 Proxy [[Call]] — dispatch `apply` trap or
@@ -1625,8 +1628,9 @@ impl Interpreter {
                 // absent.
                 if proxy.is_revoked(&self.gc_heap) {
                     return Err(VmError::TypeError {
-                        message: "Cannot perform 'apply' on a proxy that has been revoked"
-                            .to_string(),
+                        message: ("Cannot perform 'apply' on a proxy that has been revoked"
+                            .to_string())
+                        .into(),
                     });
                 }
                 hops += 1;
@@ -1655,7 +1659,7 @@ impl Interpreter {
                     current = proxy.target(&self.gc_heap);
                 } else {
                     return Err(VmError::TypeError {
-                        message: "Proxy apply trap is not callable".to_string(),
+                        message: ("Proxy apply trap is not callable".to_string()).into(),
                     });
                 }
             } else {
@@ -1947,8 +1951,9 @@ impl Interpreter {
                 // §10.5.13 Proxy [[Construct]].
                 if proxy.is_revoked(&self.gc_heap) {
                     return Err(VmError::TypeError {
-                        message: "Cannot perform 'construct' on a proxy that has been revoked"
-                            .to_string(),
+                        message: ("Cannot perform 'construct' on a proxy that has been revoked"
+                            .to_string())
+                        .into(),
                     });
                 }
                 hops += 1;
@@ -1983,7 +1988,8 @@ impl Interpreter {
                         self.run_callable_sync(context, &trap_value, handler, trap_args)?;
                     if !result.is_object_type() {
                         return Err(VmError::TypeError {
-                            message: "Proxy construct trap returned non-object".to_string(),
+                            message: ("Proxy construct trap returned non-object".to_string())
+                                .into(),
                         });
                     }
                     return Ok(result);
@@ -1991,7 +1997,7 @@ impl Interpreter {
                     current = proxy.target(&self.gc_heap);
                 } else {
                     return Err(VmError::TypeError {
-                        message: "Proxy construct trap is not callable".to_string(),
+                        message: ("Proxy construct trap is not callable".to_string()).into(),
                     });
                 }
             } else {

@@ -115,7 +115,7 @@ impl Interpreter {
         if wrote {
             let s = JsString::from_str(&buffer, self.gc_heap_mut()).map_err(|_| {
                 VmError::TypeError {
-                    message: "out of memory".to_string(),
+                    message: ("out of memory".to_string()).into(),
                 }
             })?;
             Ok(Value::string(s))
@@ -203,7 +203,7 @@ impl Interpreter {
             if still_original {
                 let js = JsString::from_str(src, self.gc_heap_mut()).map_err(|_| {
                     VmError::TypeError {
-                        message: "out of memory".to_string(),
+                        message: ("out of memory".to_string()).into(),
                     }
                 })?;
                 object::set(obj, self.gc_heap_mut(), "source", Value::string(js));
@@ -219,7 +219,7 @@ impl Interpreter {
             &mut |_: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {},
         )
         .map_err(|_| VmError::TypeError {
-            message: "out of memory".to_string(),
+            message: ("out of memory".to_string()).into(),
         })?;
         let object_proto = self.object_prototype_object_opt();
         object::set_prototype_value(obj, self.gc_heap_mut(), object_proto.map(Value::object));
@@ -384,7 +384,7 @@ impl Interpreter {
                     let s = self.coerce_to_string(context, &value)?;
                     let js = JsString::from_str(&s, self.gc_heap_mut()).map_err(|_| {
                         VmError::TypeError {
-                            message: "out of memory".to_string(),
+                            message: ("out of memory".to_string()).into(),
                         }
                     })?;
                     value = Value::string(js);
@@ -426,7 +426,7 @@ impl Interpreter {
         }
         if value.is_big_int() {
             return Err(VmError::TypeError {
-                message: BIGINT_MESSAGE.to_string(),
+                message: (BIGINT_MESSAGE.to_string()).into(),
             });
         }
         // step 11 — Object that is not callable.
@@ -605,13 +605,13 @@ impl Interpreter {
     fn json_enter(&self, state: &mut JsonState, value: &Value) -> Result<(), VmError> {
         if state.stack.len() >= MAX_NESTING_DEPTH {
             return Err(VmError::TypeError {
-                message: format!("JSON nesting exceeded {MAX_NESTING_DEPTH} levels."),
+                message: (format!("JSON nesting exceeded {MAX_NESTING_DEPTH} levels.")).into(),
             });
         }
         let id = self.json_identity(value);
         if !id.is_null() && state.stack.contains(&id) {
             return Err(VmError::TypeError {
-                message: CYCLIC_MESSAGE.to_string(),
+                message: (CYCLIC_MESSAGE.to_string()).into(),
             });
         }
         state.stack.push(id);
@@ -648,8 +648,9 @@ impl Interpreter {
             if let Some(proxy) = current.as_proxy() {
                 if proxy.is_revoked(self.gc_heap()) {
                     return Err(VmError::TypeError {
-                        message: "Cannot perform IsArray on a proxy that has been revoked"
-                            .to_string(),
+                        message: ("Cannot perform IsArray on a proxy that has been revoked"
+                            .to_string())
+                        .into(),
                     });
                 }
                 current = proxy.target(self.gc_heap());
@@ -798,7 +799,7 @@ impl Interpreter {
                 let s = self.coerce_to_string(context, space)?;
                 let js =
                     JsString::from_str(&s, self.gc_heap_mut()).map_err(|_| VmError::TypeError {
-                        message: "out of memory".to_string(),
+                        message: ("out of memory".to_string()).into(),
                     })?;
                 Value::string(js)
             } else {
@@ -835,7 +836,7 @@ impl Interpreter {
         let obj =
             object::alloc_object_with_roots(self.gc_heap_mut(), &mut roots).map_err(|_| {
                 VmError::TypeError {
-                    message: "out of memory".to_string(),
+                    message: ("out of memory".to_string()).into(),
                 }
             })?;
         let object_proto = self.object_prototype_object_opt();
@@ -847,7 +848,7 @@ impl Interpreter {
     /// Build the `key` argument passed to `toJSON` / the replacer.
     fn json_key_value(&mut self, key: &str) -> Result<Value, VmError> {
         let s = JsString::from_str(key, self.gc_heap_mut()).map_err(|_| VmError::TypeError {
-            message: "out of memory".to_string(),
+            message: ("out of memory".to_string()).into(),
         })?;
         Ok(Value::string(s))
     }

@@ -126,7 +126,7 @@ impl Interpreter {
             .unwrap_or_else(Value::undefined);
         if value.is_hole() {
             return Err(VmError::ThisUninitialized {
-                message: format!("Cannot access '{name}' before initialization"),
+                message: (format!("Cannot access '{name}' before initialization")).into(),
             });
         }
         write_register(frame, dst, value)?;
@@ -205,8 +205,9 @@ impl Interpreter {
         {
             return Err(VmError::TypeError {
                 message:
-                    "Cannot synchronously evaluate a deferred module that uses top-level await"
-                        .to_string(),
+                    ("Cannot synchronously evaluate a deferred module that uses top-level await"
+                        .to_string())
+                    .into(),
             });
         }
         self.evaluate_module(context, url).map(|_| ())
@@ -256,7 +257,7 @@ impl Interpreter {
                     if let Some(thrown) = record.evaluation_error {
                         self.set_pending_uncaught_throw(thrown);
                         return Err(VmError::Uncaught {
-                            value: self.render_thrown(&thrown),
+                            value: (self.render_thrown(&thrown)).into(),
                         });
                     }
                     return Ok(record.evaluation_promise);
@@ -314,7 +315,7 @@ impl Interpreter {
                     if let Some(thrown) = record.evaluation_error {
                         self.set_pending_uncaught_throw(thrown);
                         return Err(VmError::Uncaught {
-                            value: self.render_thrown(&thrown),
+                            value: (self.render_thrown(&thrown)).into(),
                         });
                     }
                     return Ok(());
@@ -386,7 +387,7 @@ impl Interpreter {
                 {
                     self.set_pending_uncaught_throw(thrown);
                     return Err(VmError::Uncaught {
-                        value: self.render_thrown(&thrown),
+                        value: (self.render_thrown(&thrown)).into(),
                     });
                 }
                 root
@@ -486,7 +487,7 @@ impl Interpreter {
             }
             self.set_pending_uncaught_throw(thrown);
             return VmError::Uncaught {
-                value: self.render_thrown(&thrown),
+                value: (self.render_thrown(&thrown)).into(),
             };
         }
         // Infrastructure failure — reset so a later attempt can retry.
@@ -1082,8 +1083,9 @@ impl Interpreter {
         }
         if !self.module_ready_for_sync_execution(context, target_url.as_ref(), &mut Vec::new()) {
             return Err(VmError::TypeError {
-                message: "Cannot synchronously evaluate a deferred module while it is evaluating"
-                    .to_string(),
+                message: ("Cannot synchronously evaluate a deferred module while it is evaluating"
+                    .to_string())
+                .into(),
             });
         }
         self.evaluate_module_rec(context, &target_url)?;
@@ -1295,8 +1297,9 @@ impl Interpreter {
                 } else {
                     let fallback = JsString::from_str(&value, &mut self.gc_heap).map_err(|_| {
                         VmError::TypeError {
-                            message: "dynamic import: failed to allocate rejection reason"
-                                .to_string(),
+                            message: ("dynamic import: failed to allocate rejection reason"
+                                .to_string())
+                            .into(),
                         }
                     })?;
                     Value::string(fallback)

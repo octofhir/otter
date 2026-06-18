@@ -202,7 +202,7 @@ fn eval_script(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
         .map_err(|err| match err {
             otter_vm::VmError::SyntaxError { message } => NativeError::SyntaxError {
                 name: "evalScript",
-                reason: message,
+                reason: message.into(),
             },
             // An uncaught throw from the script body arrives rendered
             // ("SyntaxError: …"); recover the spec error class so
@@ -354,13 +354,15 @@ fn spawn_worker_agent(
                 .as_number()
                 .map(|number| number.as_f64() as u64)
                 .ok_or(otter_vm::VmError::TypeError {
-                    message: "Worker backend returned a non-numeric id".to_string(),
+                    message: "Worker backend returned a non-numeric id"
+                        .to_string()
+                        .into(),
                 })
         })
         .map_err(|err| match err {
             otter_vm::VmError::Uncaught { value } => NativeError::Thrown {
                 name: "$262.agent.start",
-                message: value,
+                message: value.into(),
             },
             other => type_err(other.to_string()),
         })
@@ -457,7 +459,7 @@ fn agent_receive_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
         .map_err(|e| match e {
             otter_vm::VmError::Uncaught { value } => NativeError::Thrown {
                 name: "$262.agent.receiveBroadcast",
-                message: value,
+                message: value.into(),
             },
             other => type_err(other.to_string()),
         })
@@ -544,7 +546,7 @@ fn drain_worker_agent_events(ctx: &mut NativeCtx<'_>) -> Result<(), NativeError>
             .map_err(|err| match err {
                 otter_vm::VmError::Uncaught { value } => NativeError::Thrown {
                     name: "$262.agent.getReport",
-                    message: value,
+                    message: value.into(),
                 },
                 other => type_err(other.to_string()),
             })?;

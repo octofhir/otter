@@ -558,8 +558,9 @@ impl Interpreter {
         };
         if !(prototype.is_object_type() || prototype.is_proxy()) {
             return Err(VmError::TypeError {
-                message: "Function has non-object prototype 'undefined' in instanceof check"
-                    .to_string(),
+                message: ("Function has non-object prototype 'undefined' in instanceof check"
+                    .to_string())
+                .into(),
             });
         }
         self.value_has_proxy_aware_prototype(context, *o, &prototype)
@@ -588,8 +589,9 @@ impl Interpreter {
         };
         if !(prototype.is_object_type() || prototype.is_proxy()) {
             return Err(VmError::TypeError {
-                message: "Function has non-object prototype 'undefined' in instanceof check"
-                    .to_string(),
+                message: ("Function has non-object prototype 'undefined' in instanceof check"
+                    .to_string())
+                .into(),
             });
         }
         self.value_has_proxy_aware_prototype(context, *o, &prototype)
@@ -607,7 +609,7 @@ impl Interpreter {
     ) -> Result<bool, VmError> {
         if !target.is_object_type() {
             return Err(VmError::TypeError {
-                message: "Right-hand side of instanceof is not an object".to_string(),
+                message: ("Right-hand side of instanceof is not an object".to_string()).into(),
             });
         }
         let has_instance_sym = self.well_known_symbols.get(symbol::WellKnown::HasInstance);
@@ -621,7 +623,7 @@ impl Interpreter {
         if !handler.is_nullish() {
             if !self.is_callable_runtime(&handler) {
                 return Err(VmError::TypeError {
-                    message: "@@hasInstance must be callable".to_string(),
+                    message: ("@@hasInstance must be callable".to_string()).into(),
                 });
             }
             if let Some(native) = handler.as_native_function()
@@ -639,7 +641,7 @@ impl Interpreter {
         }
         if !self.is_callable_runtime(target) {
             return Err(VmError::TypeError {
-                message: "Right-hand side of instanceof is not callable".to_string(),
+                message: ("Right-hand side of instanceof is not callable".to_string()).into(),
             });
         }
         self.ordinary_has_instance(context, target, v)
@@ -654,7 +656,7 @@ impl Interpreter {
     ) -> Result<bool, VmError> {
         if !target.is_object_type() {
             return Err(VmError::TypeError {
-                message: "Right-hand side of instanceof is not an object".to_string(),
+                message: ("Right-hand side of instanceof is not an object".to_string()).into(),
             });
         }
         let has_instance_sym = self.well_known_symbols.get(symbol::WellKnown::HasInstance);
@@ -668,7 +670,7 @@ impl Interpreter {
         if !handler.is_nullish() {
             if !self.is_callable_runtime(&handler) {
                 return Err(VmError::TypeError {
-                    message: "@@hasInstance must be callable".to_string(),
+                    message: ("@@hasInstance must be callable".to_string()).into(),
                 });
             }
             if let Some(native) = handler.as_native_function()
@@ -686,7 +688,7 @@ impl Interpreter {
         }
         if !self.is_callable_runtime(target) {
             return Err(VmError::TypeError {
-                message: "Right-hand side of instanceof is not callable".to_string(),
+                message: ("Right-hand side of instanceof is not callable".to_string()).into(),
             });
         }
         self.ordinary_has_instance_stack_rooted(context, stack, target, v)
@@ -719,7 +721,8 @@ impl Interpreter {
         // TypedArray, collections, etc.).
         if !value.is_object_type() {
             return Err(VmError::TypeError {
-                message: "Function.prototype.apply argument list must be object-like".to_string(),
+                message: ("Function.prototype.apply argument list must be object-like".to_string())
+                    .into(),
             });
         }
         let length = self.get_property_value_for_call(context, value, "length")?;
@@ -780,7 +783,7 @@ impl Interpreter {
         }
         if !c.is_object_type() {
             return Err(VmError::TypeError {
-                message: "constructor property is not an object".to_string(),
+                message: ("constructor property is not an object".to_string()).into(),
             });
         }
         let species_sym = self
@@ -800,7 +803,7 @@ impl Interpreter {
             return Ok(s);
         }
         Err(VmError::TypeError {
-            message: "Symbol.species value is not a constructor".to_string(),
+            message: ("Symbol.species value is not a constructor".to_string()).into(),
         })
     }
     fn callable_bind_metadata_get(
@@ -1314,7 +1317,7 @@ impl Interpreter {
                         crate::object_internal_ops::ObjectIntegrityLevel::Frozen,
                     )? {
                         return Err(VmError::TypeError {
-                            message: "Object.freeze failed".to_string(),
+                            message: ("Object.freeze failed".to_string()).into(),
                         });
                     }
                     return Ok(Some(target));
@@ -1326,7 +1329,7 @@ impl Interpreter {
                         crate::object_internal_ops::ObjectIntegrityLevel::Sealed,
                     )? {
                         return Err(VmError::TypeError {
-                            message: "Object.seal failed".to_string(),
+                            message: ("Object.seal failed".to_string()).into(),
                         });
                     }
                     return Ok(Some(target));

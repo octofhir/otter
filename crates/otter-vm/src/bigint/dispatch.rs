@@ -76,7 +76,7 @@ fn to_bigint(heap: &GcHeap, value: &Value) -> Result<BigInt, VmError> {
         let f = n.as_f64();
         if !f.is_finite() || f.fract() != 0.0 {
             return Err(VmError::RangeError {
-                message: "The number is not a safe integer for BigInt".to_string(),
+                message: ("The number is not a safe integer for BigInt".to_string()).into(),
             });
         }
         return Ok(BigInt::from(f as i128));
@@ -87,7 +87,7 @@ fn to_bigint(heap: &GcHeap, value: &Value) -> Result<BigInt, VmError> {
     // §7.1.13 step 7 — Symbol → TypeError.
     if value.is_symbol() {
         return Err(VmError::TypeError {
-            message: "Cannot convert a Symbol value to a BigInt".to_string(),
+            message: ("Cannot convert a Symbol value to a BigInt".to_string()).into(),
         });
     }
     // §7.1.13 step 4 — ToPrimitive(value, "number") then
@@ -97,16 +97,16 @@ fn to_bigint(heap: &GcHeap, value: &Value) -> Result<BigInt, VmError> {
     // and surfaces as TypeError.
     if value.is_array() {
         return Err(VmError::TypeError {
-            message: "Cannot convert Array to a BigInt".to_string(),
+            message: ("Cannot convert Array to a BigInt".to_string()).into(),
         });
     }
     if value.is_null() || value.is_undefined() {
         return Err(VmError::TypeError {
-            message: "Cannot convert null or undefined to a BigInt".to_string(),
+            message: ("Cannot convert null or undefined to a BigInt".to_string()).into(),
         });
     }
     Err(VmError::TypeError {
-        message: "Cannot convert value to a BigInt".to_string(),
+        message: ("Cannot convert value to a BigInt".to_string()).into(),
     })
 }
 
@@ -119,7 +119,7 @@ fn to_bigint(heap: &GcHeap, value: &Value) -> Result<BigInt, VmError> {
 fn to_bigint_strict(heap: &GcHeap, value: &Value) -> Result<BigInt, VmError> {
     if value.is_number() {
         return Err(VmError::TypeError {
-            message: "Cannot convert a Number to a BigInt".to_string(),
+            message: ("Cannot convert a Number to a BigInt".to_string()).into(),
         });
     }
     to_bigint(heap, value)
@@ -139,7 +139,7 @@ fn string_to_bigint(text: &str) -> Result<BigInt, VmError> {
         .ok()
         .or_else(|| parse_radix_literal(trimmed))
         .ok_or_else(|| VmError::SyntaxError {
-            message: format!("Cannot convert {trimmed:?} to a BigInt"),
+            message: (format!("Cannot convert {trimmed:?} to a BigInt")).into(),
         })
 }
 
@@ -181,11 +181,11 @@ fn expect_bits(arg: Option<&Value>, heap: &GcHeap) -> Result<u32, VmError> {
         crate::number::parse::to_number_from_string(&s.to_lossy_string(heap)).as_f64()
     } else if v.is_symbol() {
         return Err(VmError::TypeError {
-            message: "Cannot convert a Symbol value to a number".to_string(),
+            message: ("Cannot convert a Symbol value to a number".to_string()).into(),
         });
     } else if v.is_big_int() {
         return Err(VmError::TypeError {
-            message: "Cannot convert a BigInt value to a number".to_string(),
+            message: ("Cannot convert a BigInt value to a number".to_string()).into(),
         });
     } else {
         // Object operands should have been pre-coerced by the
@@ -193,7 +193,7 @@ fn expect_bits(arg: Option<&Value>, heap: &GcHeap) -> Result<u32, VmError> {
         // else is treated as a non-primitive that fails the
         // ToNumber arm.
         return Err(VmError::TypeError {
-            message: "Cannot convert value to a number".to_string(),
+            message: ("Cannot convert value to a number".to_string()).into(),
         });
     };
     // §7.1.5 ToIntegerOrInfinity — NaN collapses to 0, infinities
@@ -204,14 +204,14 @@ fn expect_bits(arg: Option<&Value>, heap: &GcHeap) -> Result<u32, VmError> {
     let trunc = n.trunc();
     if trunc.is_infinite() || !(0.0..=9_007_199_254_740_991.0).contains(&trunc) {
         return Err(VmError::RangeError {
-            message: "Invalid bits parameter for BigInt.asIntN / asUintN".to_string(),
+            message: ("Invalid bits parameter for BigInt.asIntN / asUintN".to_string()).into(),
         });
     }
     if trunc > u32::MAX as f64 {
         // The spec allows up to 2^53-1, but the per-arm implementation
         // can only address up to `u32::MAX` bits before overflow.
         return Err(VmError::RangeError {
-            message: "Bits parameter exceeds supported range".to_string(),
+            message: ("Bits parameter exceeds supported range".to_string()).into(),
         });
     }
     Ok(trunc as u32)

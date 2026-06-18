@@ -170,11 +170,11 @@ fn date_vm_error(err: VmError) -> NativeError {
     match err {
         VmError::TypeError { message } => NativeError::TypeError {
             name: "Date",
-            reason: message,
+            reason: message.into(),
         },
         VmError::Uncaught { value } => NativeError::Thrown {
             name: "Date",
-            message: value,
+            message: value.into(),
         },
         other => NativeError::TypeError {
             name: "Date",

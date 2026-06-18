@@ -480,19 +480,19 @@ fn vm_err_to_native(name: &'static str) -> impl Fn(crate::VmError) -> crate::Nat
     move |err| match err {
         crate::VmError::Uncaught { value } => crate::NativeError::Thrown {
             name,
-            message: value,
+            message: value.into(),
         },
         crate::VmError::TypeError { message } => crate::NativeError::TypeError {
             name,
-            reason: message,
+            reason: message.into(),
         },
         crate::VmError::RangeError { message } => crate::NativeError::RangeError {
             name,
-            reason: message,
+            reason: message.into(),
         },
         crate::VmError::SyntaxError { message } => crate::NativeError::SyntaxError {
             name,
-            reason: message,
+            reason: message.into(),
         },
         other => crate::NativeError::TypeError {
             name,

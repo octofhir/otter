@@ -68,11 +68,11 @@ fn symbol_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
                         .map_err(|e| match e {
                             crate::VmError::TypeError { message } => NativeError::TypeError {
                                 name: "Symbol",
-                                reason: message,
+                                reason: message.into(),
                             },
                             crate::VmError::Uncaught { value } => NativeError::Thrown {
                                 name: "Symbol",
-                                message: value,
+                                message: value.into(),
                             },
                             other => NativeError::TypeError {
                                 name: "Symbol",
@@ -118,11 +118,11 @@ fn symbol_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
                 .map_err(|e| match e {
                     crate::VmError::TypeError { message } => NativeError::TypeError {
                         name: "Symbol.for",
-                        reason: message,
+                        reason: message.into(),
                     },
                     crate::VmError::Uncaught { value } => NativeError::Thrown {
                         name: "Symbol.for",
-                        message: value,
+                        message: value.into(),
                     },
                     other => NativeError::TypeError {
                         name: "Symbol.for",

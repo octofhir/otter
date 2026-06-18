@@ -422,6 +422,6 @@ fn bigint_to_vm_error(err: bigint::ops::OpError) -> VmError {
         bigint::ops::OpError::ShiftOutOfRange => "Maximum BigInt size exceeded",
     };
     VmError::RangeError {
-        message: message.to_string(),
+        message: (message.to_string()).into(),
     }
 }

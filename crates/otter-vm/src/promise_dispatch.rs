@@ -1063,7 +1063,7 @@ fn promise_vm_error(name: &'static str, err: crate::VmError) -> NativeError {
     match err {
         crate::VmError::Uncaught { value } => NativeError::Thrown {
             name,
-            message: value,
+            message: value.into(),
         },
         other => NativeError::TypeError {
             name,

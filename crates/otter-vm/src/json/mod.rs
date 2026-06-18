@@ -207,16 +207,16 @@ fn vm_to_native_parse(err: VmError) -> NativeError {
     match err {
         VmError::Uncaught { value } => NativeError::Thrown {
             name: "parse",
-            message: value,
+            message: value.into(),
         },
         VmError::RangeError { message } => NativeError::RangeError {
             name: "parse",
-            reason: message,
+            reason: message.into(),
         },
         VmError::Exit { code } => NativeError::Exit { code },
         VmError::TypeError { message } => NativeError::TypeError {
             name: "parse",
-            reason: message,
+            reason: message.into(),
         },
         other => NativeError::TypeError {
             name: "parse",
@@ -279,7 +279,7 @@ fn coerce_text_to_string(
             .map_err(|err| match err {
                 VmError::Uncaught { value } => NativeError::Thrown {
                     name,
-                    message: value,
+                    message: value.into(),
                 },
                 other => NativeError::TypeError {
                     name,
@@ -392,20 +392,20 @@ fn vm_to_native_stringify(err: VmError) -> NativeError {
     match err {
         VmError::Uncaught { value } => NativeError::Thrown {
             name: "stringify",
-            message: value,
+            message: value.into(),
         },
         VmError::SyntaxError { message } => NativeError::SyntaxError {
             name: "stringify",
-            reason: message,
+            reason: message.into(),
         },
         VmError::RangeError { message } => NativeError::RangeError {
             name: "stringify",
-            reason: message,
+            reason: message.into(),
         },
         VmError::Exit { code } => NativeError::Exit { code },
         VmError::TypeError { message } => NativeError::TypeError {
             name: "stringify",
-            reason: message,
+            reason: message.into(),
         },
         other => NativeError::TypeError {
             name: "stringify",

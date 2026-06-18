@@ -49,7 +49,9 @@ fn intl_to_vm_error(err: intl::IntlError) -> VmError {
             name: format!("Intl.{class}.prototype.{method}"),
         },
         intl::IntlError::BadArgument { .. } => VmError::TypeMismatch,
-        intl::IntlError::Engine { message, .. } => VmError::Uncaught { value: message },
+        intl::IntlError::Engine { message, .. } => VmError::Uncaught {
+            value: (message).into(),
+        },
         intl::IntlError::OutOfMemory {
             requested_bytes,
             heap_limit_bytes,

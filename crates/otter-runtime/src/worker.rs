@@ -761,7 +761,7 @@ fn vm_error_to_native(err: otter_vm::VmError) -> NativeError {
     match err {
         otter_vm::VmError::Uncaught { value } => NativeError::Thrown {
             name: "Worker",
-            message: value,
+            message: value.into(),
         },
         other => type_err("Worker", other.to_string()),
     }

@@ -1255,15 +1255,15 @@ fn vm_err(err: crate::VmError, name: &'static str) -> NativeError {
     match err {
         crate::VmError::Uncaught { value } => NativeError::Thrown {
             name,
-            message: value,
+            message: value.into(),
         },
         crate::VmError::TypeError { message } => NativeError::TypeError {
             name,
-            reason: message,
+            reason: message.into(),
         },
         crate::VmError::RangeError { message } => NativeError::RangeError {
             name,
-            reason: message,
+            reason: message.into(),
         },
         other => NativeError::TypeError {
             name,
@@ -2298,11 +2298,11 @@ fn native_string_method(
                 .map_err(|e| match e {
                     crate::VmError::Uncaught { value } => NativeError::Thrown {
                         name,
-                        message: value,
+                        message: value.into(),
                     },
                     crate::VmError::TypeError { message } => NativeError::TypeError {
                         name,
-                        reason: message,
+                        reason: message.into(),
                     },
                     other => NativeError::TypeError {
                         name,

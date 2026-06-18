@@ -775,11 +775,11 @@ fn accessor_flags(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
     let map_err = |e: crate::VmError| match e {
         crate::VmError::Uncaught { value } => NativeError::Thrown {
             name: "get RegExp.prototype.flags",
-            message: value,
+            message: value.into(),
         },
         crate::VmError::TypeError { message } => NativeError::TypeError {
             name: "get RegExp.prototype.flags",
-            reason: message,
+            reason: message.into(),
         },
         other => NativeError::TypeError {
             name: "get RegExp.prototype.flags",

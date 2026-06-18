@@ -42,7 +42,7 @@ fn coerce_length_integer(
             .map_err(|e| match e {
                 VmError::Uncaught { value } => NativeError::Thrown {
                     name,
-                    message: value,
+                    message: value.into(),
                 },
                 other => NativeError::TypeError {
                     name,

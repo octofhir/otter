@@ -420,17 +420,18 @@ impl Interpreter {
             }
         } else {
             return Err(VmError::TypeError {
-                message: format!(
+                message: (format!(
                     "Cannot delete property '{name}' of {}",
                     value_kind_name(&receiver)
-                ),
+                ))
+                .into(),
             });
         };
         // §13.5.1.2 step 5.c — when the result of `[[Delete]]` is
         // `false` in strict mode, throw a TypeError.
         if !removed && strict {
             return Err(VmError::TypeError {
-                message: format!("Cannot delete property '{name}'"),
+                message: (format!("Cannot delete property '{name}'")).into(),
             });
         }
         write_register(frame, dst, Value::boolean(removed))?;
@@ -642,7 +643,7 @@ impl Interpreter {
         };
         if !removed && strict {
             return Err(VmError::TypeError {
-                message: "Cannot delete property".to_string(),
+                message: ("Cannot delete property".to_string()).into(),
             });
         }
         write_register(frame, dst, Value::boolean(removed))?;
@@ -684,13 +685,14 @@ impl Interpreter {
         let actual_this = stack[top_idx].this_value;
         if actual_this.is_hole() {
             return Err(VmError::ThisUninitialized {
-                message: "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string(),
+                message:( "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()).into(),
             });
         }
         let base = self.get_prototype_for_op(&home)?;
         if base.is_null() || base.is_undefined() {
             return Err(VmError::TypeError {
-                message: "cannot read property of null or undefined super reference".to_string(),
+                message: ("cannot read property of null or undefined super reference".to_string())
+                    .into(),
             });
         }
         let key = match key {
@@ -738,13 +740,14 @@ impl Interpreter {
         let actual_this = stack[top_idx].this_value;
         if actual_this.is_hole() {
             return Err(VmError::ThisUninitialized {
-                message: "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string(),
+                message:( "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()).into(),
             });
         }
         let base = self.get_prototype_for_op(&home)?;
         if base.is_null() || base.is_undefined() {
             return Err(VmError::TypeError {
-                message: "cannot write property of null or undefined super reference".to_string(),
+                message: ("cannot write property of null or undefined super reference".to_string())
+                    .into(),
             });
         }
         let key = match key {
@@ -893,7 +896,7 @@ impl Interpreter {
             let ok = self.set_prototype_value_proxy_aware(context, &receiver, &proto)?;
             if !ok {
                 return Err(VmError::TypeError {
-                    message: "Object.setPrototypeOf failed".to_string(),
+                    message: ("Object.setPrototypeOf failed".to_string()).into(),
                 });
             }
         } else if receiver.is_function()
@@ -1730,10 +1733,11 @@ impl Interpreter {
             None
         } else if receiver.is_undefined() || receiver.is_null() || receiver.is_hole() {
             return Err(VmError::TypeError {
-                message: format!(
+                message: (format!(
                     "Cannot set property '{name}' on {}",
                     value_kind_name(&receiver)
-                ),
+                ))
+                .into(),
             });
         } else if receiver.is_boolean()
             || receiver.is_number()
@@ -1784,7 +1788,7 @@ impl Interpreter {
         let idx_value_raw = *read_register(frame, idx_reg)?;
         if recv.is_nullish() {
             return Err(VmError::TypeError {
-                message: "Cannot read property of null or undefined".to_string(),
+                message: ("Cannot read property of null or undefined".to_string()).into(),
             });
         }
         let idx_value = self.coerce_property_key_value(context, idx_value_raw)?;
@@ -2273,7 +2277,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         if strict && !crate::array::can_write_array_property(arr, &self.gc_heap, key) {
             return Err(VmError::TypeError {
-                message: format!("Cannot assign to read only property '{key}' of array"),
+                message: (format!("Cannot assign to read only property '{key}' of array")).into(),
             });
         }
         Ok(())
@@ -2377,8 +2381,9 @@ impl Interpreter {
                     && !object::is_extensible(obj, &self.gc_heap)
                 {
                     return Err(VmError::TypeError {
-                        message: "Cannot define private member on a non-extensible object"
-                            .to_string(),
+                        message: ("Cannot define private member on a non-extensible object"
+                            .to_string())
+                        .into(),
                     });
                 }
                 if object::deferred_namespace_target(obj, &self.gc_heap).is_some() {
@@ -2388,8 +2393,9 @@ impl Interpreter {
                     {
                         return Err(VmError::TypeError {
                             message:
-                                "Cannot add symbol property to non-extensible module namespace"
-                                    .to_string(),
+                                ("Cannot add symbol property to non-extensible module namespace"
+                                    .to_string())
+                                .into(),
                         });
                     } else {
                         self.ordinary_set_symbol_with_callable_setter(
@@ -2484,7 +2490,7 @@ impl Interpreter {
                 )?;
                 if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
                     return Err(VmError::TypeError {
-                        message: "Cannot store symbol property on function".to_string(),
+                        message: ("Cannot store symbol property on function".to_string()).into(),
                     });
                 }
             } else {
@@ -2712,7 +2718,7 @@ impl Interpreter {
                 let bag = typed_array_ensure_expando(self, &t)?;
                 if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
                     return Err(VmError::TypeError {
-                        message: "Cannot store symbol property on TypedArray".to_string(),
+                        message: ("Cannot store symbol property on TypedArray".to_string()).into(),
                     });
                 }
             } else {
@@ -2735,7 +2741,7 @@ impl Interpreter {
                 let bag = regexp_ensure_expando(self, &r, &recv)?;
                 if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
                     return Err(VmError::TypeError {
-                        message: "Cannot store symbol property on RegExp".to_string(),
+                        message: ("Cannot store symbol property on RegExp".to_string()).into(),
                     });
                 }
             } else {
@@ -2746,7 +2752,7 @@ impl Interpreter {
                 let bag = promise_ensure_expando_pub(&mut self.gc_heap, &p)?;
                 if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
                     return Err(VmError::TypeError {
-                        message: "Cannot store symbol property on Promise".to_string(),
+                        message: ("Cannot store symbol property on Promise".to_string()).into(),
                     });
                 }
             } else {
@@ -2759,7 +2765,7 @@ impl Interpreter {
             if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
                     return Err(VmError::TypeError {
-                        message: "Cannot store symbol property on DataView".to_string(),
+                        message: ("Cannot store symbol property on DataView".to_string()).into(),
                     });
                 }
             } else if let Some(s) = idx_value.as_string(&self.gc_heap) {
@@ -2773,7 +2779,8 @@ impl Interpreter {
                 let statics = c.statics(&self.gc_heap);
                 if !crate::object::set_symbol(statics, &mut self.gc_heap, sym, value) {
                     return Err(VmError::TypeError {
-                        message: "Cannot store symbol property on class constructor".to_string(),
+                        message: ("Cannot store symbol property on class constructor".to_string())
+                            .into(),
                     });
                 }
             } else {
@@ -2796,7 +2803,7 @@ impl Interpreter {
             }
         } else if recv.is_undefined() || recv.is_null() || recv.is_hole() {
             return Err(VmError::TypeError {
-                message: format!("Cannot set property on {}", value_kind_name(&recv)),
+                message: (format!("Cannot set property on {}", value_kind_name(&recv))).into(),
             });
         } else if recv.is_boolean()
             || recv.is_number()
@@ -3184,7 +3191,7 @@ impl Interpreter {
             };
             if !self.define_own_property_value(context, &target, &key, descriptor)? {
                 return Err(VmError::TypeError {
-                    message: "Cannot define property on object literal".to_string(),
+                    message: ("Cannot define property on object literal".to_string()).into(),
                 });
             }
         }
@@ -3483,7 +3490,9 @@ impl Interpreter {
                     &self.gc_heap,
                     atomized_key,
                 )
-                && ic.store(obj, &mut self.gc_heap, atomized_key, &value).is_some()
+                && ic
+                    .store(obj, &mut self.gc_heap, atomized_key, &value)
+                    .is_some()
             {
                 self.store_property_ics[site].install_with_stats(
                     &mut self.property_ic_stats,
@@ -3915,7 +3924,7 @@ impl Interpreter {
         let key_value_raw = *read_register(&stack[top_idx], key_reg)?;
         if receiver.is_nullish() {
             return Err(VmError::TypeError {
-                message: "Cannot read property of null or undefined".to_string(),
+                message: ("Cannot read property of null or undefined".to_string()).into(),
             });
         }
         let key_value = self.coerce_property_key_value(context, key_value_raw)?;
@@ -4120,7 +4129,7 @@ impl Interpreter {
     fn finish_failed_set(
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        message: impl Into<String>,
+        message: impl Into<Box<str>>,
         byte_len: u32,
     ) -> Result<bool, VmError> {
         if Self::current_frame_is_strict(stack, context) {
@@ -4133,7 +4142,7 @@ impl Interpreter {
         Ok(true)
     }
 
-    fn failed_set_result(strict: bool, message: impl Into<String>) -> Result<(), VmError> {
+    fn failed_set_result(strict: bool, message: impl Into<Box<str>>) -> Result<(), VmError> {
         if strict {
             Err(VmError::TypeError {
                 message: message.into(),
@@ -4464,16 +4473,16 @@ impl Interpreter {
                                         ) =>
                                 {
                                     return Err(VmError::TypeError {
-                                        message:
+                                        message:(
                                             "Proxy set trap reported success but target is non-configurable non-writable with a different value"
-                                                .to_string(),
+                                                .to_string()).into(),
                                     });
                                 }
                                 object::DescriptorKind::Accessor { setter: None, .. } => {
                                     return Err(VmError::TypeError {
-                                        message:
+                                        message:(
                                             "Proxy set trap reported success but target is a non-configurable accessor without a setter"
-                                                .to_string(),
+                                                .to_string()).into(),
                                     });
                                 }
                                 _ => {}
@@ -4968,7 +4977,8 @@ impl Interpreter {
         if let Some(proxy) = receiver.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {
-                    message: "Cannot perform 'set' on a proxy that has been revoked".to_string(),
+                    message: ("Cannot perform 'set' on a proxy that has been revoked".to_string())
+                        .into(),
                 });
             }
             let key_str = JsString::from_str(name, self.gc_heap_mut())?;
@@ -5015,16 +5025,16 @@ impl Interpreter {
                                     ) =>
                             {
                                 return Err(VmError::TypeError {
-                                        message:
+                                        message:(
                                             "Proxy set trap reported success but target is non-configurable non-writable with a different value"
-                                                .to_string(),
+                                                .to_string()).into(),
                                     });
                             }
                             object::DescriptorKind::Accessor { setter: None, .. } => {
                                 return Err(VmError::TypeError {
-                                    message:
+                                    message:(
                                         "Proxy set trap reported success but target is a non-configurable accessor without a setter"
-                                            .to_string(),
+                                            .to_string()).into(),
                                 });
                             }
                             _ => {}
@@ -5451,7 +5461,7 @@ impl Interpreter {
         let strict = context.function_is_strict(stack[top_idx].function_id);
         if !removed && strict {
             return Err(VmError::TypeError {
-                message: "Cannot delete property".to_string(),
+                message: ("Cannot delete property".to_string()).into(),
             });
         }
         write_register(&mut stack[top_idx], dst, Value::boolean(removed))?;
@@ -5481,7 +5491,7 @@ impl Interpreter {
         let strict = context.function_is_strict(stack[top_idx].function_id);
         if !removed && strict {
             return Err(VmError::TypeError {
-                message: "Cannot delete property".to_string(),
+                message: ("Cannot delete property".to_string()).into(),
             });
         }
         write_register(&mut stack[top_idx], dst, Value::boolean(removed))?;
@@ -5541,7 +5551,7 @@ impl Interpreter {
             // Object.setPrototypeOf throws when [[SetPrototypeOf]]
             // returns false (§20.1.2.21 step 4 DefinePropertyOrThrow).
             return Err(VmError::TypeError {
-                message: "Object.setPrototypeOf failed".to_string(),
+                message: ("Object.setPrototypeOf failed".to_string()).into(),
             });
         }
         Ok(true)

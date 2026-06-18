@@ -4103,17 +4103,21 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
         VmError::BudgetExceeded { message } => runtime_diagnostic(
             DiagnosticKind::Timeout,
             DiagnosticCode::BudgetExceeded,
-            message,
+            message.into(),
         ),
         VmError::TypeMismatch => {
             runtime_diagnostic(DiagnosticKind::Type, DiagnosticCode::TypeMismatch, display)
         }
-        VmError::TypeError { message } => {
-            runtime_diagnostic(DiagnosticKind::Type, DiagnosticCode::TypeError, message)
-        }
-        VmError::SyntaxError { message } => {
-            runtime_diagnostic(DiagnosticKind::Syntax, DiagnosticCode::SyntaxError, message)
-        }
+        VmError::TypeError { message } => runtime_diagnostic(
+            DiagnosticKind::Type,
+            DiagnosticCode::TypeError,
+            message.into(),
+        ),
+        VmError::SyntaxError { message } => runtime_diagnostic(
+            DiagnosticKind::Syntax,
+            DiagnosticCode::SyntaxError,
+            message.into(),
+        ),
         VmError::UnknownIntrinsic { name } => runtime_diagnostic(
             DiagnosticKind::Type,
             DiagnosticCode::UnknownMethod,
@@ -4124,9 +4128,11 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
             DiagnosticCode::Tdz,
             format!("cannot access local {local_index} before initialization"),
         ),
-        VmError::ThisUninitialized { message } => {
-            runtime_diagnostic(DiagnosticKind::Reference, DiagnosticCode::Tdz, message)
-        }
+        VmError::ThisUninitialized { message } => runtime_diagnostic(
+            DiagnosticKind::Reference,
+            DiagnosticCode::Tdz,
+            message.into(),
+        ),
         VmError::StackOverflow { limit } => runtime_diagnostic(
             DiagnosticKind::Range,
             DiagnosticCode::StackOverflow,
@@ -4154,7 +4160,7 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
         VmError::InvalidRegExp { message } => runtime_diagnostic(
             DiagnosticKind::Syntax,
             DiagnosticCode::InvalidRegexp,
-            message,
+            message.into(),
         ),
         VmError::MissingReturn | VmError::InvalidOperand => OtterError::Internal {
             code: DiagnosticCode::VmBytecodeInvariant.as_str().to_string(),

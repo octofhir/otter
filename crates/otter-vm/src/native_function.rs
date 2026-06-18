@@ -1286,7 +1286,7 @@ pub fn vm_to_native_error(err: crate::VmError, name: &'static str) -> NativeErro
     match err {
         crate::VmError::Uncaught { value } => NativeError::Thrown {
             name,
-            message: value,
+            message: value.into(),
         },
         crate::VmError::Coded(payload) => NativeError::Coded {
             kind: payload.kind,
@@ -1295,22 +1295,22 @@ pub fn vm_to_native_error(err: crate::VmError, name: &'static str) -> NativeErro
         },
         crate::VmError::TypeError { message } => NativeError::TypeError {
             name,
-            reason: message,
+            reason: message.into(),
         },
         crate::VmError::RangeError { message } => NativeError::RangeError {
             name,
-            reason: message,
+            reason: message.into(),
         },
         crate::VmError::SyntaxError { message } => NativeError::SyntaxError {
             name,
-            reason: message,
+            reason: message.into(),
         },
         // §10.2.2 / §13.3.7.3 — TDZ and unresolved-reference errors are
         // ReferenceErrors and must keep that class across the native
         // boundary rather than collapsing to the TypeError fallback.
         crate::VmError::ThisUninitialized { ref message } => NativeError::ReferenceError {
             name,
-            reason: message.clone(),
+            reason: message.to_string(),
         },
         crate::VmError::TemporalDeadZone { .. } | crate::VmError::UndefinedIdentifier { .. } => {
             NativeError::ReferenceError {

@@ -383,7 +383,7 @@ impl Interpreter {
                     self.run_callable_sync(context, &next_fn, iter_value, SmallVec::new())?;
                 if !crate::reflect::is_type_object_value(&result) {
                     return Err(VmError::TypeError {
-                        message: "iterator result is not an object".to_string(),
+                        message: ("iterator result is not an object".to_string()).into(),
                     });
                 }
                 // §7.4.5 IteratorComplete / §7.4.6 IteratorValue read
@@ -649,8 +649,9 @@ impl Interpreter {
                         self.run_callable_sync(context, &iter_method, mapped, SmallVec::new())?
                     } else {
                         return Err(VmError::TypeError {
-                            message: "Iterator.prototype.flatMap mapper return must be iterable"
-                                .to_string(),
+                            message: ("Iterator.prototype.flatMap mapper return must be iterable"
+                                .to_string())
+                            .into(),
                         });
                     };
                     if let Some(rc) = iter_value.as_iterator() {
@@ -683,8 +684,9 @@ impl Interpreter {
                     }
                 } else {
                     return Err(VmError::TypeError {
-                        message: "Iterator.prototype.flatMap mapper return must be iterable"
-                            .to_string(),
+                        message: ("Iterator.prototype.flatMap mapper return must be iterable"
+                            .to_string())
+                        .into(),
                     });
                 };
                 let iter_root = Value::iterator(*iter);
@@ -725,12 +727,12 @@ impl Interpreter {
         };
         if method.is_undefined() || method.is_null() {
             return Err(VmError::TypeError {
-                message: "iterator method is not callable".to_string(),
+                message: ("iterator method is not callable".to_string()).into(),
             });
         }
         if !self.is_callable_runtime(&method) {
             return Err(VmError::TypeError {
-                message: "iterator method is not callable".to_string(),
+                message: ("iterator method is not callable".to_string()).into(),
             });
         }
         let iterator = self.run_callable_sync(context, &method, *iterable, SmallVec::new())?;
@@ -743,7 +745,7 @@ impl Interpreter {
             || iterator.is_generator())
         {
             return Err(VmError::TypeError {
-                message: "iterator method did not return an object".to_string(),
+                message: ("iterator method did not return an object".to_string()).into(),
             });
         }
         let next_method = match self.ordinary_get_value(
@@ -781,7 +783,7 @@ impl Interpreter {
         let result = self.run_callable_sync(context, next_method, *iterator, SmallVec::new())?;
         if !result.is_object() && !result.is_proxy() {
             return Err(VmError::TypeError {
-                message: "iterator result is not an object".to_string(),
+                message: ("iterator result is not an object".to_string()).into(),
             });
         }
         // §7.4.6 IteratorStep — anchor the result on the GC root
@@ -828,13 +830,13 @@ impl Interpreter {
         }
         if !self.is_callable_runtime(&return_method) {
             return Err(VmError::TypeError {
-                message: "iterator `return` is not callable".to_string(),
+                message: ("iterator `return` is not callable".to_string()).into(),
             });
         }
         let result = self.run_callable_sync(context, &return_method, *iterator, SmallVec::new())?;
         if !result.is_object() && !result.is_proxy() {
             return Err(VmError::TypeError {
-                message: "iterator `return` did not yield an object".to_string(),
+                message: ("iterator `return` did not yield an object".to_string()).into(),
             });
         }
         Ok(())
@@ -982,7 +984,7 @@ impl Interpreter {
                 )?;
                 let Some(record) = result.as_object() else {
                     return Err(VmError::TypeError {
-                        message: "generator next did not return an object".to_string(),
+                        message: ("generator next did not return an object".to_string()).into(),
                     });
                 };
                 let done = crate::object::get(record, &self.gc_heap, "done")
@@ -1142,7 +1144,7 @@ impl Interpreter {
             if !handle.is_done(&self.gc_heap) {
                 handle.mark_done(&mut self.gc_heap);
                 return Err(VmError::TypeError {
-                    message: "Generator is already running".to_string(),
+                    message: ("Generator is already running".to_string()).into(),
                 });
             }
             // Completed (§27.5.3.3/.4): `next` yields {undefined, true},
@@ -1157,7 +1159,7 @@ impl Interpreter {
                 GeneratorResumeKind::Throw(reason) => {
                     self.set_pending_uncaught_throw(reason);
                     Err(VmError::Uncaught {
-                        value: self.render_thrown(&reason),
+                        value: (self.render_thrown(&reason)).into(),
                     })
                 }
             };
@@ -1275,7 +1277,7 @@ impl Interpreter {
             if sub_stack.is_empty() {
                 handle.mark_done(&mut self.gc_heap);
                 return Err(VmError::Uncaught {
-                    value: "generator-throw".to_string(),
+                    value: ("generator-throw".to_string()).into(),
                 });
             }
             // A handler caught the throw — clear the side channel.

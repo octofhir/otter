@@ -193,28 +193,28 @@ impl Interpreter {
                 )
             }
             VmError::TypeError { message } => {
-                dynamic_message = message.clone();
+                dynamic_message = message.to_string();
                 (
                     error_classes::ErrorKind::TypeError,
                     dynamic_message.as_str(),
                 )
             }
             VmError::RangeError { message } => {
-                dynamic_message = message.clone();
+                dynamic_message = message.to_string();
                 (
                     error_classes::ErrorKind::RangeError,
                     dynamic_message.as_str(),
                 )
             }
             VmError::SyntaxError { message } => {
-                dynamic_message = message.clone();
+                dynamic_message = message.to_string();
                 (
                     error_classes::ErrorKind::SyntaxError,
                     dynamic_message.as_str(),
                 )
             }
             VmError::URIError { message } => {
-                dynamic_message = message.clone();
+                dynamic_message = message.to_string();
                 (error_classes::ErrorKind::URIError, dynamic_message.as_str())
             }
             VmError::NotCallable => (
@@ -226,7 +226,7 @@ impl Interpreter {
                 "cannot access binding before initialization",
             ),
             VmError::ThisUninitialized { message } => {
-                dynamic_message = message.clone();
+                dynamic_message = message.to_string();
                 (
                     error_classes::ErrorKind::ReferenceError,
                     dynamic_message.as_str(),
@@ -399,7 +399,9 @@ pub(crate) fn symbol_to_vm_error(err: symbol_dispatch::SymbolError) -> VmError {
 
 pub(crate) fn native_to_vm_error(err: NativeError) -> VmError {
     match err {
-        NativeError::Thrown { name: _, message } => VmError::Uncaught { value: message },
+        NativeError::Thrown { name: _, message } => VmError::Uncaught {
+            value: (message).into(),
+        },
         NativeError::Coded {
             kind,
             code,
@@ -410,21 +412,21 @@ pub(crate) fn native_to_vm_error(err: NativeError) -> VmError {
             message,
         })),
         NativeError::TypeError { name, reason } => VmError::TypeError {
-            message: format!("{name}: {reason}"),
+            message: (format!("{name}: {reason}")).into(),
         },
         NativeError::SyntaxError { name, reason } => VmError::SyntaxError {
-            message: format!("{name}: {reason}"),
+            message: (format!("{name}: {reason}")).into(),
         },
         NativeError::RangeError { name, reason } => VmError::RangeError {
-            message: format!("{name}: {reason}"),
+            message: (format!("{name}: {reason}")).into(),
         },
         NativeError::URIError { name, reason } => VmError::URIError {
-            message: format!("{name}: {reason}"),
+            message: (format!("{name}: {reason}")).into(),
         },
         // Round-trips back to a ReferenceError-classed VmError so a TDZ
         // error raised behind a native boundary keeps its class.
         NativeError::ReferenceError { name, reason } => VmError::ThisUninitialized {
-            message: format!("{name}: {reason}"),
+            message: (format!("{name}: {reason}")).into(),
         },
         NativeError::Exit { code } => VmError::Exit { code },
         NativeError::Interrupted => VmError::Interrupted,

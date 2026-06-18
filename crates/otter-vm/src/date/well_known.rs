@@ -145,15 +145,15 @@ fn date_proto_to_primitive(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
         .map_err(|err| match err {
             VmError::Uncaught { value } => NativeError::Thrown {
                 name: NAME,
-                message: value,
+                message: value.into(),
             },
             VmError::TypeError { message } => NativeError::TypeError {
                 name: NAME,
-                reason: message,
+                reason: message.into(),
             },
             VmError::RangeError { message } => NativeError::RangeError {
                 name: NAME,
-                reason: message,
+                reason: message.into(),
             },
             other => NativeError::TypeError {
                 name: NAME,

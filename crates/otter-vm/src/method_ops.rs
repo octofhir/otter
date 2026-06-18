@@ -145,7 +145,7 @@ impl Interpreter {
                         name: format!("Math.{member}"),
                     },
                     math::MathError::BadArgument { reason, .. } => VmError::TypeError {
-                        message: format!("Math.{} {reason}", method.name()),
+                        message: (format!("Math.{} {reason}", method.name())).into(),
                     },
                 })?;
             write_register(&mut stack[top_idx], dst, value)?;
@@ -160,7 +160,7 @@ impl Interpreter {
             let key = VmPropertyKey::String("Math");
             if !self.ordinary_has_property_value(context, receiver, &key, 0)? {
                 return Err(VmError::UndefinedIdentifier {
-                    name: "Math".to_string(),
+                    name: ("Math".to_string()).into(),
                 });
             }
             match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
@@ -177,7 +177,7 @@ impl Interpreter {
                 "undefined"
             };
             return Err(VmError::TypeError {
-                message: format!("Cannot read properties of {label}"),
+                message: (format!("Cannot read properties of {label}")).into(),
             });
         }
         let callee = self
@@ -320,7 +320,7 @@ impl Interpreter {
                 "undefined"
             };
             return Err(VmError::TypeError {
-                message: format!("Cannot read properties of {label}"),
+                message: (format!("Cannot read properties of {label}")).into(),
             });
         }
 
@@ -649,7 +649,7 @@ impl Interpreter {
                     b.to_decimal_string(&self.gc_heap)
                 } else if original.is_symbol() {
                     return Err(VmError::TypeError {
-                        message: "Cannot convert a Symbol value to a string".to_string(),
+                        message: ("Cannot convert a Symbol value to a string".to_string()).into(),
                     });
                 } else if original.is_object()
                     || original.is_array()
@@ -679,7 +679,8 @@ impl Interpreter {
                         b.to_decimal_string(&self.gc_heap)
                     } else if primitive.is_symbol() {
                         return Err(VmError::TypeError {
-                            message: "Cannot convert a Symbol value to a string".to_string(),
+                            message: ("Cannot convert a Symbol value to a string".to_string())
+                                .into(),
                         });
                     } else {
                         return Err(VmError::TypeMismatch);
@@ -900,7 +901,7 @@ impl Interpreter {
         if recv.is_nullish() {
             let label = if recv.is_null() { "null" } else { "undefined" };
             return Err(VmError::TypeError {
-                message: format!("Cannot read properties of {label}"),
+                message: (format!("Cannot read properties of {label}")).into(),
             });
         }
         let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(arg_regs.len());
@@ -1332,9 +1333,10 @@ impl Interpreter {
         // callback runs.
         if t.is_out_of_bounds(&self.gc_heap) {
             return Err(VmError::TypeError {
-                message: format!(
+                message: (format!(
                     "TypedArray.prototype.{name} called on a detached or out-of-bounds ArrayBuffer"
-                ),
+                ))
+                .into(),
             });
         }
         let len = t.length(&self.gc_heap);
@@ -1557,28 +1559,30 @@ impl Interpreter {
         let default_name = exemplar.kind().name();
         let default_ctor = crate::object::get(self.global_this, &self.gc_heap, default_name)
             .ok_or_else(|| VmError::TypeError {
-                message: format!("%{default_name}% intrinsic is missing"),
+                message: (format!("%{default_name}% intrinsic is missing")).into(),
             })?;
         let constructor =
             self.species_constructor_value(context, &exemplar_value, &default_ctor)?;
         let result = self.run_construct_sync(context, &constructor, constructor, argv)?;
         let Some(new_ta) = result.as_typed_array(&self.gc_heap) else {
             return Err(VmError::TypeError {
-                message: "Species constructor did not return a TypedArray".to_string(),
+                message: ("Species constructor did not return a TypedArray".to_string()).into(),
             });
         };
         if new_ta.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
             return Err(VmError::TypeError {
-                message: "Species constructor returned a TypedArray with a detached buffer"
-                    .to_string(),
+                message: ("Species constructor returned a TypedArray with a detached buffer"
+                    .to_string())
+                .into(),
             });
         }
         if let Some(min) = min_length
             && new_ta.length(&self.gc_heap) < min
         {
             return Err(VmError::TypeError {
-                message: "Species constructor returned a TypedArray smaller than required"
-                    .to_string(),
+                message: ("Species constructor returned a TypedArray smaller than required"
+                    .to_string())
+                .into(),
             });
         }
         Ok(new_ta)
@@ -1651,7 +1655,7 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         if t.is_out_of_bounds(&self.gc_heap) {
             return Err(VmError::TypeError {
-                message: "Cannot slice a detached or out-of-bounds TypedArray".to_string(),
+                message: ("Cannot slice a detached or out-of-bounds TypedArray".to_string()).into(),
             });
         }
         let len = t.length(&self.gc_heap) as i64;
@@ -1674,8 +1678,10 @@ impl Interpreter {
             // of the freshly-created (zeroed) result untouched.
             if t.is_out_of_bounds(&self.gc_heap) {
                 return Err(VmError::TypeError {
-                    message: "TypedArray buffer was detached or resized out of bounds during slice"
-                        .to_string(),
+                    message:
+                        ("TypedArray buffer was detached or resized out of bounds during slice"
+                            .to_string())
+                        .into(),
                 });
             }
             let base = k as usize;

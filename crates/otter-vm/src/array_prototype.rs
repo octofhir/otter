@@ -459,12 +459,12 @@ pub(crate) fn array_includes(
             // §7.1.4 ToNumber — Symbol / BigInt fromIndex throws TypeError.
             if v.is_symbol() {
                 return Err(VmError::TypeError {
-                    message: "Cannot convert a Symbol value to a number".to_string(),
+                    message: ("Cannot convert a Symbol value to a number".to_string()).into(),
                 });
             }
             if v.is_big_int() {
                 return Err(VmError::TypeError {
-                    message: "Cannot convert a BigInt value to a number".to_string(),
+                    message: ("Cannot convert a BigInt value to a number".to_string()).into(),
                 });
             }
             let f = crate::number::parse::to_number_value(&v, interp.gc_heap());
@@ -721,7 +721,7 @@ impl Interpreter {
                 &mut external_visit,
             )
             .map_err(|_| VmError::RangeError {
-                message: "Invalid array length".to_string(),
+                message: ("Invalid array length".to_string()).into(),
             })?;
             return Ok(o);
         }
@@ -820,8 +820,9 @@ impl Interpreter {
             };
             if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {
-                    message: "Cannot perform 'IsArray' on a proxy that has been revoked"
-                        .to_string(),
+                    message: ("Cannot perform 'IsArray' on a proxy that has been revoked"
+                        .to_string())
+                    .into(),
                 });
             }
             current = proxy.target(&self.gc_heap);
@@ -881,7 +882,8 @@ impl Interpreter {
                 if target_index as f64 >= MAX_SAFE_INTEGER {
                     self.pop_iteration_anchors_to(anchor_base);
                     return Err(VmError::TypeError {
-                        message: "flatten target index exceeds maximum safe integer".to_string(),
+                        message: ("flatten target index exceeds maximum safe integer".to_string())
+                            .into(),
                     });
                 }
                 self.create_data_property_or_throw(
@@ -918,7 +920,8 @@ impl Interpreter {
         let proxy_array_target = if let Some(proxy) = o.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {
-                    message: "Cannot perform 'get' on a proxy that has been revoked".to_string(),
+                    message: ("Cannot perform 'get' on a proxy that has been revoked".to_string())
+                        .into(),
                 });
             }
             proxy.target(&self.gc_heap).as_array()
@@ -983,7 +986,7 @@ impl Interpreter {
         heap.alloc_old_with_roots(state, &mut visitor)
             .map(Value::iterator)
             .map_err(|_| VmError::TypeError {
-                message: "iterator allocation failed".to_string(),
+                message: ("iterator allocation failed".to_string()).into(),
             })
     }
 
@@ -1167,7 +1170,7 @@ impl Interpreter {
             };
             if !crate::abstract_ops::is_callable(&method) {
                 return Err(VmError::TypeError {
-                    message: "element's toLocaleString is not callable".to_string(),
+                    message: ("element's toLocaleString is not callable".to_string()).into(),
                 });
             }
             let result = self.run_callable_sync(context, &method, element, SmallVec::new())?;
@@ -1222,7 +1225,8 @@ impl Interpreter {
     ) -> Result<u64, VmError> {
         const MAX_SAFE: f64 = 9_007_199_254_740_991.0;
         let too_long = || VmError::TypeError {
-            message: "concatenated array length exceeds the maximum safe integer".to_string(),
+            message: ("concatenated array length exceeds the maximum safe integer".to_string())
+                .into(),
         };
         if self.is_concat_spreadable(context, e)? {
             let len = length_of_array_like(self, context, &e)? as u64;
@@ -1391,7 +1395,7 @@ impl Interpreter {
         // §23.1.3.30 step 1 — comparefn must be undefined or callable.
         if !comparefn.is_undefined() && !self.is_callable_runtime(&comparefn) {
             return Err(VmError::TypeError {
-                message: "Array.prototype.sort comparator is not a function".to_string(),
+                message: ("Array.prototype.sort comparator is not a function".to_string()).into(),
             });
         }
         let o = if receiver.is_object_type() {
@@ -1438,7 +1442,8 @@ impl Interpreter {
             };
             if !ok {
                 return Err(VmError::TypeError {
-                    message: format!("Cannot assign to read only property '{key}' during sort"),
+                    message: (format!("Cannot assign to read only property '{key}' during sort"))
+                        .into(),
                 });
             }
         }
@@ -1448,7 +1453,7 @@ impl Interpreter {
                 self.ordinary_delete_value(context, o, &crate::VmPropertyKey::String(&key), 0)?;
             if !deleted {
                 return Err(VmError::TypeError {
-                    message: format!("Cannot delete property '{key}' during sort"),
+                    message: (format!("Cannot delete property '{key}' during sort")).into(),
                 });
             }
         }
@@ -1466,7 +1471,8 @@ impl Interpreter {
         if let Some(arr) = o.as_array() {
             if !crate::array::length_writable(arr, self.gc_heap()) {
                 return Err(VmError::TypeError {
-                    message: "Cannot assign to read only property 'length' of object".to_string(),
+                    message: ("Cannot assign to read only property 'length' of object".to_string())
+                        .into(),
                 });
             }
         } else {
@@ -1489,7 +1495,8 @@ impl Interpreter {
             Ok(())
         } else {
             Err(VmError::TypeError {
-                message: "Cannot assign to read only property 'length' of object".to_string(),
+                message: ("Cannot assign to read only property 'length' of object".to_string())
+                    .into(),
             })
         }
     }
@@ -1515,7 +1522,7 @@ impl Interpreter {
                     }
                     crate::object::SetOutcome::Reject { .. } => {
                         return Err(VmError::TypeError {
-                            message: format!("Cannot assign to property '{key}'"),
+                            message: (format!("Cannot assign to property '{key}'")).into(),
                         });
                     }
                     crate::object::SetOutcome::AssignData => {}
@@ -1534,7 +1541,7 @@ impl Interpreter {
                 }
                 crate::object::SetOutcome::Reject { .. } => {
                     return Err(VmError::TypeError {
-                        message: format!("Cannot assign to property '{key}'"),
+                        message: (format!("Cannot assign to property '{key}'")).into(),
                     });
                 }
                 crate::object::SetOutcome::AssignData => {}
@@ -1553,7 +1560,7 @@ impl Interpreter {
             Ok(())
         } else {
             Err(VmError::TypeError {
-                message: format!("Cannot assign to read only property '{key}' of object"),
+                message: (format!("Cannot assign to read only property '{key}' of object")).into(),
             })
         }
     }
@@ -1570,7 +1577,7 @@ impl Interpreter {
             Ok(())
         } else {
             Err(VmError::TypeError {
-                message: format!("Cannot delete property '{key}'"),
+                message: (format!("Cannot delete property '{key}'")).into(),
             })
         }
     }
@@ -1708,7 +1715,7 @@ impl Interpreter {
         // §23.1.3.23 step 4 — len + argCount must stay a safe integer.
         if len + arg_count > 9_007_199_254_740_991.0 {
             return Err(VmError::TypeError {
-                message: "Pushing too many elements onto an array-like".to_string(),
+                message: ("Pushing too many elements onto an array-like".to_string()).into(),
             });
         }
         let mut n = len;
@@ -1721,7 +1728,7 @@ impl Interpreter {
             if let Some(arr) = o.as_array() {
                 if !self.array_ordinary_set_own(context, arr, &key, arg)? {
                     return Err(VmError::TypeError {
-                        message: format!("Cannot assign to read only property '{key}'"),
+                        message: (format!("Cannot assign to read only property '{key}'")).into(),
                     });
                 }
             } else {
@@ -1757,7 +1764,7 @@ impl Interpreter {
             self.ordinary_delete_value(context, o, &crate::VmPropertyKey::String(&key), 0)?;
         if !deleted {
             return Err(VmError::TypeError {
-                message: format!("Cannot delete property '{key}'"),
+                message: (format!("Cannot delete property '{key}'")).into(),
             });
         }
         self.array_set_length_throwing(context, o, new_len)?;
@@ -1827,7 +1834,7 @@ impl Interpreter {
         let new_len = len as f64 + arg_count as f64;
         if new_len > 9_007_199_254_740_991.0 {
             return Err(VmError::TypeError {
-                message: "Unshifting too many elements onto an array-like".to_string(),
+                message: ("Unshifting too many elements onto an array-like".to_string()).into(),
             });
         }
 
@@ -2129,7 +2136,7 @@ impl Interpreter {
         }
         let default_ctor = crate::object::get(self.global_this, &self.gc_heap, "Array")
             .ok_or_else(|| VmError::TypeError {
-                message: "%Array% intrinsic is missing".to_string(),
+                message: ("%Array% intrinsic is missing".to_string()).into(),
             })?;
         let constructor = self.species_constructor_value(context, &original, &default_ctor)?;
         if crate::abstract_ops::same_value(&constructor, &default_ctor, &self.gc_heap) {
@@ -2148,7 +2155,7 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         if length > u32::MAX as usize {
             return Err(VmError::RangeError {
-                message: "Invalid array length".to_string(),
+                message: ("Invalid array length".to_string()).into(),
             });
         }
         let mut external_visit = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
@@ -2161,11 +2168,11 @@ impl Interpreter {
         };
         let arr = crate::array::alloc_array_with_roots(&mut self.gc_heap, &mut external_visit)
             .map_err(|_| VmError::RangeError {
-                message: "Invalid array length".to_string(),
+                message: ("Invalid array length".to_string()).into(),
             })?;
         crate::array::set_length(arr, &mut self.gc_heap, length).map_err(|_| {
             VmError::RangeError {
-                message: "Invalid array length".to_string(),
+                message: ("Invalid array length".to_string()).into(),
             }
         })?;
         Ok(Value::array(arr))
@@ -2187,7 +2194,9 @@ impl Interpreter {
             };
             if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {
-                    message: "Cannot perform IsArray on a proxy that has been revoked".to_string(),
+                    message: ("Cannot perform IsArray on a proxy that has been revoked"
+                        .to_string())
+                    .into(),
                 });
             }
             if hops >= object::PROTO_CHAIN_HARD_CAP {
@@ -2257,7 +2266,7 @@ impl Interpreter {
             Ok(())
         } else {
             Err(VmError::TypeError {
-                message: format!("Cannot create property '{key}'"),
+                message: (format!("Cannot create property '{key}'")).into(),
             })
         }
     }
@@ -2323,11 +2332,11 @@ impl Interpreter {
             .checked_sub(actual_delete_count)
             .and_then(|n| n.checked_add(insert_count))
             .ok_or_else(|| VmError::TypeError {
-                message: "Invalid array length".to_string(),
+                message: ("Invalid array length".to_string()).into(),
             })?;
         if new_len > 9_007_199_254_740_991usize {
             return Err(VmError::TypeError {
-                message: "Invalid array length".to_string(),
+                message: ("Invalid array length".to_string()).into(),
             });
         }
 
@@ -2593,11 +2602,11 @@ impl Interpreter {
             .checked_sub(skip_count)
             .and_then(|n| n.checked_add(insert_count))
             .ok_or_else(|| VmError::TypeError {
-                message: "Invalid array length".to_string(),
+                message: ("Invalid array length".to_string()).into(),
             })?;
         if new_len > MAX_SAFE_ARRAY_LENGTH {
             return Err(VmError::TypeError {
-                message: "Invalid array length".to_string(),
+                message: ("Invalid array length".to_string()).into(),
             });
         }
         self.ensure_change_by_copy_len(new_len)?;
@@ -2623,7 +2632,8 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         if !comparefn.is_undefined() && !self.is_callable_runtime(&comparefn) {
             return Err(VmError::TypeError {
-                message: "Array.prototype.toSorted comparator is not a function".to_string(),
+                message: ("Array.prototype.toSorted comparator is not a function".to_string())
+                    .into(),
             });
         }
         let o = if receiver.is_object_type() {
@@ -2679,7 +2689,7 @@ impl Interpreter {
     fn ensure_change_by_copy_len(&self, len: usize) -> Result<(), VmError> {
         if len > u32::MAX as usize || len > MAX_ARRAY_LIKE_PROBE_LEN {
             return Err(VmError::RangeError {
-                message: "Invalid array length".to_string(),
+                message: ("Invalid array length".to_string()).into(),
             });
         }
         Ok(())
@@ -2706,7 +2716,7 @@ impl Interpreter {
         };
         if !actual.is_finite() || actual < 0.0 || actual >= len as f64 {
             return Err(VmError::RangeError {
-                message: "index out of range".to_string(),
+                message: ("index out of range".to_string()).into(),
             });
         }
         Ok(actual as usize)
@@ -2718,7 +2728,7 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         if values.len() > u32::MAX as usize {
             return Err(VmError::RangeError {
-                message: "Invalid array length".to_string(),
+                message: ("Invalid array length".to_string()).into(),
             });
         }
         let len = values.len();
@@ -2730,14 +2740,14 @@ impl Interpreter {
         };
         let arr = crate::array::alloc_array_with_roots(heap, &mut visitor).map_err(|_| {
             VmError::RangeError {
-                message: "Invalid array length".to_string(),
+                message: ("Invalid array length".to_string()).into(),
             }
         })?;
         crate::array::with_elements_mut(arr, heap, |elements| {
             elements.extend(values);
         });
         crate::array::set_length(arr, heap, len).map_err(|_| VmError::RangeError {
-            message: "Invalid array length".to_string(),
+            message: ("Invalid array length".to_string()).into(),
         })?;
         Ok(Value::array(arr))
     }

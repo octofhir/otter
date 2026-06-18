@@ -266,7 +266,7 @@ pub fn is_array(heap: &otter_gc::GcHeap, value: &Value) -> Result<bool, crate::V
         // §7.2.2 step 3.a — a revoked Proxy throws.
         if proxy.is_revoked(heap) {
             return Err(crate::VmError::TypeError {
-                message: "cannot perform IsArray on a revoked Proxy".to_string(),
+                message: ("cannot perform IsArray on a revoked Proxy".to_string()).into(),
             });
         }
         current = proxy.target(heap);

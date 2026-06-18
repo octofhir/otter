@@ -749,7 +749,7 @@ impl Interpreter {
             flags,
         )
         .map_err(|e| VmError::InvalidRegExp {
-            message: e.to_string(),
+            message: (e.to_string()).into(),
         })?;
         write_register(frame, dst, Value::regexp(regex))?;
         frame.advance_pc(self.current_byte_len)?;

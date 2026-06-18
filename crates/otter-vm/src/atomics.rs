@@ -213,7 +213,7 @@ fn vm_error_to_native(method_name: &'static str, err: VmError) -> NativeError {
     match err {
         VmError::Uncaught { value } => NativeError::Thrown {
             name: spec_name(method_name),
-            message: value,
+            message: value.into(),
         },
         other => type_err(method_name, other.to_string()),
     }

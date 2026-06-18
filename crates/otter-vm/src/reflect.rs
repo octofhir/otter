@@ -481,7 +481,7 @@ fn create_list_from_array_like(
         return interp.create_list_from_array_like(context, *v);
     }
     Err(VmError::TypeError {
-        message: "argumentsList must be an object".to_string(),
+        message: ("argumentsList must be an object".to_string()).into(),
     })
 }
 
@@ -626,15 +626,15 @@ fn vm_to_native(err: VmError) -> NativeError {
         },
         VmError::TypeError { message } => NativeError::TypeError {
             name: "Reflect",
-            reason: message,
+            reason: message.into(),
         },
         VmError::SyntaxError { message } => NativeError::SyntaxError {
             name: "Reflect",
-            reason: message,
+            reason: message.into(),
         },
         VmError::RangeError { message } => NativeError::RangeError {
             name: "Reflect",
-            reason: message,
+            reason: message.into(),
         },
         VmError::NotCallable => NativeError::TypeError {
             name: "Reflect",
@@ -642,7 +642,7 @@ fn vm_to_native(err: VmError) -> NativeError {
         },
         VmError::Uncaught { value } => NativeError::Thrown {
             name: "Reflect",
-            message: value,
+            message: value.into(),
         },
         VmError::OutOfMemory { .. } => NativeError::TypeError {
             name: "Reflect",

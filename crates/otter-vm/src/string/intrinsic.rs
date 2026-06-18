@@ -125,7 +125,7 @@ fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
             .map_err(|e| match e {
                 crate::VmError::Uncaught { value } => NativeError::Thrown {
                     name: "String",
-                    message: value,
+                    message: value.into(),
                 },
                 other => NativeError::TypeError {
                     name: "String",

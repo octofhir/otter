@@ -115,7 +115,7 @@ pub enum VmError {
     /// User-visible `TypeError` with operation context.
     TypeError {
         /// Human-readable diagnostic.
-        message: String,
+        message: Box<str>,
     },
     /// User-visible `RangeError`. Distinct from
     /// [`Self::TypeError`] so that intrinsics like
@@ -124,19 +124,19 @@ pub enum VmError {
     /// fallback `TypeError`.
     RangeError {
         /// Human-readable diagnostic.
-        message: String,
+        message: Box<str>,
     },
     /// SyntaxError raised from dynamic parse/compile paths.
     SyntaxError {
         /// Human-readable diagnostic.
-        message: String,
+        message: Box<str>,
     },
     /// `URIError` — malformed input to `decodeURI*` / `encodeURI*`
     /// (§19.2.6). Distinct from [`Self::TypeError`] so the spec-mandated
     /// class survives to the thrown instance.
     URIError {
         /// Human-readable diagnostic.
-        message: String,
+        message: Box<str>,
     },
     /// String allocation failed because the heap cap was hit.
     OutOfMemory {
@@ -151,7 +151,7 @@ pub enum VmError {
     /// a checkpoint.
     BudgetExceeded {
         /// Human-readable diagnostic.
-        message: String,
+        message: Box<str>,
     },
     /// `CALL_STRING_METHOD` referenced a method name not in
     /// [`crate::string::prototype::STRING_PROTOTYPE_METHODS`].
@@ -171,7 +171,7 @@ pub enum VmError {
     /// more than once. §13.3.7.3 / §10.2.2 — a `ReferenceError`.
     ThisUninitialized {
         /// Human-readable detail for the thrown `ReferenceError`.
-        message: String,
+        message: Box<str>,
     },
     /// JS call-stack depth exceeded the configured limit. Catchable
     /// per foundation plan §M7 ("stack-depth limit returns a
@@ -188,7 +188,7 @@ pub enum VmError {
     /// throwable conversion.
     UndefinedIdentifier {
         /// Name of the unbound identifier.
-        name: String,
+        name: Box<str>,
     },
     /// A user `throw` (or a re-throw from `finally`) walked the
     /// entire frame stack without finding a matching handler. The
@@ -197,7 +197,7 @@ pub enum VmError {
     /// surfaces this as `OtterError::Runtime { code = "UNCAUGHT" }`.
     Uncaught {
         /// Display rendering of the thrown value.
-        value: String,
+        value: Box<str>,
     },
     /// `Op::LoadRegExp` produced a pattern that the regex backend
     /// could not compile. Catchable as `SyntaxError` once a real
@@ -205,7 +205,7 @@ pub enum VmError {
     /// runtime-error code.
     InvalidRegExp {
         /// Backend diagnostic — pattern + flags + reason.
-        message: String,
+        message: Box<str>,
     },
     /// `JSON.stringify` / `JSON.parse` rejected its input. The
     /// `code` discriminates the failure family so the runtime can
@@ -227,6 +227,8 @@ pub enum VmError {
         code: u8,
     },
 }
+
+const _: () = assert!(std::mem::size_of::<VmError>() <= 24);
 
 impl std::fmt::Display for VmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

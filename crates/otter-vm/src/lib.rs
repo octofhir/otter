@@ -2596,7 +2596,7 @@ impl Interpreter {
         ) {
             self.runtime_budget_stats.record_budget_rejection();
             return Err(VmError::BudgetExceeded {
-                message: "runtime budget exceeded".to_string(),
+                message: ("runtime budget exceeded".to_string()).into(),
             });
         }
         Ok(())
@@ -4884,7 +4884,7 @@ impl Interpreter {
                         self.microtasks.end_drain();
                         return Err(RunError {
                             error: VmError::BudgetExceeded {
-                                message: "runtime microtask budget exceeded".to_string(),
+                                message: ("runtime microtask budget exceeded".to_string()).into(),
                             },
                             frames: Vec::new(),
                         });
@@ -5235,7 +5235,7 @@ impl Interpreter {
                         crate::promise::PromiseState::Rejected(reason) => {
                             return Err((
                                 VmError::Uncaught {
-                                    value: self.render_thrown(&reason),
+                                    value: (self.render_thrown(&reason)).into(),
                                 },
                                 Vec::new(),
                             ));
@@ -5609,7 +5609,8 @@ impl Interpreter {
                     if let Some(ti) = target {
                         if !stack[ti].this_value.is_hole() {
                             return Err(VmError::ThisUninitialized {
-                                message: "super constructor may only be called once".to_string(),
+                                message: ("super constructor may only be called once".to_string())
+                                    .into(),
                             });
                         }
                         stack[ti].this_value = value;
@@ -5630,12 +5631,14 @@ impl Interpreter {
                             .and_then(|cold| cold.derived_this_cell);
                         let Some(cell) = derived_this_cell else {
                             return Err(VmError::ThisUninitialized {
-                                message: "super called outside a derived constructor".to_string(),
+                                message: ("super called outside a derived constructor".to_string())
+                                    .into(),
                             });
                         };
                         if !crate::read_upvalue(&self.gc_heap, cell).is_hole() {
                             return Err(VmError::ThisUninitialized {
-                                message: "super constructor may only be called once".to_string(),
+                                message: ("super constructor may only be called once".to_string())
+                                    .into(),
                             });
                         }
                         crate::store_upvalue(&mut self.gc_heap, cell, value);
@@ -6545,7 +6548,7 @@ impl Interpreter {
                     }
                     if value.is_hole() {
                         return Err(VmError::ThisUninitialized {
-                            message: "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string(),
+                            message:( "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()).into(),
                         });
                     }
                     let frame = &mut stack[top_idx];
@@ -6945,8 +6948,9 @@ impl Interpreter {
                                 && !abstract_ops::is_constructor(&value, context, &self.gc_heap)
                             {
                                 return Err(VmError::TypeError {
-                                    message: "Class extends value is not a constructor or null"
-                                        .to_string(),
+                                    message: ("Class extends value is not a constructor or null"
+                                        .to_string())
+                                    .into(),
                                 });
                             }
                         }
@@ -6957,8 +6961,9 @@ impl Interpreter {
                             {
                                 return Err(VmError::TypeError {
                                     message:
-                                        "Classes may not have a static property named 'prototype'"
-                                            .to_string(),
+                                        ("Classes may not have a static property named 'prototype'"
+                                            .to_string())
+                                        .into(),
                                 });
                             }
                         }
@@ -7057,18 +7062,18 @@ impl Interpreter {
                     // than a VM invariant crash.
                     let Some(sym) = key.as_symbol(&self.gc_heap) else {
                         return Err(VmError::TypeError {
-                            message:
+                            message:(
                                 "Cannot read private member from an object whose class did not declare it"
-                                    .to_string(),
+                                    .to_string()).into(),
                         });
                     };
                     let found = self.private_element_lookup(context, &receiver, sym)?;
                     let result = match found {
                         None => {
                             return Err(VmError::TypeError {
-                                message:
+                                message:(
                                     "Cannot read private member from an object whose class did not declare it"
-                                        .to_string(),
+                                        .to_string()).into(),
                             });
                         }
                         Some((_, desc)) => match desc.kind {
@@ -7082,7 +7087,8 @@ impl Interpreter {
                                 )?,
                                 None => {
                                     return Err(VmError::TypeError {
-                                        message: "'#x' was defined without a getter".to_string(),
+                                        message: ("'#x' was defined without a getter".to_string())
+                                            .into(),
                                     });
                                 }
                             },
@@ -7105,18 +7111,18 @@ impl Interpreter {
                     let value = *read_register(&stack[top_idx], value_reg)?;
                     let Some(sym) = key.as_symbol(&self.gc_heap) else {
                         return Err(VmError::TypeError {
-                            message:
+                            message:(
                                 "Cannot write private member to an object whose class did not declare it"
-                                    .to_string(),
+                                    .to_string()).into(),
                         });
                     };
                     let found = self.private_element_lookup(context, &receiver, sym)?;
                     match found {
                         None => {
                             return Err(VmError::TypeError {
-                                message:
+                                message:(
                                     "Cannot write private member to an object whose class did not declare it"
-                                        .to_string(),
+                                        .to_string()).into(),
                             });
                         }
                         Some((holder, desc)) => match desc.kind {
@@ -7128,7 +7134,8 @@ impl Interpreter {
                                 }
                                 None => {
                                     return Err(VmError::TypeError {
-                                        message: "'#x' was defined without a setter".to_string(),
+                                        message: ("'#x' was defined without a setter".to_string())
+                                            .into(),
                                     });
                                 }
                             },
@@ -7137,7 +7144,8 @@ impl Interpreter {
                                     // Prototype side or a non-writable
                                     // own slot — a private method.
                                     return Err(VmError::TypeError {
-                                        message: "Private method is not writable".to_string(),
+                                        message: ("Private method is not writable".to_string())
+                                            .into(),
                                     });
                                 }
                                 let descriptor = object::PartialPropertyDescriptor {
@@ -7172,7 +7180,8 @@ impl Interpreter {
                         value
                     } else if value.is_symbol() {
                         return Err(VmError::TypeError {
-                            message: "Cannot convert a Symbol value to a number".to_string(),
+                            message: ("Cannot convert a Symbol value to a number".to_string())
+                                .into(),
                         });
                     } else {
                         Value::number(crate::number::NumberValue::from_f64(
@@ -7250,9 +7259,9 @@ impl Interpreter {
                     let brand = *read_register(&stack[top_idx], brand_reg)?;
                     let Some(sym) = brand.as_symbol(&self.gc_heap) else {
                         return Err(VmError::TypeError {
-                            message:
+                            message:(
                                 "Cannot read private member from an object whose class did not declare it"
-                                    .to_string(),
+                                    .to_string()).into(),
                         });
                     };
                     let key = VmPropertyKey::Symbol(sym);
@@ -7273,9 +7282,9 @@ impl Interpreter {
                     };
                     if !found {
                         return Err(VmError::TypeError {
-                            message:
+                            message:(
                                 "Cannot read private member from an object whose class did not declare it"
-                                    .to_string(),
+                                    .to_string()).into(),
                         });
                     }
                     let frame = &mut stack[top_idx];
@@ -8023,14 +8032,15 @@ impl Interpreter {
             } else if value.is_undefined() {
                 if derived_this.is_hole() {
                     return Err(VmError::ThisUninitialized {
-                        message: "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string(),
+                        message:( "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()).into(),
                     });
                 }
                 derived_this
             } else {
                 return Err(VmError::TypeError {
-                    message: "derived constructors may only return an object or undefined"
-                        .to_string(),
+                    message: ("derived constructors may only return an object or undefined"
+                        .to_string())
+                    .into(),
                 });
             }
         } else {
@@ -8824,7 +8834,7 @@ fn step_iterator(
             // reads the live element and terminates at the live length.
             if typed_array.is_out_of_bounds(gc_heap) {
                 return Err(VmError::TypeError {
-                    message: "typed array is out of bounds".to_string(),
+                    message: ("typed array is out of bounds".to_string()).into(),
                 });
             }
             if index >= typed_array.length(gc_heap) {
@@ -9865,7 +9875,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            VmError::TypeError { message } if message == "Cannot read properties of undefined"
+            VmError::TypeError { message } if message.as_ref() == "Cannot read properties of undefined"
         ));
     }
 
@@ -12836,7 +12846,7 @@ mod tests {
             .unwind_throw(&context, &mut stack, Value::boolean(true))
             .unwrap_err();
         match err {
-            VmError::Uncaught { value } => assert_eq!(value, "true"),
+            VmError::Uncaught { value } => assert_eq!(value.as_ref(), "true"),
             other => panic!("expected Uncaught, got {other:?}"),
         }
         assert!(stack.is_empty(), "frames should be drained on uncaught");

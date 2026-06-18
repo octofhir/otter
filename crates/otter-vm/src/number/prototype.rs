@@ -84,7 +84,7 @@ fn coerce_numeric_args(
                 Err(crate::VmError::Uncaught { value }) => {
                     return Err(NativeError::Thrown {
                         name,
-                        message: value,
+                        message: value.into(),
                     });
                 }
                 Err(err) => {

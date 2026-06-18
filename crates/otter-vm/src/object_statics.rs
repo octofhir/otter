@@ -1526,7 +1526,8 @@ pub fn call(
                 };
                 if !ok {
                     return Err(VmError::TypeError {
-                        message: format!("Cannot define property '{}'", key.label(gc_heap)),
+                        message: (format!("Cannot define property '{}'", key.label(gc_heap)))
+                            .into(),
                     });
                 }
                 Ok(Value::object(target))
@@ -1547,7 +1548,8 @@ pub fn call(
                 };
                 if !ok {
                     return Err(VmError::TypeError {
-                        message: format!("Cannot define property '{}'", key.label(gc_heap)),
+                        message: (format!("Cannot define property '{}'", key.label(gc_heap)))
+                            .into(),
                     });
                 }
                 Ok(Value::class_constructor(class))
@@ -1564,11 +1566,12 @@ pub fn call(
                 };
                 if !ok {
                     return Err(VmError::TypeError {
-                        message: format!(
+                        message: (format!(
                             "Cannot define property '{}' on function {}",
                             key.label(gc_heap),
                             native.name(gc_heap)
-                        ),
+                        ))
+                        .into(),
                     });
                 }
                 Ok(Value::native_function(native))
@@ -1585,7 +1588,8 @@ pub fn call(
                     };
                     if !existing && !r.is_extensible(gc_heap) {
                         return Err(VmError::TypeError {
-                            message: format!("Cannot define property '{}'", key.label(gc_heap)),
+                            message: (format!("Cannot define property '{}'", key.label(gc_heap)))
+                                .into(),
                         });
                     }
                     let bag = crate::property_dispatch::regexp_ensure_expando_pub(gc_heap, &r)?;
@@ -1601,7 +1605,8 @@ pub fn call(
                     };
                     if !ok {
                         return Err(VmError::TypeError {
-                            message: format!("Cannot define property '{}'", key.label(gc_heap)),
+                            message: (format!("Cannot define property '{}'", key.label(gc_heap)))
+                                .into(),
                         });
                     }
                     Ok(Value::regexp(r))
@@ -1619,7 +1624,8 @@ pub fn call(
                 };
                 if !ok {
                     return Err(VmError::TypeError {
-                        message: format!("Cannot define property '{}'", key.label(gc_heap)),
+                        message: (format!("Cannot define property '{}'", key.label(gc_heap)))
+                            .into(),
                     });
                 }
                 Ok(Value::promise(p))
@@ -1637,10 +1643,11 @@ pub fn call(
                                 || descriptor.is_accessor()
                             {
                                 return Err(VmError::TypeError {
-                                    message: format!(
+                                    message: (format!(
                                         "Cannot define property '{}'",
                                         key.label(gc_heap)
-                                    ),
+                                    ))
+                                    .into(),
                                 });
                             }
                             if let Some(value) = descriptor.value {
@@ -1663,10 +1670,11 @@ pub fn call(
                                 bag, gc_heap, k, descriptor,
                             ) {
                                 return Err(VmError::TypeError {
-                                    message: format!(
+                                    message: (format!(
                                         "Cannot define property '{}'",
                                         key.label(gc_heap)
-                                    ),
+                                    ))
+                                    .into(),
                                 });
                             }
                         }
@@ -1678,7 +1686,11 @@ pub fn call(
                             bag, gc_heap, *sym, descriptor,
                         ) {
                             return Err(VmError::TypeError {
-                                message: format!("Cannot define property '{}'", key.label(gc_heap)),
+                                message: (format!(
+                                    "Cannot define property '{}'",
+                                    key.label(gc_heap)
+                                ))
+                                .into(),
                             });
                         }
                     }
@@ -1686,7 +1698,7 @@ pub fn call(
                 Ok(Value::typed_array(t))
             } else {
                 Err(VmError::TypeError {
-                    message: "Object.defineProperty target must be an object".to_string(),
+                    message: ("Object.defineProperty target must be an object".to_string()).into(),
                 })
             }
         }
@@ -1876,12 +1888,15 @@ pub fn call(
             } else if first.is_none_or(|v| v.is_null() || v.is_undefined()) {
                 Err(VmError::TypeError {
                     message:
-                        "Object.getOwnPropertyDescriptor: cannot convert null/undefined to object"
-                            .to_string(),
+                        ("Object.getOwnPropertyDescriptor: cannot convert null/undefined to object"
+                            .to_string())
+                        .into(),
                 })
             } else {
                 Err(VmError::TypeError {
-                    message: "Object.getOwnPropertyDescriptor target must be an object".to_string(),
+                    message: ("Object.getOwnPropertyDescriptor target must be an object"
+                        .to_string())
+                    .into(),
                 })
             }
         }
@@ -2283,10 +2298,10 @@ pub fn call(
         // context); surface as a TypeError so the caller learns the
         // method needs a JS frame.
         M::GroupBy => Err(VmError::TypeError {
-            message: "Object.groupBy requires an active execution context".to_string(),
+            message: ("Object.groupBy requires an active execution context".to_string()).into(),
         }),
         M::ForInKeys => Err(VmError::TypeError {
-            message: "Object.__forInKeys requires an active execution context".to_string(),
+            message: ("Object.__forInKeys requires an active execution context".to_string()).into(),
         }),
     }
 }

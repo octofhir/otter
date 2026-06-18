@@ -138,11 +138,11 @@ fn number_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
             .map_err(|e| match e {
                 crate::VmError::TypeError { message } => NativeError::TypeError {
                     name: "Number",
-                    reason: message,
+                    reason: message.into(),
                 },
                 crate::VmError::Uncaught { value } => NativeError::Thrown {
                     name: "Number",
-                    message: value,
+                    message: value.into(),
                 },
                 other => NativeError::TypeError {
                     name: "Number",
@@ -306,7 +306,7 @@ fn global_encode_uri(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
     .map_err(|err| match err {
         crate::VmError::URIError { message } => NativeError::URIError {
             name: "encodeURI",
-            reason: message,
+            reason: message.into(),
         },
         other => NativeError::TypeError {
             name: "encodeURI",
@@ -328,7 +328,7 @@ fn global_encode_uri_component(
     .map_err(|err| match err {
         crate::VmError::URIError { message } => NativeError::URIError {
             name: "encodeURIComponent",
-            reason: message,
+            reason: message.into(),
         },
         other => NativeError::TypeError {
             name: "encodeURIComponent",
@@ -347,11 +347,11 @@ fn global_decode_uri(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
     .map_err(|err| match err {
         crate::VmError::URIError { message } => NativeError::URIError {
             name: "decodeURI",
-            reason: message,
+            reason: message.into(),
         },
         crate::VmError::TypeError { message } => NativeError::TypeError {
             name: "decodeURI",
-            reason: message,
+            reason: message.into(),
         },
         other => NativeError::TypeError {
             name: "decodeURI",
@@ -373,11 +373,11 @@ fn global_decode_uri_component(
     .map_err(|err| match err {
         crate::VmError::URIError { message } => NativeError::URIError {
             name: "decodeURIComponent",
-            reason: message,
+            reason: message.into(),
         },
         crate::VmError::TypeError { message } => NativeError::TypeError {
             name: "decodeURIComponent",
-            reason: message,
+            reason: message.into(),
         },
         other => NativeError::TypeError {
             name: "decodeURIComponent",

@@ -139,7 +139,7 @@ fn native_new_target_error(name: &'static str, err: crate::VmError) -> NativeErr
     match err {
         crate::VmError::Uncaught { value } => NativeError::Thrown {
             name,
-            message: value,
+            message: value.into(),
         },
         other => NativeError::TypeError {
             name,

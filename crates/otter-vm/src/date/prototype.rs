@@ -777,15 +777,15 @@ fn vm_to_native(name: &'static str, err: VmError) -> NativeError {
     match err {
         VmError::Uncaught { value } => NativeError::Thrown {
             name,
-            message: value,
+            message: value.into(),
         },
         VmError::TypeError { message } => NativeError::TypeError {
             name,
-            reason: message,
+            reason: message.into(),
         },
         VmError::RangeError { message } => NativeError::RangeError {
             name,
-            reason: message,
+            reason: message.into(),
         },
         other => NativeError::TypeError {
             name,

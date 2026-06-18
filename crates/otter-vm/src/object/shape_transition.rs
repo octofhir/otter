@@ -137,9 +137,8 @@ pub(crate) fn capture_store_property_transition_with_shape(
 ) -> Option<StorePropertyTransition> {
     let kind = transition_kind(obj, heap, key)?;
     let from_shape_id = super::shape_id(obj, heap);
-    let (to_shape_id, to_shape_count) = heap.read_payload(next_shape, |s| {
-        (s.id(), s.property_count())
-    });
+    let (to_shape_id, to_shape_count) =
+        heap.read_payload(next_shape, |s| (s.id(), s.property_count()));
     let existing_offset =
         heap.read_payload(obj, |body| super::body_offset_of(heap, body, key.name()));
     // The appended slot's flat index is the new shape's last offset.
@@ -212,7 +211,10 @@ pub(crate) fn replay_store_property_transition(
         let offset = usize::from(transition.slot);
         debug_assert_eq!(existing_offset, None);
         #[cfg(debug_assertions)]
-        debug_assert_eq!(current_count, offset, "replay count diverged from slot offset");
+        debug_assert_eq!(
+            current_count, offset,
+            "replay count diverged from slot offset"
+        );
         if transition.to_shape.is_null() {
             body.dictionary_shape_id = transition.to_shape_id;
             super::dict_push_key(body, key.name().to_owned());

@@ -3,10 +3,10 @@
 //! variants in a single GC body type.
 //!
 //! Replaces the earlier chunked-storage scaffold: every string lives
-//! in exactly one [`JsStringBody`] on the GC heap. Long strings own
-//! their code units inline as `Vec<u16>` / `Vec<u8>`; cons / sliced
-//! variants reference children through [`JsStringHandle`] so the
-//! collector can trace them transitively.
+//! in exactly one [`JsStringBody`] on the GC heap. Short flat strings keep
+//! their bytes/code units inside the body; longer strings use `Vec<u16>` /
+//! `Vec<u8>` side storage. Cons / sliced variants reference children through
+//! [`JsStringHandle`] so the collector can trace them transitively.
 //!
 //! # Contents
 //! - [`JsStringId`] — stable intern-table identity for shape keys.
@@ -44,6 +44,10 @@ pub const JS_STRING_BODY_TYPE_TAG: u8 = 0x20;
 /// would exceed this trigger an eager flatten before the new `Cons`
 /// node is built.
 pub const MAX_ROPE_DEPTH: u8 = 64;
+/// UTF-16 code units stored directly inside a flat string body.
+pub const INLINE_FLAT_CAP: usize = 12;
+/// Latin-1 bytes stored directly inside a Latin-1 string body.
+pub const INLINE_LATIN1_CAP: usize = 24;
 
 /// GC handle to a JavaScript string body. `Copy`. Packs into
 /// [`crate::Value`] under `TAG_PTR_STRING`.
@@ -71,9 +75,15 @@ impl JsStringId {
 /// Internal representation of a [`JsStringBody`].
 #[derive(Debug)]
 pub enum JsStringBodyRepr {
-    /// Flat WTF-16 code units stored inline.
+    /// Small flat WTF-16 code units stored inside the GC body. The live prefix
+    /// length is [`JsStringBody::len`].
+    InlineFlat([u16; INLINE_FLAT_CAP]),
+    /// Flat WTF-16 code units stored in side storage.
     Flat(Vec<u16>),
-    /// Latin-1 code units stored inline. Each byte zero-extends to
+    /// Small Latin-1 code units stored inside the GC body. The live prefix
+    /// length is [`JsStringBody::len`].
+    InlineLatin1([u8; INLINE_LATIN1_CAP]),
+    /// Latin-1 code units stored in side storage. Each byte zero-extends to
     /// a `u16` on read.
     Latin1(Vec<u8>),
     /// Rope concatenation node. Tracing visits both children.
@@ -108,6 +118,9 @@ pub struct JsStringBody {
     /// Variant-specific payload.
     pub repr: JsStringBodyRepr,
 }
+
+const _: () = assert!(std::mem::size_of::<JsStringBodyRepr>() <= 32);
+const _: () = assert!(std::mem::size_of::<JsStringBody>() <= 48);
 
 impl JsStringBody {
     /// Stable interner identity.
@@ -150,7 +163,10 @@ impl otter_gc::SafeTraceable for JsStringBody {
 
     fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
         match &self.repr {
-            JsStringBodyRepr::Flat(_) | JsStringBodyRepr::Latin1(_) => {}
+            JsStringBodyRepr::InlineFlat(_)
+            | JsStringBodyRepr::Flat(_)
+            | JsStringBodyRepr::InlineLatin1(_)
+            | JsStringBodyRepr::Latin1(_) => {}
             JsStringBodyRepr::Cons { left, right, .. } => {
                 if !left.is_null() {
                     let p = left as *const JsStringHandle as *mut RawGc;
@@ -183,20 +199,23 @@ pub fn alloc_flat_string_body_with_roots(
 ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
     let len = units.len() as u32;
     let hash = hash_utf16(units);
-    // Reserve cap budget for the heap-tracked `Vec<u16>` storage so
-    // the body's off-slot bytes count against `max_heap_bytes`. Without
-    // this, an unbounded `s += chunk` loop with cons-rope flatten
-    // bounds itself memory-wise (each epoch reclaims the prior tree)
-    // and the cap never fires — even though the actual Rust heap
-    // usage keeps doubling.
-    let bytes = (units.len() as u64).saturating_mul(2);
-    heap.reserve_bytes_with_roots(bytes, external_visit)?;
+    let repr = if units.len() <= INLINE_FLAT_CAP {
+        let mut inline = [0u16; INLINE_FLAT_CAP];
+        inline[..units.len()].copy_from_slice(units);
+        JsStringBodyRepr::InlineFlat(inline)
+    } else {
+        // Reserve cap budget for the heap-tracked `Vec<u16>` storage so
+        // the body's off-slot bytes count against `max_heap_bytes`.
+        let bytes = (units.len() as u64).saturating_mul(2);
+        heap.reserve_bytes_with_roots(bytes, external_visit)?;
+        JsStringBodyRepr::Flat(units.to_vec())
+    };
     heap.alloc_old_with_roots(
         JsStringBody {
             id,
             len,
             hash,
-            repr: JsStringBodyRepr::Flat(units.to_vec()),
+            repr,
         },
         external_visit,
     )
@@ -214,13 +233,20 @@ pub fn alloc_latin1_string_body_with_roots(
 ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
     let len = bytes.len() as u32;
     let hash = hash_latin1(bytes);
-    heap.reserve_bytes_with_roots(bytes.len() as u64, external_visit)?;
+    let repr = if bytes.len() <= INLINE_LATIN1_CAP {
+        let mut inline = [0u8; INLINE_LATIN1_CAP];
+        inline[..bytes.len()].copy_from_slice(bytes);
+        JsStringBodyRepr::InlineLatin1(inline)
+    } else {
+        heap.reserve_bytes_with_roots(bytes.len() as u64, external_visit)?;
+        JsStringBodyRepr::Latin1(bytes.to_vec())
+    };
     heap.alloc_old_with_roots(
         JsStringBody {
             id,
             len,
             hash,
-            repr: JsStringBodyRepr::Latin1(bytes.to_vec()),
+            repr,
         },
         external_visit,
     )
@@ -324,8 +350,10 @@ pub fn slice_string_body(
         Cons,
     }
     let src = heap.read_payload(string, |b| match &b.repr {
-        JsStringBodyRepr::Flat(_) => SliceSource::Flat,
-        JsStringBodyRepr::Latin1(_) => SliceSource::Latin1Slice { start, len: length },
+        JsStringBodyRepr::InlineFlat(_) | JsStringBodyRepr::Flat(_) => SliceSource::Flat,
+        JsStringBodyRepr::InlineLatin1(_) | JsStringBodyRepr::Latin1(_) => {
+            SliceSource::Latin1Slice { start, len: length }
+        }
         JsStringBodyRepr::Sliced {
             parent,
             start: pstart,
@@ -340,6 +368,11 @@ pub fn slice_string_body(
             // Hash over the sliced units, computed before the alloc
             // so the body lands with `hash` already populated.
             let hash = heap.read_payload(string, |b| match &b.repr {
+                JsStringBodyRepr::InlineFlat(units) => {
+                    let s = start as usize;
+                    let e = s + length as usize;
+                    hash_utf16(&units[s..e])
+                }
                 JsStringBodyRepr::Flat(units) => {
                     let s = start as usize;
                     let e = s + length as usize;
@@ -365,6 +398,11 @@ pub fn slice_string_body(
             // so the slice keeps the 1-byte-per-code-unit advantage
             // on the slice path.
             let bytes = heap.read_payload(string, |b| match &b.repr {
+                JsStringBodyRepr::InlineLatin1(bytes) => {
+                    let s = s as usize;
+                    let e = s + len as usize;
+                    bytes[s..e].to_vec()
+                }
                 JsStringBodyRepr::Latin1(bytes) => {
                     let s = s as usize;
                     let e = s + len as usize;
@@ -421,7 +459,12 @@ pub fn flatten_string_body(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
     // Fast path — already flat.
-    let is_flat = heap.read_payload(string, |b| matches!(b.repr, JsStringBodyRepr::Flat(_)));
+    let is_flat = heap.read_payload(string, |b| {
+        matches!(
+            b.repr,
+            JsStringBodyRepr::InlineFlat(_) | JsStringBodyRepr::Flat(_)
+        )
+    });
     if is_flat {
         return Ok(string);
     }
@@ -445,6 +488,20 @@ pub fn eq_str(heap: &GcHeap, string: JsStringHandle, key: &str) -> bool {
         Rope,
     }
     let fast = heap.read_payload(string, |b| match &b.repr {
+        JsStringBodyRepr::InlineLatin1(bytes) => {
+            let mut units = key.encode_utf16();
+            for &byte in &bytes[..b.len as usize] {
+                match units.next() {
+                    Some(u) if u == u16::from(byte) => {}
+                    _ => return Fast::Mismatch,
+                }
+            }
+            if units.next().is_none() {
+                Fast::Match
+            } else {
+                Fast::Mismatch
+            }
+        }
         JsStringBodyRepr::Latin1(bytes) => {
             // Latin-1 byte values are Unicode scalar values 0..=255,
             // so each zero-extends straight to a UTF-16 code unit.
@@ -452,6 +509,20 @@ pub fn eq_str(heap: &GcHeap, string: JsStringHandle, key: &str) -> bool {
             for &byte in bytes {
                 match units.next() {
                     Some(u) if u == u16::from(byte) => {}
+                    _ => return Fast::Mismatch,
+                }
+            }
+            if units.next().is_none() {
+                Fast::Match
+            } else {
+                Fast::Mismatch
+            }
+        }
+        JsStringBodyRepr::InlineFlat(code_units) => {
+            let mut units = key.encode_utf16();
+            for &unit in &code_units[..b.len as usize] {
+                match units.next() {
+                    Some(u) if u == unit => {}
                     _ => return Fast::Mismatch,
                 }
             }
@@ -509,6 +580,13 @@ pub fn to_utf16_vec(heap: &GcHeap, string: JsStringHandle) -> Vec<u16> {
             },
         }
         let resolved = heap.read_payload(node, |b| match &b.repr {
+            JsStringBodyRepr::InlineFlat(units) => {
+                let live = &units[..b.len as usize];
+                let s = (start as usize).min(live.len());
+                let e = s.saturating_add(length as usize).min(live.len());
+                out.extend_from_slice(&live[s..e]);
+                Resolved::Flat
+            }
             JsStringBodyRepr::Flat(units) => {
                 // Clamp the view to the body's actual length. A
                 // sliced body may carry a `start` that exceeds the
@@ -521,6 +599,13 @@ pub fn to_utf16_vec(heap: &GcHeap, string: JsStringHandle) -> Vec<u16> {
                 let e = s.saturating_add(length as usize).min(units.len());
                 out.extend_from_slice(&units[s..e]);
                 Resolved::Flat
+            }
+            JsStringBodyRepr::InlineLatin1(bytes) => {
+                let live = &bytes[..b.len as usize];
+                let s = (start as usize).min(live.len());
+                let e = s.saturating_add(length as usize).min(live.len());
+                out.extend(live[s..e].iter().map(|&b| u16::from(b)));
+                Resolved::Latin1
             }
             JsStringBodyRepr::Latin1(bytes) => {
                 let s = (start as usize).min(bytes.len());
@@ -590,10 +675,24 @@ fn to_utf16_vec_slice(heap: &GcHeap, parent: JsStringHandle, start: u32, length:
             },
         }
         let resolved = heap.read_payload(node, |b| match &b.repr {
+            JsStringBodyRepr::InlineFlat(units) => {
+                let units = &units[..b.len as usize];
+                let lo = s as usize;
+                let hi = lo + l as usize;
+                out.extend_from_slice(&units[lo..hi]);
+                Resolved::Done
+            }
             JsStringBodyRepr::Flat(units) => {
                 let lo = s as usize;
                 let hi = lo + l as usize;
                 out.extend_from_slice(&units[lo..hi]);
+                Resolved::Done
+            }
+            JsStringBodyRepr::InlineLatin1(bytes) => {
+                let bytes = &bytes[..b.len as usize];
+                let lo = s as usize;
+                let hi = lo + l as usize;
+                out.extend(bytes[lo..hi].iter().map(|&b| u16::from(b)));
                 Resolved::Done
             }
             JsStringBodyRepr::Latin1(bytes) => {
@@ -756,7 +855,7 @@ mod tests {
             assert_eq!(b.id().get(), 1);
             assert_eq!(b.len(), 0);
             assert!(b.is_empty());
-            assert!(matches!(b.repr, JsStringBodyRepr::Flat(_)));
+            assert!(matches!(b.repr, JsStringBodyRepr::InlineFlat(_)));
         });
         assert!(to_utf16_vec(&heap, s).is_empty());
     }
@@ -772,6 +871,7 @@ mod tests {
         heap.read_payload(s, |b| {
             assert_eq!(b.len(), units.len() as u32);
             assert_eq!(b.hash(), hash_utf16(&units));
+            assert!(matches!(b.repr, JsStringBodyRepr::Flat(_)));
         });
         assert_eq!(to_utf16_vec(&heap, s), units);
     }
@@ -841,7 +941,7 @@ mod tests {
         .expect("latin1");
         heap.read_payload(s, |b| {
             assert_eq!(b.len(), 5);
-            assert!(matches!(b.repr, JsStringBodyRepr::Latin1(_)));
+            assert!(matches!(b.repr, JsStringBodyRepr::InlineLatin1(_)));
         });
         let expected: Vec<u16> = b"hello".iter().map(|&b| b as u16).collect();
         assert_eq!(to_utf16_vec(&heap, s), expected);
@@ -868,7 +968,7 @@ mod tests {
         let cons = concat_string_bodies(&mut heap, left, right, &mut roots).expect("cons");
         let flat = flatten_string_body(&mut heap, cons, &mut roots).expect("flat");
         heap.read_payload(flat, |b| {
-            assert!(matches!(b.repr, JsStringBodyRepr::Flat(_)));
+            assert!(matches!(b.repr, JsStringBodyRepr::InlineFlat(_)));
             assert_eq!(b.len(), 3);
         });
     }

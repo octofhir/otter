@@ -338,6 +338,7 @@ impl JsString {
         F: FnOnce(&[u8]) -> R,
     {
         heap.read_payload(self.handle, |body| match &body.repr {
+            JsStringBodyRepr::InlineLatin1(bytes) => Some(f(&bytes[..body.len as usize])),
             JsStringBodyRepr::Latin1(bytes) => Some(f(bytes)),
             _ => None,
         })
@@ -358,7 +359,11 @@ impl JsString {
         let mut idx = index;
         loop {
             let step = heap.read_payload(handle, |body| match &body.repr {
+                JsStringBodyRepr::InlineFlat(units) => Step::Found(units[idx as usize]),
                 JsStringBodyRepr::Flat(units) => Step::Found(units[idx as usize]),
+                JsStringBodyRepr::InlineLatin1(bytes) => {
+                    Step::Found(u16::from(bytes[idx as usize]))
+                }
                 JsStringBodyRepr::Latin1(bytes) => Step::Found(u16::from(bytes[idx as usize])),
                 JsStringBodyRepr::Sliced { parent, start } => Step::Descend(*parent, *start + idx),
                 JsStringBodyRepr::Cons { left, right, .. } => {
@@ -533,17 +538,19 @@ where
     F: FnOnce(&[u8], &[u8]) -> R,
 {
     heap.read_payload(a.handle, |a_body| {
-        if let JsStringBodyRepr::Latin1(a_bytes) = &a_body.repr {
-            heap.read_payload(b.handle, |b_body| {
-                if let JsStringBodyRepr::Latin1(b_bytes) = &b_body.repr {
-                    Some(f(a_bytes, b_bytes))
-                } else {
-                    None
-                }
-            })
-        } else {
-            None
-        }
+        let a_bytes = match &a_body.repr {
+            JsStringBodyRepr::InlineLatin1(bytes) => &bytes[..a_body.len as usize],
+            JsStringBodyRepr::Latin1(bytes) => bytes.as_slice(),
+            _ => return None,
+        };
+        heap.read_payload(b.handle, |b_body| {
+            let b_bytes = match &b_body.repr {
+                JsStringBodyRepr::InlineLatin1(bytes) => &bytes[..b_body.len as usize],
+                JsStringBodyRepr::Latin1(bytes) => bytes.as_slice(),
+                _ => return None,
+            };
+            Some(f(a_bytes, b_bytes))
+        })
     })
 }
 

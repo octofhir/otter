@@ -391,6 +391,16 @@ tax (json's 43%), the indirection, and the malloc-owned-slot barrier special
 case. Large GC change but it is the other half (with D1) of "stop calling
 malloc on the hot path."
 
+### Current status
+First string-storage slice landed without waiting for full trailing-object GC:
+`JsStringBody` now stores short flat UTF-16 and Latin-1 payloads directly inside
+the existing fixed-size body (`InlineFlat` / `InlineLatin1`) and only reserves
+off-slot heap budget / allocates a `Vec` for longer strings. The body and repr
+sizes are guarded so the common fixed cell does not grow. This removes the side
+malloc for short property names, atoms, literal strings, and substring results
+that fit the inline caps while leaving cons/sliced tracing and long-string
+storage unchanged.
+
 ## D4 — `Math.sqrt`/`sin`/`cos` bridge to libm instead of a native instruction
 
 ### Evidence

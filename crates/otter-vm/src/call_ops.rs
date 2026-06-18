@@ -171,6 +171,23 @@ impl Interpreter {
         Ok(())
     }
 
+    fn bind_lean_bytecode_call_arguments(
+        function: &ExecutableFunction,
+        frame: &mut Frame,
+        args: &[Value],
+    ) -> Result<(), VmError> {
+        debug_assert!(
+            !function.needs_arguments && !function.has_rest,
+            "lean callback path must not need argument materialization"
+        );
+        let bind_count = (function.param_count as usize).min(args.len());
+        for (i, value) in args.iter().copied().take(bind_count).enumerate() {
+            let slot = frame.registers.get_mut(i).ok_or(VmError::InvalidOperand)?;
+            *slot = value;
+        }
+        Ok(())
+    }
+
     pub(crate) fn bytecode_call_target_parts(
         current: Value,
         effective_this: Value,
@@ -1884,6 +1901,66 @@ impl Interpreter {
             // The compiled entry frame ran to completion and is terminal
             // (the integer subset cannot suspend or escape its frame), so
             // return its spilled register window to the pool.
+            if let Some(mut done) = inner.pop() {
+                self.reclaim_registers(&mut done);
+            }
+            return Ok(value);
+        }
+        self.dispatch_loop(context, inner)
+    }
+
+    pub(crate) fn run_bytecode_callable_committed_lean_args(
+        &mut self,
+        inner: &mut HoltStack,
+        context: &ExecutionContext,
+        current: Value,
+        effective_this: Value,
+        effective_args: &[Value],
+    ) -> Result<Value, VmError> {
+        let (
+            function_id,
+            parent_upvalues,
+            this_for_callee,
+            new_target_for_callee,
+            derived_this_cell,
+            callee_eval_env,
+        ) = Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
+        let function = context
+            .exec_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        debug_assert!(
+            !function.is_generator
+                && !function.is_async
+                && !function.is_async_generator
+                && !function.needs_arguments
+                && !function.has_rest
+                && !function.makes_function
+                && !function.contains_direct_eval
+                && !function.is_derived_constructor,
+            "lean callback eligibility must be checked before the loop"
+        );
+        let upvalues =
+            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
+        let this_for_callee = self.this_for_bytecode_call_runtime_rooted(
+            function,
+            this_for_callee,
+            &[effective_args],
+        )?;
+        let registers = self.draw_registers(function.register_count as usize);
+        let mut new_frame =
+            Frame::with_exec_registers(function, None, upvalues, this_for_callee, registers);
+        if let Some(new_target) = new_target_for_callee {
+            let cold = self.frame_ensure_cold(&mut new_frame);
+            cold.new_target = Some(new_target);
+        }
+        if let Some(cell) = derived_this_cell {
+            let cold = self.frame_ensure_cold(&mut new_frame);
+            cold.derived_this_cell = Some(cell);
+        }
+        self.stash_frame_eval_env(function, &mut new_frame, callee_eval_env)?;
+        Self::bind_lean_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
+        inner.push(new_frame);
+        if let Some(value) = self.dispatch_jit_sync_entry(inner, context)? {
             if let Some(mut done) = inner.pop() {
                 self.reclaim_registers(&mut done);
             }

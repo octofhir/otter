@@ -846,13 +846,19 @@ fn map_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             continue;
         };
         index += 1;
-        let cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![v, k, map_value];
         let interp = ctx.interp_mut();
         let outcome = match lean {
-            Some(ref mut inner) => {
-                interp.run_bytecode_callable_committed(inner, &context, callback, this_arg, cb_args)
+            Some(ref mut inner) => interp.run_bytecode_callable_committed_lean_args(
+                inner,
+                &context,
+                callback,
+                this_arg,
+                &[v, k, map_value],
+            ),
+            None => {
+                let cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![v, k, map_value];
+                interp.run_callable_sync(&context, &callback, this_arg, cb_args)
             }
-            None => interp.run_callable_sync(&context, &callback, this_arg, cb_args),
         };
         if let Err(e) = outcome {
             err = Some(e);
@@ -976,13 +982,19 @@ fn set_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             continue;
         };
         index += 1;
-        let cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![v, v, set_value];
         let interp = ctx.interp_mut();
         let outcome = match lean {
-            Some(ref mut inner) => {
-                interp.run_bytecode_callable_committed(inner, &context, callback, this_arg, cb_args)
+            Some(ref mut inner) => interp.run_bytecode_callable_committed_lean_args(
+                inner,
+                &context,
+                callback,
+                this_arg,
+                &[v, v, set_value],
+            ),
+            None => {
+                let cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![v, v, set_value];
+                interp.run_callable_sync(&context, &callback, this_arg, cb_args)
             }
-            None => interp.run_callable_sync(&context, &callback, this_arg, cb_args),
         };
         if let Err(e) = outcome {
             err = Some(e);

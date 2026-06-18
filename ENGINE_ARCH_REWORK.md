@@ -282,6 +282,11 @@ is monomorphic and tiny.
   direct calls now bypass the generic upvalue builder when the callee has no own
   captures, carrying the already-resolved parent spine straight into the callee
   frame. Capturing callees keep the old allocation path.
+- **Borrowed lean callback arguments — LANDED.** Array iteration, Array sort,
+  Map.forEach, and Set.forEach already reuse one reservation-stable stack for
+  bytecode callbacks; the lean path now binds fixed borrowed argument arrays
+  directly into the callee frame instead of materializing a per-element
+  `SmallVec`. Generic/native fallback paths still own their argument vectors.
 - **Inline builtin callbacks**: splice a monomorphic JS callback body into
   `Array.map/filter/forEach/reduce/sort`'s native iteration so there is no
   per-element re-entry (kills the sort 2.4× / array-ops 2.7× ceiling).

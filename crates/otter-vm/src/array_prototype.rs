@@ -1313,16 +1313,18 @@ impl Interpreter {
             return Ok(Ordering::Less);
         }
         if !comparefn.is_undefined() {
-            let args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![x, y];
             let r = match lean_inner {
-                Some(inner) => self.run_bytecode_callable_committed(
+                Some(inner) => self.run_bytecode_callable_committed_lean_args(
                     inner,
                     context,
                     comparefn,
                     Value::undefined(),
-                    args,
+                    &[x, y],
                 ),
-                None => self.run_callable_sync(context, &comparefn, Value::undefined(), args),
+                None => {
+                    let args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![x, y];
+                    self.run_callable_sync(context, &comparefn, Value::undefined(), args)
+                }
             }?;
             let n = self.coerce_to_number(context, &r)?;
             let f = n.as_f64();
@@ -3127,19 +3129,13 @@ pub(crate) fn array_callback_native_dispatch(
             // park the current element before the callback runs.
             let receiver = interp.iteration_anchor(anchor_base + A_RECEIVER);
             interp.set_iteration_anchor(anchor_base + A_ELEM, v);
-            let cb_args: SmallVec<[Value; 8]> = match name {
-                "reduce" | "reduceRight" => {
-                    if !reduce_has_init {
-                        acc = v;
-                        reduce_has_init = true;
-                        interp.set_iteration_anchor(anchor_base + A_ACC, acc);
-                        continue;
-                    }
-                    let acc_now = interp.iteration_anchor(anchor_base + A_ACC);
-                    smallvec::smallvec![acc_now, v, Value::number_f64(idx as f64), receiver,]
-                }
-                _ => smallvec::smallvec![v, Value::number_f64(idx as f64), receiver,],
-            };
+            let is_reduce = matches!(name, "reduce" | "reduceRight");
+            if is_reduce && !reduce_has_init {
+                acc = v;
+                reduce_has_init = true;
+                interp.set_iteration_anchor(anchor_base + A_ACC, acc);
+                continue;
+            }
             let callback = interp.iteration_anchor(anchor_base + A_CALLBACK);
             let cb_this = interp.iteration_anchor(anchor_base + A_CB_THIS);
             // This loop always runs nested under the forEach/map/... native,
@@ -3149,9 +3145,33 @@ pub(crate) fn array_callback_native_dispatch(
             // `ExtraRoots` Vec push/truncate per element (the duplicate the
             // heap's `same_source` walk would skip anyway).
             let result = match lean_inner {
-                Some(ref mut inner) => interp
-                    .run_bytecode_callable_committed(inner, &context, callback, cb_this, cb_args),
+                Some(ref mut inner) => {
+                    if is_reduce {
+                        let acc_now = interp.iteration_anchor(anchor_base + A_ACC);
+                        interp.run_bytecode_callable_committed_lean_args(
+                            inner,
+                            &context,
+                            callback,
+                            cb_this,
+                            &[acc_now, v, Value::number_f64(idx as f64), receiver],
+                        )
+                    } else {
+                        interp.run_bytecode_callable_committed_lean_args(
+                            inner,
+                            &context,
+                            callback,
+                            cb_this,
+                            &[v, Value::number_f64(idx as f64), receiver],
+                        )
+                    }
+                }
                 None => {
+                    let cb_args: SmallVec<[Value; 8]> = if is_reduce {
+                        let acc_now = interp.iteration_anchor(anchor_base + A_ACC);
+                        smallvec::smallvec![acc_now, v, Value::number_f64(idx as f64), receiver,]
+                    } else {
+                        smallvec::smallvec![v, Value::number_f64(idx as f64), receiver,]
+                    };
                     interp.run_callable_sync_already_rooted(&context, &callback, cb_this, cb_args)
                 }
             }

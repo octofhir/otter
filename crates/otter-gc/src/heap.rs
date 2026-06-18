@@ -746,6 +746,82 @@ impl GcHeap {
         self.alloc_with_roots(value, &mut empty)
     }
 
+    /// Try to allocate a `T` in young space without running any collection.
+    ///
+    /// This is the compiled-code fast-path primitive: it succeeds only when the
+    /// nursery already has room and cap accounting can be booked immediately.
+    /// Any condition that would require a safepoint, emergency full GC, minor
+    /// scavenge, old-space overflow, or large-object handling returns `None` so
+    /// the caller can enter the normal rooted allocation path.
+    #[inline]
+    pub fn try_alloc_no_collect<T: Traceable>(&mut self, value: T) -> Option<Gc<T>> {
+        const {
+            assert!(
+                std::mem::align_of::<T>() <= crate::OBJECT_ALIGNMENT,
+                "GC body alignment exceeds OBJECT_ALIGNMENT; box the over-aligned field",
+            )
+        };
+        if self.trace_table.get(T::TYPE_TAG).is_none() {
+            self.trace_table.register::<T>();
+        }
+        let total = std::mem::size_of::<GcHeader>() + std::mem::size_of::<T>();
+        let aligned = align_up(total, CELL_SIZE);
+        debug_assert!(
+            aligned <= u32::MAX as usize,
+            "object size exceeds u32 limit"
+        );
+        if aligned > LARGE_OBJECT_THRESHOLD {
+            return None;
+        }
+        if self.gc_stress_stride != 0 && self.gc_stress_armed && !self.in_major_gc {
+            return None;
+        }
+        if self.major_gc_due() {
+            return None;
+        }
+        if self.max_heap_bytes != 0 {
+            self.drain_shared_external_releases();
+            let projected = self.tracked_bytes.saturating_add(aligned as u64);
+            if projected > self.max_heap_bytes {
+                return None;
+            }
+            self.tracked_bytes = projected;
+        }
+        let offset = match self.new_space.alloc(aligned) {
+            Some(offset) => offset,
+            None => {
+                if self.max_heap_bytes != 0 {
+                    self.tracked_bytes = self.tracked_bytes.saturating_sub(aligned as u64);
+                }
+                return None;
+            }
+        };
+        let is_marking = self.marking.is_marking();
+        // SAFETY: offset is a fresh in-cage allocation returned by new-space.
+        let header_ptr = unsafe { cage_base().add(offset as usize) as *mut GcHeader };
+        let payload_ptr =
+            unsafe { cage_base().add(offset as usize + std::mem::size_of::<GcHeader>()) as *mut T };
+        // SAFETY: header/payload are inside a freshly carved nursery cell. They
+        // are fully initialised before the handle is published.
+        unsafe {
+            let header = if is_marking {
+                GcHeader::new_young_black(T::TYPE_TAG, aligned as u32)
+            } else {
+                GcHeader::new_young(T::TYPE_TAG, aligned as u32)
+            };
+            std::ptr::write(header_ptr, header);
+            std::ptr::write(payload_ptr, value);
+        }
+        let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
+        row.live_bytes = row.live_bytes.wrapping_add(aligned);
+        row.alloc_count_total = row.alloc_count_total.wrapping_add(1);
+        row.alloc_bytes_total = row
+            .alloc_bytes_total
+            .wrapping_add(u64::try_from(aligned).unwrap_or(u64::MAX));
+        // SAFETY: offset is the cage offset of a freshly allocated `T` payload.
+        Some(unsafe { Gc::from_offset(offset) })
+    }
+
     /// Allocate a `T` while exposing caller-owned root slots to any
     /// emergency full GC or minor scavenge triggered by the allocation.
     ///
@@ -1230,30 +1306,10 @@ impl GcHeap {
     /// a hard cap is configured (that path drives full GCs itself) or
     /// while a major GC is already in flight.
     fn maybe_major_gc(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
-        // Runs regardless of any byte cap: the default cap equals the
-        // cage size, so it can never fire before the cage physically
-        // exhausts (pages carry overhead the byte-cap doesn't see).
-        // This growth trigger is what actually bounds old-space.
-        if self.in_major_gc {
+        if !self.major_gc_due() {
             return;
         }
-        // O(1) occupancy: page counts × page size (over-counts slack,
-        // which only makes the trigger fire slightly early — fine).
-        // Summing per-page allocated_bytes here would make every
-        // allocation O(pages).
-        let page_bytes = crate::page::PAGE_SIZE as u64;
-        let occupancy = (self.old_space.page_count() as u64)
-            .saturating_add(self.large_space.page_count() as u64)
-            .saturating_mul(page_bytes);
-        // `next_major_gc_bytes` is the only fire condition; it is itself
-        // clamped to a near-cage hard ceiling below. Using the ceiling as
-        // a *separate* fire condition would make GC fire on every alloc
-        // once a legitimate live set exceeds it (no reclaim possible →
-        // O(n²) thrash). Clamping the threshold instead lets a large live
-        // set settle just under the ceiling and stop collecting.
-        if occupancy < self.next_major_gc_bytes {
-            return;
-        }
+        let occupancy = self.major_gc_occupancy_bytes();
         self.in_major_gc = true;
         self.collect_full(external_visit);
         self.in_major_gc = false;
@@ -1261,7 +1317,7 @@ impl GcHeap {
         // (page-based, matching the occupancy metric above).
         let live_pages = (self.old_space.page_count() as u64)
             .saturating_add(self.large_space.page_count() as u64)
-            .saturating_mul(page_bytes);
+            .saturating_mul(crate::page::PAGE_SIZE as u64);
         let cage_hardcap = (cage_size() as u64) / 256 * MAJOR_GC_CAGE_SOFTCAP_NUM;
         // Adaptive growth. A collection that reclaims little means the heap is
         // mostly live: re-marking it again after only the tight `3/2` growth
@@ -1279,6 +1335,34 @@ impl GcHeap {
         };
         let target = live_pages.saturating_mul(num).saturating_div(den);
         self.next_major_gc_bytes = target.max(MAJOR_GC_FLOOR_BYTES).min(cage_hardcap);
+    }
+
+    fn major_gc_due(&self) -> bool {
+        // Runs regardless of any byte cap: the default cap equals the
+        // cage size, so it can never fire before the cage physically
+        // exhausts (pages carry overhead the byte-cap doesn't see).
+        // This growth trigger is what actually bounds old-space.
+        if self.in_major_gc {
+            return false;
+        }
+        // O(1) occupancy: page counts × page size (over-counts slack,
+        // which only makes the trigger fire slightly early — fine).
+        // Summing per-page allocated_bytes here would make every
+        // allocation O(pages).
+        let occupancy = self.major_gc_occupancy_bytes();
+        // `next_major_gc_bytes` is the only fire condition; it is itself
+        // clamped to a near-cage hard ceiling below. Using the ceiling as
+        // a separate fire condition would make GC fire on every alloc
+        // once a legitimate live set exceeds it. Clamping the threshold
+        // instead lets a large live set settle just under the ceiling.
+        occupancy >= self.next_major_gc_bytes
+    }
+
+    fn major_gc_occupancy_bytes(&self) -> u64 {
+        let page_bytes = crate::page::PAGE_SIZE as u64;
+        (self.old_space.page_count() as u64)
+            .saturating_add(self.large_space.page_count() as u64)
+            .saturating_mul(page_bytes)
     }
 
     /// Begin a full-GC mark phase and drain the ordinary root graph.

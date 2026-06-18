@@ -1121,6 +1121,14 @@ pub(crate) fn alloc_object_with_shape_roots(
     heap.alloc_with_roots(empty_object_body_with_shape(shape), external_visit)
 }
 
+/// Try to allocate a fresh shaped object without running a GC safepoint.
+pub(crate) fn try_alloc_object_with_shape_no_collect(
+    heap: &mut GcHeap,
+    shape: ShapeHandle,
+) -> Option<JsObject> {
+    heap.try_alloc_no_collect(empty_object_body_with_shape(shape))
+}
+
 /// Allocate a fresh empty object for diagnostic delivery after the
 /// heap cap has already fired.
 ///

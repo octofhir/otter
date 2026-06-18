@@ -365,6 +365,14 @@ objects lazily receive a fresh fallback id before losing their shape. That keeps
 observable shape identity stable for dictionary mode and makes fixed-shape
 object bodies templateable for the raw bump-allocation path.
 
+The allocation boundary now has a real no-GC young-allocation primitive:
+`GcHeap::try_alloc_no_collect` materializes a typed nursery cell only when cap
+accounting, GC-stress, growth-ratio major GC, large-object handling, and nursery
+space all allow a safepoint-free allocation. `NewObject` uses it for shaped
+ordinary objects and falls back to the existing rooted allocator on any miss.
+This preserves every collector/rooting invariant while carving out the exact
+fast/slow split the machine-code bump path needs.
+
 ## D3 — Variable-size payloads are malloc'd `Vec`s, not GC-inline storage
 
 ### Evidence

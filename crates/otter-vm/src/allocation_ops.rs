@@ -680,7 +680,15 @@ impl Interpreter {
         top_idx: usize,
         dst: u16,
     ) -> Result<(), VmError> {
-        // Allocate first, THEN read `%Object.prototype%`. The allocation
+        let shape_root = self.shape_root();
+        let obj = match crate::object::try_alloc_object_with_shape_no_collect(
+            &mut self.gc_heap,
+            shape_root,
+        ) {
+            Some(obj) => obj,
+            None => self.alloc_stack_rooted_object(stack)?,
+        };
+        // Allocate first, THEN read `%Object.prototype%`. The slow allocation
         // can trigger a scavenge that relocates the realm prototype while
         // it is still young; reading the handle beforehand would capture a
         // stale offset and install a dangling `[[Prototype]]` on the new
@@ -688,7 +696,6 @@ impl Interpreter {
         // happens to drive the GC). `object_prototype_object_opt` reads it
         // from the always-traced realm-intrinsic table, so post-alloc it
         // yields the relocated handle.
-        let obj = self.alloc_stack_rooted_object(stack)?;
         if let Some(proto) = self.object_prototype_object_opt() {
             crate::object::set_prototype(obj, &mut self.gc_heap, Some(proto));
         }

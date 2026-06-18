@@ -146,6 +146,69 @@ fn reserve_bytes_with_roots_preserves_external_stack_slot_during_emergency_gc() 
 }
 
 #[test]
+fn try_alloc_no_collect_allocates_in_young_space_without_roots() {
+    let mut heap = GcHeap::new().expect("heap");
+
+    let block = heap.try_alloc_no_collect(Block {
+        _payload: [0; 3 * 1024],
+    });
+
+    assert!(
+        block.is_some(),
+        "nursery room should satisfy no-collect alloc"
+    );
+    let stats = heap.stats();
+    assert!(
+        stats.new_allocated_bytes > 0,
+        "no-collect allocation should land in young space"
+    );
+    assert_eq!(
+        stats.old_allocated_bytes, 0,
+        "no-collect allocation must not overflow to old space"
+    );
+}
+
+#[test]
+fn try_alloc_no_collect_misses_without_booking_cap_on_overshoot() {
+    let mut heap = GcHeap::with_max_heap_bytes(1024).expect("heap");
+
+    let before = heap.tracked_bytes();
+    let block = heap.try_alloc_no_collect(Block {
+        _payload: [0; 3 * 1024],
+    });
+
+    assert!(block.is_none(), "cap overshoot should use rooted slow path");
+    assert_eq!(
+        heap.tracked_bytes(),
+        before,
+        "miss must not leave cap accounting booked"
+    );
+}
+
+#[test]
+fn try_alloc_no_collect_misses_when_nursery_needs_collection() {
+    let mut heap = GcHeap::new().expect("heap");
+    while heap
+        .try_alloc_no_collect(Block {
+            _payload: [0; 3 * 1024],
+        })
+        .is_some()
+    {}
+
+    let stats = heap.stats();
+    assert!(
+        stats.old_allocated_bytes == 0,
+        "no-collect allocation must not fall back to old space"
+    );
+    assert!(
+        stats.last_scavenge.copied_bytes == 0
+            && stats.last_scavenge.promoted_bytes == 0
+            && stats.last_scavenge.slot_updates == 0,
+        "no-collect allocation must not run a scavenge"
+    );
+}
+
+#[test]
 fn reserve_bytes_with_roots_rejects_impossible_request_without_gc() {
     let mut heap = GcHeap::with_max_heap_bytes(8 * 1024).expect("heap");
     let mut visited = false;

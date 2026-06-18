@@ -413,6 +413,14 @@ nursery cursor state yet, but it removes the extra transient argument container
 and leaves a narrower fixed-shape/array-literal slow path for the eventual bump
 emitter.
 
+Dense array construction now adopts the already-built element vector as the
+array body's backing store, accounts that backing store once, and tries the same
+no-collect young allocation boundary as shaped `NewObject` before falling back
+to the rooted allocation path. The fallback still traces the pending dense
+payload, so element handles remain movable-GC safe; hard heap caps skip the
+no-collect external-byte reservation and go straight to the rooted accounting
+path.
+
 ## D3 — Variable-size payloads are malloc'd `Vec`s, not GC-inline storage
 
 ### Evidence

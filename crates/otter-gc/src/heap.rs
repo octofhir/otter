@@ -755,6 +755,18 @@ impl GcHeap {
     /// the caller can enter the normal rooted allocation path.
     #[inline]
     pub fn try_alloc_no_collect<T: Traceable>(&mut self, value: T) -> Option<Gc<T>> {
+        self.try_alloc_no_collect_or_return(value).ok()
+    }
+
+    /// Try to allocate a `T` in young space without running any collection,
+    /// returning the original payload when a safepoint-free allocation is not
+    /// possible.
+    ///
+    /// Compound payload callers can use this to build an owned body once, try
+    /// the compiled-code fast boundary, and then hand the same body to
+    /// [`Self::alloc_with_roots`] if any guard requires the normal rooted path.
+    #[inline]
+    pub fn try_alloc_no_collect_or_return<T: Traceable>(&mut self, value: T) -> Result<Gc<T>, T> {
         const {
             assert!(
                 std::mem::align_of::<T>() <= crate::OBJECT_ALIGNMENT,
@@ -771,19 +783,19 @@ impl GcHeap {
             "object size exceeds u32 limit"
         );
         if aligned > LARGE_OBJECT_THRESHOLD {
-            return None;
+            return Err(value);
         }
         if self.gc_stress_stride != 0 && self.gc_stress_armed && !self.in_major_gc {
-            return None;
+            return Err(value);
         }
         if self.major_gc_due() {
-            return None;
+            return Err(value);
         }
         if self.max_heap_bytes != 0 {
             self.drain_shared_external_releases();
             let projected = self.tracked_bytes.saturating_add(aligned as u64);
             if projected > self.max_heap_bytes {
-                return None;
+                return Err(value);
             }
             self.tracked_bytes = projected;
         }
@@ -793,7 +805,7 @@ impl GcHeap {
                 if self.max_heap_bytes != 0 {
                     self.tracked_bytes = self.tracked_bytes.saturating_sub(aligned as u64);
                 }
-                return None;
+                return Err(value);
             }
         };
         let is_marking = self.marking.is_marking();
@@ -819,7 +831,7 @@ impl GcHeap {
             .alloc_bytes_total
             .wrapping_add(u64::try_from(aligned).unwrap_or(u64::MAX));
         // SAFETY: offset is the cage offset of a freshly allocated `T` payload.
-        Some(unsafe { Gc::from_offset(offset) })
+        Ok(unsafe { Gc::from_offset(offset) })
     }
 
     /// Allocate a `T` while exposing caller-owned root slots to any
@@ -1873,3 +1885,30 @@ impl std::fmt::Debug for GcHeap {
 
 // Drop: pages are owned by the spaces; their Drop returns them
 // to the cage automatically.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::OpaqueLeaf;
+
+    #[test]
+    fn no_collect_allocation_returns_payload_on_cap_miss() {
+        let mut heap = GcHeap::with_max_heap_bytes(1).expect("heap");
+        let leaf = OpaqueLeaf { payload: 42 };
+
+        match heap.try_alloc_no_collect_or_return(leaf) {
+            Ok(_) => panic!("allocation should not fit under the cap"),
+            Err(returned) => assert_eq!(returned.payload, 42),
+        }
+    }
+
+    #[test]
+    fn no_collect_allocation_still_succeeds_on_fast_path() {
+        let mut heap = GcHeap::new().expect("heap");
+        let handle = heap
+            .try_alloc_no_collect_or_return(OpaqueLeaf { payload: 7 })
+            .expect("fast allocation");
+
+        heap.read_payload(handle, |body| assert_eq!(body.payload, 7));
+    }
+}

@@ -376,18 +376,30 @@ pub(crate) fn from_vec_with_roots(
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
     let mut body = ArrayBody {
         length: collected.len(),
+        elements: collected,
         ..Default::default()
     };
-    {
+
+    let element_bytes = spilled_capacity_bytes(body.elements.capacity());
+    let can_reserve_without_collect = heap.max_heap_bytes() == 0;
+    let elements_reserved = element_bytes == 0
+        || (can_reserve_without_collect
+            && heap.reserve_bytes_no_collect(element_bytes as u64).is_ok());
+    if elements_reserved {
+        match heap.try_alloc_no_collect_or_return(body) {
+            Ok(array) => return Ok(array),
+            Err(returned) => body = returned,
+        }
+    } else {
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
-            for value in &collected {
+            for value in &body.elements {
                 value.trace_value_slots(visitor);
             }
         };
-        reserve_elements_for_len_with_roots(&mut body, heap, collected.len(), &mut reserve_roots)?;
+        heap.reserve_bytes_with_roots(element_bytes as u64, &mut reserve_roots)?;
     }
-    body.elements.extend(collected);
+
     heap.alloc_with_roots(body, external_visit)
 }
 
@@ -1884,6 +1896,29 @@ mod tests {
         assert_eq!(get(a, &heap, 0), Value::boolean(true));
         assert_eq!(get(a, &heap, 1), Value::null());
         assert_eq!(get(a, &heap, 2), Value::boolean(false));
+    }
+
+    #[test]
+    fn from_vec_with_roots_adopts_dense_elements() {
+        let mut heap = fresh_heap();
+        let mut external_visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+        let a = from_vec_with_roots(
+            &mut heap,
+            vec![
+                Value::number_i32(0),
+                Value::number_i32(1),
+                Value::number_i32(2),
+                Value::number_i32(3),
+                Value::number_i32(4),
+                Value::number_i32(5),
+            ],
+            &mut external_visit,
+        )
+        .unwrap();
+
+        assert_eq!(len(a, &heap), 6);
+        assert_eq!(get(a, &heap, 0), Value::number_i32(0));
+        assert_eq!(get(a, &heap, 5), Value::number_i32(5));
     }
 
     #[test]

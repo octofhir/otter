@@ -306,9 +306,9 @@ pub(crate) fn render_error_to_string_spec(
             return Ok(default.to_string());
         }
         if value.is_symbol() {
-            return Err(crate::VmError::TypeError {
-                message: (format!("Cannot convert a Symbol value to a string ('{key}')")).into(),
-            });
+            return Err(interp.err_type(
+                (format!("Cannot convert a Symbol value to a string ('{key}')")).into(),
+            ));
         }
         if let Some(s) = value.as_string(interp.gc_heap()) {
             return Ok(s.to_lossy_string(interp.gc_heap()));
@@ -322,9 +322,9 @@ pub(crate) fn render_error_to_string_spec(
             crate::abstract_ops::ToPrimitiveHint::String,
         )?;
         if primitive.is_symbol() {
-            return Err(crate::VmError::TypeError {
-                message: (format!("Cannot convert a Symbol value to a string ('{key}')")).into(),
-            });
+            return Err(interp.err_type(
+                (format!("Cannot convert a Symbol value to a string ('{key}')")).into(),
+            ));
         }
         if let Some(s) = primitive.as_string(interp.gc_heap()) {
             Ok(s.to_lossy_string(interp.gc_heap()))
@@ -474,10 +474,16 @@ impl ErrorClassRegistry {
             let (interp, _) = ctx.interp_mut_and_context();
             let display = render_error_to_string_spec(interp, &context, &receiver).map_err(
                 |err| match err {
-                    crate::VmError::Uncaught { value } => NativeError::Thrown {
-                        name: "Error.prototype.toString",
-                        message: value.into(),
-                    },
+                    crate::VmError::Uncaught => {
+                        let value = match interp.take_error_detail() {
+                            Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                            _ => Default::default(),
+                        };
+                        NativeError::Thrown {
+                            name: "Error.prototype.toString",
+                            message: value.into(),
+                        }
+                    }
                     other => NativeError::TypeError {
                         name: "Error.prototype.toString",
                         reason: other.to_string(),
@@ -581,38 +587,53 @@ impl ErrorClassRegistry {
                     reason: "cannot set stack on Error.prototype".to_string(),
                 });
             }
-            let map_err = |err: crate::VmError| match err {
-                crate::VmError::Uncaught { value } => NativeError::Thrown {
-                    name: "set Error.prototype.stack",
-                    message: value.into(),
-                },
-                other => NativeError::TypeError {
-                    name: "set Error.prototype.stack",
-                    reason: other.to_string(),
-                },
-            };
+            fn map_err(interp: &mut crate::Interpreter, err: crate::VmError) -> NativeError {
+                match err {
+                    crate::VmError::Uncaught => {
+                        let value = match interp.take_error_detail() {
+                            Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                            _ => Default::default(),
+                        };
+                        NativeError::Thrown {
+                            name: "set Error.prototype.stack",
+                            message: value.into(),
+                        }
+                    }
+                    other => NativeError::TypeError {
+                        name: "set Error.prototype.stack",
+                        reason: other.to_string(),
+                    },
+                }
+            }
             // SetterThatIgnoresPrototypeProperties steps 3-5.
-            let existing = interp
-                .ordinary_get_own_property_descriptor_value_runtime_rooted(
-                    &context,
-                    receiver,
-                    &crate::VmPropertyKey::String("stack"),
-                    0,
-                    &[&receiver, &value],
-                    &[],
-                )
-                .map_err(map_err)?;
+            let existing = match interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                &context,
+                receiver,
+                &crate::VmPropertyKey::String("stack"),
+                0,
+                &[&receiver, &value],
+                &[],
+            ) {
+                Ok(v) => v,
+                Err(e) => return Err(map_err(interp, e)),
+            };
             match existing {
                 // step 4 — no own "stack": CreateDataPropertyOrThrow.
                 None => {
-                    interp
-                        .create_data_property_or_throw(&context, receiver, "stack", value)
-                        .map_err(map_err)?;
+                    if let Err(e) =
+                        interp.create_data_property_or_throw(&context, receiver, "stack", value)
+                    {
+                        return Err(map_err(interp, e));
+                    }
                 }
                 // step 5 — own "stack" exists: Set(this, p, v, true).
-                Some(_) => interp
-                    .array_set_property_throwing(&context, receiver, "stack", value)
-                    .map_err(map_err)?,
+                Some(_) => {
+                    if let Err(e) =
+                        interp.array_set_property_throwing(&context, receiver, "stack", value)
+                    {
+                        return Err(map_err(interp, e));
+                    }
+                }
             }
             Ok(Value::undefined())
         }
@@ -702,16 +723,28 @@ impl ErrorClassRegistry {
             kind: ErrorKind,
             args: &[Value],
         ) -> Result<Value, NativeError> {
-            let map_vm_err = |err: crate::VmError| match err {
-                crate::VmError::Uncaught { value } => NativeError::Thrown {
-                    name: kind.class_name(),
-                    message: value.into(),
-                },
-                other => NativeError::TypeError {
-                    name: kind.class_name(),
-                    reason: other.to_string(),
-                },
-            };
+            fn map_vm_err(
+                ctx: &mut NativeCtx<'_>,
+                kind: ErrorKind,
+                err: crate::VmError,
+            ) -> NativeError {
+                match err {
+                    crate::VmError::Uncaught => {
+                        let value = match ctx.interp_mut().take_error_detail() {
+                            Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                            _ => Default::default(),
+                        };
+                        NativeError::Thrown {
+                            name: kind.class_name(),
+                            message: value.into(),
+                        }
+                    }
+                    other => NativeError::TypeError {
+                        name: kind.class_name(),
+                        reason: other.to_string(),
+                    },
+                }
+            }
             let context =
                 ctx.execution_context()
                     .cloned()
@@ -725,11 +758,10 @@ impl ErrorClassRegistry {
                 if v.is_undefined() {
                     None
                 } else {
-                    Some(
-                        ctx.interp_mut()
-                            .coerce_to_string(&context, v)
-                            .map_err(map_vm_err)?,
-                    )
+                    Some(match ctx.interp_mut().coerce_to_string(&context, v) {
+                        Ok(v) => v,
+                        Err(e) => return Err(map_vm_err(ctx, kind, e)),
+                    })
                 }
             } else {
                 None
@@ -740,7 +772,10 @@ impl ErrorClassRegistry {
                 ErrorKind::AggregateError => args.get(2),
                 _ => args.get(1),
             };
-            let cause = read_options_cause(ctx, &context, options).map_err(map_vm_err)?;
+            let cause = match read_options_cause(ctx, &context, options) {
+                Ok(v) => v,
+                Err(e) => return Err(map_vm_err(ctx, kind, e)),
+            };
             let registry = ctx.interp_mut().error_classes_clone();
             let mut extra_roots = Vec::with_capacity(1);
             if let Some(cause) = &cause {
@@ -838,16 +873,24 @@ impl ErrorClassRegistry {
         ///   - `message` is arg 1,
         ///   - `options.cause` lives at arg 2.
         fn ctor_aggregate(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
-            let map_vm_err = |err: crate::VmError| match err {
-                crate::VmError::Uncaught { value } => NativeError::Thrown {
-                    name: "AggregateError",
-                    message: value.into(),
-                },
-                other => NativeError::TypeError {
-                    name: "AggregateError",
-                    reason: other.to_string(),
-                },
-            };
+            fn map_vm_err(c: &mut NativeCtx<'_>, err: crate::VmError) -> NativeError {
+                match err {
+                    crate::VmError::Uncaught => {
+                        let value = match c.interp_mut().take_error_detail() {
+                            Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                            _ => Default::default(),
+                        };
+                        NativeError::Thrown {
+                            name: "AggregateError",
+                            message: value.into(),
+                        }
+                    }
+                    other => NativeError::TypeError {
+                        name: "AggregateError",
+                        reason: other.to_string(),
+                    },
+                }
+            }
             let context = c
                 .execution_context()
                 .cloned()
@@ -859,17 +902,19 @@ impl ErrorClassRegistry {
                 if v.is_undefined() {
                     None
                 } else {
-                    Some(
-                        c.interp_mut()
-                            .coerce_to_string(&context, v)
-                            .map_err(map_vm_err)?,
-                    )
+                    Some(match c.interp_mut().coerce_to_string(&context, v) {
+                        Ok(v) => v,
+                        Err(e) => return Err(map_vm_err(c, e)),
+                    })
                 }
             } else {
                 None
             };
             let errors_arg = a.first().cloned().unwrap_or(Value::undefined());
-            let cause = read_options_cause(c, &context, a.get(2)).map_err(map_vm_err)?;
+            let cause = match read_options_cause(c, &context, a.get(2)) {
+                Ok(v) => v,
+                Err(e) => return Err(map_vm_err(c, e)),
+            };
 
             // §20.5.7.1 step 4 — IterableToList(errors). Spec
             // throws `TypeError` for `null`/`undefined`. Spread
@@ -913,16 +958,24 @@ impl ErrorClassRegistry {
             context: &ExecutionContext,
             value: &Value,
         ) -> Result<Vec<Value>, NativeError> {
-            let map_err = |err: crate::VmError| match err {
-                crate::VmError::Uncaught { value } => NativeError::Thrown {
-                    name: "AggregateError",
-                    message: value.into(),
-                },
-                other => NativeError::TypeError {
-                    name: "AggregateError",
-                    reason: other.to_string(),
-                },
-            };
+            fn map_err(interp: &mut crate::Interpreter, err: crate::VmError) -> NativeError {
+                match err {
+                    crate::VmError::Uncaught => {
+                        let value = match interp.take_error_detail() {
+                            Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                            _ => Default::default(),
+                        };
+                        NativeError::Thrown {
+                            name: "AggregateError",
+                            message: value.into(),
+                        }
+                    }
+                    other => NativeError::TypeError {
+                        name: "AggregateError",
+                        reason: other.to_string(),
+                    },
+                }
+            }
             if value.is_undefined() || value.is_null() {
                 return Err(NativeError::TypeError {
                     name: "AggregateError",
@@ -960,7 +1013,7 @@ impl ErrorClassRegistry {
                 Ok(out)
             })(interp);
             interp.pop_iteration_anchors_to(anchor_base);
-            result.map_err(map_err)
+            result.map_err(|e| map_err(interp, e))
         }
 
         let mut entries: Vec<(ErrorKind, ClassEntry)> = Vec::with_capacity(7);

@@ -87,7 +87,7 @@ fn dynamic_function_ctor_call(
         .map_err(|err| {
             let reason = format!("{err}");
             match err {
-                crate::VmError::SyntaxError { .. } => NativeError::SyntaxError {
+                crate::VmError::SyntaxError => NativeError::SyntaxError {
                     name: "Function",
                     reason,
                 },

@@ -132,23 +132,35 @@ fn number_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
                 name: "Number",
                 reason: "missing execution context".to_string(),
             })?;
-        ctx.cx
-            .interp
-            .number_for_number_ctor(&context, &args[0])
-            .map_err(|e| match e {
-                crate::VmError::TypeError { message } => NativeError::TypeError {
+        match ctx.cx.interp.number_for_number_ctor(&context, &args[0]) {
+            Ok(v) => v,
+            Err(crate::VmError::TypeError) => {
+                let message = match ctx.cx.interp.take_error_detail() {
+                    Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                    _ => Default::default(),
+                };
+                return Err(NativeError::TypeError {
                     name: "Number",
                     reason: message.into(),
-                },
-                crate::VmError::Uncaught { value } => NativeError::Thrown {
+                });
+            }
+            Err(crate::VmError::Uncaught) => {
+                let value = match ctx.cx.interp.take_error_detail() {
+                    Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                    _ => Default::default(),
+                };
+                return Err(NativeError::Thrown {
                     name: "Number",
                     message: value.into(),
-                },
-                other => NativeError::TypeError {
+                });
+            }
+            Err(other) => {
+                return Err(NativeError::TypeError {
                     name: "Number",
                     reason: other.to_string(),
-                },
-            })?
+                });
+            }
+        }
     };
     if ctx.is_construct_call() {
         let this = *ctx.this_value();
@@ -208,21 +220,18 @@ fn number_parse_int_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     // `@@toPrimitive` override.
     let arg = args.first().cloned().unwrap_or(Value::undefined());
     let context = native_context(ctx, "parseInt")?;
-    let s = ctx
-        .cx
-        .interp
-        .coerce_to_string(&context, &arg)
-        .map_err(|e| crate::native_function::vm_to_native_error(e, "parseInt"))?;
+    let s_result = ctx.cx.interp.coerce_to_string(&context, &arg);
+    let s = s_result
+        .map_err(|e| crate::native_function::vm_to_native_error(&*ctx.cx.interp, e, "parseInt"))?;
     // §19.2.5 step 4: `R = ? ToInt32(radix)` — coerce the radix after
     // the string so a user `valueOf` on the radix fires in spec order.
     let radix = match args.get(1) {
         Some(radix) if !radix.is_undefined() => {
             let context = native_context(ctx, "parseInt")?;
-            let num = ctx
-                .cx
-                .interp
-                .coerce_to_number(&context, radix)
-                .map_err(|e| crate::native_function::vm_to_native_error(e, "parseInt"))?;
+            let num_result = ctx.cx.interp.coerce_to_number(&context, radix);
+            let num = num_result.map_err(|e| {
+                crate::native_function::vm_to_native_error(&*ctx.cx.interp, e, "parseInt")
+            })?;
             crate::number::bitwise::to_int32(num)
         }
         _ => 0,
@@ -237,11 +246,10 @@ fn number_parse_float_native(
     // §19.2.4 step 1: `inputString = ? ToString(string)` — observable.
     let arg = args.first().cloned().unwrap_or(Value::undefined());
     let context = native_context(ctx, "parseFloat")?;
-    let s = ctx
-        .cx
-        .interp
-        .coerce_to_string(&context, &arg)
-        .map_err(|e| crate::native_function::vm_to_native_error(e, "parseFloat"))?;
+    let s_result = ctx.cx.interp.coerce_to_string(&context, &arg);
+    let s = s_result.map_err(|e| {
+        crate::native_function::vm_to_native_error(&*ctx.cx.interp, e, "parseFloat")
+    })?;
     Ok(Value::number(crate::number::parse::parse_float(&s)))
 }
 
@@ -282,11 +290,13 @@ fn coerce_first_to_string_value(
         return Ok(arg);
     }
     let context = native_context(ctx, name)?;
-    let prim = ctx
-        .cx
-        .interp
-        .coerce_to_primitive(&context, &arg, crate::abstract_ops::ToPrimitiveHint::String)
-        .map_err(|e| crate::native_function::vm_to_native_error(e, name))?;
+    let prim_result = ctx.cx.interp.coerce_to_primitive(
+        &context,
+        &arg,
+        crate::abstract_ops::ToPrimitiveHint::String,
+    );
+    let prim = prim_result
+        .map_err(|e| crate::native_function::vm_to_native_error(&*ctx.cx.interp, e, name))?;
     if prim.is_symbol() {
         return Err(NativeError::TypeError {
             name,
@@ -298,21 +308,27 @@ fn coerce_first_to_string_value(
 
 fn global_encode_uri(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let coerced = coerce_first_to_string_value(ctx, args, "encodeURI")?;
-    crate::global_functions::call(
+    match crate::global_functions::call(
         otter_bytecode::method_id::GlobalMethod::EncodeURI,
         &[coerced],
         ctx.heap_mut(),
-    )
-    .map_err(|err| match err {
-        crate::VmError::URIError { message } => NativeError::URIError {
-            name: "encodeURI",
-            reason: message.into(),
-        },
-        other => NativeError::TypeError {
+    ) {
+        Ok(v) => Ok(v),
+        Err(crate::VmError::URIError) => {
+            let message = match ctx.interp_mut().take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            Err(NativeError::URIError {
+                name: "encodeURI",
+                reason: message.into(),
+            })
+        }
+        Err(other) => Err(NativeError::TypeError {
             name: "encodeURI",
             reason: other.to_string(),
-        },
-    })
+        }),
+    }
 }
 
 fn global_encode_uri_component(
@@ -320,44 +336,62 @@ fn global_encode_uri_component(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let coerced = coerce_first_to_string_value(ctx, args, "encodeURIComponent")?;
-    crate::global_functions::call(
+    match crate::global_functions::call(
         otter_bytecode::method_id::GlobalMethod::EncodeURIComponent,
         &[coerced],
         ctx.heap_mut(),
-    )
-    .map_err(|err| match err {
-        crate::VmError::URIError { message } => NativeError::URIError {
-            name: "encodeURIComponent",
-            reason: message.into(),
-        },
-        other => NativeError::TypeError {
+    ) {
+        Ok(v) => Ok(v),
+        Err(crate::VmError::URIError) => {
+            let message = match ctx.interp_mut().take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            Err(NativeError::URIError {
+                name: "encodeURIComponent",
+                reason: message.into(),
+            })
+        }
+        Err(other) => Err(NativeError::TypeError {
             name: "encodeURIComponent",
             reason: other.to_string(),
-        },
-    })
+        }),
+    }
 }
 
 fn global_decode_uri(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let coerced = coerce_first_to_string_value(ctx, args, "decodeURI")?;
-    crate::global_functions::call(
+    match crate::global_functions::call(
         otter_bytecode::method_id::GlobalMethod::DecodeURI,
         &[coerced],
         ctx.heap_mut(),
-    )
-    .map_err(|err| match err {
-        crate::VmError::URIError { message } => NativeError::URIError {
-            name: "decodeURI",
-            reason: message.into(),
-        },
-        crate::VmError::TypeError { message } => NativeError::TypeError {
-            name: "decodeURI",
-            reason: message.into(),
-        },
-        other => NativeError::TypeError {
+    ) {
+        Ok(v) => Ok(v),
+        Err(crate::VmError::URIError) => {
+            let message = match ctx.interp_mut().take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            Err(NativeError::URIError {
+                name: "decodeURI",
+                reason: message.into(),
+            })
+        }
+        Err(crate::VmError::TypeError) => {
+            let message = match ctx.interp_mut().take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            Err(NativeError::TypeError {
+                name: "decodeURI",
+                reason: message.into(),
+            })
+        }
+        Err(other) => Err(NativeError::TypeError {
             name: "decodeURI",
             reason: other.to_string(),
-        },
-    })
+        }),
+    }
 }
 
 fn global_decode_uri_component(
@@ -365,25 +399,37 @@ fn global_decode_uri_component(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let coerced = coerce_first_to_string_value(ctx, args, "decodeURIComponent")?;
-    crate::global_functions::call(
+    match crate::global_functions::call(
         otter_bytecode::method_id::GlobalMethod::DecodeURIComponent,
         &[coerced],
         ctx.heap_mut(),
-    )
-    .map_err(|err| match err {
-        crate::VmError::URIError { message } => NativeError::URIError {
-            name: "decodeURIComponent",
-            reason: message.into(),
-        },
-        crate::VmError::TypeError { message } => NativeError::TypeError {
-            name: "decodeURIComponent",
-            reason: message.into(),
-        },
-        other => NativeError::TypeError {
+    ) {
+        Ok(v) => Ok(v),
+        Err(crate::VmError::URIError) => {
+            let message = match ctx.interp_mut().take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            Err(NativeError::URIError {
+                name: "decodeURIComponent",
+                reason: message.into(),
+            })
+        }
+        Err(crate::VmError::TypeError) => {
+            let message = match ctx.interp_mut().take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            Err(NativeError::TypeError {
+                name: "decodeURIComponent",
+                reason: message.into(),
+            })
+        }
+        Err(other) => Err(NativeError::TypeError {
             name: "decodeURIComponent",
             reason: other.to_string(),
-        },
-    })
+        }),
+    }
 }
 
 fn global_escape(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -419,11 +465,9 @@ fn global_unescape(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
 fn global_is_nan(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let arg = args.first().cloned().unwrap_or(Value::undefined());
     let context = native_context(ctx, "isNaN")?;
-    let num = ctx
-        .cx
-        .interp
-        .coerce_to_number(&context, &arg)
-        .map_err(|e| crate::native_function::vm_to_native_error(e, "isNaN"))?;
+    let num_result = ctx.cx.interp.coerce_to_number(&context, &arg);
+    let num = num_result
+        .map_err(|e| crate::native_function::vm_to_native_error(&*ctx.cx.interp, e, "isNaN"))?;
     Ok(Value::boolean(num.as_f64().is_nan()))
 }
 
@@ -433,11 +477,9 @@ fn global_is_nan(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 fn global_is_finite(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let arg = args.first().cloned().unwrap_or(Value::undefined());
     let context = native_context(ctx, "isFinite")?;
-    let num = ctx
-        .cx
-        .interp
-        .coerce_to_number(&context, &arg)
-        .map_err(|e| crate::native_function::vm_to_native_error(e, "isFinite"))?;
+    let num_result = ctx.cx.interp.coerce_to_number(&context, &arg);
+    let num = num_result
+        .map_err(|e| crate::native_function::vm_to_native_error(&*ctx.cx.interp, e, "isFinite"))?;
     Ok(Value::boolean(num.as_f64().is_finite()))
 }
 
@@ -447,7 +489,9 @@ fn global_eval(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
     // no caller-scope restrictions apply. Errors keep their spec
     // class across the native boundary (a TDZ ReferenceError from
     // the eval body must not collapse to TypeError).
-    ctx.interp_mut()
-        .run_eval(&arg, crate::EvalCompileOptions::default())
-        .map_err(|err| crate::native_function::vm_to_native_error(err, "eval"))
+    let eval_result = ctx
+        .interp_mut()
+        .run_eval(&arg, crate::EvalCompileOptions::default());
+    eval_result
+        .map_err(|err| crate::native_function::vm_to_native_error(&*ctx.interp_mut(), err, "eval"))
 }

@@ -296,11 +296,10 @@ fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
             name: "Map.groupBy",
             reason: "missing execution context".to_string(),
         })?;
-    let items_snapshot = ctx
-        .cx
-        .interp
-        .iterator_to_list_sync(&exec_ctx, &items)
-        .map_err(map_group_by_vm_error)?;
+    let items_snapshot = match ctx.cx.interp.iterator_to_list_sync(&exec_ctx, &items) {
+        Ok(v) => v,
+        Err(e) => return Err(map_group_by_vm_error(ctx.cx.interp, e)),
+    };
     let result = ctx.alloc_map().map_err(|_| NativeError::TypeError {
         name: "Map.groupBy",
         reason: "out of memory".to_string(),
@@ -312,11 +311,15 @@ fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
         cb_args.push(Value::number(crate::number::NumberValue::from_f64(
             idx as f64,
         )));
-        let key = ctx
-            .cx
-            .interp
-            .run_callable_sync(&exec_ctx, &callback, Value::undefined(), cb_args)
-            .map_err(map_group_by_vm_error)?;
+        let key =
+            match ctx
+                .cx
+                .interp
+                .run_callable_sync(&exec_ctx, &callback, Value::undefined(), cb_args)
+            {
+                Ok(v) => v,
+                Err(e) => return Err(map_group_by_vm_error(ctx.cx.interp, e)),
+            };
         let existing = crate::collections::map_get(result, ctx.heap(), &key);
         let group_arr = if let Some(arr) = existing.and_then(|v| v.as_array()) {
             arr
@@ -360,12 +363,18 @@ fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     Ok(result_value)
 }
 
-fn map_group_by_vm_error(err: crate::VmError) -> NativeError {
+fn map_group_by_vm_error(interp: &mut crate::Interpreter, err: crate::VmError) -> NativeError {
     match err {
-        crate::VmError::Uncaught { value } => NativeError::Thrown {
-            name: "Map.groupBy",
-            message: value.into(),
-        },
+        crate::VmError::Uncaught => {
+            let value = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::Thrown {
+                name: "Map.groupBy",
+                message: value.into(),
+            }
+        }
         other => NativeError::TypeError {
             name: "Map.groupBy",
             reason: other.to_string(),
@@ -513,12 +522,12 @@ fn add_entries_from_iterable(
                 &VmPropertyKey::String(adder_name),
                 0,
             )
-            .map_err(|e| vm_to_native(e, ctor_name))?;
+            .map_err(|e| vm_to_native(interp, e, ctor_name))?;
         match outcome {
             VmGetOutcome::Value(v) => v,
             VmGetOutcome::InvokeGetter { getter } => interp
                 .run_callable_sync(&context, &getter, *target, SmallVec::new())
-                .map_err(|e| vm_to_native(e, ctor_name))?,
+                .map_err(|e| vm_to_native(interp, e, ctor_name))?,
         }
     };
     if !ctx.interp_mut().is_callable_runtime(&adder) {
@@ -558,14 +567,14 @@ fn add_entries_eager(
         let interp = ctx.interp_mut();
         interp
             .iterator_to_list_sync(context, iterable)
-            .map_err(|e| vm_to_native(e, ctor_name))?
+            .map_err(|e| vm_to_native(interp, e, ctor_name))?
     };
     for next in entries {
         let call_args = build_adder_args(ctx, context, &next, kind, None)?;
         let interp = ctx.interp_mut();
         interp
             .run_callable_sync(context, adder, *target, call_args)
-            .map_err(|e| vm_to_native(e, ctor_name))?;
+            .map_err(|e| vm_to_native(interp, e, ctor_name))?;
     }
     Ok(())
 }
@@ -583,7 +592,7 @@ fn add_entries_lazy(
         let interp = ctx.interp_mut();
         interp
             .get_iterator_sync(context, iterable)
-            .map_err(|e| vm_to_native(e, ctor_name))?
+            .map_err(|e| vm_to_native(interp, e, ctor_name))?
     };
 
     loop {
@@ -594,7 +603,7 @@ fn add_entries_lazy(
         let next = match stepped {
             Ok(Some(value)) => value,
             Ok(None) => return Ok(()),
-            Err(err) => return Err(vm_to_native(err, ctor_name)),
+            Err(err) => return Err(vm_to_native(ctx.interp_mut(), err, ctor_name)),
         };
 
         let call_args = build_adder_args(ctx, context, &next, kind, Some(&iterator))?;
@@ -609,7 +618,7 @@ fn add_entries_lazy(
             if let Some(value) = original_throw {
                 ctx.interp_mut().set_pending_uncaught_throw(value);
             }
-            return Err(vm_to_native(err, ctor_name));
+            return Err(vm_to_native(ctx.interp_mut(), err, ctor_name));
         }
     }
 }
@@ -648,7 +657,7 @@ fn build_adder_args(
                     ctx.interp_mut().set_pending_uncaught_throw(value);
                 }
             }
-            return Err(vm_to_native(err, ctor_name));
+            return Err(vm_to_native(ctx.interp_mut(), err, ctor_name));
         }
     };
     let value = match read_indexed_property(ctx, context, next, "1") {
@@ -661,7 +670,7 @@ fn build_adder_args(
                     ctx.interp_mut().set_pending_uncaught_throw(value);
                 }
             }
-            return Err(vm_to_native(err, ctor_name));
+            return Err(vm_to_native(ctx.interp_mut(), err, ctor_name));
         }
     };
     Ok(smallvec::smallvec![key, value])
@@ -805,7 +814,7 @@ fn map_proto_get_or_insert_computed(
             Value::undefined(),
             smallvec::smallvec![canonical],
         )
-        .map_err(|e| vm_to_native(e, "Map.prototype.getOrInsertComputed"))?;
+        .map_err(|e| vm_to_native(ctx.interp_mut(), e, "Map.prototype.getOrInsertComputed"))?;
     // Re-scan / insert: `map_set` overwrites an entry the callback may
     // have added for `key`, else appends a fresh one.
     ctx.map_set(&mut m, key, value)
@@ -866,7 +875,7 @@ fn map_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     }
     ctx.interp_mut().release_lean_callback_stack(lean);
     if let Some(e) = err {
-        return Err(vm_to_native(e, "Map.prototype.forEach"));
+        return Err(vm_to_native(ctx.interp_mut(), e, "Map.prototype.forEach"));
     }
     Ok(Value::undefined())
 }
@@ -1001,7 +1010,7 @@ fn set_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     }
     ctx.interp_mut().release_lean_callback_stack(lean);
     if let Some(e) = err {
-        return Err(vm_to_native(e, "Set.prototype.forEach"));
+        return Err(vm_to_native(ctx.interp_mut(), e, "Set.prototype.forEach"));
     }
     Ok(Value::undefined())
 }
@@ -1385,7 +1394,7 @@ fn weak_map_proto_get_or_insert_computed(
             Value::undefined(),
             smallvec::smallvec![key],
         )
-        .map_err(|e| vm_to_native(e, "WeakMap.prototype.getOrInsertComputed"))?;
+        .map_err(|e| vm_to_native(ctx.interp_mut(), e, "WeakMap.prototype.getOrInsertComputed"))?;
     ctx.weak_map_set(&mut m, key, value)
         .map_err(|e| collection_to_native(e, "WeakMap.prototype.getOrInsertComputed"))?;
     Ok(value)
@@ -1621,7 +1630,7 @@ fn set_record_has(
             let result = ctx
                 .interp_mut()
                 .run_callable_sync(context, has, *set, smallvec::smallvec![*value])
-                .map_err(|err| vm_to_native(err, name))?;
+                .map_err(|err| vm_to_native(ctx.interp_mut(), err, name))?;
             Ok(result.to_boolean(ctx.heap()))
         }
     }
@@ -1649,7 +1658,7 @@ fn set_record_keys(
             let iterator = ctx
                 .interp_mut()
                 .run_callable_sync(context, keys, *set, SmallVec::new())
-                .map_err(|err| vm_to_native(err, name))?;
+                .map_err(|err| vm_to_native(ctx.interp_mut(), err, name))?;
             if let Some(handle) = iterator.as_generator() {
                 return Ok(SetRecordKeys::Generator { handle });
             }
@@ -1657,14 +1666,14 @@ fn set_record_keys(
                 let values = ctx
                     .interp_mut()
                     .iterator_to_list_sync(context, &iterator)
-                    .map_err(|err| vm_to_native(err, name))?;
+                    .map_err(|err| vm_to_native(ctx.interp_mut(), err, name))?;
                 return Ok(SetRecordKeys::Snapshot { values, index: 0 });
             }
             if iterator_has_callable_iterator(ctx, context, &iterator, name)? {
                 let values = ctx
                     .interp_mut()
                     .iterator_to_list_sync(context, &iterator)
-                    .map_err(|err| vm_to_native(err, name))?;
+                    .map_err(|err| vm_to_native(ctx.interp_mut(), err, name))?;
                 return Ok(SetRecordKeys::Snapshot { values, index: 0 });
             }
             if !value_is_object_like(&iterator) {
@@ -1710,7 +1719,7 @@ fn set_record_next_key(
                     handle,
                     crate::GeneratorResumeKind::Next(Value::undefined()),
                 )
-                .map_err(|err| vm_to_native(err, name))?;
+                .map_err(|err| vm_to_native(ctx.interp_mut(), err, name))?;
             let Some(record) = result.as_object() else {
                 return Err(NativeError::TypeError {
                     name,
@@ -1733,7 +1742,7 @@ fn set_record_next_key(
         } => ctx
             .interp_mut()
             .iterator_step_sync(context, iterator, next_method)
-            .map_err(|err| vm_to_native(err, name)),
+            .map_err(|err| vm_to_native(ctx.interp_mut(), err, name)),
     }
 }
 
@@ -1746,7 +1755,7 @@ fn set_record_close(
     if let SetRecordKeys::Dynamic { iterator, .. } = keys {
         ctx.interp_mut()
             .iterator_close_sync(context, iterator)
-            .map_err(|err| vm_to_native(err, name))?;
+            .map_err(|err| vm_to_native(ctx.interp_mut(), err, name))?;
     }
     Ok(())
 }
@@ -1779,12 +1788,12 @@ fn read_property(
             &VmPropertyKey::String(property),
             0,
         )
-        .map_err(|err| vm_to_native(err, name))?;
+        .map_err(|err| vm_to_native(interp, err, name))?;
     match outcome {
         VmGetOutcome::Value(value) => Ok(value),
         VmGetOutcome::InvokeGetter { getter } => interp
             .run_callable_sync(context, &getter, *target, SmallVec::new())
-            .map_err(|err| vm_to_native(err, name)),
+            .map_err(|err| vm_to_native(interp, err, name)),
     }
 }
 
@@ -1807,12 +1816,12 @@ fn iterator_has_callable_iterator(
             &VmPropertyKey::Symbol(iterator_sym),
             0,
         )
-        .map_err(|err| vm_to_native(err, name))?;
+        .map_err(|err| vm_to_native(interp, err, name))?;
     let method = match outcome {
         VmGetOutcome::Value(value) => value,
         VmGetOutcome::InvokeGetter { getter } => interp
             .run_callable_sync(context, &getter, *target, SmallVec::new())
-            .map_err(|err| vm_to_native(err, name))?,
+            .map_err(|err| vm_to_native(interp, err, name))?,
     };
     Ok(
         !method.is_undefined()
@@ -1832,7 +1841,7 @@ fn to_number_runtime(
     } else {
         ctx.interp_mut()
             .evaluate_to_primitive(context, value, crate::abstract_ops::ToPrimitiveHint::Number)
-            .map_err(|err| vm_to_native(err, name))?
+            .map_err(|err| vm_to_native(ctx.interp_mut(), err, name))?
     };
     if primitive.is_symbol() || primitive.is_big_int() {
         return Err(NativeError::TypeError {
@@ -1882,32 +1891,56 @@ fn collection_to_native(err: CollectionError, name: &'static str) -> NativeError
     }
 }
 
-fn vm_to_native(err: VmError, name: &'static str) -> NativeError {
+fn vm_to_native(interp: &crate::Interpreter, err: VmError, name: &'static str) -> NativeError {
     match err {
-        VmError::TypeError { message } => NativeError::TypeError {
-            name,
-            reason: message.into(),
-        },
+        VmError::TypeError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::TypeError {
+                name,
+                reason: message.into(),
+            }
+        }
         VmError::TypeMismatch => NativeError::TypeError {
             name,
             reason: "type mismatch".to_string(),
         },
-        VmError::SyntaxError { message } => NativeError::SyntaxError {
-            name,
-            reason: message.into(),
-        },
-        VmError::RangeError { message } => NativeError::RangeError {
-            name,
-            reason: message.into(),
-        },
+        VmError::SyntaxError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::SyntaxError {
+                name,
+                reason: message.into(),
+            }
+        }
+        VmError::RangeError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::RangeError {
+                name,
+                reason: message.into(),
+            }
+        }
         VmError::NotCallable => NativeError::TypeError {
             name,
             reason: "value is not callable".to_string(),
         },
-        VmError::Uncaught { value } => NativeError::Thrown {
-            name,
-            message: value.into(),
-        },
+        VmError::Uncaught => {
+            let value = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::Thrown {
+                name,
+                message: value.into(),
+            }
+        }
         VmError::OutOfMemory { .. } => NativeError::TypeError {
             name,
             reason: "out of memory".to_string(),

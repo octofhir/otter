@@ -476,24 +476,51 @@ fn advance_string_index(units: &[u16], index: usize, unicode: bool) -> usize {
     index + 1
 }
 
-fn vm_err_to_native(name: &'static str) -> impl Fn(crate::VmError) -> crate::NativeError {
+fn vm_err_to_native<'a>(
+    interp: &'a crate::Interpreter,
+    name: &'static str,
+) -> impl Fn(crate::VmError) -> crate::NativeError + 'a {
     move |err| match err {
-        crate::VmError::Uncaught { value } => crate::NativeError::Thrown {
-            name,
-            message: value.into(),
-        },
-        crate::VmError::TypeError { message } => crate::NativeError::TypeError {
-            name,
-            reason: message.into(),
-        },
-        crate::VmError::RangeError { message } => crate::NativeError::RangeError {
-            name,
-            reason: message.into(),
-        },
-        crate::VmError::SyntaxError { message } => crate::NativeError::SyntaxError {
-            name,
-            reason: message.into(),
-        },
+        crate::VmError::Uncaught => {
+            let value = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                _ => Default::default(),
+            };
+            crate::NativeError::Thrown {
+                name,
+                message: value.into(),
+            }
+        }
+        crate::VmError::TypeError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            crate::NativeError::TypeError {
+                name,
+                reason: message.into(),
+            }
+        }
+        crate::VmError::RangeError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            crate::NativeError::RangeError {
+                name,
+                reason: message.into(),
+            }
+        }
+        crate::VmError::SyntaxError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            crate::NativeError::SyntaxError {
+                name,
+                reason: message.into(),
+            }
+        }
         other => crate::NativeError::TypeError {
             name,
             reason: other.to_string(),
@@ -523,14 +550,14 @@ pub(crate) fn get_property_runtime(
             &crate::VmPropertyKey::String(key),
             0,
         )
-        .map_err(vm_err_to_native(name))?;
+        .map_err(vm_err_to_native(interp, name))?;
     match outcome {
         crate::VmGetOutcome::Value(v) => Ok(v),
         crate::VmGetOutcome::InvokeGetter { getter } => {
             let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
             interp
                 .run_callable_sync(&exec, &getter, *receiver, args)
-                .map_err(vm_err_to_native(name))
+                .map_err(vm_err_to_native(interp, name))
         }
     }
 }
@@ -562,7 +589,7 @@ fn set_property_runtime(
                 let args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![value];
                 interp
                     .run_callable_sync(&exec, &setter, *receiver, args)
-                    .map_err(vm_err_to_native(name))?;
+                    .map_err(vm_err_to_native(interp, name))?;
                 return Ok(());
             }
             crate::object::SetOutcome::Reject { .. } => {
@@ -583,7 +610,7 @@ fn set_property_runtime(
             *receiver,
             0,
         )
-        .map_err(vm_err_to_native(name))?;
+        .map_err(vm_err_to_native(interp, name))?;
     // `Set(O, P, V, true)` — a `[[Set]]` returning false (e.g. a
     // non-writable `lastIndex`) is a TypeError, not a silent no-op.
     if !ok {
@@ -629,7 +656,7 @@ pub(crate) fn coerce_to_jsstring_runtime(
         })?;
         interp
             .evaluate_to_primitive(&exec, value, crate::abstract_ops::ToPrimitiveHint::String)
-            .map_err(vm_err_to_native(name))?
+            .map_err(vm_err_to_native(interp, name))?
     };
 
     crate::conversion::to_js_string_primitive(&primitive, ctx.heap_mut()).map_err(|e| {
@@ -660,7 +687,7 @@ fn to_length_runtime(
             reason: "missing execution context".to_string(),
         })?;
     let n = crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, value)
-        .map_err(vm_err_to_native(name))?
+        .map_err(vm_err_to_native(ctx.cx.interp, name))?
         .as_f64();
     if n.is_nan() || n <= 0.0 {
         return Ok(0);
@@ -690,7 +717,7 @@ fn to_integer_or_infinity_runtime(
         })?;
         interp
             .evaluate_to_primitive(&exec, value, crate::abstract_ops::ToPrimitiveHint::Number)
-            .map_err(vm_err_to_native(name))?
+            .map_err(vm_err_to_native(interp, name))?
     };
     let n = crate::number::to_number_value(&primitive, ctx.heap());
     if n.is_nan() {
@@ -727,7 +754,7 @@ fn regexp_exec_runtime(
         args.push(Value::string(s));
         let result = interp
             .run_callable_sync(&exec_ctx, &exec_fn, *rx, args)
-            .map_err(vm_err_to_native(name))?;
+            .map_err(vm_err_to_native(interp, name))?;
         if !result.is_null() && !result.is_object_type() {
             return Err(crate::NativeError::TypeError {
                 name,
@@ -768,21 +795,22 @@ pub(crate) fn regexp_string_iterator_next_runtime(
         crate::NativeCallInfo::call(*matcher),
         Some(context.clone()),
     );
-    let result =
-        regexp_exec_runtime(&mut ctx, matcher, input, name).map_err(crate::native_to_vm_error)?;
+    let result = regexp_exec_runtime(&mut ctx, matcher, input, name)
+        .map_err(|e| crate::native_to_vm_error(ctx.interp_mut(), e))?;
     if result.is_null() {
         return Ok(None);
     }
     if global {
         let matched_val = get_property_runtime(&mut ctx, &result, "0", name)
-            .map_err(crate::native_to_vm_error)?;
+            .map_err(|e| crate::native_to_vm_error(ctx.interp_mut(), e))?;
         let matched_str = coerce_to_jsstring_runtime(&mut ctx, &matched_val, name)
-            .map_err(crate::native_to_vm_error)?;
+            .map_err(|e| crate::native_to_vm_error(ctx.interp_mut(), e))?;
         if matched_str.is_empty() {
             let li_val = get_property_runtime(&mut ctx, matcher, "lastIndex", name)
-                .map_err(crate::native_to_vm_error)?;
+                .map_err(|e| crate::native_to_vm_error(ctx.interp_mut(), e))?;
             let this_index = to_length_runtime(&mut ctx, &li_val, name)
-                .map_err(crate::native_to_vm_error)? as usize;
+                .map_err(|e| crate::native_to_vm_error(ctx.interp_mut(), e))?
+                as usize;
             let input_units = input.to_utf16_vec(ctx.heap());
             let next_index = advance_string_index(&input_units, this_index, full_unicode);
             set_property_runtime(
@@ -792,7 +820,7 @@ pub(crate) fn regexp_string_iterator_next_runtime(
                 Value::number_f64(next_index as f64),
                 name,
             )
-            .map_err(crate::native_to_vm_error)?;
+            .map_err(|e| crate::native_to_vm_error(ctx.interp_mut(), e))?;
         }
     }
     Ok(Some(result))
@@ -954,7 +982,7 @@ pub fn native_regexp_symbol_replace(
                         Value::undefined(),
                         replacer_args,
                     )
-                    .map_err(vm_err_to_native(name))?
+                    .map_err(vm_err_to_native(interp, name))?
             };
             let raw_str = coerce_to_jsstring_runtime(ctx, &raw, name)?;
             raw_str.to_utf16_vec(ctx.heap())
@@ -1047,14 +1075,14 @@ pub(crate) fn get_symbol_property_runtime(
             &crate::VmPropertyKey::Symbol(sym),
             0,
         )
-        .map_err(vm_err_to_native(name))?;
+        .map_err(vm_err_to_native(interp, name))?;
     match outcome {
         crate::VmGetOutcome::Value(v) => Ok(v),
         crate::VmGetOutcome::InvokeGetter { getter } => {
             let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
             interp
                 .run_callable_sync(&exec, &getter, *receiver, args)
-                .map_err(vm_err_to_native(name))
+                .map_err(vm_err_to_native(interp, name))
         }
     }
 }
@@ -1171,7 +1199,7 @@ pub fn native_regexp_symbol_match_all(
         })?;
         interp
             .run_construct_sync(&exec_ctx, &c, c, ctor_args)
-            .map_err(vm_err_to_native(name))?
+            .map_err(vm_err_to_native(interp, name))?
     };
 
     // Step 2.f — snapshot rx.lastIndex into matcher.
@@ -1281,7 +1309,7 @@ pub fn native_regexp_symbol_split(
         })?;
         interp
             .run_construct_sync(&exec_ctx, &c, c, ctor_args)
-            .map_err(vm_err_to_native(name))?
+            .map_err(vm_err_to_native(interp, name))?
     };
 
     // Step 13 — lim = limit === undefined ? 2^32 - 1 : ToUint32(limit).
@@ -1298,7 +1326,7 @@ pub fn native_regexp_symbol_split(
                     reason: "missing execution context".to_string(),
                 })?;
         let n = crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, &limit_arg)
-            .map_err(vm_err_to_native(name))?
+            .map_err(vm_err_to_native(ctx.cx.interp, name))?
             .as_f64();
         if n.is_nan() {
             0

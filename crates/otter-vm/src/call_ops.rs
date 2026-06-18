@@ -84,7 +84,8 @@ fn invoke_native_call_with_roots(
     let call_info = NativeCallInfo::call(this_root);
     let mut ctx =
         NativeCtx::new_with_call_info_and_context(interp, call_info, Some(context.clone()));
-    let result = call.invoke(&mut ctx, args).map_err(native_to_vm_error);
+    let raw = call.invoke(&mut ctx, args);
+    let result = raw.map_err(|e| native_to_vm_error(interp, e));
     interp.gc_heap.pop_extra_roots_to(depth - 1);
     result
 }
@@ -362,9 +363,7 @@ impl Interpreter {
         // async functions, generators, async generators, and
         // MethodDefinition bodies are not constructors.
         if function.is_async || function.is_generator || function.is_method {
-            return Err(VmError::TypeError {
-                message: ("function is not a constructor".to_string()).into(),
-            });
+            return Err(self.err_type(("function is not a constructor".to_string()).into()));
         }
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
@@ -422,9 +421,7 @@ impl Interpreter {
         // §10.2.5 — async / generator functions and methods are not
         // constructors.
         if function.is_async || function.is_generator || function.is_method {
-            return Err(VmError::TypeError {
-                message: ("function is not a constructor".to_string()).into(),
-            });
+            return Err(self.err_type(("function is not a constructor".to_string()).into()));
         }
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
@@ -478,7 +475,8 @@ impl Interpreter {
         self.record_runtime_native_call();
         let mut ctx =
             NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-        let result = call.invoke(&mut ctx, args).map_err(native_to_vm_error)?;
+        let raw = call.invoke(&mut ctx, args);
+        let result = raw.map_err(|e| native_to_vm_error(self, e))?;
         Ok(if result.is_object_type() {
             result
         } else {
@@ -739,9 +737,9 @@ impl Interpreter {
         if current.as_class_constructor().is_some() {
             // §10.3.1 — a class constructor's [[Call]] always
             // throws; only [[Construct]] may enter it.
-            return Err(VmError::TypeError {
-                message: ("Class constructor cannot be invoked without 'new'".to_string()).into(),
-            });
+            return Err(self.err_type(
+                ("Class constructor cannot be invoked without 'new'".to_string()).into(),
+            ));
         }
         if current.is_bound_function() {
             return Ok(false);
@@ -948,10 +946,9 @@ impl Interpreter {
                 // always throws, including when reached through a
                 // bound-function wrapper or Reflect/Function call
                 // forwarding. Only [[Construct]] may enter it.
-                return Err(VmError::TypeError {
-                    message: ("Class constructor cannot be invoked without 'new'".to_string())
-                        .into(),
-                });
+                return Err(self.err_type(
+                    ("Class constructor cannot be invoked without 'new'".to_string()).into(),
+                ));
             }
             break;
         }
@@ -1281,10 +1278,9 @@ impl Interpreter {
                     // §10.5.13 step 9 — trap result must be an Object;
                     // primitive returns surface as TypeError.
                     if !v.is_object_type() {
-                        return Err(VmError::TypeError {
-                            message: ("Proxy construct trap returned non-object".to_string())
-                                .into(),
-                        });
+                        return Err(self.err_type(
+                            ("Proxy construct trap returned non-object".to_string()).into(),
+                        ));
                     }
                     v
                 }
@@ -1544,9 +1540,9 @@ impl Interpreter {
             }
         };
         if !proto.is_object_type() && proxy.is_some_and(|proxy| proxy.is_revoked(&self.gc_heap)) {
-            return Err(VmError::TypeError {
-                message: ("Cannot get prototype from a revoked proxy".to_string()).into(),
-            });
+            return Err(
+                self.err_type(("Cannot get prototype from a revoked proxy".to_string()).into())
+            );
         }
         Ok(proto.is_object_type().then_some(proto))
     }
@@ -1733,20 +1729,18 @@ impl Interpreter {
                 current = target;
             } else if current.as_class_constructor().is_some() {
                 // §10.3.1 — class constructors reject [[Call]].
-                return Err(VmError::TypeError {
-                    message: ("Class constructor cannot be invoked without 'new'".to_string())
-                        .into(),
-                });
+                return Err(self.err_type(
+                    ("Class constructor cannot be invoked without 'new'".to_string()).into(),
+                ));
             } else if let Some(proxy) = current.as_proxy() {
                 // §10.5.12 Proxy [[Call]] — dispatch `apply` trap or
                 // fall through to target.[[Call]] when the trap is
                 // absent.
                 if proxy.is_revoked(&self.gc_heap) {
-                    return Err(VmError::TypeError {
-                        message: ("Cannot perform 'apply' on a proxy that has been revoked"
-                            .to_string())
-                        .into(),
-                    });
+                    return Err(self.err_type(
+                        ("Cannot perform 'apply' on a proxy that has been revoked".to_string())
+                            .into(),
+                    ));
                 }
                 hops += 1;
                 let handler = proxy.handler(&self.gc_heap);
@@ -1773,9 +1767,9 @@ impl Interpreter {
                 } else if trap_value.is_undefined() || trap_value.is_null() {
                     current = proxy.target(&self.gc_heap);
                 } else {
-                    return Err(VmError::TypeError {
-                        message: ("Proxy apply trap is not callable".to_string()).into(),
-                    });
+                    return Err(
+                        self.err_type(("Proxy apply trap is not callable".to_string()).into())
+                    );
                 }
             } else {
                 break;
@@ -2054,8 +2048,13 @@ impl Interpreter {
                 state.compiled = self.resolve_jit_code_for_fid(context, state.function_id);
             }
             if let Some(code) = state.compiled.clone() {
-                return self
-                    .invoke_prepared_lean(state, context, &code, effective_this, effective_args);
+                return self.invoke_prepared_lean(
+                    state,
+                    context,
+                    &code,
+                    effective_this,
+                    effective_args,
+                );
             }
             // Still cold (below the tier-up threshold). The probe above already
             // advanced the counter, so interpret this element directly without
@@ -2222,9 +2221,7 @@ impl Interpreter {
         self.stash_frame_eval_env(function, &mut new_frame, callee_eval_env)?;
         Self::bind_lean_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
         state.stack.push(new_frame);
-        if probe
-            && let Some(value) = self.dispatch_jit_sync_entry(&mut state.stack, context)?
-        {
+        if probe && let Some(value) = self.dispatch_jit_sync_entry(&mut state.stack, context)? {
             if let Some(mut done) = state.stack.pop() {
                 self.reclaim_registers(&mut done);
             }
@@ -2291,11 +2288,10 @@ impl Interpreter {
             } else if let Some(proxy) = current.as_proxy() {
                 // §10.5.13 Proxy [[Construct]].
                 if proxy.is_revoked(&self.gc_heap) {
-                    return Err(VmError::TypeError {
-                        message: ("Cannot perform 'construct' on a proxy that has been revoked"
-                            .to_string())
-                        .into(),
-                    });
+                    return Err(self.err_type(
+                        ("Cannot perform 'construct' on a proxy that has been revoked".to_string())
+                            .into(),
+                    ));
                 }
                 hops += 1;
                 let handler = proxy.handler(&self.gc_heap);
@@ -2328,18 +2324,17 @@ impl Interpreter {
                     let result =
                         self.run_callable_sync(context, &trap_value, handler, trap_args)?;
                     if !result.is_object_type() {
-                        return Err(VmError::TypeError {
-                            message: ("Proxy construct trap returned non-object".to_string())
-                                .into(),
-                        });
+                        return Err(self.err_type(
+                            ("Proxy construct trap returned non-object".to_string()).into(),
+                        ));
                     }
                     return Ok(result);
                 } else if trap_value.is_undefined() || trap_value.is_null() {
                     current = proxy.target(&self.gc_heap);
                 } else {
-                    return Err(VmError::TypeError {
-                        message: ("Proxy construct trap is not callable".to_string()).into(),
-                    });
+                    return Err(
+                        self.err_type(("Proxy construct trap is not callable".to_string()).into())
+                    );
                 }
             } else {
                 break;

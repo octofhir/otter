@@ -70,11 +70,9 @@ fn coerce_to_string(ctx: &mut NativeCtx<'_>, value: Value) -> Result<String, Nat
             .execution_context()
             .cloned()
             .ok_or_else(|| type_err("missing execution context"))?;
-        let prim = ctx
-            .cx
-            .interp
-            .to_primitive_string_hint_sync(&exec, value)
-            .map_err(|e| crate::native_function::vm_to_native_error(e, CLASS))?;
+        let prim = ctx.cx.interp.to_primitive_string_hint_sync(&exec, value);
+        let prim =
+            prim.map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, CLASS))?;
         if let Some(s) = prim.as_string(ctx.heap()) {
             return Ok(s.to_lossy_string(ctx.heap()));
         }

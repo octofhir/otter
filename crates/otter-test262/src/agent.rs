@@ -197,56 +197,62 @@ fn is_html_dda(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
 /// with §16.1.7 GlobalDeclarationInstantiation semantics.
 fn eval_script(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let arg = args.first().cloned().unwrap_or(Value::undefined());
-    ctx.interp_mut()
-        .run_host_script(&arg)
-        .map_err(|err| match err {
-            otter_vm::VmError::SyntaxError { message } => NativeError::SyntaxError {
-                name: "evalScript",
-                reason: message.into(),
-            },
-            // An uncaught throw from the script body arrives rendered
-            // ("SyntaxError: …"); recover the spec error class so
-            // `assert.throws(SyntaxError, …)` sees the right
-            // constructor.
-            otter_vm::VmError::Uncaught { value } => {
-                let render = value.to_string();
-                let class_mapped = [
-                    ("SyntaxError", 0u8),
-                    ("TypeError", 1),
-                    ("ReferenceError", 2),
-                    ("RangeError", 3),
-                ]
-                .iter()
-                .find(|(prefix, _)| render.starts_with(prefix))
-                .map(|(_, kind)| *kind);
-                let reason = render
-                    .split_once(": ")
-                    .map(|(_, tail)| tail.to_string())
-                    .unwrap_or(render.clone());
-                match class_mapped {
-                    Some(0) => NativeError::SyntaxError {
-                        name: "evalScript",
-                        reason,
-                    },
-                    Some(2) => NativeError::ReferenceError {
-                        name: "evalScript",
-                        reason,
-                    },
-                    Some(3) => NativeError::RangeError {
-                        name: "evalScript",
-                        reason,
-                    },
-                    _ => NativeError::TypeError {
-                        name: "evalScript",
-                        reason: render,
-                    },
-                }
+    let result = ctx.interp_mut().run_host_script(&arg);
+    let detail = ctx.interp_mut().take_error_detail();
+    let detail_msg = match &detail {
+        Some(otter_vm::ErrorDetail::Message(m))
+        | Some(otter_vm::ErrorDetail::Name(m))
+        | Some(otter_vm::ErrorDetail::Uncaught(m)) => m.to_string(),
+        _ => String::new(),
+    };
+    result.map_err(|err| match err {
+        otter_vm::VmError::SyntaxError => NativeError::SyntaxError {
+            name: "evalScript",
+            reason: detail_msg,
+        },
+        // An uncaught throw from the script body arrives rendered
+        // ("SyntaxError: …"); recover the spec error class so
+        // `assert.throws(SyntaxError, …)` sees the right
+        // constructor.
+        otter_vm::VmError::Uncaught => {
+            let render = detail_msg;
+            let class_mapped = [
+                ("SyntaxError", 0u8),
+                ("TypeError", 1),
+                ("ReferenceError", 2),
+                ("RangeError", 3),
+            ]
+            .iter()
+            .find(|(prefix, _)| render.starts_with(prefix))
+            .map(|(_, kind)| *kind);
+            let reason = render
+                .split_once(": ")
+                .map(|(_, tail)| tail.to_string())
+                .unwrap_or(render.clone());
+            match class_mapped {
+                Some(0) => NativeError::SyntaxError {
+                    name: "evalScript",
+                    reason,
+                },
+                Some(2) => NativeError::ReferenceError {
+                    name: "evalScript",
+                    reason,
+                },
+                Some(3) => NativeError::RangeError {
+                    name: "evalScript",
+                    reason,
+                },
+                _ => NativeError::TypeError {
+                    name: "evalScript",
+                    reason: render,
+                },
             }
-            err => NativeError::TypeError {
-                name: "evalScript",
-                reason: err.to_string(),
-            },
-        })
+        }
+        err => NativeError::TypeError {
+            name: "evalScript",
+            reason: err.to_string(),
+        },
+    })
 }
 
 fn claim_pending_worker_inbox() {
@@ -342,30 +348,27 @@ fn spawn_worker_agent(
         "__otter_worker_spawn",
     )
     .ok_or_else(|| type_err("Worker backend is not installed"))?;
-    interp
-        .run_callable_sync(
-            &exec,
-            &spawn,
-            Value::undefined(),
-            smallvec::smallvec![path_value],
-        )
-        .and_then(|value| {
-            value
-                .as_number()
-                .map(|number| number.as_f64() as u64)
-                .ok_or(otter_vm::VmError::TypeError {
-                    message: "Worker backend returned a non-numeric id"
-                        .to_string()
-                        .into(),
-                })
-        })
-        .map_err(|err| match err {
-            otter_vm::VmError::Uncaught { value } => NativeError::Thrown {
-                name: "$262.agent.start",
-                message: value.into(),
-            },
-            other => type_err(other.to_string()),
-        })
+    let result = interp.run_callable_sync(
+        &exec,
+        &spawn,
+        Value::undefined(),
+        smallvec::smallvec![path_value],
+    );
+    let uncaught_msg = match interp.take_error_detail() {
+        Some(otter_vm::ErrorDetail::Uncaught(m)) => m.to_string(),
+        _ => String::new(),
+    };
+    match result {
+        Ok(value) => value
+            .as_number()
+            .map(|number| number.as_f64() as u64)
+            .ok_or_else(|| type_err("Worker backend returned a non-numeric id")),
+        Err(otter_vm::VmError::Uncaught) => Err(NativeError::Thrown {
+            name: "$262.agent.start",
+            message: uncaught_msg,
+        }),
+        Err(other) => Err(type_err(other.to_string())),
+    }
 }
 
 // =====================================================================
@@ -454,15 +457,18 @@ fn agent_receive_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     args_vec.push(sab_value);
     args_vec.push(num_value);
 
-    interp
-        .run_callable_sync(&exec, &handler, Value::undefined(), args_vec)
-        .map_err(|e| match e {
-            otter_vm::VmError::Uncaught { value } => NativeError::Thrown {
-                name: "$262.agent.receiveBroadcast",
-                message: value.into(),
-            },
-            other => type_err(other.to_string()),
-        })
+    let result = interp.run_callable_sync(&exec, &handler, Value::undefined(), args_vec);
+    let uncaught_msg = match interp.take_error_detail() {
+        Some(otter_vm::ErrorDetail::Uncaught(m)) => m.to_string(),
+        _ => String::new(),
+    };
+    result.map_err(|e| match e {
+        otter_vm::VmError::Uncaught => NativeError::Thrown {
+            name: "$262.agent.receiveBroadcast",
+            message: uncaught_msg,
+        },
+        other => type_err(other.to_string()),
+    })
 }
 
 // =====================================================================
@@ -536,20 +542,23 @@ fn drain_worker_agent_events(ctx: &mut NativeCtx<'_>) -> Result<(), NativeError>
     };
     let mut surfaced = Vec::new();
     for id in worker_ids {
-        let events = interp
-            .run_callable_sync(
-                &exec,
-                &drain,
-                Value::undefined(),
-                smallvec::smallvec![Value::number_f64(id as f64)],
-            )
-            .map_err(|err| match err {
-                otter_vm::VmError::Uncaught { value } => NativeError::Thrown {
-                    name: "$262.agent.getReport",
-                    message: value.into(),
-                },
-                other => type_err(other.to_string()),
-            })?;
+        let drain_result = interp.run_callable_sync(
+            &exec,
+            &drain,
+            Value::undefined(),
+            smallvec::smallvec![Value::number_f64(id as f64)],
+        );
+        let uncaught_msg = match interp.take_error_detail() {
+            Some(otter_vm::ErrorDetail::Uncaught(m)) => m.to_string(),
+            _ => String::new(),
+        };
+        let events = drain_result.map_err(|err| match err {
+            otter_vm::VmError::Uncaught => NativeError::Thrown {
+                name: "$262.agent.getReport",
+                message: uncaught_msg,
+            },
+            other => type_err(other.to_string()),
+        })?;
         let Some(events) = events.as_array() else {
             continue;
         };

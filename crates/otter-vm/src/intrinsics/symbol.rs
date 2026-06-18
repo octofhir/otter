@@ -61,24 +61,35 @@ fn symbol_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
                             name: "Symbol",
                             reason: "missing execution context".to_string(),
                         })?;
-                let coerced =
-                    ctx.cx
-                        .interp
-                        .coerce_to_string(&context, other)
-                        .map_err(|e| match e {
-                            crate::VmError::TypeError { message } => NativeError::TypeError {
-                                name: "Symbol",
-                                reason: message.into(),
-                            },
-                            crate::VmError::Uncaught { value } => NativeError::Thrown {
-                                name: "Symbol",
-                                message: value.into(),
-                            },
-                            other => NativeError::TypeError {
-                                name: "Symbol",
-                                reason: other.to_string(),
-                            },
-                        })?;
+                let coerced = match ctx.cx.interp.coerce_to_string(&context, other) {
+                    Ok(s) => s,
+                    Err(crate::VmError::TypeError) => {
+                        let message = match ctx.cx.interp.take_error_detail() {
+                            Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                            _ => Default::default(),
+                        };
+                        return Err(NativeError::TypeError {
+                            name: "Symbol",
+                            reason: message.into(),
+                        });
+                    }
+                    Err(crate::VmError::Uncaught) => {
+                        let value = match ctx.cx.interp.take_error_detail() {
+                            Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                            _ => Default::default(),
+                        };
+                        return Err(NativeError::Thrown {
+                            name: "Symbol",
+                            message: value.into(),
+                        });
+                    }
+                    Err(other) => {
+                        return Err(NativeError::TypeError {
+                            name: "Symbol",
+                            reason: other.to_string(),
+                        });
+                    }
+                };
                 let rendered = crate::string::JsString::from_str(&coerced, ctx.heap_mut())
                     .map_err(|_| NativeError::TypeError {
                         name: "Symbol",
@@ -112,23 +123,35 @@ fn symbol_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
                         name: "Symbol.for",
                         reason: "missing execution context".to_string(),
                     })?;
-            ctx.cx
-                .interp
-                .coerce_to_string(&context, other)
-                .map_err(|e| match e {
-                    crate::VmError::TypeError { message } => NativeError::TypeError {
+            match ctx.cx.interp.coerce_to_string(&context, other) {
+                Ok(s) => s,
+                Err(crate::VmError::TypeError) => {
+                    let message = match ctx.cx.interp.take_error_detail() {
+                        Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                        _ => Default::default(),
+                    };
+                    return Err(NativeError::TypeError {
                         name: "Symbol.for",
                         reason: message.into(),
-                    },
-                    crate::VmError::Uncaught { value } => NativeError::Thrown {
+                    });
+                }
+                Err(crate::VmError::Uncaught) => {
+                    let value = match ctx.cx.interp.take_error_detail() {
+                        Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                        _ => Default::default(),
+                    };
+                    return Err(NativeError::Thrown {
                         name: "Symbol.for",
                         message: value.into(),
-                    },
-                    other => NativeError::TypeError {
+                    });
+                }
+                Err(other) => {
+                    return Err(NativeError::TypeError {
                         name: "Symbol.for",
                         reason: other.to_string(),
-                    },
-                })?
+                    });
+                }
+            }
         }
     };
     let sym = ctx

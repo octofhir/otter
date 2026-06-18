@@ -65,9 +65,7 @@ impl Interpreter {
             // ToUint32 round-trip differs from the value is not a valid
             // array length and raises a RangeError (not a TypeError).
             if !raw.is_finite() || raw < 0.0 || raw != f64::from(len) {
-                return Err(VmError::RangeError {
-                    message: ("Invalid array length".to_string()).into(),
-                });
+                return Err(self.err_range(("Invalid array length".to_string()).into()));
             }
             let arr = self.alloc_stack_rooted_array(stack, &[], &[args])?;
             if len > 0 {
@@ -140,9 +138,7 @@ impl Interpreter {
         let this_arg = args.get(2).cloned().unwrap_or(Value::undefined());
         let has_map = !map_fn.is_undefined();
         if has_map && !self.is_callable_runtime(&map_fn) {
-            return Err(VmError::TypeError {
-                message: ("Array.from mapFn must be callable".to_string()).into(),
-            });
+            return Err(self.err_type(("Array.from mapFn must be callable".to_string()).into()));
         }
         let use_ctor = !constructor.is_undefined()
             && crate::abstract_ops::is_constructor(&constructor, context, &self.gc_heap);
@@ -225,9 +221,7 @@ impl Interpreter {
 
         if !iterator_method.is_undefined() && !iterator_method.is_null() {
             if !is_builtin_iterable && !self.is_callable_runtime(&iterator_method) {
-                return Err(VmError::TypeError {
-                    message: ("iterator method is not callable".to_string()).into(),
-                });
+                return Err(self.err_type(("iterator method is not callable".to_string()).into()));
             }
             // Step 6 — iterator path. `A = Construct(C)` (no length
             // forwarded; the count is unknown up front) or a fresh
@@ -298,9 +292,9 @@ impl Interpreter {
 
         // Step 4 — array-like path.
         if items.is_undefined() || items.is_null() {
-            return Err(VmError::TypeError {
-                message: ("Array.from requires an iterable or array-like".to_string()).into(),
-            });
+            return Err(
+                self.err_type(("Array.from requires an iterable or array-like".to_string()).into())
+            );
         }
         let length_value = match self.ordinary_get_value(
             context,

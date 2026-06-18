@@ -91,8 +91,43 @@ impl InterruptFlag {
     }
 }
 
-/// Runtime errors raised by the interpreter.
+/// Owned, dynamic payload for a raised [`VmError`].
+///
+/// `VmError` itself is `Copy` so it propagates up the interpreter's hot
+/// `Result<_, VmError>` chain with zero drop glue (the previous boxed-string
+/// variants forced a non-trivial `drop_in_place::<VmError>` after every
+/// fallible op — 5–18% of self-time on interpreter-bound benches). The dynamic
+/// detail that used to live inline now lives in one per-isolate slot
+/// (`Interpreter::pending_error_detail`): the raising helper stashes it, and
+/// the surfacing boundary (`vm_error_to_throwable_with_stack_roots`,
+/// `vm_to_native_error`, runtime diagnostics) reads it back paired with the
+/// `Copy` discriminant. Only one error is in flight per isolate at a time
+/// (`?` propagates eagerly), so a single slot is sound; the next raise
+/// overwrites it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum ErrorDetail {
+    /// A human-readable diagnostic message (TypeError / RangeError /
+    /// SyntaxError / URIError / BudgetExceeded / ThisUninitialized /
+    /// InvalidRegExp).
+    Message(Box<str>),
+    /// An identifier or intrinsic-method name (UndefinedIdentifier /
+    /// UnknownIntrinsic).
+    Name(Box<str>),
+    /// Display rendering of an uncaught thrown value.
+    Uncaught(Box<str>),
+    /// Operation + rejected value-kind for [`VmError::TypeMismatchAt`].
+    Mismatch(VmTypeMismatchAt),
+    /// `JSON.stringify` / `JSON.parse` failure payload.
+    Json(VmJsonError),
+    /// Node-style coded failure payload.
+    Coded(VmCodedError),
+}
+
+/// Runtime errors raised by the interpreter.
+///
+/// `Copy` by construction: every variant carries only `Copy` scalars. Dynamic
+/// payloads live in [`ErrorDetail`] on the isolate — see its docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub enum VmError {
     /// The program counter walked off the end of `code` without a
@@ -105,39 +140,21 @@ pub enum VmError {
     /// `STRING_CONCAT` on a non-string register). Indicates a
     /// compiler bug at this slice.
     TypeMismatch,
-    /// User-facing version of [`Self::TypeMismatch`] that carries
-    /// the operation name and the offending value's type. Surfaced
-    /// to JS as a `TypeError` with the spec-shaped message
-    /// `<op>: cannot operate on <kind>` so the user can read which
-    /// site rejected which kind without learning the engine
-    /// internals.
-    TypeMismatchAt(Box<VmTypeMismatchAt>),
-    /// User-visible `TypeError` with operation context.
-    TypeError {
-        /// Human-readable diagnostic.
-        message: Box<str>,
-    },
-    /// User-visible `RangeError`. Distinct from
-    /// [`Self::TypeError`] so that intrinsics like
-    /// `Number.prototype.toFixed` can surface the spec-mandated
-    /// `RangeError` for out-of-range arguments instead of the
-    /// fallback `TypeError`.
-    RangeError {
-        /// Human-readable diagnostic.
-        message: Box<str>,
-    },
-    /// SyntaxError raised from dynamic parse/compile paths.
-    SyntaxError {
-        /// Human-readable diagnostic.
-        message: Box<str>,
-    },
+    /// User-facing version of [`Self::TypeMismatch`]. Detail
+    /// ([`ErrorDetail::Mismatch`]) carries the operation name and the
+    /// offending value's type; surfaced as a `TypeError` with the message
+    /// `<op>: cannot operate on <kind>`.
+    TypeMismatchAt,
+    /// User-visible `TypeError`. Message in [`ErrorDetail::Message`].
+    TypeError,
+    /// User-visible `RangeError`. Message in [`ErrorDetail::Message`].
+    RangeError,
+    /// SyntaxError raised from dynamic parse/compile paths. Message in
+    /// [`ErrorDetail::Message`].
+    SyntaxError,
     /// `URIError` — malformed input to `decodeURI*` / `encodeURI*`
-    /// (§19.2.6). Distinct from [`Self::TypeError`] so the spec-mandated
-    /// class survives to the thrown instance.
-    URIError {
-        /// Human-readable diagnostic.
-        message: Box<str>,
-    },
+    /// (§19.2.6). Message in [`ErrorDetail::Message`].
+    URIError,
     /// String allocation failed because the heap cap was hit.
     OutOfMemory {
         /// Bytes the allocation requested.
@@ -148,17 +165,12 @@ pub enum VmError {
     /// `InterruptFlag` was tripped before the next checkpoint.
     Interrupted,
     /// A configured runtime budget rejected the current VM turn at
-    /// a checkpoint.
-    BudgetExceeded {
-        /// Human-readable diagnostic.
-        message: Box<str>,
-    },
+    /// a checkpoint. Message in [`ErrorDetail::Message`].
+    BudgetExceeded,
     /// `CALL_STRING_METHOD` referenced a method name not in
-    /// [`crate::string::prototype::STRING_PROTOTYPE_METHODS`].
-    UnknownIntrinsic {
-        /// Method name as it appeared in the constant pool.
-        name: String,
-    },
+    /// [`crate::string::prototype::STRING_PROTOTYPE_METHODS`]. Name in
+    /// [`ErrorDetail::Name`].
+    UnknownIntrinsic,
     /// A `let`/`const` binding was read before its initializer ran
     /// (Temporal Dead Zone).
     TemporalDeadZone {
@@ -166,13 +178,10 @@ pub enum VmError {
         local_index: u32,
     },
     /// The `this` binding of a derived-class constructor was used
-    /// (read, written, or implicitly returned) before the
-    /// `super(...)` call that initializes it, or `super(...)` ran
-    /// more than once. §13.3.7.3 / §10.2.2 — a `ReferenceError`.
-    ThisUninitialized {
-        /// Human-readable detail for the thrown `ReferenceError`.
-        message: Box<str>,
-    },
+    /// before the `super(...)` call that initializes it, or `super(...)` ran
+    /// more than once. §13.3.7.3 / §10.2.2 — a `ReferenceError`. Detail in
+    /// [`ErrorDetail::Message`].
+    ThisUninitialized,
     /// JS call-stack depth exceeded the configured limit. Catchable
     /// per foundation plan §M7 ("stack-depth limit returns a
     /// catchable JS error").
@@ -186,39 +195,23 @@ pub enum VmError {
     /// unbound free identifier in strict mode. Convertible to a real
     /// `ReferenceError` instance through the dispatch loop's stack-rooted
     /// throwable conversion.
-    UndefinedIdentifier {
-        /// Name of the unbound identifier.
-        name: Box<str>,
-    },
+    /// Name of the unbound identifier in [`ErrorDetail::Name`].
+    UndefinedIdentifier,
     /// A user `throw` (or a re-throw from `finally`) walked the
-    /// entire frame stack without finding a matching handler. The
-    /// payload is the JS value that was thrown, rendered for
-    /// diagnostics through `Value::display_string`; the runtime
-    /// surfaces this as `OtterError::Runtime { code = "UNCAUGHT" }`.
-    Uncaught {
-        /// Display rendering of the thrown value.
-        value: Box<str>,
-    },
+    /// entire frame stack without finding a matching handler. The display
+    /// rendering of the thrown value is in [`ErrorDetail::Uncaught`]; the
+    /// runtime surfaces this as `OtterError::Runtime { code = "UNCAUGHT" }`.
+    Uncaught,
     /// `Op::LoadRegExp` produced a pattern that the regex backend
-    /// could not compile. Catchable as `SyntaxError` once a real
-    /// error model lands; for now it surfaces through the standard
-    /// runtime-error code.
-    InvalidRegExp {
-        /// Backend diagnostic — pattern + flags + reason.
-        message: Box<str>,
-    },
-    /// `JSON.stringify` / `JSON.parse` rejected its input. The
-    /// `code` discriminates the failure family so the runtime can
-    /// surface a precise diagnostic (`JSON.stringify cannot
-    /// serialize cyclic structures.`, `JSON Parse error: <reason>
-    /// at byte N`, …) instead of the generic `TYPE_MISMATCH`.
-    JsonError(Box<VmJsonError>),
-    /// A JS error carrying a Node-style `.code` (e.g.
-    /// `ERR_INVALID_ARG_TYPE`). `kind` selects the error class; `code` is set
-    /// as an own non-enumerable property on the thrown instance. Lets native
-    /// modules surface structured `error.code` without folding it into the
-    /// message string.
-    Coded(Box<VmCodedError>),
+    /// could not compile. Backend diagnostic in [`ErrorDetail::Message`].
+    InvalidRegExp,
+    /// `JSON.stringify` / `JSON.parse` rejected its input. Payload in
+    /// [`ErrorDetail::Json`] discriminates the failure family for a precise
+    /// diagnostic instead of the generic `TYPE_MISMATCH`.
+    JsonError,
+    /// A JS error carrying a Node-style `.code` (e.g. `ERR_INVALID_ARG_TYPE`).
+    /// Payload in [`ErrorDetail::Coded`].
+    Coded,
     /// Host-visible termination requested by a native such as
     /// `process.exit(code)`. This is not a JS exception and is not
     /// routed through catch/finally handlers.
@@ -229,6 +222,12 @@ pub enum VmError {
 }
 
 const _: () = assert!(std::mem::size_of::<VmError>() <= 24);
+// `VmError` must stay `Copy` so the hot `Result<_, VmError>` chain carries no
+// drop glue. This fails to compile if any future variant gains an owned field.
+const _: fn() = || {
+    fn assert_copy<T: Copy>() {}
+    assert_copy::<VmError>();
+};
 
 impl std::fmt::Display for VmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -239,17 +238,15 @@ impl std::fmt::Display for VmError {
                 f,
                 "type mismatch: this operation does not accept a value of this type"
             ),
-            VmError::TypeMismatchAt(payload) => {
-                write!(
-                    f,
-                    "{}: cannot operate on a value of type {}",
-                    payload.op, payload.kind
-                )
-            }
-            VmError::TypeError { message } => write!(f, "{message}"),
-            VmError::RangeError { message } => write!(f, "{message}"),
-            VmError::SyntaxError { message } => write!(f, "{message}"),
-            VmError::URIError { message } => write!(f, "{message}"),
+            // Variants whose dynamic detail lives in `ErrorDetail` render only
+            // their static class text here: `Display` runs without isolate
+            // access, so the user-facing message is assembled at the surfacing
+            // boundary (`vm_error_to_throwable_with_stack_roots`,
+            // `vm_to_native_error`) from the paired `ErrorDetail`.
+            VmError::TypeMismatchAt | VmError::TypeError => write!(f, "TypeError"),
+            VmError::RangeError => write!(f, "RangeError"),
+            VmError::SyntaxError => write!(f, "SyntaxError"),
+            VmError::URIError => write!(f, "URIError"),
             VmError::OutOfMemory {
                 requested_bytes,
                 heap_limit_bytes,
@@ -258,21 +255,23 @@ impl std::fmt::Display for VmError {
                 "out of memory: requested {requested_bytes} bytes, heap limit {heap_limit_bytes}"
             ),
             VmError::Interrupted => write!(f, "interrupted"),
-            VmError::BudgetExceeded { message } => write!(f, "{message}"),
-            VmError::UnknownIntrinsic { name } => write!(f, "unknown intrinsic method `{name}`"),
+            VmError::BudgetExceeded => write!(f, "budget exceeded"),
+            VmError::UnknownIntrinsic => write!(f, "unknown intrinsic method"),
             VmError::TemporalDeadZone { local_index } => {
                 write!(f, "cannot access local {local_index} before initialization")
             }
-            VmError::ThisUninitialized { message } => write!(f, "{message}"),
+            VmError::ThisUninitialized => {
+                write!(f, "cannot access binding before initialization")
+            }
             VmError::StackOverflow { limit } => {
                 write!(f, "maximum call stack size exceeded (limit {limit})")
             }
             VmError::NotCallable => write!(f, "value is not a function"),
-            VmError::UndefinedIdentifier { name } => write!(f, "{name} is not defined"),
-            VmError::Uncaught { value } => write!(f, "uncaught exception: {value}"),
-            VmError::InvalidRegExp { message } => write!(f, "{message}"),
-            VmError::JsonError(payload) => write!(f, "{}", payload.message),
-            VmError::Coded(payload) => write!(f, "{}", payload.message),
+            VmError::UndefinedIdentifier => write!(f, "identifier is not defined"),
+            VmError::Uncaught => write!(f, "uncaught exception"),
+            VmError::InvalidRegExp => write!(f, "invalid regular expression"),
+            VmError::JsonError => write!(f, "JSON error"),
+            VmError::Coded => write!(f, "error"),
             VmError::Exit { code } => write!(f, "process exited with code {code}"),
         }
     }
@@ -327,16 +326,46 @@ pub struct RunError {
     pub error: VmError,
     /// Top-of-stack first; element zero is the failing function.
     pub frames: Vec<StackFrameSnapshot>,
+    /// Dynamic message/payload for `error`, captured from the isolate's
+    /// pending-error slot at the moment the error surfaced (where the isolate
+    /// is in scope). `VmError` is `Copy` and carries no message, so this is how
+    /// the host-facing renderer recovers the full diagnostic across the
+    /// crate boundary. `None` for host-internal `RunError`s.
+    pub detail: Option<ErrorDetail>,
 }
 
 impl RunError {
     /// Convenience constructor for the no-frames case (e.g., setup
-    /// errors before any frame exists).
+    /// errors before any frame exists). Carries no captured detail.
     #[must_use]
     pub fn bare(error: VmError) -> Self {
         Self {
             error,
             frames: Vec::new(),
+            detail: None,
+        }
+    }
+
+    /// Render the full user-facing message: the captured dynamic detail when
+    /// present, else `error`'s static `Display` text.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match (&self.error, &self.detail) {
+            (_, Some(ErrorDetail::Message(m))) => m.to_string(),
+            (VmError::UndefinedIdentifier, Some(ErrorDetail::Name(n))) => {
+                format!("{n} is not defined")
+            }
+            (VmError::UnknownIntrinsic, Some(ErrorDetail::Name(n))) => {
+                format!("unknown intrinsic method `{n}`")
+            }
+            (_, Some(ErrorDetail::Name(n))) => n.to_string(),
+            (_, Some(ErrorDetail::Uncaught(v))) => format!("uncaught exception: {v}"),
+            (_, Some(ErrorDetail::Mismatch(p))) => {
+                format!("{}: cannot operate on a value of type {}", p.op, p.kind)
+            }
+            (_, Some(ErrorDetail::Json(p))) => p.message.clone(),
+            (_, Some(ErrorDetail::Coded(p))) => p.message.clone(),
+            (error, None) => error.to_string(),
         }
     }
 }

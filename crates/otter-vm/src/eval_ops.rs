@@ -430,9 +430,7 @@ impl Interpreter {
             return Ok(match promise.state(&self.gc_heap) {
                 crate::promise::PromiseState::Fulfilled(v) => v,
                 crate::promise::PromiseState::Rejected(reason) => {
-                    return Err(VmError::Uncaught {
-                        value: (self.render_thrown(&reason)).into(),
-                    });
+                    return Err(self.err_uncaught((self.render_thrown(&reason)).into()));
                 }
                 crate::promise::PromiseState::Pending => Value::undefined(),
             });
@@ -552,9 +550,9 @@ impl Interpreter {
             return Ok(s.to_lossy_string(&self.gc_heap));
         }
         if primitive.is_symbol() {
-            return Err(VmError::TypeError {
-                message: ("Cannot convert a Symbol value to a string".to_string()).into(),
-            });
+            return Err(
+                self.err_type(("Cannot convert a Symbol value to a string".to_string()).into())
+            );
         }
         Ok(primitive.display_string(&self.gc_heap))
     }
@@ -583,16 +581,12 @@ impl Interpreter {
         source: &str,
         options: EvalCompileOptions,
     ) -> Result<BytecodeModule, VmError> {
-        let hook = self
-            .eval_hook
-            .as_ref()
-            .ok_or_else(|| VmError::SyntaxError {
-                message: ("eval / new Function are disabled (no compiler hook installed)"
-                    .to_string())
-                .into(),
-            })?;
-        hook(source, options).map_err(|message| VmError::SyntaxError {
-            message: message.into(),
-        })
+        let hook = self.eval_hook.as_ref().ok_or_else(|| {
+            self.err_syntax(
+                ("eval / new Function are disabled (no compiler hook installed)".to_string())
+                    .into(),
+            )
+        })?;
+        hook(source, options).map_err(|message| self.err_syntax(message.into()))
     }
 }

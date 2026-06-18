@@ -100,7 +100,7 @@ impl Interpreter {
                         )?);
                     }
                 }
-                let result = bigint::dispatch::call(&mut self.gc_heap, method, &coerced)?;
+                let result = bigint::dispatch::call(self, method, &coerced)?;
                 finish_static_call(frame, dst, result, self.current_byte_len)
             }
             Op::ArrayBufferCall => unreachable!("ArrayBufferCall requires stack-rooted dispatch"),
@@ -142,7 +142,7 @@ impl Interpreter {
         let result = binary::dispatch::array_buffer_call_with_roots(
             method,
             &args,
-            &mut self.gc_heap,
+            self,
             &mut external_visit,
         )?;
         finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len)
@@ -172,7 +172,7 @@ impl Interpreter {
         let result = binary::dispatch::shared_array_buffer_call_with_roots(
             method,
             &args,
-            &mut self.gc_heap,
+            self,
             &mut external_visit,
         )?;
         finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len)
@@ -311,17 +311,15 @@ impl Interpreter {
             )
         };
         if !target.is_object_type() {
-            return Err(VmError::TypeError {
-                message: ("DefineOwnProperty target must be an object".to_string()).into(),
-            });
+            return Err(
+                self.err_type(("DefineOwnProperty target must be an object".to_string()).into())
+            );
         }
         let key = self.evaluate_to_property_key(context, &key_value)?;
         let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;
         let ok = self.define_own_property_value(context, &target, &key, descriptor)?;
         if !ok {
-            return Err(VmError::TypeError {
-                message: ("Cannot define property".to_string()).into(),
-            });
+            return Err(self.err_type(("Cannot define property".to_string()).into()));
         }
         let frame = &mut stack[top_idx];
         frame.advance_pc(self.current_byte_len)?;
@@ -371,9 +369,7 @@ impl Interpreter {
         };
         let proto_value = if proto.is_null() { None } else { Some(proto) };
         if !object::set_prototype_value(obj, &mut self.gc_heap, proto_value) {
-            return Err(VmError::TypeError {
-                message: ("Object.create failed".to_string()).into(),
-            });
+            return Err(self.err_type(("Object.create failed".to_string()).into()));
         }
         if let Some(props_arg) = args.get(1)
             && !props_arg.is_undefined()
@@ -402,13 +398,13 @@ impl Interpreter {
                     &key,
                     descriptor,
                 )? {
-                    return Err(VmError::TypeError {
-                        message: (format!(
+                    return Err(self.err_type(
+                        (format!(
                             "Cannot define property '{}'",
                             property_key_label(&key, &self.gc_heap)
                         ))
                         .into(),
-                    });
+                    ));
                 }
             }
         }
@@ -434,9 +430,9 @@ impl Interpreter {
         let target_value = args.first().cloned().unwrap_or(Value::undefined());
         // §20.1.2.3 step 1 — `Type(O)` must be Object.
         if !target_value.is_object_type() {
-            return Err(VmError::TypeError {
-                message: ("Object.defineProperties target must be an object".to_string()).into(),
-            });
+            return Err(self.err_type(
+                ("Object.defineProperties target must be an object".to_string()).into(),
+            ));
         }
         // §20.1.2.3 step 2 — `props = ToObject(Properties)`; the
         // resulting object is then enumerated for own enumerable
@@ -452,10 +448,9 @@ impl Interpreter {
         // properties (except `String`, where the code units
         // surface as indexed slots).
         if props_value.is_nullish() {
-            return Err(VmError::TypeError {
-                message: ("Object.defineProperties properties must be an object".to_string())
-                    .into(),
-            });
+            return Err(self.err_type(
+                ("Object.defineProperties properties must be an object".to_string()).into(),
+            ));
         }
         let keys = own_enumerable_keys_for_define(self, context, &props_value)?;
         for key in keys {
@@ -475,13 +470,13 @@ impl Interpreter {
             let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;
             let ok = self.define_own_property_value(context, &target_value, &key, descriptor)?;
             if !ok {
-                return Err(VmError::TypeError {
-                    message: (format!(
+                return Err(self.err_type(
+                    (format!(
                         "Object.defineProperties: cannot define '{}'",
                         property_key_label(&key, &self.gc_heap)
                     ))
                     .into(),
-                });
+                ));
             }
         }
         Ok(target_value)
@@ -515,9 +510,9 @@ impl Interpreter {
         let target_value: Value = if is_property_bearing_object(&target_input) {
             target_input
         } else if target_input.is_nullish() {
-            return Err(VmError::TypeError {
-                message: ("Object.assign called on null or undefined".to_string()).into(),
-            });
+            return Err(
+                self.err_type(("Object.assign called on null or undefined".to_string()).into())
+            );
         } else {
             let arg_slice = args;
             match stack {
@@ -626,14 +621,14 @@ impl Interpreter {
                     // string keys; String wrappers carry indexed
                     // code-unit slots.
                     None => {
-                        return Err(VmError::TypeError {
-                            message: ("Object.keys called on null or undefined".to_string()).into(),
-                        });
+                        return Err(self.err_type(
+                            ("Object.keys called on null or undefined".to_string()).into(),
+                        ));
                     }
                     Some(target) if target.is_nullish() => {
-                        return Err(VmError::TypeError {
-                            message: ("Object.keys called on null or undefined".to_string()).into(),
-                        });
+                        return Err(self.err_type(
+                            ("Object.keys called on null or undefined".to_string()).into(),
+                        ));
                     }
                     Some(target)
                         if target.is_boolean()
@@ -668,16 +663,14 @@ impl Interpreter {
             M::Values => {
                 let values: Vec<Value> = match args.first() {
                     None => {
-                        return Err(VmError::TypeError {
-                            message: ("Object.values called on null or undefined".to_string())
-                                .into(),
-                        });
+                        return Err(self.err_type(
+                            ("Object.values called on null or undefined".to_string()).into(),
+                        ));
                     }
                     Some(target) if target.is_nullish() => {
-                        return Err(VmError::TypeError {
-                            message: ("Object.values called on null or undefined".to_string())
-                                .into(),
-                        });
+                        return Err(self.err_type(
+                            ("Object.values called on null or undefined".to_string()).into(),
+                        ));
                     }
                     Some(target)
                         if target.is_boolean()
@@ -718,16 +711,14 @@ impl Interpreter {
             M::Entries => {
                 let raw: Vec<(String, Value)> = match args.first() {
                     None => {
-                        return Err(VmError::TypeError {
-                            message: ("Object.entries called on null or undefined".to_string())
-                                .into(),
-                        });
+                        return Err(self.err_type(
+                            ("Object.entries called on null or undefined".to_string()).into(),
+                        ));
                     }
                     Some(target) if target.is_nullish() => {
-                        return Err(VmError::TypeError {
-                            message: ("Object.entries called on null or undefined".to_string())
-                                .into(),
-                        });
+                        return Err(self.err_type(
+                            ("Object.entries called on null or undefined".to_string()).into(),
+                        ));
                     }
                     Some(target)
                         if target.is_boolean()
@@ -785,11 +776,10 @@ impl Interpreter {
                 // <https://tc39.es/ecma262/#sec-object.fromentries>
                 let iter = args.first().cloned().unwrap_or(Value::undefined());
                 if iter.is_nullish() {
-                    return Err(VmError::TypeError {
-                        message: ("Object.fromEntries: iterable must not be null or undefined"
-                            .to_string())
-                        .into(),
-                    });
+                    return Err(self.err_type(
+                        ("Object.fromEntries: iterable must not be null or undefined".to_string())
+                            .into(),
+                    ));
                 }
                 // §20.1.2.7 step 2 — `obj = OrdinaryObjectCreate(%Object.prototype%)`.
                 let object_proto = self.constructor_prototype_value("Object").ok();
@@ -808,11 +798,11 @@ impl Interpreter {
 
                     if !entry.is_object_type() {
                         let _ = self.iterator_close_sync(context, &iterator);
-                        return Err(VmError::TypeError {
-                            message: ("Object.fromEntries: iterator value is not an entry object"
+                        return Err(self.err_type(
+                            ("Object.fromEntries: iterator value is not an entry object"
                                 .to_string())
                             .into(),
-                        });
+                        ));
                     }
 
                     let key = match read_indexed_entry(self, context, &entry, "0") {
@@ -861,18 +851,16 @@ impl Interpreter {
             M::GetOwnPropertyDescriptor => {
                 let key = Self::coerce_vm_property_key(args.get(1), &self.gc_heap)?;
                 let Some(target) = args.first() else {
-                    return Err(VmError::TypeError {
-                        message: ("Object.getOwnPropertyDescriptor called on null or undefined"
-                            .to_string())
-                        .into(),
-                    });
+                    return Err(self.err_type(
+                        ("Object.getOwnPropertyDescriptor called on null or undefined".to_string())
+                            .into(),
+                    ));
                 };
                 if target.is_nullish() {
-                    return Err(VmError::TypeError {
-                        message: ("Object.getOwnPropertyDescriptor called on null or undefined"
-                            .to_string())
-                        .into(),
-                    });
+                    return Err(self.err_type(
+                        ("Object.getOwnPropertyDescriptor called on null or undefined".to_string())
+                            .into(),
+                    ));
                 }
                 let desc = if target.is_object()
                     || target.is_string()
@@ -963,11 +951,10 @@ impl Interpreter {
                 {
                     None
                 } else {
-                    return Err(VmError::TypeError {
-                        message: ("Object.getOwnPropertyDescriptor target must be an object"
-                            .to_string())
-                        .into(),
-                    });
+                    return Err(self.err_type(
+                        ("Object.getOwnPropertyDescriptor target must be an object".to_string())
+                            .into(),
+                    ));
                 };
                 match desc {
                     Some(desc) => {
@@ -1003,18 +990,18 @@ impl Interpreter {
                 }
                 let result_root = Value::object(result);
                 let Some(target) = args.first() else {
-                    return Err(VmError::TypeError {
-                        message: ("Object.getOwnPropertyDescriptors called on null or undefined"
+                    return Err(self.err_type(
+                        ("Object.getOwnPropertyDescriptors called on null or undefined"
                             .to_string())
                         .into(),
-                    });
+                    ));
                 };
                 if target.is_nullish() {
-                    return Err(VmError::TypeError {
-                        message: ("Object.getOwnPropertyDescriptors called on null or undefined"
+                    return Err(self.err_type(
+                        ("Object.getOwnPropertyDescriptors called on null or undefined"
                             .to_string())
                         .into(),
-                    });
+                    ));
                 }
                 if target.is_boolean()
                     || target.is_number()
@@ -1115,18 +1102,16 @@ impl Interpreter {
             }
             M::GetOwnPropertyNames => {
                 let Some(target) = args.first() else {
-                    return Err(VmError::TypeError {
-                        message: ("Object.getOwnPropertyNames called on null or undefined"
-                            .to_string())
-                        .into(),
-                    });
+                    return Err(self.err_type(
+                        ("Object.getOwnPropertyNames called on null or undefined".to_string())
+                            .into(),
+                    ));
                 };
                 if target.is_nullish() {
-                    return Err(VmError::TypeError {
-                        message: ("Object.getOwnPropertyNames called on null or undefined"
-                            .to_string())
-                        .into(),
-                    });
+                    return Err(self.err_type(
+                        ("Object.getOwnPropertyNames called on null or undefined".to_string())
+                            .into(),
+                    ));
                 }
                 let owned: Vec<String> = if target.is_boolean()
                     || target.is_number()
@@ -1163,18 +1148,16 @@ impl Interpreter {
             }
             M::GetOwnPropertySymbols => {
                 let Some(target) = args.first() else {
-                    return Err(VmError::TypeError {
-                        message: ("Object.getOwnPropertySymbols called on null or undefined"
-                            .to_string())
-                        .into(),
-                    });
+                    return Err(self.err_type(
+                        ("Object.getOwnPropertySymbols called on null or undefined".to_string())
+                            .into(),
+                    ));
                 };
                 if target.is_nullish() {
-                    return Err(VmError::TypeError {
-                        message: ("Object.getOwnPropertySymbols called on null or undefined"
-                            .to_string())
-                        .into(),
-                    });
+                    return Err(self.err_type(
+                        ("Object.getOwnPropertySymbols called on null or undefined".to_string())
+                            .into(),
+                    ));
                 }
                 let syms: Vec<Value> = if target.is_boolean()
                     || target.is_number()
@@ -1219,14 +1202,14 @@ impl Interpreter {
         let items = args.first().cloned().unwrap_or(Value::undefined());
         let callback = args.get(1).cloned().unwrap_or(Value::undefined());
         if items.is_nullish() {
-            return Err(VmError::TypeError {
-                message: ("Object.groupBy: items must be iterable".to_string()).into(),
-            });
+            return Err(
+                self.err_type(("Object.groupBy: items must be iterable".to_string()).into())
+            );
         }
         if !self.is_callable_runtime(&callback) {
-            return Err(VmError::TypeError {
-                message: ("Object.groupBy: callback must be a function".to_string()).into(),
-            });
+            return Err(
+                self.err_type(("Object.groupBy: callback must be a function".to_string()).into())
+            );
         }
         let items_snapshot = self.iterator_to_list_sync(context, &items)?;
         let result =
@@ -1412,7 +1395,7 @@ fn own_enumerable_keys_for_define(
         let keys = interp.own_property_keys_value(context, props)?;
         let mut out = Vec::new();
         for key in keys {
-            let vm_key = value_to_static_property_key(&key, interp.gc_heap())?;
+            let vm_key = value_to_static_property_key(interp, &key, interp.gc_heap())?;
             let desc = interp.get_own_property_descriptor_for_value(context, *props, Some(&key))?;
             if desc.is_some_and(|desc| desc.enumerable()) {
                 out.push(vm_key);
@@ -1444,6 +1427,7 @@ fn own_enumerable_keys_for_define(
 }
 
 fn value_to_static_property_key(
+    interp: &Interpreter,
     value: &Value,
     heap: &otter_gc::GcHeap,
 ) -> Result<VmPropertyKey<'static>, VmError> {
@@ -1453,9 +1437,7 @@ fn value_to_static_property_key(
     if let Some(sym) = value.as_symbol(heap) {
         return Ok(VmPropertyKey::Symbol(sym));
     }
-    Err(VmError::TypeError {
-        message: ("property key must be a string or symbol".to_string()).into(),
-    })
+    Err(interp.err_type(("property key must be a string or symbol".to_string()).into()))
 }
 
 fn property_key_label(key: &VmPropertyKey<'_>, heap: &otter_gc::GcHeap) -> String {
@@ -1611,10 +1593,9 @@ fn assign_copy_source_keys(
         } else if let Some(sym) = key_value.as_symbol(interp.gc_heap()) {
             VmPropertyKey::Symbol(sym)
         } else {
-            return Err(VmError::TypeError {
-                message: ("Object.assign source ownKeys returned non-property key".to_string())
-                    .into(),
-            });
+            return Err(interp.err_type(
+                ("Object.assign source ownKeys returned non-property key".to_string()).into(),
+            ));
         };
         let desc = interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
             context,
@@ -1681,9 +1662,9 @@ fn assign_set_string(
             interp.string_object_exotic_descriptor(obj, &VmPropertyKey::String(key))?
             && !desc.writable()
         {
-            return Err(VmError::TypeError {
-                message: (format!("Cannot assign to read-only property '{key}'")).into(),
-            });
+            return Err(
+                interp.err_type((format!("Cannot assign to read-only property '{key}'")).into())
+            );
         }
         return interp.ordinary_set_with_callable_setter(context, obj, key, value, true);
     }
@@ -1692,9 +1673,7 @@ fn assign_set_string(
             let number_len = crate::coerce::to_number_or_throw(interp, context, &value)?;
             let new_len = crate::number::bitwise::to_uint32(number_len);
             if (new_len as f64) != number_len.as_f64() {
-                return Err(VmError::RangeError {
-                    message: ("Invalid array length".to_string()).into(),
-                });
+                return Err(interp.err_range(("Invalid array length".to_string()).into()));
             }
             crate::array::set_length(arr, &mut interp.gc_heap, new_len as usize)
                 .map_err(|_| VmError::TypeMismatch)?;
@@ -1711,13 +1690,13 @@ fn assign_set_string(
     }
     // For other exotic value kinds, surface failure rather than
     // silently dropping the assign step.
-    Err(VmError::TypeError {
-        message: (format!(
+    Err(interp.err_type(
+        (format!(
             "Object.assign: cannot set '{key}' on {}",
             crate::value_kind_name(target_value)
         ))
         .into(),
-    })
+    ))
 }
 
 fn assign_set_symbol(
@@ -1735,13 +1714,13 @@ fn assign_set_symbol(
         crate::array::set_symbol_property(arr, &mut interp.gc_heap, sym, value);
         return Ok(());
     }
-    Err(VmError::TypeError {
-        message: (format!(
+    Err(interp.err_type(
+        (format!(
             "Object.assign: cannot set symbol on {}",
             crate::value_kind_name(target_value)
         ))
         .into(),
-    })
+    ))
 }
 
 /// §7.3.2 `Get(target, name)` for indexed-string entry probing in

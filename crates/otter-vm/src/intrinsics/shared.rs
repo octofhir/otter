@@ -112,9 +112,10 @@ pub(crate) fn native_new_target_prototype(
             })? {
             VmGetOutcome::Value(value) => Some(value),
             VmGetOutcome::InvokeGetter { getter } => Some(
-                interp
-                    .run_callable_sync(&exec, &getter, new_target, SmallVec::new())
-                    .map_err(|err| native_new_target_error(name, err))?,
+                match interp.run_callable_sync(&exec, &getter, new_target, SmallVec::new()) {
+                    Ok(v) => v,
+                    Err(err) => return Err(native_new_target_error(interp, name, err)),
+                },
             ),
         }
     } else if let Some(class) = new_target.as_class_constructor() {
@@ -135,12 +136,22 @@ pub(crate) fn native_new_target_prototype(
     Ok(proto.filter(|value| value.is_object_type() || value.is_proxy()))
 }
 
-fn native_new_target_error(name: &'static str, err: crate::VmError) -> NativeError {
+fn native_new_target_error(
+    interp: &crate::Interpreter,
+    name: &'static str,
+    err: crate::VmError,
+) -> NativeError {
     match err {
-        crate::VmError::Uncaught { value } => NativeError::Thrown {
-            name,
-            message: value.into(),
-        },
+        crate::VmError::Uncaught => {
+            let value = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::Thrown {
+                name,
+                message: value.into(),
+            }
+        }
         other => NativeError::TypeError {
             name,
             reason: other.to_string(),

@@ -149,8 +149,8 @@ pub use frame_state::{
 };
 pub use property_ic::PropertyIcStats;
 pub use run_control::{
-    DEFAULT_MAX_STACK_DEPTH, DEFAULT_MAX_SYNC_REENTRY_DEPTH, InterruptFlag, NO_HANDLER_OFFSET,
-    RunError, StackFrameSnapshot, VmError,
+    DEFAULT_MAX_STACK_DEPTH, DEFAULT_MAX_SYNC_REENTRY_DEPTH, ErrorDetail, InterruptFlag,
+    NO_HANDLER_OFFSET, RunError, StackFrameSnapshot, VmError,
 };
 
 use crate::holt_stack::{HoltCallReservation, HoltStack};
@@ -395,6 +395,16 @@ pub struct Interpreter {
     /// visits every live entry so cached closure upvalues and lexical receiver
     /// slots move with the heap across callback allocations.
     lean_callback_roots: Vec<call_ops::LeanCallbackRoot>,
+    /// Owned dynamic payload for the most recently raised [`VmError`]. The
+    /// error itself is `Copy` (no drop glue on the hot `Result` chain); its
+    /// message / name / structured payload is stashed here by the raising
+    /// helpers (`type_error`, `range_error`, …) and read back at the surfacing
+    /// boundary. Only one error is in flight per isolate at a time, so a single
+    /// slot is sound; the next raise overwrites it. Not GC-traced — holds only
+    /// owned strings / plain data. Interior-mutable so the `err_*` raising
+    /// helpers take `&self` and stay callable from `&self` methods and from
+    /// `ok_or_else` / `map_err` closures without borrow conflicts.
+    pending_error_detail: std::cell::RefCell<Option<run_control::ErrorDetail>>,
     /// Scratch GC-root stack for native recursive algorithms (today:
     /// `JSON.stringify`'s spec serializer) that must hold live `Value`s
     /// across calls which allocate — e.g. key-name `JsString`s minted by
@@ -1178,6 +1188,7 @@ impl Interpreter {
             string_constant_cache: rustc_hash::FxHashMap::default(),
             bigint_constant_cache: rustc_hash::FxHashMap::default(),
             lean_callback_roots: Vec::new(),
+            pending_error_detail: std::cell::RefCell::new(None),
             json_root_stack: Vec::new(),
             array_index_accessor_protector: false,
             interrupt: InterruptFlag::new(),
@@ -2672,9 +2683,7 @@ impl Interpreter {
             self.runtime_budget,
         ) {
             self.runtime_budget_stats.record_budget_rejection();
-            return Err(VmError::BudgetExceeded {
-                message: ("runtime budget exceeded".to_string()).into(),
-            });
+            return Err(self.err_budget(("runtime budget exceeded".to_string()).into()));
         }
         Ok(())
     }
@@ -3260,12 +3269,7 @@ impl Interpreter {
         {
             return Ok(intrinsic_or_null(self, value));
         }
-        Err(VmError::TypeMismatchAt(Box::new(
-            run_control::VmTypeMismatchAt {
-                op: "Object.getPrototypeOf".to_string(),
-                kind: value_kind_name(value).to_string(),
-            },
-        )))
+        Err(self.err_type_mismatch_at("Object.getPrototypeOf", value_kind_name(value)))
     }
 
     pub(crate) fn object_prototype_object_opt(&self) -> Option<JsObject> {
@@ -4867,7 +4871,11 @@ impl Interpreter {
         self.ensure_property_ic_capacity(context);
         let result = match self.run_inner(context) {
             Ok(v) => Ok(v),
-            Err((error, frames)) => Err(RunError { error, frames }),
+            Err((error, frames)) => Err(RunError {
+                error,
+                frames,
+                detail: self.take_error_detail(),
+            }),
         };
         self.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
         result
@@ -4938,17 +4946,15 @@ impl Interpreter {
                 if iters >= microtask::MAX_DRAIN_ITERS {
                     self.microtasks.end_drain();
                     return Err(RunError {
-                        error: VmError::JsonError(Box::new(run_control::VmJsonError {
-                            // Reusing the structured-error channel
-                            // until task 34 introduces a real
-                            // microtask-error code.
-                            code: "MICROTASK_RUNAWAY",
-                            message: format!(
+                        error: self.err_json(
+                            "MICROTASK_RUNAWAY",
+                            format!(
                                 "microtask drain exceeded {} iterations",
                                 microtask::MAX_DRAIN_ITERS
                             ),
-                        })),
+                        ),
                         frames: Vec::new(),
+                        detail: self.take_error_detail(),
                     });
                 }
                 iters += 1;
@@ -4960,10 +4966,11 @@ impl Interpreter {
                         self.runtime_budget_stats.record_budget_rejection();
                         self.microtasks.end_drain();
                         return Err(RunError {
-                            error: VmError::BudgetExceeded {
-                                message: ("runtime microtask budget exceeded".to_string()).into(),
-                            },
+                            error: self.err_budget(
+                                ("runtime microtask budget exceeded".to_string()).into(),
+                            ),
                             frames: Vec::new(),
+                            detail: self.take_error_detail(),
                         });
                     }
                 }
@@ -4973,6 +4980,7 @@ impl Interpreter {
                     return Err(RunError {
                         error: VmError::InvalidOperand,
                         frames: Vec::new(),
+                        detail: self.take_error_detail(),
                     });
                 };
                 if let Err(err) = self.invoke_microtask(&context, task) {
@@ -5044,6 +5052,7 @@ impl Interpreter {
                         limit: self.max_stack_depth,
                     },
                     frames: Vec::new(),
+                    detail: self.take_error_detail(),
                 });
             }
             if let Some(bound) = current.as_bound_function() {
@@ -5081,7 +5090,7 @@ impl Interpreter {
                     }
                     Err(vm_err) => {
                         if result_capability.is_some() {
-                            let reason = vm_err_to_value(&vm_err, &mut self.gc_heap);
+                            let reason = vm_err_to_value(self, &vm_err);
                             self.settle_microtask_capability(
                                 context,
                                 result_capability,
@@ -5092,6 +5101,7 @@ impl Interpreter {
                             Err(RunError {
                                 error: vm_err,
                                 frames: Vec::new(),
+                                detail: self.take_error_detail(),
                             })
                         }
                     }
@@ -5107,7 +5117,7 @@ impl Interpreter {
                     Ok(())
                 }
                 Err(err) => {
-                    let vm_err = native_to_vm_error(err);
+                    let vm_err = native_to_vm_error(self, err);
                     if result_capability.is_some() {
                         // Reaction-mode: route the error into the
                         // downstream promise as a rejection rather
@@ -5122,13 +5132,14 @@ impl Interpreter {
                         let reason = self
                             .pending_uncaught_throw
                             .take()
-                            .unwrap_or_else(|| vm_err_to_value(&vm_err, &mut self.gc_heap));
+                            .unwrap_or_else(|| vm_err_to_value(self, &vm_err));
                         self.settle_microtask_capability(context, result_capability, Err(reason));
                         Ok(())
                     } else {
                         Err(RunError {
                             error: vm_err,
                             frames: Vec::new(),
+                            detail: self.take_error_detail(),
                         })
                     }
                 }
@@ -5147,6 +5158,7 @@ impl Interpreter {
                 return Err(RunError {
                     error,
                     frames: Vec::new(),
+                    detail: self.take_error_detail(),
                 });
             }
         };
@@ -5156,6 +5168,7 @@ impl Interpreter {
                 return Err(RunError {
                     error: VmError::InvalidOperand,
                     frames: Vec::new(),
+                    detail: self.take_error_detail(),
                 });
             }
         };
@@ -5166,6 +5179,7 @@ impl Interpreter {
                     return Err(RunError {
                         error: VmError::from(oom),
                         frames: Vec::new(),
+                        detail: self.take_error_detail(),
                     });
                 }
             };
@@ -5179,6 +5193,7 @@ impl Interpreter {
                 return Err(RunError {
                     error,
                     frames: Vec::new(),
+                    detail: self.take_error_detail(),
                 });
             }
         };
@@ -5192,6 +5207,7 @@ impl Interpreter {
             .map_err(|error| RunError {
                 error,
                 frames: Vec::new(),
+                detail: self.take_error_detail(),
             })?;
         let mut stack: HoltStack = HoltStack::new();
         stack.push(new_frame);
@@ -5216,12 +5232,16 @@ impl Interpreter {
                     let reason = self
                         .pending_uncaught_throw
                         .take()
-                        .unwrap_or_else(|| vm_err_to_value(&error, &mut self.gc_heap));
+                        .unwrap_or_else(|| vm_err_to_value(self, &error));
                     self.settle_microtask_capability(context, result_capability, Err(reason));
                     Ok(())
                 } else {
                     let frames = snapshot_frames(context, &stack);
-                    Err(RunError { error, frames })
+                    Err(RunError {
+                        error,
+                        frames,
+                        detail: self.take_error_detail(),
+                    })
                 }
             }
         }
@@ -5311,9 +5331,7 @@ impl Interpreter {
                         crate::promise::PromiseState::Fulfilled(v) => return Ok(v),
                         crate::promise::PromiseState::Rejected(reason) => {
                             return Err((
-                                VmError::Uncaught {
-                                    value: (self.render_thrown(&reason)).into(),
-                                },
+                                self.err_uncaught((self.render_thrown(&reason)).into()),
                                 Vec::new(),
                             ));
                         }
@@ -5380,7 +5398,7 @@ impl Interpreter {
                 match self.dispatch_loop_inner(context, stack) {
                     Ok(value) => break Ok(value),
                     Err(err) => {
-                        if matches!(err, VmError::Uncaught { .. })
+                        if matches!(err, VmError::Uncaught)
                             && !stack.is_empty()
                             && let Some(thrown) = self.pending_uncaught_throw.take()
                         {
@@ -5408,9 +5426,9 @@ impl Interpreter {
                         {
                             let uncaught = if matches!(
                                 err,
-                                VmError::OutOfMemory { .. } | VmError::JsonError(_)
+                                VmError::OutOfMemory { .. } | VmError::JsonError
                             ) {
-                                Some(err.clone())
+                                Some(err)
                             } else {
                                 None
                             };
@@ -5685,10 +5703,9 @@ impl Interpreter {
                     });
                     if let Some(ti) = target {
                         if !stack[ti].this_value.is_hole() {
-                            return Err(VmError::ThisUninitialized {
-                                message: ("super constructor may only be called once".to_string())
-                                    .into(),
-                            });
+                            return Err(self.err_this_uninit(
+                                ("super constructor may only be called once".to_string()).into(),
+                            ));
                         }
                         stack[ti].this_value = value;
                         let frame = &mut stack[ti];
@@ -5707,16 +5724,14 @@ impl Interpreter {
                             .frame_cold(&stack[top_idx])
                             .and_then(|cold| cold.derived_this_cell);
                         let Some(cell) = derived_this_cell else {
-                            return Err(VmError::ThisUninitialized {
-                                message: ("super called outside a derived constructor".to_string())
-                                    .into(),
-                            });
+                            return Err(self.err_this_uninit(
+                                ("super called outside a derived constructor".to_string()).into(),
+                            ));
                         };
                         if !crate::read_upvalue(&self.gc_heap, cell).is_hole() {
-                            return Err(VmError::ThisUninitialized {
-                                message: ("super constructor may only be called once".to_string())
-                                    .into(),
-                            });
+                            return Err(self.err_this_uninit(
+                                ("super constructor may only be called once".to_string()).into(),
+                            ));
                         }
                         crate::store_upvalue(&mut self.gc_heap, cell, value);
                     }
@@ -6621,9 +6636,7 @@ impl Interpreter {
                         }
                     }
                     if value.is_hole() {
-                        return Err(VmError::ThisUninitialized {
-                            message:( "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()).into(),
-                        });
+                        return Err(self.err_this_uninit(( "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()).into()));
                     }
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, value)?;
@@ -7021,11 +7034,11 @@ impl Interpreter {
                             if !value.is_null()
                                 && !abstract_ops::is_constructor(&value, context, &self.gc_heap)
                             {
-                                return Err(VmError::TypeError {
-                                    message: ("Class extends value is not a constructor or null"
+                                return Err(self.err_type(
+                                    ("Class extends value is not a constructor or null"
                                         .to_string())
                                     .into(),
-                                });
+                                ));
                             }
                         }
                         _ => {
@@ -7033,12 +7046,11 @@ impl Interpreter {
                                 .as_string(&self.gc_heap)
                                 .is_some_and(|s| s.to_lossy_string(&self.gc_heap) == "prototype")
                             {
-                                return Err(VmError::TypeError {
-                                    message:
-                                        ("Classes may not have a static property named 'prototype'"
-                                            .to_string())
-                                        .into(),
-                                });
+                                return Err(self.err_type(
+                                    ("Classes may not have a static property named 'prototype'"
+                                        .to_string())
+                                    .into(),
+                                ));
                             }
                         }
                     }
@@ -7135,20 +7147,16 @@ impl Interpreter {
                     // surface the spec's brand-check TypeError rather
                     // than a VM invariant crash.
                     let Some(sym) = key.as_symbol(&self.gc_heap) else {
-                        return Err(VmError::TypeError {
-                            message:(
+                        return Err(self.err_type((
                                 "Cannot read private member from an object whose class did not declare it"
-                                    .to_string()).into(),
-                        });
+                                    .to_string()).into()));
                     };
                     let found = self.private_element_lookup(context, &receiver, sym)?;
                     let result = match found {
                         None => {
-                            return Err(VmError::TypeError {
-                                message:(
+                            return Err(self.err_type((
                                     "Cannot read private member from an object whose class did not declare it"
-                                        .to_string()).into(),
-                            });
+                                        .to_string()).into()));
                         }
                         Some((_, desc)) => match desc.kind {
                             object::DescriptorKind::Data { value } => value,
@@ -7160,10 +7168,9 @@ impl Interpreter {
                                     smallvec::SmallVec::new(),
                                 )?,
                                 None => {
-                                    return Err(VmError::TypeError {
-                                        message: ("'#x' was defined without a getter".to_string())
-                                            .into(),
-                                    });
+                                    return Err(self.err_type(
+                                        ("'#x' was defined without a getter".to_string()).into(),
+                                    ));
                                 }
                             },
                         },
@@ -7184,20 +7191,16 @@ impl Interpreter {
                     let key = *read_register(&stack[top_idx], key_reg)?;
                     let value = *read_register(&stack[top_idx], value_reg)?;
                     let Some(sym) = key.as_symbol(&self.gc_heap) else {
-                        return Err(VmError::TypeError {
-                            message:(
+                        return Err(self.err_type((
                                 "Cannot write private member to an object whose class did not declare it"
-                                    .to_string()).into(),
-                        });
+                                    .to_string()).into()));
                     };
                     let found = self.private_element_lookup(context, &receiver, sym)?;
                     match found {
                         None => {
-                            return Err(VmError::TypeError {
-                                message:(
+                            return Err(self.err_type((
                                     "Cannot write private member to an object whose class did not declare it"
-                                        .to_string()).into(),
-                            });
+                                        .to_string()).into()));
                         }
                         Some((holder, desc)) => match desc.kind {
                             object::DescriptorKind::Accessor { setter, .. } => match setter {
@@ -7207,20 +7210,18 @@ impl Interpreter {
                                     self.run_callable_sync(context, &setter, receiver, argv)?;
                                 }
                                 None => {
-                                    return Err(VmError::TypeError {
-                                        message: ("'#x' was defined without a setter".to_string())
-                                            .into(),
-                                    });
+                                    return Err(self.err_type(
+                                        ("'#x' was defined without a setter".to_string()).into(),
+                                    ));
                                 }
                             },
                             object::DescriptorKind::Data { .. } => {
                                 if holder != receiver || !desc.flags.writable() {
                                     // Prototype side or a non-writable
                                     // own slot — a private method.
-                                    return Err(VmError::TypeError {
-                                        message: ("Private method is not writable".to_string())
-                                            .into(),
-                                    });
+                                    return Err(self.err_type(
+                                        ("Private method is not writable".to_string()).into(),
+                                    ));
                                 }
                                 let descriptor = object::PartialPropertyDescriptor {
                                     value: Some(value),
@@ -7253,10 +7254,9 @@ impl Interpreter {
                     let result = if value.is_number() || value.is_big_int() {
                         value
                     } else if value.is_symbol() {
-                        return Err(VmError::TypeError {
-                            message: ("Cannot convert a Symbol value to a number".to_string())
-                                .into(),
-                        });
+                        return Err(self.err_type(
+                            ("Cannot convert a Symbol value to a number".to_string()).into(),
+                        ));
                     } else {
                         Value::number(crate::number::NumberValue::from_f64(
                             crate::number::parse::to_number_value(&value, &self.gc_heap),
@@ -7332,11 +7332,9 @@ impl Interpreter {
                     let receiver = *read_register(&stack[top_idx], obj_reg)?;
                     let brand = *read_register(&stack[top_idx], brand_reg)?;
                     let Some(sym) = brand.as_symbol(&self.gc_heap) else {
-                        return Err(VmError::TypeError {
-                            message:(
+                        return Err(self.err_type((
                                 "Cannot read private member from an object whose class did not declare it"
-                                    .to_string()).into(),
-                        });
+                                    .to_string()).into()));
                     };
                     let key = VmPropertyKey::Symbol(sym);
                     // §6.2.12 — a Proxy answers brand checks from its
@@ -7355,11 +7353,9 @@ impl Interpreter {
                         .is_some()
                     };
                     if !found {
-                        return Err(VmError::TypeError {
-                            message:(
+                        return Err(self.err_type((
                                 "Cannot read private member from an object whose class did not declare it"
-                                    .to_string()).into(),
-                        });
+                                    .to_string()).into()));
                     }
                     let frame = &mut stack[top_idx];
                     frame.advance_pc(self.current_byte_len)?;
@@ -8105,17 +8101,14 @@ impl Interpreter {
                 value
             } else if value.is_undefined() {
                 if derived_this.is_hole() {
-                    return Err(VmError::ThisUninitialized {
-                        message:( "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()).into(),
-                    });
+                    return Err(self.err_this_uninit(( "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()).into()));
                 }
                 derived_this
             } else {
-                return Err(VmError::TypeError {
-                    message: ("derived constructors may only return an object or undefined"
-                        .to_string())
-                    .into(),
-                });
+                return Err(self.err_type(
+                    ("derived constructors may only return an object or undefined".to_string())
+                        .into(),
+                ));
             }
         } else {
             match construct_target {
@@ -8227,6 +8220,200 @@ impl Interpreter {
             self.unwind_abrupt(stack, crate::cold_frame::AbruptKind::Return(value), 0)
         } else {
             self.pop_frame(stack, value)
+        }
+    }
+}
+
+impl Interpreter {
+    /// Stash `detail` for the in-flight error and return the matching `Copy`
+    /// [`VmError`]. One error is in flight per isolate at a time, so the slot is
+    /// overwritten by the next raise and read at the surfacing boundary.
+    #[inline]
+    fn raise(&self, detail: run_control::ErrorDetail, err: VmError) -> VmError {
+        *self.pending_error_detail.borrow_mut() = Some(detail);
+        err
+    }
+
+    /// Raise a `TypeError` carrying `message`.
+    pub(crate) fn err_type(&self, message: Box<str>) -> VmError {
+        self.raise(
+            run_control::ErrorDetail::Message(message),
+            VmError::TypeError,
+        )
+    }
+
+    /// Raise a `RangeError` carrying `message`.
+    pub(crate) fn err_range(&self, message: Box<str>) -> VmError {
+        self.raise(
+            run_control::ErrorDetail::Message(message),
+            VmError::RangeError,
+        )
+    }
+
+    /// Raise a `SyntaxError` carrying `message`.
+    pub(crate) fn err_syntax(&self, message: Box<str>) -> VmError {
+        self.raise(
+            run_control::ErrorDetail::Message(message),
+            VmError::SyntaxError,
+        )
+    }
+
+    /// Raise a `URIError` carrying `message`.
+    pub(crate) fn err_uri(&self, message: Box<str>) -> VmError {
+        self.raise(
+            run_control::ErrorDetail::Message(message),
+            VmError::URIError,
+        )
+    }
+
+    /// Raise a budget-exceeded error carrying `message`.
+    pub(crate) fn err_budget(&self, message: Box<str>) -> VmError {
+        self.raise(
+            run_control::ErrorDetail::Message(message),
+            VmError::BudgetExceeded,
+        )
+    }
+
+    /// Raise a derived-`this`-uninitialized `ReferenceError` carrying `message`.
+    pub(crate) fn err_this_uninit(&self, message: Box<str>) -> VmError {
+        self.raise(
+            run_control::ErrorDetail::Message(message),
+            VmError::ThisUninitialized,
+        )
+    }
+
+    /// Raise an invalid-regexp error carrying the backend `message`.
+    pub(crate) fn err_invalid_regexp(&self, message: Box<str>) -> VmError {
+        self.raise(
+            run_control::ErrorDetail::Message(message),
+            VmError::InvalidRegExp,
+        )
+    }
+
+    /// Raise an unresolved-identifier `ReferenceError` carrying `name`.
+    pub(crate) fn err_undefined_ident(&self, name: Box<str>) -> VmError {
+        self.raise(
+            run_control::ErrorDetail::Name(name),
+            VmError::UndefinedIdentifier,
+        )
+    }
+
+    /// Raise an unknown-intrinsic `TypeError` carrying the method `name`.
+    pub(crate) fn err_unknown_intrinsic(&self, name: Box<str>) -> VmError {
+        self.raise(
+            run_control::ErrorDetail::Name(name),
+            VmError::UnknownIntrinsic,
+        )
+    }
+
+    /// Raise an uncaught-exception error carrying the thrown value's `display`.
+    pub(crate) fn err_uncaught(&self, display: Box<str>) -> VmError {
+        self.raise(
+            run_control::ErrorDetail::Uncaught(display),
+            VmError::Uncaught,
+        )
+    }
+
+    /// Raise a `TypeError` with operation context (`<op>: cannot operate on
+    /// a value of type <kind>`).
+    pub(crate) fn err_type_mismatch_at(
+        &self,
+        op: impl Into<String>,
+        kind: impl Into<String>,
+    ) -> VmError {
+        self.raise(
+            run_control::ErrorDetail::Mismatch(run_control::VmTypeMismatchAt {
+                op: op.into(),
+                kind: kind.into(),
+            }),
+            VmError::TypeMismatchAt,
+        )
+    }
+
+    /// Raise a `JSON.stringify`/`JSON.parse` error.
+    pub(crate) fn err_json(&self, code: &'static str, message: impl Into<String>) -> VmError {
+        self.raise(
+            run_control::ErrorDetail::Json(run_control::VmJsonError {
+                code,
+                message: message.into(),
+            }),
+            VmError::JsonError,
+        )
+    }
+
+    /// Raise a Node-style coded error.
+    pub(crate) fn err_coded(
+        &self,
+        kind: crate::error_classes::ErrorKind,
+        code: &'static str,
+        message: impl Into<String>,
+    ) -> VmError {
+        self.raise(
+            run_control::ErrorDetail::Coded(run_control::VmCodedError {
+                kind,
+                code,
+                message: message.into(),
+            }),
+            VmError::Coded,
+        )
+    }
+
+    /// Clone the in-flight error's dynamic detail, set by the `err_*` helpers.
+    /// Read at the surfacing boundary paired with the `Copy` [`VmError`].
+    pub fn error_detail(&self) -> Option<run_control::ErrorDetail> {
+        self.pending_error_detail.borrow().clone()
+    }
+
+    /// Take the in-flight error's dynamic detail.
+    pub fn take_error_detail(&self) -> Option<run_control::ErrorDetail> {
+        self.pending_error_detail.borrow_mut().take()
+    }
+
+    /// Render the full, dynamic user-facing message for `err`, pairing the
+    /// `Copy` discriminant with the in-flight [`run_control::ErrorDetail`].
+    /// `VmError`'s own `Display` is intentionally lossy (no isolate access), so
+    /// any site that needs the dynamic message must route through here.
+    pub(crate) fn render_vm_error(&self, err: &VmError) -> String {
+        use run_control::ErrorDetail;
+        let detail = self.pending_error_detail.borrow();
+        match err {
+            VmError::TypeError
+            | VmError::RangeError
+            | VmError::SyntaxError
+            | VmError::URIError
+            | VmError::BudgetExceeded
+            | VmError::ThisUninitialized
+            | VmError::InvalidRegExp => match detail.as_ref() {
+                Some(ErrorDetail::Message(m)) => m.to_string(),
+                _ => err.to_string(),
+            },
+            VmError::UndefinedIdentifier => match detail.as_ref() {
+                Some(ErrorDetail::Name(n)) => format!("{n} is not defined"),
+                _ => err.to_string(),
+            },
+            VmError::UnknownIntrinsic => match detail.as_ref() {
+                Some(ErrorDetail::Name(n)) => format!("unknown intrinsic method `{n}`"),
+                _ => err.to_string(),
+            },
+            VmError::Uncaught => match detail.as_ref() {
+                Some(ErrorDetail::Uncaught(v)) => format!("uncaught exception: {v}"),
+                _ => err.to_string(),
+            },
+            VmError::TypeMismatchAt => match detail.as_ref() {
+                Some(ErrorDetail::Mismatch(p)) => {
+                    format!("{}: cannot operate on a value of type {}", p.op, p.kind)
+                }
+                _ => err.to_string(),
+            },
+            VmError::JsonError => match detail.as_ref() {
+                Some(ErrorDetail::Json(p)) => p.message.clone(),
+                _ => err.to_string(),
+            },
+            VmError::Coded => match detail.as_ref() {
+                Some(ErrorDetail::Coded(p)) => p.message.clone(),
+                _ => err.to_string(),
+            },
+            other => other.to_string(),
         }
     }
 }
@@ -8593,7 +8780,7 @@ fn string_proto_iterator(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
         })?;
         let text = interp
             .coerce_to_string(&exec, &this)
-            .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, NAME))?;
         JsString::from_str(&text, ctx.heap_mut()).map_err(|_| NativeError::TypeError {
             name: NAME,
             reason: "out of memory".to_string(),
@@ -8897,9 +9084,7 @@ fn step_iterator(
             // shrunk resizable buffer or a detached one); otherwise it
             // reads the live element and terminates at the live length.
             if typed_array.is_out_of_bounds(gc_heap) {
-                return Err(VmError::TypeError {
-                    message: ("typed array is out of bounds".to_string()).into(),
-                });
+                return Err(VmError::TypeError);
             }
             if index >= typed_array.length(gc_heap) {
                 None
@@ -10106,10 +10291,13 @@ mod tests {
             )
             .expect_err("nullish method call should reject before intrinsic fallback");
 
-        assert!(matches!(
-            err,
-            VmError::TypeError { message } if message.as_ref() == "Cannot read properties of undefined"
-        ));
+        assert!(matches!(err, VmError::TypeError));
+        assert_eq!(
+            interp.error_detail(),
+            Some(run_control::ErrorDetail::Message(
+                "Cannot read properties of undefined".into()
+            ))
+        );
     }
 
     #[test]
@@ -12725,7 +12913,7 @@ mod tests {
         });
         let context = ExecutionContext::from_module(module);
         let err = interp.run(&context).unwrap_err();
-        assert!(matches!(err.error, VmError::BudgetExceeded { .. }));
+        assert!(matches!(err.error, VmError::BudgetExceeded));
         let stats = interp.runtime_budget_stats();
         assert_eq!(stats.budget_rejections, 1);
         assert_eq!(stats.budget_limit_observations, 1);
@@ -13079,7 +13267,10 @@ mod tests {
             .unwind_throw(&context, &mut stack, Value::boolean(true))
             .unwrap_err();
         match err {
-            VmError::Uncaught { value } => assert_eq!(value.as_ref(), "true"),
+            VmError::Uncaught => assert_eq!(
+                interp.error_detail(),
+                Some(run_control::ErrorDetail::Uncaught("true".into()))
+            ),
             other => panic!("expected Uncaught, got {other:?}"),
         }
         assert!(stack.is_empty(), "frames should be drained on uncaught");

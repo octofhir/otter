@@ -256,7 +256,7 @@ fn drain_iterable_into_values(
         .cx
         .interp
         .run_callable_sync(exec_ctx, &iter_method, src_value, no_args)
-        .map_err(|e| vm_to_native(e, "TypedArray"))?;
+        .map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray"))?;
     // §7.4.2 GetIteratorFromMethod step 4 — `next` is read off the
     // iterator object as a property, so a user-overridden
     // `%ArrayIteratorPrototype%.next` (or any custom `next`) drives
@@ -284,7 +284,7 @@ fn drain_iterable_into_values(
                 .cx
                 .interp
                 .iterator_next_full(exec_ctx, &handle)
-                .map_err(|e| vm_to_native(e, "TypedArray"))?;
+                .map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray"))?;
             if done {
                 break;
             }
@@ -300,7 +300,7 @@ fn drain_iterable_into_values(
             .cx
             .interp
             .run_callable_sync(exec_ctx, &next_method, iter_obj, smallvec::SmallVec::new())
-            .map_err(|e| vm_to_native(e, "TypedArray"))?;
+            .map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray"))?;
         if !crate::reflect::is_type_object_value(&result) {
             return Err(NativeError::TypeError {
                 name: "TypedArray",
@@ -336,11 +336,11 @@ fn coerce_values_for_kind(
     for value in values {
         let converted = if kind.is_bigint() {
             let big = crate::coerce::to_big_int_or_throw(ctx.cx.interp, exec, &value)
-                .map_err(|e| vm_to_native(e, "TypedArray"))?;
+                .map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray"))?;
             Value::big_int(big)
         } else {
             let number = crate::coerce::to_number_or_throw(ctx.cx.interp, exec, &value)
-                .map_err(|e| vm_to_native(e, "TypedArray"))?;
+                .map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray"))?;
             Value::number(number)
         };
         out.push(converted);
@@ -363,14 +363,14 @@ fn ta_get_via(
         .cx
         .interp
         .ordinary_get_value(exec, source, source, key, 0)
-        .map_err(|e| vm_to_native(e, "TypedArray"))?;
+        .map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray"))?;
     match outcome {
         crate::VmGetOutcome::Value(v) => Ok(v),
         crate::VmGetOutcome::InvokeGetter { getter } => ctx
             .cx
             .interp
             .run_callable_sync(exec, &getter, source, smallvec::SmallVec::new())
-            .map_err(|e| vm_to_native(e, "TypedArray")),
+            .map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray")),
     }
 }
 
@@ -388,7 +388,7 @@ fn read_array_like_coerced(
 ) -> Result<Vec<Value>, NativeError> {
     let len_value = ta_get_via(ctx, exec, source, &crate::VmPropertyKey::String("length"))?;
     let len_number = crate::coerce::to_number_or_throw(ctx.cx.interp, exec, &len_value)
-        .map_err(|e| vm_to_native(e, "TypedArray"))?;
+        .map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray"))?;
     let n = len_number.as_f64();
     let len = if n.is_nan() || n <= 0.0 {
         0
@@ -415,11 +415,11 @@ fn read_array_like_coerced(
         )?;
         let converted = if kind.is_bigint() {
             let big = crate::coerce::to_big_int_or_throw(ctx.cx.interp, exec, &value)
-                .map_err(|e| vm_to_native(e, "TypedArray"))?;
+                .map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray"))?;
             Value::big_int(big)
         } else {
             let number = crate::coerce::to_number_or_throw(ctx.cx.interp, exec, &value)
-                .map_err(|e| vm_to_native(e, "TypedArray"))?;
+                .map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray"))?;
             Value::number(number)
         };
         out.push(converted);
@@ -653,7 +653,7 @@ fn ta_from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError
     // then per-index Get / map / Set in order.
     let len_value = ta_get_via(ctx, &exec, source, &crate::VmPropertyKey::String("length"))?;
     let len = crate::coerce::to_length_or_throw(ctx.cx.interp, &exec, &len_value)
-        .map_err(|e| vm_to_native(e, name))?;
+        .map_err(|e| vm_to_native(ctx.cx.interp, e, name))?;
     let target = ta_create_from_constructor(ctx, &exec, &receiver, len, name)?;
     for k in 0..len {
         let value = ta_get_via(
@@ -717,7 +717,7 @@ fn ta_create_from_constructor(
         .cx
         .interp
         .run_construct_sync(exec, ctor, *ctor, smallvec::smallvec![len_arg])
-        .map_err(|e| vm_to_native(e, name))?;
+        .map_err(|e| vm_to_native(ctx.cx.interp, e, name))?;
     let Some(target) = result.as_typed_array(ctx.heap()) else {
         return Err(NativeError::TypeError {
             name,
@@ -763,17 +763,17 @@ fn ta_from_store(
         ctx.cx
             .interp
             .run_callable_sync(exec, mapfn, *this_arg, smallvec::smallvec![value, index])
-            .map_err(|e| vm_to_native(e, name))?
+            .map_err(|e| vm_to_native(ctx.cx.interp, e, name))?
     } else {
         value
     };
     let converted = if target.kind().is_bigint() {
         let big = crate::coerce::to_big_int_or_throw(ctx.cx.interp, exec, &mapped)
-            .map_err(|e| vm_to_native(e, name))?;
+            .map_err(|e| vm_to_native(ctx.cx.interp, e, name))?;
         Value::big_int(big)
     } else {
         let number = crate::coerce::to_number_or_throw(ctx.cx.interp, exec, &mapped)
-            .map_err(|e| vm_to_native(e, name))?;
+            .map_err(|e| vm_to_native(ctx.cx.interp, e, name))?;
         Value::number(number)
     };
     target.set(ctx.heap_mut(), k, &converted);
@@ -869,10 +869,10 @@ fn ta_ctor_dispatch(
                 let value = dispatch::typed_array_from_values_with_roots(
                     kind,
                     drained_slice,
-                    ctx.heap_mut(),
+                    ctx.interp_mut(),
                     &mut external_visit,
                 )
-                .map_err(|e| vm_to_native(e, typed_array_name(kind)))?;
+                .map_err(|e| vm_to_native(ctx.cx.interp, e, typed_array_name(kind)))?;
                 apply_typed_array_new_target_proto(ctx, kind, &value)?;
                 return Ok(value);
             }
@@ -913,11 +913,14 @@ fn ta_ctor_dispatch(
                     continue;
                 }
                 let interp = ctx.interp_mut();
-                let primitive = interp
-                    .evaluate_to_primitive(exec, slot, crate::abstract_ops::ToPrimitiveHint::Number)
-                    .map_err(|e| {
-                        crate::native_function::vm_to_native_error(e, typed_array_name(kind))
-                    })?;
+                let primitive = interp.evaluate_to_primitive(
+                    exec,
+                    slot,
+                    crate::abstract_ops::ToPrimitiveHint::Number,
+                );
+                let primitive = primitive.map_err(|e| {
+                    crate::native_function::vm_to_native_error(interp, e, typed_array_name(kind))
+                })?;
                 *slot = primitive;
             }
             out
@@ -961,10 +964,10 @@ fn ta_ctor_dispatch(
         kind,
         TypedArrayMethod::Construct,
         coerced_slice,
-        ctx.heap_mut(),
+        ctx.interp_mut(),
         &mut external_visit,
     )
-    .map_err(|e| vm_to_native(e, typed_array_name(kind)))?;
+    .map_err(|e| vm_to_native(ctx.cx.interp, e, typed_array_name(kind)))?;
     // §10.1.13 GetPrototypeFromConstructor — derived `super()`
     // construction forwards `new.target`, so the allocated typed
     // array receives `Subclass.prototype` as its observable
@@ -1101,9 +1104,9 @@ fn ta_proto_dispatch(
                 if value.is_number() || value.is_undefined() {
                     continue;
                 }
-                let n = interp
-                    .coerce_to_number(&context, &value)
-                    .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+                let n = interp.coerce_to_number(&context, &value);
+                let n =
+                    n.map_err(|e| crate::native_function::vm_to_native_error(interp, e, NAME))?;
                 small_args[idx] = Value::number(n);
             }
         }
@@ -1167,7 +1170,7 @@ fn ta_species_dispatch(
     } else {
         interp.typed_array_subarray_value_dispatch(&context, &t, args)
     };
-    result.map_err(|err| crate::native_function::vm_to_native_error(err, method_name))
+    result.map_err(|err| crate::native_function::vm_to_native_error(interp, err, method_name))
 }
 
 fn ta_callback_dispatch(
@@ -1187,22 +1190,21 @@ fn ta_callback_dispatch(
         name: method_name,
         reason: "missing execution context".to_string(),
     })?;
-    interp
-        .typed_array_callback_value_dispatch(&context, &t, method_name, args)
-        .map_err(|err| crate::native_function::vm_to_native_error(err, method_name))
+    let result = interp.typed_array_callback_value_dispatch(&context, &t, method_name, args);
+    result.map_err(|err| crate::native_function::vm_to_native_error(interp, err, method_name))
 }
 
 // ---------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------
 
-fn vm_to_native(err: VmError, name: &'static str) -> NativeError {
+fn vm_to_native(interp: &crate::Interpreter, err: VmError, name: &'static str) -> NativeError {
     // Delegate to the canonical mapping so a thrown JS exception
     // (`VmError::Uncaught`) keeps its identity as `NativeError::Thrown`
     // rather than collapsing into a generic TypeError — array-like
     // `length` getters / element `valueOf` hooks re-throw user errors
     // (Test262Error, RangeError, …) that must propagate unchanged.
-    crate::native_function::vm_to_native_error(err, name)
+    crate::native_function::vm_to_native_error(interp, err, name)
 }
 
 // ---------------------------------------------------------------

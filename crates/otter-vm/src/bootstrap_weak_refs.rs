@@ -154,7 +154,13 @@ fn fr_proto_register(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
         held_value,
         unregister_token.as_ref(),
     )
-    .map_err(|e| vm_to_native(e, "FinalizationRegistry.prototype.register"))?;
+    .map_err(|e| {
+        vm_to_native(
+            ctx.interp_mut(),
+            e,
+            "FinalizationRegistry.prototype.register",
+        )
+    })?;
     Ok(Value::undefined())
 }
 
@@ -170,7 +176,13 @@ fn fr_proto_unregister(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
         });
     }
     let removed = weak_refs::finalization_registry_unregister(registry, ctx.heap_mut(), &token)
-        .map_err(|e| vm_to_native(e, "FinalizationRegistry.prototype.unregister"))?;
+        .map_err(|e| {
+            vm_to_native(
+                ctx.interp_mut(),
+                e,
+                "FinalizationRegistry.prototype.unregister",
+            )
+        })?;
     Ok(Value::boolean(removed))
 }
 
@@ -218,20 +230,36 @@ fn oom(name: &'static str) -> NativeError {
     }
 }
 
-fn vm_to_native(err: crate::VmError, name: &'static str) -> NativeError {
+fn vm_to_native(
+    interp: &crate::Interpreter,
+    err: crate::VmError,
+    name: &'static str,
+) -> NativeError {
     match err {
-        crate::VmError::TypeError { message } => NativeError::TypeError {
-            name,
-            reason: message.into(),
-        },
+        crate::VmError::TypeError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::TypeError {
+                name,
+                reason: message.into(),
+            }
+        }
         crate::VmError::NotCallable => NativeError::TypeError {
             name,
             reason: "value is not callable".to_string(),
         },
-        crate::VmError::Uncaught { value } => NativeError::Thrown {
-            name,
-            message: value.into(),
-        },
+        crate::VmError::Uncaught => {
+            let value = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::Thrown {
+                name,
+                message: value.into(),
+            }
+        }
         other => NativeError::TypeError {
             name,
             reason: other.to_string(),

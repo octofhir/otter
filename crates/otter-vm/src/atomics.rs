@@ -201,7 +201,7 @@ fn to_primitive_number(
     })?;
     interp
         .evaluate_to_primitive(&exec, value, ToPrimitiveHint::Number)
-        .map_err(|e| vm_error_to_native(method_name, e))
+        .map_err(|e| vm_error_to_native(interp, method_name, e))
 }
 
 /// Convert a [`VmError`] surfaced from re-entering the interpreter
@@ -209,12 +209,22 @@ fn to_primitive_number(
 /// maps to `NativeError::Thrown` so the original user-thrown value
 /// rides through (the runtime mapper at `lib.rs:15616` reconstructs
 /// the JS exception from the `message` field).
-fn vm_error_to_native(method_name: &'static str, err: VmError) -> NativeError {
+fn vm_error_to_native(
+    interp: &crate::Interpreter,
+    method_name: &'static str,
+    err: VmError,
+) -> NativeError {
     match err {
-        VmError::Uncaught { value } => NativeError::Thrown {
-            name: spec_name(method_name),
-            message: value.into(),
-        },
+        VmError::Uncaught => {
+            let value = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::Thrown {
+                name: spec_name(method_name),
+                message: value.into(),
+            }
+        }
         other => type_err(method_name, other.to_string()),
     }
 }

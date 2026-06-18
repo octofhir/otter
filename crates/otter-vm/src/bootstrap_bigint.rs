@@ -60,32 +60,20 @@ fn bigint_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
         });
     }
     let coerced = coerce_bigint_call_args(ctx, args, "BigInt")?;
-    bigint::dispatch::call(
-        ctx.interp_mut().gc_heap_mut(),
-        BigIntMethod::Construct,
-        &coerced,
-    )
-    .map_err(|e| vm_to_native(e, "BigInt"))
+    bigint::dispatch::call(ctx.interp_mut(), BigIntMethod::Construct, &coerced)
+        .map_err(|e| vm_to_native(ctx.interp_mut(), e, "BigInt"))
 }
 
 fn bigint_static_as_int_n(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let coerced = coerce_bigint_call_args(ctx, args, "BigInt.asIntN")?;
-    bigint::dispatch::call(
-        ctx.interp_mut().gc_heap_mut(),
-        BigIntMethod::AsIntN,
-        &coerced,
-    )
-    .map_err(|e| vm_to_native(e, "BigInt.asIntN"))
+    bigint::dispatch::call(ctx.interp_mut(), BigIntMethod::AsIntN, &coerced)
+        .map_err(|e| vm_to_native(ctx.interp_mut(), e, "BigInt.asIntN"))
 }
 
 fn bigint_static_as_uint_n(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let coerced = coerce_bigint_call_args(ctx, args, "BigInt.asUintN")?;
-    bigint::dispatch::call(
-        ctx.interp_mut().gc_heap_mut(),
-        BigIntMethod::AsUintN,
-        &coerced,
-    )
-    .map_err(|e| vm_to_native(e, "BigInt.asUintN"))
+    bigint::dispatch::call(ctx.interp_mut(), BigIntMethod::AsUintN, &coerced)
+        .map_err(|e| vm_to_native(ctx.interp_mut(), e, "BigInt.asUintN"))
 }
 
 /// §7.1.13 ToBigInt step 4 — Array operands flow through
@@ -144,7 +132,7 @@ fn coerce_bigint_call_args(
             })?;
             let primitive = interp
                 .evaluate_to_primitive(&exec, slot, crate::abstract_ops::ToPrimitiveHint::Number)
-                .map_err(|e| vm_to_native(e, name))?;
+                .map_err(|e| vm_to_native(interp, e, name))?;
             *slot = primitive;
         }
     }
@@ -190,7 +178,7 @@ fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
                     reason: "missing execution context".to_string(),
                 })?;
                 crate::coerce::to_number_or_throw(interp, &exec, &v)
-                    .map_err(|err| vm_to_native(err, "BigInt.prototype.toString"))?
+                    .map_err(|err| vm_to_native(interp, err, "BigInt.prototype.toString"))?
             };
             let f = number.as_f64();
             let trunc = if f.is_nan() { 0.0 } else { f.trunc() };
@@ -240,28 +228,52 @@ fn oom(name: &'static str) -> NativeError {
     }
 }
 
-fn vm_to_native(err: VmError, name: &'static str) -> NativeError {
+fn vm_to_native(interp: &crate::Interpreter, err: VmError, name: &'static str) -> NativeError {
     match err {
-        VmError::TypeError { message } => NativeError::TypeError {
-            name,
-            reason: message.into(),
-        },
+        VmError::TypeError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::TypeError {
+                name,
+                reason: message.into(),
+            }
+        }
         VmError::TypeMismatch => NativeError::TypeError {
             name,
             reason: "type mismatch".to_string(),
         },
-        VmError::RangeError { message } => NativeError::RangeError {
-            name,
-            reason: message.into(),
-        },
-        VmError::SyntaxError { message } => NativeError::SyntaxError {
-            name,
-            reason: message.into(),
-        },
-        VmError::Uncaught { value } => NativeError::Thrown {
-            name,
-            message: value.into(),
-        },
+        VmError::RangeError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::RangeError {
+                name,
+                reason: message.into(),
+            }
+        }
+        VmError::SyntaxError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::SyntaxError {
+                name,
+                reason: message.into(),
+            }
+        }
+        VmError::Uncaught => {
+            let value = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::Thrown {
+                name,
+                message: value.into(),
+            }
+        }
         other => NativeError::TypeError {
             name,
             reason: other.to_string(),

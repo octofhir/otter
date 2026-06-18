@@ -88,11 +88,9 @@ pub fn to_number_field(
                 name: class,
                 reason: "missing execution context".to_string(),
             })?;
-        let n = ctx
-            .cx
-            .interp
-            .number_for_number_ctor(&exec, value)
-            .map_err(|e| crate::native_function::vm_to_native_error(e, class))?;
+        let computed = ctx.cx.interp.number_for_number_ctor(&exec, value);
+        let n = computed
+            .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))?;
         return Ok(n.as_f64());
     }
     Ok(crate::number::parse::to_number_value(value, ctx.heap()))
@@ -223,11 +221,10 @@ pub fn read_option_string(
             name: class,
             reason: "missing execution context".to_string(),
         })?;
-    ctx.cx
-        .interp
-        .coerce_to_string(&exec, &field)
+    let coerced = ctx.cx.interp.coerce_to_string(&exec, &field);
+    coerced
         .map(Some)
-        .map_err(|e| crate::native_function::vm_to_native_error(e, class))
+        .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))
 }
 
 /// Read a string-typed field that requires a String value (§the field
@@ -252,10 +249,8 @@ pub fn read_required_string(
                 name: class,
                 reason: "missing execution context".to_string(),
             })?;
-        ctx.cx
-            .interp
-            .to_primitive_string_hint_sync(&exec, field)
-            .map_err(|e| crate::native_function::vm_to_native_error(e, class))?
+        let prim = ctx.cx.interp.to_primitive_string_hint_sync(&exec, field);
+        prim.map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))?
     } else {
         field
     };
@@ -318,11 +313,9 @@ pub fn parse_overflow(
             name: "Temporal",
             reason: "missing execution context".to_string(),
         })?;
-    let s = ctx
-        .cx
-        .interp
-        .coerce_to_string(&exec, &field)
-        .map_err(|e| crate::native_function::vm_to_native_error(e, "Temporal"))?;
+    let coerced = ctx.cx.interp.coerce_to_string(&exec, &field);
+    let s = coerced
+        .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, "Temporal"))?;
     temporal_rs::options::Overflow::from_str(&s)
         .map(Some)
         .map_err(|_| NativeError::RangeError {
@@ -366,18 +359,20 @@ pub fn get_option_value(
             reason: "missing execution context".to_string(),
         })?;
     let key = crate::VmPropertyKey::String(name);
-    let outcome = ctx
+    let got = ctx
         .cx
         .interp
-        .ordinary_get_value(&exec, options, options, &key, 0)
-        .map_err(|e| vm_to_native_error(e, class))?;
+        .ordinary_get_value(&exec, options, options, &key, 0);
+    let outcome = got.map_err(|e| vm_to_native_error(ctx.cx.interp, e, class))?;
     match outcome {
         crate::VmGetOutcome::Value(v) => Ok(v),
-        crate::VmGetOutcome::InvokeGetter { getter } => ctx
-            .cx
-            .interp
-            .run_callable_sync(&exec, &getter, options, smallvec::SmallVec::new())
-            .map_err(|e| vm_to_native_error(e, class)),
+        crate::VmGetOutcome::InvokeGetter { getter } => {
+            let called =
+                ctx.cx
+                    .interp
+                    .run_callable_sync(&exec, &getter, options, smallvec::SmallVec::new());
+            called.map_err(|e| vm_to_native_error(ctx.cx.interp, e, class))
+        }
     }
 }
 
@@ -656,11 +651,9 @@ pub fn parse_to_string_rounding_options(
                     name: class,
                     reason: "missing execution context".to_string(),
                 })?;
-            let s = ctx
-                .cx
-                .interp
-                .coerce_to_string(&exec, &frac)
-                .map_err(|e| crate::native_function::vm_to_native_error(e, class))?;
+            let coerced = ctx.cx.interp.coerce_to_string(&exec, &frac);
+            let s = coerced
+                .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))?;
             if s == "auto" {
                 opts.precision = temporal_rs::parsers::Precision::Auto;
             } else {

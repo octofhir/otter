@@ -275,7 +275,7 @@ fn coerce_set_args(
         for slot in coerced.iter_mut() {
             let n = interp
                 .coerce_to_number(&exec, slot)
-                .map_err(|err| crate::native_function::vm_to_native_error(err, name))?;
+                .map_err(|err| crate::native_function::vm_to_native_error(interp, err, name))?;
             *slot = Value::number(n);
         }
     }
@@ -715,9 +715,10 @@ fn date_prototype_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Va
     })?;
 
     // Step 2 — ToPrimitive(O, number).
-    let tv = interp
-        .evaluate_to_primitive(&exec, &receiver, ToPrimitiveHint::Number)
-        .map_err(|err| vm_to_native(NAME, err))?;
+    let tv = match interp.evaluate_to_primitive(&exec, &receiver, ToPrimitiveHint::Number) {
+        Ok(v) => v,
+        Err(err) => return Err(vm_to_native(interp, NAME, err)),
+    };
     // Step 3 — non-finite Number → null.
     if let Some(n) = tv.as_number()
         && !n.as_f64().is_finite()
@@ -730,7 +731,7 @@ fn date_prototype_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Va
         || receiver.is_boolean()
         || receiver.is_string()
         || receiver.is_symbol();
-    let method = if receiver_is_primitive {
+    let method_outcome = if receiver_is_primitive {
         let proto = interp
             .intrinsic_prototype_object_for(&receiver)
             .ok_or_else(|| NativeError::TypeError {
@@ -752,13 +753,19 @@ fn date_prototype_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Va
             &VmPropertyKey::String("toISOString"),
             0,
         )
-    }
-    .map_err(|err| vm_to_native(NAME, err))?;
+    };
+    let method = match method_outcome {
+        Ok(v) => v,
+        Err(err) => return Err(vm_to_native(interp, NAME, err)),
+    };
     let method = match method {
         VmGetOutcome::Value(v) => v,
-        VmGetOutcome::InvokeGetter { getter } => interp
-            .run_callable_sync(&exec, &getter, receiver, SmallVec::new())
-            .map_err(|err| vm_to_native(NAME, err))?,
+        VmGetOutcome::InvokeGetter { getter } => {
+            match interp.run_callable_sync(&exec, &getter, receiver, SmallVec::new()) {
+                Ok(v) => v,
+                Err(err) => return Err(vm_to_native(interp, NAME, err)),
+            }
+        }
     };
     if !abstract_ops::is_callable(&method) {
         return Err(NativeError::TypeError {
@@ -766,27 +773,46 @@ fn date_prototype_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Va
             reason: "toISOString is not callable".to_string(),
         });
     }
-    interp
-        .run_callable_sync(&exec, &method, receiver, SmallVec::new())
-        .map_err(|err| vm_to_native(NAME, err))
+    match interp.run_callable_sync(&exec, &method, receiver, SmallVec::new()) {
+        Ok(v) => Ok(v),
+        Err(err) => Err(vm_to_native(interp, NAME, err)),
+    }
 }
 
 /// `VmError → NativeError` mapper for the generic `toJSON` bridge.
 /// Preserves user-thrown values via `NativeError::Thrown`.
-fn vm_to_native(name: &'static str, err: VmError) -> NativeError {
+fn vm_to_native(interp: &crate::Interpreter, name: &'static str, err: VmError) -> NativeError {
     match err {
-        VmError::Uncaught { value } => NativeError::Thrown {
-            name,
-            message: value.into(),
-        },
-        VmError::TypeError { message } => NativeError::TypeError {
-            name,
-            reason: message.into(),
-        },
-        VmError::RangeError { message } => NativeError::RangeError {
-            name,
-            reason: message.into(),
-        },
+        VmError::Uncaught => {
+            let value = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::Thrown {
+                name,
+                message: value.into(),
+            }
+        }
+        VmError::TypeError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::TypeError {
+                name,
+                reason: message.into(),
+            }
+        }
+        VmError::RangeError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::RangeError {
+                name,
+                reason: message.into(),
+            }
+        }
         other => NativeError::TypeError {
             name,
             reason: other.to_string(),

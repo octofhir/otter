@@ -208,6 +208,7 @@ impl Interpreter {
                 return Err(RunError {
                     error: VmError::InvalidOperand,
                     frames: Vec::new(),
+                    detail: self.take_error_detail(),
                 });
             }
         }
@@ -240,7 +241,7 @@ impl Interpreter {
                     // §27.6.3 AsyncGenerator resumption settles the
                     // front request as rejected instead of letting the
                     // throw escape the dispatch tick.
-                    if matches!(error, VmError::Uncaught { .. }) {
+                    if matches!(error, VmError::Uncaught) {
                         let reason = self.take_pending_uncaught_throw().unwrap_or(value);
                         owner.mark_done(&mut self.gc_heap);
                         self.async_generator_complete_step(context, &owner, Err(reason), true)
@@ -250,7 +251,11 @@ impl Interpreter {
                         return Ok(());
                     }
                     let frames = snapshot_frames(context, &stack);
-                    return Err(RunError { error, frames });
+                    return Err(RunError {
+                        error,
+                        frames,
+                        detail: self.take_error_detail(),
+                    });
                 }
                 if stack.is_empty() {
                     // Throw drained out of the gen body; settle the
@@ -301,7 +306,11 @@ impl Interpreter {
                         Ok(())
                     } else {
                         let frames = snapshot_frames(context, &stack);
-                        Err(RunError { error, frames })
+                        Err(RunError {
+                            error,
+                            frames,
+                            detail: self.take_error_detail(),
+                        })
                     }
                 }
             }
@@ -353,6 +362,7 @@ impl Interpreter {
                 return Err(RunError {
                     error: VmError::InvalidOperand,
                     frames: Vec::new(),
+                    detail: self.take_error_detail(),
                 });
             }
         }
@@ -380,7 +390,11 @@ impl Interpreter {
                 // structure exactly as a synchronous throw would.
                 if let Err(error) = self.unwind_throw(context, &mut stack, value) {
                     let frames = snapshot_frames(context, &stack);
-                    return Err(RunError { error, frames });
+                    return Err(RunError {
+                        error,
+                        frames,
+                        detail: self.take_error_detail(),
+                    });
                 }
                 if stack.is_empty() {
                     // The rejection drained through the async frame's
@@ -392,7 +406,11 @@ impl Interpreter {
                 Ok(_) => Ok(()),
                 Err(error) => {
                     let frames = snapshot_frames(context, &stack);
-                    Err(RunError { error, frames })
+                    Err(RunError {
+                        error,
+                        frames,
+                        detail: self.take_error_detail(),
+                    })
                 }
             }
         })();
@@ -456,9 +474,9 @@ impl Interpreter {
                 if uncaught_error.is_none() {
                     self.pending_uncaught_throw = Some(payload);
                 }
-                return Err(uncaught_error.take().unwrap_or(VmError::Uncaught {
-                    value: (display).into(),
-                }));
+                return Err(uncaught_error
+                    .take()
+                    .unwrap_or(self.err_uncaught((display).into())));
             }
             let popped_handler = {
                 let frame = stack.last_mut().expect("frame present");

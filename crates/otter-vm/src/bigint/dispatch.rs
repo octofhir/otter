@@ -16,7 +16,6 @@ use super::BigIntValue;
 use crate::{Value, VmError, oom_to_vm};
 use num_bigint::BigInt;
 use num_traits::Signed;
-use otter_gc::GcHeap;
 
 /// Dispatch `BigInt(...)` ([`BigIntMethod::Construct`]) /
 /// `BigInt.<method>(...)`. Routes the typed [`BigIntMethod`]
@@ -26,7 +25,7 @@ use otter_gc::GcHeap;
 /// - [`VmError::TypeMismatch`] for wrong-shape arguments.
 /// - [`VmError::OutOfMemory`] when the body allocation fails.
 pub fn call(
-    heap: &mut GcHeap,
+    interp: &mut crate::Interpreter,
     method: otter_bytecode::method_id::BigIntMethod,
     args: &[Value],
 ) -> Result<Value, VmError> {
@@ -35,26 +34,28 @@ pub fn call(
         // §21.2.1 BigInt(value) — coerce `value` to a BigInt.
         M::Construct => {
             let value = args.first().cloned().unwrap_or(Value::undefined());
-            let big = to_bigint(heap, &value)?;
-            let handle = BigIntValue::from_inner(heap, big).map_err(oom_to_vm)?;
+            let big = to_bigint(interp, &value)?;
+            let handle = BigIntValue::from_inner(interp.gc_heap_mut(), big).map_err(oom_to_vm)?;
             Ok(Value::big_int(handle))
         }
         // §21.2.2.1 BigInt.asIntN(bits, value).
         M::AsIntN => {
-            let bits = expect_bits(args.first(), heap)?;
+            let bits = expect_bits(args.first(), interp)?;
             let value = args.get(1).cloned().unwrap_or(Value::undefined());
-            let n = to_bigint_strict(heap, &value)?;
+            let n = to_bigint_strict(interp, &value)?;
             let clipped = as_int_n(bits, &n);
-            let handle = BigIntValue::from_inner(heap, clipped).map_err(oom_to_vm)?;
+            let handle =
+                BigIntValue::from_inner(interp.gc_heap_mut(), clipped).map_err(oom_to_vm)?;
             Ok(Value::big_int(handle))
         }
         // §21.2.2.2 BigInt.asUintN(bits, value).
         M::AsUintN => {
-            let bits = expect_bits(args.first(), heap)?;
+            let bits = expect_bits(args.first(), interp)?;
             let value = args.get(1).cloned().unwrap_or(Value::undefined());
-            let n = to_bigint_strict(heap, &value)?;
+            let n = to_bigint_strict(interp, &value)?;
             let clipped = as_uint_n(bits, &n);
-            let handle = BigIntValue::from_inner(heap, clipped).map_err(oom_to_vm)?;
+            let handle =
+                BigIntValue::from_inner(interp.gc_heap_mut(), clipped).map_err(oom_to_vm)?;
             Ok(Value::big_int(handle))
         }
     }
@@ -62,9 +63,9 @@ pub fn call(
 
 /// §7.1.13 ToBigInt — Number must be a safe integer; String parses
 /// as integer literal; Boolean → 0n / 1n; BigInt passes through.
-fn to_bigint(heap: &GcHeap, value: &Value) -> Result<BigInt, VmError> {
+fn to_bigint(interp: &crate::Interpreter, value: &Value) -> Result<BigInt, VmError> {
     if let Some(b) = value.as_big_int() {
-        return Ok(b.clone_inner(heap));
+        return Ok(b.clone_inner(interp.gc_heap()));
     }
     if let Some(b) = value.as_boolean() {
         return Ok(BigInt::from(if b { 1 } else { 0 }));
@@ -75,20 +76,19 @@ fn to_bigint(heap: &GcHeap, value: &Value) -> Result<BigInt, VmError> {
     if let Some(n) = value.as_number() {
         let f = n.as_f64();
         if !f.is_finite() || f.fract() != 0.0 {
-            return Err(VmError::RangeError {
-                message: ("The number is not a safe integer for BigInt".to_string()).into(),
-            });
+            return Err(interp
+                .err_range(("The number is not a safe integer for BigInt".to_string()).into()));
         }
         return Ok(BigInt::from(f as i128));
     }
-    if let Some(s) = value.as_string(heap) {
-        return string_to_bigint(&s.to_lossy_string(heap));
+    if let Some(s) = value.as_string(interp.gc_heap()) {
+        return string_to_bigint(interp, &s.to_lossy_string(interp.gc_heap()));
     }
     // §7.1.13 step 7 — Symbol → TypeError.
     if value.is_symbol() {
-        return Err(VmError::TypeError {
-            message: ("Cannot convert a Symbol value to a BigInt".to_string()).into(),
-        });
+        return Err(
+            interp.err_type(("Cannot convert a Symbol value to a BigInt".to_string()).into())
+        );
     }
     // §7.1.13 step 4 — ToPrimitive(value, "number") then
     // recursive ToBigInt. The caller (`bigint_ctor_call`) has
@@ -96,18 +96,14 @@ fn to_bigint(heap: &GcHeap, value: &Value) -> Result<BigInt, VmError> {
     // primitive here. A remaining Object reaches the wildcard
     // and surfaces as TypeError.
     if value.is_array() {
-        return Err(VmError::TypeError {
-            message: ("Cannot convert Array to a BigInt".to_string()).into(),
-        });
+        return Err(interp.err_type(("Cannot convert Array to a BigInt".to_string()).into()));
     }
     if value.is_null() || value.is_undefined() {
-        return Err(VmError::TypeError {
-            message: ("Cannot convert null or undefined to a BigInt".to_string()).into(),
-        });
+        return Err(
+            interp.err_type(("Cannot convert null or undefined to a BigInt".to_string()).into())
+        );
     }
-    Err(VmError::TypeError {
-        message: ("Cannot convert value to a BigInt".to_string()).into(),
-    })
+    Err(interp.err_type(("Cannot convert value to a BigInt".to_string()).into()))
 }
 
 /// §7.1.13 ToBigInt — the strict conversion used by `BigInt.asIntN` /
@@ -116,16 +112,14 @@ fn to_bigint(heap: &GcHeap, value: &Value) -> Result<BigInt, VmError> {
 /// silent integer conversion. The operand is already ToPrimitive'd by
 /// `coerce_bigint_call_args`, so a Number reaching this point came from
 /// a numeric primitive or a `valueOf` / `@@toPrimitive` result.
-fn to_bigint_strict(heap: &GcHeap, value: &Value) -> Result<BigInt, VmError> {
+fn to_bigint_strict(interp: &crate::Interpreter, value: &Value) -> Result<BigInt, VmError> {
     if value.is_number() {
-        return Err(VmError::TypeError {
-            message: ("Cannot convert a Number to a BigInt".to_string()).into(),
-        });
+        return Err(interp.err_type(("Cannot convert a Number to a BigInt".to_string()).into()));
     }
-    to_bigint(heap, value)
+    to_bigint(interp, value)
 }
 
-fn string_to_bigint(text: &str) -> Result<BigInt, VmError> {
+fn string_to_bigint(interp: &crate::Interpreter, text: &str) -> Result<BigInt, VmError> {
     let trimmed = text.trim();
     // §7.1.14.1 StringToBigInt — empty string is 0n, accept decimal
     // / `0x` / `0o` / `0b` prefixes with optional leading sign on
@@ -138,8 +132,8 @@ fn string_to_bigint(text: &str) -> Result<BigInt, VmError> {
         .parse::<BigInt>()
         .ok()
         .or_else(|| parse_radix_literal(trimmed))
-        .ok_or_else(|| VmError::SyntaxError {
-            message: (format!("Cannot convert {trimmed:?} to a BigInt")).into(),
+        .ok_or_else(|| {
+            interp.err_syntax((format!("Cannot convert {trimmed:?} to a BigInt")).into())
         })
 }
 
@@ -165,7 +159,7 @@ fn parse_radix_literal(input: &str) -> Option<BigInt> {
 /// then `ToIntegerOrInfinity`, rejecting Symbol / BigInt with
 /// **TypeError**, negatives and overflow with **RangeError**, and
 /// returning `0` for NaN / undefined per the spec.
-fn expect_bits(arg: Option<&Value>, heap: &GcHeap) -> Result<u32, VmError> {
+fn expect_bits(arg: Option<&Value>, interp: &crate::Interpreter) -> Result<u32, VmError> {
     let Some(v) = arg else {
         return Ok(0);
     };
@@ -177,24 +171,22 @@ fn expect_bits(arg: Option<&Value>, heap: &GcHeap) -> Result<u32, VmError> {
         0.0
     } else if let Some(b) = v.as_boolean() {
         if b { 1.0 } else { 0.0 }
-    } else if let Some(s) = v.as_string(heap) {
-        crate::number::parse::to_number_from_string(&s.to_lossy_string(heap)).as_f64()
+    } else if let Some(s) = v.as_string(interp.gc_heap()) {
+        crate::number::parse::to_number_from_string(&s.to_lossy_string(interp.gc_heap())).as_f64()
     } else if v.is_symbol() {
-        return Err(VmError::TypeError {
-            message: ("Cannot convert a Symbol value to a number".to_string()).into(),
-        });
+        return Err(
+            interp.err_type(("Cannot convert a Symbol value to a number".to_string()).into())
+        );
     } else if v.is_big_int() {
-        return Err(VmError::TypeError {
-            message: ("Cannot convert a BigInt value to a number".to_string()).into(),
-        });
+        return Err(
+            interp.err_type(("Cannot convert a BigInt value to a number".to_string()).into())
+        );
     } else {
         // Object operands should have been pre-coerced by the
         // dispatcher's `coerce_bigint_call_args` ladder. Anything
         // else is treated as a non-primitive that fails the
         // ToNumber arm.
-        return Err(VmError::TypeError {
-            message: ("Cannot convert value to a number".to_string()).into(),
-        });
+        return Err(interp.err_type(("Cannot convert value to a number".to_string()).into()));
     };
     // §7.1.5 ToIntegerOrInfinity — NaN collapses to 0, infinities
     // stay; §7.1.22 ToIndex then rejects negatives / overflows.
@@ -203,16 +195,13 @@ fn expect_bits(arg: Option<&Value>, heap: &GcHeap) -> Result<u32, VmError> {
     }
     let trunc = n.trunc();
     if trunc.is_infinite() || !(0.0..=9_007_199_254_740_991.0).contains(&trunc) {
-        return Err(VmError::RangeError {
-            message: ("Invalid bits parameter for BigInt.asIntN / asUintN".to_string()).into(),
-        });
+        return Err(interp
+            .err_range(("Invalid bits parameter for BigInt.asIntN / asUintN".to_string()).into()));
     }
     if trunc > u32::MAX as f64 {
         // The spec allows up to 2^53-1, but the per-arm implementation
         // can only address up to `u32::MAX` bits before overflow.
-        return Err(VmError::RangeError {
-            message: ("Bits parameter exceeds supported range".to_string()).into(),
-        });
+        return Err(interp.err_range(("Bits parameter exceeds supported range".to_string()).into()));
     }
     Ok(trunc as u32)
 }

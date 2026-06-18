@@ -25,15 +25,11 @@ use super::typed_array::{JsTypedArray, TypedArrayKind};
 /// **TypeError** for `Symbol` and `BigInt` operands. The shared
 /// `to_index` helper collapses both outcomes to `None`; this wrapper
 /// recovers the spec error class from the original value.
-fn to_index_error(value: &Value, what: &str) -> VmError {
+fn to_index_error(interp: &crate::Interpreter, value: &Value, what: &str) -> VmError {
     if value.is_symbol() || value.is_big_int() {
-        VmError::TypeError {
-            message: (format!("Cannot convert {what} to a number")).into(),
-        }
+        interp.err_type((format!("Cannot convert {what} to a number")).into())
     } else {
-        VmError::RangeError {
-            message: (format!("Invalid {what}")).into(),
-        }
+        interp.err_range((format!("Invalid {what}")).into())
     }
 }
 
@@ -49,13 +45,12 @@ fn to_index_error(value: &Value, what: &str) -> VmError {
 pub fn array_buffer_call(
     method: otter_bytecode::method_id::ArrayBufferMethod,
     args: &[Value],
-    _gc_heap: &otter_gc::GcHeap,
+    interp: &crate::Interpreter,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::ArrayBufferMethod as M;
     match method {
-        M::Construct => Err(VmError::TypeError {
-            message: ("ArrayBuffer construction requires rooted dispatch".to_string()).into(),
-        }),
+        M::Construct => Err(interp
+            .err_type(("ArrayBuffer construction requires rooted dispatch".to_string()).into())),
         // §25.1.3.1 ArrayBuffer.isView(arg) — returns `true` when
         // arg is a TypedArray or DataView.
         M::IsView => {
@@ -70,7 +65,7 @@ pub fn array_buffer_call(
 pub fn array_buffer_call_with_roots(
     method: otter_bytecode::method_id::ArrayBufferMethod,
     args: &[Value],
-    gc_heap: &mut otter_gc::GcHeap,
+    interp: &mut crate::Interpreter,
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::ArrayBufferMethod as M;
@@ -79,57 +74,69 @@ pub fn array_buffer_call_with_roots(
             let length = match args.first() {
                 None => 0u64,
                 Some(v) if v.is_undefined() => 0u64,
-                Some(v) => {
-                    to_index(v, gc_heap).ok_or_else(|| to_index_error(v, "ArrayBuffer length"))?
-                }
+                Some(v) => to_index(v, interp.gc_heap_mut())
+                    .ok_or_else(|| to_index_error(interp, v, "ArrayBuffer length"))?,
             };
             let max_byte_length = match args.get(1) {
                 None => None,
                 Some(v) if v.is_undefined() => None,
                 Some(opts) if opts.as_object().is_some() => {
                     let opts = opts.as_object().expect("checked object");
-                    crate::object::get(opts, gc_heap, "maxByteLength")
+                    crate::object::get(opts, interp.gc_heap_mut(), "maxByteLength")
                         .filter(|value| !value.is_undefined())
                         .map(|value| {
-                            to_index(&value, gc_heap)
-                                .ok_or_else(|| to_index_error(&value, "ArrayBuffer maxByteLength"))
+                            to_index(&value, interp.gc_heap_mut()).ok_or_else(|| {
+                                to_index_error(interp, &value, "ArrayBuffer maxByteLength")
+                            })
                         })
                         .transpose()?
                 }
                 Some(v) => Some(
-                    to_index(v, gc_heap)
-                        .ok_or_else(|| to_index_error(v, "ArrayBuffer maxByteLength"))?,
+                    to_index(v, interp.gc_heap_mut())
+                        .ok_or_else(|| to_index_error(interp, v, "ArrayBuffer maxByteLength"))?,
                 ),
             };
             let len = length as usize;
-            let buf = match max_byte_length {
-                Some(max) => {
-                    let max = max as usize;
-                    if max < len {
-                        return Err(VmError::RangeError {
-                            message: ("ArrayBuffer maxByteLength is smaller than byteLength"
-                                .to_string())
-                            .into(),
-                        });
-                    }
-                    JsArrayBuffer::new_resizable_with_roots(len, max, gc_heap, external_visit)
-                        .map_err(oom_to_vm)?
-                        .ok_or_else(|| VmError::RangeError {
-                            message: (format!(
+            let buf =
+                match max_byte_length {
+                    Some(max) => {
+                        let max = max as usize;
+                        if max < len {
+                            return Err(interp.err_range(
+                                ("ArrayBuffer maxByteLength is smaller than byteLength"
+                                    .to_string())
+                                .into(),
+                            ));
+                        }
+                        let allocated = JsArrayBuffer::new_resizable_with_roots(
+                            len,
+                            max,
+                            interp.gc_heap_mut(),
+                            external_visit,
+                        )
+                        .map_err(oom_to_vm)?;
+                        allocated.ok_or_else(|| {
+                            interp.err_range((format!(
                                 "ArrayBuffer allocation of {max} bytes exceeds the available heap"
                             ))
-                            .into(),
+                            .into())
                         })?
-                }
-                None => JsArrayBuffer::try_new_with_roots(len, gc_heap, external_visit)
-                    .map_err(oom_to_vm)?
-                    .ok_or_else(|| VmError::RangeError {
-                        message: (format!(
+                    }
+                    None => {
+                        let allocated = JsArrayBuffer::try_new_with_roots(
+                            len,
+                            interp.gc_heap_mut(),
+                            external_visit,
+                        )
+                        .map_err(oom_to_vm)?;
+                        allocated.ok_or_else(|| {
+                            interp.err_range((format!(
                             "ArrayBuffer allocation of {len} bytes exceeds the available heap"
                         ))
-                        .into(),
-                    })?,
-            };
+                        .into())
+                        })?
+                    }
+                };
             Ok(Value::array_buffer(buf))
         }
         M::IsView => {
@@ -148,7 +155,7 @@ pub fn array_buffer_call_with_roots(
 pub fn shared_array_buffer_call_with_roots(
     method: otter_bytecode::method_id::SharedArrayBufferMethod,
     args: &[Value],
-    gc_heap: &mut otter_gc::GcHeap,
+    interp: &mut crate::Interpreter,
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::SharedArrayBufferMethod as M;
@@ -158,57 +165,67 @@ pub fn shared_array_buffer_call_with_roots(
             let length = match args.first() {
                 None => 0u64,
                 Some(v) if v.is_undefined() => 0u64,
-                Some(v) => to_index(v, gc_heap)
-                    .ok_or_else(|| to_index_error(v, "SharedArrayBuffer length"))?,
+                Some(v) => to_index(v, interp.gc_heap_mut())
+                    .ok_or_else(|| to_index_error(interp, v, "SharedArrayBuffer length"))?,
             };
             let max_byte_length = match args.get(1) {
                 None => None,
                 Some(v) if v.is_undefined() => None,
                 Some(opts) if opts.as_object().is_some() => {
                     let opts = opts.as_object().expect("checked object");
-                    crate::object::get(opts, gc_heap, "maxByteLength")
+                    crate::object::get(opts, interp.gc_heap_mut(), "maxByteLength")
                         .filter(|value| !value.is_undefined())
                         .map(|value| {
-                            to_index(&value, gc_heap).ok_or_else(|| {
-                                to_index_error(&value, "SharedArrayBuffer maxByteLength")
+                            to_index(&value, interp.gc_heap_mut()).ok_or_else(|| {
+                                to_index_error(interp, &value, "SharedArrayBuffer maxByteLength")
                             })
                         })
                         .transpose()?
                 }
-                Some(v) => Some(
-                    to_index(v, gc_heap)
-                        .ok_or_else(|| to_index_error(v, "SharedArrayBuffer maxByteLength"))?,
-                ),
+                Some(v) => {
+                    Some(to_index(v, interp.gc_heap_mut()).ok_or_else(|| {
+                        to_index_error(interp, v, "SharedArrayBuffer maxByteLength")
+                    })?)
+                }
             };
             let len = length as usize;
             let buf = match max_byte_length {
                 Some(max) => {
                     let max = max as usize;
                     if max < len {
-                        return Err(VmError::RangeError {
-                            message: ("SharedArrayBuffer maxByteLength is smaller than byteLength"
+                        return Err(interp.err_range(
+                            ("SharedArrayBuffer maxByteLength is smaller than byteLength"
                                 .to_string())
                             .into(),
-                        });
+                        ));
                     }
-                    JsArrayBuffer::new_shared_growable_with_roots(len, max, gc_heap, external_visit)
-                        .map_err(oom_to_vm)?
-                        .ok_or_else(|| {
-                            VmError::RangeError {
-                        message:( format!(
+                    let allocated = JsArrayBuffer::new_shared_growable_with_roots(
+                        len,
+                        max,
+                        interp.gc_heap_mut(),
+                        external_visit,
+                    )
+                    .map_err(oom_to_vm)?;
+                    allocated.ok_or_else(|| {
+                        interp.err_range(( format!(
                             "SharedArrayBuffer allocation of {max} bytes exceeds the available heap"
-                        )).into(),
-                    }
-                        })?
+                        )).into())
+                    })?
                 }
-                None => JsArrayBuffer::try_new_shared_with_roots(len, gc_heap, external_visit)
-                    .map_err(oom_to_vm)?
-                    .ok_or_else(|| VmError::RangeError {
-                        message: (format!(
+                None => {
+                    let allocated = JsArrayBuffer::try_new_shared_with_roots(
+                        len,
+                        interp.gc_heap_mut(),
+                        external_visit,
+                    )
+                    .map_err(oom_to_vm)?;
+                    allocated.ok_or_else(|| {
+                        interp.err_range((format!(
                             "SharedArrayBuffer allocation of {len} bytes exceeds the available heap"
                         ))
-                        .into(),
-                    })?,
+                        .into())
+                    })?
+                }
             };
             Ok(Value::array_buffer(buf))
         }
@@ -284,14 +301,14 @@ pub fn typed_array_call_with_roots(
     kind: TypedArrayKind,
     method: otter_bytecode::method_id::TypedArrayMethod,
     args: &[Value],
-    gc_heap: &mut otter_gc::GcHeap,
+    interp: &mut crate::Interpreter,
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::TypedArrayMethod as M;
     match method {
-        M::Construct => construct_typed_array_with_roots(kind, args, gc_heap, external_visit),
-        M::From => from_static_with_roots(kind, args, gc_heap, external_visit),
-        M::Of => of_static_with_roots(kind, args, gc_heap, external_visit),
+        M::Construct => construct_typed_array_with_roots(kind, args, interp, external_visit),
+        M::From => from_static_with_roots(kind, args, interp, external_visit),
+        M::Of => of_static_with_roots(kind, args, interp, external_visit),
     }
 }
 
@@ -302,77 +319,85 @@ fn oom_to_vm(err: otter_gc::OutOfMemory) -> VmError {
     }
 }
 
-fn typed_array_byte_len(len: usize, bpe: usize) -> Result<usize, VmError> {
-    len.checked_mul(bpe).ok_or_else(|| VmError::RangeError {
-        message: ("TypedArray byte length overflow".to_string()).into(),
-    })
+fn typed_array_byte_len(
+    interp: &crate::Interpreter,
+    len: usize,
+    bpe: usize,
+) -> Result<usize, VmError> {
+    len.checked_mul(bpe)
+        .ok_or_else(|| interp.err_range(("TypedArray byte length overflow".to_string()).into()))
 }
 
 pub(crate) fn typed_array_from_values_with_roots(
     kind: TypedArrayKind,
     values: &[Value],
-    gc_heap: &mut otter_gc::GcHeap,
+    interp: &mut crate::Interpreter,
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
     let bpe = kind.bytes_per_element();
-    let byte_len = typed_array_byte_len(values.len(), bpe)?;
+    let byte_len = typed_array_byte_len(interp, values.len(), bpe)?;
     let mut buffer_roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         external_visit(visitor);
         for value in values {
             value.trace_value_slots(visitor);
         }
     };
-    let new_buf = JsArrayBuffer::try_new_with_roots(byte_len, gc_heap, &mut buffer_roots)
-        .map_err(oom_to_vm)?
-        .ok_or_else(|| VmError::RangeError {
-            message: (format!(
-                "TypedArray allocation of {byte_len} bytes exceeds the available heap"
-            ))
-            .into(),
-        })?;
-    let view = JsTypedArray::new(gc_heap, new_buf, kind, 0, values.len()).map_err(oom_to_vm)?;
+    let allocated =
+        JsArrayBuffer::try_new_with_roots(byte_len, interp.gc_heap_mut(), &mut buffer_roots)
+            .map_err(oom_to_vm)?;
+    let new_buf = allocated.ok_or_else(|| {
+        interp.err_range(
+            (format!("TypedArray allocation of {byte_len} bytes exceeds the available heap"))
+                .into(),
+        )
+    })?;
+    let view = JsTypedArray::new(interp.gc_heap_mut(), new_buf, kind, 0, values.len())
+        .map_err(oom_to_vm)?;
     let mut encoded = vec![0u8; byte_len];
     for (i, value) in values.iter().enumerate() {
-        kind.write(gc_heap, &mut encoded, i * bpe, value);
+        kind.write(interp.gc_heap_mut(), &mut encoded, i * bpe, value);
     }
-    new_buf.with_bytes_mut(gc_heap, |bytes| bytes.copy_from_slice(&encoded));
+    new_buf.with_bytes_mut(interp.gc_heap_mut(), |bytes| {
+        bytes.copy_from_slice(&encoded)
+    });
     Ok(Value::typed_array(view))
 }
 
 fn new_zeroed_typed_array_with_roots(
     kind: TypedArrayKind,
     len: usize,
-    gc_heap: &mut otter_gc::GcHeap,
+    interp: &mut crate::Interpreter,
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
-    let byte_len = typed_array_byte_len(len, kind.bytes_per_element())?;
-    let new_buf = JsArrayBuffer::try_new_with_roots(byte_len, gc_heap, external_visit)
-        .map_err(oom_to_vm)?
-        .ok_or_else(|| VmError::RangeError {
-            message: (format!(
-                "TypedArray allocation of {byte_len} bytes exceeds the available heap"
-            ))
-            .into(),
-        })?;
-    let view = JsTypedArray::new(gc_heap, new_buf, kind, 0, len).map_err(oom_to_vm)?;
+    let byte_len = typed_array_byte_len(interp, len, kind.bytes_per_element())?;
+    let allocated =
+        JsArrayBuffer::try_new_with_roots(byte_len, interp.gc_heap_mut(), external_visit)
+            .map_err(oom_to_vm)?;
+    let new_buf = allocated.ok_or_else(|| {
+        interp.err_range(
+            (format!("TypedArray allocation of {byte_len} bytes exceeds the available heap"))
+                .into(),
+        )
+    })?;
+    let view = JsTypedArray::new(interp.gc_heap_mut(), new_buf, kind, 0, len).map_err(oom_to_vm)?;
     Ok(Value::typed_array(view))
 }
 
 fn construct_typed_array_with_roots(
     kind: TypedArrayKind,
     args: &[Value],
-    gc_heap: &mut otter_gc::GcHeap,
+    interp: &mut crate::Interpreter,
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
     let bpe = kind.bytes_per_element();
     let Some(first) = args.first() else {
-        return new_zeroed_typed_array_with_roots(kind, 0, gc_heap, external_visit);
+        return new_zeroed_typed_array_with_roots(kind, 0, interp, external_visit);
     };
     if first.is_undefined() {
-        return new_zeroed_typed_array_with_roots(kind, 0, gc_heap, external_visit);
+        return new_zeroed_typed_array_with_roots(kind, 0, interp, external_visit);
     }
     if let Some(buf) = first.as_array_buffer() {
-        if buf.is_detached(gc_heap) {
+        if buf.is_detached(interp.gc_heap()) {
             return Err(VmError::TypeMismatch);
         }
         // §23.2.5.1 InitializeTypedArrayFromArrayBuffer: byteOffset
@@ -382,18 +407,19 @@ fn construct_typed_array_with_roots(
         let byte_offset = match args.get(1) {
             None => 0u64,
             Some(v) if v.is_undefined() => 0u64,
-            Some(v) => to_index(v, gc_heap).ok_or_else(|| to_index_error(v, "byteOffset"))?,
+            Some(v) => to_index(v, interp.gc_heap_mut())
+                .ok_or_else(|| to_index_error(interp, v, "byteOffset"))?,
         } as usize;
         if !byte_offset.is_multiple_of(bpe) {
-            return Err(VmError::RangeError {
-                message: (format!("start offset must be a multiple of {bpe}")).into(),
-            });
+            return Err(
+                interp.err_range((format!("start offset must be a multiple of {bpe}")).into())
+            );
         }
-        let buf_len = buf.byte_length(gc_heap);
+        let buf_len = buf.byte_length(interp.gc_heap());
         if byte_offset > buf_len {
-            return Err(VmError::RangeError {
-                message: ("start offset is outside the bounds of the buffer".to_string()).into(),
-            });
+            return Err(interp.err_range(
+                ("start offset is outside the bounds of the buffer".to_string()).into(),
+            ));
         }
         let length = match args.get(2) {
             None => {
@@ -402,13 +428,11 @@ fn construct_typed_array_with_roots(
                 // applies only to fixed-length buffers; a resizable
                 // buffer with auto length is length-tracking and simply
                 // floors (bytesAvailable / elementSize).
-                if !buf.is_resizable(gc_heap) && !remaining.is_multiple_of(bpe) {
-                    return Err(VmError::RangeError {
-                        message: (format!(
-                            "buffer length minus the offset must be a multiple of {bpe}"
-                        ))
-                        .into(),
-                    });
+                if !buf.is_resizable(interp.gc_heap()) && !remaining.is_multiple_of(bpe) {
+                    return Err(interp.err_range(
+                        (format!("buffer length minus the offset must be a multiple of {bpe}"))
+                            .into(),
+                    ));
                 }
                 remaining / bpe
             }
@@ -418,79 +442,83 @@ fn construct_typed_array_with_roots(
                 // applies only to fixed-length buffers; a resizable
                 // buffer with auto length is length-tracking and simply
                 // floors (bytesAvailable / elementSize).
-                if !buf.is_resizable(gc_heap) && !remaining.is_multiple_of(bpe) {
-                    return Err(VmError::RangeError {
-                        message: (format!(
-                            "buffer length minus the offset must be a multiple of {bpe}"
-                        ))
-                        .into(),
-                    });
+                if !buf.is_resizable(interp.gc_heap()) && !remaining.is_multiple_of(bpe) {
+                    return Err(interp.err_range(
+                        (format!("buffer length minus the offset must be a multiple of {bpe}"))
+                            .into(),
+                    ));
                 }
                 remaining / bpe
             }
             Some(v) => {
-                let n = to_index(v, gc_heap).ok_or_else(|| to_index_error(v, "length"))? as usize;
+                let n = to_index(v, interp.gc_heap_mut())
+                    .ok_or_else(|| to_index_error(interp, v, "length"))?
+                    as usize;
                 if byte_offset + n * bpe > buf_len {
-                    return Err(VmError::RangeError {
-                        message: ("invalid typed array length".to_string()).into(),
-                    });
+                    return Err(interp.err_range(("invalid typed array length".to_string()).into()));
                 }
                 n
             }
         };
-        let view = JsTypedArray::new(gc_heap, buf, kind, byte_offset, length).map_err(oom_to_vm)?;
+        let view = JsTypedArray::new(interp.gc_heap_mut(), buf, kind, byte_offset, length)
+            .map_err(oom_to_vm)?;
         // §23.2.5.1 — absent length over a length-resizable buffer (a
         // resizable ArrayBuffer or a growable SharedArrayBuffer) makes
         // [[ArrayLength]] AUTO (length-tracking).
         let length_absent = args.get(2).is_none() || args.get(2).is_some_and(|v| v.is_undefined());
-        if length_absent && (buf.is_resizable(gc_heap) || buf.is_growable(gc_heap)) {
-            view.set_length_tracking(gc_heap);
+        if length_absent
+            && (buf.is_resizable(interp.gc_heap()) || buf.is_growable(interp.gc_heap()))
+        {
+            view.set_length_tracking(interp.gc_heap_mut());
         }
         return Ok(Value::typed_array(view));
     }
-    if let Some(src) = first.as_typed_array(gc_heap) {
-        if src.is_out_of_bounds(gc_heap) {
+    if let Some(src) = first.as_typed_array(interp.gc_heap()) {
+        if src.is_out_of_bounds(interp.gc_heap()) {
             return Err(VmError::TypeMismatch);
         }
-        let len = src.length(gc_heap);
+        let len = src.length(interp.gc_heap());
         let mut values: Vec<Value> = Vec::with_capacity(len);
         for i in 0..len {
-            let v = src.get(gc_heap, i).map_err(oom_to_vm)?;
-            values.push(coerce_for_kind(gc_heap, kind, &v)?);
+            let v = src.get(interp.gc_heap_mut(), i).map_err(oom_to_vm)?;
+            values.push(coerce_for_kind(interp.gc_heap_mut(), kind, &v)?);
         }
-        return typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit);
+        return typed_array_from_values_with_roots(kind, &values, interp, external_visit);
     }
     if let Some(arr) = first.as_array() {
-        let len = crate::array::len(arr, gc_heap);
+        let len = crate::array::len(arr, interp.gc_heap());
         let mut values: Vec<Value> = Vec::with_capacity(len);
         for i in 0..len {
-            let v = crate::array::get(arr, gc_heap, i);
-            values.push(coerce_for_kind(gc_heap, kind, &v)?);
+            let v = crate::array::get(arr, interp.gc_heap_mut(), i);
+            values.push(coerce_for_kind(interp.gc_heap_mut(), kind, &v)?);
         }
-        return typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit);
+        return typed_array_from_values_with_roots(kind, &values, interp, external_visit);
     }
     if first.is_number() || first.is_boolean() || first.is_null() || first.is_string() {
-        let length = to_index(first, gc_heap).ok_or(VmError::TypeMismatch)? as usize;
-        return new_zeroed_typed_array_with_roots(kind, length, gc_heap, external_visit);
+        let length = to_index(first, interp.gc_heap_mut()).ok_or(VmError::TypeMismatch)? as usize;
+        return new_zeroed_typed_array_with_roots(kind, length, interp, external_visit);
     }
     if let Some(obj) = first.as_object() {
-        let length_value = crate::object::get(obj, gc_heap, "length").unwrap_or(Value::undefined());
-        let len = to_index(&length_value, gc_heap).ok_or(VmError::TypeMismatch)? as usize;
-        if let Some(dense_values) = crate::object::with_properties(obj, gc_heap, |props| {
+        let length_value =
+            crate::object::get(obj, interp.gc_heap_mut(), "length").unwrap_or(Value::undefined());
+        let len =
+            to_index(&length_value, interp.gc_heap_mut()).ok_or(VmError::TypeMismatch)? as usize;
+        if let Some(dense_values) = crate::object::with_properties(obj, interp.gc_heap(), |props| {
             props.dense_indexed_data_values(len)
         }) {
             let mut values = Vec::with_capacity(len);
             for value in dense_values {
-                values.push(coerce_for_kind(gc_heap, kind, &value)?);
+                values.push(coerce_for_kind(interp.gc_heap_mut(), kind, &value)?);
             }
-            return typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit);
+            return typed_array_from_values_with_roots(kind, &values, interp, external_visit);
         }
         let mut values: Vec<Value> = Vec::with_capacity(len);
         for i in 0..len {
-            let v = crate::object::get(obj, gc_heap, &i.to_string()).unwrap_or(Value::undefined());
-            values.push(coerce_for_kind(gc_heap, kind, &v)?);
+            let v = crate::object::get(obj, interp.gc_heap_mut(), &i.to_string())
+                .unwrap_or(Value::undefined());
+            values.push(coerce_for_kind(interp.gc_heap_mut(), kind, &v)?);
         }
-        return typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit);
+        return typed_array_from_values_with_roots(kind, &values, interp, external_visit);
     }
     Err(VmError::TypeMismatch)
 }
@@ -498,38 +526,38 @@ fn construct_typed_array_with_roots(
 fn from_static_with_roots(
     kind: TypedArrayKind,
     args: &[Value],
-    gc_heap: &mut otter_gc::GcHeap,
+    interp: &mut crate::Interpreter,
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
     let source = args.first().cloned().unwrap_or(Value::undefined());
-    if let Some(src) = source.as_typed_array(gc_heap) {
-        if src.buffer(gc_heap).is_detached(gc_heap) {
+    if let Some(src) = source.as_typed_array(interp.gc_heap()) {
+        if src.buffer(interp.gc_heap()).is_detached(interp.gc_heap()) {
             return Err(VmError::TypeMismatch);
         }
-        let len = src.length(gc_heap);
+        let len = src.length(interp.gc_heap());
         let mut values: Vec<Value> = Vec::with_capacity(len);
         for i in 0..len {
-            let v = src.get(gc_heap, i).map_err(oom_to_vm)?;
-            values.push(coerce_for_kind(gc_heap, kind, &v)?);
+            let v = src.get(interp.gc_heap_mut(), i).map_err(oom_to_vm)?;
+            values.push(coerce_for_kind(interp.gc_heap_mut(), kind, &v)?);
         }
-        return typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit);
+        return typed_array_from_values_with_roots(kind, &values, interp, external_visit);
     }
     if let Some(arr) = source.as_array() {
-        let len = crate::array::len(arr, gc_heap);
+        let len = crate::array::len(arr, interp.gc_heap());
         let mut values: Vec<Value> = Vec::with_capacity(len);
         for i in 0..len {
-            let v = crate::array::get(arr, gc_heap, i);
-            values.push(coerce_for_kind(gc_heap, kind, &v)?);
+            let v = crate::array::get(arr, interp.gc_heap_mut(), i);
+            values.push(coerce_for_kind(interp.gc_heap_mut(), kind, &v)?);
         }
-        return typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit);
+        return typed_array_from_values_with_roots(kind, &values, interp, external_visit);
     }
-    if let Some(s) = source.as_string(gc_heap) {
-        let text = s.to_lossy_string(gc_heap);
+    if let Some(s) = source.as_string(interp.gc_heap()) {
+        let text = s.to_lossy_string(interp.gc_heap());
         let mut chars: Vec<Value> = Vec::with_capacity(text.chars().count());
         for c in text.chars() {
             if kind.is_bigint() {
-                let h =
-                    crate::bigint::BigIntValue::from_i32(gc_heap, c as i32).map_err(oom_to_vm)?;
+                let h = crate::bigint::BigIntValue::from_i32(interp.gc_heap_mut(), c as i32)
+                    .map_err(oom_to_vm)?;
                 chars.push(Value::big_int(h));
             } else {
                 chars.push(Value::number(crate::number::NumberValue::from_i32(
@@ -537,17 +565,19 @@ fn from_static_with_roots(
                 )));
             }
         }
-        return typed_array_from_values_with_roots(kind, &chars, gc_heap, external_visit);
+        return typed_array_from_values_with_roots(kind, &chars, interp, external_visit);
     }
     if let Some(obj) = source.as_object() {
-        let len_value = crate::object::get(obj, gc_heap, "length").unwrap_or(Value::undefined());
-        let len = to_index(&len_value, gc_heap).ok_or(VmError::TypeMismatch)? as usize;
+        let len_value =
+            crate::object::get(obj, interp.gc_heap_mut(), "length").unwrap_or(Value::undefined());
+        let len = to_index(&len_value, interp.gc_heap_mut()).ok_or(VmError::TypeMismatch)? as usize;
         let mut values: Vec<Value> = Vec::with_capacity(len);
         for i in 0..len {
-            let v = crate::object::get(obj, gc_heap, &i.to_string()).unwrap_or(Value::undefined());
-            values.push(coerce_for_kind(gc_heap, kind, &v)?);
+            let v = crate::object::get(obj, interp.gc_heap_mut(), &i.to_string())
+                .unwrap_or(Value::undefined());
+            values.push(coerce_for_kind(interp.gc_heap_mut(), kind, &v)?);
         }
-        return typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit);
+        return typed_array_from_values_with_roots(kind, &values, interp, external_visit);
     }
     Err(VmError::TypeMismatch)
 }
@@ -555,14 +585,14 @@ fn from_static_with_roots(
 fn of_static_with_roots(
     kind: TypedArrayKind,
     args: &[Value],
-    gc_heap: &mut otter_gc::GcHeap,
+    interp: &mut crate::Interpreter,
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
     let mut values: Vec<Value> = Vec::with_capacity(args.len());
     for v in args {
-        values.push(coerce_for_kind(gc_heap, kind, v)?);
+        values.push(coerce_for_kind(interp.gc_heap_mut(), kind, v)?);
     }
-    typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit)
+    typed_array_from_values_with_roots(kind, &values, interp, external_visit)
 }
 
 /// §6.2.10 SetValueFromBuffer's element-type conversion gates: a
@@ -638,15 +668,15 @@ mod tests {
 
     #[test]
     fn array_buffer_constructor_with_roots_accounts_backing_store() {
-        let mut heap = otter_gc::GcHeap::with_max_heap_bytes(1024 * 1024).expect("heap");
+        let mut interp = crate::Interpreter::with_string_heap_cap(1024 * 1024);
         let args = [Value::number(NumberValue::from_i32(64))];
         let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
 
-        let before = heap.tracked_bytes();
+        let before = interp.gc_heap().tracked_bytes();
         let value = array_buffer_call_with_roots(
             ArrayBufferMethod::Construct,
             &args,
-            &mut heap,
+            &mut interp,
             &mut external_visit,
         )
         .expect("array buffer");
@@ -655,44 +685,44 @@ mod tests {
         // `tracked_bytes` is heap-allocated payload + external
         // reservations; the GC body adds its own header/payload
         // overhead on top of the 64-byte backing store.
-        let after = heap.tracked_bytes();
+        let after = interp.gc_heap().tracked_bytes();
         assert!(after - before >= 64);
         let _ = value;
         // The backing store stays accounted until the GC body that
         // owns the `ExternalMemory` token is collected. After full
         // GC, the external reservation is released even if the
         // body's own heap page is retained.
-        heap.collect_full(&mut |_| {});
-        assert!(heap.tracked_bytes() <= after - 64);
+        interp.gc_heap_mut().collect_full(&mut |_| {});
+        assert!(interp.gc_heap().tracked_bytes() <= after - 64);
     }
 
     #[test]
     fn typed_array_constructor_with_roots_accounts_backing_store() {
-        let mut heap = otter_gc::GcHeap::with_max_heap_bytes(1024 * 1024).expect("heap");
+        let mut interp = crate::Interpreter::with_string_heap_cap(1024 * 1024);
         let args = [Value::number(NumberValue::from_i32(4))];
         let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
 
-        let before = heap.tracked_bytes();
+        let before = interp.gc_heap().tracked_bytes();
         let value = typed_array_call_with_roots(
             TypedArrayKind::Int16,
             TypedArrayMethod::Construct,
             &args,
-            &mut heap,
+            &mut interp,
             &mut external_visit,
         )
         .expect("typed array");
 
         assert!(value.is_typed_array());
-        let after = heap.tracked_bytes();
+        let after = interp.gc_heap().tracked_bytes();
         assert!(after - before >= 8);
         let _ = value;
-        heap.collect_full(&mut |_| {});
-        assert!(heap.tracked_bytes() <= after - 8);
+        interp.gc_heap_mut().collect_full(&mut |_| {});
+        assert!(interp.gc_heap().tracked_bytes() <= after - 8);
     }
 
     #[test]
     fn shared_array_buffer_constructor_uses_rooted_dispatch_boundary() {
-        let mut heap = otter_gc::GcHeap::with_max_heap_bytes(1024 * 1024).expect("heap");
+        let mut interp = crate::Interpreter::with_string_heap_cap(1024 * 1024);
         let args = [Value::number(NumberValue::from_i32(64))];
         let mut visited_roots = false;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
@@ -703,7 +733,7 @@ mod tests {
         let value = shared_array_buffer_call_with_roots(
             SharedArrayBufferMethod::Construct,
             &args,
-            &mut heap,
+            &mut interp,
             &mut external_visit,
         )
         .expect("shared array buffer");
@@ -713,23 +743,27 @@ mod tests {
             panic!("expected array buffer");
         };
         assert!(buffer.is_shared());
-        assert_eq!(buffer.shared_external_bytes_for_test(&heap), Some(64));
-        let after = heap.tracked_bytes();
+        assert_eq!(
+            buffer.shared_external_bytes_for_test(interp.gc_heap()),
+            Some(64)
+        );
+        let after = interp.gc_heap().tracked_bytes();
         assert!(after >= 64);
         // `buffer` is a `Copy` GC handle; the body it points at is
         // unreachable from any root, so a full GC collects it and
         // releases the external reservation.
-        heap.collect_full(&mut |_| {});
-        assert!(heap.tracked_bytes() <= after - 64);
+        interp.gc_heap_mut().collect_full(&mut |_| {});
+        assert!(interp.gc_heap().tracked_bytes() <= after - 64);
     }
 
     #[test]
     fn shared_array_buffer_growable_accounts_max_backing_store() {
-        let mut heap = otter_gc::GcHeap::with_max_heap_bytes(1024 * 1024).expect("heap");
-        let options = crate::object::alloc_object_old_for_fixture(&mut heap).expect("options");
+        let mut interp = crate::Interpreter::with_string_heap_cap(1024 * 1024);
+        let options =
+            crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("options");
         crate::object::set(
             options,
-            &mut heap,
+            interp.gc_heap_mut(),
             "maxByteLength",
             Value::number(NumberValue::from_i32(128)),
         );
@@ -739,11 +773,11 @@ mod tests {
         ];
         let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
 
-        let before = heap.tracked_bytes();
+        let before = interp.gc_heap().tracked_bytes();
         let value = shared_array_buffer_call_with_roots(
             SharedArrayBufferMethod::Construct,
             &args,
-            &mut heap,
+            &mut interp,
             &mut external_visit,
         )
         .expect("shared array buffer");
@@ -752,11 +786,14 @@ mod tests {
             panic!("expected array buffer");
         };
         assert!(buffer.is_shared());
-        assert!(buffer.is_growable(&heap));
-        assert_eq!(buffer.shared_external_bytes_for_test(&heap), Some(128));
-        let after = heap.tracked_bytes();
+        assert!(buffer.is_growable(interp.gc_heap()));
+        assert_eq!(
+            buffer.shared_external_bytes_for_test(interp.gc_heap()),
+            Some(128)
+        );
+        let after = interp.gc_heap().tracked_bytes();
         assert!(after - before >= 128);
-        heap.collect_full(&mut |_| {});
-        assert!(heap.tracked_bytes() <= after - 128);
+        interp.gc_heap_mut().collect_full(&mut |_| {});
+        assert!(interp.gc_heap().tracked_bytes() <= after - 128);
     }
 }

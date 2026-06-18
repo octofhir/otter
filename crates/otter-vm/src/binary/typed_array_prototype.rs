@@ -147,8 +147,9 @@ fn to_integer_or_infinity_arg(
         .execution_context()
         .cloned()
         .ok_or_else(|| type_error("missing execution context"))?;
-    let number = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, value)
-        .map_err(|e| crate::native_function::vm_to_native_error(e, name))?;
+    let result = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, value);
+    let number = result
+        .map_err(|e| crate::native_function::vm_to_native_error(ctx.interp_mut(), e, name))?;
     let n = number.as_f64();
     if n.is_nan() {
         return Ok(0);
@@ -184,8 +185,11 @@ fn integer_index_arg(
         .execution_context()
         .cloned()
         .ok_or_else(|| type_error("missing execution context"))?;
-    let n = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, v)
-        .map_err(|e| crate::native_function::vm_to_native_error(e, "TypedArray.prototype"))?
+    let result = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, v);
+    let n = result
+        .map_err(|e| {
+            crate::native_function::vm_to_native_error(ctx.interp_mut(), e, "TypedArray.prototype")
+        })?
         .as_f64();
     if n.is_nan() {
         return Ok(0);
@@ -225,8 +229,10 @@ fn ta_set_offset(ctx: &mut NativeCtx<'_>, arg: Option<&Value>) -> Result<f64, Na
         .execution_context()
         .cloned()
         .ok_or_else(|| type_error("missing execution context"))?;
-    let number = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, value)
-        .map_err(|e| crate::native_function::vm_to_native_error(e, "TypedArray.prototype.set"))?;
+    let result = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, value);
+    let number = result.map_err(|e| {
+        crate::native_function::vm_to_native_error(ctx.interp_mut(), e, "TypedArray.prototype.set")
+    })?;
     let n = number.as_f64();
     Ok(if n.is_nan() { 0.0 } else { n.trunc() })
 }
@@ -528,8 +534,13 @@ fn impl_join(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
                         name: "TypedArray.prototype.join",
                         reason: "missing execution context".to_string(),
                     })?;
-            crate::coerce::to_string_or_throw(ctx.cx.interp, &exec_ctx, v).map_err(|e| {
-                crate::native_function::vm_to_native_error(e, "TypedArray.prototype.join")
+            let result = crate::coerce::to_string_or_throw(ctx.cx.interp, &exec_ctx, v);
+            result.map_err(|e| {
+                crate::native_function::vm_to_native_error(
+                    ctx.cx.interp,
+                    e,
+                    "TypedArray.prototype.join",
+                )
             })?
         }
     };
@@ -591,13 +602,15 @@ fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
         if !ctx.cx.interp.is_callable_runtime(&method) {
             return Err(type_error("element toLocaleString is not callable"));
         }
-        let rendered = ctx
-            .cx
-            .interp
-            .run_callable_sync(&exec, &method, element, smallvec::smallvec![])
-            .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
-        let s = crate::coerce::to_string_or_throw(ctx.cx.interp, &exec, &rendered)
-            .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+        let rendered_result =
+            ctx.cx
+                .interp
+                .run_callable_sync(&exec, &method, element, smallvec::smallvec![]);
+        let rendered = rendered_result
+            .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, NAME))?;
+        let s_result = crate::coerce::to_string_or_throw(ctx.cx.interp, &exec, &rendered);
+        let s = s_result
+            .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, NAME))?;
         parts.push(s);
     }
     let joined = parts.join(",");
@@ -700,16 +713,20 @@ fn ta_get(
         .execution_context()
         .cloned()
         .ok_or_else(|| type_error("missing execution context"))?;
-    let outcome = ctx
+    let outcome_result = ctx
         .interp_mut()
-        .ordinary_get_value(&exec, source, source, &key, 0)
-        .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+        .ordinary_get_value(&exec, source, source, &key, 0);
+    let outcome = outcome_result
+        .map_err(|e| crate::native_function::vm_to_native_error(ctx.interp_mut(), e, NAME))?;
     match outcome {
         crate::VmGetOutcome::Value(v) => Ok(v),
-        crate::VmGetOutcome::InvokeGetter { getter } => ctx
-            .interp_mut()
-            .run_callable_sync(&exec, &getter, source, smallvec::smallvec![])
-            .map_err(|e| crate::native_function::vm_to_native_error(e, NAME)),
+        crate::VmGetOutcome::InvokeGetter { getter } => {
+            let result =
+                ctx.interp_mut()
+                    .run_callable_sync(&exec, &getter, source, smallvec::smallvec![]);
+            result
+                .map_err(|e| crate::native_function::vm_to_native_error(ctx.interp_mut(), e, NAME))
+        }
     }
 }
 
@@ -720,8 +737,9 @@ fn ta_array_like_length(ctx: &mut NativeCtx<'_>, source: Value) -> Result<usize,
         .execution_context()
         .cloned()
         .ok_or_else(|| type_error("missing execution context"))?;
-    let number = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, &len_value)
-        .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+    let result = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, &len_value);
+    let number = result
+        .map_err(|e| crate::native_function::vm_to_native_error(ctx.interp_mut(), e, NAME))?;
     let n = number.as_f64();
     let len = if n.is_nan() || n <= 0.0 {
         0.0
@@ -745,12 +763,14 @@ fn ta_coerce_value(
         .cloned()
         .ok_or_else(|| type_error("missing execution context"))?;
     let converted = if kind.is_bigint() {
-        let big = crate::coerce::to_big_int_or_throw(ctx.interp_mut(), &exec, value)
-            .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+        let result = crate::coerce::to_big_int_or_throw(ctx.interp_mut(), &exec, value);
+        let big = result
+            .map_err(|e| crate::native_function::vm_to_native_error(ctx.interp_mut(), e, NAME))?;
         Value::big_int(big)
     } else {
-        let number = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, value)
-            .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+        let result = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, value);
+        let number = result
+            .map_err(|e| crate::native_function::vm_to_native_error(ctx.interp_mut(), e, NAME))?;
         number_value(number.as_f64())
     };
     crate::binary::dispatch::coerce_element_for_store(ctx.heap_mut(), kind, &converted)
@@ -844,19 +864,25 @@ fn sort_with_comparefn(
                 let mut argv: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
                 argv.push(items[i]);
                 argv.push(items[j]);
-                let raw = ctx
-                    .cx
-                    .interp
-                    .run_callable_sync(&exec_ctx, cmp, Value::undefined(), argv)
+                let raw_result =
+                    ctx.cx
+                        .interp
+                        .run_callable_sync(&exec_ctx, cmp, Value::undefined(), argv);
+                let raw = raw_result.map_err(|e| {
+                    crate::native_function::vm_to_native_error(
+                        ctx.cx.interp,
+                        e,
+                        "TypedArray.prototype.sort",
+                    )
+                })?;
+                let v_result = ctx.cx.interp.coerce_to_number(&exec_ctx, &raw);
+                let v = v_result
                     .map_err(|e| {
-                        crate::native_function::vm_to_native_error(e, "TypedArray.prototype.sort")
-                    })?;
-                let v = ctx
-                    .cx
-                    .interp
-                    .coerce_to_number(&exec_ctx, &raw)
-                    .map_err(|e| {
-                        crate::native_function::vm_to_native_error(e, "TypedArray.prototype.sort")
+                        crate::native_function::vm_to_native_error(
+                            ctx.cx.interp,
+                            e,
+                            "TypedArray.prototype.sort",
+                        )
                     })?
                     .as_f64();
                 if detach_watch.is_some_and(|t| t.buffer(ctx.heap()).is_detached(ctx.heap())) {
@@ -904,10 +930,12 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         .cloned()
         .ok_or_else(|| type_error("missing execution context"))?;
     let kind = t.kind();
-    let value = ctx
+    let value_result = ctx
         .interp_mut()
-        .typed_array_coerce_element(&exec, kind, raw_value)
-        .map_err(|e| crate::native_function::vm_to_native_error(e, "TypedArray.prototype.with"))?;
+        .typed_array_coerce_element(&exec, kind, raw_value);
+    let value = value_result.map_err(|e| {
+        crate::native_function::vm_to_native_error(ctx.interp_mut(), e, "TypedArray.prototype.with")
+    })?;
     // §23.2.3.36 step 9 — IsValidIntegerIndex(O, actualIndex) is
     // re-checked against the CURRENT state: the value's coercion can
     // detach or resize the backing buffer, so a once-valid index may

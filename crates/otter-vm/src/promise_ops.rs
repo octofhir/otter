@@ -124,7 +124,7 @@ impl Interpreter {
             method,
             args.as_slice(),
         )
-        .map_err(native_to_vm_error)?;
+        .map_err(|e| native_to_vm_error(self, e))?;
         let top_idx = stack.len() - 1;
         write_register(&mut stack[top_idx], dst, result)
     }

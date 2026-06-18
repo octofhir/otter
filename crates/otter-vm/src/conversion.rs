@@ -258,9 +258,8 @@ impl Interpreter {
                 if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                     cold.pending_to_primitive = None;
                 }
-                return Err(VmError::TypeError {
-                    message: ("Symbol.toPrimitive returned a non-primitive".to_string()).into(),
-                });
+                return Err(self
+                    .err_type(("Symbol.toPrimitive returned a non-primitive".to_string()).into()));
             }
             // Non-primitive — advance to the next stage.
             return self.drive_to_primitive_stage(
@@ -585,10 +584,9 @@ impl Interpreter {
                             );
                         }
                         Some(_) => {
-                            return Err(VmError::TypeError {
-                                message: ("Symbol.toPrimitive method is not callable".to_string())
-                                    .into(),
-                            });
+                            return Err(self.err_type(
+                                ("Symbol.toPrimitive method is not callable".to_string()).into(),
+                            ));
                         }
                     }
                 }
@@ -714,9 +712,9 @@ impl Interpreter {
                     if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                         cold.pending_to_primitive = None;
                     }
-                    return Err(VmError::TypeError {
-                        message: ("Symbol.toPrimitive returned a non-primitive".to_string()).into(),
-                    });
+                    return Err(self.err_type(
+                        ("Symbol.toPrimitive returned a non-primitive".to_string()).into(),
+                    ));
                 }
             }
         }

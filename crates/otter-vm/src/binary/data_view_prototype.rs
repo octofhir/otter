@@ -76,8 +76,9 @@ fn to_index_or_throw(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<usize, Na
         .execution_context()
         .cloned()
         .ok_or_else(|| bad("missing execution context"))?;
-    let number = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, value)
-        .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+    let result = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, value);
+    let number = result
+        .map_err(|e| crate::native_function::vm_to_native_error(ctx.interp_mut(), e, NAME))?;
     let n = number.as_f64();
     let integer = if n.is_nan() { 0.0 } else { n.trunc() };
     if !(0.0..=9_007_199_254_740_991.0).contains(&integer) {
@@ -101,12 +102,14 @@ fn convert_set_value(
         .cloned()
         .ok_or_else(|| bad("missing execution context"))?;
     if is_bigint {
-        let big = crate::coerce::to_big_int_or_throw(ctx.interp_mut(), &exec, value)
-            .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+        let result = crate::coerce::to_big_int_or_throw(ctx.interp_mut(), &exec, value);
+        let big = result
+            .map_err(|e| crate::native_function::vm_to_native_error(ctx.interp_mut(), e, NAME))?;
         Ok(Value::big_int(big))
     } else {
-        let number = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, value)
-            .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+        let result = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, value);
+        let number = result
+            .map_err(|e| crate::native_function::vm_to_native_error(ctx.interp_mut(), e, NAME))?;
         Ok(number_value(number.as_f64()))
     }
 }

@@ -150,25 +150,25 @@ fn native_call(
         use otter_bytecode::method_id::ObjectMethod as M;
         match method {
             M::Create => {
-                return ctx
+                let create_result = ctx
                     .cx
                     .interp
-                    .do_object_create_with_descriptors(context, None, args)
-                    .map_err(|err| object_native_error(method.name(), err));
+                    .do_object_create_with_descriptors(context, None, args);
+                return create_result
+                    .map_err(|err| object_native_error(ctx.cx.interp, method.name(), err));
             }
             M::DefineProperties => {
-                return ctx
+                let define_result = ctx
                     .cx
                     .interp
-                    .do_object_define_properties(context, None, args)
-                    .map_err(|err| object_native_error(method.name(), err));
+                    .do_object_define_properties(context, None, args);
+                return define_result
+                    .map_err(|err| object_native_error(ctx.cx.interp, method.name(), err));
             }
             M::Assign => {
-                return ctx
-                    .cx
-                    .interp
-                    .do_object_assign(context, None, args)
-                    .map_err(|err| object_native_error(method.name(), err));
+                let assign_result = ctx.cx.interp.do_object_assign(context, None, args);
+                return assign_result
+                    .map_err(|err| object_native_error(ctx.cx.interp, method.name(), err));
             }
             M::GetOwnPropertyDescriptor | M::HasOwn => {
                 // §20.1.2.10 / §20.1.2.13 step 1 — ToObject(O) throws
@@ -192,11 +192,9 @@ fn native_call(
                     || key_arg.is_undefined()
                     || key_arg.is_symbol());
                 if needs_coercion {
-                    let coerced_key = ctx
-                        .cx
-                        .interp
-                        .evaluate_to_property_key(context, &key_arg)
-                        .map_err(|err| object_native_error(method.name(), err))?;
+                    let key_result = ctx.cx.interp.evaluate_to_property_key(context, &key_arg);
+                    let coerced_key = key_result
+                        .map_err(|err| object_native_error(ctx.cx.interp, method.name(), err))?;
                     let coerced_value = match &coerced_key {
                         crate::VmPropertyKey::Symbol(sym) => Value::symbol(*sym),
                         other => Value::string(
@@ -233,22 +231,25 @@ fn native_call(
 
     // Function / Proxy spec ladders go first so they observe the
     // canonical descriptor / trap behaviour.
-    if let Some(result) = ctx
-        .cx
-        .interp
-        .try_function_object_static_call(context.as_ref(), None, method, args)
-        .map_err(|err| object_native_error(method.name(), err))?
+    let function_result =
+        ctx.cx
+            .interp
+            .try_function_object_static_call(context.as_ref(), None, method, args);
+    if let Some(result) =
+        function_result.map_err(|err| object_native_error(ctx.cx.interp, method.name(), err))?
     {
         return Ok(result);
     }
-    if let Some(context) = context.as_ref()
-        && let Some(result) = ctx
+    if let Some(context) = context.as_ref() {
+        let proxy_result = ctx
             .cx
             .interp
-            .try_proxy_object_static_call(context, None, method, args)
-            .map_err(|err| object_native_error(method.name(), err))?
-    {
-        return Ok(result);
+            .try_proxy_object_static_call(context, None, method, args);
+        if let Some(result) =
+            proxy_result.map_err(|err| object_native_error(ctx.cx.interp, method.name(), err))?
+        {
+            return Ok(result);
+        }
     }
 
     // Full spec-aware dispatch (primitive coercion, accessor
@@ -256,14 +257,16 @@ fn native_call(
     // operand-dispatcher helper. Reuse it with an empty frame stack
     // so the alloc helpers fall back to runtime-rooted allocation
     // and `args` survives via slice_roots.
-    if let Some(context) = context.as_ref()
-        && let Some(result) = ctx
+    if let Some(context) = context.as_ref() {
+        let static_result = ctx
             .cx
             .interp
-            .object_static_call_no_stack(context, method, args)
-            .map_err(|err| object_native_error(method.name(), err))?
-    {
-        return Ok(result);
+            .object_static_call_no_stack(context, method, args);
+        if let Some(result) =
+            static_result.map_err(|err| object_native_error(ctx.cx.interp, method.name(), err))?
+        {
+            return Ok(result);
+        }
     }
 
     // Ordinary-object integrity levels run through the interpreter so the
@@ -280,12 +283,13 @@ fn native_call(
             } else {
                 ctx.cx.interp.seal_object(obj)
             };
-            result.map_err(|err| object_native_error(method.name(), err))?;
+            result.map_err(|err| object_native_error(ctx.cx.interp, method.name(), err))?;
             return Ok(arg);
         }
     }
 
-    call(method, args, ctx.heap_mut()).map_err(|err| object_native_error(method.name(), err))
+    let call_result = call(ctx.cx.interp, method, args);
+    call_result.map_err(|err| object_native_error(ctx.cx.interp, method.name(), err))
 }
 
 fn set_from_entries_key_heap(
@@ -383,8 +387,12 @@ fn class_constructor_own_property_keys_without_context(
     Ok(keys)
 }
 
-fn object_native_error(name: &'static str, err: VmError) -> NativeError {
-    crate::native_function::vm_to_native_error(err, name)
+fn object_native_error(
+    interp: &crate::Interpreter,
+    name: &'static str,
+    err: VmError,
+) -> NativeError {
+    crate::native_function::vm_to_native_error(interp, err, name)
 }
 
 macro_rules! native_object_static {
@@ -469,9 +477,9 @@ fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
         None
     };
     if let Some(name) = primitive_proto_name {
-        return interp
-            .constructor_prototype_value(name)
-            .map_err(|err| object_native_error("Object.getPrototypeOf", err));
+        let proto_result = interp.constructor_prototype_value(name);
+        return proto_result
+            .map_err(|err| object_native_error(interp, "Object.getPrototypeOf", err));
     }
     let function_id = target.as_function().or(closure_id);
     if let Some(function_id) = function_id
@@ -479,9 +487,8 @@ fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     {
         return Ok(Value::object(proto));
     }
-    interp
-        .ordinary_get_prototype_value(&exec_ctx, target, 0)
-        .map_err(|err| object_native_error("Object.getPrototypeOf", err))
+    let ordinary_result = interp.ordinary_get_prototype_value(&exec_ctx, target, 0);
+    ordinary_result.map_err(|err| object_native_error(interp, "Object.getPrototypeOf", err))
 }
 
 /// §20.1.2.21 `Object.setPrototypeOf(O, proto)` — assigns the
@@ -512,11 +519,12 @@ fn native_set_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
             name: "Object.setPrototypeOf",
             reason: "missing execution context".to_string(),
         })?;
-    let ok = ctx
+    let set_result = ctx
         .cx
         .interp
-        .set_prototype_value_proxy_aware(&exec_ctx, &target, &proto)
-        .map_err(|err| object_native_error("Object.setPrototypeOf", err))?;
+        .set_prototype_value_proxy_aware(&exec_ctx, &target, &proto);
+    let ok = set_result
+        .map_err(|err| object_native_error(ctx.cx.interp, "Object.setPrototypeOf", err))?;
     if !ok {
         return Err(NativeError::TypeError {
             name: "Object.setPrototypeOf",
@@ -541,8 +549,9 @@ fn native_prototype_to_string(
     // `Get(O, @@toStringTag)` call, so proxy revocation triggered by
     // the tag getter cannot retroactively change the builtin tag.
     let builtin_tag = builtin_to_string_tag(ctx);
-    let explicit_tag = explicit_to_string_tag_with_context(ctx, &exec_ctx)
-        .map_err(|err| object_native_error("toString", err))?;
+    let tag_result = explicit_to_string_tag_with_context(ctx, &exec_ctx);
+    let explicit_tag =
+        tag_result.map_err(|err| object_native_error(ctx.cx.interp, "toString", err))?;
     let tag = match explicit_tag {
         Some(t) => t,
         None => builtin_tag,
@@ -636,17 +645,21 @@ fn native_prototype_to_locale_string(
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     if let Some(context) = ctx.execution_context().cloned() {
-        let callee = ctx
+        let callee_result = ctx
             .cx
             .interp
-            .get_property_value_for_call(&context, this_value, "toString")
-            .map_err(|err| object_native_error("toLocaleString", err))?;
+            .get_property_value_for_call(&context, this_value, "toString");
+        let callee = callee_result
+            .map_err(|err| object_native_error(ctx.cx.interp, "toLocaleString", err))?;
         if crate::is_callable_value(&callee) {
-            let result = ctx
-                .cx
-                .interp
-                .run_callable_sync(&context, &callee, this_value, smallvec::SmallVec::new())
-                .map_err(|err| object_native_error("toLocaleString", err))?;
+            let invoke_result = ctx.cx.interp.run_callable_sync(
+                &context,
+                &callee,
+                this_value,
+                smallvec::SmallVec::new(),
+            );
+            let result = invoke_result
+                .map_err(|err| object_native_error(ctx.cx.interp, "toLocaleString", err))?;
             return Ok(result);
         }
     }
@@ -659,21 +672,19 @@ fn native_prototype_has_own_property(
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     if let Some(context) = ctx.execution_context().cloned() {
-        let key = ctx
-            .cx
-            .interp
-            .to_property_key_sync(
-                &context,
-                args.first().cloned().unwrap_or(Value::undefined()),
-            )
-            .map_err(|err| object_native_error("hasOwnProperty", err))?;
+        let key_result = ctx.cx.interp.to_property_key_sync(
+            &context,
+            args.first().cloned().unwrap_or(Value::undefined()),
+        );
+        let key =
+            key_result.map_err(|err| object_native_error(ctx.cx.interp, "hasOwnProperty", err))?;
         if this_value.is_nullish() {
             return Err(NativeError::TypeError {
                 name: "hasOwnProperty",
                 reason: "cannot convert null or undefined to object".to_string(),
             });
         }
-        let desc = ctx
+        let desc_result = ctx
             .cx
             .interp
             .ordinary_get_own_property_descriptor_value_runtime_rooted(
@@ -683,8 +694,9 @@ fn native_prototype_has_own_property(
                 0,
                 &[&this_value],
                 &[],
-            )
-            .map_err(|err| object_native_error("hasOwnProperty", err))?;
+            );
+        let desc =
+            desc_result.map_err(|err| object_native_error(ctx.cx.interp, "hasOwnProperty", err))?;
         return Ok(Value::boolean(desc.is_some()));
     }
     if this_value.is_nullish() {
@@ -695,8 +707,8 @@ fn native_prototype_has_own_property(
     }
     let this_kind = *ctx.this_value();
     let present = if let Some(obj) = this_kind.as_object() {
-        has_own_property(obj, ctx.heap(), args.first())
-            .map_err(|err| object_native_error("hasOwnProperty", err))?
+        let has_result = has_own_property(obj, ctx.heap(), args.first());
+        has_result.map_err(|err| object_native_error(ctx.cx.interp, "hasOwnProperty", err))?
     } else if let Some(native) = this_kind.as_native_function() {
         native_function_has_own(&native, ctx.heap_mut(), args.first())
     } else if let Some(bound) = this_kind.as_bound_function() {
@@ -709,8 +721,9 @@ fn native_prototype_has_own_property(
         if is_prototype_key {
             true
         } else {
-            has_own_property(class.statics(ctx.heap()), ctx.heap(), key)
-                .map_err(|err| object_native_error("hasOwnProperty", err))?
+            let statics = class.statics(ctx.heap());
+            let class_result = has_own_property(statics, ctx.heap(), key);
+            class_result.map_err(|err| object_native_error(ctx.cx.interp, "hasOwnProperty", err))?
         }
     } else {
         false
@@ -730,19 +743,21 @@ fn native_prototype_property_is_enumerable(
         });
     }
     if let Some(context) = ctx.execution_context().cloned() {
-        let desc = ctx
-            .cx
-            .interp
-            .get_own_property_descriptor_for_value(&context, this_value, args.first())
-            .map_err(|err| object_native_error("propertyIsEnumerable", err))?;
+        let desc_result =
+            ctx.cx
+                .interp
+                .get_own_property_descriptor_for_value(&context, this_value, args.first());
+        let desc = desc_result
+            .map_err(|err| object_native_error(ctx.cx.interp, "propertyIsEnumerable", err))?;
         return Ok(Value::boolean(
             desc.as_ref().is_some_and(PropertyDescriptor::enumerable),
         ));
     }
     let this_clone = *ctx.this_value();
     let enumerable = if let Some(obj) = this_clone.as_object() {
-        let key = expect_property_key(args.first(), ctx.heap())
-            .map_err(|err| object_native_error("propertyIsEnumerable", err))?;
+        let key_result = expect_property_key(args.first(), ctx.heap());
+        let key = key_result
+            .map_err(|err| object_native_error(ctx.cx.interp, "propertyIsEnumerable", err))?;
         match key {
             PropertyKey::String(key) => match crate::object::lookup_own(obj, ctx.heap(), &key) {
                 PropertyLookup::Data { flags, .. } | PropertyLookup::Accessor { flags, .. } => {
@@ -760,18 +775,23 @@ fn native_prototype_property_is_enumerable(
             }
         }
     } else if let Some(native) = this_clone.as_native_function() {
-        let key_owned = expect_property_key(args.first(), ctx.heap())
-            .map_err(|err| object_native_error("propertyIsEnumerable", err))?;
+        let key_owned_result = expect_property_key(args.first(), ctx.heap());
+        let key_owned = key_owned_result
+            .map_err(|err| object_native_error(ctx.cx.interp, "propertyIsEnumerable", err))?;
         let desc = match key_owned {
-            PropertyKey::String(key) => native
-                .own_property_descriptor(ctx.heap_mut(), &key)
-                .map_err(|err| object_native_error("propertyIsEnumerable", err.into()))?,
+            PropertyKey::String(key) => {
+                let native_desc_result = native.own_property_descriptor(ctx.heap_mut(), &key);
+                native_desc_result.map_err(|err| {
+                    object_native_error(ctx.cx.interp, "propertyIsEnumerable", err.into())
+                })?
+            }
             PropertyKey::Symbol(sym) => native.own_symbol_property_descriptor(ctx.heap(), sym),
         };
         desc.as_ref().is_some_and(PropertyDescriptor::enumerable)
     } else if let Some(bound) = this_clone.as_bound_function() {
-        let key = expect_property_key(args.first(), ctx.heap())
-            .map_err(|err| object_native_error("propertyIsEnumerable", err))?;
+        let bound_key_result = expect_property_key(args.first(), ctx.heap());
+        let key = bound_key_result
+            .map_err(|err| object_native_error(ctx.cx.interp, "propertyIsEnumerable", err))?;
         match key {
             PropertyKey::String(key) => {
                 crate::function_metadata::bound_own_property_is_enumerable(&bound, ctx.heap(), &key)
@@ -811,11 +831,12 @@ fn native_prototype_is_prototype_of(
         })?;
     let mut current = target;
     for _ in 0..crate::object::PROTO_CHAIN_HARD_CAP {
-        let proto = ctx
+        let proto_result = ctx
             .cx
             .interp
-            .ordinary_get_prototype_value(&exec_ctx, current, 0)
-            .map_err(|err| object_native_error("isPrototypeOf", err))?;
+            .ordinary_get_prototype_value(&exec_ctx, current, 0);
+        let proto =
+            proto_result.map_err(|err| object_native_error(ctx.cx.interp, "isPrototypeOf", err))?;
         if proto.is_null() {
             return Ok(Value::boolean(false));
         }
@@ -851,11 +872,12 @@ pub fn native_prototype_proto_get(
     // `[[GetPrototypeOf]]` so user `getPrototypeOf` traps fire
     // observably.
     if let Some(exec_ctx) = ctx.execution_context().cloned() {
-        let result = ctx
+        let proto_result = ctx
             .cx
             .interp
-            .ordinary_get_prototype_value(&exec_ctx, this_value, 0)
-            .map_err(|err| object_native_error("get __proto__", err))?;
+            .ordinary_get_prototype_value(&exec_ctx, this_value, 0);
+        let result =
+            proto_result.map_err(|err| object_native_error(ctx.cx.interp, "get __proto__", err))?;
         return Ok(result);
     }
     // Context-less fallback (sync embedders without a JS frame).
@@ -944,11 +966,11 @@ pub fn native_prototype_proto_set(
             name: "set __proto__",
             reason: "missing execution context".to_string(),
         })?;
-    let ok = ctx
-        .cx
-        .interp
-        .set_prototype_value_proxy_aware(&exec_ctx, &this_value, &proto_value)
-        .map_err(|err| object_native_error("set __proto__", err))?;
+    let set_result =
+        ctx.cx
+            .interp
+            .set_prototype_value_proxy_aware(&exec_ctx, &this_value, &proto_value);
+    let ok = set_result.map_err(|err| object_native_error(ctx.cx.interp, "set __proto__", err))?;
     if !ok {
         return Err(NativeError::TypeError {
             name: "set __proto__",
@@ -1030,11 +1052,12 @@ fn define_accessor_helper(
         && this_value.is_object_type()
     {
         let key = property_key_to_vm_key(&key);
-        let ok = ctx
-            .cx
-            .interp
-            .define_own_property_value(&exec_ctx, &this_value, &key, desc)
-            .map_err(|err| object_native_error(method_name, err))?;
+        let define_result =
+            ctx.cx
+                .interp
+                .define_own_property_value(&exec_ctx, &this_value, &key, desc);
+        let ok =
+            define_result.map_err(|err| object_native_error(ctx.cx.interp, method_name, err))?;
         if !ok {
             return Err(NativeError::TypeError {
                 name: method_name,
@@ -1124,7 +1147,7 @@ fn lookup_accessor_helper(
             _ => return Ok(Value::undefined()),
         };
         while let Some(value) = current {
-            let desc = ctx
+            let desc_result = ctx
                 .cx
                 .interp
                 .ordinary_get_own_property_descriptor_value_runtime_rooted(
@@ -1134,8 +1157,9 @@ fn lookup_accessor_helper(
                     0,
                     &[&value],
                     &[],
-                )
-                .map_err(|err| object_native_error(method_name, err))?;
+                );
+            let desc =
+                desc_result.map_err(|err| object_native_error(ctx.cx.interp, method_name, err))?;
             if let Some(desc) = desc {
                 return Ok(match desc.kind {
                     DescriptorKind::Accessor { getter, setter } => {
@@ -1148,11 +1172,12 @@ fn lookup_accessor_helper(
                     DescriptorKind::Data { .. } => Value::undefined(),
                 });
             }
-            let proto = ctx
+            let proto_result = ctx
                 .cx
                 .interp
-                .ordinary_get_prototype_value(&exec_ctx, value, 0)
-                .map_err(|err| object_native_error(method_name, err))?;
+                .ordinary_get_prototype_value(&exec_ctx, value, 0);
+            let proto =
+                proto_result.map_err(|err| object_native_error(ctx.cx.interp, method_name, err))?;
             current = if proto.is_null() { None } else { Some(proto) };
         }
         return Ok(Value::undefined());
@@ -1467,11 +1492,12 @@ fn bound_function_has_own(
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-properties-of-the-object-constructor>
 pub fn call(
+    interp: &mut crate::Interpreter,
     method: otter_bytecode::method_id::ObjectMethod,
     args: &[Value],
-    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::ObjectMethod as M;
+    let gc_heap: &mut otter_gc::GcHeap = interp.gc_heap_for_cx_mut();
     match method {
         // §20.1.2.2 Object.create(O, Properties)
         // <https://tc39.es/ecma262/#sec-object.create>
@@ -1525,10 +1551,8 @@ pub fn call(
                     ),
                 };
                 if !ok {
-                    return Err(VmError::TypeError {
-                        message: (format!("Cannot define property '{}'", key.label(gc_heap)))
-                            .into(),
-                    });
+                    let msg = format!("Cannot define property '{}'", key.label(gc_heap));
+                    return Err(interp.err_type(msg.into()));
                 }
                 Ok(Value::object(target))
             } else if let Some(class) = first.and_then(|v| v.as_class_constructor()) {
@@ -1547,10 +1571,8 @@ pub fn call(
                     ),
                 };
                 if !ok {
-                    return Err(VmError::TypeError {
-                        message: (format!("Cannot define property '{}'", key.label(gc_heap)))
-                            .into(),
-                    });
+                    let msg = format!("Cannot define property '{}'", key.label(gc_heap));
+                    return Err(interp.err_type(msg.into()));
                 }
                 Ok(Value::class_constructor(class))
             } else if let Some(native) = first.and_then(|v| v.as_native_function()) {
@@ -1565,14 +1587,12 @@ pub fn call(
                     }
                 };
                 if !ok {
-                    return Err(VmError::TypeError {
-                        message: (format!(
-                            "Cannot define property '{}' on function {}",
-                            key.label(gc_heap),
-                            native.name(gc_heap)
-                        ))
-                        .into(),
-                    });
+                    let msg = format!(
+                        "Cannot define property '{}' on function {}",
+                        key.label(gc_heap),
+                        native.name(gc_heap)
+                    );
+                    return Err(interp.err_type(msg.into()));
                 }
                 Ok(Value::native_function(native))
             } else if let Some(r) = first.and_then(|v| v.as_regexp()) {
@@ -1587,10 +1607,8 @@ pub fn call(
                         }),
                     };
                     if !existing && !r.is_extensible(gc_heap) {
-                        return Err(VmError::TypeError {
-                            message: (format!("Cannot define property '{}'", key.label(gc_heap)))
-                                .into(),
-                        });
+                        let msg = format!("Cannot define property '{}'", key.label(gc_heap));
+                        return Err(interp.err_type(msg.into()));
                     }
                     let bag = crate::property_dispatch::regexp_ensure_expando_pub(gc_heap, &r)?;
                     let ok = match &key {
@@ -1604,10 +1622,8 @@ pub fn call(
                         }
                     };
                     if !ok {
-                        return Err(VmError::TypeError {
-                            message: (format!("Cannot define property '{}'", key.label(gc_heap)))
-                                .into(),
-                        });
+                        let msg = format!("Cannot define property '{}'", key.label(gc_heap));
+                        return Err(interp.err_type(msg.into()));
                     }
                     Ok(Value::regexp(r))
                 }
@@ -1623,10 +1639,8 @@ pub fn call(
                     ),
                 };
                 if !ok {
-                    return Err(VmError::TypeError {
-                        message: (format!("Cannot define property '{}'", key.label(gc_heap)))
-                            .into(),
-                    });
+                    let msg = format!("Cannot define property '{}'", key.label(gc_heap));
+                    return Err(interp.err_type(msg.into()));
                 }
                 Ok(Value::promise(p))
             } else if let Some(t) = first.and_then(|v| v.as_typed_array(gc_heap)) {
@@ -1642,13 +1656,9 @@ pub fn call(
                                 || descriptor.writable == Some(false)
                                 || descriptor.is_accessor()
                             {
-                                return Err(VmError::TypeError {
-                                    message: (format!(
-                                        "Cannot define property '{}'",
-                                        key.label(gc_heap)
-                                    ))
-                                    .into(),
-                                });
+                                let msg =
+                                    format!("Cannot define property '{}'", key.label(gc_heap));
+                                return Err(interp.err_type(msg.into()));
                             }
                             if let Some(value) = descriptor.value {
                                 let coerced = crate::binary::dispatch::coerce_element_for_store(
@@ -1669,13 +1679,9 @@ pub fn call(
                             if !crate::object::define_own_property_partial(
                                 bag, gc_heap, k, descriptor,
                             ) {
-                                return Err(VmError::TypeError {
-                                    message: (format!(
-                                        "Cannot define property '{}'",
-                                        key.label(gc_heap)
-                                    ))
-                                    .into(),
-                                });
+                                let msg =
+                                    format!("Cannot define property '{}'", key.label(gc_heap));
+                                return Err(interp.err_type(msg.into()));
                             }
                         }
                     }
@@ -1685,21 +1691,16 @@ pub fn call(
                         if !crate::object::define_own_symbol_property_partial(
                             bag, gc_heap, *sym, descriptor,
                         ) {
-                            return Err(VmError::TypeError {
-                                message: (format!(
-                                    "Cannot define property '{}'",
-                                    key.label(gc_heap)
-                                ))
-                                .into(),
-                            });
+                            let msg = format!("Cannot define property '{}'", key.label(gc_heap));
+                            return Err(interp.err_type(msg.into()));
                         }
                     }
                 }
                 Ok(Value::typed_array(t))
             } else {
-                Err(VmError::TypeError {
-                    message: ("Object.defineProperty target must be an object".to_string()).into(),
-                })
+                Err(interp.err_type(
+                    ("Object.defineProperty target must be an object".to_string()).into(),
+                ))
             }
         }
         // §20.1.2.5 Object.defineProperties(O, Properties)
@@ -1886,18 +1887,15 @@ pub fn call(
                 // wrappers carry no own data props for arbitrary keys.
                 Ok(Value::undefined())
             } else if first.is_none_or(|v| v.is_null() || v.is_undefined()) {
-                Err(VmError::TypeError {
-                    message:
-                        ("Object.getOwnPropertyDescriptor: cannot convert null/undefined to object"
-                            .to_string())
-                        .into(),
-                })
-            } else {
-                Err(VmError::TypeError {
-                    message: ("Object.getOwnPropertyDescriptor target must be an object"
+                Err(interp.err_type(
+                    ("Object.getOwnPropertyDescriptor: cannot convert null/undefined to object"
                         .to_string())
                     .into(),
-                })
+                ))
+            } else {
+                Err(interp.err_type(
+                    ("Object.getOwnPropertyDescriptor target must be an object".to_string()).into(),
+                ))
             }
         }
         // §20.1.2.11 Object.getOwnPropertyDescriptors(O)
@@ -2297,12 +2295,11 @@ pub fn call(
         // (e.g. through `Reflect.apply` without a live execution
         // context); surface as a TypeError so the caller learns the
         // method needs a JS frame.
-        M::GroupBy => Err(VmError::TypeError {
-            message: ("Object.groupBy requires an active execution context".to_string()).into(),
-        }),
-        M::ForInKeys => Err(VmError::TypeError {
-            message: ("Object.__forInKeys requires an active execution context".to_string()).into(),
-        }),
+        M::GroupBy => Err(interp
+            .err_type(("Object.groupBy requires an active execution context".to_string()).into())),
+        M::ForInKeys => Err(interp.err_type(
+            ("Object.__forInKeys requires an active execution context".to_string()).into(),
+        )),
     }
 }
 
@@ -2529,14 +2526,11 @@ fn native_to_property_key(
 ) -> Result<PropertyKey, NativeError> {
     let value = arg.cloned().unwrap_or(Value::undefined());
     let Some(exec_ctx) = ctx.execution_context().cloned() else {
-        return expect_property_key(Some(&value), ctx.heap())
-            .map_err(|err| object_native_error(method_name, err));
+        let expect_result = expect_property_key(Some(&value), ctx.heap());
+        return expect_result.map_err(|err| object_native_error(ctx.cx.interp, method_name, err));
     };
-    let key = ctx
-        .cx
-        .interp
-        .to_property_key_sync(&exec_ctx, value)
-        .map_err(|err| object_native_error(method_name, err))?;
+    let key_result = ctx.cx.interp.to_property_key_sync(&exec_ctx, value);
+    let key = key_result.map_err(|err| object_native_error(ctx.cx.interp, method_name, err))?;
     match key {
         crate::VmPropertyKey::Symbol(sym) => Ok(PropertyKey::Symbol(sym)),
         crate::VmPropertyKey::Atom(atom) => Ok(PropertyKey::String(atom.name().to_string())),

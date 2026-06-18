@@ -32,26 +32,26 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let locale = *read_register(frame, locale_reg)?;
         let options = *read_register(frame, options_reg)?;
-        let value = intl::construct(class, &locale, &options, &mut self.gc_heap)
-            .map_err(intl_to_vm_error)?;
+        let value = match intl::construct(class, &locale, &options, &mut self.gc_heap) {
+            Ok(v) => v,
+            Err(e) => return Err(intl_to_vm_error(self, e)),
+        };
         write_register(frame, dst, value)?;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 }
 
-fn intl_to_vm_error(err: intl::IntlError) -> VmError {
+fn intl_to_vm_error(interp: &crate::Interpreter, err: intl::IntlError) -> VmError {
     match err {
-        intl::IntlError::UnknownClass(name) => VmError::UnknownIntrinsic {
-            name: format!("Intl.{name}"),
-        },
-        intl::IntlError::UnknownMember { class, method } => VmError::UnknownIntrinsic {
-            name: format!("Intl.{class}.prototype.{method}"),
-        },
+        intl::IntlError::UnknownClass(name) => {
+            interp.err_unknown_intrinsic(format!("Intl.{name}").into())
+        }
+        intl::IntlError::UnknownMember { class, method } => {
+            interp.err_unknown_intrinsic(format!("Intl.{class}.prototype.{method}").into())
+        }
         intl::IntlError::BadArgument { .. } => VmError::TypeMismatch,
-        intl::IntlError::Engine { message, .. } => VmError::Uncaught {
-            value: (message).into(),
-        },
+        intl::IntlError::Engine { message, .. } => interp.err_uncaught((message).into()),
         intl::IntlError::OutOfMemory {
             requested_bytes,
             heap_limit_bytes,

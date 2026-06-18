@@ -50,8 +50,8 @@ fn oom(err: impl std::fmt::Display) -> NativeError {
 /// Propagate a VM error across the `require` boundary *intact* — a thrown JS
 /// value stays a thrown value (no re-wrapping/stringifying at each nested
 /// require level), so the original error survives to the outermost boundary.
-fn vm_err(err: otter_vm::VmError) -> NativeError {
-    otter_vm::native_function::vm_to_native_error(err, "require")
+fn vm_err(interp: &otter_vm::Interpreter, err: otter_vm::VmError) -> NativeError {
+    otter_vm::native_function::vm_to_native_error(interp, err, "require")
 }
 
 /// Run an embedded JavaScript shim as a CommonJS module and return its
@@ -378,7 +378,9 @@ pub(crate) fn cjs_instantiate_file(
     let context = context.ok_or_else(|| {
         runtime_type_error("require", "missing execution context for module load")
     })?;
-    let wrapper = interp.create_commonjs_wrapper(source).map_err(vm_err)?;
+    let wrapper = interp
+        .create_commonjs_wrapper(source)
+        .map_err(|e| vm_err(interp, e))?;
     let call_args: SmallVec<[Value; 8]> = smallvec![
         exports_val,
         require_val,
@@ -406,7 +408,8 @@ pub(crate) fn cjs_instantiate_file(
         .expect("require cache survives module-root rooting");
     let exports_val = interp.module_root(exports_idx);
 
-    let result = run.map_err(vm_err).map(|_ret| {
+    let run = run.map_err(|e| vm_err(interp, e));
+    let result = run.map(|_ret| {
         // `module.exports` may have been reassigned by the module body.
         let final_exports = object::get(module, interp.gc_heap(), "exports").unwrap_or(exports_val);
         object::set(module, interp.gc_heap_mut(), "loaded", Value::boolean(true));

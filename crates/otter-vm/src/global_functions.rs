@@ -333,9 +333,7 @@ fn uri_decode(input: &str, _component: bool) -> Result<String, VmError> {
 }
 
 fn uri_error() -> VmError {
-    VmError::URIError {
-        message: ("URI malformed".to_string()).into(),
-    }
+    VmError::URIError
 }
 
 fn hex_digit(b: u8) -> Result<u8, VmError> {

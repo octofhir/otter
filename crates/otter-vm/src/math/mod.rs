@@ -730,9 +730,9 @@ fn native_sum_precise(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 
     // step — GetIterator(items, sync). Rejects non-iterables (and the
     // `Math.sumPrecise()` / `{}` cases) with a TypeError.
-    let (iterator, next) = interp
-        .get_iterator_sync(&exec, &items)
-        .map_err(|e| vm_to_native_error(e, "Math.sumPrecise"))?;
+    let iter_result = interp.get_iterator_sync(&exec, &items);
+    let (iterator, next) =
+        iter_result.map_err(|e| vm_to_native_error(interp, e, "Math.sumPrecise"))?;
 
     let mut state = SumState::MinusZero;
     let mut acc = num_bigint::BigInt::from(0);
@@ -789,7 +789,7 @@ fn native_sum_precise(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             }
             // IteratorStepValue threw: the record is already closed by
             // the protocol; propagate without re-closing.
-            Err(e) => return Err(vm_to_native_error(e, "Math.sumPrecise")),
+            Err(e) => return Err(vm_to_native_error(interp, e, "Math.sumPrecise")),
         }
     }
 

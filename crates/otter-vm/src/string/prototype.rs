@@ -1251,20 +1251,38 @@ fn impl_to_upper_case(
 
 /// Map a [`crate::VmError`] from an interpreter re-entry onto the
 /// native error surface, preserving thrown user values.
-fn vm_err(err: crate::VmError, name: &'static str) -> NativeError {
+fn vm_err(interp: &crate::Interpreter, err: crate::VmError, name: &'static str) -> NativeError {
     match err {
-        crate::VmError::Uncaught { value } => NativeError::Thrown {
-            name,
-            message: value.into(),
-        },
-        crate::VmError::TypeError { message } => NativeError::TypeError {
-            name,
-            reason: message.into(),
-        },
-        crate::VmError::RangeError { message } => NativeError::RangeError {
-            name,
-            reason: message.into(),
-        },
+        crate::VmError::Uncaught => {
+            let value = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::Thrown {
+                name,
+                message: value.into(),
+            }
+        }
+        crate::VmError::TypeError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::TypeError {
+                name,
+                reason: message.into(),
+            }
+        }
+        crate::VmError::RangeError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::RangeError {
+                name,
+                reason: message.into(),
+            }
+        }
         other => NativeError::TypeError {
             name,
             reason: other.to_string(),
@@ -1285,14 +1303,18 @@ fn get_value(
         .cloned()
         .ok_or_else(|| type_error(name, "missing execution context"))?;
     let interp = ctx.interp_mut();
-    match interp
-        .ordinary_get_value(&exec, value, value, key, 0)
-        .map_err(|e| vm_err(e, name))?
-    {
+    let outcome = match interp.ordinary_get_value(&exec, value, value, key, 0) {
+        Ok(v) => v,
+        Err(e) => return Err(vm_err(interp, e, name)),
+    };
+    match outcome {
         VmGetOutcome::Value(v) => Ok(v),
-        VmGetOutcome::InvokeGetter { getter } => interp
-            .run_callable_sync(&exec, &getter, value, SmallVec::new())
-            .map_err(|e| vm_err(e, name)),
+        VmGetOutcome::InvokeGetter { getter } => {
+            match interp.run_callable_sync(&exec, &getter, value, SmallVec::new()) {
+                Ok(v) => Ok(v),
+                Err(e) => Err(vm_err(interp, e, name)),
+            }
+        }
     }
 }
 
@@ -1349,10 +1371,11 @@ fn value_to_string(
         .execution_context()
         .cloned()
         .ok_or_else(|| type_error(name, "missing execution context"))?;
-    let text = ctx
-        .interp_mut()
-        .coerce_to_string(&exec, &value)
-        .map_err(|e| vm_err(e, name))?;
+    let interp = ctx.interp_mut();
+    let text = match interp.coerce_to_string(&exec, &value) {
+        Ok(t) => t,
+        Err(e) => return Err(vm_err(interp, e, name)),
+    };
     JsString::from_str(&text, ctx.heap_mut()).map_err(NativeError::from)
 }
 
@@ -1439,10 +1462,11 @@ fn string_replace_spec(
                 .cloned()
                 .ok_or_else(|| type_error(name, "missing execution context"))?;
             let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![this, replace_value];
-            return ctx
-                .interp_mut()
-                .run_callable_sync(&exec, &method, search, cb_args)
-                .map_err(|e| vm_err(e, name));
+            let interp = ctx.interp_mut();
+            return match interp.run_callable_sync(&exec, &method, search, cb_args) {
+                Ok(v) => Ok(v),
+                Err(e) => Err(vm_err(interp, e, name)),
+            };
         }
     }
 
@@ -1480,10 +1504,16 @@ fn string_replace_spec(
                 Value::number_f64(pos as f64),
                 Value::string(string),
             ];
-            let raw = ctx
-                .interp_mut()
-                .run_callable_sync(&exec, &replace_value, Value::undefined(), cb_args)
-                .map_err(|e| vm_err(e, name))?;
+            let interp = ctx.interp_mut();
+            let raw = match interp.run_callable_sync(
+                &exec,
+                &replace_value,
+                Value::undefined(),
+                cb_args,
+            ) {
+                Ok(v) => v,
+                Err(e) => return Err(vm_err(interp, e, name)),
+            };
             value_to_string(ctx, raw, name)?.to_utf16_vec(ctx.heap())
         } else {
             get_substitution(
@@ -1914,9 +1944,11 @@ fn impl_match(
         .cloned()
         .ok_or_else(|| type_error(NAME, "missing execution context"))?;
     let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![Value::string(s)];
-    ctx.interp_mut()
-        .run_callable_sync(&exec, &method, rx_value, cb_args)
-        .map_err(|e| vm_err(e, NAME))
+    let interp = ctx.interp_mut();
+    match interp.run_callable_sync(&exec, &method, rx_value, cb_args) {
+        Ok(v) => Ok(v),
+        Err(e) => Err(vm_err(interp, e, NAME)),
+    }
 }
 
 fn impl_match_all(
@@ -1944,9 +1976,11 @@ fn impl_match_all(
         .cloned()
         .ok_or_else(|| type_error(NAME, "missing execution context"))?;
     let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![Value::string(s)];
-    ctx.interp_mut()
-        .run_callable_sync(&exec, &method, rx_value, cb_args)
-        .map_err(|e| vm_err(e, NAME))
+    let interp = ctx.interp_mut();
+    match interp.run_callable_sync(&exec, &method, rx_value, cb_args) {
+        Ok(v) => Ok(v),
+        Err(e) => Err(vm_err(interp, e, NAME)),
+    }
 }
 
 fn impl_search(
@@ -1970,9 +2004,11 @@ fn impl_search(
         .cloned()
         .ok_or_else(|| type_error(NAME, "missing execution context"))?;
     let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![Value::string(s)];
-    ctx.interp_mut()
-        .run_callable_sync(&exec, &method, rx_value, cb_args)
-        .map_err(|e| vm_err(e, NAME))
+    let interp = ctx.interp_mut();
+    match interp.run_callable_sync(&exec, &method, rx_value, cb_args) {
+        Ok(v) => Ok(v),
+        Err(e) => Err(vm_err(interp, e, NAME)),
+    }
 }
 
 type StringNativeFn = fn(&mut NativeCtx<'_>, &Value, &[Value]) -> Result<Value, NativeError>;
@@ -2216,10 +2252,11 @@ fn native_string_method(
                 .ok_or_else(|| type_error("split", "missing execution context"))?;
             let limit = args.get(1).copied().unwrap_or_else(Value::undefined);
             let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![this, limit];
-            return ctx
-                .interp_mut()
-                .run_callable_sync(&exec, &splitter, separator, cb_args)
-                .map_err(|e| vm_err(e, "split"));
+            let interp = ctx.interp_mut();
+            return match interp.run_callable_sync(&exec, &splitter, separator, cb_args) {
+                Ok(v) => Ok(v),
+                Err(e) => Err(vm_err(interp, e, "split")),
+            };
         }
     }
     // §22.1.3.{11,13,14} `match` / `search` / `matchAll` — an Object
@@ -2253,10 +2290,11 @@ fn native_string_method(
                     .cloned()
                     .ok_or_else(|| type_error(name, "missing execution context"))?;
                 let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![this];
-                return ctx
-                    .interp_mut()
-                    .run_callable_sync(&exec, &method, arg, cb_args)
-                    .map_err(|e| vm_err(e, name));
+                let interp = ctx.interp_mut();
+                return match interp.run_callable_sync(&exec, &method, arg, cb_args) {
+                    Ok(v) => Ok(v),
+                    Err(e) => Err(vm_err(interp, e, name)),
+                };
             }
         }
     }
@@ -2293,22 +2331,10 @@ fn native_string_method(
         }
         if needs_coerce && let Some(exec) = ctx.execution_context().cloned() {
             let interp = ctx.interp_mut();
-            let s = interp
-                .coerce_to_string(&exec, &receiver)
-                .map_err(|e| match e {
-                    crate::VmError::Uncaught { value } => NativeError::Thrown {
-                        name,
-                        message: value.into(),
-                    },
-                    crate::VmError::TypeError { message } => NativeError::TypeError {
-                        name,
-                        reason: message.into(),
-                    },
-                    other => NativeError::TypeError {
-                        name,
-                        reason: other.to_string(),
-                    },
-                })?;
+            let s = match interp.coerce_to_string(&exec, &receiver) {
+                Ok(s) => s,
+                Err(e) => return Err(vm_err(interp, e, name)),
+            };
 
             Value::string(JsString::from_str(&s, ctx.heap_mut()).map_err(|_| {
                 NativeError::TypeError {
@@ -2331,9 +2357,10 @@ fn native_string_method(
     // `valueOf` / `toString`.
     let mut coerced_args: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
     if let Some(exec) = ctx.execution_context().cloned() {
-        ctx.interp_mut()
+        let interp = ctx.interp_mut();
+        interp
             .coerce_string_method_args(&exec, name, &mut coerced_args)
-            .map_err(|e| crate::native_function::vm_to_native_error(e, name))?;
+            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))?;
     }
     let impl_fn = intrinsic_impl(name).ok_or_else(|| NativeError::TypeError {
         name,

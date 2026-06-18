@@ -759,9 +759,9 @@ fn worker_id_from_object(
 
 fn vm_error_to_native(err: otter_vm::VmError) -> NativeError {
     match err {
-        otter_vm::VmError::Uncaught { value } => NativeError::Thrown {
+        otter_vm::VmError::Uncaught => NativeError::Thrown {
             name: "Worker",
-            message: value.into(),
+            message: err.to_string(),
         },
         other => type_err("Worker", other.to_string()),
     }

@@ -753,9 +753,7 @@ impl Interpreter {
             pattern_utf16,
             flags,
         )
-        .map_err(|e| VmError::InvalidRegExp {
-            message: (e.to_string()).into(),
-        })?;
+        .map_err(|e| self.err_invalid_regexp((e.to_string()).into()))?;
         write_register(frame, dst, Value::regexp(regex))?;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())

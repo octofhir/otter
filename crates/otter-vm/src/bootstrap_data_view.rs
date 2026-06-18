@@ -83,7 +83,7 @@ fn ctor_to_index(ctx: &mut NativeCtx<'_>, value: Option<&Value>) -> Result<usize
             reason: "missing execution context".to_string(),
         })?;
     let number = crate::coerce::to_number_or_throw(ctx.interp_mut(), &exec, value)
-        .map_err(|e| crate::native_function::vm_to_native_error(e, "DataView"))?;
+        .map_err(|e| crate::native_function::vm_to_native_error(ctx.interp_mut(), e, "DataView"))?;
     let n = number.as_f64();
     let integer = if n.is_nan() { 0.0 } else { n.trunc() };
     if !(0.0..=9_007_199_254_740_991.0).contains(&integer) {

@@ -67,8 +67,10 @@ fn native_is_array(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
     // §7.2.2 IsArray — shared with the `Op::IsArray` fast path so the
     // direct call and `Array.isArray.call(...)` agree (Proxy recursion,
     // revoked-Proxy TypeError).
-    let mut result = crate::abstract_ops::is_array(ctx.heap(), &value)
-        .map_err(|err| crate::native_function::vm_to_native_error(err, "Array.isArray"))?;
+    let is_array_result = crate::abstract_ops::is_array(ctx.heap(), &value);
+    let mut result = is_array_result.map_err(|err| {
+        crate::native_function::vm_to_native_error(ctx.cx.interp, err, "Array.isArray")
+    })?;
     if !result
         && let Some(obj) = value.as_object()
         && let Some(array_prototype) = ctx.cx.interp.realm_intrinsics.array_prototype
@@ -89,9 +91,8 @@ fn native_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         name: "Array.of",
         reason: "missing execution context".to_string(),
     })?;
-    interp
-        .array_of_sync(&exec, this_value, args)
-        .map_err(|e| vm_to_native_array_static("Array.of", e))
+    let result = interp.array_of_sync(&exec, this_value, args);
+    result.map_err(|e| vm_to_native_array_static(interp, "Array.of", e))
 }
 
 /// §23.1.2.1 `Array.from(items, mapFn?, thisArg?)` JS-visible
@@ -105,9 +106,8 @@ fn native_from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
         name: "Array.from",
         reason: "missing execution context".to_string(),
     })?;
-    interp
-        .array_from_sync(&exec, this_value, args)
-        .map_err(|e| vm_to_native_array_static("Array.from", e))
+    let result = interp.array_from_sync(&exec, this_value, args);
+    result.map_err(|e| vm_to_native_array_static(interp, "Array.from", e))
 }
 
 /// §23.1.2.2 `Array.fromAsync(items, mapFn?, thisArg?)`.
@@ -124,20 +124,42 @@ fn native_from_async(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value,
     })
 }
 
-fn vm_to_native_array_static(name: &'static str, err: VmError) -> NativeError {
+fn vm_to_native_array_static(
+    interp: &crate::Interpreter,
+    name: &'static str,
+    err: VmError,
+) -> NativeError {
     match err {
-        VmError::Uncaught { value } => NativeError::Thrown {
-            name,
-            message: value.into(),
-        },
-        VmError::TypeError { message } => NativeError::TypeError {
-            name,
-            reason: message.into(),
-        },
-        VmError::RangeError { message } => NativeError::RangeError {
-            name,
-            reason: message.into(),
-        },
+        VmError::Uncaught => {
+            let value: Box<str> = match interp.error_detail() {
+                Some(crate::run_control::ErrorDetail::Uncaught(v)) => v,
+                _ => Default::default(),
+            };
+            NativeError::Thrown {
+                name,
+                message: value.into(),
+            }
+        }
+        VmError::TypeError => {
+            let message: Box<str> = match interp.error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::TypeError {
+                name,
+                reason: message.into(),
+            }
+        }
+        VmError::RangeError => {
+            let message: Box<str> = match interp.error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::RangeError {
+                name,
+                reason: message.into(),
+            }
+        }
         other => NativeError::TypeError {
             name,
             reason: other.to_string(),

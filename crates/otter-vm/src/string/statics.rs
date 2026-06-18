@@ -107,12 +107,12 @@ fn string_raw(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
     let raw = interp
         .get_property_value_for_call(&context, template, "raw")
-        .map_err(|e| crate::native_function::vm_to_native_error(e, "String.raw"))?;
+        .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "String.raw"))?;
     let len_val = interp
         .get_property_value_for_call(&context, raw, "length")
-        .map_err(|e| crate::native_function::vm_to_native_error(e, "String.raw"))?;
+        .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "String.raw"))?;
     let literal_segments = crate::to_length(&len_val, interp.gc_heap())
-        .map_err(|e| crate::native_function::vm_to_native_error(e, "String.raw"))?;
+        .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "String.raw"))?;
     if literal_segments == 0 {
         return Ok(Value::string(JsString::from_str("", interp.gc_heap_mut())?));
     }
@@ -123,10 +123,10 @@ fn string_raw(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
         let key = next_index.to_string();
         let seg_val = interp
             .get_property_value_for_call(&context, raw, &key)
-            .map_err(|e| crate::native_function::vm_to_native_error(e, "String.raw"))?;
+            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "String.raw"))?;
         let seg = interp
             .coerce_to_string(&context, &seg_val)
-            .map_err(|e| crate::native_function::vm_to_native_error(e, "String.raw"))?;
+            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "String.raw"))?;
         out.push_str(&seg);
         if next_index + 1 == literal_segments {
             break;
@@ -134,7 +134,7 @@ fn string_raw(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
         if let Some(sub) = substitutions.get(next_index) {
             let sub_str = interp
                 .coerce_to_string(&context, sub)
-                .map_err(|e| crate::native_function::vm_to_native_error(e, "String.raw"))?;
+                .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "String.raw"))?;
             out.push_str(&sub_str);
         }
     }
@@ -174,7 +174,9 @@ fn string_from_char_code(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
     let mut units: Vec<u16> = Vec::with_capacity(args.len());
     for arg in args {
         let n = crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, arg)
-            .map_err(|e| crate::native_function::vm_to_native_error(e, "String.fromCharCode"))?
+            .map_err(|e| {
+                crate::native_function::vm_to_native_error(ctx.cx.interp, e, "String.fromCharCode")
+            })?
             .as_f64();
         units.push(to_uint16(n));
     }
@@ -219,7 +221,9 @@ fn string_from_code_point(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
     let mut units: Vec<u16> = Vec::with_capacity(args.len() * 2);
     for arg in args {
         let n = crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, arg)
-            .map_err(|e| crate::native_function::vm_to_native_error(e, "String.fromCodePoint"))?
+            .map_err(|e| {
+                crate::native_function::vm_to_native_error(ctx.cx.interp, e, "String.fromCodePoint")
+            })?
             .as_f64();
         if !n.is_finite() || n < 0.0 || n > 0x10FFFF as f64 || n.fract() != 0.0 {
             return Err(NativeError::RangeError {

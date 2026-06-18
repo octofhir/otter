@@ -1282,40 +1282,64 @@ impl From<otter_gc::OutOfMemory> for NativeError {
 /// as [`NativeError::Thrown`] so callbacks that `throw` surface intact;
 /// the spec error classes map to their `NativeError` counterparts and
 /// everything else falls back to a `TypeError` with the rendered cause.
-pub fn vm_to_native_error(err: crate::VmError, name: &'static str) -> NativeError {
+pub fn vm_to_native_error(
+    interp: &crate::Interpreter,
+    err: crate::VmError,
+    name: &'static str,
+) -> NativeError {
+    use crate::run_control::ErrorDetail;
+    // The dynamic message/payload for an in-flight error lives in the isolate's
+    // pending-error slot (`VmError` is `Copy`); pull it out here paired with the
+    // `Copy` discriminant.
+    let detail = interp.error_detail();
+    let message = || match &detail {
+        Some(ErrorDetail::Message(m)) => m.to_string(),
+        Some(ErrorDetail::Name(m)) => m.to_string(),
+        Some(ErrorDetail::Uncaught(m)) => m.to_string(),
+        _ => err.to_string(),
+    };
     match err {
-        crate::VmError::Uncaught { value } => NativeError::Thrown {
+        crate::VmError::Uncaught => NativeError::Thrown {
             name,
-            message: value.into(),
+            message: message(),
         },
-        crate::VmError::Coded(payload) => NativeError::Coded {
-            kind: payload.kind,
-            code: payload.code,
-            message: payload.message,
-        },
-        crate::VmError::TypeError { message } => NativeError::TypeError {
+        crate::VmError::Coded => {
+            if let Some(ErrorDetail::Coded(payload)) = detail {
+                NativeError::Coded {
+                    kind: payload.kind,
+                    code: payload.code,
+                    message: payload.message,
+                }
+            } else {
+                NativeError::TypeError {
+                    name,
+                    reason: err.to_string(),
+                }
+            }
+        }
+        crate::VmError::TypeError | crate::VmError::TypeMismatchAt => NativeError::TypeError {
             name,
-            reason: message.into(),
+            reason: message(),
         },
-        crate::VmError::RangeError { message } => NativeError::RangeError {
+        crate::VmError::RangeError => NativeError::RangeError {
             name,
-            reason: message.into(),
+            reason: message(),
         },
-        crate::VmError::SyntaxError { message } => NativeError::SyntaxError {
+        crate::VmError::SyntaxError => NativeError::SyntaxError {
             name,
-            reason: message.into(),
+            reason: message(),
         },
         // §10.2.2 / §13.3.7.3 — TDZ and unresolved-reference errors are
         // ReferenceErrors and must keep that class across the native
         // boundary rather than collapsing to the TypeError fallback.
-        crate::VmError::ThisUninitialized { ref message } => NativeError::ReferenceError {
+        crate::VmError::ThisUninitialized => NativeError::ReferenceError {
             name,
-            reason: message.to_string(),
+            reason: message(),
         },
-        crate::VmError::TemporalDeadZone { .. } | crate::VmError::UndefinedIdentifier { .. } => {
+        crate::VmError::TemporalDeadZone { .. } | crate::VmError::UndefinedIdentifier => {
             NativeError::ReferenceError {
                 name,
-                reason: err.to_string(),
+                reason: message(),
             }
         }
         crate::VmError::Interrupted => NativeError::Interrupted,
@@ -1336,9 +1360,12 @@ pub fn vm_to_native_error(err: crate::VmError, name: &'static str) -> NativeErro
         // boundary so a host (e.g. the CommonJS loader) can surface a clean
         // process termination instead of an uncatchable-looking TypeError.
         crate::VmError::Exit { code } => NativeError::Exit { code },
-        other => NativeError::TypeError {
+        // URIError / BudgetExceeded / UnknownIntrinsic / InvalidRegExp carry a
+        // message/name detail; the rest render their static `Display` text via
+        // `message()`'s fallback.
+        _ => NativeError::TypeError {
             name,
-            reason: other.to_string(),
+            reason: message(),
         },
     }
 }

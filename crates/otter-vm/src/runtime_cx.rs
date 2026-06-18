@@ -500,7 +500,7 @@ impl<'rt> NativeCtx<'rt> {
         self.cx
             .interp
             .run_construct_sync(&context, &target, target, argv)
-            .map_err(|err| native_function::vm_to_native_error(err, "construct"))
+            .map_err(|err| native_function::vm_to_native_error(self.cx.interp, err, "construct"))
     }
 
     /// Resolve a `globalThis.<name>` value (e.g. a constructor) for native use.

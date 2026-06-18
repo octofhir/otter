@@ -81,7 +81,11 @@ fn coerce_numeric_args(
                 crate::abstract_ops::ToPrimitiveHint::Number,
             ) {
                 Ok(primitive) => out.push(primitive),
-                Err(crate::VmError::Uncaught { value }) => {
+                Err(crate::VmError::Uncaught) => {
+                    let value = match interp.take_error_detail() {
+                        Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                        _ => Default::default(),
+                    };
                     return Err(NativeError::Thrown {
                         name,
                         message: value.into(),
@@ -158,8 +162,9 @@ fn to_string_radix(
                     name,
                     reason: "missing execution context".to_string(),
                 })?;
-                crate::coerce::to_number_or_throw(interp, &exec, &v)
-                    .map_err(|err| crate::native_function::vm_to_native_error(err, name))?
+                let number_result = crate::coerce::to_number_or_throw(interp, &exec, &v);
+                number_result
+                    .map_err(|err| crate::native_function::vm_to_native_error(interp, err, name))?
             };
             let f = number.as_f64();
             let trunc = if f.is_nan() { 0.0 } else { f.trunc() };

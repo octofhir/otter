@@ -196,28 +196,52 @@ fn native_parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
         .and_then(|v| v.as_string(ctx.heap()))
         .map(|s| s.to_lossy_string(ctx.heap()))
         .and_then(|text| parse::parse_source_tree(&text));
-    ctx.interp_mut()
-        .json_internalize_root(&context, unfiltered, reviver, source_tree.as_ref())
-        .map_err(vm_to_native_parse)
+    match ctx.interp_mut().json_internalize_root(
+        &context,
+        unfiltered,
+        reviver,
+        source_tree.as_ref(),
+    ) {
+        Ok(v) => Ok(v),
+        Err(err) => Err(vm_to_native_parse(ctx.interp_mut(), err)),
+    }
 }
 
 /// Map a reviver-path [`VmError`] onto the native surface, preserving
 /// user exceptions (`Uncaught` → `Thrown`).
-fn vm_to_native_parse(err: VmError) -> NativeError {
+fn vm_to_native_parse(interp: &crate::Interpreter, err: VmError) -> NativeError {
     match err {
-        VmError::Uncaught { value } => NativeError::Thrown {
-            name: "parse",
-            message: value.into(),
-        },
-        VmError::RangeError { message } => NativeError::RangeError {
-            name: "parse",
-            reason: message.into(),
-        },
+        VmError::Uncaught => {
+            let value = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::Thrown {
+                name: "parse",
+                message: value.into(),
+            }
+        }
+        VmError::RangeError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::RangeError {
+                name: "parse",
+                reason: message.into(),
+            }
+        }
         VmError::Exit { code } => NativeError::Exit { code },
-        VmError::TypeError { message } => NativeError::TypeError {
-            name: "parse",
-            reason: message.into(),
-        },
+        VmError::TypeError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::TypeError {
+                name: "parse",
+                reason: message.into(),
+            }
+        }
         other => NativeError::TypeError {
             name: "parse",
             reason: other.to_string(),
@@ -274,18 +298,29 @@ fn coerce_text_to_string(
             name,
             reason: "missing execution context".to_string(),
         })?;
-        let primitive = interp
-            .evaluate_to_primitive(&exec, &value, crate::abstract_ops::ToPrimitiveHint::String)
-            .map_err(|err| match err {
-                VmError::Uncaught { value } => NativeError::Thrown {
+        let primitive = match interp.evaluate_to_primitive(
+            &exec,
+            &value,
+            crate::abstract_ops::ToPrimitiveHint::String,
+        ) {
+            Ok(p) => p,
+            Err(VmError::Uncaught) => {
+                let thrown = match interp.take_error_detail() {
+                    Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                    _ => Default::default(),
+                };
+                return Err(NativeError::Thrown {
                     name,
-                    message: value.into(),
-                },
-                other => NativeError::TypeError {
+                    message: thrown.into(),
+                });
+            }
+            Err(other) => {
+                return Err(NativeError::TypeError {
                     name,
                     reason: other.to_string(),
-                },
-            })?;
+                });
+            }
+        };
         if primitive.is_symbol() {
             return Err(NativeError::TypeError {
                 name,
@@ -378,9 +413,10 @@ fn native_stringify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
             name: "stringify",
             reason: "missing execution context".to_string(),
         })?;
-    ctx.interp_mut()
-        .json_stringify_spec(&context, args)
-        .map_err(vm_to_native_stringify)
+    match ctx.interp_mut().json_stringify_spec(&context, args) {
+        Ok(v) => Ok(v),
+        Err(err) => Err(vm_to_native_stringify(ctx.interp_mut(), err)),
+    }
 }
 
 /// Map a serializer [`VmError`] to the native error surface. A user
@@ -388,25 +424,49 @@ fn native_stringify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
 /// verbatim (`VmError::Uncaught` → `NativeError::Thrown`) so its
 /// original constructor is observable; only the serializer's own
 /// synthetic failures (cyclic, BigInt, depth) become `TypeError`s.
-fn vm_to_native_stringify(err: VmError) -> NativeError {
+fn vm_to_native_stringify(interp: &crate::Interpreter, err: VmError) -> NativeError {
     match err {
-        VmError::Uncaught { value } => NativeError::Thrown {
-            name: "stringify",
-            message: value.into(),
-        },
-        VmError::SyntaxError { message } => NativeError::SyntaxError {
-            name: "stringify",
-            reason: message.into(),
-        },
-        VmError::RangeError { message } => NativeError::RangeError {
-            name: "stringify",
-            reason: message.into(),
-        },
+        VmError::Uncaught => {
+            let value = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::Thrown {
+                name: "stringify",
+                message: value.into(),
+            }
+        }
+        VmError::SyntaxError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::SyntaxError {
+                name: "stringify",
+                reason: message.into(),
+            }
+        }
+        VmError::RangeError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::RangeError {
+                name: "stringify",
+                reason: message.into(),
+            }
+        }
         VmError::Exit { code } => NativeError::Exit { code },
-        VmError::TypeError { message } => NativeError::TypeError {
-            name: "stringify",
-            reason: message.into(),
-        },
+        VmError::TypeError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::TypeError {
+                name: "stringify",
+                reason: message.into(),
+            }
+        }
         other => NativeError::TypeError {
             name: "stringify",
             reason: other.to_string(),

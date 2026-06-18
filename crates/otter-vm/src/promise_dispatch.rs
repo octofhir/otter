@@ -824,7 +824,7 @@ fn invoke_then_interp(
     let then = get_callable_property(interp, exec, receiver, "then", NAME)?;
     interp
         .run_callable_sync(exec, &then, receiver, smallvec![on_fulfilled, on_rejected])
-        .map_err(|err| promise_vm_error(NAME, err))
+        .map_err(|err| promise_vm_error(interp, NAME, err))
 }
 
 /// §27.2.5.3 `Promise.prototype.finally(onFinally)`.
@@ -923,7 +923,7 @@ fn make_then_finally(
                         Value::undefined(),
                         SmallVec::new(),
                     )
-                    .map_err(|err| promise_vm_error("Promise.prototype.finally", err))?
+                    .map_err(|err| promise_vm_error(interp, "Promise.prototype.finally", err))?
             };
             let resolved = {
                 let (interp, _) = ctx.interp_mut_and_context();
@@ -973,7 +973,7 @@ fn make_catch_finally(
                         Value::undefined(),
                         SmallVec::new(),
                     )
-                    .map_err(|err| promise_vm_error("Promise.prototype.finally", err))?
+                    .map_err(|err| promise_vm_error(interp, "Promise.prototype.finally", err))?
             };
             let resolved = {
                 let (interp, _) = ctx.interp_mut_and_context();
@@ -1059,12 +1059,22 @@ fn builtin_promise_constructor(interp: &Interpreter) -> Result<Value, NativeErro
     })
 }
 
-fn promise_vm_error(name: &'static str, err: crate::VmError) -> NativeError {
+fn promise_vm_error(
+    interp: &crate::Interpreter,
+    name: &'static str,
+    err: crate::VmError,
+) -> NativeError {
     match err {
-        crate::VmError::Uncaught { value } => NativeError::Thrown {
-            name,
-            message: value.into(),
-        },
+        crate::VmError::Uncaught => {
+            let value = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::Thrown {
+                name,
+                message: value.into(),
+            }
+        }
         other => NativeError::TypeError {
             name,
             reason: other.to_string(),
@@ -1129,7 +1139,7 @@ fn new_generic_promise_capability(
     };
     let promise = interp
         .run_construct_sync(&exec, &constructor, constructor, smallvec![executor])
-        .map_err(|err| promise_vm_error("Promise", err))?;
+        .map_err(|err| promise_vm_error(interp, "Promise", err))?;
     let resolve = (*state.resolve.borrow()).unwrap_or(Value::undefined());
     let reject = (*state.reject.borrow()).unwrap_or(Value::undefined());
     if !crate::is_callable_value(&resolve) {
@@ -1164,7 +1174,7 @@ fn call_capability_function(
     })?;
     interp
         .run_callable_sync(exec, function, Value::undefined(), smallvec![value])
-        .map_err(|err| promise_vm_error("Promise", err))?;
+        .map_err(|err| promise_vm_error(interp, "Promise", err))?;
     Ok(())
 }
 
@@ -1184,16 +1194,17 @@ fn call_capability_reject(
     call_capability_function(interp, cap, &cap.reject, reason)
 }
 
-fn native_error_rejection_value(err: NativeError, heap: &mut otter_gc::GcHeap) -> Value {
+fn native_error_rejection_value(interp: &mut Interpreter, err: NativeError) -> Value {
     if let NativeError::Thrown { message, .. } = err {
+        let heap = interp.gc_heap_mut();
         return Value::string(
             crate::JsString::from_str(&message, heap).unwrap_or_else(|_| {
                 crate::JsString::from_str("", heap).expect("empty string allocates")
             }),
         );
     }
-    let vm_error = crate::native_to_vm_error(err);
-    crate::error_ops::vm_err_to_value(&vm_error, heap)
+    let vm_error = crate::native_to_vm_error(interp, err);
+    crate::error_ops::vm_err_to_value(interp, &vm_error)
 }
 
 fn native_error_rejection_value_preserving_throw(
@@ -1205,7 +1216,7 @@ fn native_error_rejection_value_preserving_throw(
     {
         return value;
     }
-    native_error_rejection_value(err, interp.gc_heap_mut())
+    native_error_rejection_value(interp, err)
 }
 
 fn reject_capability_error(
@@ -1231,12 +1242,12 @@ fn get_property_runtime(
     let property_key = crate::VmPropertyKey::String(key);
     match interp
         .ordinary_get_value(context, receiver, receiver, &property_key, 0)
-        .map_err(|err| promise_vm_error(name, err))?
+        .map_err(|err| promise_vm_error(interp, name, err))?
     {
         crate::VmGetOutcome::Value(value) => Ok(value),
         crate::VmGetOutcome::InvokeGetter { getter } => interp
             .run_callable_sync(context, &getter, receiver, SmallVec::new())
-            .map_err(|err| promise_vm_error(name, err)),
+            .map_err(|err| promise_vm_error(interp, name, err)),
     }
 }
 
@@ -1251,12 +1262,12 @@ fn get_symbol_property_runtime(
     let property_key = crate::VmPropertyKey::Symbol(sym);
     match interp
         .ordinary_get_value(context, receiver, receiver, &property_key, 0)
-        .map_err(|err| promise_vm_error(name, err))?
+        .map_err(|err| promise_vm_error(interp, name, err))?
     {
         crate::VmGetOutcome::Value(value) => Ok(value),
         crate::VmGetOutcome::InvokeGetter { getter } => interp
             .run_callable_sync(context, &getter, receiver, SmallVec::new())
-            .map_err(|err| promise_vm_error(name, err)),
+            .map_err(|err| promise_vm_error(interp, name, err)),
     }
 }
 
@@ -1312,12 +1323,12 @@ fn get_callable_property(
     let property_key = crate::VmPropertyKey::String(key);
     let value = match interp
         .ordinary_get_value(context, receiver, receiver, &property_key, 0)
-        .map_err(|err| promise_vm_error(name, err))?
+        .map_err(|err| promise_vm_error(interp, name, err))?
     {
         crate::VmGetOutcome::Value(value) => value,
         crate::VmGetOutcome::InvokeGetter { getter } => interp
             .run_callable_sync(context, &getter, receiver, SmallVec::new())
-            .map_err(|err| promise_vm_error(name, err))?,
+            .map_err(|err| promise_vm_error(interp, name, err))?,
     };
     if !interp.is_callable_runtime(&value) {
         return Err(NativeError::TypeError {
@@ -1345,7 +1356,7 @@ fn call_promise_resolve(
 ) -> Result<Value, NativeError> {
     interp
         .run_callable_sync(context, resolve_fn, *constructor, smallvec![value])
-        .map_err(|err| promise_vm_error("Promise.resolve", err))
+        .map_err(|err| promise_vm_error(interp, "Promise.resolve", err))
 }
 
 fn attach_then_value(
@@ -1363,7 +1374,7 @@ fn attach_then_value(
             promise,
             smallvec![on_fulfilled, on_rejected],
         )
-        .map_err(|err| promise_vm_error("Promise combinator", err))?;
+        .map_err(|err| promise_vm_error(interp, "Promise combinator", err))?;
     Ok(())
 }
 
@@ -1475,15 +1486,12 @@ fn static_try_generic(
         Ok(value) => {
             call_capability_resolve(interp, &cap, value)?;
         }
-        Err(crate::VmError::Uncaught { value }) => {
-            let reason = crate::error_ops::vm_err_to_value(
-                &crate::VmError::Uncaught { value },
-                interp.gc_heap_mut(),
-            );
+        Err(crate::VmError::Uncaught) => {
+            let reason = crate::error_ops::vm_err_to_value(interp, &crate::VmError::Uncaught);
             call_capability_reject(interp, &cap, reason)?;
         }
         Err(other) => {
-            let reason = crate::error_ops::vm_err_to_value(&other, interp.gc_heap_mut());
+            let reason = crate::error_ops::vm_err_to_value(interp, &other);
             call_capability_reject(interp, &cap, reason)?;
         }
     }
@@ -1535,7 +1543,10 @@ fn static_all_keyed_generic(
     }
     let all_keys = match interp.own_property_keys_value(&exec, &promises) {
         Ok(keys) => keys,
-        Err(err) => return reject_capability_error(interp, &cap, promise_vm_error(name, err)),
+        Err(err) => {
+            let native = promise_vm_error(interp, name, err);
+            return reject_capability_error(interp, &cap, native);
+        }
     };
 
     (|| -> Result<Value, NativeError> {
@@ -1579,7 +1590,8 @@ fn static_all_keyed_generic(
             ) {
                 Ok(desc) => desc,
                 Err(err) => {
-                    return reject_capability_error(interp, &cap, promise_vm_error(name, err));
+                    let native = promise_vm_error(interp, name, err);
+                    return reject_capability_error(interp, &cap, native);
                 }
             };
             if !desc.as_ref().is_some_and(|desc| desc.enumerable()) {
@@ -1709,12 +1721,12 @@ fn keyed_get(
 ) -> Result<Value, NativeError> {
     match interp
         .ordinary_get_value(context, receiver, receiver, key, 0)
-        .map_err(|err| promise_vm_error(name, err))?
+        .map_err(|err| promise_vm_error(interp, name, err))?
     {
         crate::VmGetOutcome::Value(value) => Ok(value),
         crate::VmGetOutcome::InvokeGetter { getter } => interp
             .run_callable_sync(context, &getter, receiver, SmallVec::new())
-            .map_err(|err| promise_vm_error(name, err)),
+            .map_err(|err| promise_vm_error(interp, name, err)),
     }
 }
 
@@ -1868,7 +1880,8 @@ fn static_all_generic(
     let (iterator, next_method) = match interp.get_iterator_sync(&exec, &iterable) {
         Ok(record) => record,
         Err(err) => {
-            return reject_capability_error(interp, &cap, promise_vm_error("Promise.all", err));
+            let native = promise_vm_error(interp, "Promise.all", err);
+            return reject_capability_error(interp, &cap, native);
         }
     };
     let anchor_base = interp.push_iteration_anchor(iterator) - 1;
@@ -1895,11 +1908,8 @@ fn static_all_generic(
                 Ok(Some(value)) => value,
                 Ok(None) => break,
                 Err(err) => {
-                    return reject_capability_error(
-                        interp,
-                        &cap,
-                        promise_vm_error("Promise.all", err),
-                    );
+                    let native = promise_vm_error(interp, "Promise.all", err);
+                    return reject_capability_error(interp, &cap, native);
                 }
             };
             let i = slots.reserve_slot(
@@ -2031,7 +2041,8 @@ fn static_race_generic(
     let (iterator, next_method) = match interp.get_iterator_sync(&exec, &iterable) {
         Ok(record) => record,
         Err(err) => {
-            return reject_capability_error(interp, &cap, promise_vm_error("Promise.race", err));
+            let native = promise_vm_error(interp, "Promise.race", err);
+            return reject_capability_error(interp, &cap, native);
         }
     };
     let anchor_base = interp.push_iteration_anchor(iterator) - 1;
@@ -2042,11 +2053,8 @@ fn static_race_generic(
                 Ok(Some(value)) => value,
                 Ok(None) => break,
                 Err(err) => {
-                    return reject_capability_error(
-                        interp,
-                        &cap,
-                        promise_vm_error("Promise.race", err),
-                    );
+                    let native = promise_vm_error(interp, "Promise.race", err);
+                    return reject_capability_error(interp, &cap, native);
                 }
             };
             let value_anchor_base = interp.push_iteration_anchor(next_value) - 1;
@@ -2094,11 +2102,8 @@ fn static_all_settled_generic(
     let (iterator, next_method) = match interp.get_iterator_sync(&exec, &iterable) {
         Ok(record) => record,
         Err(err) => {
-            return reject_capability_error(
-                interp,
-                &cap,
-                promise_vm_error("Promise.allSettled", err),
-            );
+            let native = promise_vm_error(interp, "Promise.allSettled", err);
+            return reject_capability_error(interp, &cap, native);
         }
     };
     let anchor_base = interp.push_iteration_anchor(iterator) - 1;
@@ -2126,11 +2131,8 @@ fn static_all_settled_generic(
                 Ok(Some(value)) => value,
                 Ok(None) => break,
                 Err(err) => {
-                    return reject_capability_error(
-                        interp,
-                        &cap,
-                        promise_vm_error("Promise.allSettled", err),
-                    );
+                    let native = promise_vm_error(interp, "Promise.allSettled", err);
+                    return reject_capability_error(interp, &cap, native);
                 }
             };
             let i = slots.reserve_slot(
@@ -2463,7 +2465,8 @@ fn static_any_generic(
     let (iterator, next_method) = match interp.get_iterator_sync(&exec, &iterable) {
         Ok(record) => record,
         Err(err) => {
-            return reject_capability_error(interp, &cap, promise_vm_error("Promise.any", err));
+            let native = promise_vm_error(interp, "Promise.any", err);
+            return reject_capability_error(interp, &cap, native);
         }
     };
     let anchor_base = interp.push_iteration_anchor(iterator) - 1;
@@ -2492,11 +2495,8 @@ fn static_any_generic(
                 Ok(Some(value)) => value,
                 Ok(None) => break,
                 Err(err) => {
-                    return reject_capability_error(
-                        interp,
-                        &cap,
-                        promise_vm_error("Promise.any", err),
-                    );
+                    let native = promise_vm_error(interp, "Promise.any", err);
+                    return reject_capability_error(interp, &cap, native);
                 }
             };
             let i = errors.reserve_slot(
@@ -3017,9 +3017,9 @@ fn make_resolve_thenable_job(
                     // §27.2.1.3.2 — an abrupt `then` call rejects the
                     // promise with the thrown value, preserving its
                     // identity (a user `throw obj` keeps `obj`).
-                    let reason = interp.take_pending_uncaught_throw().unwrap_or_else(|| {
-                        crate::error_ops::vm_err_to_value(&err, interp.gc_heap_mut())
-                    });
+                    let reason = interp
+                        .take_pending_uncaught_throw()
+                        .unwrap_or_else(|| crate::error_ops::vm_err_to_value(interp, &err));
                     let _ = interp.run_callable_sync(
                         &exec,
                         &on_reject,

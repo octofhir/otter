@@ -54,16 +54,8 @@ impl Interpreter {
         bigint_op: BigIntBinop,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
-        run_numeric_values(
-            &mut self.gc_heap,
-            frame,
-            dst,
-            lhs,
-            rhs,
-            op,
-            bigint_op,
-            self.current_byte_len,
-        )
+        let byte_len = self.current_byte_len;
+        run_numeric_values(self, frame, dst, lhs, rhs, op, bigint_op, byte_len)
     }
 
     pub(crate) fn run_add_regs(
@@ -311,7 +303,7 @@ fn binop_values(
 }
 
 fn run_numeric_values(
-    heap: &mut otter_gc::GcHeap,
+    interp: &mut Interpreter,
     frame: &mut Frame,
     dst: u16,
     lhs: Value,
@@ -320,15 +312,18 @@ fn run_numeric_values(
     bigint_op: BigIntBinop,
     byte_len: u32,
 ) -> Result<(), VmError> {
-    let lnum = abstract_ops::to_numeric_kind(&lhs, heap).ok_or(VmError::TypeMismatch)?;
-    let rnum = abstract_ops::to_numeric_kind(&rhs, heap).ok_or(VmError::TypeMismatch)?;
+    let lnum =
+        abstract_ops::to_numeric_kind(&lhs, interp.gc_heap()).ok_or(VmError::TypeMismatch)?;
+    let rnum =
+        abstract_ops::to_numeric_kind(&rhs, interp.gc_heap()).ok_or(VmError::TypeMismatch)?;
     let result = match (lnum, rnum) {
         (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
             Value::number(op(a, b))
         }
         (abstract_ops::NumericKind::Big(a), abstract_ops::NumericKind::Big(b)) => {
-            let folded = bigint_op(&a, &b).map_err(bigint_to_vm_error)?;
-            let handle = bigint::BigIntValue::from_inner(heap, folded).map_err(oom_to_vm)?;
+            let folded = bigint_op(&a, &b).map_err(|err| bigint_to_vm_error(interp, err))?;
+            let handle =
+                bigint::BigIntValue::from_inner(interp.gc_heap_mut(), folded).map_err(oom_to_vm)?;
             Value::big_int(handle)
         }
         _ => return Err(VmError::TypeMismatch),
@@ -412,7 +407,7 @@ pub(crate) fn bigint_xor_op(
     Ok(bigint::ops::bitwise_xor(a, b))
 }
 
-fn bigint_to_vm_error(err: bigint::ops::OpError) -> VmError {
+fn bigint_to_vm_error(interp: &Interpreter, err: bigint::ops::OpError) -> VmError {
     // §6.1.6.2.5 / .3 / .9 — BigInt division and remainder by zero,
     // a negative `**` exponent, and an unrepresentable shift all
     // raise RangeError, not TypeError.
@@ -421,7 +416,5 @@ fn bigint_to_vm_error(err: bigint::ops::OpError) -> VmError {
         bigint::ops::OpError::NegativeExponent => "Exponent must be non-negative",
         bigint::ops::OpError::ShiftOutOfRange => "Maximum BigInt size exceeded",
     };
-    VmError::RangeError {
-        message: (message.to_string()).into(),
-    }
+    interp.err_range((message.to_string()).into())
 }

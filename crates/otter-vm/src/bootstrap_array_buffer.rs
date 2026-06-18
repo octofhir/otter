@@ -37,18 +37,25 @@ fn coerce_length_integer(
             name,
             reason: "missing execution context for ToPrimitive".to_string(),
         })?;
-        interp
-            .evaluate_to_primitive(&exec, value, ToPrimitiveHint::Number)
-            .map_err(|e| match e {
-                VmError::Uncaught { value } => NativeError::Thrown {
+        match interp.evaluate_to_primitive(&exec, value, ToPrimitiveHint::Number) {
+            Ok(v) => v,
+            Err(VmError::Uncaught) => {
+                let value = match interp.take_error_detail() {
+                    Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                    _ => Default::default(),
+                };
+                return Err(NativeError::Thrown {
                     name,
                     message: value.into(),
-                },
-                other => NativeError::TypeError {
+                });
+            }
+            Err(other) => {
+                return Err(NativeError::TypeError {
                     name,
                     reason: other.to_string(),
-                },
-            })?
+                });
+            }
+        }
     };
     if primitive.is_symbol() {
         return Err(NativeError::TypeError {
@@ -173,10 +180,10 @@ fn sab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     let value = dispatch::shared_array_buffer_call_with_roots(
         SharedArrayBufferMethod::Construct,
         args,
-        ctx.heap_mut(),
+        ctx.interp_mut(),
         &mut external_visit,
     )
-    .map_err(|e| vm_to_native(e, "SharedArrayBuffer"))?;
+    .map_err(|e| vm_to_native(ctx.cx.interp, e, "SharedArrayBuffer"))?;
     if let Some(proto) = proto {
         ctx.interp_mut()
             .set_non_gc_exotic_prototype_override(&value, Some(proto));
@@ -256,7 +263,7 @@ fn observable_to_index_arg(
         .cx
         .interp
         .coerce_to_number(&exec_ctx, v)
-        .map_err(|e| crate::native_function::vm_to_native_error(e, name))?;
+        .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, name))?;
     Ok(Value::number(n))
 }
 
@@ -292,12 +299,12 @@ fn observable_max_byte_length_option(
                 &VmPropertyKey::String("maxByteLength"),
                 0,
             )
-            .map_err(|err| vm_to_native(err, name))?
+            .map_err(|err| vm_to_native(interp, err, name))?
         {
             VmGetOutcome::Value(value) => value,
             VmGetOutcome::InvokeGetter { getter } => interp
                 .run_callable_sync(&exec_ctx, &getter, options, smallvec::SmallVec::new())
-                .map_err(|err| vm_to_native(err, name))?,
+                .map_err(|err| vm_to_native(interp, err, name))?,
         }
     };
 
@@ -389,10 +396,10 @@ fn ab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
     let value = dispatch::array_buffer_call_with_roots(
         ArrayBufferMethod::Construct,
         args,
-        ctx.heap_mut(),
+        ctx.interp_mut(),
         &mut external_visit,
     )
-    .map_err(|e| vm_to_native(e, "ArrayBuffer"))?;
+    .map_err(|e| vm_to_native(ctx.cx.interp, e, "ArrayBuffer"))?;
     if let Some(proto) = proto {
         ctx.interp_mut()
             .set_non_gc_exotic_prototype_override(&value, Some(proto));
@@ -401,8 +408,8 @@ fn ab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
 }
 
 fn ab_is_view(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch::array_buffer_call(ArrayBufferMethod::IsView, args, _ctx.heap())
-        .map_err(|e| vm_to_native(e, "ArrayBuffer.isView"))
+    dispatch::array_buffer_call(ArrayBufferMethod::IsView, args, _ctx.interp_mut())
+        .map_err(|e| vm_to_native(_ctx.cx.interp, e, "ArrayBuffer.isView"))
 }
 
 // ---------------------------------------------------------------
@@ -435,7 +442,7 @@ fn ab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
         .cx
         .interp
         .integer_or_infinity_for_arg(&exec_ctx, args.first())
-        .map_err(|e| vm_to_native(e, NAME))?;
+        .map_err(|e| vm_to_native(ctx.cx.interp, e, NAME))?;
     let first = relative_clamp_f(start_f, len);
     let end_f = match args.get(1) {
         None => len as f64,
@@ -444,7 +451,7 @@ fn ab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
             .cx
             .interp
             .integer_or_infinity_for_arg(&exec_ctx, args.get(1))
-            .map_err(|e| vm_to_native(e, NAME))?,
+            .map_err(|e| vm_to_native(ctx.cx.interp, e, NAME))?,
     };
     let final_end = relative_clamp_f(end_f, len);
     let new_len = (final_end - first).max(0) as usize;
@@ -458,7 +465,7 @@ fn ab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
         .cx
         .interp
         .species_constructor_value(&exec_ctx, &this_value, &default_ctor)
-        .map_err(|e| vm_to_native(e, NAME))?;
+        .map_err(|e| vm_to_native(ctx.cx.interp, e, NAME))?;
     let mut argv: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
     argv.push(Value::number(crate::number::NumberValue::from_f64(
         new_len as f64,
@@ -467,7 +474,7 @@ fn ab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
         .cx
         .interp
         .run_construct_sync(&exec_ctx, &ctor, ctor, argv)
-        .map_err(|e| vm_to_native(e, NAME))?;
+        .map_err(|e| vm_to_native(ctx.cx.interp, e, NAME))?;
     // Steps 16-21 — result-shape checks.
     let Some(new_buf) = new_value.as_array_buffer() else {
         return Err(NativeError::TypeError {
@@ -552,7 +559,7 @@ fn sab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         .cx
         .interp
         .integer_or_infinity_for_arg(&exec_ctx, args.first())
-        .map_err(|e| vm_to_native(e, NAME))?;
+        .map_err(|e| vm_to_native(ctx.cx.interp, e, NAME))?;
     let first = relative_clamp_f(start_f, len);
     let end_f = match args.get(1) {
         None => len as f64,
@@ -561,7 +568,7 @@ fn sab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             .cx
             .interp
             .integer_or_infinity_for_arg(&exec_ctx, args.get(1))
-            .map_err(|e| vm_to_native(e, NAME))?,
+            .map_err(|e| vm_to_native(ctx.cx.interp, e, NAME))?,
     };
     let final_end = relative_clamp_f(end_f, len);
     let new_len = (final_end - first).max(0) as usize;
@@ -577,7 +584,7 @@ fn sab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         .cx
         .interp
         .species_constructor_value(&exec_ctx, &this_value, &default_ctor)
-        .map_err(|e| vm_to_native(e, NAME))?;
+        .map_err(|e| vm_to_native(ctx.cx.interp, e, NAME))?;
     let mut argv: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
     argv.push(Value::number(crate::number::NumberValue::from_f64(
         new_len as f64,
@@ -586,7 +593,7 @@ fn sab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         .cx
         .interp
         .run_construct_sync(&exec_ctx, &ctor, ctor, argv)
-        .map_err(|e| vm_to_native(e, NAME))?;
+        .map_err(|e| vm_to_native(ctx.cx.interp, e, NAME))?;
     // Steps 13-16 — result must be a SharedArrayBuffer, distinct from
     // the source, and at least `new_len` bytes long.
     let Some(new_buf) = new_value.as_array_buffer().filter(|b| b.is_shared()) else {
@@ -790,6 +797,6 @@ fn receiver_sab(
     }
 }
 
-fn vm_to_native(err: VmError, name: &'static str) -> NativeError {
-    crate::native_function::vm_to_native_error(err, name)
+fn vm_to_native(interp: &crate::Interpreter, err: VmError, name: &'static str) -> NativeError {
+    crate::native_function::vm_to_native_error(interp, err, name)
 }

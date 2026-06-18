@@ -120,18 +120,29 @@ fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
             name: "String",
             reason: "missing execution context".to_string(),
         })?;
-        interp
-            .evaluate_to_primitive(&exec, &raw, crate::abstract_ops::ToPrimitiveHint::String)
-            .map_err(|e| match e {
-                crate::VmError::Uncaught { value } => NativeError::Thrown {
+        match interp.evaluate_to_primitive(
+            &exec,
+            &raw,
+            crate::abstract_ops::ToPrimitiveHint::String,
+        ) {
+            Ok(p) => p,
+            Err(crate::VmError::Uncaught) => {
+                let value = match interp.take_error_detail() {
+                    Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                    _ => Default::default(),
+                };
+                return Err(NativeError::Thrown {
                     name: "String",
                     message: value.into(),
-                },
-                other => NativeError::TypeError {
+                });
+            }
+            Err(other) => {
+                return Err(NativeError::TypeError {
                     name: "String",
                     reason: other.to_string(),
-                },
-            })?
+                });
+            }
+        }
     };
     let value = crate::string::dispatch::call(
         otter_bytecode::method_id::StringMethod::Construct,

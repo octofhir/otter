@@ -140,24 +140,41 @@ fn date_proto_to_primitive(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
         name: NAME,
         reason: "missing execution context".to_string(),
     })?;
-    interp
-        .evaluate_ordinary_to_primitive(&exec, &receiver, try_first)
-        .map_err(|err| match err {
-            VmError::Uncaught { value } => NativeError::Thrown {
+    match interp.evaluate_ordinary_to_primitive(&exec, &receiver, try_first) {
+        Ok(v) => Ok(v),
+        Err(VmError::Uncaught) => {
+            let value = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                _ => Default::default(),
+            };
+            Err(NativeError::Thrown {
                 name: NAME,
                 message: value.into(),
-            },
-            VmError::TypeError { message } => NativeError::TypeError {
+            })
+        }
+        Err(VmError::TypeError) => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            Err(NativeError::TypeError {
                 name: NAME,
                 reason: message.into(),
-            },
-            VmError::RangeError { message } => NativeError::RangeError {
+            })
+        }
+        Err(VmError::RangeError) => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            Err(NativeError::RangeError {
                 name: NAME,
                 reason: message.into(),
-            },
-            other => NativeError::TypeError {
-                name: NAME,
-                reason: other.to_string(),
-            },
-        })
+            })
+        }
+        Err(other) => Err(NativeError::TypeError {
+            name: NAME,
+            reason: other.to_string(),
+        }),
+    }
 }

@@ -168,9 +168,7 @@ impl Interpreter {
                 }
                 Ok(Value::weak_set(s))
             }
-            _ => Err(VmError::UnknownIntrinsic {
-                name: format!("new {kind}"),
-            }),
+            _ => Err(self.err_unknown_intrinsic(format!("new {kind}").into())),
         }
     }
 }

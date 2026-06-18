@@ -772,20 +772,34 @@ fn accessor_flags(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
         reason: "missing execution context".to_string(),
     })?;
     let mut out = String::with_capacity(8);
-    let map_err = |e: crate::VmError| match e {
-        crate::VmError::Uncaught { value } => NativeError::Thrown {
-            name: "get RegExp.prototype.flags",
-            message: value.into(),
-        },
-        crate::VmError::TypeError { message } => NativeError::TypeError {
-            name: "get RegExp.prototype.flags",
-            reason: message.into(),
-        },
-        other => NativeError::TypeError {
-            name: "get RegExp.prototype.flags",
-            reason: other.to_string(),
-        },
-    };
+    fn map_err(interp: &crate::Interpreter, e: crate::VmError) -> NativeError {
+        match e {
+            crate::VmError::Uncaught => {
+                let value = match interp.take_error_detail() {
+                    Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                    _ => Default::default(),
+                };
+                NativeError::Thrown {
+                    name: "get RegExp.prototype.flags",
+                    message: value.into(),
+                }
+            }
+            crate::VmError::TypeError => {
+                let message = match interp.take_error_detail() {
+                    Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                    _ => Default::default(),
+                };
+                NativeError::TypeError {
+                    name: "get RegExp.prototype.flags",
+                    reason: message.into(),
+                }
+            }
+            other => NativeError::TypeError {
+                name: "get RegExp.prototype.flags",
+                reason: other.to_string(),
+            },
+        }
+    }
     for &(prop, letter) in &[
         ("hasIndices", 'd'),
         ("global", 'g'),
@@ -796,22 +810,24 @@ fn accessor_flags(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
         ("unicodeSets", 'v'),
         ("sticky", 'y'),
     ] {
-        let outcome = interp
-            .ordinary_get_value(
-                &exec,
-                receiver,
-                receiver,
-                &crate::VmPropertyKey::String(prop),
-                0,
-            )
-            .map_err(map_err)?;
+        let outcome = match interp.ordinary_get_value(
+            &exec,
+            receiver,
+            receiver,
+            &crate::VmPropertyKey::String(prop),
+            0,
+        ) {
+            Ok(v) => v,
+            Err(e) => return Err(map_err(interp, e)),
+        };
         let value = match outcome {
             crate::VmGetOutcome::Value(v) => v,
             crate::VmGetOutcome::InvokeGetter { getter } => {
                 let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                interp
-                    .run_callable_sync(&exec, &getter, receiver, args)
-                    .map_err(map_err)?
+                match interp.run_callable_sync(&exec, &getter, receiver, args) {
+                    Ok(v) => v,
+                    Err(e) => return Err(map_err(interp, e)),
+                }
             }
         };
         if value.to_boolean(interp.gc_heap()) {
@@ -914,7 +930,7 @@ fn coerce_to_string(
     // its `toString` / `valueOf` (a Symbol throws), not a debug render.
     let exec = ctx.execution_context().cloned().ok_or_else(|| oom(name))?;
     let s = crate::coerce::to_string_or_throw(ctx.interp_mut(), &exec, v)
-        .map_err(|e| crate::native_function::vm_to_native_error(e, name))?;
+        .map_err(|e| crate::native_function::vm_to_native_error(ctx.interp_mut(), e, name))?;
     JsString::from_str(&s, ctx.heap_mut()).map_err(|_| oom(name))
 }
 

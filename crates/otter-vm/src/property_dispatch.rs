@@ -56,7 +56,7 @@ impl Interpreter {
                 self.run_callable_sync(context, &setter, Value::array(arr), args)?;
             }
             _ => {
-                Self::failed_set_result(
+                self.failed_set_result(
                     strict,
                     format!("Cannot assign to accessor property '{key}' without a setter"),
                 )?;
@@ -419,20 +419,18 @@ impl Interpreter {
                 true
             }
         } else {
-            return Err(VmError::TypeError {
-                message: (format!(
+            return Err(self.err_type(
+                (format!(
                     "Cannot delete property '{name}' of {}",
                     value_kind_name(&receiver)
                 ))
                 .into(),
-            });
+            ));
         };
         // §13.5.1.2 step 5.c — when the result of `[[Delete]]` is
         // `false` in strict mode, throw a TypeError.
         if !removed && strict {
-            return Err(VmError::TypeError {
-                message: (format!("Cannot delete property '{name}'")).into(),
-            });
+            return Err(self.err_type((format!("Cannot delete property '{name}'")).into()));
         }
         write_register(frame, dst, Value::boolean(removed))?;
         frame.advance_pc(self.current_byte_len)?;
@@ -642,9 +640,7 @@ impl Interpreter {
             return Err(VmError::TypeMismatch);
         };
         if !removed && strict {
-            return Err(VmError::TypeError {
-                message: ("Cannot delete property".to_string()).into(),
-            });
+            return Err(self.err_type(("Cannot delete property".to_string()).into()));
         }
         write_register(frame, dst, Value::boolean(removed))?;
         frame.advance_pc(self.current_byte_len)?;
@@ -684,16 +680,13 @@ impl Interpreter {
         // key's `toString` must observe the pre-coercion super base).
         let actual_this = stack[top_idx].this_value;
         if actual_this.is_hole() {
-            return Err(VmError::ThisUninitialized {
-                message:( "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()).into(),
-            });
+            return Err(self.err_this_uninit(( "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()).into()));
         }
         let base = self.get_prototype_for_op(&home)?;
         if base.is_null() || base.is_undefined() {
-            return Err(VmError::TypeError {
-                message: ("cannot read property of null or undefined super reference".to_string())
-                    .into(),
-            });
+            return Err(self.err_type(
+                ("cannot read property of null or undefined super reference".to_string()).into(),
+            ));
         }
         let key = match key {
             SuperReadKey::Resolved(k) => k,
@@ -739,16 +732,13 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let actual_this = stack[top_idx].this_value;
         if actual_this.is_hole() {
-            return Err(VmError::ThisUninitialized {
-                message:( "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()).into(),
-            });
+            return Err(self.err_this_uninit(( "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()).into()));
         }
         let base = self.get_prototype_for_op(&home)?;
         if base.is_null() || base.is_undefined() {
-            return Err(VmError::TypeError {
-                message: ("cannot write property of null or undefined super reference".to_string())
-                    .into(),
-            });
+            return Err(self.err_type(
+                ("cannot write property of null or undefined super reference".to_string()).into(),
+            ));
         }
         let key = match key {
             SuperReadKey::Resolved(VmPropertyKey::String(s)) => s.to_string(),
@@ -788,7 +778,7 @@ impl Interpreter {
                 self.run_callable_sync(context, &setter, actual_this, args)?;
             }
             object::SetOutcome::Reject { .. } => {
-                Self::failed_set_result(
+                self.failed_set_result(
                     strict,
                     format!("Cannot assign to read-only property '{key}'"),
                 )?;
@@ -802,7 +792,7 @@ impl Interpreter {
                     actual_this,
                     1,
                 )? {
-                    Self::failed_set_result(strict, format!("Cannot assign to property '{key}'"))?;
+                    self.failed_set_result(strict, format!("Cannot assign to property '{key}'"))?;
                 }
             }
             object::SetOutcome::AssignData => {
@@ -831,7 +821,7 @@ impl Interpreter {
                         )?;
                     }
                     if !self.ordinary_set_data_property(this_obj, &key, value)? {
-                        Self::failed_set_result(
+                        self.failed_set_result(
                             strict,
                             format!("Cannot assign to read-only property '{key}'"),
                         )?;
@@ -842,7 +832,7 @@ impl Interpreter {
                     // statics object.
                     let statics = c.statics(&self.gc_heap);
                     if !self.ordinary_set_data_property(statics, &key, value)? {
-                        Self::failed_set_result(
+                        self.failed_set_result(
                             strict,
                             format!("Cannot assign to read-only property '{key}'"),
                         )?;
@@ -895,9 +885,7 @@ impl Interpreter {
         if receiver.is_object() {
             let ok = self.set_prototype_value_proxy_aware(context, &receiver, &proto)?;
             if !ok {
-                return Err(VmError::TypeError {
-                    message: ("Object.setPrototypeOf failed".to_string()).into(),
-                });
+                return Err(self.err_type(("Object.setPrototypeOf failed".to_string()).into()));
             }
         } else if receiver.is_function()
             || receiver.is_closure()
@@ -1412,7 +1400,7 @@ impl Interpreter {
         {
             self.ensure_deferred_namespace_ready(context, &receiver, true)?;
             if !self.ordinary_set_data_property(o, name, value)? {
-                Self::failed_set_result(
+                self.failed_set_result(
                     strict,
                     format!("Cannot assign to read-only property '{name}'"),
                 )?;
@@ -1424,7 +1412,7 @@ impl Interpreter {
             Some(o)
         } else if let Some(c) = receiver.as_class_constructor() {
             if self.class_store_hits_readonly_intrinsic(context, c, name)? {
-                Self::failed_set_result(
+                self.failed_set_result(
                     strict,
                     format!("Cannot assign to read-only property '{name}' of class"),
                 )?;
@@ -1464,7 +1452,7 @@ impl Interpreter {
                                 return Ok(());
                             }
                             object::SetOutcome::Reject { .. } => {
-                                Self::failed_set_result(
+                                self.failed_set_result(
                                     strict,
                                     format!("Cannot assign to read-only property '{name}'"),
                                 )?;
@@ -1479,7 +1467,7 @@ impl Interpreter {
                         }
                     }
                     if !r.is_extensible(&self.gc_heap) {
-                        Self::failed_set_result(
+                        self.failed_set_result(
                             strict,
                             format!("Cannot add property '{name}' to non-extensible RegExp"),
                         )?;
@@ -1492,7 +1480,7 @@ impl Interpreter {
                 } else {
                     let bag = regexp_ensure_expando(self, &r, &receiver)?;
                     if !self.ordinary_set_data_property(bag, name, value)? {
-                        Self::failed_set_result(
+                        self.failed_set_result(
                             strict,
                             format!("Cannot assign to property '{name}'"),
                         )?;
@@ -1518,7 +1506,7 @@ impl Interpreter {
                     descriptor,
                 )?;
                 if !ok {
-                    Self::failed_set_result(
+                    self.failed_set_result(
                         strict,
                         "Cannot assign to read only property 'length' of array".to_string(),
                     )?;
@@ -1541,7 +1529,7 @@ impl Interpreter {
                                 return Ok(());
                             }
                             object::SetOutcome::Reject { .. } => {
-                                Self::failed_set_result(
+                                self.failed_set_result(
                                     strict,
                                     format!("Cannot assign to property '{name}'"),
                                 )?;
@@ -1595,7 +1583,7 @@ impl Interpreter {
                     self.ordinary_function_own_property_descriptor(Some(context), owner, fid, name)?
                     && !desc.writable()
                 {
-                    Self::failed_set_result(
+                    self.failed_set_result(
                         strict,
                         format!("Cannot assign to read-only property '{name}' of function"),
                     )?;
@@ -1615,7 +1603,7 @@ impl Interpreter {
                     Some(bag)
                 }
             } else if !has_own && !self.ordinary_function_is_extensible(fid) {
-                Self::failed_set_result(
+                self.failed_set_result(
                     strict,
                     format!("Cannot add property '{name}' to non-extensible function"),
                 )?;
@@ -1632,7 +1620,7 @@ impl Interpreter {
         } else if let Some(native) = receiver.as_native_function() {
             match native.own_property_descriptor(&mut self.gc_heap, name)? {
                 Some(desc) if !desc.writable() => {
-                    Self::failed_set_result(
+                    self.failed_set_result(
                         strict,
                         format!(
                             "Cannot assign to read-only property '{name}' of function {}",
@@ -1646,7 +1634,7 @@ impl Interpreter {
                         function_metadata::ordinary_function_metadata_key(name).is_none();
                     let desc = object::PropertyDescriptor::data(value, true, enumerable, true);
                     if !native.define_own_property(&mut self.gc_heap, name, desc) {
-                        Self::failed_set_result(
+                        self.failed_set_result(
                             strict,
                             format!(
                                 "Cannot define property '{name}' on function {}",
@@ -1662,7 +1650,7 @@ impl Interpreter {
             match function_metadata::bound_own_property_descriptor(bound, &mut self.gc_heap, name)?
             {
                 Some(desc) if !desc.writable() => {
-                    Self::failed_set_result(
+                    self.failed_set_result(
                         strict,
                         format!("Cannot assign to read-only property '{name}' of bound function"),
                     )?;
@@ -1676,7 +1664,7 @@ impl Interpreter {
                         name,
                         desc,
                     ) {
-                        Self::failed_set_result(
+                        self.failed_set_result(
                             strict,
                             format!("Cannot define property '{name}' on bound function"),
                         )?;
@@ -1712,7 +1700,7 @@ impl Interpreter {
             // rejects the write), receiver-phase define otherwise.
             let vm_key = VmPropertyKey::OwnedString(name.to_string());
             if !self.ordinary_set_data_value(context, receiver, &vm_key, value, receiver, 0)? {
-                Self::failed_set_result(
+                self.failed_set_result(
                     strict,
                     format!("Cannot assign to read-only property '{name}'"),
                 )?;
@@ -1725,27 +1713,27 @@ impl Interpreter {
             // the write.
             let vm_key = VmPropertyKey::OwnedString(name.to_string());
             if !self.ordinary_set_data_value(context, receiver, &vm_key, value, receiver, 0)? {
-                Self::failed_set_result(
+                self.failed_set_result(
                     strict,
                     format!("Cannot assign to read-only property '{name}'"),
                 )?;
             }
             None
         } else if receiver.is_undefined() || receiver.is_null() || receiver.is_hole() {
-            return Err(VmError::TypeError {
-                message: (format!(
+            return Err(self.err_type(
+                (format!(
                     "Cannot set property '{name}' on {}",
                     value_kind_name(&receiver)
                 ))
                 .into(),
-            });
+            ));
         } else if receiver.is_boolean()
             || receiver.is_number()
             || receiver.is_string()
             || receiver.is_symbol()
             || receiver.is_big_int()
         {
-            Self::failed_set_result(
+            self.failed_set_result(
                 strict,
                 format!(
                     "Cannot set property '{name}' on {}",
@@ -1760,7 +1748,7 @@ impl Interpreter {
             // FinalizationRegistry, ArrayBuffer,
             // SharedArrayBuffer, DataView, Iterator, Generator,
             // Proxy already handled higher up).
-            Self::failed_set_result(
+            self.failed_set_result(
                 strict,
                 format!(
                     "Cannot set property '{name}' on {}",
@@ -1787,9 +1775,9 @@ impl Interpreter {
         let recv = *read_register(frame, recv_reg)?;
         let idx_value_raw = *read_register(frame, idx_reg)?;
         if recv.is_nullish() {
-            return Err(VmError::TypeError {
-                message: ("Cannot read property of null or undefined".to_string()).into(),
-            });
+            return Err(
+                self.err_type(("Cannot read property of null or undefined".to_string()).into())
+            );
         }
         let idx_value = self.coerce_property_key_value(context, idx_value_raw)?;
         write_register(frame, idx_reg, idx_value)?;
@@ -2276,9 +2264,9 @@ impl Interpreter {
         strict: bool,
     ) -> Result<(), VmError> {
         if strict && !crate::array::can_write_array_property(arr, &self.gc_heap, key) {
-            return Err(VmError::TypeError {
-                message: (format!("Cannot assign to read only property '{key}' of array")).into(),
-            });
+            return Err(self.err_type(
+                (format!("Cannot assign to read only property '{key}' of array")).into(),
+            ));
         }
         Ok(())
     }
@@ -2320,7 +2308,7 @@ impl Interpreter {
                 let handled =
                     self.ordinary_set_data_value(context, proto, &vm_key, value, receiver, 0)?;
                 if !handled {
-                    Self::failed_set_result(strict, "Cannot assign to property")?;
+                    self.failed_set_result(strict, "Cannot assign to property")?;
                 }
                 return Ok(true);
             }
@@ -2340,7 +2328,7 @@ impl Interpreter {
                 Ok(true)
             }
             object::SetOutcome::Reject { .. } => {
-                Self::failed_set_result(strict, format!("Cannot assign to property '{key}'"))?;
+                self.failed_set_result(strict, format!("Cannot assign to property '{key}'"))?;
                 Ok(true)
             }
             object::SetOutcome::ExoticParent { parent } => {
@@ -2349,7 +2337,7 @@ impl Interpreter {
                 let handled =
                     self.ordinary_set_data_value(context, parent, &vm_key, value, receiver, 1)?;
                 if !handled {
-                    Self::failed_set_result(strict, "Cannot assign to property")?;
+                    self.failed_set_result(strict, "Cannot assign to property")?;
                 }
                 Ok(true)
             }
@@ -2380,23 +2368,21 @@ impl Interpreter {
                     && object::get_own_symbol_descriptor(obj, &self.gc_heap, sym).is_none()
                     && !object::is_extensible(obj, &self.gc_heap)
                 {
-                    return Err(VmError::TypeError {
-                        message: ("Cannot define private member on a non-extensible object"
-                            .to_string())
-                        .into(),
-                    });
+                    return Err(self.err_type(
+                        ("Cannot define private member on a non-extensible object".to_string())
+                            .into(),
+                    ));
                 }
                 if object::deferred_namespace_target(obj, &self.gc_heap).is_some() {
                     self.ensure_deferred_namespace_ready(context, &recv, false)?;
                     if !object::deferred_namespace_is_populated(obj, &self.gc_heap)
                         && object::get_own_symbol_descriptor(obj, &self.gc_heap, sym).is_none()
                     {
-                        return Err(VmError::TypeError {
-                            message:
-                                ("Cannot add symbol property to non-extensible module namespace"
-                                    .to_string())
-                                .into(),
-                        });
+                        return Err(self.err_type(
+                            ("Cannot add symbol property to non-extensible module namespace"
+                                .to_string())
+                            .into(),
+                        ));
                     } else {
                         self.ordinary_set_symbol_with_callable_setter(
                             context, obj, sym, value, strict,
@@ -2443,14 +2429,14 @@ impl Interpreter {
                     &key,
                 )? {
                     Some(desc) if !desc.writable() => {
-                        Self::failed_set_result(
+                        self.failed_set_result(
                             strict,
                             format!("Cannot assign to read-only property '{key}' of function"),
                         )?;
                     }
                     _ => {
                         if !has_own && !self.ordinary_function_is_extensible(fid) {
-                            Self::failed_set_result(
+                            self.failed_set_result(
                                 strict,
                                 format!("Cannot add property '{key}' to non-extensible function"),
                             )?;
@@ -2475,7 +2461,7 @@ impl Interpreter {
                     .ordinary_function_has_own_symbol_property_for_extensibility(owner, fid, sym)
                     && !self.ordinary_function_is_extensible(fid)
                 {
-                    Self::failed_set_result(
+                    self.failed_set_result(
                         strict,
                         "Cannot add symbol property to non-extensible function",
                     )?;
@@ -2489,9 +2475,9 @@ impl Interpreter {
                     &[&recv, &idx_value, &value],
                 )?;
                 if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
-                    return Err(VmError::TypeError {
-                        message: ("Cannot store symbol property on function".to_string()).into(),
-                    });
+                    return Err(self.err_type(
+                        ("Cannot store symbol property on function".to_string()).into(),
+                    ));
                 }
             } else {
                 return Err(VmError::TypeMismatch);
@@ -2501,7 +2487,7 @@ impl Interpreter {
                 let key = key.to_lossy_string(&self.gc_heap);
                 match native.own_property_descriptor(&mut self.gc_heap, &key)? {
                     Some(desc) if !desc.writable() => {
-                        Self::failed_set_result(
+                        self.failed_set_result(
                             strict,
                             format!(
                                 "Cannot assign to read-only property '{key}' of function {}",
@@ -2513,7 +2499,7 @@ impl Interpreter {
                         let desc =
                             crate::object::PropertyDescriptor::data(value, true, false, true);
                         if !native.define_own_property(&mut self.gc_heap, &key, desc) {
-                            Self::failed_set_result(
+                            self.failed_set_result(
                                 strict,
                                 format!(
                                     "Cannot define property '{key}' on function {}",
@@ -2545,7 +2531,7 @@ impl Interpreter {
                     &key,
                 )? {
                     Some(desc) if !desc.writable() => {
-                        Self::failed_set_result(
+                        self.failed_set_result(
                             strict,
                             format!(
                                 "Cannot assign to read-only property '{key}' of bound function"
@@ -2561,7 +2547,7 @@ impl Interpreter {
                             &key,
                             desc,
                         ) {
-                            Self::failed_set_result(
+                            self.failed_set_result(
                                 strict,
                                 format!("Cannot define property '{key}' on bound function"),
                             )?;
@@ -2625,7 +2611,7 @@ impl Interpreter {
                                     return Ok(());
                                 }
                                 object::SetOutcome::Reject { .. } => {
-                                    Self::failed_set_result(
+                                    self.failed_set_result(
                                         strict,
                                         format!("Cannot assign to property '{name}'"),
                                     )?;
@@ -2717,9 +2703,9 @@ impl Interpreter {
             } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let bag = typed_array_ensure_expando(self, &t)?;
                 if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
-                    return Err(VmError::TypeError {
-                        message: ("Cannot store symbol property on TypedArray".to_string()).into(),
-                    });
+                    return Err(self.err_type(
+                        ("Cannot store symbol property on TypedArray".to_string()).into(),
+                    ));
                 }
             } else {
                 return Err(VmError::TypeMismatch);
@@ -2731,7 +2717,7 @@ impl Interpreter {
                     object::get_own_symbol_descriptor(bag, &self.gc_heap, sym).is_none()
                 });
                 if absent && !r.is_extensible(&self.gc_heap) {
-                    Self::failed_set_result(
+                    self.failed_set_result(
                         strict,
                         "Cannot add symbol property to non-extensible RegExp",
                     )?;
@@ -2740,9 +2726,8 @@ impl Interpreter {
                 }
                 let bag = regexp_ensure_expando(self, &r, &recv)?;
                 if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
-                    return Err(VmError::TypeError {
-                        message: ("Cannot store symbol property on RegExp".to_string()).into(),
-                    });
+                    return Err(self
+                        .err_type(("Cannot store symbol property on RegExp".to_string()).into()));
                 }
             } else {
                 return Err(VmError::TypeMismatch);
@@ -2751,9 +2736,8 @@ impl Interpreter {
             if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let bag = promise_ensure_expando_pub(&mut self.gc_heap, &p)?;
                 if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
-                    return Err(VmError::TypeError {
-                        message: ("Cannot store symbol property on Promise".to_string()).into(),
-                    });
+                    return Err(self
+                        .err_type(("Cannot store symbol property on Promise".to_string()).into()));
                 }
             } else {
                 return Err(VmError::TypeMismatch);
@@ -2764,9 +2748,9 @@ impl Interpreter {
             let bag = data_view_ensure_expando_pub(&mut self.gc_heap, &dv)?;
             if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
-                    return Err(VmError::TypeError {
-                        message: ("Cannot store symbol property on DataView".to_string()).into(),
-                    });
+                    return Err(self.err_type(
+                        ("Cannot store symbol property on DataView".to_string()).into(),
+                    ));
                 }
             } else if let Some(s) = idx_value.as_string(&self.gc_heap) {
                 let name = s.to_lossy_string(&self.gc_heap);
@@ -2778,10 +2762,9 @@ impl Interpreter {
             if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let statics = c.statics(&self.gc_heap);
                 if !crate::object::set_symbol(statics, &mut self.gc_heap, sym, value) {
-                    return Err(VmError::TypeError {
-                        message: ("Cannot store symbol property on class constructor".to_string())
-                            .into(),
-                    });
+                    return Err(self.err_type(
+                        ("Cannot store symbol property on class constructor".to_string()).into(),
+                    ));
                 }
             } else {
                 return Err(VmError::TypeMismatch);
@@ -2799,19 +2782,18 @@ impl Interpreter {
                 return Err(VmError::TypeMismatch);
             };
             if !self.ordinary_set_data_value(context, recv, &vm_key, value, recv, 0)? {
-                Self::failed_set_result(strict, "Cannot assign to read-only property")?;
+                self.failed_set_result(strict, "Cannot assign to read-only property")?;
             }
         } else if recv.is_undefined() || recv.is_null() || recv.is_hole() {
-            return Err(VmError::TypeError {
-                message: (format!("Cannot set property on {}", value_kind_name(&recv))).into(),
-            });
+            return Err(self
+                .err_type((format!("Cannot set property on {}", value_kind_name(&recv))).into()));
         } else if recv.is_boolean()
             || recv.is_number()
             || recv.is_string()
             || recv.is_symbol()
             || recv.is_big_int()
         {
-            Self::failed_set_result(
+            self.failed_set_result(
                 strict,
                 format!("Cannot set property on {}", value_kind_name(&recv)),
             )?;
@@ -2839,18 +2821,18 @@ impl Interpreter {
                 if self.ordinary_set_data_property(obj, key, value)? {
                     Ok(())
                 } else {
-                    Self::failed_set_result(
+                    self.failed_set_result(
                         strict,
                         format!("Cannot assign to read-only property '{key}'"),
                     )
                 }
             }
-            object::SetOutcome::InvokeSetter { .. } => Self::failed_set_result(
+            object::SetOutcome::InvokeSetter { .. } => self.failed_set_result(
                 strict,
                 format!("Cannot assign to accessor property '{key}' without a setter"),
             ),
             object::SetOutcome::Reject { .. } => {
-                Self::failed_set_result(strict, format!("Cannot assign to property '{key}'"))
+                self.failed_set_result(strict, format!("Cannot assign to property '{key}'"))
             }
             // §10.1.9.2 step 2 — the walk hit an exotic prototype
             // (e.g. a TypedArray): continue through parent.[[Set]]
@@ -2864,7 +2846,7 @@ impl Interpreter {
                     receiver,
                     1,
                 )? {
-                    Self::failed_set_result(strict, format!("Cannot assign to property '{key}'"))?;
+                    self.failed_set_result(strict, format!("Cannot assign to property '{key}'"))?;
                 }
                 Ok(())
             }
@@ -2892,7 +2874,7 @@ impl Interpreter {
                 if self.ordinary_set_data_property(obj, key, value)? {
                     Ok(())
                 } else {
-                    Self::failed_set_result(
+                    self.failed_set_result(
                         strict,
                         format!("Cannot assign to read-only property '{key}'"),
                     )
@@ -2905,7 +2887,7 @@ impl Interpreter {
                 Ok(())
             }
             object::SetOutcome::Reject { .. } => {
-                Self::failed_set_result(strict, format!("Cannot assign to property '{key}'"))
+                self.failed_set_result(strict, format!("Cannot assign to property '{key}'"))
             }
             object::SetOutcome::ExoticParent { parent } => {
                 if !self.ordinary_set_data_value(
@@ -2916,7 +2898,7 @@ impl Interpreter {
                     Value::object(obj),
                     1,
                 )? {
-                    Self::failed_set_result(strict, format!("Cannot assign to property '{key}'"))?;
+                    self.failed_set_result(strict, format!("Cannot assign to property '{key}'"))?;
                 }
                 Ok(())
             }
@@ -2937,7 +2919,7 @@ impl Interpreter {
         match crate::object::resolve_symbol_set(obj, &self.gc_heap, sym) {
             object::SetOutcome::AssignData => {
                 if !crate::object::set_symbol(obj, &mut self.gc_heap, sym, value) {
-                    Self::failed_set_result(strict, "Cannot assign to symbol property")?;
+                    self.failed_set_result(strict, "Cannot assign to symbol property")?;
                 }
                 Ok(())
             }
@@ -2948,7 +2930,7 @@ impl Interpreter {
                 Ok(())
             }
             object::SetOutcome::Reject { .. } => {
-                Self::failed_set_result(strict, "Cannot assign to symbol property")
+                self.failed_set_result(strict, "Cannot assign to symbol property")
             }
             object::SetOutcome::ExoticParent { parent } => {
                 if !self.ordinary_set_data_value(
@@ -2959,7 +2941,7 @@ impl Interpreter {
                     Value::object(obj),
                     1,
                 )? {
-                    Self::failed_set_result(strict, "Cannot assign to symbol property")?;
+                    self.failed_set_result(strict, "Cannot assign to symbol property")?;
                 }
                 Ok(())
             }
@@ -3190,9 +3172,9 @@ impl Interpreter {
                 ..Default::default()
             };
             if !self.define_own_property_value(context, &target, &key, descriptor)? {
-                return Err(VmError::TypeError {
-                    message: ("Cannot define property on object literal".to_string()).into(),
-                });
+                return Err(
+                    self.err_type(("Cannot define property on object literal".to_string()).into())
+                );
             }
         }
         Ok(())
@@ -3960,9 +3942,9 @@ impl Interpreter {
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
         let key_value_raw = *read_register(&stack[top_idx], key_reg)?;
         if receiver.is_nullish() {
-            return Err(VmError::TypeError {
-                message: ("Cannot read property of null or undefined".to_string()).into(),
-            });
+            return Err(
+                self.err_type(("Cannot read property of null or undefined".to_string()).into())
+            );
         }
         let key_value = self.coerce_property_key_value(context, key_value_raw)?;
         write_register(&mut stack[top_idx], key_reg, key_value)?;
@@ -4164,26 +4146,23 @@ impl Interpreter {
     }
 
     fn finish_failed_set(
+        &self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
         message: impl Into<Box<str>>,
         byte_len: u32,
     ) -> Result<bool, VmError> {
         if Self::current_frame_is_strict(stack, context) {
-            return Err(VmError::TypeError {
-                message: message.into(),
-            });
+            return Err(self.err_type(message.into()));
         }
         let top_idx = stack.len() - 1;
         stack[top_idx].advance_pc(byte_len)?;
         Ok(true)
     }
 
-    fn failed_set_result(strict: bool, message: impl Into<Box<str>>) -> Result<(), VmError> {
+    fn failed_set_result(&self, strict: bool, message: impl Into<Box<str>>) -> Result<(), VmError> {
         if strict {
-            Err(VmError::TypeError {
-                message: message.into(),
-            })
+            Err(self.err_type(message.into()))
         } else {
             Ok(())
         }
@@ -4242,13 +4221,13 @@ impl Interpreter {
                         object::PropertyLookup::Data { flags, .. } => {
                             if !flags.writable() {
                                 let name = key.string_name().unwrap_or("symbol");
-                                Self::failed_set_result(
+                                self.failed_set_result(
                                     strict,
                                     format!("Cannot assign to read-only property '{name}'"),
                                 )?;
                             } else {
                                 let name = key.string_name().unwrap_or("symbol");
-                                Self::failed_set_result(
+                                self.failed_set_result(
                                     strict,
                                     format!("Cannot assign to property '{name}' on primitive"),
                                 )?;
@@ -4259,7 +4238,7 @@ impl Interpreter {
                         }
                         object::PropertyLookup::Accessor { setter, .. } => {
                             let Some(setter) = setter else {
-                                Self::failed_set_result(
+                                self.failed_set_result(
                                     strict,
                                     "Cannot assign to accessor property without a setter",
                                 )?;
@@ -4315,7 +4294,7 @@ impl Interpreter {
                                             )?;
                                         }
                                         object::SetOutcome::Reject { .. } => {
-                                            Self::failed_set_result(
+                                            self.failed_set_result(
                                                 strict,
                                                 "Cannot assign to symbol property",
                                             )?;
@@ -4329,7 +4308,7 @@ impl Interpreter {
                                                 receiver,
                                                 1,
                                             )? {
-                                                Self::failed_set_result(
+                                                self.failed_set_result(
                                                     strict,
                                                     "Cannot assign to symbol property",
                                                 )?;
@@ -4356,7 +4335,7 @@ impl Interpreter {
                                             )?;
                                         }
                                         object::SetOutcome::Reject { .. } => {
-                                            Self::failed_set_result(
+                                            self.failed_set_result(
                                                 strict,
                                                 format!("Cannot assign to property '{key}'"),
                                             )?;
@@ -4370,7 +4349,7 @@ impl Interpreter {
                                                 receiver,
                                                 1,
                                             )? {
-                                                Self::failed_set_result(
+                                                self.failed_set_result(
                                                     strict,
                                                     format!("Cannot assign to property '{key}'"),
                                                 )?;
@@ -4390,7 +4369,7 @@ impl Interpreter {
 
         let top_idx = stack.len() - 1;
         let name = key.string_name().unwrap_or("symbol");
-        Self::failed_set_result(
+        self.failed_set_result(
             strict,
             format!("Cannot assign to property '{name}' on primitive"),
         )?;
@@ -4509,18 +4488,14 @@ impl Interpreter {
                                             &self.gc_heap,
                                         ) =>
                                 {
-                                    return Err(VmError::TypeError {
-                                        message:(
+                                    return Err(self.err_type((
                                             "Proxy set trap reported success but target is non-configurable non-writable with a different value"
-                                                .to_string()).into(),
-                                    });
+                                                .to_string()).into()));
                                 }
                                 object::DescriptorKind::Accessor { setter: None, .. } => {
-                                    return Err(VmError::TypeError {
-                                        message:(
+                                    return Err(self.err_type((
                                             "Proxy set trap reported success but target is a non-configurable accessor without a setter"
-                                                .to_string()).into(),
-                                    });
+                                                .to_string()).into()));
                                 }
                                 _ => {}
                             }
@@ -4546,7 +4521,7 @@ impl Interpreter {
                         Value::proxy(proxy),
                         0,
                     )? {
-                        Self::failed_set_result(strict, "Cannot assign to property")?;
+                        self.failed_set_result(strict, "Cannot assign to property")?;
                     }
                 }
             }
@@ -4648,7 +4623,7 @@ impl Interpreter {
             match object::resolve_symbol_set(obj, &self.gc_heap, *sym) {
                 object::SetOutcome::AssignData => {
                     if !object::set_symbol(obj, &mut self.gc_heap, *sym, value) {
-                        return Self::finish_failed_set(
+                        return self.finish_failed_set(
                             stack,
                             context,
                             "Cannot assign to symbol property",
@@ -4658,7 +4633,7 @@ impl Interpreter {
                 }
                 object::SetOutcome::InvokeSetter { setter } => {
                     if !abstract_ops::is_callable(&setter) {
-                        return Self::finish_failed_set(
+                        return self.finish_failed_set(
                             stack,
                             context,
                             "Cannot assign to accessor property without a setter",
@@ -4672,7 +4647,7 @@ impl Interpreter {
                     return Ok(true);
                 }
                 object::SetOutcome::Reject { .. } => {
-                    return Self::finish_failed_set(
+                    return self.finish_failed_set(
                         stack,
                         context,
                         "Cannot assign to symbol property",
@@ -4722,7 +4697,7 @@ impl Interpreter {
                             match object::resolve_set(proto_obj, &self.gc_heap, key) {
                                 object::SetOutcome::InvokeSetter { setter } => {
                                     if !abstract_ops::is_callable(&setter) {
-                                        return Self::finish_failed_set(
+                                        return self.finish_failed_set(
                                             stack,
                                             context,
                                             "Cannot assign to accessor property without a setter",
@@ -4743,7 +4718,7 @@ impl Interpreter {
                                     return Ok(true);
                                 }
                                 object::SetOutcome::Reject { .. } => {
-                                    return Self::finish_failed_set(
+                                    return self.finish_failed_set(
                                         stack,
                                         context,
                                         format!("Cannot assign to read-only property '{key}'"),
@@ -4756,7 +4731,7 @@ impl Interpreter {
                             }
                         }
                         if !r.is_extensible(&self.gc_heap) {
-                            return Self::finish_failed_set(
+                            return self.finish_failed_set(
                                 stack,
                                 context,
                                 format!("Cannot add property '{key}' to non-extensible RegExp"),
@@ -4766,7 +4741,7 @@ impl Interpreter {
                     }
                     let bag = regexp_ensure_expando(self, r, &receiver)?;
                     if !self.ordinary_set_data_property(bag, key, value)? {
-                        return Self::finish_failed_set(
+                        return self.finish_failed_set(
                             stack,
                             context,
                             format!("Cannot assign to property '{key}'"),
@@ -4779,7 +4754,7 @@ impl Interpreter {
                         object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym).is_none()
                     });
                     if absent && !r.is_extensible(&self.gc_heap) {
-                        return Self::finish_failed_set(
+                        return self.finish_failed_set(
                             stack,
                             context,
                             "Cannot add symbol property to non-extensible RegExp",
@@ -4788,7 +4763,7 @@ impl Interpreter {
                     }
                     let bag = regexp_ensure_expando(self, r, &receiver)?;
                     if !object::set_symbol(bag, &mut self.gc_heap, *sym, value) {
-                        return Self::finish_failed_set(
+                        return self.finish_failed_set(
                             stack,
                             context,
                             "Cannot assign to symbol property",
@@ -4806,7 +4781,7 @@ impl Interpreter {
             if let ComputedPropertyKey::String(name) = &key
                 && self.class_store_hits_readonly_intrinsic(context, class, name)?
             {
-                return Self::finish_failed_set(
+                return self.finish_failed_set(
                     stack,
                     context,
                     format!("Cannot assign to read-only property '{name}' of class"),
@@ -4831,7 +4806,7 @@ impl Interpreter {
                         )?
                         && !desc.writable()
                     {
-                        return Self::finish_failed_set(
+                        return self.finish_failed_set(
                             stack,
                             context,
                             format!("Cannot assign to read-only property '{key}' of function"),
@@ -4843,7 +4818,7 @@ impl Interpreter {
                             context, owner, fid, key,
                         )?;
                     if !has_own && !self.ordinary_function_is_extensible(fid) {
-                        return Self::finish_failed_set(
+                        return self.finish_failed_set(
                             stack,
                             context,
                             format!("Cannot add property '{key}' to non-extensible function"),
@@ -4856,7 +4831,7 @@ impl Interpreter {
                         owner, fid, *sym,
                     ) && !self.ordinary_function_is_extensible(fid)
                     {
-                        return Self::finish_failed_set(
+                        return self.finish_failed_set(
                             stack,
                             context,
                             "Cannot add symbol property to non-extensible function",
@@ -4885,7 +4860,7 @@ impl Interpreter {
                     ComputedPropertyKey::Symbol(sym) => VmPropertyKey::Symbol(*sym),
                 };
                 if !self.ordinary_set_data_value(context, parent, &pkey, value, receiver, 1)? {
-                    return Self::finish_failed_set(
+                    return self.finish_failed_set(
                         stack,
                         context,
                         "Cannot assign to read-only property",
@@ -4905,7 +4880,7 @@ impl Interpreter {
                     }
                 };
                 if !ok {
-                    return Self::finish_failed_set(
+                    return self.finish_failed_set(
                         stack,
                         context,
                         "Cannot assign to read-only property",
@@ -4917,7 +4892,7 @@ impl Interpreter {
             }
             object::SetOutcome::InvokeSetter { setter } => {
                 if !abstract_ops::is_callable(&setter) {
-                    return Self::finish_failed_set(
+                    return self.finish_failed_set(
                         stack,
                         context,
                         "Cannot assign to accessor property without a setter",
@@ -4930,7 +4905,7 @@ impl Interpreter {
                 self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
                 Ok(true)
             }
-            object::SetOutcome::Reject { .. } => Self::finish_failed_set(
+            object::SetOutcome::Reject { .. } => self.finish_failed_set(
                 stack,
                 context,
                 "Cannot assign to property",
@@ -5013,10 +4988,9 @@ impl Interpreter {
         // when present; otherwise delegate to the target.
         if let Some(proxy) = receiver.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
-                return Err(VmError::TypeError {
-                    message: ("Cannot perform 'set' on a proxy that has been revoked".to_string())
-                        .into(),
-                });
+                return Err(self.err_type(
+                    ("Cannot perform 'set' on a proxy that has been revoked".to_string()).into(),
+                ));
             }
             let key_str = JsString::from_str(name, self.gc_heap_mut())?;
             let key_vm = VmPropertyKey::atom(atomized_key);
@@ -5031,7 +5005,7 @@ impl Interpreter {
                 Some(result) => {
                     let ok = result.to_boolean(&self.gc_heap);
                     if !ok {
-                        Self::failed_set_result(
+                        self.failed_set_result(
                             strict,
                             format!("Cannot assign to property '{name}'"),
                         )?;
@@ -5061,18 +5035,14 @@ impl Interpreter {
                                         &self.gc_heap,
                                     ) =>
                             {
-                                return Err(VmError::TypeError {
-                                        message:(
+                                return Err(self.err_type((
                                             "Proxy set trap reported success but target is non-configurable non-writable with a different value"
-                                                .to_string()).into(),
-                                    });
+                                                .to_string()).into()));
                             }
                             object::DescriptorKind::Accessor { setter: None, .. } => {
-                                return Err(VmError::TypeError {
-                                    message:(
+                                return Err(self.err_type((
                                         "Proxy set trap reported success but target is a non-configurable accessor without a setter"
-                                            .to_string()).into(),
-                                });
+                                            .to_string()).into()));
                             }
                             _ => {}
                         }
@@ -5097,7 +5067,7 @@ impl Interpreter {
                         Value::proxy(proxy),
                         0,
                     )? {
-                        Self::failed_set_result(
+                        self.failed_set_result(
                             strict,
                             format!("Cannot assign to property '{name}'"),
                         )?;
@@ -5229,7 +5199,7 @@ impl Interpreter {
             o
         } else if let Some(c) = receiver.as_class_constructor() {
             if self.class_store_hits_readonly_intrinsic(context, c, name)? {
-                return Self::finish_failed_set(
+                return self.finish_failed_set(
                     stack,
                     context,
                     format!("Cannot assign to read-only property '{name}' of class"),
@@ -5248,7 +5218,7 @@ impl Interpreter {
                     self.ordinary_function_own_property_descriptor(Some(context), owner, fid, name)?
                 && !desc.writable()
             {
-                return Self::finish_failed_set(
+                return self.finish_failed_set(
                     stack,
                     context,
                     format!("Cannot assign to read-only property '{name}' of function"),
@@ -5281,7 +5251,7 @@ impl Interpreter {
                     receiver,
                     1,
                 )? {
-                    return Self::finish_failed_set(
+                    return self.finish_failed_set(
                         stack,
                         context,
                         format!("Cannot assign to property '{name}'"),
@@ -5305,7 +5275,7 @@ impl Interpreter {
                     None
                 };
                 if transition.is_none() && !self.ordinary_set_data_property(obj, name, value)? {
-                    return Self::finish_failed_set(
+                    return self.finish_failed_set(
                         stack,
                         context,
                         format!("Cannot assign to property '{name}'"),
@@ -5347,7 +5317,7 @@ impl Interpreter {
                 if !abstract_ops::is_callable(&setter) {
                     // Spec §10.1.9 step 5.b — accessor with non-
                     // callable setter rejects.
-                    return Self::finish_failed_set(
+                    return self.finish_failed_set(
                         stack,
                         context,
                         format!("Cannot assign to accessor property '{name}' without a setter"),
@@ -5360,7 +5330,7 @@ impl Interpreter {
                 self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
                 Ok(true)
             }
-            object::SetOutcome::Reject { .. } => Self::finish_failed_set(
+            object::SetOutcome::Reject { .. } => self.finish_failed_set(
                 stack,
                 context,
                 format!("Cannot assign to property '{name}'"),
@@ -5497,9 +5467,7 @@ impl Interpreter {
         // throws a TypeError (the computed-key path already does this).
         let strict = context.function_is_strict(stack[top_idx].function_id);
         if !removed && strict {
-            return Err(VmError::TypeError {
-                message: ("Cannot delete property".to_string()).into(),
-            });
+            return Err(self.err_type(("Cannot delete property".to_string()).into()));
         }
         write_register(&mut stack[top_idx], dst, Value::boolean(removed))?;
         Ok(true)
@@ -5527,9 +5495,7 @@ impl Interpreter {
         let removed = self.ordinary_delete_value(context, receiver, &key, 0)?;
         let strict = context.function_is_strict(stack[top_idx].function_id);
         if !removed && strict {
-            return Err(VmError::TypeError {
-                message: ("Cannot delete property".to_string()).into(),
-            });
+            return Err(self.err_type(("Cannot delete property".to_string()).into()));
         }
         write_register(&mut stack[top_idx], dst, Value::boolean(removed))?;
         Ok(true)
@@ -5587,9 +5553,7 @@ impl Interpreter {
         if !ok {
             // Object.setPrototypeOf throws when [[SetPrototypeOf]]
             // returns false (§20.1.2.21 step 4 DefinePropertyOrThrow).
-            return Err(VmError::TypeError {
-                message: ("Object.setPrototypeOf failed".to_string()).into(),
-            });
+            return Err(self.err_type(("Object.setPrototypeOf failed".to_string()).into()));
         }
         Ok(true)
     }

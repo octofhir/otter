@@ -557,11 +557,10 @@ impl Interpreter {
             return Ok(false);
         };
         if !(prototype.is_object_type() || prototype.is_proxy()) {
-            return Err(VmError::TypeError {
-                message: ("Function has non-object prototype 'undefined' in instanceof check"
-                    .to_string())
-                .into(),
-            });
+            return Err(self.err_type(
+                ("Function has non-object prototype 'undefined' in instanceof check".to_string())
+                    .into(),
+            ));
         }
         self.value_has_proxy_aware_prototype(context, *o, &prototype)
     }
@@ -588,11 +587,10 @@ impl Interpreter {
             return Ok(false);
         };
         if !(prototype.is_object_type() || prototype.is_proxy()) {
-            return Err(VmError::TypeError {
-                message: ("Function has non-object prototype 'undefined' in instanceof check"
-                    .to_string())
-                .into(),
-            });
+            return Err(self.err_type(
+                ("Function has non-object prototype 'undefined' in instanceof check".to_string())
+                    .into(),
+            ));
         }
         self.value_has_proxy_aware_prototype(context, *o, &prototype)
     }
@@ -608,9 +606,8 @@ impl Interpreter {
         target: &Value,
     ) -> Result<bool, VmError> {
         if !target.is_object_type() {
-            return Err(VmError::TypeError {
-                message: ("Right-hand side of instanceof is not an object".to_string()).into(),
-            });
+            return Err(self
+                .err_type(("Right-hand side of instanceof is not an object".to_string()).into()));
         }
         let has_instance_sym = self.well_known_symbols.get(symbol::WellKnown::HasInstance);
         let key = VmPropertyKey::Symbol(has_instance_sym);
@@ -622,9 +619,7 @@ impl Interpreter {
         };
         if !handler.is_nullish() {
             if !self.is_callable_runtime(&handler) {
-                return Err(VmError::TypeError {
-                    message: ("@@hasInstance must be callable".to_string()).into(),
-                });
+                return Err(self.err_type(("@@hasInstance must be callable".to_string()).into()));
             }
             if let Some(native) = handler.as_native_function()
                 && native.is_vm_intrinsic(
@@ -640,9 +635,9 @@ impl Interpreter {
             return Ok(result.to_boolean(&self.gc_heap));
         }
         if !self.is_callable_runtime(target) {
-            return Err(VmError::TypeError {
-                message: ("Right-hand side of instanceof is not callable".to_string()).into(),
-            });
+            return Err(
+                self.err_type(("Right-hand side of instanceof is not callable".to_string()).into())
+            );
         }
         self.ordinary_has_instance(context, target, v)
     }
@@ -655,9 +650,8 @@ impl Interpreter {
         target: &Value,
     ) -> Result<bool, VmError> {
         if !target.is_object_type() {
-            return Err(VmError::TypeError {
-                message: ("Right-hand side of instanceof is not an object".to_string()).into(),
-            });
+            return Err(self
+                .err_type(("Right-hand side of instanceof is not an object".to_string()).into()));
         }
         let has_instance_sym = self.well_known_symbols.get(symbol::WellKnown::HasInstance);
         let key = VmPropertyKey::Symbol(has_instance_sym);
@@ -669,9 +663,7 @@ impl Interpreter {
         };
         if !handler.is_nullish() {
             if !self.is_callable_runtime(&handler) {
-                return Err(VmError::TypeError {
-                    message: ("@@hasInstance must be callable".to_string()).into(),
-                });
+                return Err(self.err_type(("@@hasInstance must be callable".to_string()).into()));
             }
             if let Some(native) = handler.as_native_function()
                 && native.is_vm_intrinsic(
@@ -687,9 +679,9 @@ impl Interpreter {
             return Ok(result.to_boolean(&self.gc_heap));
         }
         if !self.is_callable_runtime(target) {
-            return Err(VmError::TypeError {
-                message: ("Right-hand side of instanceof is not callable".to_string()).into(),
-            });
+            return Err(
+                self.err_type(("Right-hand side of instanceof is not callable".to_string()).into())
+            );
         }
         self.ordinary_has_instance_stack_rooted(context, stack, target, v)
     }
@@ -720,10 +712,9 @@ impl Interpreter {
         // `[[Get]]` ladder (RegExp, ArrayBuffer, DataView,
         // TypedArray, collections, etc.).
         if !value.is_object_type() {
-            return Err(VmError::TypeError {
-                message: ("Function.prototype.apply argument list must be object-like".to_string())
-                    .into(),
-            });
+            return Err(self.err_type(
+                ("Function.prototype.apply argument list must be object-like".to_string()).into(),
+            ));
         }
         let length = self.get_property_value_for_call(context, value, "length")?;
         let len = to_length(&length, &self.gc_heap)?;
@@ -782,9 +773,7 @@ impl Interpreter {
             return Ok(*default_ctor);
         }
         if !c.is_object_type() {
-            return Err(VmError::TypeError {
-                message: ("constructor property is not an object".to_string()).into(),
-            });
+            return Err(self.err_type(("constructor property is not an object".to_string()).into()));
         }
         let species_sym = self
             .well_known_symbols()
@@ -802,9 +791,7 @@ impl Interpreter {
         if abstract_ops::is_constructor(&s, context, &self.gc_heap) {
             return Ok(s);
         }
-        Err(VmError::TypeError {
-            message: ("Symbol.species value is not a constructor".to_string()).into(),
-        })
+        Err(self.err_type(("Symbol.species value is not a constructor".to_string()).into()))
     }
     fn callable_bind_metadata_get(
         &mut self,
@@ -1316,9 +1303,7 @@ impl Interpreter {
                         &target,
                         crate::object_internal_ops::ObjectIntegrityLevel::Frozen,
                     )? {
-                        return Err(VmError::TypeError {
-                            message: ("Object.freeze failed".to_string()).into(),
-                        });
+                        return Err(self.err_type(("Object.freeze failed".to_string()).into()));
                     }
                     return Ok(Some(target));
                 }
@@ -1328,9 +1313,7 @@ impl Interpreter {
                         &target,
                         crate::object_internal_ops::ObjectIntegrityLevel::Sealed,
                     )? {
-                        return Err(VmError::TypeError {
-                            message: ("Object.seal failed".to_string()).into(),
-                        });
+                        return Err(self.err_type(("Object.seal failed".to_string()).into()));
                     }
                     return Ok(Some(target));
                 }

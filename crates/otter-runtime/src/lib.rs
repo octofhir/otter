@@ -1877,6 +1877,7 @@ impl Runtime {
                         map_vm_error(otter_vm::RunError {
                             error: err,
                             frames: Vec::new(),
+                            detail: None,
                         })
                     })?;
                 // Drive the parked top-level-await frames to
@@ -2058,7 +2059,7 @@ impl Runtime {
                 // sub-loop) so `.catch` observes the spec-correct
                 // payload, not a stringified `VmError::Uncaught`
                 // rendering.
-                if matches!(err, otter_vm::VmError::Uncaught { .. })
+                if matches!(err, otter_vm::VmError::Uncaught)
                     && let Some(thrown) = self.interp.take_pending_uncaught_throw()
                 {
                     return Err(DynLoadError::Thrown(thrown));
@@ -2149,7 +2150,7 @@ impl Runtime {
             self.interp
                 .run_callable_sync(&context, &callee, otter_vm::Value::undefined(), args)
         {
-            if matches!(err, otter_vm::VmError::Uncaught { .. })
+            if matches!(err, otter_vm::VmError::Uncaught)
                 && let Some(thrown) = self.interp.take_pending_uncaught_throw()
             {
                 return Err(DynLoadError::Thrown(thrown));
@@ -2493,6 +2494,7 @@ impl Runtime {
                 map_vm_error(otter_vm::RunError {
                     error,
                     frames: Vec::new(),
+                    detail: None,
                 })
             })?;
         let outcome = self.interp.drain_microtasks(&context);
@@ -4064,8 +4066,14 @@ fn enrich_runtime_diagnostic_with_cause(
 }
 
 fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
-    use otter_vm::VmError;
-    let otter_vm::RunError { error, frames } = run_err;
+    use otter_vm::{ErrorDetail, VmError};
+    // Render the message before destructuring moves `detail` out of `run_err`.
+    let detail_message = run_err.message();
+    let otter_vm::RunError {
+        error,
+        frames,
+        detail,
+    } = run_err;
     let stack_frames: Vec<StackFrame> = frames
         .into_iter()
         .map(|f| StackFrame {
@@ -4100,38 +4108,38 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
             requested_bytes,
             heap_limit_bytes,
         },
-        VmError::BudgetExceeded { message } => runtime_diagnostic(
+        VmError::BudgetExceeded => runtime_diagnostic(
             DiagnosticKind::Timeout,
             DiagnosticCode::BudgetExceeded,
-            message.into(),
+            detail_message,
         ),
         VmError::TypeMismatch => {
             runtime_diagnostic(DiagnosticKind::Type, DiagnosticCode::TypeMismatch, display)
         }
-        VmError::TypeError { message } => runtime_diagnostic(
+        VmError::TypeError | VmError::TypeMismatchAt => runtime_diagnostic(
             DiagnosticKind::Type,
             DiagnosticCode::TypeError,
-            message.into(),
+            detail_message,
         ),
-        VmError::SyntaxError { message } => runtime_diagnostic(
+        VmError::SyntaxError => runtime_diagnostic(
             DiagnosticKind::Syntax,
             DiagnosticCode::SyntaxError,
-            message.into(),
+            detail_message,
         ),
-        VmError::UnknownIntrinsic { name } => runtime_diagnostic(
+        VmError::UnknownIntrinsic => runtime_diagnostic(
             DiagnosticKind::Type,
             DiagnosticCode::UnknownMethod,
-            format!("unknown method `{name}`"),
+            detail_message,
         ),
         VmError::TemporalDeadZone { local_index } => runtime_diagnostic(
             DiagnosticKind::Reference,
             DiagnosticCode::Tdz,
             format!("cannot access local {local_index} before initialization"),
         ),
-        VmError::ThisUninitialized { message } => runtime_diagnostic(
+        VmError::ThisUninitialized => runtime_diagnostic(
             DiagnosticKind::Reference,
             DiagnosticCode::Tdz,
-            message.into(),
+            detail_message,
         ),
         VmError::StackOverflow { limit } => runtime_diagnostic(
             DiagnosticKind::Range,
@@ -4143,24 +4151,28 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
             DiagnosticCode::NotCallable,
             "value is not a function".to_string(),
         ),
-        VmError::Uncaught { value } => runtime_diagnostic(
+        VmError::Uncaught => runtime_diagnostic(
             DiagnosticKind::Type,
             DiagnosticCode::Uncaught,
-            format!("uncaught exception: {value}"),
+            detail_message,
         ),
-        VmError::JsonError(payload) => {
+        VmError::JsonError => {
             // `code` is `&'static str` from the VM JSON path (every
             // value is one of the `JSON_*` codes in the closed
             // [`DiagnosticCode`] set). Parse it back through
             // `DiagnosticCode::parse` so the diagnostic still
             // carries a typed code in the closed set.
-            let typed = DiagnosticCode::parse(payload.code).unwrap_or(DiagnosticCode::JsonBadArg);
-            runtime_diagnostic(DiagnosticKind::Type, typed, payload.message)
+            let (code, message) = match &detail {
+                Some(ErrorDetail::Json(p)) => (p.code, p.message.clone()),
+                _ => ("JSON_BAD_ARG", detail_message),
+            };
+            let typed = DiagnosticCode::parse(code).unwrap_or(DiagnosticCode::JsonBadArg);
+            runtime_diagnostic(DiagnosticKind::Type, typed, message)
         }
-        VmError::InvalidRegExp { message } => runtime_diagnostic(
+        VmError::InvalidRegExp => runtime_diagnostic(
             DiagnosticKind::Syntax,
             DiagnosticCode::InvalidRegexp,
-            message.into(),
+            detail_message,
         ),
         VmError::MissingReturn | VmError::InvalidOperand => OtterError::Internal {
             code: DiagnosticCode::VmBytecodeInvariant.as_str().to_string(),

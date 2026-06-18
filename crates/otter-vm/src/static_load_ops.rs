@@ -32,9 +32,8 @@ impl Interpreter {
         let name = context
             .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
-        let value = math::load_constant(name).ok_or_else(|| VmError::UnknownIntrinsic {
-            name: format!("Math.{name}"),
-        })?;
+        let value = math::load_constant(name)
+            .ok_or_else(|| self.err_unknown_intrinsic(format!("Math.{name}").into()))?;
         write_register(frame, dst, value)?;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
@@ -50,7 +49,8 @@ impl Interpreter {
         let name = context
             .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
-        let value = symbol_dispatch::load_static(self, name).map_err(symbol_to_vm_error)?;
+        let value =
+            symbol_dispatch::load_static(self, name).map_err(|e| symbol_to_vm_error(self, e))?;
         write_register(frame, dst, value)?;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())

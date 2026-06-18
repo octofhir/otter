@@ -62,9 +62,7 @@ impl Interpreter {
             .unwrap_or_default();
         let namespace = self
             .resolve_module_namespace(context, referrer.as_str(), specifier)
-            .ok_or_else(|| VmError::UnknownIntrinsic {
-                name: format!("import \"{specifier}\""),
-            })?;
+            .ok_or_else(|| self.err_unknown_intrinsic(format!("import \"{specifier}\"").into()))?;
         write_register(frame, dst, Value::object(namespace))?;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
@@ -91,8 +89,8 @@ impl Interpreter {
             .unwrap_or_default();
         let namespace = self
             .resolve_module_namespace_object(context, referrer.as_str(), specifier.as_str())
-            .ok_or_else(|| VmError::UnknownIntrinsic {
-                name: format!("import * as \"{specifier}\""),
+            .ok_or_else(|| {
+                self.err_unknown_intrinsic(format!("import * as \"{specifier}\"").into())
             })?;
         write_register(frame, dst, Value::object(namespace))?;
         frame.advance_pc(self.current_byte_len)?;
@@ -125,9 +123,9 @@ impl Interpreter {
             .resolve_module_binding(&url, &name)
             .unwrap_or_else(Value::undefined);
         if value.is_hole() {
-            return Err(VmError::ThisUninitialized {
-                message: (format!("Cannot access '{name}' before initialization")).into(),
-            });
+            return Err(self.err_this_uninit(
+                (format!("Cannot access '{name}' before initialization")).into(),
+            ));
         }
         write_register(frame, dst, value)?;
         frame.advance_pc(self.current_byte_len)?;
@@ -154,8 +152,8 @@ impl Interpreter {
             .unwrap_or_default();
         let target = context
             .module_resolution_target(referrer.as_str(), specifier.as_str())
-            .ok_or_else(|| VmError::UnknownIntrinsic {
-                name: format!("import defer \"{specifier}\""),
+            .ok_or_else(|| {
+                self.err_unknown_intrinsic(format!("import defer \"{specifier}\"").into())
             })?
             .to_string();
         let target_url: std::sync::Arc<str> = std::sync::Arc::from(target.as_str());
@@ -203,12 +201,11 @@ impl Interpreter {
                 .and_then(|fid| context.function(fid))
                 .is_some_and(|f| f.is_async)
         {
-            return Err(VmError::TypeError {
-                message:
-                    ("Cannot synchronously evaluate a deferred module that uses top-level await"
-                        .to_string())
-                    .into(),
-            });
+            return Err(self.err_type(
+                ("Cannot synchronously evaluate a deferred module that uses top-level await"
+                    .to_string())
+                .into(),
+            ));
         }
         self.evaluate_module(context, url).map(|_| ())
     }
@@ -256,9 +253,7 @@ impl Interpreter {
                 ModuleStatus::Evaluated => {
                     if let Some(thrown) = record.evaluation_error {
                         self.set_pending_uncaught_throw(thrown);
-                        return Err(VmError::Uncaught {
-                            value: (self.render_thrown(&thrown)).into(),
-                        });
+                        return Err(self.err_uncaught((self.render_thrown(&thrown)).into()));
                     }
                     return Ok(record.evaluation_promise);
                 }
@@ -314,9 +309,7 @@ impl Interpreter {
                 ModuleStatus::Evaluated | ModuleStatus::EvaluatingAsync => {
                     if let Some(thrown) = record.evaluation_error {
                         self.set_pending_uncaught_throw(thrown);
-                        return Err(VmError::Uncaught {
-                            value: (self.render_thrown(&thrown)).into(),
-                        });
+                        return Err(self.err_uncaught((self.render_thrown(&thrown)).into()));
                     }
                     return Ok(());
                 }
@@ -386,9 +379,7 @@ impl Interpreter {
                     .and_then(|record| record.evaluation_error)
                 {
                     self.set_pending_uncaught_throw(thrown);
-                    return Err(VmError::Uncaught {
-                        value: (self.render_thrown(&thrown)).into(),
-                    });
+                    return Err(self.err_uncaught((self.render_thrown(&thrown)).into()));
                 }
                 root
             };
@@ -467,7 +458,7 @@ impl Interpreter {
     /// every module still on the DFS stack `Evaluated` with the thrown
     /// value cached as its `[[EvaluationError]]`.
     fn fail_evaluation_stack(&mut self, state: ModuleEvalState, err: VmError) -> VmError {
-        if matches!(err, VmError::Uncaught { .. })
+        if matches!(err, VmError::Uncaught)
             && let Some(thrown) = self.take_pending_uncaught_throw()
         {
             for member in state.stack {
@@ -486,9 +477,7 @@ impl Interpreter {
                 }
             }
             self.set_pending_uncaught_throw(thrown);
-            return VmError::Uncaught {
-                value: (self.render_thrown(&thrown)).into(),
-            };
+            return self.err_uncaught((self.render_thrown(&thrown)).into());
         }
         // Infrastructure failure — reset so a later attempt can retry.
         for member in state.stack {
@@ -652,7 +641,7 @@ impl Interpreter {
     /// rejected walk propagates. An infrastructure error (no pending
     /// thrown value) is fatal and propagates as `Err` instead.
     fn thrown_value_for_walk(&mut self, err: VmError) -> Result<Value, VmError> {
-        if matches!(err, VmError::Uncaught { .. })
+        if matches!(err, VmError::Uncaught)
             && let Some(thrown) = self.take_pending_uncaught_throw()
         {
             return Ok(thrown);
@@ -921,7 +910,7 @@ impl Interpreter {
                                 std::sync::Arc::from(target.as_str()),
                             )
                             .map_err(|e| {
-                                crate::native_function::vm_to_native_error(e, "import()")
+                                crate::native_function::vm_to_native_error(interp, e, "import()")
                             })?;
                     }
                     Ok(None) => {
@@ -937,12 +926,12 @@ impl Interpreter {
                     }
                     Err(err) => {
                         let reason = match err {
-                            VmError::Uncaught { .. } => interp
+                            VmError::Uncaught => interp
                                 .take_pending_uncaught_throw()
                                 .unwrap_or_else(Value::undefined),
                             other => {
                                 return Err(crate::native_function::vm_to_native_error(
-                                    other, "import()",
+                                    interp, other, "import()",
                                 ));
                             }
                         };
@@ -1082,11 +1071,11 @@ impl Interpreter {
             return Ok(());
         }
         if !self.module_ready_for_sync_execution(context, target_url.as_ref(), &mut Vec::new()) {
-            return Err(VmError::TypeError {
-                message: ("Cannot synchronously evaluate a deferred module while it is evaluating"
+            return Err(self.err_type(
+                ("Cannot synchronously evaluate a deferred module while it is evaluating"
                     .to_string())
                 .into(),
-            });
+            ));
         }
         self.evaluate_module_rec(context, &target_url)?;
         if let Some(env) = self.module_environments.get(&target_url).copied() {
@@ -1249,14 +1238,16 @@ impl Interpreter {
                         Ok(None) => {
                             let ns = self
                                 .resolve_module_namespace(context, referrer.as_str(), &specifier)
-                                .ok_or_else(|| VmError::UnknownIntrinsic {
-                                    name: format!("import \"{specifier}\""),
+                                .ok_or_else(|| {
+                                    self.err_unknown_intrinsic(
+                                        format!("import \"{specifier}\"").into(),
+                                    )
                                 })?;
                             let namespace_value = Value::object(ns);
                             promise_dispatch::PromiseBuilder::with_context(import_context.clone())
                                 .fulfilled_stack_rooted(self, stack, namespace_value, &[], &[])?
                         }
-                        Err(VmError::Uncaught { .. }) => {
+                        Err(VmError::Uncaught) => {
                             let reason = self
                                 .take_pending_uncaught_throw()
                                 .unwrap_or_else(Value::undefined);
@@ -1291,16 +1282,19 @@ impl Interpreter {
                         .rejected_stack_rooted(self, stack, reason, &[], &[])?
                 }
             }
-            Err(VmError::Uncaught { value }) => {
+            Err(VmError::Uncaught) => {
+                let value = match self.take_error_detail() {
+                    Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                    _ => Default::default(),
+                };
                 let reason = if let Some(thrown) = self.take_pending_uncaught_throw() {
                     thrown
                 } else {
                     let fallback = JsString::from_str(&value, &mut self.gc_heap).map_err(|_| {
-                        VmError::TypeError {
-                            message: ("dynamic import: failed to allocate rejection reason"
-                                .to_string())
-                            .into(),
-                        }
+                        self.err_type(
+                            ("dynamic import: failed to allocate rejection reason".to_string())
+                                .into(),
+                        )
                     })?;
                     Value::string(fallback)
                 };

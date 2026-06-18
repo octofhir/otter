@@ -480,9 +480,7 @@ fn create_list_from_array_like(
     {
         return interp.create_list_from_array_like(context, *v);
     }
-    Err(VmError::TypeError {
-        message: ("argumentsList must be an object".to_string()).into(),
-    })
+    Err(interp.err_type(("argumentsList must be an object".to_string()).into()))
 }
 
 // Static namespace spec installed by bootstrap. Every method is
@@ -615,35 +613,62 @@ fn invoke(
         name: "Reflect",
         reason: "no active execution context".to_string(),
     })?;
-    call(interp, &context, method, args).map_err(vm_to_native)
+    match call(interp, &context, method, args) {
+        Ok(v) => Ok(v),
+        Err(e) => Err(vm_to_native(interp, e)),
+    }
 }
 
-fn vm_to_native(err: VmError) -> NativeError {
+fn vm_to_native(interp: &mut Interpreter, err: VmError) -> NativeError {
     match err {
         VmError::TypeMismatch => NativeError::TypeError {
             name: "Reflect",
             reason: "type mismatch".to_string(),
         },
-        VmError::TypeError { message } => NativeError::TypeError {
-            name: "Reflect",
-            reason: message.into(),
-        },
-        VmError::SyntaxError { message } => NativeError::SyntaxError {
-            name: "Reflect",
-            reason: message.into(),
-        },
-        VmError::RangeError { message } => NativeError::RangeError {
-            name: "Reflect",
-            reason: message.into(),
-        },
+        VmError::TypeError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::TypeError {
+                name: "Reflect",
+                reason: message.into(),
+            }
+        }
+        VmError::SyntaxError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::SyntaxError {
+                name: "Reflect",
+                reason: message.into(),
+            }
+        }
+        VmError::RangeError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::RangeError {
+                name: "Reflect",
+                reason: message.into(),
+            }
+        }
         VmError::NotCallable => NativeError::TypeError {
             name: "Reflect",
             reason: "value is not a function".to_string(),
         },
-        VmError::Uncaught { value } => NativeError::Thrown {
-            name: "Reflect",
-            message: value.into(),
-        },
+        VmError::Uncaught => {
+            let value = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::Thrown {
+                name: "Reflect",
+                message: value.into(),
+            }
+        }
         VmError::OutOfMemory { .. } => NativeError::TypeError {
             name: "Reflect",
             reason: "out of memory".to_string(),

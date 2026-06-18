@@ -115,10 +115,14 @@ fn date_construct_time_value(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<
                 name: "Date",
                 reason: "missing execution context".to_string(),
             })?;
-        ctx.cx
+        match ctx
+            .cx
             .interp
             .coerce_to_primitive(&context, &value, ToPrimitiveHint::Default)
-            .map_err(date_vm_error)?
+        {
+            Ok(v) => v,
+            Err(err) => return Err(date_vm_error(ctx.cx.interp, err)),
+        }
     };
 
     if primitive.as_string(ctx.heap()).is_some() {
@@ -135,11 +139,10 @@ fn date_construct_time_value(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<
             name: "Date",
             reason: "missing execution context".to_string(),
         })?;
-    ctx.cx
-        .interp
-        .coerce_to_number(&context, &primitive)
-        .map(|n| n.as_f64())
-        .map_err(date_vm_error)
+    match ctx.cx.interp.coerce_to_number(&context, &primitive) {
+        Ok(n) => Ok(n.as_f64()),
+        Err(err) => Err(date_vm_error(ctx.cx.interp, err)),
+    }
 }
 
 fn coerce_number_args(
@@ -156,26 +159,37 @@ fn coerce_number_args(
         })?;
     let mut coerced = SmallVec::with_capacity(args.len());
     for value in args {
-        let number = ctx
-            .cx
-            .interp
-            .coerce_to_number(&context, value)
-            .map_err(date_vm_error)?;
+        let number = match ctx.cx.interp.coerce_to_number(&context, value) {
+            Ok(n) => n,
+            Err(err) => return Err(date_vm_error(ctx.cx.interp, err)),
+        };
         coerced.push(Value::number(number));
     }
     Ok(coerced)
 }
 
-fn date_vm_error(err: VmError) -> NativeError {
+fn date_vm_error(interp: &crate::Interpreter, err: VmError) -> NativeError {
     match err {
-        VmError::TypeError { message } => NativeError::TypeError {
-            name: "Date",
-            reason: message.into(),
-        },
-        VmError::Uncaught { value } => NativeError::Thrown {
-            name: "Date",
-            message: value.into(),
-        },
+        VmError::TypeError => {
+            let message = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::TypeError {
+                name: "Date",
+                reason: message.into(),
+            }
+        }
+        VmError::Uncaught => {
+            let value = match interp.take_error_detail() {
+                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                _ => Default::default(),
+            };
+            NativeError::Thrown {
+                name: "Date",
+                message: value.into(),
+            }
+        }
         other => NativeError::TypeError {
             name: "Date",
             reason: other.to_string(),

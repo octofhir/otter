@@ -168,53 +168,70 @@ impl Interpreter {
         stack: &HoltStack,
         err: &VmError,
     ) -> Option<Value> {
-        let dynamic_message: String;
+        use crate::run_control::ErrorDetail;
         let is_oom = matches!(err, VmError::OutOfMemory { .. });
         // Node-style `.code` to stamp on the instance after it is built.
         let mut node_code: Option<&'static str> = None;
-        let (kind, message) = match err {
-            VmError::Coded(payload) => {
-                node_code = Some(payload.code);
-                dynamic_message = payload.message.clone();
-                (payload.kind, dynamic_message.as_str())
+        // `VmError` is `Copy`; its dynamic message/payload lives in the isolate
+        // pending-error slot. Pull it out once, paired with the discriminant.
+        let detail = self.error_detail();
+        let msg_detail = || match &detail {
+            Some(ErrorDetail::Message(m)) => m.to_string(),
+            Some(ErrorDetail::Name(m)) => m.to_string(),
+            Some(ErrorDetail::Uncaught(m)) => m.to_string(),
+            _ => String::new(),
+        };
+        let dynamic_message: String;
+        let (kind, message): (error_classes::ErrorKind, &str) = match err {
+            VmError::Coded => {
+                if let Some(ErrorDetail::Coded(payload)) = &detail {
+                    node_code = Some(payload.code);
+                    dynamic_message = payload.message.clone();
+                    (payload.kind, dynamic_message.as_str())
+                } else {
+                    dynamic_message = msg_detail();
+                    (error_classes::ErrorKind::Error, dynamic_message.as_str())
+                }
             }
             VmError::TypeMismatch => (
                 error_classes::ErrorKind::TypeError,
                 "type mismatch: this operation does not accept a value of this type",
             ),
-            VmError::TypeMismatchAt(payload) => {
-                dynamic_message = format!(
-                    "{}: cannot operate on a value of type {}",
-                    payload.op, payload.kind
-                );
+            VmError::TypeMismatchAt => {
+                dynamic_message = match &detail {
+                    Some(ErrorDetail::Mismatch(p)) => {
+                        format!("{}: cannot operate on a value of type {}", p.op, p.kind)
+                    }
+                    _ => "TypeError".to_string(),
+                };
                 (
                     error_classes::ErrorKind::TypeError,
                     dynamic_message.as_str(),
                 )
             }
-            VmError::TypeError { message } => {
-                dynamic_message = message.to_string();
+            VmError::TypeError => {
+                dynamic_message = msg_detail();
                 (
                     error_classes::ErrorKind::TypeError,
                     dynamic_message.as_str(),
                 )
             }
-            VmError::RangeError { message } => {
-                dynamic_message = message.to_string();
+            VmError::RangeError => {
+                dynamic_message = msg_detail();
                 (
                     error_classes::ErrorKind::RangeError,
                     dynamic_message.as_str(),
                 )
             }
-            VmError::SyntaxError { message } => {
-                dynamic_message = message.to_string();
+            VmError::SyntaxError => {
+                dynamic_message = msg_detail();
                 (
                     error_classes::ErrorKind::SyntaxError,
                     dynamic_message.as_str(),
                 )
             }
-            VmError::URIError { message } => {
-                dynamic_message = message.to_string();
+            VmError::URIError => {
+                dynamic_message = msg_detail();
                 (error_classes::ErrorKind::URIError, dynamic_message.as_str())
             }
             VmError::NotCallable => (
@@ -225,21 +242,24 @@ impl Interpreter {
                 error_classes::ErrorKind::ReferenceError,
                 "cannot access binding before initialization",
             ),
-            VmError::ThisUninitialized { message } => {
-                dynamic_message = message.to_string();
+            VmError::ThisUninitialized => {
+                dynamic_message = msg_detail();
                 (
                     error_classes::ErrorKind::ReferenceError,
                     dynamic_message.as_str(),
                 )
             }
-            VmError::UndefinedIdentifier { name } => {
-                dynamic_message = format!("{name} is not defined");
+            VmError::UndefinedIdentifier => {
+                dynamic_message = match &detail {
+                    Some(ErrorDetail::Name(name)) => format!("{name} is not defined"),
+                    _ => "identifier is not defined".to_string(),
+                };
                 (
                     error_classes::ErrorKind::ReferenceError,
                     dynamic_message.as_str(),
                 )
             }
-            VmError::UnknownIntrinsic { .. } => (
+            VmError::UnknownIntrinsic => (
                 error_classes::ErrorKind::TypeError,
                 "unknown intrinsic method",
             ),
@@ -254,14 +274,20 @@ impl Interpreter {
             // exception classes:
             //   parse failures → SyntaxError (§25.5.1.1 step 2),
             //   cyclic / BigInt / depth / bad-arg → TypeError.
-            VmError::JsonError(payload) => {
-                dynamic_message = payload.message.clone();
-                let kind = if payload.code == "JSON_PARSE" {
-                    error_classes::ErrorKind::SyntaxError
-                } else {
-                    error_classes::ErrorKind::TypeError
+            VmError::JsonError => {
+                let (jkind, jmsg) = match &detail {
+                    Some(ErrorDetail::Json(payload)) => {
+                        let kind = if payload.code == "JSON_PARSE" {
+                            error_classes::ErrorKind::SyntaxError
+                        } else {
+                            error_classes::ErrorKind::TypeError
+                        };
+                        (kind, payload.message.clone())
+                    }
+                    _ => (error_classes::ErrorKind::TypeError, String::new()),
                 };
-                (kind, dynamic_message.as_str())
+                dynamic_message = jmsg;
+                (jkind, dynamic_message.as_str())
             }
             // Hard / structural errors stay as host failures so the
             // caller surfaces them through `RunError` rather than
@@ -381,11 +407,14 @@ pub(crate) fn snapshot_frames(
         .collect()
 }
 
-pub(crate) fn symbol_to_vm_error(err: symbol_dispatch::SymbolError) -> VmError {
+pub(crate) fn symbol_to_vm_error(
+    interp: &crate::Interpreter,
+    err: symbol_dispatch::SymbolError,
+) -> VmError {
     match err {
-        symbol_dispatch::SymbolError::UnknownMember(name) => VmError::UnknownIntrinsic {
-            name: format!("Symbol.{name}"),
-        },
+        symbol_dispatch::SymbolError::UnknownMember(name) => {
+            interp.err_unknown_intrinsic(format!("Symbol.{name}").into())
+        }
         symbol_dispatch::SymbolError::BadArgument { .. } => VmError::TypeMismatch,
         symbol_dispatch::SymbolError::OutOfMemory {
             requested_bytes,
@@ -397,37 +426,31 @@ pub(crate) fn symbol_to_vm_error(err: symbol_dispatch::SymbolError) -> VmError {
     }
 }
 
-pub(crate) fn native_to_vm_error(err: NativeError) -> VmError {
+pub(crate) fn native_to_vm_error(interp: &crate::Interpreter, err: NativeError) -> VmError {
     match err {
-        NativeError::Thrown { name: _, message } => VmError::Uncaught {
-            value: (message).into(),
-        },
+        NativeError::Thrown { name: _, message } => interp.err_uncaught(message.into()),
         NativeError::Coded {
             kind,
             code,
             message,
-        } => VmError::Coded(Box::new(crate::run_control::VmCodedError {
-            kind,
-            code,
-            message,
-        })),
-        NativeError::TypeError { name, reason } => VmError::TypeError {
-            message: (format!("{name}: {reason}")).into(),
-        },
-        NativeError::SyntaxError { name, reason } => VmError::SyntaxError {
-            message: (format!("{name}: {reason}")).into(),
-        },
-        NativeError::RangeError { name, reason } => VmError::RangeError {
-            message: (format!("{name}: {reason}")).into(),
-        },
-        NativeError::URIError { name, reason } => VmError::URIError {
-            message: (format!("{name}: {reason}")).into(),
-        },
+        } => interp.err_coded(kind, code, message),
+        NativeError::TypeError { name, reason } => {
+            interp.err_type(format!("{name}: {reason}").into())
+        }
+        NativeError::SyntaxError { name, reason } => {
+            interp.err_syntax(format!("{name}: {reason}").into())
+        }
+        NativeError::RangeError { name, reason } => {
+            interp.err_range(format!("{name}: {reason}").into())
+        }
+        NativeError::URIError { name, reason } => {
+            interp.err_uri(format!("{name}: {reason}").into())
+        }
         // Round-trips back to a ReferenceError-classed VmError so a TDZ
         // error raised behind a native boundary keeps its class.
-        NativeError::ReferenceError { name, reason } => VmError::ThisUninitialized {
-            message: (format!("{name}: {reason}")).into(),
-        },
+        NativeError::ReferenceError { name, reason } => {
+            interp.err_this_uninit(format!("{name}: {reason}").into())
+        }
         NativeError::Exit { code } => VmError::Exit { code },
         NativeError::Interrupted => VmError::Interrupted,
         NativeError::OutOfMemory {
@@ -445,9 +468,11 @@ pub(crate) fn native_to_vm_error(err: NativeError) -> VmError {
 /// reason for promise reactions. Foundation: a plain string is
 /// fine; once the full Error hierarchy is in we'll synthesize a
 /// real `TypeError` / `RangeError` instance.
-pub(crate) fn vm_err_to_value(err: &VmError, heap: &mut otter_gc::GcHeap) -> Value {
+pub(crate) fn vm_err_to_value(interp: &mut crate::Interpreter, err: &VmError) -> Value {
+    let message = interp.render_vm_error(err);
+    let heap = interp.gc_heap_mut();
     Value::string(
-        crate::JsString::from_str(&err.to_string(), heap).unwrap_or_else(|_| {
+        crate::JsString::from_str(&message, heap).unwrap_or_else(|_| {
             // Allocator failure here is exceptional; substitute
             // an empty string rather than panicking.
             crate::JsString::from_str("", heap).expect("empty string allocates")

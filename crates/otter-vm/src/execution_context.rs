@@ -126,6 +126,15 @@ impl ExecutionContext {
         self.function_base
     }
 
+    /// Stable cache key prefix for constant-pool values owned by this linked
+    /// chunk. Separately linked standalone modules can both start at function
+    /// id zero, so constant caches must key by the shared module allocation
+    /// rather than by function id alone.
+    #[must_use]
+    pub(crate) fn constant_cache_key(&self, idx: u32) -> (usize, u32) {
+        (Arc::as_ptr(&self.module) as usize, idx)
+    }
+
     /// Shared code-space registry this chunk was linked into.
     #[must_use]
     pub(crate) fn space(&self) -> &Arc<CodeSpace> {

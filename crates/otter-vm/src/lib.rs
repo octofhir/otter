@@ -378,6 +378,12 @@ pub struct Interpreter {
     /// template-strings object per tagged-template site, keyed by
     /// `(chunk function_base, site index)`.
     template_objects: rustc_hash::FxHashMap<(u32, u32), Value>,
+    /// Per-context string constant cache. `LoadString` materializes immutable
+    /// primitive string literals once per linked chunk identity and
+    /// constant-pool index, then reuses the GC string handle on later
+    /// executions. Values are traced from [`RuntimeState::trace_roots`] so a
+    /// moving collection can rewrite cached handles in place.
+    string_constant_cache: rustc_hash::FxHashMap<(usize, u32), Value>,
     /// Scratch GC-root stack for native recursive algorithms (today:
     /// `JSON.stringify`'s spec serializer) that must hold live `Value`s
     /// across calls which allocate — e.g. key-name `JsString`s minted by
@@ -780,9 +786,37 @@ impl Interpreter {
         self.template_objects.values()
     }
 
+    /// Root-tracing view of cached string constants.
+    pub(crate) fn string_constants_for_trace(&self) -> impl Iterator<Item = &Value> {
+        self.string_constant_cache.values()
+    }
+
+    #[cfg(test)]
+    fn string_constant_cache_len_for_test(&self) -> usize {
+        self.string_constant_cache.len()
+    }
+
     /// Root-tracing view of the native serializer scratch root stack.
     pub(crate) fn json_root_stack_for_trace(&self) -> impl Iterator<Item = &Value> {
         self.json_root_stack.iter()
+    }
+
+    pub(crate) fn load_string_constant_value(
+        &mut self,
+        context: &ExecutionContext,
+        idx: u32,
+    ) -> Result<Value, VmError> {
+        let key = context.constant_cache_key(idx);
+        if let Some(value) = self.string_constant_cache.get(&key) {
+            return Ok(*value);
+        }
+        let units = context
+            .string_constant_units(idx)
+            .ok_or(VmError::InvalidOperand)?;
+        let string = JsString::from_utf16_units(units, self.gc_heap_mut())?;
+        let value = Value::string(string);
+        self.string_constant_cache.insert(key, value);
+        Ok(value)
     }
 
     /// Push `value` onto the native serializer scratch root stack,
@@ -1113,6 +1147,7 @@ impl Interpreter {
         startup_timer.mark("vm_shape_runtime");
         let mut interp = Self {
             template_objects: rustc_hash::FxHashMap::default(),
+            string_constant_cache: rustc_hash::FxHashMap::default(),
             json_root_stack: Vec::new(),
             array_index_accessor_protector: false,
             interrupt: InterruptFlag::new(),
@@ -6455,12 +6490,9 @@ impl Interpreter {
                     let idx = context
                         .exec_const_index(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
-                    let units = context
-                        .string_constant_units(idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let s = JsString::from_utf16_units(units, self.gc_heap_mut())?;
+                    let value = self.load_string_constant_value(context, idx)?;
                     let frame = &mut stack[top_idx];
-                    write_register(frame, dst, Value::string(s))?;
+                    write_register(frame, dst, value)?;
                     frame.advance_pc(self.current_byte_len)?;
                     continue;
                 }
@@ -9168,6 +9200,91 @@ mod tests {
         let mut interp = Interpreter::new();
         let context = ExecutionContext::from_module(module);
         assert_eq!(interp.run(&context).unwrap(), Value::undefined());
+    }
+
+    #[test]
+    fn load_string_constant_reuses_traced_cache_entry() {
+        let code = vec![
+            Instruction {
+                pc: 0,
+                op: Op::LoadString,
+                operands: vec![Operand::Register(0), Operand::ConstIndex(0)].into(),
+            },
+            Instruction {
+                pc: 1,
+                op: Op::LoadString,
+                operands: vec![Operand::Register(1), Operand::ConstIndex(0)].into(),
+            },
+            Instruction {
+                pc: 2,
+                op: Op::Return,
+                operands: vec![Operand::Register(1)].into(),
+            },
+        ];
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            template_sites: Vec::new(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 2, code)],
+            constants: vec![Constant::String {
+                utf16: "cached literal".encode_utf16().collect(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let context = ExecutionContext::from_module(module);
+
+        assert!(interp.run(&context).unwrap().is_string());
+        assert_eq!(interp.string_constant_cache_len_for_test(), 1);
+
+        interp.force_gc();
+
+        assert!(interp.run(&context).unwrap().is_string());
+        assert_eq!(interp.string_constant_cache_len_for_test(), 1);
+    }
+
+    #[test]
+    fn load_string_constant_cache_distinguishes_standalone_contexts() {
+        fn module_with_string(name: &str, literal: &str) -> BytecodeModule {
+            BytecodeModule {
+                module: name.to_string(),
+                template_sites: Vec::new(),
+                source_kind: BcSourceKind::TypeScript,
+                functions: vec![test_function(
+                    0,
+                    "<main>",
+                    0,
+                    1,
+                    vec![
+                        Instruction {
+                            pc: 0,
+                            op: Op::LoadString,
+                            operands: vec![Operand::Register(0), Operand::ConstIndex(0)].into(),
+                        },
+                        Instruction {
+                            pc: 1,
+                            op: Op::Return,
+                            operands: vec![Operand::Register(0)].into(),
+                        },
+                    ],
+                )],
+                constants: vec![Constant::String {
+                    utf16: literal.encode_utf16().collect(),
+                }],
+                module_resolutions: Vec::new(),
+                module_inits: Vec::new(),
+            }
+        }
+
+        let mut interp = Interpreter::new();
+        let first = ExecutionContext::from_module(module_with_string("first.ts", "first literal"));
+        let second =
+            ExecutionContext::from_module(module_with_string("second.ts", "second literal"));
+
+        assert!(interp.run(&first).unwrap().is_string());
+        assert!(interp.run(&second).unwrap().is_string());
+        assert_eq!(interp.string_constant_cache_len_for_test(), 2);
     }
 
     #[test]

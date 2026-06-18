@@ -447,6 +447,13 @@ units fit in one byte: `from_str`, rooted `from_str_with_roots`, and
 directly; non-ASCII Latin-1 and UTF-16-unit callers compact through a temporary
 byte vector so the persistent GC payload stays Latin-1.
 
+Bytecode string constants now materialize once per linked execution chunk
+identity and constant-pool index, then reuse the cached primitive string handle
+on subsequent `LoadString` executions. The cache is owned by the interpreter and
+traced as a runtime root, so moving GC rewrites cached handles in place. This
+removes repeat literal allocation from hot loops without changing string
+primitive semantics; full trailing-storage strings remain the deeper GC target.
+
 Dense arrays still use a `Vec<Value>` because the current baseline JIT reads
 that vector's probed pointer/length layout for inline dense element access, but
 the array shell no longer pays for sparse/named/accessor/symbol/source/prototype

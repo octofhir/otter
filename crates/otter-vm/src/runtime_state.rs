@@ -103,6 +103,12 @@ impl<'a> RuntimeState<'a> {
         for value in interp.template_objects_for_trace() {
             value.trace_value_slots(visitor);
         }
+        // Primitive string constants materialized from bytecode constant pools.
+        // Immutable strings can be reused across executions, but cached GC
+        // handles must move with the heap.
+        for value in interp.string_constants_for_trace() {
+            value.trace_value_slots(visitor);
+        }
         // 2b-quater) Native serializer scratch roots (`JSON.stringify`).
         for value in interp.json_root_stack_for_trace() {
             value.trace_value_slots(visitor);

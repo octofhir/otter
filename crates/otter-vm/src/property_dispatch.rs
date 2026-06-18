@@ -3286,12 +3286,9 @@ impl Interpreter {
                 let idx = context
                     .exec_const_index(instr, 1)
                     .ok_or(VmError::InvalidOperand)?;
-                let units = context
-                    .string_constant_units(idx)
-                    .ok_or(VmError::InvalidOperand)?;
-                let s = JsString::from_utf16_units(units, self.gc_heap_mut())?;
+                let value = self.load_string_constant_value(context, idx)?;
                 let frame = &mut stack[frame_index];
-                write_register(frame, dst, Value::string(s))
+                write_register(frame, dst, value)
             }
             Op::LoadNumber => {
                 let dst = context

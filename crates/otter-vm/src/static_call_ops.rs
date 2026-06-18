@@ -1409,22 +1409,7 @@ fn own_enumerable_keys_for_define(
         for idx in 0..dense_len {
             out.push(idx.to_string());
         }
-        let (named, accessor_keys): (Vec<String>, Vec<String>) =
-            interp.gc_heap().read_payload(arr, |body| {
-                let named = body
-                    .named_properties
-                    .as_ref()
-                    .map_or_else(Vec::new, |m| m.keys().cloned().collect());
-                let accessors = body.accessors.as_ref().map_or_else(Vec::new, |m| {
-                    m.keys()
-                        .filter(|k| k.parse::<usize>().is_err())
-                        .cloned()
-                        .collect()
-                });
-                (named, accessors)
-            });
-        out.extend(named);
-        for key in accessor_keys {
+        for key in array::own_non_index_string_keys(arr, interp.gc_heap()) {
             if !out.contains(&key) {
                 out.push(key);
             }

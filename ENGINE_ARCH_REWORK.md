@@ -136,15 +136,18 @@ Stages (each: implement → `just test262` full → diff failing-set → commit)
   REMAINING for B: the scattered mutation-internal `.kind.is_data()` /
   `.flags.*` reads (is_sealed, integrity loops, enumeration) still read `slots`
   — correct (slots authoritative), to flip before E can drop `slots`.
-- **C. Migrate accessor storage to the value slot.** A shaped accessor slot
-  stores an `AccessorPair` GC cell handle in the value array; shape's
-  `own_is_accessor` marks it. Remove `kind` from per-object storage.
-- **D. defineProperty / freeze / seal as attribute transitions.** Changing
-  w/e/c or data↔accessor transitions the object to the attribute-encoding
-  shape instead of mutating `slots[i].flags`. Freeze/seal → bulk transition.
-- **E. Remove `slots` from shaped objects.** `slots` becomes dict-mode-only;
-  move it into `ExoticSlots` (like `dictionary_keys`). Shaped objects (the
-  common case) carry no `slots`. **ObjectBody → ~88B.**
+- **C. Migrate accessor storage to the value slot. — LANDED.** String-keyed
+  accessor slots now store a GC-managed accessor cell in the flat value slab;
+  per-slot metadata carries only flags plus the accessor discriminator.
+- **D. defineProperty / freeze / seal as attribute transitions. — LANDED.**
+  Existing shaped-string redefinitions and integrity operations rebuild the
+  attribute-encoding hidden class instead of mutating shaped slot flags in
+  place; dictionary/no-shape fallbacks still materialize metadata.
+- **E. Remove `slots` from shaped objects. — LANDED.** Per-slot metadata moved
+  into `ExoticSlots` and is allocated only for dictionary-mode or
+  attribute-overridden objects. Shaped ordinary objects derive count and
+  attributes from the shape and carry no slot metadata. **ObjectBody is now
+  size-guarded at 72B.**
 
 Gotchas: transition-cache blow-up if attrs over-specialize (mitigate: only
 non-default attrs create attr-transitions; default w+e+c data is the fast
@@ -326,6 +329,22 @@ property access, faster zero-init. This is the **single biggest allocation
 lever** and underpins json (6.5×), prop-access (8.6×), array-ops (7.9×), and
 every OO workload.
 
+### Current status
+Plain object bodies are split: dictionary keys/index, materialized slot
+metadata, symbol props, host data, native call/construct hooks, wrapper payloads,
+Date/Error/raw-JSON/arguments markers, and non-ordinary prototypes live in one
+lazy `ExoticSlots` box. The hot `ObjectBody` is size-guarded at **72B** and
+contains the JIT-visible shape, value-slab pointer/vector, prototype mirror,
+extensibility/override bits, and optional sidecar pointer.
+
+Array bodies now follow the same pattern for cold array-exotic state:
+`ArrayBody` keeps only dense `elements`, logical `length`, and one optional
+`ArrayExoticSlots` sidecar. Sparse/named/accessor/symbol properties,
+descriptor flags, captured JSON source bytes, dirty state, extensibility, and
+per-instance prototype overrides moved out of the plain dense array body. The
+JIT-visible `elements`/`length` offsets remain baked from `offset_of!`, and the
+hot array shell is size-guarded at **<=48B**.
+
 ## D2 — No inline allocation: `new` / object & array literals bridge to the interpreter
 
 ### Evidence
@@ -400,6 +419,12 @@ sizes are guarded so the common fixed cell does not grow. This removes the side
 malloc for short property names, atoms, literal strings, and substring results
 that fit the inline caps while leaving cons/sliced tracing and long-string
 storage unchanged.
+
+Dense arrays still use a `Vec<Value>` because the current baseline JIT reads
+that vector's probed pointer/length layout for inline dense element access, but
+the array shell no longer pays for sparse/named/accessor/symbol/source/prototype
+metadata in every dense array. Full variable-size GC trailing storage remains
+the deeper D3 target.
 
 ## D4 — `Math.sqrt`/`sin`/`cos` bridge to libm instead of a native instruction
 

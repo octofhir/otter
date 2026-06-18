@@ -664,11 +664,7 @@ impl Interpreter {
             // §10.4.2 — named own properties (`arr.foo = 1`)
             // live in the per-array `named_properties` side
             // table.
-            if let Some(value) = self.gc_heap.read_payload(arr, |body| {
-                body.named_properties
-                    .as_ref()
-                    .and_then(|m| m.get(key).cloned())
-            }) {
+            if let Some(value) = array::get_own_named_data_property(arr, &self.gc_heap, key) {
                 let flags = array::get_property_flags(arr, &self.gc_heap, key)
                     .unwrap_or_else(object::PropertyFlags::data_default);
                 return Ok(Some(object::PropertyDescriptor {
@@ -2718,31 +2714,7 @@ impl Interpreter {
             return Ok(keys);
         }
         if let Some(arr) = target.as_array() {
-            let (indices, string_keys) = self.gc_heap.read_payload(arr, |body| {
-                let mut indices = BTreeSet::new();
-                for (idx, value) in body.elements.iter().enumerate() {
-                    if !value.is_hole() {
-                        indices.insert(idx);
-                    }
-                }
-                if let Some(sparse) = &body.sparse_elements {
-                    indices.extend(sparse.keys().copied());
-                }
-                let mut string_keys = Vec::new();
-                if let Some(named) = &body.named_properties {
-                    string_keys.extend(named.keys().cloned());
-                }
-                if let Some(accessors) = &body.accessors {
-                    for key in accessors.keys() {
-                        if let Some(index) = object::array_index_property_name(key) {
-                            indices.insert(index as usize);
-                        } else if !string_keys.iter().any(|existing| existing == key) {
-                            string_keys.push(key.clone());
-                        }
-                    }
-                }
-                (indices, string_keys)
-            });
+            let (indices, string_keys) = array::own_index_and_string_keys(arr, &self.gc_heap);
             let mut keys: Vec<Value> = Vec::with_capacity(indices.len() + string_keys.len() + 2);
             for idx in indices {
                 let key = idx.to_string();

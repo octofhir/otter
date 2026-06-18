@@ -11,15 +11,19 @@
 //! - Large sparse indices live in `sparse_elements` so Array-index
 //!   semantics do not force host-sized dense allocations.
 //! - Missing-index reads return `undefined`.
-//! - Element growth goes through helpers that reserve off-slot
-//!   `SmallVec` capacity against the heap cap before resizing.
+//! - Element growth goes through helpers that reserve off-slot dense
+//!   `Vec` capacity against the heap cap before resizing.
+//! - Rare array state (sparse/named/accessor/symbol properties,
+//!   descriptor flags, captured JSON source text, and per-instance
+//!   prototype overrides) lives behind one sidecar so plain dense
+//!   arrays keep a small hot body.
 //!
 //! # See also
 //!
 //! - <https://tc39.es/ecma262/#sec-array-exotic-objects>
 //! - [GC API](../../../docs/book/src/engine/gc-api.md)
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::mem;
 use std::sync::Arc;
 
@@ -58,15 +62,27 @@ pub struct ArrayBody {
     /// elements are written.
     #[pelt(skip)]
     pub(crate) length: usize,
+    /// Lazily-allocated rare/exotic array state. `None` for ordinary dense
+    /// arrays with default extensibility and no named/sparse/symbol/accessor
+    /// baggage, so the GC cell only carries the JIT-visible dense storage and
+    /// logical length in the common case.
+    #[pelt(via = trace_array_exotic_slots)]
+    pub(crate) exotic: Option<Box<ArrayExoticSlots>>,
+}
+
+/// Cold sidecar for Array exotic features that are absent from ordinary dense
+/// arrays.
+#[derive(Debug, Default)]
+pub(crate) struct ArrayExoticSlots {
     /// Sparse array-indexed own elements.
     ///
     /// This is intentionally separate from string-keyed
     /// `named_properties`: array indices have different `length`
     /// semantics in ECMA-262, but storing huge holes densely would
     /// violate the task-84 survivability gate.
-    pub(crate) sparse_elements: Option<HashMap<usize, Value>>,
+    sparse_elements: Option<HashMap<usize, Value>>,
     /// Optional non-index string-keyed own properties.
-    pub(crate) named_properties: Option<HashMap<String, Value>>,
+    named_properties: Option<HashMap<String, Value>>,
     /// Accessor descriptors installed via
     /// `Object.defineProperty` on the array. Keyed by string key
     /// (covers both indexed and named keys). `(getter, setter)` —
@@ -74,51 +90,44 @@ pub struct ArrayBody {
     /// sparse element value for that slot; named accessors override
     /// the `named_properties` data entry. Spec: §10.4.2.1
     /// ArrayExoticObject [[DefineOwnProperty]].
-    pub(crate) accessors: Option<HashMap<String, (Option<Value>, Option<Value>)>>,
+    accessors: Option<HashMap<String, (Option<Value>, Option<Value>)>>,
     /// Descriptor flags for properties installed through
     /// `Object.defineProperty`. Missing entries use the ordinary
     /// array defaults for data properties.
-    #[pelt(skip)]
-    pub(crate) property_flags: Option<HashMap<String, PropertyFlags>>,
+    property_flags: Option<HashMap<String, PropertyFlags>>,
     /// Symbol-keyed own properties. Stored as a vector of
     /// `(JsSymbol, Value)` pairs (mirroring `JsObject::symbol_props`)
     /// because `JsSymbol` is identity-based — `ptr_eq` is the
     /// authoritative comparator. Typical arrays have zero entries,
     /// so the `Option` keeps the inline footprint at one word.
-    #[pelt(via = trace_array_symbol_properties)]
-    pub(crate) symbol_properties: Option<Vec<(crate::symbol::JsSymbol, Value)>>,
+    symbol_properties: Option<Vec<(crate::symbol::JsSymbol, Value)>>,
     /// Symbol-keyed accessor descriptors installed via
     /// `Object.defineProperty(arr, sym, { get, set })`. Kept separate
     /// from `symbol_properties` (which is data-only); a given symbol is
     /// in exactly one table. `(getter, setter)` — either may be `None`.
     /// Spec: §10.4.2.1 ArrayExoticObject [[DefineOwnProperty]].
-    #[pelt(via = trace_array_symbol_accessors)]
-    pub(crate) symbol_accessors:
-        Option<Vec<(crate::symbol::JsSymbol, (Option<Value>, Option<Value>))>>,
+    symbol_accessors: Option<Vec<(crate::symbol::JsSymbol, (Option<Value>, Option<Value>))>>,
     /// Verbatim slice of input text captured by `JSON.parse` for the
     /// lazy stringify memcpy fast-path. `Some` only when the array
     /// originated from `JSON.parse`; the slice spans the closing
     /// brackets `[…]` exactly.
     ///
     /// Spec: <https://tc39.es/ecma262/#sec-json.stringify> §25.5.2
-    #[pelt(skip)]
-    pub(crate) source_bytes: Option<Arc<[u8]>>,
+    source_bytes: Option<Arc<[u8]>>,
     /// `true` once the array has been mutated since `source_bytes`
     /// was captured. Always `false` while `source_bytes` is `None`
     /// (no fast path is in play to invalidate).
-    #[pelt(skip)]
-    pub(crate) dirty: bool,
+    dirty: bool,
     /// `[[Extensible]]` internal slot per §10.1.3. Starts `true`
     /// (`Default::default()`); flipped to `false` by
     /// `Object.preventExtensions` / `seal` / `freeze` on the array
     /// exotic. New string-keyed writes against a non-extensible
     /// array are rejected by the foundation OrdinarySet path.
-    #[pelt(skip)]
-    pub(crate) extensible: ExtensibleFlag,
+    extensible: ExtensibleFlag,
     /// Per-instance `[[Prototype]]` override for Array exotic
     /// objects constructed through subclassing. Plain arrays leave
     /// this unset and resolve to the realm `%Array.prototype%`.
-    pub(crate) prototype_override: Option<Value>,
+    prototype_override: Option<Value>,
 }
 
 /// Byte offset of [`ArrayBody::elements`] from the body start (after the GC
@@ -131,6 +140,11 @@ pub const ARRAY_BODY_ELEMENTS_OFFSET: usize = std::mem::offset_of!(ArrayBody, el
 /// header). The baseline JIT reads this for the `arr.length` fast path after
 /// guarding the receiver body tag.
 pub const ARRAY_BODY_LENGTH_OFFSET: usize = std::mem::offset_of!(ArrayBody, length);
+
+// Keep the JIT-visible dense array shell small and offset-stable: cold array
+// state must stay in `ArrayExoticSlots`, not creep back into `ArrayBody`.
+const _: () = assert!(std::mem::offset_of!(ArrayBody, elements) == 0);
+const _: () = assert!(std::mem::size_of::<ArrayBody>() <= 48);
 
 /// Trace helper for symbol-keyed own properties: only `Value` parts
 /// of each `(JsSymbol, Value)` pair carry GC slots — the `JsSymbol`
@@ -165,6 +179,37 @@ fn trace_array_symbol_accessors(
     }
 }
 
+fn trace_array_exotic_slots(field: &Option<Box<ArrayExoticSlots>>, visitor: &mut SlotVisitor<'_>) {
+    let Some(exotic) = field.as_ref() else {
+        return;
+    };
+    if let Some(sparse) = &exotic.sparse_elements {
+        for value in sparse.values() {
+            value.trace_value_slots(visitor);
+        }
+    }
+    if let Some(named) = &exotic.named_properties {
+        for value in named.values() {
+            value.trace_value_slots(visitor);
+        }
+    }
+    if let Some(accessors) = &exotic.accessors {
+        for (getter, setter) in accessors.values() {
+            if let Some(g) = getter {
+                g.trace_value_slots(visitor);
+            }
+            if let Some(s) = setter {
+                s.trace_value_slots(visitor);
+            }
+        }
+    }
+    trace_array_symbol_properties(&exotic.symbol_properties, visitor);
+    trace_array_symbol_accessors(&exotic.symbol_accessors, visitor);
+    if let Some(proto) = exotic.prototype_override {
+        proto.trace_value_slots(visitor);
+    }
+}
+
 /// One-byte `[[Extensible]]` slot. Wrapper around `bool` with a
 /// `Default = true` impl so [`ArrayBody::default()`] keeps the spec
 /// initial state without spelling the field on every constructor.
@@ -177,9 +222,71 @@ impl Default for ExtensibleFlag {
     }
 }
 
+impl ArrayBody {
+    #[inline]
+    fn exotic(&self) -> Option<&ArrayExoticSlots> {
+        self.exotic.as_deref()
+    }
+
+    #[inline]
+    fn exotic_mut(&mut self) -> &mut ArrayExoticSlots {
+        self.exotic
+            .get_or_insert_with(|| Box::new(ArrayExoticSlots::default()))
+    }
+
+    #[inline]
+    fn sparse_elements(&self) -> Option<&HashMap<usize, Value>> {
+        self.exotic().and_then(|e| e.sparse_elements.as_ref())
+    }
+
+    #[inline]
+    fn named_properties(&self) -> Option<&HashMap<String, Value>> {
+        self.exotic().and_then(|e| e.named_properties.as_ref())
+    }
+
+    #[inline]
+    fn accessors(&self) -> Option<&HashMap<String, (Option<Value>, Option<Value>)>> {
+        self.exotic().and_then(|e| e.accessors.as_ref())
+    }
+
+    #[inline]
+    fn property_flags(&self) -> Option<&HashMap<String, PropertyFlags>> {
+        self.exotic().and_then(|e| e.property_flags.as_ref())
+    }
+
+    #[inline]
+    fn symbol_properties(&self) -> Option<&Vec<(crate::symbol::JsSymbol, Value)>> {
+        self.exotic().and_then(|e| e.symbol_properties.as_ref())
+    }
+
+    #[inline]
+    fn symbol_accessors(
+        &self,
+    ) -> Option<&Vec<(crate::symbol::JsSymbol, (Option<Value>, Option<Value>))>> {
+        self.exotic().and_then(|e| e.symbol_accessors.as_ref())
+    }
+
+    #[inline]
+    fn prototype_override(&self) -> Option<Value> {
+        self.exotic().and_then(|e| e.prototype_override)
+    }
+
+    #[inline]
+    fn extensible(&self) -> bool {
+        self.exotic().is_none_or(|e| e.extensible.0)
+    }
+
+    #[inline]
+    fn mark_dirty(&mut self) {
+        if let Some(exotic) = self.exotic.as_deref_mut() {
+            exotic.dirty = true;
+        }
+    }
+}
+
 /// Read the Array exotic's per-instance `[[Prototype]]` override.
 pub(crate) fn prototype_override(arr: JsArray, heap: &GcHeap) -> Option<Value> {
-    heap.read_payload(arr, |body| body.prototype_override)
+    heap.read_payload(arr, |body| body.prototype_override())
 }
 
 /// Set the Array exotic's per-instance `[[Prototype]]` override.
@@ -193,7 +300,7 @@ pub(crate) fn prototype_override(arr: JsArray, heap: &GcHeap) -> Option<Value> {
 pub(crate) fn set_prototype_override(arr: JsArray, heap: &mut GcHeap, proto: Option<Value>) {
     let barrier_value = proto;
     heap.with_payload(arr, |body| {
-        body.prototype_override = proto;
+        body.exotic_mut().prototype_override = proto;
     });
     if let Some(value) = &barrier_value {
         heap.record_write(arr, value);
@@ -293,8 +400,11 @@ fn from_elements_with_source_old_for_fixture(
     let collected: Vec<Value> = values.into_iter().collect();
     let mut body = ArrayBody {
         length: collected.len(),
-        source_bytes: Some(source_bytes),
-        dirty: false,
+        exotic: Some(Box::new(ArrayExoticSlots {
+            source_bytes: Some(source_bytes),
+            dirty: false,
+            ..ArrayExoticSlots::default()
+        })),
         ..Default::default()
     };
     reserve_elements_for_len(&mut body, heap, collected.len())?;
@@ -314,8 +424,11 @@ pub(crate) fn from_elements_with_source_and_roots(
     let collected: Vec<Value> = values.into_iter().collect();
     let mut body = ArrayBody {
         length: collected.len(),
-        source_bytes: Some(source_bytes),
-        dirty: false,
+        exotic: Some(Box::new(ArrayExoticSlots {
+            source_bytes: Some(source_bytes),
+            dirty: false,
+            ..ArrayExoticSlots::default()
+        })),
         ..Default::default()
     };
     {
@@ -354,8 +467,7 @@ pub fn get(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> Value {
             .get(idx)
             .cloned()
             .or_else(|| {
-                body.sparse_elements
-                    .as_ref()
+                body.sparse_elements()
                     .and_then(|sparse| sparse.get(&idx).cloned())
             })
             .unwrap_or(Value::undefined());
@@ -378,8 +490,7 @@ pub fn has_own_element(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> boo
         if let Some(slot) = body.elements.get(idx) {
             return !slot.is_hole();
         }
-        body.sparse_elements
-            .as_ref()
+        body.sparse_elements()
             .is_some_and(|sparse| sparse.contains_key(&idx))
     })
 }
@@ -432,10 +543,13 @@ fn set_index_value(
     let target_len = idx.saturating_add(1);
     if should_store_sparse(arr, heap, idx) {
         heap.with_payload(arr, |body| {
-            let sparse = body.sparse_elements.get_or_insert_with(HashMap::new);
+            let sparse = body
+                .exotic_mut()
+                .sparse_elements
+                .get_or_insert_with(HashMap::new);
             sparse.insert(idx, value);
             body.length = body.length.max(target_len);
-            body.dirty = true;
+            body.mark_dirty();
         });
         heap.record_write(arr, &barrier_value);
         return Ok(());
@@ -445,7 +559,7 @@ fn set_index_value(
         if idx < body.elements.len() {
             body.elements[idx] = value;
             body.length = body.length.max(target_len);
-            body.dirty = true;
+            body.mark_dirty();
             return;
         }
         body.elements
@@ -455,7 +569,7 @@ fn set_index_value(
         }
         body.elements.push(value);
         body.length = body.length.max(target_len);
-        body.dirty = true;
+        body.mark_dirty();
     });
     heap.record_write(arr, &barrier_value);
     Ok(())
@@ -486,10 +600,13 @@ pub(crate) fn set_with_roots(
     let target_len = idx.saturating_add(1);
     if should_store_sparse(arr, heap, idx) {
         heap.with_payload(arr, |body| {
-            let sparse = body.sparse_elements.get_or_insert_with(HashMap::new);
+            let sparse = body
+                .exotic_mut()
+                .sparse_elements
+                .get_or_insert_with(HashMap::new);
             sparse.insert(idx, value);
             body.length = body.length.max(target_len);
-            body.dirty = true;
+            body.mark_dirty();
         });
         heap.record_write(arr, &barrier_value);
         return Ok(());
@@ -505,7 +622,7 @@ pub(crate) fn set_with_roots(
         if idx < body.elements.len() {
             body.elements[idx] = value;
             body.length = body.length.max(target_len);
-            body.dirty = true;
+            body.mark_dirty();
             return;
         }
         body.elements
@@ -515,7 +632,7 @@ pub(crate) fn set_with_roots(
         }
         body.elements.push(value);
         body.length = body.length.max(target_len);
-        body.dirty = true;
+        body.mark_dirty();
     });
     heap.record_write(arr, &barrier_value);
     Ok(())
@@ -539,7 +656,7 @@ pub(crate) fn can_fast_fill_dense_range(
     }
     const MAX_DENSE_INDEX: usize = 1 << 20;
     heap.read_payload(arr, |body| {
-        if !body.extensible.0 || body.prototype_override.is_some() || end > MAX_DENSE_INDEX {
+        if !body.extensible() || body.prototype_override().is_some() || end > MAX_DENSE_INDEX {
             return false;
         }
         if start.saturating_sub(body.elements.len()) > 1024 {
@@ -551,15 +668,13 @@ pub(crate) fn can_fast_fill_dense_range(
                 .is_some_and(|idx| (start..end).contains(&idx))
         };
         if body
-            .accessors
-            .as_ref()
+            .accessors()
             .is_some_and(|accessors| accessors.keys().any(|key| in_range(key)))
         {
             return false;
         }
         if body
-            .property_flags
-            .as_ref()
+            .property_flags()
             .is_some_and(|flags| flags.keys().any(|key| in_range(key)))
         {
             return false;
@@ -604,7 +719,7 @@ pub(crate) fn fill_dense_range_with_roots(
             body.elements.push(value);
         }
         body.length = body.length.max(end);
-        body.dirty = true;
+        body.mark_dirty();
     });
     heap.record_write(arr, &value);
     Ok(())
@@ -632,7 +747,7 @@ pub fn push(
         }
         body.elements.push(value);
         body.length = target_len;
-        body.dirty = true;
+        body.mark_dirty();
         body.length
     });
     heap.record_write(arr, &barrier_value);
@@ -669,7 +784,7 @@ pub(crate) fn push_with_roots(
         }
         body.elements.push(value);
         body.length = target_len;
-        body.dirty = true;
+        body.mark_dirty();
         body.length
     });
     heap.record_write(arr, &barrier_value);
@@ -698,25 +813,31 @@ pub fn set_length(
         heap.with_payload(arr, |body| {
             body.length = new_len;
             body.elements.truncate(new_len);
-            if let Some(sparse) = body.sparse_elements.as_mut() {
+            if let Some(exotic) = body.exotic.as_deref_mut()
+                && let Some(sparse) = exotic.sparse_elements.as_mut()
+            {
                 sparse.retain(|k, _| *k < new_len);
                 if sparse.is_empty() {
-                    body.sparse_elements = None;
+                    exotic.sparse_elements = None;
                 }
             }
-            if let Some(accessors) = body.accessors.as_mut() {
+            if let Some(exotic) = body.exotic.as_deref_mut()
+                && let Some(accessors) = exotic.accessors.as_mut()
+            {
                 accessors.retain(|key, _| !array_index_at_or_above(key, new_len));
                 if accessors.is_empty() {
-                    body.accessors = None;
+                    exotic.accessors = None;
                 }
             }
-            if let Some(flags) = body.property_flags.as_mut() {
+            if let Some(exotic) = body.exotic.as_deref_mut()
+                && let Some(flags) = exotic.property_flags.as_mut()
+            {
                 flags.retain(|key, _| key == "length" || !array_index_at_or_above(key, new_len));
                 if flags.is_empty() {
-                    body.property_flags = None;
+                    exotic.property_flags = None;
                 }
             }
-            body.dirty = true;
+            body.mark_dirty();
         });
         return Ok(());
     }
@@ -733,7 +854,7 @@ pub fn set_length(
             }
         }
         body.length = new_len;
-        body.dirty = true;
+        body.mark_dirty();
     });
     Ok(())
 }
@@ -767,10 +888,10 @@ pub(crate) fn set_length_checked(
                 present.push(idx);
             }
         }
-        if let Some(sparse) = body.sparse_elements.as_ref() {
+        if let Some(sparse) = body.sparse_elements() {
             present.extend(sparse.keys().copied().filter(|&k| k >= new_len && k < cur));
         }
-        if let Some(accessors) = body.accessors.as_ref() {
+        if let Some(accessors) = body.accessors() {
             for key in accessors.keys() {
                 if let Some(idx) = crate::object::array_index_property_name(key) {
                     let idx = idx as usize;
@@ -785,8 +906,7 @@ pub(crate) fn set_length_checked(
         for &idx in present.iter().rev() {
             let key = idx.to_string();
             let configurable = body
-                .property_flags
-                .as_ref()
+                .property_flags()
                 .and_then(|flags| flags.get(&key))
                 .is_none_or(|flags| flags.configurable());
             if !configurable {
@@ -821,50 +941,62 @@ fn delete_array_body_index(body: &mut ArrayBody, idx: usize) {
     if let Some(slot) = body.elements.get_mut(idx) {
         *slot = Value::hole();
     }
-    if let Some(sparse) = body.sparse_elements.as_mut() {
+    if let Some(exotic) = body.exotic.as_deref_mut()
+        && let Some(sparse) = exotic.sparse_elements.as_mut()
+    {
         sparse.remove(&idx);
         if sparse.is_empty() {
-            body.sparse_elements = None;
+            exotic.sparse_elements = None;
         }
     }
     let key = idx.to_string();
-    if let Some(accessors) = body.accessors.as_mut() {
+    if let Some(exotic) = body.exotic.as_deref_mut()
+        && let Some(accessors) = exotic.accessors.as_mut()
+    {
         accessors.remove(&key);
         if accessors.is_empty() {
-            body.accessors = None;
+            exotic.accessors = None;
         }
     }
-    if let Some(flags) = body.property_flags.as_mut() {
+    if let Some(exotic) = body.exotic.as_deref_mut()
+        && let Some(flags) = exotic.property_flags.as_mut()
+    {
         flags.remove(&key);
         if flags.is_empty() {
-            body.property_flags = None;
+            exotic.property_flags = None;
         }
     }
-    body.dirty = true;
+    body.mark_dirty();
 }
 
 fn truncate_array_body_to(body: &mut ArrayBody, len: usize) {
     body.length = len;
     body.elements.truncate(len);
-    if let Some(sparse) = body.sparse_elements.as_mut() {
+    if let Some(exotic) = body.exotic.as_deref_mut()
+        && let Some(sparse) = exotic.sparse_elements.as_mut()
+    {
         sparse.retain(|idx, _| *idx < len);
         if sparse.is_empty() {
-            body.sparse_elements = None;
+            exotic.sparse_elements = None;
         }
     }
-    if let Some(accessors) = body.accessors.as_mut() {
+    if let Some(exotic) = body.exotic.as_deref_mut()
+        && let Some(accessors) = exotic.accessors.as_mut()
+    {
         accessors.retain(|key, _| !array_index_at_or_above(key, len));
         if accessors.is_empty() {
-            body.accessors = None;
+            exotic.accessors = None;
         }
     }
-    if let Some(flags) = body.property_flags.as_mut() {
+    if let Some(exotic) = body.exotic.as_deref_mut()
+        && let Some(flags) = exotic.property_flags.as_mut()
+    {
         flags.retain(|key, _| key == "length" || !array_index_at_or_above(key, len));
         if flags.is_empty() {
-            body.property_flags = None;
+            exotic.property_flags = None;
         }
     }
-    body.dirty = true;
+    body.mark_dirty();
 }
 
 fn array_index_at_or_above(key: &str, limit: usize) -> bool {
@@ -883,8 +1015,9 @@ pub fn pop(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
         let popped = if idx < body.elements.len() {
             body.elements.get(idx).cloned()
         } else {
-            body.sparse_elements
-                .as_mut()
+            body.exotic
+                .as_deref_mut()
+                .and_then(|exotic| exotic.sparse_elements.as_mut())
                 .and_then(|sparse| sparse.remove(&idx))
         };
         truncate_array_body_to(body, idx);
@@ -899,7 +1032,7 @@ pub fn pop(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
 /// `[[Extensible]]` slot to `false`. Idempotent.
 pub fn prevent_extensions(arr: JsArray, heap: &mut otter_gc::GcHeap) {
     heap.with_payload(arr, |body| {
-        body.extensible = ExtensibleFlag(false);
+        body.exotic_mut().extensible = ExtensibleFlag(false);
     });
 }
 
@@ -915,14 +1048,17 @@ pub fn set_integrity_level(arr: JsArray, heap: &mut otter_gc::GcHeap, frozen: bo
                 keys.push((i.to_string(), false));
             }
         }
-        if let Some(sparse) = &body.sparse_elements {
+        if let Some(sparse) = body.sparse_elements() {
             keys.extend(sparse.keys().map(|k| (k.to_string(), false)));
         }
-        if let Some(named) = &body.named_properties {
+        if let Some(named) = body.named_properties() {
             keys.extend(named.keys().map(|k| (k.clone(), false)));
         }
         keys.push(("length".to_string(), true));
-        let flags = body.property_flags.get_or_insert_with(HashMap::new);
+        let flags = body
+            .exotic_mut()
+            .property_flags
+            .get_or_insert_with(HashMap::new);
         for (key, is_length) in keys {
             let entry = flags.entry(key).or_insert_with(|| {
                 if is_length {
@@ -950,17 +1086,16 @@ pub fn test_integrity_level(arr: JsArray, heap: &otter_gc::GcHeap, frozen: bool)
                 keys.push(i.to_string());
             }
         }
-        if let Some(sparse) = &body.sparse_elements {
+        if let Some(sparse) = body.sparse_elements() {
             keys.extend(sparse.keys().map(|k| k.to_string()));
         }
-        if let Some(named) = &body.named_properties {
+        if let Some(named) = body.named_properties() {
             keys.extend(named.keys().cloned());
         }
         keys.push("length".to_string());
         keys.iter().all(|key| {
             let entry = body
-                .property_flags
-                .as_ref()
+                .property_flags()
                 .and_then(|flags| flags.get(key))
                 .copied()
                 .unwrap_or_else(|| {
@@ -984,7 +1119,8 @@ pub fn set_named_property_flags(
     new_flags: PropertyFlags,
 ) {
     heap.with_payload(arr, |body| {
-        body.property_flags
+        body.exotic_mut()
+            .property_flags
             .get_or_insert_with(HashMap::new)
             .insert(key.to_string(), new_flags);
     });
@@ -993,7 +1129,7 @@ pub fn set_named_property_flags(
 /// §10.1.3 `[[IsExtensible]]` on the array exotic.
 #[must_use]
 pub fn is_extensible(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
-    heap.read_payload(arr, |body| body.extensible.0)
+    heap.read_payload(arr, |body| body.extensible())
 }
 
 /// Install a symbol-keyed own property on the array exotic body.
@@ -1011,19 +1147,24 @@ pub fn set_symbol_property(
     heap.with_payload(arr, |body| {
         // A symbol is in exactly one table — installing a data value
         // removes any accessor previously held for the same key.
-        if let Some(accessors) = body.symbol_accessors.as_mut() {
+        if let Some(exotic) = body.exotic.as_deref_mut()
+            && let Some(accessors) = exotic.symbol_accessors.as_mut()
+        {
             accessors.retain(|(k, _)| !k.ptr_eq(key));
             if accessors.is_empty() {
-                body.symbol_accessors = None;
+                exotic.symbol_accessors = None;
             }
         }
-        let table = body.symbol_properties.get_or_insert_with(Vec::new);
+        let table = body
+            .exotic_mut()
+            .symbol_properties
+            .get_or_insert_with(Vec::new);
         if let Some(slot) = table.iter_mut().find(|(k, _)| k.ptr_eq(key)) {
             slot.1 = value;
         } else {
             table.push((key, value));
         }
-        body.dirty = true;
+        body.mark_dirty();
     });
     heap.record_write(arr, &barrier_value);
 }
@@ -1038,19 +1179,24 @@ pub fn set_symbol_accessor(
     setter: Option<Value>,
 ) {
     heap.with_payload(arr, |body| {
-        if let Some(table) = body.symbol_properties.as_mut() {
+        if let Some(exotic) = body.exotic.as_deref_mut()
+            && let Some(table) = exotic.symbol_properties.as_mut()
+        {
             table.retain(|(k, _)| !k.ptr_eq(key));
             if table.is_empty() {
-                body.symbol_properties = None;
+                exotic.symbol_properties = None;
             }
         }
-        let accessors = body.symbol_accessors.get_or_insert_with(Vec::new);
+        let accessors = body
+            .exotic_mut()
+            .symbol_accessors
+            .get_or_insert_with(Vec::new);
         if let Some(slot) = accessors.iter_mut().find(|(k, _)| k.ptr_eq(key)) {
             slot.1 = (getter, setter);
         } else {
             accessors.push((key, (getter, setter)));
         }
-        body.dirty = true;
+        body.mark_dirty();
     });
     if let Some(g) = &getter {
         heap.record_write(arr, g);
@@ -1069,8 +1215,7 @@ pub fn get_symbol_accessor(
     key: crate::symbol::JsSymbol,
 ) -> Option<(Option<Value>, Option<Value>)> {
     heap.read_payload(arr, |body| {
-        body.symbol_accessors
-            .as_ref()
+        body.symbol_accessors()
             .and_then(|table| table.iter().find(|(k, _)| k.ptr_eq(key)).map(|(_, v)| *v))
     })
 }
@@ -1084,8 +1229,7 @@ pub fn get_symbol_property(
     key: crate::symbol::JsSymbol,
 ) -> Option<Value> {
     heap.read_payload(arr, |body| {
-        body.symbol_properties
-            .as_ref()
+        body.symbol_properties()
             .and_then(|table| table.iter().find(|(k, _)| k.ptr_eq(key)).map(|(_, v)| *v))
     })
 }
@@ -1100,23 +1244,25 @@ pub fn delete_symbol_property(
     key: crate::symbol::JsSymbol,
 ) -> bool {
     heap.with_payload(arr, |body| {
-        if let Some(table) = body.symbol_properties.as_mut()
+        if let Some(exotic) = body.exotic.as_deref_mut()
+            && let Some(table) = exotic.symbol_properties.as_mut()
             && let Some(pos) = table.iter().position(|(k, _)| k.ptr_eq(key))
         {
             table.remove(pos);
             if table.is_empty() {
-                body.symbol_properties = None;
+                exotic.symbol_properties = None;
             }
-            body.dirty = true;
+            body.mark_dirty();
         }
-        if let Some(table) = body.symbol_accessors.as_mut()
+        if let Some(exotic) = body.exotic.as_deref_mut()
+            && let Some(table) = exotic.symbol_accessors.as_mut()
             && let Some(pos) = table.iter().position(|(k, _)| k.ptr_eq(key))
         {
             table.remove(pos);
             if table.is_empty() {
-                body.symbol_accessors = None;
+                exotic.symbol_accessors = None;
             }
-            body.dirty = true;
+            body.mark_dirty();
         }
         true
     })
@@ -1128,10 +1274,9 @@ pub fn delete_symbol_property(
 pub fn own_symbol_keys(arr: JsArray, heap: &otter_gc::GcHeap) -> Vec<crate::symbol::JsSymbol> {
     heap.read_payload(arr, |body| {
         let mut keys: Vec<crate::symbol::JsSymbol> = body
-            .symbol_properties
-            .as_ref()
+            .symbol_properties()
             .map_or_else(Vec::new, |t| t.iter().map(|(k, _)| *k).collect());
-        if let Some(accessors) = body.symbol_accessors.as_ref() {
+        if let Some(accessors) = body.symbol_accessors() {
             keys.extend(accessors.iter().map(|(k, _)| *k));
         }
         keys
@@ -1175,18 +1320,19 @@ pub fn set_named_property(
     // through OrdinaryDefineOwnProperty which only fails when the
     // property is absent and the object is non-extensible).
     let absent = heap.read_payload(arr, |body| {
-        body.named_properties
-            .as_ref()
-            .is_none_or(|m| !m.contains_key(key))
+        body.named_properties().is_none_or(|m| !m.contains_key(key))
     });
     if absent && !is_extensible(arr, heap) {
         return Ok(());
     }
     let barrier_value = value;
     heap.with_payload(arr, |body| {
-        let map = body.named_properties.get_or_insert_with(HashMap::new);
+        let map = body
+            .exotic_mut()
+            .named_properties
+            .get_or_insert_with(HashMap::new);
         map.insert(key.to_string(), value);
-        body.dirty = true;
+        body.mark_dirty();
     });
     heap.record_write(arr, &barrier_value);
     Ok(())
@@ -1206,9 +1352,12 @@ pub(crate) fn define_named_data_property(
 ) {
     let barrier_value = value;
     heap.with_payload(arr, |body| {
-        let map = body.named_properties.get_or_insert_with(HashMap::new);
+        let map = body
+            .exotic_mut()
+            .named_properties
+            .get_or_insert_with(HashMap::new);
         map.insert(key.to_string(), value);
-        body.dirty = true;
+        body.mark_dirty();
     });
     heap.record_write(arr, &barrier_value);
 }
@@ -1221,8 +1370,7 @@ pub(crate) fn get_property_flags(
     key: &str,
 ) -> Option<PropertyFlags> {
     heap.read_payload(arr, |body| {
-        body.property_flags
-            .as_ref()
+        body.property_flags()
             .and_then(|flags| flags.get(key).copied())
     })
 }
@@ -1235,9 +1383,12 @@ pub(crate) fn set_property_flags(
     flags: PropertyFlags,
 ) {
     heap.with_payload(arr, |body| {
-        let map = body.property_flags.get_or_insert_with(HashMap::new);
+        let map = body
+            .exotic_mut()
+            .property_flags
+            .get_or_insert_with(HashMap::new);
         map.insert(key.to_string(), flags);
-        body.dirty = true;
+        body.mark_dirty();
     });
 }
 
@@ -1258,16 +1409,28 @@ pub fn get_named_property(arr: JsArray, heap: &otter_gc::GcHeap, key: &str) -> O
                 .filter(|v| !v.is_hole())
                 .cloned()
                 .or_else(|| {
-                    body.sparse_elements
-                        .as_ref()
+                    body.sparse_elements()
                         .and_then(|sparse| sparse.get(&idx).cloned())
                 })
         });
     }
     heap.read_payload(arr, |body| {
-        body.named_properties
-            .as_ref()
-            .and_then(|m| m.get(key).cloned())
+        body.named_properties().and_then(|m| m.get(key).cloned())
+    })
+}
+
+/// Read a non-index string-keyed own data property from the array side table.
+///
+/// Callers that already handled `"length"` and array-index keys use this to
+/// avoid depending on the cold sidecar's storage layout.
+#[must_use]
+pub(crate) fn get_own_named_data_property(
+    arr: JsArray,
+    heap: &otter_gc::GcHeap,
+    key: &str,
+) -> Option<Value> {
+    heap.read_payload(arr, |body| {
+        body.named_properties().and_then(|m| m.get(key).cloned())
     })
 }
 
@@ -1284,7 +1447,7 @@ pub fn set_accessor(
     setter: Option<Value>,
 ) {
     heap.with_payload(arr, |body| {
-        let map = body.accessors.get_or_insert_with(HashMap::new);
+        let map = body.exotic_mut().accessors.get_or_insert_with(HashMap::new);
         map.insert(key.to_string(), (getter, setter));
         // Hide the underlying dense / sparse / named data slot so
         // subsequent ordinary reads see the accessor instead of the
@@ -1294,14 +1457,18 @@ pub fn set_accessor(
             if let Some(slot) = body.elements.get_mut(idx) {
                 *slot = Value::hole();
             }
-            if let Some(sparse) = body.sparse_elements.as_mut() {
+            if let Some(exotic) = body.exotic.as_deref_mut()
+                && let Some(sparse) = exotic.sparse_elements.as_mut()
+            {
                 sparse.remove(&idx);
             }
         }
-        if let Some(named) = body.named_properties.as_mut() {
+        if let Some(exotic) = body.exotic.as_deref_mut()
+            && let Some(named) = exotic.named_properties.as_mut()
+        {
             named.remove(key);
         }
-        body.dirty = true;
+        body.mark_dirty();
     });
     if let Some(g) = &getter {
         heap.record_write(arr, g);
@@ -1316,7 +1483,7 @@ pub fn set_accessor(
 /// [`get_accessor`] lookup (and its key allocation) for plain arrays.
 #[must_use]
 pub fn has_accessors(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
-    heap.read_payload(arr, |body| body.accessors.is_some())
+    heap.read_payload(arr, |body| body.accessors().is_some())
 }
 
 /// Look up an accessor descriptor previously installed via
@@ -1329,7 +1496,7 @@ pub fn get_accessor(
     key: &str,
 ) -> Option<(Option<Value>, Option<Value>)> {
     heap.read_payload(arr, |body| {
-        body.accessors.as_ref().and_then(|m| m.get(key).cloned())
+        body.accessors().and_then(|m| m.get(key).cloned())
     })
 }
 
@@ -1338,11 +1505,12 @@ pub fn get_accessor(
 pub fn delete_accessor(arr: JsArray, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
     heap.with_payload(arr, |body| {
         let removed = body
-            .accessors
-            .as_mut()
+            .exotic
+            .as_deref_mut()
+            .and_then(|exotic| exotic.accessors.as_mut())
             .is_some_and(|m| m.remove(key).is_some());
         if removed {
-            body.dirty = true;
+            body.mark_dirty();
         }
         removed
     })
@@ -1360,59 +1528,113 @@ pub fn delete_named_property(arr: JsArray, heap: &mut otter_gc::GcHeap, key: &st
     if let Some(idx) = crate::object::array_index_property_name(key) {
         let idx = idx as usize;
         return heap.with_payload(arr, |body| {
-            if let Some(accessors) = body.accessors.as_mut() {
+            if let Some(exotic) = body.exotic.as_deref_mut()
+                && let Some(accessors) = exotic.accessors.as_mut()
+            {
                 accessors.remove(key);
                 if accessors.is_empty() {
-                    body.accessors = None;
+                    exotic.accessors = None;
                 }
             }
             if let Some(slot) = body.elements.get_mut(idx) {
                 *slot = Value::hole();
             }
-            if let Some(sparse) = body.sparse_elements.as_mut() {
+            if let Some(exotic) = body.exotic.as_deref_mut()
+                && let Some(sparse) = exotic.sparse_elements.as_mut()
+            {
                 sparse.remove(&idx);
             }
-            if let Some(flags) = body.property_flags.as_mut() {
+            if let Some(exotic) = body.exotic.as_deref_mut()
+                && let Some(flags) = exotic.property_flags.as_mut()
+            {
                 flags.remove(key);
                 if flags.is_empty() {
-                    body.property_flags = None;
+                    exotic.property_flags = None;
                 }
             }
-            body.dirty = true;
+            body.mark_dirty();
             true
         });
     }
     heap.with_payload(arr, |body| {
-        if let Some(accessors) = body.accessors.as_mut() {
+        if let Some(exotic) = body.exotic.as_deref_mut()
+            && let Some(accessors) = exotic.accessors.as_mut()
+        {
             accessors.remove(key);
             if accessors.is_empty() {
-                body.accessors = None;
+                exotic.accessors = None;
             }
         }
-        if let Some(props) = body.named_properties.as_mut() {
+        if let Some(exotic) = body.exotic.as_deref_mut()
+            && let Some(props) = exotic.named_properties.as_mut()
+        {
             props.remove(key);
             if props.is_empty() {
-                body.named_properties = None;
+                exotic.named_properties = None;
             }
         }
-        if let Some(flags) = body.property_flags.as_mut() {
+        if let Some(exotic) = body.exotic.as_deref_mut()
+            && let Some(flags) = exotic.property_flags.as_mut()
+        {
             flags.remove(key);
             if flags.is_empty() {
-                body.property_flags = None;
+                exotic.property_flags = None;
             }
         }
-        body.dirty = true;
+        body.mark_dirty();
         true
     })
 }
 
+/// Own array-index keys plus non-index string keys in array own-key order.
+///
+/// Dense/sparse/accessor numeric keys are returned as indices; non-index data
+/// and accessor names are deduplicated in insertion-table order.
+#[must_use]
+pub(crate) fn own_index_and_string_keys(
+    arr: JsArray,
+    heap: &otter_gc::GcHeap,
+) -> (BTreeSet<usize>, Vec<String>) {
+    heap.read_payload(arr, |body| {
+        let mut indices = BTreeSet::new();
+        for (idx, value) in body.elements.iter().enumerate() {
+            if !value.is_hole() {
+                indices.insert(idx);
+            }
+        }
+        if let Some(sparse) = body.sparse_elements() {
+            indices.extend(sparse.keys().copied());
+        }
+        let mut string_keys = Vec::new();
+        if let Some(named) = body.named_properties() {
+            string_keys.extend(named.keys().cloned());
+        }
+        if let Some(accessors) = body.accessors() {
+            for key in accessors.keys() {
+                if let Some(index) = crate::object::array_index_property_name(key) {
+                    indices.insert(index as usize);
+                } else if !string_keys.iter().any(|existing| existing == key) {
+                    string_keys.push(key.clone());
+                }
+            }
+        }
+        (indices, string_keys)
+    })
+}
+
+/// Non-index own string keys from named data properties and accessors.
+#[must_use]
+pub(crate) fn own_non_index_string_keys(arr: JsArray, heap: &otter_gc::GcHeap) -> Vec<String> {
+    let (_, keys) = own_index_and_string_keys(arr, heap);
+    keys
+}
+
 pub(crate) fn can_write_array_property(arr: JsArray, heap: &otter_gc::GcHeap, key: &str) -> bool {
     heap.read_payload(arr, |body| {
-        if body.accessors.as_ref().is_some_and(|m| m.contains_key(key)) {
+        if body.accessors().is_some_and(|m| m.contains_key(key)) {
             return false;
         }
-        body.property_flags
-            .as_ref()
+        body.property_flags()
             .and_then(|flags| flags.get(key))
             .is_none_or(|flags| flags.writable())
     })
@@ -1420,8 +1642,7 @@ pub(crate) fn can_write_array_property(arr: JsArray, heap: &otter_gc::GcHeap, ke
 
 fn can_delete_array_property(arr: JsArray, heap: &otter_gc::GcHeap, key: &str) -> bool {
     heap.read_payload(arr, |body| {
-        body.property_flags
-            .as_ref()
+        body.property_flags()
             .and_then(|flags| flags.get(key))
             .is_none_or(|flags| flags.configurable())
     })
@@ -1449,7 +1670,7 @@ pub(crate) fn with_elements_mut<R>(
     let (out, children) = heap.with_payload(arr, |body| {
         let out = f(&mut body.elements);
         body.length = body.elements.len();
-        body.dirty = true;
+        body.mark_dirty();
         let children: SmallVec<[Value; 8]> = body.elements.iter().cloned().collect();
         (out, children)
     });
@@ -1478,10 +1699,11 @@ pub fn ptr_eq(a: JsArray, b: JsArray) -> bool {
 #[must_use]
 pub fn clean_source_bytes(arr: JsArray, heap: &otter_gc::GcHeap) -> Option<Arc<[u8]>> {
     heap.read_payload(arr, |body| {
-        if body.dirty {
+        let exotic = body.exotic()?;
+        if exotic.dirty {
             return None;
         }
-        let source = body.source_bytes.as_ref()?;
+        let source = exotic.source_bytes.as_ref()?;
         if !body.elements.iter().all(is_render_stable_primitive) {
             return None;
         }

@@ -25,14 +25,29 @@ impl Interpreter {
         dst: u16,
         idx: u32,
     ) -> Result<(), VmError> {
+        let value = self.load_bigint_constant_value(context, idx)?;
+        write_register(frame, dst, value)?;
+        frame.advance_pc(self.current_byte_len)?;
+        Ok(())
+    }
+
+    pub(crate) fn load_bigint_constant_value(
+        &mut self,
+        context: &ExecutionContext,
+        idx: u32,
+    ) -> Result<Value, VmError> {
+        let key = context.constant_cache_key(idx);
+        if let Some(value) = self.bigint_constant_cache.get(&key) {
+            return Ok(*value);
+        }
         let decimal = context
             .bigint_decimal_constant(idx)
             .ok_or(VmError::InvalidOperand)?;
         let value = bigint::BigIntValue::from_decimal(&mut self.gc_heap, decimal)
             .ok_or(VmError::InvalidOperand)?
             .map_err(crate::oom_to_vm)?;
-        write_register(frame, dst, Value::big_int(value))?;
-        frame.advance_pc(self.current_byte_len)?;
-        Ok(())
+        let value = Value::big_int(value);
+        self.bigint_constant_cache.insert(key, value);
+        Ok(value)
     }
 }

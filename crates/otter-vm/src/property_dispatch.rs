@@ -3290,6 +3290,17 @@ impl Interpreter {
                 let frame = &mut stack[frame_index];
                 write_register(frame, dst, value)
             }
+            Op::LoadBigInt => {
+                let dst = context
+                    .exec_register(instr, 0)
+                    .ok_or(VmError::InvalidOperand)?;
+                let idx = context
+                    .exec_const_index(instr, 1)
+                    .ok_or(VmError::InvalidOperand)?;
+                let value = self.load_bigint_constant_value(context, idx)?;
+                let frame = &mut stack[frame_index];
+                write_register(frame, dst, value)
+            }
             Op::LoadNumber => {
                 let dst = context
                     .exec_register(instr, 0)

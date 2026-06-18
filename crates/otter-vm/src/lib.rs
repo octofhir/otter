@@ -384,6 +384,11 @@ pub struct Interpreter {
     /// executions. Values are traced from [`RuntimeState::trace_roots`] so a
     /// moving collection can rewrite cached handles in place.
     string_constant_cache: rustc_hash::FxHashMap<(usize, u32), Value>,
+    /// Per-context BigInt constant cache. BigInt primitives are immutable and
+    /// have numeric, not object-identity, semantics, so `LoadBigInt` can parse
+    /// and allocate each bytecode literal once per linked chunk identity and
+    /// constant-pool index. Cached handles are traced with other runtime roots.
+    bigint_constant_cache: rustc_hash::FxHashMap<(usize, u32), Value>,
     /// Scratch GC-root stack for native recursive algorithms (today:
     /// `JSON.stringify`'s spec serializer) that must hold live `Value`s
     /// across calls which allocate — e.g. key-name `JsString`s minted by
@@ -791,9 +796,19 @@ impl Interpreter {
         self.string_constant_cache.values()
     }
 
+    /// Root-tracing view of cached BigInt constants.
+    pub(crate) fn bigint_constants_for_trace(&self) -> impl Iterator<Item = &Value> {
+        self.bigint_constant_cache.values()
+    }
+
     #[cfg(test)]
     fn string_constant_cache_len_for_test(&self) -> usize {
         self.string_constant_cache.len()
+    }
+
+    #[cfg(test)]
+    fn bigint_constant_cache_len_for_test(&self) -> usize {
+        self.bigint_constant_cache.len()
     }
 
     /// Root-tracing view of the native serializer scratch root stack.
@@ -1148,6 +1163,7 @@ impl Interpreter {
         let mut interp = Self {
             template_objects: rustc_hash::FxHashMap::default(),
             string_constant_cache: rustc_hash::FxHashMap::default(),
+            bigint_constant_cache: rustc_hash::FxHashMap::default(),
             json_root_stack: Vec::new(),
             array_index_accessor_protector: false,
             interrupt: InterruptFlag::new(),
@@ -9285,6 +9301,90 @@ mod tests {
         assert!(interp.run(&first).unwrap().is_string());
         assert!(interp.run(&second).unwrap().is_string());
         assert_eq!(interp.string_constant_cache_len_for_test(), 2);
+    }
+
+    #[test]
+    fn load_bigint_constant_reuses_traced_cache_entry() {
+        let code = vec![
+            Instruction {
+                pc: 0,
+                op: Op::LoadBigInt,
+                operands: vec![Operand::Register(0), Operand::ConstIndex(0)].into(),
+            },
+            Instruction {
+                pc: 1,
+                op: Op::LoadBigInt,
+                operands: vec![Operand::Register(1), Operand::ConstIndex(0)].into(),
+            },
+            Instruction {
+                pc: 2,
+                op: Op::Return,
+                operands: vec![Operand::Register(1)].into(),
+            },
+        ];
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            template_sites: Vec::new(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 2, code)],
+            constants: vec![Constant::BigInt {
+                decimal: "9007199254740993".to_string(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let context = ExecutionContext::from_module(module);
+
+        assert!(interp.run(&context).unwrap().is_big_int());
+        assert_eq!(interp.bigint_constant_cache_len_for_test(), 1);
+
+        interp.force_gc();
+
+        assert!(interp.run(&context).unwrap().is_big_int());
+        assert_eq!(interp.bigint_constant_cache_len_for_test(), 1);
+    }
+
+    #[test]
+    fn load_bigint_constant_cache_distinguishes_standalone_contexts() {
+        fn module_with_bigint(name: &str, decimal: &str) -> BytecodeModule {
+            BytecodeModule {
+                module: name.to_string(),
+                template_sites: Vec::new(),
+                source_kind: BcSourceKind::TypeScript,
+                functions: vec![test_function(
+                    0,
+                    "<main>",
+                    0,
+                    1,
+                    vec![
+                        Instruction {
+                            pc: 0,
+                            op: Op::LoadBigInt,
+                            operands: vec![Operand::Register(0), Operand::ConstIndex(0)].into(),
+                        },
+                        Instruction {
+                            pc: 1,
+                            op: Op::Return,
+                            operands: vec![Operand::Register(0)].into(),
+                        },
+                    ],
+                )],
+                constants: vec![Constant::BigInt {
+                    decimal: decimal.to_string(),
+                }],
+                module_resolutions: Vec::new(),
+                module_inits: Vec::new(),
+            }
+        }
+
+        let mut interp = Interpreter::new();
+        let first = ExecutionContext::from_module(module_with_bigint("first.ts", "1"));
+        let second = ExecutionContext::from_module(module_with_bigint("second.ts", "2"));
+
+        assert!(interp.run(&first).unwrap().is_big_int());
+        assert!(interp.run(&second).unwrap().is_big_int());
+        assert_eq!(interp.bigint_constant_cache_len_for_test(), 2);
     }
 
     #[test]

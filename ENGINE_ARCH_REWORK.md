@@ -464,6 +464,13 @@ traced as a runtime root, so moving GC rewrites cached handles in place. This
 removes repeat literal allocation from hot loops without changing string
 primitive semantics; full trailing-storage strings remain the deeper GC target.
 
+BigInt bytecode constants now follow the same immutable literal-cache shape:
+`LoadBigInt` parses and allocates a BigInt body once per linked execution chunk
+identity and constant-pool index, reuses the primitive handle on later
+executions, and traces cached handles as runtime roots. RegExp literals stay
+fresh objects as required by JavaScript semantics; only immutable primitive
+literal payloads use this cache.
+
 Dense arrays still use a `Vec<Value>` because the current baseline JIT reads
 that vector's probed pointer/length layout for inline dense element access, but
 the array shell no longer pays for sparse/named/accessor/symbol/source/prototype

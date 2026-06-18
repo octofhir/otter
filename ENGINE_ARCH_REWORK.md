@@ -291,6 +291,14 @@ is monomorphic and tiny.
   callback methods now share the same one-stack bytecode callback path and bind
   their fixed `(value, index, receiver)` / reducer argument arrays from borrowed
   slices. Native/bound/proxy callbacks keep the existing owned fallback.
+- **Prepared lean callback target state — LANDED.** Native callback loops now
+  resolve bytecode function/closure metadata once when acquiring the lean path,
+  keep the resolved callback root on the interpreter's traced root stack, and
+  reuse the prepared target for every element. This removes the repeated
+  closure-body read / `bytecode_call_target_parts` work from Array callbacks,
+  Array sort, Map.forEach, Set.forEach, and TypedArray callback methods while
+  keeping captured upvalues, lexical `this`, `new.target`, and eval environments
+  visible to moving GC.
 - **Inline builtin callbacks**: splice a monomorphic JS callback body into
   `Array.map/filter/forEach/reduce/sort`'s native iteration so there is no
   per-element re-entry (kills the sort 2.4× / array-ops 2.7× ceiling).

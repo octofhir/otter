@@ -848,10 +848,9 @@ fn map_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
         index += 1;
         let interp = ctx.interp_mut();
         let outcome = match lean {
-            Some(ref mut inner) => interp.run_bytecode_callable_committed_lean_args(
-                inner,
+            Some(ref mut state) => interp.run_bytecode_callable_committed_lean_args(
+                state,
                 &context,
-                callback,
                 this_arg,
                 &[v, k, map_value],
             ),
@@ -984,10 +983,9 @@ fn set_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
         index += 1;
         let interp = ctx.interp_mut();
         let outcome = match lean {
-            Some(ref mut inner) => interp.run_bytecode_callable_committed_lean_args(
-                inner,
+            Some(ref mut state) => interp.run_bytecode_callable_committed_lean_args(
+                state,
                 &context,
-                callback,
                 this_arg,
                 &[v, v, set_value],
             ),

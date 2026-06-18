@@ -1298,7 +1298,7 @@ impl Interpreter {
         x: Value,
         y: Value,
         comparefn: Value,
-        lean_inner: Option<&mut crate::holt_stack::HoltStack>,
+        lean_inner: Option<&mut crate::call_ops::LeanCallbackState>,
     ) -> Result<std::cmp::Ordering, VmError> {
         use std::cmp::Ordering;
         let x_undef = x.is_undefined();
@@ -1314,10 +1314,9 @@ impl Interpreter {
         }
         if !comparefn.is_undefined() {
             let r = match lean_inner {
-                Some(inner) => self.run_bytecode_callable_committed_lean_args(
-                    inner,
+                Some(state) => self.run_bytecode_callable_committed_lean_args(
+                    state,
                     context,
-                    comparefn,
                     Value::undefined(),
                     &[x, y],
                 ),
@@ -1350,7 +1349,7 @@ impl Interpreter {
         context: &ExecutionContext,
         items: Vec<Value>,
         comparefn: Value,
-        mut lean_inner: Option<&mut crate::holt_stack::HoltStack>,
+        mut lean_inner: Option<&mut crate::call_ops::LeanCallbackState>,
     ) -> Result<Vec<Value>, VmError> {
         use std::cmp::Ordering;
         let n = items.len();
@@ -3145,21 +3144,19 @@ pub(crate) fn array_callback_native_dispatch(
             // `ExtraRoots` Vec push/truncate per element (the duplicate the
             // heap's `same_source` walk would skip anyway).
             let result = match lean_inner {
-                Some(ref mut inner) => {
+                Some(ref mut state) => {
                     if is_reduce {
                         let acc_now = interp.iteration_anchor(anchor_base + A_ACC);
                         interp.run_bytecode_callable_committed_lean_args(
-                            inner,
+                            state,
                             &context,
-                            callback,
                             cb_this,
                             &[acc_now, v, Value::number_f64(idx as f64), receiver],
                         )
                     } else {
                         interp.run_bytecode_callable_committed_lean_args(
-                            inner,
+                            state,
                             &context,
-                            callback,
                             cb_this,
                             &[v, Value::number_f64(idx as f64), receiver],
                         )

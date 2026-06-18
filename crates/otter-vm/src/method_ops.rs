@@ -19,7 +19,7 @@
 //! - [`crate::call_ops`]
 //! - [`crate::executable`]
 
-use crate::holt_stack::HoltStack;
+use crate::{call_ops::LeanCallbackState, holt_stack::HoltStack};
 use otter_bytecode::Operand;
 use smallvec::SmallVec;
 
@@ -1320,15 +1320,16 @@ impl Interpreter {
 
     fn run_typed_array_callback(
         &mut self,
-        lean: &mut Option<HoltStack>,
+        lean: &mut Option<LeanCallbackState>,
         context: &ExecutionContext,
         callee: Value,
         this_arg: Value,
         args: &[Value],
     ) -> Result<Value, VmError> {
         match lean {
-            Some(inner) => self
-                .run_bytecode_callable_committed_lean_args(inner, context, callee, this_arg, args),
+            Some(inner) => {
+                self.run_bytecode_callable_committed_lean_args(inner, context, this_arg, args)
+            }
             None => {
                 let mut owned: SmallVec<[Value; 8]> = SmallVec::with_capacity(args.len());
                 owned.extend(args.iter().copied());
@@ -1363,7 +1364,7 @@ impl Interpreter {
         let mut lean = self.acquire_lean_callback_stack(context, callee);
 
         let result =
-            (|interp: &mut Self, lean: &mut Option<HoltStack>| -> Result<Value, VmError> {
+            (|interp: &mut Self, lean: &mut Option<LeanCallbackState>| -> Result<Value, VmError> {
                 match name {
                     "forEach" => {
                         for i in 0..len {

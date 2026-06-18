@@ -114,6 +114,11 @@ impl<'a> RuntimeState<'a> {
         for value in interp.bigint_constants_for_trace() {
             value.trace_value_slots(visitor);
         }
+        // Prepared native-loop callbacks cache resolved closure metadata between
+        // repeated invocations; every cached slot must move with the heap.
+        for root in interp.lean_callback_roots_for_trace() {
+            root.trace_slots(visitor);
+        }
         // 2b-quater) Native serializer scratch roots (`JSON.stringify`).
         for value in interp.json_root_stack_for_trace() {
             value.trace_value_slots(visitor);

@@ -389,6 +389,12 @@ pub struct Interpreter {
     /// and allocate each bytecode literal once per linked chunk identity and
     /// constant-pool index. Cached handles are traced with other runtime roots.
     bigint_constant_cache: rustc_hash::FxHashMap<(usize, u32), Value>,
+    /// Prepared bytecode callback metadata for native loops that repeatedly
+    /// call the same JS function. Entries are a strict stack: acquisition
+    /// pushes resolved closure state, release pops it. Runtime root tracing
+    /// visits every live entry so cached closure upvalues and lexical receiver
+    /// slots move with the heap across callback allocations.
+    lean_callback_roots: Vec<call_ops::LeanCallbackRoot>,
     /// Scratch GC-root stack for native recursive algorithms (today:
     /// `JSON.stringify`'s spec serializer) that must hold live `Value`s
     /// across calls which allocate — e.g. key-name `JsString`s minted by
@@ -811,6 +817,13 @@ impl Interpreter {
         self.bigint_constant_cache.len()
     }
 
+    /// Root-tracing view of prepared lean callback state.
+    pub(crate) fn lean_callback_roots_for_trace(
+        &self,
+    ) -> impl Iterator<Item = &call_ops::LeanCallbackRoot> {
+        self.lean_callback_roots.iter()
+    }
+
     /// Root-tracing view of the native serializer scratch root stack.
     pub(crate) fn json_root_stack_for_trace(&self) -> impl Iterator<Item = &Value> {
         self.json_root_stack.iter()
@@ -1164,6 +1177,7 @@ impl Interpreter {
             template_objects: rustc_hash::FxHashMap::default(),
             string_constant_cache: rustc_hash::FxHashMap::default(),
             bigint_constant_cache: rustc_hash::FxHashMap::default(),
+            lean_callback_roots: Vec::new(),
             json_root_stack: Vec::new(),
             array_index_accessor_protector: false,
             interrupt: InterruptFlag::new(),

@@ -112,6 +112,82 @@ pub(crate) type BytecodeCallTargetParts = (
     Option<crate::eval_env::EvalEnvHandle>,
 );
 
+#[derive(Clone)]
+pub(crate) struct LeanCallbackRoot {
+    callback: Value,
+    function_id: u32,
+    parent_upvalues: crate::frame_state::UpvalueSpine,
+    bound_this: Option<Value>,
+    bound_new_target: Option<Value>,
+    bound_derived_this: Option<crate::UpvalueCell>,
+    eval_env: Option<crate::eval_env::EvalEnvHandle>,
+}
+
+impl LeanCallbackRoot {
+    fn from_callback(callback: Value, heap: &otter_gc::GcHeap) -> Option<Self> {
+        if let Some(function_id) = callback.as_function() {
+            return Some(Self {
+                callback,
+                function_id,
+                parent_upvalues: Frame::empty_upvalues(),
+                bound_this: None,
+                bound_new_target: None,
+                bound_derived_this: None,
+                eval_env: None,
+            });
+        }
+        let closure = callback.as_closure(heap)?;
+        let function_id = closure.function_id();
+        let (parent_upvalues, bound_this, bound_new_target, bound_derived_this, eval_env) = heap
+            .read_payload(closure.handle, |body| {
+                (
+                    body.upvalues.clone().into_boxed_slice(),
+                    body.bound_this,
+                    body.bound_new_target,
+                    body.bound_derived_this,
+                    body.eval_env,
+                )
+            });
+        Some(Self {
+            callback,
+            function_id,
+            parent_upvalues,
+            bound_this,
+            bound_new_target,
+            bound_derived_this,
+            eval_env,
+        })
+    }
+
+    pub(crate) fn trace_slots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        self.callback.trace_value_slots(visitor);
+        for slot in self.parent_upvalues.iter() {
+            let p = slot as *const crate::UpvalueCell as *mut RawGc;
+            visitor(p);
+        }
+        if let Some(value) = &self.bound_this {
+            value.trace_value_slots(visitor);
+        }
+        if let Some(value) = &self.bound_new_target {
+            value.trace_value_slots(visitor);
+        }
+        if let Some(cell) = &self.bound_derived_this {
+            let p = cell as *const crate::UpvalueCell as *mut RawGc;
+            visitor(p);
+        }
+        if let Some(env) = &self.eval_env {
+            let p = env as *const crate::eval_env::EvalEnvHandle as *mut RawGc;
+            visitor(p);
+        }
+    }
+}
+
+pub(crate) struct LeanCallbackState {
+    stack: HoltStack,
+    root_index: usize,
+    function_id: u32,
+}
+
 impl Interpreter {
     /// §9.1 — install the frame's direct-eval variable environment:
     /// a `contains_direct_eval` function gets a FRESH record chained
@@ -1736,20 +1812,18 @@ impl Interpreter {
     /// bound/proxy/native dispatch loop has resolved to a plain bytecode
     /// function/closure.
     ///
-    /// Extracted (not duplicated) so a hot native callback loop (Array
-    /// iteration) can reuse ONE persistent reservation-stable stack across
-    /// elements instead of drawing/returning a pooled stack per call, and skip
-    /// the per-call bound/proxy/native wrapper checks. The caller owns `inner`
-    /// (draws it + returns it to the pool); this method leaves it empty on every
-    /// completion path (the callee frame is popped), so it is immediately
-    /// reusable for the next call. A generator callee consumes the frame into a
-    /// generator object and leaves `inner` untouched.
+    /// Extracted (not duplicated) so a hot native callback loop can reuse one
+    /// prepared callback state across elements instead of drawing/returning a
+    /// pooled stack, resolving closure metadata, and walking bound/proxy/native
+    /// wrappers per call. The state owns its reservation-stable stack; this
+    /// method leaves that stack empty on every completion path (the callee frame
+    /// is popped), so it is immediately reusable for the next call.
     /// If `callback` is a plain bytecode function/closure eligible for the lean
     /// per-element invoke path (not native/bound/proxy/generator/async/…), enter
-    /// the sync-reentry guard once and draw ONE reservation-stable stack for the
-    /// whole callback-driving loop; otherwise `None`. The caller then invokes
-    /// the callback via [`Self::run_bytecode_callable_committed`] on the returned
-    /// stack per element, and MUST pass the result to
+    /// the sync-reentry guard once, draw one reservation-stable stack, and push
+    /// the resolved callback metadata onto the interpreter's traced root stack;
+    /// otherwise `None`. The caller invokes the callback with the returned
+    /// state per element, and MUST pass the state to
     /// [`Self::release_lean_callback_stack`] on every completion path.
     /// `function_id` is shape-stable, so resolving eligibility once is valid for
     /// the whole loop.
@@ -1757,25 +1831,28 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         callback: Value,
-    ) -> Option<HoltStack> {
-        let fid = callback
-            .as_closure(&self.gc_heap)
-            .map(|c| c.function_id())
-            .or_else(|| callback.as_function());
-        let eligible = fid
-            .and_then(|fid| context.exec_function(fid))
-            .is_some_and(|f| {
-                !f.is_generator
-                    && !f.is_async
-                    && !f.is_async_generator
-                    && !f.needs_arguments
-                    && !f.has_rest
-                    && !f.makes_function
-                    && !f.contains_direct_eval
-                    && !f.is_derived_constructor
-            });
+    ) -> Option<LeanCallbackState> {
+        let root = LeanCallbackRoot::from_callback(callback, &self.gc_heap)?;
+        let eligible = context.exec_function(root.function_id).is_some_and(|f| {
+            !f.is_generator
+                && !f.is_async
+                && !f.is_async_generator
+                && !f.needs_arguments
+                && !f.has_rest
+                && !f.makes_function
+                && !f.contains_direct_eval
+                && !f.is_derived_constructor
+        });
         if eligible && self.enter_sync_reentry().is_ok() {
-            Some(self.draw_stack())
+            let stack = self.draw_stack();
+            let root_index = self.lean_callback_roots.len();
+            let function_id = root.function_id;
+            self.lean_callback_roots.push(root);
+            Some(LeanCallbackState {
+                stack,
+                root_index,
+                function_id,
+            })
         } else {
             None
         }
@@ -1783,9 +1860,17 @@ impl Interpreter {
 
     /// Return the lean-path stack to the pool and leave the sync-reentry guard
     /// entered by [`Self::acquire_lean_callback_stack`]. No-op for `None`.
-    pub(crate) fn release_lean_callback_stack(&mut self, stack: Option<HoltStack>) {
-        if let Some(stack) = stack {
-            self.return_stack(stack);
+    pub(crate) fn release_lean_callback_stack(&mut self, state: Option<LeanCallbackState>) {
+        if let Some(state) = state {
+            self.return_stack(state.stack);
+            let root = self
+                .lean_callback_roots
+                .pop()
+                .expect("lean callback root stack underflow");
+            debug_assert_eq!(
+                root.function_id, state.function_id,
+                "lean callback roots must release in LIFO order"
+            );
             self.leave_sync_reentry();
         }
     }
@@ -1911,9 +1996,8 @@ impl Interpreter {
 
     pub(crate) fn run_bytecode_callable_committed_lean_args(
         &mut self,
-        inner: &mut HoltStack,
+        state: &mut LeanCallbackState,
         context: &ExecutionContext,
-        current: Value,
         effective_this: Value,
         effective_args: &[Value],
     ) -> Result<Value, VmError> {
@@ -1924,7 +2008,20 @@ impl Interpreter {
             new_target_for_callee,
             derived_this_cell,
             callee_eval_env,
-        ) = Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
+        ) = {
+            let root = self
+                .lean_callback_roots
+                .get(state.root_index)
+                .ok_or(VmError::InvalidOperand)?;
+            (
+                root.function_id,
+                root.parent_upvalues.clone(),
+                root.bound_this.unwrap_or(effective_this),
+                root.bound_new_target,
+                root.bound_derived_this,
+                root.eval_env,
+            )
+        };
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -1959,14 +2056,14 @@ impl Interpreter {
         }
         self.stash_frame_eval_env(function, &mut new_frame, callee_eval_env)?;
         Self::bind_lean_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
-        inner.push(new_frame);
-        if let Some(value) = self.dispatch_jit_sync_entry(inner, context)? {
-            if let Some(mut done) = inner.pop() {
+        state.stack.push(new_frame);
+        if let Some(value) = self.dispatch_jit_sync_entry(&mut state.stack, context)? {
+            if let Some(mut done) = state.stack.pop() {
                 self.reclaim_registers(&mut done);
             }
             return Ok(value);
         }
-        self.dispatch_loop(context, inner)
+        self.dispatch_loop(context, &mut state.stack)
     }
 
     /// Synchronously perform `Construct(target, args, newTarget)`.

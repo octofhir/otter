@@ -358,6 +358,13 @@ the same allocation/GC envelope), with unchanged `gcAllocBytesTotal`
 nursery allocation path; this bridge slice mainly prepares a narrower allocation
 stub boundary.
 
+The next structural cleanup removes a hidden per-object allocation cost from
+the fast shaped path: shaped objects now leave dictionary identity unassigned
+and read identity from the installed shape, while dictionary/attribute-overridden
+objects lazily receive a fresh fallback id before losing their shape. That keeps
+observable shape identity stable for dictionary mode and makes fixed-shape
+object bodies templateable for the raw bump-allocation path.
+
 ## D3 — Variable-size payloads are malloc'd `Vec`s, not GC-inline storage
 
 ### Evidence

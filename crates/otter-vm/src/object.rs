@@ -403,6 +403,11 @@ fn slot_lookup(flags: PropertyFlags, kind: &SlotKind, value: Value) -> PropertyL
 pub(crate) struct ShapeId(u64);
 
 impl ShapeId {
+    /// Placeholder for fast-shaped objects that have never needed dictionary
+    /// identity. Shape-backed objects read identity from the installed GC shape;
+    /// dictionary-mode transitions overwrite this with [`next_shape_id`].
+    const UNASSIGNED: Self = Self(0);
+
     /// Raw VM-local id. Exposed to the [`crate::inspect`] snapshot
     /// surface so embedder DTOs can carry a stable identity without
     /// publishing the wrapper type itself.
@@ -493,6 +498,9 @@ pub struct ObjectBody {
     /// metadata for dictionary/attribute-overridden objects.
     values: Vec<Value>,
     /// Fallback/dictionary identity used only when [`Self::shape`] is null.
+    /// Fast shaped objects keep this as [`ShapeId::UNASSIGNED`] so allocation
+    /// does not need per-object unique metadata; conversion to dictionary mode
+    /// assigns a fresh id before clearing the shape.
     dictionary_shape_id: ShapeId,
     /// Whether string-keyed shape assumptions are IC-compatible.
     ///
@@ -1049,7 +1057,7 @@ fn empty_object_body() -> ObjectBody {
         shape: ShapeHandle::null(),
         values_ptr: std::ptr::null_mut(),
         values: Vec::new(),
-        dictionary_shape_id: next_shape_id(),
+        dictionary_shape_id: ShapeId::UNASSIGNED,
         shape_cache_mode: ShapeCacheMode::Fast,
         jit_proto: otter_gc::Gc::null(),
         extensible: true,
@@ -1064,6 +1072,12 @@ fn empty_object_body_with_shape(shape: ShapeHandle) -> ObjectBody {
     body
 }
 
+fn empty_dictionary_object_body() -> ObjectBody {
+    let mut body = empty_object_body();
+    body.dictionary_shape_id = next_shape_id();
+    body
+}
+
 /// Allocate an old-space object for raw GC fixtures.
 ///
 /// Production VM allocation paths must use stack/runtime/native root contracts.
@@ -1071,7 +1085,7 @@ fn empty_object_body_with_shape(shape: ShapeHandle) -> ObjectBody {
 pub(crate) fn alloc_object_old_for_fixture(
     heap: &mut GcHeap,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
-    heap.alloc_old(empty_object_body())
+    heap.alloc_old(empty_dictionary_object_body())
 }
 
 /// Allocate an empty object directly in non-moving old space.
@@ -1082,7 +1096,7 @@ pub(crate) fn alloc_object_old_for_fixture(
 /// every minor collection. The empty body holds no GC edges, so no caller
 /// roots are required across the allocation.
 pub(crate) fn alloc_object_old(heap: &mut GcHeap) -> Result<JsObject, otter_gc::OutOfMemory> {
-    heap.alloc_old(empty_object_body())
+    heap.alloc_old(empty_dictionary_object_body())
 }
 
 /// Allocate a fresh empty object through the young-generation allocation path.
@@ -1095,7 +1109,7 @@ pub(crate) fn alloc_object_with_roots(
     heap: &mut GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
-    heap.alloc_with_roots(empty_object_body(), external_visit)
+    heap.alloc_with_roots(empty_dictionary_object_body(), external_visit)
 }
 
 /// Allocate a fresh empty object with the root hidden class installed.
@@ -1125,7 +1139,7 @@ pub(crate) fn alloc_object_with_shape_roots(
 pub(crate) fn alloc_diagnostic_object(
     heap: &mut GcHeap,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
-    heap.alloc_old_diagnostic(empty_object_body())
+    heap.alloc_old_diagnostic(empty_dictionary_object_body())
 }
 
 /// Allocate a fresh object backed by Rust-owned host data.
@@ -1172,7 +1186,7 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
             shape,
             values_ptr: std::ptr::null_mut(),
             values: Vec::new(),
-            dictionary_shape_id: next_shape_id(),
+            dictionary_shape_id: ShapeId::UNASSIGNED,
             shape_cache_mode: ShapeCacheMode::Fast,
             jit_proto: otter_gc::Gc::null(),
             extensible: true,
@@ -1344,6 +1358,11 @@ fn body_shape_id(heap: &otter_gc::GcHeap, body: &ObjectBody) -> ShapeId {
     if !body.shape.is_null() {
         return heap.read_payload(body.shape, shape_body::ShapeBody::id);
     }
+    debug_assert_ne!(
+        body.dictionary_shape_id,
+        ShapeId::UNASSIGNED,
+        "dictionary-mode object needs assigned shape id"
+    );
     body.dictionary_shape_id
 }
 

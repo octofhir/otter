@@ -8460,16 +8460,6 @@ fn require_callable(arg: Option<&Value>) -> Result<Value, VmError> {
     }
 }
 
-/// Build the canonical `(value, index, array)` argument tuple every
-/// `Array.prototype` callback expects.
-fn build_array_cb_args(value: &Value, index: usize, arr: &Value) -> SmallVec<[Value; 8]> {
-    let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
-    cb_args.push(*value);
-    cb_args.push(Value::number(NumberValue::from_i32(index as i32)));
-    cb_args.push(*arr);
-    cb_args
-}
-
 fn read_register(frame: &Frame, idx: u16) -> Result<&Value, VmError> {
     frame
         .registers

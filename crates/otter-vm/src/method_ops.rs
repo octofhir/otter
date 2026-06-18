@@ -27,8 +27,7 @@ use crate::{
     BoundFunction, ExecutionContext, GeneratorResumeKind, Interpreter, JsString, NumberValue,
     Value, VmError, VmGetOutcome, VmPropertyKey, bigint,
     boolean::prototype as boolean_prototype,
-    bootstrap_collections, build_array_cb_args, collections_prototype, date, descriptor_value,
-    function_metadata, math,
+    bootstrap_collections, collections_prototype, date, descriptor_value, function_metadata, math,
     native_function::VmIntrinsicFunction,
     number,
     operand_decode::{const_operand, register_operand},
@@ -1319,6 +1318,25 @@ impl Interpreter {
         t.get(&mut self.gc_heap, i).map_err(crate::oom_to_vm)
     }
 
+    fn run_typed_array_callback(
+        &mut self,
+        lean: &mut Option<HoltStack>,
+        context: &ExecutionContext,
+        callee: Value,
+        this_arg: Value,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        match lean {
+            Some(inner) => self
+                .run_bytecode_callable_committed_lean_args(inner, context, callee, this_arg, args),
+            None => {
+                let mut owned: SmallVec<[Value; 8]> = SmallVec::with_capacity(args.len());
+                owned.extend(args.iter().copied());
+                self.run_callable_sync(context, &callee, this_arg, owned)
+            }
+        }
+    }
+
     pub(crate) fn typed_array_callback_value_dispatch(
         &mut self,
         context: &ExecutionContext,
@@ -1341,186 +1359,269 @@ impl Interpreter {
         }
         let len = t.length(&self.gc_heap);
         let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+        let callee = require_callable(args.first())?;
+        let mut lean = self.acquire_lean_callback_stack(context, callee);
 
-        match name {
-            "forEach" => {
-                let callee = require_callable(args.first())?;
-                for i in 0..len {
-                    let value = self.ta_live_element(t, i)?;
-                    let cb_args = build_array_cb_args(&value, i, &ta_value);
-                    self.run_callable_sync(context, &callee, this_arg, cb_args)?;
-                }
-                Ok(Value::undefined())
-            }
-            "map" => {
-                // §23.2.3.20 — `A = ? TypedArraySpeciesCreate(O, « len »)`
-                // (step 5) runs before any callback. `A` is pinned on the
-                // iteration-anchor stack so it stays GC-rooted across each
-                // callback re-entry.
-                let callee = require_callable(args.first())?;
-                let a = self.typed_array_species_create(context, t, len)?;
-                let a_value = Value::typed_array(a);
-                let target_kind = a.kind();
-                let anchor = self.push_iteration_anchor(a_value);
-                let result = (|interp: &mut Self| -> Result<(), VmError> {
-                    for i in 0..len {
-                        let value = interp.ta_live_element(t, i)?;
-                        let cb_args = build_array_cb_args(&value, i, &ta_value);
-                        let mapped =
-                            interp.run_callable_sync(context, &callee, this_arg, cb_args)?;
-                        let coerced = crate::binary::dispatch::coerce_element_for_store(
-                            &mut interp.gc_heap,
-                            target_kind,
-                            &mapped,
-                        )?;
-                        a.set(&mut interp.gc_heap, i, &coerced);
+        let result =
+            (|interp: &mut Self, lean: &mut Option<HoltStack>| -> Result<Value, VmError> {
+                match name {
+                    "forEach" => {
+                        for i in 0..len {
+                            let value = interp.ta_live_element(t, i)?;
+                            interp.run_typed_array_callback(
+                                lean,
+                                context,
+                                callee,
+                                this_arg,
+                                &[
+                                    value,
+                                    Value::number(NumberValue::from_i32(i as i32)),
+                                    ta_value,
+                                ],
+                            )?;
+                        }
+                        Ok(Value::undefined())
                     }
-                    Ok(())
-                })(self);
-                self.pop_iteration_anchors_to(anchor - 1);
-                result?;
-                Ok(a_value)
-            }
-            "filter" => {
-                // §23.2.3.10 — run the predicate over every element,
-                // collecting kept values, then call
-                // `TypedArraySpeciesCreate(O, « captured »)` (step 9) with
-                // the kept count and copy the survivors in.
-                let callee = require_callable(args.first())?;
-                let mut kept: Vec<Value> = Vec::new();
-                for i in 0..len {
-                    let value = self.ta_live_element(t, i)?;
-                    let cb_args = build_array_cb_args(&value, i, &ta_value);
-                    let selected = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
-                    if selected.to_boolean(&self.gc_heap) {
-                        kept.push(value);
+                    "map" => {
+                        // §23.2.3.20 — `A = ? TypedArraySpeciesCreate(O, « len »)`
+                        // (step 5) runs before any callback. `A` is pinned on the
+                        // iteration-anchor stack so it stays GC-rooted across each
+                        // callback re-entry.
+                        let a = interp.typed_array_species_create(context, t, len)?;
+                        let a_value = Value::typed_array(a);
+                        let target_kind = a.kind();
+                        let anchor = interp.push_iteration_anchor(a_value);
+                        let result = (|interp: &mut Self| -> Result<(), VmError> {
+                            for i in 0..len {
+                                let value = interp.ta_live_element(t, i)?;
+                                let mapped = interp.run_typed_array_callback(
+                                    lean,
+                                    context,
+                                    callee,
+                                    this_arg,
+                                    &[
+                                        value,
+                                        Value::number(NumberValue::from_i32(i as i32)),
+                                        ta_value,
+                                    ],
+                                )?;
+                                let coerced = crate::binary::dispatch::coerce_element_for_store(
+                                    &mut interp.gc_heap,
+                                    target_kind,
+                                    &mapped,
+                                )?;
+                                a.set(&mut interp.gc_heap, i, &coerced);
+                            }
+                            Ok(())
+                        })(interp);
+                        interp.pop_iteration_anchors_to(anchor - 1);
+                        result?;
+                        Ok(a_value)
                     }
-                }
-                let a = self.typed_array_species_create(context, t, kept.len())?;
-                let target_kind = a.kind();
-                for (i, value) in kept.iter().enumerate() {
-                    let coerced = crate::binary::dispatch::coerce_element_for_store(
-                        &mut self.gc_heap,
-                        target_kind,
-                        value,
-                    )?;
-                    a.set(&mut self.gc_heap, i, &coerced);
-                }
-                Ok(Value::typed_array(a))
-            }
-            "find" => {
-                let callee = require_callable(args.first())?;
-                let mut found = Value::undefined();
-                for i in 0..len {
-                    let value = self.ta_live_element(t, i)?;
-                    let cb_args = build_array_cb_args(&value, i, &ta_value);
-                    let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
-                    if hit.to_boolean(&self.gc_heap) {
-                        found = value;
-                        break;
+                    "filter" => {
+                        // §23.2.3.10 — run the predicate over every element,
+                        // collecting kept values, then call
+                        // `TypedArraySpeciesCreate(O, « captured »)` (step 9) with
+                        // the kept count and copy the survivors in.
+                        let mut kept: Vec<Value> = Vec::new();
+                        for i in 0..len {
+                            let value = interp.ta_live_element(t, i)?;
+                            let selected = interp.run_typed_array_callback(
+                                lean,
+                                context,
+                                callee,
+                                this_arg,
+                                &[
+                                    value,
+                                    Value::number(NumberValue::from_i32(i as i32)),
+                                    ta_value,
+                                ],
+                            )?;
+                            if selected.to_boolean(&interp.gc_heap) {
+                                kept.push(value);
+                            }
+                        }
+                        let a = interp.typed_array_species_create(context, t, kept.len())?;
+                        let target_kind = a.kind();
+                        for (i, value) in kept.iter().enumerate() {
+                            let coerced = crate::binary::dispatch::coerce_element_for_store(
+                                &mut interp.gc_heap,
+                                target_kind,
+                                value,
+                            )?;
+                            a.set(&mut interp.gc_heap, i, &coerced);
+                        }
+                        Ok(Value::typed_array(a))
                     }
-                }
-                Ok(found)
-            }
-            "findIndex" => {
-                let callee = require_callable(args.first())?;
-                let mut idx: i32 = -1;
-                for i in 0..len {
-                    let value = self.ta_live_element(t, i)?;
-                    let cb_args = build_array_cb_args(&value, i, &ta_value);
-                    let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
-                    if hit.to_boolean(&self.gc_heap) {
-                        idx = i as i32;
-                        break;
+                    "find" => {
+                        let mut found = Value::undefined();
+                        for i in 0..len {
+                            let value = interp.ta_live_element(t, i)?;
+                            let hit = interp.run_typed_array_callback(
+                                lean,
+                                context,
+                                callee,
+                                this_arg,
+                                &[
+                                    value,
+                                    Value::number(NumberValue::from_i32(i as i32)),
+                                    ta_value,
+                                ],
+                            )?;
+                            if hit.to_boolean(&interp.gc_heap) {
+                                found = value;
+                                break;
+                            }
+                        }
+                        Ok(found)
                     }
-                }
-                Ok(Value::number_i32(idx))
-            }
-            "findLast" => {
-                let callee = require_callable(args.first())?;
-                let mut found = Value::undefined();
-                for i in (0..len).rev() {
-                    let value = self.ta_live_element(t, i)?;
-                    let cb_args = build_array_cb_args(&value, i, &ta_value);
-                    let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
-                    if hit.to_boolean(&self.gc_heap) {
-                        found = value;
-                        break;
+                    "findIndex" => {
+                        let mut idx: i32 = -1;
+                        for i in 0..len {
+                            let value = interp.ta_live_element(t, i)?;
+                            let hit = interp.run_typed_array_callback(
+                                lean,
+                                context,
+                                callee,
+                                this_arg,
+                                &[
+                                    value,
+                                    Value::number(NumberValue::from_i32(i as i32)),
+                                    ta_value,
+                                ],
+                            )?;
+                            if hit.to_boolean(&interp.gc_heap) {
+                                idx = i as i32;
+                                break;
+                            }
+                        }
+                        Ok(Value::number_i32(idx))
                     }
-                }
-                Ok(found)
-            }
-            "findLastIndex" => {
-                let callee = require_callable(args.first())?;
-                let mut idx: i32 = -1;
-                for i in (0..len).rev() {
-                    let value = self.ta_live_element(t, i)?;
-                    let cb_args = build_array_cb_args(&value, i, &ta_value);
-                    let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
-                    if hit.to_boolean(&self.gc_heap) {
-                        idx = i as i32;
-                        break;
+                    "findLast" => {
+                        let mut found = Value::undefined();
+                        for i in (0..len).rev() {
+                            let value = interp.ta_live_element(t, i)?;
+                            let hit = interp.run_typed_array_callback(
+                                lean,
+                                context,
+                                callee,
+                                this_arg,
+                                &[
+                                    value,
+                                    Value::number(NumberValue::from_i32(i as i32)),
+                                    ta_value,
+                                ],
+                            )?;
+                            if hit.to_boolean(&interp.gc_heap) {
+                                found = value;
+                                break;
+                            }
+                        }
+                        Ok(found)
                     }
-                }
-                Ok(Value::number_i32(idx))
-            }
-            "every" => {
-                let callee = require_callable(args.first())?;
-                let mut all = true;
-                for i in 0..len {
-                    let value = self.ta_live_element(t, i)?;
-                    let cb_args = build_array_cb_args(&value, i, &ta_value);
-                    let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
-                    if !hit.to_boolean(&self.gc_heap) {
-                        all = false;
-                        break;
+                    "findLastIndex" => {
+                        let mut idx: i32 = -1;
+                        for i in (0..len).rev() {
+                            let value = interp.ta_live_element(t, i)?;
+                            let hit = interp.run_typed_array_callback(
+                                lean,
+                                context,
+                                callee,
+                                this_arg,
+                                &[
+                                    value,
+                                    Value::number(NumberValue::from_i32(i as i32)),
+                                    ta_value,
+                                ],
+                            )?;
+                            if hit.to_boolean(&interp.gc_heap) {
+                                idx = i as i32;
+                                break;
+                            }
+                        }
+                        Ok(Value::number_i32(idx))
                     }
-                }
-                Ok(Value::boolean(all))
-            }
-            "some" => {
-                let callee = require_callable(args.first())?;
-                let mut any = false;
-                for i in 0..len {
-                    let value = self.ta_live_element(t, i)?;
-                    let cb_args = build_array_cb_args(&value, i, &ta_value);
-                    let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
-                    if hit.to_boolean(&self.gc_heap) {
-                        any = true;
-                        break;
+                    "every" => {
+                        let mut all = true;
+                        for i in 0..len {
+                            let value = interp.ta_live_element(t, i)?;
+                            let hit = interp.run_typed_array_callback(
+                                lean,
+                                context,
+                                callee,
+                                this_arg,
+                                &[
+                                    value,
+                                    Value::number(NumberValue::from_i32(i as i32)),
+                                    ta_value,
+                                ],
+                            )?;
+                            if !hit.to_boolean(&interp.gc_heap) {
+                                all = false;
+                                break;
+                            }
+                        }
+                        Ok(Value::boolean(all))
                     }
+                    "some" => {
+                        let mut any = false;
+                        for i in 0..len {
+                            let value = interp.ta_live_element(t, i)?;
+                            let hit = interp.run_typed_array_callback(
+                                lean,
+                                context,
+                                callee,
+                                this_arg,
+                                &[
+                                    value,
+                                    Value::number(NumberValue::from_i32(i as i32)),
+                                    ta_value,
+                                ],
+                            )?;
+                            if hit.to_boolean(&interp.gc_heap) {
+                                any = true;
+                                break;
+                            }
+                        }
+                        Ok(Value::boolean(any))
+                    }
+                    "reduce" | "reduceRight" => {
+                        let has_init = args.len() >= 2;
+                        let reverse = name == "reduceRight";
+                        if len == 0 && !has_init {
+                            return Err(VmError::TypeMismatch);
+                        }
+                        let step: i64 = if reverse { -1 } else { 1 };
+                        let (mut acc, start_idx) = if has_init {
+                            (args[1], if reverse { len as i64 - 1 } else { 0 })
+                        } else {
+                            let seed = if reverse { len - 1 } else { 0 };
+                            (interp.ta_live_element(t, seed)?, seed as i64 + step)
+                        };
+                        let mut i = start_idx;
+                        while i >= 0 && (i as usize) < len {
+                            let value = interp.ta_live_element(t, i as usize)?;
+                            acc = interp.run_typed_array_callback(
+                                lean,
+                                context,
+                                callee,
+                                Value::undefined(),
+                                &[
+                                    acc,
+                                    value,
+                                    Value::number(NumberValue::from_i32(i as i32)),
+                                    ta_value,
+                                ],
+                            )?;
+                            i += step;
+                        }
+                        Ok(acc)
+                    }
+                    _ => Err(VmError::TypeMismatch),
                 }
-                Ok(Value::boolean(any))
-            }
-            "reduce" | "reduceRight" => {
-                let callee = require_callable(args.first())?;
-                let has_init = args.len() >= 2;
-                let reverse = name == "reduceRight";
-                if len == 0 && !has_init {
-                    return Err(VmError::TypeMismatch);
-                }
-                let step: i64 = if reverse { -1 } else { 1 };
-                let (mut acc, start_idx) = if has_init {
-                    (args[1], if reverse { len as i64 - 1 } else { 0 })
-                } else {
-                    let seed = if reverse { len - 1 } else { 0 };
-                    (self.ta_live_element(t, seed)?, seed as i64 + step)
-                };
-                let mut i = start_idx;
-                while i >= 0 && (i as usize) < len {
-                    let value = self.ta_live_element(t, i as usize)?;
-                    let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
-                    cb_args.push(acc);
-                    cb_args.push(value);
-                    cb_args.push(Value::number(NumberValue::from_i32(i as i32)));
-                    cb_args.push(ta_value);
-                    acc = self.run_callable_sync(context, &callee, Value::undefined(), cb_args)?;
-                    i += step;
-                }
-                Ok(acc)
-            }
-            _ => Err(VmError::TypeMismatch),
-        }
+            })(self, &mut lean);
+        self.release_lean_callback_stack(lean);
+        result
     }
 
     /// §23.2.4.1 `TypedArraySpeciesCreate(exemplar, « length »)`.

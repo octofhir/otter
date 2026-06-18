@@ -287,6 +287,10 @@ is monomorphic and tiny.
   bytecode callbacks; the lean path now binds fixed borrowed argument arrays
   directly into the callee frame instead of materializing a per-element
   `SmallVec`. Generic/native fallback paths still own their argument vectors.
+- **TypedArray callback loops on the lean path — LANDED.** `%TypedArray%`
+  callback methods now share the same one-stack bytecode callback path and bind
+  their fixed `(value, index, receiver)` / reducer argument arrays from borrowed
+  slices. Native/bound/proxy callbacks keep the existing owned fallback.
 - **Inline builtin callbacks**: splice a monomorphic JS callback body into
   `Array.map/filter/forEach/reduce/sort`'s native iteration so there is no
   per-element re-entry (kills the sort 2.4× / array-ops 2.7× ceiling).

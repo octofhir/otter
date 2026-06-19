@@ -865,7 +865,7 @@ mod arm64 {
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
     use otter_vm::{JitFunctionView, JitInlineCallee, JitInlineMethod, JitTypedArrayLayout};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     /// Comparison flavors that emit a `cset` from integer `cmp` flags.
     enum Cmp {
@@ -1034,6 +1034,148 @@ mod arm64 {
         Ok(())
     }
 
+    /// First caller-saved FP register used to park decoded `f64` values.
+    const FP_RESIDENCY_BASE: u32 = 3;
+    /// Number of FP residency registers (`d3`..=`d7`). Caller-saved (`v8`–`v15`
+    /// are callee-saved and would force a prologue spill on every call), and
+    /// clobbered across calls — which is exactly where residency is cleared.
+    const FP_RESIDENCY_REGS: usize = 5;
+
+    /// Tracks which frame slots have their decoded `f64` currently parked in a
+    /// caller-saved FP register, so a later float consumer reads the register
+    /// instead of reloading + NaN-decoding the slot. This is the first
+    /// optimizing-tier slice ([`OPTIMIZING_TIER.md`] S1): a write-through read
+    /// cache over the linear emitter. Memory stays authoritative (every parked
+    /// value is also boxed and stored to its slot), so the cache is advisory —
+    /// dropping any entry is always sound. Unboxed numbers are not GC pointers,
+    /// so holding one in a register across ops cannot dangle.
+    #[derive(Default)]
+    struct FloatResidency {
+        /// `entries[i] == Some(slot)` means `d(FP_RESIDENCY_BASE + i)` holds the
+        /// `f64` of frame slot `slot`.
+        entries: [Option<u16>; FP_RESIDENCY_REGS],
+        /// Round-robin victim for the next assignment.
+        next: usize,
+    }
+
+    impl FloatResidency {
+        /// Drop all residency — used at block boundaries (branch targets,
+        /// safepoints, any op outside the modelled numeric set).
+        fn clear(&mut self) {
+            self.entries = [None; FP_RESIDENCY_REGS];
+        }
+
+        /// Drop any entry for `slot` (its value in memory/registers changed).
+        fn invalidate(&mut self, slot: u16) {
+            for e in self.entries.iter_mut() {
+                if *e == Some(slot) {
+                    *e = None;
+                }
+            }
+        }
+
+        /// FP register currently holding `slot`'s `f64`, if any.
+        fn lookup(&self, slot: u16) -> Option<u32> {
+            self.entries
+                .iter()
+                .position(|e| *e == Some(slot))
+                .map(|i| FP_RESIDENCY_BASE + i as u32)
+        }
+
+        /// Reserve an FP register for `slot` (evicting round-robin) and return
+        /// its number. The evicted slot is simply dropped from the cache — its
+        /// authoritative value is still in memory.
+        fn assign(&mut self, slot: u16) -> u32 {
+            self.invalidate(slot);
+            let i = self.next;
+            self.next = (self.next + 1) % FP_RESIDENCY_REGS;
+            self.entries[i] = Some(slot);
+            FP_RESIDENCY_BASE + i as u32
+        }
+    }
+
+    /// Materialize `slot` as an `f64` in `dst_d`. Reads the parked residency
+    /// register when present (a plain `fmov`); otherwise loads the boxed Value
+    /// into `scratch_x` and NaN-decodes it, bailing on a non-number.
+    fn load_operand_f64(
+        ops: &mut Assembler,
+        fres: &FloatResidency,
+        slot: u16,
+        dst_d: u32,
+        scratch_x: u32,
+        bail: DynamicLabel,
+    ) -> Result<(), Unsupported> {
+        if let Some(src_d) = fres.lookup(slot) {
+            if src_d != dst_d {
+                dynasm!(ops ; .arch aarch64 ; fmov D(dst_d), D(src_d));
+            }
+        } else {
+            load_reg(ops, scratch_x, slot)?;
+            emit_num_to_double(ops, scratch_x, dst_d, bail);
+        }
+        Ok(())
+    }
+
+    /// Residency-aware `Add`/`Sub`/`Mul`/`Div`. Computes purely in `f64` (no
+    /// int fast path), writes the boxed result through to the frame slot so
+    /// memory stays authoritative for bails/safepoints, then parks the result's
+    /// `f64` in a residency register for later consumers. Only used for
+    /// float-natured functions (those containing `Op::Div`); for an all-integer
+    /// result the `f64` box is the same Number as the int32 box and
+    /// `int32 op int32` is exact in `f64` (operands are ≤ 32-bit).
+    fn emit_float_binop_res(
+        ops: &mut Assembler,
+        operands: &[Operand],
+        bail: DynamicLabel,
+        op: Op,
+        fres: &mut FloatResidency,
+    ) -> Result<(), Unsupported> {
+        let (dst, lhs, rhs) = reg3(operands)?;
+        load_operand_f64(ops, fres, lhs, 0, 9, bail)?;
+        load_operand_f64(ops, fres, rhs, 1, 10, bail)?;
+        match op {
+            Op::Add => dynasm!(ops ; .arch aarch64 ; fadd d2, d0, d1),
+            Op::Sub => dynasm!(ops ; .arch aarch64 ; fsub d2, d0, d1),
+            Op::Mul => dynasm!(ops ; .arch aarch64 ; fmul d2, d0, d1),
+            Op::Div => dynasm!(ops ; .arch aarch64 ; fdiv d2, d0, d1),
+            _ => return Err(Unsupported::ArgCount(0)),
+        }
+        emit_box_double(ops, 2, 13);
+        store_reg(ops, 13, dst)?;
+        let park = fres.assign(dst);
+        dynasm!(ops ; .arch aarch64 ; fmov D(park), d2);
+        Ok(())
+    }
+
+    /// Residency-aware comparison: decode both operands to `f64` (from residency
+    /// or memory) and `fcmp`, matching the `f64` path of [`emit_cmp`]. The
+    /// destination receives a boolean, so its residency is dropped.
+    fn emit_cmp_res(
+        ops: &mut Assembler,
+        operands: &[Operand],
+        bail: DynamicLabel,
+        cmp: Cmp,
+        fres: &mut FloatResidency,
+    ) -> Result<(), Unsupported> {
+        let (dst, lhs, rhs) = reg3(operands)?;
+        load_operand_f64(ops, fres, lhs, 0, 9, bail)?;
+        load_operand_f64(ops, fres, rhs, 1, 10, bail)?;
+        dynasm!(ops ; .arch aarch64 ; fcmp d0, d1);
+        match cmp {
+            Cmp::Lt => dynasm!(ops ; .arch aarch64 ; cset w13, mi),
+            Cmp::Le => dynasm!(ops ; .arch aarch64 ; cset w13, ls),
+            Cmp::Gt => dynasm!(ops ; .arch aarch64 ; cset w13, gt),
+            Cmp::Ge => dynasm!(ops ; .arch aarch64 ; cset w13, ge),
+            Cmp::Eq => dynasm!(ops ; .arch aarch64 ; cset w13, eq),
+            Cmp::Ne => dynasm!(ops ; .arch aarch64 ; cset w13, ne),
+        }
+        dynasm!(ops ; .arch aarch64 ; add w13, w13, SPECIAL_FALSE);
+        box_low32!(ops, 13, 12, TAG_SPECIAL);
+        store_reg(ops, 13, dst)?;
+        fres.invalidate(dst);
+        Ok(())
+    }
+
     /// Emit an int32 bitwise/shift op (`BitwiseOr`/`And`/`Xor`/`Shl`/`Shr`).
     ///
     /// Both operands must already be int32-tagged Values; a non-int32 operand
@@ -1133,6 +1275,29 @@ mod arm64 {
             }
         }
 
+        // Every instruction reachable by a branch is a basic-block boundary: the
+        // incoming register state is unknown, so FP residency is cleared on
+        // entry. Includes forward targets, unlike `loop_headers`.
+        let mut branch_targets: BTreeSet<u32> = BTreeSet::new();
+        for instr in &view.instructions {
+            if matches!(instr.op, Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue) {
+                let rel = imm32(instr.operands.as_slice(), 0)?;
+                let target = branch_target(instr, rel);
+                if let Ok(pc) = u32::try_from(target) {
+                    branch_targets.insert(pc);
+                }
+            }
+        }
+
+        // FP-residency read cache (OPTIMIZING_TIER.md S1) is enabled only for
+        // float-natured functions — those that divide. Integer-heavy code (no
+        // `Op::Div`) keeps the byte-identical int-fast-path emit, so this can
+        // never slow a non-dividing function. `Op::Div` always produces a
+        // Number via `f64`, so a function that contains one already runs its
+        // arithmetic through the double path on the hot values.
+        let enable_fres = view.instructions.iter().any(|i| i.op == Op::Div);
+        let mut fres = FloatResidency::default();
+
         // One self-patching WhiskerIC cell per `LoadProperty` op. Allocated up
         // front (stable boxed buffer) so each site can bake its cell address;
         // filled at runtime by `jit_load_prop_stub` on a monomorphic own-data
@@ -1172,6 +1337,13 @@ mod arm64 {
 
         for instr in &view.instructions {
             dynasm!(ops ; .arch aarch64 ; =>labels[&instr.byte_pc]);
+            // A branch target is a block boundary: control can arrive here from
+            // elsewhere with unknown register state (and OSR enters loop headers
+            // with values freshly loaded from memory), so no FP register can be
+            // assumed to hold a slot's value.
+            if enable_fres && branch_targets.contains(&instr.byte_pc) {
+                fres.clear();
+            }
             // Stamp this op's byte-PC into the context so any bail (guard
             // failure or unsupported opcode) resumes the interpreter at the
             // exact instruction, preserving committed side effects.
@@ -1220,11 +1392,28 @@ mod arm64 {
                     load_reg(&mut ops, 9, src)?;
                     store_reg(&mut ops, 9, idx)?;
                 }
+                Op::Add | Op::Sub | Op::Mul | Op::Div if enable_fres => {
+                    emit_float_binop_res(&mut ops, ops_ref, bail, instr.op, &mut fres)?;
+                }
                 Op::Add | Op::Sub | Op::Mul => {
                     emit_add_sub_mul(&mut ops, ops_ref, bail, instr.op)?;
                 }
                 Op::Div => emit_div(&mut ops, ops_ref, bail)?,
                 Op::Rem => emit_rem(&mut ops, ops_ref, bail)?,
+                Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq | Op::Equal
+                | Op::NotEqual
+                    if enable_fres =>
+                {
+                    let cmp = match instr.op {
+                        Op::LessThan => Cmp::Lt,
+                        Op::LessEq => Cmp::Le,
+                        Op::GreaterThan => Cmp::Gt,
+                        Op::GreaterEq => Cmp::Ge,
+                        Op::Equal => Cmp::Eq,
+                        _ => Cmp::Ne,
+                    };
+                    emit_cmp_res(&mut ops, ops_ref, bail, cmp, &mut fres)?;
+                }
                 Op::LessThan => emit_cmp(&mut ops, ops_ref, bail, Cmp::Lt)?,
                 Op::LessEq => emit_cmp(&mut ops, ops_ref, bail, Cmp::Le)?,
                 Op::GreaterThan => emit_cmp(&mut ops, ops_ref, bail, Cmp::Gt)?,
@@ -1877,6 +2066,25 @@ mod arm64 {
                     // it (entering at PC 0 would bail immediately).
                     osr_only = true;
                     dynasm!(ops ; .arch aarch64 ; b =>bail);
+                }
+            }
+            // Maintain FP residency after the op. The arithmetic/compare arms
+            // managed it themselves above; a load only overwrites its own
+            // destination slot (so just drop that slot, preserving residency of
+            // values around it in a numeric cluster); anything else is a
+            // boundary or writes a slot the cache cannot track, so drop all.
+            if enable_fres {
+                match instr.op {
+                    Op::Add | Op::Sub | Op::Mul | Op::Div | Op::LessThan | Op::LessEq
+                    | Op::GreaterThan | Op::GreaterEq | Op::Equal | Op::NotEqual => {}
+                    Op::LoadInt32 | Op::LoadLocal | Op::LoadNumber | Op::LoadString
+                    | Op::LoadTrue | Op::LoadFalse | Op::LoadUndefined | Op::LoadHole
+                    | Op::LoadBigInt => {
+                        if let Ok(dst) = reg(ops_ref, 0) {
+                            fres.invalidate(dst);
+                        }
+                    }
+                    _ => fres.clear(),
                 }
             }
         }

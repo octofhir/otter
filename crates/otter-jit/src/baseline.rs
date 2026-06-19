@@ -1001,6 +1001,39 @@ mod arm64 {
         Ok(())
     }
 
+    /// Emit `Rem` (`%`): an int32 fast path that computes the truncating integer
+    /// remainder with `sdiv`/`msub`. Cases the integer path cannot represent
+    /// `bail` to the interpreter, which owns the full `f64`/`fmod` semantics:
+    /// a non-int32 operand, a zero divisor (`NaN`), and a zero remainder from a
+    /// negative dividend (JS yields `-0`, which int32 cannot encode). A zero
+    /// remainder from a non-negative dividend is `+0` and stays on the int path.
+    /// `i32::MIN % -1` needs no special case: AArch64 `sdiv` defines it as
+    /// `i32::MIN`, so `msub` yields the correct `0` remainder.
+    fn emit_rem(
+        ops: &mut Assembler,
+        operands: &[Operand],
+        bail: DynamicLabel,
+    ) -> Result<(), Unsupported> {
+        let (dst, lhs, rhs) = reg3(operands)?;
+        load_reg(ops, 9, lhs)?;
+        load_reg(ops, 10, rhs)?;
+        guard_int32!(ops, 9, bail);
+        guard_int32!(ops, 10, bail);
+        let store = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch aarch64
+            ; cbz w10, =>bail          // rhs == 0 → interpreter yields NaN
+            ; sdiv w11, w9, w10        // truncating quotient
+            ; msub w13, w11, w10, w9   // remainder = lhs - quotient * rhs
+            ; cbnz w13, =>store        // nonzero remainder: sign already correct
+            ; tbnz w9, #31, =>bail     // zero remainder, negative dividend → -0
+            ; =>store
+        );
+        box_low32!(ops, 13, 12, TAG_INT32);
+        store_reg(ops, 13, dst)?;
+        Ok(())
+    }
+
     /// Emit an int32 bitwise/shift op (`BitwiseOr`/`And`/`Xor`/`Shl`/`Shr`).
     ///
     /// Both operands must already be int32-tagged Values; a non-int32 operand
@@ -1191,6 +1224,7 @@ mod arm64 {
                     emit_add_sub_mul(&mut ops, ops_ref, bail, instr.op)?;
                 }
                 Op::Div => emit_div(&mut ops, ops_ref, bail)?,
+                Op::Rem => emit_rem(&mut ops, ops_ref, bail)?,
                 Op::LessThan => emit_cmp(&mut ops, ops_ref, bail, Cmp::Lt)?,
                 Op::LessEq => emit_cmp(&mut ops, ops_ref, bail, Cmp::Le)?,
                 Op::GreaterThan => emit_cmp(&mut ops, ops_ref, bail, Cmp::Gt)?,
@@ -1820,7 +1854,6 @@ mod arm64 {
                 // descriptor writes). All run to completion without pushing a
                 // frame.
                 Op::MakeClosure
-                | Op::Rem
                 | Op::Ushr
                 | Op::LoadString
                 | Op::LoadNumber
@@ -1924,6 +1957,7 @@ mod arm64 {
                 | Op::Sub
                 | Op::Mul
                 | Op::Div
+                | Op::Rem
                 | Op::BitwiseOr
                 | Op::BitwiseAnd
                 | Op::BitwiseXor
@@ -2009,6 +2043,7 @@ mod arm64 {
             }
             Op::Add | Op::Sub | Op::Mul => emit_add_sub_mul(ops, ops_ref, bail, instr.op)?,
             Op::Div => emit_div(ops, ops_ref, bail)?,
+            Op::Rem => emit_rem(ops, ops_ref, bail)?,
             Op::BitwiseOr => emit_int_binop(ops, ops_ref, bail, IntBinOp::Or)?,
             Op::BitwiseAnd => emit_int_binop(ops, ops_ref, bail, IntBinOp::And)?,
             Op::BitwiseXor => emit_int_binop(ops, ops_ref, bail, IntBinOp::Xor)?,

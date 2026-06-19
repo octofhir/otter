@@ -56,8 +56,23 @@ pub fn div(lhs: NumberValue, rhs: NumberValue) -> NumberValue {
 }
 
 /// `lhs % rhs` per IEEE-754 remainder semantics.
+///
+/// Two `Smi` operands take an integer remainder, avoiding the `fmod`
+/// call the `f64` path lowers to. `checked_rem` returns `None` for the
+/// two integer cases the fast path cannot represent — `rhs == 0` (JS
+/// yields `NaN`) and `i32::MIN % -1` (overflow) — which fall through to
+/// the `f64` path. A zero remainder takes the sign of the dividend, so
+/// a negative dividend with no remainder must produce `-0`, not `Smi(0)`.
 #[must_use]
 pub fn rem(lhs: NumberValue, rhs: NumberValue) -> NumberValue {
+    if let (NumberValue::Smi(a), NumberValue::Smi(b)) = (lhs, rhs)
+        && let Some(r) = a.checked_rem(b)
+    {
+        if r != 0 || a >= 0 {
+            return NumberValue::Smi(r);
+        }
+        return NumberValue::Double(-0.0);
+    }
     NumberValue::Double(lhs.as_f64() % rhs.as_f64()).canonicalize()
 }
 
@@ -122,5 +137,47 @@ mod tests {
             NumberValue::Double(d) => assert!((d - 0.5).abs() < 1e-12),
             other => panic!("expected Double, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn smi_rem_stays_smi() {
+        assert_eq!(
+            rem(NumberValue::Smi(7), NumberValue::Smi(3)),
+            NumberValue::Smi(1)
+        );
+        assert_eq!(
+            rem(NumberValue::Smi(-7), NumberValue::Smi(3)),
+            NumberValue::Smi(-1)
+        );
+        assert_eq!(
+            rem(NumberValue::Smi(7), NumberValue::Smi(-3)),
+            NumberValue::Smi(1)
+        );
+    }
+
+    #[test]
+    fn smi_rem_zero_takes_dividend_sign() {
+        // 6 % 3 === +0
+        let r = rem(NumberValue::Smi(6), NumberValue::Smi(3));
+        assert_eq!(r, NumberValue::Smi(0));
+        assert!(!r.is_negative_zero());
+        // -6 % 3 === -0
+        let r = rem(NumberValue::Smi(-6), NumberValue::Smi(3));
+        assert!(r.is_negative_zero());
+        // -6 % -3 === -0
+        let r = rem(NumberValue::Smi(-6), NumberValue::Smi(-3));
+        assert!(r.is_negative_zero());
+    }
+
+    #[test]
+    fn smi_rem_by_zero_is_nan() {
+        assert!(rem(NumberValue::Smi(5), NumberValue::Smi(0)).is_nan());
+    }
+
+    #[test]
+    fn smi_rem_min_by_neg_one_is_zero() {
+        // i32::MIN % -1 overflows the integer path; falls through to f64.
+        let r = rem(NumberValue::Smi(i32::MIN), NumberValue::Smi(-1));
+        assert!(r.as_f64() == 0.0);
     }
 }

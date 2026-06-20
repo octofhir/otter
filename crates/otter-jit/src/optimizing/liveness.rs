@@ -214,6 +214,7 @@ mod tests {
                 operands: operands.clone(),
                 make_self: false,
                 load_array_length: false,
+                load_number: None,
                 arith_feedback: *fb,
             })
             .collect();

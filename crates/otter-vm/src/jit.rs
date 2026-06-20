@@ -278,6 +278,12 @@ pub struct JitInstrView {
     /// `"length"`. The emitter uses it to try the Array exotic length fast
     /// path before falling back to ordinary property semantics.
     pub load_array_length: bool,
+    /// Resolved `f64` value of a `LoadNumber` instruction, whose operand is a
+    /// number-constant-pool index rather than an inline immediate. Baked at
+    /// view build so the optimizing tier can materialize the constant as a
+    /// `ConstF64` node without reaching back into the constant pool. `None` for
+    /// every other opcode.
+    pub load_number: Option<f64>,
     /// Baked operand-representation feedback bits for an arithmetic / relational
     /// site (see [`crate::jit_feedback`]). `0` for non-arithmetic instructions
     /// and for sites the interpreter never observed; the optimizing tier reads

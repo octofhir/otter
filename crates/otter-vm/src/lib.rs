@@ -7424,6 +7424,13 @@ impl Interpreter {
                         .ok_or(VmError::InvalidOperand)?;
                     let delta = context.exec_imm32(instr, 2).unwrap_or(1);
                     let value = *read_register(&stack[top_idx], src)?;
+                    // Record operand-type feedback for the optimizing tier: the
+                    // updated operand against the int32 step. A counting loop's
+                    // `i++` thus reads as int32-only and lowers to a guarded
+                    // `Int32Add`.
+                    if self.jit_hook.is_some() {
+                        self.note_arith(value, Value::number_i32(delta));
+                    }
                     let primitive = self.evaluate_to_primitive(
                         context,
                         &value,
@@ -14062,6 +14069,7 @@ mod tests {
                     operands: Vec::new(),
                     make_self: false,
                     load_array_length: false,
+                    load_number: None,
                     arith_feedback: 0,
                 })
                 .collect(),

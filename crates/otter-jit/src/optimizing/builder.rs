@@ -16,11 +16,13 @@
 //!    without computing dominance.
 //!
 //! Arithmetic / comparison sites consult the interpreter's per-site operand
-//! feedback ([`ArithFeedback`], baked into [`JitInstrView::arith_feedback`]):
-//! an int32-only site lowers to an unboxed `Int32*` node guarded by `CheckInt32`
-//! on its operands. Any opcode outside the int32 subset — or any non-int32
-//! arithmetic site — aborts the whole-function compile with [`Unsupported`], and
-//! the VM keeps running the baseline / interpreter.
+//! feedback ([`ArithFeedback`], baked into [`JitInstrView::arith_feedback`]): an
+//! int32-only site lowers to an unboxed `Int32*` node guarded by `CheckInt32`; a
+//! site that has seen doubles (but only numbers) lowers to a `Float64*` node
+//! whose operands are widened / number-checked to `f64`. Any opcode outside the
+//! numeric subset — or a site that has seen a string / bigint / object — aborts
+//! the whole-function compile with [`Unsupported`], and the VM keeps running the
+//! baseline / interpreter.
 //!
 //! # See also
 //! - [`super::ir`] — the graph the builder produces.
@@ -429,6 +431,7 @@ impl<'a> Builder<'a> {
             let byte_pc = instr.byte_pc;
             let feedback = instr.arith_feedback;
             let make_self = instr.make_self;
+            let load_number = instr.load_number;
             let operands = instr.operands.clone();
             match op {
                 // The leading named-function self-binding. The closure value is
@@ -444,6 +447,18 @@ impl<'a> Builder<'a> {
                     let dst = reg(&operands, 0)?;
                     let v = imm32(&operands, 1)?;
                     let node = self.graph.add_node(NodeKind::ConstInt32(v), block, byte_pc);
+                    self.graph.set_frame_dst(node, dst);
+                    self.push_body(block, node);
+                    self.def_register(dst, block, node, byte_pc);
+                }
+                Op::LoadNumber => {
+                    let dst = reg(&operands, 0)?;
+                    // The f64 value of the number-constant-pool entry is baked
+                    // into the view at compile snapshot time; without it the
+                    // constant cannot be materialized, so bail.
+                    let v = load_number
+                        .ok_or(Unsupported::OperandShape("LoadNumber constant unresolved"))?;
+                    let node = self.graph.add_node(NodeKind::ConstF64(v), block, byte_pc);
                     self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
                     self.def_register(dst, block, node, byte_pc);
@@ -486,20 +501,36 @@ impl<'a> Builder<'a> {
                     self.def_register(dst, block, node, byte_pc);
                 }
                 // `ToPrimitive` / `ToNumeric` are identity on a number, and the
-                // arithmetic site's `CheckInt32` guard enforces the int32
-                // speculation: a non-int32 operand bails to the interpreter,
-                // which performs the spec-correct coercion. So under int32
-                // speculation these are sound as a register copy.
+                // arithmetic site's `CheckInt32` / `CheckNumber` guard enforces
+                // the numeric speculation: a non-numeric operand bails to the
+                // interpreter, which performs the spec-correct coercion. So under
+                // numeric speculation these are sound as a register copy.
                 Op::ToPrimitive | Op::ToNumeric => {
                     let dst = reg(&operands, 0)?;
                     let src = reg(&operands, 1)?;
                     let node = self.read_variable(src, block);
                     self.def_register(dst, block, node, byte_pc);
                 }
-                Op::Add | Op::Sub | Op::Mul => {
+                Op::Add | Op::Sub | Op::Mul | Op::Div => {
                     let (dst, lhs, rhs) =
                         (reg(&operands, 0)?, reg(&operands, 1)?, reg(&operands, 2)?);
-                    let node = self.int32_binop(block, op, lhs, rhs, feedback, byte_pc)?;
+                    let node = self.arith_binop(block, op, lhs, rhs, feedback, byte_pc)?;
+                    self.graph.set_frame_dst(node, dst);
+                    self.push_body(block, node);
+                    self.def_register(dst, block, node, byte_pc);
+                }
+                // `Increment dst, src, delta` is `dst = src + delta` (delta is an
+                // inline immediate, default 1; a negative delta is `--`). It
+                // lowers exactly like `Add` of `src` and a constant step.
+                Op::Increment => {
+                    let dst = reg(&operands, 0)?;
+                    let src = reg(&operands, 1)?;
+                    let delta = match operands.get(2) {
+                        Some(Operand::Imm32(v)) => *v,
+                        None => 1,
+                        _ => return Err(Unsupported::OperandShape("increment delta")),
+                    };
+                    let node = self.increment(block, src, delta, feedback, byte_pc)?;
                     self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
                     self.def_register(dst, block, node, byte_pc);
@@ -513,11 +544,7 @@ impl<'a> Builder<'a> {
                     let (dst, lhs, rhs) =
                         (reg(&operands, 0)?, reg(&operands, 1)?, reg(&operands, 2)?);
                     let cmp = CmpOp::from_op(op).expect("comparison opcode");
-                    let l = self.int32_operand(block, lhs, feedback, byte_pc)?;
-                    let r = self.int32_operand(block, rhs, feedback, byte_pc)?;
-                    let node =
-                        self.graph
-                            .add_node(NodeKind::Int32Compare(cmp, l, r), block, byte_pc);
+                    let node = self.compare(block, cmp, lhs, rhs, feedback, byte_pc)?;
                     self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
                     self.def_register(dst, block, node, byte_pc);
@@ -565,6 +592,11 @@ impl<'a> Builder<'a> {
                     let node = self
                         .graph
                         .add_node(NodeKind::ConstUndefined, block, byte_pc);
+                    // The node must be in the block body so the emitter
+                    // materializes `undefined` into its home before the
+                    // terminator reads it; an unlowered return value would box a
+                    // garbage register.
+                    self.push_body(block, node);
                     self.set_term(block, Terminator::Return(node));
                 }
                 other => return Err(Unsupported::Opcode(other)),
@@ -604,6 +636,110 @@ impl<'a> Builder<'a> {
         Ok(self.graph.add_node(kind, block, byte_pc))
     }
 
+    /// Lower an `Add` / `Sub` / `Mul` / `Div` site to a typed arithmetic node,
+    /// picking the representation from the site's operand feedback:
+    ///
+    /// - `is_int32_only` (and not `Div`, whose int32 operands still yield a
+    ///   non-integer result) → an unboxed `Int32*` node guarded by `CheckInt32`.
+    /// - otherwise `is_numeric_only` → a `Float64*` node whose operands are
+    ///   widened to `f64` (`CheckNumber` on a tagged operand, `Int32ToFloat64`
+    ///   on an already-unboxed int).
+    /// - neither → bail (the site has seen a string / bigint / object).
+    fn arith_binop(
+        &mut self,
+        block: BlockId,
+        op: Op,
+        lhs: u16,
+        rhs: u16,
+        feedback: u8,
+        byte_pc: u32,
+    ) -> Result<NodeId, Unsupported> {
+        let fb = ArithFeedback::from_bits(feedback);
+        // `Div` of two int32s is generally non-integer (`5/2`), so it always
+        // takes the float path; the other three stay int32 when the operands are.
+        if fb.is_int32_only() && !matches!(op, Op::Div) {
+            return self.int32_binop(block, op, lhs, rhs, feedback, byte_pc);
+        }
+        if !fb.is_numeric_only() {
+            return Err(Unsupported::TypeFeedback(feedback));
+        }
+        let l = self.float_operand(block, lhs, byte_pc);
+        let r = self.float_operand(block, rhs, byte_pc);
+        let kind = match op {
+            Op::Add => NodeKind::Float64Add(l, r),
+            Op::Sub => NodeKind::Float64Sub(l, r),
+            Op::Mul => NodeKind::Float64Mul(l, r),
+            Op::Div => NodeKind::Float64Div(l, r),
+            _ => unreachable!("arith_binop on non-arithmetic op"),
+        };
+        Ok(self.graph.add_node(kind, block, byte_pc))
+    }
+
+    /// Lower a relational / equality site, mirroring [`Self::arith_binop`]'s
+    /// representation choice: an int32-only site compares unboxed int32s, an
+    /// otherwise-numeric site compares `f64`s, anything else bails.
+    fn compare(
+        &mut self,
+        block: BlockId,
+        cmp: CmpOp,
+        lhs: u16,
+        rhs: u16,
+        feedback: u8,
+        byte_pc: u32,
+    ) -> Result<NodeId, Unsupported> {
+        let fb = ArithFeedback::from_bits(feedback);
+        if fb.is_int32_only() {
+            let l = self.int32_operand(block, lhs, feedback, byte_pc)?;
+            let r = self.int32_operand(block, rhs, feedback, byte_pc)?;
+            return Ok(self
+                .graph
+                .add_node(NodeKind::Int32Compare(cmp, l, r), block, byte_pc));
+        }
+        if !fb.is_numeric_only() {
+            return Err(Unsupported::TypeFeedback(feedback));
+        }
+        let l = self.float_operand(block, lhs, byte_pc);
+        let r = self.float_operand(block, rhs, byte_pc);
+        Ok(self
+            .graph
+            .add_node(NodeKind::Float64Compare(cmp, l, r), block, byte_pc))
+    }
+
+    /// Lower an `Increment` (`dst = src + delta`) to a typed add of `src` and a
+    /// constant step, mirroring [`Self::arith_binop`]'s int32-vs-float choice
+    /// from the site feedback.
+    fn increment(
+        &mut self,
+        block: BlockId,
+        src: u16,
+        delta: i32,
+        feedback: u8,
+        byte_pc: u32,
+    ) -> Result<NodeId, Unsupported> {
+        let fb = ArithFeedback::from_bits(feedback);
+        if fb.is_int32_only() {
+            let s = self.int32_operand(block, src, feedback, byte_pc)?;
+            let step = self
+                .graph
+                .add_node(NodeKind::ConstInt32(delta), block, byte_pc);
+            self.push_body(block, step);
+            return Ok(self
+                .graph
+                .add_node(NodeKind::Int32Add(s, step), block, byte_pc));
+        }
+        if !fb.is_numeric_only() {
+            return Err(Unsupported::TypeFeedback(feedback));
+        }
+        let s = self.float_operand(block, src, byte_pc);
+        let step = self
+            .graph
+            .add_node(NodeKind::ConstF64(f64::from(delta)), block, byte_pc);
+        self.push_body(block, step);
+        Ok(self
+            .graph
+            .add_node(NodeKind::Float64Add(s, step), block, byte_pc))
+    }
+
     /// Resolve a register operand to an [`Repr::Int32`] node, inserting a
     /// `CheckInt32` guard when the value is still tagged. A site whose feedback
     /// proves it is not int32-only bails the function.
@@ -629,6 +765,32 @@ impl<'a> Builder<'a> {
         Ok(check)
     }
 
+    /// Resolve a register operand to an [`Repr::Float64`] node for a numeric
+    /// site. An already-`Float64` value is used directly; an unboxed `Int32` is
+    /// widened with `Int32ToFloat64`; any other (tagged) value is unboxed by a
+    /// `CheckNumber` guard, which deopts on a non-number. The caller establishes
+    /// `is_numeric_only` before calling, so the guard's speculation is sound.
+    fn float_operand(&mut self, block: BlockId, operand_reg: u16, byte_pc: u32) -> NodeId {
+        let node = self.read_variable(operand_reg, block);
+        match self.graph.node(node).repr {
+            Repr::Float64 => node,
+            Repr::Int32 => {
+                let widen = self
+                    .graph
+                    .add_node(NodeKind::Int32ToFloat64(node), block, byte_pc);
+                self.push_body(block, widen);
+                widen
+            }
+            Repr::Tagged | Repr::Bool => {
+                let check = self
+                    .graph
+                    .add_node(NodeKind::CheckNumber(node), block, byte_pc);
+                self.push_body(block, check);
+                check
+            }
+        }
+    }
+
     fn push_body(&mut self, block: BlockId, node: NodeId) {
         self.graph.blocks[block as usize].body.push(node);
     }
@@ -641,7 +803,7 @@ impl<'a> Builder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use otter_vm::jit_feedback::ARITH_INT32;
+    use otter_vm::jit_feedback::{ARITH_FLOAT64, ARITH_INT32};
 
     const STRIDE: u32 = 4;
 
@@ -669,6 +831,7 @@ mod tests {
                 operands: operands.clone(),
                 make_self: false,
                 load_array_length: false,
+                load_number: None,
                 arith_feedback: *fb,
             })
             .collect();
@@ -819,7 +982,25 @@ mod tests {
 
     #[test]
     fn bails_on_unsupported_opcode() {
+        // `Rem` (`%`) is outside the arithmetic subset and bails the function.
         let err = build(&view(
+            2,
+            4,
+            &[
+                (Op::Rem, vec![r(2), r(0), r(1)], ARITH_INT32),
+                (Op::ReturnValue, vec![r(2)], 0),
+            ],
+        ))
+        .unwrap_err();
+        assert_eq!(err, Unsupported::Opcode(Op::Rem));
+    }
+
+    #[test]
+    fn div_lowers_to_float() {
+        // `Div` always takes the float path (int32 operands still yield a
+        // non-integer result), so its operands are widened/checked to f64 and
+        // the node is a `Float64Div`.
+        let g = build(&view(
             2,
             4,
             &[
@@ -827,8 +1008,33 @@ mod tests {
                 (Op::ReturnValue, vec![r(2)], 0),
             ],
         ))
-        .unwrap_err();
-        assert_eq!(err, Unsupported::Opcode(Op::Div));
+        .expect("div builds on the float path");
+        assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::Float64Div(..))), 1);
+        // Both tagged params are guarded by a `CheckNumber`.
+        assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::CheckNumber(_))), 2);
+    }
+
+    #[test]
+    fn float_site_widens_int_operand() {
+        // `r2 = r0 + 1` with a site that has observed a double: the int32 const
+        // is widened to f64 (`Int32ToFloat64`) and the tagged param is
+        // number-checked, feeding a `Float64Add`.
+        let g = build(&view(
+            1,
+            4,
+            &[
+                (Op::LoadInt32, vec![r(1), imm(1)], 0),
+                (Op::Add, vec![r(2), r(0), r(1)], ARITH_FLOAT64 | ARITH_INT32),
+                (Op::ReturnValue, vec![r(2)], 0),
+            ],
+        ))
+        .expect("float add builds");
+        assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::Float64Add(..))), 1);
+        assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::CheckNumber(_))), 1);
+        assert_eq!(
+            count_kind(&g, |k| matches!(k, NodeKind::Int32ToFloat64(_))),
+            1
+        );
     }
 
     #[test]

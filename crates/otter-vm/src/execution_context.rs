@@ -266,6 +266,12 @@ impl ExecutionContext {
             {
                 instr.load_array_length = true;
             }
+            if instr.op == otter_bytecode::Op::LoadNumber
+                && let Some(&otter_bytecode::Operand::ConstIndex(idx)) = instr.operands.get(1)
+                && let Some(bits) = self.number_constant_bits(idx)
+            {
+                instr.load_number = Some(f64::from_bits(bits));
+            }
         }
         Some(view)
     }

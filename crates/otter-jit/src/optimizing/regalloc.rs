@@ -47,9 +47,11 @@
 //!    interval, and take the register free longest. If none covers the whole
 //!    interval we **spill**: whichever of the current interval or a blocking
 //!    active interval has the furthest next-use is sent to a fresh spill slot.
-//!    Registers are partitioned into classes by [`Repr`]; today `Int32`, `Bool`
-//!    and `Tagged` share one GP pool, but the class is selected through
-//!    [`reg_class_of`] so a future FP pool for `Float64` is a single added arm.
+//!    Registers are partitioned into classes by [`Repr`] via [`reg_class_of`]:
+//!    `Int32` / `Bool` / `Tagged` allocate from the GP pool and `Float64` from a
+//!    disjoint FP pool, each sized independently. The scan logic is class-generic
+//!    (free-until / next-use are computed per class), so the two pools never
+//!    alias.
 //! 5. **Resolution.** For every control-flow edge `pred → succ`, values live
 //!    across the edge whose home differs between the two ends, plus each `succ`
 //!    phi mapping its `pred`-edge input to the phi's home, become a *parallel*
@@ -94,21 +96,27 @@ pub enum Location {
 }
 
 /// Register class an interval allocates from. Distinct classes draw from
-/// disjoint physical register pools and never alias.
+/// disjoint physical register pools and never alias. A [`Location::Reg`] index
+/// is interpreted *within* its value's class (the emitter recovers the class
+/// from the value's [`Repr`]), so `Reg(3)` of a `Gp` value and `Reg(3)` of an
+/// `Fp` value are different physical registers and never interfere.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum RegClass {
     /// General-purpose integer / pointer registers (`Int32`, `Bool`, `Tagged`).
     Gp,
+    /// Floating-point registers (`Float64`).
+    Fp,
 }
 
-/// Pick the register class a value of representation `repr` must live in. The
-/// single extension point for a second pool: a `Float64` value would return a
-/// future `RegClass::Fp` arm here and the scan would allocate it from a separate
-/// register count, leaving the rest of the allocator unchanged.
+/// Pick the register class a value of representation `repr` must live in. `Gp`
+/// and `Fp` draw from separate physical register pools sized independently by
+/// the scan, so adding the float subset needed only this arm plus a per-class
+/// register count — the rest of the allocator is class-generic.
 #[must_use]
 fn reg_class_of(repr: Repr) -> RegClass {
     match repr {
         Repr::Int32 | Repr::Bool | Repr::Tagged => RegClass::Gp,
+        Repr::Float64 => RegClass::Fp,
     }
 }
 
@@ -278,20 +286,22 @@ pub struct Allocation {
     pub edge_moves: Vec<EdgeMoves>,
 }
 
-/// Allocate registers for `graph` given its `liveness` and a count `gp_regs` of
-/// abstract GP registers (`Reg(0..gp_regs)`). The result is interference-free:
-/// no two values live at the same position share a `Reg`.
+/// Allocate registers for `graph` given its `liveness` and the per-class
+/// register counts `gp_regs` / `fp_regs` (`Reg(0..count)` within each class).
+/// The result is interference-free: no two values live at the same position
+/// share a `Reg` *of the same class*.
 #[must_use]
 pub fn allocate(
     graph: &Graph,
     liveness: &Liveness,
     gp_regs: u32,
+    fp_regs: u32,
     deopt_uses: &FxHashMap<NodeId, Vec<NodeId>>,
 ) -> Allocation {
     let numbering = Numbering::build(graph, liveness);
     let loops = detect_loops(graph, liveness, &numbering);
     let intervals = build_intervals(graph, liveness, &numbering, &loops, deopt_uses);
-    let scan = LinearScan::run(intervals, gp_regs);
+    let scan = LinearScan::run(intervals, gp_regs, fp_regs);
     let location = scan.locations();
     let edge_moves = resolve(graph, liveness, &numbering, &scan, &location);
     Allocation {
@@ -565,21 +575,32 @@ fn terminator_use(graph: &Graph, block: BlockId) -> Option<NodeId> {
 struct LinearScan {
     /// Allocated intervals, indexed by a dense local id.
     intervals: Vec<Interval>,
-    /// Registers available per class.
+    /// General-purpose registers available (`RegClass::Gp`).
     gp_regs: u32,
+    /// Floating-point registers available (`RegClass::Fp`).
+    fp_regs: u32,
     /// Spill slots handed out so far.
     spill_slots: u32,
 }
 
 impl LinearScan {
-    fn run(intervals: Vec<Interval>, gp_regs: u32) -> Self {
+    fn run(intervals: Vec<Interval>, gp_regs: u32, fp_regs: u32) -> Self {
         let mut scan = LinearScan {
             intervals,
             gp_regs,
+            fp_regs,
             spill_slots: 0,
         };
         scan.allocate_all();
         scan
+    }
+
+    /// Physical register count for `class`.
+    fn regs_of(&self, class: RegClass) -> u32 {
+        match class {
+            RegClass::Gp => self.gp_regs,
+            RegClass::Fp => self.fp_regs,
+        }
     }
 
     fn allocate_all(&mut self) {
@@ -644,7 +665,7 @@ impl LinearScan {
     ) -> bool {
         let class = self.intervals[cur].class;
         // free_until[r] = first position at which register r is next needed.
-        let mut free_until = vec![u32::MAX; self.gp_regs as usize];
+        let mut free_until = vec![u32::MAX; self.regs_of(class) as usize];
 
         // Active intervals of the same class occupy their register from now on.
         for &a in active {
@@ -711,8 +732,8 @@ impl LinearScan {
         // `cur`). A register whose occupant is needed furthest out is the cheapest
         // to free. `occupied[r]` records that *some* interval holds `r`, so a
         // still-live occupant whose next use is `MAX` is never mistaken for free.
-        let mut next_use = vec![u32::MAX; self.gp_regs as usize];
-        let mut occupied = vec![false; self.gp_regs as usize];
+        let mut next_use = vec![u32::MAX; self.regs_of(class) as usize];
+        let mut occupied = vec![false; self.regs_of(class) as usize];
 
         for &a in active.iter() {
             if self.intervals[a].class != class {
@@ -857,6 +878,11 @@ fn resolve(
                 for &phi in &graph.block(succ).phis {
                     let inputs = graph.node(phi).kind.inputs();
                     if let Some(&input) = inputs.get(idx)
+                        // A `Float64` input lives in an FP register; its phi
+                        // reconciliation is a cross-class `fmov` the emitter does
+                        // directly (see `emit_edge`), not a GP parallel move, so
+                        // it must stay out of this same-class move set.
+                        && graph.node(input).repr != Repr::Float64
                         && let (Some(&dst), Some(src)) =
                             (location.get(&phi), scan.location_of(input))
                         && src != dst
@@ -979,6 +1005,7 @@ mod tests {
                 operands: operands.clone(),
                 make_self: false,
                 load_array_length: false,
+                load_number: None,
                 arith_feedback: *fb,
             })
             .collect();
@@ -1065,7 +1092,7 @@ mod tests {
         .expect("diamond builds");
         let live = liveness::analyze(&g, &Default::default());
 
-        let alloc = allocate(&g, &live, 7, &Default::default());
+        let alloc = allocate(&g, &live, 7, 6, &Default::default());
         assert_interference_free(&g, &live, &alloc);
 
         // The merge phi must be correctly reconciled from *both* predecessors:
@@ -1127,7 +1154,7 @@ mod tests {
         .expect("loop builds");
         let live = liveness::analyze(&g, &Default::default());
 
-        let alloc = allocate(&g, &live, 7, &Default::default());
+        let alloc = allocate(&g, &live, 7, 6, &Default::default());
         assert_interference_free(&g, &live, &alloc);
 
         // The loop has header phis (i and acc); the back edge must carry phi
@@ -1192,7 +1219,7 @@ mod tests {
         .expect("loop builds");
         let live = liveness::analyze(&g, &Default::default());
 
-        let alloc = allocate(&g, &live, 1, &Default::default());
+        let alloc = allocate(&g, &live, 1, 6, &Default::default());
         assert_interference_free(&g, &live, &alloc);
         assert!(
             alloc.spill_slots >= 1,

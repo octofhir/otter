@@ -2,10 +2,11 @@
 //!
 //! Lowers a register-allocated typed SSA [`Graph`] to native arm64. Unlike the
 //! baseline template emitter, this consumes a real backend pipeline — typed SSA,
-//! SSA liveness, linear-scan register allocation, and per-guard deopt frame
-//! states — and emits multi-block code with unboxed int32 islands, control flow
-//! over allocated registers, parallel edge moves at control-flow merges, and
-//! exact-PC deoptimization to the interpreter at every speculation guard.
+//! SSA liveness, linear-scan register allocation (GP + FP classes), and per-guard
+//! deopt frame states — and emits multi-block code with unboxed int32 and f64
+//! islands, control flow over allocated registers, parallel edge moves at
+//! control-flow merges, and exact-PC deoptimization to the interpreter at every
+//! speculation guard.
 //!
 //! # ABI
 //! Compiled functions are `extern "C" fn(*mut JitCtx) -> JitRet` — the identical
@@ -16,22 +17,25 @@
 //! the live interpreter registers, stamps the resume byte-PC into `ctx.bail_pc`,
 //! and yields `status: 1` (the VM resumes the interpreter at that PC).
 //!
-//! Abstract allocator registers `Reg(0..7)` map to physical `x9..x15`; `x16` and
-//! `x17` are emit scratch (loads, boxing, parallel-move temp). All are
-//! caller-saved and the int32 subset makes no calls, so none need a prologue
-//! save. Spill slot `s` lives at `[sp, #s*8]` in the JIT spill area reserved
-//! below the saved frame; the parallel-move cycle-break scratch is the one extra
-//! slot `Spill(spill_slots)`.
+//! Abstract GP allocator registers `Reg(0..7)` map to physical `x9..x15`; `x16`
+//! and `x17` are GP emit scratch (loads, boxing, parallel-move temp). FP
+//! allocator registers `Reg(0..6)` map to physical `d0..d5`, with `d6`/`d7` as FP
+//! scratch. All are caller-saved and the numeric subset makes no calls, so none
+//! need a prologue save. Spill slot `s` lives at `[sp, #s*8]` in the JIT spill
+//! area reserved below the saved frame; the parallel-move cycle-break scratch is
+//! the one extra slot `Spill(spill_slots)`.
 //!
 //! # GC contract
-//! The int32 subset has no `Call` and allocates nothing, so it has no safepoints.
-//! The frame register window `[x19]` is the GC root array and must always hold
-//! valid NaN-boxed `Value`s: it arrives holding the boxed parameters, and the
-//! emitted body never writes an unboxed integer into a `[x19]` slot. Computed
-//! values live unboxed in `x9..x15` and in the `[sp]` spill area, which hold
-//! non-pointers and so need no stack maps. `[x19]` slots are written only on a
-//! deopt restore, where each live value is re-boxed to a tagged `Value` first.
-//! The result is returned in `x0` boxed; it is never written to the frame array.
+//! The numeric subset has no `Call` and allocates nothing, so it has no
+//! safepoints. The frame register window `[x19]` is the GC root array and must
+//! always hold valid NaN-boxed `Value`s: it arrives holding the boxed
+//! parameters, and the emitted body never writes an unboxed number into a
+//! `[x19]` slot. Computed values live unboxed in `x9..x15`, `d0..d7`, and in the
+//! `[sp]` spill area, which hold non-pointers (a boxed double is its bits
+//! verbatim, also a non-pointer) and so need no stack maps. `[x19]` slots are
+//! written only on a deopt restore, where each live value is re-boxed to a
+//! tagged `Value` first. The result is returned in `x0` boxed; it is never
+//! written to the frame array.
 //!
 //! # Invariants
 //! - **Whole-function correctness gate.** Any value the emitter must read (an
@@ -63,6 +67,12 @@ use crate::CompiledCode;
 /// Number of abstract GP registers handed to the allocator (`Reg(0..7)`), mapped
 /// to physical `x9..x15`.
 pub const GP_REGS: u32 = 7;
+
+/// Number of abstract FP registers handed to the allocator (`Reg(0..6)` of the
+/// `Fp` class), mapped to physical `d0..d5`. `d6`/`d7` are reserved as FP emit
+/// scratch (load staging, box/unbox, arithmetic temporaries), mirroring the
+/// `x16`/`x17` GP scratch pair.
+pub const FP_REGS: u32 = 6;
 
 /// Finalized optimizing-tier machine code for one function. Wraps a
 /// [`CompiledCode`] and runs through the shared baseline entry, so it inherits
@@ -136,6 +146,19 @@ mod arm64 {
         9 + i
     }
 
+    /// Physical FP register holding `Fp`-class allocator `Reg(i)`.
+    /// `Reg(0..FP_REGS)` → `d0..d5`. FP scratch `d6`/`d7` are reserved and never
+    /// returned here.
+    fn phys_fp(i: u32) -> u32 {
+        debug_assert!(i < super::FP_REGS);
+        i
+    }
+
+    /// FP scratch register for load staging / verbatim boxing (`d6`).
+    const FP_LOAD_SCRATCH: u32 = 6;
+    /// FP scratch register for the second arithmetic operand (`d7`).
+    const FP_ARITH_SCRATCH: u32 = 7;
+
     /// Frame byte offset of spill slot `s` within the JIT spill area (`[sp]`).
     fn spill_off(s: u32) -> u32 {
         s * 8
@@ -197,6 +220,55 @@ mod arm64 {
         }
     }
 
+    /// Load a `Float64` value's home `loc` into physical d-register `dst`.
+    fn load_fp_loc(ops: &mut Assembler, dst: u32, loc: Location) {
+        match loc {
+            Location::Reg(r) => {
+                let src = phys_fp(r);
+                if src != dst {
+                    dynasm!(ops ; .arch aarch64 ; fmov D(dst), D(src));
+                }
+            }
+            Location::Spill(s) => {
+                let off = spill_off(s);
+                dynasm!(ops ; .arch aarch64 ; ldr D(dst), [sp, off]);
+            }
+        }
+    }
+
+    /// Store physical d-register `src` into a `Float64` value's home `loc`.
+    fn store_fp_loc(ops: &mut Assembler, loc: Location, src: u32) {
+        match loc {
+            Location::Reg(r) => {
+                let dst = phys_fp(r);
+                if dst != src {
+                    dynasm!(ops ; .arch aarch64 ; fmov D(dst), D(src));
+                }
+            }
+            Location::Spill(s) => {
+                let off = spill_off(s);
+                dynasm!(ops ; .arch aarch64 ; str D(src), [sp, off]);
+            }
+        }
+    }
+
+    /// Materialize the boxed (tagged `Value`) form of an SSA value held at home
+    /// `loc` into GP register `gp_dst`, regardless of its `repr`. A `Float64`
+    /// value lives in an FP home: its boxed form is its bits verbatim, an `fmov`
+    /// from the FP home into `gp_dst` (no NaN canonicalization — the producer
+    /// already canonicalized any `NaN`). `Int32` / `Bool` / `Tagged` values load
+    /// into `gp_dst` and box in place via `box_value` (`tag_scratch` carries the
+    /// tag immediate and must differ from `gp_dst`).
+    fn box_into_gp(ops: &mut Assembler, gp_dst: u32, repr: Repr, loc: Location, tag_scratch: u32) {
+        if repr == Repr::Float64 {
+            load_fp_loc(ops, FP_LOAD_SCRATCH, loc);
+            dynasm!(ops ; .arch aarch64 ; fmov X(gp_dst), D(FP_LOAD_SCRATCH));
+        } else {
+            load_loc(ops, gp_dst, loc);
+            box_value(ops, gp_dst, repr, tag_scratch);
+        }
+    }
+
     /// Emit one parallel-move `from → to`. A register/register move is a `mov`; a
     /// spill on either end goes through `scratch_x`; a spill→spill move routes the
     /// load and store through `scratch_x` as well.
@@ -231,10 +303,15 @@ mod arm64 {
     /// Emit a control-flow `pred → succ` edge: first the allocator's ordered,
     /// cycle-safe location moves (phi reconciliation + cross-edge relocation),
     /// then **representation reconciliation** — a phi is always `Tagged`, but a
-    /// typed (`Int32` / `Bool`) input flows in unboxed, so after the raw bits land
-    /// in the phi's home the value is re-boxed there in place. Boxing in place is
-    /// sound because the home now holds the phi's value and the phi is read only
-    /// as a `Tagged` value (its typed consumers go through a `CheckInt32` unbox).
+    /// typed input flows in unboxed, so its boxed bits are placed in the phi's
+    /// home here. An `Int32` / `Bool` input was already copied (raw) into the phi
+    /// home by the GP parallel moves above, so it is re-boxed in place. A
+    /// `Float64` input lives in an FP register that the GP parallel moves cannot
+    /// reach (the allocator omits its phi move precisely for this), so its bits
+    /// are read from the FP home and `fmov`-ed verbatim into the phi's GP home
+    /// (the verbatim bits *are* the boxed double). Boxing into the phi home is
+    /// sound because the phi is read only as a `Tagged` value (typed consumers go
+    /// through a `Check*` unbox).
     fn emit_edge(
         ops: &mut Assembler,
         graph: &Graph,
@@ -262,10 +339,20 @@ mod arm64 {
             // A typed phi input that is itself dead (no home) cannot have been
             // moved in; the phi would then have no value — abort to the baseline.
             let phi_home = require_loc(alloc, phi)?;
-            require_loc(alloc, input)?;
-            load_loc(ops, BOX_SCRATCH, phi_home);
-            box_value(ops, BOX_SCRATCH, input_repr, MOVE_SCRATCH);
-            store_loc(ops, phi_home, BOX_SCRATCH);
+            let input_home = require_loc(alloc, input)?;
+            if input_repr == Repr::Float64 {
+                // The FP-resident input had no GP parallel move; read its FP home
+                // and store the verbatim (boxed) bits into the phi's GP home.
+                load_fp_loc(ops, FP_LOAD_SCRATCH, input_home);
+                dynasm!(ops ; .arch aarch64 ; fmov X(BOX_SCRATCH), D(FP_LOAD_SCRATCH));
+                store_loc(ops, phi_home, BOX_SCRATCH);
+            } else {
+                // Int32 / Bool: the raw bits are already in the phi home (GP
+                // parallel move); re-box in place.
+                load_loc(ops, BOX_SCRATCH, phi_home);
+                box_value(ops, BOX_SCRATCH, input_repr, MOVE_SCRATCH);
+                store_loc(ops, phi_home, BOX_SCRATCH);
+            }
         }
         Ok(())
     }
@@ -298,6 +385,10 @@ mod arm64 {
                 );
             }
             Repr::Tagged => {}
+            // A `Float64` value lives in an FP register, not in `xr`; its boxed
+            // form is produced by `box_into_gp` (verbatim `fmov`), which never
+            // routes through here.
+            Repr::Float64 => unreachable!("float boxing goes through box_into_gp"),
         }
     }
 
@@ -437,8 +528,7 @@ mod arm64 {
                 Terminator::Return(v) => {
                     let loc = require_loc(alloc, *v)?;
                     let repr = graph.node(*v).repr;
-                    load_loc(&mut ops, 0, loc);
-                    box_value(&mut ops, 0, repr, BOX_SCRATCH);
+                    box_into_gp(&mut ops, 0, repr, loc, BOX_SCRATCH);
                     dynasm!(&mut ops ; .arch aarch64 ; movz x1, STATUS_RETURNED as u32);
                     emit_epilogue(&mut ops, spill_bytes);
                 }
@@ -632,6 +722,111 @@ mod arm64 {
                 }
                 Ok(())
             }
+            NodeKind::ConstF64(v) => {
+                if let Some(loc) = dst {
+                    // Materialize the f64 bit pattern in a GP scratch, move it to
+                    // the FP scratch, and store to the (FP) home.
+                    emit_load_u64(ops, box_scratch, v.to_bits());
+                    dynasm!(ops ; .arch aarch64 ; fmov D(FP_LOAD_SCRATCH), X(box_scratch));
+                    store_fp_loc(ops, loc, FP_LOAD_SCRATCH);
+                }
+                Ok(())
+            }
+            NodeKind::CheckNumber(operand) => {
+                // Guard the operand (a boxed Tagged value) is a number, unboxing
+                // it to an f64 in the FP home. An int32-tagged operand is widened
+                // (scvtf); a real double is its bits verbatim; a non-number
+                // (special / pointer tag 0x7FFA..=0x7FFF) deopts.
+                let oloc = require_loc(alloc, *operand)?;
+                let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
+                load_loc(ops, box_scratch, oloc);
+                debug_assert_eq!(TAG_INT32, 0x7FF9);
+                let int32_path = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                // x16 = top16(value) - TAG_INT32 (= 0x7000 + 0xFF9). Z set ⇒ the
+                // value is int32-tagged. Then `(tag - 0x7FF9) ∈ [1, 6]` ⇒ a
+                // special / pointer tag (0x7FFA..=0x7FFF) ⇒ non-number ⇒ deopt;
+                // every other prefix (the whole double range, including the
+                // canonical NaN at 0x7FF8 and the negative half ≥ 0x8000) passes.
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; lsr x16, X(box_scratch), #48
+                    ; sub x16, x16, #0xFF9
+                    ; subs x16, x16, #7, lsl #12
+                    ; b.eq =>int32_path
+                    ; cmp x16, #6
+                    ; b.ls =>exit
+                    // Double: the operand bits are the f64 verbatim.
+                    ; fmov D(FP_LOAD_SCRATCH), X(box_scratch)
+                    ; b =>done
+                    ; =>int32_path
+                    // Int32: widen the signed low-32 payload to f64.
+                    ; scvtf D(FP_LOAD_SCRATCH), W(box_scratch)
+                    ; =>done
+                );
+                if let Some(loc) = dst {
+                    store_fp_loc(ops, loc, FP_LOAD_SCRATCH);
+                }
+                Ok(())
+            }
+            NodeKind::Int32ToFloat64(operand) => {
+                // Widen an already-unboxed int32 (low 32 bits of its GP home) to
+                // f64. No guard: the input's int32-ness was established upstream.
+                let oloc = require_loc(alloc, *operand)?;
+                if let Some(loc) = dst {
+                    load_loc(ops, box_scratch, oloc);
+                    dynasm!(ops ; .arch aarch64 ; scvtf D(FP_LOAD_SCRATCH), W(box_scratch));
+                    store_fp_loc(ops, loc, FP_LOAD_SCRATCH);
+                }
+                Ok(())
+            }
+            NodeKind::Float64Add(a, b)
+            | NodeKind::Float64Sub(a, b)
+            | NodeKind::Float64Mul(a, b)
+            | NodeKind::Float64Div(a, b) => {
+                // IEEE arithmetic is total — no overflow guard / deopt. A dead
+                // result has no observable effect, so skip it entirely.
+                let Some(loc) = dst else { return Ok(()) };
+                let aloc = require_loc(alloc, *a)?;
+                let bloc = require_loc(alloc, *b)?;
+                load_fp_loc(ops, FP_LOAD_SCRATCH, aloc);
+                load_fp_loc(ops, FP_ARITH_SCRATCH, bloc);
+                match &node.kind {
+                    NodeKind::Float64Add(_, _) => dynasm!(ops ; .arch aarch64
+                        ; fadd D(FP_LOAD_SCRATCH), D(FP_LOAD_SCRATCH), D(FP_ARITH_SCRATCH)),
+                    NodeKind::Float64Sub(_, _) => dynasm!(ops ; .arch aarch64
+                        ; fsub D(FP_LOAD_SCRATCH), D(FP_LOAD_SCRATCH), D(FP_ARITH_SCRATCH)),
+                    NodeKind::Float64Mul(_, _) => dynasm!(ops ; .arch aarch64
+                        ; fmul D(FP_LOAD_SCRATCH), D(FP_LOAD_SCRATCH), D(FP_ARITH_SCRATCH)),
+                    NodeKind::Float64Div(_, _) => dynasm!(ops ; .arch aarch64
+                        ; fdiv D(FP_LOAD_SCRATCH), D(FP_LOAD_SCRATCH), D(FP_ARITH_SCRATCH)),
+                    _ => unreachable!(),
+                }
+                store_fp_loc(ops, loc, FP_LOAD_SCRATCH);
+                Ok(())
+            }
+            NodeKind::Float64Compare(op, a, b) => {
+                let aloc = require_loc(alloc, *a)?;
+                let bloc = require_loc(alloc, *b)?;
+                load_fp_loc(ops, FP_LOAD_SCRATCH, aloc);
+                load_fp_loc(ops, FP_ARITH_SCRATCH, bloc);
+                dynasm!(ops ; .arch aarch64 ; fcmp D(FP_LOAD_SCRATCH), D(FP_ARITH_SCRATCH));
+                if let Some(loc) = dst {
+                    // Unordered-safe conditions: a NaN operand makes every
+                    // relation but `Ne` false, matching JS number comparison.
+                    match op {
+                        CmpOp::Lt => dynasm!(ops ; .arch aarch64 ; cset W(box_scratch), mi),
+                        CmpOp::Le => dynasm!(ops ; .arch aarch64 ; cset W(box_scratch), ls),
+                        CmpOp::Gt => dynasm!(ops ; .arch aarch64 ; cset W(box_scratch), gt),
+                        CmpOp::Ge => dynasm!(ops ; .arch aarch64 ; cset W(box_scratch), ge),
+                        CmpOp::Eq => dynasm!(ops ; .arch aarch64 ; cset W(box_scratch), eq),
+                        CmpOp::Ne => dynasm!(ops ; .arch aarch64 ; cset W(box_scratch), ne),
+                    }
+                    // Unboxed Bool (0/1) in the home.
+                    store_loc(ops, loc, box_scratch);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -678,11 +873,11 @@ mod arm64 {
             for &(regn, value) in &point.registers {
                 let loc = require_loc(alloc, value)?;
                 let repr = graph.node(value).repr;
-                load_loc(ops, box_scratch, loc);
                 // Box with the move scratch (x16) as the tag temp so it never
                 // aliases the value being boxed in box_scratch (x17) or any
-                // allocatable register (x9..x15).
-                box_value(ops, box_scratch, repr, MOVE_SCRATCH);
+                // allocatable register (x9..x15). A Float64 value is fmov-ed
+                // verbatim from its FP home (box_into_gp).
+                box_into_gp(ops, box_scratch, repr, loc, MOVE_SCRATCH);
                 let off = u32::from(regn) * 8;
                 dynasm!(ops ; .arch aarch64 ; str X(box_scratch), [x19, off]);
             }
@@ -706,7 +901,10 @@ mod tests {
 
     use crate::optimizing::{build_graph, deopt, liveness, regalloc};
     use otter_bytecode::{Op, Operand};
-    use otter_vm::{JitFunctionView, jit_feedback::ARITH_INT32};
+    use otter_vm::{
+        JitFunctionView,
+        jit_feedback::{ARITH_FLOAT64, ARITH_INT32},
+    };
 
     const TAG_INT32: u64 = 0x7FF9;
 
@@ -747,6 +945,7 @@ mod tests {
                 operands: ops.clone(),
                 make_self: matches!(op, Op::MakeFunction),
                 load_array_length: false,
+                load_number: None,
                 arith_feedback: *fb,
             })
             .collect();
@@ -779,7 +978,7 @@ mod tests {
         let frames = deopt::capture_frame_states(&g, &bcl);
         let deopt_uses = deopt::deopt_value_uses(&frames);
         let live = liveness::analyze(&g, &deopt_uses);
-        let alloc = regalloc::allocate(&g, &live, super::GP_REGS, &deopt_uses);
+        let alloc = regalloc::allocate(&g, &live, super::GP_REGS, super::FP_REGS, &deopt_uses);
         let code = super::emit(v, &g, &live, &alloc, &frames).expect("emits");
 
         let mut regs = vec![0u64; 64];
@@ -850,5 +1049,95 @@ mod tests {
         let double_bits = 3.5_f64.to_bits(); // a real double, not NaN-boxed int32
         let (status, _value) = run(&v, &[double_bits]);
         assert_eq!(status, 1, "non-int32 param deopts to the interpreter");
+    }
+
+    const SPECIAL_UNDEFINED: u64 = 0x7FFA << 48;
+
+    /// `f(a){ return a / 2 }` — a float site (`Div` always lowers float): the
+    /// param is `CheckNumber`-unboxed, the int32 const `2` is widened, and the
+    /// `fdiv` result is returned as a boxed double.
+    fn divide_by_two() -> JitFunctionView {
+        view(
+            1,
+            4,
+            &[
+                (Op::LoadInt32, vec![r(1), imm(2)], 0),
+                (Op::Div, vec![r(2), r(0), r(1)], ARITH_INT32),
+                (Op::ReturnValue, vec![r(2)], 0),
+            ],
+        )
+    }
+
+    #[test]
+    fn float_divide_int_param_widens() {
+        // a = 5 (boxed int32): CheckNumber widens via scvtf, 5/2 = 2.5.
+        let (status, value) = run(&divide_by_two(), &[boxi(5)]);
+        assert_eq!(status, 0, "returns, no bail");
+        assert_eq!(f64::from_bits(value), 2.5);
+    }
+
+    #[test]
+    fn float_divide_double_param_verbatim() {
+        // a = 7.0 (real double, bits verbatim): CheckNumber takes the double
+        // path, 7.0/2 = 3.5.
+        let (status, value) = run(&divide_by_two(), &[7.0_f64.to_bits()]);
+        assert_eq!(status, 0);
+        assert_eq!(f64::from_bits(value), 3.5);
+    }
+
+    #[test]
+    fn float_divide_non_number_bails() {
+        // a = undefined: CheckNumber sees a non-number tag and deopts.
+        let (status, _value) = run(&divide_by_two(), &[SPECIAL_UNDEFINED]);
+        assert_eq!(status, 1, "non-number operand deopts to the interpreter");
+    }
+
+    /// `f(n){ let x=0.0; let i=0; while(i<n){ x = x + 1.5; i = i+1 } return x }`
+    /// — a loop carrying a `Float64` accumulator through a `Tagged` header phi
+    /// (boxed on the back edge, `CheckNumber`-unboxed at the top each iteration),
+    /// the canonical mandelbrot/nbody shape. Returns `n * 1.5`.
+    fn float_accumulate_loop() -> JitFunctionView {
+        // r0 = n (param). r1 = x, r2 = i, r3 = 1.5 const, r4 = i<n, r5 = 1 const.
+        view(
+            1,
+            8,
+            &[
+                (Op::LoadInt32, vec![r(1), imm(0)], 0), // x = 0  (int, widened on first add)
+                (Op::LoadInt32, vec![r(2), imm(0)], 0), // i = 0
+                (Op::LessThan, vec![r(4), r(2), r(0)], ARITH_INT32), // header: i < n
+                (Op::JumpIfFalse, vec![imm(5), r(4)], 0), // -> exit (idx 9)
+                (Op::LoadNumber, vec![r(3), Operand::ConstIndex(0)], 0), // 1.5
+                (Op::Add, vec![r(1), r(1), r(3)], ARITH_FLOAT64 | ARITH_INT32), // x += 1.5
+                (Op::LoadInt32, vec![r(5), imm(1)], 0),
+                (Op::Add, vec![r(2), r(2), r(5)], ARITH_INT32), // i += 1
+                (Op::Jump, vec![imm(-7)], 0),
+                (Op::ReturnValue, vec![r(1)], 0), // return x
+            ],
+        )
+    }
+
+    #[test]
+    fn return_undefined_materializes_value() {
+        // A function whose only terminator is `ReturnUndefined` must box and
+        // return the `undefined` special, not a garbage register: the returned
+        // value's SSA node has to be lowered before the return reads its home.
+        let v = view(0, 1, &[(Op::ReturnUndefined, vec![], 0)]);
+        let (status, value) = run(&v, &[]);
+        assert_eq!(status, 0, "returns, no bail");
+        assert_eq!(value, SPECIAL_UNDEFINED, "returns boxed undefined");
+    }
+
+    #[test]
+    fn float_loop_accumulates_through_tagged_phi() {
+        // The `LoadNumber` const must be resolved in the view (the test helper
+        // leaves it None), so bake 1.5 onto that instruction.
+        let mut v = float_accumulate_loop();
+        v.instructions[4].load_number = Some(1.5);
+        let (status, value) = run(&v, &[boxi(4)]);
+        assert_eq!(status, 0, "returns, no bail");
+        assert_eq!(f64::from_bits(value), 6.0, "4 * 1.5");
+        let (s2, v2) = run(&v, &[boxi(100)]);
+        assert_eq!(s2, 0);
+        assert_eq!(f64::from_bits(v2), 150.0, "100 * 1.5");
     }
 }

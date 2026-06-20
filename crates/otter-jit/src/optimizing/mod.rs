@@ -2,15 +2,16 @@
 //!
 //! A second compiled tier above the baseline: it builds a **typed SSA graph**
 //! from a hot function's bytecode, speculates unboxed numeric representations
-//! from the interpreter's operand-type feedback, and (in later steps) lowers to
-//! unboxed arm64 with register allocation and deoptimizes to the interpreter
+//! from the interpreter's operand-type feedback, lowers to unboxed arm64 with
+//! register allocation, and deoptimizes to the interpreter at a guard's exact PC
 //! when a type guard fails. The baseline tier remains the fast fallback and the
 //! deopt target.
 //!
 //! The full pipeline runs end to end: [`build_graph`] constructs the typed SSA
-//! over the int32-numeric monomorphic subset, [`liveness`] / [`regalloc`] assign
-//! machine homes, [`deopt`] captures per-guard frame states, and [`emit`] lowers
-//! to executable arm64. [`compile`] orchestrates these and returns a
+//! over the monomorphic numeric subset (unboxed `int32` and `f64` islands),
+//! [`liveness`] / [`regalloc`] assign machine homes (GP + FP register classes),
+//! [`deopt`] captures per-guard frame states, and [`emit`] lowers to executable
+//! arm64. [`compile`] orchestrates these and returns a
 //! [`otter_vm::JitFunctionCode`]; the baseline tier is tried as a fallback for
 //! anything the optimizing tier declines with [`Unsupported`].
 //!
@@ -86,7 +87,7 @@ pub fn compile(
     let frames = deopt::capture_frame_states(&graph, &bcl);
     let deopt_uses = deopt::deopt_value_uses(&frames);
     let liveness = liveness::analyze(&graph, &deopt_uses);
-    let alloc = regalloc::allocate(&graph, &liveness, emit::GP_REGS, &deopt_uses);
+    let alloc = regalloc::allocate(&graph, &liveness, emit::GP_REGS, emit::FP_REGS, &deopt_uses);
     let code = emit::emit(view, &graph, &liveness, &alloc, &frames)?;
     Ok(std::sync::Arc::new(code))
 }

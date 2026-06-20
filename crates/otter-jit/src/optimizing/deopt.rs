@@ -65,7 +65,12 @@ fn reg_effects(op: Op, operands: &[Operand]) -> RegEffects {
     let mut defs = Vec::new();
     let mut uses = Vec::new();
     match op {
-        Op::LoadInt32 | Op::LoadTrue | Op::LoadFalse | Op::LoadUndefined | Op::MakeFunction => {
+        Op::LoadInt32
+        | Op::LoadNumber
+        | Op::LoadTrue
+        | Op::LoadFalse
+        | Op::LoadUndefined
+        | Op::MakeFunction => {
             if let Some(d) = reg(operands, 0) {
                 defs.push(d);
             }
@@ -88,7 +93,10 @@ fn reg_effects(op: Op, operands: &[Operand]) -> RegEffects {
                 defs.push(d);
             }
         }
-        Op::ToPrimitive | Op::ToNumeric => {
+        // `ToPrimitive dst, src` / `ToNumeric dst, src` / `Increment dst, src,
+        // delta` all write `dst` and read `src` (the inline delta is an
+        // immediate, not a register).
+        Op::ToPrimitive | Op::ToNumeric | Op::Increment => {
             if let Some(d) = reg(operands, 0) {
                 defs.push(d);
             }
@@ -99,6 +107,7 @@ fn reg_effects(op: Op, operands: &[Operand]) -> RegEffects {
         Op::Add
         | Op::Sub
         | Op::Mul
+        | Op::Div
         | Op::LessThan
         | Op::LessEq
         | Op::GreaterThan
@@ -254,14 +263,16 @@ fn reverse_postorder(graph: &Graph) -> Vec<BlockId> {
 }
 
 /// Whether a node can deoptimize and therefore needs a captured frame state: a
-/// speculation guard (`CheckInt32`) or an arithmetic node that deopts on int32
-/// overflow (`Int32Add` / `Int32Sub` / `Int32Mul`). An overflow resumes the
-/// interpreter at the arithmetic instruction's byte-PC, so it needs the same
-/// live-register frame state as a guard does.
+/// speculation guard (`CheckInt32` / `CheckNumber`) or an arithmetic node that
+/// deopts on int32 overflow (`Int32Add` / `Int32Sub` / `Int32Mul`). An overflow
+/// resumes the interpreter at the arithmetic instruction's byte-PC, so it needs
+/// the same live-register frame state as a guard does. Float arithmetic is total
+/// (IEEE) and never deopts, so the `Float64*` nodes are absent here.
 fn can_deopt(kind: &NodeKind) -> bool {
     matches!(
         kind,
         NodeKind::CheckInt32(_)
+            | NodeKind::CheckNumber(_)
             | NodeKind::Int32Add(_, _)
             | NodeKind::Int32Sub(_, _)
             | NodeKind::Int32Mul(_, _)
@@ -269,7 +280,7 @@ fn can_deopt(kind: &NodeKind) -> bool {
 }
 
 /// Capture the deopt frame state at every node that can deoptimize: a speculation
-/// guard (`CheckInt32`) or an overflowing int32 arithmetic node.
+/// guard (`CheckInt32` / `CheckNumber`) or an overflowing int32 arithmetic node.
 ///
 /// Reconstructs, per block in RPO, the interpreter environment (register → SSA
 /// value) by inheriting from a predecessor and overlaying header phis, then
@@ -416,6 +427,7 @@ mod tests {
                 operands: operands.clone(),
                 make_self: false,
                 load_array_length: false,
+                load_number: None,
                 arith_feedback: *fb,
             })
             .collect();

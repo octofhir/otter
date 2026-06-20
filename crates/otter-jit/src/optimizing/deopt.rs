@@ -96,7 +96,10 @@ fn reg_effects(op: Op, operands: &[Operand]) -> RegEffects {
         // `ToPrimitive dst, src` / `ToNumeric dst, src` / `Increment dst, src,
         // delta` all write `dst` and read `src` (the inline delta is an
         // immediate, not a register).
-        Op::ToPrimitive | Op::ToNumeric | Op::Increment => {
+        // `ToPrimitive dst, src` / `ToNumeric dst, src` / `Increment dst, src,
+        // delta` / `LoadProperty dst, obj, name` all write `dst` and read the
+        // second register operand.
+        Op::ToPrimitive | Op::ToNumeric | Op::Increment | Op::LoadProperty => {
             if let Some(d) = reg(operands, 0) {
                 defs.push(d);
             }
@@ -273,6 +276,7 @@ fn can_deopt(kind: &NodeKind) -> bool {
         kind,
         NodeKind::CheckInt32(_)
             | NodeKind::CheckNumber(_)
+            | NodeKind::CheckShape(_, _)
             | NodeKind::Int32Add(_, _)
             | NodeKind::Int32Sub(_, _)
             | NodeKind::Int32Mul(_, _)
@@ -428,6 +432,7 @@ mod tests {
                 make_self: false,
                 load_array_length: false,
                 load_number: None,
+                property_feedback: None,
                 arith_feedback: *fb,
             })
             .collect();

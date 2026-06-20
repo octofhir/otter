@@ -144,6 +144,17 @@ pub enum NodeKind {
     /// `f64 <cmp> f64`. Result [`Repr::Bool`]. IEEE ordered comparison
     /// (a `NaN` operand yields `false` for every relation, matching JS).
     Float64Compare(CmpOp, NodeId, NodeId),
+    /// Speculative "operand is an ordinary object of the baked shape" guard.
+    /// Carries the receiver and the receiver shape's compressed `Gc` offset. A
+    /// non-object, or a different shape (or dictionary mode), deoptimizes.
+    /// Result [`Repr::Tagged`] — the guarded receiver, passed through so a
+    /// `LoadSlot` consumes it.
+    CheckShape(NodeId, u32),
+    /// Load the `Value` at a fixed byte offset within a shape-guarded receiver's
+    /// value slab (the offset baked from the monomorphic own-data property IC).
+    /// Pure (no deopt, no allocation); the preceding `CheckShape` established the
+    /// receiver shape. Result [`Repr::Tagged`].
+    LoadSlot(NodeId, u32),
 }
 
 impl NodeKind {
@@ -154,7 +165,11 @@ impl NodeKind {
     #[must_use]
     pub fn inputs(&self) -> Vec<NodeId> {
         match self {
-            NodeKind::CheckInt32(a) | NodeKind::CheckNumber(a) | NodeKind::Int32ToFloat64(a) => {
+            NodeKind::CheckInt32(a)
+            | NodeKind::CheckNumber(a)
+            | NodeKind::Int32ToFloat64(a)
+            | NodeKind::CheckShape(a, _)
+            | NodeKind::LoadSlot(a, _) => {
                 vec![*a]
             }
             NodeKind::Int32Add(a, b)
@@ -186,9 +201,11 @@ impl NodeKind {
             }
         };
         match self {
-            NodeKind::CheckInt32(a) | NodeKind::CheckNumber(a) | NodeKind::Int32ToFloat64(a) => {
-                fix(a)
-            }
+            NodeKind::CheckInt32(a)
+            | NodeKind::CheckNumber(a)
+            | NodeKind::Int32ToFloat64(a)
+            | NodeKind::CheckShape(a, _)
+            | NodeKind::LoadSlot(a, _) => fix(a),
             NodeKind::Int32Add(a, b)
             | NodeKind::Int32Sub(a, b)
             | NodeKind::Int32Mul(a, b)
@@ -234,7 +251,9 @@ impl NodeKind {
             | NodeKind::ConstBool(_)
             | NodeKind::ConstUndefined
             | NodeKind::SelfClosure
-            | NodeKind::Phi(_) => Repr::Tagged,
+            | NodeKind::Phi(_)
+            | NodeKind::CheckShape(_, _)
+            | NodeKind::LoadSlot(_, _) => Repr::Tagged,
         }
     }
 }

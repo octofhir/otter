@@ -2413,6 +2413,7 @@ impl Interpreter {
         let mut view = context.jit_function_view(fid)?;
         Self::bake_typed_array_layout(&mut view);
         self.bake_arith_feedback(&mut view, fid);
+        self.bake_property_feedback(&mut view);
         self.bake_inline_callees(&mut view, context, fid);
         let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
         let (regs, params) = (view.register_count, view.param_count);
@@ -2484,6 +2485,45 @@ impl Interpreter {
             if let Some(fb) = self.jit_arith_feedback.get(&(fid, instr.byte_pc)) {
                 instr.arith_feedback = fb.bits();
             }
+        }
+    }
+
+    /// Copy each monomorphic own-data property IC into the compile snapshot as
+    /// `(shape_offset, slot_byte)`, so the optimizing tier can lower a
+    /// `LoadProperty` / `StoreProperty` to a shape guard plus an inline slot
+    /// access. Only a single-entry own-data site qualifies; everything else
+    /// (polymorphic, megamorphic, prototype, dictionary) stays `None` and lowers
+    /// through the property bridge.
+    fn bake_property_feedback(&self, view: &mut jit::JitFunctionView) {
+        for instr in &mut view.instructions {
+            let Some(site) = instr.property_ic_site else {
+                continue;
+            };
+            instr.property_feedback = match instr.op {
+                otter_bytecode::Op::LoadProperty => {
+                    self.load_property_ics
+                        .get(site)
+                        .and_then(|e| match e.entries() {
+                            [property_ic::LoadPropertyIc::OwnData { hit }] => Some((
+                                hit.shape.offset(),
+                                u32::from(hit.slot) * std::mem::size_of::<Value>() as u32,
+                            )),
+                            _ => None,
+                        })
+                }
+                otter_bytecode::Op::StoreProperty => {
+                    self.store_property_ics
+                        .get(site)
+                        .and_then(|e| match e.entries() {
+                            [property_ic::StorePropertyIc::ExistingOwnDataStore { hit }] => Some((
+                                hit.shape.offset(),
+                                u32::from(hit.slot) * std::mem::size_of::<Value>() as u32,
+                            )),
+                            _ => None,
+                        })
+                }
+                _ => None,
+            };
         }
     }
 

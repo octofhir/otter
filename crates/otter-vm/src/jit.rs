@@ -292,6 +292,16 @@ pub struct JitInstrView {
     /// `Interpreter::bake_arith_feedback` at tier-up; the raw `jit_view()`
     /// snapshot leaves it `0`.
     pub arith_feedback: u8,
+    /// Monomorphic own-data property feedback for a `LoadProperty` /
+    /// `StoreProperty` site: `Some((shape_offset, slot_byte))` when the
+    /// interpreter observed exactly one receiver shape that owns the named slot
+    /// (`shape_offset` is the receiver shape's compressed `Gc` offset for the
+    /// guard, `slot_byte` the value's byte offset within the object's value
+    /// slab). The optimizing tier lowers such a site to a `CheckShape` guard plus
+    /// an inline slot load/store. `None` for non-property ops and for
+    /// polymorphic / megamorphic / prototype / dictionary sites. Baked by
+    /// `Interpreter::bake_property_feedback`.
+    pub property_feedback: Option<(u32, u32)>,
 }
 
 /// Frame stack the interpreter dispatches over. Exposed so the JIT crate can

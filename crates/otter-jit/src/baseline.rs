@@ -58,7 +58,7 @@ const TAG_FUNCTION_ID: u64 = 0x7FFB;
 /// NaN-box tag for object-class heap pointers (`value/tag.rs`). The low 32
 /// bits are a `Gc` offset; the body type is discriminated by the GC header
 /// tag, so inline property loads must also check [`OBJECT_BODY_TYPE_TAG`].
-const TAG_PTR_OBJECT: u64 = 0x7FFC;
+pub(crate) const TAG_PTR_OBJECT: u64 = 0x7FFC;
 /// NaN-box tag for callable heap pointers (`value/tag.rs` `TAG_PTR_FUNCTION`).
 /// A prototype method slot holds one of these; the low 32 bits are a `Gc`
 /// offset to the callable body, discriminated by the GC header tag.
@@ -67,7 +67,7 @@ const TAG_PTR_FUNCTION: u64 = 0x7FFE;
 /// `otter_vm::object::OBJECT_BODY_TYPE_TAG`). Guarded before an inline
 /// shape-slot read so a non-object body sharing `TAG_PTR_OBJECT` cannot be
 /// misread.
-const OBJECT_BODY_TYPE_TAG: u32 = 0x11;
+pub(crate) const OBJECT_BODY_TYPE_TAG: u32 = 0x11;
 /// GC header type tag for a `JsClosureBody` (mirrors
 /// `otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG`). Guarded before reading a
 /// resolved method's `function_id` so a native callable sharing
@@ -3737,6 +3737,7 @@ mod tests {
                 make_self: false,
                 load_array_length: false,
                 load_number: None,
+                property_feedback: None,
                 arith_feedback: 0,
             })
             .collect();

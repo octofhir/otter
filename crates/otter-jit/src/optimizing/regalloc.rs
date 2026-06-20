@@ -1006,6 +1006,7 @@ mod tests {
                 make_self: false,
                 load_array_length: false,
                 load_number: None,
+                property_feedback: None,
                 arith_feedback: *fb,
             })
             .collect();

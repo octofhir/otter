@@ -126,8 +126,8 @@ mod arm64 {
     };
     use crate::CompiledCode;
     use crate::baseline::{
-        BAIL_PC_OFFSET, SPECIAL_FALSE, SPECIAL_TRUE, STATUS_BAILED, STATUS_RETURNED, TAG_INT32,
-        TAG_SPECIAL,
+        BAIL_PC_OFFSET, OBJECT_BODY_TYPE_TAG, SPECIAL_FALSE, SPECIAL_TRUE, STATUS_BAILED,
+        STATUS_RETURNED, TAG_INT32, TAG_PTR_OBJECT, TAG_SPECIAL,
     };
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
     use otter_vm::JitFunctionView;
@@ -436,7 +436,7 @@ mod arm64 {
 
     /// Lower a register-allocated graph to native arm64.
     pub(in crate::optimizing) fn emit(
-        _view: &JitFunctionView,
+        view: &JitFunctionView,
         graph: &Graph,
         liveness: &Liveness,
         alloc: &Allocation,
@@ -510,6 +510,7 @@ mod arm64 {
             for &nid in &block.body {
                 lower_node(
                     &mut ops,
+                    view,
                     graph,
                     alloc,
                     frames,
@@ -595,8 +596,10 @@ mod arm64 {
 
     /// Lower one SSA body node. A node's result goes to its home; a node with no
     /// home is dead and emits only the guards that can deopt.
+    #[allow(clippy::too_many_arguments)]
     fn lower_node(
         ops: &mut Assembler,
+        view: &JitFunctionView,
         graph: &Graph,
         alloc: &Allocation,
         frames: &FxHashMap<NodeId, DeoptPoint>,
@@ -827,6 +830,66 @@ mod arm64 {
                 }
                 Ok(())
             }
+            NodeKind::CheckShape(obj, shape_offset) => {
+                // Guard the receiver is an ordinary object of the baked shape:
+                // pointer tag, GC type tag, then receiver-shape == baked shape. A
+                // miss deopts. The guarded (tagged) receiver is the result.
+                let oloc = require_loc(alloc, *obj)?;
+                let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
+                debug_assert_eq!(box_scratch, BOX_SCRATCH);
+                load_loc(ops, box_scratch, oloc);
+                debug_assert_eq!(TAG_PTR_OBJECT, 0x7FFC);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; lsr x16, X(box_scratch), #48
+                    ; sub x16, x16, #0xFFC
+                    ; subs x16, x16, #7, lsl #12
+                    ; b.ne =>exit
+                );
+                if let Some(loc) = dst {
+                    store_loc(ops, loc, box_scratch);
+                }
+                // Decompress: GcHeader ptr = cage_base + low32(value).
+                dynasm!(ops ; .arch aarch64 ; mov W(MOVE_SCRATCH), W(box_scratch));
+                emit_load_u64(ops, box_scratch, view.cage_base as u64);
+                let shape_byte = view.object_shape_byte;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; add x16, x16, X(box_scratch)
+                    ; ldrb w17, [x16]
+                    ; cmp w17, OBJECT_BODY_TYPE_TAG
+                    ; b.ne =>exit
+                    ; ldr w17, [x16, shape_byte]
+                );
+                emit_load_u64(ops, MOVE_SCRATCH, u64::from(*shape_offset));
+                dynasm!(ops ; .arch aarch64 ; cmp W(box_scratch), W(MOVE_SCRATCH) ; b.ne =>exit);
+                Ok(())
+            }
+            NodeKind::LoadSlot(obj, value_byte) => {
+                // Read the slot at the baked byte offset within the shape-guarded
+                // receiver's value slab. No guard (CheckShape established it).
+                if *value_byte > 32760 {
+                    return Err(Unsupported::Unlowered(
+                        "property slot offset out of ldr range",
+                    ));
+                }
+                let oloc = require_loc(alloc, *obj)?;
+                if let Some(loc) = dst {
+                    let values_ptr_byte = view.object_values_ptr_byte;
+                    let slot_byte = *value_byte;
+                    load_loc(ops, box_scratch, oloc);
+                    dynasm!(ops ; .arch aarch64 ; mov W(MOVE_SCRATCH), W(box_scratch));
+                    emit_load_u64(ops, box_scratch, view.cage_base as u64);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; add x16, x16, X(box_scratch)
+                        ; ldr X(box_scratch), [x16, values_ptr_byte]
+                        ; ldr X(box_scratch), [X(box_scratch), slot_byte]
+                    );
+                    store_loc(ops, loc, box_scratch);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -946,6 +1009,7 @@ mod tests {
                 make_self: matches!(op, Op::MakeFunction),
                 load_array_length: false,
                 load_number: None,
+                property_feedback: None,
                 arith_feedback: *fb,
             })
             .collect();

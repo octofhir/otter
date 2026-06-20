@@ -432,6 +432,7 @@ impl<'a> Builder<'a> {
             let feedback = instr.arith_feedback;
             let make_self = instr.make_self;
             let load_number = instr.load_number;
+            let property_feedback = instr.property_feedback;
             let operands = instr.operands.clone();
             match op {
                 // The leading named-function self-binding. The closure value is
@@ -473,6 +474,32 @@ impl<'a> Builder<'a> {
                     self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
                     self.def_register(dst, block, node, byte_pc);
+                }
+                // `LoadProperty dst, obj, name` — lower a monomorphic own-data
+                // site to a `CheckShape` guard plus an inline `LoadSlot`. A site
+                // without baked own-data feedback (polymorphic / prototype /
+                // dictionary / never observed) bails the function.
+                Op::LoadProperty => {
+                    let dst = reg(&operands, 0)?;
+                    let obj_reg = reg(&operands, 1)?;
+                    // Inline slot access decompresses object pointers against the
+                    // baked GC cage base; without it the layout offsets are absent.
+                    let Some((shape, slot_byte)) =
+                        property_feedback.filter(|_| self.view.cage_base != 0)
+                    else {
+                        return Err(Unsupported::Opcode(Op::LoadProperty));
+                    };
+                    let obj = self.read_variable(obj_reg, block);
+                    let checked =
+                        self.graph
+                            .add_node(NodeKind::CheckShape(obj, shape), block, byte_pc);
+                    self.push_body(block, checked);
+                    let load =
+                        self.graph
+                            .add_node(NodeKind::LoadSlot(checked, slot_byte), block, byte_pc);
+                    self.graph.set_frame_dst(load, dst);
+                    self.push_body(block, load);
+                    self.def_register(dst, block, load, byte_pc);
                 }
                 Op::LoadUndefined => {
                     let dst = reg(&operands, 0)?;
@@ -832,6 +859,7 @@ mod tests {
                 make_self: false,
                 load_array_length: false,
                 load_number: None,
+                property_feedback: None,
                 arith_feedback: *fb,
             })
             .collect();

@@ -33,6 +33,7 @@
 
 mod baseline;
 mod code;
+pub mod optimizing;
 
 pub use baseline::{BaselineCode, Unsupported, compile};
 pub use code::CompiledCode;

@@ -137,11 +137,21 @@ failing-set diff), and committed.
    feedback (`jit_method_site_feedback`) already existed. Element-kind feedback
    is added when the IR first consumes arrays. *Verified: byte-identical
    test262 failing-set both JIT modes; no bench delta.*
-2. **Typed SSA IR.** Build an SSA graph from bytecode for a hot function; nodes
-   carry a representation (`Tagged` / `Int32` / `Float64`). From the stage-1
-   feedback, insert `CheckInt32` / `CheckNumber` guard nodes (speculation).
-   Start narrow: purely numeric monomorphic functions
-   (mandelbrot / nbody / fib); everything else falls back to the baseline.
+2. **Typed SSA IR.** ⏳ *graph construction landed (int32 subset).* New
+   `crates/otter-jit/src/optimizing/` (`pub mod optimizing`): `ir.rs` (typed
+   SSA — `Graph` / `Block` / `Node` / `Repr{Tagged,Int32,Bool}`) and
+   `builder.rs` (bytecode → SSA via Braun et al. sealed-blocks: CFG discovery,
+   on-demand phi insertion, loop back-edges without dominance). Arithmetic /
+   comparison sites read the stage-1 `arith_feedback` and lower int32-only
+   sites to unboxed `Int32Add/Sub/Mul` / `Int32Compare` guarded by
+   `CheckInt32`. Whole-function bail to baseline via `Unsupported` on any
+   opcode / operand / branch / feedback outside the subset. `build_graph(view)`
+   is the entry; emits **no code yet** and is not wired into tier-up, so VM
+   behavior is unchanged. Unit-tested: straight-line, diamond merge (phi),
+   counting loop (header phis), opcode + feedback bails. *Remaining for stage 2:
+   the float subset — `Repr::Float64`, `CheckNumber`, `Float64*` nodes,
+   `Int32ToFloat64` widening, `LoadNumber` constant threading into the view,
+   and `Div`/`Rem` — to cover mandelbrot/nbody; then `Call` (feeds stage 5).*
 3. **Lowering + unboxed + linear-scan regalloc.** Float64/Int32 live in CPU/FP
    registers across the loop, boxed only at tagged-use boundaries. Emit arm64
    (dynasm). Adds LICM (`arr.length`, loop invariants) and bounds-check

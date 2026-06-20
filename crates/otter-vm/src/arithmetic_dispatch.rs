@@ -54,6 +54,9 @@ impl Interpreter {
         bigint_op: BigIntBinop,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
+        if self.jit_hook.is_some() {
+            self.note_arith(lhs, rhs);
+        }
         let byte_len = self.current_byte_len;
         run_numeric_values(self, frame, dst, lhs, rhs, op, bigint_op, byte_len)
     }
@@ -66,6 +69,9 @@ impl Interpreter {
         rhs: u16,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
+        if self.jit_hook.is_some() {
+            self.note_arith(lhs, rhs);
+        }
         self.run_add_values(frame, dst, lhs, rhs)
     }
 
@@ -115,7 +121,7 @@ impl Interpreter {
     }
 
     pub(crate) fn run_compare_regs(
-        &self,
+        &mut self,
         frame: &mut Frame,
         dst: u16,
         lhs: u16,
@@ -123,6 +129,9 @@ impl Interpreter {
         op: Op,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
+        if self.jit_hook.is_some() {
+            self.note_arith(lhs, rhs);
+        }
         run_compare_values(
             &self.gc_heap,
             frame,
@@ -135,13 +144,16 @@ impl Interpreter {
     }
 
     pub(crate) fn run_ushr_regs(
-        &self,
+        &mut self,
         frame: &mut Frame,
         dst: u16,
         lhs: u16,
         rhs: u16,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
+        if self.jit_hook.is_some() {
+            self.note_arith(lhs, rhs);
+        }
         let lk = abstract_ops::to_numeric_kind(&lhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
         let rk = abstract_ops::to_numeric_kind(&rhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
         let result = match (lk, rk) {

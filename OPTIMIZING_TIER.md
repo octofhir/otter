@@ -99,3 +99,63 @@ Regex stays out of scope throughout.
 
 _Started 2026-06-19 on `perf/engine-rewrite`. Reproducers: `benchmarks/micro/`,
 `benchmarks/scripts/{mandelbrot,nbody,fib}.js`. Profiles: `benchmarks/profiles/`._
+
+---
+
+# Part II — a separate optimizing tier (Maglev-analog)
+
+The in-place slices above (S1) raised the baseline's ceiling but cannot reach
+it: the baseline is by construction a single linear pass with no IR, no register
+allocation, and no deopt, so LICM / linear-scan regalloc / speculative inlining
+have nowhere to live. S1 (`d593463f`, write-through f64 read cache gated on
+`Op::Div`, ~7% mandelbrot) is its practical limit and the new tier subsumes it.
+
+This part is a **second compiled tier** living in `crates/otter-jit/src/optimizing/`,
+selected by hotness *above* the baseline in the existing tier-up ladder (not an
+env flag — the new path is the default and is reverted via git, never a
+kill-switch). It builds a typed SSA graph from bytecode for a hot function,
+speculates representations from interpreter type feedback, lowers to unboxed
+arm64 with linear-scan register allocation, and deoptimizes to the
+interpreter/baseline when a guard fails. The baseline stays as the fast
+fallback and the deopt target.
+
+Target: close the compute gap on `mandelbrot` / `nbody` / `fib` (6–12× node →
+~1.5–2×). Each stage is a multiplier, gated (test262 JIT-off == JIT-on
+failing-set diff), and committed.
+
+## Stages
+
+1. **Type feedback (foundation, 0 perf by itself).** ✅ *landed.* The
+   interpreter records observed operand representations per arithmetic /
+   relational site during warm-up. See [`crates/otter-vm/src/jit_feedback.rs`]
+   (`ArithFeedback`, an OR-accumulated `{Int32, Float64, String, BigInt, Other}`
+   bitset) keyed on `Interpreter::jit_arith_feedback: (function_id, byte_pc)`.
+   Recorded by the `run_*_regs` arithmetic helpers (gated on a JIT hook being
+   installed, so interpreter-only runs pay nothing) and baked into
+   `JitInstrView::arith_feedback` by `Interpreter::bake_arith_feedback` at
+   tier-up. Call-site mono/poly feedback (`jit_call_site_feedback`) and method
+   feedback (`jit_method_site_feedback`) already existed. Element-kind feedback
+   is added when the IR first consumes arrays. *Verified: byte-identical
+   test262 failing-set both JIT modes; no bench delta.*
+2. **Typed SSA IR.** Build an SSA graph from bytecode for a hot function; nodes
+   carry a representation (`Tagged` / `Int32` / `Float64`). From the stage-1
+   feedback, insert `CheckInt32` / `CheckNumber` guard nodes (speculation).
+   Start narrow: purely numeric monomorphic functions
+   (mandelbrot / nbody / fib); everything else falls back to the baseline.
+3. **Lowering + unboxed + linear-scan regalloc.** Float64/Int32 live in CPU/FP
+   registers across the loop, boxed only at tagged-use boundaries. Emit arm64
+   (dynasm). Adds LICM (`arr.length`, loop invariants) and bounds-check
+   elimination. ~2–3× on mandelbrot.
+4. **Deopt.** A failed type guard reconstructs the baseline/interpreter frame
+   from per-guard deopt metadata (SSA values → interpreter registers) and
+   resumes there — making speculation safe.
+5. **Speculative inlining** of monomorphic tiny callees (fib recursion,
+   sort comparator, map/filter callback) — kills the per-call frame-build tax
+   (~57% of fib self-time). ~2× on call-bound code.
+
+GC contract carried over: only the frame register window is rooted; unboxed
+numbers in registers across a safepoint are safe (not pointers), boxed pointers
+in registers across a safepoint require a flush/stack-map. Deopt must
+reconstruct exact interpreter state. Regex stays out of scope.
+
+_Part II started 2026-06-20 on `perf/engine-rewrite`._

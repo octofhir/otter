@@ -211,6 +211,9 @@ impl ExecutableFunction {
                     // can inspect constant strings without exposing them to the
                     // external JIT crate.
                     load_array_length: false,
+                    // Baked by `Interpreter::bake_arith_feedback` from the live
+                    // per-site warmup feedback; the raw snapshot carries none.
+                    arith_feedback: 0,
                 })
                 .collect(),
             // Baked by `Interpreter::bake_inline_callees` (it holds the live

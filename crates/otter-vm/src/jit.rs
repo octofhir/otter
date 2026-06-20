@@ -278,6 +278,14 @@ pub struct JitInstrView {
     /// `"length"`. The emitter uses it to try the Array exotic length fast
     /// path before falling back to ordinary property semantics.
     pub load_array_length: bool,
+    /// Baked operand-representation feedback bits for an arithmetic / relational
+    /// site (see [`crate::jit_feedback`]). `0` for non-arithmetic instructions
+    /// and for sites the interpreter never observed; the optimizing tier reads
+    /// it to choose an unboxed `Int32` / `Float64` lowering and emit the
+    /// matching speculation guard. Populated by
+    /// `Interpreter::bake_arith_feedback` at tier-up; the raw `jit_view()`
+    /// snapshot leaves it `0`.
+    pub arith_feedback: u8,
 }
 
 /// Frame stack the interpreter dispatches over. Exposed so the JIT crate can

@@ -94,6 +94,7 @@ pub mod intrinsics;
 mod iterator_ops;
 pub mod iterator_state;
 pub mod jit;
+pub mod jit_feedback;
 pub mod js_surface;
 pub mod json;
 pub mod math;
@@ -430,6 +431,14 @@ pub struct Interpreter {
     /// the dispatch path. Centralises the PC advance so opcode helpers
     /// stay byte-length agnostic.
     current_byte_len: u32,
+    /// Global function id of the instruction currently being dispatched, and
+    /// its byte-offset PC. Stashed by `dispatch_loop_inner` right after each
+    /// fetch so the arithmetic / relational opcode helpers can key their
+    /// optimizing-tier operand-type feedback by `(function_id, byte_pc)` without
+    /// threading the loop's call-frame coordinates through every helper
+    /// signature. Read only while a JIT hook is installed.
+    current_function_id: u32,
+    current_byte_pc: u32,
     /// Per-isolate GC heap. Owned here so allocator-bearing
     /// opcodes (e.g. `Op::MakeClosure`'s upvalue alloc since
     /// task 76) reach it through `&mut self`. The `Runtime`
@@ -561,6 +570,14 @@ pub struct Interpreter {
     /// `Op::CallMethodValue` arm during warmup and read at compile time
     /// (`bake_inline_callees`). Only mutated when a JIT hook is installed.
     jit_method_site_feedback: rustc_hash::FxHashMap<(u32, u32), MethodCallFeedback>,
+    /// Per-site operand-representation feedback driving the optimizing tier's
+    /// type speculation, keyed `(function_id, byte_pc)`. Recorded by the
+    /// interpreter arithmetic / relational arms during the warmup runs that
+    /// precede tier-up, and baked into the compile snapshot
+    /// (`JitInstrView::arith_feedback`) so the optimizing tier can choose an
+    /// unboxed `Int32` / `Float64` lowering and insert the matching guard. Only
+    /// mutated when a JIT hook is installed.
+    jit_arith_feedback: rustc_hash::FxHashMap<(u32, u32), jit_feedback::ArithFeedback>,
     /// OSR targets that bailed, had no trampoline, or whose function is
     /// uncompilable; OSR is not retried for them. Keyed by `(function_id,
     /// loop_header_pc)` so a bail in one loop disables only *that* loop header,
@@ -1193,6 +1210,8 @@ impl Interpreter {
             array_index_accessor_protector: false,
             interrupt: InterruptFlag::new(),
             current_byte_len: 1,
+            current_function_id: 0,
+            current_byte_pc: 0,
             gc_heap,
             code_space: std::sync::Arc::new(code_space::CodeSpace::default()),
             shape_runtime,
@@ -1219,6 +1238,7 @@ impl Interpreter {
             jit_call_counts: rustc_hash::FxHashMap::default(),
             jit_call_site_feedback: rustc_hash::FxHashMap::default(),
             jit_method_site_feedback: rustc_hash::FxHashMap::default(),
+            jit_arith_feedback: rustc_hash::FxHashMap::default(),
             jit_osr_disabled: rustc_hash::FxHashSet::default(),
             jit_osr_counts: rustc_hash::FxHashMap::default(),
             jit_osr_threshold: std::env::var("OTTER_JIT_OSR_THRESHOLD")
@@ -2326,6 +2346,7 @@ impl Interpreter {
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         let mut view = context.jit_function_view(fid)?;
         Self::bake_typed_array_layout(&mut view);
+        self.bake_arith_feedback(&mut view, fid);
         self.bake_inline_callees(&mut view, context, fid);
         let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
         let (regs, params) = (view.register_count, view.param_count);
@@ -2369,6 +2390,35 @@ impl Interpreter {
             array_length_byte: header + crate::array::ARRAY_BODY_LENGTH_OFFSET as u32,
         };
         view.cage_base = otter_gc::cage_base() as usize;
+    }
+
+    /// Fold the operand representations of one observed arithmetic / relational
+    /// execution into the optimizing-tier type-feedback cell for the currently
+    /// dispatching site (`current_function_id`, `current_byte_pc`). Called from
+    /// the arithmetic opcode helpers; gated by the caller on a JIT hook being
+    /// installed, so interpreter-only execution records nothing. The cell is
+    /// baked into the compile snapshot at tier-up.
+    #[inline]
+    pub(crate) fn note_arith(&mut self, lhs: Value, rhs: Value) {
+        self.jit_arith_feedback
+            .entry((self.current_function_id, self.current_byte_pc))
+            .or_default()
+            .record(lhs, rhs);
+    }
+
+    /// Copy the warmup operand-type feedback recorded for `fid`'s arithmetic /
+    /// relational sites into the compile snapshot, keyed by each instruction's
+    /// byte-PC. Sites the interpreter never observed stay `0` (unknown), which
+    /// the optimizing tier lowers generically.
+    fn bake_arith_feedback(&self, view: &mut jit::JitFunctionView, fid: u32) {
+        if self.jit_arith_feedback.is_empty() {
+            return;
+        }
+        for instr in &mut view.instructions {
+            if let Some(fb) = self.jit_arith_feedback.get(&(fid, instr.byte_pc)) {
+                instr.arith_feedback = fb.bits();
+            }
+        }
     }
 
     /// Record a `Mono`/`Poly` observation for one `Op::Call` site, the feedback
@@ -5521,6 +5571,8 @@ impl Interpreter {
                 .ok_or(VmError::MissingReturn)?;
             let op = instr.op();
             self.current_byte_len = instr.byte_len();
+            self.current_function_id = function_id;
+            self.current_byte_pc = pc;
             // Inlined runtime metering on the dispatch hot path. The three
             // former per-op method calls collapse into `record_reductions`
             // (`#[inline]`), an inlined monotonic stack-depth max, and a
@@ -13958,5 +14010,67 @@ mod tests {
             interp.jit_call_site_feedback.get(&(7, site_a)),
             Some(&CallTargetFeedback::Mono(3))
         );
+    }
+
+    #[test]
+    fn arith_feedback_accumulates_per_site_and_bakes_into_view() {
+        let mut interp = Interpreter::new();
+
+        // A pure-int32 site under fid 5 at byte-PC 16.
+        interp.current_function_id = 5;
+        interp.current_byte_pc = 16;
+        interp.note_arith(Value::number_i32(1), Value::number_i32(2));
+        interp.note_arith(Value::number_i32(7), Value::number_i32(-3));
+        let int_site = interp.jit_arith_feedback.get(&(5, 16)).copied().unwrap();
+        assert!(int_site.is_int32_only());
+        assert!(int_site.is_numeric_only());
+
+        // A second site that mixes int32 and double → numeric but not int32.
+        interp.current_byte_pc = 32;
+        interp.note_arith(Value::number_i32(1), Value::number_f64(2.5));
+        let num_site = interp.jit_arith_feedback.get(&(5, 32)).copied().unwrap();
+        assert!(!num_site.is_int32_only());
+        assert!(num_site.is_numeric_only());
+
+        // Same byte-PC under a different fid is independent (never recorded).
+        assert!(!interp.jit_arith_feedback.contains_key(&(9, 16)));
+
+        // Baking copies each site's bits into the matching instruction by
+        // byte-PC; unobserved instructions stay 0.
+        let mut view = jit::JitFunctionView {
+            function_id: 5,
+            param_count: 0,
+            register_count: 4,
+            code_byte_len: 64,
+            is_strict: false,
+            is_async: false,
+            is_generator: false,
+            is_async_generator: false,
+            cage_base: 0,
+            ta_layout: jit::JitTypedArrayLayout::default(),
+            object_shape_byte: 0,
+            object_values_ptr_byte: 0,
+            jit_proto_byte: 0,
+            closure_fid_byte: 0,
+            instructions: vec![16u32, 32, 48]
+                .into_iter()
+                .map(|byte_pc| jit::JitInstrView {
+                    op: Op::Add,
+                    byte_pc,
+                    byte_len: 16,
+                    property_ic_site: None,
+                    operands: Vec::new(),
+                    make_self: false,
+                    load_array_length: false,
+                    arith_feedback: 0,
+                })
+                .collect(),
+            inline_callees: rustc_hash::FxHashMap::default(),
+            inline_methods: rustc_hash::FxHashMap::default(),
+        };
+        interp.bake_arith_feedback(&mut view, 5);
+        assert_eq!(view.instructions[0].arith_feedback, int_site.bits());
+        assert_eq!(view.instructions[1].arith_feedback, num_site.bits());
+        assert_eq!(view.instructions[2].arith_feedback, 0);
     }
 }

@@ -3468,6 +3468,7 @@ mod tests {
                 operands: operands.clone(),
                 make_self: false,
                 load_array_length: false,
+                arith_feedback: 0,
             })
             .collect();
         JitFunctionView {

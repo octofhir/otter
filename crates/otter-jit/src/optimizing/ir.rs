@@ -287,6 +287,16 @@ pub struct Graph {
     /// phi defines on block entry. Entries for trivially-eliminated phis become
     /// stale but are never read (only live `Block::phis` are consulted).
     pub phi_reg: rustc_hash::FxHashMap<NodeId, u16>,
+    /// Per-block ordered log of bytecode-register definitions performed while
+    /// translating the block's instructions: `(byte_pc, register, value)` in
+    /// execution order. Unlike [`Node::frame_dst`] (which records only a value's
+    /// *primary* destination), this captures *every* register rebind — including
+    /// `LoadLocal` / `StoreLocal` aliasing that binds a register to an existing
+    /// SSA value without producing a node. Deopt frame-state reconstruction
+    /// replays it to know precisely which SSA value each interpreter register
+    /// holds at a guard, which `frame_dst` alone cannot express for aliased
+    /// registers.
+    pub reg_writes: rustc_hash::FxHashMap<BlockId, Vec<(u32, u16, NodeId)>>,
 }
 
 impl Graph {
@@ -299,6 +309,7 @@ impl Graph {
             param_count,
             register_count,
             phi_reg: rustc_hash::FxHashMap::default(),
+            reg_writes: rustc_hash::FxHashMap::default(),
         }
     }
 

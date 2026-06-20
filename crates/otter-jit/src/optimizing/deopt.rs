@@ -65,11 +65,7 @@ fn reg_effects(op: Op, operands: &[Operand]) -> RegEffects {
     let mut defs = Vec::new();
     let mut uses = Vec::new();
     match op {
-        Op::LoadInt32
-        | Op::LoadTrue
-        | Op::LoadFalse
-        | Op::LoadUndefined
-        | Op::MakeFunction => {
+        Op::LoadInt32 | Op::LoadTrue | Op::LoadFalse | Op::LoadUndefined | Op::MakeFunction => {
             if let Some(d) = reg(operands, 0) {
                 defs.push(d);
             }
@@ -141,18 +137,16 @@ fn reg_effects(op: Op, operands: &[Operand]) -> RegEffects {
 
 /// Byte-PC successors of the instruction at index `i` (fallthrough + branch
 /// target), as instruction byte-PCs.
-fn successors(
-    view: &JitFunctionView,
-    i: usize,
-    index_of_pc: &FxHashMap<u32, usize>,
-) -> Vec<u32> {
+fn successors(view: &JitFunctionView, i: usize, index_of_pc: &FxHashMap<u32, usize>) -> Vec<u32> {
     let instr = &view.instructions[i];
     let next_pc = view.instructions.get(i + 1).map(|n| n.byte_pc);
     let branch = |slot: usize| -> Option<u32> {
         match instr.operands.get(slot) {
             Some(Operand::Imm32(rel)) => {
                 let target = i64::from(instr.byte_pc) + 1 + i64::from(*rel);
-                u32::try_from(target).ok().filter(|pc| index_of_pc.contains_key(pc))
+                u32::try_from(target)
+                    .ok()
+                    .filter(|pc| index_of_pc.contains_key(pc))
             }
             _ => None,
         }
@@ -259,14 +253,35 @@ fn reverse_postorder(graph: &Graph) -> Vec<BlockId> {
     post
 }
 
-/// Capture the deopt frame state at every speculation guard (`CheckInt32`).
+/// Whether a node can deoptimize and therefore needs a captured frame state: a
+/// speculation guard (`CheckInt32`) or an arithmetic node that deopts on int32
+/// overflow (`Int32Add` / `Int32Sub` / `Int32Mul`). An overflow resumes the
+/// interpreter at the arithmetic instruction's byte-PC, so it needs the same
+/// live-register frame state as a guard does.
+fn can_deopt(kind: &NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::CheckInt32(_)
+            | NodeKind::Int32Add(_, _)
+            | NodeKind::Int32Sub(_, _)
+            | NodeKind::Int32Mul(_, _)
+    )
+}
+
+/// Capture the deopt frame state at every node that can deoptimize: a speculation
+/// guard (`CheckInt32`) or an overflowing int32 arithmetic node.
 ///
 /// Reconstructs, per block in RPO, the interpreter environment (register → SSA
 /// value) by inheriting from a predecessor and overlaying header phis, then
-/// walks the block recording, at each guard, the value of every register live at
-/// the guard's byte-PC (per [`bytecode_liveness`]). A register live at a merge
-/// necessarily flows through a phi (or is unchanged across all predecessors), so
-/// the captured value is always correct for the live set.
+/// walks the block recording, at each deopt-capable node, the value of every
+/// register live at its byte-PC (per [`bytecode_liveness`]). A register live at a
+/// merge necessarily flows through a phi (or is unchanged across all
+/// predecessors), so the captured value is always correct for the live set.
+///
+/// The environment overlay is applied *before* recording at a node so an
+/// arithmetic node's own freshly-written destination register restores to a
+/// pre-instruction value (the operands), exactly matching what the interpreter
+/// re-reads when it re-executes that instruction after the bail.
 #[must_use]
 pub fn capture_frame_states(
     graph: &Graph,
@@ -307,10 +322,30 @@ pub fn capture_frame_states(
             e
         };
 
+        // The block's register rebinds, in execution order (byte_pc ascending).
+        // Replaying these — rather than only `frame_dst` — captures `LoadLocal` /
+        // `StoreLocal` aliasing, so the env reflects exactly which SSA value each
+        // interpreter register holds, matching what the resumed bytecode reads.
+        let empty = Vec::new();
+        let writes = graph.reg_writes.get(&b).unwrap_or(&empty);
+        let mut wi = 0usize;
+
         for &nid in &block.body {
             let node = graph.node(nid);
-            if matches!(node.kind, NodeKind::CheckInt32(_)) {
+            if can_deopt(&node.kind) {
                 let pc = node.byte_pc;
+                // Apply every register rebind from an instruction strictly before
+                // this guard's instruction. A rebind at the guard's own `pc` is
+                // that instruction's def, which `live_before[pc]` excludes — the
+                // interpreter re-executes the instruction, so its def is restored
+                // by re-running, not by the frame state.
+                while wi < writes.len() && writes[wi].0 < pc {
+                    let (_, r, v) = writes[wi];
+                    if (r as usize) < rc {
+                        env[r as usize] = Some(v);
+                    }
+                    wi += 1;
+                }
                 let mut registers: Vec<(u16, NodeId)> = Vec::new();
                 if let Some(live) = bytecode_live.get(&pc) {
                     let mut regs: Vec<u16> = live.iter().copied().collect();
@@ -321,19 +356,36 @@ pub fn capture_frame_states(
                         }
                     }
                 }
-                points
-                    .entry(nid)
-                    .or_insert(DeoptPoint { byte_pc: pc, registers });
+                points.entry(nid).or_insert(DeoptPoint {
+                    byte_pc: pc,
+                    registers,
+                });
             }
-            if let Some(r) = node.frame_dst
-                && (r as usize) < rc
-            {
-                env[r as usize] = Some(nid);
+        }
+        // Apply the remaining rebinds to form the block-exit environment that
+        // successors inherit.
+        while wi < writes.len() {
+            let (_, r, v) = writes[wi];
+            if (r as usize) < rc {
+                env[r as usize] = Some(v);
             }
+            wi += 1;
         }
         exit_env[b as usize] = Some(env);
     }
     points
+}
+
+/// Per-guard SSA values a deopt frame restores, keyed by guard node. The
+/// register allocator consumes this to keep each such value live to its guard so
+/// the deopt exit can read it from a stable home (see [`super::liveness::analyze`]
+/// and [`super::regalloc::allocate`]).
+#[must_use]
+pub fn deopt_value_uses(frames: &FxHashMap<NodeId, DeoptPoint>) -> FxHashMap<NodeId, Vec<NodeId>> {
+    frames
+        .iter()
+        .map(|(&nid, point)| (nid, point.registers.iter().map(|&(_, v)| v).collect()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -494,11 +546,23 @@ mod tests {
         let regs: std::collections::HashMap<u16, NodeId> =
             point.registers.iter().copied().collect();
         // r0 = n restores the parameter; r1 = i and r2 = acc restore header phis.
-        assert!(matches!(g.node(regs[&0]).kind, NodeKind::Param(0)), "n is the param");
-        assert!(matches!(g.node(regs[&1]).kind, NodeKind::Phi(_)), "i is a header phi");
-        assert!(matches!(g.node(regs[&2]).kind, NodeKind::Phi(_)), "acc is a header phi");
+        assert!(
+            matches!(g.node(regs[&0]).kind, NodeKind::Param(0)),
+            "n is the param"
+        );
+        assert!(
+            matches!(g.node(regs[&1]).kind, NodeKind::Phi(_)),
+            "i is a header phi"
+        );
+        assert!(
+            matches!(g.node(regs[&2]).kind, NodeKind::Phi(_)),
+            "acc is a header phi"
+        );
         // r3 (the comparison result) is not yet defined at the guard, so it is
         // not restored.
-        assert!(!regs.contains_key(&3), "comparison result not live before itself");
+        assert!(
+            !regs.contains_key(&3),
+            "comparison result not live before itself"
+        );
     }
 }

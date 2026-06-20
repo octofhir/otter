@@ -7,16 +7,17 @@
 //! when a type guard fails. The baseline tier remains the fast fallback and the
 //! deopt target.
 //!
-//! This module currently implements the **graph construction** step
-//! ([`build_graph`]): bytecode → typed SSA over the int32-numeric monomorphic
-//! subset. It emits no machine code yet, so it is not wired into the tier-up
-//! ladder — lowering + execution land in the next step. Anything outside the
-//! subset returns [`Unsupported`] and the VM keeps using the baseline /
-//! interpreter unchanged.
+//! The full pipeline runs end to end: [`build_graph`] constructs the typed SSA
+//! over the int32-numeric monomorphic subset, [`liveness`] / [`regalloc`] assign
+//! machine homes, [`deopt`] captures per-guard frame states, and [`emit`] lowers
+//! to executable arm64. [`compile`] orchestrates these and returns a
+//! [`otter_vm::JitFunctionCode`]; the baseline tier is tried as a fallback for
+//! anything the optimizing tier declines with [`Unsupported`].
 //!
 //! # Contents
 //! - [`ir`] — the typed SSA graph (`Graph`, `Block`, `Node`, `Repr`).
 //! - [`build_graph`] — bytecode → SSA entry point.
+//! - [`compile`] — the full pipeline to executable machine code.
 //! - [`Unsupported`] — why a function is outside the optimizing subset.
 //!
 //! # See also
@@ -25,6 +26,7 @@
 
 mod builder;
 pub mod deopt;
+pub mod emit;
 pub mod ir;
 pub mod liveness;
 pub mod regalloc;
@@ -55,10 +57,36 @@ pub enum Unsupported {
     /// A graph shape that is built but not yet lowered to machine code (a
     /// comparison / boolean result, a phi) in the current emitter.
     Unlowered(&'static str),
+    /// A value the emitter must read (an operand, return value, phi edge input,
+    /// or deopt frame-state value) has no register-allocation home. Aborting the
+    /// whole compile keeps every emitted function correct (no wild access); the
+    /// VM falls back to the baseline. Widening coverage is a later concern.
+    Unallocated,
 }
 
 /// Build the typed SSA graph for `view`, or report why it is outside the
 /// optimizing subset.
 pub fn build_graph(view: &JitFunctionView) -> Result<ir::Graph, Unsupported> {
     builder::build(view)
+}
+
+/// Run the whole optimizing-tier pipeline for `view` — graph construction, SSA
+/// liveness, linear-scan register allocation, deopt frame-state capture, and
+/// machine-code emission — returning a type-erased [`otter_vm::JitFunctionCode`]
+/// or the [`Unsupported`] reason the function is outside the tier (the VM then
+/// falls back to the baseline).
+pub fn compile(
+    view: &JitFunctionView,
+) -> Result<std::sync::Arc<dyn otter_vm::JitFunctionCode>, Unsupported> {
+    let graph = build_graph(view)?;
+    // Deopt frame states are computed before register allocation: a value a guard
+    // restores is an additional use that must extend its live range, so the
+    // allocator keeps it in a home the deopt exit can read.
+    let bcl = deopt::bytecode_liveness(view);
+    let frames = deopt::capture_frame_states(&graph, &bcl);
+    let deopt_uses = deopt::deopt_value_uses(&frames);
+    let liveness = liveness::analyze(&graph, &deopt_uses);
+    let alloc = regalloc::allocate(&graph, &liveness, emit::GP_REGS, &deopt_uses);
+    let code = emit::emit(view, &graph, &liveness, &alloc, &frames)?;
+    Ok(std::sync::Arc::new(code))
 }

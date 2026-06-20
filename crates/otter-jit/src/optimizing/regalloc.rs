@@ -282,10 +282,15 @@ pub struct Allocation {
 /// abstract GP registers (`Reg(0..gp_regs)`). The result is interference-free:
 /// no two values live at the same position share a `Reg`.
 #[must_use]
-pub fn allocate(graph: &Graph, liveness: &Liveness, gp_regs: u32) -> Allocation {
+pub fn allocate(
+    graph: &Graph,
+    liveness: &Liveness,
+    gp_regs: u32,
+    deopt_uses: &FxHashMap<NodeId, Vec<NodeId>>,
+) -> Allocation {
     let numbering = Numbering::build(graph, liveness);
     let loops = detect_loops(graph, liveness, &numbering);
-    let intervals = build_intervals(graph, liveness, &numbering, &loops);
+    let intervals = build_intervals(graph, liveness, &numbering, &loops, deopt_uses);
     let scan = LinearScan::run(intervals, gp_regs);
     let location = scan.locations();
     let edge_moves = resolve(graph, liveness, &numbering, &scan, &location);
@@ -390,9 +395,7 @@ fn detect_loops(graph: &Graph, liveness: &Liveness, numbering: &Numbering) -> Ve
     // a back-edge. (Under a reducible CFG this coincides with `s` dominating `b`.)
     for &b in &liveness.rpo {
         for s in successors(graph, b) {
-            if rpo_index[s as usize] != u32::MAX
-                && rpo_index[s as usize] <= rpo_index[b as usize]
-            {
+            if rpo_index[s as usize] != u32::MAX && rpo_index[s as usize] <= rpo_index[b as usize] {
                 let body = natural_loop_body(graph, s, b);
                 if let Some(existing) = loops.iter_mut().find(|l| l.header == s) {
                     existing.blocks.extend(body);
@@ -461,6 +464,7 @@ fn build_intervals(
     liveness: &Liveness,
     numbering: &Numbering,
     loops: &[NaturalLoop],
+    deopt_uses: &FxHashMap<NodeId, Vec<NodeId>>,
 ) -> Vec<Interval> {
     let mut intervals: FxHashMap<NodeId, Interval> = FxHashMap::default();
 
@@ -489,6 +493,15 @@ fn build_intervals(
                 let iv = interval_for(&mut intervals, graph, input);
                 iv.add_range(block_start, use_pos);
                 iv.add_use(use_pos);
+            }
+            // Deopt frame-state values a guard reads are uses at the guard, so
+            // the value stays in a home the deopt exit can restore from.
+            if let Some(dvals) = deopt_uses.get(&nid) {
+                for &v in dvals {
+                    let iv = interval_for(&mut intervals, graph, v);
+                    iv.add_range(block_start, use_pos);
+                    iv.add_use(use_pos);
+                }
             }
         }
         // Terminator use (Branch.cond / Return value): live to the block end.
@@ -839,11 +852,7 @@ fn resolve(
 
             // Phi resolution: for each phi in `succ`, move this edge's input from
             // its pred-end home to the phi's home.
-            let pred_idx = graph
-                .block(succ)
-                .preds
-                .iter()
-                .position(|&p| p == pred);
+            let pred_idx = graph.block(succ).preds.iter().position(|&p| p == pred);
             if let Some(idx) = pred_idx {
                 for &phi in &graph.block(succ).phis {
                     let inputs = graph.node(phi).kind.inputs();
@@ -1005,7 +1014,7 @@ mod tests {
     fn intervals_of(graph: &Graph, live: &Liveness) -> Vec<Interval> {
         let numbering = Numbering::build(graph, live);
         let loops = detect_loops(graph, live, &numbering);
-        build_intervals(graph, live, &numbering, &loops)
+        build_intervals(graph, live, &numbering, &loops, &FxHashMap::default())
     }
 
     /// Assert no two values whose intervals overlap share the same `Reg`.
@@ -1025,11 +1034,10 @@ mod tests {
                     continue;
                 }
                 // Same register: their ranges must not overlap at any position.
-                let overlap = a.ranges.iter().any(|&(af, at)| {
-                    b.ranges
-                        .iter()
-                        .any(|&(bf, bt)| af < bt && bf < at)
-                });
+                let overlap = a
+                    .ranges
+                    .iter()
+                    .any(|&(af, at)| b.ranges.iter().any(|&(bf, bt)| af < bt && bf < at));
                 assert!(
                     !overlap,
                     "values {} and {} share Reg({ra}) but their intervals overlap",
@@ -1055,9 +1063,9 @@ mod tests {
             ],
         ))
         .expect("diamond builds");
-        let live = liveness::analyze(&g);
+        let live = liveness::analyze(&g, &Default::default());
 
-        let alloc = allocate(&g, &live, 7);
+        let alloc = allocate(&g, &live, 7, &Default::default());
         assert_interference_free(&g, &live, &alloc);
 
         // The merge phi must be correctly reconciled from *both* predecessors:
@@ -1117,9 +1125,9 @@ mod tests {
             ],
         ))
         .expect("loop builds");
-        let live = liveness::analyze(&g);
+        let live = liveness::analyze(&g, &Default::default());
 
-        let alloc = allocate(&g, &live, 7);
+        let alloc = allocate(&g, &live, 7, &Default::default());
         assert_interference_free(&g, &live, &alloc);
 
         // The loop has header phis (i and acc); the back edge must carry phi
@@ -1182,9 +1190,9 @@ mod tests {
             ],
         ))
         .expect("loop builds");
-        let live = liveness::analyze(&g);
+        let live = liveness::analyze(&g, &Default::default());
 
-        let alloc = allocate(&g, &live, 1);
+        let alloc = allocate(&g, &live, 1, &Default::default());
         assert_interference_free(&g, &live, &alloc);
         assert!(
             alloc.spill_slots >= 1,

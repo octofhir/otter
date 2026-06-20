@@ -279,6 +279,22 @@ impl<'a> Builder<'a> {
         self.current_def[reg as usize].insert(block, node);
     }
 
+    /// Bind `reg` to `node` in `block` while translating the instruction at
+    /// `byte_pc`, and log the rebind for deopt frame-state reconstruction. Used
+    /// for every per-instruction register definition (including `LoadLocal` /
+    /// `StoreLocal` aliasing) so deopt knows the exact SSA value each register
+    /// holds at a guard. Phi creation and the entry-block seeding use
+    /// [`Self::write_variable`] directly (their register state is reconstructed by
+    /// deopt from block entry, not from this log).
+    fn def_register(&mut self, reg: u16, block: BlockId, node: NodeId, byte_pc: u32) {
+        self.write_variable(reg, block, node);
+        self.graph
+            .reg_writes
+            .entry(block)
+            .or_default()
+            .push((byte_pc, reg, node));
+    }
+
     fn read_variable(&mut self, reg: u16, block: BlockId) -> NodeId {
         if let Some(&node) = self.current_def[reg as usize].get(&block) {
             return node;
@@ -290,7 +306,10 @@ impl<'a> Builder<'a> {
         let val = if !self.graph.blocks[block as usize].sealed {
             // Unknown predecessors: an incomplete phi, filled at seal time.
             let phi = self.new_phi(reg, block);
-            self.incomplete_phis.entry(block).or_default().push((reg, phi));
+            self.incomplete_phis
+                .entry(block)
+                .or_default()
+                .push((reg, phi));
             phi
         } else {
             let preds = self.graph.blocks[block as usize].preds.clone();
@@ -419,7 +438,7 @@ impl<'a> Builder<'a> {
                 Op::MakeFunction if make_self => {
                     let dst = reg(&operands, 0)?;
                     let node = self.graph.add_node(NodeKind::SelfClosure, block, byte_pc);
-                    self.write_variable(dst, block, node);
+                    self.def_register(dst, block, node, byte_pc);
                 }
                 Op::LoadInt32 => {
                     let dst = reg(&operands, 0)?;
@@ -427,7 +446,7 @@ impl<'a> Builder<'a> {
                     let node = self.graph.add_node(NodeKind::ConstInt32(v), block, byte_pc);
                     self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
-                    self.write_variable(dst, block, node);
+                    self.def_register(dst, block, node, byte_pc);
                 }
                 Op::LoadTrue | Op::LoadFalse => {
                     let dst = reg(&operands, 0)?;
@@ -438,14 +457,16 @@ impl<'a> Builder<'a> {
                     );
                     self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
-                    self.write_variable(dst, block, node);
+                    self.def_register(dst, block, node, byte_pc);
                 }
                 Op::LoadUndefined => {
                     let dst = reg(&operands, 0)?;
-                    let node = self.graph.add_node(NodeKind::ConstUndefined, block, byte_pc);
+                    let node = self
+                        .graph
+                        .add_node(NodeKind::ConstUndefined, block, byte_pc);
                     self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
-                    self.write_variable(dst, block, node);
+                    self.def_register(dst, block, node, byte_pc);
                 }
                 // `LoadLocal dst, srcIdx` / `StoreLocal src, dstIdx` are register
                 // copies (the local index is an inline immediate). Alias the SSA
@@ -455,14 +476,14 @@ impl<'a> Builder<'a> {
                     let src = u16::try_from(imm32(&operands, 1)?)
                         .map_err(|_| Unsupported::OperandShape("local index"))?;
                     let node = self.read_variable(src, block);
-                    self.write_variable(dst, block, node);
+                    self.def_register(dst, block, node, byte_pc);
                 }
                 Op::StoreLocal => {
                     let src = reg(&operands, 0)?;
                     let dst = u16::try_from(imm32(&operands, 1)?)
                         .map_err(|_| Unsupported::OperandShape("local index"))?;
                     let node = self.read_variable(src, block);
-                    self.write_variable(dst, block, node);
+                    self.def_register(dst, block, node, byte_pc);
                 }
                 // `ToPrimitive` / `ToNumeric` are identity on a number, and the
                 // arithmetic site's `CheckInt32` guard enforces the int32
@@ -473,27 +494,33 @@ impl<'a> Builder<'a> {
                     let dst = reg(&operands, 0)?;
                     let src = reg(&operands, 1)?;
                     let node = self.read_variable(src, block);
-                    self.write_variable(dst, block, node);
+                    self.def_register(dst, block, node, byte_pc);
                 }
                 Op::Add | Op::Sub | Op::Mul => {
-                    let (dst, lhs, rhs) = (reg(&operands, 0)?, reg(&operands, 1)?, reg(&operands, 2)?);
+                    let (dst, lhs, rhs) =
+                        (reg(&operands, 0)?, reg(&operands, 1)?, reg(&operands, 2)?);
                     let node = self.int32_binop(block, op, lhs, rhs, feedback, byte_pc)?;
                     self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
-                    self.write_variable(dst, block, node);
+                    self.def_register(dst, block, node, byte_pc);
                 }
-                Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq | Op::Equal
+                Op::LessThan
+                | Op::LessEq
+                | Op::GreaterThan
+                | Op::GreaterEq
+                | Op::Equal
                 | Op::NotEqual => {
-                    let (dst, lhs, rhs) = (reg(&operands, 0)?, reg(&operands, 1)?, reg(&operands, 2)?);
+                    let (dst, lhs, rhs) =
+                        (reg(&operands, 0)?, reg(&operands, 1)?, reg(&operands, 2)?);
                     let cmp = CmpOp::from_op(op).expect("comparison opcode");
                     let l = self.int32_operand(block, lhs, feedback, byte_pc)?;
                     let r = self.int32_operand(block, rhs, feedback, byte_pc)?;
-                    let node = self
-                        .graph
-                        .add_node(NodeKind::Int32Compare(cmp, l, r), block, byte_pc);
+                    let node =
+                        self.graph
+                            .add_node(NodeKind::Int32Compare(cmp, l, r), block, byte_pc);
                     self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
-                    self.write_variable(dst, block, node);
+                    self.def_register(dst, block, node, byte_pc);
                 }
                 Op::Jump => {
                     let rel = imm32(&operands, 0)?;
@@ -508,7 +535,9 @@ impl<'a> Builder<'a> {
                     let tgt_block = self.cfg.block_of_pc[&target];
                     let succs = &self.cfg.succs[block as usize];
                     if succs.len() < 2 {
-                        return Err(Unsupported::OperandShape("conditional branch without fallthrough"));
+                        return Err(Unsupported::OperandShape(
+                            "conditional branch without fallthrough",
+                        ));
                     }
                     // succs == [target, fallthrough] (built in CFG discovery).
                     let fallthrough = succs[1];
@@ -533,7 +562,9 @@ impl<'a> Builder<'a> {
                     self.set_term(block, Terminator::Return(node));
                 }
                 Op::ReturnUndefined => {
-                    let node = self.graph.add_node(NodeKind::ConstUndefined, block, byte_pc);
+                    let node = self
+                        .graph
+                        .add_node(NodeKind::ConstUndefined, block, byte_pc);
                     self.set_term(block, Terminator::Return(node));
                 }
                 other => return Err(Unsupported::Opcode(other)),
@@ -591,7 +622,9 @@ impl<'a> Builder<'a> {
         if self.graph.node(node).repr == Repr::Int32 {
             return Ok(node);
         }
-        let check = self.graph.add_node(NodeKind::CheckInt32(node), block, byte_pc);
+        let check = self
+            .graph
+            .add_node(NodeKind::CheckInt32(node), block, byte_pc);
         self.push_body(block, check);
         Ok(check)
     }
@@ -620,7 +653,11 @@ mod tests {
 
     /// Build a `JitFunctionView` from `(op, operands, arith_feedback)` triples,
     /// assigning byte-PCs at a fixed stride.
-    fn view(param_count: u16, register_count: u16, instrs: &[(Op, Vec<Operand>, u8)]) -> JitFunctionView {
+    fn view(
+        param_count: u16,
+        register_count: u16,
+        instrs: &[(Op, Vec<Operand>, u8)],
+    ) -> JitFunctionView {
         let instructions = instrs
             .iter()
             .enumerate()
@@ -685,10 +722,7 @@ mod tests {
         assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::Int32Add(..))), 1);
         // Only the tagged parameter needs a guard; the int32 const does not.
         assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::CheckInt32(_))), 1);
-        assert!(matches!(
-            g.blocks[0].term,
-            Some(Terminator::Return(_))
-        ));
+        assert!(matches!(g.blocks[0].term, Some(Terminator::Return(_))));
     }
 
     #[test]

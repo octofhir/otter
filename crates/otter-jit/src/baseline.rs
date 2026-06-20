@@ -1403,7 +1403,11 @@ mod arm64 {
                 }
                 Op::Div => emit_div(&mut ops, ops_ref, bail)?,
                 Op::Rem => emit_rem(&mut ops, ops_ref, bail)?,
-                Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq | Op::Equal
+                Op::LessThan
+                | Op::LessEq
+                | Op::GreaterThan
+                | Op::GreaterEq
+                | Op::Equal
                 | Op::NotEqual
                     if enable_fres =>
                 {
@@ -2078,10 +2082,24 @@ mod arm64 {
             // boundary or writes a slot the cache cannot track, so drop all.
             if enable_fres {
                 match instr.op {
-                    Op::Add | Op::Sub | Op::Mul | Op::Div | Op::LessThan | Op::LessEq
-                    | Op::GreaterThan | Op::GreaterEq | Op::Equal | Op::NotEqual => {}
-                    Op::LoadInt32 | Op::LoadLocal | Op::LoadNumber | Op::LoadString
-                    | Op::LoadTrue | Op::LoadFalse | Op::LoadUndefined | Op::LoadHole
+                    Op::Add
+                    | Op::Sub
+                    | Op::Mul
+                    | Op::Div
+                    | Op::LessThan
+                    | Op::LessEq
+                    | Op::GreaterThan
+                    | Op::GreaterEq
+                    | Op::Equal
+                    | Op::NotEqual => {}
+                    Op::LoadInt32
+                    | Op::LoadLocal
+                    | Op::LoadNumber
+                    | Op::LoadString
+                    | Op::LoadTrue
+                    | Op::LoadFalse
+                    | Op::LoadUndefined
+                    | Op::LoadHole
                     | Op::LoadBigInt => {
                         if let Ok(dst) = reg(ops_ref, 0) {
                             fres.invalidate(dst);

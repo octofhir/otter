@@ -61,19 +61,32 @@ impl otter_vm::JitCompilerHook for BaselineJitCompiler {
         &self,
         request: otter_vm::JitCompileRequest,
     ) -> Result<otter_vm::JitCompileStatus, otter_vm::JitCompileError> {
-        // The optimizing tier's production backend (register allocation,
-        // representation selection, exact-PC deopt) is being built up; it is not
-        // yet wired into execution. Until its emitter lands, the baseline tier
-        // serves every function.
+        let fid = request.function.function_id;
+        let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
+        // Try the optimizing tier (register allocation, representation
+        // selection, exact-PC deopt) first; it covers the int32 arithmetic /
+        // control-flow / loop subset. Anything it declines falls through to the
+        // baseline template tier, which serves the broader opcode surface.
+        match optimizing::compile(&request.function) {
+            Ok(code) => {
+                if trace {
+                    eprintln!("[otter-jit] optimizing tier compiled fid {fid}");
+                }
+                return Ok(otter_vm::JitCompileStatus::Compiled { code });
+            }
+            Err(reason) => {
+                if trace {
+                    eprintln!("[otter-jit] optimizing tier declined fid {fid}: {reason:?}");
+                }
+            }
+        }
+
         match baseline::compile(&request.function) {
             Ok(code) => Ok(otter_vm::JitCompileStatus::Compiled {
                 code: std::sync::Arc::new(code),
             }),
             Err(reason) => Ok(otter_vm::JitCompileStatus::Unsupported {
-                reason: format!(
-                    "function {} not in baseline subset: {reason:?}",
-                    request.function.function_id
-                ),
+                reason: format!("function {fid} not in baseline subset: {reason:?}"),
             }),
         }
     }

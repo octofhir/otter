@@ -23,7 +23,7 @@
 //! # See also
 //! - [`super::ir`] — the graph analyzed here.
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::ir::{BlockId, Graph, NodeId, Terminator};
 
@@ -79,14 +79,22 @@ fn reverse_postorder(graph: &Graph) -> Vec<BlockId> {
 }
 
 /// Compute SSA liveness for `graph`.
-pub fn analyze(graph: &Graph) -> Liveness {
+///
+/// `deopt_uses` maps each guard / overflowing-arithmetic node to the SSA values
+/// its deopt frame state restores. These are *additional uses* at the guard:
+/// a value read only to reconstruct the interpreter frame must stay live to the
+/// guard so the register allocator keeps it in a home the deopt exit can read.
+/// Omitting them would let the allocator reuse the register and corrupt the
+/// restored frame.
+pub fn analyze(graph: &Graph, deopt_uses: &FxHashMap<NodeId, Vec<NodeId>>) -> Liveness {
     let n = graph.blocks.len();
     let rpo = reverse_postorder(graph);
 
     // Precompute per-block defs and upward-exposed uses (non-φ).
     // defs(b)  = every value defined in b (φ heads + body nodes).
     // uses(b)  = body operands whose definition is not in b (φ operands are
-    //            handled at predecessor edges, never here).
+    //            handled at predecessor edges, never here), plus deopt
+    //            frame-state values a guard in b reads that are defined outside b.
     let mut defs: Vec<FxHashSet<NodeId>> = vec![FxHashSet::default(); n];
     let mut uses: Vec<FxHashSet<NodeId>> = vec![FxHashSet::default(); n];
     for (b, block) in graph.blocks.iter().enumerate() {
@@ -103,6 +111,13 @@ pub fn analyze(graph: &Graph) -> Liveness {
             for input in graph.node(nid).kind.inputs() {
                 if !d.contains(&input) {
                     u.insert(input);
+                }
+            }
+            if let Some(dvals) = deopt_uses.get(&nid) {
+                for &v in dvals {
+                    if !d.contains(&v) {
+                        u.insert(v);
+                    }
                 }
             }
         }
@@ -250,7 +265,7 @@ mod tests {
         ))
         .expect("loop builds");
 
-        let live = analyze(&g);
+        let live = analyze(&g, &Default::default());
         assert_eq!(live.rpo[0], g.entry, "entry first in RPO");
         assert_eq!(live.rpo.len(), g.blocks.len(), "every block ordered once");
 
@@ -284,7 +299,10 @@ mod tests {
             .iter()
             .flat_map(|&phi| g.node(phi).kind.inputs())
             .collect();
-        assert!(!header_phi_inputs.is_empty(), "header has loop-carried phis");
+        assert!(
+            !header_phi_inputs.is_empty(),
+            "header has loop-carried phis"
+        );
         for v in &header_phi_inputs {
             assert!(
                 live.live_out[body as usize].contains(v)
@@ -306,7 +324,7 @@ mod tests {
             ],
         ))
         .expect("builds");
-        let live = analyze(&g);
+        let live = analyze(&g, &Default::default());
         assert_eq!(live.rpo.len(), 1);
         // Single block: nothing is live-in (params are defs in the entry block)
         // and nothing live-out (the return consumes the last value).

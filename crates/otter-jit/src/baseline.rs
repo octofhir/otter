@@ -74,7 +74,7 @@ pub(crate) const OBJECT_BODY_TYPE_TAG: u32 = 0x11;
 /// [`TAG_PTR_FUNCTION`] is never misread as a bytecode closure.
 const JS_CLOSURE_BODY_TYPE_TAG: u32 = 0x23;
 /// `SPECIAL` payload for the internal array/`this` hole sentinel.
-const SPECIAL_HOLE: u64 = 2;
+pub(crate) const SPECIAL_HOLE: u64 = 2;
 /// `SPECIAL` payload for `false`.
 pub(crate) const SPECIAL_FALSE: u32 = 3;
 /// `SPECIAL` payload for `true`.
@@ -186,6 +186,9 @@ const DIRECT_ENTRY_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_entry_addr)
 const DIRECT_REGS_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_regs) as u32;
 const DIRECT_SELF_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_self_closure) as u32;
 const DIRECT_THIS_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_this_value) as u32;
+/// Byte offset of the precomputed `this` bits in [`JitCtx`], for inline
+/// `LoadThis` in both the baseline and optimizing tiers.
+pub(crate) const THIS_VALUE_OFFSET: u32 = std::mem::offset_of!(JitCtx, this_value) as u32;
 const DIRECT_FRAME_INDEX_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_frame_index) as u32;
 const DIRECT_UPVALUES_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_upvalues_ptr) as u32;
 const JIT_CTX_STACK_SIZE: u32 = ((std::mem::size_of::<JitCtx>() + 15) & !15) as u32;
@@ -909,9 +912,9 @@ mod arm64 {
         JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS, OBJECT_BODY_TYPE_TAG, Op, Operand,
         REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE,
         STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_FUNCTION_ID, TAG_INT32,
-        TAG_NAN, TAG_PTR_FUNCTION, TAG_PTR_OBJECT, TAG_SPECIAL, UPVALUE_CELL_SIZE,
-        UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, Unsupported, VM_OFFSET, WhiskerIcCell,
-        jit_abort_direct_call_stub, jit_call_method_stub, jit_delegate_op_stub,
+        TAG_NAN, TAG_PTR_FUNCTION, TAG_PTR_OBJECT, TAG_SPECIAL, THIS_VALUE_OFFSET,
+        UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, Unsupported, VM_OFFSET,
+        WhiskerIcCell, jit_abort_direct_call_stub, jit_call_method_stub, jit_delegate_op_stub,
         jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
         jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub, jit_load_upvalue_stub,
         jit_make_fn_stub, jit_new_array_stub, jit_new_object_stub, jit_prepare_direct_call_stub,
@@ -1882,7 +1885,7 @@ mod arm64 {
                     // `this`-before-super, which the interpreter resolves.
                     let dst = reg(ops_ref, 0)?;
                     let hole = (TAG_SPECIAL << 48) | SPECIAL_HOLE;
-                    dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, #16]);
+                    dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, THIS_VALUE_OFFSET]);
                     emit_load_u64(&mut ops, 12, hole);
                     dynasm!(ops ; .arch aarch64 ; cmp x9, x12 ; b.eq =>bail);
                     store_reg(&mut ops, 9, dst)?;

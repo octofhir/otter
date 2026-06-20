@@ -70,6 +70,8 @@ fn reg_effects(op: Op, operands: &[Operand]) -> RegEffects {
         | Op::LoadTrue
         | Op::LoadFalse
         | Op::LoadUndefined
+        | Op::LoadThis
+        | Op::LoadHole
         | Op::MakeFunction => {
             if let Some(d) = reg(operands, 0) {
                 defs.push(d);
@@ -295,6 +297,7 @@ fn can_deopt(kind: &NodeKind) -> bool {
         NodeKind::CheckInt32(_)
             | NodeKind::CheckNumber(_)
             | NodeKind::CheckShape(_, _)
+            | NodeKind::LoadThis
             | NodeKind::Int32Add(_, _)
             | NodeKind::Int32Sub(_, _)
             | NodeKind::Int32Mul(_, _)

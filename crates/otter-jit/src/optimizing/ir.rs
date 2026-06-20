@@ -156,6 +156,12 @@ pub enum NodeKind {
     /// `int32 >> (int32 & 31)` — arithmetic (sign-propagating) right shift,
     /// matching JS `>>`. Result [`Repr::Int32`].
     Int32Shr(NodeId, NodeId),
+    /// The function's `this` binding, read from `JitCtx.this_value`. A TDZ hole
+    /// (a derived-constructor `this` before `super(...)`) deoptimizes — the
+    /// interpreter owns that ReferenceError. Result [`Repr::Tagged`].
+    LoadThis,
+    /// The TDZ / uninitialized hole sentinel. Result [`Repr::Tagged`].
+    LoadHole,
     /// Speculative "operand is an ordinary object of the baked shape" guard.
     /// Carries the receiver and the receiver shape's compressed `Gc` offset. A
     /// non-object, or a different shape (or dictionary mode), deoptimizes.
@@ -210,7 +216,9 @@ impl NodeKind {
             | NodeKind::ConstF64(_)
             | NodeKind::ConstBool(_)
             | NodeKind::ConstUndefined
-            | NodeKind::SelfClosure => Vec::new(),
+            | NodeKind::SelfClosure
+            | NodeKind::LoadThis
+            | NodeKind::LoadHole => Vec::new(),
         }
     }
 
@@ -248,7 +256,9 @@ impl NodeKind {
                 fix(b);
             }
             NodeKind::Phi(ops) => ops.iter_mut().for_each(fix),
-            NodeKind::Param(_)
+            NodeKind::LoadThis
+            | NodeKind::LoadHole
+            | NodeKind::Param(_)
             | NodeKind::ConstInt32(_)
             | NodeKind::ConstF64(_)
             | NodeKind::ConstBool(_)
@@ -288,7 +298,9 @@ impl NodeKind {
             | NodeKind::Phi(_)
             | NodeKind::CheckShape(_, _)
             | NodeKind::LoadSlot(_, _)
-            | NodeKind::StoreSlot(_, _, _) => Repr::Tagged,
+            | NodeKind::StoreSlot(_, _, _)
+            | NodeKind::LoadThis
+            | NodeKind::LoadHole => Repr::Tagged,
         }
     }
 }

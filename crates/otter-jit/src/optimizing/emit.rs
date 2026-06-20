@@ -126,8 +126,8 @@ mod arm64 {
     };
     use crate::CompiledCode;
     use crate::baseline::{
-        BAIL_PC_OFFSET, OBJECT_BODY_TYPE_TAG, SPECIAL_FALSE, SPECIAL_TRUE, STATUS_BAILED,
-        STATUS_RETURNED, TAG_INT32, TAG_PTR_OBJECT, TAG_SPECIAL,
+        BAIL_PC_OFFSET, OBJECT_BODY_TYPE_TAG, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE,
+        STATUS_BAILED, STATUS_RETURNED, TAG_INT32, TAG_PTR_OBJECT, TAG_SPECIAL, THIS_VALUE_OFFSET,
     };
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
     use otter_vm::JitFunctionView;
@@ -964,6 +964,25 @@ mod arm64 {
                     _ => return Err(Unsupported::Unlowered("store-slot value not int32/f64")),
                 }
                 dynasm!(ops ; .arch aarch64 ; str x17, [x16, slot_byte]);
+                Ok(())
+            }
+            NodeKind::LoadThis => {
+                // `this` bits from JitCtx; a TDZ hole (derived-ctor this before
+                // super) deopts to the interpreter.
+                let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
+                dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x20, THIS_VALUE_OFFSET]);
+                emit_load_u64(ops, MOVE_SCRATCH, (TAG_SPECIAL << 48) | SPECIAL_HOLE);
+                dynasm!(ops ; .arch aarch64 ; cmp X(box_scratch), X(MOVE_SCRATCH) ; b.eq =>exit);
+                if let Some(loc) = dst {
+                    store_loc(ops, loc, box_scratch);
+                }
+                Ok(())
+            }
+            NodeKind::LoadHole => {
+                if let Some(loc) = dst {
+                    emit_load_u64(ops, box_scratch, (TAG_SPECIAL << 48) | SPECIAL_HOLE);
+                    store_loc(ops, loc, box_scratch);
+                }
                 Ok(())
             }
         }

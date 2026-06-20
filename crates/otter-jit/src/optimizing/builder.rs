@@ -543,6 +543,21 @@ impl<'a> Builder<'a> {
                     self.push_body(block, node);
                     self.def_register(dst, block, node, byte_pc);
                 }
+                // `this` and the TDZ hole sentinel: small Tagged loads that let
+                // methods (`this.x`) and hole-using bodies enter the optimizing
+                // tier. A hole `this` (derived-ctor before `super`) deopts.
+                Op::LoadThis | Op::LoadHole => {
+                    let dst = reg(&operands, 0)?;
+                    let kind = if matches!(op, Op::LoadThis) {
+                        NodeKind::LoadThis
+                    } else {
+                        NodeKind::LoadHole
+                    };
+                    let node = self.graph.add_node(kind, block, byte_pc);
+                    self.graph.set_frame_dst(node, dst);
+                    self.push_body(block, node);
+                    self.def_register(dst, block, node, byte_pc);
+                }
                 // `LoadLocal dst, srcIdx` / `StoreLocal src, dstIdx` are register
                 // copies (the local index is an inline immediate). Alias the SSA
                 // value; no node needed.

@@ -26,6 +26,7 @@
 mod builder;
 pub mod ir;
 pub mod liveness;
+pub mod regalloc;
 
 use otter_bytecode::Op;
 use otter_vm::JitFunctionView;

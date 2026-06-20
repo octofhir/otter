@@ -323,7 +323,79 @@ impl<'a> Builder<'a> {
             operands.push(self.read_variable(reg, pred));
         }
         self.graph.nodes[phi as usize].kind = NodeKind::Phi(operands);
-        phi
+        self.try_remove_trivial_phi(phi)
+    }
+
+    /// Braun et al. `tryRemoveTrivialPhi`: a phi all of whose operands are the
+    /// same value (ignoring self-references) is redundant — replace every use of
+    /// it with that single value, drop it from its block, and recurse on any phi
+    /// that used it (it may have become trivial too). Returns the value callers
+    /// should use in place of `phi` (the collapsed value, or `phi` if it is a
+    /// real merge). Keeps the graph free of the phis-for-unchanged-registers that
+    /// on-demand SSA construction otherwise produces — fewer phis, fewer
+    /// resolution moves, and a cleaner deopt frame state.
+    fn try_remove_trivial_phi(&mut self, phi: NodeId) -> NodeId {
+        let NodeKind::Phi(operands) = self.graph.node(phi).kind.clone() else {
+            return phi;
+        };
+        let mut same: Option<NodeId> = None;
+        for op in operands {
+            if op == phi || Some(op) == same {
+                continue; // self-reference or a repeat of the one distinct value
+            }
+            if same.is_some() {
+                return phi; // two distinct inputs: a real merge
+            }
+            same = Some(op);
+        }
+        let Some(same) = same else {
+            // No distinct operand (empty / pure self-loop): unreachable in
+            // practice; leave it rather than invent a value.
+            return phi;
+        };
+        // Collect phi users (which may themselves become trivial) before the
+        // rewrite redirects them.
+        let phi_users: Vec<NodeId> = self
+            .graph
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(id, node)| {
+                *id as NodeId != phi
+                    && matches!(node.kind, NodeKind::Phi(_))
+                    && node.kind.inputs().contains(&phi)
+            })
+            .map(|(id, _)| id as NodeId)
+            .collect();
+        self.replace_all_uses(phi, same);
+        let block = self.graph.node(phi).block;
+        self.graph.blocks[block as usize].phis.retain(|&p| p != phi);
+        for user in phi_users {
+            self.try_remove_trivial_phi(user);
+        }
+        same
+    }
+
+    /// Redirect every reference to `old` (node operands, terminators, and the
+    /// per-block register definitions) to `new`.
+    fn replace_all_uses(&mut self, old: NodeId, new: NodeId) {
+        for node in &mut self.graph.nodes {
+            node.kind.replace_input(old, new);
+        }
+        for block in &mut self.graph.blocks {
+            match &mut block.term {
+                Some(Terminator::Return(v)) if *v == old => *v = new,
+                Some(Terminator::Branch { cond, .. }) if *cond == old => *cond = new,
+                _ => {}
+            }
+        }
+        for defs in &mut self.current_def {
+            for v in defs.values_mut() {
+                if *v == old {
+                    *v = new;
+                }
+            }
+        }
     }
 
     /// Translate one block's instructions into nodes and a terminator.
@@ -688,9 +760,26 @@ mod tests {
             .find(|b| b.start_pc == 2 * STRIDE)
             .expect("header block");
         assert_eq!(header.preds.len(), 2, "entry + back edge");
-        // Loop-carried i and acc each need a header phi.
-        assert!(header.phis.len() >= 2, "phis for i and acc");
+        // Exactly the two genuinely loop-carried values (i and acc) get a header
+        // phi; trivial-phi elimination collapses the invariant n's phi.
+        assert_eq!(header.phis.len(), 2, "phis for i and acc only");
         assert!(g.blocks.iter().all(|b| b.sealed), "all blocks sealed");
+
+        // No trivial phi survives anywhere: every live phi merges at least two
+        // distinct inputs (ignoring self-references).
+        for block in &g.blocks {
+            for &phi in &block.phis {
+                let NodeKind::Phi(ops) = &g.node(phi).kind else {
+                    unreachable!("block.phis holds phi nodes");
+                };
+                let distinct: std::collections::HashSet<NodeId> =
+                    ops.iter().copied().filter(|&op| op != phi).collect();
+                assert!(
+                    distinct.len() >= 2,
+                    "phi {phi} is trivial (inputs {ops:?}) and should be eliminated"
+                );
+            }
+        }
     }
 
     #[test]

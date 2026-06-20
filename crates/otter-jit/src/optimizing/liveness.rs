@@ -266,24 +266,30 @@ mod tests {
             .iter()
             .position(|b| b.start_pc == 4 * STRIDE)
             .unwrap() as BlockId;
-        // The back edge carries the next-iteration loop values (i+1, acc+i, and
-        // the invariant) — they are live OUT of the loop body and feed the
-        // header's phis at the edge (an SSA phi input is live-out of the
-        // predecessor, never live-in of the phi's block). At least two
-        // loop-carried values cross the back edge.
+        // The back edge carries the next-iteration loop values (i+1, acc+i) plus
+        // the loop-invariant n, all live OUT of the loop body. At least two
+        // values cross the back edge.
         assert!(
             live.live_out[body as usize].len() >= 2,
             "loop body keeps loop-carried values live across the back edge"
         );
-        // Every back-edge value is consumed by a header phi (its def is in the
-        // body, its use is the header phi on this edge).
-        let header_phi_inputs: FxHashSet<NodeId> = g.block(header).phis.iter().flat_map(|&phi| {
-            g.node(phi).kind.inputs()
-        }).collect();
-        for &v in &live.live_out[body as usize] {
+        // The header's phi inputs on the back edge are exactly values that are
+        // live-out of the body (an SSA phi input is live-out of its predecessor,
+        // never live-in of the phi's block). With trivial-phi elimination, the
+        // invariant n flows directly (no phi), so the phi inputs are a subset of
+        // the back-edge live set rather than equal to it.
+        let header_phi_inputs: FxHashSet<NodeId> = g
+            .block(header)
+            .phis
+            .iter()
+            .flat_map(|&phi| g.node(phi).kind.inputs())
+            .collect();
+        assert!(!header_phi_inputs.is_empty(), "header has loop-carried phis");
+        for v in &header_phi_inputs {
             assert!(
-                header_phi_inputs.contains(&v),
-                "back-edge value feeds a header phi"
+                live.live_out[body as usize].contains(v)
+                    || live.live_out[g.entry as usize].contains(v),
+                "each header phi input is live-out of one of its predecessors"
             );
         }
     }

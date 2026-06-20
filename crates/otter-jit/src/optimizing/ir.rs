@@ -144,6 +144,33 @@ impl NodeKind {
         }
     }
 
+    /// Rewrite every operand equal to `old` to `new`. Used by trivial-phi
+    /// elimination to redirect all uses of a removed phi to its single distinct
+    /// input.
+    pub fn replace_input(&mut self, old: NodeId, new: NodeId) {
+        let fix = |x: &mut NodeId| {
+            if *x == old {
+                *x = new;
+            }
+        };
+        match self {
+            NodeKind::CheckInt32(a) => fix(a),
+            NodeKind::Int32Add(a, b)
+            | NodeKind::Int32Sub(a, b)
+            | NodeKind::Int32Mul(a, b)
+            | NodeKind::Int32Compare(_, a, b) => {
+                fix(a);
+                fix(b);
+            }
+            NodeKind::Phi(ops) => ops.iter_mut().for_each(fix),
+            NodeKind::Param(_)
+            | NodeKind::ConstInt32(_)
+            | NodeKind::ConstBool(_)
+            | NodeKind::ConstUndefined
+            | NodeKind::SelfClosure => {}
+        }
+    }
+
     /// The representation a node of this kind produces.
     #[must_use]
     pub fn repr(&self) -> Repr {

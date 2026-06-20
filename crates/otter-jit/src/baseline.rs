@@ -761,7 +761,7 @@ impl JitFunctionCode for BaselineCode {
         let entry = unsafe { self.code.entry_ptr() };
         // SAFETY: `entry` points into the live mapping; `ptrs` upholds the
         // reentry contract (valid, non-aliased for the call).
-        unsafe { self.enter_at(ptrs, entry) }
+        unsafe { enter_compiled(ptrs, entry) }
     }
 
     fn osr_entry(&self, ptrs: JitReentryPtrs, byte_pc: u32) -> Option<JitExecOutcome> {
@@ -770,23 +770,26 @@ impl JitFunctionCode for BaselineCode {
         // points at a prologue trampoline emitted with the `JitEntry` ABI.
         let entry = unsafe { self.code.ptr_at(offset) };
         // SAFETY: same reentry contract as `run_entry`.
-        Some(unsafe { self.enter_at(ptrs, entry) })
+        Some(unsafe { enter_compiled(ptrs, entry) })
     }
 }
 
-impl BaselineCode {
-    /// Build the `JitCtx` for `ptrs` and invoke compiled code at `entry`.
-    ///
-    /// Shared by the function-entry path ([`Self::run_entry`]) and the
-    /// loop-header OSR path ([`Self::osr_entry`]); both ABIs are identical (the
-    /// trampoline runs the same prologue), differing only in which instruction
-    /// the prologue falls through / branches to.
-    ///
-    /// # Safety
-    /// `entry` must point at a prologue emitted with the [`JitEntry`] ABI inside
-    /// this code's live mapping, and `ptrs` must uphold the
-    /// [`JitReentryPtrs`](otter_vm::JitReentryPtrs) contract.
-    unsafe fn enter_at(&self, ptrs: JitReentryPtrs, entry: *const u8) -> JitExecOutcome {
+/// Build the `JitCtx` for `ptrs` and invoke compiled code at `entry`, mapping
+/// the returned status to a [`JitExecOutcome`].
+///
+/// Shared across compiled tiers and entry kinds: the baseline function-entry
+/// and loop-header OSR paths, and the optimizing tier — every compiled entry
+/// uses the identical [`JitEntry`] ABI (`extern "C" fn(*mut JitCtx) -> JitRet`)
+/// and the same `JitCtx` construction, differing only in which instruction the
+/// prologue branches to. Lives free (it uses no compiled-code state) so any
+/// [`JitFunctionCode`] implementation can reuse it.
+///
+/// # Safety
+/// `entry` must point at a prologue emitted with the [`JitEntry`] ABI inside a
+/// live executable mapping that outlives the call, and `ptrs` must uphold the
+/// [`JitReentryPtrs`](otter_vm::JitReentryPtrs) contract.
+pub(crate) unsafe fn enter_compiled(ptrs: JitReentryPtrs, entry: *const u8) -> JitExecOutcome {
+    {
         let stack = ptrs.stack.cast::<JitFrameStack>();
         let vm = ptrs.vm.cast::<Interpreter>();
         // SAFETY: `ptrs.stack` is a valid `*mut JitFrameStack` for this call.

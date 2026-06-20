@@ -20,6 +20,12 @@ result_large_err = "allow"
 too_many_arguments = "allow"
 type_complexity = "allow"
 arc_with_non_send_sync = "allow"
+# `VmError` is a large enum with drop glue. `.ok_or(VmError::X)` eagerly builds
+# and drops it on the success path — drop_in_place<VmError> measured several
+# percent of hot dispatch/call self-time — so the engine uses `.ok_or_else`
+# even for fieldless variants. The lint's "cheap value" heuristic does not model
+# that, so allow it here (the perf win is real and measured).
+unnecessary_lazy_evaluations = "allow"
 
 [dependencies]
 otter-bytecode = { workspace = true }

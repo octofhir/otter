@@ -203,5 +203,8 @@ impl<'a> RuntimeState<'a> {
         //    `GcHeap::collect_full` that walks the live
         //    `&mut HoltStack` directly. This
         //    `RuntimeState` walker stays as-is.
+        // 9b) The flat JIT register stack DOES live on the `Interpreter`
+        //    struct, so its in-flight callee windows are traced here.
+        interp.trace_reg_stack(visitor);
     }
 }

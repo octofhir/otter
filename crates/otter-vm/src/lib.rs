@@ -628,6 +628,16 @@ pub struct Interpreter {
     /// allocation-free. Drawn by [`Self::draw_stack`], returned by
     /// [`Self::return_stack`].
     holt_pool: Vec<HoltStack>,
+    /// Flat register stack for JIT-built callee windows. Compiled code sets up a
+    /// direct call by bumping `reg_top`, writing the callee's window into
+    /// `reg_stack[reg_top..reg_top+regcount]`, and running the callee — no Rust
+    /// frame-build bridge. Allocated once to `REG_STACK_CAP` and never
+    /// reallocated (windows hold raw pointers into it). `reg_stack[0..reg_top]`
+    /// is a GC root set (live callee windows of in-flight frameless JIT calls).
+    reg_stack: Vec<Value>,
+    /// Live extent of [`Self::reg_stack`] — the top of the JIT call register
+    /// stack. `0` whenever no frameless JIT call is in flight.
+    reg_top: usize,
     /// Optional per-turn resource policy. This slice records observations but
     /// does not yet yield or reject when a limit is exceeded.
     runtime_budget: RuntimeBudget,
@@ -1251,6 +1261,8 @@ impl Interpreter {
             jit_runtime_stats: JitRuntimeStats::default(),
             reg_pool: Vec::new(),
             holt_pool: Vec::new(),
+            reg_stack: Vec::new(),
+            reg_top: 0,
             runtime_budget: RuntimeBudget::default(),
             runtime_budget_stats: RuntimeBudgetStats::default(),
             runtime_budget_depth: 0,
@@ -1694,7 +1706,9 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         self.jit_runtime_stats.runtime_calls =
             self.jit_runtime_stats.runtime_calls.saturating_add(1);
-        let frame = stack.get(frame_index).ok_or_else(|| VmError::InvalidOperand)?;
+        let frame = stack
+            .get(frame_index)
+            .ok_or_else(|| VmError::InvalidOperand)?;
         let callee = *frame
             .registers
             .get(callee_reg as usize)
@@ -1712,7 +1726,9 @@ impl Interpreter {
         {
             self.jit_runtime_stats.direct_calls =
                 self.jit_runtime_stats.direct_calls.saturating_add(1);
-            let frame = stack.get_mut(frame_index).ok_or_else(|| VmError::InvalidOperand)?;
+            let frame = stack
+                .get_mut(frame_index)
+                .ok_or_else(|| VmError::InvalidOperand)?;
             *frame
                 .registers
                 .get_mut(dst as usize)
@@ -1722,7 +1738,9 @@ impl Interpreter {
 
         self.jit_runtime_stats.rust_call_fallbacks =
             self.jit_runtime_stats.rust_call_fallbacks.saturating_add(1);
-        let frame = stack.get(frame_index).ok_or_else(|| VmError::InvalidOperand)?;
+        let frame = stack
+            .get(frame_index)
+            .ok_or_else(|| VmError::InvalidOperand)?;
         let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(arg_regs.len());
         for &r in arg_regs {
             args.push(
@@ -1734,7 +1752,9 @@ impl Interpreter {
         }
         let result =
             self.run_callable_sync_already_rooted(context, &callee, Value::undefined(), args)?;
-        let frame = stack.get_mut(frame_index).ok_or_else(|| VmError::InvalidOperand)?;
+        let frame = stack
+            .get_mut(frame_index)
+            .ok_or_else(|| VmError::InvalidOperand)?;
         *frame
             .registers
             .get_mut(dst as usize)
@@ -1812,7 +1832,9 @@ impl Interpreter {
 
         let bind_count = usize::from(plan.param_count).min(arg_regs.len());
         let callee_now = {
-            let caller = stack.get(frame_index).ok_or_else(|| VmError::InvalidOperand)?;
+            let caller = stack
+                .get(frame_index)
+                .ok_or_else(|| VmError::InvalidOperand)?;
             for (dst_slot, &src) in callee_frame
                 .frame_mut()
                 .registers
@@ -1870,7 +1892,9 @@ impl Interpreter {
     ) -> Result<Option<jit::JitPreparedDirectCall>, VmError> {
         self.jit_runtime_stats.runtime_calls =
             self.jit_runtime_stats.runtime_calls.saturating_add(1);
-        let frame = stack.get(frame_index).ok_or_else(|| VmError::InvalidOperand)?;
+        let frame = stack
+            .get(frame_index)
+            .ok_or_else(|| VmError::InvalidOperand)?;
         let callee = *frame
             .registers
             .get(callee_reg as usize)
@@ -2056,6 +2080,46 @@ impl Interpreter {
             .ok_or_else(|| VmError::InvalidOperand)? = value;
         self.leave_sync_reentry();
         Ok(())
+    }
+
+    /// Resume a *frameless* self-recursive JIT callee that bailed mid-execution.
+    ///
+    /// The inline self-call ([`crate::baseline`]) runs a self-recursive callee in
+    /// compiled code with its register window in the flat register stack and no
+    /// `HoltStack` frame. On a bail it has no frame to resume, so this rebuilds
+    /// one: it copies the live top window (`regcount` slots), pops it off the
+    /// register stack, materializes an interpreter [`Frame`] (self-recursion ⇒
+    /// the function id and upvalue spine come from the caller frame at
+    /// `caller_frame_index`), resumes the interpreter at `bail_pc`, and returns
+    /// the callee's completion value (the caller's compiled code stores it).
+    pub fn jit_self_call_bail(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut jit::JitFrameStack,
+        caller_frame_index: usize,
+        bail_pc: u32,
+        regcount: usize,
+    ) -> Result<Value, VmError> {
+        let base = self
+            .reg_top
+            .checked_sub(regcount)
+            .ok_or(VmError::InvalidOperand)?;
+        let mut registers: smallvec::SmallVec<[Value; 8]> =
+            smallvec::SmallVec::with_capacity(regcount);
+        registers.extend_from_slice(&self.reg_stack[base..base + regcount]);
+        self.reg_top = base;
+
+        let caller = stack
+            .get(caller_frame_index)
+            .ok_or(VmError::InvalidOperand)?;
+        let fid = caller.function_id;
+        let upvalues = caller.upvalues.clone();
+        let function = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
+        let mut frame =
+            Frame::with_exec_registers(function, None, upvalues, Value::undefined(), registers);
+        frame.pc = bail_pc;
+        stack.push(frame);
+        self.dispatch_loop(context, stack)
     }
 
     /// Finish a direct compiled call whose callee bailed to the interpreter.
@@ -2266,7 +2330,9 @@ impl Interpreter {
         idx: u32,
     ) -> Result<(), VmError> {
         // `self` and `stack` are disjoint, so the two `&mut` are non-aliasing.
-        let frame = stack.get_mut(frame_index).ok_or_else(|| VmError::InvalidOperand)?;
+        let frame = stack
+            .get_mut(frame_index)
+            .ok_or_else(|| VmError::InvalidOperand)?;
         self.run_make_function_reg(context, frame, dst, idx)
     }
 
@@ -4734,6 +4800,45 @@ impl Interpreter {
     /// Return a terminated frame's spilled register backing to the pool for
     /// reuse. Inline windows (and a full pool) are dropped normally. The buffer
     /// is cleared, so it carries no live `Value`s — the pool is never traced.
+    /// Total slots in the flat JIT register stack. A frameless JIT call chain
+    /// exceeding this throws a stack overflow (the same bound the frame-depth
+    /// limit enforces, expressed in register slots).
+    pub(crate) const REG_STACK_CAP: usize = 512 * 1024;
+
+    /// Base pointer of the flat JIT register stack, allocating its fixed backing
+    /// buffer on first use. Stable for the interpreter's life (never
+    /// reallocated). Compiled code reads it from `JitCtx.reg_stack_base` to build
+    /// self-recursive callee windows inline.
+    pub fn jit_reg_stack_base(&mut self) -> *mut u64 {
+        if self.reg_stack.capacity() == 0 {
+            self.reg_stack = vec![Value::undefined(); Self::REG_STACK_CAP];
+        }
+        self.reg_stack.as_mut_ptr().cast::<u64>()
+    }
+
+    /// Address of `reg_top` (the live extent of the flat register stack, in
+    /// slots). Compiled code reads it from `JitCtx.reg_top_ptr` to reserve and
+    /// release callee windows.
+    pub fn jit_reg_top_ptr(&mut self) -> *mut usize {
+        &mut self.reg_top
+    }
+
+    /// Capacity of the flat JIT register stack in slots — the overflow bound
+    /// compiled code checks before reserving a callee window.
+    #[must_use]
+    pub fn jit_reg_stack_cap() -> usize {
+        Self::REG_STACK_CAP
+    }
+
+    /// GC-trace the live JIT register stack (`reg_stack[0..reg_top]`): every
+    /// callee window of an in-flight frameless JIT call. A no-op when no such
+    /// call is in flight.
+    pub(crate) fn trace_reg_stack(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        for value in &self.reg_stack[..self.reg_top] {
+            value.trace_value_slots(visitor);
+        }
+    }
+
     #[inline]
     pub(crate) fn reclaim_registers(&mut self, frame: &mut Frame) {
         // Only an inline-owned, heap-spilled window goes back to the pool. A
@@ -5565,7 +5670,9 @@ impl Interpreter {
                         _ => None,
                     };
                 }
-                foreign_context.as_ref().ok_or_else(|| VmError::InvalidOperand)?
+                foreign_context
+                    .as_ref()
+                    .ok_or_else(|| VmError::InvalidOperand)?
             };
             let function = context
                 .exec_function(function_id)
@@ -6407,7 +6514,10 @@ impl Interpreter {
                     // descriptor-backed arguments object.
                     let dst = register_operand(context.exec_operand(instr, 0))?;
                     let (elements, kind, mapped_entries, callee) = {
-                        let function_id = stack.last().ok_or_else(|| VmError::InvalidOperand)?.function_id;
+                        let function_id = stack
+                            .last()
+                            .ok_or_else(|| VmError::InvalidOperand)?
+                            .function_id;
                         let function = context
                             .exec_function(function_id)
                             .ok_or_else(|| VmError::InvalidOperand)?;
@@ -7716,7 +7826,8 @@ impl Interpreter {
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let floor = context
                         .exec_imm32(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)? as u32;
+                        .ok_or_else(|| VmError::InvalidOperand)?
+                        as u32;
                     let next_pc = (stack[top_idx].pc as i64 + 1).saturating_add(offset as i64);
                     if !(0..=u32::MAX as i64).contains(&next_pc) {
                         return Err(VmError::InvalidOperand);

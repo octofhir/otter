@@ -136,6 +136,15 @@ pub struct JitCtx {
     /// [`otter_vm::JitPreparedDirectCall::upvalues_ptr`]); the dispatch tail
     /// copies it into the callee `JitCtx.upvalues_ptr`.
     direct_upvalues_ptr: usize,
+    /// Base of the interpreter's flat JIT register stack
+    /// (`reg_stack[0]`). Compiled code builds a self-recursive callee window at
+    /// `reg_stack_base + reg_top*8` without a Rust frame-build bridge.
+    reg_stack_base: *mut u64,
+    /// Address of the interpreter's `reg_top` (live extent of the flat register
+    /// stack, in slots). Compiled code loads it, reserves a callee window by
+    /// adding the callee register count, and stores it back; the matching pop on
+    /// return restores it.
+    reg_top_ptr: *mut usize,
 }
 
 /// Two-word return of compiled code (`x0`/`x1` on arm64).
@@ -162,6 +171,12 @@ const CONTEXT_OFFSET: u32 = std::mem::offset_of!(JitCtx, context) as u32;
 const FRAME_INDEX_OFFSET: u32 = std::mem::offset_of!(JitCtx, frame_index) as u32;
 /// Byte offset of [`JitCtx::upvalues_ptr`] for inline upvalue access.
 const UPVALUES_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, upvalues_ptr) as u32;
+/// Byte offset of [`JitCtx::reg_stack_base`] — the flat JIT register stack base
+/// used to build a self-recursive callee window inline.
+const REG_STACK_BASE_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_stack_base) as u32;
+/// Byte offset of [`JitCtx::reg_top_ptr`] — the address of the interpreter's
+/// `reg_top`, bumped to reserve a callee window and restored on return.
+const REG_TOP_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_top_ptr) as u32;
 /// Size of one `UpvalueCell` (a 4-byte compressed `Gc<UpvalueCellBody>`).
 const UPVALUE_CELL_SIZE: u32 = 4;
 /// Byte offset of the single `Value` inside an `UpvalueCellBody` from its
@@ -333,6 +348,37 @@ extern "C" fn jit_abort_direct_call_stub(ctx: *mut JitCtx, callee_frame_index: u
     let stack = unsafe { &mut *ctx.stack };
     vm.jit_abort_direct_call(stack, callee_frame_index as usize);
     0
+}
+
+/// Bridge stub for a *frameless* self-recursive callee that bailed: rebuild an
+/// interpreter frame from the live register-stack window and run it to
+/// completion. Returns the callee's value in `x0` with `STATUS_RETURNED`, or
+/// `STATUS_THREW` (error parked in `ctx`) on an uncaught throw.
+extern "C" fn jit_self_call_bail_stub(ctx: *mut JitCtx, bail_pc: u64, regcount: u64) -> JitRet {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    match vm.jit_self_call_bail(
+        context,
+        stack,
+        ctx.frame_index,
+        bail_pc as u32,
+        regcount as usize,
+    ) {
+        Ok(value) => JitRet {
+            value: value.to_bits(),
+            status: STATUS_RETURNED,
+        },
+        Err(err) => {
+            park_jit_error(ctx, err);
+            JitRet {
+                value: 0,
+                status: STATUS_THREW,
+            }
+        }
+    }
 }
 
 /// Bridge stub: build a `MakeFunction` closure from compiled code. Returns `0`
@@ -804,6 +850,11 @@ pub(crate) unsafe fn enter_compiled(ptrs: JitReentryPtrs, entry: *const u8) -> J
         // entry (frame-owned), and the cells it holds are old-space (immobile).
         let upvalues_ptr =
             Interpreter::jit_frame_upvalues_ptr(unsafe { &*stack }, ptrs.frame_index);
+        // SAFETY: `vm` is a valid `*mut Interpreter` for this entry and not
+        // aliased by a live `&mut` (the VM froze its borrows); these return the
+        // stable base / `reg_top` address of the flat JIT register stack.
+        let reg_stack_base = unsafe { (*vm).jit_reg_stack_base() };
+        let reg_top_ptr = unsafe { (*vm).jit_reg_top_ptr() };
         let mut error = None;
         let mut ctx = JitCtx {
             regs,
@@ -822,6 +873,8 @@ pub(crate) unsafe fn enter_compiled(ptrs: JitReentryPtrs, entry: *const u8) -> J
             direct_this_value: 0,
             direct_frame_index: 0,
             direct_upvalues_ptr: 0,
+            reg_stack_base,
+            reg_top_ptr,
         };
         // SAFETY: the mapping is live and `entry` was emitted with the
         // `JitEntry` ABI.
@@ -854,19 +907,20 @@ mod arm64 {
         DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET,
         DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET, JIT_CTX_STACK_SIZE,
         JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS, OBJECT_BODY_TYPE_TAG, Op, Operand,
-        SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED,
-        STATUS_THREW, TAG_FUNCTION_ID, TAG_INT32, TAG_NAN, TAG_PTR_FUNCTION, TAG_PTR_OBJECT,
-        TAG_SPECIAL, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, Unsupported,
-        VM_OFFSET, WhiskerIcCell, jit_abort_direct_call_stub, jit_call_method_stub,
-        jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
-        jit_finish_direct_call_returned_stub, jit_load_element_stub, jit_load_global_stub,
-        jit_load_prop_stub, jit_load_upvalue_stub, jit_make_fn_stub, jit_new_array_stub,
-        jit_new_object_stub, jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub,
-        jit_store_element_stub, jit_store_prop_stub, jit_store_upvalue_stub,
-        jit_write_barrier_stub, reg_offset,
+        REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE,
+        STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_FUNCTION_ID, TAG_INT32,
+        TAG_NAN, TAG_PTR_FUNCTION, TAG_PTR_OBJECT, TAG_SPECIAL, UPVALUE_CELL_SIZE,
+        UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, Unsupported, VM_OFFSET, WhiskerIcCell,
+        jit_abort_direct_call_stub, jit_call_method_stub, jit_delegate_op_stub,
+        jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
+        jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub, jit_load_upvalue_stub,
+        jit_make_fn_stub, jit_new_array_stub, jit_new_object_stub, jit_prepare_direct_call_stub,
+        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub, jit_store_element_stub,
+        jit_store_prop_stub, jit_store_upvalue_stub, jit_write_barrier_stub, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
+    use otter_vm::Interpreter;
     use otter_vm::{JitFunctionView, JitInlineCallee, JitInlineMethod, JitTypedArrayLayout};
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -1330,6 +1384,12 @@ mod arm64 {
         let mut store_ic_idx: usize = 0;
 
         let entry = ops.offset();
+        // Self-recursion target: a direct `Op::Call` to the running closure
+        // re-enters here (a fresh callee `JitCtx` in `x0`) without a Rust
+        // frame-build bridge. Only used when the body is frame-index-free.
+        let self_call_safe = is_self_call_safe(view);
+        let self_entry = ops.new_dynamic_label();
+        dynasm!(ops ; .arch aarch64 ; =>self_entry);
         emit_prologue(&mut ops);
 
         // Stable GC cage base, baked for inline property-load decompression.
@@ -1498,7 +1558,22 @@ mod arm64 {
                         None => false,
                     };
                     if !inlined {
-                        emit_call(&mut ops, ops_ref, bail, threw)?;
+                        // A frame-index-free function re-enters self-recursive
+                        // calls inline (no Rust frame-build bridge), bailing on a
+                        // guard miss; any other function takes the direct-call
+                        // bridge.
+                        if self_call_safe {
+                            emit_self_recursive_call(
+                                &mut ops,
+                                ops_ref,
+                                view.register_count,
+                                self_entry,
+                                bail,
+                                threw,
+                            )?;
+                        } else {
+                            emit_call(&mut ops, ops_ref, bail, threw)?;
+                        }
                     }
                 }
                 // `recv.name(args…)` — IC-resolve the method + direct-branch to
@@ -2784,6 +2859,172 @@ mod arm64 {
         Ok(true)
     }
 
+    /// Emit a self-recursive `Op::Call` inline, with no Rust frame-build bridge:
+    /// guard the callee is the running closure, reserve a callee window on the
+    /// interpreter's flat register stack, bind args, build the callee `JitCtx`,
+    /// and re-enter the function's own entry. A guard miss or a register-stack
+    /// overflow falls through to the general direct-call bridge (`emit_call`,
+    /// emitted at `bridge`). The callee's compiled completion writes its value
+    /// straight to `dst`; a callee bail rebuilds an interpreter frame from the
+    /// window and runs it to completion ([`jit_self_call_bail_stub`]).
+    ///
+    /// Only emitted for a frame-index-free function (see [`is_self_call_safe`]):
+    /// its body uses no stub that addresses registers through
+    /// `JitCtx.frame_index`, so a frameless callee window is sound. A guard miss
+    /// (the call is not self-recursive) or a register-stack overflow bails to the
+    /// interpreter at the call (`bail`), which reconstructs a real frame.
+    fn emit_self_recursive_call(
+        ops: &mut Assembler,
+        operands: &[Operand],
+        regcount: u16,
+        self_entry: DynamicLabel,
+        bail: DynamicLabel,
+        threw: DynamicLabel,
+    ) -> Result<(), Unsupported> {
+        let dst = reg(operands, 0)?;
+        let callee = reg(operands, 1)?;
+        let argc = const_index(operands, 2)? as usize;
+        if argc > MAX_INLINE_ARGS {
+            return Err(Unsupported::ArgCount(argc));
+        }
+        let rc = u32::from(regcount);
+        let done = ops.new_dynamic_label();
+        let returned = ops.new_dynamic_label();
+        let bailed = ops.new_dynamic_label();
+        let fill = ops.new_dynamic_label();
+        let fill_done = ops.new_dynamic_label();
+        let undef_bits: u64 = (TAG_SPECIAL) << 48;
+
+        // Guard the callee is the running closure (`ctx.self_closure` @ +8).
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x9, [x19, callee as u32 * 8]
+            ; ldr x10, [x20, #8]
+            ; cmp x9, x10
+            ; b.ne =>bail
+        );
+        // Reserve the window: x12 = &reg_top, x11 = old top, x14 = window ptr,
+        // x13 = new top. Overflow → bridge.
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x12, [x20, REG_TOP_PTR_OFFSET]
+            ; ldr x11, [x12]
+            ; ldr x9, [x20, REG_STACK_BASE_OFFSET]
+            ; add x14, x9, x11, lsl #3
+        );
+        emit_load_u64(ops, 13, u64::from(rc));
+        dynasm!(ops ; .arch aarch64 ; add x13, x11, x13);
+        emit_load_u64(ops, 9, Interpreter::jit_reg_stack_cap() as u64);
+        dynasm!(ops ; .arch aarch64 ; cmp x13, x9 ; b.hi =>bail ; str x13, [x12]);
+        // Zero-fill the window to `undefined`.
+        emit_load_u64(ops, 10, undef_bits);
+        emit_load_u64(ops, 15, u64::from(rc));
+        dynasm!(ops
+            ; .arch aarch64
+            ; movz x9, 0
+            ; =>fill
+            ; cmp x9, x15
+            ; b.hs =>fill_done
+            ; str x10, [x14, x9, lsl #3]
+            ; add x9, x9, #1
+            ; b =>fill
+            ; =>fill_done
+        );
+        // Bind args into the window's leading slots.
+        for slot in 0..argc {
+            let areg = reg(operands, 3 + slot)?;
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x9, [x19, areg as u32 * 8]
+                ; str x9, [x14, slot as u32 * 8]
+            );
+        }
+        // Build the callee `JitCtx` on the native stack and re-enter `self_entry`.
+        // regs = window; self_closure / upvalues / vm / stack / context /
+        // frame_index / error / reg-stack pointers copy from the caller ctx
+        // (self-recursion shares them); this = undefined; bail_pc = 0.
+        dynasm!(ops
+            ; .arch aarch64
+            ; sub sp, sp, JIT_CTX_STACK_SIZE
+            ; str x14, [sp]
+            ; ldr x9, [x20, #8] ; str x9, [sp, #8]
+        );
+        emit_load_u64(ops, 9, undef_bits);
+        dynasm!(ops ; .arch aarch64 ; str x9, [sp, #16] ; str wzr, [sp, BAIL_PC_OFFSET]);
+        for off in [
+            VM_OFFSET,
+            STACK_OFFSET,
+            CONTEXT_OFFSET,
+            FRAME_INDEX_OFFSET,
+            ERROR_SLOT_OFFSET,
+            UPVALUES_PTR_OFFSET,
+            REG_STACK_BASE_OFFSET,
+            REG_TOP_PTR_OFFSET,
+        ] {
+            dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, off] ; str x9, [sp, off]);
+        }
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov x0, sp
+            ; bl =>self_entry
+            ; cmp x1, STATUS_BAILED as u32
+            ; b.eq =>bailed
+            ; add sp, sp, JIT_CTX_STACK_SIZE
+            ; cmp x1, STATUS_RETURNED as u32
+            ; b.eq =>returned
+            ; b =>threw
+        );
+        // Returned: pop the window, store the value into `dst`.
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>returned
+            ; ldr x12, [x20, REG_TOP_PTR_OFFSET]
+            ; ldr x13, [x12]
+        );
+        emit_load_u64(ops, 9, u64::from(rc));
+        dynasm!(ops ; .arch aarch64 ; sub x13, x13, x9 ; str x13, [x12]);
+        store_reg(ops, 0, dst)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done);
+        // Bailed: read the callee's resume PC, drop the native ctx, and run the
+        // bailed callee to completion through the bail helper (which rebuilds an
+        // interpreter frame from the live window and pops it). Helper returns the
+        // value in x0 and status in x1.
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>bailed
+            ; ldr w2, [sp, BAIL_PC_OFFSET]
+            ; add sp, sp, JIT_CTX_STACK_SIZE
+            ; mov x0, x20
+            ; mov w1, w2
+        );
+        emit_load_u64(ops, 2, u64::from(rc));
+        emit_load_u64(ops, 16, jit_self_call_bail_stub as *const () as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; cmp x1, STATUS_THREW as u32
+            ; b.eq =>threw
+        );
+        store_reg(ops, 0, dst)?;
+        dynasm!(ops ; .arch aarch64 ; =>done);
+        Ok(())
+    }
+
+    /// Whether `view`'s body is safe to run as a frameless self-recursive callee:
+    /// every op either runs inline against the register window (`x19`) or is a
+    /// `Call` (self-recursive — resolved by the inline guard — or a guard miss
+    /// that bails) or the self-binding `MakeFunction`. Any op that addresses
+    /// registers through `JitCtx.frame_index` (a runtime stub: property/element
+    /// access, array/object literals, non-self closures, …) needs a real frame
+    /// and disqualifies the function.
+    fn is_self_call_safe(view: &JitFunctionView) -> bool {
+        view.instructions.iter().all(|instr| {
+            is_inline_pure_op(instr.op)
+                || instr.op == Op::Call
+                || (instr.op == Op::MakeFunction && instr.make_self)
+        })
+    }
+
     /// Emit a direct `Call`: ask the VM to publish an eligible callee frame,
     /// build the callee `JitCtx` on the native stack, branch to the compiled
     /// entry, then finish/pop/store through the narrow direct-call ABI. Cold or
@@ -2874,6 +3115,12 @@ mod arm64 {
             // in the direct callee read its cells without the stub.
             ; ldr x9, [x20, DIRECT_UPVALUES_OFFSET]
             ; str x9, [sp, UPVALUES_PTR_OFFSET]
+            // Propagate the flat register-stack pointers so the direct callee can
+            // build its own self-recursive call windows inline.
+            ; ldr x9, [x20, REG_STACK_BASE_OFFSET]
+            ; str x9, [sp, REG_STACK_BASE_OFFSET]
+            ; ldr x9, [x20, REG_TOP_PTR_OFFSET]
+            ; str x9, [sp, REG_TOP_PTR_OFFSET]
             ; mov x0, sp
             ; ldr x16, [x20, DIRECT_ENTRY_OFFSET]
             ; blr x16

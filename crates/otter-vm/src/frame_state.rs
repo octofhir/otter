@@ -35,9 +35,114 @@ pub(crate) type UpvalueSpine = Box<[UpvalueCell]>;
 // rest/incoming args, …) lives in `cold_frame::ColdFramePool` and is
 // reached lazily through `frame.cold`.
 const _: () = assert!(
-    std::mem::size_of::<Frame>() <= 128,
-    "hot Frame must stay within two cache lines; cold-state fields belong in ColdFrame",
+    std::mem::size_of::<Frame>() <= 144,
+    "hot Frame must stay within ~2 cache lines; cold-state fields belong in ColdFrame",
 );
+
+/// A frame's register window: inline-owned (interpreter and parked frames) or a
+/// slice into the interpreter's flat register stack (the JIT direct-call path,
+/// which builds callee windows in machine code without a Rust bridge). Derefs to
+/// `[Value]` so register access is uniform.
+#[derive(Debug)]
+pub enum FrameRegisters {
+    /// Inline-owned window — every interpreter-created frame, and any frame that
+    /// may be parked (generators / async), since a parked window must survive
+    /// while other frames push/pop the flat stack.
+    Owned(SmallVec<[Value; 8]>),
+    /// A `[ptr, ptr+len)` window into the interpreter's reserved (never
+    /// reallocating) flat register stack, built by the JIT direct-call path. A
+    /// `Window` frame is never parked (the direct-call eligibility check rejects
+    /// generators / async), so its window is only ever popped when the frame ends.
+    Window {
+        /// First slot of the window in the flat register stack.
+        ptr: *mut Value,
+        /// Window length (the callee's register count).
+        len: u16,
+    },
+}
+
+impl FrameRegisters {
+    #[inline]
+    #[must_use]
+    pub fn as_slice(&self) -> &[Value] {
+        match self {
+            FrameRegisters::Owned(v) => v,
+            // SAFETY: a `Window` points at `len` live slots in the reserved flat
+            // register stack, valid for the frame's life (the stack never
+            // reallocates; the window is popped only when the frame ends).
+            FrameRegisters::Window { ptr, len } => unsafe {
+                std::slice::from_raw_parts(*ptr, *len as usize)
+            },
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn as_mut_slice(&mut self) -> &mut [Value] {
+        match self {
+            FrameRegisters::Owned(v) => v,
+            // SAFETY: see `as_slice`; `&mut self` gives exclusive access.
+            FrameRegisters::Window { ptr, len } => unsafe {
+                std::slice::from_raw_parts_mut(*ptr, *len as usize)
+            },
+        }
+    }
+
+    /// Raw pointer to the first slot (the JIT frame register base).
+    #[inline]
+    #[must_use]
+    pub fn as_mut_ptr(&mut self) -> *mut Value {
+        match self {
+            FrameRegisters::Owned(v) => v.as_mut_ptr(),
+            FrameRegisters::Window { ptr, .. } => *ptr,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            FrameRegisters::Owned(v) => v.len(),
+            FrameRegisters::Window { len, .. } => *len as usize,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl std::ops::Deref for FrameRegisters {
+    type Target = [Value];
+    #[inline]
+    fn deref(&self) -> &[Value] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::DerefMut for FrameRegisters {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [Value] {
+        self.as_mut_slice()
+    }
+}
+
+impl Default for FrameRegisters {
+    fn default() -> Self {
+        FrameRegisters::Owned(SmallVec::new())
+    }
+}
+
+impl Clone for FrameRegisters {
+    /// Always clones to `Owned` (a `Window` aliases the flat stack and must not
+    /// be duplicated). Cloning is a cold path (frame park / generator save) that
+    /// needs an owned copy anyway.
+    fn clone(&self) -> Self {
+        FrameRegisters::Owned(SmallVec::from_slice(self.as_slice()))
+    }
+}
 
 /// One call frame. Compact and cache-conscious per foundation
 /// plan §M7. Slice 13 promotes the interpreter to a real frame
@@ -50,7 +155,7 @@ pub struct Frame {
     /// Byte offset into the executable function's encoded stream.
     pub pc: u32,
     /// Register window for this frame.
-    pub registers: SmallVec<[Value; 8]>,
+    pub registers: FrameRegisters,
     /// When `Some(reg)`, returning from this frame writes the
     /// completion value into the **caller's** register `reg` and
     /// resumes at the caller's next pc. `<main>` carries `None`
@@ -386,7 +491,7 @@ impl Frame {
         Self {
             function_id: function.id,
             pc: 0,
-            registers,
+            registers: FrameRegisters::Owned(registers),
             return_register,
             upvalues,
             this_value,
@@ -437,7 +542,7 @@ impl Frame {
         Self {
             function_id: function.id,
             pc: 0,
-            registers,
+            registers: FrameRegisters::Owned(registers),
             return_register,
             upvalues,
             this_value,
@@ -450,7 +555,7 @@ impl Frame {
     /// Trace locals, register window, receiver, parked side-channel
     /// values, and nested generator / async state held by this frame.
     pub(crate) fn trace_frame_slots(&self, visitor: &mut SlotVisitor<'_>) {
-        for value in &self.registers {
+        for value in self.registers.iter() {
             value.trace_value_slots(visitor);
         }
         for slot in self.upvalues.iter() {

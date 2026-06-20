@@ -4736,9 +4736,14 @@ impl Interpreter {
     /// is cleared, so it carries no live `Value`s — the pool is never traced.
     #[inline]
     pub(crate) fn reclaim_registers(&mut self, frame: &mut Frame) {
-        if frame.registers.spilled() && self.reg_pool.len() < Self::REG_POOL_CAP {
-            let regs = std::mem::take(&mut frame.registers);
-            let mut buf = regs.into_vec();
+        // Only an inline-owned, heap-spilled window goes back to the pool. A
+        // `Window` frame's registers live in the flat register stack and are
+        // released when its window is popped, not here.
+        if let crate::frame_state::FrameRegisters::Owned(regs) = &mut frame.registers
+            && regs.spilled()
+            && self.reg_pool.len() < Self::REG_POOL_CAP
+        {
+            let mut buf = std::mem::take(regs).into_vec();
             buf.clear();
             self.reg_pool.push(buf);
         }

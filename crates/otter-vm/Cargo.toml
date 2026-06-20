@@ -6,8 +6,20 @@ publish.workspace = true
 license.workspace = true
 description = "Interpreter and value model for the Otter foundation engine."
 
-[lints]
-workspace = true
+# `unsafe_code` ban lifted for this crate only: the register-window frame stack
+# (flat `Value` stack, JIT-built callee windows) needs raw-pointer windows so
+# compiled code sets up calls without a Rust bridge. All other `crates/*`
+# (otter-nodejs, otter-node-compat, …) keep the workspace `forbid(unsafe_code)`.
+# Mirrors the workspace lint set otherwise.
+[lints.rust]
+missing_docs = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+result_large_err = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+arc_with_non_send_sync = "allow"
 
 [dependencies]
 otter-bytecode = { workspace = true }

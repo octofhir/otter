@@ -289,7 +289,7 @@ impl<'a> Builder<'a> {
     fn read_variable_recursive(&mut self, reg: u16, block: BlockId) -> NodeId {
         let val = if !self.graph.blocks[block as usize].sealed {
             // Unknown predecessors: an incomplete phi, filled at seal time.
-            let phi = self.new_phi(block);
+            let phi = self.new_phi(reg, block);
             self.incomplete_phis.entry(block).or_default().push((reg, phi));
             phi
         } else {
@@ -299,7 +299,7 @@ impl<'a> Builder<'a> {
             } else {
                 // Place the phi and record it as this register's def *before*
                 // filling operands, so a self-referential loop terminates.
-                let phi = self.new_phi(block);
+                let phi = self.new_phi(reg, block);
                 self.write_variable(reg, block, phi);
                 self.add_phi_operands(reg, phi)
             }
@@ -308,10 +308,11 @@ impl<'a> Builder<'a> {
         val
     }
 
-    fn new_phi(&mut self, block: BlockId) -> NodeId {
+    fn new_phi(&mut self, reg: u16, block: BlockId) -> NodeId {
         let pc = self.graph.blocks[block as usize].start_pc;
         let phi = self.graph.add_node(NodeKind::Phi(Vec::new()), block, pc);
         self.graph.blocks[block as usize].phis.push(phi);
+        self.graph.phi_reg.insert(phi, reg);
         phi
     }
 

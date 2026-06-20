@@ -24,6 +24,7 @@
 //! - [`crate::baseline`] — the fallback tier and deopt target.
 
 mod builder;
+pub mod deopt;
 pub mod ir;
 pub mod liveness;
 pub mod regalloc;

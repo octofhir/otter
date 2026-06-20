@@ -282,6 +282,11 @@ pub struct Graph {
     pub param_count: u16,
     /// Source register-window length.
     pub register_count: u16,
+    /// The bytecode register each `Phi` node merges, recorded at construction.
+    /// Used by deopt frame-state reconstruction to know which register a header
+    /// phi defines on block entry. Entries for trivially-eliminated phis become
+    /// stale but are never read (only live `Block::phis` are consulted).
+    pub phi_reg: rustc_hash::FxHashMap<NodeId, u16>,
 }
 
 impl Graph {
@@ -293,6 +298,7 @@ impl Graph {
             entry: 0,
             param_count,
             register_count,
+            phi_reg: rustc_hash::FxHashMap::default(),
         }
     }
 

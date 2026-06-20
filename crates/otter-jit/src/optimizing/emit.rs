@@ -890,6 +890,46 @@ mod arm64 {
                 }
                 Ok(())
             }
+            NodeKind::StoreSlot(obj, value_byte, value) => {
+                // Write a primitive (int32 / f64) into the shape-guarded
+                // receiver's value slab. No write barrier: a primitive `Value` is
+                // never a `Gc` pointer (the builder admits only Int32 / Float64).
+                if *value_byte > 32760 {
+                    return Err(Unsupported::Unlowered(
+                        "property slot offset out of str range",
+                    ));
+                }
+                debug_assert_eq!(box_scratch, BOX_SCRATCH);
+                let oloc = require_loc(alloc, *obj)?;
+                let vloc = require_loc(alloc, *value)?;
+                let vrepr = graph.node(*value).kind.repr();
+                let values_ptr_byte = view.object_values_ptr_byte;
+                let slot_byte = *value_byte;
+                // Slab base pointer → x16.
+                load_loc(ops, box_scratch, oloc);
+                dynasm!(ops ; .arch aarch64 ; mov W(MOVE_SCRATCH), W(box_scratch));
+                emit_load_u64(ops, box_scratch, view.cage_base as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; add x16, x16, X(box_scratch)
+                    ; ldr x16, [x16, values_ptr_byte]
+                );
+                // Boxed value → x17 (box_scratch). Float boxing uses the FP load
+                // scratch and never touches x16; int32 boxing inserts the tag with
+                // `movk` (the producer zeroed bits 63:32), needing no scratch.
+                match vrepr {
+                    Repr::Float64 => {
+                        box_into_gp(ops, box_scratch, Repr::Float64, vloc, MOVE_SCRATCH)
+                    }
+                    Repr::Int32 => {
+                        load_loc(ops, box_scratch, vloc);
+                        dynasm!(ops ; .arch aarch64 ; movk x17, TAG_INT32 as u32, lsl #48);
+                    }
+                    _ => return Err(Unsupported::Unlowered("store-slot value not int32/f64")),
+                }
+                dynasm!(ops ; .arch aarch64 ; str x17, [x16, slot_byte]);
+                Ok(())
+            }
         }
     }
 

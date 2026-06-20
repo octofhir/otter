@@ -501,6 +501,39 @@ impl<'a> Builder<'a> {
                     self.push_body(block, load);
                     self.def_register(dst, block, load, byte_pc);
                 }
+                // `StoreProperty obj, name, src` — `CheckShape` + inline
+                // `StoreSlot`, but only for a primitive (int32 / f64 / bool)
+                // value: a primitive `Value` is never a `Gc` pointer, so no
+                // generational write barrier is needed (the optimizing tier has no
+                // safepoint to run one). A pointer-valued store, or a non-own-data
+                // site, bails to the baseline.
+                Op::StoreProperty => {
+                    let obj_reg = reg(&operands, 0)?;
+                    let src_reg = reg(&operands, 2)?;
+                    let Some((shape, slot_byte)) =
+                        property_feedback.filter(|_| self.view.cage_base != 0)
+                    else {
+                        return Err(Unsupported::Opcode(Op::StoreProperty));
+                    };
+                    let value = self.read_variable(src_reg, block);
+                    if !matches!(
+                        self.graph.node(value).kind.repr(),
+                        Repr::Int32 | Repr::Float64
+                    ) {
+                        return Err(Unsupported::Opcode(Op::StoreProperty));
+                    }
+                    let obj = self.read_variable(obj_reg, block);
+                    let checked =
+                        self.graph
+                            .add_node(NodeKind::CheckShape(obj, shape), block, byte_pc);
+                    self.push_body(block, checked);
+                    let store = self.graph.add_node(
+                        NodeKind::StoreSlot(checked, slot_byte, value),
+                        block,
+                        byte_pc,
+                    );
+                    self.push_body(block, store);
+                }
                 Op::LoadUndefined => {
                     let dst = reg(&operands, 0)?;
                     let node = self

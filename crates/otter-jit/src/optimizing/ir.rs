@@ -155,6 +155,11 @@ pub enum NodeKind {
     /// Pure (no deopt, no allocation); the preceding `CheckShape` established the
     /// receiver shape. Result [`Repr::Tagged`].
     LoadSlot(NodeId, u32),
+    /// Store a value into a fixed byte offset within a shape-guarded receiver's
+    /// value slab. Inputs `(receiver, value)`; the value is always a primitive
+    /// (int32 / f64 / bool), so the stored `Value` is never a `Gc` pointer and no
+    /// generational write barrier is needed. A side effect — produces no result.
+    StoreSlot(NodeId, u32, NodeId),
 }
 
 impl NodeKind {
@@ -180,7 +185,8 @@ impl NodeKind {
             | NodeKind::Float64Sub(a, b)
             | NodeKind::Float64Mul(a, b)
             | NodeKind::Float64Div(a, b)
-            | NodeKind::Float64Compare(_, a, b) => vec![*a, *b],
+            | NodeKind::Float64Compare(_, a, b)
+            | NodeKind::StoreSlot(a, _, b) => vec![*a, *b],
             NodeKind::Phi(ops) => ops.clone(),
             NodeKind::Param(_)
             | NodeKind::ConstInt32(_)
@@ -214,7 +220,8 @@ impl NodeKind {
             | NodeKind::Float64Sub(a, b)
             | NodeKind::Float64Mul(a, b)
             | NodeKind::Float64Div(a, b)
-            | NodeKind::Float64Compare(_, a, b) => {
+            | NodeKind::Float64Compare(_, a, b)
+            | NodeKind::StoreSlot(a, _, b) => {
                 fix(a);
                 fix(b);
             }
@@ -253,7 +260,8 @@ impl NodeKind {
             | NodeKind::SelfClosure
             | NodeKind::Phi(_)
             | NodeKind::CheckShape(_, _)
-            | NodeKind::LoadSlot(_, _) => Repr::Tagged,
+            | NodeKind::LoadSlot(_, _)
+            | NodeKind::StoreSlot(_, _, _) => Repr::Tagged,
         }
     }
 }

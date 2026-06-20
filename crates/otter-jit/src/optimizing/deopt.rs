@@ -107,6 +107,19 @@ fn reg_effects(op: Op, operands: &[Operand]) -> RegEffects {
                 uses.push(s);
             }
         }
+        // `StoreProperty obj, name, src, scratch` reads the receiver and the
+        // stored value and clobbers the scratch register.
+        Op::StoreProperty => {
+            if let Some(o) = reg(operands, 0) {
+                uses.push(o);
+            }
+            if let Some(s) = reg(operands, 2) {
+                uses.push(s);
+            }
+            if let Some(d) = reg(operands, 3) {
+                defs.push(d);
+            }
+        }
         Op::Add
         | Op::Sub
         | Op::Mul

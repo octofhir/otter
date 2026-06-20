@@ -47,9 +47,9 @@ use crate::CompiledCode;
 /// canonicalised to this so it stays a valid `Number(NaN)`.
 const TAG_NAN: u64 = 0x7FF8;
 /// NaN-box tag for a 32-bit signed integer immediate (`value/tag.rs`).
-const TAG_INT32: u64 = 0x7FF9;
+pub(crate) const TAG_INT32: u64 = 0x7FF9;
 /// NaN-box tag for special immediates (undefined/null/hole/boolean).
-const TAG_SPECIAL: u64 = 0x7FFA;
+pub(crate) const TAG_SPECIAL: u64 = 0x7FFA;
 /// NaN-box tag for a closure-less bytecode function reference (`value/tag.rs`
 /// `TAG_FUNCTION_ID`). The low 32 bits are the function id; the whole Value is
 /// `(TAG_FUNCTION_ID << 48) | fid`, so an inlined call site guards identity by
@@ -76,9 +76,9 @@ const JS_CLOSURE_BODY_TYPE_TAG: u32 = 0x23;
 /// `SPECIAL` payload for the internal array/`this` hole sentinel.
 const SPECIAL_HOLE: u64 = 2;
 /// `SPECIAL` payload for `false`.
-const SPECIAL_FALSE: u32 = 3;
+pub(crate) const SPECIAL_FALSE: u32 = 3;
 /// `SPECIAL` payload for `true`.
-const SPECIAL_TRUE: u32 = 4;
+pub(crate) const SPECIAL_TRUE: u32 = 4;
 /// Largest argument count the `Call` emitter inlines (args passed in registers
 /// to the call stub). Functions called with more args fall back.
 const MAX_INLINE_ARGS: usize = 4;
@@ -146,13 +146,13 @@ struct JitRet {
 }
 
 /// `status` discriminants in [`JitRet`].
-const STATUS_RETURNED: u64 = 0;
-const STATUS_BAILED: u64 = 1;
+pub(crate) const STATUS_RETURNED: u64 = 0;
+pub(crate) const STATUS_BAILED: u64 = 1;
 const STATUS_THREW: u64 = 2;
 
 /// Byte offset of [`JitCtx::bail_pc`] — where compiled code stamps the current
 /// instruction's byte-PC before each op so a bail resumes at the exact site.
-const BAIL_PC_OFFSET: u32 = std::mem::offset_of!(JitCtx, bail_pc) as u32;
+pub(crate) const BAIL_PC_OFFSET: u32 = std::mem::offset_of!(JitCtx, bail_pc) as u32;
 /// Byte offset of [`JitCtx::error`] for nested direct-call context construction.
 #[allow(dead_code)]
 const ERROR_SLOT_OFFSET: u32 = std::mem::offset_of!(JitCtx, error) as u32;

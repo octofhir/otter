@@ -152,20 +152,64 @@ failing-set diff), and committed.
    the float subset — `Repr::Float64`, `CheckNumber`, `Float64*` nodes,
    `Int32ToFloat64` widening, `LoadNumber` constant threading into the view,
    and `Div`/`Rem` — to cover mandelbrot/nbody; then `Call` (feeds stage 5).*
-3. **Lowering + unboxed + linear-scan regalloc.** Float64/Int32 live in CPU/FP
-   registers across the loop, boxed only at tagged-use boundaries. Emit arm64
-   (dynasm). Adds LICM (`arr.length`, loop invariants) and bounds-check
-   elimination. ~2–3× on mandelbrot.
-4. **Deopt.** A failed type guard reconstructs the baseline/interpreter frame
-   from per-guard deopt metadata (SSA values → interpreter registers) and
-   resumes there — making speculation safe.
-5. **Speculative inlining** of monomorphic tiny callees (fib recursion,
-   sort comparator, map/filter callback) — kills the per-call frame-build tax
-   (~57% of fib self-time). ~2× on call-bound code.
+## Production backend — NO simplifications
 
-GC contract carried over: only the frame register window is rooted; unboxed
-numbers in registers across a safepoint are safe (not pointers), boxed pointers
-in registers across a safepoint require a flush/stack-map. Deopt must
-reconstruct exact interpreter state. Regex stays out of scope.
+The backend is built to **production Maglev grade (or better)**. No toy
+shortcuts: no bail-to-entry instead of real deopt, no "skip register
+allocation", no single-block-only emitter, no write-through-everything. Each
+component below is the full algorithm; opcode/representation coverage grows
+incrementally, but the *algorithms* are complete from the start.
+
+### Backend pipeline (post-SSA)
+
+3. **Liveness.** ✅ *landed* (`liveness.rs`). SSA live-in/out per block via
+   backward dataflow to a fixpoint (correct for reducible *and* irreducible
+   loops, no separate loop-extension pass), with φ inputs treated as uses on the
+   predecessor edge. Plus a reverse-postorder block order. Consumed by both the
+   allocator and the deoptimizer. Unit-tested incl. loop back-edge liveness.
+4. **Trivial-φ elimination + representation selection.** Braun
+   `tryRemoveTrivialPhi` (collapse `φ(x,x)`/self-refs) during/after build. Then
+   representation selection: each value gets `Int32` / `Float64` / `Tagged`;
+   insert conversion nodes (`Int32ToFloat64`, box, unbox) at φ inputs and use
+   sites where reprs differ. Loop-carried numeric φs are kept **unboxed** across
+   the back-edge — the core perf win.
+5. **Linear-scan register allocation (Wimmer/Mössenböck on SSA).** Build live
+   intervals with lifetime holes from the liveness sets + def/use positions
+   (loop-aware interval extension). Two register files — GP (`x9`–`x15`,
+   `x21`–`x28`) for `Int32`/`Tagged`, FP (`d`-regs) for `Float64`. Spill slots
+   in a JIT-private frame area; spill by furthest-next-use. Fixed-register
+   constraints (params, return, call ABI). Resolve φs and block-boundary
+   register/spill mismatches with parallel moves on the edges.
+6. **Exact-PC deoptimization.** Each speculation guard carries **deopt
+   metadata**: the bytecode PC to resume at + a frame-state snapshot mapping
+   every *live* interpreter register → the SSA value holding it → its physical
+   location (reg / spill / constant), captured at build time from the SSA
+   environment. On guard failure a deopt exit reconstructs the exact interpreter
+   frame (box each live value, store to its register slot, set PC) and returns
+   `STATUS_BAILED` so the interpreter resumes at that instruction. Real deopt —
+   not bail-to-entry.
+7. **Safepoints / GC stack maps.** Values live across a `Call` / allocation that
+   are boxed pointers are recorded in a safepoint stack map (or flushed to the
+   frame) so the moving collector can find/update them; unboxed numbers need no
+   map.
+8. **Emission.** arm64 (dynasm), shared ABI with the baseline
+   (`enter_compiled`). Unboxed numerics stay in registers across the loop; box
+   only at tagged boundaries. LICM (`arr.length`, loop invariants) and
+   bounds-check elimination.
+9. **Speculative inlining** of monomorphic tiny callees (fib recursion, sort
+   comparator, map/filter callback) into the SSA graph before allocation —
+   kills the per-call frame-build tax (~57% of fib self-time).
+
+### Coverage roadmap (algorithms stay full; this is just opcode breadth)
+- int32 arithmetic + control flow + loops → integer loop kernels.
+- float subset (`Repr::Float64`, `CheckNumber`, `Float64*`, `Int32ToFloat64`,
+  `LoadNumber` constant threading, `Div`/`Rem`) → mandelbrot / nbody.
+- `Call` + speculative inlining → fib and callback-bound code.
+- element-kind feedback + typed-array / dense-array element access.
+
+GC contract: only the frame register window is rooted; unboxed numbers in
+registers across a safepoint are safe (not pointers); boxed pointers across a
+safepoint need the safepoint stack map (step 7). Deopt reconstructs exact
+interpreter state. Regex stays out of scope.
 
 _Part II started 2026-06-20 on `perf/engine-rewrite`._

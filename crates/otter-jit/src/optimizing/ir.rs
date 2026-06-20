@@ -101,6 +101,11 @@ pub enum NodeKind {
     ConstBool(bool),
     /// Boxed `undefined`.
     ConstUndefined,
+    /// The running function's own closure (`MakeFunction` self-binding), read
+    /// from the entry context. A tagged value never used as a numeric operand in
+    /// this subset (a use that needs it as a number deoptimizes); present so the
+    /// near-universal leading self-binding does not disqualify a function.
+    SelfClosure,
     /// SSA phi. Operands are aligned 1:1 with the owning block's `preds`. May be
     /// temporarily empty (incomplete) during construction of an unsealed block.
     Phi(Vec<NodeId>),
@@ -118,6 +123,27 @@ pub enum NodeKind {
 }
 
 impl NodeKind {
+    /// SSA value operands this node consumes, in operand order. For a `Phi`
+    /// these are the per-predecessor inputs (aligned to the block's `preds`),
+    /// which liveness treats as uses at the predecessor edges rather than as
+    /// block-local uses.
+    #[must_use]
+    pub fn inputs(&self) -> Vec<NodeId> {
+        match self {
+            NodeKind::CheckInt32(a) => vec![*a],
+            NodeKind::Int32Add(a, b)
+            | NodeKind::Int32Sub(a, b)
+            | NodeKind::Int32Mul(a, b)
+            | NodeKind::Int32Compare(_, a, b) => vec![*a, *b],
+            NodeKind::Phi(ops) => ops.clone(),
+            NodeKind::Param(_)
+            | NodeKind::ConstInt32(_)
+            | NodeKind::ConstBool(_)
+            | NodeKind::ConstUndefined
+            | NodeKind::SelfClosure => Vec::new(),
+        }
+    }
+
     /// The representation a node of this kind produces.
     #[must_use]
     pub fn repr(&self) -> Repr {
@@ -133,6 +159,7 @@ impl NodeKind {
             NodeKind::Param(_)
             | NodeKind::ConstBool(_)
             | NodeKind::ConstUndefined
+            | NodeKind::SelfClosure
             | NodeKind::Phi(_) => Repr::Tagged,
         }
     }
@@ -148,6 +175,17 @@ pub struct Node {
     pub repr: Repr,
     /// Block this node belongs to.
     pub block: BlockId,
+    /// Byte-PC of the bytecode instruction this node serves. A node that can
+    /// deoptimize (a `Check*` guard, an overflowing `Int32*`) stamps this so the
+    /// interpreter resumes at the exact instruction. Synthetic entry defs use
+    /// `0`.
+    pub byte_pc: u32,
+    /// Bytecode register this node's value is written through to, for deopt
+    /// coherence: a freshly computed value that is the result of a
+    /// register-writing instruction is boxed and stored to this frame slot so a
+    /// later bail sees a current frame. `None` for temps (e.g. `Check*`) and
+    /// values already resident in their frame slot (`Param`).
+    pub frame_dst: Option<u16>,
 }
 
 /// Per-block control transfer.
@@ -231,13 +269,25 @@ impl Graph {
         }
     }
 
-    /// Append a node in `block`, returning its id. The repr is derived from the
-    /// kind.
-    pub(super) fn add_node(&mut self, kind: NodeKind, block: BlockId) -> NodeId {
+    /// Append a node in `block` originating at `byte_pc`, returning its id. The
+    /// repr is derived from the kind; `frame_dst` starts `None` (set by
+    /// [`Self::set_frame_dst`] for register-writing instructions).
+    pub(super) fn add_node(&mut self, kind: NodeKind, block: BlockId, byte_pc: u32) -> NodeId {
         let repr = kind.repr();
         let id = self.nodes.len() as NodeId;
-        self.nodes.push(Node { kind, repr, block });
+        self.nodes.push(Node {
+            kind,
+            repr,
+            block,
+            byte_pc,
+            frame_dst: None,
+        });
         id
+    }
+
+    /// Mark `node` as written through to bytecode register `reg`.
+    pub(super) fn set_frame_dst(&mut self, node: NodeId, reg: u16) {
+        self.nodes[node as usize].frame_dst = Some(reg);
     }
 
     /// Borrow a node by id.

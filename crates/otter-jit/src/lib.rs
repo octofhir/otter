@@ -61,6 +61,10 @@ impl otter_vm::JitCompilerHook for BaselineJitCompiler {
         &self,
         request: otter_vm::JitCompileRequest,
     ) -> Result<otter_vm::JitCompileStatus, otter_vm::JitCompileError> {
+        // The optimizing tier's production backend (register allocation,
+        // representation selection, exact-PC deopt) is being built up; it is not
+        // yet wired into execution. Until its emitter lands, the baseline tier
+        // serves every function.
         match baseline::compile(&request.function) {
             Ok(code) => Ok(otter_vm::JitCompileStatus::Compiled {
                 code: std::sync::Arc::new(code),

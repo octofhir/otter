@@ -224,9 +224,10 @@ impl<'a> Builder<'a> {
             } else {
                 NodeKind::ConstUndefined
             };
-            let node = self.graph.add_node(kind, self.graph.entry);
-            self.graph.blocks[self.graph.entry as usize].body.push(node);
-            self.write_variable(r, self.graph.entry, node);
+            let entry = self.graph.entry;
+            let node = self.graph.add_node(kind, entry, 0);
+            self.graph.blocks[entry as usize].body.push(node);
+            self.write_variable(r, entry, node);
         }
 
         let block_count = self.cfg.ranges.len();
@@ -308,7 +309,8 @@ impl<'a> Builder<'a> {
     }
 
     fn new_phi(&mut self, block: BlockId) -> NodeId {
-        let phi = self.graph.add_node(NodeKind::Phi(Vec::new()), block);
+        let pc = self.graph.blocks[block as usize].start_pc;
+        let phi = self.graph.add_node(NodeKind::Phi(Vec::new()), block, pc);
         self.graph.blocks[block as usize].phis.push(phi);
         phi
     }
@@ -334,26 +336,41 @@ impl<'a> Builder<'a> {
             let op = instr.op;
             let byte_pc = instr.byte_pc;
             let feedback = instr.arith_feedback;
+            let make_self = instr.make_self;
             let operands = instr.operands.clone();
             match op {
+                // The leading named-function self-binding. The closure value is
+                // never a numeric operand in this subset; only `make_self`
+                // (no allocation) is accepted — any other `MakeFunction`
+                // allocates and bails to the baseline.
+                Op::MakeFunction if make_self => {
+                    let dst = reg(&operands, 0)?;
+                    let node = self.graph.add_node(NodeKind::SelfClosure, block, byte_pc);
+                    self.write_variable(dst, block, node);
+                }
                 Op::LoadInt32 => {
                     let dst = reg(&operands, 0)?;
                     let v = imm32(&operands, 1)?;
-                    let node = self.graph.add_node(NodeKind::ConstInt32(v), block);
+                    let node = self.graph.add_node(NodeKind::ConstInt32(v), block, byte_pc);
+                    self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
                     self.write_variable(dst, block, node);
                 }
                 Op::LoadTrue | Op::LoadFalse => {
                     let dst = reg(&operands, 0)?;
-                    let node = self
-                        .graph
-                        .add_node(NodeKind::ConstBool(matches!(op, Op::LoadTrue)), block);
+                    let node = self.graph.add_node(
+                        NodeKind::ConstBool(matches!(op, Op::LoadTrue)),
+                        block,
+                        byte_pc,
+                    );
+                    self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
                     self.write_variable(dst, block, node);
                 }
                 Op::LoadUndefined => {
                     let dst = reg(&operands, 0)?;
-                    let node = self.graph.add_node(NodeKind::ConstUndefined, block);
+                    let node = self.graph.add_node(NodeKind::ConstUndefined, block, byte_pc);
+                    self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
                     self.write_variable(dst, block, node);
                 }
@@ -374,9 +391,21 @@ impl<'a> Builder<'a> {
                     let node = self.read_variable(src, block);
                     self.write_variable(dst, block, node);
                 }
+                // `ToPrimitive` / `ToNumeric` are identity on a number, and the
+                // arithmetic site's `CheckInt32` guard enforces the int32
+                // speculation: a non-int32 operand bails to the interpreter,
+                // which performs the spec-correct coercion. So under int32
+                // speculation these are sound as a register copy.
+                Op::ToPrimitive | Op::ToNumeric => {
+                    let dst = reg(&operands, 0)?;
+                    let src = reg(&operands, 1)?;
+                    let node = self.read_variable(src, block);
+                    self.write_variable(dst, block, node);
+                }
                 Op::Add | Op::Sub | Op::Mul => {
                     let (dst, lhs, rhs) = (reg(&operands, 0)?, reg(&operands, 1)?, reg(&operands, 2)?);
-                    let node = self.int32_binop(block, op, lhs, rhs, feedback)?;
+                    let node = self.int32_binop(block, op, lhs, rhs, feedback, byte_pc)?;
+                    self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
                     self.write_variable(dst, block, node);
                 }
@@ -384,9 +413,12 @@ impl<'a> Builder<'a> {
                 | Op::NotEqual => {
                     let (dst, lhs, rhs) = (reg(&operands, 0)?, reg(&operands, 1)?, reg(&operands, 2)?);
                     let cmp = CmpOp::from_op(op).expect("comparison opcode");
-                    let l = self.int32_operand(block, lhs, feedback)?;
-                    let r = self.int32_operand(block, rhs, feedback)?;
-                    let node = self.graph.add_node(NodeKind::Int32Compare(cmp, l, r), block);
+                    let l = self.int32_operand(block, lhs, feedback, byte_pc)?;
+                    let r = self.int32_operand(block, rhs, feedback, byte_pc)?;
+                    let node = self
+                        .graph
+                        .add_node(NodeKind::Int32Compare(cmp, l, r), block, byte_pc);
+                    self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
                     self.write_variable(dst, block, node);
                 }
@@ -428,7 +460,7 @@ impl<'a> Builder<'a> {
                     self.set_term(block, Terminator::Return(node));
                 }
                 Op::ReturnUndefined => {
-                    let node = self.graph.add_node(NodeKind::ConstUndefined, block);
+                    let node = self.graph.add_node(NodeKind::ConstUndefined, block, byte_pc);
                     self.set_term(block, Terminator::Return(node));
                 }
                 other => return Err(Unsupported::Opcode(other)),
@@ -455,16 +487,17 @@ impl<'a> Builder<'a> {
         lhs: u16,
         rhs: u16,
         feedback: u8,
+        byte_pc: u32,
     ) -> Result<NodeId, Unsupported> {
-        let l = self.int32_operand(block, lhs, feedback)?;
-        let r = self.int32_operand(block, rhs, feedback)?;
+        let l = self.int32_operand(block, lhs, feedback, byte_pc)?;
+        let r = self.int32_operand(block, rhs, feedback, byte_pc)?;
         let kind = match op {
             Op::Add => NodeKind::Int32Add(l, r),
             Op::Sub => NodeKind::Int32Sub(l, r),
             Op::Mul => NodeKind::Int32Mul(l, r),
             _ => unreachable!("int32_binop on non-arithmetic op"),
         };
-        Ok(self.graph.add_node(kind, block))
+        Ok(self.graph.add_node(kind, block, byte_pc))
     }
 
     /// Resolve a register operand to an [`Repr::Int32`] node, inserting a
@@ -475,6 +508,7 @@ impl<'a> Builder<'a> {
         block: BlockId,
         operand_reg: u16,
         raw_feedback: u8,
+        byte_pc: u32,
     ) -> Result<NodeId, Unsupported> {
         let feedback = ArithFeedback::from_bits(raw_feedback);
         if !feedback.is_int32_only() {
@@ -484,7 +518,7 @@ impl<'a> Builder<'a> {
         if self.graph.node(node).repr == Repr::Int32 {
             return Ok(node);
         }
-        let check = self.graph.add_node(NodeKind::CheckInt32(node), block);
+        let check = self.graph.add_node(NodeKind::CheckInt32(node), block, byte_pc);
         self.push_body(block, check);
         Ok(check)
     }

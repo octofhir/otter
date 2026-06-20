@@ -25,6 +25,7 @@
 
 mod builder;
 pub mod ir;
+pub mod liveness;
 
 use otter_bytecode::Op;
 use otter_vm::JitFunctionView;
@@ -46,6 +47,12 @@ pub enum Unsupported {
     /// int32-only (unobserved, float, string, mixed, …); carries the raw
     /// feedback bits.
     TypeFeedback(u8),
+    /// The function has control flow (more than one basic block); the
+    /// single-block emitter cannot lower it yet.
+    ControlFlow,
+    /// A graph shape that is built but not yet lowered to machine code (a
+    /// comparison / boolean result, a phi) in the current emitter.
+    Unlowered(&'static str),
 }
 
 /// Build the typed SSA graph for `view`, or report why it is outside the

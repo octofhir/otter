@@ -579,6 +579,19 @@ impl<'a> Builder<'a> {
                     self.push_body(block, node);
                     self.def_register(dst, block, node, byte_pc);
                 }
+                // Bitwise / shift sites are integer ops: JS coerces both operands
+                // to int32 and the result is int32 (`|`, `&`, `^`, `<<`, `>>`
+                // all stay in signed-int32 range). Speculate int32 operands from
+                // feedback (`CheckInt32`); a non-int32 site bails. `>>>` is absent
+                // — its result can exceed the int32 range (a double).
+                Op::BitwiseOr | Op::BitwiseAnd | Op::BitwiseXor | Op::Shl | Op::Shr => {
+                    let (dst, lhs, rhs) =
+                        (reg(&operands, 0)?, reg(&operands, 1)?, reg(&operands, 2)?);
+                    let node = self.bitwise_binop(block, op, lhs, rhs, feedback, byte_pc)?;
+                    self.graph.set_frame_dst(node, dst);
+                    self.push_body(block, node);
+                    self.def_register(dst, block, node, byte_pc);
+                }
                 // `Increment dst, src, delta` is `dst = src + delta` (delta is an
                 // inline immediate, default 1; a negative delta is `--`). It
                 // lowers exactly like `Add` of `src` and a constant step.
@@ -692,6 +705,34 @@ impl<'a> Builder<'a> {
             Op::Sub => NodeKind::Int32Sub(l, r),
             Op::Mul => NodeKind::Int32Mul(l, r),
             _ => unreachable!("int32_binop on non-arithmetic op"),
+        };
+        Ok(self.graph.add_node(kind, block, byte_pc))
+    }
+
+    /// Build a typed `Int32*` bitwise / shift node, speculating int32 operands
+    /// from the site's feedback (`CheckInt32`). Bails the whole function if the
+    /// site is not int32-only.
+    fn bitwise_binop(
+        &mut self,
+        block: BlockId,
+        op: Op,
+        lhs: u16,
+        rhs: u16,
+        feedback: u8,
+        byte_pc: u32,
+    ) -> Result<NodeId, Unsupported> {
+        if !ArithFeedback::from_bits(feedback).is_int32_only() {
+            return Err(Unsupported::TypeFeedback(feedback));
+        }
+        let l = self.int32_operand(block, lhs, feedback, byte_pc)?;
+        let r = self.int32_operand(block, rhs, feedback, byte_pc)?;
+        let kind = match op {
+            Op::BitwiseOr => NodeKind::Int32BitOr(l, r),
+            Op::BitwiseAnd => NodeKind::Int32BitAnd(l, r),
+            Op::BitwiseXor => NodeKind::Int32BitXor(l, r),
+            Op::Shl => NodeKind::Int32Shl(l, r),
+            Op::Shr => NodeKind::Int32Shr(l, r),
+            _ => unreachable!("bitwise_binop on non-bitwise op"),
         };
         Ok(self.graph.add_node(kind, block, byte_pc))
     }

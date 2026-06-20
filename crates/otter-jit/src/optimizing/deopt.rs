@@ -124,6 +124,11 @@ fn reg_effects(op: Op, operands: &[Operand]) -> RegEffects {
         | Op::Sub
         | Op::Mul
         | Op::Div
+        | Op::BitwiseOr
+        | Op::BitwiseAnd
+        | Op::BitwiseXor
+        | Op::Shl
+        | Op::Shr
         | Op::LessThan
         | Op::LessEq
         | Op::GreaterThan

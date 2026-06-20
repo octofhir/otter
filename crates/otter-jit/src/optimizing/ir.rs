@@ -144,6 +144,18 @@ pub enum NodeKind {
     /// `f64 <cmp> f64`. Result [`Repr::Bool`]. IEEE ordered comparison
     /// (a `NaN` operand yields `false` for every relation, matching JS).
     Float64Compare(CmpOp, NodeId, NodeId),
+    /// `int32 | int32`. Result [`Repr::Int32`]. Total (no deopt).
+    Int32BitOr(NodeId, NodeId),
+    /// `int32 & int32`.
+    Int32BitAnd(NodeId, NodeId),
+    /// `int32 ^ int32`.
+    Int32BitXor(NodeId, NodeId),
+    /// `int32 << (int32 & 31)` — arm64 32-bit `lslv` masks the shift amount mod
+    /// 32, matching JS `ToInt32(a) << (ToUint32(b) & 31)`. Result wraps to int32.
+    Int32Shl(NodeId, NodeId),
+    /// `int32 >> (int32 & 31)` — arithmetic (sign-propagating) right shift,
+    /// matching JS `>>`. Result [`Repr::Int32`].
+    Int32Shr(NodeId, NodeId),
     /// Speculative "operand is an ordinary object of the baked shape" guard.
     /// Carries the receiver and the receiver shape's compressed `Gc` offset. A
     /// non-object, or a different shape (or dictionary mode), deoptimizes.
@@ -186,7 +198,12 @@ impl NodeKind {
             | NodeKind::Float64Mul(a, b)
             | NodeKind::Float64Div(a, b)
             | NodeKind::Float64Compare(_, a, b)
-            | NodeKind::StoreSlot(a, _, b) => vec![*a, *b],
+            | NodeKind::StoreSlot(a, _, b)
+            | NodeKind::Int32BitOr(a, b)
+            | NodeKind::Int32BitAnd(a, b)
+            | NodeKind::Int32BitXor(a, b)
+            | NodeKind::Int32Shl(a, b)
+            | NodeKind::Int32Shr(a, b) => vec![*a, *b],
             NodeKind::Phi(ops) => ops.clone(),
             NodeKind::Param(_)
             | NodeKind::ConstInt32(_)
@@ -221,7 +238,12 @@ impl NodeKind {
             | NodeKind::Float64Mul(a, b)
             | NodeKind::Float64Div(a, b)
             | NodeKind::Float64Compare(_, a, b)
-            | NodeKind::StoreSlot(a, _, b) => {
+            | NodeKind::StoreSlot(a, _, b)
+            | NodeKind::Int32BitOr(a, b)
+            | NodeKind::Int32BitAnd(a, b)
+            | NodeKind::Int32BitXor(a, b)
+            | NodeKind::Int32Shl(a, b)
+            | NodeKind::Int32Shr(a, b) => {
                 fix(a);
                 fix(b);
             }
@@ -243,7 +265,12 @@ impl NodeKind {
             | NodeKind::CheckInt32(_)
             | NodeKind::Int32Add(_, _)
             | NodeKind::Int32Sub(_, _)
-            | NodeKind::Int32Mul(_, _) => Repr::Int32,
+            | NodeKind::Int32Mul(_, _)
+            | NodeKind::Int32BitOr(_, _)
+            | NodeKind::Int32BitAnd(_, _)
+            | NodeKind::Int32BitXor(_, _)
+            | NodeKind::Int32Shl(_, _)
+            | NodeKind::Int32Shr(_, _) => Repr::Int32,
             NodeKind::ConstF64(_)
             | NodeKind::CheckNumber(_)
             | NodeKind::Int32ToFloat64(_)

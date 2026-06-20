@@ -705,6 +705,42 @@ mod arm64 {
                 }
                 Ok(())
             }
+            NodeKind::Int32BitOr(a, b)
+            | NodeKind::Int32BitAnd(a, b)
+            | NodeKind::Int32BitXor(a, b)
+            | NodeKind::Int32Shl(a, b)
+            | NodeKind::Int32Shr(a, b) => {
+                // Pure int32 bitwise / shift on W views; no overflow, no deopt.
+                // arm64 32-bit `lslv`/`asrv` mask the shift amount mod 32 — the
+                // JS `& 31` shift semantics.
+                let aloc = require_loc(alloc, *a)?;
+                let bloc = require_loc(alloc, *b)?;
+                load_loc(ops, 16, aloc);
+                load_loc(ops, 17, bloc);
+                match &node.kind {
+                    NodeKind::Int32BitOr(_, _) => {
+                        dynasm!(ops ; .arch aarch64 ; orr w16, w16, w17);
+                    }
+                    NodeKind::Int32BitAnd(_, _) => {
+                        dynasm!(ops ; .arch aarch64 ; and w16, w16, w17);
+                    }
+                    NodeKind::Int32BitXor(_, _) => {
+                        dynasm!(ops ; .arch aarch64 ; eor w16, w16, w17);
+                    }
+                    NodeKind::Int32Shl(_, _) => {
+                        dynasm!(ops ; .arch aarch64 ; lslv w16, w16, w17);
+                    }
+                    NodeKind::Int32Shr(_, _) => {
+                        dynasm!(ops ; .arch aarch64 ; asrv w16, w16, w17);
+                    }
+                    _ => unreachable!(),
+                }
+                if let Some(loc) = dst {
+                    dynasm!(ops ; .arch aarch64 ; mov W(box_scratch), w16);
+                    store_loc(ops, loc, box_scratch);
+                }
+                Ok(())
+            }
             NodeKind::Int32Compare(op, a, b) => {
                 let aloc = require_loc(alloc, *a)?;
                 let bloc = require_loc(alloc, *b)?;

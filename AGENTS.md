@@ -314,10 +314,10 @@ Pure Rust implementation - no external JavaScript engine dependencies.
   - CI/E2E compatibility check: `cargo test -p otter-cli trace_e2e_generates_chrome_perfetto_compatible_json`
 - CPU profile + folded flamegraph stacks:
   - `cargo run -p otter-cli -- run <file> --cpu-prof --cpu-prof-dir /tmp/otter-prof`
-  - Optional: `--cpu-prof-interval 1000 --cpu-prof-name my-run.cpuprofile`
+  - Optional: `--cpu-prof-interval 1000 --cpu-prof-name my-run`
   - Produces both `.cpuprofile` (DevTools/Speedscope) and `.folded` (inferno/flamegraph.pl).
-  - Stack samples are captured from `VmContext::capture_profiler_stack()` (via runtime debug snapshot), so function/file/line metadata should come from VM frames, not CLI-only reconstruction.
-  - Baseline overhead sanity check (`cpu-prof` should stay opt-in): compare `/usr/bin/time -p target/debug/otter --timeout 0 run <file>` vs `/usr/bin/time -p target/debug/otter --timeout 0 --cpu-prof --cpu-prof-dir /tmp/otter-prof run <file>` and watch `real` delta.
+  - Stack samples are captured by an opt-in VM dispatch sampler from live VM frames; `--cpu-prof-interval` is bytecode dispatch ticks between sample attempts.
+  - Baseline overhead sanity check (`cpu-prof` should stay opt-in): compare `/usr/bin/time -p target/release/otter run <file>` vs `/usr/bin/time -p target/release/otter run --cpu-prof --cpu-prof-dir /tmp/otter-prof <file>` and watch `real` / `sys` delta.
   - Script args are forwarded to `process.argv`: `cargo run -p otter-cli -- run benchmarks/cpu/flamegraph.ts math 2`
   - Shorthand mode also forwards args: `cargo run -p otter-cli -- benchmarks/cpu/flamegraph.ts json 1`
 - Async/op trace (Chrome/Perfetto compatible):

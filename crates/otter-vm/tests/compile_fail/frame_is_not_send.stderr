@@ -1,3 +1,28 @@
+error[E0277]: `*mut otter_vm::Value` cannot be sent between threads safely
+  --> tests/compile_fail/frame_is_not_send.rs:11:17
+   |
+11 |     assert_send(frame);
+   |     ----------- ^^^^^ `*mut otter_vm::Value` cannot be sent between threads safely
+   |     |
+   |     required by a bound introduced by this call
+   |
+   = help: within `Frame`, the trait `Send` is not implemented for `*mut otter_vm::Value`
+note: required because it appears within the type `otter_vm::frame_state::FrameRegisters`
+  --> src/frame_state.rs
+   |
+   | pub enum FrameRegisters {
+   |          ^^^^^^^^^^^^^^
+note: required because it appears within the type `Frame`
+  --> src/frame_state.rs
+   |
+   | pub struct Frame {
+   |            ^^^^^
+note: required by a bound in `assert_send`
+  --> tests/compile_fail/frame_is_not_send.rs:6:19
+   |
+ 6 | fn assert_send<T: Send>(_t: T) {}
+   |                   ^^^^ required by this bound in `assert_send`
+
 error[E0277]: `*const ()` cannot be sent between threads safely
   --> tests/compile_fail/frame_is_not_send.rs:11:17
    |

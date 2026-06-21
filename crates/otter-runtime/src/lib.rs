@@ -105,6 +105,7 @@ pub use otter_compiler::{
     CompiledSourceSpan, LiveBindingSlot,
 };
 pub use otter_gc;
+pub use otter_vm::CpuProfile;
 pub use otter_vm::{
     AccessorSpec, Attr, ConstSpec, ConstValue, ConstructorSpec, JsObject, JsSurfaceError,
     MethodSpec, NativeCall, ObjectBuilder, Value, bootstrap, intrinsic_install, object,
@@ -2633,6 +2634,22 @@ impl Runtime {
     /// [`inspect::StepTracer`].
     pub fn set_tracer(&mut self, tracer: Option<Box<dyn inspect::StepTracer>>) {
         self.interp.set_tracer(tracer);
+    }
+
+    /// Enable VM stack sampling for CPU-profile artifacts.
+    pub fn enable_cpu_profiler(&mut self, interval: u64) {
+        self.interp.enable_cpu_profiler(interval);
+    }
+
+    /// Disable VM stack sampling without returning collected samples.
+    pub fn disable_cpu_profiler(&mut self) {
+        self.interp.disable_cpu_profiler();
+    }
+
+    /// Take and clear the current VM stack CPU profile.
+    #[must_use]
+    pub fn take_cpu_profile(&mut self) -> Option<otter_vm::CpuProfile> {
+        self.interp.take_cpu_profile()
     }
 
     /// Type-count summary of every live GC body. See

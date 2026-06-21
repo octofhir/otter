@@ -19,7 +19,7 @@
 //! - JSON outputs (`--json`, `--dump-bytecode=json`, error payloads)
 //!   match the documented CLI and bytecode-dump wire formats.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -347,9 +347,28 @@ struct RunArgs {
     /// Force local package binary resolution.
     #[arg(long, conflicts_with = "script")]
     bin: bool,
+    /// Emit VM stack CPU profile artifacts after the run.
+    #[arg(long)]
+    cpu_prof: bool,
+    /// Directory for `--cpu-prof` artifacts.
+    #[arg(long, default_value = "/tmp/otter-prof", requires = "cpu_prof")]
+    cpu_prof_dir: PathBuf,
+    /// Sample every N bytecode dispatch ticks for `--cpu-prof`.
+    #[arg(long, default_value_t = 1000, requires = "cpu_prof")]
+    cpu_prof_interval: u64,
+    /// Base file name for `--cpu-prof` artifacts.
+    #[arg(long, requires = "cpu_prof")]
+    cpu_prof_name: Option<String>,
     /// Forwarded target arguments.
     #[arg(trailing_var_arg = true)]
     args: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CpuProfileOptions {
+    dir: PathBuf,
+    interval: u64,
+    name: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -505,6 +524,10 @@ async fn main() -> ExitCode {
                     target: positional,
                     script: false,
                     bin: false,
+                    cpu_prof: false,
+                    cpu_prof_dir: PathBuf::from("/tmp/otter-prof"),
+                    cpu_prof_interval: 1000,
+                    cpu_prof_name: None,
                     args: forwarded_args,
                 },
                 json,
@@ -568,8 +591,19 @@ async fn run_file(
     dump_mode: Option<&str>,
     caps: &CapabilitySet,
     startup_timer: &CliStartupTimer,
+    cpu_profile: Option<&CpuProfileOptions>,
 ) -> Result<ExitCode, OtterError> {
-    run_file_with_cwd(path, args, None, json, dump_mode, caps, startup_timer).await
+    run_file_with_cwd(
+        path,
+        args,
+        None,
+        json,
+        dump_mode,
+        caps,
+        startup_timer,
+        cpu_profile,
+    )
+    .await
 }
 
 async fn run_file_with_cwd(
@@ -580,8 +614,14 @@ async fn run_file_with_cwd(
     dump_mode: Option<&str>,
     caps: &CapabilitySet,
     startup_timer: &CliStartupTimer,
+    cpu_profile: Option<&CpuProfileOptions>,
 ) -> Result<ExitCode, OtterError> {
     if let Some(mode) = dump_mode {
+        if cpu_profile.is_some() {
+            return Err(pm_config_error(
+                "--cpu-prof cannot be combined with --dump-bytecode",
+            ));
+        }
         return run_dump(path, mode, caps, startup_timer).await;
     }
     // Route module-shaped files through the module-graph
@@ -589,6 +629,18 @@ async fn run_file_with_cwd(
     // detection is AST-based (see `Otter::run_file` for the
     // shared helper used in the embedder Layer-A path).
     //
+    if let Some(profile) = cpu_profile {
+        return run_file_with_cpu_profile(
+            path,
+            args,
+            process_cwd,
+            json,
+            caps,
+            startup_timer,
+            profile,
+        )
+        .await;
+    }
     let mut builder = cli_otter_builder(caps)
         .process_argv(process_argv_for_file(path, args))
         .module_loader(cli_loader_config_for_entry(path).await);
@@ -610,6 +662,232 @@ async fn run_file_with_cwd(
         );
     }
     Ok(ExitCode::from(result.exit_code()))
+}
+
+async fn run_file_with_cpu_profile(
+    path: &std::path::Path,
+    args: &[String],
+    process_cwd: Option<&Path>,
+    json: bool,
+    caps: &CapabilitySet,
+    startup_timer: &CliStartupTimer,
+    profile_options: &CpuProfileOptions,
+) -> Result<ExitCode, OtterError> {
+    let mut builder = otter_runtime::Runtime::builder()
+        .capabilities(caps.clone())
+        .with_node_apis()
+        .with_web_apis()
+        .process_argv(process_argv_for_file(path, args))
+        .module_loader(cli_loader_config_for_entry(path).await);
+    if let Some(cwd) = process_cwd {
+        builder = builder.process_cwd(cwd.to_path_buf());
+    }
+    let mut runtime = builder.build()?;
+    startup_timer.mark("runtime_build");
+    runtime.enable_cpu_profiler(profile_options.interval);
+    let result = runtime.run_file(path)?;
+    startup_timer.mark("runtime_run_file");
+    let profile = runtime
+        .take_cpu_profile()
+        .unwrap_or_else(|| otter_runtime::CpuProfile {
+            interval: profile_options.interval.max(1),
+            samples: Vec::new(),
+            time_deltas_us: Vec::new(),
+        });
+    let artifacts = write_cpu_profile_artifacts(path, &profile, profile_options)?;
+    eprintln!(
+        "cpu profile written: {} ({} samples), {}",
+        artifacts.cpuprofile.display(),
+        profile.sample_count(),
+        artifacts.folded.display()
+    );
+    emit_otter_stats_if_requested(&result);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "completion": result.completion_string(),
+                "exitCode": result.exit_code(),
+                "cpuProfile": {
+                    "cpuprofile": artifacts.cpuprofile,
+                    "folded": artifacts.folded,
+                    "samples": profile.sample_count(),
+                }
+            })
+        );
+    }
+    Ok(ExitCode::from(result.exit_code()))
+}
+
+#[derive(Debug, Clone)]
+struct CpuProfileArtifacts {
+    cpuprofile: PathBuf,
+    folded: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CpuProfileFrameKey {
+    function_name: String,
+    module: String,
+    line: u32,
+    column: u32,
+}
+
+#[derive(Debug)]
+struct CpuProfileNode {
+    id: u32,
+    key: CpuProfileFrameKey,
+    hit_count: u32,
+    children: BTreeMap<CpuProfileFrameKey, usize>,
+}
+
+fn write_cpu_profile_artifacts(
+    entry_path: &Path,
+    profile: &otter_runtime::CpuProfile,
+    options: &CpuProfileOptions,
+) -> Result<CpuProfileArtifacts, OtterError> {
+    std::fs::create_dir_all(&options.dir).map_err(|err| pm_io_error(&options.dir, err))?;
+    let base = cpu_profile_base_name(entry_path, options);
+    let cpuprofile = options.dir.join(format!("{base}.cpuprofile"));
+    let folded = options.dir.join(format!("{base}.folded"));
+    write_chrome_cpu_profile(&cpuprofile, profile)?;
+    write_folded_cpu_profile(&folded, profile)?;
+    Ok(CpuProfileArtifacts { cpuprofile, folded })
+}
+
+fn cpu_profile_base_name(entry_path: &Path, options: &CpuProfileOptions) -> String {
+    let raw = options.name.clone().unwrap_or_else(|| {
+        entry_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("otter-profile")
+            .to_string()
+    });
+    raw.strip_suffix(".cpuprofile")
+        .or_else(|| raw.strip_suffix(".folded"))
+        .unwrap_or(&raw)
+        .to_string()
+}
+
+fn write_chrome_cpu_profile(
+    path: &Path,
+    profile: &otter_runtime::CpuProfile,
+) -> Result<(), OtterError> {
+    let mut nodes = vec![CpuProfileNode {
+        id: 1,
+        key: CpuProfileFrameKey {
+            function_name: "(root)".to_string(),
+            module: String::new(),
+            line: 0,
+            column: 0,
+        },
+        hit_count: 0,
+        children: BTreeMap::new(),
+    }];
+    let mut sample_ids = Vec::with_capacity(profile.samples.len());
+    for sample in &profile.samples {
+        let mut current = 0usize;
+        for frame in sample.iter().rev() {
+            let key = CpuProfileFrameKey {
+                function_name: frame.function_name.clone(),
+                module: frame.module.clone(),
+                line: 0,
+                column: frame.span.0,
+            };
+            let child = if let Some(&idx) = nodes[current].children.get(&key) {
+                idx
+            } else {
+                let idx = nodes.len();
+                let id = u32::try_from(idx + 1).unwrap_or(u32::MAX);
+                nodes.push(CpuProfileNode {
+                    id,
+                    key: key.clone(),
+                    hit_count: 0,
+                    children: BTreeMap::new(),
+                });
+                nodes[current].children.insert(key, idx);
+                idx
+            };
+            current = child;
+        }
+        nodes[current].hit_count = nodes[current].hit_count.saturating_add(1);
+        sample_ids.push(nodes[current].id);
+    }
+    let node_json = nodes
+        .iter()
+        .map(|node| {
+            let children = node
+                .children
+                .values()
+                .map(|&idx| nodes[idx].id)
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "id": node.id,
+                "callFrame": {
+                    "functionName": node.key.function_name,
+                    "scriptId": "0",
+                    "url": node.key.module,
+                    "lineNumber": node.key.line,
+                    "columnNumber": node.key.column,
+                },
+                "hitCount": node.hit_count,
+                "children": children,
+            })
+        })
+        .collect::<Vec<_>>();
+    let time_deltas = if profile.time_deltas_us.len() == sample_ids.len() {
+        profile.time_deltas_us.clone()
+    } else {
+        vec![1; sample_ids.len()]
+    };
+    let end_time = time_deltas.iter().copied().sum::<u64>();
+    let payload = serde_json::json!({
+        "nodes": node_json,
+        "startTime": 0,
+        "endTime": end_time,
+        "samples": sample_ids,
+        "timeDeltas": time_deltas,
+    });
+    let file = std::fs::File::create(path).map_err(|err| pm_io_error(path, err))?;
+    serde_json::to_writer_pretty(file, &payload).map_err(|err| OtterError::Internal {
+        code: DiagnosticCode::DumpJson.as_str().to_string(),
+        message: err.to_string(),
+    })
+}
+
+fn write_folded_cpu_profile(
+    path: &Path,
+    profile: &otter_runtime::CpuProfile,
+) -> Result<(), OtterError> {
+    let mut folded: BTreeMap<String, u64> = BTreeMap::new();
+    for sample in &profile.samples {
+        let stack = if sample.is_empty() {
+            "(idle)".to_string()
+        } else {
+            sample
+                .iter()
+                .rev()
+                .map(|frame| folded_frame_name(&frame.function_name, &frame.module))
+                .collect::<Vec<_>>()
+                .join(";")
+        };
+        *folded.entry(stack).or_insert(0) += 1;
+    }
+    let mut out = std::fs::File::create(path).map_err(|err| pm_io_error(path, err))?;
+    for (stack, count) in folded {
+        writeln!(out, "{stack} {count}").map_err(|err| pm_io_error(path, err))?;
+    }
+    Ok(())
+}
+
+fn folded_frame_name(function_name: &str, module: &str) -> String {
+    let mut name = function_name.replace(';', "\\;");
+    if !module.is_empty() {
+        name.push_str(" [");
+        name.push_str(&module.replace(';', "\\;"));
+        name.push(']');
+    }
+    name
 }
 
 fn emit_otter_stats_if_requested(result: &otter_runtime::ExecutionResult) {
@@ -664,9 +942,23 @@ async fn run_target(
 ) -> Result<ExitCode, OtterError> {
     let project_root = std::env::current_dir().map_err(|err| pm_config_error(err.to_string()))?;
     let target_args = args.args.clone();
+    let cpu_profile = args.cpu_prof.then(|| CpuProfileOptions {
+        dir: args.cpu_prof_dir.clone(),
+        interval: args.cpu_prof_interval,
+        name: args.cpu_prof_name.clone(),
+    });
     match resolve_run_target(&project_root, &args).await? {
         RunTarget::File(path) => {
-            run_file(&path, &target_args, json, dump_mode, caps, startup_timer).await
+            run_file(
+                &path,
+                &target_args,
+                json,
+                dump_mode,
+                caps,
+                startup_timer,
+                cpu_profile.as_ref(),
+            )
+            .await
         }
         RunTarget::Script {
             project_root,
@@ -685,6 +977,7 @@ async fn run_target(
                 json,
                 caps,
                 startup_timer,
+                cpu_profile.as_ref(),
             )
             .await
         }
@@ -696,6 +989,7 @@ async fn run_target(
                 dump_mode,
                 caps,
                 startup_timer,
+                cpu_profile.as_ref(),
             )
             .await
         }
@@ -854,6 +1148,7 @@ async fn run_package_script(
     json: bool,
     caps: &CapabilitySet,
     startup_timer: &CliStartupTimer,
+    cpu_profile: Option<&CpuProfileOptions>,
 ) -> Result<ExitCode, OtterError> {
     let invocation = resolve_package_script_invocation(project_root, command, args).await?;
     run_file_with_cwd(
@@ -864,6 +1159,7 @@ async fn run_package_script(
         None,
         caps,
         startup_timer,
+        cpu_profile,
     )
     .await
 }
@@ -2298,6 +2594,10 @@ integrity = "sha512-test"
             target: tmp.path().join("task.ts").to_string_lossy().to_string(),
             script: false,
             bin: false,
+            cpu_prof: false,
+            cpu_prof_dir: PathBuf::from("/tmp/otter-prof"),
+            cpu_prof_interval: 1000,
+            cpu_prof_name: None,
             args: Vec::new(),
         };
         assert!(matches!(
@@ -2332,6 +2632,10 @@ integrity = "sha512-test"
             target: "tool".to_string(),
             script: false,
             bin: false,
+            cpu_prof: false,
+            cpu_prof_dir: PathBuf::from("/tmp/otter-prof"),
+            cpu_prof_interval: 1000,
+            cpu_prof_name: None,
             args: Vec::new(),
         };
         let err = resolve_run_target(tmp.path(), &args).await.unwrap_err();
@@ -2363,6 +2667,10 @@ integrity = "sha512-test"
             target: "tool".to_string(),
             script: false,
             bin: true,
+            cpu_prof: false,
+            cpu_prof_dir: PathBuf::from("/tmp/otter-prof"),
+            cpu_prof_interval: 1000,
+            cpu_prof_name: None,
             args: Vec::new(),
         };
         let resolved = resolve_run_target(tmp.path(), &args).await.unwrap();
@@ -2419,6 +2727,10 @@ trust = "untrusted"
             target: "tool".to_string(),
             script: false,
             bin: true,
+            cpu_prof: false,
+            cpu_prof_dir: PathBuf::from("/tmp/otter-prof"),
+            cpu_prof_interval: 1000,
+            cpu_prof_name: None,
             args: Vec::new(),
         };
         let resolved = resolve_run_target(tmp.path(), &args).await.unwrap();
@@ -2500,6 +2812,7 @@ if (value !== 53) fail();
             None,
             &CapabilitySet::default(),
             &startup_timer,
+            None,
         )
         .await
         .unwrap();
@@ -2529,6 +2842,7 @@ if (process.argv[3] !== "two words") throw new Error("missing second arg");
             None,
             &CapabilitySet::default(),
             &startup_timer,
+            None,
         )
         .await
         .unwrap();
@@ -2551,6 +2865,7 @@ if (process.argv[3] !== "two words") throw new Error("missing second arg");
             None,
             &CapabilitySet::default(),
             &startup_timer,
+            None,
         )
         .await
         .unwrap();
@@ -2595,6 +2910,7 @@ if (process.argv[3] !== "from-cli") fail();
             false,
             &CapabilitySet::default(),
             &startup_timer,
+            None,
         )
         .await
         .unwrap();
@@ -2641,6 +2957,7 @@ if (process.argv[3] !== "from-cli") fail();
             false,
             &CapabilitySet::default(),
             &startup_timer,
+            None,
         )
         .await
         .unwrap();
@@ -2661,6 +2978,7 @@ if (process.argv[3] !== "from-cli") fail();
             false,
             &CapabilitySet::default(),
             &CliStartupTimer::from_env(),
+            None,
         )
         .await
         .unwrap_err();
@@ -3270,6 +3588,10 @@ trust = "untrusted"
             target: "fixture-tool".to_string(),
             script: false,
             bin: true,
+            cpu_prof: false,
+            cpu_prof_dir: PathBuf::from("/tmp/otter-prof"),
+            cpu_prof_interval: 1000,
+            cpu_prof_name: None,
             args: Vec::new(),
         };
         let resolved = resolve_run_target(&root, &args).await.unwrap();
@@ -3393,6 +3715,7 @@ trust = "untrusted"
             None,
             &CapabilitySet::default(),
             &startup_timer,
+            None,
         )
         .await
         .unwrap_err();

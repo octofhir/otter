@@ -54,6 +54,7 @@ pub mod collections_prototype;
 pub mod console;
 mod constant_ops;
 mod conversion;
+mod cpu_profile;
 pub mod date;
 pub mod eval_env;
 // `date` is a directory module — see `date/mod.rs`.
@@ -143,6 +144,7 @@ mod gc_invariants;
 #[cfg(test)]
 mod test_support;
 
+pub use cpu_profile::CpuProfile;
 pub use execution_context::ExecutionContext;
 pub use frame_state::{
     AsyncFrameState, Frame, PendingBindFunction, PendingBindStage, PendingGetIterator,
@@ -813,6 +815,9 @@ pub struct Interpreter {
     /// branches around the observer with no further work. See
     /// [`crate::inspect`] for the format contract.
     tracer: Option<Box<dyn inspect::StepTracer>>,
+    /// Optional VM stack sampler used by CLI/debug tooling to emit Chrome
+    /// `.cpuprofile` and folded-stack artifacts.
+    cpu_profiler: Option<cpu_profile::CpuProfiler>,
 }
 
 impl std::fmt::Debug for Interpreter {
@@ -1306,6 +1311,7 @@ impl Interpreter {
             realm_intrinsics: realm_intrinsics::RealmIntrinsics::default(),
             regex_compile_cache: regexp::RegexCompileCache::default(),
             tracer: None,
+            cpu_profiler: None,
         };
         // Cache typed handles for the well-known constructors and
         // prototypes. Subsequent runtime lookups read the slots and
@@ -3768,6 +3774,24 @@ impl Interpreter {
         self.tracer = tracer;
     }
 
+    /// Enable the VM stack profiler, sampling every `interval` bytecode ticks.
+    pub fn enable_cpu_profiler(&mut self, interval: u64) {
+        self.cpu_profiler = Some(cpu_profile::CpuProfiler::new(interval));
+    }
+
+    /// Disable the VM stack profiler without returning its samples.
+    pub fn disable_cpu_profiler(&mut self) {
+        self.cpu_profiler = None;
+    }
+
+    /// Take and clear the current CPU profile, if profiling was enabled.
+    #[must_use]
+    pub fn take_cpu_profile(&mut self) -> Option<CpuProfile> {
+        self.cpu_profiler
+            .take()
+            .map(cpu_profile::CpuProfiler::finish)
+    }
+
     /// Whether a step tracer is installed.
     #[must_use]
     pub fn has_tracer(&self) -> bool {
@@ -5754,6 +5778,10 @@ impl Interpreter {
             }
             if enforce_budget {
                 self.enforce_runtime_budget_checkpoint()?;
+            }
+
+            if let Some(profiler) = self.cpu_profiler.as_mut() {
+                profiler.maybe_sample(context, stack);
             }
 
             // Step-trace hook. The hot path checks one `Option` slot
@@ -14069,8 +14097,6 @@ mod tests {
         let mut stack: HoltStack = HoltStack::new();
         stack.push(Frame::for_function(&module.functions[0]));
         let context = ExecutionContext::from_module(module.clone());
-        // Reserve a scratch slot in <main> to receive the result.
-        stack[0].registers.push(Value::undefined());
         // Caller-supplied this is `Null` — the closure must override.
         interp
             .invoke(
@@ -14238,6 +14264,7 @@ mod tests {
                     load_array_length: false,
                     load_number: None,
                     arith_feedback: 0,
+                    property_feedback: None,
                 })
                 .collect(),
             inline_callees: rustc_hash::FxHashMap::default(),

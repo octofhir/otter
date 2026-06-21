@@ -58,6 +58,13 @@ enum SortComparatorFastPath {
     NumericSub,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ArrayCallbackFastPath {
+    MapMulAdd { mul: f64, add: f64 },
+    FilterRemEqZero { divisor: f64 },
+    ReduceAdd,
+}
+
 fn is_numeric_sub_sort_comparator_function(
     context: &ExecutionContext,
     function: &crate::executable::ExecutableFunction,
@@ -117,6 +124,215 @@ fn is_numeric_sub_sort_comparator_function(
         && context.exec_register(&code[8], 1) == lhs_num
         && context.exec_register(&code[8], 2) == rhs_num
         && context.exec_register(&code[9], 0) == sub_dst
+}
+
+fn array_callback_function_id(heap: &otter_gc::GcHeap, callback: Value) -> Option<u32> {
+    callback.as_function().or_else(|| {
+        callback
+            .as_closure(heap)
+            .map(|closure| closure.function_id())
+    })
+}
+
+fn array_callback_fast_path(
+    context: &ExecutionContext,
+    heap: &otter_gc::GcHeap,
+    kind: ArrayCallbackKind,
+    callback: Value,
+) -> Option<ArrayCallbackFastPath> {
+    let function_id = array_callback_function_id(heap, callback)?;
+    let function = context.exec_function(function_id)?;
+    if function.has_rest
+        || function.needs_arguments
+        || function.is_async
+        || function.is_generator
+        || function.is_async_generator
+        || function.contains_direct_eval
+    {
+        return None;
+    }
+    match kind {
+        ArrayCallbackKind::Map => match_map_mul_add_callback(context, function),
+        ArrayCallbackKind::Filter => match_filter_rem_eq_zero_callback(context, function),
+        ArrayCallbackKind::Reduce | ArrayCallbackKind::ReduceRight => {
+            match_reduce_add_callback(context, function)
+        }
+        _ => None,
+    }
+}
+
+fn match_map_mul_add_callback(
+    context: &ExecutionContext,
+    function: &crate::executable::ExecutableFunction,
+) -> Option<ArrayCallbackFastPath> {
+    if function.param_count != 1 || function.code.len() != 9 {
+        return None;
+    }
+    let code = &function.code;
+    if code[0].op() != Op::StoreLocal
+        || code[1].op() != Op::LoadLocal
+        || code[2].op() != Op::LoadInt32
+        || code[3].op() != Op::ToPrimitive
+        || code[4].op() != Op::ToNumeric
+        || code[5].op() != Op::Mul
+        || code[6].op() != Op::LoadInt32
+        || code[7].op() != Op::Add
+        || code[8].op() != Op::ReturnValue
+    {
+        return None;
+    }
+    let local = context.exec_imm32(&code[0], 1)?;
+    if context.exec_register(&code[0], 0) != Some(0)
+        || context.exec_imm32(&code[1], 1) != Some(local)
+    {
+        return None;
+    }
+    let loaded = context.exec_register(&code[1], 0)?;
+    let mul_const = context.exec_register(&code[2], 0)?;
+    let primitive = context.exec_register(&code[3], 0)?;
+    let numeric = context.exec_register(&code[4], 0)?;
+    let mul_dst = context.exec_register(&code[5], 0)?;
+    let add_const = context.exec_register(&code[6], 0)?;
+    let add_dst = context.exec_register(&code[7], 0)?;
+    if context.exec_register(&code[3], 1) == Some(loaded)
+        && context.exec_register(&code[4], 1) == Some(primitive)
+        && context.exec_register(&code[5], 1) == Some(numeric)
+        && context.exec_register(&code[5], 2) == Some(mul_const)
+        && context.exec_register(&code[7], 1) == Some(mul_dst)
+        && context.exec_register(&code[7], 2) == Some(add_const)
+        && context.exec_register(&code[8], 0) == Some(add_dst)
+    {
+        Some(ArrayCallbackFastPath::MapMulAdd {
+            mul: f64::from(context.exec_imm32(&code[2], 1)?),
+            add: f64::from(context.exec_imm32(&code[6], 1)?),
+        })
+    } else {
+        None
+    }
+}
+
+fn match_filter_rem_eq_zero_callback(
+    context: &ExecutionContext,
+    function: &crate::executable::ExecutableFunction,
+) -> Option<ArrayCallbackFastPath> {
+    if function.param_count != 1 || function.code.len() != 9 {
+        return None;
+    }
+    let code = &function.code;
+    if code[0].op() != Op::StoreLocal
+        || code[1].op() != Op::LoadLocal
+        || code[2].op() != Op::LoadInt32
+        || code[3].op() != Op::ToPrimitive
+        || code[4].op() != Op::ToNumeric
+        || code[5].op() != Op::Rem
+        || code[6].op() != Op::LoadInt32
+        || code[7].op() != Op::Equal
+        || code[8].op() != Op::ReturnValue
+    {
+        return None;
+    }
+    let local = context.exec_imm32(&code[0], 1)?;
+    if context.exec_register(&code[0], 0) != Some(0)
+        || context.exec_imm32(&code[1], 1) != Some(local)
+    {
+        return None;
+    }
+    let loaded = context.exec_register(&code[1], 0)?;
+    let divisor_reg = context.exec_register(&code[2], 0)?;
+    let primitive = context.exec_register(&code[3], 0)?;
+    let numeric = context.exec_register(&code[4], 0)?;
+    let rem_dst = context.exec_register(&code[5], 0)?;
+    let zero_reg = context.exec_register(&code[6], 0)?;
+    let eq_dst = context.exec_register(&code[7], 0)?;
+    if context.exec_register(&code[3], 1) == Some(loaded)
+        && context.exec_register(&code[4], 1) == Some(primitive)
+        && context.exec_register(&code[5], 1) == Some(numeric)
+        && context.exec_register(&code[5], 2) == Some(divisor_reg)
+        && context.exec_imm32(&code[6], 1) == Some(0)
+        && context.exec_register(&code[7], 1) == Some(rem_dst)
+        && context.exec_register(&code[7], 2) == Some(zero_reg)
+        && context.exec_register(&code[8], 0) == Some(eq_dst)
+    {
+        Some(ArrayCallbackFastPath::FilterRemEqZero {
+            divisor: f64::from(context.exec_imm32(&code[2], 1)?),
+        })
+    } else {
+        None
+    }
+}
+
+fn match_reduce_add_callback(
+    context: &ExecutionContext,
+    function: &crate::executable::ExecutableFunction,
+) -> Option<ArrayCallbackFastPath> {
+    if function.param_count != 2 || function.code.len() != 8 {
+        return None;
+    }
+    let code = &function.code;
+    if code[0].op() != Op::StoreLocal
+        || code[1].op() != Op::StoreLocal
+        || code[2].op() != Op::LoadLocal
+        || code[3].op() != Op::LoadLocal
+        || code[4].op() != Op::ToPrimitive
+        || code[5].op() != Op::ToPrimitive
+        || code[6].op() != Op::Add
+        || code[7].op() != Op::ReturnValue
+    {
+        return None;
+    }
+    let lhs_local = context.exec_imm32(&code[0], 1)?;
+    let rhs_local = context.exec_imm32(&code[1], 1)?;
+    let lhs_loaded = context.exec_register(&code[2], 0)?;
+    let rhs_loaded = context.exec_register(&code[3], 0)?;
+    let lhs_prim = context.exec_register(&code[4], 0)?;
+    let rhs_prim = context.exec_register(&code[5], 0)?;
+    let add_dst = context.exec_register(&code[6], 0)?;
+    if context.exec_register(&code[0], 0) == Some(0)
+        && context.exec_register(&code[1], 0) == Some(1)
+        && context.exec_imm32(&code[2], 1) == Some(lhs_local)
+        && context.exec_imm32(&code[3], 1) == Some(rhs_local)
+        && lhs_local != rhs_local
+        && context.exec_register(&code[4], 1) == Some(lhs_loaded)
+        && context.exec_register(&code[5], 1) == Some(rhs_loaded)
+        && context.exec_register(&code[6], 1) == Some(lhs_prim)
+        && context.exec_register(&code[6], 2) == Some(rhs_prim)
+        && context.exec_register(&code[7], 0) == Some(add_dst)
+    {
+        Some(ArrayCallbackFastPath::ReduceAdd)
+    } else {
+        None
+    }
+}
+
+fn execute_array_callback_fast_path(
+    fast_path: Option<ArrayCallbackFastPath>,
+    kind: ArrayCallbackKind,
+    reduce_kind: bool,
+    acc: Value,
+    value: Value,
+) -> Option<Value> {
+    match fast_path {
+        Some(ArrayCallbackFastPath::MapMulAdd { mul, add }) if kind == ArrayCallbackKind::Map => {
+            value
+                .as_f64()
+                .map(|value| Value::number_f64(value * mul + add))
+        }
+        Some(ArrayCallbackFastPath::FilterRemEqZero { divisor })
+            if kind == ArrayCallbackKind::Filter =>
+        {
+            value.as_f64().map(|value| {
+                let rem = value % divisor;
+                Value::boolean(!rem.is_nan() && rem == 0.0)
+            })
+        }
+        Some(ArrayCallbackFastPath::ReduceAdd) if reduce_kind => {
+            match (acc.as_f64(), value.as_f64()) {
+                (Some(acc), Some(value)) => Some(Value::number_f64(acc + value)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Static `Array.prototype` method specs.
@@ -3084,6 +3300,7 @@ pub(crate) fn array_callback_native_dispatch(
     } else {
         this_arg
     };
+    let callback_fast_path = array_callback_fast_path(&context, interp.gc_heap(), kind, callback);
     // String-exotic wrappers expose their code-unit indices through
     // `[[StringData]]`, which the ordinary `[[HasProperty]]` ladder may
     // not surface — resolve those directly.
@@ -3308,33 +3525,43 @@ pub(crate) fn array_callback_native_dispatch(
             // already live. Use the already-rooted re-entry to drop a redundant
             // `ExtraRoots` Vec push/truncate per element (the duplicate the
             // heap's `same_source` walk would skip anyway).
-            let cb_result = match lean_inner {
-                Some(ref mut state) => {
-                    if reduce_kind {
-                        let acc_now = interp.iteration_anchor(anchor_base + A_ACC);
-                        interp.run_bytecode_callable_committed_lean_args(
-                            state,
-                            &context,
-                            cb_this,
-                            &[acc_now, v, Value::number_f64(idx as f64), receiver],
-                        )
-                    } else {
-                        interp.run_bytecode_callable_committed_lean_args(
-                            state,
-                            &context,
-                            cb_this,
-                            &[v, Value::number_f64(idx as f64), receiver],
-                        )
+            let acc_now = if reduce_kind {
+                interp.iteration_anchor(anchor_base + A_ACC)
+            } else {
+                Value::undefined()
+            };
+            let cb_result = if let Some(result) =
+                execute_array_callback_fast_path(callback_fast_path, kind, reduce_kind, acc_now, v)
+            {
+                Ok(result)
+            } else {
+                match lean_inner {
+                    Some(ref mut state) => {
+                        if reduce_kind {
+                            interp.run_bytecode_callable_committed_lean_args(
+                                state,
+                                &context,
+                                cb_this,
+                                &[acc_now, v, Value::number_f64(idx as f64), receiver],
+                            )
+                        } else {
+                            interp.run_bytecode_callable_committed_lean_args(
+                                state,
+                                &context,
+                                cb_this,
+                                &[v, Value::number_f64(idx as f64), receiver],
+                            )
+                        }
                     }
-                }
-                None => {
-                    let cb_args: SmallVec<[Value; 8]> = if reduce_kind {
-                        let acc_now = interp.iteration_anchor(anchor_base + A_ACC);
-                        smallvec::smallvec![acc_now, v, Value::number_f64(idx as f64), receiver,]
-                    } else {
-                        smallvec::smallvec![v, Value::number_f64(idx as f64), receiver,]
-                    };
-                    interp.run_callable_sync_already_rooted(&context, &callback, cb_this, cb_args)
+                    None => {
+                        let cb_args: SmallVec<[Value; 8]> = if reduce_kind {
+                            smallvec::smallvec![acc_now, v, Value::number_f64(idx as f64), receiver,]
+                        } else {
+                            smallvec::smallvec![v, Value::number_f64(idx as f64), receiver,]
+                        };
+                        interp
+                            .run_callable_sync_already_rooted(&context, &callback, cb_this, cb_args)
+                    }
                 }
             };
             let result = cb_result.map_err(|err| {
@@ -3583,6 +3810,234 @@ mod tests {
         }
     }
 
+    fn callback_function(
+        name: &str,
+        param_count: u16,
+        scratch: u16,
+        code: Vec<Instruction>,
+    ) -> Function {
+        let spans = code
+            .iter()
+            .map(|instruction| SpanEntry {
+                pc: instruction.pc,
+                span: (0, 0),
+            })
+            .collect();
+        Function {
+            id: 0,
+            name: name.to_string(),
+            span: (0, 0),
+            locals: 0,
+            scratch,
+            param_count,
+            length: param_count,
+            own_upvalue_count: 0,
+            is_strict: false,
+            is_arrow: true,
+            is_method: false,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_async_generator: false,
+            is_derived_constructor: false,
+            is_module: false,
+            needs_arguments: false,
+            arguments_object_kind: ArgumentsObjectKind::Unmapped,
+            mapped_argument_bindings: Vec::new(),
+            source_text: None,
+            source_text_span: None,
+            module_url: String::new(),
+            direct_eval_bindings: Vec::new(),
+            contains_direct_eval: false,
+            code,
+            spans,
+        }
+    }
+
+    fn map_mul_add_function(final_op: Op) -> Function {
+        callback_function(
+            "<map-callback>",
+            1,
+            8,
+            vec![
+                instr(
+                    0,
+                    Op::StoreLocal,
+                    vec![Operand::Register(0), Operand::Imm32(2)],
+                ),
+                instr(
+                    1,
+                    Op::LoadLocal,
+                    vec![Operand::Register(1), Operand::Imm32(2)],
+                ),
+                instr(
+                    2,
+                    Op::LoadInt32,
+                    vec![Operand::Register(2), Operand::Imm32(2)],
+                ),
+                instr(
+                    3,
+                    Op::ToPrimitive,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(1),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                instr(
+                    4,
+                    Op::ToNumeric,
+                    vec![Operand::Register(4), Operand::Register(3)],
+                ),
+                instr(
+                    5,
+                    Op::Mul,
+                    vec![
+                        Operand::Register(5),
+                        Operand::Register(4),
+                        Operand::Register(2),
+                    ],
+                ),
+                instr(
+                    6,
+                    Op::LoadInt32,
+                    vec![Operand::Register(6), Operand::Imm32(1)],
+                ),
+                instr(
+                    7,
+                    final_op,
+                    vec![
+                        Operand::Register(7),
+                        Operand::Register(5),
+                        Operand::Register(6),
+                    ],
+                ),
+                instr(8, Op::ReturnValue, vec![Operand::Register(7)]),
+            ],
+        )
+    }
+
+    fn filter_rem_eq_zero_function(compare_op: Op) -> Function {
+        callback_function(
+            "<filter-callback>",
+            1,
+            8,
+            vec![
+                instr(
+                    0,
+                    Op::StoreLocal,
+                    vec![Operand::Register(0), Operand::Imm32(2)],
+                ),
+                instr(
+                    1,
+                    Op::LoadLocal,
+                    vec![Operand::Register(1), Operand::Imm32(2)],
+                ),
+                instr(
+                    2,
+                    Op::LoadInt32,
+                    vec![Operand::Register(2), Operand::Imm32(3)],
+                ),
+                instr(
+                    3,
+                    Op::ToPrimitive,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(1),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                instr(
+                    4,
+                    Op::ToNumeric,
+                    vec![Operand::Register(4), Operand::Register(3)],
+                ),
+                instr(
+                    5,
+                    Op::Rem,
+                    vec![
+                        Operand::Register(5),
+                        Operand::Register(4),
+                        Operand::Register(2),
+                    ],
+                ),
+                instr(
+                    6,
+                    Op::LoadInt32,
+                    vec![Operand::Register(6), Operand::Imm32(0)],
+                ),
+                instr(
+                    7,
+                    compare_op,
+                    vec![
+                        Operand::Register(7),
+                        Operand::Register(5),
+                        Operand::Register(6),
+                    ],
+                ),
+                instr(8, Op::ReturnValue, vec![Operand::Register(7)]),
+            ],
+        )
+    }
+
+    fn reduce_add_function(op: Op) -> Function {
+        callback_function(
+            "<reduce-callback>",
+            2,
+            7,
+            vec![
+                instr(
+                    0,
+                    Op::StoreLocal,
+                    vec![Operand::Register(0), Operand::Imm32(2)],
+                ),
+                instr(
+                    1,
+                    Op::StoreLocal,
+                    vec![Operand::Register(1), Operand::Imm32(3)],
+                ),
+                instr(
+                    2,
+                    Op::LoadLocal,
+                    vec![Operand::Register(2), Operand::Imm32(2)],
+                ),
+                instr(
+                    3,
+                    Op::LoadLocal,
+                    vec![Operand::Register(3), Operand::Imm32(3)],
+                ),
+                instr(
+                    4,
+                    Op::ToPrimitive,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(2),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                instr(
+                    5,
+                    Op::ToPrimitive,
+                    vec![
+                        Operand::Register(5),
+                        Operand::Register(3),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                instr(
+                    6,
+                    op,
+                    vec![
+                        Operand::Register(6),
+                        Operand::Register(4),
+                        Operand::Register(5),
+                    ],
+                ),
+                instr(7, Op::ReturnValue, vec![Operand::Register(6)]),
+            ],
+        )
+    }
+
     fn instr(pc: u32, op: Op, operands: Vec<Operand>) -> Instruction {
         Instruction {
             pc,
@@ -3617,5 +4072,62 @@ mod tests {
         let function = context.exec_function(0).expect("test function");
 
         assert!(!is_numeric_sub_sort_comparator_function(&context, function));
+    }
+
+    #[test]
+    fn recognizes_numeric_map_callback_shape() {
+        let context = context_for(map_mul_add_function(Op::Add));
+        let function = context.exec_function(0).expect("test function");
+
+        assert_eq!(
+            match_map_mul_add_callback(&context, function),
+            Some(ArrayCallbackFastPath::MapMulAdd { mul: 2.0, add: 1.0 })
+        );
+    }
+
+    #[test]
+    fn rejects_non_add_map_callback_shape() {
+        let context = context_for(map_mul_add_function(Op::Sub));
+        let function = context.exec_function(0).expect("test function");
+
+        assert_eq!(match_map_mul_add_callback(&context, function), None);
+    }
+
+    #[test]
+    fn recognizes_numeric_filter_callback_shape() {
+        let context = context_for(filter_rem_eq_zero_function(Op::Equal));
+        let function = context.exec_function(0).expect("test function");
+
+        assert_eq!(
+            match_filter_rem_eq_zero_callback(&context, function),
+            Some(ArrayCallbackFastPath::FilterRemEqZero { divisor: 3.0 })
+        );
+    }
+
+    #[test]
+    fn rejects_non_equal_filter_callback_shape() {
+        let context = context_for(filter_rem_eq_zero_function(Op::NotEqual));
+        let function = context.exec_function(0).expect("test function");
+
+        assert_eq!(match_filter_rem_eq_zero_callback(&context, function), None);
+    }
+
+    #[test]
+    fn recognizes_numeric_reduce_callback_shape() {
+        let context = context_for(reduce_add_function(Op::Add));
+        let function = context.exec_function(0).expect("test function");
+
+        assert_eq!(
+            match_reduce_add_callback(&context, function),
+            Some(ArrayCallbackFastPath::ReduceAdd)
+        );
+    }
+
+    #[test]
+    fn rejects_non_add_reduce_callback_shape() {
+        let context = context_for(reduce_add_function(Op::Sub));
+        let function = context.exec_function(0).expect("test function");
+
+        assert_eq!(match_reduce_add_callback(&context, function), None);
     }
 }

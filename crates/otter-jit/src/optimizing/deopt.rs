@@ -445,6 +445,40 @@ pub fn capture_osr_entries(
     let mut exit_env: Vec<Option<Vec<Option<NodeId>>>> = vec![None; graph.blocks.len()];
     let mut entries: Vec<OsrEntry> = Vec::new();
 
+    // Loop headers and their back-edge spans `[header_pc, backedge_source_pc]`. A
+    // header is the target of a backward branch; its back-edge source is the
+    // latest-starting predecessor that branches back to it.
+    let headers: Vec<(BlockId, u32, u32)> = graph
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(b, block)| {
+            let hpc = block.start_pc;
+            block
+                .preds
+                .iter()
+                .map(|&p| graph.block(p).start_pc)
+                .filter(|&pc| pc > hpc)
+                .max()
+                .map(|bsrc| (b as BlockId, hpc, bsrc))
+        })
+        .collect();
+    // Only OSR the outermost loop of a nest. Entering an inner loop mid-nest
+    // re-derives the enclosing loops' induction state in ways that are subtle to
+    // get right; entering the outermost header runs the whole (entry-tier-correct)
+    // nest compiled. The interpreter's backedge counter fires on the outer header
+    // too — just later — so the hot nest still tiers up. A header is outermost
+    // when no other header's span strictly encloses its own.
+    let outermost: FxHashSet<BlockId> = headers
+        .iter()
+        .filter(|&&(b, hpc, bsrc)| {
+            !headers.iter().any(|&(b2, hpc2, bsrc2)| {
+                b2 != b && hpc2 <= hpc && bsrc2 >= bsrc && (hpc2 < hpc || bsrc2 > bsrc)
+            })
+        })
+        .map(|&(b, _, _)| b)
+        .collect();
+
     for &b in &rpo {
         let block = graph.block(b);
         let mut env: Vec<Option<NodeId>> = if b == graph.entry {
@@ -470,11 +504,7 @@ pub fn capture_osr_entries(
         // A loop header is the target of a back edge: a predecessor whose block
         // begins later in the bytecode (the block that ends in the backward
         // branch). The interpreter's backedge counter fires at exactly this pc.
-        let is_loop_header = block
-            .preds
-            .iter()
-            .any(|&p| graph.block(p).start_pc > block.start_pc);
-        if is_loop_header {
+        if outermost.contains(&b) {
             let pc = block.start_pc;
             let mut registers: Vec<(u16, NodeId)> = Vec::new();
             if let Some(live) = bytecode_live.get(&pc) {

@@ -568,16 +568,29 @@ mod arm64 {
                 } => {
                     let cloc = require_loc(alloc, *cond)?;
                     load_loc(&mut ops, BOX_SCRATCH, cloc);
-                    // The cond is an unboxed Bool (0/1). Test it; route each edge
-                    // through its own moves. The false setup is a cold trampoline
-                    // so the true edge's moves can fall straight through.
                     let false_setup = ops.new_dynamic_label();
                     let true_moves = edge_moves_for(b, *on_true);
                     let false_moves = edge_moves_for(b, *on_false);
-                    dynasm!(&mut ops
-                        ; .arch aarch64
-                        ; cbz W(BOX_SCRATCH), =>false_setup
-                    );
+                    // An unboxed `Bool` cond is 0/1 → `cbz`. A `Tagged` cond is a
+                    // boxed boolean (a comparison result merged through a phi for
+                    // `&&` / `||` / a ternary): boxed false is
+                    // `TAG_SPECIAL<<48 | SPECIAL_FALSE`, so compare against it.
+                    // `JumpIf*` operands are always boolean — the bytecode compiler
+                    // emits an explicit truthiness test for non-boolean conditions.
+                    if graph.node(*cond).repr == Repr::Bool {
+                        dynasm!(&mut ops ; .arch aarch64 ; cbz W(BOX_SCRATCH), =>false_setup);
+                    } else {
+                        emit_load_u64(
+                            &mut ops,
+                            MOVE_SCRATCH,
+                            (TAG_SPECIAL << 48) | SPECIAL_FALSE as u64,
+                        );
+                        dynasm!(&mut ops
+                            ; .arch aarch64
+                            ; cmp X(BOX_SCRATCH), X(MOVE_SCRATCH)
+                            ; b.eq =>false_setup
+                        );
+                    }
                     // cond != 0 → true edge. The false trampoline is emitted
                     // immediately after, so the true edge always needs an
                     // explicit branch (it can never fall through). `cond` was
@@ -614,19 +627,42 @@ mod arm64 {
         // entry and the interpreter).
         let mut osr_offsets: rustc_hash::FxHashMap<u32, usize> = rustc_hash::FxHashMap::default();
         for osr in osr_entries {
-            let eligible = osr.registers.iter().all(|(_, v)| {
-                !alloc.location.contains_key(v) || graph.node(*v).kind.repr() == Repr::Tagged
+            if osr.registers.iter().any(|(_, v)| {
+                alloc.location.contains_key(v) && graph.node(*v).kind.repr() != Repr::Tagged
+            }) {
+                continue;
+            }
+            // Build the reload set: each register's header value that the header
+            // actually reads — its own phis (loop-carried; defined at the header,
+            // so absent from live-in) and the live-in invariants. Then require
+            // pairwise-distinct homes: if two reloads target the same home (an
+            // env/allocation node mismatch), one would clobber the other, so skip
+            // the whole header rather than corrupt the frame. Correctness over
+            // coverage — an un-OSR'd header still runs in the interpreter, and an
+            // enclosing loop's header (cleaner set) can still tier up.
+            let phis = &graph.block(osr.block).phis;
+            let live_in = &liveness.live_in[osr.block as usize];
+            let mut reloads: Vec<(u16, Location)> = Vec::new();
+            for &(r, v) in &osr.registers {
+                if !phis.contains(&v) && !live_in.contains(&v) {
+                    continue;
+                }
+                if let Some(&home) = alloc.location.get(&v) {
+                    reloads.push((r, home));
+                }
+            }
+            let mut homes: Vec<Location> = reloads.iter().map(|&(_, h)| h).collect();
+            homes.sort_unstable_by_key(|h| match h {
+                Location::Reg(i) => (0u8, *i),
+                Location::Spill(i) => (1u8, *i),
             });
-            if !eligible {
+            if homes.windows(2).any(|w| w[0] == w[1]) {
                 continue;
             }
             let off = ops.offset();
             emit_prologue(&mut ops, spill_bytes);
-            for &(r, v) in &osr.registers {
-                let Some(&home) = alloc.location.get(&v) else {
-                    continue;
-                };
-                let src_off = (r as u32) * 8;
+            for (r, home) in reloads {
+                let src_off = u32::from(r) * 8;
                 dynasm!(&mut ops ; .arch aarch64 ; ldr X(BOX_SCRATCH), [x19, src_off]);
                 store_loc(&mut ops, home, BOX_SCRATCH);
             }

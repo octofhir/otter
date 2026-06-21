@@ -27,6 +27,21 @@ Fresh release binary: `target/release/otter`.
 Output parity across `benchmarks/scripts/*.js` passed after the latest JIT
 commits. GC-stress smoke passed for `fib`, `prop-access`, and `nbody`.
 
+## Architecture Scope
+
+The active measurements are arm64-focused because the current Tier1 backend is
+hand-emitted arm64 dynasm. Multi-architecture support is still mandatory:
+
+- Cranelift is the planned post-Tier1 backend for portable Tier2/DeepDive
+  codegen.
+- Required targets remain aarch64 and x86_64; Windows x86_64 is tracked under
+  release hardening once the portable backend is integrated.
+- Future progress entries must state whether a JIT slice is arm64-only,
+  Cranelift-portable, or runtime-only.
+- Node/V8 is the reference point for architecture coverage, tiering behavior,
+  deopt/safepoint practice, and release gates. Do not copy names; do compare
+  mechanics and verification standards.
+
 ## Remaining Queue
 
 ### Open 1: callback-heavy builtins
@@ -124,3 +139,4 @@ Risk:
 - Adding feature flags or env kill-switches.
 - Landing benchmark-fit shortcuts that bypass object, callback, GC, string,
   JSON, or RegExp semantics.
+- Treating arm64-only dynasm as the final architecture story.

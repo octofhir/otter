@@ -207,6 +207,12 @@ DeepDive work:
 Cranelift integration is therefore a post-Tier1 backend slice, not a shortcut
 around current exact-deopt, GC, IC, or builtin correctness work.
 
+Node/V8 is the primary external reference for this backend work: architecture
+coverage, tier transitions, deopt metadata, safepoint discipline, IC dependency
+tracking, and release gating should be compared against how V8 ships through
+Node. The comparison is technical guidance only; Otter keeps its own naming,
+bytecode, GC, frame-state, and capability model.
+
 ### DeepDiveJIT: peak optimizer
 
 DeepDiveJIT is the later peak tier. It is not a Tier1 task, but it remains part

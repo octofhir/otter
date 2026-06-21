@@ -30,6 +30,27 @@ Numeric opt-JIT and OSR are no longer the Tier1 blocker. The remaining Tier1
 work is concentrated in builtin/runtime call surfaces and residual object /
 callback overhead.
 
+## Architecture Scope
+
+Current Tier1 measurements and hand-emitted machine code are focused on arm64.
+That is a sequencing choice, not a product constraint. Otter must support the
+required deployment architectures after Tier1:
+
+- aarch64 macOS/Linux;
+- x86_64 Linux/macOS;
+- Windows x86_64 once the runtime/JIT integration is portable enough.
+
+The post-Tier1 backend plan is Cranelift-backed Tier2/DeepDive codegen with
+Otter-owned deopt metadata and StoneMaps safepoint metadata. The current dynasm
+arm64 backend remains the Tier1 path until Cranelift is correct, faster, and
+covered by the same parity/GC/Test262 gates.
+
+Reference engines are allowed and expected for architecture decisions. Node/V8
+is the primary comparison point for multi-architecture release practice,
+tiering, deopt metadata, safepoints, IC dependency invalidation, and benchmark
+methodology. Use it as a reference, not as a naming source or a reason to bypass
+Otter's own GC/deopt invariants.
+
 ## Remaining Work
 
 ### 1. Callback and comparator hot paths
@@ -172,3 +193,15 @@ Tier1 is closed when all of the following are true:
 - New feature flags or env kill-switches.
 - Rewriting unrelated runtime surfaces to chase one benchmark.
 - Shipping a speedup that regresses any already-closed Tier1 benchmark.
+
+## Mandatory Post-Tier1 Work
+
+- Cranelift backend for portable Tier2/DeepDive codegen.
+- Multi-architecture JIT support for aarch64 and x86_64, with Windows x86_64
+  tracked as a release-hardening target.
+- CI/release gates that run the same correctness and regression checks per
+  supported architecture.
+- Keep arm64 dynasm only as the proven Tier1 backend until the portable backend
+  is ready to replace or sit above it.
+- Compare architecture coverage and release gating against Node/V8 before
+  declaring multi-arch work complete.

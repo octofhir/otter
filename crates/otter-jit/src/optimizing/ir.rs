@@ -179,6 +179,24 @@ pub enum NodeKind {
         /// SSA inputs `(callee, args...)`, matching the register metadata above.
         inputs: Vec<NodeId>,
     },
+    /// Bytecode method call. Inputs are `(receiver, args...)`; the property name
+    /// and IC site are bytecode metadata. A monomorphic compiled method uses the
+    /// direct-call protocol; every ineligible receiver/method falls back to the
+    /// full method-call VM stub in place.
+    CallMethod {
+        /// Receiver object/value.
+        recv: NodeId,
+        /// Bytecode receiver register.
+        recv_reg: u16,
+        /// Property atom index.
+        name: u32,
+        /// Monomorphic call IC site index.
+        site: u64,
+        /// Bytecode argument registers, in call order.
+        arg_regs: Vec<u16>,
+        /// Argument values.
+        args: Vec<NodeId>,
+    },
     /// Speculative "operand is an ordinary object of the baked shape" guard.
     /// Carries the receiver and the receiver shape's compressed `Gc` offset. A
     /// non-object, or a different shape (or dictionary mode), deoptimizes.
@@ -255,6 +273,12 @@ impl NodeKind {
             | NodeKind::LoadThis
             | NodeKind::LoadHole => Vec::new(),
             NodeKind::Call { inputs, .. } => inputs.clone(),
+            NodeKind::CallMethod { recv, args, .. } => {
+                let mut inputs = Vec::with_capacity(args.len() + 1);
+                inputs.push(*recv);
+                inputs.extend(args.iter().copied());
+                inputs
+            }
         }
     }
 
@@ -309,6 +333,10 @@ impl NodeKind {
             | NodeKind::ConstUndefined
             | NodeKind::SelfClosure => {}
             NodeKind::Call { inputs, .. } => inputs.iter_mut().for_each(fix),
+            NodeKind::CallMethod { recv, args, .. } => {
+                fix(recv);
+                args.iter_mut().for_each(fix);
+            }
         }
     }
 
@@ -344,6 +372,7 @@ impl NodeKind {
             | NodeKind::Phi(_)
             | NodeKind::LoadUpvalue(_)
             | NodeKind::Call { .. }
+            | NodeKind::CallMethod { .. }
             | NodeKind::CheckShape(_, _)
             | NodeKind::LoadSlot(_, _)
             | NodeKind::StoreSlot(_, _, _)

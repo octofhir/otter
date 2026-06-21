@@ -251,7 +251,7 @@ pub(crate) extern "C" fn jit_prepare_direct_call_stub(
 /// rather than "bail to the interpreter" (a native/polymorphic method in a hot
 /// loop must keep running compiled).
 #[allow(clippy::too_many_arguments)]
-extern "C" fn jit_prepare_direct_method_call_stub(
+pub(crate) extern "C" fn jit_prepare_direct_method_call_stub(
     ctx: *mut JitCtx,
     recv: u64,
     name_idx: u64,
@@ -676,7 +676,7 @@ extern "C" fn jit_new_array_stub(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
 /// At most [`MAX_INLINE_ARGS`] argument registers are passed (a0..a2 here,
 /// since `recv` and `name_idx` consume two of the eight ABI registers).
 #[allow(clippy::too_many_arguments)]
-extern "C" fn jit_call_method_stub(
+pub(crate) extern "C" fn jit_call_method_stub(
     ctx: *mut JitCtx,
     dst: u64,
     recv: u64,

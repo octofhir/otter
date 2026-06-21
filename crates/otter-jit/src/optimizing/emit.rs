@@ -145,6 +145,7 @@ pub(super) fn emit(
     _liveness: &Liveness,
     _alloc: &Allocation,
     _frames: &rustc_hash::FxHashMap<NodeId, DeoptPoint>,
+    _call_resume_frames: &rustc_hash::FxHashMap<NodeId, DeoptPoint>,
     _block_deopts: &rustc_hash::FxHashMap<BlockId, DeoptPoint>,
     _osr_entries: &[OsrEntry],
 ) -> Result<OptimizedCode, Unsupported> {
@@ -165,9 +166,9 @@ mod arm64 {
         REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE,
         STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_INT32, TAG_PTR_OBJECT,
         TAG_SPECIAL, THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET,
-        UPVALUES_PTR_OFFSET, VM_OFFSET, jit_abort_direct_call_stub,
+        UPVALUES_PTR_OFFSET, VM_OFFSET, jit_abort_direct_call_stub, jit_call_method_stub,
         jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
-        jit_prepare_direct_call_stub,
+        jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub,
     };
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
     use otter_vm::JitFunctionView;
@@ -877,6 +878,33 @@ mod arm64 {
         Ok(())
     }
 
+    fn value_is_used_after(
+        graph: &Graph,
+        frames: &FxHashMap<NodeId, DeoptPoint>,
+        value: NodeId,
+    ) -> bool {
+        for block in &graph.blocks {
+            for &phi in &block.phis {
+                if graph.node(phi).kind.inputs().contains(&value) {
+                    return true;
+                }
+            }
+            for &nid in &block.body {
+                if nid != value && graph.node(nid).kind.inputs().contains(&value) {
+                    return true;
+                }
+            }
+            match &block.term {
+                Some(Terminator::Return(v)) if *v == value => return true,
+                Some(Terminator::Branch { cond, .. }) if *cond == value => return true,
+                _ => {}
+            }
+        }
+        frames
+            .values()
+            .any(|point| point.registers.iter().any(|&(_, v)| v == value))
+    }
+
     fn emit_status_stub_call(ops: &mut Assembler, addr: usize, threw: DynamicLabel) {
         emit_load_u64(ops, 16, addr as u64);
         dynasm!(ops
@@ -1092,6 +1120,7 @@ mod arm64 {
         liveness: &Liveness,
         alloc: &Allocation,
         frames: &FxHashMap<NodeId, DeoptPoint>,
+        call_resume_frames: &FxHashMap<NodeId, DeoptPoint>,
         block_deopts: &FxHashMap<BlockId, DeoptPoint>,
         osr_entries: &[OsrEntry],
     ) -> Result<OptimizedCode, Unsupported> {
@@ -1168,6 +1197,7 @@ mod arm64 {
                     graph,
                     alloc,
                     frames,
+                    call_resume_frames,
                     &mut deopt_labels,
                     threw,
                     nid,
@@ -1345,6 +1375,7 @@ mod arm64 {
         graph: &Graph,
         alloc: &Allocation,
         frames: &FxHashMap<NodeId, DeoptPoint>,
+        call_resume_frames: &FxHashMap<NodeId, DeoptPoint>,
         deopt_labels: &mut FxHashMap<NodeId, DynamicLabel>,
         threw: DynamicLabel,
         nid: NodeId,
@@ -1803,8 +1834,12 @@ mod arm64 {
                 );
                 emit_direct_call_tail(ops, dst_reg, threw, done);
                 dynasm!(ops ; .arch aarch64 ; =>done);
-                emit_frame_reload(ops, graph, alloc, point, Some(dst_reg), box_scratch)?;
-                if let Some(loc) = dst {
+                let resume = call_resume_frames.get(&nid).unwrap_or(point);
+                emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
+                if value_is_used_after(graph, call_resume_frames, nid)
+                    && let Some(loc) = dst
+                    && !resume.registers.iter().any(|&(r, _)| r == dst_reg)
+                {
                     let off = u32::from(dst_reg) * 8;
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
                     store_loc(ops, loc, box_scratch);
@@ -1822,6 +1857,83 @@ mod arm64 {
                 );
                 emit_epilogue(ops, spill_bytes);
                 dynasm!(ops ; .arch aarch64 ; =>after);
+                Ok(())
+            }
+            NodeKind::CallMethod {
+                recv_reg,
+                name,
+                site,
+                arg_regs,
+                ..
+            } => {
+                let point = frames.get(&nid).ok_or(Unsupported::Unlowered(
+                    "method call without safepoint state",
+                ))?;
+                let fallback = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                let dst_reg = node
+                    .frame_dst
+                    .ok_or(Unsupported::Unlowered("method call without frame dst"))?;
+                if arg_regs.len() > 3 {
+                    return Err(Unsupported::OperandShape("method call arg count"));
+                }
+
+                emit_frame_materialize(ops, graph, alloc, point, box_scratch)?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; mov x0, x20
+                    ; movz x1, *recv_reg as u32
+                );
+                emit_load_u64(ops, 2, u64::from(*name));
+                emit_load_u64(ops, 3, *site);
+                dynasm!(ops ; .arch aarch64 ; movz x4, arg_regs.len() as u32);
+                for slot in 0..3 {
+                    let arg = arg_regs.get(slot).copied().unwrap_or(0);
+                    let xn = 5 + slot as u32;
+                    dynasm!(ops ; .arch aarch64 ; movz X(xn), arg as u32);
+                }
+                emit_load_u64(
+                    ops,
+                    16,
+                    jit_prepare_direct_method_call_stub as *const () as u64,
+                );
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; blr x16
+                    ; cmp x0, #1
+                    ; b.eq =>threw
+                    ; cmp x0, #2
+                    ; b.eq =>fallback
+                );
+
+                emit_direct_call_tail(ops, dst_reg, threw, done);
+
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; =>fallback
+                    ; mov x0, x20
+                    ; movz x1, dst_reg as u32
+                    ; movz x2, *recv_reg as u32
+                );
+                emit_load_u64(ops, 3, u64::from(*name));
+                dynasm!(ops ; .arch aarch64 ; movz x4, arg_regs.len() as u32);
+                for slot in 0..3 {
+                    let arg = arg_regs.get(slot).copied().unwrap_or(0);
+                    let xn = 5 + slot as u32;
+                    dynasm!(ops ; .arch aarch64 ; movz X(xn), arg as u32);
+                }
+                emit_status_stub_call(ops, jit_call_method_stub as *const () as usize, threw);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                let resume = call_resume_frames.get(&nid).unwrap_or(point);
+                emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
+                if value_is_used_after(graph, call_resume_frames, nid)
+                    && let Some(loc) = dst
+                    && !resume.registers.iter().any(|&(r, _)| r == dst_reg)
+                {
+                    let off = u32::from(dst_reg) * 8;
+                    dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
+                    store_loc(ops, loc, box_scratch);
+                }
                 Ok(())
             }
             NodeKind::LoadThis => {
@@ -2032,12 +2144,24 @@ mod tests {
         let g = build_graph(v).expect("builds");
         let bcl = deopt::bytecode_liveness(v);
         let frames = deopt::capture_frame_states(&g, &bcl);
-        let deopt_uses = deopt::deopt_value_uses(&frames);
+        let call_resume_frames = deopt::capture_call_resume_states(&g, v, &bcl);
+        let live_uses = deopt::merge_frame_state_uses([&frames, &call_resume_frames]);
+        let deopt_uses = deopt::deopt_value_uses(&live_uses);
         let block_deopts = deopt::capture_deopt_terminators(&g, &bcl);
         let live = liveness::analyze(&g, &deopt_uses, &block_deopts);
         let alloc = regalloc::allocate(&g, &live, super::GP_REGS, super::FP_REGS, &deopt_uses);
         let osr = deopt::capture_osr_entries(&g, &bcl);
-        let code = super::emit(v, &g, &live, &alloc, &frames, &block_deopts, &osr).expect("emits");
+        let code = super::emit(
+            v,
+            &g,
+            &live,
+            &alloc,
+            &frames,
+            &call_resume_frames,
+            &block_deopts,
+            &osr,
+        )
+        .expect("emits");
 
         let mut regs = vec![0u64; 64];
         for (i, &p) in params.iter().enumerate() {

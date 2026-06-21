@@ -365,6 +365,7 @@ fn can_deopt(kind: &NodeKind) -> bool {
             | NodeKind::CheckShape(_, _)
             | NodeKind::LoadUpvalue(_)
             | NodeKind::Call { .. }
+            | NodeKind::CallMethod { .. }
             | NodeKind::LoadElement(_, _)
             | NodeKind::StoreElement(_, _, _)
             | NodeKind::LoadArrayLength(_)
@@ -481,6 +482,131 @@ pub fn capture_frame_states(
         exit_env[b as usize] = Some(env);
     }
     points
+}
+
+/// Capture post-call frame states used to reload optimized homes after a call.
+///
+/// Calls materialize the interpreter frame before entering runtime/direct-call
+/// code. On return, the VM frame contains the call's destination plus any
+/// side-effected registers. This helper replays register writes through the call
+/// instruction and captures the bytecode live-before set for the next
+/// instruction, so the emitter reloads exactly the values the optimized
+/// continuation expects.
+#[must_use]
+pub fn capture_call_resume_states(
+    graph: &Graph,
+    view: &JitFunctionView,
+    bytecode_live: &FxHashMap<u32, FxHashSet<u16>>,
+) -> FxHashMap<NodeId, DeoptPoint> {
+    let rc = graph.register_count as usize;
+    let rpo = reverse_postorder(graph);
+    let mut exit_env: Vec<Option<Vec<Option<NodeId>>>> = vec![None; graph.blocks.len()];
+    let mut next_pc: FxHashMap<u32, u32> = FxHashMap::default();
+    for pair in view.instructions.windows(2) {
+        next_pc.insert(pair[0].byte_pc, pair[1].byte_pc);
+    }
+    let mut points: FxHashMap<NodeId, DeoptPoint> = FxHashMap::default();
+
+    for &b in &rpo {
+        let block = graph.block(b);
+        let mut env: Vec<Option<NodeId>> = if b == graph.entry {
+            (0..rc)
+                .map(|r| graph.block(graph.entry).body.get(r).copied())
+                .collect()
+        } else {
+            let mut e = block
+                .preds
+                .iter()
+                .find_map(|&p| exit_env[p as usize].clone())
+                .unwrap_or_else(|| vec![None; rc]);
+            for &phi in &block.phis {
+                if let Some(&r) = graph.phi_reg.get(&phi)
+                    && (r as usize) < rc
+                {
+                    e[r as usize] = Some(phi);
+                }
+            }
+            e
+        };
+
+        let empty = Vec::new();
+        let writes = graph.reg_writes.get(&b).unwrap_or(&empty);
+        let mut wi = 0usize;
+
+        for &nid in &block.body {
+            let node = graph.node(nid);
+            if matches!(
+                node.kind,
+                NodeKind::Call { .. } | NodeKind::CallMethod { .. }
+            ) {
+                let pc = node.byte_pc;
+                while wi < writes.len() && writes[wi].0 <= pc {
+                    let (_, r, v) = writes[wi];
+                    if (r as usize) < rc {
+                        env[r as usize] = Some(v);
+                    }
+                    wi += 1;
+                }
+                let mut registers: Vec<(u16, NodeId)> = Vec::new();
+                if let Some(next) = next_pc.get(&pc)
+                    && let Some(live) = bytecode_live.get(next)
+                {
+                    let mut regs: Vec<u16> = live.iter().copied().collect();
+                    regs.sort_unstable();
+                    for r in regs {
+                        if let Some(Some(v)) = env.get(r as usize) {
+                            registers.push((r, *v));
+                        }
+                    }
+                }
+                points.entry(nid).or_insert(DeoptPoint {
+                    byte_pc: pc,
+                    registers,
+                });
+            }
+        }
+        while wi < writes.len() {
+            let (_, r, v) = writes[wi];
+            if (r as usize) < rc {
+                env[r as usize] = Some(v);
+            }
+            wi += 1;
+        }
+        exit_env[b as usize] = Some(env);
+    }
+
+    points
+}
+
+/// Merge several frame-state maps by node id for allocator liveness.
+///
+/// A call node has two distinct frame states: the pre-call safepoint used to
+/// materialize GC roots and the post-call resume state used to reload optimized
+/// homes. Register allocation must keep values for both states live at the call,
+/// so this helper unions their `(register, value)` pairs without losing either
+/// state's uses.
+#[must_use]
+pub fn merge_frame_state_uses<'a>(
+    maps: impl IntoIterator<Item = &'a FxHashMap<NodeId, DeoptPoint>>,
+) -> FxHashMap<NodeId, DeoptPoint> {
+    let mut merged = FxHashMap::default();
+    for map in maps {
+        for (&node, point) in map {
+            let entry = merged.entry(node).or_insert_with(|| point.clone());
+            for &(reg, value) in &point.registers {
+                if !entry
+                    .registers
+                    .iter()
+                    .any(|&(existing_reg, existing_value)| {
+                        existing_reg == reg && existing_value == value
+                    })
+                {
+                    entry.registers.push((reg, value));
+                }
+            }
+        }
+    }
+    merged
 }
 
 /// An on-stack-replacement entry point: a loop-header block the interpreter can

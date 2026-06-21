@@ -275,11 +275,12 @@ impl<'a> Builder<'a> {
     }
 
     fn run(&mut self) -> Result<(), Unsupported> {
-        // Entry block: every register starts as a parameter (first
-        // `param_count`) or `undefined` (locals / scratch), so reading any
-        // register always terminates even on a path that never assigned it.
+        // Entry block: a normal function entry sees formal parameters in the
+        // leading registers and `undefined` in locals / scratch. An OSR entry is
+        // different: every bytecode register is supplied by the interpreter
+        // frame at the loop header, so every seed is a frame parameter.
         for r in 0..self.view.register_count {
-            let kind = if r < self.view.param_count {
+            let kind = if self.is_osr_target() || r < self.view.param_count {
                 NodeKind::Param(r)
             } else {
                 NodeKind::ConstUndefined
@@ -555,6 +556,7 @@ impl<'a> Builder<'a> {
             let load_number = instr.load_number;
             let load_array_length = instr.load_array_length;
             let property_feedback = instr.property_feedback;
+            let property_ic_site = instr.property_ic_site;
             let operands = instr.operands.clone();
             match op {
                 // The leading named-function self-binding. The closure value is
@@ -781,8 +783,54 @@ impl<'a> Builder<'a> {
                     self.def_register(dst, block, call, byte_pc);
                 }
                 Op::CallMethodValue => {
-                    self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
-                    return Ok(());
+                    const MAX_METHOD_ARGS: usize = 3;
+                    let dst = reg(&operands, 0)?;
+                    let recv_reg = reg(&operands, 1)?;
+                    let name = const_index(&operands, 2)?;
+                    let argc = const_index(&operands, 3)? as usize;
+                    if argc > MAX_METHOD_ARGS {
+                        return Err(Unsupported::OperandShape("method call arg count"));
+                    }
+                    if !self.view.inline_methods.contains_key(&byte_pc) {
+                        self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
+                        return Ok(());
+                    }
+                    let Some(site) = property_ic_site else {
+                        self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
+                        return Ok(());
+                    };
+                    let recv = self.read_variable(recv_reg, block);
+                    let unsafe_receiver = match &self.graph.node(recv).kind {
+                        NodeKind::ConstUndefined | NodeKind::LoadHole => true,
+                        NodeKind::Phi(_) => true,
+                        _ => false,
+                    };
+                    if unsafe_receiver {
+                        self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
+                        return Ok(());
+                    }
+                    let mut args = Vec::with_capacity(argc);
+                    let mut arg_regs = Vec::with_capacity(argc);
+                    for slot in 0..argc {
+                        let arg_reg = reg(&operands, 4 + slot)?;
+                        arg_regs.push(arg_reg);
+                        args.push(self.read_variable(arg_reg, block));
+                    }
+                    let call = self.graph.add_node(
+                        NodeKind::CallMethod {
+                            recv,
+                            recv_reg,
+                            name,
+                            site: site as u64,
+                            arg_regs,
+                            args,
+                        },
+                        block,
+                        byte_pc,
+                    );
+                    self.graph.set_frame_dst(call, dst);
+                    self.push_body(block, call);
+                    self.def_register(dst, block, call, byte_pc);
                 }
                 Op::LoadUndefined => {
                     let dst = reg(&operands, 0)?;

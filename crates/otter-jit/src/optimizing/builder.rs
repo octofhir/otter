@@ -38,13 +38,14 @@ use super::Unsupported;
 use super::ir::{BlockId, CmpOp, Graph, NodeId, NodeKind, Repr, Terminator};
 
 /// Build a typed SSA graph for `view`, or report why the function is outside the
-/// optimizing subset.
-pub(super) fn build(view: &JitFunctionView) -> Result<Graph, Unsupported> {
+/// optimizing subset. When `osr_pc` is set, build only the region reachable from
+/// that loop header, with a synthetic entry edge feeding the header phis.
+pub(super) fn build(view: &JitFunctionView, osr_pc: Option<u32>) -> Result<Graph, Unsupported> {
     if view.instructions.is_empty() {
         return Err(Unsupported::Empty);
     }
     let cfg = Cfg::discover(view)?;
-    let mut builder = Builder::new(view, cfg);
+    let mut builder = Builder::new(view, cfg, osr_pc)?;
     builder.run()?;
     Ok(builder.graph)
 }
@@ -178,6 +179,20 @@ impl Cfg {
             block_of_pc,
         })
     }
+
+    fn reachable_from(&self, entry: BlockId) -> FxHashSet<BlockId> {
+        let mut seen = FxHashSet::default();
+        let mut stack = vec![entry];
+        while let Some(block) = stack.pop() {
+            if !seen.insert(block) {
+                continue;
+            }
+            for &succ in &self.succs[block as usize] {
+                stack.push(succ);
+            }
+        }
+        seen
+    }
 }
 
 /// SSA construction state.
@@ -185,6 +200,10 @@ struct Builder<'a> {
     view: &'a JitFunctionView,
     cfg: Cfg,
     graph: Graph,
+    /// Real CFG blocks reachable from the selected entry. Whole-function
+    /// compiles include every block; OSR-target compiles include only blocks
+    /// reachable from the hot loop header.
+    active_blocks: FxHashSet<BlockId>,
     /// `current_def[reg][block]` — the SSA node defining `reg` at the end of (or
     /// within) `block`.
     current_def: Vec<FxHashMap<BlockId, NodeId>>,
@@ -194,26 +213,58 @@ struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
-    fn new(view: &'a JitFunctionView, cfg: Cfg) -> Self {
+    fn new(view: &'a JitFunctionView, cfg: Cfg, osr_pc: Option<u32>) -> Result<Self, Unsupported> {
+        let (entry, active_blocks, synthetic_entry) = if let Some(pc) = osr_pc {
+            let target = *cfg
+                .block_of_pc
+                .get(&pc)
+                .ok_or(Unsupported::BranchTarget(i64::from(pc)))?;
+            let active = cfg.reachable_from(target);
+            (
+                cfg.ranges.len() as BlockId,
+                active,
+                Some(cfg.ranges.len() as BlockId),
+            )
+        } else {
+            (0, (0..cfg.ranges.len() as BlockId).collect(), None)
+        };
         // Materialize one block per CFG range (the graph starts with just the
         // entry block).
-        let mut graph = Graph::new(view.param_count, view.register_count);
+        let mut graph = Graph::new(view.param_count, view.register_count, entry);
         graph.blocks.clear();
         for &(start, _) in &cfg.ranges {
             let pc = view.instructions[start].byte_pc;
             graph.blocks.push(super::ir::Block::new(pc));
         }
+        if synthetic_entry.is_some() {
+            graph.blocks.push(super::ir::Block::new(osr_pc.unwrap()));
+        }
         for (b, p) in cfg.preds.iter().enumerate() {
-            graph.blocks[b].preds = p.clone();
+            let mut preds: Vec<BlockId> = p
+                .iter()
+                .copied()
+                .filter(|pred| active_blocks.contains(pred))
+                .collect();
+            if Some(b as BlockId) == osr_pc.and_then(|pc| cfg.block_of_pc.get(&pc).copied()) {
+                preds.insert(0, entry);
+            }
+            graph.blocks[b].preds = preds;
+        }
+        if let Some(entry) = synthetic_entry {
+            let target = cfg.block_of_pc[&osr_pc.unwrap()];
+            graph.blocks[entry as usize].term = Some(Terminator::Jump(target));
+            graph.blocks[entry as usize].sealed = true;
+            graph.blocks[entry as usize].filled = true;
         }
         let reg_count = view.register_count as usize;
-        Self {
+        Ok(Self {
             view,
             cfg,
             graph,
+            active_blocks,
             current_def: vec![FxHashMap::default(); reg_count],
             incomplete_phis: FxHashMap::default(),
-        }
+        })
     }
 
     fn run(&mut self) -> Result<(), Unsupported> {
@@ -234,6 +285,11 @@ impl<'a> Builder<'a> {
 
         let block_count = self.cfg.ranges.len();
         for b in 0..block_count {
+            if !self.active_blocks.contains(&(b as BlockId)) {
+                self.graph.blocks[b].filled = true;
+                self.graph.blocks[b].sealed = true;
+                continue;
+            }
             self.seal_ready();
             self.fill_block(b as BlockId)?;
             self.graph.blocks[b].filled = true;
@@ -280,6 +336,14 @@ impl<'a> Builder<'a> {
             }
         }
         Ok(())
+    }
+
+    fn is_osr_target(&self) -> bool {
+        self.graph.entry != 0
+    }
+
+    fn allow_empty_feedback_for_osr(&self, feedback: ArithFeedback) -> bool {
+        feedback.is_empty() && self.is_osr_target()
     }
 
     /// Seal every unsealed block whose predecessors are all filled, to a
@@ -645,11 +709,60 @@ impl<'a> Builder<'a> {
                     self.push_body(block, load);
                     self.def_register(dst, block, load, byte_pc);
                 }
+                // `StoreElement recv, idx, src` — inline typed-array element
+                // stores for primitive numeric values. Every miss deoptimizes at
+                // this exact PC, letting the interpreter perform full `[[Set]]`
+                // semantics, including coercion cases this tier does not lower.
+                Op::StoreElement => {
+                    let recv_reg = reg(&operands, 0)?;
+                    let idx_reg = reg(&operands, 1)?;
+                    let src_reg = reg(&operands, 2)?;
+                    if self.view.cage_base == 0 {
+                        self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
+                        return Ok(());
+                    }
+                    let recv = self.read_variable(recv_reg, block);
+                    let idx = match self.int32_index_operand(block, idx_reg, byte_pc) {
+                        Ok(idx) => idx,
+                        Err(reason) => {
+                            self.deopt_or_decline(block, byte_pc, reason)?;
+                            return Ok(());
+                        }
+                    };
+                    let value = self.read_variable(src_reg, block);
+                    if !matches!(
+                        self.graph.node(value).kind.repr(),
+                        Repr::Int32 | Repr::Float64
+                    ) {
+                        self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
+                        return Ok(());
+                    }
+                    let store = self.graph.add_node(
+                        NodeKind::StoreElement(recv, idx, value),
+                        block,
+                        byte_pc,
+                    );
+                    self.push_body(block, store);
+                }
                 Op::LoadUndefined => {
                     let dst = reg(&operands, 0)?;
                     let node = self
                         .graph
                         .add_node(NodeKind::ConstUndefined, block, byte_pc);
+                    self.graph.set_frame_dst(node, dst);
+                    self.push_body(block, node);
+                    self.def_register(dst, block, node, byte_pc);
+                }
+                Op::LoadUpvalue => {
+                    let dst = reg(&operands, 0)?;
+                    let idx = imm32(&operands, 1)?;
+                    if idx < 0 || self.view.cage_base == 0 {
+                        self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
+                        return Ok(());
+                    }
+                    let node = self
+                        .graph
+                        .add_node(NodeKind::LoadUpvalue(idx), block, byte_pc);
                     self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
                     self.def_register(dst, block, node, byte_pc);
@@ -920,7 +1033,8 @@ impl<'a> Builder<'a> {
         feedback: u8,
         byte_pc: u32,
     ) -> Result<NodeId, Unsupported> {
-        if !ArithFeedback::from_bits(feedback).is_int32_only() {
+        let fb = ArithFeedback::from_bits(feedback);
+        if !fb.is_int32_only() && !self.allow_empty_feedback_for_osr(fb) {
             return Err(Unsupported::TypeFeedback(feedback));
         }
         let l = self.int32_operand(block, lhs, feedback, byte_pc)?;
@@ -960,7 +1074,7 @@ impl<'a> Builder<'a> {
         if fb.is_int32_only() && !matches!(op, Op::Div) {
             return self.int32_binop(block, op, lhs, rhs, feedback, byte_pc);
         }
-        if !fb.is_numeric_only() {
+        if !fb.is_numeric_only() && !self.allow_empty_feedback_for_osr(fb) {
             return Err(Unsupported::TypeFeedback(feedback));
         }
         let l = self.float_operand(block, lhs, byte_pc);
@@ -995,7 +1109,7 @@ impl<'a> Builder<'a> {
                 .graph
                 .add_node(NodeKind::Int32Compare(cmp, l, r), block, byte_pc));
         }
-        if !fb.is_numeric_only() {
+        if !fb.is_numeric_only() && !self.allow_empty_feedback_for_osr(fb) {
             return Err(Unsupported::TypeFeedback(feedback));
         }
         let l = self.float_operand(block, lhs, byte_pc);
@@ -1017,7 +1131,7 @@ impl<'a> Builder<'a> {
         byte_pc: u32,
     ) -> Result<NodeId, Unsupported> {
         let fb = ArithFeedback::from_bits(feedback);
-        if fb.is_int32_only() {
+        if fb.is_int32_only() || self.allow_empty_feedback_for_osr(fb) {
             let s = self.int32_operand(block, src, feedback, byte_pc)?;
             let step = self
                 .graph
@@ -1051,7 +1165,7 @@ impl<'a> Builder<'a> {
         byte_pc: u32,
     ) -> Result<NodeId, Unsupported> {
         let feedback = ArithFeedback::from_bits(raw_feedback);
-        if !feedback.is_int32_only() {
+        if !feedback.is_int32_only() && !self.allow_empty_feedback_for_osr(feedback) {
             return Err(Unsupported::TypeFeedback(raw_feedback));
         }
         let node = self.read_variable(operand_reg, block);
@@ -1147,12 +1261,25 @@ impl<'a> Builder<'a> {
         has_loop && !in_loop
     }
 
+    fn block_is_in_loop(&self, block: BlockId) -> bool {
+        let block_start = self.graph.blocks[block as usize].start_pc;
+        self.graph.blocks.iter().any(|header| {
+            matches!(
+                self.back_edge_pc(header),
+                Some(backedge_pc) if header.start_pc <= block_start && block_start <= backedge_pc
+            )
+        })
+    }
+
     fn deopt_or_decline(
         &mut self,
         block: BlockId,
         byte_pc: u32,
         reason: Unsupported,
     ) -> Result<(), Unsupported> {
+        if self.block_is_in_loop(block) {
+            return Err(reason);
+        }
         if !self.can_deopt_at(byte_pc) {
             return Err(reason);
         }
@@ -1229,10 +1356,14 @@ mod tests {
         g.nodes.iter().filter(|n| pred(&n.kind)).count()
     }
 
+    fn build_full(view: &JitFunctionView) -> Result<Graph, Unsupported> {
+        build(view, None)
+    }
+
     #[test]
     fn straight_line_int_add_guards_param_only() {
         // r2 = r0 + 1; return r2   (r0 is a parameter, 1 is an int32 const)
-        let g = build(&view(
+        let g = build_full(&view(
             1,
             4,
             &[
@@ -1259,7 +1390,7 @@ mod tests {
         //  3 Jump ->merge(5)
         //  4 LoadInt32 r2, 2          (else)
         //  5 ReturnValue r2           (merge)
-        let g = build(&view(
+        let g = build_full(&view(
             2,
             4,
             &[
@@ -1297,7 +1428,7 @@ mod tests {
         //  6 Add r1, r1, r4
         //  7 Jump ->header(2)
         //  8 ReturnValue r2          (exit)
-        let g = build(&view(
+        let g = build_full(&view(
             1,
             5,
             &[
@@ -1345,7 +1476,7 @@ mod tests {
     #[test]
     fn bails_on_unsupported_opcode() {
         // `Rem` (`%`) is outside the arithmetic subset and bails the function.
-        let err = build(&view(
+        let err = build_full(&view(
             2,
             4,
             &[
@@ -1361,7 +1492,7 @@ mod tests {
     fn unknown_feedback_after_loop_deopts_epilogue_only() {
         // A cold/unobserved arithmetic op after a hot loop should not prevent OSR
         // into the loop. The epilogue resumes in the interpreter at that op.
-        let g = build(&view(
+        let g = build_full(&view(
             1,
             6,
             &[
@@ -1388,11 +1519,86 @@ mod tests {
     }
 
     #[test]
+    fn osr_target_skips_unsupported_earlier_loop() {
+        // A setup loop contains an unsupported `%`, then execution reaches a
+        // later simple hot loop. Whole-function compilation must decline the
+        // setup loop, but an OSR-target compile rooted at the later header should
+        // build only the region reachable from that header.
+        let v = view(
+            1,
+            8,
+            &[
+                (Op::LoadInt32, vec![r(1), imm(0)], 0),
+                (Op::LessThan, vec![r(2), r(1), r(0)], ARITH_INT32),
+                (Op::JumpIfFalse, vec![imm(rel(2, 6)), r(2)], 0),
+                (Op::Rem, vec![r(3), r(1), r(0)], ARITH_INT32),
+                (Op::Increment, vec![r(1), r(1), imm(1)], ARITH_INT32),
+                (Op::Jump, vec![imm(rel(5, 1))], 0),
+                (Op::LoadInt32, vec![r(4), imm(0)], 0),
+                (Op::LoadInt32, vec![r(6), imm(1)], 0),
+                (Op::LessThan, vec![r(5), r(4), r(0)], ARITH_INT32),
+                (Op::JumpIfFalse, vec![imm(rel(9, 12)), r(5)], 0),
+                (Op::Add, vec![r(4), r(4), r(6)], ARITH_INT32),
+                (Op::Jump, vec![imm(rel(11, 8))], 0),
+                (Op::ReturnValue, vec![r(4)], 0),
+            ],
+        );
+        assert_eq!(
+            build_full(&v).unwrap_err(),
+            Unsupported::Opcode(Op::Rem),
+            "whole-function compile still rejects the setup loop"
+        );
+
+        let g = build(&v, Some(8 * STRIDE)).expect("target OSR graph builds");
+        assert_ne!(g.entry, 0, "OSR graph uses a synthetic entry");
+        let header_id = g
+            .blocks
+            .iter()
+            .position(|b| b.start_pc == 8 * STRIDE && b.preds.contains(&g.entry))
+            .expect("target header block") as BlockId;
+        let header = g.block(header_id);
+        assert_eq!(header.preds.len(), 2, "synthetic entry + backedge");
+        assert!(
+            header.phis.iter().any(|&phi| {
+                matches!(g.node(phi).kind, NodeKind::Phi(ref ops) if ops.len() == 2)
+            }),
+            "loop-carried value keeps a real phi"
+        );
+    }
+
+    #[test]
+    fn osr_target_declines_unsupported_inside_target_loop() {
+        // Deopt terminators are only safe outside the optimized loop. An
+        // unsupported opcode inside the target loop would execute a compiled
+        // prefix and then re-run the bytecode body from the unsupported PC, so
+        // target compilation must decline instead.
+        let v = view(
+            1,
+            7,
+            &[
+                (Op::LoadInt32, vec![r(1), imm(0)], 0),
+                (Op::LoadInt32, vec![r(5), imm(1)], 0),
+                (Op::LessThan, vec![r(2), r(1), r(0)], ARITH_INT32),
+                (Op::JumpIfFalse, vec![imm(rel(3, 7)), r(2)], 0),
+                (Op::Rem, vec![r(3), r(1), r(5)], ARITH_INT32),
+                (Op::Increment, vec![r(1), r(1), imm(1)], ARITH_INT32),
+                (Op::Jump, vec![imm(rel(6, 2))], 0),
+                (Op::ReturnValue, vec![r(1)], 0),
+            ],
+        );
+
+        assert_eq!(
+            build(&v, Some(2 * STRIDE)).unwrap_err(),
+            Unsupported::Opcode(Op::Rem)
+        );
+    }
+
+    #[test]
     fn div_lowers_to_float() {
         // `Div` always takes the float path (int32 operands still yield a
         // non-integer result), so its operands are widened/checked to f64 and
         // the node is a `Float64Div`.
-        let g = build(&view(
+        let g = build_full(&view(
             2,
             4,
             &[
@@ -1411,7 +1617,7 @@ mod tests {
         // `r2 = r0 + 1` with a site that has observed a double: the int32 const
         // is widened to f64 (`Int32ToFloat64`) and the tagged param is
         // number-checked, feeding a `Float64Add`.
-        let g = build(&view(
+        let g = build_full(&view(
             1,
             4,
             &[
@@ -1432,7 +1638,7 @@ mod tests {
     #[test]
     fn bails_on_non_int32_feedback() {
         // Unobserved arithmetic site (feedback 0) cannot be speculated int32.
-        let err = build(&view(
+        let err = build_full(&view(
             2,
             4,
             &[

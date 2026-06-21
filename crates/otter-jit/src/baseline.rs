@@ -170,7 +170,7 @@ const STACK_OFFSET: u32 = std::mem::offset_of!(JitCtx, stack) as u32;
 const CONTEXT_OFFSET: u32 = std::mem::offset_of!(JitCtx, context) as u32;
 const FRAME_INDEX_OFFSET: u32 = std::mem::offset_of!(JitCtx, frame_index) as u32;
 /// Byte offset of [`JitCtx::upvalues_ptr`] for inline upvalue access.
-const UPVALUES_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, upvalues_ptr) as u32;
+pub(crate) const UPVALUES_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, upvalues_ptr) as u32;
 /// Byte offset of [`JitCtx::reg_stack_base`] — the flat JIT register stack base
 /// used to build a self-recursive callee window inline.
 const REG_STACK_BASE_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_stack_base) as u32;
@@ -178,10 +178,10 @@ const REG_STACK_BASE_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_stack_base) 
 /// `reg_top`, bumped to reserve a callee window and restored on return.
 const REG_TOP_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_top_ptr) as u32;
 /// Size of one `UpvalueCell` (a 4-byte compressed `Gc<UpvalueCellBody>`).
-const UPVALUE_CELL_SIZE: u32 = 4;
+pub(crate) const UPVALUE_CELL_SIZE: u32 = 4;
 /// Byte offset of the single `Value` inside an `UpvalueCellBody` from its
 /// decompressed pointer (just past the 8-byte `GcHeader`).
-const UPVALUE_VALUE_OFFSET: u32 = 8;
+pub(crate) const UPVALUE_VALUE_OFFSET: u32 = 8;
 const DIRECT_ENTRY_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_entry_addr) as u32;
 const DIRECT_REGS_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_regs) as u32;
 const DIRECT_SELF_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_self_closure) as u32;

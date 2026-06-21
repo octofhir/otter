@@ -72,6 +72,7 @@ fn reg_effects(op: Op, operands: &[Operand]) -> RegEffects {
         | Op::LoadUndefined
         | Op::LoadThis
         | Op::LoadHole
+        | Op::LoadUpvalue
         | Op::MakeFunction => {
             if let Some(d) = reg(operands, 0) {
                 defs.push(d);
@@ -121,6 +122,23 @@ fn reg_effects(op: Op, operands: &[Operand]) -> RegEffects {
             }
             if let Some(i) = reg(operands, 2) {
                 uses.push(i);
+            }
+        }
+        // `StoreElement recv, idx, src, scratch` reads the receiver, computed
+        // key, and stored value; on a deopt miss the interpreter re-runs the
+        // store at the same byte-PC.
+        Op::StoreElement => {
+            if let Some(o) = reg(operands, 0) {
+                uses.push(o);
+            }
+            if let Some(i) = reg(operands, 1) {
+                uses.push(i);
+            }
+            if let Some(s) = reg(operands, 2) {
+                uses.push(s);
+            }
+            if let Some(d) = reg(operands, 3) {
+                defs.push(d);
             }
         }
         // `StoreProperty obj, name, src, scratch` reads the receiver and the
@@ -311,7 +329,9 @@ fn can_deopt(kind: &NodeKind) -> bool {
         NodeKind::CheckInt32(_)
             | NodeKind::CheckNumber(_)
             | NodeKind::CheckShape(_, _)
+            | NodeKind::LoadUpvalue(_)
             | NodeKind::LoadElement(_, _)
+            | NodeKind::StoreElement(_, _, _)
             | NodeKind::LoadArrayLength(_)
             | NodeKind::LoadThis
             | NodeKind::Int32Add(_, _)

@@ -161,6 +161,7 @@ mod arm64 {
     use crate::baseline::{
         BAIL_PC_OFFSET, OBJECT_BODY_TYPE_TAG, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE,
         STATUS_BAILED, STATUS_RETURNED, TAG_INT32, TAG_PTR_OBJECT, TAG_SPECIAL, THIS_VALUE_OFFSET,
+        UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET,
     };
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
     use otter_vm::JitFunctionView;
@@ -668,6 +669,108 @@ mod arm64 {
         dynasm!(ops ; .arch aarch64 ; =>done);
     }
 
+    /// Lower speculative typed-array `recv[idx] = value` fast paths. The
+    /// optimizing tier has no safepoints, so every miss deopts instead of
+    /// calling the VM store stub.
+    fn emit_element_store(
+        ops: &mut Assembler,
+        view: &JitFunctionView,
+        recv_loc: Location,
+        idx_loc: Location,
+        value_loc: Location,
+        value_repr: Repr,
+        exit: DynamicLabel,
+    ) -> Result<(), Unsupported> {
+        let ta_tag = u32::from(view.ta_layout.ta_type_tag);
+        let local_buf_type_tag = u32::from(view.ta_layout.local_buffer_type_tag);
+        let kind_float64 = view.ta_layout.kind_float64;
+        let kind_int32 = view.ta_layout.kind_int32;
+        let buffer_local_tag = view.ta_layout.buffer_local_tag;
+        let ta_kind_byte = view.ta_layout.ta_kind_byte;
+        let ta_byte_offset_byte = view.ta_layout.ta_byte_offset_byte;
+        let ta_length_byte = view.ta_layout.ta_length_byte;
+        let ta_length_tracking_byte = view.ta_layout.ta_length_tracking_byte;
+        let buffer_disc_byte = view.ta_layout.buffer_disc_byte;
+        let buffer_handle_byte = view.ta_layout.buffer_handle_byte;
+        let (ptr_word, len_word) = vec_layout_offsets();
+        let bytes_ptr_byte = view.ta_layout.buf_bytes_byte + ptr_word;
+        let bytes_len_byte = view.ta_layout.buf_bytes_byte + len_word;
+        let f64_path = ops.new_dynamic_label();
+        let i32_path = ops.new_dynamic_label();
+        let done = ops.new_dynamic_label();
+
+        emit_recv_body(ops, view, recv_loc, exit);
+        load_loc(ops, 5, idx_loc);
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov w5, w5
+            ; cmp w2, ta_tag
+            ; b.ne =>exit
+            ; ldrb w3, [x0, ta_length_tracking_byte]
+            ; cbnz w3, =>exit
+            ; ldr x3, [x0, ta_length_byte]
+            ; cmp x5, x3
+            ; b.hs =>exit
+            ; ldr w3, [x0, buffer_disc_byte]
+            ; movz w4, buffer_local_tag
+            ; cmp w3, w4
+            ; b.ne =>exit
+            ; ldr w3, [x0, buffer_handle_byte]
+            ; add x3, x1, x3
+            ; ldrb w4, [x3]
+            ; cmp w4, local_buf_type_tag
+            ; b.ne =>exit
+            ; ldr x6, [x3, bytes_ptr_byte]
+            ; ldr x7, [x3, bytes_len_byte]
+            ; ldr x3, [x0, ta_byte_offset_byte]
+            ; ldr w4, [x0, ta_kind_byte]
+            ; cmp w4, kind_float64
+            ; b.eq =>f64_path
+            ; cmp w4, kind_int32
+            ; b.eq =>i32_path
+            ; b =>exit
+            ; =>f64_path
+            ; lsl x4, x5, #3
+            ; add x4, x4, x3
+            ; add x0, x4, #8
+            ; cmp x0, x7
+            ; b.hi =>exit
+            ; add x4, x6, x4
+        );
+        match value_repr {
+            Repr::Float64 => load_fp_loc(ops, FP_LOAD_SCRATCH, value_loc),
+            Repr::Int32 => {
+                load_loc(ops, 0, value_loc);
+                dynasm!(ops ; .arch aarch64 ; scvtf D(FP_LOAD_SCRATCH), w0);
+            }
+            _ => return Err(Unsupported::Unlowered("store-element value not int32/f64")),
+        }
+        dynasm!(ops
+            ; .arch aarch64
+            ; str D(FP_LOAD_SCRATCH), [x4]
+            ; b =>done
+            ; =>i32_path
+            ; lsl x4, x5, #2
+            ; add x4, x4, x3
+            ; add x0, x4, #4
+            ; cmp x0, x7
+            ; b.hi =>exit
+            ; add x4, x6, x4
+        );
+        match value_repr {
+            Repr::Int32 => {
+                load_loc(ops, 0, value_loc);
+                dynasm!(ops ; .arch aarch64 ; str w0, [x4]);
+            }
+            Repr::Float64 => {
+                dynasm!(ops ; .arch aarch64 ; b =>exit);
+            }
+            _ => return Err(Unsupported::Unlowered("store-element value not int32/f64")),
+        }
+        dynasm!(ops ; .arch aarch64 ; =>done);
+        Ok(())
+    }
+
     /// Emit the function prologue (copied from the baseline) then reserve the
     /// spill area. Returns the byte size subtracted from `sp` (0 when no spill
     /// area is needed).
@@ -1020,7 +1123,7 @@ mod arm64 {
         Ok(OptimizedCode {
             code: CompiledCode::new(buf, entry),
             osr_offsets,
-            entry_via_osr_only: !block_deopts.is_empty(),
+            entry_via_osr_only: !block_deopts.is_empty() || graph.entry != 0,
         })
     }
 
@@ -1401,6 +1504,14 @@ mod arm64 {
                 emit_element_load(ops, view, recv_loc, idx_loc, dst, exit);
                 Ok(())
             }
+            NodeKind::StoreElement(recv, idx, value) => {
+                let recv_loc = require_loc(alloc, *recv)?;
+                let idx_loc = require_loc(alloc, *idx)?;
+                let value_loc = require_loc(alloc, *value)?;
+                let value_repr = graph.node(*value).kind.repr();
+                let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
+                emit_element_store(ops, view, recv_loc, idx_loc, value_loc, value_repr, exit)
+            }
             NodeKind::StoreSlot(obj, value_byte, value) => {
                 // Write a primitive (int32 / f64) into the shape-guarded
                 // receiver's value slab. No write barrier: a primitive `Value` is
@@ -1456,6 +1567,35 @@ mod arm64 {
             NodeKind::LoadHole => {
                 if let Some(loc) = dst {
                     emit_load_u64(ops, box_scratch, (TAG_SPECIAL << 48) | SPECIAL_HOLE);
+                    store_loc(ops, loc, box_scratch);
+                }
+                Ok(())
+            }
+            NodeKind::LoadUpvalue(idx) => {
+                let idx =
+                    u32::try_from(*idx).map_err(|_| Unsupported::OperandShape("upvalue index"))?;
+                let idx_off = idx
+                    .checked_mul(UPVALUE_CELL_SIZE)
+                    .ok_or(Unsupported::OperandShape("upvalue index"))?;
+                if idx_off > 32760 {
+                    return Err(Unsupported::OperandShape("upvalue index"));
+                }
+                let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr x16, [x20, UPVALUES_PTR_OFFSET]
+                    ; cbz x16, =>exit
+                    ; ldr w17, [x16, idx_off]
+                );
+                emit_load_u64(ops, 16, view.cage_base as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; add x16, x16, x17
+                    ; ldr X(box_scratch), [x16, UPVALUE_VALUE_OFFSET]
+                );
+                emit_load_u64(ops, MOVE_SCRATCH, (TAG_SPECIAL << 48) | SPECIAL_HOLE);
+                dynasm!(ops ; .arch aarch64 ; cmp X(box_scratch), X(MOVE_SCRATCH) ; b.eq =>exit);
+                if let Some(loc) = dst {
                     store_loc(ops, loc, box_scratch);
                 }
                 Ok(())

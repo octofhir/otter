@@ -68,7 +68,12 @@ pub enum Unsupported {
 /// Build the typed SSA graph for `view`, or report why it is outside the
 /// optimizing subset.
 pub fn build_graph(view: &JitFunctionView) -> Result<ir::Graph, Unsupported> {
-    builder::build(view)
+    builder::build(view, None)
+}
+
+/// Build a typed SSA graph rooted at a loop-header OSR entry.
+pub fn build_osr_graph(view: &JitFunctionView, osr_pc: u32) -> Result<ir::Graph, Unsupported> {
+    builder::build(view, Some(osr_pc))
 }
 
 /// Run the whole optimizing-tier pipeline for `view` — graph construction, SSA
@@ -78,8 +83,12 @@ pub fn build_graph(view: &JitFunctionView) -> Result<ir::Graph, Unsupported> {
 /// falls back to the baseline).
 pub fn compile(
     view: &JitFunctionView,
+    osr_pc: Option<u32>,
 ) -> Result<std::sync::Arc<dyn otter_vm::JitFunctionCode>, Unsupported> {
-    let graph = build_graph(view)?;
+    let graph = match osr_pc {
+        Some(pc) => build_osr_graph(view, pc)?,
+        None => build_graph(view)?,
+    };
     // Deopt frame states are computed before register allocation: a value a guard
     // restores is an additional use that must extend its live range, so the
     // allocator keeps it in a home the deopt exit can read.

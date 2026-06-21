@@ -162,6 +162,11 @@ pub enum NodeKind {
     LoadThis,
     /// The TDZ / uninitialized hole sentinel. Result [`Repr::Tagged`].
     LoadHole,
+    /// Load a captured binding from the current frame's upvalue spine. The
+    /// upvalue index is the bytecode immediate. Missing spine / TDZ hole
+    /// deoptimizes so the interpreter owns the exact ReferenceError path.
+    /// Result [`Repr::Tagged`].
+    LoadUpvalue(i32),
     /// Speculative "operand is an ordinary object of the baked shape" guard.
     /// Carries the receiver and the receiver shape's compressed `Gc` offset. A
     /// non-object, or a different shape (or dictionary mode), deoptimizes.
@@ -183,6 +188,12 @@ pub enum NodeKind {
     /// deoptimizes at the load's exact PC so the interpreter owns the full
     /// `[[Get]]` semantics. Result [`Repr::Tagged`].
     LoadElement(NodeId, NodeId),
+    /// Speculative typed-array computed element write. Inputs are `(receiver,
+    /// index, value)`, where `index` is already unboxed int32 and `value` is a
+    /// primitive numeric value. A miss deoptimizes at the store's exact PC so the
+    /// interpreter owns `[[Set]]`, coercion, accessors, growth, and barriers.
+    /// Side-effect only; no result is consumed.
+    StoreElement(NodeId, NodeId, NodeId),
     /// Speculative Array `.length` read. The receiver must be a dense Array body
     /// and the length must fit int32; otherwise deopt. Result [`Repr::Int32`].
     LoadArrayLength(NodeId),
@@ -220,6 +231,7 @@ impl NodeKind {
             | NodeKind::Int32BitXor(a, b)
             | NodeKind::Int32Shl(a, b)
             | NodeKind::Int32Shr(a, b) => vec![*a, *b],
+            NodeKind::StoreElement(a, b, c) => vec![*a, *b, *c],
             NodeKind::Phi(ops) => ops.clone(),
             NodeKind::Param(_)
             | NodeKind::ConstInt32(_)
@@ -227,6 +239,7 @@ impl NodeKind {
             | NodeKind::ConstBool(_)
             | NodeKind::ConstUndefined
             | NodeKind::SelfClosure
+            | NodeKind::LoadUpvalue(_)
             | NodeKind::LoadThis
             | NodeKind::LoadHole => Vec::new(),
         }
@@ -267,9 +280,15 @@ impl NodeKind {
                 fix(a);
                 fix(b);
             }
+            NodeKind::StoreElement(a, b, c) => {
+                fix(a);
+                fix(b);
+                fix(c);
+            }
             NodeKind::Phi(ops) => ops.iter_mut().for_each(fix),
             NodeKind::LoadThis
             | NodeKind::LoadHole
+            | NodeKind::LoadUpvalue(_)
             | NodeKind::Param(_)
             | NodeKind::ConstInt32(_)
             | NodeKind::ConstF64(_)
@@ -309,10 +328,12 @@ impl NodeKind {
             | NodeKind::ConstUndefined
             | NodeKind::SelfClosure
             | NodeKind::Phi(_)
+            | NodeKind::LoadUpvalue(_)
             | NodeKind::CheckShape(_, _)
             | NodeKind::LoadSlot(_, _)
             | NodeKind::StoreSlot(_, _, _)
             | NodeKind::LoadElement(_, _)
+            | NodeKind::StoreElement(_, _, _)
             | NodeKind::LoadThis
             | NodeKind::LoadHole => Repr::Tagged,
         }
@@ -435,11 +456,11 @@ pub struct Graph {
 
 impl Graph {
     /// Construct an empty graph with a single (entry) block at byte-PC 0.
-    pub(super) fn new(param_count: u16, register_count: u16) -> Self {
+    pub(super) fn new(param_count: u16, register_count: u16, entry: BlockId) -> Self {
         Self {
             nodes: Vec::new(),
             blocks: vec![Block::new(0)],
-            entry: 0,
+            entry,
             param_count,
             register_count,
             phi_reg: rustc_hash::FxHashMap::default(),

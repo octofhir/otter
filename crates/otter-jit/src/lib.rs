@@ -62,21 +62,24 @@ impl otter_vm::JitCompilerHook for BaselineJitCompiler {
         request: otter_vm::JitCompileRequest,
     ) -> Result<otter_vm::JitCompileStatus, otter_vm::JitCompileError> {
         let fid = request.function.function_id;
+        let osr_pc = request.osr_pc;
         let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
         // Try the optimizing tier (register allocation, representation
         // selection, exact-PC deopt) first; it covers the int32 arithmetic /
         // control-flow / loop subset. Anything it declines falls through to the
         // baseline template tier, which serves the broader opcode surface.
-        match optimizing::compile(&request.function) {
+        match optimizing::compile(&request.function, osr_pc) {
             Ok(code) => {
                 if trace {
-                    eprintln!("[otter-jit] optimizing tier compiled fid {fid}");
+                    eprintln!("[otter-jit] optimizing tier compiled fid {fid} osr={osr_pc:?}");
                 }
                 return Ok(otter_vm::JitCompileStatus::Compiled { code });
             }
             Err(reason) => {
                 if trace {
-                    eprintln!("[otter-jit] optimizing tier declined fid {fid}: {reason:?}");
+                    eprintln!(
+                        "[otter-jit] optimizing tier declined fid {fid} osr={osr_pc:?}: {reason:?}"
+                    );
                 }
             }
         }

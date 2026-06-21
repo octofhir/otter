@@ -603,6 +603,12 @@ pub struct Interpreter {
     /// installed baseline body; `None` records a function the emitter could not
     /// compile (outside the supported subset), so it is never retried.
     jit_code: rustc_hash::FxHashMap<u32, Option<std::sync::Arc<dyn jit::JitFunctionCode>>>,
+    /// OSR-target compiled-code cache keyed by `(function_id, loop_header_pc)`.
+    /// A target compile is not interchangeable with another header in the same
+    /// function: its synthetic entry edge and captured OSR reload set are rooted
+    /// at one loop header.
+    jit_osr_code:
+        rustc_hash::FxHashMap<(u32, u32), Option<std::sync::Arc<dyn jit::JitFunctionCode>>>,
     /// Single-entry monomorphic cache over [`Self::jit_code`] for the hot
     /// compiled→compiled call bridge ([`Self::jit_runtime_call`]). Records the
     /// last function id whose installed body is a non-OSR baseline body, so a
@@ -1257,6 +1263,7 @@ impl Interpreter {
                 .filter(|&t| t > 0)
                 .unwrap_or(Self::JIT_OSR_THRESHOLD),
             jit_code: rustc_hash::FxHashMap::default(),
+            jit_osr_code: rustc_hash::FxHashMap::default(),
             jit_code_cache: None,
             jit_runtime_stats: JitRuntimeStats::default(),
             reg_pool: Vec::new(),
@@ -1519,12 +1526,12 @@ impl Interpreter {
         }
         // Resolve compiled code, compiling once and caching the result (shared
         // with the function-entry path; `None` records an uncompilable body).
-        let code = match self.jit_code.get(&fid) {
+        let osr_key = (fid, osr_pc);
+        let code = match self.jit_osr_code.get(&osr_key) {
             Some(slot) => slot.clone(),
             None => {
-                let compiled = self.compile_jit_function(context, fid);
-                self.jit_code.insert(fid, compiled.clone());
-                self.jit_code_cache = None;
+                let compiled = self.compile_jit_function(context, fid, Some(osr_pc));
+                self.jit_osr_code.insert(osr_key, compiled.clone());
                 compiled
             }
         };
@@ -1645,7 +1652,7 @@ impl Interpreter {
             if count < Self::JIT_TIER_UP_THRESHOLD {
                 return None;
             }
-            let compiled = self.compile_jit_function(context, fid);
+            let compiled = self.compile_jit_function(context, fid, None);
             self.jit_runtime_stats.compile_attempts =
                 self.jit_runtime_stats.compile_attempts.saturating_add(1);
             self.jit_code.insert(fid, compiled.clone());
@@ -2409,6 +2416,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         fid: u32,
+        osr_pc: Option<u32>,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         let mut view = context.jit_function_view(fid)?;
         Self::bake_typed_array_layout(&mut view);
@@ -2418,7 +2426,10 @@ impl Interpreter {
         let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
         let (regs, params) = (view.register_count, view.param_count);
         let hook = self.jit_hook.as_ref()?.clone();
-        let status = hook.compile_function(jit::JitCompileRequest { function: view });
+        let status = hook.compile_function(jit::JitCompileRequest {
+            function: view,
+            osr_pc,
+        });
         if trace {
             eprintln!("[jit] compile fid={fid} regs={regs} params={params} -> {status:?}");
         }

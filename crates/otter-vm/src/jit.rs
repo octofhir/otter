@@ -38,6 +38,9 @@ use otter_bytecode::{Op, Operand};
 pub struct JitCompileRequest {
     /// Function snapshot to compile.
     pub function: JitFunctionView,
+    /// Loop-header byte-PC for an OSR-target compile. `None` means normal
+    /// function-entry compilation.
+    pub osr_pc: Option<u32>,
 }
 
 /// Owned snapshot of one executable function body.

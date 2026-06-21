@@ -482,6 +482,7 @@ impl<'a> Builder<'a> {
             let feedback = instr.arith_feedback;
             let make_self = instr.make_self;
             let load_number = instr.load_number;
+            let load_array_length = instr.load_array_length;
             let property_feedback = instr.property_feedback;
             let operands = instr.operands.clone();
             match op {
@@ -532,6 +533,24 @@ impl<'a> Builder<'a> {
                 Op::LoadProperty => {
                     let dst = reg(&operands, 0)?;
                     let obj_reg = reg(&operands, 1)?;
+                    if load_array_length {
+                        if self.view.cage_base == 0 {
+                            self.deopt_or_decline(
+                                block,
+                                byte_pc,
+                                Unsupported::Opcode(Op::LoadProperty),
+                            )?;
+                            return Ok(());
+                        }
+                        let obj = self.read_variable(obj_reg, block);
+                        let load =
+                            self.graph
+                                .add_node(NodeKind::LoadArrayLength(obj), block, byte_pc);
+                        self.graph.set_frame_dst(load, dst);
+                        self.push_body(block, load);
+                        self.def_register(dst, block, load, byte_pc);
+                        continue;
+                    }
                     // Inline slot access decompresses object pointers against the
                     // baked GC cage base; without it the layout offsets are absent.
                     let Some((shape, slot_byte)) =
@@ -598,6 +617,33 @@ impl<'a> Builder<'a> {
                         byte_pc,
                     );
                     self.push_body(block, store);
+                }
+                // `LoadElement dst, recv, idx` — inline only dense Array and
+                // Float64Array / Int32Array fast paths. Every miss deoptimizes at
+                // this exact PC, letting the interpreter perform the full
+                // computed `[[Get]]` semantics.
+                Op::LoadElement => {
+                    let dst = reg(&operands, 0)?;
+                    let recv_reg = reg(&operands, 1)?;
+                    let idx_reg = reg(&operands, 2)?;
+                    if self.view.cage_base == 0 {
+                        self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
+                        return Ok(());
+                    }
+                    let recv = self.read_variable(recv_reg, block);
+                    let idx = match self.int32_index_operand(block, idx_reg, byte_pc) {
+                        Ok(idx) => idx,
+                        Err(reason) => {
+                            self.deopt_or_decline(block, byte_pc, reason)?;
+                            return Ok(());
+                        }
+                    };
+                    let load =
+                        self.graph
+                            .add_node(NodeKind::LoadElement(recv, idx), block, byte_pc);
+                    self.graph.set_frame_dst(load, dst);
+                    self.push_body(block, load);
+                    self.def_register(dst, block, load, byte_pc);
                 }
                 Op::LoadUndefined => {
                     let dst = reg(&operands, 0)?;
@@ -1042,6 +1088,30 @@ impl<'a> Builder<'a> {
                 self.push_body(block, check);
                 check
             }
+        }
+    }
+
+    /// Resolve a computed-element index to unboxed int32. This guard is not
+    /// tied to arithmetic feedback: non-int32 indexes are valid JavaScript, but
+    /// outside the inline element fast path, so the guard deopts and the
+    /// interpreter handles property-key coercion.
+    fn int32_index_operand(
+        &mut self,
+        block: BlockId,
+        operand_reg: u16,
+        byte_pc: u32,
+    ) -> Result<NodeId, Unsupported> {
+        let node = self.read_variable(operand_reg, block);
+        match self.graph.node(node).repr {
+            Repr::Int32 => Ok(node),
+            Repr::Tagged => {
+                let check = self
+                    .graph
+                    .add_node(NodeKind::CheckInt32(node), block, byte_pc);
+                self.push_body(block, check);
+                Ok(check)
+            }
+            Repr::Float64 | Repr::Bool => Err(Unsupported::OperandShape("element index repr")),
         }
     }
 

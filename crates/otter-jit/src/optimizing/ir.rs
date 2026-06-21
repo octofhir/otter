@@ -178,6 +178,14 @@ pub enum NodeKind {
     /// (int32 / f64 / bool), so the stored `Value` is never a `Gc` pointer and no
     /// generational write barrier is needed. A side effect — produces no result.
     StoreSlot(NodeId, u32, NodeId),
+    /// Speculative dense-array / typed-array computed element read. Inputs are
+    /// `(receiver, index)`, where `index` is already unboxed int32. A miss
+    /// deoptimizes at the load's exact PC so the interpreter owns the full
+    /// `[[Get]]` semantics. Result [`Repr::Tagged`].
+    LoadElement(NodeId, NodeId),
+    /// Speculative Array `.length` read. The receiver must be a dense Array body
+    /// and the length must fit int32; otherwise deopt. Result [`Repr::Int32`].
+    LoadArrayLength(NodeId),
 }
 
 impl NodeKind {
@@ -192,7 +200,8 @@ impl NodeKind {
             | NodeKind::CheckNumber(a)
             | NodeKind::Int32ToFloat64(a)
             | NodeKind::CheckShape(a, _)
-            | NodeKind::LoadSlot(a, _) => {
+            | NodeKind::LoadSlot(a, _)
+            | NodeKind::LoadArrayLength(a) => {
                 vec![*a]
             }
             NodeKind::Int32Add(a, b)
@@ -205,6 +214,7 @@ impl NodeKind {
             | NodeKind::Float64Div(a, b)
             | NodeKind::Float64Compare(_, a, b)
             | NodeKind::StoreSlot(a, _, b)
+            | NodeKind::LoadElement(a, b)
             | NodeKind::Int32BitOr(a, b)
             | NodeKind::Int32BitAnd(a, b)
             | NodeKind::Int32BitXor(a, b)
@@ -236,7 +246,8 @@ impl NodeKind {
             | NodeKind::CheckNumber(a)
             | NodeKind::Int32ToFloat64(a)
             | NodeKind::CheckShape(a, _)
-            | NodeKind::LoadSlot(a, _) => fix(a),
+            | NodeKind::LoadSlot(a, _)
+            | NodeKind::LoadArrayLength(a) => fix(a),
             NodeKind::Int32Add(a, b)
             | NodeKind::Int32Sub(a, b)
             | NodeKind::Int32Mul(a, b)
@@ -247,6 +258,7 @@ impl NodeKind {
             | NodeKind::Float64Div(a, b)
             | NodeKind::Float64Compare(_, a, b)
             | NodeKind::StoreSlot(a, _, b)
+            | NodeKind::LoadElement(a, b)
             | NodeKind::Int32BitOr(a, b)
             | NodeKind::Int32BitAnd(a, b)
             | NodeKind::Int32BitXor(a, b)
@@ -273,6 +285,7 @@ impl NodeKind {
         match self {
             NodeKind::ConstInt32(_)
             | NodeKind::CheckInt32(_)
+            | NodeKind::LoadArrayLength(_)
             | NodeKind::Int32Add(_, _)
             | NodeKind::Int32Sub(_, _)
             | NodeKind::Int32Mul(_, _)
@@ -299,6 +312,7 @@ impl NodeKind {
             | NodeKind::CheckShape(_, _)
             | NodeKind::LoadSlot(_, _)
             | NodeKind::StoreSlot(_, _, _)
+            | NodeKind::LoadElement(_, _)
             | NodeKind::LoadThis
             | NodeKind::LoadHole => Repr::Tagged,
         }

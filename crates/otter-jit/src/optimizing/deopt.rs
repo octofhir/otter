@@ -109,6 +109,20 @@ fn reg_effects(op: Op, operands: &[Operand]) -> RegEffects {
                 uses.push(s);
             }
         }
+        // `LoadElement dst, recv, idx` reads receiver and computed key, writes
+        // the destination. The optimizing fast path may deopt at the load, so
+        // the live-before state must contain the pre-instruction operands.
+        Op::LoadElement => {
+            if let Some(d) = reg(operands, 0) {
+                defs.push(d);
+            }
+            if let Some(o) = reg(operands, 1) {
+                uses.push(o);
+            }
+            if let Some(i) = reg(operands, 2) {
+                uses.push(i);
+            }
+        }
         // `StoreProperty obj, name, src, scratch` reads the receiver and the
         // stored value and clobbers the scratch register.
         Op::StoreProperty => {
@@ -297,6 +311,8 @@ fn can_deopt(kind: &NodeKind) -> bool {
         NodeKind::CheckInt32(_)
             | NodeKind::CheckNumber(_)
             | NodeKind::CheckShape(_, _)
+            | NodeKind::LoadElement(_, _)
+            | NodeKind::LoadArrayLength(_)
             | NodeKind::LoadThis
             | NodeKind::Int32Add(_, _)
             | NodeKind::Int32Sub(_, _)

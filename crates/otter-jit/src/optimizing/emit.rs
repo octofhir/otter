@@ -191,6 +191,8 @@ mod arm64 {
     const FP_LOAD_SCRATCH: u32 = 6;
     /// FP scratch register for the second arithmetic operand (`d7`).
     const FP_ARITH_SCRATCH: u32 = 7;
+    /// NaN-box high-16 for the canonical quiet NaN double (`value/tag.rs`).
+    const TAG_NAN: u64 = 0x7FF8;
 
     /// Frame byte offset of spill slot `s` within the JIT spill area (`[sp]`).
     fn spill_off(s: u32) -> u32 {
@@ -219,6 +221,52 @@ mod arm64 {
         if l3 != 0 {
             dynasm!(ops ; .arch aarch64 ; movk X(xr), l3, lsl #48);
         }
+    }
+
+    /// Probe the `Vec<T>` field layout by value identity, returning the byte
+    /// offsets of its data-pointer and length words. The standard library does
+    /// not promise field order, while the JIT must read `Vec<Value>` /
+    /// `Vec<u8>` backing storage without naming the VM-side Rust type here.
+    fn vec_layout_offsets() -> (u32, u32) {
+        static CACHE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+        *CACHE.get_or_init(|| {
+            let mut v: Vec<u8> = Vec::with_capacity(4);
+            v.push(0xA5);
+            let ptr = v.as_ptr() as usize;
+            let len = v.len();
+            assert_eq!(std::mem::size_of::<Vec<u8>>(), 24);
+            // SAFETY: copy the Vec's three machine words by value. They are
+            // compared to known pointer/length values, never dereferenced.
+            let words: [usize; 3] = unsafe { std::mem::transmute_copy(&v) };
+            let mut ptr_off = None;
+            let mut len_off = None;
+            for (i, &w) in words.iter().enumerate() {
+                if w == ptr {
+                    ptr_off = Some((i * 8) as u32);
+                } else if w == len {
+                    len_off = Some((i * 8) as u32);
+                }
+            }
+            (
+                ptr_off.expect("Vec data-pointer word not found"),
+                len_off.expect("Vec length word not found"),
+            )
+        })
+    }
+
+    /// Box the f64 in `src_d` into x-register `dst_x` as a tagged `Value`.
+    /// Non-NaN doubles are their own boxed representation; NaN is canonicalized
+    /// so it never aliases the NaN-box tag range.
+    fn emit_box_double(ops: &mut Assembler, src_d: u32, dst_x: u32) {
+        let ready = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch aarch64
+            ; fmov X(dst_x), D(src_d)
+            ; fcmp D(src_d), D(src_d)
+            ; b.vc =>ready
+            ; movz X(dst_x), TAG_NAN as u32, lsl #48
+            ; =>ready
+        );
     }
 
     /// Load a value's home `loc` into physical x-register `dst`.
@@ -434,6 +482,190 @@ mod arm64 {
             .get(&value)
             .copied()
             .ok_or(Unsupported::Unallocated)
+    }
+
+    /// Load and guard a tagged object receiver. Leaves:
+    /// - `x0`: decompressed body pointer
+    /// - `x1`: cage base
+    /// - `w2`: body type tag
+    fn emit_recv_body(
+        ops: &mut Assembler,
+        view: &JitFunctionView,
+        recv_loc: Location,
+        exit: DynamicLabel,
+    ) {
+        load_loc(ops, 0, recv_loc);
+        dynasm!(ops
+            ; .arch aarch64
+            ; lsr x3, x0, #48
+            ; movz x4, TAG_PTR_OBJECT as u32
+            ; cmp x3, x4
+            ; b.ne =>exit
+            ; mov w0, w0
+        );
+        emit_load_u64(ops, 1, view.cage_base as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x0, x1, x0
+            ; ldrb w2, [x0]
+        );
+    }
+
+    /// Lower speculative Array `.length` to an int32 result, deoptimizing on
+    /// non-Array receiver or lengths outside the int32 fast path.
+    fn emit_array_length_load(
+        ops: &mut Assembler,
+        view: &JitFunctionView,
+        recv_loc: Location,
+        dst: Option<Location>,
+        exit: DynamicLabel,
+    ) {
+        emit_recv_body(ops, view, recv_loc, exit);
+        let array_tag = u32::from(view.ta_layout.array_type_tag);
+        let length_byte = view.ta_layout.array_length_byte;
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp w2, array_tag
+            ; b.ne =>exit
+            ; ldr x3, [x0, length_byte]
+        );
+        emit_load_u64(ops, 4, i32::MAX as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp x3, x4
+            ; b.hi =>exit
+            ; mov w3, w3
+        );
+        if let Some(loc) = dst {
+            store_loc(ops, loc, 3);
+        }
+    }
+
+    /// Lower speculative dense-array / typed-array `recv[idx]` fast paths.
+    /// Every miss deopts to the interpreter at the `LoadElement` byte-PC.
+    fn emit_element_load(
+        ops: &mut Assembler,
+        view: &JitFunctionView,
+        recv_loc: Location,
+        idx_loc: Location,
+        dst: Option<Location>,
+        exit: DynamicLabel,
+    ) {
+        let array_tag = u32::from(view.ta_layout.array_type_tag);
+        let ta_tag = u32::from(view.ta_layout.ta_type_tag);
+        let local_buf_type_tag = u32::from(view.ta_layout.local_buffer_type_tag);
+        let kind_float64 = view.ta_layout.kind_float64;
+        let kind_int32 = view.ta_layout.kind_int32;
+        let buffer_local_tag = view.ta_layout.buffer_local_tag;
+        let ta_kind_byte = view.ta_layout.ta_kind_byte;
+        let ta_byte_offset_byte = view.ta_layout.ta_byte_offset_byte;
+        let ta_length_byte = view.ta_layout.ta_length_byte;
+        let ta_length_tracking_byte = view.ta_layout.ta_length_tracking_byte;
+        let buffer_disc_byte = view.ta_layout.buffer_disc_byte;
+        let buffer_handle_byte = view.ta_layout.buffer_handle_byte;
+        let (ptr_word, len_word) = vec_layout_offsets();
+        let arr_ptr_byte = view.ta_layout.array_elements_byte + ptr_word;
+        let arr_len_byte = view.ta_layout.array_elements_byte + len_word;
+        let bytes_ptr_byte = view.ta_layout.buf_bytes_byte + ptr_word;
+        let bytes_len_byte = view.ta_layout.buf_bytes_byte + len_word;
+        let hole_bits = (TAG_SPECIAL << 48) | SPECIAL_HOLE;
+        let array_path = ops.new_dynamic_label();
+        let ta_path = ops.new_dynamic_label();
+        let f64_path = ops.new_dynamic_label();
+        let i32_path = ops.new_dynamic_label();
+        let done = ops.new_dynamic_label();
+
+        emit_recv_body(ops, view, recv_loc, exit);
+        load_loc(ops, 5, idx_loc);
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov w5, w5
+            ; cmp w2, array_tag
+            ; b.eq =>array_path
+            ; cmp w2, ta_tag
+            ; b.eq =>ta_path
+            ; b =>exit
+        );
+
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>array_path
+            ; ldr x3, [x0, arr_len_byte]
+            ; cmp x5, x3
+            ; b.hs =>exit
+            ; ldr x3, [x0, arr_ptr_byte]
+            ; lsl x4, x5, #3
+            ; add x4, x3, x4
+            ; ldr x6, [x4]
+        );
+        emit_load_u64(ops, 7, hole_bits);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp x6, x7
+            ; b.eq =>exit
+        );
+        if let Some(loc) = dst {
+            store_loc(ops, loc, 6);
+        }
+        dynasm!(ops ; .arch aarch64 ; b =>done);
+
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>ta_path
+            ; ldrb w3, [x0, ta_length_tracking_byte]
+            ; cbnz w3, =>exit
+            ; ldr x3, [x0, ta_length_byte]
+            ; cmp x5, x3
+            ; b.hs =>exit
+            ; ldr w3, [x0, buffer_disc_byte]
+            ; movz w4, buffer_local_tag
+            ; cmp w3, w4
+            ; b.ne =>exit
+            ; ldr w3, [x0, buffer_handle_byte]
+            ; add x3, x1, x3
+            ; ldrb w4, [x3]
+            ; cmp w4, local_buf_type_tag
+            ; b.ne =>exit
+            ; ldr x6, [x3, bytes_ptr_byte]
+            ; ldr x7, [x3, bytes_len_byte]
+            ; ldr x3, [x0, ta_byte_offset_byte]
+            ; ldr w4, [x0, ta_kind_byte]
+            ; cmp w4, kind_float64
+            ; b.eq =>f64_path
+            ; cmp w4, kind_int32
+            ; b.eq =>i32_path
+            ; b =>exit
+            ; =>f64_path
+            ; lsl x4, x5, #3
+            ; add x4, x4, x3
+            ; add x0, x4, #8
+            ; cmp x0, x7
+            ; b.hi =>exit
+            ; add x4, x6, x4
+            ; ldr D(FP_LOAD_SCRATCH), [x4]
+        );
+        emit_box_double(ops, FP_LOAD_SCRATCH, 6);
+        if let Some(loc) = dst {
+            store_loc(ops, loc, 6);
+        }
+        dynasm!(ops
+            ; .arch aarch64
+            ; b =>done
+            ; =>i32_path
+            ; lsl x4, x5, #2
+            ; add x4, x4, x3
+            ; add x0, x4, #4
+            ; cmp x0, x7
+            ; b.hi =>exit
+            ; add x4, x6, x4
+            ; ldr w6, [x4]
+            ; movz x7, TAG_INT32 as u32, lsl #48
+            ; orr x6, x6, x7
+        );
+        if let Some(loc) = dst {
+            store_loc(ops, loc, 6);
+        }
+        dynasm!(ops ; .arch aarch64 ; =>done);
     }
 
     /// Emit the function prologue (copied from the baseline) then reserve the
@@ -1154,6 +1386,19 @@ mod arm64 {
                     );
                     store_loc(ops, loc, box_scratch);
                 }
+                Ok(())
+            }
+            NodeKind::LoadArrayLength(obj) => {
+                let oloc = require_loc(alloc, *obj)?;
+                let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
+                emit_array_length_load(ops, view, oloc, dst, exit);
+                Ok(())
+            }
+            NodeKind::LoadElement(recv, idx) => {
+                let recv_loc = require_loc(alloc, *recv)?;
+                let idx_loc = require_loc(alloc, *idx)?;
+                let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
+                emit_element_load(ops, view, recv_loc, idx_loc, dst, exit);
                 Ok(())
             }
             NodeKind::StoreSlot(obj, value_byte, value) => {

@@ -3427,6 +3427,36 @@ impl Interpreter {
         scratch_reg: u16,
     ) -> Result<(), VmError> {
         self.record_jit_runtime_property_stub();
+        let receiver = *read_register(&stack[frame_index], recv_reg)?;
+        let key_value = *read_register(&stack[frame_index], idx_reg)?;
+        let value = *read_register(&stack[frame_index], src_reg)?;
+        if let Some(arr) = receiver.as_array()
+            && let Some(n) = key_value.as_number()
+            && let Some(idx) = crate::array::index_from_number(n)
+            && crate::array::can_fast_fill_dense_range(arr, &self.gc_heap, idx, idx + 1)
+        {
+            let strict = context.function_is_strict(stack[frame_index].function_id);
+            if !self.array_index_store_via_proto(context, arr, idx, value, strict)? {
+                if strict {
+                    let key = idx.to_string();
+                    self.array_strict_write_guard(arr, &key, true)?;
+                }
+                let roots = self.collect_allocation_roots(stack);
+                let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                    for &slot in &roots {
+                        visitor(slot);
+                    }
+                };
+                crate::array::set_with_roots(
+                    arr,
+                    &mut self.gc_heap,
+                    idx,
+                    value,
+                    &mut external_visit,
+                )?;
+            }
+            return Ok(());
+        }
         let saved_pc = stack[frame_index].pc;
         let operands = [
             Operand::Register(recv_reg),

@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use otter_bytecode::{Op, Operand};
 use otter_vm::JitFunctionView;
 use otter_vm::jit_feedback::ArithFeedback;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::Unsupported;
 use super::ir::{BlockId, CmpOp, Graph, NodeId, NodeKind, Repr, Terminator};
@@ -241,6 +241,44 @@ impl<'a> Builder<'a> {
         }
         self.seal_ready();
         debug_assert!(self.graph.blocks.iter().all(|blk| blk.sealed));
+
+        // On-demand SSA construction can leave a phi trivial after one of its
+        // operands collapses on a back edge *after* the phi's own triviality
+        // check ran, and the collapse's user-recursion does not always reach it.
+        // Such a residue is orphaned from its block's phi list but still named by
+        // `reg_writes` (and thus by deopt / OSR frame states), where it has no
+        // home and restores garbage. Sweep to a fixpoint so no trivial phi
+        // survives into the backend.
+        let mut visited: FxHashSet<NodeId> = FxHashSet::default();
+        loop {
+            let trivial = self.graph.nodes.iter().enumerate().find_map(|(id, node)| {
+                let id = id as NodeId;
+                if visited.contains(&id) {
+                    return None;
+                }
+                let NodeKind::Phi(ops) = &node.kind else {
+                    return None;
+                };
+                let mut same: Option<NodeId> = None;
+                for &op in ops {
+                    if op == id || Some(op) == same {
+                        continue;
+                    }
+                    if same.is_some() {
+                        return None;
+                    }
+                    same = Some(op);
+                }
+                same.map(|_| id)
+            });
+            match trivial {
+                Some(phi) => {
+                    visited.insert(phi);
+                    self.try_remove_trivial_phi(phi);
+                }
+                None => break,
+            }
+        }
         Ok(())
     }
 
@@ -413,6 +451,18 @@ impl<'a> Builder<'a> {
         }
         for defs in &mut self.current_def {
             for v in defs.values_mut() {
+                if *v == old {
+                    *v = new;
+                }
+            }
+        }
+        // The per-block register-write log is replayed by the deopt / OSR frame
+        // reconstruction to map each interpreter register to its SSA value. A
+        // collapsed trivial phi must be redirected here too, or a guard's frame
+        // state restores a value with no home: read uninitialized, corrupting
+        // the resumed interpreter frame.
+        for writes in self.graph.reg_writes.values_mut() {
+            for (_, _, v) in writes.iter_mut() {
                 if *v == old {
                     *v = new;
                 }

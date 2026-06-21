@@ -70,6 +70,13 @@ fn reg(operands: &[Operand], i: usize) -> Result<u16, Unsupported> {
     }
 }
 
+fn const_index(operands: &[Operand], i: usize) -> Result<u32, Unsupported> {
+    match operands.get(i) {
+        Some(Operand::ConstIndex(n)) => Ok(*n),
+        _ => Err(Unsupported::OperandShape("expected const index")),
+    }
+}
+
 /// Static control-flow graph over the instruction stream: block leaders, the
 /// instruction-index range of each block, and the successor / predecessor edge
 /// sets.
@@ -743,6 +750,39 @@ impl<'a> Builder<'a> {
                         byte_pc,
                     );
                     self.push_body(block, store);
+                }
+                Op::Call => {
+                    const MAX_INLINE_ARGS: usize = 4;
+                    let dst = reg(&operands, 0)?;
+                    let callee_reg = reg(&operands, 1)?;
+                    let argc = const_index(&operands, 2)? as usize;
+                    if argc > MAX_INLINE_ARGS {
+                        return Err(Unsupported::OperandShape("call arg count"));
+                    }
+                    let mut inputs = Vec::with_capacity(argc + 1);
+                    inputs.push(self.read_variable(callee_reg, block));
+                    let mut arg_regs = Vec::with_capacity(argc);
+                    for slot in 0..argc {
+                        let arg_reg = reg(&operands, 3 + slot)?;
+                        arg_regs.push(arg_reg);
+                        inputs.push(self.read_variable(arg_reg, block));
+                    }
+                    let call = self.graph.add_node(
+                        NodeKind::Call {
+                            callee_reg,
+                            arg_regs,
+                            inputs,
+                        },
+                        block,
+                        byte_pc,
+                    );
+                    self.graph.set_frame_dst(call, dst);
+                    self.push_body(block, call);
+                    self.def_register(dst, block, call, byte_pc);
+                }
+                Op::CallMethodValue => {
+                    self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
+                    return Ok(());
                 }
                 Op::LoadUndefined => {
                     let dst = reg(&operands, 0)?;

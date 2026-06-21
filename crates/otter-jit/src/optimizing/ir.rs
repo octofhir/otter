@@ -167,6 +167,18 @@ pub enum NodeKind {
     /// deoptimizes so the interpreter owns the exact ReferenceError path.
     /// Result [`Repr::Tagged`].
     LoadUpvalue(i32),
+    /// Direct bytecode function call. Inputs are `(callee, args...)`; result is
+    /// the boxed return value. The emitter materializes a call safepoint frame,
+    /// prepares a compiled direct callee through the VM, and deoptimizes at the
+    /// call PC when the site is ineligible.
+    Call {
+        /// Bytecode register containing the callee value.
+        callee_reg: u16,
+        /// Bytecode argument registers, in call order.
+        arg_regs: Vec<u16>,
+        /// SSA inputs `(callee, args...)`, matching the register metadata above.
+        inputs: Vec<NodeId>,
+    },
     /// Speculative "operand is an ordinary object of the baked shape" guard.
     /// Carries the receiver and the receiver shape's compressed `Gc` offset. A
     /// non-object, or a different shape (or dictionary mode), deoptimizes.
@@ -242,6 +254,7 @@ impl NodeKind {
             | NodeKind::LoadUpvalue(_)
             | NodeKind::LoadThis
             | NodeKind::LoadHole => Vec::new(),
+            NodeKind::Call { inputs, .. } => inputs.clone(),
         }
     }
 
@@ -295,6 +308,7 @@ impl NodeKind {
             | NodeKind::ConstBool(_)
             | NodeKind::ConstUndefined
             | NodeKind::SelfClosure => {}
+            NodeKind::Call { inputs, .. } => inputs.iter_mut().for_each(fix),
         }
     }
 
@@ -329,6 +343,7 @@ impl NodeKind {
             | NodeKind::SelfClosure
             | NodeKind::Phi(_)
             | NodeKind::LoadUpvalue(_)
+            | NodeKind::Call { .. }
             | NodeKind::CheckShape(_, _)
             | NodeKind::LoadSlot(_, _)
             | NodeKind::StoreSlot(_, _, _)

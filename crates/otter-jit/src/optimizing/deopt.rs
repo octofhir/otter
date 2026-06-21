@@ -190,6 +190,40 @@ fn reg_effects(op: Op, operands: &[Operand]) -> RegEffects {
                 uses.push(s);
             }
         }
+        Op::Call => {
+            if let Some(d) = reg(operands, 0) {
+                defs.push(d);
+            }
+            if let Some(c) = reg(operands, 1) {
+                uses.push(c);
+            }
+            let argc = match operands.get(2) {
+                Some(Operand::ConstIndex(n)) => *n as usize,
+                _ => 0,
+            };
+            for slot in 0..argc {
+                if let Some(a) = reg(operands, 3 + slot) {
+                    uses.push(a);
+                }
+            }
+        }
+        Op::CallMethodValue => {
+            if let Some(d) = reg(operands, 0) {
+                defs.push(d);
+            }
+            if let Some(r) = reg(operands, 1) {
+                uses.push(r);
+            }
+            let argc = match operands.get(3) {
+                Some(Operand::ConstIndex(n)) => *n as usize,
+                _ => 0,
+            };
+            for slot in 0..argc {
+                if let Some(a) = reg(operands, 4 + slot) {
+                    uses.push(a);
+                }
+            }
+        }
         // No register effects.
         Op::Jump | Op::ReturnUndefined => {}
         // Any opcode outside the subset would have failed the builder; model it
@@ -330,6 +364,7 @@ fn can_deopt(kind: &NodeKind) -> bool {
             | NodeKind::CheckNumber(_)
             | NodeKind::CheckShape(_, _)
             | NodeKind::LoadUpvalue(_)
+            | NodeKind::Call { .. }
             | NodeKind::LoadElement(_, _)
             | NodeKind::StoreElement(_, _, _)
             | NodeKind::LoadArrayLength(_)

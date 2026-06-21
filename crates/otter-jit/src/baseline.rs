@@ -157,41 +157,43 @@ struct JitRet {
 /// `status` discriminants in [`JitRet`].
 pub(crate) const STATUS_RETURNED: u64 = 0;
 pub(crate) const STATUS_BAILED: u64 = 1;
-const STATUS_THREW: u64 = 2;
+pub(crate) const STATUS_THREW: u64 = 2;
 
 /// Byte offset of [`JitCtx::bail_pc`] — where compiled code stamps the current
 /// instruction's byte-PC before each op so a bail resumes at the exact site.
 pub(crate) const BAIL_PC_OFFSET: u32 = std::mem::offset_of!(JitCtx, bail_pc) as u32;
 /// Byte offset of [`JitCtx::error`] for nested direct-call context construction.
 #[allow(dead_code)]
-const ERROR_SLOT_OFFSET: u32 = std::mem::offset_of!(JitCtx, error) as u32;
-const VM_OFFSET: u32 = std::mem::offset_of!(JitCtx, vm) as u32;
-const STACK_OFFSET: u32 = std::mem::offset_of!(JitCtx, stack) as u32;
-const CONTEXT_OFFSET: u32 = std::mem::offset_of!(JitCtx, context) as u32;
-const FRAME_INDEX_OFFSET: u32 = std::mem::offset_of!(JitCtx, frame_index) as u32;
+pub(crate) const ERROR_SLOT_OFFSET: u32 = std::mem::offset_of!(JitCtx, error) as u32;
+pub(crate) const VM_OFFSET: u32 = std::mem::offset_of!(JitCtx, vm) as u32;
+pub(crate) const STACK_OFFSET: u32 = std::mem::offset_of!(JitCtx, stack) as u32;
+pub(crate) const CONTEXT_OFFSET: u32 = std::mem::offset_of!(JitCtx, context) as u32;
+pub(crate) const FRAME_INDEX_OFFSET: u32 = std::mem::offset_of!(JitCtx, frame_index) as u32;
 /// Byte offset of [`JitCtx::upvalues_ptr`] for inline upvalue access.
 pub(crate) const UPVALUES_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, upvalues_ptr) as u32;
 /// Byte offset of [`JitCtx::reg_stack_base`] — the flat JIT register stack base
 /// used to build a self-recursive callee window inline.
-const REG_STACK_BASE_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_stack_base) as u32;
+pub(crate) const REG_STACK_BASE_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_stack_base) as u32;
 /// Byte offset of [`JitCtx::reg_top_ptr`] — the address of the interpreter's
 /// `reg_top`, bumped to reserve a callee window and restored on return.
-const REG_TOP_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_top_ptr) as u32;
+pub(crate) const REG_TOP_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_top_ptr) as u32;
 /// Size of one `UpvalueCell` (a 4-byte compressed `Gc<UpvalueCellBody>`).
 pub(crate) const UPVALUE_CELL_SIZE: u32 = 4;
 /// Byte offset of the single `Value` inside an `UpvalueCellBody` from its
 /// decompressed pointer (just past the 8-byte `GcHeader`).
 pub(crate) const UPVALUE_VALUE_OFFSET: u32 = 8;
-const DIRECT_ENTRY_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_entry_addr) as u32;
-const DIRECT_REGS_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_regs) as u32;
-const DIRECT_SELF_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_self_closure) as u32;
-const DIRECT_THIS_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_this_value) as u32;
+pub(crate) const DIRECT_ENTRY_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_entry_addr) as u32;
+pub(crate) const DIRECT_REGS_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_regs) as u32;
+pub(crate) const DIRECT_SELF_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_self_closure) as u32;
+pub(crate) const DIRECT_THIS_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_this_value) as u32;
 /// Byte offset of the precomputed `this` bits in [`JitCtx`], for inline
 /// `LoadThis` in both the baseline and optimizing tiers.
 pub(crate) const THIS_VALUE_OFFSET: u32 = std::mem::offset_of!(JitCtx, this_value) as u32;
-const DIRECT_FRAME_INDEX_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_frame_index) as u32;
-const DIRECT_UPVALUES_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_upvalues_ptr) as u32;
-const JIT_CTX_STACK_SIZE: u32 = ((std::mem::size_of::<JitCtx>() + 15) & !15) as u32;
+pub(crate) const DIRECT_FRAME_INDEX_OFFSET: u32 =
+    std::mem::offset_of!(JitCtx, direct_frame_index) as u32;
+pub(crate) const DIRECT_UPVALUES_OFFSET: u32 =
+    std::mem::offset_of!(JitCtx, direct_upvalues_ptr) as u32;
+pub(crate) const JIT_CTX_STACK_SIZE: u32 = ((std::mem::size_of::<JitCtx>() + 15) & !15) as u32;
 
 /// Compiled-code entry signature.
 type JitEntry = extern "C" fn(*mut JitCtx) -> JitRet;
@@ -209,7 +211,7 @@ fn park_jit_error(ctx: &mut JitCtx, err: VmError) {
 /// - `0`: direct target prepared in `ctx.direct_*`.
 /// - `1`: throw, error parked in `ctx.error`.
 /// - `2`: ineligible/cold callee; caller should bail to the interpreter.
-extern "C" fn jit_prepare_direct_call_stub(
+pub(crate) extern "C" fn jit_prepare_direct_call_stub(
     ctx: *mut JitCtx,
     callee: u64,
     argc: u64,
@@ -292,7 +294,7 @@ extern "C" fn jit_prepare_direct_method_call_stub(
     }
 }
 
-extern "C" fn jit_finish_direct_call_returned_stub(
+pub(crate) extern "C" fn jit_finish_direct_call_returned_stub(
     ctx: *mut JitCtx,
     dst: u64,
     callee_frame_index: u64,
@@ -317,7 +319,7 @@ extern "C" fn jit_finish_direct_call_returned_stub(
     }
 }
 
-extern "C" fn jit_finish_direct_call_bailed_stub(
+pub(crate) extern "C" fn jit_finish_direct_call_bailed_stub(
     ctx: *mut JitCtx,
     dst: u64,
     callee_frame_index: u64,
@@ -344,7 +346,10 @@ extern "C" fn jit_finish_direct_call_bailed_stub(
     }
 }
 
-extern "C" fn jit_abort_direct_call_stub(ctx: *mut JitCtx, callee_frame_index: u64) -> u64 {
+pub(crate) extern "C" fn jit_abort_direct_call_stub(
+    ctx: *mut JitCtx,
+    callee_frame_index: u64,
+) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };

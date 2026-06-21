@@ -159,9 +159,15 @@ mod arm64 {
     };
     use crate::CompiledCode;
     use crate::baseline::{
-        BAIL_PC_OFFSET, OBJECT_BODY_TYPE_TAG, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE,
-        STATUS_BAILED, STATUS_RETURNED, TAG_INT32, TAG_PTR_OBJECT, TAG_SPECIAL, THIS_VALUE_OFFSET,
-        UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET,
+        BAIL_PC_OFFSET, CONTEXT_OFFSET, DIRECT_ENTRY_OFFSET, DIRECT_FRAME_INDEX_OFFSET,
+        DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET,
+        ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET, JIT_CTX_STACK_SIZE, OBJECT_BODY_TYPE_TAG,
+        REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE,
+        STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_INT32, TAG_PTR_OBJECT,
+        TAG_SPECIAL, THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET,
+        UPVALUES_PTR_OFFSET, VM_OFFSET, jit_abort_direct_call_stub,
+        jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
+        jit_prepare_direct_call_stub,
     };
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
     use otter_vm::JitFunctionView;
@@ -348,6 +354,39 @@ mod arm64 {
         } else {
             load_loc(ops, gp_dst, loc);
             box_value(ops, gp_dst, repr, tag_scratch);
+        }
+    }
+
+    fn emit_rematerialized_boxed(
+        ops: &mut Assembler,
+        kind: &NodeKind,
+        gp_dst: u32,
+        tag_scratch: u32,
+    ) -> bool {
+        match kind {
+            NodeKind::ConstUndefined => {
+                emit_load_u64(ops, gp_dst, TAG_SPECIAL << 48);
+                true
+            }
+            NodeKind::ConstBool(value) => {
+                let special = if *value { SPECIAL_TRUE } else { SPECIAL_FALSE };
+                emit_load_u64(ops, gp_dst, (TAG_SPECIAL << 48) | u64::from(special));
+                true
+            }
+            NodeKind::ConstInt32(value) => {
+                emit_load_u64(ops, gp_dst, u64::from(*value as u32));
+                box_value(ops, gp_dst, Repr::Int32, tag_scratch);
+                true
+            }
+            NodeKind::ConstF64(value) => {
+                emit_load_u64(ops, gp_dst, value.to_bits());
+                true
+            }
+            NodeKind::SelfClosure => {
+                dynasm!(ops ; .arch aarch64 ; ldr X(gp_dst), [x20, #8]);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -771,6 +810,166 @@ mod arm64 {
         Ok(())
     }
 
+    fn emit_frame_materialize(
+        ops: &mut Assembler,
+        graph: &Graph,
+        alloc: &Allocation,
+        point: &DeoptPoint,
+        box_scratch: u32,
+    ) -> Result<(), Unsupported> {
+        for &(regn, value) in &point.registers {
+            let node = graph.node(value);
+            if !emit_rematerialized_boxed(ops, &node.kind, box_scratch, MOVE_SCRATCH) {
+                let loc = require_loc(alloc, value)?;
+                box_into_gp(ops, box_scratch, node.repr, loc, MOVE_SCRATCH);
+            }
+            let off = u32::from(regn) * 8;
+            dynasm!(ops ; .arch aarch64 ; str X(box_scratch), [x19, off]);
+        }
+        Ok(())
+    }
+
+    fn emit_frame_reload(
+        ops: &mut Assembler,
+        graph: &Graph,
+        alloc: &Allocation,
+        point: &DeoptPoint,
+        skip_reg: Option<u16>,
+        box_scratch: u32,
+    ) -> Result<(), Unsupported> {
+        for &(regn, value) in &point.registers {
+            if Some(regn) == skip_reg {
+                continue;
+            }
+            let Some(&loc) = alloc.location.get(&value) else {
+                continue;
+            };
+            let off = u32::from(regn) * 8;
+            dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
+            match graph.node(value).repr {
+                Repr::Tagged => store_loc(ops, loc, box_scratch),
+                Repr::Int32 => {
+                    dynasm!(ops ; .arch aarch64 ; mov W(box_scratch), W(box_scratch));
+                    store_loc(ops, loc, box_scratch);
+                }
+                Repr::Float64 => {
+                    dynasm!(ops ; .arch aarch64 ; fmov D(FP_LOAD_SCRATCH), X(box_scratch));
+                    store_fp_loc(ops, loc, FP_LOAD_SCRATCH);
+                }
+                Repr::Bool => {
+                    let is_true = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+                    emit_load_u64(ops, MOVE_SCRATCH, (TAG_SPECIAL << 48) | SPECIAL_TRUE as u64);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; cmp X(box_scratch), X(MOVE_SCRATCH)
+                        ; b.eq =>is_true
+                        ; movz W(box_scratch), #0
+                        ; b =>done
+                        ; =>is_true
+                        ; movz W(box_scratch), #1
+                        ; =>done
+                    );
+                    store_loc(ops, loc, box_scratch);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_status_stub_call(ops: &mut Assembler, addr: usize, threw: DynamicLabel) {
+        emit_load_u64(ops, 16, addr as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; cbnz x0, =>threw
+        );
+    }
+
+    fn emit_direct_call_tail(
+        ops: &mut Assembler,
+        dst_reg: u16,
+        threw: DynamicLabel,
+        done: DynamicLabel,
+    ) {
+        let direct_returned = ops.new_dynamic_label();
+        let direct_bailed = ops.new_dynamic_label();
+        let direct_threw = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch aarch64
+            ; sub sp, sp, JIT_CTX_STACK_SIZE
+            ; ldr x9, [x20, DIRECT_REGS_OFFSET]
+            ; str x9, [sp]
+            ; ldr x9, [x20, DIRECT_SELF_OFFSET]
+            ; str x9, [sp, #8]
+            ; ldr x9, [x20, DIRECT_THIS_OFFSET]
+            ; str x9, [sp, #16]
+            ; str wzr, [sp, BAIL_PC_OFFSET]
+            ; ldr x9, [x20, VM_OFFSET]
+            ; str x9, [sp, VM_OFFSET]
+            ; ldr x9, [x20, STACK_OFFSET]
+            ; str x9, [sp, STACK_OFFSET]
+            ; ldr x9, [x20, CONTEXT_OFFSET]
+            ; str x9, [sp, CONTEXT_OFFSET]
+            ; ldr x9, [x20, DIRECT_FRAME_INDEX_OFFSET]
+            ; str x9, [sp, FRAME_INDEX_OFFSET]
+            ; ldr x9, [x20, ERROR_SLOT_OFFSET]
+            ; str x9, [sp, ERROR_SLOT_OFFSET]
+            ; ldr x9, [x20, DIRECT_UPVALUES_OFFSET]
+            ; str x9, [sp, UPVALUES_PTR_OFFSET]
+            ; ldr x9, [x20, REG_STACK_BASE_OFFSET]
+            ; str x9, [sp, REG_STACK_BASE_OFFSET]
+            ; ldr x9, [x20, REG_TOP_PTR_OFFSET]
+            ; str x9, [sp, REG_TOP_PTR_OFFSET]
+            ; mov x0, sp
+            ; ldr x16, [x20, DIRECT_ENTRY_OFFSET]
+            ; blr x16
+            ; cmp x1, STATUS_RETURNED as u32
+            ; b.eq =>direct_returned
+            ; cmp x1, STATUS_BAILED as u32
+            ; b.eq =>direct_bailed
+            ; b =>direct_threw
+            ; =>direct_returned
+            ; mov x3, x0
+            ; ldr x2, [x20, DIRECT_FRAME_INDEX_OFFSET]
+            ; add sp, sp, JIT_CTX_STACK_SIZE
+            ; mov x0, x20
+            ; movz x1, dst_reg as u32
+        );
+        emit_status_stub_call(
+            ops,
+            jit_finish_direct_call_returned_stub as *const () as usize,
+            threw,
+        );
+        dynasm!(ops ; .arch aarch64 ; b =>done);
+
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>direct_bailed
+            ; ldr w3, [sp, BAIL_PC_OFFSET]
+            ; ldr x2, [x20, DIRECT_FRAME_INDEX_OFFSET]
+            ; add sp, sp, JIT_CTX_STACK_SIZE
+            ; mov x0, x20
+            ; movz x1, dst_reg as u32
+        );
+        emit_status_stub_call(
+            ops,
+            jit_finish_direct_call_bailed_stub as *const () as usize,
+            threw,
+        );
+        dynasm!(ops ; .arch aarch64 ; b =>done);
+
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>direct_threw
+            ; ldr x1, [x20, DIRECT_FRAME_INDEX_OFFSET]
+            ; add sp, sp, JIT_CTX_STACK_SIZE
+            ; mov x0, x20
+        );
+        emit_status_stub_call(ops, jit_abort_direct_call_stub as *const () as usize, threw);
+        dynasm!(ops ; .arch aarch64 ; b =>threw);
+    }
+
     /// Emit the function prologue (copied from the baseline) then reserve the
     /// spill area. Returns the byte size subtracted from `sp` (0 when no spill
     /// area is needed).
@@ -908,6 +1107,7 @@ mod arm64 {
             .collect();
         // One cold deopt-exit label per deopt-capable node (filled after the body).
         let mut deopt_labels: FxHashMap<NodeId, DynamicLabel> = FxHashMap::default();
+        let threw = ops.new_dynamic_label();
 
         // Fast lookup: edge moves keyed by (pred, succ).
         let mut edge_index: FxHashMap<(BlockId, BlockId), &EdgeMoves> = FxHashMap::default();
@@ -969,7 +1169,9 @@ mod arm64 {
                     alloc,
                     frames,
                     &mut deopt_labels,
+                    threw,
                     nid,
+                    spill_bytes,
                     BOX_SCRATCH,
                 )?;
             }
@@ -1063,6 +1265,13 @@ mod arm64 {
             spill_bytes,
             BOX_SCRATCH,
         )?;
+        dynasm!(&mut ops
+            ; .arch aarch64
+            ; =>threw
+            ; movz x0, #0
+            ; movz x1, STATUS_THREW as u32
+        );
+        emit_epilogue(&mut ops, spill_bytes);
 
         // OSR-entry trampolines, one per eligible loop header. Each sets up the
         // frame, reloads every live interpreter register from the frame window
@@ -1137,7 +1346,9 @@ mod arm64 {
         alloc: &Allocation,
         frames: &FxHashMap<NodeId, DeoptPoint>,
         deopt_labels: &mut FxHashMap<NodeId, DynamicLabel>,
+        threw: DynamicLabel,
         nid: NodeId,
+        spill_bytes: u32,
         box_scratch: u32,
     ) -> Result<(), Unsupported> {
         let node = graph.node(nid);
@@ -1552,6 +1763,67 @@ mod arm64 {
                 dynasm!(ops ; .arch aarch64 ; str x17, [x16, slot_byte]);
                 Ok(())
             }
+            NodeKind::Call {
+                callee_reg,
+                arg_regs,
+                ..
+            } => {
+                let point = frames
+                    .get(&nid)
+                    .ok_or(Unsupported::Unlowered("call without safepoint state"))?;
+                let bail = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                let after = ops.new_dynamic_label();
+                let dst_reg = node
+                    .frame_dst
+                    .ok_or(Unsupported::Unlowered("call without frame dst"))?;
+                if arg_regs.len() > 4 {
+                    return Err(Unsupported::OperandShape("call arg count"));
+                }
+                emit_frame_materialize(ops, graph, alloc, point, box_scratch)?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; mov x0, x20
+                    ; movz x1, *callee_reg as u32
+                    ; movz x2, arg_regs.len() as u32
+                );
+                for slot in 0..4 {
+                    let arg = arg_regs.get(slot).copied().unwrap_or(0);
+                    let xn = 3 + slot as u32;
+                    dynasm!(ops ; .arch aarch64 ; movz X(xn), arg as u32);
+                }
+                emit_load_u64(ops, 16, jit_prepare_direct_call_stub as *const () as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; blr x16
+                    ; cmp x0, #1
+                    ; b.eq =>threw
+                    ; cmp x0, #2
+                    ; b.eq =>bail
+                );
+                emit_direct_call_tail(ops, dst_reg, threw, done);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_frame_reload(ops, graph, alloc, point, Some(dst_reg), box_scratch)?;
+                if let Some(loc) = dst {
+                    let off = u32::from(dst_reg) * 8;
+                    dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
+                    store_loc(ops, loc, box_scratch);
+                }
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; b =>after
+                    ; =>bail
+                );
+                emit_load_u64(ops, box_scratch, u64::from(point.byte_pc));
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; str W(box_scratch), [x20, BAIL_PC_OFFSET]
+                    ; movz x1, STATUS_BAILED as u32
+                );
+                emit_epilogue(ops, spill_bytes);
+                dynasm!(ops ; .arch aarch64 ; =>after);
+                Ok(())
+            }
             NodeKind::LoadThis => {
                 // `this` bits from JitCtx; a TDZ hole (derived-ctor this before
                 // super) deopts to the interpreter.
@@ -1658,9 +1930,11 @@ mod arm64 {
         box_scratch: u32,
     ) -> Result<(), Unsupported> {
         for &(regn, value) in &point.registers {
-            let loc = require_loc(alloc, value)?;
-            let repr = graph.node(value).repr;
-            box_into_gp(ops, box_scratch, repr, loc, MOVE_SCRATCH);
+            let node = graph.node(value);
+            if !emit_rematerialized_boxed(ops, &node.kind, box_scratch, MOVE_SCRATCH) {
+                let loc = require_loc(alloc, value)?;
+                box_into_gp(ops, box_scratch, node.repr, loc, MOVE_SCRATCH);
+            }
             let off = u32::from(regn) * 8;
             dynasm!(ops ; .arch aarch64 ; str X(box_scratch), [x19, off]);
         }

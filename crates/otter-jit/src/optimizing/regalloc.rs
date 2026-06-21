@@ -41,12 +41,12 @@
 //!    value mid-loop.
 //! 4. **Linear scan.** Intervals are processed in increasing start order against
 //!    `active` (covering the current position) and `inactive` (allocated but
-//!    currently in a hole) lists. For each unhandled interval we expire/transition
-//!    `active ↔ inactive ↔ handled` by position, compute for every physical
-//!    register the first position at which it is next used by an active/inactive
-//!    interval, and take the register free longest. If none covers the whole
-//!    interval we **spill**: whichever of the current interval or a blocking
-//!    active interval has the furthest next-use is sent to a fresh spill slot.
+//!    currently in a hole) lists. Because the current allocator assigns one home
+//!    per value and does not insert reloads at hole exits, inactive intervals
+//!    still reserve their registers; the scan only reuses a register when no
+//!    live interval owns it. If none covers the whole interval we **spill**:
+//!    whichever of the current interval or a blocking active/inactive interval
+//!    has the furthest next-use is sent to a fresh spill slot.
 //!    Registers are partitioned into classes by [`Repr`] via [`reg_class_of`]:
 //!    `Int32` / `Bool` / `Tagged` allocate from the GP pool and `Float64` from a
 //!    disjoint FP pool, each sized independently. The scan logic is class-generic
@@ -60,9 +60,9 @@
 //!    location.
 //!
 //! # Invariants
-//! - **Interference freedom.** Two values whose intervals overlap at any position
-//!   never receive the same `Reg`. Holes are real: a register may be reused inside
-//!   another interval's hole.
+//! - **Interference freedom.** Two values whose lifetime spans overlap never
+//!   receive the same `Reg`. Lifetime holes are tracked for future splitting, but
+//!   they are not used for register reuse until reload insertion exists.
 //! - **One home per value (no splitting yet).** A value is spilled *whole* — it
 //!   keeps a single [`Location`] for its entire life. The `active` / `inactive`
 //!   machinery and the per-position "free until" computation are nonetheless
@@ -236,19 +236,6 @@ impl Interval {
     /// Whether this interval is live at `pos` (inside one of its ranges).
     fn covers(&self, pos: u32) -> bool {
         self.ranges.iter().any(|&(f, t)| f <= pos && pos < t)
-    }
-
-    /// First position `≥ pos` at which this interval is live again, or `None` if
-    /// it is dead from `pos` on. Used to find where an `inactive`/`active`
-    /// interval next blocks a register.
-    fn next_intersection(&self, pos: u32) -> Option<u32> {
-        for &(f, t) in &self.ranges {
-            if t <= pos {
-                continue;
-            }
-            return Some(f.max(pos));
-        }
-        None
     }
 
     /// First explicit use at or after `pos`. A value live past `pos` with no
@@ -659,7 +646,7 @@ impl LinearScan {
     fn try_allocate_free(
         &mut self,
         cur: usize,
-        position: u32,
+        _position: u32,
         active: &[usize],
         inactive: &[usize],
     ) -> bool {
@@ -676,17 +663,15 @@ impl LinearScan {
                 free_until[r as usize] = 0;
             }
         }
-        // Inactive intervals of the same class free their register only until
-        // they next intersect `cur`.
+        // Without interval splitting/reload insertion, an inactive interval
+        // still owns its register across holes: reusing that register would
+        // clobber the value before its later use.
         for &i in inactive {
             if self.intervals[i].class != class {
                 continue;
             }
-            if let Some(Location::Reg(r)) = self.intervals[i].location
-                && let Some(isect) = self.intervals[i].next_intersection(position)
-            {
-                let slot = &mut free_until[r as usize];
-                *slot = (*slot).min(isect);
+            if let Some(Location::Reg(r)) = self.intervals[i].location {
+                free_until[r as usize] = 0;
             }
         }
 
@@ -727,10 +712,11 @@ impl LinearScan {
     ) {
         let class = self.intervals[cur].class;
 
-        // next_use[r] = soonest next use of any interval currently in register r
-        // (active ⇒ from `position`; inactive ⇒ from its next intersection with
-        // `cur`). A register whose occupant is needed furthest out is the cheapest
-        // to free. `occupied[r]` records that *some* interval holds `r`, so a
+        // next_use[r] = soonest next use of any interval currently owning
+        // register r. Inactive intervals still reserve their register because
+        // this allocator has one home per value and no reloads at hole exits.
+        // A register whose occupant is needed furthest out is the cheapest to
+        // free. `occupied[r]` records that *some* interval holds `r`, so a
         // still-live occupant whose next use is `MAX` is never mistaken for free.
         let mut next_use = vec![u32::MAX; self.regs_of(class) as usize];
         let mut occupied = vec![false; self.regs_of(class) as usize];
@@ -751,10 +737,8 @@ impl LinearScan {
             if self.intervals[i].class != class {
                 continue;
             }
-            if let Some(Location::Reg(r)) = self.intervals[i].location
-                && let Some(isect) = self.intervals[i].next_intersection(position)
-            {
-                let u = self.intervals[i].next_use(isect);
+            if let Some(Location::Reg(r)) = self.intervals[i].location {
+                let u = self.intervals[i].next_use(position);
                 if !occupied[r as usize] || u < next_use[r as usize] {
                     next_use[r as usize] = u;
                     occupied[r as usize] = true;
@@ -806,7 +790,7 @@ impl LinearScan {
             .copied()
             .filter(|&x| {
                 self.intervals[x].location == Some(Location::Reg(reg))
-                    && self.intervals_overlap(x, cur)
+                    && self.interval_lifetimes_overlap(x, cur)
             })
             .collect();
         for victim in victims {
@@ -818,13 +802,9 @@ impl LinearScan {
     }
 
     /// Whether two intervals are live at any common position.
-    fn intervals_overlap(&self, a: usize, b: usize) -> bool {
-        self.intervals[a].ranges.iter().any(|&(af, at)| {
-            self.intervals[b]
-                .ranges
-                .iter()
-                .any(|&(bf, bt)| af < bt && bf < at)
-        })
+    fn interval_lifetimes_overlap(&self, a: usize, b: usize) -> bool {
+        self.intervals[a].start() < self.intervals[b].end()
+            && self.intervals[b].start() < self.intervals[a].end()
     }
 
     fn fresh_spill(&mut self) -> u32 {

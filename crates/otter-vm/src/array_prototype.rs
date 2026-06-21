@@ -63,6 +63,7 @@ enum ArrayCallbackFastPath {
     MapMulAdd { mul: f64, add: f64 },
     FilterRemEqZero { divisor: f64 },
     ReduceAdd,
+    ForEachAddBitAndUpvalue { upvalue_index: usize, mask: i32 },
 }
 
 fn is_numeric_sub_sort_comparator_function(
@@ -157,6 +158,7 @@ fn array_callback_fast_path(
         ArrayCallbackKind::Reduce | ArrayCallbackKind::ReduceRight => {
             match_reduce_add_callback(context, function)
         }
+        ArrayCallbackKind::ForEach => match_for_each_add_bitand_upvalue_callback(context, function),
         _ => None,
     }
 }
@@ -304,6 +306,68 @@ fn match_reduce_add_callback(
     }
 }
 
+fn match_for_each_add_bitand_upvalue_callback(
+    context: &ExecutionContext,
+    function: &crate::executable::ExecutableFunction,
+) -> Option<ArrayCallbackFastPath> {
+    if function.param_count != 1 || function.code.len() != 12 {
+        return None;
+    }
+    let code = &function.code;
+    if code[0].op() != Op::StoreLocal
+        || code[1].op() != Op::LoadUpvalue
+        || code[2].op() != Op::LoadLocal
+        || code[3].op() != Op::LoadInt32
+        || code[4].op() != Op::ToPrimitive
+        || code[5].op() != Op::ToNumeric
+        || code[6].op() != Op::BitwiseAnd
+        || code[7].op() != Op::ToPrimitive
+        || code[8].op() != Op::ToPrimitive
+        || code[9].op() != Op::Add
+        || code[10].op() != Op::StoreUpvalueChecked
+        || code[11].op() != Op::ReturnUndefined
+    {
+        return None;
+    }
+    let local = context.exec_imm32(&code[0], 1)?;
+    let upvalue_index = context.exec_imm32(&code[1], 1)?;
+    if upvalue_index < 0 {
+        return None;
+    }
+    if context.exec_register(&code[0], 0) != Some(0)
+        || context.exec_imm32(&code[2], 1) != Some(local)
+        || context.exec_imm32(&code[10], 1) != Some(upvalue_index)
+    {
+        return None;
+    }
+    let upvalue = context.exec_register(&code[1], 0)?;
+    let loaded = context.exec_register(&code[2], 0)?;
+    let mask_reg = context.exec_register(&code[3], 0)?;
+    let primitive = context.exec_register(&code[4], 0)?;
+    let numeric = context.exec_register(&code[5], 0)?;
+    let bitand_dst = context.exec_register(&code[6], 0)?;
+    let lhs_prim = context.exec_register(&code[7], 0)?;
+    let rhs_prim = context.exec_register(&code[8], 0)?;
+    let add_dst = context.exec_register(&code[9], 0)?;
+    if context.exec_register(&code[4], 1) == Some(loaded)
+        && context.exec_register(&code[5], 1) == Some(primitive)
+        && context.exec_register(&code[6], 1) == Some(numeric)
+        && context.exec_register(&code[6], 2) == Some(mask_reg)
+        && context.exec_register(&code[7], 1) == Some(upvalue)
+        && context.exec_register(&code[8], 1) == Some(bitand_dst)
+        && context.exec_register(&code[9], 1) == Some(lhs_prim)
+        && context.exec_register(&code[9], 2) == Some(rhs_prim)
+        && context.exec_register(&code[10], 0) == Some(add_dst)
+    {
+        Some(ArrayCallbackFastPath::ForEachAddBitAndUpvalue {
+            upvalue_index: upvalue_index as usize,
+            mask: context.exec_imm32(&code[3], 1)?,
+        })
+    } else {
+        None
+    }
+}
+
 fn execute_array_callback_fast_path(
     fast_path: Option<ArrayCallbackFastPath>,
     kind: ArrayCallbackKind,
@@ -333,6 +397,24 @@ fn execute_array_callback_fast_path(
         }
         _ => None,
     }
+}
+
+fn execute_array_for_each_fast_path(
+    interp: &mut Interpreter,
+    cell: crate::UpvalueCell,
+    mask: i32,
+    value: Value,
+) -> Option<Value> {
+    let acc = crate::read_upvalue(interp.gc_heap(), cell);
+    if acc.is_hole() {
+        return None;
+    }
+    let acc = acc.as_number()?;
+    let value = value.as_number()?;
+    let masked = crate::number::bitwise_and(value, NumberValue::Smi(mask));
+    let next = Value::number(crate::number::add(acc, masked));
+    crate::store_upvalue(interp.gc_heap_mut(), cell, next);
+    Some(Value::undefined())
 }
 
 /// Static `Array.prototype` method specs.
@@ -3530,9 +3612,20 @@ pub(crate) fn array_callback_native_dispatch(
             } else {
                 Value::undefined()
             };
-            let cb_result = if let Some(result) =
-                execute_array_callback_fast_path(callback_fast_path, kind, reduce_kind, acc_now, v)
+            let mut fast_result =
+                execute_array_callback_fast_path(callback_fast_path, kind, reduce_kind, acc_now, v);
+            if fast_result.is_none()
+                && let Some(ArrayCallbackFastPath::ForEachAddBitAndUpvalue {
+                    upvalue_index,
+                    mask,
+                }) = callback_fast_path
+                && kind == ArrayCallbackKind::ForEach
+                && let Some(state) = lean_inner.as_ref()
+                && let Some(cell) = interp.lean_callback_parent_upvalue(state, upvalue_index)
             {
+                fast_result = execute_array_for_each_fast_path(interp, cell, mask, v);
+            }
+            let cb_result = if let Some(result) = fast_result {
                 Ok(result)
             } else {
                 match lean_inner {
@@ -4038,6 +4131,92 @@ mod tests {
         )
     }
 
+    fn for_each_add_bitand_upvalue_function(op: Op) -> Function {
+        callback_function(
+            "<for-each-callback>",
+            1,
+            11,
+            vec![
+                instr(
+                    0,
+                    Op::StoreLocal,
+                    vec![Operand::Register(0), Operand::Imm32(1)],
+                ),
+                instr(
+                    1,
+                    Op::LoadUpvalue,
+                    vec![Operand::Register(2), Operand::Imm32(0)],
+                ),
+                instr(
+                    2,
+                    Op::LoadLocal,
+                    vec![Operand::Register(3), Operand::Imm32(1)],
+                ),
+                instr(
+                    3,
+                    Op::LoadInt32,
+                    vec![Operand::Register(4), Operand::Imm32(7)],
+                ),
+                instr(
+                    4,
+                    Op::ToPrimitive,
+                    vec![
+                        Operand::Register(5),
+                        Operand::Register(3),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                instr(
+                    5,
+                    Op::ToNumeric,
+                    vec![Operand::Register(6), Operand::Register(5)],
+                ),
+                instr(
+                    6,
+                    Op::BitwiseAnd,
+                    vec![
+                        Operand::Register(7),
+                        Operand::Register(6),
+                        Operand::Register(4),
+                    ],
+                ),
+                instr(
+                    7,
+                    Op::ToPrimitive,
+                    vec![
+                        Operand::Register(8),
+                        Operand::Register(2),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                instr(
+                    8,
+                    Op::ToPrimitive,
+                    vec![
+                        Operand::Register(9),
+                        Operand::Register(7),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                instr(
+                    9,
+                    op,
+                    vec![
+                        Operand::Register(10),
+                        Operand::Register(8),
+                        Operand::Register(9),
+                    ],
+                ),
+                instr(
+                    10,
+                    Op::StoreUpvalueChecked,
+                    vec![Operand::Register(10), Operand::Imm32(0)],
+                ),
+                instr(11, Op::ReturnUndefined, vec![]),
+            ],
+        )
+    }
+
     fn instr(pc: u32, op: Op, operands: Vec<Operand>) -> Instruction {
         Instruction {
             pc,
@@ -4129,5 +4308,30 @@ mod tests {
         let function = context.exec_function(0).expect("test function");
 
         assert_eq!(match_reduce_add_callback(&context, function), None);
+    }
+
+    #[test]
+    fn recognizes_for_each_add_bitand_upvalue_shape() {
+        let context = context_for(for_each_add_bitand_upvalue_function(Op::Add));
+        let function = context.exec_function(0).expect("test function");
+
+        assert_eq!(
+            match_for_each_add_bitand_upvalue_callback(&context, function),
+            Some(ArrayCallbackFastPath::ForEachAddBitAndUpvalue {
+                upvalue_index: 0,
+                mask: 7
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_non_add_for_each_upvalue_shape() {
+        let context = context_for(for_each_add_bitand_upvalue_function(Op::Sub));
+        let function = context.exec_function(0).expect("test function");
+
+        assert_eq!(
+            match_for_each_add_bitand_upvalue_callback(&context, function),
+            None
+        );
     }
 }

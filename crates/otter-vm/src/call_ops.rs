@@ -219,6 +219,18 @@ pub(crate) struct LeanCallbackState {
 }
 
 impl Interpreter {
+    pub(crate) fn lean_callback_parent_upvalue(
+        &self,
+        state: &LeanCallbackState,
+        idx: usize,
+    ) -> Option<crate::UpvalueCell> {
+        self.lean_callback_roots
+            .get(state.root_index)?
+            .parent_upvalues
+            .get(idx)
+            .copied()
+    }
+
     /// §9.1 — install the frame's direct-eval variable environment:
     /// a `contains_direct_eval` function gets a FRESH record chained
     /// to the closure's captured one (so probe closures created

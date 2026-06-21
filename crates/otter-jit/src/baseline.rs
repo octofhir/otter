@@ -73,6 +73,8 @@ pub(crate) const OBJECT_BODY_TYPE_TAG: u32 = 0x11;
 /// resolved method's `function_id` so a native callable sharing
 /// [`TAG_PTR_FUNCTION`] is never misread as a bytecode closure.
 pub(crate) const JS_CLOSURE_BODY_TYPE_TAG: u32 = 0x23;
+/// `SPECIAL` payload for `null`.
+pub(crate) const SPECIAL_NULL: u64 = 1;
 /// `SPECIAL` payload for the internal array/`this` hole sentinel.
 pub(crate) const SPECIAL_HOLE: u64 = 2;
 /// `SPECIAL` payload for `false`.
@@ -919,9 +921,9 @@ mod arm64 {
         DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET,
         DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET, JIT_CTX_STACK_SIZE,
         JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS, OBJECT_BODY_TYPE_TAG, Op, Operand,
-        REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE,
-        STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_FUNCTION_ID, TAG_INT32,
-        TAG_NAN, TAG_PTR_FUNCTION, TAG_PTR_OBJECT, TAG_SPECIAL, THIS_VALUE_OFFSET,
+        REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_NULL,
+        SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_FUNCTION_ID,
+        TAG_INT32, TAG_NAN, TAG_PTR_FUNCTION, TAG_PTR_OBJECT, TAG_SPECIAL, THIS_VALUE_OFFSET,
         UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, Unsupported, VM_OFFSET,
         WhiskerIcCell, jit_abort_direct_call_stub, jit_call_method_stub, jit_delegate_op_stub,
         jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
@@ -1443,6 +1445,11 @@ mod arm64 {
                     let dst = reg(ops_ref, 0)?;
                     // SPECIAL payload 0 == undefined.
                     emit_load_u64(&mut ops, 9, TAG_SPECIAL << 48);
+                    store_reg(&mut ops, 9, dst)?;
+                }
+                Op::LoadNull => {
+                    let dst = reg(ops_ref, 0)?;
+                    emit_load_u64(&mut ops, 9, (TAG_SPECIAL << 48) | SPECIAL_NULL);
                     store_reg(&mut ops, 9, dst)?;
                 }
                 Op::LoadHole => {
@@ -3299,6 +3306,66 @@ mod arm64 {
             Cmp::Ne => dynasm!(ops ; .arch aarch64 ; cset w13, ne),
         }
         dynasm!(ops ; .arch aarch64 ; b =>have_bool ; =>float_path);
+        if matches!(cmp, Cmp::Eq | Cmp::Ne) {
+            let lhs_non_number = ops.new_dynamic_label();
+            let number_path = ops.new_dynamic_label();
+            let raw_identity = ops.new_dynamic_label();
+            let strict_false = ops.new_dynamic_label();
+            // Strict equality can decide object/function/special identity
+            // without decoding to Number. Strings and BigInts still bail
+            // because their equality reads heap body contents.
+            dynasm!(ops
+                ; .arch aarch64
+                ; lsr x14, x9, #48
+                ; lsr x15, x10, #48
+                ; movz x11, TAG_SPECIAL as u32
+                ; sub x12, x14, x11
+                ; cmp x12, #5
+                ; b.ls =>lhs_non_number
+                ; sub x12, x15, x11
+                ; cmp x12, #5
+                ; b.ls =>strict_false
+                ; b =>number_path
+                ; =>lhs_non_number
+                ; sub x12, x15, x11
+                ; cmp x12, #5
+                ; b.hi =>strict_false
+                ; cmp x14, x15
+                ; b.ne =>strict_false
+                ; cmp x14, x11
+                ; b.eq =>raw_identity
+                ; movz x11, TAG_FUNCTION_ID as u32
+                ; cmp x14, x11
+                ; b.eq =>raw_identity
+                ; movz x11, TAG_PTR_OBJECT as u32
+                ; cmp x14, x11
+                ; b.eq =>raw_identity
+                ; movz x11, TAG_PTR_FUNCTION as u32
+                ; cmp x14, x11
+                ; b.eq =>raw_identity
+                ; b =>bail
+                ; =>raw_identity
+                ; cmp x9, x10
+            );
+            match cmp {
+                Cmp::Eq => dynasm!(ops ; .arch aarch64 ; cset w13, eq),
+                Cmp::Ne => dynasm!(ops ; .arch aarch64 ; cset w13, ne),
+                _ => unreachable!(),
+            }
+            let false_value = match cmp {
+                Cmp::Eq => 0,
+                Cmp::Ne => 1,
+                _ => unreachable!(),
+            };
+            dynasm!(ops
+                ; .arch aarch64
+                ; b =>have_bool
+                ; =>strict_false
+                ; movz w13, false_value
+                ; b =>have_bool
+                ; =>number_path
+            );
+        }
         // Double path: decode both to f64 and `fcmp`. The FP condition codes
         // differ from the integer ones so an unordered (NaN) compare yields the
         // ECMAScript result (every relational compare false, `!=` true):
@@ -4023,6 +4090,46 @@ mod tests {
         assert_eq!(run_cmp(Op::GreaterThan, nan, box_f64(1.0)), f);
         assert_eq!(run_cmp(Op::Equal, nan, nan), f);
         assert_eq!(run_cmp(Op::NotEqual, nan, box_f64(1.0)), t);
+    }
+
+    #[test]
+    fn strict_non_number_identity_comparisons() {
+        let t = (TAG_SPECIAL << 48) | u64::from(super::SPECIAL_TRUE);
+        let f = (TAG_SPECIAL << 48) | u64::from(super::SPECIAL_FALSE);
+        let cmp_view = |op: Op| {
+            view(&[
+                (
+                    op,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ])
+        };
+        let run_cmp = |op: Op, a: u64, b: u64| {
+            let v = cmp_view(op);
+            let mut regs = [a, b, 0, 0, 0, 0, 0, 0];
+            match run(&v, &mut regs) {
+                Exit::Returned(bits) => bits,
+                Exit::Bailed => panic!("cmp bailed"),
+            }
+        };
+        let null = (TAG_SPECIAL << 48) | u64::from(super::SPECIAL_NULL);
+        let obj_a = (super::TAG_PTR_OBJECT << 48) | 0x1234;
+        let obj_b = (super::TAG_PTR_OBJECT << 48) | 0x5678;
+        assert_eq!(run_cmp(Op::Equal, obj_a, null), f);
+        assert_eq!(run_cmp(Op::NotEqual, obj_a, null), t);
+        assert_eq!(run_cmp(Op::Equal, obj_a, obj_a), t);
+        assert_eq!(run_cmp(Op::Equal, obj_a, obj_b), f);
+
+        let v = cmp_view(Op::Equal);
+        let string_a = (0x7FFD_u64 << 48) | 0x1234;
+        let string_b = (0x7FFD_u64 << 48) | 0x5678;
+        let mut regs = [string_a, string_b, 0, 0, 0, 0, 0, 0];
+        assert!(matches!(run(&v, &mut regs), Exit::Bailed));
     }
 
     #[test]

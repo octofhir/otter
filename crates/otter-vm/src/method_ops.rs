@@ -564,6 +564,16 @@ impl Interpreter {
             return Ok(());
         }
         // §7.3.11 GetMethod + §7.3.14 Call.
+        if name == "toString"
+            && recv_value.is_number()
+            && let Some(result) =
+                self.try_fast_primitive_number_to_string(recv_value, arg_values.as_slice())?
+        {
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            write_register(&mut stack[top_idx], dst, result)?;
+            return Ok(());
+        }
+        // §7.3.11 GetMethod + §7.3.14 Call.
         if self.has_plain_builtin_method(recv_value, name) {
             let method = self
                 .get_method_value_for_call(context, stack, recv_value, name)?
@@ -917,6 +927,13 @@ impl Interpreter {
             write_register(&mut stack[frame_index], dst, result)?;
             return Ok(());
         }
+        if name == "toString"
+            && recv.is_number()
+            && let Some(result) = self.try_fast_primitive_number_to_string(recv, args.as_slice())?
+        {
+            write_register(&mut stack[frame_index], dst, result)?;
+            return Ok(());
+        }
         let saved_pc = stack[frame_index].pc;
         let method = self
             .get_method_value_for_call(context, stack, recv, name)?
@@ -950,6 +967,31 @@ impl Interpreter {
             return Ok(None);
         }
         Ok(string_prototype::fast_primitive_char_code_at(
+            recv_value,
+            args,
+            &mut self.gc_heap,
+        ))
+    }
+
+    fn try_fast_primitive_number_to_string(
+        &mut self,
+        recv_value: Value,
+        args: &[Value],
+    ) -> Result<Option<Value>, VmError> {
+        let Some(proto) = self.constructor_prototype_value("Number")?.as_object() else {
+            return Ok(None);
+        };
+        let value = match crate::object::lookup(proto, &self.gc_heap, "toString") {
+            crate::object::PropertyLookup::Data { value, .. } => value,
+            crate::object::PropertyLookup::Accessor { .. }
+            | crate::object::PropertyLookup::Absent => {
+                return Ok(None);
+            }
+        };
+        if !number::prototype::is_to_string_builtin(value, &self.gc_heap) {
+            return Ok(None);
+        }
+        Ok(number::prototype::fast_primitive_to_string(
             recv_value,
             args,
             &mut self.gc_heap,

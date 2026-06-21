@@ -194,6 +194,34 @@ fn number_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     to_string_radix(ctx, args, "Number.prototype.toString")
 }
 
+pub(crate) fn is_to_string_builtin(value: Value, heap: &otter_gc::GcHeap) -> bool {
+    value
+        .as_native_function()
+        .is_some_and(|native| native.is_static_fn(heap, number_to_string))
+        || value
+            .as_object()
+            .and_then(|obj| crate::object::call_native(obj, heap))
+            .and_then(|native| native.as_native_function())
+            .is_some_and(|native| native.is_static_fn(heap, number_to_string))
+}
+
+pub(crate) fn fast_primitive_to_string(
+    receiver: Value,
+    args: &[Value],
+    heap: &mut otter_gc::GcHeap,
+) -> Option<Value> {
+    let recv = receiver.as_number()?;
+    match args.first().copied() {
+        None => {}
+        Some(arg) if arg.is_undefined() => {}
+        Some(arg) if arg.as_number().is_some_and(|n| n.as_f64() == 10.0) => {}
+        Some(_) => return None,
+    }
+    Some(Value::string(
+        super::ecma::number_to_string(recv.as_f64(), heap).ok()?,
+    ))
+}
+
 fn number_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     to_string_radix(ctx, args, "Number.prototype.toLocaleString")
 }

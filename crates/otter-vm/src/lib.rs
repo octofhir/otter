@@ -10778,6 +10778,105 @@ mod tests {
     }
 
     #[test]
+    fn call_method_number_to_string_builtin_fast_path() {
+        let mut interp = Interpreter::new();
+
+        let stack = call_number_to_string(&mut interp, Value::number_i32(42), None)
+            .expect("Number.prototype.toString should resolve");
+
+        let result = stack[0].registers[2]
+            .as_string(interp.gc_heap_mut())
+            .expect("string result")
+            .to_lossy_string(interp.gc_heap());
+        assert_eq!(result, "42");
+    }
+
+    #[test]
+    fn call_method_number_to_string_callable_shadow_falls_back() {
+        fn replacement(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+            Ok(Value::number_i32(777))
+        }
+
+        let mut interp = Interpreter::new();
+        let proto = interp
+            .constructor_prototype_value("Number")
+            .expect("Number.prototype")
+            .as_object()
+            .expect("Number.prototype object");
+        let replacement = native_value_static(interp.gc_heap_mut(), "replacement", 1, replacement)
+            .expect("replacement");
+        object::set(proto, interp.gc_heap_mut(), "toString", replacement);
+
+        let stack = call_number_to_string(&mut interp, Value::number_i32(42), None)
+            .expect("Number.prototype.toString shadow should resolve");
+
+        assert_eq!(stack[0].registers[2], Value::number_i32(777));
+    }
+
+    #[test]
+    fn call_method_number_to_string_non_decimal_radix_falls_back() {
+        let mut interp = Interpreter::new();
+
+        let stack = call_number_to_string(
+            &mut interp,
+            Value::number_i32(42),
+            Some(Value::number_i32(16)),
+        )
+        .expect("Number.prototype.toString radix should resolve");
+
+        let result = stack[0].registers[2]
+            .as_string(interp.gc_heap_mut())
+            .expect("string result")
+            .to_lossy_string(interp.gc_heap());
+        assert_eq!(result, "2a");
+    }
+
+    fn call_number_to_string(
+        interp: &mut Interpreter,
+        recv: Value,
+        arg: Option<Value>,
+    ) -> Result<HoltStack, VmError> {
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            template_sites: Vec::new(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 4, Vec::new())],
+            constants: vec![Constant::String {
+                utf16: "toString".encode_utf16().collect(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let context = ExecutionContext::from_module(module.clone());
+        let mut stack: HoltStack = HoltStack::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = recv;
+        let has_arg = arg.is_some();
+        if let Some(arg) = arg {
+            frame.registers[1] = arg;
+        }
+        stack.push(frame);
+        let operands = if !has_arg {
+            vec![
+                Operand::Register(2),
+                Operand::Register(0),
+                Operand::ConstIndex(0),
+                Operand::ConstIndex(0),
+            ]
+        } else {
+            vec![
+                Operand::Register(2),
+                Operand::Register(0),
+                Operand::ConstIndex(0),
+                Operand::ConstIndex(1),
+                Operand::Register(1),
+            ]
+        };
+        interp.do_call_method_value(&mut stack, &context, &operands)?;
+        Ok(stack)
+    }
+
+    #[test]
     fn call_method_boolean_prototype_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),

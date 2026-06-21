@@ -5919,7 +5919,16 @@ impl Interpreter {
                 }
                 Op::New => {
                     let operands = context.exec_operands(instr);
+                    let depth_before = stack.len();
                     self.do_construct(stack, context, operands)?;
+                    // Tier-up hook, mirroring `Op::Call`: a bytecode
+                    // constructor frame pushed by `new` can enter JIT at pc=0.
+                    if self.jit_hook.is_some()
+                        && stack.len() > depth_before
+                        && let Some(Some(value)) = self.maybe_dispatch_jit(stack, context)?
+                    {
+                        return Ok(value);
+                    }
                     continue;
                 }
                 Op::NewSpread => {

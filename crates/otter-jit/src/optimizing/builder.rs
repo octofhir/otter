@@ -712,7 +712,9 @@ impl<'a> Builder<'a> {
                     // truthiness (`if (x)`, `while (obj)`, a `&&`/`||` result
                     // merged through a phi) — full ToBoolean is outside this tier,
                     // so bail rather than mis-evaluate it.
-                    if self.graph.node(cond_node).kind.repr() != Repr::Bool {
+                    if self.graph.node(cond_node).kind.repr() != Repr::Bool
+                        && !self.is_boxed_bool(cond_node, &mut FxHashSet::default())
+                    {
                         return Err(Unsupported::OperandShape("non-boolean branch condition"));
                     }
                     let (on_true, on_false) = if matches!(op, Op::JumpIfTrue) {
@@ -810,6 +812,30 @@ impl<'a> Builder<'a> {
     /// Build a typed `Int32*` bitwise / shift node, speculating int32 operands
     /// from the site's feedback (`CheckInt32`). Bails the whole function if the
     /// site is not int32-only.
+    fn is_boxed_bool(&self, value: NodeId, visiting: &mut FxHashSet<NodeId>) -> bool {
+        if !visiting.insert(value) {
+            return false;
+        }
+        let node = self.graph.node(value);
+        let result = match &node.kind {
+            NodeKind::ConstBool(_) => true,
+            NodeKind::Phi(inputs) => {
+                let mut saw_value = false;
+                let all_bool = inputs.iter().all(|&input| {
+                    if visiting.contains(&input) {
+                        return true;
+                    }
+                    saw_value = true;
+                    self.is_boxed_bool(input, visiting)
+                });
+                saw_value && all_bool
+            }
+            _ => node.repr == Repr::Bool,
+        };
+        visiting.remove(&value);
+        result
+    }
+
     fn bitwise_binop(
         &mut self,
         block: BlockId,

@@ -3813,6 +3813,8 @@ mod tests {
             direct_this_value: 0,
             direct_frame_index: 0,
             direct_upvalues_ptr: 0,
+            reg_stack_base: std::ptr::null_mut(),
+            reg_top_ptr: std::ptr::null_mut(),
         };
         // SAFETY: integer-only function; never dereferences the null vm/stack.
         let entry: JitEntry = unsafe { std::mem::transmute(code.code.entry_ptr()) };

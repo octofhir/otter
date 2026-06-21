@@ -278,7 +278,7 @@ mod tests {
         ))
         .expect("loop builds");
 
-        let live = analyze(&g, &Default::default());
+        let live = analyze(&g, &Default::default(), &Default::default());
         assert_eq!(live.rpo[0], g.entry, "entry first in RPO");
         assert_eq!(live.rpo.len(), g.blocks.len(), "every block ordered once");
 
@@ -337,7 +337,7 @@ mod tests {
             ],
         ))
         .expect("builds");
-        let live = analyze(&g, &Default::default());
+        let live = analyze(&g, &Default::default(), &Default::default());
         assert_eq!(live.rpo.len(), 1);
         // Single block: nothing is live-in (params are defs in the entry block)
         // and nothing live-out (the return consumes the last value).

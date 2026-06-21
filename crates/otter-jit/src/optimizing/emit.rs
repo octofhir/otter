@@ -164,7 +164,7 @@ mod arm64 {
     };
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
     use otter_vm::JitFunctionView;
-    use rustc_hash::FxHashMap;
+    use rustc_hash::{FxHashMap, FxHashSet};
 
     /// Emit scratch register for parallel-move spill→spill staging and tag
     /// immediates (`x16`). Never an allocatable home (those are `x9..x15`).
@@ -467,6 +467,90 @@ mod arm64 {
         );
     }
 
+    fn emit_osr_type_miss(
+        ops: &mut Assembler,
+        fail: DynamicLabel,
+        byte_pc: u32,
+        spill_bytes: u32,
+        box_scratch: u32,
+    ) {
+        dynasm!(ops ; .arch aarch64 ; =>fail);
+        emit_load_u64(ops, box_scratch, u64::from(byte_pc));
+        dynasm!(ops ; .arch aarch64 ; str W(box_scratch), [x20, BAIL_PC_OFFSET]);
+        dynasm!(ops ; .arch aarch64 ; movz x1, STATUS_BAILED as u32);
+        emit_epilogue(ops, spill_bytes);
+    }
+
+    fn emit_osr_reload(
+        ops: &mut Assembler,
+        repr: Repr,
+        home: Location,
+        src_off: u32,
+        fail: DynamicLabel,
+    ) {
+        dynasm!(ops ; .arch aarch64 ; ldr X(BOX_SCRATCH), [x19, src_off]);
+        match repr {
+            Repr::Tagged => store_loc(ops, home, BOX_SCRATCH),
+            Repr::Int32 => {
+                debug_assert_eq!(TAG_INT32, 0x7FF9);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; lsr x16, X(BOX_SCRATCH), #48
+                    ; sub x16, x16, #0xFF9
+                    ; subs x16, x16, #7, lsl #12
+                    ; b.ne =>fail
+                    ; mov W(BOX_SCRATCH), W(BOX_SCRATCH)
+                );
+                store_loc(ops, home, BOX_SCRATCH);
+            }
+            Repr::Float64 => {
+                let int32_path = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; lsr x16, X(BOX_SCRATCH), #48
+                    ; sub x16, x16, #0xFF9
+                    ; subs x16, x16, #7, lsl #12
+                    ; b.eq =>int32_path
+                    ; cmp x16, #6
+                    ; b.ls =>fail
+                    ; fmov D(FP_LOAD_SCRATCH), X(BOX_SCRATCH)
+                    ; b =>done
+                    ; =>int32_path
+                    ; scvtf D(FP_LOAD_SCRATCH), W(BOX_SCRATCH)
+                    ; =>done
+                );
+                store_fp_loc(ops, home, FP_LOAD_SCRATCH);
+            }
+            Repr::Bool => {
+                let is_true = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                emit_load_u64(
+                    ops,
+                    MOVE_SCRATCH,
+                    (TAG_SPECIAL << 48) | SPECIAL_FALSE as u64,
+                );
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; cmp X(BOX_SCRATCH), X(MOVE_SCRATCH)
+                    ; b.ne =>is_true
+                    ; movz W(BOX_SCRATCH), #0
+                    ; b =>done
+                    ; =>is_true
+                );
+                emit_load_u64(ops, MOVE_SCRATCH, (TAG_SPECIAL << 48) | SPECIAL_TRUE as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; cmp X(BOX_SCRATCH), X(MOVE_SCRATCH)
+                    ; b.ne =>fail
+                    ; movz W(BOX_SCRATCH), #1
+                    ; =>done
+                );
+                store_loc(ops, home, BOX_SCRATCH);
+            }
+        }
+    }
+
     /// Lower a register-allocated graph to native arm64.
     pub(in crate::optimizing) fn emit(
         view: &JitFunctionView,
@@ -591,7 +675,20 @@ mod arm64 {
                     let false_setup = ops.new_dynamic_label();
                     let true_moves = edge_moves_for(b, *on_true);
                     let false_moves = edge_moves_for(b, *on_false);
-                    dynasm!(&mut ops ; .arch aarch64 ; cbz W(BOX_SCRATCH), =>false_setup);
+                    if graph.node(*cond).repr == Repr::Bool {
+                        dynasm!(&mut ops ; .arch aarch64 ; cbz W(BOX_SCRATCH), =>false_setup);
+                    } else {
+                        emit_load_u64(
+                            &mut ops,
+                            MOVE_SCRATCH,
+                            (TAG_SPECIAL << 48) | SPECIAL_FALSE as u64,
+                        );
+                        dynasm!(&mut ops
+                            ; .arch aarch64
+                            ; cmp X(BOX_SCRATCH), X(MOVE_SCRATCH)
+                            ; b.eq =>false_setup
+                        );
+                    }
                     // cond != 0 → true edge. The false trampoline is emitted
                     // immediately after, so the true edge always needs an
                     // explicit branch (it can never fall through). `cond` was
@@ -634,18 +731,10 @@ mod arm64 {
 
         // OSR-entry trampolines, one per eligible loop header. Each sets up the
         // frame, reloads every live interpreter register from the frame window
-        // `[x19, r*8]` into the home the header expects, then branches to the
-        // header block. Only headers whose live values all live in tagged homes
-        // (loop-carried phis and tagged invariants) are emitted; a header with a
-        // typed-home invariant is skipped (the function still runs via its normal
-        // entry and the interpreter).
+        // `[x19, r*8]` into the representation-specific home the header expects,
+        // then branches to the header block.
         let mut osr_offsets: rustc_hash::FxHashMap<u32, usize> = rustc_hash::FxHashMap::default();
         for osr in osr_entries {
-            if osr.registers.iter().any(|(_, v)| {
-                alloc.location.contains_key(v) && graph.node(*v).kind.repr() != Repr::Tagged
-            }) {
-                continue;
-            }
             // Build the reload set: each register's header value that the header
             // actually reads — its own phis (loop-carried; defined at the header,
             // so absent from live-in) and the live-in invariants. Then require
@@ -656,31 +745,40 @@ mod arm64 {
             // enclosing loop's header (cleaner set) can still tier up.
             let phis = &graph.block(osr.block).phis;
             let live_in = &liveness.live_in[osr.block as usize];
-            let mut reloads: Vec<(u16, Location)> = Vec::new();
+            let mut reloads: Vec<(u16, NodeId, Location, Repr)> = Vec::new();
+            let mut seen_values: FxHashSet<NodeId> = FxHashSet::default();
             for &(r, v) in &osr.registers {
                 if !phis.contains(&v) && !live_in.contains(&v) {
                     continue;
                 }
+                if !seen_values.insert(v) {
+                    continue;
+                }
                 if let Some(&home) = alloc.location.get(&v) {
-                    reloads.push((r, home));
+                    reloads.push((r, v, home, graph.node(v).repr));
                 }
             }
-            let mut homes: Vec<Location> = reloads.iter().map(|&(_, h)| h).collect();
-            homes.sort_unstable_by_key(|h| match h {
-                Location::Reg(i) => (0u8, *i),
-                Location::Spill(i) => (1u8, *i),
-            });
+            let mut homes: Vec<(u8, u32)> = reloads
+                .iter()
+                .map(|&(_, _, h, repr)| match h {
+                    Location::Reg(i) if repr == Repr::Float64 => (1, i),
+                    Location::Reg(i) => (0, i),
+                    Location::Spill(i) => (2, i),
+                })
+                .collect();
+            homes.sort_unstable();
             if homes.windows(2).any(|w| w[0] == w[1]) {
                 continue;
             }
             let off = ops.offset();
+            let osr_fail = ops.new_dynamic_label();
             emit_prologue(&mut ops, spill_bytes);
-            for (r, home) in reloads {
+            for (r, _, home, repr) in reloads {
                 let src_off = u32::from(r) * 8;
-                dynasm!(&mut ops ; .arch aarch64 ; ldr X(BOX_SCRATCH), [x19, src_off]);
-                store_loc(&mut ops, home, BOX_SCRATCH);
+                emit_osr_reload(&mut ops, repr, home, src_off, osr_fail);
             }
             dynasm!(&mut ops ; .arch aarch64 ; b =>block_labels[osr.block as usize]);
+            emit_osr_type_miss(&mut ops, osr_fail, osr.byte_pc, spill_bytes, BOX_SCRATCH);
             osr_offsets.insert(osr.byte_pc, off.0);
         }
 
@@ -745,9 +843,21 @@ mod arm64 {
                 Ok(())
             }
             NodeKind::CheckInt32(operand) => {
-                // Guard the operand (a boxed Tagged value) is int32; its low 32
-                // bits are the unboxed int. A non-int32 input deopts.
+                // Guard a boxed operand is int32; an already-unboxed int32 input
+                // can appear after SSA rewrites and passes through unchanged.
                 let oloc = require_loc(alloc, *operand)?;
+                if graph.node(*operand).repr == Repr::Int32 {
+                    if let Some(loc) = dst {
+                        load_loc(ops, box_scratch, oloc);
+                        store_loc(ops, loc, box_scratch);
+                    }
+                    return Ok(());
+                }
+                if graph.node(*operand).repr != Repr::Tagged {
+                    return Err(Unsupported::Unlowered(
+                        "check-int32 operand not tagged/int32",
+                    ));
+                }
                 let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
                 load_loc(ops, box_scratch, oloc);
                 // Guard top16(value) == TAG_INT32 (0x7FF9) using only the move
@@ -872,11 +982,31 @@ mod arm64 {
                 Ok(())
             }
             NodeKind::CheckNumber(operand) => {
-                // Guard the operand (a boxed Tagged value) is a number, unboxing
-                // it to an f64 in the FP home. An int32-tagged operand is widened
-                // (scvtf); a real double is its bits verbatim; a non-number
-                // (special / pointer tag 0x7FFA..=0x7FFF) deopts.
+                // Guard a boxed operand is a number, unboxing it to f64. An
+                // already-typed numeric input can appear after SSA rewrites and
+                // is converted/copied without a tag check.
                 let oloc = require_loc(alloc, *operand)?;
+                match graph.node(*operand).repr {
+                    Repr::Float64 => {
+                        if let Some(loc) = dst {
+                            load_fp_loc(ops, FP_LOAD_SCRATCH, oloc);
+                            store_fp_loc(ops, loc, FP_LOAD_SCRATCH);
+                        }
+                        return Ok(());
+                    }
+                    Repr::Int32 => {
+                        if let Some(loc) = dst {
+                            load_loc(ops, box_scratch, oloc);
+                            dynasm!(ops ; .arch aarch64 ; scvtf D(FP_LOAD_SCRATCH), W(box_scratch));
+                            store_fp_loc(ops, loc, FP_LOAD_SCRATCH);
+                        }
+                        return Ok(());
+                    }
+                    Repr::Tagged => {}
+                    Repr::Bool => {
+                        return Err(Unsupported::Unlowered("check-number operand not numeric"));
+                    }
+                }
                 let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
                 load_loc(ops, box_scratch, oloc);
                 debug_assert_eq!(TAG_INT32, 0x7FF9);

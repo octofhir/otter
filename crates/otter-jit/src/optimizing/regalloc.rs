@@ -1091,7 +1091,7 @@ mod tests {
             ],
         ))
         .expect("diamond builds");
-        let live = liveness::analyze(&g, &Default::default());
+        let live = liveness::analyze(&g, &Default::default(), &Default::default());
 
         let alloc = allocate(&g, &live, 7, 6, &Default::default());
         assert_interference_free(&g, &live, &alloc);
@@ -1153,7 +1153,7 @@ mod tests {
             ],
         ))
         .expect("loop builds");
-        let live = liveness::analyze(&g, &Default::default());
+        let live = liveness::analyze(&g, &Default::default(), &Default::default());
 
         let alloc = allocate(&g, &live, 7, 6, &Default::default());
         assert_interference_free(&g, &live, &alloc);
@@ -1218,7 +1218,7 @@ mod tests {
             ],
         ))
         .expect("loop builds");
-        let live = liveness::analyze(&g, &Default::default());
+        let live = liveness::analyze(&g, &Default::default(), &Default::default());
 
         let alloc = allocate(&g, &live, 1, 6, &Default::default());
         assert_interference_free(&g, &live, &alloc);

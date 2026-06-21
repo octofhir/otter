@@ -54,7 +54,7 @@ pub(crate) const TAG_SPECIAL: u64 = 0x7FFA;
 /// `TAG_FUNCTION_ID`). The low 32 bits are the function id; the whole Value is
 /// `(TAG_FUNCTION_ID << 48) | fid`, so an inlined call site guards identity by
 /// comparing the callee register to that exact immediate.
-const TAG_FUNCTION_ID: u64 = 0x7FFB;
+pub(crate) const TAG_FUNCTION_ID: u64 = 0x7FFB;
 /// NaN-box tag for object-class heap pointers (`value/tag.rs`). The low 32
 /// bits are a `Gc` offset; the body type is discriminated by the GC header
 /// tag, so inline property loads must also check [`OBJECT_BODY_TYPE_TAG`].
@@ -62,7 +62,7 @@ pub(crate) const TAG_PTR_OBJECT: u64 = 0x7FFC;
 /// NaN-box tag for callable heap pointers (`value/tag.rs` `TAG_PTR_FUNCTION`).
 /// A prototype method slot holds one of these; the low 32 bits are a `Gc`
 /// offset to the callable body, discriminated by the GC header tag.
-const TAG_PTR_FUNCTION: u64 = 0x7FFE;
+pub(crate) const TAG_PTR_FUNCTION: u64 = 0x7FFE;
 /// GC header type tag for an ordinary `ObjectBody` (mirrors
 /// `otter_vm::object::OBJECT_BODY_TYPE_TAG`). Guarded before an inline
 /// shape-slot read so a non-object body sharing `TAG_PTR_OBJECT` cannot be
@@ -72,7 +72,7 @@ pub(crate) const OBJECT_BODY_TYPE_TAG: u32 = 0x11;
 /// `otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG`). Guarded before reading a
 /// resolved method's `function_id` so a native callable sharing
 /// [`TAG_PTR_FUNCTION`] is never misread as a bytecode closure.
-const JS_CLOSURE_BODY_TYPE_TAG: u32 = 0x23;
+pub(crate) const JS_CLOSURE_BODY_TYPE_TAG: u32 = 0x23;
 /// `SPECIAL` payload for the internal array/`this` hole sentinel.
 pub(crate) const SPECIAL_HOLE: u64 = 2;
 /// `SPECIAL` payload for `false`.

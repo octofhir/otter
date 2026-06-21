@@ -197,6 +197,21 @@ pub enum NodeKind {
         /// Argument values.
         args: Vec<NodeId>,
     },
+    /// Guard that `recv.name` still resolves to the monomorphic bytecode method
+    /// whose body was inlined at a `CallMethodValue` site. Result is the tagged
+    /// receiver, so the inlined body can use the checked value as `this`.
+    CheckMethodIdentity {
+        /// Receiver object/value.
+        recv: NodeId,
+        /// Receiver shape-handle compressed offset.
+        recv_shape: u32,
+        /// Prototype shape-handle compressed offset.
+        proto_shape: u32,
+        /// Byte offset of the method slot in the prototype value slab.
+        method_value_byte: u32,
+        /// Expected bytecode function id.
+        method_fid: u32,
+    },
     /// Speculative "operand is an ordinary object of the baked shape" guard.
     /// Carries the receiver and the receiver shape's compressed `Gc` offset. A
     /// non-object, or a different shape (or dictionary mode), deoptimizes.
@@ -279,6 +294,7 @@ impl NodeKind {
                 inputs.extend(args.iter().copied());
                 inputs
             }
+            NodeKind::CheckMethodIdentity { recv, .. } => vec![*recv],
         }
     }
 
@@ -337,6 +353,7 @@ impl NodeKind {
                 fix(recv);
                 args.iter_mut().for_each(fix);
             }
+            NodeKind::CheckMethodIdentity { recv, .. } => fix(recv),
         }
     }
 
@@ -373,6 +390,7 @@ impl NodeKind {
             | NodeKind::LoadUpvalue(_)
             | NodeKind::Call { .. }
             | NodeKind::CallMethod { .. }
+            | NodeKind::CheckMethodIdentity { .. }
             | NodeKind::CheckShape(_, _)
             | NodeKind::LoadSlot(_, _)
             | NodeKind::StoreSlot(_, _, _)

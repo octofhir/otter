@@ -363,6 +363,7 @@ fn can_deopt(kind: &NodeKind) -> bool {
         NodeKind::CheckInt32(_)
             | NodeKind::CheckNumber(_)
             | NodeKind::CheckShape(_, _)
+            | NodeKind::CheckMethodIdentity { .. }
             | NodeKind::LoadUpvalue(_)
             | NodeKind::Call { .. }
             | NodeKind::CallMethod { .. }

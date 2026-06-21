@@ -30,8 +30,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use otter_bytecode::{Op, Operand};
-use otter_vm::JitFunctionView;
 use otter_vm::jit_feedback::ArithFeedback;
+use otter_vm::{JitFunctionView, JitInlineMethod};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::Unsupported;
@@ -791,10 +791,10 @@ impl<'a> Builder<'a> {
                     if argc > MAX_METHOD_ARGS {
                         return Err(Unsupported::OperandShape("method call arg count"));
                     }
-                    if !self.view.inline_methods.contains_key(&byte_pc) {
+                    let Some(method) = self.view.inline_methods.get(&byte_pc).cloned() else {
                         self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
                         return Ok(());
-                    }
+                    };
                     let Some(site) = property_ic_site else {
                         self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
                         return Ok(());
@@ -815,6 +815,12 @@ impl<'a> Builder<'a> {
                         let arg_reg = reg(&operands, 4 + slot)?;
                         arg_regs.push(arg_reg);
                         args.push(self.read_variable(arg_reg, block));
+                    }
+                    if let Some(result) =
+                        self.try_inline_method(block, byte_pc, recv, &method, argc, &args)?
+                    {
+                        self.def_register(dst, block, result, byte_pc);
+                        continue;
                     }
                     let call = self.graph.add_node(
                         NodeKind::CallMethod {
@@ -1138,6 +1144,386 @@ impl<'a> Builder<'a> {
         Ok(self.graph.add_node(kind, block, byte_pc))
     }
 
+    fn int32_node_operand(
+        &mut self,
+        block: BlockId,
+        node: NodeId,
+        raw_feedback: u8,
+        byte_pc: u32,
+    ) -> Result<NodeId, Unsupported> {
+        let feedback = ArithFeedback::from_bits(raw_feedback);
+        if !feedback.is_int32_only() && !self.allow_empty_feedback_for_osr(feedback) {
+            return Err(Unsupported::TypeFeedback(raw_feedback));
+        }
+        if self.graph.node(node).repr == Repr::Int32 {
+            return Ok(node);
+        }
+        let check = self
+            .graph
+            .add_node(NodeKind::CheckInt32(node), block, byte_pc);
+        self.push_body(block, check);
+        Ok(check)
+    }
+
+    fn float_node_operand(&mut self, block: BlockId, node: NodeId, byte_pc: u32) -> NodeId {
+        match self.graph.node(node).repr {
+            Repr::Float64 => node,
+            Repr::Int32 => {
+                let widen = self
+                    .graph
+                    .add_node(NodeKind::Int32ToFloat64(node), block, byte_pc);
+                self.push_body(block, widen);
+                widen
+            }
+            Repr::Tagged | Repr::Bool => {
+                let check = self
+                    .graph
+                    .add_node(NodeKind::CheckNumber(node), block, byte_pc);
+                self.push_body(block, check);
+                check
+            }
+        }
+    }
+
+    fn arith_node_binop(
+        &mut self,
+        block: BlockId,
+        op: Op,
+        lhs: NodeId,
+        rhs: NodeId,
+        feedback: u8,
+        byte_pc: u32,
+    ) -> Result<NodeId, Unsupported> {
+        let fb = ArithFeedback::from_bits(feedback);
+        if fb.is_int32_only() && !matches!(op, Op::Div) {
+            let l = self.int32_node_operand(block, lhs, feedback, byte_pc)?;
+            let r = self.int32_node_operand(block, rhs, feedback, byte_pc)?;
+            let kind = match op {
+                Op::Add => NodeKind::Int32Add(l, r),
+                Op::Sub => NodeKind::Int32Sub(l, r),
+                Op::Mul => NodeKind::Int32Mul(l, r),
+                _ => unreachable!("arith_node_binop on non-int arithmetic op"),
+            };
+            return Ok(self.graph.add_node(kind, block, byte_pc));
+        }
+        if !fb.is_numeric_only() && !self.allow_empty_feedback_for_osr(fb) {
+            return Err(Unsupported::TypeFeedback(feedback));
+        }
+        let l = self.float_node_operand(block, lhs, byte_pc);
+        let r = self.float_node_operand(block, rhs, byte_pc);
+        let kind = match op {
+            Op::Add => NodeKind::Float64Add(l, r),
+            Op::Sub => NodeKind::Float64Sub(l, r),
+            Op::Mul => NodeKind::Float64Mul(l, r),
+            Op::Div => NodeKind::Float64Div(l, r),
+            _ => unreachable!("arith_node_binop on non-arithmetic op"),
+        };
+        Ok(self.graph.add_node(kind, block, byte_pc))
+    }
+
+    fn bitwise_node_binop(
+        &mut self,
+        block: BlockId,
+        op: Op,
+        lhs: NodeId,
+        rhs: NodeId,
+        feedback: u8,
+        byte_pc: u32,
+    ) -> Result<NodeId, Unsupported> {
+        let fb = ArithFeedback::from_bits(feedback);
+        if !fb.is_int32_only() && !self.allow_empty_feedback_for_osr(fb) {
+            return Err(Unsupported::TypeFeedback(feedback));
+        }
+        let l = self.int32_node_operand(block, lhs, feedback, byte_pc)?;
+        let r = self.int32_node_operand(block, rhs, feedback, byte_pc)?;
+        let kind = match op {
+            Op::BitwiseOr => NodeKind::Int32BitOr(l, r),
+            Op::BitwiseAnd => NodeKind::Int32BitAnd(l, r),
+            Op::BitwiseXor => NodeKind::Int32BitXor(l, r),
+            Op::Shl => NodeKind::Int32Shl(l, r),
+            Op::Shr => NodeKind::Int32Shr(l, r),
+            _ => unreachable!("bitwise_node_binop on non-bitwise op"),
+        };
+        Ok(self.graph.add_node(kind, block, byte_pc))
+    }
+
+    fn inline_method_allows_store(method: &JitInlineMethod) -> bool {
+        let mut store_seen = false;
+        for instr in &method.instructions {
+            if store_seen
+                && !matches!(
+                    instr.op,
+                    Op::LoadThis
+                        | Op::LoadInt32
+                        | Op::LoadLocal
+                        | Op::LoadUndefined
+                        | Op::LoadHole
+                        | Op::LoadTrue
+                        | Op::LoadFalse
+                        | Op::StoreLocal
+                        | Op::Return
+                        | Op::ReturnValue
+                        | Op::ReturnUndefined
+                )
+            {
+                return false;
+            }
+            if instr.op == Op::StoreProperty {
+                store_seen = true;
+            }
+        }
+        true
+    }
+
+    fn try_inline_method(
+        &mut self,
+        block: BlockId,
+        call_pc: u32,
+        recv: NodeId,
+        method: &JitInlineMethod,
+        argc: usize,
+        args: &[NodeId],
+    ) -> Result<Option<NodeId>, Unsupported> {
+        const MAX_INLINE_METHOD_REGS: u16 = 64;
+        const MAX_INLINE_METHOD_INSTRS: usize = 64;
+        if self.view.cage_base == 0
+            || argc != usize::from(method.param_count)
+            || method.register_count > MAX_INLINE_METHOD_REGS
+            || method.instructions.len() > MAX_INLINE_METHOD_INSTRS
+            || !Self::inline_method_allows_store(method)
+        {
+            return Ok(None);
+        }
+        let start_nodes = self.graph.nodes.len();
+        let start_body = self.graph.blocks[block as usize].body.len();
+        macro_rules! decline_inline {
+            () => {{
+                self.graph.nodes.truncate(start_nodes);
+                self.graph.blocks[block as usize].body.truncate(start_body);
+                return Ok(None);
+            }};
+        }
+
+        let checked = self.graph.add_node(
+            NodeKind::CheckMethodIdentity {
+                recv,
+                recv_shape: method.recv_shape,
+                proto_shape: method.proto_shape,
+                method_value_byte: method.method_value_byte,
+                method_fid: method.method_fid,
+            },
+            block,
+            call_pc,
+        );
+        self.push_body(block, checked);
+
+        let mut regs: Vec<Option<NodeId>> = vec![None; method.register_count as usize];
+        for (slot, &arg) in args.iter().enumerate() {
+            if slot < regs.len() {
+                regs[slot] = Some(arg);
+            }
+        }
+        let mut returned = None;
+
+        for instr in &method.instructions {
+            let op = instr.op;
+            let operands = instr.operands.as_slice();
+            let read = |regs: &[Option<NodeId>], regn: u16| -> Result<NodeId, Unsupported> {
+                regs.get(regn as usize)
+                    .copied()
+                    .flatten()
+                    .ok_or(Unsupported::OperandShape("inline method register"))
+            };
+            let write =
+                |regs: &mut [Option<NodeId>], regn: u16, node: NodeId| -> Result<(), Unsupported> {
+                    let Some(slot) = regs.get_mut(regn as usize) else {
+                        return Err(Unsupported::OperandShape("inline method register"));
+                    };
+                    *slot = Some(node);
+                    Ok(())
+                };
+            match op {
+                Op::LoadThis => {
+                    let dst = reg(operands, 0)?;
+                    write(&mut regs, dst, checked)?;
+                }
+                Op::LoadInt32 => {
+                    let dst = reg(operands, 0)?;
+                    let value = imm32(operands, 1)?;
+                    let node = self
+                        .graph
+                        .add_node(NodeKind::ConstInt32(value), block, call_pc);
+                    self.push_body(block, node);
+                    write(&mut regs, dst, node)?;
+                }
+                Op::LoadNumber => {
+                    let dst = reg(operands, 0)?;
+                    let Some(value) = instr.load_number else {
+                        decline_inline!();
+                    };
+                    let node = self
+                        .graph
+                        .add_node(NodeKind::ConstF64(value), block, call_pc);
+                    self.push_body(block, node);
+                    write(&mut regs, dst, node)?;
+                }
+                Op::LoadTrue | Op::LoadFalse => {
+                    let dst = reg(operands, 0)?;
+                    let node = self.graph.add_node(
+                        NodeKind::ConstBool(matches!(op, Op::LoadTrue)),
+                        block,
+                        call_pc,
+                    );
+                    self.push_body(block, node);
+                    write(&mut regs, dst, node)?;
+                }
+                Op::LoadUndefined | Op::LoadHole => {
+                    let dst = reg(operands, 0)?;
+                    let kind = if matches!(op, Op::LoadUndefined) {
+                        NodeKind::ConstUndefined
+                    } else {
+                        NodeKind::LoadHole
+                    };
+                    let node = self.graph.add_node(kind, block, call_pc);
+                    self.push_body(block, node);
+                    write(&mut regs, dst, node)?;
+                }
+                Op::LoadLocal => {
+                    let dst = reg(operands, 0)?;
+                    let src = u16::try_from(imm32(operands, 1)?)
+                        .map_err(|_| Unsupported::OperandShape("inline local index"))?;
+                    let node = read(&regs, src)?;
+                    write(&mut regs, dst, node)?;
+                }
+                Op::StoreLocal => {
+                    let src = reg(operands, 0)?;
+                    let dst = u16::try_from(imm32(operands, 1)?)
+                        .map_err(|_| Unsupported::OperandShape("inline local index"))?;
+                    let node = read(&regs, src)?;
+                    write(&mut regs, dst, node)?;
+                }
+                Op::ToPrimitive | Op::ToNumeric => {
+                    let dst = reg(operands, 0)?;
+                    let src = reg(operands, 1)?;
+                    let node = read(&regs, src)?;
+                    write(&mut regs, dst, node)?;
+                }
+                Op::LoadProperty => {
+                    let dst = reg(operands, 0)?;
+                    let obj_reg = reg(operands, 1)?;
+                    let obj = read(&regs, obj_reg)?;
+                    let Some(&slot_byte) = method.prop_offsets.get(&instr.byte_pc) else {
+                        decline_inline!();
+                    };
+                    let checked_obj = self.graph.add_node(
+                        NodeKind::CheckShape(obj, method.recv_shape),
+                        block,
+                        call_pc,
+                    );
+                    self.push_body(block, checked_obj);
+                    let load = self.graph.add_node(
+                        NodeKind::LoadSlot(checked_obj, slot_byte),
+                        block,
+                        call_pc,
+                    );
+                    self.push_body(block, load);
+                    write(&mut regs, dst, load)?;
+                }
+                Op::StoreProperty => {
+                    let obj_reg = reg(operands, 0)?;
+                    let src_reg = reg(operands, 2)?;
+                    let obj = read(&regs, obj_reg)?;
+                    let value = read(&regs, src_reg)?;
+                    if !matches!(self.graph.node(value).repr, Repr::Int32 | Repr::Float64) {
+                        decline_inline!();
+                    }
+                    let Some(&slot_byte) = method.prop_offsets.get(&instr.byte_pc) else {
+                        decline_inline!();
+                    };
+                    let checked_obj = self.graph.add_node(
+                        NodeKind::CheckShape(obj, method.recv_shape),
+                        block,
+                        call_pc,
+                    );
+                    self.push_body(block, checked_obj);
+                    let store = self.graph.add_node(
+                        NodeKind::StoreSlot(checked_obj, slot_byte, value),
+                        block,
+                        call_pc,
+                    );
+                    self.push_body(block, store);
+                }
+                Op::Add | Op::Sub | Op::Mul | Op::Div => {
+                    let dst = reg(operands, 0)?;
+                    let lhs = read(&regs, reg(operands, 1)?)?;
+                    let rhs = read(&regs, reg(operands, 2)?)?;
+                    let node =
+                        self.arith_node_binop(block, op, lhs, rhs, instr.arith_feedback, call_pc)?;
+                    self.push_body(block, node);
+                    write(&mut regs, dst, node)?;
+                }
+                Op::BitwiseOr | Op::BitwiseAnd | Op::BitwiseXor | Op::Shl | Op::Shr => {
+                    let dst = reg(operands, 0)?;
+                    let lhs = read(&regs, reg(operands, 1)?)?;
+                    let rhs = read(&regs, reg(operands, 2)?)?;
+                    let node = self.bitwise_node_binop(
+                        block,
+                        op,
+                        lhs,
+                        rhs,
+                        instr.arith_feedback,
+                        call_pc,
+                    )?;
+                    self.push_body(block, node);
+                    write(&mut regs, dst, node)?;
+                }
+                Op::Increment => {
+                    let dst = reg(operands, 0)?;
+                    let src = read(&regs, reg(operands, 1)?)?;
+                    let delta = match operands.get(2) {
+                        Some(Operand::Imm32(v)) => *v,
+                        None => 1,
+                        _ => return Err(Unsupported::OperandShape("increment delta")),
+                    };
+                    let step = self
+                        .graph
+                        .add_node(NodeKind::ConstInt32(delta), block, call_pc);
+                    self.push_body(block, step);
+                    let node = self.arith_node_binop(
+                        block,
+                        Op::Add,
+                        src,
+                        step,
+                        instr.arith_feedback,
+                        call_pc,
+                    )?;
+                    self.push_body(block, node);
+                    write(&mut regs, dst, node)?;
+                }
+                Op::Return | Op::ReturnValue => {
+                    let src = reg(operands, 0)?;
+                    returned = Some(read(&regs, src)?);
+                    break;
+                }
+                Op::ReturnUndefined => {
+                    let node = self
+                        .graph
+                        .add_node(NodeKind::ConstUndefined, block, call_pc);
+                    self.push_body(block, node);
+                    returned = Some(node);
+                    break;
+                }
+                _ => decline_inline!(),
+            }
+        }
+
+        if returned.is_none() {
+            self.graph.nodes.truncate(start_nodes);
+            self.graph.blocks[block as usize].body.truncate(start_body);
+        }
+        Ok(returned)
+    }
+
     /// Lower an `Add` / `Sub` / `Mul` / `Div` site to a typed arithmetic node,
     /// picking the representation from the site's operand feedback:
     ///
@@ -1446,6 +1832,86 @@ mod tests {
 
     fn build_full(view: &JitFunctionView) -> Result<Graph, Unsupported> {
         build(view, None)
+    }
+
+    #[test]
+    fn monomorphic_tiny_method_inlines_into_graph() {
+        let method_load_pc = 4;
+        let mut prop_offsets = FxHashMap::default();
+        prop_offsets.insert(method_load_pc, 0);
+        let method = JitInlineMethod {
+            method_fid: 42,
+            recv_shape: 100,
+            proto_shape: 200,
+            method_value_byte: 8,
+            param_count: 0,
+            register_count: 2,
+            instructions: vec![
+                otter_vm::JitInstrView {
+                    op: Op::LoadThis,
+                    byte_pc: 0,
+                    byte_len: STRIDE,
+                    property_ic_site: None,
+                    operands: vec![r(0)],
+                    make_self: false,
+                    load_array_length: false,
+                    load_number: None,
+                    property_feedback: None,
+                    arith_feedback: 0,
+                },
+                otter_vm::JitInstrView {
+                    op: Op::LoadProperty,
+                    byte_pc: method_load_pc,
+                    byte_len: STRIDE,
+                    property_ic_site: None,
+                    operands: vec![r(1), r(0), Operand::ConstIndex(0)],
+                    make_self: false,
+                    load_array_length: false,
+                    load_number: None,
+                    property_feedback: None,
+                    arith_feedback: 0,
+                },
+                otter_vm::JitInstrView {
+                    op: Op::ReturnValue,
+                    byte_pc: 8,
+                    byte_len: STRIDE,
+                    property_ic_site: None,
+                    operands: vec![r(1)],
+                    make_self: false,
+                    load_array_length: false,
+                    load_number: None,
+                    property_feedback: None,
+                    arith_feedback: 0,
+                },
+            ],
+            prop_offsets,
+        };
+        let mut v = view(
+            1,
+            3,
+            &[
+                (
+                    Op::CallMethodValue,
+                    vec![r(1), r(0), Operand::ConstIndex(0), Operand::ConstIndex(0)],
+                    0,
+                ),
+                (Op::ReturnValue, vec![r(1)], 0),
+            ],
+        );
+        v.cage_base = 1;
+        v.instructions[0].property_ic_site = Some(7);
+        v.inline_methods.insert(0, method);
+
+        let g = build_full(&v).expect("inline method builds");
+        assert_eq!(
+            count_kind(&g, |k| matches!(k, NodeKind::CallMethod { .. })),
+            0
+        );
+        assert_eq!(
+            count_kind(&g, |k| matches!(k, NodeKind::CheckMethodIdentity { .. })),
+            1
+        );
+        assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::LoadSlot(_, _))), 1);
     }
 
     #[test]

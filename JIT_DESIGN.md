@@ -184,6 +184,29 @@ current hot-region coverage into the general mid-tier optimizer:
 This work must continue the current exact-deopt discipline. No optimizer slice
 may replace exact PC/frame-state deopt with entry bails or interpreter replay.
 
+### Cranelift backend
+
+The current Tier1 backend is hand-emitted arm64 dynasm because it gives direct
+control over the VM ABI while the deopt/OSR model is still settling. That is not
+the final backend strategy.
+
+After Tier1, Cranelift is the planned backend for portable Tier2 and later
+DeepDive work:
+
+- lower DiveJIT SSA into Cranelift IR instead of growing a second large
+  hand-written machine-code emitter;
+- use Cranelift register allocation, instruction selection, and multi-platform
+  codegen for x86_64/aarch64;
+- attach Otter deopt metadata and StoneMaps safepoint metadata to Cranelift
+  call/guard sites;
+- keep Otter-owned frame-state snapshots as the source of truth, with Cranelift
+  locations mapped back into deopt/safepoint records;
+- preserve the existing dynasm backend as the Tier1 arm64 path until the
+  Cranelift backend is faster, correct, and covered by the same gates.
+
+Cranelift integration is therefore a post-Tier1 backend slice, not a shortcut
+around current exact-deopt, GC, IC, or builtin correctness work.
+
 ### DeepDiveJIT: peak optimizer
 
 DeepDiveJIT is the later peak tier. It is not a Tier1 task, but it remains part

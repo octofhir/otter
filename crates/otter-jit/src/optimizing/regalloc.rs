@@ -564,7 +564,7 @@ fn terminator_use(graph: &Graph, block: BlockId) -> Option<NodeId> {
     match &graph.block(block).term {
         Some(Terminator::Return(v)) => Some(*v),
         Some(Terminator::Branch { cond, .. }) => Some(*cond),
-        Some(Terminator::Jump(_)) | None => None,
+        Some(Terminator::Jump(_)) | Some(Terminator::Deopt(_)) | None => None,
     }
 }
 

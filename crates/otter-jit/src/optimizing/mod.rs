@@ -85,12 +85,21 @@ pub fn compile(
     // allocator keeps it in a home the deopt exit can read.
     let bcl = deopt::bytecode_liveness(view);
     let frames = deopt::capture_frame_states(&graph, &bcl);
+    let block_deopts = deopt::capture_deopt_terminators(&graph, &bcl);
     let deopt_uses = deopt::deopt_value_uses(&frames);
-    let liveness = liveness::analyze(&graph, &deopt_uses);
+    let liveness = liveness::analyze(&graph, &deopt_uses, &block_deopts);
     let alloc = regalloc::allocate(&graph, &liveness, emit::GP_REGS, emit::FP_REGS, &deopt_uses);
     // OSR entries reuse the same register→value environment reconstruction as the
     // deopt frame states, captured at each loop header instead of each guard.
     let osr_entries = deopt::capture_osr_entries(&graph, &bcl);
-    let code = emit::emit(view, &graph, &liveness, &alloc, &frames, &osr_entries)?;
+    let code = emit::emit(
+        view,
+        &graph,
+        &liveness,
+        &alloc,
+        &frames,
+        &block_deopts,
+        &osr_entries,
+    )?;
     Ok(std::sync::Arc::new(code))
 }

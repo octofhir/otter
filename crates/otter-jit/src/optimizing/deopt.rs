@@ -535,6 +535,74 @@ pub fn capture_osr_entries(
     entries
 }
 
+/// Capture the deopt frame state at every block ending in a
+/// [`Terminator::Deopt`] (an instruction outside the optimizing subset). Like
+/// [`capture_osr_entries`], reconstructs the register → SSA value environment per
+/// block and records the value of every register live at the deopt byte-PC.
+/// Keyed by the deopting block.
+#[must_use]
+pub fn capture_deopt_terminators(
+    graph: &Graph,
+    bytecode_live: &FxHashMap<u32, FxHashSet<u16>>,
+) -> FxHashMap<BlockId, DeoptPoint> {
+    use super::ir::Terminator;
+    let rc = graph.register_count as usize;
+    let rpo = reverse_postorder(graph);
+    let mut exit_env: Vec<Option<Vec<Option<NodeId>>>> = vec![None; graph.blocks.len()];
+    let mut out: FxHashMap<BlockId, DeoptPoint> = FxHashMap::default();
+
+    for &b in &rpo {
+        let block = graph.block(b);
+        let mut env: Vec<Option<NodeId>> = if b == graph.entry {
+            (0..rc)
+                .map(|r| graph.block(graph.entry).body.get(r).copied())
+                .collect()
+        } else {
+            let mut e = block
+                .preds
+                .iter()
+                .find_map(|&p| exit_env[p as usize].clone())
+                .unwrap_or_else(|| vec![None; rc]);
+            for &phi in &block.phis {
+                if let Some(&r) = graph.phi_reg.get(&phi)
+                    && (r as usize) < rc
+                {
+                    e[r as usize] = Some(phi);
+                }
+            }
+            e
+        };
+        let empty = Vec::new();
+        let writes = graph.reg_writes.get(&b).unwrap_or(&empty);
+        for &(_, r, v) in writes {
+            if (r as usize) < rc {
+                env[r as usize] = Some(v);
+            }
+        }
+        if let Some(Terminator::Deopt(pc)) = &block.term {
+            let mut registers: Vec<(u16, NodeId)> = Vec::new();
+            if let Some(live) = bytecode_live.get(pc) {
+                let mut regs: Vec<u16> = live.iter().copied().collect();
+                regs.sort_unstable();
+                for r in regs {
+                    if let Some(Some(v)) = env.get(r as usize) {
+                        registers.push((r, *v));
+                    }
+                }
+            }
+            out.insert(
+                b,
+                DeoptPoint {
+                    byte_pc: *pc,
+                    registers,
+                },
+            );
+        }
+        exit_env[b as usize] = Some(env);
+    }
+    out
+}
+
 /// Per-guard SSA values a deopt frame restores, keyed by guard node. The
 /// register allocator consumes this to keep each such value live to its guard so
 /// the deopt exit can read it from a stable home (see [`super::liveness::analyze`]

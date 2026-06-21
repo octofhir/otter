@@ -47,7 +47,7 @@ pub fn successors(graph: &Graph, block: BlockId) -> Vec<BlockId> {
         Some(Terminator::Branch {
             on_true, on_false, ..
         }) => vec![on_true, on_false],
-        Some(Terminator::Return(_)) | None => Vec::new(),
+        Some(Terminator::Return(_)) | Some(Terminator::Deopt(_)) | None => Vec::new(),
     }
 }
 
@@ -86,7 +86,11 @@ fn reverse_postorder(graph: &Graph) -> Vec<BlockId> {
 /// guard so the register allocator keeps it in a home the deopt exit can read.
 /// Omitting them would let the allocator reuse the register and corrupt the
 /// restored frame.
-pub fn analyze(graph: &Graph, deopt_uses: &FxHashMap<NodeId, Vec<NodeId>>) -> Liveness {
+pub fn analyze(
+    graph: &Graph,
+    deopt_uses: &FxHashMap<NodeId, Vec<NodeId>>,
+    block_deopts: &FxHashMap<BlockId, super::deopt::DeoptPoint>,
+) -> Liveness {
     let n = graph.blocks.len();
     let rpo = reverse_postorder(graph);
 
@@ -118,6 +122,13 @@ pub fn analyze(graph: &Graph, deopt_uses: &FxHashMap<NodeId, Vec<NodeId>>) -> Li
                     if !d.contains(&v) {
                         u.insert(v);
                     }
+                }
+            }
+        }
+        if let Some(dp) = block_deopts.get(&(b as BlockId)) {
+            for &(_, v) in &dp.registers {
+                if !d.contains(&v) {
+                    u.insert(v);
                 }
             }
         }

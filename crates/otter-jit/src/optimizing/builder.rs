@@ -695,7 +695,32 @@ impl<'a> Builder<'a> {
                     self.push_body(block, node);
                     self.set_term(block, Terminator::Return(node));
                 }
-                other => return Err(Unsupported::Opcode(other)),
+                // An opcode outside the optimizing subset. Deopt-to-interpreter
+                // for it only pays off to compile (and OSR) a hot loop while
+                // leaving the rest to the interpreter — so require the function to
+                // have a loop, and the op to sit OUTSIDE every loop
+                // (prologue / epilogue, e.g. `console.log` after the loop). A
+                // deopt from inside a loop body could let an OSR'd loop reorder
+                // side effects; and a loopless function compiled only to deopt
+                // buys nothing. Either way, decline → baseline / interpreter.
+                _ => {
+                    let back_edge_pc = |h: &super::ir::Block| {
+                        h.preds
+                            .iter()
+                            .map(|&p| self.graph.blocks[p as usize].start_pc)
+                            .filter(|&pc| pc > h.start_pc)
+                            .max()
+                    };
+                    let has_loop = self.graph.blocks.iter().any(|h| back_edge_pc(h).is_some());
+                    let in_loop = self.graph.blocks.iter().any(|h| {
+                        matches!(back_edge_pc(h), Some(bpc) if h.start_pc <= byte_pc && byte_pc <= bpc)
+                    });
+                    if !has_loop || in_loop {
+                        return Err(Unsupported::Opcode(op));
+                    }
+                    self.set_term(block, Terminator::Deopt(byte_pc));
+                    return Ok(());
+                }
             }
         }
         // A block whose last instruction was not a terminator falls through to

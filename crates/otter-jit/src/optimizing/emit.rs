@@ -82,6 +82,13 @@ pub struct OptimizedCode {
     /// Loop-header byte-PC → byte offset of that header's OSR-entry trampoline
     /// within `code`. Empty when the function has no eligible loop header.
     osr_offsets: rustc_hash::FxHashMap<u32, usize>,
+    /// The function contains a `Deopt` terminator (an un-compilable
+    /// prologue / epilogue around a hot loop). Such a function is entered ONLY
+    /// through an OSR loop header; a function-entry call runs the interpreter
+    /// from the top (returns a bail at PC 0). This keeps the un-compilable parts
+    /// — and their side-effect ordering — exactly as the interpreter runs them,
+    /// while the hot loop still tiers up via OSR.
+    entry_via_osr_only: bool,
 }
 
 impl std::fmt::Debug for OptimizedCode {
@@ -97,13 +104,20 @@ impl otter_vm::JitFunctionCode for OptimizedCode {
         self.code.len()
     }
 
-    fn run_entry(&self, ptrs: otter_vm::JitReentryPtrs) -> otter_vm::JitExecOutcome {
+    fn run_entry(&self, _ptrs: otter_vm::JitReentryPtrs) -> otter_vm::JitExecOutcome {
+        if self.entry_via_osr_only {
+            // The compiled code has an un-compilable prologue / epilogue: never
+            // run it from the top. Bail at PC 0 so the interpreter runs the
+            // function (it will OSR the hot loop on a backedge). The frame is
+            // untouched, so resuming the interpreter at PC 0 is exact.
+            return otter_vm::JitExecOutcome::Bailed(0);
+        }
         // SAFETY: the mapping is live for `self`, and the entry was emitted with
         // the shared `JitEntry` ABI (`extern "C" fn(*mut JitCtx) -> JitRet`).
         let entry = unsafe { self.code.entry_ptr() };
-        // SAFETY: `entry` points into the live mapping; `ptrs` upholds the
+        // SAFETY: `entry` points into the live mapping; `_ptrs` upholds the
         // reentry contract.
-        unsafe { crate::baseline::enter_compiled(ptrs, entry) }
+        unsafe { crate::baseline::enter_compiled(_ptrs, entry) }
     }
 
     fn osr_entry(
@@ -131,6 +145,7 @@ pub(super) fn emit(
     _liveness: &Liveness,
     _alloc: &Allocation,
     _frames: &rustc_hash::FxHashMap<NodeId, DeoptPoint>,
+    _block_deopts: &rustc_hash::FxHashMap<BlockId, DeoptPoint>,
     _osr_entries: &[OsrEntry],
 ) -> Result<OptimizedCode, Unsupported> {
     Err(Unsupported::Unlowered("optimizing emit: non-aarch64 host"))
@@ -459,6 +474,7 @@ mod arm64 {
         liveness: &Liveness,
         alloc: &Allocation,
         frames: &FxHashMap<NodeId, DeoptPoint>,
+        block_deopts: &FxHashMap<BlockId, DeoptPoint>,
         osr_entries: &[OsrEntry],
     ) -> Result<OptimizedCode, Unsupported> {
         let mut ops = Assembler::new().expect("assembler alloc");
@@ -588,6 +604,19 @@ mod arm64 {
                     emit_edge(&mut ops, graph, alloc, false_moves, b, *on_false)?;
                     dynasm!(&mut ops ; .arch aarch64 ; b =>block_labels[*on_false as usize]);
                 }
+                Terminator::Deopt(_) => {
+                    let point = block_deopts.get(&b).ok_or(Unsupported::Unlowered(
+                        "deopt terminator without frame state",
+                    ))?;
+                    emit_frame_restore_and_bail(
+                        &mut ops,
+                        graph,
+                        alloc,
+                        point,
+                        spill_bytes,
+                        BOX_SCRATCH,
+                    )?;
+                }
             }
         }
 
@@ -661,6 +690,7 @@ mod arm64 {
         Ok(OptimizedCode {
             code: CompiledCode::new(buf, entry),
             osr_offsets,
+            entry_via_osr_only: !block_deopts.is_empty(),
         })
     }
 
@@ -1096,25 +1126,33 @@ mod arm64 {
                 .get(&nid)
                 .ok_or(Unsupported::Unlowered("deopt exit without frame state"))?;
             dynasm!(ops ; .arch aarch64 ; =>label);
-            // Restore each live register: load the SSA value from its home, box
-            // it to a tagged Value per its repr, store to the frame slot.
-            for &(regn, value) in &point.registers {
-                let loc = require_loc(alloc, value)?;
-                let repr = graph.node(value).repr;
-                // Box with the move scratch (x16) as the tag temp so it never
-                // aliases the value being boxed in box_scratch (x17) or any
-                // allocatable register (x9..x15). A Float64 value is fmov-ed
-                // verbatim from its FP home (box_into_gp).
-                box_into_gp(ops, box_scratch, repr, loc, MOVE_SCRATCH);
-                let off = u32::from(regn) * 8;
-                dynasm!(ops ; .arch aarch64 ; str X(box_scratch), [x19, off]);
-            }
-            // Stamp the resume byte-PC into ctx.bail_pc (32-bit).
-            emit_load_u64(ops, box_scratch, u64::from(point.byte_pc));
-            dynasm!(ops ; .arch aarch64 ; str W(box_scratch), [x20, BAIL_PC_OFFSET]);
-            dynasm!(ops ; .arch aarch64 ; movz x1, STATUS_BAILED as u32);
-            emit_epilogue(ops, spill_bytes);
+            emit_frame_restore_and_bail(ops, graph, alloc, point, spill_bytes, box_scratch)?;
         }
+        Ok(())
+    }
+
+    /// Restore the live interpreter registers from a deopt frame state and return
+    /// `STATUS_BAILED` at `point.byte_pc`. Shared by per-guard cold deopt exits
+    /// and the `Deopt` terminator.
+    fn emit_frame_restore_and_bail(
+        ops: &mut Assembler,
+        graph: &Graph,
+        alloc: &Allocation,
+        point: &DeoptPoint,
+        spill_bytes: u32,
+        box_scratch: u32,
+    ) -> Result<(), Unsupported> {
+        for &(regn, value) in &point.registers {
+            let loc = require_loc(alloc, value)?;
+            let repr = graph.node(value).repr;
+            box_into_gp(ops, box_scratch, repr, loc, MOVE_SCRATCH);
+            let off = u32::from(regn) * 8;
+            dynasm!(ops ; .arch aarch64 ; str X(box_scratch), [x19, off]);
+        }
+        emit_load_u64(ops, box_scratch, u64::from(point.byte_pc));
+        dynasm!(ops ; .arch aarch64 ; str W(box_scratch), [x20, BAIL_PC_OFFSET]);
+        dynasm!(ops ; .arch aarch64 ; movz x1, STATUS_BAILED as u32);
+        emit_epilogue(ops, spill_bytes);
         Ok(())
     }
 }
@@ -1206,10 +1244,11 @@ mod tests {
         let bcl = deopt::bytecode_liveness(v);
         let frames = deopt::capture_frame_states(&g, &bcl);
         let deopt_uses = deopt::deopt_value_uses(&frames);
-        let live = liveness::analyze(&g, &deopt_uses);
+        let block_deopts = deopt::capture_deopt_terminators(&g, &bcl);
+        let live = liveness::analyze(&g, &deopt_uses, &block_deopts);
         let alloc = regalloc::allocate(&g, &live, super::GP_REGS, super::FP_REGS, &deopt_uses);
         let osr = deopt::capture_osr_entries(&g, &bcl);
-        let code = super::emit(v, &g, &live, &alloc, &frames, &osr).expect("emits");
+        let code = super::emit(v, &g, &live, &alloc, &frames, &block_deopts, &osr).expect("emits");
 
         let mut regs = vec![0u64; 64];
         for (i, &p) in params.iter().enumerate() {

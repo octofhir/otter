@@ -345,6 +345,13 @@ pub enum Terminator {
         /// Target when the predicate is false.
         on_false: BlockId,
     },
+    /// Leave compiled code: an instruction outside the optimizing subset was
+    /// reached, restore the live interpreter registers and resume the interpreter
+    /// at this byte-PC. Lets a function with a hot compilable loop and an
+    /// un-compilable prologue / epilogue still compile and OSR the loop. No
+    /// successors. A function containing one is entered ONLY through an OSR loop
+    /// header — its function-entry runs the interpreter (see emit).
+    Deopt(u32),
 }
 
 /// A basic block: a maximal straight-line instruction range plus its

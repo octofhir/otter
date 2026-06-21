@@ -525,6 +525,29 @@ pub fn has_own_element(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> boo
     })
 }
 
+/// Fast read for callback-heavy dense array algorithms.
+///
+/// Returns an own data element only when the array has no indexed accessors.
+/// `None` means the caller must run the ordinary property path so holes,
+/// accessors, inherited indices, and sparse misses stay observable.
+#[must_use]
+pub(crate) fn own_data_element_without_accessors(
+    arr: JsArray,
+    heap: &otter_gc::GcHeap,
+    idx: usize,
+) -> Option<Value> {
+    heap.read_payload(arr, |body| {
+        if body.accessors().is_some() {
+            return None;
+        }
+        let value = body.elements.get(idx).cloned().or_else(|| {
+            body.sparse_elements()
+                .and_then(|sparse| sparse.get(&idx).cloned())
+        })?;
+        if value.is_hole() { None } else { Some(value) }
+    })
+}
+
 /// Write element at `idx`, extending with the internal
 /// hole sentinel when `idx > len` so absent slots remain
 /// distinguishable from explicit `undefined` per ECMA-262 §10.4.2.

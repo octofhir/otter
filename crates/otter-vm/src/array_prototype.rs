@@ -1315,8 +1315,11 @@ impl Interpreter {
                     self.run_callable_sync(context, &comparefn, Value::undefined(), args)
                 }
             }?;
-            let n = self.coerce_to_number(context, &r)?;
-            let f = n.as_f64();
+            let f = if let Some(f) = r.as_f64() {
+                f
+            } else {
+                self.coerce_to_number(context, &r)?.as_f64()
+            };
             return Ok(if f.is_nan() {
                 Ordering::Equal
             } else if f < 0.0 {
@@ -1339,40 +1342,57 @@ impl Interpreter {
         context: &ExecutionContext,
         items: Vec<Value>,
         comparefn: Value,
-        mut lean_inner: Option<&mut crate::call_ops::LeanCallbackState>,
+        lean_inner: Option<&mut crate::call_ops::LeanCallbackState>,
     ) -> Result<Vec<Value>, VmError> {
         use std::cmp::Ordering;
         let n = items.len();
         if n <= 1 {
             return Ok(items);
         }
-        let mid = n / 2;
-        let mut left = items;
-        let right = left.split_off(mid);
-        let left = self.sort_merge(context, left, comparefn, lean_inner.as_deref_mut())?;
-        let right = self.sort_merge(context, right, comparefn, lean_inner.as_deref_mut())?;
-        let mut out = Vec::with_capacity(n);
-        let (mut i, mut j) = (0usize, 0usize);
-        while i < left.len() && j < right.len() {
-            // Stable: keep the left element on a tie.
-            if self.sort_compare(
-                context,
-                left[i],
-                right[j],
-                comparefn,
-                lean_inner.as_deref_mut(),
-            )? != Ordering::Greater
-            {
-                out.push(left[i]);
-                i += 1;
-            } else {
-                out.push(right[j]);
-                j += 1;
+        let mut src = items;
+        let mut dst = vec![Value::undefined(); n];
+        let mut width = 1usize;
+        let mut lean_inner = lean_inner;
+        while width < n {
+            let mut start = 0usize;
+            while start < n {
+                let mid = (start + width).min(n);
+                let end = (start + width.saturating_mul(2)).min(n);
+                let (mut left, mut right, mut out) = (start, mid, start);
+                while left < mid && right < end {
+                    // Stable: keep the left element on a tie.
+                    if self.sort_compare(
+                        context,
+                        src[left],
+                        src[right],
+                        comparefn,
+                        lean_inner.as_deref_mut(),
+                    )? != Ordering::Greater
+                    {
+                        dst[out] = src[left];
+                        left += 1;
+                    } else {
+                        dst[out] = src[right];
+                        right += 1;
+                    }
+                    out += 1;
+                }
+                while left < mid {
+                    dst[out] = src[left];
+                    left += 1;
+                    out += 1;
+                }
+                while right < end {
+                    dst[out] = src[right];
+                    right += 1;
+                    out += 1;
+                }
+                start = end;
             }
+            std::mem::swap(&mut src, &mut dst);
+            width = width.saturating_mul(2);
         }
-        out.extend_from_slice(&left[i..]);
-        out.extend_from_slice(&right[j..]);
-        Ok(out)
+        Ok(src)
     }
 
     /// §23.1.3.30 live `Array.prototype.sort` over a generic receiver.
@@ -2781,12 +2801,87 @@ fn collect_own_indices_below(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArrayCallbackKind {
+    ForEach,
+    Map,
+    Filter,
+    Some,
+    Every,
+    Find,
+    FindIndex,
+    FindLast,
+    FindLastIndex,
+    Reduce,
+    ReduceRight,
+    FlatMap,
+}
+
+impl ArrayCallbackKind {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "forEach" => Self::ForEach,
+            "map" => Self::Map,
+            "filter" => Self::Filter,
+            "some" => Self::Some,
+            "every" => Self::Every,
+            "find" => Self::Find,
+            "findIndex" => Self::FindIndex,
+            "findLast" => Self::FindLast,
+            "findLastIndex" => Self::FindLastIndex,
+            "reduce" => Self::Reduce,
+            "reduceRight" => Self::ReduceRight,
+            "flatMap" => Self::FlatMap,
+            _ => return None,
+        })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::ForEach => "forEach",
+            Self::Map => "map",
+            Self::Filter => "filter",
+            Self::Some => "some",
+            Self::Every => "every",
+            Self::Find => "find",
+            Self::FindIndex => "findIndex",
+            Self::FindLast => "findLast",
+            Self::FindLastIndex => "findLastIndex",
+            Self::Reduce => "reduce",
+            Self::ReduceRight => "reduceRight",
+            Self::FlatMap => "flatMap",
+        }
+    }
+
+    fn visits_absent(self) -> bool {
+        matches!(
+            self,
+            Self::Find | Self::FindIndex | Self::FindLast | Self::FindLastIndex
+        )
+    }
+
+    fn reverse(self) -> bool {
+        matches!(
+            self,
+            Self::ReduceRight | Self::FindLast | Self::FindLastIndex
+        )
+    }
+
+    fn is_reduce(self) -> bool {
+        matches!(self, Self::Reduce | Self::ReduceRight)
+    }
+}
+
 /// Dispatches callback-based `Array.prototype` NativeCtx methods.
 pub(crate) fn array_callback_native_dispatch(
     name: &str,
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
+    let kind = ArrayCallbackKind::from_name(name).ok_or_else(|| NativeError::TypeError {
+        name: "Array.prototype callback",
+        reason: format!("unknown callback method '{name}'"),
+    })?;
     let raw_receiver = *ctx.this_value();
     if raw_receiver.is_null() || raw_receiver.is_undefined() {
         return Err(NativeError::TypeError {
@@ -2832,15 +2927,15 @@ pub(crate) fn array_callback_native_dispatch(
         });
     }
     let callback_roots = [receiver, callback, this_arg];
-    let mut output_target = match name {
-        "map" => {
+    let mut output_target = match kind {
+        ArrayCallbackKind::Map => {
             let created =
                 interp.array_species_create(&context, receiver, len, &[args, &callback_roots]);
             Some(created.map_err(|err| {
                 crate::native_function::vm_to_native_error(interp, err, "Array.prototype callback")
             })?)
         }
-        "filter" | "flatMap" => {
+        ArrayCallbackKind::Filter | ArrayCallbackKind::FlatMap => {
             let created =
                 interp.array_species_create(&context, receiver, 0, &[args, &callback_roots]);
             Some(created.map_err(|err| {
@@ -2853,7 +2948,7 @@ pub(crate) fn array_callback_native_dispatch(
     // T): each callback result that IsArray is spliced one level deep
     // through the observable HasProperty / Get / CreateDataProperty
     // protocol — not the raw element snapshot the generic loop uses.
-    if name == "flatMap" {
+    if kind == ArrayCallbackKind::FlatMap {
         let target = output_target.expect("flatMap output target created above");
         let anchor_base = interp.push_iteration_anchor(target) - 1;
         interp.push_iteration_anchor(receiver);
@@ -2873,12 +2968,13 @@ pub(crate) fn array_callback_native_dispatch(
     }
     // `find` family visits every index `0..len` (an absent slot yields
     // `undefined` for the element); the rest skip absent indices.
-    let visit_all = matches!(name, "find" | "findIndex" | "findLast" | "findLastIndex");
-    let reverse = matches!(name, "reduceRight" | "findLast" | "findLastIndex");
+    let visit_all = kind.visits_absent();
+    let reverse = kind.reverse();
     // `reduce` / `reduceRight` do not accept a `thisArg`; the callback
     // runs with `undefined` this (the second positional is the
     // initialValue, not a receiver).
-    let cb_this = if name == "reduce" || name == "reduceRight" {
+    let reduce_kind = kind.is_reduce();
+    let cb_this = if reduce_kind {
         Value::undefined()
     } else {
         this_arg
@@ -2938,7 +3034,7 @@ pub(crate) fn array_callback_native_dispatch(
     let mut bool_acc: bool = matches!(name, "every");
     let mut target_index = 0usize;
     let mut reduce_has_init = args.len() >= 2;
-    if (name == "reduce" || name == "reduceRight") && reduce_has_init {
+    if reduce_kind && reduce_has_init {
         acc = args[1];
     }
     // Root every heap handle the loop carries across a reentrant callback
@@ -3013,10 +3109,10 @@ pub(crate) fn array_callback_native_dispatch(
                 // element) or running the property protocol. The slow path
                 // still owns holes (inherited `Array.prototype[k]`), accessors,
                 // and sparse/exotic shapes.
-                if !crate::array::has_accessors(arr, interp.gc_heap())
-                    && crate::array::has_own_element(arr, interp.gc_heap(), idx)
+                if let Some(value) =
+                    crate::array::own_data_element_without_accessors(arr, interp.gc_heap(), idx)
                 {
-                    (true, crate::array::get(arr, interp.gc_heap(), idx))
+                    (true, value)
                 } else {
                     // A present own element (data or accessor) reads through
                     // the ordinary `[[Get]]`. An absent index (hole / beyond
@@ -3093,8 +3189,7 @@ pub(crate) fn array_callback_native_dispatch(
             // park the current element before the callback runs.
             let receiver = interp.iteration_anchor(anchor_base + A_RECEIVER);
             interp.set_iteration_anchor(anchor_base + A_ELEM, v);
-            let is_reduce = matches!(name, "reduce" | "reduceRight");
-            if is_reduce && !reduce_has_init {
+            if reduce_kind && !reduce_has_init {
                 acc = v;
                 reduce_has_init = true;
                 interp.set_iteration_anchor(anchor_base + A_ACC, acc);
@@ -3110,7 +3205,7 @@ pub(crate) fn array_callback_native_dispatch(
             // heap's `same_source` walk would skip anyway).
             let cb_result = match lean_inner {
                 Some(ref mut state) => {
-                    if is_reduce {
+                    if reduce_kind {
                         let acc_now = interp.iteration_anchor(anchor_base + A_ACC);
                         interp.run_bytecode_callable_committed_lean_args(
                             state,
@@ -3128,7 +3223,7 @@ pub(crate) fn array_callback_native_dispatch(
                     }
                 }
                 None => {
-                    let cb_args: SmallVec<[Value; 8]> = if is_reduce {
+                    let cb_args: SmallVec<[Value; 8]> = if reduce_kind {
                         let acc_now = interp.iteration_anchor(anchor_base + A_ACC);
                         smallvec::smallvec![acc_now, v, Value::number_f64(idx as f64), receiver,]
                     } else {
@@ -3142,9 +3237,9 @@ pub(crate) fn array_callback_native_dispatch(
             })?;
             // The callback may have moved the element / output target.
             let v = interp.iteration_anchor(anchor_base + A_ELEM);
-            match name {
-                "forEach" => {}
-                "map" => {
+            match kind {
+                ArrayCallbackKind::ForEach => {}
+                ArrayCallbackKind::Map => {
                     let target = interp.iteration_anchor(anchor_base + A_OUTPUT);
                     if target.is_undefined() {
                         return Err(NativeError::TypeError {
@@ -3158,7 +3253,7 @@ pub(crate) fn array_callback_native_dispatch(
                         crate::native_function::vm_to_native_error(interp, err, "map")
                     })?;
                 }
-                "filter" if result.to_boolean(interp.gc_heap()) => {
+                ArrayCallbackKind::Filter if result.to_boolean(interp.gc_heap()) => {
                     let target = interp.iteration_anchor(anchor_base + A_OUTPUT);
                     if target.is_undefined() {
                         return Err(NativeError::TypeError {
@@ -3173,24 +3268,28 @@ pub(crate) fn array_callback_native_dispatch(
                     })?;
                     target_index += 1;
                 }
-                "find" | "findLast" if result.to_boolean(interp.gc_heap()) => {
+                ArrayCallbackKind::Find | ArrayCallbackKind::FindLast
+                    if result.to_boolean(interp.gc_heap()) =>
+                {
                     found_val = v;
                     found_idx = Some(idx);
                     break;
                 }
-                "findIndex" | "findLastIndex" if result.to_boolean(interp.gc_heap()) => {
+                ArrayCallbackKind::FindIndex | ArrayCallbackKind::FindLastIndex
+                    if result.to_boolean(interp.gc_heap()) =>
+                {
                     found_idx = Some(idx);
                     break;
                 }
-                "every" if !result.to_boolean(interp.gc_heap()) => {
+                ArrayCallbackKind::Every if !result.to_boolean(interp.gc_heap()) => {
                     bool_acc = false;
                     break;
                 }
-                "some" if result.to_boolean(interp.gc_heap()) => {
+                ArrayCallbackKind::Some if result.to_boolean(interp.gc_heap()) => {
                     bool_acc = true;
                     break;
                 }
-                "reduce" | "reduceRight" => {
+                ArrayCallbackKind::Reduce | ArrayCallbackKind::ReduceRight => {
                     acc = result;
                     interp.set_iteration_anchor(anchor_base + A_ACC, acc);
                 }
@@ -3210,14 +3309,14 @@ pub(crate) fn array_callback_native_dispatch(
     acc = interp.iteration_anchor(anchor_base + A_ACC);
     interp.pop_iteration_anchors_to(anchor_base);
     walk?;
-    match name {
-        "forEach" => Ok(Value::undefined()),
-        "find" | "findLast" => Ok(found_val),
-        "findIndex" | "findLastIndex" => Ok(Value::number(NumberValue::from_f64(
-            found_idx.map_or(-1.0, |i| i as f64),
-        ))),
-        "every" | "some" => Ok(Value::boolean(bool_acc)),
-        "reduce" | "reduceRight" => {
+    match kind {
+        ArrayCallbackKind::ForEach => Ok(Value::undefined()),
+        ArrayCallbackKind::Find | ArrayCallbackKind::FindLast => Ok(found_val),
+        ArrayCallbackKind::FindIndex | ArrayCallbackKind::FindLastIndex => Ok(Value::number(
+            NumberValue::from_f64(found_idx.map_or(-1.0, |i| i as f64)),
+        )),
+        ArrayCallbackKind::Every | ArrayCallbackKind::Some => Ok(Value::boolean(bool_acc)),
+        ArrayCallbackKind::Reduce | ArrayCallbackKind::ReduceRight => {
             if !reduce_has_init {
                 return Err(NativeError::TypeError {
                     name: "reduce",
@@ -3226,14 +3325,12 @@ pub(crate) fn array_callback_native_dispatch(
             }
             Ok(acc)
         }
-        "map" | "filter" | "flatMap" => output_target.ok_or_else(|| NativeError::TypeError {
-            name: "Array.prototype callback",
-            reason: "missing output target".to_string(),
-        }),
-        _ => Err(NativeError::TypeError {
-            name: "Array.prototype callback",
-            reason: format!("unknown callback method '{name}'"),
-        }),
+        ArrayCallbackKind::Map | ArrayCallbackKind::Filter | ArrayCallbackKind::FlatMap => {
+            output_target.ok_or_else(|| NativeError::TypeError {
+                name: kind.name(),
+                reason: "missing output target".to_string(),
+            })
+        }
     }
 }
 

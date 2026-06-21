@@ -189,6 +189,13 @@ pub(crate) struct LeanCallbackState {
     function_id: u32,
     /// Callee register-window length, read once from the executable function.
     register_count: usize,
+    /// Number of formal parameters to bind on the lean path.
+    param_count: usize,
+    /// Strict and arrow callbacks use the incoming receiver directly.
+    this_passthrough: bool,
+    /// Whether the callback has captured upvalues that must be refreshed from
+    /// the traced root before each off-stack recycled-frame entry.
+    has_parent_upvalues: bool,
     /// True when the callback carries no bound `new.target`, derived-`this`
     /// cell, or captured eval environment — i.e. the per-element frame needs no
     /// pooled cold record. The hot Array/Map/Set/TypedArray callbacks (plain
@@ -283,6 +290,24 @@ impl Interpreter {
         for (i, value) in args.iter().copied().take(bind_count).enumerate() {
             let slot = frame.registers.get_mut(i).ok_or(VmError::InvalidOperand)?;
             *slot = value;
+        }
+        Ok(())
+    }
+
+    fn reset_and_bind_lean_bytecode_call_arguments(
+        param_count: usize,
+        frame: &mut Frame,
+        args: &[Value],
+    ) -> Result<(), VmError> {
+        let bind_count = param_count.min(args.len());
+        if bind_count > frame.registers.len() {
+            return Err(VmError::InvalidOperand);
+        }
+        for slot in frame.registers.iter_mut().skip(bind_count) {
+            *slot = Value::undefined();
+        }
+        for (i, value) in args.iter().copied().take(bind_count).enumerate() {
+            frame.registers[i] = value;
         }
         Ok(())
     }
@@ -1849,19 +1874,20 @@ impl Interpreter {
         callback: Value,
     ) -> Option<LeanCallbackState> {
         let root = LeanCallbackRoot::from_callback(callback, &self.gc_heap)?;
-        let register_count = context
-            .exec_function(root.function_id)
-            .filter(|f| {
-                !f.is_generator
-                    && !f.is_async
-                    && !f.is_async_generator
-                    && !f.needs_arguments
-                    && !f.has_rest
-                    && !f.makes_function
-                    && !f.contains_direct_eval
-                    && !f.is_derived_constructor
-            })
-            .map(|f| f.register_count as usize)?;
+        let function = context.exec_function(root.function_id).filter(|f| {
+            !f.is_generator
+                && !f.is_async
+                && !f.is_async_generator
+                && !f.needs_arguments
+                && !f.has_rest
+                && !f.makes_function
+                && !f.contains_direct_eval
+                && !f.is_derived_constructor
+        })?;
+        let register_count = function.register_count as usize;
+        let param_count = function.param_count as usize;
+        let this_passthrough = function.is_strict || function.is_arrow;
+        let has_parent_upvalues = !root.parent_upvalues.is_empty();
         // A callback with no bound `new.target` / derived-`this` cell / captured
         // eval environment needs no pooled cold record, so its per-element frame
         // is a flat register window the prepared fast path can recycle in place.
@@ -1878,6 +1904,9 @@ impl Interpreter {
                 root_index,
                 function_id,
                 register_count,
+                param_count,
+                this_passthrough,
+                has_parent_upvalues,
                 fast_reuse,
                 compiled: None,
                 reuse_frame: None,
@@ -2077,9 +2106,6 @@ impl Interpreter {
         effective_this: Value,
         effective_args: &[Value],
     ) -> Result<Value, VmError> {
-        let function = context
-            .exec_function(state.function_id)
-            .ok_or(VmError::InvalidOperand)?;
         // Refresh the GC-live inputs from the traced root every element: the
         // recycled frame is held off-stack between calls and is not itself
         // traced, so its captured upvalues / receiver could be relocated by a
@@ -2092,21 +2118,30 @@ impl Interpreter {
                 .ok_or(VmError::InvalidOperand)?;
             (
                 root.bound_this.unwrap_or(effective_this),
-                root.parent_upvalues.clone(),
+                state
+                    .has_parent_upvalues
+                    .then(|| root.parent_upvalues.clone()),
             )
         };
         // The builtin passes a constant receiver across the whole loop, so the
         // §10.2 sloppy-`this` coercion is computed once and reused.
-        let this_for_callee = match state.cached_this {
-            Some((input, coerced)) if input == bound_this => coerced,
-            _ => {
-                let coerced = self.this_for_bytecode_call_runtime_rooted(
-                    function,
-                    bound_this,
-                    &[effective_args],
-                )?;
-                state.cached_this = Some((bound_this, coerced));
-                coerced
+        let this_for_callee = if state.this_passthrough {
+            bound_this
+        } else {
+            match state.cached_this {
+                Some((input, coerced)) if input == bound_this => coerced,
+                _ => {
+                    let function = context
+                        .exec_function(state.function_id)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let coerced = self.this_for_bytecode_call_runtime_rooted(
+                        function,
+                        bound_this,
+                        &[effective_args],
+                    )?;
+                    state.cached_this = Some((bound_this, coerced));
+                    coerced
+                }
             }
         };
         let register_count = state.register_count;
@@ -2116,14 +2151,17 @@ impl Interpreter {
                 frame.pc = 0;
                 frame.return_register = None;
                 frame.this_value = this_for_callee;
-                frame.upvalues = parent_upvalues;
-                for slot in frame.registers.iter_mut() {
-                    *slot = Value::undefined();
+                if let Some(parent_upvalues) = parent_upvalues {
+                    frame.upvalues = parent_upvalues;
                 }
                 frame
             }
             None => {
+                let function = context
+                    .exec_function(state.function_id)
+                    .ok_or(VmError::InvalidOperand)?;
                 let registers = self.draw_registers(register_count);
+                let parent_upvalues = parent_upvalues.unwrap_or_else(Frame::empty_upvalues);
                 Frame::with_exec_registers(
                     function,
                     None,
@@ -2133,7 +2171,11 @@ impl Interpreter {
                 )
             }
         };
-        Self::bind_lean_bytecode_call_arguments(function, &mut frame, effective_args)?;
+        Self::reset_and_bind_lean_bytecode_call_arguments(
+            state.param_count,
+            &mut frame,
+            effective_args,
+        )?;
         state.stack.push(frame);
         let top_idx = state.stack.len() - 1;
         match self.run_compiled_frame(&mut state.stack, context, top_idx, code) {

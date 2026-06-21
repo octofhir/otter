@@ -3254,6 +3254,13 @@ impl Interpreter {
                     crate::bigint::ops::rem,
                 )
             }
+            Op::Add => {
+                let (dst, lhs, rhs) = context
+                    .exec_register3(instr)
+                    .ok_or(VmError::InvalidOperand)?;
+                let frame = &mut stack[frame_index];
+                self.run_add_regs(frame, dst, lhs, rhs)
+            }
             Op::Ushr => {
                 let (dst, lhs, rhs) = context
                     .exec_register3(instr)

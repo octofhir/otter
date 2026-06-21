@@ -623,9 +623,9 @@ extern "C" fn jit_store_upvalue_stub(ctx: *mut JitCtx, src: u64, idx: u64) -> u6
 }
 
 /// Bridge stub: re-run one synchronous opcode (closure/object/array
-/// construction, string constant, checked upvalue store, remainder, unsigned
-/// shift) at `byte_pc` through [`Interpreter::jit_runtime_delegate_op`]. Returns
-/// `0` on success, `1` on throw (error parked in `ctx`).
+/// construction, string constant, checked upvalue store, addition, remainder,
+/// unsigned shift) at `byte_pc` through [`Interpreter::jit_runtime_delegate_op`].
+/// Returns `0` on success, `1` on throw (error parked in `ctx`).
 extern "C" fn jit_delegate_op_stub(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
@@ -989,6 +989,32 @@ mod arm64 {
         };
     }
 
+    /// Emit `dst = ToPrimitive(src)` for already-primitive values. Objects,
+    /// callables, and bytecode-function references bail to the interpreter so
+    /// observable `@@toPrimitive` / `valueOf` / `toString` hooks still run.
+    fn emit_to_primitive_identity(
+        ops: &mut Assembler,
+        dst: u16,
+        src: u16,
+        bail: DynamicLabel,
+    ) -> Result<(), Unsupported> {
+        load_reg(ops, 9, src)?;
+        dynasm!(ops
+            ; .arch aarch64
+            ; lsr x14, x9, #48
+            ; movz x15, TAG_FUNCTION_ID as u32
+            ; cmp x14, x15
+            ; b.eq =>bail
+            ; movz x15, TAG_PTR_OBJECT as u32
+            ; cmp x14, x15
+            ; b.eq =>bail
+            ; movz x15, TAG_PTR_FUNCTION as u32
+            ; cmp x14, x15
+            ; b.eq =>bail
+        );
+        store_reg(ops, 9, dst)
+    }
+
     /// Integer binary ops that share the int32 fast-path shape: guard both
     /// operands int32, apply a single 32-bit instruction, re-box as int32.
     enum IntBinOp {
@@ -1049,6 +1075,49 @@ mod arm64 {
         }
         emit_box_double(ops, 2, 13);
         store_reg(ops, 13, dst)?;
+        dynasm!(ops ; .arch aarch64 ; =>done);
+        Ok(())
+    }
+
+    /// Emit `Add` with the same numeric inline path as [`emit_add_sub_mul`],
+    /// but delegate non-number operands back to the VM instead of bailing out
+    /// of compiled code. That keeps string/boolean/null `+` loops resident in
+    /// baseline JIT while preserving the interpreter's full `+` semantics.
+    fn emit_add_with_runtime_fallback(
+        ops: &mut Assembler,
+        operands: &[Operand],
+        byte_pc: u32,
+        threw: DynamicLabel,
+    ) -> Result<(), Unsupported> {
+        let (dst, lhs, rhs) = reg3(operands)?;
+        load_reg(ops, 9, lhs)?;
+        load_reg(ops, 10, rhs)?;
+        let float_path = ops.new_dynamic_label();
+        let runtime_path = ops.new_dynamic_label();
+        let done = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch aarch64
+            ; lsr x14, x9, #48
+            ; movz x15, TAG_INT32 as u32
+            ; cmp x14, x15
+            ; b.ne =>float_path
+            ; lsr x14, x10, #48
+            ; cmp x14, x15
+            ; b.ne =>float_path
+            ; adds w13, w9, w10
+            ; b.vs =>float_path
+        );
+        box_low32!(ops, 13, 12, TAG_INT32);
+        store_reg(ops, 13, dst)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done ; =>float_path);
+        emit_num_to_double(ops, 9, 0, runtime_path);
+        emit_num_to_double(ops, 10, 1, runtime_path);
+        dynasm!(ops ; .arch aarch64 ; fadd d2, d0, d1);
+        emit_box_double(ops, 2, 13);
+        store_reg(ops, 13, dst)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done ; =>runtime_path ; mov x0, x20);
+        emit_load_u64(ops, 1, u64::from(byte_pc));
+        emit_call_stub(ops, jit_delegate_op_stub as *const () as usize, threw);
         dynasm!(ops ; .arch aarch64 ; =>done);
         Ok(())
     }
@@ -1474,10 +1543,11 @@ mod arm64 {
                     load_reg(&mut ops, 9, src)?;
                     store_reg(&mut ops, 9, idx)?;
                 }
-                Op::Add | Op::Sub | Op::Mul | Op::Div if enable_fres => {
+                Op::Add => emit_add_with_runtime_fallback(&mut ops, ops_ref, instr.byte_pc, threw)?,
+                Op::Sub | Op::Mul | Op::Div if enable_fres => {
                     emit_float_binop_res(&mut ops, ops_ref, bail, instr.op, &mut fres)?;
                 }
-                Op::Add | Op::Sub | Op::Mul => {
+                Op::Sub | Op::Mul => {
                     emit_add_sub_mul(&mut ops, ops_ref, bail, instr.op)?;
                 }
                 Op::Div => emit_div(&mut ops, ops_ref, bail)?,
@@ -1506,10 +1576,16 @@ mod arm64 {
                 Op::GreaterEq => emit_cmp(&mut ops, ops_ref, bail, Cmp::Ge)?,
                 Op::Equal => emit_cmp(&mut ops, ops_ref, bail, Cmp::Eq)?,
                 Op::NotEqual => emit_cmp(&mut ops, ops_ref, bail, Cmp::Ne)?,
-                // `ToPrimitive`/`ToNumeric` are identity on a number (int32 or
-                // double); emit a guarded move. Non-numbers (objects needing
-                // `valueOf`, strings, etc.) bail to the interpreter.
-                Op::ToPrimitive | Op::ToNumeric => {
+                // `ToPrimitive` is identity on primitives. Object/function
+                // families bail so observable coercion hooks run in the VM.
+                Op::ToPrimitive => {
+                    let dst = reg(ops_ref, 0)?;
+                    let src = reg(ops_ref, 1)?;
+                    emit_to_primitive_identity(&mut ops, dst, src, bail)?;
+                }
+                // `ToNumeric` is identity on a number (int32 or double); emit
+                // a guarded move. Other primitives/objects need the VM path.
+                Op::ToNumeric => {
                     let dst = reg(ops_ref, 0)?;
                     let src = reg(ops_ref, 1)?;
                     load_reg(&mut ops, 9, src)?;
@@ -2176,8 +2252,7 @@ mod arm64 {
             // boundary or writes a slot the cache cannot track, so drop all.
             if enable_fres {
                 match instr.op {
-                    Op::Add
-                    | Op::Sub
+                    Op::Sub
                     | Op::Mul
                     | Op::Div
                     | Op::LessThan
@@ -2378,7 +2453,12 @@ mod arm64 {
             Op::GreaterEq => emit_cmp(ops, ops_ref, bail, Cmp::Ge)?,
             Op::Equal => emit_cmp(ops, ops_ref, bail, Cmp::Eq)?,
             Op::NotEqual => emit_cmp(ops, ops_ref, bail, Cmp::Ne)?,
-            Op::ToPrimitive | Op::ToNumeric => {
+            Op::ToPrimitive => {
+                let dst = reg(ops_ref, 0)?;
+                let src = reg(ops_ref, 1)?;
+                emit_to_primitive_identity(ops, dst, src, bail)?;
+            }
+            Op::ToNumeric => {
                 let dst = reg(ops_ref, 0)?;
                 let src = reg(ops_ref, 1)?;
                 load_reg(ops, 9, src)?;
@@ -4135,10 +4215,40 @@ mod tests {
     #[test]
     fn bails_on_non_number_operand() {
         // A tagged non-number (undefined = TAG_SPECIAL, payload 0) must bail to
-        // the interpreter — only int32 and doubles take the compiled arith path.
-        let v = add_view();
+        // the interpreter for numeric-only operators; only int32 and doubles
+        // take the compiled arith path. `Add` has a runtime fallback for JS
+        // string/primitive concatenation semantics.
+        let v = view(&[
+            (
+                Op::Sub,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
+        ]);
         let mut regs = [box_i32(10), TAG_SPECIAL << 48, 0, 0, 0, 0, 0, 0];
         assert!(matches!(run(&v, &mut regs), Exit::Bailed));
+    }
+
+    #[test]
+    fn to_primitive_passes_string_primitive() {
+        let v = view(&[
+            (
+                Op::ToPrimitive,
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(1)]),
+        ]);
+        let string = (0x7FFD_u64 << 48) | 0x1234;
+        let mut regs = [string, 0, 0, 0, 0, 0, 0, 0];
+        assert!(matches!(run(&v, &mut regs), Exit::Returned(bits) if bits == string));
     }
 
     #[test]

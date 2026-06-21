@@ -537,7 +537,12 @@ impl<'a> Builder<'a> {
                     let Some((shape, slot_byte)) =
                         property_feedback.filter(|_| self.view.cage_base != 0)
                     else {
-                        return Err(Unsupported::Opcode(Op::LoadProperty));
+                        self.deopt_or_decline(
+                            block,
+                            byte_pc,
+                            Unsupported::Opcode(Op::LoadProperty),
+                        )?;
+                        return Ok(());
                     };
                     let obj = self.read_variable(obj_reg, block);
                     let checked =
@@ -563,14 +568,24 @@ impl<'a> Builder<'a> {
                     let Some((shape, slot_byte)) =
                         property_feedback.filter(|_| self.view.cage_base != 0)
                     else {
-                        return Err(Unsupported::Opcode(Op::StoreProperty));
+                        self.deopt_or_decline(
+                            block,
+                            byte_pc,
+                            Unsupported::Opcode(Op::StoreProperty),
+                        )?;
+                        return Ok(());
                     };
                     let value = self.read_variable(src_reg, block);
                     if !matches!(
                         self.graph.node(value).kind.repr(),
                         Repr::Int32 | Repr::Float64
                     ) {
-                        return Err(Unsupported::Opcode(Op::StoreProperty));
+                        self.deopt_or_decline(
+                            block,
+                            byte_pc,
+                            Unsupported::Opcode(Op::StoreProperty),
+                        )?;
+                        return Ok(());
                     }
                     let obj = self.read_variable(obj_reg, block);
                     let checked =
@@ -639,7 +654,14 @@ impl<'a> Builder<'a> {
                 Op::Add | Op::Sub | Op::Mul | Op::Div => {
                     let (dst, lhs, rhs) =
                         (reg(&operands, 0)?, reg(&operands, 1)?, reg(&operands, 2)?);
-                    let node = self.arith_binop(block, op, lhs, rhs, feedback, byte_pc)?;
+                    let node = match self.arith_binop(block, op, lhs, rhs, feedback, byte_pc) {
+                        Ok(node) => node,
+                        Err(reason @ Unsupported::TypeFeedback(_)) => {
+                            self.deopt_or_decline(block, byte_pc, reason)?;
+                            return Ok(());
+                        }
+                        Err(reason) => return Err(reason),
+                    };
                     self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
                     self.def_register(dst, block, node, byte_pc);
@@ -652,7 +674,14 @@ impl<'a> Builder<'a> {
                 Op::BitwiseOr | Op::BitwiseAnd | Op::BitwiseXor | Op::Shl | Op::Shr => {
                     let (dst, lhs, rhs) =
                         (reg(&operands, 0)?, reg(&operands, 1)?, reg(&operands, 2)?);
-                    let node = self.bitwise_binop(block, op, lhs, rhs, feedback, byte_pc)?;
+                    let node = match self.bitwise_binop(block, op, lhs, rhs, feedback, byte_pc) {
+                        Ok(node) => node,
+                        Err(reason @ Unsupported::TypeFeedback(_)) => {
+                            self.deopt_or_decline(block, byte_pc, reason)?;
+                            return Ok(());
+                        }
+                        Err(reason) => return Err(reason),
+                    };
                     self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
                     self.def_register(dst, block, node, byte_pc);
@@ -668,7 +697,14 @@ impl<'a> Builder<'a> {
                         None => 1,
                         _ => return Err(Unsupported::OperandShape("increment delta")),
                     };
-                    let node = self.increment(block, src, delta, feedback, byte_pc)?;
+                    let node = match self.increment(block, src, delta, feedback, byte_pc) {
+                        Ok(node) => node,
+                        Err(reason @ Unsupported::TypeFeedback(_)) => {
+                            self.deopt_or_decline(block, byte_pc, reason)?;
+                            return Ok(());
+                        }
+                        Err(reason) => return Err(reason),
+                    };
                     self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
                     self.def_register(dst, block, node, byte_pc);
@@ -682,7 +718,14 @@ impl<'a> Builder<'a> {
                     let (dst, lhs, rhs) =
                         (reg(&operands, 0)?, reg(&operands, 1)?, reg(&operands, 2)?);
                     let cmp = CmpOp::from_op(op).expect("comparison opcode");
-                    let node = self.compare(block, cmp, lhs, rhs, feedback, byte_pc)?;
+                    let node = match self.compare(block, cmp, lhs, rhs, feedback, byte_pc) {
+                        Ok(node) => node,
+                        Err(reason @ Unsupported::TypeFeedback(_)) => {
+                            self.deopt_or_decline(block, byte_pc, reason)?;
+                            return Ok(());
+                        }
+                        Err(reason) => return Err(reason),
+                    };
                     self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
                     self.def_register(dst, block, node, byte_pc);
@@ -756,21 +799,7 @@ impl<'a> Builder<'a> {
                 // side effects; and a loopless function compiled only to deopt
                 // buys nothing. Either way, decline → baseline / interpreter.
                 _ => {
-                    let back_edge_pc = |h: &super::ir::Block| {
-                        h.preds
-                            .iter()
-                            .map(|&p| self.graph.blocks[p as usize].start_pc)
-                            .filter(|&pc| pc > h.start_pc)
-                            .max()
-                    };
-                    let has_loop = self.graph.blocks.iter().any(|h| back_edge_pc(h).is_some());
-                    let in_loop = self.graph.blocks.iter().any(|h| {
-                        matches!(back_edge_pc(h), Some(bpc) if h.start_pc <= byte_pc && byte_pc <= bpc)
-                    });
-                    if !has_loop || in_loop {
-                        return Err(Unsupported::Opcode(op));
-                    }
-                    self.set_term(block, Terminator::Deopt(byte_pc));
+                    self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
                     return Ok(());
                 }
             }
@@ -1023,6 +1052,43 @@ impl<'a> Builder<'a> {
     fn set_term(&mut self, block: BlockId, term: Terminator) {
         self.graph.blocks[block as usize].term = Some(term);
     }
+
+    fn back_edge_pc(&self, header: &super::ir::Block) -> Option<u32> {
+        header
+            .preds
+            .iter()
+            .map(|&p| self.graph.blocks[p as usize].start_pc)
+            .filter(|&pc| pc > header.start_pc)
+            .max()
+    }
+
+    fn can_deopt_at(&self, byte_pc: u32) -> bool {
+        let has_loop = self
+            .graph
+            .blocks
+            .iter()
+            .any(|header| self.back_edge_pc(header).is_some());
+        let in_loop = self.graph.blocks.iter().any(|header| {
+            matches!(
+                self.back_edge_pc(header),
+                Some(backedge_pc) if header.start_pc <= byte_pc && byte_pc <= backedge_pc
+            )
+        });
+        has_loop && !in_loop
+    }
+
+    fn deopt_or_decline(
+        &mut self,
+        block: BlockId,
+        byte_pc: u32,
+        reason: Unsupported,
+    ) -> Result<(), Unsupported> {
+        if !self.can_deopt_at(byte_pc) {
+            return Err(reason);
+        }
+        self.set_term(block, Terminator::Deopt(byte_pc));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1219,6 +1285,36 @@ mod tests {
         ))
         .unwrap_err();
         assert_eq!(err, Unsupported::Opcode(Op::Rem));
+    }
+
+    #[test]
+    fn unknown_feedback_after_loop_deopts_epilogue_only() {
+        // A cold/unobserved arithmetic op after a hot loop should not prevent OSR
+        // into the loop. The epilogue resumes in the interpreter at that op.
+        let g = build(&view(
+            1,
+            6,
+            &[
+                (Op::LoadInt32, vec![r(1), imm(0)], 0),
+                (Op::LoadInt32, vec![r(2), imm(0)], 0),
+                (Op::LessThan, vec![r(3), r(1), r(0)], ARITH_INT32),
+                (Op::JumpIfFalse, vec![imm(rel(3, 8)), r(3)], 0),
+                (Op::Add, vec![r(2), r(2), r(1)], ARITH_INT32),
+                (Op::LoadInt32, vec![r(4), imm(1)], 0),
+                (Op::Add, vec![r(1), r(1), r(4)], ARITH_INT32),
+                (Op::Jump, vec![imm(rel(7, 2))], 0),
+                (Op::Add, vec![r(5), r(2), r(4)], 0),
+                (Op::ReturnValue, vec![r(5)], 0),
+            ],
+        ))
+        .expect("unknown feedback after loop deopts");
+
+        let epilogue = g
+            .blocks
+            .iter()
+            .find(|b| b.start_pc == 8 * STRIDE)
+            .expect("epilogue block");
+        assert!(matches!(epilogue.term, Some(Terminator::Deopt(pc)) if pc == 8 * STRIDE));
     }
 
     #[test]

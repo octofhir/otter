@@ -467,6 +467,39 @@ fn impl_char_code_at(
     Ok(Value::number(value))
 }
 
+pub(crate) fn is_char_code_at_builtin(value: Value, heap: &otter_gc::GcHeap) -> bool {
+    value
+        .as_native_function()
+        .is_some_and(|native| native.is_static_fn(heap, bridge_char_code_at))
+        || value
+            .as_object()
+            .and_then(|obj| crate::object::call_native(obj, heap))
+            .and_then(|native| native.as_native_function())
+            .is_some_and(|native| native.is_static_fn(heap, bridge_char_code_at))
+}
+
+pub(crate) fn fast_primitive_char_code_at(
+    receiver: Value,
+    args: &[Value],
+    heap: &mut otter_gc::GcHeap,
+) -> Option<Value> {
+    let recv = receiver.as_string(heap)?;
+    let pos = match args.first().copied() {
+        None => 0,
+        Some(arg) if arg.is_undefined() => 0,
+        Some(arg) => arg.as_number().map(number_to_int)?,
+    };
+    let len = i64::from(recv.len());
+    if pos < 0 || pos >= len {
+        return Some(Value::number(NumberValue::Double(f64::NAN)));
+    }
+    let value = match recv.char_code_at(pos as u32, heap) {
+        Some(unit) => NumberValue::from_i32(i32::from(unit)),
+        None => NumberValue::Double(f64::NAN),
+    };
+    Some(Value::number(value))
+}
+
 fn impl_char_at(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,

@@ -10644,6 +10644,92 @@ mod tests {
     }
 
     #[test]
+    fn call_method_string_char_code_at_builtin_fast_path() {
+        let mut interp = Interpreter::new();
+        let recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
+
+        let stack = call_char_code_at(&mut interp, recv).expect("charCodeAt should resolve");
+
+        assert_eq!(stack[0].registers[2], Value::number_i32(98));
+    }
+
+    #[test]
+    fn call_method_string_char_code_at_callable_shadow_falls_back() {
+        fn replacement(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+            Ok(Value::number_i32(777))
+        }
+
+        let mut interp = Interpreter::new();
+        let proto = interp
+            .constructor_prototype_value("String")
+            .expect("String.prototype")
+            .as_object()
+            .expect("String.prototype object");
+        let replacement = native_value_static(interp.gc_heap_mut(), "replacement", 1, replacement)
+            .expect("replacement");
+        object::set(proto, interp.gc_heap_mut(), "charCodeAt", replacement);
+        let recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
+
+        let stack = call_char_code_at(&mut interp, recv).expect("charCodeAt shadow should resolve");
+
+        assert_eq!(stack[0].registers[2], Value::number_i32(777));
+    }
+
+    #[test]
+    fn call_method_string_char_code_at_non_callable_shadows_builtin() {
+        let mut interp = Interpreter::new();
+        let proto = interp
+            .constructor_prototype_value("String")
+            .expect("String.prototype")
+            .as_object()
+            .expect("String.prototype object");
+        object::set(
+            proto,
+            interp.gc_heap_mut(),
+            "charCodeAt",
+            Value::number_i32(1),
+        );
+        let recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
+
+        let err = call_char_code_at(&mut interp, recv)
+            .expect_err("non-callable String.prototype.charCodeAt should shadow builtin");
+
+        assert!(matches!(err, VmError::NotCallable));
+    }
+
+    fn call_char_code_at(interp: &mut Interpreter, recv: Value) -> Result<HoltStack, VmError> {
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            template_sites: Vec::new(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 3, Vec::new())],
+            constants: vec![Constant::String {
+                utf16: "charCodeAt".encode_utf16().collect(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let context = ExecutionContext::from_module(module.clone());
+        let mut stack: HoltStack = HoltStack::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = recv;
+        frame.registers[1] = Value::number_i32(1);
+        stack.push(frame);
+        interp.do_call_method_value(
+            &mut stack,
+            &context,
+            &[
+                Operand::Register(2),
+                Operand::Register(0),
+                Operand::ConstIndex(0),
+                Operand::ConstIndex(1),
+                Operand::Register(1),
+            ],
+        )?;
+        Ok(stack)
+    }
+
+    #[test]
     fn call_method_number_prototype_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),

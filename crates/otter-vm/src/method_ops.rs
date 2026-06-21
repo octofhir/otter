@@ -554,6 +554,16 @@ impl Interpreter {
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
         // §7.3.11 GetMethod + §7.3.14 Call.
+        if name == "charCodeAt"
+            && recv_value.is_string()
+            && let Some(result) =
+                self.try_fast_primitive_string_char_code_at(recv_value, arg_values.as_slice())?
+        {
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            write_register(&mut stack[top_idx], dst, result)?;
+            return Ok(());
+        }
+        // §7.3.11 GetMethod + §7.3.14 Call.
         if self.has_plain_builtin_method(recv_value, name) {
             let method = self
                 .get_method_value_for_call(context, stack, recv_value, name)?
@@ -899,6 +909,14 @@ impl Interpreter {
         let name = context
             .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
+        if name == "charCodeAt"
+            && recv.is_string()
+            && let Some(result) =
+                self.try_fast_primitive_string_char_code_at(recv, args.as_slice())?
+        {
+            write_register(&mut stack[frame_index], dst, result)?;
+            return Ok(());
+        }
         let saved_pc = stack[frame_index].pc;
         let method = self
             .get_method_value_for_call(context, stack, recv, name)?
@@ -911,6 +929,31 @@ impl Interpreter {
         stack[frame_index].pc = saved_pc;
         write_register(&mut stack[frame_index], dst, result)?;
         Ok(())
+    }
+
+    fn try_fast_primitive_string_char_code_at(
+        &mut self,
+        recv_value: Value,
+        args: &[Value],
+    ) -> Result<Option<Value>, VmError> {
+        let Some(proto) = self.constructor_prototype_value("String")?.as_object() else {
+            return Ok(None);
+        };
+        let value = match crate::object::lookup(proto, &self.gc_heap, "charCodeAt") {
+            crate::object::PropertyLookup::Data { value, .. } => value,
+            crate::object::PropertyLookup::Accessor { .. }
+            | crate::object::PropertyLookup::Absent => {
+                return Ok(None);
+            }
+        };
+        if !string_prototype::is_char_code_at_builtin(value, &self.gc_heap) {
+            return Ok(None);
+        }
+        Ok(string_prototype::fast_primitive_char_code_at(
+            recv_value,
+            args,
+            &mut self.gc_heap,
+        ))
     }
 
     /// Resolve a method by receiver shape through the call site's load IC.

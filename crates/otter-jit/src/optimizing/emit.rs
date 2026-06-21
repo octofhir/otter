@@ -58,7 +58,7 @@
 //! - [`super::deopt`] — the per-guard frame states consumed here.
 
 use super::Unsupported;
-use super::deopt::DeoptPoint;
+use super::deopt::{DeoptPoint, OsrEntry};
 use super::ir::{BlockId, CmpOp, Graph, NodeId, NodeKind, Repr, Terminator};
 use super::liveness::Liveness;
 use super::regalloc::{Allocation, EdgeMoves, Location};
@@ -79,6 +79,9 @@ pub const FP_REGS: u32 = 6;
 /// the exact reentry ABI and deopt-resume handling.
 pub struct OptimizedCode {
     code: CompiledCode,
+    /// Loop-header byte-PC → byte offset of that header's OSR-entry trampoline
+    /// within `code`. Empty when the function has no eligible loop header.
+    osr_offsets: rustc_hash::FxHashMap<u32, usize>,
 }
 
 impl std::fmt::Debug for OptimizedCode {
@@ -102,6 +105,20 @@ impl otter_vm::JitFunctionCode for OptimizedCode {
         // reentry contract.
         unsafe { crate::baseline::enter_compiled(ptrs, entry) }
     }
+
+    fn osr_entry(
+        &self,
+        ptrs: otter_vm::JitReentryPtrs,
+        byte_pc: u32,
+    ) -> Option<otter_vm::JitExecOutcome> {
+        let offset = *self.osr_offsets.get(&byte_pc)?;
+        // SAFETY: `offset` is an assembler offset recorded for this buffer at a
+        // loop-header OSR trampoline emitted with the `JitEntry` ABI.
+        let entry = unsafe { self.code.ptr_at(offset) };
+        // SAFETY: same reentry contract as `run_entry`; the trampoline reloads
+        // the live interpreter registers before branching to the loop header.
+        Some(unsafe { crate::baseline::enter_compiled(ptrs, entry) })
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -114,6 +131,7 @@ pub(super) fn emit(
     _liveness: &Liveness,
     _alloc: &Allocation,
     _frames: &rustc_hash::FxHashMap<NodeId, DeoptPoint>,
+    _osr_entries: &[OsrEntry],
 ) -> Result<OptimizedCode, Unsupported> {
     Err(Unsupported::Unlowered("optimizing emit: non-aarch64 host"))
 }
@@ -122,7 +140,7 @@ pub(super) fn emit(
 mod arm64 {
     use super::{
         Allocation, BlockId, CmpOp, DeoptPoint, EdgeMoves, GP_REGS, Graph, Liveness, Location,
-        NodeId, NodeKind, OptimizedCode, Repr, Terminator, Unsupported,
+        NodeId, NodeKind, OptimizedCode, OsrEntry, Repr, Terminator, Unsupported,
     };
     use crate::CompiledCode;
     use crate::baseline::{
@@ -441,6 +459,7 @@ mod arm64 {
         liveness: &Liveness,
         alloc: &Allocation,
         frames: &FxHashMap<NodeId, DeoptPoint>,
+        osr_entries: &[OsrEntry],
     ) -> Result<OptimizedCode, Unsupported> {
         let mut ops = Assembler::new().expect("assembler alloc");
 
@@ -586,11 +605,41 @@ mod arm64 {
             BOX_SCRATCH,
         )?;
 
+        // OSR-entry trampolines, one per eligible loop header. Each sets up the
+        // frame, reloads every live interpreter register from the frame window
+        // `[x19, r*8]` into the home the header expects, then branches to the
+        // header block. Only headers whose live values all live in tagged homes
+        // (loop-carried phis and tagged invariants) are emitted; a header with a
+        // typed-home invariant is skipped (the function still runs via its normal
+        // entry and the interpreter).
+        let mut osr_offsets: rustc_hash::FxHashMap<u32, usize> = rustc_hash::FxHashMap::default();
+        for osr in osr_entries {
+            let eligible = osr.registers.iter().all(|(_, v)| {
+                !alloc.location.contains_key(v) || graph.node(*v).kind.repr() == Repr::Tagged
+            });
+            if !eligible {
+                continue;
+            }
+            let off = ops.offset();
+            emit_prologue(&mut ops, spill_bytes);
+            for &(r, v) in &osr.registers {
+                let Some(&home) = alloc.location.get(&v) else {
+                    continue;
+                };
+                let src_off = (r as u32) * 8;
+                dynasm!(&mut ops ; .arch aarch64 ; ldr X(BOX_SCRATCH), [x19, src_off]);
+                store_loc(&mut ops, home, BOX_SCRATCH);
+            }
+            dynasm!(&mut ops ; .arch aarch64 ; b =>block_labels[osr.block as usize]);
+            osr_offsets.insert(osr.byte_pc, off.0);
+        }
+
         let buf = ops
             .finalize()
             .map_err(|_| Unsupported::Unlowered("assembler finalize failed"))?;
         Ok(OptimizedCode {
             code: CompiledCode::new(buf, entry),
+            osr_offsets,
         })
     }
 
@@ -1138,7 +1187,8 @@ mod tests {
         let deopt_uses = deopt::deopt_value_uses(&frames);
         let live = liveness::analyze(&g, &deopt_uses);
         let alloc = regalloc::allocate(&g, &live, super::GP_REGS, super::FP_REGS, &deopt_uses);
-        let code = super::emit(v, &g, &live, &alloc, &frames).expect("emits");
+        let osr = deopt::capture_osr_entries(&g, &bcl);
+        let code = super::emit(v, &g, &live, &alloc, &frames, &osr).expect("emits");
 
         let mut regs = vec![0u64; 64];
         for (i, &p) in params.iter().enumerate() {

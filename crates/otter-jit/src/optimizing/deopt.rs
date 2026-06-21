@@ -412,6 +412,99 @@ pub fn capture_frame_states(
     points
 }
 
+/// An on-stack-replacement entry point: a loop-header block the interpreter can
+/// jump into mid-loop, with the SSA value each live interpreter register must be
+/// reloaded into.
+#[derive(Clone, Debug)]
+pub struct OsrEntry {
+    /// Loop-header byte-PC the interpreter resumes into (its `frame.pc` at the
+    /// backward branch). The OSR trampoline is keyed by this.
+    pub byte_pc: u32,
+    /// The header block the trampoline branches to after reloading registers.
+    pub block: BlockId,
+    /// `(register, value)` for every register live at the header entry, ascending
+    /// by register. The trampoline loads the interpreter frame slot `[x19, r*8]`
+    /// into the home the allocator gave `value` (unboxing for a typed home).
+    pub registers: Vec<(u16, NodeId)>,
+}
+
+/// Capture an [`OsrEntry`] for every loop header (a block with a back-edge
+/// predecessor). Reconstructs the interpreter environment (register → SSA value)
+/// at each block entry exactly as [`capture_frame_states`] does — inherit a
+/// forward predecessor's exit env, overlay the block's header phis — and, for a
+/// loop header, records the value of every register live at the header. This is
+/// the inverse of a deopt frame state: deopt writes live homes out to the
+/// interpreter frame; OSR reads the interpreter frame back into live homes.
+#[must_use]
+pub fn capture_osr_entries(
+    graph: &Graph,
+    bytecode_live: &FxHashMap<u32, FxHashSet<u16>>,
+) -> Vec<OsrEntry> {
+    let rc = graph.register_count as usize;
+    let rpo = reverse_postorder(graph);
+    let mut exit_env: Vec<Option<Vec<Option<NodeId>>>> = vec![None; graph.blocks.len()];
+    let mut entries: Vec<OsrEntry> = Vec::new();
+
+    for &b in &rpo {
+        let block = graph.block(b);
+        let mut env: Vec<Option<NodeId>> = if b == graph.entry {
+            (0..rc)
+                .map(|r| graph.block(graph.entry).body.get(r).copied())
+                .collect()
+        } else {
+            let mut e = block
+                .preds
+                .iter()
+                .find_map(|&p| exit_env[p as usize].clone())
+                .unwrap_or_else(|| vec![None; rc]);
+            for &phi in &block.phis {
+                if let Some(&r) = graph.phi_reg.get(&phi)
+                    && (r as usize) < rc
+                {
+                    e[r as usize] = Some(phi);
+                }
+            }
+            e
+        };
+
+        // A loop header is the target of a back edge: a predecessor whose block
+        // begins later in the bytecode (the block that ends in the backward
+        // branch). The interpreter's backedge counter fires at exactly this pc.
+        let is_loop_header = block
+            .preds
+            .iter()
+            .any(|&p| graph.block(p).start_pc > block.start_pc);
+        if is_loop_header {
+            let pc = block.start_pc;
+            let mut registers: Vec<(u16, NodeId)> = Vec::new();
+            if let Some(live) = bytecode_live.get(&pc) {
+                let mut regs: Vec<u16> = live.iter().copied().collect();
+                regs.sort_unstable();
+                for r in regs {
+                    if let Some(Some(v)) = env.get(r as usize) {
+                        registers.push((r, *v));
+                    }
+                }
+            }
+            entries.push(OsrEntry {
+                byte_pc: pc,
+                block: b,
+                registers,
+            });
+        }
+
+        let empty = Vec::new();
+        let writes = graph.reg_writes.get(&b).unwrap_or(&empty);
+        for &(_, r, v) in writes {
+            if (r as usize) < rc {
+                env[r as usize] = Some(v);
+            }
+        }
+        exit_env[b as usize] = Some(env);
+    }
+    entries
+}
+
 /// Per-guard SSA values a deopt frame restores, keyed by guard node. The
 /// register allocator consumes this to keep each such value live to its guard so
 /// the deopt exit can read it from a stable home (see [`super::liveness::analyze`]

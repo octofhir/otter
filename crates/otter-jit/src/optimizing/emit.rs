@@ -169,10 +169,10 @@ mod arm64 {
         THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, VM_OFFSET,
         jit_abort_direct_call_stub, jit_call_method_stub, jit_finish_direct_call_bailed_stub,
         jit_finish_direct_call_returned_stub, jit_prepare_direct_call_stub,
-        jit_prepare_direct_method_call_stub,
+        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
     };
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
-    use otter_vm::JitFunctionView;
+    use otter_vm::{Interpreter, JitFunctionView};
     use rustc_hash::{FxHashMap, FxHashSet};
 
     /// Emit scratch register for parallel-move spill→spill staging and tag
@@ -1151,7 +1151,9 @@ mod arm64 {
                 .unwrap_or(&[])
         };
 
+        let self_entry = ops.new_dynamic_label();
         let entry = ops.offset();
+        dynasm!(&mut ops ; .arch aarch64 ; =>self_entry);
         emit_prologue(&mut ops, spill_bytes);
 
         // Entry param load: each per-register entry def that has a home is a
@@ -1200,6 +1202,7 @@ mod arm64 {
                     frames,
                     call_resume_frames,
                     &mut deopt_labels,
+                    self_entry,
                     threw,
                     nid,
                     spill_bytes,
@@ -1378,6 +1381,7 @@ mod arm64 {
         frames: &FxHashMap<NodeId, DeoptPoint>,
         call_resume_frames: &FxHashMap<NodeId, DeoptPoint>,
         deopt_labels: &mut FxHashMap<NodeId, DynamicLabel>,
+        self_entry: DynamicLabel,
         threw: DynamicLabel,
         nid: NodeId,
         spill_bytes: u32,
@@ -1881,7 +1885,7 @@ mod arm64 {
             NodeKind::Call {
                 callee_reg,
                 arg_regs,
-                ..
+                inputs,
             } => {
                 let point = frames
                     .get(&nid)
@@ -1896,6 +1900,47 @@ mod arm64 {
                     return Err(Unsupported::OperandShape("call arg count"));
                 }
                 emit_frame_materialize(ops, graph, alloc, point, box_scratch)?;
+                if matches!(
+                    inputs.first().map(|callee| &graph.node(*callee).kind),
+                    Some(NodeKind::SelfClosure)
+                ) && graph_allows_frameless_self_call(graph)
+                {
+                    emit_self_recursive_call(
+                        ops,
+                        graph.register_count,
+                        dst_reg,
+                        *callee_reg,
+                        arg_regs,
+                        self_entry,
+                        bail,
+                        threw,
+                    )?;
+                    dynasm!(ops ; .arch aarch64 ; =>done);
+                    let resume = call_resume_frames.get(&nid).unwrap_or(point);
+                    emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
+                    if value_is_used_after(graph, call_resume_frames, nid)
+                        && let Some(loc) = dst
+                        && !resume.registers.iter().any(|&(r, _)| r == dst_reg)
+                    {
+                        let off = u32::from(dst_reg) * 8;
+                        dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
+                        store_loc(ops, loc, box_scratch);
+                    }
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; b =>after
+                        ; =>bail
+                    );
+                    emit_load_u64(ops, box_scratch, u64::from(point.byte_pc));
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; str W(box_scratch), [x20, BAIL_PC_OFFSET]
+                        ; movz x1, STATUS_BAILED as u32
+                    );
+                    emit_epilogue(ops, spill_bytes);
+                    dynasm!(ops ; .arch aarch64 ; =>after);
+                    return Ok(());
+                }
                 dynasm!(ops
                     ; .arch aarch64
                     ; mov x0, x20
@@ -2069,6 +2114,152 @@ mod arm64 {
                 Ok(())
             }
         }
+    }
+
+    fn graph_allows_frameless_self_call(graph: &Graph) -> bool {
+        graph.blocks.iter().all(|block| {
+            block.body.iter().all(|&nid| {
+                matches!(
+                    graph.node(nid).kind,
+                    NodeKind::Param(_)
+                        | NodeKind::Phi(_)
+                        | NodeKind::ConstUndefined
+                        | NodeKind::ConstBool(_)
+                        | NodeKind::SelfClosure
+                        | NodeKind::ConstInt32(_)
+                        | NodeKind::CheckInt32(_)
+                        | NodeKind::Int32Add(_, _)
+                        | NodeKind::Int32Sub(_, _)
+                        | NodeKind::Int32Mul(_, _)
+                        | NodeKind::Int32BitOr(_, _)
+                        | NodeKind::Int32BitAnd(_, _)
+                        | NodeKind::Int32BitXor(_, _)
+                        | NodeKind::Int32Shl(_, _)
+                        | NodeKind::Int32Shr(_, _)
+                        | NodeKind::Int32Compare(_, _, _)
+                        | NodeKind::Call { .. }
+                )
+            })
+        })
+    }
+
+    fn emit_self_recursive_call(
+        ops: &mut Assembler,
+        regcount: u16,
+        dst_reg: u16,
+        callee_reg: u16,
+        arg_regs: &[u16],
+        self_entry: DynamicLabel,
+        bail: DynamicLabel,
+        threw: DynamicLabel,
+    ) -> Result<(), Unsupported> {
+        let rc = u32::from(regcount);
+        let done = ops.new_dynamic_label();
+        let returned = ops.new_dynamic_label();
+        let bailed = ops.new_dynamic_label();
+        let fill = ops.new_dynamic_label();
+        let fill_done = ops.new_dynamic_label();
+        let undef_bits = TAG_SPECIAL << 48;
+
+        let callee_off = u32::from(callee_reg) * 8;
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x9, [x19, callee_off]
+            ; ldr x10, [x20, #8]
+            ; cmp x9, x10
+            ; b.ne =>bail
+            ; ldr x12, [x20, REG_TOP_PTR_OFFSET]
+            ; ldr x11, [x12]
+            ; ldr x9, [x20, REG_STACK_BASE_OFFSET]
+            ; add x14, x9, x11, lsl #3
+        );
+        emit_load_u64(ops, 13, u64::from(rc));
+        dynasm!(ops ; .arch aarch64 ; add x13, x11, x13);
+        emit_load_u64(ops, 9, Interpreter::jit_reg_stack_cap() as u64);
+        dynasm!(ops ; .arch aarch64 ; cmp x13, x9 ; b.hi =>bail ; str x13, [x12]);
+
+        emit_load_u64(ops, 10, undef_bits);
+        emit_load_u64(ops, 15, u64::from(rc));
+        dynasm!(ops
+            ; .arch aarch64
+            ; movz x9, 0
+            ; =>fill
+            ; cmp x9, x15
+            ; b.hs =>fill_done
+            ; str x10, [x14, x9, lsl #3]
+            ; add x9, x9, #1
+            ; b =>fill
+            ; =>fill_done
+        );
+        for (slot, &areg) in arg_regs.iter().enumerate() {
+            let off = u32::from(areg) * 8;
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x9, [x19, off]
+                ; str x9, [x14, slot as u32 * 8]
+            );
+        }
+
+        dynasm!(ops
+            ; .arch aarch64
+            ; sub sp, sp, JIT_CTX_STACK_SIZE
+            ; str x14, [sp]
+            ; ldr x9, [x20, #8]
+            ; str x9, [sp, #8]
+        );
+        emit_load_u64(ops, 9, undef_bits);
+        dynasm!(ops ; .arch aarch64 ; str x9, [sp, #16] ; str wzr, [sp, BAIL_PC_OFFSET]);
+        for off in [
+            VM_OFFSET,
+            STACK_OFFSET,
+            CONTEXT_OFFSET,
+            FRAME_INDEX_OFFSET,
+            ERROR_SLOT_OFFSET,
+            UPVALUES_PTR_OFFSET,
+            REG_STACK_BASE_OFFSET,
+            REG_TOP_PTR_OFFSET,
+        ] {
+            dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, off] ; str x9, [sp, off]);
+        }
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov x0, sp
+            ; bl =>self_entry
+            ; cmp x1, STATUS_BAILED as u32
+            ; b.eq =>bailed
+            ; add sp, sp, JIT_CTX_STACK_SIZE
+            ; cmp x1, STATUS_RETURNED as u32
+            ; b.eq =>returned
+            ; b =>threw
+            ; =>returned
+            ; ldr x12, [x20, REG_TOP_PTR_OFFSET]
+            ; ldr x13, [x12]
+        );
+        emit_load_u64(ops, 9, u64::from(rc));
+        let dst_off = u32::from(dst_reg) * 8;
+        dynasm!(ops
+            ; .arch aarch64
+            ; sub x13, x13, x9
+            ; str x13, [x12]
+            ; str x0, [x19, dst_off]
+            ; b =>done
+            ; =>bailed
+            ; ldr w2, [sp, BAIL_PC_OFFSET]
+            ; add sp, sp, JIT_CTX_STACK_SIZE
+            ; mov x0, x20
+            ; mov w1, w2
+        );
+        emit_load_u64(ops, 2, u64::from(rc));
+        emit_load_u64(ops, 16, jit_self_call_bail_stub as *const () as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; cmp x1, STATUS_THREW as u32
+            ; b.eq =>threw
+            ; str x0, [x19, dst_off]
+            ; =>done
+        );
+        Ok(())
     }
 
     /// The deopt-exit label for a deopt-capable node, creating it on first use.

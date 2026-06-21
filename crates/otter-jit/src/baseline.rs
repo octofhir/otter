@@ -149,7 +149,7 @@ pub struct JitCtx {
 
 /// Two-word return of compiled code (`x0`/`x1` on arm64).
 #[repr(C)]
-struct JitRet {
+pub(crate) struct JitRet {
     value: u64,
     status: u64,
 }
@@ -362,7 +362,11 @@ pub(crate) extern "C" fn jit_abort_direct_call_stub(
 /// interpreter frame from the live register-stack window and run it to
 /// completion. Returns the callee's value in `x0` with `STATUS_RETURNED`, or
 /// `STATUS_THREW` (error parked in `ctx`) on an uncaught throw.
-extern "C" fn jit_self_call_bail_stub(ctx: *mut JitCtx, bail_pc: u64, regcount: u64) -> JitRet {
+pub(crate) extern "C" fn jit_self_call_bail_stub(
+    ctx: *mut JitCtx,
+    bail_pc: u64,
+    regcount: u64,
+) -> JitRet {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };

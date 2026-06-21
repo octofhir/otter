@@ -27,6 +27,8 @@
 
 use smallvec::SmallVec;
 
+use otter_bytecode::Op;
+
 use crate::Value;
 use crate::js_surface::{Attr, JsSurfaceError, MethodSpec};
 use crate::number::NumberValue;
@@ -50,6 +52,72 @@ use crate::{ExecutionContext, Interpreter, NativeCall, NativeCtx, NativeError, V
 const MAX_ARRAY_LIKE_PROBE_LEN: usize = 1 << 25;
 const MAX_SPARSE_PREFIX_PROBE_LEN: usize = 1024;
 const MAX_SAFE_ARRAY_LENGTH: usize = 9_007_199_254_740_991;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SortComparatorFastPath {
+    NumericSub,
+}
+
+fn is_numeric_sub_sort_comparator_function(
+    context: &ExecutionContext,
+    function: &crate::executable::ExecutableFunction,
+) -> bool {
+    if function.param_count != 2
+        || function.has_rest
+        || function.needs_arguments
+        || function.is_async
+        || function.is_generator
+        || function.is_async_generator
+        || function.contains_direct_eval
+        || function.code.len() != 10
+    {
+        return false;
+    }
+
+    let code = &function.code;
+    if code[0].op() != Op::StoreLocal
+        || code[1].op() != Op::StoreLocal
+        || code[2].op() != Op::LoadLocal
+        || code[3].op() != Op::LoadLocal
+        || code[4].op() != Op::ToPrimitive
+        || code[5].op() != Op::ToNumeric
+        || code[6].op() != Op::ToPrimitive
+        || code[7].op() != Op::ToNumeric
+        || code[8].op() != Op::Sub
+        || code[9].op() != Op::ReturnValue
+    {
+        return false;
+    }
+
+    let lhs_local = context.exec_imm32(&code[0], 1);
+    let rhs_local = context.exec_imm32(&code[1], 1);
+    let lhs_load_local = context.exec_imm32(&code[2], 1);
+    let rhs_load_local = context.exec_imm32(&code[3], 1);
+    if context.exec_register(&code[0], 0) != Some(0)
+        || context.exec_register(&code[1], 0) != Some(1)
+        || lhs_local != lhs_load_local
+        || rhs_local != rhs_load_local
+        || lhs_local == rhs_local
+    {
+        return false;
+    }
+
+    let lhs_loaded = context.exec_register(&code[2], 0);
+    let rhs_loaded = context.exec_register(&code[3], 0);
+    let lhs_prim = context.exec_register(&code[4], 0);
+    let rhs_prim = context.exec_register(&code[6], 0);
+    let lhs_num = context.exec_register(&code[5], 0);
+    let rhs_num = context.exec_register(&code[7], 0);
+    let sub_dst = context.exec_register(&code[8], 0);
+
+    context.exec_register(&code[4], 1) == lhs_loaded
+        && context.exec_register(&code[5], 1) == lhs_prim
+        && context.exec_register(&code[6], 1) == rhs_loaded
+        && context.exec_register(&code[7], 1) == rhs_prim
+        && context.exec_register(&code[8], 1) == lhs_num
+        && context.exec_register(&code[8], 2) == rhs_num
+        && context.exec_register(&code[9], 0) == sub_dst
+}
 
 /// Static `Array.prototype` method specs.
 pub static ARRAY_PROTOTYPE_METHODS: &[MethodSpec] = &[
@@ -1288,6 +1356,7 @@ impl Interpreter {
         x: Value,
         y: Value,
         comparefn: Value,
+        fast_path: Option<SortComparatorFastPath>,
         lean_inner: Option<&mut crate::call_ops::LeanCallbackState>,
     ) -> Result<std::cmp::Ordering, VmError> {
         use std::cmp::Ordering;
@@ -1303,6 +1372,20 @@ impl Interpreter {
             return Ok(Ordering::Less);
         }
         if !comparefn.is_undefined() {
+            if fast_path == Some(SortComparatorFastPath::NumericSub)
+                && let (Some(lhs), Some(rhs)) = (x.as_f64(), y.as_f64())
+            {
+                let f = lhs - rhs;
+                return Ok(if f.is_nan() {
+                    Ordering::Equal
+                } else if f < 0.0 {
+                    Ordering::Less
+                } else if f > 0.0 {
+                    Ordering::Greater
+                } else {
+                    Ordering::Equal
+                });
+            }
             let r = match lean_inner {
                 Some(state) => self.run_bytecode_callable_committed_lean_args(
                     state,
@@ -1342,6 +1425,7 @@ impl Interpreter {
         context: &ExecutionContext,
         items: Vec<Value>,
         comparefn: Value,
+        fast_path: Option<SortComparatorFastPath>,
         lean_inner: Option<&mut crate::call_ops::LeanCallbackState>,
     ) -> Result<Vec<Value>, VmError> {
         use std::cmp::Ordering;
@@ -1366,6 +1450,7 @@ impl Interpreter {
                         src[left],
                         src[right],
                         comparefn,
+                        fast_path,
                         lean_inner.as_deref_mut(),
                     )? != Ordering::Greater
                     {
@@ -1393,6 +1478,24 @@ impl Interpreter {
             width = width.saturating_mul(2);
         }
         Ok(src)
+    }
+
+    fn sort_comparator_fast_path(
+        &self,
+        context: &ExecutionContext,
+        comparefn: Value,
+    ) -> Option<SortComparatorFastPath> {
+        if comparefn.is_undefined() {
+            return None;
+        }
+        let function_id = comparefn.as_function().or_else(|| {
+            comparefn
+                .as_closure(&self.gc_heap)
+                .map(|closure| closure.function_id())
+        })?;
+        let function = context.exec_function(function_id)?;
+        is_numeric_sub_sort_comparator_function(context, function)
+            .then_some(SortComparatorFastPath::NumericSub)
     }
 
     /// §23.1.3.30 live `Array.prototype.sort` over a generic receiver.
@@ -1435,8 +1538,9 @@ impl Interpreter {
         // bytecode tail on ONE reservation-stable stack (see
         // `acquire_lean_callback_stack`). The `?` below cannot early-return
         // before release: capture the result and release on both paths.
+        let fast_path = self.sort_comparator_fast_path(context, comparefn);
         let mut lean = self.acquire_lean_callback_stack(context, comparefn);
-        let sorted = self.sort_merge(context, items, comparefn, lean.as_mut());
+        let sorted = self.sort_merge(context, items, comparefn, fast_path, lean.as_mut());
         self.release_lean_callback_stack(lean);
         let sorted = sorted?;
         // §23.1.3.30 steps 8-9 — write the sorted prefix back with
@@ -2628,8 +2732,9 @@ impl Interpreter {
         for k in 0..len {
             items.push(self.array_method_get_property(context, o, &format_index_key(k as f64))?);
         }
+        let fast_path = self.sort_comparator_fast_path(context, comparefn);
         let mut lean = self.acquire_lean_callback_stack(context, comparefn);
-        let sorted = self.sort_merge(context, items, comparefn, lean.as_mut());
+        let sorted = self.sort_merge(context, items, comparefn, fast_path, lean.as_mut());
         self.release_lean_callback_stack(lean);
         let sorted = sorted?;
         self.array_create_from_dense_values(sorted)
@@ -3369,4 +3474,148 @@ fn native_reduce_right(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
 }
 fn native_flat_map(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     array_callback_native_dispatch("flatMap", ctx, args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use otter_bytecode::{
+        ArgumentsObjectKind, BytecodeModule, Function, Instruction, Operand,
+        SourceKind as BcSourceKind, SpanEntry,
+    };
+
+    fn comparator_function(op: Op) -> Function {
+        let code = vec![
+            instr(
+                0,
+                Op::StoreLocal,
+                vec![Operand::Register(0), Operand::Imm32(2)],
+            ),
+            instr(
+                1,
+                Op::StoreLocal,
+                vec![Operand::Register(1), Operand::Imm32(3)],
+            ),
+            instr(
+                2,
+                Op::LoadLocal,
+                vec![Operand::Register(4), Operand::Imm32(2)],
+            ),
+            instr(
+                3,
+                Op::LoadLocal,
+                vec![Operand::Register(5), Operand::Imm32(3)],
+            ),
+            instr(
+                4,
+                Op::ToPrimitive,
+                vec![
+                    Operand::Register(6),
+                    Operand::Register(4),
+                    Operand::ConstIndex(0),
+                ],
+            ),
+            instr(
+                5,
+                Op::ToNumeric,
+                vec![Operand::Register(7), Operand::Register(6)],
+            ),
+            instr(
+                6,
+                Op::ToPrimitive,
+                vec![
+                    Operand::Register(8),
+                    Operand::Register(5),
+                    Operand::ConstIndex(0),
+                ],
+            ),
+            instr(
+                7,
+                Op::ToNumeric,
+                vec![Operand::Register(9), Operand::Register(8)],
+            ),
+            instr(
+                8,
+                op,
+                vec![
+                    Operand::Register(10),
+                    Operand::Register(7),
+                    Operand::Register(9),
+                ],
+            ),
+            instr(9, Op::ReturnValue, vec![Operand::Register(10)]),
+        ];
+        let spans = code
+            .iter()
+            .map(|instruction| SpanEntry {
+                pc: instruction.pc,
+                span: (0, 0),
+            })
+            .collect();
+        Function {
+            id: 0,
+            name: "<sort-comparator>".to_string(),
+            span: (0, 0),
+            locals: 0,
+            scratch: 11,
+            param_count: 2,
+            length: 2,
+            own_upvalue_count: 0,
+            is_strict: false,
+            is_arrow: true,
+            is_method: false,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_async_generator: false,
+            is_derived_constructor: false,
+            is_module: false,
+            needs_arguments: false,
+            arguments_object_kind: ArgumentsObjectKind::Unmapped,
+            mapped_argument_bindings: Vec::new(),
+            source_text: None,
+            source_text_span: None,
+            module_url: String::new(),
+            direct_eval_bindings: Vec::new(),
+            contains_direct_eval: false,
+            code,
+            spans,
+        }
+    }
+
+    fn instr(pc: u32, op: Op, operands: Vec<Operand>) -> Instruction {
+        Instruction {
+            pc,
+            op,
+            operands: operands.into(),
+        }
+    }
+
+    fn context_for(function: Function) -> ExecutionContext {
+        ExecutionContext::from_module(BytecodeModule {
+            module: "sort-comparator-test.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: BcSourceKind::JavaScript,
+            functions: vec![function],
+            constants: Vec::new(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn recognizes_numeric_sub_sort_comparator_shape() {
+        let context = context_for(comparator_function(Op::Sub));
+        let function = context.exec_function(0).expect("test function");
+
+        assert!(is_numeric_sub_sort_comparator_function(&context, function));
+    }
+
+    #[test]
+    fn rejects_non_sub_sort_comparator_shape() {
+        let context = context_for(comparator_function(Op::Add));
+        let function = context.exec_function(0).expect("test function");
+
+        assert!(!is_numeric_sub_sort_comparator_function(&context, function));
+    }
 }

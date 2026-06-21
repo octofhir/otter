@@ -4,9 +4,9 @@
 **Branch:** `perf/engine-rewrite`
 **Current head:** `19acb56d feat(jit): fast-path opt self recursion`
 
-This document describes the current JIT architecture and the work that remains
-to close Tier1. Historical phase notes were removed; completed implementation
-details live in git history.
+This document describes the current JIT architecture, the work that remains to
+close Tier1, and the post-Tier1 roadmap. Historical phase logs were removed;
+completed implementation details live in git history.
 
 ## Current Architecture
 
@@ -161,6 +161,110 @@ These are Tier1 closure items, but not necessarily compiler features:
   fast-shape regressions;
 - regex: measure match/replace/exec separately and preserve `lastIndex`,
   captures, replacement, Unicode, and case-folding semantics.
+
+## Post-Tier1 Roadmap
+
+Tier1 closure is a sequencing gate, not the end of the engine plan. The items
+below remain committed scope after Tier1 is stable.
+
+### Tier2: broaden DiveJIT
+
+DiveJIT already exists as the optimizing tier. After Tier1, broaden it from the
+current hot-region coverage into the general mid-tier optimizer:
+
+- wider opcode coverage for object/array/string-heavy loops;
+- richer representation selection across tagged, int32, float64, bool, object,
+  string, and typed-array values;
+- speculative inlining beyond tiny monomorphic methods, including hot
+  callbacks and constructors;
+- bounds-check elimination for dense arrays and typed arrays;
+- loop-invariant code motion where deopt metadata can prove exact resume state;
+- better compile budgeting and tiering policy.
+
+This work must continue the current exact-deopt discipline. No optimizer slice
+may replace exact PC/frame-state deopt with entry bails or interpreter replay.
+
+### DeepDiveJIT: peak optimizer
+
+DeepDiveJIT is the later peak tier. It is not a Tier1 task, but it remains part
+of the intended engine:
+
+- deeper inlining with call-graph budgeting;
+- scalar replacement and escape analysis;
+- allocation sinking;
+- polymorphic inline-cache specialization;
+- advanced loop optimization;
+- code invalidation and dependency tracking for shapes/prototypes/globals.
+
+DeepDiveJIT depends on Tier2 stability, precise safepoints, and a mature
+feedback/dependency model.
+
+### StoneMaps and GC integration
+
+Tier1 mostly avoids GC-bearing machine-register liveness across safepoints.
+Future optimizer work needs production stack maps:
+
+- precise safepoint maps for boxed/tagged values;
+- deopt snapshots sharing metadata with safepoint maps where possible;
+- stack-map validation under moving GC stress;
+- compiled allocation fast paths with write barriers;
+- young-generation and allocation-throughput improvements where runtime
+  workloads are allocation-bound.
+
+No conservative native-stack scanning. Moving-GC correctness stays mandatory.
+
+### KelpHeap layout work
+
+Hot heap bodies must continue moving toward JIT-readable layouts:
+
+- dense array headers and element storage with stable offsets;
+- typed-array fixed headers and data-pointer/length/kind access;
+- string representation that supports fast code-unit reads and substrings;
+- closure/function metadata that compiled code can guard and load cheaply;
+- cold fallback paths for dictionary, accessor, proxy, exotic, and unstable
+  layouts.
+
+### ShellBuiltins
+
+After Tier1, common builtins should gain dedicated fast paths or intrinsic
+lowerings:
+
+- Array callback methods once callback semantics are stable;
+- sort comparator plumbing and numeric comparator specialization;
+- String methods (`charCodeAt`, `slice`, `indexOf`, `split`, `join`);
+- JSON parse/stringify hot object/array paths;
+- TypedArray constructors and element operations.
+
+Builtin fast paths must preserve observable coercion order, species,
+prototype/accessor effects, throws, and GC movement.
+
+### RippleRegex
+
+Regex throughput remains a major engine workstream after Tier1:
+
+- parser/bytecode/interpreter cleanup if the current engine remains;
+- or a contained replacement subsystem with clear compatibility gates;
+- optimized `exec`, `match`, `replace`, captures, global/sticky lastIndex, and
+  Unicode/case-insensitive behavior.
+
+### PebbleBytecode and tiering metadata
+
+The bytecode format and metadata should become friendlier to tiering:
+
+- stable site ids for feedback vectors and ICs;
+- compact frame-state metadata for deopt;
+- bytecode annotations for hot loops, safepoints, and call sites;
+- optional startup snapshot / code-cache hooks once runtime shape stabilizes.
+
+### TideLoop, Scout, and RaftRelease
+
+Runtime and release work remains in scope:
+
+- async/event-loop/module scheduling hardening;
+- profiler/debugger/heap/IC/deopt observability;
+- multi-platform JIT backend story;
+- fuzzing and differential testing;
+- release dashboards and regression gates.
 
 ## Verification Contract
 

@@ -657,6 +657,14 @@ impl<'a> Builder<'a> {
                     // succs == [target, fallthrough] (built in CFG discovery).
                     let fallthrough = succs[1];
                     let cond_node = self.read_variable(cond, block);
+                    // Only an unboxed `Bool` condition (a comparison result) is
+                    // compiled. A `Tagged` condition is a value tested for JS
+                    // truthiness (`if (x)`, `while (obj)`, a `&&`/`||` result
+                    // merged through a phi) — full ToBoolean is outside this tier,
+                    // so bail rather than mis-evaluate it.
+                    if self.graph.node(cond_node).kind.repr() != Repr::Bool {
+                        return Err(Unsupported::OperandShape("non-boolean branch condition"));
+                    }
                     let (on_true, on_false) = if matches!(op, Op::JumpIfTrue) {
                         (tgt_block, fallthrough)
                     } else {

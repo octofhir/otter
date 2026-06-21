@@ -568,29 +568,14 @@ mod arm64 {
                 } => {
                     let cloc = require_loc(alloc, *cond)?;
                     load_loc(&mut ops, BOX_SCRATCH, cloc);
+                    // The cond is an unboxed Bool (0/1) — the builder declines a
+                    // non-boolean (Tagged) branch condition. Test it; route each
+                    // edge through its own moves. The false setup is a cold
+                    // trampoline so the true edge can fall straight through.
                     let false_setup = ops.new_dynamic_label();
                     let true_moves = edge_moves_for(b, *on_true);
                     let false_moves = edge_moves_for(b, *on_false);
-                    // An unboxed `Bool` cond is 0/1 → `cbz`. A `Tagged` cond is a
-                    // boxed boolean (a comparison result merged through a phi for
-                    // `&&` / `||` / a ternary): boxed false is
-                    // `TAG_SPECIAL<<48 | SPECIAL_FALSE`, so compare against it.
-                    // `JumpIf*` operands are always boolean — the bytecode compiler
-                    // emits an explicit truthiness test for non-boolean conditions.
-                    if graph.node(*cond).repr == Repr::Bool {
-                        dynasm!(&mut ops ; .arch aarch64 ; cbz W(BOX_SCRATCH), =>false_setup);
-                    } else {
-                        emit_load_u64(
-                            &mut ops,
-                            MOVE_SCRATCH,
-                            (TAG_SPECIAL << 48) | SPECIAL_FALSE as u64,
-                        );
-                        dynasm!(&mut ops
-                            ; .arch aarch64
-                            ; cmp X(BOX_SCRATCH), X(MOVE_SCRATCH)
-                            ; b.eq =>false_setup
-                        );
-                    }
+                    dynasm!(&mut ops ; .arch aarch64 ; cbz W(BOX_SCRATCH), =>false_setup);
                     // cond != 0 → true edge. The false trampoline is emitted
                     // immediately after, so the true edge always needs an
                     // explicit branch (it can never fall through). `cond` was

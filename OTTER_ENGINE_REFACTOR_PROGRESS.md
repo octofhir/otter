@@ -2,7 +2,7 @@
 
 **Updated:** 2026-06-22
 **Plan source:** [`plan.md`](plan.md)  
-**Current head:** `a961af63 perf(vm): fast-path simple constructors`
+**Current head:** `e2217376 perf(jit): inline dense array stores`
 
 This log keeps only live Tier1 work. Completed history was removed from this
 file on purpose; use `git log` for landed slices.
@@ -19,7 +19,7 @@ Fresh release binary: `target/release/otter`.
 | `typed-array.js` | 1.97s | 0.09s | 0.03s | closed enough for Tier1 |
 | `prop-access.js` | 2.11s | 0.17s | 0.03s | open |
 | `array-ops.js` | 2.36s | 0.45s | 0.09s | open |
-| `sort.js` | 2.76s | 0.35–0.53s | 0.16s | open; fill-loop store stubs closed |
+| `sort.js` | 2.76s | 0.29–0.53s | 0.16s | open; fill-loop store stubs closed; unsigned-shift callback body faster |
 | `json.js` | 1.39s | 1.42s | 0.23s | open |
 | `string-ops.js` | 0.43s | 0.44s | 0.03s | open |
 | `regex.js` | 2.21s | 2.20s | 0.03s | open |
@@ -31,8 +31,11 @@ store-property stub path for `prop-access.js`; measured JIT runtime property
 stubs dropped to 4 on the full benchmark and 0 on construct-only isolation.
 `sort.js` now bypasses the hot dense-array fill-loop `StoreElement` bridge after
 bounded `new Array(n)` dense-hole construction and guarded dense-array store
-lowering. Full benchmark JIT runtime property stubs dropped from ~760k to 42;
-the remaining dominant cost is still the ~760k direct callback/comparator calls.
+lowering. Full benchmark JIT runtime property stubs dropped from ~760k to 42.
+The RNG callback body's unsigned right shift no longer delegates from baseline
+JIT for positive finite double inputs; a measured fill-only run is ~109ms and a
+full `sort.js` run is ~284ms. The remaining dominant cost is still the ~760k
+direct callback/comparator calls.
 
 ## Architecture Scope
 
@@ -59,7 +62,8 @@ Next actions:
 
 - Add or use focused counters for array callback and sort comparator paths.
 - Measure the residual cost inside prepared lean callback invocation now that
-  `sort.js` dense fill-loop stores no longer dominate runtime property stubs.
+  `sort.js` dense fill-loop stores and RNG unsigned-shift delegates no longer
+  dominate runtime property stubs.
 - Cut the measured cost without changing generic Array semantics.
 - Re-run parity, GC stress, and targeted Array Test262 subsets.
 

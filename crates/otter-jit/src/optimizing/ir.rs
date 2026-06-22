@@ -156,6 +156,10 @@ pub enum NodeKind {
     /// `int32 >> (int32 & 31)` — arithmetic (sign-propagating) right shift,
     /// matching JS `>>`. Result [`Repr::Int32`].
     Int32Shr(NodeId, NodeId),
+    /// `int32 >>> (int32 & 31)` — logical right shift, then widened to `f64`
+    /// because JavaScript `>>>` returns an unsigned 32-bit value that may not
+    /// fit signed int32. Result [`Repr::Float64`].
+    Int32UshrToFloat64(NodeId, NodeId),
     /// The function's `this` binding, read from `JitCtx.this_value`. A TDZ hole
     /// (a derived-constructor `this` before `super(...)`) deoptimizes — the
     /// interpreter owns that ReferenceError. Result [`Repr::Tagged`].
@@ -275,7 +279,8 @@ impl NodeKind {
             | NodeKind::Int32BitAnd(a, b)
             | NodeKind::Int32BitXor(a, b)
             | NodeKind::Int32Shl(a, b)
-            | NodeKind::Int32Shr(a, b) => vec![*a, *b],
+            | NodeKind::Int32Shr(a, b)
+            | NodeKind::Int32UshrToFloat64(a, b) => vec![*a, *b],
             NodeKind::StoreElement(a, b, c) => vec![*a, *b, *c],
             NodeKind::Phi(ops) => ops.clone(),
             NodeKind::Param(_)
@@ -329,7 +334,8 @@ impl NodeKind {
             | NodeKind::Int32BitAnd(a, b)
             | NodeKind::Int32BitXor(a, b)
             | NodeKind::Int32Shl(a, b)
-            | NodeKind::Int32Shr(a, b) => {
+            | NodeKind::Int32Shr(a, b)
+            | NodeKind::Int32UshrToFloat64(a, b) => {
                 fix(a);
                 fix(b);
             }
@@ -378,7 +384,8 @@ impl NodeKind {
             | NodeKind::Float64Add(_, _)
             | NodeKind::Float64Sub(_, _)
             | NodeKind::Float64Mul(_, _)
-            | NodeKind::Float64Div(_, _) => Repr::Float64,
+            | NodeKind::Float64Div(_, _)
+            | NodeKind::Int32UshrToFloat64(_, _) => Repr::Float64,
             NodeKind::Int32Compare(_, _, _) | NodeKind::Float64Compare(_, _, _) => Repr::Bool,
             // Register-carried values are tagged at block boundaries; a phi
             // therefore lives in tagged form (lowering boxes typed inputs).

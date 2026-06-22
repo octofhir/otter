@@ -1375,6 +1375,53 @@ mod arm64 {
         );
     }
 
+    /// Fast-path `ToUint32` for unsigned shifts.
+    ///
+    /// Int32-tagged values pass through as raw low-32 bits. Positive finite
+    /// doubles below `2^64` truncate to `u64`; taking the low 32 bits then
+    /// matches ECMAScript modulo `2^32`. Negative, NaN, infinity, huge, string,
+    /// BigInt, and object coercion cases bail to the interpreter.
+    fn emit_to_uint32_fast(ops: &mut Assembler, src_x: u32, dst_w: u32, bail: DynamicLabel) {
+        let is_non_int = ops.new_dynamic_label();
+        let double_ready = ops.new_dynamic_label();
+        let done = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch aarch64
+            ; lsr x14, X(src_x), #48
+            ; movz x15, TAG_INT32 as u32
+            ; cmp x14, x15
+            ; b.ne =>is_non_int
+            ; mov W(dst_w), W(src_x)
+            ; b =>done
+            ; =>is_non_int
+            ; sub x14, x14, x15
+            ; cmp x14, #6
+            ; b.ls =>bail
+            ; fmov d0, X(src_x)
+            ; fcmp d0, d0
+            ; b.vs =>bail
+        );
+        emit_load_u64(ops, 14, 0.0f64.to_bits());
+        dynasm!(ops
+            ; .arch aarch64
+            ; fmov d1, x14
+            ; fcmp d0, d1
+            ; b.lt =>bail
+        );
+        emit_load_u64(ops, 14, 18_446_744_073_709_551_616.0f64.to_bits());
+        dynasm!(ops
+            ; .arch aarch64
+            ; fmov d1, x14
+            ; fcmp d0, d1
+            ; b.lt =>double_ready
+            ; b =>bail
+            ; =>double_ready
+            ; fcvtzu x14, d0
+            ; mov W(dst_w), w14
+            ; =>done
+        );
+    }
+
     /// Emit an int32 bitwise/shift op (`BitwiseOr`/`And`/`Xor`/`Shl`/`Shr`).
     ///
     /// Operands take the guarded `ToInt32` fast path above; misses bail to the
@@ -1400,6 +1447,29 @@ mod arm64 {
             IntBinOp::Shr => dynasm!(ops ; .arch aarch64 ; asr w13, w11, w12),
         }
         box_low32!(ops, 13, 12, TAG_INT32);
+        store_reg(ops, 13, dst)?;
+        Ok(())
+    }
+
+    /// Emit unsigned right shift. The result is boxed as a double because JS
+    /// `>>>` returns a uint32-valued Number and values above `i32::MAX` cannot
+    /// be represented by Otter's int32 tag.
+    fn emit_ushr(
+        ops: &mut Assembler,
+        operands: &[Operand],
+        bail: DynamicLabel,
+    ) -> Result<(), Unsupported> {
+        let (dst, lhs, rhs) = reg3(operands)?;
+        load_reg(ops, 9, lhs)?;
+        load_reg(ops, 10, rhs)?;
+        emit_to_uint32_fast(ops, 9, 11, bail);
+        emit_to_uint32_fast(ops, 10, 12, bail);
+        dynasm!(ops
+            ; .arch aarch64
+            ; lsr w13, w11, w12
+            ; ucvtf d0, w13
+        );
+        emit_box_double(ops, 0, 13);
         store_reg(ops, 13, dst)?;
         Ok(())
     }
@@ -2263,6 +2333,7 @@ mod arm64 {
                 Op::BitwiseXor => emit_int_binop(&mut ops, ops_ref, bail, IntBinOp::Xor)?,
                 Op::Shl => emit_int_binop(&mut ops, ops_ref, bail, IntBinOp::Shl)?,
                 Op::Shr => emit_int_binop(&mut ops, ops_ref, bail, IntBinOp::Shr)?,
+                Op::Ushr => emit_ushr(&mut ops, ops_ref, bail)?,
                 Op::Return | Op::ReturnValue => {
                     let src = reg(ops_ref, 0)?;
                     let off = reg_offset(src)?;
@@ -2286,7 +2357,6 @@ mod arm64 {
                 // descriptor writes). All run to completion without pushing a
                 // frame.
                 Op::MakeClosure
-                | Op::Ushr
                 | Op::LoadString
                 | Op::LoadNumber
                 | Op::MathCall
@@ -2427,6 +2497,7 @@ mod arm64 {
                 | Op::BitwiseXor
                 | Op::Shl
                 | Op::Shr
+                | Op::Ushr
                 | Op::LessThan
                 | Op::LessEq
                 | Op::GreaterThan
@@ -2513,6 +2584,7 @@ mod arm64 {
             Op::BitwiseXor => emit_int_binop(ops, ops_ref, bail, IntBinOp::Xor)?,
             Op::Shl => emit_int_binop(ops, ops_ref, bail, IntBinOp::Shl)?,
             Op::Shr => emit_int_binop(ops, ops_ref, bail, IntBinOp::Shr)?,
+            Op::Ushr => emit_ushr(ops, ops_ref, bail)?,
             Op::LessThan => emit_cmp(ops, ops_ref, bail, Cmp::Lt)?,
             Op::LessEq => emit_cmp(ops, ops_ref, bail, Cmp::Le)?,
             Op::GreaterThan => emit_cmp(ops, ops_ref, bail, Cmp::Gt)?,
@@ -4118,6 +4190,13 @@ mod tests {
         }
     }
 
+    fn expect_f64(view: &JitFunctionView, regs: &mut [u64], expected: f64) {
+        match run(view, regs) {
+            Exit::Returned(bits) => assert_eq!(unbox_f64(bits), expected),
+            Exit::Bailed => panic!("expected Returned({expected}), got Bailed"),
+        }
+    }
+
     #[test]
     fn add_two_ints() {
         let v = view(&[
@@ -4191,6 +4270,57 @@ mod tests {
             (Op::ReturnValue, vec![Operand::Register(2)]),
         ]);
         let mut regs = [box_f64(2_147_483_648.0), box_i32(0), 0, 0, 0, 0, 0, 0];
+        assert!(matches!(run(&v, &mut regs), Exit::Bailed));
+    }
+
+    #[test]
+    fn ushr_boxes_unsigned_int32_result_as_double() {
+        let v = view(&[
+            (
+                Op::Ushr,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
+        ]);
+        let mut regs = [box_i32(-1), box_i32(0), 0, 0, 0, 0, 0, 0];
+        expect_f64(&v, &mut regs, 4_294_967_295.0);
+    }
+
+    #[test]
+    fn ushr_truncates_positive_double_mod_uint32() {
+        let v = view(&[
+            (
+                Op::Ushr,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
+        ]);
+        let mut regs = [box_f64(4_294_967_301.9), box_i32(0), 0, 0, 0, 0, 0, 0];
+        expect_f64(&v, &mut regs, 5.0);
+    }
+
+    #[test]
+    fn ushr_bails_on_negative_double() {
+        let v = view(&[
+            (
+                Op::Ushr,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
+        ]);
+        let mut regs = [box_f64(-1.0), box_i32(0), 0, 0, 0, 0, 0, 0];
         assert!(matches!(run(&v, &mut regs), Exit::Bailed));
     }
 

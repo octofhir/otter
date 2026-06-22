@@ -920,11 +920,11 @@ impl<'a> Builder<'a> {
                     self.def_register(dst, block, node, byte_pc);
                 }
                 // Bitwise / shift sites are integer ops: JS coerces both operands
-                // to int32 and the result is int32 (`|`, `&`, `^`, `<<`, `>>`
-                // all stay in signed-int32 range). Speculate int32 operands from
-                // feedback (`CheckInt32`); a non-int32 site bails. `>>>` is absent
-                // — its result can exceed the int32 range (a double).
-                Op::BitwiseOr | Op::BitwiseAnd | Op::BitwiseXor | Op::Shl | Op::Shr => {
+                // to int32. `|`, `&`, `^`, `<<`, `>>` stay in signed-int32
+                // range; `>>>` widens the unsigned result to float64.
+                // Speculate int32 operands from feedback (`CheckInt32`); a
+                // non-int32 site bails.
+                Op::BitwiseOr | Op::BitwiseAnd | Op::BitwiseXor | Op::Shl | Op::Shr | Op::Ushr => {
                     let (dst, lhs, rhs) =
                         (reg(&operands, 0)?, reg(&operands, 1)?, reg(&operands, 2)?);
                     let node = match self.bitwise_binop(block, op, lhs, rhs, feedback, byte_pc) {
@@ -1139,6 +1139,7 @@ impl<'a> Builder<'a> {
             Op::BitwiseXor => NodeKind::Int32BitXor(l, r),
             Op::Shl => NodeKind::Int32Shl(l, r),
             Op::Shr => NodeKind::Int32Shr(l, r),
+            Op::Ushr => NodeKind::Int32UshrToFloat64(l, r),
             _ => unreachable!("bitwise_binop on non-bitwise op"),
         };
         Ok(self.graph.add_node(kind, block, byte_pc))
@@ -1242,6 +1243,7 @@ impl<'a> Builder<'a> {
             Op::BitwiseXor => NodeKind::Int32BitXor(l, r),
             Op::Shl => NodeKind::Int32Shl(l, r),
             Op::Shr => NodeKind::Int32Shr(l, r),
+            Op::Ushr => NodeKind::Int32UshrToFloat64(l, r),
             _ => unreachable!("bitwise_node_binop on non-bitwise op"),
         };
         Ok(self.graph.add_node(kind, block, byte_pc))
@@ -1462,7 +1464,7 @@ impl<'a> Builder<'a> {
                     self.push_body(block, node);
                     write(&mut regs, dst, node)?;
                 }
-                Op::BitwiseOr | Op::BitwiseAnd | Op::BitwiseXor | Op::Shl | Op::Shr => {
+                Op::BitwiseOr | Op::BitwiseAnd | Op::BitwiseXor | Op::Shl | Op::Shr | Op::Ushr => {
                     let dst = reg(operands, 0)?;
                     let lhs = read(&regs, reg(operands, 1)?)?;
                     let rhs = read(&regs, reg(operands, 2)?)?;

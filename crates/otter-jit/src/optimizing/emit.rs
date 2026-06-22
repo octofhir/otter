@@ -1549,7 +1549,8 @@ mod arm64 {
             | NodeKind::Int32BitAnd(a, b)
             | NodeKind::Int32BitXor(a, b)
             | NodeKind::Int32Shl(a, b)
-            | NodeKind::Int32Shr(a, b) => {
+            | NodeKind::Int32Shr(a, b)
+            | NodeKind::Int32UshrToFloat64(a, b) => {
                 // Pure int32 bitwise / shift on W views; no overflow, no deopt.
                 // arm64 32-bit `lslv`/`asrv` mask the shift amount mod 32 — the
                 // JS `& 31` shift semantics.
@@ -1573,11 +1574,22 @@ mod arm64 {
                     NodeKind::Int32Shr(_, _) => {
                         dynasm!(ops ; .arch aarch64 ; asrv w16, w16, w17);
                     }
+                    NodeKind::Int32UshrToFloat64(_, _) => {
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; lsrv w16, w16, w17
+                            ; ucvtf D(FP_LOAD_SCRATCH), w16
+                        );
+                    }
                     _ => unreachable!(),
                 }
                 if let Some(loc) = dst {
-                    dynasm!(ops ; .arch aarch64 ; mov W(box_scratch), w16);
-                    store_loc(ops, loc, box_scratch);
+                    if matches!(node.kind, NodeKind::Int32UshrToFloat64(_, _)) {
+                        store_fp_loc(ops, loc, FP_LOAD_SCRATCH);
+                    } else {
+                        dynasm!(ops ; .arch aarch64 ; mov W(box_scratch), w16);
+                        store_loc(ops, loc, box_scratch);
+                    }
                 }
                 Ok(())
             }
@@ -2184,6 +2196,7 @@ mod arm64 {
                         | NodeKind::Int32BitXor(_, _)
                         | NodeKind::Int32Shl(_, _)
                         | NodeKind::Int32Shr(_, _)
+                        | NodeKind::Int32UshrToFloat64(_, _)
                         | NodeKind::Int32Compare(_, _, _)
                         | NodeKind::Call { .. }
                 )
@@ -2595,6 +2608,25 @@ mod tests {
         // a = undefined: CheckNumber sees a non-number tag and deopts.
         let (status, _value) = run(&divide_by_two(), &[SPECIAL_UNDEFINED]);
         assert_eq!(status, 1, "non-number operand deopts to the interpreter");
+    }
+
+    fn ushr_zero() -> JitFunctionView {
+        view(
+            1,
+            4,
+            &[
+                (Op::LoadInt32, vec![r(1), imm(0)], 0),
+                (Op::Ushr, vec![r(2), r(0), r(1)], ARITH_INT32),
+                (Op::ReturnValue, vec![r(2)], 0),
+            ],
+        )
+    }
+
+    #[test]
+    fn ushr_int32_result_widens_to_double() {
+        let (status, value) = run(&ushr_zero(), &[boxi(-1)]);
+        assert_eq!(status, 0, "returns, no bail");
+        assert_eq!(f64::from_bits(value), 4_294_967_295.0);
     }
 
     /// `f(n){ let x=0.0; let i=0; while(i<n){ x = x + 1.5; i = i+1 } return x }`

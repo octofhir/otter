@@ -2016,6 +2016,37 @@ impl Interpreter {
         }
     }
 
+    /// Validate a tiny closure-call inline candidate and return its captured
+    /// upvalue-spine base without cloning or publishing a callee frame.
+    ///
+    /// The baseline uses this only for leaf bodies with no allocation/call GC
+    /// points. Returning a pointer into the closure body's `Vec<UpvalueCell>` is
+    /// therefore safe for the dynamic extent of the inlined body: the closure is
+    /// still rooted in the caller frame and the upvalue vector is immutable
+    /// after closure creation.
+    pub fn jit_inline_closure_upvalues(
+        &mut self,
+        callee: Value,
+        expected_fid: u32,
+    ) -> Option<usize> {
+        self.jit_runtime_stats.runtime_calls =
+            self.jit_runtime_stats.runtime_calls.saturating_add(1);
+        let closure = callee.as_closure(&self.gc_heap)?;
+        if closure.function_id() != expected_fid {
+            return None;
+        }
+        self.gc_heap.read_payload(closure.handle(), |body| {
+            if body.upvalues.is_empty()
+                || body.bound_new_target.is_some()
+                || body.bound_derived_this.is_some()
+                || body.eval_env.is_some()
+            {
+                return None;
+            }
+            Some(body.upvalues.as_ptr() as usize)
+        })
+    }
+
     /// Prepare an eligible compiled **method** callee (`recv.name(args…)`) for
     /// direct machine-code entry, the `CallMethodValue` analogue of
     /// [`Self::jit_prepare_direct_call`].

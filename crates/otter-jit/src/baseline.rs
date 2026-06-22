@@ -253,6 +253,23 @@ pub(crate) extern "C" fn jit_prepare_direct_call_stub(
     }
 }
 
+/// Validate a closure callee for scratch-frame inlining and return its captured
+/// upvalue-spine base, or `0` when the site must take the normal call path.
+pub(crate) extern "C" fn jit_inline_closure_upvalues_stub(
+    ctx: *mut JitCtx,
+    callee_reg: u64,
+    expected_fid: u64,
+) -> usize {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    // SAFETY: `callee_reg` comes from a bytecode register operand inside the
+    // active frame window.
+    let callee_bits = unsafe { *ctx.regs.add(callee_reg as usize) };
+    vm.jit_inline_closure_upvalues(Value::from_bits(callee_bits), expected_fid as u32)
+        .unwrap_or(0)
+}
+
 /// Prepare a direct compiled **method** call (`recv.name(args…)`). Same
 /// `ctx.direct_*` / status contract as [`jit_prepare_direct_call_stub`], but
 /// status `2` means "ineligible — use the in-place full method-call stub"
@@ -936,11 +953,11 @@ mod arm64 {
         THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET,
         Unsupported, VM_OFFSET, WhiskerIcCell, jit_abort_direct_call_stub, jit_call_method_stub,
         jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
-        jit_finish_direct_call_returned_stub, jit_load_element_stub, jit_load_global_stub,
-        jit_load_prop_stub, jit_load_upvalue_stub, jit_make_fn_stub, jit_new_array_stub,
-        jit_new_object_stub, jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub,
-        jit_self_call_bail_stub, jit_store_element_stub, jit_store_prop_stub,
-        jit_store_upvalue_stub, jit_write_barrier_stub, reg_offset,
+        jit_finish_direct_call_returned_stub, jit_inline_closure_upvalues_stub,
+        jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub, jit_load_upvalue_stub,
+        jit_make_fn_stub, jit_new_array_stub, jit_new_object_stub, jit_prepare_direct_call_stub,
+        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub, jit_store_element_stub,
+        jit_store_prop_stub, jit_store_upvalue_stub, jit_write_barrier_stub, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -1777,7 +1794,9 @@ mod arm64 {
                     // identity guard (no per-call bridge); fall back to the
                     // direct-call bridge for absent / ineligible sites.
                     let inlined = match view.inline_callees.get(&instr.byte_pc) {
-                        Some(callee) => try_emit_inline_call(&mut ops, callee, ops_ref, bail)?,
+                        Some(callee) => {
+                            try_emit_inline_call(&mut ops, callee, ops_ref, cage_base, bail)?
+                        }
                         None => false,
                     };
                     if !inlined {
@@ -2473,6 +2492,19 @@ mod arm64 {
     /// Largest argument count an inlined call accepts.
     const INLINE_MAX_ARGS: usize = 8;
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum InlineCallKind {
+        Plain,
+        ClosureUpvalues,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum InlineKnown {
+        Unknown,
+        Number,
+        Bool,
+    }
+
     /// Whether an op may appear in an inlined leaf callee: a pure, non-allocating
     /// operation with no `this`/upvalue/global/heap access and no further call,
     /// so the spliced body has no GC point and commits nothing observable before
@@ -2481,6 +2513,7 @@ mod arm64 {
         matches!(
             op,
             Op::LoadInt32
+                | Op::LoadNumber
                 | Op::LoadLocal
                 | Op::LoadUndefined
                 | Op::LoadHole
@@ -2515,6 +2548,136 @@ mod arm64 {
         )
     }
 
+    fn classify_inline_call(callee: &JitInlineCallee) -> Option<InlineCallKind> {
+        let has_upvalue_op = callee.instructions.iter().any(|instr| {
+            matches!(
+                instr.op,
+                Op::LoadUpvalue | Op::StoreUpvalue | Op::StoreUpvalueChecked
+            )
+        });
+        if !has_upvalue_op {
+            return callee
+                .instructions
+                .iter()
+                .all(|instr| is_inline_pure_op(instr.op))
+                .then_some(InlineCallKind::Plain);
+        }
+
+        let mut regs = vec![InlineKnown::Unknown; usize::from(callee.register_count)];
+        let mut store_seen = false;
+        for instr in &callee.instructions {
+            let operands = instr.operands.as_slice();
+            let read = |regs: &[InlineKnown], regn: u16| -> Option<InlineKnown> {
+                regs.get(regn as usize).copied()
+            };
+            let write = |regs: &mut [InlineKnown], regn: u16, kind: InlineKnown| -> Option<()> {
+                let slot = regs.get_mut(regn as usize)?;
+                *slot = kind;
+                Some(())
+            };
+
+            match instr.op {
+                Op::LoadInt32 | Op::LoadNumber => {
+                    write(&mut regs, reg(operands, 0).ok()?, InlineKnown::Number)?;
+                }
+                Op::LoadTrue | Op::LoadFalse => {
+                    write(&mut regs, reg(operands, 0).ok()?, InlineKnown::Bool)?;
+                }
+                Op::LoadUndefined | Op::LoadHole => {
+                    write(&mut regs, reg(operands, 0).ok()?, InlineKnown::Unknown)?;
+                }
+                Op::LoadLocal => {
+                    let dst = reg(operands, 0).ok()?;
+                    let src = local_index(operands, 1).ok()?;
+                    let kind = read(&regs, src)?;
+                    write(&mut regs, dst, kind)?;
+                }
+                Op::StoreLocal => {
+                    let src = reg(operands, 0).ok()?;
+                    let dst = local_index(operands, 1).ok()?;
+                    let kind = read(&regs, src)?;
+                    write(&mut regs, dst, kind)?;
+                }
+                Op::LoadUpvalue => {
+                    write(&mut regs, reg(operands, 0).ok()?, InlineKnown::Unknown)?;
+                }
+                Op::ToPrimitive => {
+                    let dst = reg(operands, 0).ok()?;
+                    let src = reg(operands, 1).ok()?;
+                    let kind = read(&regs, src)?;
+                    if store_seen && kind != InlineKnown::Number {
+                        return None;
+                    }
+                    write(&mut regs, dst, kind)?;
+                }
+                Op::ToNumeric => {
+                    let dst = reg(operands, 0).ok()?;
+                    let src = reg(operands, 1).ok()?;
+                    let kind = read(&regs, src)?;
+                    if store_seen && kind != InlineKnown::Number {
+                        return None;
+                    }
+                    write(&mut regs, dst, InlineKnown::Number)?;
+                }
+                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem => {
+                    let dst = reg(operands, 0).ok()?;
+                    let lhs = read(&regs, reg(operands, 1).ok()?)?;
+                    let rhs = read(&regs, reg(operands, 2).ok()?)?;
+                    if store_seen && (lhs != InlineKnown::Number || rhs != InlineKnown::Number) {
+                        return None;
+                    }
+                    write(&mut regs, dst, InlineKnown::Number)?;
+                }
+                Op::BitwiseOr
+                | Op::BitwiseAnd
+                | Op::BitwiseXor
+                | Op::Shl
+                | Op::Shr
+                | Op::Ushr
+                | Op::LessThan
+                | Op::LessEq
+                | Op::GreaterThan
+                | Op::GreaterEq
+                | Op::Equal
+                | Op::NotEqual => {
+                    let dst = reg(operands, 0).ok()?;
+                    let lhs = read(&regs, reg(operands, 1).ok()?)?;
+                    let rhs = read(&regs, reg(operands, 2).ok()?)?;
+                    if store_seen {
+                        return None;
+                    }
+                    let result = if matches!(
+                        instr.op,
+                        Op::LessThan
+                            | Op::LessEq
+                            | Op::GreaterThan
+                            | Op::GreaterEq
+                            | Op::Equal
+                            | Op::NotEqual
+                    ) {
+                        InlineKnown::Bool
+                    } else {
+                        let _ = (lhs, rhs);
+                        InlineKnown::Number
+                    };
+                    write(&mut regs, dst, result)?;
+                }
+                Op::StoreUpvalue | Op::StoreUpvalueChecked => {
+                    let src = reg(operands, 0).ok()?;
+                    if read(&regs, src)? != InlineKnown::Number {
+                        return None;
+                    }
+                    store_seen = true;
+                }
+                Op::Return | Op::ReturnValue | Op::ReturnUndefined => {}
+                // Keep upvalue inlining straight-line. The existing plain
+                // inliner still owns branchy pure callees.
+                _ => return None,
+            }
+        }
+        Some(InlineCallKind::ClosureUpvalues)
+    }
+
     /// Emit one op of an inlined callee body. The frame-register base `x19`
     /// already points at the callee scratch window, so `load_reg`/`store_reg`
     /// address callee registers. Bails route to `bail` (the site's scratch-aware
@@ -2528,6 +2691,7 @@ mod arm64 {
         bail: DynamicLabel,
         inline_done: DynamicLabel,
         clabels: &BTreeMap<u32, DynamicLabel>,
+        cage_base: usize,
     ) -> Result<(), Unsupported> {
         let ops_ref = instr.operands.as_slice();
         let ctarget = |rel: i32| -> Result<DynamicLabel, Unsupported> {
@@ -2542,6 +2706,14 @@ mod arm64 {
                 let dst = reg(ops_ref, 0)?;
                 let v = imm32(ops_ref, 1)?;
                 emit_load_u64(ops, 9, (TAG_INT32 << 48) | u64::from(v as u32));
+                store_reg(ops, 9, dst)?;
+            }
+            Op::LoadNumber => {
+                let dst = reg(ops_ref, 0)?;
+                let Some(value) = instr.load_number else {
+                    return Err(Unsupported::OperandShape("load-number constant"));
+                };
+                emit_load_u64(ops, 9, value.to_bits());
                 store_reg(ops, 9, dst)?;
             }
             Op::LoadLocal => {
@@ -2575,6 +2747,79 @@ mod arm64 {
                 let idx = local_index(ops_ref, 1)?;
                 load_reg(ops, 9, src)?;
                 store_reg(ops, 9, idx)?;
+            }
+            Op::LoadUpvalue => {
+                if cage_base == 0 {
+                    return Err(Unsupported::OperandShape("inline upvalue without cage"));
+                }
+                let dst = reg(ops_ref, 0)?;
+                let idx = imm32(ops_ref, 1)?;
+                if idx < 0 {
+                    return Err(Unsupported::OperandShape("upvalue index"));
+                }
+                let idx_off = u32::try_from(idx)
+                    .ok()
+                    .and_then(|idx| idx.checked_mul(UPVALUE_CELL_SIZE))
+                    .ok_or(Unsupported::OperandShape("upvalue index"))?;
+                if idx_off > 32760 {
+                    return Err(Unsupported::OperandShape("upvalue index"));
+                }
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr x9, [x20, UPVALUES_PTR_OFFSET]
+                    ; cbz x9, =>bail
+                    ; ldr w10, [x9, idx_off]
+                );
+                emit_load_u64(ops, 11, cage_base as u64);
+                emit_load_u64(ops, 12, (TAG_SPECIAL << 48) | SPECIAL_HOLE);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; add x11, x11, x10
+                    ; ldr x9, [x11, UPVALUE_VALUE_OFFSET]
+                    ; cmp x9, x12
+                    ; b.eq =>bail
+                );
+                store_reg(ops, 9, dst)?;
+            }
+            Op::StoreUpvalue | Op::StoreUpvalueChecked => {
+                if cage_base == 0 {
+                    return Err(Unsupported::OperandShape("inline upvalue without cage"));
+                }
+                let src = reg(ops_ref, 0)?;
+                let idx = imm32(ops_ref, 1)?;
+                if idx < 0 {
+                    return Err(Unsupported::OperandShape("upvalue index"));
+                }
+                let idx_off = u32::try_from(idx)
+                    .ok()
+                    .and_then(|idx| idx.checked_mul(UPVALUE_CELL_SIZE))
+                    .ok_or(Unsupported::OperandShape("upvalue index"))?;
+                if idx_off > 32760 {
+                    return Err(Unsupported::OperandShape("upvalue index"));
+                }
+                load_reg(ops, 12, src)?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; lsr x10, x12, #48
+                    ; movz x11, TAG_PTR_OBJECT as u32
+                    ; cmp x10, x11
+                    ; b.hs =>bail
+                    ; ldr x9, [x20, UPVALUES_PTR_OFFSET]
+                    ; cbz x9, =>bail
+                    ; ldr w10, [x9, idx_off]
+                );
+                emit_load_u64(ops, 13, cage_base as u64);
+                dynasm!(ops ; .arch aarch64 ; add x13, x13, x10);
+                if instr.op == Op::StoreUpvalueChecked {
+                    emit_load_u64(ops, 11, (TAG_SPECIAL << 48) | SPECIAL_HOLE);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr x14, [x13, UPVALUE_VALUE_OFFSET]
+                        ; cmp x14, x11
+                        ; b.eq =>bail
+                    );
+                }
+                dynasm!(ops ; .arch aarch64 ; str x12, [x13, UPVALUE_VALUE_OFFSET]);
             }
             Op::Add | Op::Sub | Op::Mul => emit_add_sub_mul(ops, ops_ref, bail, instr.op)?,
             Op::Div => emit_div(ops, ops_ref, bail)?,
@@ -2658,17 +2903,21 @@ mod arm64 {
         ops: &mut Assembler,
         callee: &JitInlineCallee,
         call_operands: &[Operand],
+        cage_base: usize,
         bail: DynamicLabel,
     ) -> Result<bool, Unsupported> {
         let dst = reg(call_operands, 0)?;
         let callee_reg = reg(call_operands, 1)?;
         let argc = const_index(call_operands, 2)? as usize;
+        let Some(kind) = classify_inline_call(callee) else {
+            return Ok(false);
+        };
 
         if argc != usize::from(callee.param_count)
             || argc > INLINE_MAX_ARGS
             || callee.register_count > INLINE_MAX_REGS
             || callee.instructions.len() > INLINE_MAX_INSTRS
-            || !callee.instructions.iter().all(|i| is_inline_pure_op(i.op))
+            || (kind == InlineCallKind::ClosureUpvalues && cage_base == 0)
         {
             return Ok(false);
         }
@@ -2681,23 +2930,53 @@ mod arm64 {
         let inline_done = ops.new_dynamic_label();
         let inline_bail = ops.new_dynamic_label();
         let after = ops.new_dynamic_label();
-        let scratch_bytes = (u32::from(callee.register_count) * 8).next_multiple_of(16);
+        let saved_upvalues_slot = u32::from(callee.register_count);
+        let scratch_regs =
+            u32::from(callee.register_count) + u32::from(kind == InlineCallKind::ClosureUpvalues);
+        let scratch_bytes = (scratch_regs * 8).next_multiple_of(16);
 
-        // Identity guard (x19 = caller frame base, sp not yet moved): the callee
-        // register must be exactly the speculated function value, else bail.
-        load_reg(ops, 9, callee_reg)?;
-        emit_load_u64(
-            ops,
-            10,
-            (TAG_FUNCTION_ID << 48) | u64::from(callee.function_id),
-        );
-        dynasm!(ops ; .arch aarch64 ; cmp x9, x10 ; b.ne =>bail);
+        // Identity guard (x19 = caller frame base, sp not yet moved). Plain
+        // function values compare directly. Closure-upvalue inlines ask the VM
+        // to validate the current closure's function id and unsupported closure
+        // metadata, returning the immutable upvalue-spine base on success.
+        if kind == InlineCallKind::Plain {
+            load_reg(ops, 9, callee_reg)?;
+            emit_load_u64(
+                ops,
+                10,
+                (TAG_FUNCTION_ID << 48) | u64::from(callee.function_id),
+            );
+            dynasm!(ops ; .arch aarch64 ; cmp x9, x10 ; b.ne =>bail);
+        } else {
+            dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, callee_reg as u32);
+            emit_load_u64(ops, 2, u64::from(callee.function_id));
+            emit_load_u64(
+                ops,
+                16,
+                jit_inline_closure_upvalues_stub as *const () as u64,
+            );
+            dynasm!(ops
+                ; .arch aarch64
+                ; blr x16
+                ; cbz x0, =>bail
+                ; mov x15, x0
+            );
+        }
 
         // Reserve scratch, copy args into param slots (read via caller base x19),
         // zero the remaining slots to undefined (a fresh frame's register state),
         // then repoint x19 at the scratch base for the body.
         if scratch_bytes > 0 {
             dynasm!(ops ; .arch aarch64 ; sub sp, sp, scratch_bytes);
+        }
+        if kind == InlineCallKind::ClosureUpvalues {
+            let saved_off = saved_upvalues_slot * 8;
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x14, [x20, UPVALUES_PTR_OFFSET]
+                ; str x14, [sp, saved_off]
+                ; str x15, [x20, UPVALUES_PTR_OFFSET]
+            );
         }
         for slot in 0..argc {
             let areg = reg(call_operands, 3 + slot)?;
@@ -2712,12 +2991,20 @@ mod arm64 {
 
         for i in &callee.instructions {
             dynasm!(ops ; .arch aarch64 ; =>clabels[&i.byte_pc]);
-            emit_inline_pure_op(ops, i, inline_bail, inline_done, &clabels)?;
+            emit_inline_pure_op(ops, i, inline_bail, inline_done, &clabels, cage_base)?;
         }
 
         // Normal completion: result in x9, unwind scratch, restore caller base,
         // store to dst.
         dynasm!(ops ; .arch aarch64 ; =>inline_done);
+        if kind == InlineCallKind::ClosureUpvalues {
+            let saved_off = saved_upvalues_slot * 8;
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x14, [sp, saved_off]
+                ; str x14, [x20, UPVALUES_PTR_OFFSET]
+            );
+        }
         if scratch_bytes > 0 {
             dynasm!(ops ; .arch aarch64 ; add sp, sp, scratch_bytes);
         }
@@ -2731,6 +3018,14 @@ mod arm64 {
         // Bail path: unwind scratch so the shared bail epilogue sees the frame
         // base sp (it reloads x19/x20 from the stack), then jump to it.
         dynasm!(ops ; .arch aarch64 ; =>inline_bail);
+        if kind == InlineCallKind::ClosureUpvalues {
+            let saved_off = saved_upvalues_slot * 8;
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x14, [sp, saved_off]
+                ; str x14, [x20, UPVALUES_PTR_OFFSET]
+            );
+        }
         if scratch_bytes > 0 {
             dynasm!(ops ; .arch aarch64 ; add sp, sp, scratch_bytes);
         }
@@ -2881,7 +3176,7 @@ mod arm64 {
                 );
                 Ok(())
             }
-            _ => emit_inline_pure_op(ops, instr, bail, inline_done, clabels),
+            _ => emit_inline_pure_op(ops, instr, bail, inline_done, clabels, cage_base),
         }
     }
 

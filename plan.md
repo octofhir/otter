@@ -2,7 +2,7 @@
 
 **Updated:** 2026-06-22
 **Branch:** `main`
-**Current head:** `e2217376 perf(jit): inline dense array stores`
+**Baseline before current slice:** `7a4506d8 perf(jit): fast-path unsigned shifts`
 
 This file tracks only the work still required to close Tier1. Completed slices
 live in git history and are intentionally not repeated here.
@@ -21,7 +21,7 @@ Measured on 2026-06-21 with `OTTER_JIT=1`; Node measured with the same scripts.
 | `typed-array.js` | 0.09s | 0.03s | small | no Tier1 blocker |
 | `prop-access.js` | 0.17s | 0.03s | open | finish residual object/method cost |
 | `array-ops.js` | 0.45s | 0.09s | open | callback-heavy builtin path |
-| `sort.js` | 0.29–0.53s | 0.16s | open | fill-loop store stubs closed; callback body unsigned shift faster |
+| `sort.js` | 0.25–0.53s | 0.16s | open | fill-loop direct calls closed; sort runtime still open |
 | `json.js` | 1.42s | 0.23s | open | runtime/builtin throughput |
 | `string-ops.js` | 0.44s | 0.03s | open | string builtin throughput |
 | `regex.js` | 2.20s | 0.03s | open | regex engine throughput |
@@ -81,9 +81,12 @@ dense hole storage for moderate lengths, and Tier1 dense-array `StoreElement`
 inlines the fill loop when the array-index accessor protector and array exotic
 state prove the write is not observable. Full benchmark JIT runtime property
 stubs dropped from ~760k to 42. Baseline JIT now handles unsigned right shift in
-the RNG callback body for the positive finite double path, cutting a measured
-fill-only run to ~109ms and a full `sort.js` run to ~284ms. The remaining hot
-cost is still the ~760k direct JS callback/comparator calls.
+the RNG callback body for the positive finite double path. Tiny closure-upvalue
+leaf calls inline through a guarded closure-validation helper, so the RNG fill
+loop no longer publishes a callee frame or enters compiled direct-call code on
+every iteration. Measured fill-only is ~73ms, prefilled sort is ~147ms, and full
+`sort.js` is ~254ms; `jitDirectCalls` dropped from ~760k to 0. The remaining hot
+cost is the per-call closure validation helper plus native sort/runtime work.
 
 Gates:
 

@@ -14,10 +14,12 @@
 //!
 //! # Invariants
 //! - Greedy quantifiers explore the longer match first; lazy the shorter.
-//! - Every instruction dispatch counts one step against the budget.
+//! - Each backtrack point explored counts one step against the budget, so a
+//!   catastrophic-backtracking input aborts while a linear forward match pays
+//!   nothing per character.
 //! - Reported positions are UTF-16 code-unit offsets.
 //!
-//! # Phase-1 note
+//! # Lookbehind
 //! Lookbehind is evaluated by scanning candidate start positions and requiring
 //! the body to end exactly at the assertion point. This is boolean-correct and
 //! variable-length-capable; capture slots inside the body keep their first write
@@ -146,10 +148,20 @@ impl Matcher<'_, '_> {
         // separate decode-then-act dispatch step.
         let prog = self.program;
         // `u64::MAX` sentinel turns the unbounded case into a never-taken
-        // compare instead of an `Option` test on every instruction.
+        // compare instead of an `Option` test.
         let limit = self.step_limit.unwrap_or(u64::MAX);
 
         while let Some(frame) = stack.pop() {
+            // Account one step per backtrack point explored, not per
+            // instruction: catastrophic backtracking is an explosion in the
+            // number of alternatives tried (frames popped here), and a
+            // quadratic lookbehind scan re-pops a frame per candidate start, so
+            // both are bounded — while a linear forward match (which pushes no
+            // frame it later pops) pays nothing on its hot per-character path.
+            self.steps += 1;
+            if self.steps > limit {
+                return Err(ExecError::StepLimitExceeded);
+            }
             // Undo every capture write made on the abandoned path so this
             // alternative resumes from the slot state captured at its split.
             while log.len() > frame.log_mark {
@@ -158,11 +170,6 @@ impl Matcher<'_, '_> {
             }
             let (mut pc, mut pos) = (frame.pc, frame.pos);
             let accepted = loop {
-                self.steps += 1;
-                if self.steps > limit {
-                    return Err(ExecError::StepLimitExceeded);
-                }
-
                 match &prog.insns[pc] {
                     Insn::Match | Insn::LookMatch => {
                         if end_anchor.is_none_or(|t| pos == t) {

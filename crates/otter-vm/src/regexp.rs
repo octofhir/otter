@@ -355,10 +355,10 @@ impl JsRegExp {
         flag_str: &str,
     ) -> Result<Self, RegExpError> {
         let flags = RegExpFlags::parse(flag_str)?;
-        // `regress` parses from a Rust `&str`, so feed it the lossy
-        // UTF-8 reading. JS-only escape sequences (`\u{...}`,
-        // `\xNN`, surrogate pairs) survive the round-trip because
-        // they are ASCII at the byte level.
+        // The engine compiles a pattern from a Rust `&str`, so feed it the
+        // lossy UTF-8 reading. JS-only escape sequences (`\u{...}`, `\xNN`,
+        // surrogate pairs) survive the round-trip because they are ASCII at
+        // the byte level.
         let source = String::from_utf16_lossy(pattern_utf16);
         // `g`, `y`, and `d` are spec-level state above the matcher and are not
         // part of the compiled pattern.

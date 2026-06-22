@@ -42,7 +42,7 @@ pub enum DiagnosticCode {
     TsUnsupported,
     /// AST node not yet lowered by the foundation compiler.
     FeatureNotInSlice,
-    /// `regress` rejected the regular expression source.
+    /// The regex engine rejected the regular expression source.
     InvalidRegexp,
 
     // ── Resolve (module loader, after capability gate) ─────────

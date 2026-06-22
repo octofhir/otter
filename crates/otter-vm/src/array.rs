@@ -1707,6 +1707,76 @@ pub fn with_elements<R>(arr: JsArray, heap: &otter_gc::GcHeap, f: impl FnOnce(&[
     heap.read_payload(arr, |body| f(&body.elements))
 }
 
+/// Clone a proven plain dense prefix for builtin fast paths.
+///
+/// Returns `None` if any observable array exotic state, sparse storage,
+/// length/dense mismatch, or hole would make a raw element walk differ from
+/// ordinary `HasProperty` / `Get` semantics.
+pub(crate) fn plain_dense_prefix_values(
+    arr: JsArray,
+    heap: &otter_gc::GcHeap,
+    len: usize,
+) -> Option<Vec<Value>> {
+    heap.read_payload(arr, |body| {
+        if body.exotic.is_some() || body.length != len || body.elements.len() < len {
+            return None;
+        }
+        let prefix = &body.elements[..len];
+        if prefix.iter().any(|value| value.is_hole()) {
+            return None;
+        }
+        Some(prefix.to_vec())
+    })
+}
+
+/// Write a caller-proven plain dense range with per-element values.
+///
+/// The caller owns the same spec checks as [`fill_dense_range_with_roots`].
+pub(crate) fn write_dense_range_with_roots(
+    mut arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    start: usize,
+    values: &[Value],
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<(), otter_gc::OutOfMemory> {
+    if values.is_empty() {
+        return Ok(());
+    }
+    let end = start.saturating_add(values.len());
+    {
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            for value in values {
+                value.trace_value_slots(visitor);
+            }
+        };
+        reserve_for_target_len_with_roots(&mut arr, heap, end, &mut reserve_roots)?;
+    }
+    heap.with_payload(arr, |body| {
+        body.elements
+            .reserve_exact(end.saturating_sub(body.elements.len()));
+        while body.elements.len() < start {
+            body.elements.push(Value::hole());
+        }
+        let existing_end = end.min(body.elements.len());
+        for (slot, value) in body.elements[start..existing_end]
+            .iter_mut()
+            .zip(values.iter().copied())
+        {
+            *slot = value;
+        }
+        for value in &values[existing_end.saturating_sub(start)..] {
+            body.elements.push(*value);
+        }
+        body.length = body.length.max(end);
+        body.mark_dirty();
+    });
+    for value in values {
+        heap.record_write(arr, value);
+    }
+    Ok(())
+}
+
 /// Crate-internal mutable access to dense elements for in-place
 /// rewrites that do not grow capacity.
 ///

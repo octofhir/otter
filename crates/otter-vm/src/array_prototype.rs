@@ -445,6 +445,119 @@ fn execute_array_for_each_fast_path(
     Some(Value::undefined())
 }
 
+fn try_dense_array_callback_fast_path(
+    interp: &mut Interpreter,
+    kind: ArrayCallbackKind,
+    receiver: Value,
+    len: usize,
+    output_target: Option<Value>,
+    callback_fast_path: Option<ArrayCallbackFastPath>,
+    args: &[Value],
+) -> Option<Result<Value, NativeError>> {
+    let arr = receiver.as_array()?;
+    let values = crate::array::plain_dense_prefix_values(arr, interp.gc_heap(), len)?;
+    match callback_fast_path {
+        Some(ArrayCallbackFastPath::MapMulAdd { mul, add }) if kind == ArrayCallbackKind::Map => {
+            let target = output_target?;
+            let target_arr = target.as_array()?;
+            if !crate::array::can_fast_fill_dense_range(target_arr, interp.gc_heap(), 0, len) {
+                return None;
+            }
+            let mut mapped = Vec::with_capacity(values.len());
+            for value in values {
+                let value = value.as_f64()?;
+                mapped.push(Value::number_f64(value * mul + add));
+            }
+            let receiver_root = receiver;
+            let target_root = target;
+            let mut external_visit = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                receiver_root.trace_value_slots(visit);
+                target_root.trace_value_slots(visit);
+                for value in args {
+                    value.trace_value_slots(visit);
+                }
+            };
+            let result = crate::array::write_dense_range_with_roots(
+                target_arr,
+                interp.gc_heap_mut(),
+                0,
+                &mapped,
+                &mut external_visit,
+            )
+            .map(|_| target)
+            .map_err(|_| NativeError::TypeError {
+                name: "map",
+                reason: "out of memory".to_string(),
+            });
+            Some(result)
+        }
+        Some(ArrayCallbackFastPath::FilterRemEqZero { divisor })
+            if kind == ArrayCallbackKind::Filter =>
+        {
+            let target = output_target?;
+            let target_arr = target.as_array()?;
+            if !crate::array::can_fast_fill_dense_range(target_arr, interp.gc_heap(), 0, len) {
+                return None;
+            }
+            let mut filtered = Vec::new();
+            for value in values {
+                let number = value.as_f64()?;
+                let rem = number % divisor;
+                if !rem.is_nan() && rem == 0.0 {
+                    filtered.push(value);
+                }
+            }
+            let receiver_root = receiver;
+            let target_root = target;
+            let mut external_visit = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                receiver_root.trace_value_slots(visit);
+                target_root.trace_value_slots(visit);
+                for value in args {
+                    value.trace_value_slots(visit);
+                }
+            };
+            let result = crate::array::write_dense_range_with_roots(
+                target_arr,
+                interp.gc_heap_mut(),
+                0,
+                &filtered,
+                &mut external_visit,
+            )
+            .map(|_| target)
+            .map_err(|_| NativeError::TypeError {
+                name: "filter",
+                reason: "out of memory".to_string(),
+            });
+            Some(result)
+        }
+        Some(ArrayCallbackFastPath::ReduceAdd) if kind.is_reduce() => {
+            let acc = args.get(1).copied().and_then(Value::as_f64);
+            if kind.reverse() {
+                let mut iter = values.into_iter().rev();
+                let mut acc = match acc {
+                    Some(acc) => acc,
+                    None => iter.next()?.as_f64()?,
+                };
+                for value in iter {
+                    acc += value.as_f64()?;
+                }
+                Some(Ok(Value::number_f64(acc)))
+            } else {
+                let mut iter = values.into_iter();
+                let mut acc = match acc {
+                    Some(acc) => acc,
+                    None => iter.next()?.as_f64()?,
+                };
+                for value in iter {
+                    acc += value.as_f64()?;
+                }
+                Some(Ok(Value::number_f64(acc)))
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Static `Array.prototype` method specs.
 pub static ARRAY_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("push", 1, native_push),
@@ -3411,6 +3524,17 @@ pub(crate) fn array_callback_native_dispatch(
         this_arg
     };
     let callback_fast_path = array_callback_fast_path(&context, interp.gc_heap(), kind, callback);
+    if let Some(result) = try_dense_array_callback_fast_path(
+        interp,
+        kind,
+        receiver,
+        len,
+        output_target,
+        callback_fast_path,
+        args,
+    ) {
+        return result;
+    }
     // String-exotic wrappers expose their code-unit indices through
     // `[[StringData]]`, which the ordinary `[[HasProperty]]` ladder may
     // not surface — resolve those directly.

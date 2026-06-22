@@ -236,10 +236,39 @@ impl Matcher<'_, '_> {
                     Insn::Repeat { atom, min, greedy } => {
                         // Tight one-code-unit scan (non-Unicode), then a single
                         // chained give-back frame rather than a split per char.
+                        // The atom kind is matched once, outside the per-unit
+                        // loop, so each loop is a single specialized test.
                         let units = self.units();
+                        let len = units.len();
                         let mut end = pos;
-                        while end < units.len() && self.atom_matches(atom, u32::from(units[end])) {
-                            end += 1;
+                        match atom {
+                            RepeatAtom::Char { cp, ignore_case } => {
+                                let (cp, ic) = (*cp, *ignore_case);
+                                while end < len && self.char_eq(cp, u32::from(units[end]), ic) {
+                                    end += 1;
+                                }
+                            }
+                            RepeatAtom::Any { dot_all } => {
+                                let da = *dot_all;
+                                while end < len
+                                    && (da || !is_line_terminator(u32::from(units[end])))
+                                {
+                                    end += 1;
+                                }
+                            }
+                            RepeatAtom::Class {
+                                class,
+                                negate,
+                                ignore_case,
+                            } => {
+                                let set = &prog.classes[*class as usize];
+                                let (neg, ic) = (*negate, *ignore_case);
+                                while end < len
+                                    && self.class_member(set, neg, u32::from(units[end]), ic)
+                                {
+                                    end += 1;
+                                }
+                            }
                         }
                         if (end - pos) < *min as usize {
                             break None;
@@ -495,26 +524,6 @@ impl Matcher<'_, '_> {
 
     fn char_eq(&self, target: u32, cp: u32, ignore_case: bool) -> bool {
         cp == target || (ignore_case && self.canon(cp) == self.canon(target))
-    }
-
-    /// Whether `atom` matches the single code unit `u` (fused-repeat scan,
-    /// non-Unicode, so a code unit is a code point).
-    #[inline]
-    fn atom_matches(&self, atom: &RepeatAtom, u: u32) -> bool {
-        match atom {
-            RepeatAtom::Char { cp, ignore_case } => self.char_eq(*cp, u, *ignore_case),
-            RepeatAtom::Class {
-                class,
-                negate,
-                ignore_case,
-            } => self.class_member(
-                &self.program.classes[*class as usize],
-                *negate,
-                u,
-                *ignore_case,
-            ),
-            RepeatAtom::Any { dot_all } => *dot_all || !is_line_terminator(u),
-        }
     }
 
     fn class_member(&self, set: &ClassSet, negate: bool, cp: u32, ignore_case: bool) -> bool {

@@ -3447,10 +3447,11 @@ impl Interpreter {
                         visitor(slot);
                     }
                 };
-                crate::array::set_with_roots(
+                crate::array::fill_dense_range_with_roots(
                     arr,
                     &mut self.gc_heap,
                     idx,
+                    idx + 1,
                     value,
                     &mut external_visit,
                 )?;

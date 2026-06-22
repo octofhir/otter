@@ -152,16 +152,35 @@ pub(crate) struct Prefilter {
     /// The full set, consulted only for code points `>= TABLE` when `has_high`.
     high: CodePointSet,
     /// `Some(u)` when the set is exactly one BMP, non-surrogate code point: the
-    /// scan reduces to a single-unit equality search.
+    /// scan reduces to a single-unit equality search. Always `None` when
+    /// [`Self::canon`] is set (the input must be canonicalized first).
     single: Option<u16>,
+    /// Case-folding mode for `i`-flag patterns: `Some(true)` folds the input by
+    /// the unicode rule, `Some(false)` by the non-unicode rule, before the
+    /// membership test — the stored set already holds canonicalized members, so
+    /// this mirrors `char_eq` exactly. `None` for case-sensitive prefilters.
+    canon: Option<bool>,
 }
 
 impl Prefilter {
     const TABLE: usize = 256;
 
-    /// Build from a first-set. Cheap; runs once at lowering.
+    /// Build a case-sensitive prefilter from a first-set. Cheap; runs once at
+    /// lowering.
     #[must_use]
     pub(crate) fn from_set(set: &CodePointSet) -> Self {
+        Self::build(set, None)
+    }
+
+    /// Build a case-insensitive prefilter: `set` holds the canonicalized member
+    /// code points and the scan canonicalizes each input code point by the
+    /// `unicode` rule before testing membership.
+    #[must_use]
+    pub(crate) fn from_set_canon(set: &CodePointSet, unicode: bool) -> Self {
+        Self::build(set, Some(unicode))
+    }
+
+    fn build(set: &CodePointSet, canon: Option<bool>) -> Self {
         let mut table = [false; Self::TABLE];
         let mut has_high = false;
         for r in set.ranges() {
@@ -173,10 +192,11 @@ impl Prefilter {
                 has_high = true;
             }
         }
-        let single = match set.ranges() {
-            [r] if r.start() == r.end()
-                && *r.start() < 0x1_0000
-                && !(0xD800..=0xDFFF).contains(r.start()) =>
+        let single = match (canon, set.ranges()) {
+            (None, [r])
+                if r.start() == r.end()
+                    && *r.start() < 0x1_0000
+                    && !(0xD800..=0xDFFF).contains(r.start()) =>
             {
                 Some(*r.start() as u16)
             }
@@ -187,6 +207,7 @@ impl Prefilter {
             has_high,
             high: set.clone(),
             single,
+            canon,
         }
     }
 
@@ -196,11 +217,17 @@ impl Prefilter {
         self.single
     }
 
-    /// Whether decoded code point `cp` can begin a match. O(1) for the common
-    /// BMP range; a set test only for high code points when the set has any.
+    /// Whether decoded code point `cp` can begin a match. Canonicalizes first
+    /// for an `i`-flag prefilter. O(1) for the common BMP range; a set test only
+    /// for high code points when the set has any.
     #[inline]
     #[must_use]
     pub(crate) fn cp_may_start(&self, cp: u32) -> bool {
+        let cp = match self.canon {
+            Some(true) => crate::casefold::fold_unicode(cp),
+            Some(false) => crate::casefold::canonicalize(cp),
+            None => cp,
+        };
         if (cp as usize) < Self::TABLE {
             self.table[cp as usize]
         } else {

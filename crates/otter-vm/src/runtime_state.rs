@@ -170,6 +170,10 @@ impl<'a> RuntimeState<'a> {
         if include_shape_runtime {
             interp.shape_runtime_for_trace().trace_roots(visitor);
         }
+        for shape in interp.simple_constructor_shapes_for_trace() {
+            let p = shape as *const crate::object::ShapeHandle as *mut otter_gc::raw::RawGc;
+            visitor(p);
+        }
         // 7b) Store-property ICs can retain cached GC shape transitions.
         for ic in interp.store_property_ics_for_trace() {
             ic.trace_roots(visitor);

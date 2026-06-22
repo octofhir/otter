@@ -1121,6 +1121,49 @@ pub(crate) fn alloc_object_with_shape_roots(
     heap.alloc_with_roots(empty_object_body_with_shape(shape), external_visit)
 }
 
+/// Initialize a freshly allocated shaped object with the values for every
+/// hidden-class data slot, in shape order.
+pub(crate) fn initialize_shaped_data_slots(obj: JsObject, heap: &mut GcHeap, values: &[Value]) {
+    let expected = heap.read_payload(obj, |body| body_property_count(heap, body));
+    heap.with_payload(obj, |body| {
+        debug_assert!(
+            !body.shape.is_null(),
+            "bulk slot init only applies to shaped objects"
+        );
+        debug_assert!(
+            body.values.is_empty(),
+            "bulk slot init requires a fresh object"
+        );
+        debug_assert_eq!(
+            expected,
+            values.len(),
+            "shape slot count and init value count diverged"
+        );
+        for (index, value) in values.iter().copied().enumerate() {
+            body.push_slot(index, SlotMeta::data_default(), value);
+        }
+    });
+    for value in values {
+        heap.record_write(obj, value);
+    }
+}
+
+/// Replace the root hidden class on a fresh, slotless object before bulk
+/// constructor initialization.
+pub(crate) fn set_fresh_object_shape(obj: JsObject, heap: &mut GcHeap, shape: ShapeHandle) {
+    heap.with_payload(obj, |body| {
+        debug_assert!(
+            body.values.is_empty(),
+            "fast constructor shape install requires a fresh object"
+        );
+        debug_assert!(
+            !shape.is_null(),
+            "fast constructor shape install requires a shaped target"
+        );
+        body.shape = shape;
+    });
+}
+
 /// Try to allocate a fresh shaped object without running a GC safepoint.
 pub(crate) fn try_alloc_object_with_shape_no_collect(
     heap: &mut GcHeap,

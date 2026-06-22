@@ -1158,6 +1158,7 @@ impl Interpreter {
     ) -> Result<bool, VmError> {
         let mut current = callee;
         let effective_new_target = current;
+        let is_direct_class_construct = current.as_class_constructor().is_some();
         if let Some(class) = current.as_class_constructor() {
             current = class.ctor(&self.gc_heap);
         }
@@ -1179,6 +1180,29 @@ impl Interpreter {
         };
         let receiver = self.alloc_stack_rooted_object_with_extra_roots(stack, &[&proto])?;
         crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
+        if is_direct_class_construct
+            && let Some(function_id) = current
+                .as_function()
+                .or_else(|| current.as_closure(&self.gc_heap).map(|c| c.function_id()))
+            && let Some(function) = context.exec_function(function_id)
+        {
+            let top_idx = stack.len() - 1;
+            let args_window =
+                BytecodeArgumentWindow::new(&stack[top_idx], operands, first_arg_operand, argc);
+            let args = args_window.to_smallvec8()?;
+            let init = self.simple_constructor_init(context, function_id, function);
+            if self.try_finish_simple_constructor_init(
+                stack,
+                function_id,
+                init,
+                receiver,
+                proto,
+                args.as_slice(),
+                dst,
+            )? {
+                return Ok(true);
+            }
+        }
         let top_idx = stack.len() - 1;
         let frame = {
             let caller = &stack[top_idx];
@@ -1194,6 +1218,115 @@ impl Interpreter {
         };
         stack.push(frame);
         Ok(true)
+    }
+
+    fn simple_constructor_init(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        function: &ExecutableFunction,
+    ) -> Option<crate::constructor_fast_path::SimpleConstructorInit> {
+        if let Some(cached) = self.simple_constructor_init_cache.get(&function_id) {
+            return cached.clone();
+        }
+        let init = crate::constructor_fast_path::match_simple_constructor_init(context, function);
+        self.simple_constructor_init_cache
+            .insert(function_id, init.clone());
+        init
+    }
+
+    fn try_finish_simple_constructor_init(
+        &mut self,
+        stack: &mut HoltStack,
+        function_id: u32,
+        init: Option<crate::constructor_fast_path::SimpleConstructorInit>,
+        receiver: JsObject,
+        proto: Value,
+        args: &[Value],
+        dst: u16,
+    ) -> Result<bool, VmError> {
+        let Some(init) = init else {
+            return Ok(false);
+        };
+        let Some(proto_obj) = proto.as_object() else {
+            return Ok(false);
+        };
+        if init.fields.iter().any(|field| {
+            !matches!(
+                crate::object::lookup(proto_obj, &self.gc_heap, &field.name),
+                crate::object::PropertyLookup::Absent
+            )
+        }) {
+            return Ok(false);
+        }
+
+        let values = init
+            .fields
+            .iter()
+            .map(|field| field.source.resolve(args))
+            .collect::<Vec<_>>();
+
+        let shape =
+            self.simple_constructor_shape(function_id, stack, proto, values.as_slice(), &init)?;
+
+        crate::object::set_fresh_object_shape(receiver, &mut self.gc_heap, shape);
+        crate::object::initialize_shaped_data_slots(receiver, &mut self.gc_heap, values.as_slice());
+
+        let top_idx = stack.len() - 1;
+        let frame = &mut stack[top_idx];
+        write_register(frame, dst, Value::object(receiver))?;
+        Ok(true)
+    }
+
+    fn simple_constructor_shape(
+        &mut self,
+        function_id: u32,
+        stack: &HoltStack,
+        proto: Value,
+        values: &[Value],
+        init: &crate::constructor_fast_path::SimpleConstructorInit,
+    ) -> Result<crate::object::ShapeHandle, VmError> {
+        if let Some(shape) = self.simple_constructor_shape_cache.get(&function_id) {
+            return Ok(*shape);
+        }
+
+        let mut shape = self.shape_root();
+        let roots = self.collect_allocation_roots(stack);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            proto.trace_value_slots(visitor);
+            for value in values {
+                value.trace_value_slots(visitor);
+            }
+        };
+        for field in &init.fields {
+            if let Some(child) = self.shape_runtime.child_if_cached(
+                &self.gc_heap,
+                shape,
+                &field.name,
+                crate::object::PropertyFlags::data_default(),
+                false,
+            ) {
+                shape = child;
+                continue;
+            }
+            shape = self
+                .shape_runtime
+                .child_with_roots(
+                    &mut self.gc_heap,
+                    shape,
+                    &field.name,
+                    crate::object::PropertyFlags::data_default(),
+                    false,
+                    &mut external_visit,
+                )
+                .map_err(VmError::from)?;
+        }
+        self.simple_constructor_shape_cache
+            .insert(function_id, shape);
+        Ok(shape)
     }
 
     pub(crate) fn do_construct_spread(

@@ -53,6 +53,7 @@ pub mod collections;
 pub mod collections_prototype;
 pub mod console;
 mod constant_ops;
+mod constructor_fast_path;
 mod conversion;
 mod cpu_profile;
 pub mod date;
@@ -458,6 +459,15 @@ pub struct Interpreter {
     /// Runtime object storage uses the root, interned shape keys, and
     /// transition/cache tables here.
     shape_runtime: object::ShapeRuntime,
+    /// Per-function cache for conservative base-class constructor initializers
+    /// recognized by `constructor_fast_path`. Entries hold owned strings and
+    /// source descriptors only; GC shape handles stay in `shape_runtime`.
+    simple_constructor_init_cache:
+        rustc_hash::FxHashMap<u32, Option<constructor_fast_path::SimpleConstructorInit>>,
+    /// Final hidden class reached by a cached simple constructor initializer.
+    /// These handles are traced explicitly because a moving GC must rewrite the
+    /// cache slot, not only the owning `shape_runtime` transition table.
+    simple_constructor_shape_cache: rustc_hash::FxHashMap<u32, object::ShapeHandle>,
     max_stack_depth: u32,
     sync_reentry_depth: u32,
     allow_blocking_atomics_wait: bool,
@@ -1236,6 +1246,8 @@ impl Interpreter {
             gc_heap,
             code_space: std::sync::Arc::new(code_space::CodeSpace::default()),
             shape_runtime,
+            simple_constructor_init_cache: rustc_hash::FxHashMap::default(),
+            simple_constructor_shape_cache: rustc_hash::FxHashMap::default(),
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
             sync_reentry_depth: 0,
             allow_blocking_atomics_wait: false,
@@ -4325,6 +4337,13 @@ impl Interpreter {
     #[must_use]
     pub(crate) fn shape_runtime_for_trace(&self) -> &object::ShapeRuntime {
         &self.shape_runtime
+    }
+
+    /// Borrow cached simple-constructor final shapes for root tracing.
+    pub(crate) fn simple_constructor_shapes_for_trace(
+        &self,
+    ) -> impl Iterator<Item = &object::ShapeHandle> {
+        self.simple_constructor_shape_cache.values()
     }
 
     /// Borrow store-property ICs for root tracing of cached GC shape handles.

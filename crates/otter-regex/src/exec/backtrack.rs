@@ -38,23 +38,29 @@ use crate::program::{Insn, Program};
 
 /// Capture slots: `Some(pos)` once written, `None` if the group is unset.
 ///
-/// The backtracker snapshots the full slot array onto its stack on every
-/// alternation / quantifier split (and clones it for each lookaround), so this
-/// is allocated and copied on the hottest path. Inlining the common case (a
-/// pattern with up to three capturing groups — `slot_count <= 8`) keeps those
-/// snapshots on the stack with no heap traffic; wider patterns spill to the
-/// heap exactly as a `Vec` would.
+/// A single instance is mutated in place for an entire match attempt. Rather
+/// than snapshot the whole array onto the backtrack stack at every alternation
+/// / quantifier split, each write is recorded in an undo log (see [`UndoLog`])
+/// and rolled back when the matcher backtracks past it — so a split is O(1)
+/// regardless of how many capture groups the pattern has. Inlining the common
+/// case (up to three capturing groups — `slot_count <= 8`) keeps the array on
+/// the stack with no heap traffic; wider patterns spill to the heap as a `Vec`.
 type Caps = SmallVec<[Option<usize>; 8]>;
 
-/// Reusable backtrack-stack buffer.
+/// One recorded capture-slot write: `(slot, previous_value)`. Replaying the log
+/// in reverse restores the slots to an earlier point.
+type UndoEntry = (usize, Option<usize>);
+
+/// Reusable per-attempt buffers.
 ///
-/// The top-level backtrack stack is the same shape for every match attempt, so
-/// a global search (`/g`) that probes many start offsets can keep one buffer and
-/// clear it per attempt instead of allocating a fresh `Vec` each time. Nested
-/// lookaround evaluation still uses its own transient stack.
+/// The backtrack stack and undo log are the same shape for every match attempt,
+/// so a global search (`/g`) that probes many start offsets keeps one of each
+/// and clears them per attempt instead of allocating fresh `Vec`s each time.
+/// Nested lookaround evaluation still uses its own transient buffers.
 #[derive(Debug, Default)]
 pub(crate) struct Scratch {
     stack: Vec<Frame>,
+    log: Vec<UndoEntry>,
 }
 
 impl Scratch {
@@ -82,8 +88,10 @@ pub(crate) fn attempt(
     };
     let caps: Caps = smallvec![None; program.slot_count()];
     let mut stack = core::mem::take(&mut scratch.stack);
-    let result = m.run(0, at, None, false, caps, &mut stack);
+    let mut log = core::mem::take(&mut scratch.log);
+    let result = m.run(0, at, None, false, caps, &mut stack, &mut log);
     scratch.stack = stack;
+    scratch.log = log;
     match result? {
         Some((_, caps)) => Ok(Some(caps)),
         None => Ok(None),
@@ -98,11 +106,15 @@ struct Matcher<'p, 't> {
 }
 
 /// A pending alternative on the backtrack stack.
+///
+/// `log_mark` is the undo-log length at the moment this alternative was pushed;
+/// resuming it first rolls the capture slots back to that point, undoing every
+/// write the abandoned path made.
 #[derive(Debug)]
 struct Frame {
     pc: usize,
     pos: usize,
-    caps: Caps,
+    log_mark: usize,
 }
 
 impl Matcher<'_, '_> {
@@ -116,14 +128,16 @@ impl Matcher<'_, '_> {
         start: usize,
         end_anchor: Option<usize>,
         freeze_capture_saves: bool,
-        caps0: Caps,
+        mut caps: Caps,
         stack: &mut Vec<Frame>,
+        log: &mut Vec<UndoEntry>,
     ) -> Result<Option<(usize, Caps)>, ExecError> {
         stack.clear();
+        log.clear();
         stack.push(Frame {
             pc: entry,
             pos: start,
-            caps: caps0,
+            log_mark: 0,
         });
 
         // Copy the program reference into a local so instruction borrows are
@@ -136,7 +150,13 @@ impl Matcher<'_, '_> {
         let limit = self.step_limit.unwrap_or(u64::MAX);
 
         while let Some(frame) = stack.pop() {
-            let (mut pc, mut pos, mut caps) = (frame.pc, frame.pos, frame.caps);
+            // Undo every capture write made on the abandoned path so this
+            // alternative resumes from the slot state captured at its split.
+            while log.len() > frame.log_mark {
+                let (slot, old) = log.pop().unwrap();
+                caps[slot] = old;
+            }
+            let (mut pc, mut pos) = (frame.pc, frame.pos);
             let accepted = loop {
                 self.steps += 1;
                 if self.steps > limit {
@@ -146,7 +166,7 @@ impl Matcher<'_, '_> {
                 match &prog.insns[pc] {
                     Insn::Match | Insn::LookMatch => {
                         if end_anchor.is_none_or(|t| pos == t) {
-                            break Some((pos, caps));
+                            break Some(pos);
                         }
                         break None;
                     }
@@ -177,22 +197,27 @@ impl Matcher<'_, '_> {
                     },
                     Insn::Jump(t) => pc = *t,
                     Insn::Split(a, b) => {
+                        // O(1): record where to resume and the undo-log mark to
+                        // roll back to, instead of cloning the whole slot array.
                         stack.push(Frame {
                             pc: *b,
                             pos,
-                            caps: caps.clone(),
+                            log_mark: log.len(),
                         });
                         pc = *a;
                     }
                     Insn::Save(slot) => {
                         let slot = *slot;
                         if !freeze_capture_saves || caps[slot].is_none() {
+                            log.push((slot, caps[slot]));
                             caps[slot] = Some(pos);
                         }
                         pc += 1;
                     }
                     Insn::SetMark(slot) => {
-                        caps[*slot] = Some(pos);
+                        let slot = *slot;
+                        log.push((slot, caps[slot]));
+                        caps[slot] = Some(pos);
                         pc += 1;
                     }
                     Insn::ClearCapture(index) => {
@@ -200,7 +225,9 @@ impl Matcher<'_, '_> {
                         if !freeze_capture_saves
                             || (caps[2 * g].is_none() && caps[2 * g + 1].is_none())
                         {
+                            log.push((2 * g, caps[2 * g]));
                             caps[2 * g] = None;
+                            log.push((2 * g + 1, caps[2 * g + 1]));
                             caps[2 * g + 1] = None;
                         }
                         pc += 1;
@@ -250,7 +277,14 @@ impl Matcher<'_, '_> {
                         let (negate, behind, look_entry) = (*negate, *behind, *entry);
                         match self.eval_look(negate, behind, look_entry, pos, &caps)? {
                             Some(updated) => {
-                                caps = updated;
+                                // Apply the lookaround's capture writes, logging
+                                // each overwrite so a later backtrack restores it.
+                                for i in 0..caps.len() {
+                                    if caps[i] != updated[i] {
+                                        log.push((i, caps[i]));
+                                        caps[i] = updated[i];
+                                    }
+                                }
                                 pc += 1;
                             }
                             None => break None,
@@ -259,8 +293,8 @@ impl Matcher<'_, '_> {
                 }
             };
 
-            if let Some(result) = accepted {
-                return Ok(Some(result));
+            if let Some(pos) = accepted {
+                return Ok(Some((pos, caps)));
             }
         }
         Ok(None)
@@ -276,23 +310,38 @@ impl Matcher<'_, '_> {
         pos: usize,
         caps: &Caps,
     ) -> Result<Option<Caps>, ExecError> {
-        // Lookaround bodies recurse into `run` while the caller's stack is live,
-        // so they evaluate on their own transient buffer.
+        // Lookaround bodies recurse into `run` while the caller's stack and undo
+        // log are live, so they evaluate on their own transient buffers.
         let mut look_stack = Vec::new();
+        let mut look_log = Vec::new();
         let found = if behind {
             let mut hit = None;
             for s in 0..=pos {
-                if let Some((_, updated)) =
-                    self.run(entry, s, Some(pos), true, caps.clone(), &mut look_stack)?
-                {
+                if let Some((_, updated)) = self.run(
+                    entry,
+                    s,
+                    Some(pos),
+                    true,
+                    caps.clone(),
+                    &mut look_stack,
+                    &mut look_log,
+                )? {
                     hit = Some(updated);
                     break;
                 }
             }
             hit
         } else {
-            self.run(entry, pos, None, false, caps.clone(), &mut look_stack)?
-                .map(|(_, c)| c)
+            self.run(
+                entry,
+                pos,
+                None,
+                false,
+                caps.clone(),
+                &mut look_stack,
+                &mut look_log,
+            )?
+            .map(|(_, c)| c)
         };
 
         Ok(match (negate, found) {

@@ -18,7 +18,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-pattern-matching> (§22.2.2)
 
-use crate::classes::CodePointSet;
+use crate::classes::{ClassSet, CodePointSet};
 use crate::flags::Flags;
 use crate::parser::Parsed;
 use crate::parser::ast::{Assertion, GroupKind, Node, Quantifier};
@@ -30,6 +30,7 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
     let mark_base = 2 * (parsed.group_count as usize + 1);
     let mut e = Emitter {
         insns: Vec::new(),
+        classes: Vec::new(),
         next_mark: mark_base,
     };
     e.emit(Insn::Save(0));
@@ -39,23 +40,23 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
 
     // Precompute each class's ASCII membership bitmap so the executor tests the
     // dominant ASCII range with one bit check instead of a binary search.
-    for insn in &mut e.insns {
-        if let Insn::Class { set, .. } = insn {
-            set.finalize_ascii();
-        }
+    for set in &mut e.classes {
+        set.finalize_ascii();
     }
 
     let loop_marks = e.next_mark - mark_base;
     let unicode = flags.is_unicode_mode();
-    let prefilter = compute_first_set(&e.insns, flags.ignore_case, unicode).map(|(set, canon)| {
-        if canon {
-            crate::program::Prefilter::from_set_canon(&set, unicode)
-        } else {
-            crate::program::Prefilter::from_set(&set)
-        }
-    });
+    let prefilter =
+        compute_first_set(&e.insns, &e.classes, flags.ignore_case, unicode).map(|(set, canon)| {
+            if canon {
+                crate::program::Prefilter::from_set_canon(&set, unicode)
+            } else {
+                crate::program::Prefilter::from_set(&set)
+            }
+        });
     Program {
         insns: e.insns,
+        classes: e.classes,
         group_count: parsed.group_count,
         group_names: parsed.group_names,
         unicode,
@@ -78,6 +79,7 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
 /// canonicalization to pay off.
 fn compute_first_set(
     insns: &[Insn],
+    classes: &[crate::classes::ClassSet],
     ignore_case: bool,
     unicode: bool,
 ) -> Option<(CodePointSet, bool)> {
@@ -111,12 +113,12 @@ fn compute_first_set(
                 out.insert(*cp);
             }
             Insn::Class {
-                set,
+                class,
                 negate: false,
                 ignore_case,
-            } if set.strings.is_empty() => {
+            } if classes[*class as usize].strings.is_empty() => {
                 needs_canon |= *ignore_case;
-                out.union_with(&set.code_points);
+                out.union_with(&classes[*class as usize].code_points);
             }
             // Anything else (anchor, `.`, backref, lookaround, negated/string
             // class, or `Match` reachable zero-width) makes the start set
@@ -164,6 +166,8 @@ fn canonicalize_set(set: &CodePointSet, unicode: bool) -> Option<CodePointSet> {
 
 struct Emitter {
     insns: Vec<Insn>,
+    /// Out-of-line class sets; an `Insn::Class` stores an index into this.
+    classes: Vec<ClassSet>,
     /// Next free loop-mark slot.
     next_mark: usize,
 }
@@ -173,6 +177,13 @@ impl Emitter {
         let at = self.insns.len();
         self.insns.push(insn);
         at
+    }
+
+    /// Store a class set out of line, returning its index for an `Insn::Class`.
+    fn intern_class(&mut self, set: ClassSet) -> u32 {
+        let idx = self.classes.len() as u32;
+        self.classes.push(set);
+        idx
     }
 
     fn here(&self) -> usize {
@@ -203,8 +214,9 @@ impl Emitter {
                 ignore_case,
             } => {
                 if set.strings.is_empty() {
+                    let class = self.intern_class(set.clone());
                     self.emit(Insn::Class {
-                        set: set.clone(),
+                        class,
                         negate: *negate,
                         ignore_case: *ignore_case,
                     });
@@ -260,7 +272,7 @@ impl Emitter {
                 ignore_case,
             } => {
                 self.emit(Insn::BackRef {
-                    indices: indices.clone(),
+                    indices: indices.clone().into_boxed_slice(),
                     ignore_case: *ignore_case,
                 });
             }
@@ -316,7 +328,26 @@ impl Emitter {
     /// guards against an empty-matching body re-iterating forever
     /// (§22.2.2.5.1): each iteration records its start position and fails the
     /// back-edge if the body consumed nothing.
+    ///
+    /// When the body provably consumes at least one code point every iteration,
+    /// that guard is unnecessary, so the loop drops the per-iteration `SetMark`
+    /// and `CheckProgress` (and the mark slot) — two fewer instruction
+    /// dispatches per matched character on the hot `\w+` / `[0-9]+` shape.
     fn compile_star(&mut self, node: &Node, greedy: bool, captures: &[u32]) {
+        if consumes_input(node) {
+            let split = self.emit(Insn::Split(0, 0));
+            let body = self.here();
+            self.clear_captures(captures);
+            self.compile(node);
+            self.emit(Insn::Jump(split));
+            let out = self.here();
+            self.insns[split] = if greedy {
+                Insn::Split(body, out)
+            } else {
+                Insn::Split(out, body)
+            };
+            return;
+        }
         let mark = self.new_mark();
         let head = self.emit(Insn::SetMark(mark));
         let split = self.emit(Insn::Split(0, 0));
@@ -419,4 +450,29 @@ fn capture_indices(node: &Node) -> Vec<u32> {
     let mut out = Vec::new();
     visit(node, &mut out);
     out
+}
+
+/// Whether `node` provably consumes at least one code point on every successful
+/// match. Conservative: returns `false` whenever unsure, so an unbounded-loop
+/// progress guard is only ever dropped when an empty iteration is impossible.
+fn consumes_input(node: &Node) -> bool {
+    match node {
+        Node::Char { .. } | Node::AnyChar { .. } => true,
+        // A class always consumes one code point unless it carries an empty
+        // string alternative (`v`-mode `\q{}`).
+        Node::Class { set, .. } => set.strings.is_empty(),
+        Node::Group { kind, body } => match kind {
+            GroupKind::Capturing { .. } | GroupKind::NonCapturing => consumes_input(body),
+            // Lookarounds are zero-width.
+            GroupKind::Lookahead { .. } | GroupKind::Lookbehind { .. } => false,
+        },
+        // A concatenation consumes if any element always consumes.
+        Node::Concat(nodes) => nodes.iter().any(consumes_input),
+        // An alternation consumes only if every branch always consumes.
+        Node::Alternate(nodes) => !nodes.is_empty() && nodes.iter().all(consumes_input),
+        // `e{n,…}` consumes iff `n >= 1` and `e` consumes; otherwise it may
+        // match the empty string.
+        Node::Repeat { node, quant } => quant.min >= 1 && consumes_input(node),
+        Node::Empty | Node::Assert(_) | Node::BackRef { .. } => false,
+    }
 }

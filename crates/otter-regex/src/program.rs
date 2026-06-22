@@ -38,8 +38,10 @@ pub(crate) enum Insn {
     },
     /// Match one code point against a class set; `negate` inverts membership.
     Class {
-        /// The class set tested against the current code point.
-        set: ClassSet,
+        /// Index into [`Program::classes`] of the set tested against the current
+        /// code point. Held out-of-line so the instruction stays small and the
+        /// program vector dense — class sets are the only large operand.
+        class: u32,
         /// `true` for a negated class `[^...]`.
         negate: bool,
         /// `true` for case-insensitive class membership.
@@ -70,8 +72,9 @@ pub(crate) enum Insn {
     BackRef {
         /// 1-based group indices this resolves to. Duplicate named
         /// backreferences try the capture that participated; if none did, the
-        /// backreference matches the empty string.
-        indices: Vec<u32>,
+        /// backreference matches the empty string. Boxed to keep the
+        /// instruction small.
+        indices: Box<[u32]>,
         /// `true` for a case-insensitive comparison.
         ignore_case: bool,
     },
@@ -108,6 +111,9 @@ pub(crate) enum Insn {
 pub(crate) struct Program {
     /// The flat instruction vector; execution begins at index `0`.
     pub(crate) insns: Vec<Insn>,
+    /// Out-of-line class sets, indexed by [`Insn::Class::class`]. Kept here so
+    /// the instruction vector stays small and cache-dense.
+    pub(crate) classes: Vec<ClassSet>,
     /// Number of capturing groups (group 0 excluded).
     pub(crate) group_count: u32,
     /// Capture-group names in source order; `None` for unnamed groups. Index `i`

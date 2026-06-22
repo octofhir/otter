@@ -192,11 +192,18 @@ impl Matcher<'_, '_> {
                         _ => break None,
                     },
                     Insn::Class {
-                        set,
+                        class,
                         negate,
                         ignore_case,
                     } => match self.decode(pos) {
-                        Some((cp, w)) if self.class_member(set, *negate, cp, *ignore_case) => {
+                        Some((cp, w))
+                            if self.class_member(
+                                &prog.classes[*class as usize],
+                                *negate,
+                                cp,
+                                *ignore_case,
+                            ) =>
+                        {
                             pc += 1;
                             pos += w;
                         }

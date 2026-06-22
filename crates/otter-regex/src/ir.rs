@@ -335,17 +335,24 @@ impl Emitter {
     /// dispatches per matched character on the hot `\w+` / `[0-9]+` shape.
     fn compile_star(&mut self, node: &Node, greedy: bool, captures: &[u32]) {
         if consumes_input(node) {
-            let split = self.emit(Insn::Split(0, 0));
+            // Trailing-split loop: an entry split allows zero iterations, and a
+            // second split *after* the body decides whether to re-iterate. This
+            // keeps the back-edge a single `Split` instead of a `Jump` back to a
+            // leading split, so each matched character pays one control dispatch
+            // (the trailing split) plus the body — no separate jump.
+            let entry = self.emit(Insn::Split(0, 0));
             let body = self.here();
             self.clear_captures(captures);
             self.compile(node);
-            self.emit(Insn::Jump(split));
+            let back = self.emit(Insn::Split(0, 0));
             let out = self.here();
-            self.insns[split] = if greedy {
+            let split = if greedy {
                 Insn::Split(body, out)
             } else {
                 Insn::Split(out, body)
             };
+            self.insns[entry] = split.clone();
+            self.insns[back] = split;
             return;
         }
         let mark = self.new_mark();

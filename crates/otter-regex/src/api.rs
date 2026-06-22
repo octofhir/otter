@@ -1,7 +1,6 @@
 //! The public API surface — [`Regex`], [`Match`], and the match iterator.
 //!
-//! This is the exact surface a host VM consumes (see `docs/regex-rewrite-
-//! research.md` §1 for the contract mapped from Otter's call sites). A
+//! This is the exact surface a host VM consumes. A
 //! [`Regex`] is compiled once from a UTF-16 (or `&str`) pattern plus [`Flags`];
 //! [`Regex::find_utf16`] runs it against a UTF-16 subject from a start offset,
 //! yielding [`Match`]es. The stateful JS flags `g`/`y`/`d` are handled by the

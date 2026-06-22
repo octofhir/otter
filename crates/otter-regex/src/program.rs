@@ -113,31 +113,22 @@ pub(crate) struct Program {
     /// Capture-group names in source order; `None` for unnamed groups. Index `i`
     /// names group `i + 1`.
     pub(crate) group_names: Vec<Option<String>>,
-    /// `true` if any instruction is a backreference (engine-selection input).
-    pub(crate) has_backref: bool,
-    /// `m` — multiline anchors.
-    pub(crate) multiline: bool,
-    /// `i` — case-insensitive matching.
-    pub(crate) ignore_case: bool,
     /// `u`/`v` — code-point (surrogate-pair-aware) traversal.
     pub(crate) unicode: bool,
     /// Number of loop-mark slots (one per unbounded quantifier), allocated after
     /// the capture slots.
     pub(crate) loop_marks: usize,
-    /// Code points that can begin a match, when the pattern starts with a single
-    /// literal or non-negated class (including a leading alternation of such).
-    /// Used as a scan prefilter: positions whose code point is not a member
-    /// cannot start a match, so the executor skips them without running. `None`
-    /// when no such prefilter applies (anchored, empty-matching, or
-    /// case-insensitive starts).
-    pub(crate) first_set: Option<CodePointSet>,
-    /// Fast-dispatch form of [`Self::first_set`] for the scan loop: an O(1)
-    /// membership table for the common BMP range plus a single-literal fast
-    /// path. `None` exactly when `first_set` is `None`.
+    /// Scan prefilter for the leftmost search: the set of code points that can
+    /// begin a match, when the pattern starts with a single literal or
+    /// non-negated class (including a leading alternation of such). Positions
+    /// whose code point is not a member cannot start a match, so the executor
+    /// skips them without running. `None` when no such prefilter applies
+    /// (anchored, empty-matching, or an uncharacterizable leading instruction).
     pub(crate) prefilter: Option<Prefilter>,
 }
 
-/// A scan prefilter derived from [`Program::first_set`].
+/// A scan prefilter: the set of code points that can begin a match, in a form
+/// the leftmost search dispatches on cheaply.
 ///
 /// Replaces the per-position binary search over code-point ranges with an O(1)
 /// table lookup for code units below `TABLE`, and offers a single-literal fast

@@ -108,17 +108,6 @@ impl CodePointSet {
             .is_ok()
     }
 
-    /// Set union (`A` or `B`).
-    #[must_use]
-    pub(crate) fn union(&self, other: &CodePointSet) -> CodePointSet {
-        let mut out = self.clone();
-        for r in &other.ranges {
-            out.ranges.push(r.clone());
-        }
-        out.normalize();
-        out
-    }
-
     /// Add every member of `other` into `self`.
     pub(crate) fn union_with(&mut self, other: &CodePointSet) {
         for r in &other.ranges {

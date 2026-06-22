@@ -28,12 +28,6 @@
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-regexp-regular-expression-objects>
-//! - `docs/regex-rewrite-research.md` — the architecture decision record.
-
-// Milestone-1 scaffold: the parser, lowering, and executor bodies are `todo!()`
-// until Milestone 2, so the internal types/fns they will consume are not yet
-// referenced. Removed once M2 wires the pipeline end to end.
-#![allow(dead_code)]
 
 mod api;
 mod casefold;

@@ -30,7 +30,6 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
     let mark_base = 2 * (parsed.group_count as usize + 1);
     let mut e = Emitter {
         insns: Vec::new(),
-        mark_base,
         next_mark: mark_base,
     };
     e.emit(Insn::Save(0));
@@ -46,28 +45,21 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
         }
     }
 
-    let has_backref = e.insns.iter().any(|i| matches!(i, Insn::BackRef { .. }));
     let loop_marks = e.next_mark - mark_base;
     let unicode = flags.is_unicode_mode();
-    let first = compute_first_set(&e.insns, flags.ignore_case, unicode);
-    let prefilter = first.as_ref().map(|(set, canon)| {
-        if *canon {
-            crate::program::Prefilter::from_set_canon(set, unicode)
+    let prefilter = compute_first_set(&e.insns, flags.ignore_case, unicode).map(|(set, canon)| {
+        if canon {
+            crate::program::Prefilter::from_set_canon(&set, unicode)
         } else {
-            crate::program::Prefilter::from_set(set)
+            crate::program::Prefilter::from_set(&set)
         }
     });
-    let first_set = first.map(|(set, _)| set);
     Program {
         insns: e.insns,
         group_count: parsed.group_count,
         group_names: parsed.group_names,
-        has_backref,
-        multiline: flags.multiline,
-        ignore_case: flags.ignore_case,
-        unicode: flags.is_unicode_mode(),
+        unicode,
         loop_marks,
-        first_set,
         prefilter,
     }
 }
@@ -172,8 +164,6 @@ fn canonicalize_set(set: &CodePointSet, unicode: bool) -> Option<CodePointSet> {
 
 struct Emitter {
     insns: Vec<Insn>,
-    /// First loop-mark slot index (just past the capture slots).
-    mark_base: usize,
     /// Next free loop-mark slot.
     next_mark: usize,
 }

@@ -36,12 +36,6 @@ impl<'t> Input<'t> {
         }
     }
 
-    /// Number of code units in the subject.
-    #[must_use]
-    pub(crate) fn len(&self) -> usize {
-        self.units.len()
-    }
-
     /// Whether traversal decodes surrogate pairs to code points.
     #[must_use]
     pub(crate) fn is_code_point_mode(&self) -> bool {

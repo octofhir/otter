@@ -15,8 +15,8 @@
 //! # Invariants
 //! - The parser never recurses deeper than [`MAX_NESTING_DEPTH`] frames.
 //! - Capture-group ids are assigned in source order, 1-based.
-//! - Counted quantifiers above [`MAX_REPEAT`] are rejected (Phase 1 expansion
-//!   limit), keeping lowering output bounded.
+//! - Counted quantifiers above [`MAX_REPEAT`] are rejected, keeping the
+//!   lowering output bounded.
 //!
 //! # Scope
 //! Inline modifier groups `(?ims-ims:...)` (§22.2.1 RegularExpressionModifiers)
@@ -45,7 +45,8 @@ use ast::{Assertion, GroupKind, Node, Quantifier};
 /// later-phase task (an explicit work-stack or a large dedicated parse stack).
 pub(crate) const MAX_NESTING_DEPTH: usize = 200;
 
-/// Maximum counted-quantifier expansion the Phase-1 lowering accepts.
+/// Maximum counted-quantifier expansion the lowering accepts, bounding how far
+/// `{n,m}` can inflate the instruction vector.
 pub(crate) const MAX_REPEAT: u32 = 100_000;
 
 /// The result of a successful parse: the AST plus capture-group bookkeeping the

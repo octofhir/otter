@@ -2524,6 +2524,8 @@ impl Interpreter {
             array_type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
             array_elements_byte: header + crate::array::ARRAY_BODY_ELEMENTS_OFFSET as u32,
             array_length_byte: header + crate::array::ARRAY_BODY_LENGTH_OFFSET as u32,
+            array_exotic_byte: header
+                + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32,
         };
         view.cage_base = otter_gc::cage_base() as usize;
     }
@@ -4955,6 +4957,13 @@ impl Interpreter {
     /// release callee windows.
     pub fn jit_reg_top_ptr(&mut self) -> *mut usize {
         &mut self.reg_top
+    }
+
+    /// Address of the live array-index accessor protector. Compiled dense-array
+    /// stores read this on every store attempt because a VM call inside the same
+    /// compiled entry can invalidate the protector before a later store.
+    pub fn jit_array_index_accessor_protector_ptr(&mut self) -> *const bool {
+        &self.array_index_accessor_protector
     }
 
     /// Capacity of the flat JIT register stack in slots — the overflow bound

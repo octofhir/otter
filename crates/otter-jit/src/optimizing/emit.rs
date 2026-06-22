@@ -160,16 +160,16 @@ mod arm64 {
     };
     use crate::CompiledCode;
     use crate::baseline::{
-        BAIL_PC_OFFSET, CONTEXT_OFFSET, DIRECT_ENTRY_OFFSET, DIRECT_FRAME_INDEX_OFFSET,
-        DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET,
-        ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET, JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG,
-        OBJECT_BODY_TYPE_TAG, REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET, SPECIAL_FALSE,
-        SPECIAL_HOLE, SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
-        TAG_FUNCTION_ID, TAG_INT32, TAG_PTR_FUNCTION, TAG_PTR_OBJECT, TAG_SPECIAL,
-        THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, VM_OFFSET,
-        jit_abort_direct_call_stub, jit_call_method_stub, jit_finish_direct_call_bailed_stub,
-        jit_finish_direct_call_returned_stub, jit_prepare_direct_call_stub,
-        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
+        ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET, BAIL_PC_OFFSET, CONTEXT_OFFSET,
+        DIRECT_ENTRY_OFFSET, DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET,
+        DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET,
+        JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG, OBJECT_BODY_TYPE_TAG, REG_STACK_BASE_OFFSET,
+        REG_TOP_PTR_OFFSET, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED,
+        STATUS_RETURNED, STATUS_THREW, TAG_FUNCTION_ID, TAG_INT32, TAG_PTR_FUNCTION,
+        TAG_PTR_OBJECT, TAG_SPECIAL, THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET,
+        UPVALUES_PTR_OFFSET, VM_OFFSET, jit_abort_direct_call_stub, jit_call_method_stub,
+        jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
+        jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
     };
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
     use otter_vm::{Interpreter, JitFunctionView};
@@ -710,9 +710,9 @@ mod arm64 {
         dynasm!(ops ; .arch aarch64 ; =>done);
     }
 
-    /// Lower speculative typed-array `recv[idx] = value` fast paths. The
-    /// optimizing tier has no safepoints, so every miss deopts instead of
-    /// calling the VM store stub.
+    /// Lower speculative dense-array / typed-array `recv[idx] = value` fast
+    /// paths. The optimizing tier has no safepoints, so every miss deopts
+    /// instead of calling the VM store stub.
     fn emit_element_store(
         ops: &mut Assembler,
         view: &JitFunctionView,
@@ -722,6 +722,7 @@ mod arm64 {
         value_repr: Repr,
         exit: DynamicLabel,
     ) -> Result<(), Unsupported> {
+        let array_tag = u32::from(view.ta_layout.array_type_tag);
         let ta_tag = u32::from(view.ta_layout.ta_type_tag);
         let local_buf_type_tag = u32::from(view.ta_layout.local_buffer_type_tag);
         let kind_float64 = view.ta_layout.kind_float64;
@@ -734,8 +735,13 @@ mod arm64 {
         let buffer_disc_byte = view.ta_layout.buffer_disc_byte;
         let buffer_handle_byte = view.ta_layout.buffer_handle_byte;
         let (ptr_word, len_word) = vec_layout_offsets();
+        let arr_ptr_byte = view.ta_layout.array_elements_byte + ptr_word;
+        let arr_len_byte = view.ta_layout.array_elements_byte + len_word;
+        let arr_length_byte = view.ta_layout.array_length_byte;
+        let arr_exotic_byte = view.ta_layout.array_exotic_byte;
         let bytes_ptr_byte = view.ta_layout.buf_bytes_byte + ptr_word;
         let bytes_len_byte = view.ta_layout.buf_bytes_byte + len_word;
+        let array_path = ops.new_dynamic_label();
         let f64_path = ops.new_dynamic_label();
         let i32_path = ops.new_dynamic_label();
         let done = ops.new_dynamic_label();
@@ -745,6 +751,8 @@ mod arm64 {
         dynasm!(ops
             ; .arch aarch64
             ; mov w5, w5
+            ; cmp w2, array_tag
+            ; b.eq =>array_path
             ; cmp w2, ta_tag
             ; b.ne =>exit
             ; ldrb w3, [x0, ta_length_tracking_byte]
@@ -770,6 +778,46 @@ mod arm64 {
             ; cmp w4, kind_int32
             ; b.eq =>i32_path
             ; b =>exit
+            ; =>array_path
+            ; ldr x3, [x20, ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET]
+            ; ldrb w3, [x3]
+            ; cbnz w3, =>exit
+            ; ldr x3, [x0, arr_exotic_byte]
+            ; cbnz x3, =>exit
+            ; ldr x3, [x0, arr_len_byte]
+            ; cmp x5, x3
+            ; b.hs =>exit
+            ; ldr x3, [x0, arr_length_byte]
+            ; cmp x5, x3
+            ; b.hs =>exit
+            ; ldr x4, [x0, arr_ptr_byte]
+            ; lsl x3, x5, #3
+            ; add x4, x4, x3
+        );
+        match value_repr {
+            Repr::Int32 => {
+                load_loc(ops, 6, value_loc);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; movz x7, TAG_INT32 as u32, lsl #48
+                    ; orr x6, x6, x7
+                    ; str x6, [x4]
+                    ; b =>done
+                );
+            }
+            Repr::Float64 => {
+                load_fp_loc(ops, FP_LOAD_SCRATCH, value_loc);
+                emit_box_double(ops, FP_LOAD_SCRATCH, 6);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; str x6, [x4]
+                    ; b =>done
+                );
+            }
+            _ => return Err(Unsupported::Unlowered("store-element value not int32/f64")),
+        }
+        dynasm!(ops
+            ; .arch aarch64
             ; =>f64_path
             ; lsl x4, x5, #3
             ; add x4, x4, x3

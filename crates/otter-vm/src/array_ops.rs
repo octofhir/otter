@@ -26,6 +26,8 @@ use crate::{
     operand_decode::register_operand, read_register, symbol, to_length, write_register,
 };
 
+const MAX_DENSE_ARRAY_CONSTRUCT_HOLES: u32 = 65_536;
+
 impl Interpreter {
     pub(crate) fn run_array_static_operands(
         &mut self,
@@ -78,13 +80,24 @@ impl Interpreter {
                         value.trace_value_slots(visitor);
                     }
                 };
-                array::set_with_roots(
-                    arr,
-                    &mut self.gc_heap,
-                    (len - 1) as usize,
-                    Value::hole(),
-                    &mut external_visit,
-                )?;
+                if len <= MAX_DENSE_ARRAY_CONSTRUCT_HOLES {
+                    array::fill_dense_range_with_roots(
+                        arr,
+                        &mut self.gc_heap,
+                        0,
+                        len as usize,
+                        Value::hole(),
+                        &mut external_visit,
+                    )?;
+                } else {
+                    array::set_with_roots(
+                        arr,
+                        &mut self.gc_heap,
+                        (len - 1) as usize,
+                        Value::hole(),
+                        &mut external_visit,
+                    )?;
+                }
             }
             return Ok(Value::array(arr));
         }
@@ -585,5 +598,34 @@ mod tests {
         assert_eq!(crate::array::len(array, interp.gc_heap()), 8);
         assert!(!crate::array::has_own_element(array, interp.gc_heap(), 0));
         assert!(!crate::array::has_own_element(array, interp.gc_heap(), 7));
+    }
+
+    #[test]
+    fn array_construct_moderate_length_materializes_dense_holes() {
+        let mut interp = Interpreter::new();
+        let module = empty_module();
+        let mut stack: HoltStack = HoltStack::new();
+        stack.push(Frame::for_function(&module.functions[0]));
+        let before_reserved = interp.gc_heap().stats().reserved_bytes;
+
+        let result = interp
+            .array_construct_stack_rooted(&stack, &[Value::number_i32(20_000)])
+            .expect("Array constructor");
+
+        let after_reserved = interp.gc_heap().stats().reserved_bytes;
+        assert!(
+            after_reserved > before_reserved,
+            "moderate Array(length) should reserve dense hole storage"
+        );
+        let Some(array) = result.as_array() else {
+            panic!("expected array");
+        };
+        assert_eq!(crate::array::len(array, interp.gc_heap()), 20_000);
+        assert!(!crate::array::has_own_element(array, interp.gc_heap(), 0));
+        assert!(!crate::array::has_own_element(
+            array,
+            interp.gc_heap(),
+            19_999
+        ));
     }
 }

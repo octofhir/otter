@@ -256,6 +256,10 @@ pub struct JitTypedArrayLayout {
     pub array_elements_byte: u32,
     /// Offset to `ArrayBody.length`, the logical `length` property.
     pub array_length_byte: u32,
+    /// Offset to `ArrayBody.exotic`; a non-null sidecar means custom
+    /// prototype/accessor/descriptor/source-text state may make dense stores
+    /// observable, so inline stores must miss to the runtime path.
+    pub array_exotic_byte: u32,
 }
 
 /// Owned snapshot of one executable instruction.

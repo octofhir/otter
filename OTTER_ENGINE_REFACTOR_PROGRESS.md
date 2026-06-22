@@ -19,7 +19,7 @@ Fresh release binary: `target/release/otter`.
 | `typed-array.js` | 1.97s | 0.09s | 0.03s | closed enough for Tier1 |
 | `prop-access.js` | 2.11s | 0.17s | 0.03s | open |
 | `array-ops.js` | 2.36s | 0.45s | 0.09s | open |
-| `sort.js` | 2.76s | 1.12s | 0.16s | open |
+| `sort.js` | 2.76s | 0.35–0.53s | 0.16s | open; fill-loop store stubs closed |
 | `json.js` | 1.39s | 1.42s | 0.23s | open |
 | `string-ops.js` | 0.43s | 0.44s | 0.03s | open |
 | `regex.js` | 2.21s | 2.20s | 0.03s | open |
@@ -29,6 +29,10 @@ commits. GC-stress smoke passed for `fib`, `prop-access`, and `nbody`.
 Simple constructor field initialization now bypasses the hot `this.x/y/tag`
 store-property stub path for `prop-access.js`; measured JIT runtime property
 stubs dropped to 4 on the full benchmark and 0 on construct-only isolation.
+`sort.js` now bypasses the hot dense-array fill-loop `StoreElement` bridge after
+bounded `new Array(n)` dense-hole construction and guarded dense-array store
+lowering. Full benchmark JIT runtime property stubs dropped from ~760k to 42;
+the remaining dominant cost is still the ~760k direct callback/comparator calls.
 
 ## Architecture Scope
 
@@ -54,7 +58,8 @@ Benchmarks: `array-ops.js`, `sort.js`.
 Next actions:
 
 - Add or use focused counters for array callback and sort comparator paths.
-- Measure the residual cost inside prepared lean callback invocation.
+- Measure the residual cost inside prepared lean callback invocation now that
+  `sort.js` dense fill-loop stores no longer dominate runtime property stubs.
 - Cut the measured cost without changing generic Array semantics.
 - Re-run parity, GC stress, and targeted Array Test262 subsets.
 

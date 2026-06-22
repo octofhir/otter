@@ -147,6 +147,10 @@ pub struct JitCtx {
     /// adding the callee register count, and stores it back; the matching pop on
     /// return restores it.
     reg_top_ptr: *mut usize,
+    /// Address of the live array-index accessor protector. Dense array stores
+    /// read through this pointer at the store site, not at entry, because a
+    /// re-entered VM call can invalidate the protector before later stores.
+    array_index_accessor_protector_ptr: *const bool,
 }
 
 /// Two-word return of compiled code (`x0`/`x1` on arm64).
@@ -179,6 +183,8 @@ pub(crate) const REG_STACK_BASE_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_s
 /// Byte offset of [`JitCtx::reg_top_ptr`] — the address of the interpreter's
 /// `reg_top`, bumped to reserve a callee window and restored on return.
 pub(crate) const REG_TOP_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_top_ptr) as u32;
+pub(crate) const ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET: u32 =
+    std::mem::offset_of!(JitCtx, array_index_accessor_protector_ptr) as u32;
 /// Size of one `UpvalueCell` (a 4-byte compressed `Gc<UpvalueCellBody>`).
 pub(crate) const UPVALUE_CELL_SIZE: u32 = 4;
 /// Byte offset of the single `Value` inside an `UpvalueCellBody` from its
@@ -869,6 +875,8 @@ pub(crate) unsafe fn enter_compiled(ptrs: JitReentryPtrs, entry: *const u8) -> J
         // stable base / `reg_top` address of the flat JIT register stack.
         let reg_stack_base = unsafe { (*vm).jit_reg_stack_base() };
         let reg_top_ptr = unsafe { (*vm).jit_reg_top_ptr() };
+        let array_index_accessor_protector_ptr =
+            unsafe { (*vm).jit_array_index_accessor_protector_ptr() };
         let mut error = None;
         let mut ctx = JitCtx {
             regs,
@@ -889,6 +897,7 @@ pub(crate) unsafe fn enter_compiled(ptrs: JitReentryPtrs, entry: *const u8) -> J
             direct_upvalues_ptr: 0,
             reg_stack_base,
             reg_top_ptr,
+            array_index_accessor_protector_ptr,
         };
         // SAFETY: the mapping is live and `entry` was emitted with the
         // `JitEntry` ABI.
@@ -917,20 +926,21 @@ fn reg_offset(idx: u16) -> Result<u32, Unsupported> {
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
     use super::{
-        BAIL_PC_OFFSET, BaselineCode, CONTEXT_OFFSET, DIRECT_ENTRY_OFFSET,
-        DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET,
-        DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET, JIT_CTX_STACK_SIZE,
-        JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS, OBJECT_BODY_TYPE_TAG, Op, Operand,
-        REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_NULL,
-        SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_FUNCTION_ID,
-        TAG_INT32, TAG_NAN, TAG_PTR_FUNCTION, TAG_PTR_OBJECT, TAG_SPECIAL, THIS_VALUE_OFFSET,
-        UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, Unsupported, VM_OFFSET,
-        WhiskerIcCell, jit_abort_direct_call_stub, jit_call_method_stub, jit_delegate_op_stub,
-        jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
-        jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub, jit_load_upvalue_stub,
-        jit_make_fn_stub, jit_new_array_stub, jit_new_object_stub, jit_prepare_direct_call_stub,
-        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub, jit_store_element_stub,
-        jit_store_prop_stub, jit_store_upvalue_stub, jit_write_barrier_stub, reg_offset,
+        ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET, BAIL_PC_OFFSET, BaselineCode, CONTEXT_OFFSET,
+        DIRECT_ENTRY_OFFSET, DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET,
+        DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET,
+        JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS, OBJECT_BODY_TYPE_TAG, Op,
+        Operand, REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET, SPECIAL_FALSE, SPECIAL_HOLE,
+        SPECIAL_NULL, SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
+        TAG_FUNCTION_ID, TAG_INT32, TAG_NAN, TAG_PTR_FUNCTION, TAG_PTR_OBJECT, TAG_SPECIAL,
+        THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET,
+        Unsupported, VM_OFFSET, WhiskerIcCell, jit_abort_direct_call_stub, jit_call_method_stub,
+        jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
+        jit_finish_direct_call_returned_stub, jit_load_element_stub, jit_load_global_stub,
+        jit_load_prop_stub, jit_load_upvalue_stub, jit_make_fn_stub, jit_new_array_stub,
+        jit_new_object_stub, jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub,
+        jit_self_call_bail_stub, jit_store_element_stub, jit_store_prop_stub,
+        jit_store_upvalue_stub, jit_write_barrier_stub, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -1780,9 +1790,10 @@ mod arm64 {
                     emit_call_stub(&mut ops, jit_load_element_stub as *const () as usize, threw);
                     dynasm!(ops ; .arch aarch64 ; =>el_done);
                 }
-                // `recv[idx] = src` — inline `Float64Array`/`Int32Array` element
-                // store (guarded, no safepoint); every other case misses to the
-                // safe element-store bridge. Operands: recv, idx, src, scratch.
+                // `recv[idx] = src` — inline plain dense `Array` stores and
+                // `Float64Array`/`Int32Array` element stores (guarded, no
+                // safepoint); every other case misses to the safe element-store
+                // bridge. Operands: recv, idx, src, scratch.
                 Op::StoreElement => {
                     let recv = reg(ops_ref, 0)?;
                     let idx = reg(ops_ref, 1)?;
@@ -1795,6 +1806,13 @@ mod arm64 {
                         let recv_off = reg_offset(recv)?;
                         let idx_off = reg_offset(idx)?;
                         let src_off = reg_offset(src)?;
+                        let array_miss = ops.new_dynamic_label();
+                        emit_array_store(
+                            &mut ops, &ta_layout, cage_base, recv_off, idx_off, src_off,
+                            array_miss, el_done, threw, recv, src,
+                        );
+                        dynasm!(ops ; .arch aarch64 ; =>array_miss);
+
                         let f64_path = ops.new_dynamic_label();
                         let i32_path = ops.new_dynamic_label();
                         emit_ta_guard_chain(
@@ -3268,6 +3286,8 @@ mod arm64 {
             ; str x9, [sp, REG_STACK_BASE_OFFSET]
             ; ldr x9, [x20, REG_TOP_PTR_OFFSET]
             ; str x9, [sp, REG_TOP_PTR_OFFSET]
+            ; ldr x9, [x20, ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET]
+            ; str x9, [sp, ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET]
             ; mov x0, sp
             ; ldr x16, [x20, DIRECT_ENTRY_OFFSET]
             ; blr x16
@@ -3734,8 +3754,8 @@ mod arm64 {
         );
     }
 
-    /// Typed-array store guard chain (the store path is typed-array only for
-    /// now): prelude + `Float64Array`/`Int32Array` backing dispatch.
+    /// Typed-array store guard chain: prelude + `Float64Array`/`Int32Array`
+    /// backing dispatch.
     #[allow(clippy::too_many_arguments)]
     fn emit_ta_guard_chain(
         ops: &mut Assembler,
@@ -3752,6 +3772,65 @@ mod arm64 {
         dynasm!(ops ; .arch aarch64 ; cmp w10, ta_type_tag ; b.ne =>el_miss);
         emit_idx_int32(ops, idx_off, el_miss);
         emit_ta_backing(ops, ta, el_miss, f64_path, i32_path);
+    }
+
+    /// Inline dense `Array` element store for the narrow non-observable case:
+    /// default prototype, no exotic sidecar, intact array-index accessor
+    /// protector, int32 index inside both logical `length` and the dense
+    /// elements vector. Misses route to the existing typed-array/runtime path.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_array_store(
+        ops: &mut Assembler,
+        layout: &JitTypedArrayLayout,
+        cage_base: usize,
+        recv_off: u32,
+        idx_off: u32,
+        src_off: u32,
+        el_miss: DynamicLabel,
+        el_done: DynamicLabel,
+        threw: DynamicLabel,
+        recv_reg: u16,
+        src_reg: u16,
+    ) {
+        let array_tag = u32::from(layout.array_type_tag);
+        let (ptr_word, len_word) = vec_layout_offsets();
+        let arr_ptr_byte = layout.array_elements_byte + ptr_word;
+        let arr_len_byte = layout.array_elements_byte + len_word;
+        let length_byte = layout.array_length_byte;
+        let exotic_byte = layout.array_exotic_byte;
+
+        emit_recv_decompress(ops, cage_base, recv_off, el_miss);
+        emit_idx_int32(ops, idx_off, el_miss);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp w10, array_tag
+            ; b.ne =>el_miss
+            ; ldr x14, [x20, ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET]
+            ; ldrb w14, [x14]
+            ; cbnz w14, =>el_miss              // indexed proto/accessor hazard
+            ; ldr x14, [x9, exotic_byte]
+            ; cbnz x14, =>el_miss              // custom proto/accessor/flags/source
+            ; ldr x17, [x9, arr_len_byte]      // elements Vec length
+            ; cmp x12, x17
+            ; b.hs =>el_miss
+            ; ldr x16, [x9, length_byte]       // logical length
+            ; cmp x12, x16
+            ; b.hs =>el_miss                   // would need length update
+            ; ldr x13, [x9, arr_ptr_byte]      // elements Vec data pointer
+            ; lsl x14, x12, #3
+            ; add x14, x13, x14                // element address
+            ; ldr x9, [x19, src_off]
+            ; str x9, [x14]
+            ; lsr x10, x9, #48
+            ; movz x11, TAG_PTR_OBJECT as u32
+            ; cmp x10, x11
+            ; b.lo =>el_done                   // primitive value, no barrier
+            ; mov x0, x20
+            ; movz x1, recv_reg as u32
+            ; movz x2, src_reg as u32
+        );
+        emit_call_stub(ops, jit_write_barrier_stub as *const () as usize, threw);
+        dynasm!(ops ; .arch aarch64 ; b =>el_done);
     }
 
     /// Unified inline `LoadElement`: one receiver decompress + one index guard,
@@ -4000,6 +4079,7 @@ mod tests {
     fn run(view: &JitFunctionView, regs: &mut [u64]) -> Exit {
         let code = compile(view).expect("compiles");
         let mut error = None;
+        let array_index_accessor_protector = false;
         let mut ctx = JitCtx {
             regs: regs.as_mut_ptr(),
             self_closure: 0,
@@ -4019,6 +4099,7 @@ mod tests {
             direct_upvalues_ptr: 0,
             reg_stack_base: std::ptr::null_mut(),
             reg_top_ptr: std::ptr::null_mut(),
+            array_index_accessor_protector_ptr: &array_index_accessor_protector,
         };
         // SAFETY: integer-only function; never dereferences the null vm/stack.
         let entry: JitEntry = unsafe { std::mem::transmute(code.code.entry_ptr()) };

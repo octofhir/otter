@@ -3592,10 +3592,11 @@ impl Interpreter {
     }
 
     /// JIT bridge: run the GC write barrier after an inline `StoreProperty`
-    /// wrote a heap-pointer value into `obj_reg`'s value slab. The emitted
+    /// wrote a heap-pointer value into `obj_reg`'s object slab or dense array
+    /// storage. The emitted
     /// fast path already performed the slot store and only calls here when the
     /// stored value is a pointer (primitive stores need no barrier), so this
-    /// just marks the parent object's card for the old→young edge.
+    /// just marks the parent container's card for the old→young edge.
     pub fn jit_runtime_write_barrier(
         &mut self,
         stack: &HoltStack,
@@ -3606,13 +3607,14 @@ impl Interpreter {
         let Ok(receiver) = read_register(&stack[frame_index], obj_reg) else {
             return;
         };
-        let Some(obj) = receiver.as_object() else {
-            return;
-        };
         let Ok(value) = read_register(&stack[frame_index], src) else {
             return;
         };
-        self.gc_heap.record_write(obj, value);
+        if let Some(obj) = receiver.as_object() {
+            self.gc_heap.record_write(obj, value);
+        } else if let Some(arr) = receiver.as_array() {
+            self.gc_heap.record_write(arr, value);
+        }
     }
 
     /// Drive one tick of [`Op::LoadProperty`] when the receiver is

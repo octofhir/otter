@@ -21,7 +21,7 @@ Measured on 2026-06-21 with `OTTER_JIT=1`; Node measured with the same scripts.
 | `typed-array.js` | 0.09s | 0.03s | small | no Tier1 blocker |
 | `prop-access.js` | 0.17s | 0.03s | open | finish residual object/method cost |
 | `array-ops.js` | 0.45s | 0.09s | open | callback-heavy builtin path |
-| `sort.js` | 1.12s | 0.16s | open | comparator-heavy builtin path |
+| `sort.js` | 0.35–0.53s | 0.16s | open | fill-loop store stubs closed; comparator-heavy path remains |
 | `json.js` | 1.42s | 0.23s | open | runtime/builtin throughput |
 | `string-ops.js` | 0.44s | 0.03s | open | string builtin throughput |
 | `regex.js` | 2.20s | 0.03s | open | regex engine throughput |
@@ -75,6 +75,13 @@ Work:
   - comparator fast return-to-number path for monomorphic numeric comparators.
 - Keep generic semantics intact: holes, inherited indices, accessors, species,
   callback side effects, detached buffers, throws, and GC movement.
+
+Current `sort.js` status: bounded `new Array(n)` construction now materializes
+dense hole storage for moderate lengths, and Tier1 dense-array `StoreElement`
+inlines the fill loop when the array-index accessor protector and array exotic
+state prove the write is not observable. Full benchmark JIT runtime property
+stubs dropped from ~760k to 42. The remaining hot cost is the ~760k direct JS
+callback/comparator calls.
 
 Gates:
 

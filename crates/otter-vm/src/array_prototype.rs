@@ -58,6 +58,34 @@ enum SortComparatorFastPath {
     NumericSub,
 }
 
+fn numeric_sub_sort_order(x: Value, y: Value) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    let x_undef = x.is_undefined();
+    let y_undef = y.is_undefined();
+    if x_undef && y_undef {
+        return Some(Ordering::Equal);
+    }
+    if x_undef {
+        return Some(Ordering::Greater);
+    }
+    if y_undef {
+        return Some(Ordering::Less);
+    }
+    let (Some(lhs), Some(rhs)) = (x.as_f64(), y.as_f64()) else {
+        return None;
+    };
+    let f = lhs - rhs;
+    Some(if f.is_nan() {
+        Ordering::Equal
+    } else if f < 0.0 {
+        Ordering::Less
+    } else if f > 0.0 {
+        Ordering::Greater
+    } else {
+        Ordering::Equal
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ArrayCallbackFastPath {
     MapMulAdd { mul: f64, add: f64 },
@@ -1670,19 +1698,10 @@ impl Interpreter {
             return Ok(Ordering::Less);
         }
         if !comparefn.is_undefined() {
-            if fast_path == Some(SortComparatorFastPath::NumericSub)
-                && let (Some(lhs), Some(rhs)) = (x.as_f64(), y.as_f64())
-            {
-                let f = lhs - rhs;
-                return Ok(if f.is_nan() {
-                    Ordering::Equal
-                } else if f < 0.0 {
-                    Ordering::Less
-                } else if f > 0.0 {
-                    Ordering::Greater
-                } else {
-                    Ordering::Equal
-                });
+            if fast_path == Some(SortComparatorFastPath::NumericSub) {
+                if let Some(order) = numeric_sub_sort_order(x, y) {
+                    return Ok(order);
+                }
             }
             let r = match lean_inner {
                 Some(state) => self.run_bytecode_callable_committed_lean_args(
@@ -1742,16 +1761,25 @@ impl Interpreter {
                 let end = (start + width.saturating_mul(2)).min(n);
                 let (mut left, mut right, mut out) = (start, mid, start);
                 while left < mid && right < end {
+                    let order = match fast_path {
+                        Some(SortComparatorFastPath::NumericSub) => {
+                            numeric_sub_sort_order(src[left], src[right])
+                        }
+                        None => None,
+                    };
+                    let order = match order {
+                        Some(order) => order,
+                        None => self.sort_compare(
+                            context,
+                            src[left],
+                            src[right],
+                            comparefn,
+                            fast_path,
+                            lean_inner.as_deref_mut(),
+                        )?,
+                    };
                     // Stable: keep the left element on a tie.
-                    if self.sort_compare(
-                        context,
-                        src[left],
-                        src[right],
-                        comparefn,
-                        fast_path,
-                        lean_inner.as_deref_mut(),
-                    )? != Ordering::Greater
-                    {
+                    if order != Ordering::Greater {
                         dst[out] = src[left];
                         left += 1;
                     } else {

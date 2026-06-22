@@ -1316,13 +1316,61 @@ mod arm64 {
         Ok(())
     }
 
+    /// Fast-path `ToInt32` for bitwise operators.
+    ///
+    /// Int32-tagged values are unboxed directly. Doubles are accepted only when
+    /// finite and already inside the signed 32-bit range; all modulo, NaN,
+    /// infinity, string, BigInt, and object coercion cases bail to the
+    /// interpreter for exact ECMAScript semantics.
+    fn emit_to_int32_fast(ops: &mut Assembler, src_x: u32, dst_w: u32, bail: DynamicLabel) {
+        let is_non_int = ops.new_dynamic_label();
+        let double_ready = ops.new_dynamic_label();
+        let done = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch aarch64
+            ; lsr x14, X(src_x), #48
+            ; movz x15, TAG_INT32 as u32
+            ; cmp x14, x15
+            ; b.ne =>is_non_int
+            ; mov W(dst_w), W(src_x)
+            ; b =>done
+            ; =>is_non_int
+            // Double iff high-16 is outside the tagged non-number range
+            // 0x7FFA..=0x7FFF. The canonical NaN tag flows to the fcmp check
+            // below and bails as a non-finite double.
+            ; sub x14, x14, x15
+            ; cmp x14, #6
+            ; b.ls =>bail
+            ; fmov d0, X(src_x)
+            ; fcmp d0, d0
+            ; b.vs =>bail
+        );
+        emit_load_u64(ops, 14, (-2_147_483_648.0f64).to_bits());
+        dynasm!(ops
+            ; .arch aarch64
+            ; fmov d1, x14
+            ; fcmp d0, d1
+            ; b.lt =>bail
+        );
+        emit_load_u64(ops, 14, 2_147_483_648.0f64.to_bits());
+        dynasm!(ops
+            ; .arch aarch64
+            ; fmov d1, x14
+            ; fcmp d0, d1
+            ; b.lt =>double_ready
+            ; b =>bail
+            ; =>double_ready
+            ; fcvtzs W(dst_w), d0
+            ; =>done
+        );
+    }
+
     /// Emit an int32 bitwise/shift op (`BitwiseOr`/`And`/`Xor`/`Shl`/`Shr`).
     ///
-    /// Both operands must already be int32-tagged Values; a non-int32 operand
-    /// bails to the interpreter (which performs the full `ToInt32`/`ToUint32`
-    /// coercion). Result is int32, matching JS semantics: the AArch64 32-bit
-    /// `lsl`/`asr` mask the shift count to its low 5 bits exactly as JS masks
-    /// the right operand to `& 31`.
+    /// Operands take the guarded `ToInt32` fast path above; misses bail to the
+    /// interpreter. Result is int32, matching JS semantics for accepted inputs:
+    /// the AArch64 32-bit `lsl`/`asr` mask the shift count to its low 5 bits
+    /// exactly as JS masks the right operand to `& 31`.
     fn emit_int_binop(
         ops: &mut Assembler,
         operands: &[Operand],
@@ -1332,14 +1380,14 @@ mod arm64 {
         let (dst, lhs, rhs) = reg3(operands)?;
         load_reg(ops, 9, lhs)?;
         load_reg(ops, 10, rhs)?;
-        guard_int32!(ops, 9, bail);
-        guard_int32!(ops, 10, bail);
+        emit_to_int32_fast(ops, 9, 11, bail);
+        emit_to_int32_fast(ops, 10, 12, bail);
         match kind {
-            IntBinOp::Or => dynasm!(ops ; .arch aarch64 ; orr w13, w9, w10),
-            IntBinOp::And => dynasm!(ops ; .arch aarch64 ; and w13, w9, w10),
-            IntBinOp::Xor => dynasm!(ops ; .arch aarch64 ; eor w13, w9, w10),
-            IntBinOp::Shl => dynasm!(ops ; .arch aarch64 ; lsl w13, w9, w10),
-            IntBinOp::Shr => dynasm!(ops ; .arch aarch64 ; asr w13, w9, w10),
+            IntBinOp::Or => dynasm!(ops ; .arch aarch64 ; orr w13, w11, w12),
+            IntBinOp::And => dynasm!(ops ; .arch aarch64 ; and w13, w11, w12),
+            IntBinOp::Xor => dynasm!(ops ; .arch aarch64 ; eor w13, w11, w12),
+            IntBinOp::Shl => dynasm!(ops ; .arch aarch64 ; lsl w13, w11, w12),
+            IntBinOp::Shr => dynasm!(ops ; .arch aarch64 ; asr w13, w11, w12),
         }
         box_low32!(ops, 13, 12, TAG_INT32);
         store_reg(ops, 13, dst)?;
@@ -4029,6 +4077,40 @@ mod tests {
         ]);
         let mut regs = [0u64; 8];
         expect_int(&v, &mut regs, 58);
+    }
+
+    #[test]
+    fn bitwise_or_truncates_in_range_double() {
+        let v = view(&[
+            (
+                Op::BitwiseOr,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
+        ]);
+        let mut regs = [box_f64(123.9), box_i32(0), 0, 0, 0, 0, 0, 0];
+        expect_int(&v, &mut regs, 123);
+    }
+
+    #[test]
+    fn bitwise_or_bails_on_out_of_range_double() {
+        let v = view(&[
+            (
+                Op::BitwiseOr,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
+        ]);
+        let mut regs = [box_f64(2_147_483_648.0), box_i32(0), 0, 0, 0, 0, 0, 0];
+        assert!(matches!(run(&v, &mut regs), Exit::Bailed));
     }
 
     #[test]

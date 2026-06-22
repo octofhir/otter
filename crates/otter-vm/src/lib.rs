@@ -1562,11 +1562,15 @@ impl Interpreter {
             Some(jit::JitExecOutcome::Bailed(pc)) => {
                 // Compiled body hit a guard or unsupported opcode. Resume the
                 // interpreter at the exact bail PC (committed side effects are
-                // preserved). Disable only this loop header (not the whole
-                // function): a different hot loop in the same body (e.g. the real
-                // kernel after a one-off setup loop that bails) can still tier up.
+                // preserved). Disable this loop header only when the miss was in
+                // the target loop itself. A compiled OSR slice may finish the hot
+                // loop, continue through cold epilogue/outer-loop code, and bail
+                // there; that should not permanently suppress the header on the
+                // next hot iteration.
                 stack[top_idx].pc = pc;
-                self.jit_osr_disabled.insert((fid, osr_pc));
+                if Self::osr_bail_inside_target_loop(context, fid, osr_pc, pc) {
+                    self.jit_osr_disabled.insert((fid, osr_pc));
+                }
                 Ok(None)
             }
             Some(jit::JitExecOutcome::Returned(value)) => {
@@ -1575,6 +1579,42 @@ impl Interpreter {
             }
             Some(jit::JitExecOutcome::Threw(err)) => Err(err),
         }
+    }
+
+    fn osr_bail_inside_target_loop(
+        context: &ExecutionContext,
+        fid: u32,
+        osr_pc: u32,
+        bail_pc: u32,
+    ) -> bool {
+        let Some(view) = context.jit_function_view(fid) else {
+            return true;
+        };
+        Self::osr_bail_inside_target_loop_instructions(&view.instructions, osr_pc, bail_pc)
+    }
+
+    fn osr_bail_inside_target_loop_instructions(
+        instructions: &[JitInstrView],
+        osr_pc: u32,
+        bail_pc: u32,
+    ) -> bool {
+        let mut loop_end = None;
+        for instr in instructions {
+            if !matches!(instr.op, Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse) {
+                continue;
+            }
+            let Some(otter_bytecode::Operand::Imm32(rel)) = instr.operands.first() else {
+                continue;
+            };
+            let target = i64::from(instr.byte_pc) + 1 + i64::from(*rel);
+            if target == i64::from(osr_pc) && instr.byte_pc >= osr_pc {
+                loop_end = Some(loop_end.map_or(instr.byte_pc, |end: u32| end.max(instr.byte_pc)));
+            }
+        }
+        let Some(loop_end) = loop_end else {
+            return true;
+        };
+        osr_pc <= bail_pc && bail_pc <= loop_end
     }
 
     /// Tier-up entry point for a synchronously-entered call frame (the
@@ -9668,6 +9708,48 @@ mod tests {
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
         }
+    }
+
+    fn jit_instr(op: Op, byte_pc: u32, operands: Vec<Operand>) -> JitInstrView {
+        JitInstrView {
+            op,
+            byte_pc,
+            byte_len: 1,
+            property_ic_site: None,
+            operands,
+            make_self: false,
+            load_array_length: false,
+            load_number: None,
+            arith_feedback: 0,
+            property_feedback: None,
+        }
+    }
+
+    #[test]
+    fn osr_bail_policy_only_disables_target_loop_misses() {
+        let instructions = vec![
+            jit_instr(
+                Op::LoadInt32,
+                0,
+                vec![Operand::Register(0), Operand::Imm32(0)],
+            ),
+            jit_instr(
+                Op::Jump,
+                40,
+                vec![Operand::Imm32(-31)], // target = 40 + 1 - 31 = 10.
+            ),
+        ];
+
+        assert!(Interpreter::osr_bail_inside_target_loop_instructions(
+            &instructions,
+            10,
+            30
+        ));
+        assert!(!Interpreter::osr_bail_inside_target_loop_instructions(
+            &instructions,
+            10,
+            50
+        ));
     }
 
     #[test]

@@ -189,6 +189,12 @@ pub(crate) struct ClassSet {
     pub(crate) code_points: CodePointSet,
     /// Multi-code-point string alternatives, longest-first for match priority.
     pub(crate) strings: Vec<Vec<u32>>,
+    /// O(1) membership bitmap for code points `0..128`, one bit per code point.
+    /// Populated by [`Self::finalize_ascii`] once at lowering; the executor uses
+    /// it instead of a binary search over `code_points` for the dominant ASCII
+    /// range. Zero until finalized, so every compiled class must be finalized
+    /// before execution (the lowering pass does this for every `Insn::Class`).
+    pub(crate) ascii_lo: u128,
 }
 
 impl ClassSet {
@@ -198,6 +204,7 @@ impl ClassSet {
         Self {
             code_points,
             strings: Vec::new(),
+            ascii_lo: 0,
         }
     }
 
@@ -243,6 +250,7 @@ impl ClassSet {
                 .filter(|s| other.strings.contains(*s))
                 .cloned()
                 .collect(),
+            ascii_lo: 0,
         }
     }
 
@@ -258,6 +266,7 @@ impl ClassSet {
                 .filter(|s| !other.strings.contains(*s))
                 .cloned()
                 .collect(),
+            ascii_lo: 0,
         }
     }
 
@@ -269,7 +278,33 @@ impl ClassSet {
         ClassSet {
             code_points: self.code_points.negate(),
             strings: Vec::new(),
+            ascii_lo: 0,
         }
+    }
+
+    /// Precompute the ASCII (`0..128`) membership bitmap from `code_points`.
+    /// Idempotent; the lowering pass calls it once per compiled class so the
+    /// executor can test the dominant ASCII range with a single bit check.
+    pub(crate) fn finalize_ascii(&mut self) {
+        let mut bits: u128 = 0;
+        for r in self.code_points.ranges() {
+            let lo = *r.start();
+            if lo >= 128 {
+                continue;
+            }
+            for cp in lo..=(*r.end()).min(127) {
+                bits |= 1u128 << cp;
+            }
+        }
+        self.ascii_lo = bits;
+    }
+
+    /// Whether ASCII code point `cp` (`< 128`) is a member, via the bitmap.
+    #[inline]
+    #[must_use]
+    pub(crate) fn ascii_contains(&self, cp: u32) -> bool {
+        debug_assert!(cp < 128);
+        (self.ascii_lo >> cp) & 1 == 1
     }
 }
 

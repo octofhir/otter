@@ -406,13 +406,22 @@ impl Matcher<'_, '_> {
     }
 
     fn class_member(&self, set: &ClassSet, negate: bool, cp: u32, ignore_case: bool) -> bool {
-        let mut inside = set.code_points.contains(cp);
-        if !inside && ignore_case {
-            inside = set.code_points.contains(ascii_other_case(cp));
-            if !inside && self.program.unicode {
-                inside = set.code_points.contains(fold_unicode(cp));
+        let inside = if cp < 128 {
+            // ASCII fast path: an O(1) bitmap check. Both case-fold directions
+            // for ASCII letters stay in ASCII, so the opposite-case probe covers
+            // the unicode fold here too (a non-ASCII member can never fold into
+            // the ASCII range).
+            set.ascii_contains(cp) || (ignore_case && set.ascii_contains(ascii_other_case(cp)))
+        } else {
+            let mut m = set.code_points.contains(cp);
+            if !m && ignore_case {
+                m = set.code_points.contains(ascii_other_case(cp));
+                if !m && self.program.unicode {
+                    m = set.code_points.contains(fold_unicode(cp));
+                }
             }
-        }
+            m
+        };
         inside != negate
     }
 

@@ -38,10 +38,26 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
     e.emit(Insn::Save(1));
     e.emit(Insn::Match);
 
+    // Precompute each class's ASCII membership bitmap so the executor tests the
+    // dominant ASCII range with one bit check instead of a binary search.
+    for insn in &mut e.insns {
+        if let Insn::Class { set, .. } = insn {
+            set.finalize_ascii();
+        }
+    }
+
     let has_backref = e.insns.iter().any(|i| matches!(i, Insn::BackRef { .. }));
     let loop_marks = e.next_mark - mark_base;
-    let first_set = compute_first_set(&e.insns, flags.ignore_case);
-    let prefilter = first_set.as_ref().map(crate::program::Prefilter::from_set);
+    let unicode = flags.is_unicode_mode();
+    let first = compute_first_set(&e.insns, flags.ignore_case, unicode);
+    let prefilter = first.as_ref().map(|(set, canon)| {
+        if *canon {
+            crate::program::Prefilter::from_set_canon(set, unicode)
+        } else {
+            crate::program::Prefilter::from_set(set)
+        }
+    });
+    let first_set = first.map(|(set, _)| set);
     Program {
         insns: e.insns,
         group_count: parsed.group_count,
@@ -58,20 +74,27 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
 
 /// If every match must begin by consuming a single literal or non-negated class
 /// — including a leading alternation of such (`foo|bar`) or a leading quantified
-/// atom whose start is still characterizable — return the union of code points
-/// that can start a match. Conservatively `None` under case-insensitivity
-/// (folding widens the start set) or for any non-characterizable leading
-/// instruction (anchor, `.`, backref, lookaround, or a path that can match the
-/// empty string).
-fn compute_first_set(insns: &[Insn], ignore_case: bool) -> Option<CodePointSet> {
-    if ignore_case {
-        return None;
-    }
+/// atom whose start is still characterizable — return the code points that can
+/// start a match plus whether the scan must canonicalize the input first.
+///
+/// The boolean is `true` when any leading atom matches case-insensitively
+/// (`i` flag, or an inline `(?i:` modifier); in that case the returned set holds
+/// the *canonicalized* member code points so the scan can fold each input code
+/// point and compare, mirroring `char_eq` exactly. `None` for any
+/// non-characterizable leading instruction (anchor, `.`, backref, lookaround, or
+/// a path that can match the empty string), or a leading class too large for
+/// canonicalization to pay off.
+fn compute_first_set(
+    insns: &[Insn],
+    ignore_case: bool,
+    unicode: bool,
+) -> Option<(CodePointSet, bool)> {
     // BFS over the zero-width-passable prefix: follow control flow until the
     // first consuming instruction on every path. Every reachable consuming
     // instruction must be a literal or non-negated class, or the whole filter
     // is unsound (could skip a valid start) and we bail.
     let mut out = CodePointSet::new();
+    let mut needs_canon = ignore_case;
     let mut visited = vec![false; insns.len()];
     let mut work = vec![0usize];
     while let Some(pc) = work.pop() {
@@ -90,22 +113,61 @@ fn compute_first_set(insns: &[Insn], ignore_case: bool) -> Option<CodePointSet> 
                 work.push(*b);
             }
             // First consuming instruction on this path: must be characterizable.
-            Insn::Char {
-                cp,
-                ignore_case: false,
-            } => out.insert(*cp),
+            // A case-insensitive atom forces canonicalization of the whole set.
+            Insn::Char { cp, ignore_case } => {
+                needs_canon |= *ignore_case;
+                out.insert(*cp);
+            }
             Insn::Class {
                 set,
                 negate: false,
-                ignore_case: false,
-            } if set.strings.is_empty() => out.union_with(&set.code_points),
-            // Anything else (anchor, `.`, backref, lookaround, case-folded atom,
-            // negated/string class, or `Match` reachable zero-width) makes the
-            // start set unsound.
+                ignore_case,
+            } if set.strings.is_empty() => {
+                needs_canon |= *ignore_case;
+                out.union_with(&set.code_points);
+            }
+            // Anything else (anchor, `.`, backref, lookaround, negated/string
+            // class, or `Match` reachable zero-width) makes the start set
+            // unsound.
             _ => return None,
         }
     }
-    if out.is_empty() { None } else { Some(out) }
+    if out.is_empty() {
+        return None;
+    }
+    if needs_canon {
+        out = canonicalize_set(&out, unicode)?;
+        if out.is_empty() {
+            return None;
+        }
+    }
+    Some((out, needs_canon))
+}
+
+/// Fold every member of `set` to its canonical form (`fold_unicode` under `u`/
+/// `v`, else `canonicalize`). Returns `None` when the set is too large for the
+/// per-code-point fold to be worth it — such a prefilter would barely filter.
+fn canonicalize_set(set: &CodePointSet, unicode: bool) -> Option<CodePointSet> {
+    const MAX_FOLD: u32 = 4096;
+    let mut count: u32 = 0;
+    for r in set.ranges() {
+        count = count.saturating_add(*r.end() - *r.start() + 1);
+        if count > MAX_FOLD {
+            return None;
+        }
+    }
+    let mut out = CodePointSet::new();
+    for r in set.ranges() {
+        for cp in *r.start()..=*r.end() {
+            let c = if unicode {
+                crate::casefold::fold_unicode(cp)
+            } else {
+                crate::casefold::canonicalize(cp)
+            };
+            out.insert(c);
+        }
+    }
+    Some(out)
 }
 
 struct Emitter {

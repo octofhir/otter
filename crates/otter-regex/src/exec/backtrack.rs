@@ -105,21 +105,6 @@ struct Frame {
     caps: Caps,
 }
 
-/// The decoded action of one instruction, computed while the instruction is
-/// borrowed so the borrow can end before any `&mut self` work (lookaround).
-enum Act {
-    Accept,
-    Backtrack,
-    Goto(usize),
-    Consume(usize, usize),
-    Split(usize, usize),
-    Save(usize),
-    ClearCapture(u32),
-    SetMark(usize),
-    CheckProgress(usize),
-    Look(bool, bool, usize),
-}
-
 impl Matcher<'_, '_> {
     /// Run from `entry` at `start`. `end_anchor`, when set, only accepts a
     /// terminator reached exactly at that offset (used by lookbehind).
@@ -141,118 +126,77 @@ impl Matcher<'_, '_> {
             caps: caps0,
         });
 
+        // Copy the program reference into a local so instruction borrows are
+        // independent of `&mut self`: the consuming arms can mutate `pc`/`pos`
+        // and the lookaround arm can call `&mut self` `eval_look` without a
+        // separate decode-then-act dispatch step.
+        let prog = self.program;
+        // `u64::MAX` sentinel turns the unbounded case into a never-taken
+        // compare instead of an `Option` test on every instruction.
+        let limit = self.step_limit.unwrap_or(u64::MAX);
+
         while let Some(frame) = stack.pop() {
             let (mut pc, mut pos, mut caps) = (frame.pc, frame.pos, frame.caps);
             let accepted = loop {
                 self.steps += 1;
-                if let Some(limit) = self.step_limit
-                    && self.steps > limit
-                {
+                if self.steps > limit {
                     return Err(ExecError::StepLimitExceeded);
                 }
 
-                let act = {
-                    let insn = &self.program.insns[pc];
-                    match insn {
-                        Insn::Match | Insn::LookMatch => {
-                            if end_anchor.is_none_or(|t| pos == t) {
-                                Act::Accept
-                            } else {
-                                Act::Backtrack
-                            }
+                match &prog.insns[pc] {
+                    Insn::Match | Insn::LookMatch => {
+                        if end_anchor.is_none_or(|t| pos == t) {
+                            break Some((pos, caps));
                         }
-                        Insn::Char { cp: c, ignore_case } => match self.decode(pos) {
-                            Some((cp, w)) if self.char_eq(*c, cp, *ignore_case) => {
-                                Act::Consume(pc + 1, pos + w)
-                            }
-                            _ => Act::Backtrack,
-                        },
-                        Insn::AnyChar { dot_all } => match self.decode(pos) {
-                            Some((cp, w)) if *dot_all || !is_line_terminator(cp) => {
-                                Act::Consume(pc + 1, pos + w)
-                            }
-                            _ => Act::Backtrack,
-                        },
-                        Insn::Class {
-                            set,
-                            negate,
-                            ignore_case,
-                        } => match self.decode(pos) {
-                            Some((cp, w)) if self.class_member(set, *negate, cp, *ignore_case) => {
-                                Act::Consume(pc + 1, pos + w)
-                            }
-                            _ => Act::Backtrack,
-                        },
-                        Insn::Jump(t) => Act::Goto(*t),
-                        Insn::Split(a, b) => Act::Split(*a, *b),
-                        Insn::ClearCapture(index) => Act::ClearCapture(*index),
-                        Insn::Save(slot) => Act::Save(*slot),
-                        Insn::SetMark(slot) => Act::SetMark(*slot),
-                        Insn::CheckProgress(slot) => Act::CheckProgress(*slot),
-                        Insn::AssertStart { multiline } => {
-                            if self.at_start(pos, *multiline) {
-                                Act::Goto(pc + 1)
-                            } else {
-                                Act::Backtrack
-                            }
-                        }
-                        Insn::AssertEnd { multiline } => {
-                            if self.at_end(pos, *multiline) {
-                                Act::Goto(pc + 1)
-                            } else {
-                                Act::Backtrack
-                            }
-                        }
-                        Insn::WordBoundary(invert) => {
-                            if self.word_boundary(pos) != *invert {
-                                Act::Goto(pc + 1)
-                            } else {
-                                Act::Backtrack
-                            }
-                        }
-                        Insn::BackRef {
-                            indices,
-                            ignore_case,
-                        } => match self.match_backref(indices, pos, &caps, *ignore_case) {
-                            Some(next) => Act::Consume(pc + 1, next),
-                            None => Act::Backtrack,
-                        },
-                        Insn::Look {
-                            negate,
-                            behind,
-                            entry,
-                        } => Act::Look(*negate, *behind, *entry),
+                        break None;
                     }
-                };
-
-                match act {
-                    Act::Accept => break Some((pos, caps)),
-                    Act::Backtrack => break None,
-                    Act::Goto(t) => pc = t,
-                    Act::Consume(next_pc, next_pos) => {
-                        pc = next_pc;
-                        pos = next_pos;
-                    }
-                    Act::Split(a, b) => {
+                    Insn::Char { cp: c, ignore_case } => match self.decode(pos) {
+                        Some((cp, w)) if self.char_eq(*c, cp, *ignore_case) => {
+                            pc += 1;
+                            pos += w;
+                        }
+                        _ => break None,
+                    },
+                    Insn::AnyChar { dot_all } => match self.decode(pos) {
+                        Some((cp, w)) if *dot_all || !is_line_terminator(cp) => {
+                            pc += 1;
+                            pos += w;
+                        }
+                        _ => break None,
+                    },
+                    Insn::Class {
+                        set,
+                        negate,
+                        ignore_case,
+                    } => match self.decode(pos) {
+                        Some((cp, w)) if self.class_member(set, *negate, cp, *ignore_case) => {
+                            pc += 1;
+                            pos += w;
+                        }
+                        _ => break None,
+                    },
+                    Insn::Jump(t) => pc = *t,
+                    Insn::Split(a, b) => {
                         stack.push(Frame {
-                            pc: b,
+                            pc: *b,
                             pos,
                             caps: caps.clone(),
                         });
-                        pc = a;
+                        pc = *a;
                     }
-                    Act::Save(slot) => {
+                    Insn::Save(slot) => {
+                        let slot = *slot;
                         if !freeze_capture_saves || caps[slot].is_none() {
                             caps[slot] = Some(pos);
                         }
                         pc += 1;
                     }
-                    Act::SetMark(slot) => {
-                        caps[slot] = Some(pos);
+                    Insn::SetMark(slot) => {
+                        caps[*slot] = Some(pos);
                         pc += 1;
                     }
-                    Act::ClearCapture(index) => {
-                        let g = index as usize;
+                    Insn::ClearCapture(index) => {
+                        let g = *index as usize;
                         if !freeze_capture_saves
                             || (caps[2 * g].is_none() && caps[2 * g + 1].is_none())
                         {
@@ -261,13 +205,49 @@ impl Matcher<'_, '_> {
                         }
                         pc += 1;
                     }
-                    Act::CheckProgress(slot) => {
-                        if caps[slot] == Some(pos) {
+                    Insn::CheckProgress(slot) => {
+                        if caps[*slot] == Some(pos) {
                             break None;
                         }
                         pc += 1;
                     }
-                    Act::Look(negate, behind, look_entry) => {
+                    Insn::AssertStart { multiline } => {
+                        if self.at_start(pos, *multiline) {
+                            pc += 1;
+                        } else {
+                            break None;
+                        }
+                    }
+                    Insn::AssertEnd { multiline } => {
+                        if self.at_end(pos, *multiline) {
+                            pc += 1;
+                        } else {
+                            break None;
+                        }
+                    }
+                    Insn::WordBoundary(invert) => {
+                        if self.word_boundary(pos) != *invert {
+                            pc += 1;
+                        } else {
+                            break None;
+                        }
+                    }
+                    Insn::BackRef {
+                        indices,
+                        ignore_case,
+                    } => match self.match_backref(indices, pos, &caps, *ignore_case) {
+                        Some(next) => {
+                            pc += 1;
+                            pos = next;
+                        }
+                        None => break None,
+                    },
+                    Insn::Look {
+                        negate,
+                        behind,
+                        entry,
+                    } => {
+                        let (negate, behind, look_entry) = (*negate, *behind, *entry);
                         match self.eval_look(negate, behind, look_entry, pos, &caps)? {
                             Some(updated) => {
                                 caps = updated;

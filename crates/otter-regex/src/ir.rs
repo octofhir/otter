@@ -41,6 +41,7 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
     let has_backref = e.insns.iter().any(|i| matches!(i, Insn::BackRef { .. }));
     let loop_marks = e.next_mark - mark_base;
     let first_set = compute_first_set(&e.insns, flags.ignore_case);
+    let prefilter = first_set.as_ref().map(crate::program::Prefilter::from_set);
     Program {
         insns: e.insns,
         group_count: parsed.group_count,
@@ -51,39 +52,60 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
         unicode: flags.is_unicode_mode(),
         loop_marks,
         first_set,
+        prefilter,
     }
 }
 
-/// If the program must begin by consuming a single literal or non-negated class
-/// (no anchor, no empty alternative), return the set of code points that can
-/// start a match. Conservatively `None` under case-insensitivity (folding widens
-/// the start set) or for any non-trivial leading instruction.
+/// If every match must begin by consuming a single literal or non-negated class
+/// — including a leading alternation of such (`foo|bar`) or a leading quantified
+/// atom whose start is still characterizable — return the union of code points
+/// that can start a match. Conservatively `None` under case-insensitivity
+/// (folding widens the start set) or for any non-characterizable leading
+/// instruction (anchor, `.`, backref, lookaround, or a path that can match the
+/// empty string).
 fn compute_first_set(insns: &[Insn], ignore_case: bool) -> Option<CodePointSet> {
     if ignore_case {
         return None;
     }
-    let mut pc = 0;
-    loop {
-        match insns.get(pc)? {
-            Insn::Save(_) | Insn::ClearCapture(_) => pc += 1,
+    // BFS over the zero-width-passable prefix: follow control flow until the
+    // first consuming instruction on every path. Every reachable consuming
+    // instruction must be a literal or non-negated class, or the whole filter
+    // is unsound (could skip a valid start) and we bail.
+    let mut out = CodePointSet::new();
+    let mut visited = vec![false; insns.len()];
+    let mut work = vec![0usize];
+    while let Some(pc) = work.pop() {
+        if pc >= insns.len() || visited[pc] {
+            continue;
+        }
+        visited[pc] = true;
+        match &insns[pc] {
+            // Zero-width control flow / bookkeeping: pass through.
+            Insn::Save(_) | Insn::ClearCapture(_) | Insn::SetMark(_) | Insn::CheckProgress(_) => {
+                work.push(pc + 1)
+            }
+            Insn::Jump(t) => work.push(*t),
+            Insn::Split(a, b) => {
+                work.push(*a);
+                work.push(*b);
+            }
+            // First consuming instruction on this path: must be characterizable.
             Insn::Char {
                 cp,
                 ignore_case: false,
-            } => {
-                let mut set = CodePointSet::new();
-                set.insert(*cp);
-                return Some(set);
-            }
+            } => out.insert(*cp),
             Insn::Class {
                 set,
                 negate: false,
                 ignore_case: false,
-            } if set.strings.is_empty() => {
-                return Some(set.code_points.clone());
-            }
+            } if set.strings.is_empty() => out.union_with(&set.code_points),
+            // Anything else (anchor, `.`, backref, lookaround, case-folded atom,
+            // negated/string class, or `Match` reachable zero-width) makes the
+            // start set unsound.
             _ => return None,
         }
     }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 struct Emitter {

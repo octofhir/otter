@@ -142,13 +142,31 @@ impl Iterator for Matches<'_, '_> {
         let mut pos = self.next_start;
         loop {
             // First-set prefilter: skip positions that cannot start a match.
-            if let Some(first) = &program.first_set {
-                while pos < self.text.len() {
-                    let (cp, _) = decode_at(self.text, pos, unicode);
-                    if first.contains(cp) {
-                        break;
+            if let Some(pf) = &program.prefilter {
+                if let Some(unit) = pf.single() {
+                    // Single-literal fast path: a vectorizable equality scan for
+                    // the one code unit that can begin a match.
+                    match self
+                        .text
+                        .get(pos..)
+                        .and_then(|t| t.iter().position(|&u| u == unit))
+                    {
+                        Some(off) => pos += off,
+                        // No further occurrence: a single-literal prefilter means
+                        // every match must consume that unit, so no match remains.
+                        // Step past the end so the terminator below fires (rather
+                        // than clamping to `len`, which would oscillate with
+                        // `advance_scan`).
+                        None => pos = self.text.len() + 1,
                     }
-                    pos = advance_scan(self.text, pos, unicode);
+                } else {
+                    while pos < self.text.len() {
+                        let (cp, _) = decode_at(self.text, pos, unicode);
+                        if pf.cp_may_start(cp) {
+                            break;
+                        }
+                        pos = advance_scan(self.text, pos, unicode);
+                    }
                 }
             }
             if pos > self.text.len() {

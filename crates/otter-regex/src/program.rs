@@ -125,11 +125,88 @@ pub(crate) struct Program {
     /// the capture slots.
     pub(crate) loop_marks: usize,
     /// Code points that can begin a match, when the pattern starts with a single
-    /// literal or non-negated class. Used as a scan prefilter: positions whose
-    /// code point is not a member cannot start a match, so the executor skips
-    /// them without running. `None` when no such prefilter applies (anchored,
-    /// empty-matching, alternation, or case-insensitive starts).
+    /// literal or non-negated class (including a leading alternation of such).
+    /// Used as a scan prefilter: positions whose code point is not a member
+    /// cannot start a match, so the executor skips them without running. `None`
+    /// when no such prefilter applies (anchored, empty-matching, or
+    /// case-insensitive starts).
     pub(crate) first_set: Option<CodePointSet>,
+    /// Fast-dispatch form of [`Self::first_set`] for the scan loop: an O(1)
+    /// membership table for the common BMP range plus a single-literal fast
+    /// path. `None` exactly when `first_set` is `None`.
+    pub(crate) prefilter: Option<Prefilter>,
+}
+
+/// A scan prefilter derived from [`Program::first_set`].
+///
+/// Replaces the per-position binary search over code-point ranges with an O(1)
+/// table lookup for code units below `TABLE`, and offers a single-literal fast
+/// path that the leftmost search turns into a vectorizable equality scan.
+#[derive(Debug, Clone)]
+pub(crate) struct Prefilter {
+    /// Membership for code units `0..TABLE` (covers ASCII and Latin-1).
+    table: [bool; Self::TABLE],
+    /// Whether any member code point is `>= TABLE`; when `false`, a code unit
+    /// at or above the table can never start a match.
+    has_high: bool,
+    /// The full set, consulted only for code points `>= TABLE` when `has_high`.
+    high: CodePointSet,
+    /// `Some(u)` when the set is exactly one BMP, non-surrogate code point: the
+    /// scan reduces to a single-unit equality search.
+    single: Option<u16>,
+}
+
+impl Prefilter {
+    const TABLE: usize = 256;
+
+    /// Build from a first-set. Cheap; runs once at lowering.
+    #[must_use]
+    pub(crate) fn from_set(set: &CodePointSet) -> Self {
+        let mut table = [false; Self::TABLE];
+        let mut has_high = false;
+        for r in set.ranges() {
+            let hi = *r.end();
+            for cp in *r.start()..=hi.min(Self::TABLE as u32 - 1) {
+                table[cp as usize] = true;
+            }
+            if hi >= Self::TABLE as u32 {
+                has_high = true;
+            }
+        }
+        let single = match set.ranges() {
+            [r] if r.start() == r.end()
+                && *r.start() < 0x1_0000
+                && !(0xD800..=0xDFFF).contains(r.start()) =>
+            {
+                Some(*r.start() as u16)
+            }
+            _ => None,
+        };
+        Self {
+            table,
+            has_high,
+            high: set.clone(),
+            single,
+        }
+    }
+
+    /// The single-literal code unit, when the prefilter is one BMP literal.
+    #[must_use]
+    pub(crate) fn single(&self) -> Option<u16> {
+        self.single
+    }
+
+    /// Whether decoded code point `cp` can begin a match. O(1) for the common
+    /// BMP range; a set test only for high code points when the set has any.
+    #[inline]
+    #[must_use]
+    pub(crate) fn cp_may_start(&self, cp: u32) -> bool {
+        if (cp as usize) < Self::TABLE {
+            self.table[cp as usize]
+        } else {
+            self.has_high && self.high.contains(cp)
+        }
+    }
 }
 
 impl Program {

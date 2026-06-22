@@ -1,8 +1,8 @@
 # Otter Engine Refactor Progress
 
-**Updated:** 2026-06-21  
+**Updated:** 2026-06-22
 **Plan source:** [`plan.md`](plan.md)  
-**Current head:** `19acb56d feat(jit): fast-path opt self recursion`
+**Current head:** `a961af63 perf(vm): fast-path simple constructors`
 
 This log keeps only live Tier1 work. Completed history was removed from this
 file on purpose; use `git log` for landed slices.
@@ -17,7 +17,7 @@ Fresh release binary: `target/release/otter`.
 | `nbody.js` | 0.89s | 0.07s | 0.03s | closed enough for Tier1 |
 | `fib.js` | 1.27s | 0.09s | 0.04s | closed enough for Tier1 |
 | `typed-array.js` | 1.97s | 0.09s | 0.03s | closed enough for Tier1 |
-| `prop-access.js` | 2.11s | 0.23s | 0.03s | open |
+| `prop-access.js` | 2.11s | 0.17s | 0.03s | open |
 | `array-ops.js` | 2.36s | 0.45s | 0.09s | open |
 | `sort.js` | 2.76s | 1.12s | 0.16s | open |
 | `json.js` | 1.39s | 1.42s | 0.23s | open |
@@ -26,6 +26,9 @@ Fresh release binary: `target/release/otter`.
 
 Output parity across `benchmarks/scripts/*.js` passed after the latest JIT
 commits. GC-stress smoke passed for `fib`, `prop-access`, and `nbody`.
+Simple constructor field initialization now bypasses the hot `this.x/y/tag`
+store-property stub path for `prop-access.js`; measured JIT runtime property
+stubs dropped to 4 on the full benchmark and 0 on construct-only isolation.
 
 ## Architecture Scope
 
@@ -66,9 +69,11 @@ Benchmark: `prop-access.js`.
 
 Next actions:
 
-- Inspect the hot loop graph and explain every remaining fallback.
-- Patch only measured misses in dense element load, property load/store, or
-  method identity/inlining.
+- Re-profile after simple-constructor fast initialization.
+- Explain remaining allocation/class-entry, `pts[i]`, method-call, and
+  property-load/store costs.
+- Patch only measured misses in dense element load, property load/store,
+  object allocation, or method identity/inlining.
 - Keep exact deopt frame state and write barriers intact.
 
 Risk:

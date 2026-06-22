@@ -1,8 +1,8 @@
 # OtterJS Tier1 JIT Closure Plan
 
-**Updated:** 2026-06-21  
+**Updated:** 2026-06-22
 **Branch:** `perf/engine-rewrite`  
-**Current head:** `19acb56d feat(jit): fast-path opt self recursion`
+**Current head:** `a961af63 perf(vm): fast-path simple constructors`
 
 This file tracks only the work still required to close Tier1. Completed slices
 live in git history and are intentionally not repeated here.
@@ -19,7 +19,7 @@ Measured on 2026-06-21 with `OTTER_JIT=1`; Node measured with the same scripts.
 | `nbody.js` | 0.07s | 0.03s | small | no Tier1 blocker |
 | `fib.js` | 0.09s | 0.04s | small | no Tier1 blocker |
 | `typed-array.js` | 0.09s | 0.03s | small | no Tier1 blocker |
-| `prop-access.js` | 0.23s | 0.03s | open | finish object/method fast paths |
+| `prop-access.js` | 0.17s | 0.03s | open | finish residual object/method cost |
 | `array-ops.js` | 0.45s | 0.09s | open | callback-heavy builtin path |
 | `sort.js` | 1.12s | 0.16s | open | comparator-heavy builtin path |
 | `json.js` | 1.42s | 0.23s | open | runtime/builtin throughput |
@@ -87,18 +87,22 @@ Gates:
 
 Target: `prop-access.js`.
 
-Goal: make the hot loop stay on inline IC / inlined method paths with minimal
-Rust stub traffic.
+Goal: close the remaining post-constructor gap now that simple constructor
+field initialization no longer dominates runtime property stubs.
 
 Work:
 
-- Verify the hot loop graph for `Point.prototype.bump`, `dist2`, `p.x`, `p.y`,
-  `p.tag`, and `pts[i]`; every fallback call in the hot region must be explained.
+- Re-profile `Point.prototype.bump`, `dist2`, `p.x`, `p.y`, `p.tag`, `pts[i]`,
+  and object allocation/class construct entry; every remaining fallback or
+  runtime call in the hot region must be explained.
 - Extend opt lowering only where a measured fallback remains:
   - dense array element load for object arrays if `pts[i]` is still a stub;
   - property store/load in inlined method bodies if any site misses the inline IC;
   - method identity guards only where the receiver/prototype chain feedback is
     monomorphic and stable.
+- Keep the simple-constructor path conservative: no duplicate fields,
+  `__proto__`, inherited accessors/data, proxies, derived constructors,
+  `arguments`, rest params, direct eval, or observable non-store bytecode.
 - Preserve deopt exactness and write barriers. No stub bypass may skip accessor,
   prototype, dictionary, proxy, or GC semantics.
 

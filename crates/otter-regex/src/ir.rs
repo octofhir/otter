@@ -55,11 +55,16 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
                 crate::program::Prefilter::from_set(&set)
             }
         });
+    let names: std::sync::Arc<[String]> = parsed
+        .group_names
+        .into_iter()
+        .map(Option::unwrap_or_default)
+        .collect();
     Program {
         insns: e.insns,
         classes: e.classes,
         group_count: parsed.group_count,
-        group_names: parsed.group_names,
+        names,
         unicode,
         loop_marks,
         prefilter,

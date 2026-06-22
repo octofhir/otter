@@ -244,15 +244,10 @@ fn build_match(program: &Program, caps: &[Option<usize>]) -> Match {
         };
         captures.push(entry);
     }
-    let group_names = program
-        .group_names
-        .iter()
-        .map(|n| n.clone().unwrap_or_default())
-        .collect();
     Match {
         range,
         captures,
-        group_names,
+        group_names: program.names.clone(),
     }
 }
 
@@ -267,9 +262,10 @@ pub struct Match {
     /// group that did not participate in the match.
     pub captures: Vec<Option<Range<usize>>>,
     /// Capture-group names in source order, parallel to a notional `group N`;
-    /// the empty string marks an unnamed group. Used by [`Match::named_groups`]
-    /// and [`Match::named_group`].
-    pub(crate) group_names: Vec<String>,
+    /// the empty string marks an unnamed group. Shared with the compiled
+    /// program (`Arc`), so producing a match clones a pointer, not the names.
+    /// Used by [`Match::named_groups`] and [`Match::named_group`].
+    pub(crate) group_names: std::sync::Arc<[String]>,
 }
 
 impl Match {

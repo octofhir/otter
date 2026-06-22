@@ -144,9 +144,10 @@ pub(crate) struct Program {
     pub(crate) classes: Vec<ClassSet>,
     /// Number of capturing groups (group 0 excluded).
     pub(crate) group_count: u32,
-    /// Capture-group names in source order; `None` for unnamed groups. Index `i`
-    /// names group `i + 1`.
-    pub(crate) group_names: Vec<Option<String>>,
+    /// Resolved capture-group names in source order, the empty string for an
+    /// unnamed group; index `i` names group `i + 1`. Shared (`Arc`) so each
+    /// produced [`crate::Match`] clones a pointer, not the whole name list.
+    pub(crate) names: std::sync::Arc<[String]>,
     /// `u`/`v` — code-point (surrogate-pair-aware) traversal.
     pub(crate) unicode: bool,
     /// Number of loop-mark slots (one per unbounded quantifier), allocated after

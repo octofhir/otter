@@ -36,7 +36,7 @@ use crate::casefold::{ascii_other_case, canonicalize, fold_unicode};
 use crate::classes::ClassSet;
 use crate::cursor::Input;
 use crate::error::ExecError;
-use crate::program::{Insn, Program};
+use crate::program::{Insn, Program, RepeatAtom};
 
 /// Capture slots: `Some(pos)` once written, `None` if the group is unset.
 ///
@@ -117,6 +117,21 @@ struct Frame {
     pc: usize,
     pos: usize,
     log_mark: usize,
+    resume: Resume,
+}
+
+/// How a popped [`Frame`] continues.
+#[derive(Debug, Clone, Copy)]
+enum Resume {
+    /// Ordinary alternative: run the inner loop from `(pc, pos)`.
+    At,
+    /// One give-back step of a greedy fused repeat: `pos` is the length to try
+    /// now; on resume, schedule the next-shorter length (down to `low`) before
+    /// running the continuation at `pc`.
+    RepeatGreedy { low: usize },
+    /// One give-forward step of a lazy fused repeat: `pos` is the length to try
+    /// now; on resume, schedule the next-longer length (up to `high`).
+    RepeatLazy { high: usize },
 }
 
 impl Matcher<'_, '_> {
@@ -140,6 +155,7 @@ impl Matcher<'_, '_> {
             pc: entry,
             pos: start,
             log_mark: 0,
+            resume: Resume::At,
         });
 
         // Copy the program reference into a local so instruction borrows are
@@ -168,6 +184,32 @@ impl Matcher<'_, '_> {
                 let (slot, old) = log.pop().unwrap();
                 caps[slot] = old;
             }
+            // For a fused-repeat give-back, chain the next length before running
+            // the continuation, so the stack holds at most one give-back frame
+            // per active repeat instead of one per matched character.
+            match frame.resume {
+                Resume::At => {}
+                Resume::RepeatGreedy { low } => {
+                    if frame.pos > low {
+                        stack.push(Frame {
+                            pc: frame.pc,
+                            pos: frame.pos - 1,
+                            log_mark: frame.log_mark,
+                            resume: Resume::RepeatGreedy { low },
+                        });
+                    }
+                }
+                Resume::RepeatLazy { high } => {
+                    if frame.pos < high {
+                        stack.push(Frame {
+                            pc: frame.pc,
+                            pos: frame.pos + 1,
+                            log_mark: frame.log_mark,
+                            resume: Resume::RepeatLazy { high },
+                        });
+                    }
+                }
+            }
             let (mut pc, mut pos) = (frame.pc, frame.pos);
             let accepted = loop {
                 match &prog.insns[pc] {
@@ -191,6 +233,41 @@ impl Matcher<'_, '_> {
                         }
                         _ => break None,
                     },
+                    Insn::Repeat { atom, min, greedy } => {
+                        // Tight one-code-unit scan (non-Unicode), then a single
+                        // chained give-back frame rather than a split per char.
+                        let units = self.units();
+                        let mut end = pos;
+                        while end < units.len() && self.atom_matches(atom, u32::from(units[end])) {
+                            end += 1;
+                        }
+                        if (end - pos) < *min as usize {
+                            break None;
+                        }
+                        let low = pos + *min as usize;
+                        if *greedy {
+                            if end > low {
+                                stack.push(Frame {
+                                    pc: pc + 1,
+                                    pos: end - 1,
+                                    log_mark: log.len(),
+                                    resume: Resume::RepeatGreedy { low },
+                                });
+                            }
+                            pos = end;
+                        } else {
+                            if end > low {
+                                stack.push(Frame {
+                                    pc: pc + 1,
+                                    pos: low + 1,
+                                    log_mark: log.len(),
+                                    resume: Resume::RepeatLazy { high: end },
+                                });
+                            }
+                            pos = low;
+                        }
+                        pc += 1;
+                    }
                     Insn::Class {
                         class,
                         negate,
@@ -217,6 +294,7 @@ impl Matcher<'_, '_> {
                             pc: *b,
                             pos,
                             log_mark: log.len(),
+                            resume: Resume::At,
                         });
                         pc = *a;
                     }
@@ -417,6 +495,26 @@ impl Matcher<'_, '_> {
 
     fn char_eq(&self, target: u32, cp: u32, ignore_case: bool) -> bool {
         cp == target || (ignore_case && self.canon(cp) == self.canon(target))
+    }
+
+    /// Whether `atom` matches the single code unit `u` (fused-repeat scan,
+    /// non-Unicode, so a code unit is a code point).
+    #[inline]
+    fn atom_matches(&self, atom: &RepeatAtom, u: u32) -> bool {
+        match atom {
+            RepeatAtom::Char { cp, ignore_case } => self.char_eq(*cp, u, *ignore_case),
+            RepeatAtom::Class {
+                class,
+                negate,
+                ignore_case,
+            } => self.class_member(
+                &self.program.classes[*class as usize],
+                *negate,
+                u,
+                *ignore_case,
+            ),
+            RepeatAtom::Any { dot_all } => *dot_all || !is_line_terminator(u),
+        }
     }
 
     fn class_member(&self, set: &ClassSet, negate: bool, cp: u32, ignore_case: bool) -> bool {

@@ -32,6 +32,7 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
         insns: Vec::new(),
         classes: Vec::new(),
         next_mark: mark_base,
+        unicode: flags.is_unicode_mode(),
     };
     e.emit(Insn::Save(0));
     e.compile(&parsed.root);
@@ -120,6 +121,31 @@ fn compute_first_set(
                 needs_canon |= *ignore_case;
                 out.union_with(&classes[*class as usize].code_points);
             }
+            // A fused repeat's atom is the first thing matched. Contribute its
+            // start set; if it may match zero times (`min == 0`), also follow
+            // through to whatever can begin after it.
+            Insn::Repeat { atom, min, .. } => {
+                use crate::program::RepeatAtom;
+                match atom {
+                    RepeatAtom::Char { cp, ignore_case } => {
+                        needs_canon |= *ignore_case;
+                        out.insert(*cp);
+                    }
+                    RepeatAtom::Class {
+                        class,
+                        negate: false,
+                        ignore_case,
+                    } if classes[*class as usize].strings.is_empty() => {
+                        needs_canon |= *ignore_case;
+                        out.union_with(&classes[*class as usize].code_points);
+                    }
+                    // Negated class or `.` — uncharacterizable start.
+                    _ => return None,
+                }
+                if *min == 0 {
+                    work.push(pc + 1);
+                }
+            }
             // Anything else (anchor, `.`, backref, lookaround, negated/string
             // class, or `Match` reachable zero-width) makes the start set
             // unsound.
@@ -170,6 +196,9 @@ struct Emitter {
     classes: Vec<ClassSet>,
     /// Next free loop-mark slot.
     next_mark: usize,
+    /// `u`/`v` mode — disables the fused single-unit repeat (atoms are
+    /// variable-width under surrogate-pair traversal).
+    unicode: bool,
 }
 
 impl Emitter {
@@ -313,6 +342,16 @@ impl Emitter {
 
     fn compile_repeat(&mut self, node: &Node, quant: Quantifier) {
         let Quantifier { min, max, greedy } = quant;
+        // Fuse an unbounded repeat of a single one-code-unit atom into one
+        // instruction so the matcher consumes it in a tight loop. Only in
+        // non-Unicode mode, where every atom is exactly one code unit.
+        if max.is_none()
+            && !self.unicode
+            && let Some(atom) = self.fuseable_atom(node)
+        {
+            self.emit(Insn::Repeat { atom, min, greedy });
+            return;
+        }
         let captures = capture_indices(node);
         for _ in 0..min {
             self.clear_captures(&captures);
@@ -321,6 +360,32 @@ impl Emitter {
         match max {
             None => self.compile_star(node, greedy, &captures),
             Some(max) => self.compile_bounded(node, max - min, greedy, &captures),
+        }
+    }
+
+    /// The fused-repeat atom for `node`, when it is a single one-code-unit atom
+    /// (a literal, `.`, or a string-free class). Interns the class set if any.
+    fn fuseable_atom(&mut self, node: &Node) -> Option<crate::program::RepeatAtom> {
+        use crate::program::RepeatAtom;
+        match node {
+            Node::Char { cp, ignore_case } => Some(RepeatAtom::Char {
+                cp: *cp,
+                ignore_case: *ignore_case,
+            }),
+            Node::AnyChar { dot_all } => Some(RepeatAtom::Any { dot_all: *dot_all }),
+            Node::Class {
+                set,
+                negate,
+                ignore_case,
+            } if set.strings.is_empty() => {
+                let class = self.intern_class(set.clone());
+                Some(RepeatAtom::Class {
+                    class,
+                    negate: *negate,
+                    ignore_case: *ignore_case,
+                })
+            }
+            _ => None,
         }
     }
 

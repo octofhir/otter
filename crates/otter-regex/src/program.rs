@@ -52,6 +52,18 @@ pub(crate) enum Insn {
         /// Whether the `s` (dotAll) flag is in effect.
         dot_all: bool,
     },
+    /// A fused unbounded repeat of a single atom (`a+`, `\w*`, `.{2,}`, …) in
+    /// non-Unicode mode, where every atom is exactly one code unit. The matcher
+    /// consumes the atom in a tight loop instead of dispatching a split-loop per
+    /// character, and backtracks by giving back one unit at a time.
+    Repeat {
+        /// The single-code-unit atom matched repeatedly.
+        atom: RepeatAtom,
+        /// Mandatory minimum repetitions (`+` → 1, `*` → 0, `{n,}` → n).
+        min: u32,
+        /// `true` for a greedy repeat (longest first), `false` for lazy.
+        greedy: bool,
+    },
     /// Unconditional jump to an instruction index.
     Jump(usize),
     /// Try the first target; on backtrack, resume at the second.
@@ -104,6 +116,22 @@ pub(crate) enum Insn {
     LookMatch,
     /// Accepting terminator of the whole pattern.
     Match,
+}
+
+/// The single-code-unit atom of a fused [`Insn::Repeat`].
+#[derive(Debug, Clone)]
+pub(crate) enum RepeatAtom {
+    /// One literal code unit; case-folded when `ignore_case`.
+    Char { cp: u32, ignore_case: bool },
+    /// One code unit tested against [`Program::classes`]`[class]`; `negate`
+    /// inverts membership.
+    Class {
+        class: u32,
+        negate: bool,
+        ignore_case: bool,
+    },
+    /// Any code unit (line terminators excluded unless `dot_all`).
+    Any { dot_all: bool },
 }
 
 /// A compiled program ready for execution.

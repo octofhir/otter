@@ -639,9 +639,7 @@ impl Interpreter {
             // the observable path (which handles hole -> inherited / `null`).
             let fast_value = if state.property_list.is_none() {
                 holder.as_array().and_then(|arr| {
-                    usize::try_from(index).ok().and_then(|i| {
-                        crate::array::own_data_element_without_accessors(arr, self.gc_heap(), i)
-                    })
+                    crate::array::own_data_element_without_accessors(arr, self.gc_heap(), index)
                 })
             } else {
                 None

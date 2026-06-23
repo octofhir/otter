@@ -4785,7 +4785,7 @@ mod tests {
                 Exit::Bailed => panic!("cmp bailed"),
             }
         };
-        let null = (TAG_SPECIAL << 48) | u64::from(super::SPECIAL_NULL);
+        let null = (TAG_SPECIAL << 48) | super::SPECIAL_NULL;
         let obj_a = (super::TAG_PTR_OBJECT << 48) | 0x1234;
         let obj_b = (super::TAG_PTR_OBJECT << 48) | 0x5678;
         assert_eq!(run_cmp(Op::Equal, obj_a, null), f);

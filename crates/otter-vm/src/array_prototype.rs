@@ -1811,10 +1811,10 @@ impl Interpreter {
             return Ok(Ordering::Less);
         }
         if !comparefn.is_undefined() {
-            if fast_path == Some(SortComparatorFastPath::NumericSub) {
-                if let Some(order) = numeric_sub_sort_order(x, y) {
-                    return Ok(order);
-                }
+            if fast_path == Some(SortComparatorFastPath::NumericSub)
+                && let Some(order) = numeric_sub_sort_order(x, y)
+            {
+                return Ok(order);
             }
             let r = match lean_inner {
                 Some(state) => self.run_bytecode_callable_committed_lean_args(

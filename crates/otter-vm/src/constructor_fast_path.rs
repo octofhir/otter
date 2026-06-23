@@ -77,8 +77,12 @@ pub(crate) fn match_simple_constructor_init(
     }
 
     let mut registers = vec![RegisterValue::Unknown; function.register_count as usize];
-    for index in 0..function.param_count as usize {
-        registers[index] = RegisterValue::Param(index);
+    for (index, slot) in registers
+        .iter_mut()
+        .take(function.param_count as usize)
+        .enumerate()
+    {
+        *slot = RegisterValue::Param(index);
     }
 
     let mut fields: Vec<SimpleConstructorField> = Vec::new();

@@ -2277,7 +2277,7 @@ impl Runtime {
             let mut ctx = otter_vm::NativeCtx::new_with_call_info_and_context(
                 &mut self.interp,
                 otter_vm::NativeCallInfo::call(global_value),
-                Some(&context),
+                Some(context),
             );
             let data = materialize_data(&mut ctx)
                 .map_err(map_native_error)

@@ -1163,6 +1163,7 @@ mod arm64 {
     }
 
     /// Lower a register-allocated graph to native arm64.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::optimizing) fn emit(
         view: &JitFunctionView,
         graph: &Graph,
@@ -2204,6 +2205,7 @@ mod arm64 {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_self_recursive_call(
         ops: &mut Assembler,
         regcount: u16,

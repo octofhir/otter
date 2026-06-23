@@ -800,11 +800,10 @@ impl<'a> Builder<'a> {
                         return Ok(());
                     };
                     let recv = self.read_variable(recv_reg, block);
-                    let unsafe_receiver = match &self.graph.node(recv).kind {
-                        NodeKind::ConstUndefined | NodeKind::LoadHole => true,
-                        NodeKind::Phi(_) => true,
-                        _ => false,
-                    };
+                    let unsafe_receiver = matches!(
+                        &self.graph.node(recv).kind,
+                        NodeKind::ConstUndefined | NodeKind::LoadHole | NodeKind::Phi(_)
+                    );
                     if unsafe_receiver {
                         self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
                         return Ok(());

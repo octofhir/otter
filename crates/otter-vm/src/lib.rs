@@ -5444,7 +5444,7 @@ impl Interpreter {
             let call_info = NativeCallInfo::call(effective_this);
             self.record_runtime_native_call();
             let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(&context));
+                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context));
             return match call.invoke(&mut ctx, effective_args.as_slice()) {
                 Ok(value) => {
                     self.settle_microtask_capability(context, result_capability, Ok(value));

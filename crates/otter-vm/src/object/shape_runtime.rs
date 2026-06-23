@@ -24,7 +24,7 @@
 //! - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots-ownpropertykeys>
 //! - Architecture plan §4.1 (hidden classes).
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use otter_gc::GcHeap;
 use otter_gc::heap::RootSlotVisitor;
@@ -58,9 +58,9 @@ struct TransitionKey {
 pub(crate) struct ShapeRuntime {
     root: ShapeHandle,
     next_string_id: u32,
-    interned_keys: HashMap<String, JsStringHandle>,
-    transitions: HashMap<TransitionKey, ShapeHandle>,
-    offset_cache: HashMap<ShapeId, HashMap<JsStringId, u32>>,
+    interned_keys: FxHashMap<String, JsStringHandle>,
+    transitions: FxHashMap<TransitionKey, ShapeHandle>,
+    offset_cache: FxHashMap<ShapeId, FxHashMap<JsStringId, u32>>,
     observer: Option<Box<dyn ShapeTransitionObserver>>,
 }
 
@@ -85,9 +85,9 @@ impl ShapeRuntime {
         Ok(Self {
             root,
             next_string_id: 1,
-            interned_keys: HashMap::new(),
-            transitions: HashMap::new(),
-            offset_cache: HashMap::new(),
+            interned_keys: FxHashMap::default(),
+            transitions: FxHashMap::default(),
+            offset_cache: FxHashMap::default(),
             observer: None,
         })
     }
@@ -281,7 +281,7 @@ impl ShapeRuntime {
             return cache.get(&key_id).copied();
         }
 
-        let mut cache = HashMap::new();
+        let mut cache = FxHashMap::default();
         for (key_handle, offset) in shape_keys_ordered(heap, shape) {
             let id = heap.read_payload(key_handle, JsStringBody::id);
             cache.insert(id, offset);

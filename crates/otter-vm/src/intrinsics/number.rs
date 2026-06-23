@@ -306,29 +306,28 @@ fn coerce_first_to_string_value(
     Ok(prim)
 }
 
+/// §19.2.6.* `encodeURI` / `encodeURIComponent` / `decodeURI` /
+/// `decodeURIComponent` reject malformed input with a `URIError` and
+/// nothing else. The inner [`crate::global_functions::call`] surfaces
+/// failures as the unit-variant [`crate::VmError::URIError`], which
+/// carries no message detail, so map any error to a `URIError` with a
+/// constant reason. (Reading `take_error_detail` here would observe
+/// stale cross-call state — there is no per-call detail to read.)
+fn uri_malformed(name: &'static str) -> NativeError {
+    NativeError::URIError {
+        name,
+        reason: "URI malformed".to_string(),
+    }
+}
+
 fn global_encode_uri(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let coerced = coerce_first_to_string_value(ctx, args, "encodeURI")?;
-    match crate::global_functions::call(
+    crate::global_functions::call(
         otter_bytecode::method_id::GlobalMethod::EncodeURI,
         &[coerced],
         ctx.heap_mut(),
-    ) {
-        Ok(v) => Ok(v),
-        Err(crate::VmError::URIError) => {
-            let message = match ctx.interp_mut().take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                _ => Default::default(),
-            };
-            Err(NativeError::URIError {
-                name: "encodeURI",
-                reason: message.into(),
-            })
-        }
-        Err(other) => Err(NativeError::TypeError {
-            name: "encodeURI",
-            reason: other.to_string(),
-        }),
-    }
+    )
+    .map_err(|_| uri_malformed("encodeURI"))
 }
 
 fn global_encode_uri_component(
@@ -336,62 +335,22 @@ fn global_encode_uri_component(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let coerced = coerce_first_to_string_value(ctx, args, "encodeURIComponent")?;
-    match crate::global_functions::call(
+    crate::global_functions::call(
         otter_bytecode::method_id::GlobalMethod::EncodeURIComponent,
         &[coerced],
         ctx.heap_mut(),
-    ) {
-        Ok(v) => Ok(v),
-        Err(crate::VmError::URIError) => {
-            let message = match ctx.interp_mut().take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                _ => Default::default(),
-            };
-            Err(NativeError::URIError {
-                name: "encodeURIComponent",
-                reason: message.into(),
-            })
-        }
-        Err(other) => Err(NativeError::TypeError {
-            name: "encodeURIComponent",
-            reason: other.to_string(),
-        }),
-    }
+    )
+    .map_err(|_| uri_malformed("encodeURIComponent"))
 }
 
 fn global_decode_uri(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let coerced = coerce_first_to_string_value(ctx, args, "decodeURI")?;
-    match crate::global_functions::call(
+    crate::global_functions::call(
         otter_bytecode::method_id::GlobalMethod::DecodeURI,
         &[coerced],
         ctx.heap_mut(),
-    ) {
-        Ok(v) => Ok(v),
-        Err(crate::VmError::URIError) => {
-            let message = match ctx.interp_mut().take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                _ => Default::default(),
-            };
-            Err(NativeError::URIError {
-                name: "decodeURI",
-                reason: message.into(),
-            })
-        }
-        Err(crate::VmError::TypeError) => {
-            let message = match ctx.interp_mut().take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                _ => Default::default(),
-            };
-            Err(NativeError::TypeError {
-                name: "decodeURI",
-                reason: message.into(),
-            })
-        }
-        Err(other) => Err(NativeError::TypeError {
-            name: "decodeURI",
-            reason: other.to_string(),
-        }),
-    }
+    )
+    .map_err(|_| uri_malformed("decodeURI"))
 }
 
 fn global_decode_uri_component(
@@ -399,37 +358,12 @@ fn global_decode_uri_component(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let coerced = coerce_first_to_string_value(ctx, args, "decodeURIComponent")?;
-    match crate::global_functions::call(
+    crate::global_functions::call(
         otter_bytecode::method_id::GlobalMethod::DecodeURIComponent,
         &[coerced],
         ctx.heap_mut(),
-    ) {
-        Ok(v) => Ok(v),
-        Err(crate::VmError::URIError) => {
-            let message = match ctx.interp_mut().take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                _ => Default::default(),
-            };
-            Err(NativeError::URIError {
-                name: "decodeURIComponent",
-                reason: message.into(),
-            })
-        }
-        Err(crate::VmError::TypeError) => {
-            let message = match ctx.interp_mut().take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                _ => Default::default(),
-            };
-            Err(NativeError::TypeError {
-                name: "decodeURIComponent",
-                reason: message.into(),
-            })
-        }
-        Err(other) => Err(NativeError::TypeError {
-            name: "decodeURIComponent",
-            reason: other.to_string(),
-        }),
-    }
+    )
+    .map_err(|_| uri_malformed("decodeURIComponent"))
 }
 
 fn global_escape(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

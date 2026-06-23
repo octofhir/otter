@@ -105,12 +105,16 @@ pub fn call(
             gc_heap,
         ),
         M::DecodeURI => {
-            let out = uri_decode(&coerce_to_string(args.first(), gc_heap), false)?;
-            js_string(&out, gc_heap)
+            let out = uri_decode(&coerce_to_utf16(args.first(), gc_heap), false)?;
+            Ok(Value::string(
+                JsString::from_utf16_units(&out, gc_heap).map_err(|_| VmError::TypeMismatch)?,
+            ))
         }
         M::DecodeURIComponent => {
-            let out = uri_decode(&coerce_to_string(args.first(), gc_heap), true)?;
-            js_string(&out, gc_heap)
+            let out = uri_decode(&coerce_to_utf16(args.first(), gc_heap), true)?;
+            Ok(Value::string(
+                JsString::from_utf16_units(&out, gc_heap).map_err(|_| VmError::TypeMismatch)?,
+            ))
         }
         // §B.2.1.1 `escape(string)` — legacy AnnexB encoder. Walks
         // the UTF-16 code units; preserves the spec's "static
@@ -303,33 +307,88 @@ fn uri_encode(units: &[u16], component: bool) -> Result<String, VmError> {
     Ok(out)
 }
 
-/// §19.2.6.4 Decode — inverse of [`uri_encode`]. Raises
-/// `TypeMismatch` (eventually `URIError`) on malformed escapes.
-fn uri_decode(input: &str, _component: bool) -> Result<String, VmError> {
-    let bytes = input.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'%' {
-            // §19.2.6.1 Decode step 4.b — a `%` must be followed by two
-            // hexadecimal digits or the input is malformed (`URIError`).
-            if i + 2 >= bytes.len() {
+/// §19.2.6.7 Decode — inverse of [`uri_encode`]. Walks the input's
+/// UTF-16 code units (so a lone surrogate that isn't part of a `%XX`
+/// escape passes through unchanged) and emits UTF-16. Each `%XX`
+/// escape contributes one octet; the octet stream is decoded as
+/// well-formed UTF-8, rejecting overlong forms, encoded surrogates,
+/// and truncated sequences with a `URIError`. When `component` is
+/// false (`decodeURI`), a decoded octet whose code point is in the
+/// reserved set `;/?:@&=+$,#` keeps its original `%XX` spelling
+/// instead of being decoded.
+fn uri_decode(units: &[u16], component: bool) -> Result<Vec<u16>, VmError> {
+    fn is_reserved(b: u8) -> bool {
+        matches!(
+            b,
+            b';' | b'/' | b'?' | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b',' | b'#'
+        )
+    }
+    // Read the two hex digits following a `%` at `units[at]`, returning
+    // the decoded octet. Malformed / truncated escapes are URIErrors.
+    fn escaped_octet(units: &[u16], at: usize) -> Result<u8, VmError> {
+        let hi = units.get(at + 1).copied().ok_or_else(uri_error)?;
+        let lo = units.get(at + 2).copied().ok_or_else(uri_error)?;
+        let hi = u8::try_from(hi).ok().ok_or_else(uri_error)?;
+        let lo = u8::try_from(lo).ok().ok_or_else(uri_error)?;
+        Ok((hex_digit(hi)? << 4) | hex_digit(lo)?)
+    }
+
+    let mut out: Vec<u16> = Vec::with_capacity(units.len());
+    let len = units.len();
+    let mut k = 0;
+    while k < len {
+        let c = units[k];
+        if c != b'%' as u16 {
+            out.push(c);
+            k += 1;
+            continue;
+        }
+        let start = k;
+        let b = escaped_octet(units, k)?;
+        k += 3;
+        if b & 0x80 == 0 {
+            // Single octet. decodeURI keeps reserved characters encoded.
+            if !component && is_reserved(b) {
+                out.extend_from_slice(&units[start..start + 3]);
+            } else {
+                out.push(b as u16);
+            }
+            continue;
+        }
+        // Multi-octet UTF-8: the leading byte's high-one run gives the
+        // sequence length (2..=4); 0b10xxxxxx or >4 is malformed.
+        let n = match b {
+            0b1100_0000..=0b1101_1111 => 2,
+            0b1110_0000..=0b1110_1111 => 3,
+            0b1111_0000..=0b1111_0111 => 4,
+            _ => return Err(uri_error()),
+        };
+        let mut cp: u32 = (b & (0x7F >> n)) as u32;
+        for _ in 1..n {
+            if units.get(k).copied() != Some(b'%' as u16) {
                 return Err(uri_error());
             }
-            let hi = hex_digit(bytes[i + 1])?;
-            let lo = hex_digit(bytes[i + 2])?;
-            out.push((hi << 4) | lo);
-            i += 3;
+            let cont = escaped_octet(units, k)?;
+            if cont & 0xC0 != 0x80 {
+                return Err(uri_error());
+            }
+            cp = (cp << 6) | (cont & 0x3F) as u32;
+            k += 3;
+        }
+        // Reject overlong encodings, out-of-range, and encoded surrogates.
+        let min = [0, 0, 0x80, 0x800, 0x1_0000][n];
+        if cp < min || cp > 0x10_FFFF || (0xD800..=0xDFFF).contains(&cp) {
+            return Err(uri_error());
+        }
+        if cp <= 0xFFFF {
+            out.push(cp as u16);
         } else {
-            out.push(b);
-            i += 1;
+            let v = cp - 0x1_0000;
+            out.push((0xD800 + (v >> 10)) as u16);
+            out.push((0xDC00 + (v & 0x3FF)) as u16);
         }
     }
-    // §19.2.6.1 step 4.d — the decoded octet stream must be well-formed
-    // UTF-8 (rejecting overlong forms, lone surrogates, truncated multi-
-    // byte sequences); otherwise the URI is malformed.
-    String::from_utf8(out).map_err(|_| uri_error())
+    Ok(out)
 }
 
 fn uri_error() -> VmError {

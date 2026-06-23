@@ -517,7 +517,7 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
         helper,
         "next",
         0,
-        iterator_proto_next,
+        iterator_helper_proto_next,
         "IteratorHelperPrototype.next",
     )?;
     install_method(
@@ -525,7 +525,7 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
         helper,
         "return",
         1,
-        iterator_proto_return,
+        iterator_helper_proto_return,
         "IteratorHelperPrototype.return",
     )?;
     // §27.1.3.2 — `%WrapForValidIteratorPrototype%` owns `next` and
@@ -535,7 +535,7 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
         wrap_for_valid_iterator,
         "next",
         0,
-        iterator_proto_next,
+        wrap_for_valid_iterator_next,
         "WrapForValidIteratorPrototype.next",
     )?;
     install_method(
@@ -849,6 +849,22 @@ fn iterator_arg_count_native(
             interp.evaluate_to_primitive(&exec, &arg, crate::abstract_ops::ToPrimitiveHint::Number);
         result.map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))?
     };
+    // §7.1.4 ToNumber — a Symbol or BigInt operand is a TypeError, not a
+    // coercion to NaN (which would surface as the §27.5.1.2 step 4
+    // RangeError). The receiver check has already run, so this is the
+    // first observable rejection for `take(0n)` / `drop(Symbol())`.
+    if primitive.is_symbol() {
+        return Err(crate::NativeError::TypeError {
+            name,
+            reason: "cannot convert a Symbol value to a number".to_string(),
+        });
+    }
+    if primitive.is_big_int() {
+        return Err(crate::NativeError::TypeError {
+            name,
+            reason: "cannot convert a BigInt value to a number".to_string(),
+        });
+    }
     let n = crate::number::to_number_value(&primitive, ctx.heap());
     if n.is_nan() {
         return Err(crate::NativeError::RangeError {
@@ -1167,6 +1183,118 @@ pub(crate) fn iterator_proto_next(
         crate::native_function::vm_to_native_error(ctx.cx.interp, e, "Iterator.prototype.next")
     })?;
     Ok(Value::object(obj))
+}
+
+/// §27.1.4 — the `%IteratorHelperPrototype%` `next` / `return` methods
+/// require the receiver to carry an iterator-helper `[[UnderlyingIterator]]`
+/// (the lazy map / filter / take / drop / flatMap state). A plain
+/// generator or any other iterator lacks that slot, so the method throws
+/// rather than silently driving an unrelated iterator.
+fn require_iterator_helper(
+    ctx: &mut crate::NativeCtx<'_>,
+    name: &'static str,
+) -> Result<(), crate::NativeError> {
+    let this_value = *ctx.this_value();
+    if let Some(h) = this_value.as_iterator() {
+        let is_helper = ctx.cx.interp.gc_heap_for_cx().read_payload(h, |state| {
+            matches!(
+                state,
+                crate::IteratorState::Map { .. }
+                    | crate::IteratorState::Filter { .. }
+                    | crate::IteratorState::Take { .. }
+                    | crate::IteratorState::Drop { .. }
+                    | crate::IteratorState::FlatMap { .. }
+                    | crate::IteratorState::Exhausted {
+                        origin: Some(crate::iterator_state::BuiltinIteratorOrigin::Helper),
+                    }
+            )
+        });
+        if is_helper {
+            return Ok(());
+        }
+    }
+    Err(crate::NativeError::TypeError {
+        name,
+        reason: "this is not an Iterator Helper".to_string(),
+    })
+}
+
+fn iterator_helper_proto_next(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    require_iterator_helper(ctx, "IteratorHelperPrototype.next")?;
+    iterator_proto_next(ctx, args)
+}
+
+fn iterator_helper_proto_return(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    require_iterator_helper(ctx, "IteratorHelperPrototype.return")?;
+    iterator_proto_return(ctx, args)
+}
+
+/// §27.1.3.2.1 `%WrapForValidIteratorPrototype%.next` — call the wrapped
+/// iterator record's stored `next` on its iterator and forward the result
+/// VERBATIM: no `IteratorComplete` / `IteratorValue` extraction and, in
+/// particular, no "result is an Object" validation. A wrap that
+/// `Iterator.from` built over a bare `{ next }` object therefore surfaces
+/// whatever that `next` returns, including a non-object.
+fn wrap_for_valid_iterator_next(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    const NAME: &str = "WrapForValidIteratorPrototype.next";
+    let handle = iterator_receiver_builtin(ctx, NAME)?;
+    let wrapped = ctx
+        .cx
+        .interp
+        .gc_heap_for_cx()
+        .read_payload(handle, |state| match state {
+            crate::IteratorState::User {
+                iterator,
+                next_method,
+            } => Some((*iterator, *next_method)),
+            _ => None,
+        });
+    let Some((iterator, next_method)) = wrapped else {
+        // Generator-backed (or already-exhausted) wrap: the underlying
+        // `next` yields a spec-shaped result object already, so the
+        // generic reconstructing step is equivalent.
+        return iterator_proto_next(ctx, args);
+    };
+    let (interp, exec_ctx) = ctx.interp_mut_and_context();
+    let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
+        name: NAME,
+        reason: "missing execution context".to_string(),
+    })?;
+    // §7.4.4 GetIteratorDirect caches the `next` method at record
+    // creation; fall back to a fresh `[[Get]]` for records that defer it.
+    let next_fn = match next_method {
+        Some(v) => v,
+        None => {
+            let key = crate::VmPropertyKey::String("next");
+            match interp
+                .ordinary_get_value(&exec_ctx, iterator, iterator, &key, 0)
+                .map_err(|e| crate::native_function::vm_to_native_error(interp, e, NAME))?
+            {
+                crate::VmGetOutcome::Value(v) => v,
+                crate::VmGetOutcome::InvokeGetter { getter } => interp
+                    .run_callable_sync(&exec_ctx, &getter, iterator, smallvec::SmallVec::new())
+                    .map_err(|e| crate::native_function::vm_to_native_error(interp, e, NAME))?,
+            }
+        }
+    };
+    if !interp.is_callable_runtime(&next_fn) {
+        return Err(crate::NativeError::TypeError {
+            name: NAME,
+            reason: "iterator `next` is not callable".to_string(),
+        });
+    }
+    interp
+        .run_callable_sync(&exec_ctx, &next_fn, iterator, smallvec::SmallVec::new())
+        .map_err(|e| crate::native_function::vm_to_native_error(interp, e, NAME))
 }
 
 /// §22.2.7.2 `%RegExpStringIteratorPrototype%.next`.

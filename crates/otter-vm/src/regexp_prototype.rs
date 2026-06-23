@@ -946,6 +946,68 @@ pub fn native_regexp_symbol_replace(
         set_property_runtime(ctx, &receiver, "lastIndex", Value::number_i32(0), name)?;
     }
 
+    // Fast path: a global, non-sticky, pristine RegExp with the native `exec`
+    // and a literal (`$`-free) string replacement. The replacement reads neither
+    // the matched text nor captures, and `lastIndex` was just reset to a plain
+    // `0`, so the per-match exec protocol and substitution machinery have no
+    // observable effect: collect the matches in one engine pass and stitch the
+    // source segments and literal template directly. Restricted to global so a
+    // non-global `lastIndex` read (its `ToLength` may fire a `valueOf`) stays
+    // observable, and to a regex with no own-property expando so an overridden
+    // `unicode` / `flags` cannot change the empty-match advancement the engine
+    // pass bakes in from the compiled flags. The whole loop runs on host
+    // buffers; only the final string allocation touches the GC.
+    if global
+        && let Some(re) = receiver.as_regexp()
+        && !flags_str.contains('y')
+        && !functional_replace
+        && re.expando(ctx.heap()).is_none()
+    {
+        let template = replacement_template.expect("non-functional path has a template");
+        let template_units = template.to_utf16_vec(ctx.heap());
+        if !template_units.contains(&0x24) {
+            let exec_fn = get_property_runtime(ctx, &receiver, "exec", name)?;
+            if exec_fn
+                .as_native_function()
+                .is_some_and(|nf| nf.is_static_native(ctx.heap(), crate::bootstrap_regexp::proto_exec))
+            {
+                let found = re.find_from_utf16(ctx.heap(), &s_units, 0);
+                let mut accumulated: Vec<u16> = Vec::new();
+                let mut next_source_position: usize = 0;
+                for m in &found {
+                    let position = m.range.start;
+                    let match_length = m.range.end - m.range.start;
+                    if position >= next_source_position {
+                        let projected = accumulated
+                            .len()
+                            .saturating_add(position - next_source_position)
+                            .saturating_add(template_units.len());
+                        if projected > MAX_STRING_UNITS {
+                            return Err(crate::NativeError::RangeError {
+                                name,
+                                reason: "Invalid string length".to_string(),
+                            });
+                        }
+                        accumulated.extend_from_slice(&s_units[next_source_position..position]);
+                        accumulated.extend_from_slice(&template_units);
+                        next_source_position = position + match_length;
+                    }
+                }
+                if next_source_position < length_s {
+                    accumulated.extend_from_slice(&s_units[next_source_position..]);
+                }
+                return Ok(Value::string(
+                    JsString::from_utf16_units(&accumulated, ctx.heap_mut()).map_err(|_| {
+                        crate::NativeError::TypeError {
+                            name,
+                            reason: "out of memory".to_string(),
+                        }
+                    })?,
+                ));
+            }
+        }
+    }
+
     // Step 10-12 — collect results.
     let mut results: Vec<Value> = Vec::new();
     loop {

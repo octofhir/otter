@@ -272,11 +272,32 @@ impl Matcher<'_, '_> {
                                 ignore_case,
                             } => {
                                 let set = &prog.classes[*class as usize];
-                                let (neg, ic) = (*negate, *ignore_case);
-                                while end < len
-                                    && self.class_member(set, neg, u32::from(units[end]), ic)
-                                {
-                                    end += 1;
+                                let neg = *negate;
+                                if *ignore_case {
+                                    while end < len
+                                        && self.class_member(set, neg, u32::from(units[end]), true)
+                                    {
+                                        end += 1;
+                                    }
+                                } else {
+                                    // Case-sensitive ASCII fast path: a u128
+                                    // bitmap test per unit, no function call, so
+                                    // the optimizer keeps the loop tight. Units
+                                    // at or above the table fall back to the
+                                    // range set.
+                                    let bits = set.ascii_lo;
+                                    while end < len {
+                                        let u = u32::from(units[end]);
+                                        let in_set = if u < 128 {
+                                            (bits >> u) & 1 != 0
+                                        } else {
+                                            set.code_points.contains(u)
+                                        };
+                                        if in_set == neg {
+                                            break;
+                                        }
+                                        end += 1;
+                                    }
                                 }
                             }
                         }

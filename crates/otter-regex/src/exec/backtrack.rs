@@ -361,7 +361,13 @@ impl Matcher<'_, '_> {
                     Insn::Save(slot) => {
                         let slot = *slot;
                         if !freeze_capture_saves || caps[slot].is_none() {
-                            log.push((slot, caps[slot]));
+                            // Slots 0/1 (the overall match bounds) are written
+                            // once by the outermost saves bracketing the whole
+                            // pattern — never inside a loop or alternation — so
+                            // they are never restored and need no undo entry.
+                            if slot > 1 {
+                                log.push((slot, caps[slot]));
+                            }
                             caps[slot] = Some(pos);
                         }
                         pc += 1;

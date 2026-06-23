@@ -199,7 +199,31 @@ impl Iterator for Matches<'_, '_> {
                     };
                     return Some(Ok(mat));
                 }
-                Ok(None) => pos = advance_scan(self.text, pos, unicode),
+                Ok(None) => {
+                    // When the unique leading consumer is a possessive `min >= 1`
+                    // repeat, every prefilter-positive position in the current run
+                    // fails identically, so skip the whole run in one step rather
+                    // than retrying each interior position (O(run²) -> O(run)).
+                    if let (true, Some(pf)) = (program.lead_possessive_run, &program.prefilter) {
+                        let mut e = advance_scan(self.text, pos, unicode);
+                        if unicode {
+                            while e < self.text.len() {
+                                let (cp, _) = decode_at(self.text, e, unicode);
+                                if !pf.cp_may_start(cp) {
+                                    break;
+                                }
+                                e = advance_scan(self.text, e, unicode);
+                            }
+                        } else {
+                            while e < self.text.len() && pf.cp_may_start(u32::from(self.text[e])) {
+                                e += 1;
+                            }
+                        }
+                        pos = e;
+                    } else {
+                        pos = advance_scan(self.text, pos, unicode);
+                    }
+                }
             }
         }
     }

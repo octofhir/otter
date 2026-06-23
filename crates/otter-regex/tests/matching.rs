@@ -350,6 +350,53 @@ fn empty_body_star_terminates() {
     assert_eq!(matched_text("(?:)*", "", "x").as_deref(), Some(""));
 }
 
+/// Auto-possessification (§4 of `REGEX_RESEARCH.md`): a greedy repeat whose
+/// give-back is provably futile (disjoint required follower) must keep identical
+/// match semantics, and an *overlapping* follower must NOT be possessified
+/// (give-back is then genuinely needed).
+#[test]
+fn possessive_disjoint_preserves_matches() {
+    // `[a-z.]+` is disjoint from the required `@`: possessifiable. Leftmost scan
+    // must still find the email after skipping the futile leading runs.
+    assert_eq!(
+        matched_text("([a-z.]+)@([a-z.]+)", "i", "aaa bbb@ccc end").as_deref(),
+        Some("bbb@ccc")
+    );
+    // Captures are unchanged by possessification.
+    assert_eq!(
+        first_match("([a-z.]+)@([a-z.]+)", "i", "a.b@example.com"),
+        Some((0, 15, vec![Some((0, 3)), Some((4, 15))]))
+    );
+    // A run with no following `@` yields no match (the whole-run skip must not
+    // wrongly report one).
+    assert_eq!(matched_text("[a-z]+@", "", "abc def ghi"), None);
+}
+
+#[test]
+fn overlapping_follower_is_not_possessified() {
+    // `\w+` overlaps the required `\d` (a digit is a word char), so give-back to
+    // the final digit is the only way to satisfy `\d`. Possessifying here would
+    // wrongly drop the match — it must still succeed.
+    assert_eq!(matched_text(r"\w+\d", "", "abc1").as_deref(), Some("abc1"));
+    assert_eq!(matched_text(r"\w+\w", "", "ab").as_deref(), Some("ab"));
+    // Disjoint variant of the same shape stays correct too.
+    assert_eq!(
+        matched_text(r"[a-z]+\d", "", "abc1").as_deref(),
+        Some("abc1")
+    );
+    assert_eq!(matched_text(r"[a-z]+\d", "", "abcd"), None);
+}
+
+#[test]
+fn possessive_lead_run_skip_is_leftmost() {
+    // Several disjoint-follower runs precede the match; the per-run skip must
+    // land on the leftmost real match, not overshoot it.
+    assert_eq!(
+        first_match("[a-z]+@[a-z]+", "", "one two three@four five").map(|m| (m.0, m.1)),
+        Some((8, 18))
+    );
+}
+
 #[test]
 fn step_budget_aborts_catastrophic_backtracking() {
     // Classic ReDoS pattern; a tight budget must surface an error, not hang.

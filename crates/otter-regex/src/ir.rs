@@ -49,9 +49,7 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
     // a per-character case-fold probe. This is the hot path for `/i` patterns
     // such as `[a-z]{4,}` under the `i` flag.
     if !flags.is_unicode_mode() {
-        let Emitter {
-            insns, classes, ..
-        } = &mut e;
+        let Emitter { insns, classes, .. } = &mut e;
         for insn in insns.iter_mut() {
             match insn {
                 Insn::Class {
@@ -81,6 +79,10 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
         set.finalize_ascii();
     }
 
+    // Auto-possessify greedy fused repeats whose give-back is provably futile.
+    mark_possessive(&mut e.insns, &e.classes, flags.is_unicode_mode());
+    let lead_possessive_run = lead_possessive_run(&e.insns);
+
     let loop_marks = e.next_mark - mark_base;
     let unicode = flags.is_unicode_mode();
     let prefilter =
@@ -104,7 +106,35 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
         unicode,
         loop_marks,
         prefilter,
+        lead_possessive_run,
     }
+}
+
+/// Whether the unique first consuming instruction — reached from entry through
+/// only zero-width bookkeeping and unconditional jumps — is a possessive greedy
+/// repeat with `min >= 1`. See [`Program::lead_possessive_run`]. A branch,
+/// assertion, or any other first consumer makes the whole-run skip unsound, so
+/// the walk bails (returns `false`) on anything else.
+fn lead_possessive_run(insns: &[Insn]) -> bool {
+    let mut pc = 0;
+    for _ in 0..=insns.len() {
+        match insns.get(pc) {
+            Some(
+                Insn::Save(_) | Insn::ClearCapture(_) | Insn::SetMark(_) | Insn::CheckProgress(_),
+            ) => {
+                pc += 1;
+            }
+            Some(Insn::Jump(t)) => pc = *t,
+            Some(Insn::Repeat {
+                greedy: true,
+                possessive: true,
+                min,
+                ..
+            }) if *min >= 1 => return true,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// If every match must begin by consuming a single literal or non-negated class
@@ -258,6 +288,187 @@ fn canonicalize_set(set: &CodePointSet, unicode: bool) -> Option<CodePointSet> {
         }
     }
     Some(out)
+}
+
+/// Mark every greedy fused [`Insn::Repeat`] whose give-back is provably futile
+/// as possessive — see the field doc on [`Insn::Repeat`] and §4 of
+/// `REGEX_RESEARCH.md` for the soundness argument (PCRE2 auto-possessification).
+///
+/// A greedy `C+`/`C*` is possessifiable when the unique required atom `A` that
+/// must follow it (reached through only zero-width bookkeeping and unconditional
+/// jumps — no alternation, assertion, lookaround, or end-of-pattern) matches a
+/// set of code points disjoint from `C`'s. Then no give-back position (which is
+/// always inside the consumed `C`-run) can ever satisfy `A`, so dropping the
+/// give-back changes neither the accepted language nor any capture.
+fn mark_possessive(insns: &mut [Insn], classes: &[ClassSet], unicode: bool) {
+    // Cap on how many distinct code points a repeat atom may match before the
+    // disjointness test is skipped. A huge set (e.g. a negated class) is left
+    // non-possessive rather than enumerated.
+    const REP_CAP: usize = 2048;
+    let mut marks: Vec<usize> = Vec::new();
+    for (i, insn) in insns.iter().enumerate() {
+        if let Insn::Repeat {
+            atom,
+            greedy: true,
+            possessive: false,
+            ..
+        } = insn
+        {
+            let Some(rep) = repeat_atom_set(atom, classes) else {
+                continue;
+            };
+            let Some(chars) = bounded_members(&rep, REP_CAP) else {
+                continue;
+            };
+            let Some(fpc) = follower_pc(insns, i + 1) else {
+                continue;
+            };
+            // Disjoint — and so possessifiable — iff no character the repeat can
+            // consume can also match the required follower atom. The membership
+            // test mirrors the executor's `char_eq`/`class_member` exactly, so
+            // case folding (the `/i` follower atom keeps its `ignore_case` flag)
+            // is handled with no language drift.
+            if chars
+                .iter()
+                .all(|&c| !follower_matches(&insns[fpc], classes, c, unicode))
+            {
+                marks.push(i);
+            }
+        }
+    }
+    for i in marks {
+        if let Insn::Repeat { possessive, .. } = &mut insns[i] {
+            *possessive = true;
+        }
+    }
+}
+
+/// The exact code points a fused-repeat atom can consume, or `None` when the set
+/// cannot be characterized here without reconstructing a case-fold orbit
+/// (`.`/`AnyChar`, or a case-insensitive atom). Non-Unicode `/i` classes have
+/// already been folded into the set with `ignore_case` cleared, so the common
+/// `/i` class repeat is still characterized.
+fn repeat_atom_set(atom: &RepeatAtom, classes: &[ClassSet]) -> Option<CodePointSet> {
+    match atom {
+        RepeatAtom::Char {
+            cp,
+            ignore_case: false,
+        } => {
+            let mut s = CodePointSet::new();
+            s.insert(*cp);
+            Some(s)
+        }
+        RepeatAtom::Class {
+            class,
+            negate,
+            ignore_case: false,
+        } => {
+            let cps = &classes[*class as usize].code_points;
+            Some(if *negate { cps.negate() } else { cps.clone() })
+        }
+        RepeatAtom::Char { .. } | RepeatAtom::Class { .. } | RepeatAtom::Any { .. } => None,
+    }
+}
+
+/// Expand `set` to its individual code points, or `None` when it has more than
+/// `cap` members (too large to enumerate cheaply for the disjointness test).
+fn bounded_members(set: &CodePointSet, cap: usize) -> Option<Vec<u32>> {
+    let mut total: usize = 0;
+    for r in set.ranges() {
+        total = total.saturating_add((*r.end() - *r.start()) as usize + 1);
+        if total > cap {
+            return None;
+        }
+    }
+    let mut out = Vec::with_capacity(total);
+    for r in set.ranges() {
+        out.extend(*r.start()..=*r.end());
+    }
+    Some(out)
+}
+
+/// Walk forward from `start` through zero-width bookkeeping instructions and
+/// unconditional jumps to the first *consuming* instruction, returning its
+/// index. Returns `None` — disabling possessification — for any control flow
+/// that could make a give-back necessary: a branch (`Split`), an assertion, a
+/// lookaround, a backreference, a repeat that may match zero times, or reaching
+/// the pattern end. The iteration count is bounded by the program length so a
+/// `Jump` cycle cannot loop forever.
+fn follower_pc(insns: &[Insn], start: usize) -> Option<usize> {
+    let mut pc = start;
+    for _ in 0..=insns.len() {
+        match insns.get(pc)? {
+            Insn::Save(_) | Insn::ClearCapture(_) | Insn::SetMark(_) | Insn::CheckProgress(_) => {
+                pc += 1;
+            }
+            Insn::Jump(t) => pc = *t,
+            Insn::Char { .. } | Insn::CharSeq(_) | Insn::Class { .. } | Insn::AnyChar { .. } => {
+                return Some(pc);
+            }
+            // A `min == 0` repeat could be skipped, handing an interior run
+            // position to whatever follows — too complex to characterize, bail.
+            Insn::Repeat { min, .. } if *min >= 1 => return Some(pc),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Whether the consuming instruction at `insn` can match code point `c`. Mirrors
+/// the executor's matching predicate (including `/i` folding) so the disjointness
+/// analysis never disagrees with execution. Only called on the consuming
+/// instructions [`follower_pc`] returns.
+fn follower_matches(insn: &Insn, classes: &[ClassSet], c: u32, unicode: bool) -> bool {
+    match insn {
+        Insn::Char { cp, ignore_case } => char_matches(*cp, c, *ignore_case, unicode),
+        Insn::CharSeq(seq) => c == u32::from(seq[0]),
+        Insn::Class {
+            class,
+            negate,
+            ignore_case,
+        } => class_matches(&classes[*class as usize], *negate, c, *ignore_case, unicode),
+        Insn::AnyChar { dot_all } => *dot_all || !is_line_terminator(c),
+        Insn::Repeat { atom, .. } => match atom {
+            RepeatAtom::Char { cp, ignore_case } => char_matches(*cp, c, *ignore_case, unicode),
+            RepeatAtom::Class {
+                class,
+                negate,
+                ignore_case,
+            } => class_matches(&classes[*class as usize], *negate, c, *ignore_case, unicode),
+            RepeatAtom::Any { dot_all } => *dot_all || !is_line_terminator(c),
+        },
+        // follower_pc never returns any other instruction.
+        _ => true,
+    }
+}
+
+fn fold(cp: u32, unicode: bool) -> u32 {
+    if unicode {
+        crate::casefold::fold_unicode(cp)
+    } else {
+        crate::casefold::canonicalize(cp)
+    }
+}
+
+fn char_matches(target: u32, c: u32, ignore_case: bool, unicode: bool) -> bool {
+    c == target || (ignore_case && fold(c, unicode) == fold(target, unicode))
+}
+
+fn class_matches(set: &ClassSet, negate: bool, c: u32, ignore_case: bool, unicode: bool) -> bool {
+    let mut inside = set.code_points.contains(c);
+    if !inside && ignore_case {
+        inside = set
+            .code_points
+            .contains(crate::casefold::ascii_other_case(c));
+        if !inside && unicode {
+            inside = set.code_points.contains(crate::casefold::fold_unicode(c));
+        }
+    }
+    inside != negate
+}
+
+fn is_line_terminator(cp: u32) -> bool {
+    matches!(cp, 0x0A | 0x0D | 0x2028 | 0x2029)
 }
 
 struct Emitter {
@@ -455,7 +666,12 @@ impl Emitter {
             && !self.unicode
             && let Some(atom) = self.fuseable_atom(node)
         {
-            self.emit(Insn::Repeat { atom, min, greedy });
+            self.emit(Insn::Repeat {
+                atom,
+                min,
+                greedy,
+                possessive: false,
+            });
             return;
         }
         let captures = capture_indices(node);

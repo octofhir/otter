@@ -254,7 +254,12 @@ impl Matcher<'_, '_> {
                         }
                         _ => break None,
                     },
-                    Insn::Repeat { atom, min, greedy } => {
+                    Insn::Repeat {
+                        atom,
+                        min,
+                        greedy,
+                        possessive,
+                    } => {
                         // Tight one-code-unit scan (non-Unicode), then a single
                         // chained give-back frame rather than a split per char.
                         // The atom kind is matched once, outside the per-unit
@@ -321,7 +326,10 @@ impl Matcher<'_, '_> {
                         }
                         let low = pos + *min as usize;
                         if *greedy {
-                            if end > low {
+                            // A possessive repeat keeps no give-back frame: the
+                            // required atom that follows is disjoint from this
+                            // atom, so no shorter length could satisfy it.
+                            if !*possessive && end > low {
                                 stack.push(Frame {
                                     pc: pc + 1,
                                     pos: end - 1,

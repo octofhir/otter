@@ -66,6 +66,14 @@ pub(crate) enum Insn {
         min: u32,
         /// `true` for a greedy repeat (longest first), `false` for lazy.
         greedy: bool,
+        /// `true` when the greedy repeat needs no give-back: every character it
+        /// can consume is provably disjoint from the unique required atom that
+        /// must follow, so no shorter match can ever satisfy the continuation
+        /// (auto-possessification — §22.2.2 semantics are unchanged because the
+        /// only position the follower can match is the run boundary, exactly
+        /// what the maximal munch already exposes). Set by lowering's
+        /// possessification pass; always `false` for a lazy repeat.
+        possessive: bool,
     },
     /// Unconditional jump to an instruction index.
     Jump(usize),
@@ -163,6 +171,17 @@ pub(crate) struct Program {
     /// skips them without running. `None` when no such prefilter applies
     /// (anchored, empty-matching, or an uncharacterizable leading instruction).
     pub(crate) prefilter: Option<Prefilter>,
+    /// `true` when the unique first consuming instruction (reached from entry
+    /// through only zero-width bookkeeping and jumps — no branch or assertion) is
+    /// a possessive greedy repeat with `min >= 1`. Every start position inside a
+    /// run of that repeat's characters then fails identically (the repeat
+    /// consumes to the same run boundary, never gives back, and its disjoint
+    /// follower fails at that boundary), so on a failed attempt the leftmost
+    /// search skips the entire run in one step instead of retrying each interior
+    /// position — turning the per-run cost from O(run²) to O(run). The run is
+    /// exactly the maximal span of [`Prefilter`] members, so the skip reuses the
+    /// prefilter membership test.
+    pub(crate) lead_possessive_run: bool,
 }
 
 /// A scan prefilter: the set of code points that can begin a match, in a form

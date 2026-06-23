@@ -2259,6 +2259,45 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
+        // Dense fast path: a plain extensible array with a writable `length`,
+        // the default `%Array.prototype%` (no inherited integer setter), and no
+        // accessor/attribute override across the appended range appends straight
+        // to the dense element vector — no `ToString(index)` key, no per-element
+        // ordinary-set protocol. Anything else (sealed/frozen, non-writable
+        // length, prototype override, accessor in range, oversize) returns
+        // `false` from the guard and falls to the spec-generic path below.
+        if let Some(arr) = o.as_array() {
+            let cur = crate::array::len(arr, self.gc_heap());
+            let end = cur + args.len();
+            // `push` creates a *new* index `cur`, so `Set` would consult the
+            // prototype chain for an inherited setter / non-writable data
+            // property at that index. The protector is tripped whenever an
+            // indexed accessor is installed anywhere (most relevantly
+            // `%Array.prototype%`), so gating on it keeps the polluted-prototype
+            // case on the spec-generic path. `can_fast_fill_dense_range` covers
+            // the array's own accessor/attribute overrides + extensibility.
+            if !self.array_index_accessor_protector
+                && crate::array::length_writable(arr, self.gc_heap())
+                && crate::array::can_fast_fill_dense_range(arr, self.gc_heap(), cur, end)
+            {
+                for (i, &arg) in args.iter().enumerate() {
+                    let rest = &args[i + 1..];
+                    let mut visit = |v: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                        for slice in roots {
+                            for val in *slice {
+                                val.trace_value_slots(v);
+                            }
+                        }
+                        for val in rest {
+                            val.trace_value_slots(v);
+                        }
+                    };
+                    crate::array::push_with_roots(arr, self.gc_heap_mut(), arg, &mut visit)
+                        .map_err(VmError::from)?;
+                }
+                return Ok(Value::number(NumberValue::from_f64(end as f64)));
+            }
+        }
         let len = length_of_array_like(self, context, &o)? as f64;
         let arg_count = args.len() as f64;
         // §23.1.3.23 step 4 — len + argCount must stay a safe integer.
@@ -2301,6 +2340,27 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
+        // Dense fast path (symmetric with `array_push`): a plain extensible
+        // array with a writable `length` and no accessor/attribute override on
+        // the last index truncates the dense vector and returns the tail element
+        // directly — no `ToString(index)` key, no delete protocol. `array::pop`
+        // handles holes/sparse correctly (returns `undefined`).
+        if let Some(arr) = o.as_array() {
+            let cur = crate::array::len(arr, self.gc_heap());
+            // The last index must be a *present own* element: then `Get` and
+            // `DeletePropertyOrThrow` resolve to the own slot and never consult
+            // the prototype chain (a hole would make `Get` read an inherited
+            // value — see the polluted-prototype test). `can_fast_fill_dense_range`
+            // rules out an own accessor / non-configurable override + a
+            // sealed/frozen array; `length_writable` guards the length write.
+            if cur > 0
+                && crate::array::has_own_element(arr, self.gc_heap(), cur - 1)
+                && crate::array::length_writable(arr, self.gc_heap())
+                && crate::array::can_fast_fill_dense_range(arr, self.gc_heap(), cur - 1, cur)
+            {
+                return Ok(crate::array::pop(arr, self.gc_heap_mut()));
+            }
+        }
         let len = length_of_array_like(self, context, &o)? as f64;
         if len == 0.0 {
             self.array_set_length_throwing(context, o, 0.0)?;

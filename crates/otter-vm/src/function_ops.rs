@@ -262,7 +262,18 @@ impl Interpreter {
         let prototype = read_register(&stack[frame_idx], proto_reg)?
             .as_object()
             .ok_or(VmError::TypeMismatch)?;
-        let _ = self.define_own_property_partial(prototype, "constructor", constructor_desc)?;
+        // §15.7.10 steps 17/20 — the compiler reserves `prototype.constructor`
+        // with an `undefined` placeholder before the class elements run, so it
+        // precedes the methods in own-key order. A class element whose
+        // computed key evaluates to "constructor" (`['constructor']() {}`) is
+        // an ordinary method and overrides that slot (step 20 runs after step
+        // 17). Only fill the placeholder here: if the slot already holds a real
+        // value, a class element claimed it and must not be clobbered.
+        let placeholder_pending = crate::object::get_own(prototype, &self.gc_heap, "constructor")
+            .is_none_or(|value| value.is_undefined());
+        if placeholder_pending {
+            let _ = self.define_own_property_partial(prototype, "constructor", constructor_desc)?;
+        }
         let frame = &mut stack[frame_idx];
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
@@ -1121,7 +1132,28 @@ impl Interpreter {
                 keys.push(key);
             }
         }
-        Ok(keys)
+        // §10.1.11 OrdinaryOwnPropertyKeys — array-index keys come first
+        // in ascending numeric order, then the remaining string keys in
+        // creation order. The metadata + statics merge above preserves
+        // creation order for the string keys but leaves integer-index
+        // static names (e.g. `static [1]() {}`) interleaved, so lift
+        // them to the front here.
+        let mut indices: Vec<(u32, String)> = Vec::new();
+        let mut strings: Vec<String> = Vec::with_capacity(keys.len());
+        for key in keys {
+            match crate::object::array_index_property_name(&key) {
+                Some(idx) => indices.push((idx, key)),
+                None => strings.push(key),
+            }
+        }
+        if indices.is_empty() {
+            return Ok(strings);
+        }
+        indices.sort_by_key(|(idx, _)| *idx);
+        let mut ordered: Vec<String> = Vec::with_capacity(indices.len() + strings.len());
+        ordered.extend(indices.into_iter().map(|(_, key)| key));
+        ordered.extend(strings);
+        Ok(ordered)
     }
 
     pub(crate) fn ordinary_function_own_property_descriptor(

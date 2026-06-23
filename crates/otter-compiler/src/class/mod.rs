@@ -560,6 +560,62 @@ fn compile_class_strict(
     let ctor_reg = cx.alloc_scratch();
     emit_make_callable(cx, ctor_reg, ctor_const, &ctor_captures, false, span)?;
 
+    // §15.7.14 step 17 — `proto.constructor` is created BEFORE the
+    // class elements run, so among the prototype's string keys it
+    // precedes the methods (OrdinaryOwnPropertyKeys lists string keys
+    // in insertion order; integer-index keys still sort ahead of
+    // both). Reserve the slot now with a placeholder value; `MakeClass`
+    // overwrites it with the real class constructor. Mirrors the method
+    // path's non-enumerable, writable, configurable data descriptor.
+    {
+        let undef_reg = cx.alloc_scratch();
+        cx.emit(Op::LoadUndefined, [Operand::Register(undef_reg)], span);
+        let desc_reg = cx.alloc_scratch();
+        cx.emit(Op::NewObject, [Operand::Register(desc_reg)], span);
+        let true_reg = cx.alloc_scratch();
+        cx.emit(Op::LoadTrue, [Operand::Register(true_reg)], span);
+        let false_reg = cx.alloc_scratch();
+        cx.emit(Op::LoadFalse, [Operand::Register(false_reg)], span);
+        for (attr, value_reg) in [
+            ("value", undef_reg),
+            ("writable", true_reg),
+            ("enumerable", false_reg),
+            ("configurable", true_reg),
+        ] {
+            let attr_const = cx.intern_string_constant(attr);
+            let attr_scratch = cx.alloc_scratch();
+            cx.emit(
+                Op::StoreProperty,
+                vec![
+                    Operand::Register(desc_reg),
+                    Operand::ConstIndex(attr_const),
+                    Operand::Register(value_reg),
+                    Operand::Register(attr_scratch),
+                ],
+                span,
+            );
+        }
+        let key_reg = cx.alloc_scratch();
+        let ctor_key_const = cx.intern_string_constant("constructor");
+        cx.emit(
+            Op::LoadString,
+            [
+                Operand::Register(key_reg),
+                Operand::ConstIndex(ctor_key_const),
+            ],
+            span,
+        );
+        cx.emit(
+            Op::DefineOwnProperty,
+            [
+                Operand::Register(prototype_reg),
+                Operand::Register(key_reg),
+                Operand::Register(desc_reg),
+            ],
+            span,
+        );
+    }
+
     // Install methods (instance + static) onto the right side.
     // Foundation: getter / setter accessors round-trip as plain
     // data methods (their function body is callable and addressable

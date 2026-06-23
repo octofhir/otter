@@ -2759,6 +2759,14 @@ impl Interpreter {
                 let s = string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
                 keys.push(Value::string(s));
             }
+            // §10.1.11 — symbol keys follow the string keys. A class
+            // constructor's own symbol-keyed properties (e.g. a static
+            // `[sym]() {}` method) live on its statics object.
+            let statics = class.statics(&self.gc_heap);
+            let symbols: Vec<Value> = object::with_properties(statics, &self.gc_heap, |p| {
+                p.symbol_keys().map(Value::symbol).collect()
+            });
+            keys.extend(symbols);
             return Ok(keys);
         }
         if let Some(regexp) = target.as_regexp() {

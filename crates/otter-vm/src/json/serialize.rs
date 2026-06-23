@@ -629,8 +629,31 @@ impl Interpreter {
             }
             let key = index.to_string();
             let holder = self.json_root_get(value_root);
-            // §25.5.2.5 — an omitted element serialises as `null`.
-            if !self.serialize_json_property_into(context, state, &key, holder, out)? {
+            // Fast path: read the element straight from the dense vector,
+            // skipping the per-index `Get(holder, ToString(index))` string-keyed
+            // property lookup. `own_data_element_without_accessors` returns the
+            // own element only when the array has no indexed accessors and the
+            // slot is a present (non-hole) value — so the read is identical to
+            // `[[Get]]` and the prototype chain is never consulted. A hole,
+            // accessor, sparse miss, or active array-form replacer falls back to
+            // the observable path (which handles hole -> inherited / `null`).
+            let fast_value = if state.property_list.is_none() {
+                holder.as_array().and_then(|arr| {
+                    usize::try_from(index).ok().and_then(|i| {
+                        crate::array::own_data_element_without_accessors(arr, self.gc_heap(), i)
+                    })
+                })
+            } else {
+                None
+            };
+            let rendered = match fast_value {
+                Some(value) => {
+                    self.serialize_json_known_value_into(context, state, &key, value_root, value, out)?
+                }
+                // §25.5.2.5 — an omitted element serialises as `null`.
+                None => self.serialize_json_property_into(context, state, &key, holder, out)?,
+            };
+            if !rendered {
                 out.push_str("null");
             }
         }

@@ -702,17 +702,32 @@ fn regexp_error_to_syntax_error(err: crate::regexp::RegExpError) -> NativeError 
 }
 
 fn proto_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    let re = receiver_regexp(ctx, "RegExp.prototype.toString")?;
-    let source =
-        crate::regexp_prototype::escape_regexp_pattern_utf16(&re.pattern_utf16(ctx.heap()));
-    let flags = re.flags(ctx.heap()).to_js_string();
-    // `/` + escaped source units + `/` + flag letters, code-unit exact so
-    // lone surrogates in the pattern survive `toString`.
-    let mut rendered: Vec<u16> = Vec::with_capacity(source.len() + flags.len() + 2);
+    // §22.2.6.13 — generic over any object receiver: read `source` and
+    // `flags` through `[[Get]]` (firing accessors / Proxy traps) and
+    // `ToString` each, rather than requiring a real RegExp. A real
+    // RegExp resolves its own `source` / `flags` accessor getters, and
+    // `%RegExp.prototype%` yields the `"(?:)"` / `""` sentinels.
+    const NAME: &str = "RegExp.prototype.toString";
+    let receiver = *ctx.this_value();
+    if !receiver.is_object_type() {
+        return Err(NativeError::TypeError {
+            name: "RegExp.prototype.toString",
+            reason: "this value must be an Object".to_string(),
+        });
+    }
+    let source_val = crate::regexp_prototype::get_property_runtime(ctx, &receiver, "source", NAME)?;
+    let pattern = crate::regexp_prototype::coerce_to_jsstring_runtime(ctx, &source_val, NAME)?;
+    let flags_val = crate::regexp_prototype::get_property_runtime(ctx, &receiver, "flags", NAME)?;
+    let flags = crate::regexp_prototype::coerce_to_jsstring_runtime(ctx, &flags_val, NAME)?;
+    // `/` + pattern + `/` + flags, concatenated at the code-unit level so
+    // any lone surrogate in the coerced strings survives.
+    let pattern_units = pattern.to_utf16_vec(ctx.heap());
+    let flag_units = flags.to_utf16_vec(ctx.heap());
+    let mut rendered: Vec<u16> = Vec::with_capacity(pattern_units.len() + flag_units.len() + 2);
     rendered.push(b'/' as u16);
-    rendered.extend_from_slice(&source);
+    rendered.extend_from_slice(&pattern_units);
     rendered.push(b'/' as u16);
-    rendered.extend(flags.encode_utf16());
+    rendered.extend_from_slice(&flag_units);
 
     let s = JsString::from_utf16_units(&rendered, ctx.heap_mut())
         .map_err(|_| oom("RegExp.prototype.toString"))?;

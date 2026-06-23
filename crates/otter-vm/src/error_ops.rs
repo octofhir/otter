@@ -95,18 +95,22 @@ impl Interpreter {
         message: Option<String>,
         message_value: &Value,
     ) -> Result<object::JsObject, VmError> {
-        let proto = self.error_classes.prototype(kind);
-        let proto_value = Value::object(proto);
         let message_gc_value = message
             .as_ref()
             .map(|text| JsString::from_str(text, self.gc_heap_mut()).map(Value::string))
             .transpose()?;
-        let mut extra_roots: SmallVec<[&Value; 4]> =
-            smallvec::smallvec![message_value, &proto_value];
+        let mut extra_roots: SmallVec<[&Value; 4]> = smallvec::smallvec![message_value];
         if let Some(ref message_gc_value) = message_gc_value {
             extra_roots.push(message_gc_value);
         }
         let obj = self.alloc_stack_rooted_object_with_extra_roots(stack, &extra_roots)?;
+        // Fetch the prototype only after every allocation in this function:
+        // the message-string and object allocs above can each trigger a major
+        // GC that relocates the (old-gen) error prototype. The class registry
+        // is a GC root whose handles the collector forwards in place, so it
+        // always yields the live pointer — a handle captured earlier would be
+        // stale and silently corrupt the new instance's `[[Prototype]]`.
+        let proto = self.error_classes.prototype(kind);
         object::set_prototype(obj, &mut self.gc_heap, Some(proto));
         // §20.5.* — mark the `[[ErrorData]]` internal slot.
         object::set_error_data(obj, &mut self.gc_heap);

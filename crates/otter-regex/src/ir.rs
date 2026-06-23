@@ -34,9 +34,11 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
         next_mark: mark_base,
         unicode: flags.is_unicode_mode(),
     };
-    e.emit(Insn::Save(0));
+    // The overall-match bounds (slots 0/1) are not emitted as `Save`
+    // instructions: the executor seeds slot 0 with the start offset before it
+    // runs, and the terminating `Match` records slot 1. This removes two
+    // instruction dispatches from every match.
     e.compile(&parsed.root);
-    e.emit(Insn::Save(1));
     e.emit(Insn::Match);
 
     // Precompute each class's ASCII membership bitmap so the executor tests the

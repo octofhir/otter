@@ -88,7 +88,9 @@ pub(crate) fn attempt(
         steps: 0,
         step_limit: config.step_limit,
     };
-    let caps: Caps = smallvec![None; program.slot_count()];
+    let mut caps: Caps = smallvec![None; program.slot_count()];
+    // Seed the overall-match start; the lowering no longer emits a `Save(0)`.
+    caps[0] = Some(at);
     let mut stack = core::mem::take(&mut scratch.stack);
     let mut log = core::mem::take(&mut scratch.log);
     let result = m.run(0, at, None, false, caps, &mut stack, &mut log);
@@ -213,7 +215,16 @@ impl Matcher<'_, '_> {
             let (mut pc, mut pos) = (frame.pc, frame.pos);
             let accepted = loop {
                 match &prog.insns[pc] {
-                    Insn::Match | Insn::LookMatch => {
+                    // Top-level accept: record the overall-match end (the
+                    // lowering no longer emits a `Save(1)`). `Match` is only the
+                    // whole-pattern terminator, never reached with `end_anchor`.
+                    Insn::Match => {
+                        caps[1] = Some(pos);
+                        break Some(pos);
+                    }
+                    // Lookaround-body terminator: must land exactly at the
+                    // assertion point when anchored (lookbehind).
+                    Insn::LookMatch => {
                         if end_anchor.is_none_or(|t| pos == t) {
                             break Some(pos);
                         }

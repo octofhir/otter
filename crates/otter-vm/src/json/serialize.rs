@@ -61,6 +61,53 @@ struct JsonState {
     /// is callable). Held on the interpreter's root stack rather than
     /// inline so a scavenge during traversal can't strand it.
     replacer_root: Option<usize>,
+    /// Per-call cache of the enumerable string key list (name + flat slot
+    /// offset) for each hidden class seen on the fast object path. Objects
+    /// of one shape share an identical enumerable key set, so a homogeneous
+    /// array (the common `JSON.stringify` of records) clones each key name
+    /// once per stringify rather than once per element. Scoped to a single
+    /// call: shapes are stable for the duration, so a [`object::ShapeId`]
+    /// key cannot alias a different shape mid-serialisation.
+    key_cache: rustc_hash::FxHashMap<object::ShapeId, std::rc::Rc<[(Box<str>, u16)]>>,
+}
+
+/// Resolved enumerable member list for one object container.
+enum KeySource {
+    /// Ordinary fast path: a hidden-class-cached `(name, flat slot)` list
+    /// shared (via `Rc`) across every object of the same shape, plus the
+    /// shape id used to re-validate the holder before each direct slot read.
+    Fast(std::rc::Rc<[(Box<str>, u16)]>, object::ShapeId),
+    /// Observable/replacer path: owned key names read through `[[Get]]`.
+    Slow(Vec<String>),
+}
+
+impl KeySource {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Fast(list, _) => list.len(),
+            Self::Slow(keys) => keys.len(),
+        }
+    }
+
+    #[inline]
+    fn fast_shape(&self) -> Option<object::ShapeId> {
+        match self {
+            Self::Fast(_, sid) => Some(*sid),
+            Self::Slow(_) => None,
+        }
+    }
+
+    /// `(key name, direct slot offset)` for member `i`. The slot offset is
+    /// present only on the fast path (the slow path always re-reads via
+    /// `[[Get]]`).
+    #[inline]
+    fn entry(&self, i: usize) -> (&str, Option<u16>) {
+        match self {
+            Self::Fast(list, _) => (&list[i].0, Some(list[i].1)),
+            Self::Slow(keys) => (keys[i].as_str(), None),
+        }
+    }
 }
 
 impl Interpreter {
@@ -410,7 +457,7 @@ impl Interpreter {
             return Ok(true);
         }
         if let Some(n) = value.as_number() {
-            out.push_str(&render_number(n));
+            render_number_into(n, out);
             return Ok(true);
         }
         if value.is_big_int() {
@@ -450,43 +497,55 @@ impl Interpreter {
         // enumerable accessors; everything else (replacer property list, proxy /
         // typed array / module namespace / String wrapper, any enumerable
         // getter) keeps the spec `[[Get]]` per key.
-        let (entries, fast_shape): (Vec<(String, Option<u16>)>, Option<object::ShapeId>) =
-            match &state.property_list {
-                Some(list) => (list.iter().map(|k| (k.clone(), None)).collect(), None),
-                None => {
-                    let v = self.json_root_get(value_root);
-                    let heap = self.gc_heap();
-                    let fast = v.as_object().filter(|obj| {
-                        v.as_proxy().is_none()
-                            && v.as_typed_array(heap).is_none()
-                            && object::module_namespace_env(*obj, heap).is_none()
-                            && object::string_data(*obj, heap).is_none()
-                    });
-                    match fast.and_then(|obj| {
-                        object::with_properties(obj, heap, |p| p.enumerable_string_data_offsets())
-                            .map(|offs| (obj, offs))
-                    }) {
-                        Some((obj, offs)) => {
-                            let sid = object::shape_id(obj, heap);
-                            (
-                                offs.into_iter().map(|(k, o)| (k, Some(o))).collect(),
-                                Some(sid),
-                            )
-                        }
-                        None => {
-                            let keys = self.json_enumerable_string_keys(context, &v)?;
-                            (keys.into_iter().map(|k| (k, None)).collect(), None)
-                        }
+        // Resolve this container's enumerable member list. The fast object
+        // path caches the (name, slot) list by hidden class so a homogeneous
+        // array clones each key name once per stringify rather than per
+        // element; the slow path keeps the observable `[[Get]]` key order.
+        let keys: KeySource = match &state.property_list {
+            Some(list) => KeySource::Slow(list.clone()),
+            None => {
+                let v = self.json_root_get(value_root);
+                let heap = self.gc_heap();
+                let fast = v.as_object().filter(|obj| {
+                    v.as_proxy().is_none()
+                        && v.as_typed_array(heap).is_none()
+                        && object::module_namespace_env(*obj, heap).is_none()
+                        && object::string_data(*obj, heap).is_none()
+                });
+                let fast_sid = fast.and_then(|obj| {
+                    let sid = object::shape_id(obj, heap);
+                    if state.key_cache.contains_key(&sid) {
+                        return Some(sid);
+                    }
+                    let offs = object::with_properties(obj, heap, |p| {
+                        p.enumerable_string_data_offsets()
+                    })?;
+                    let list: std::rc::Rc<[(Box<str>, u16)]> = offs
+                        .into_iter()
+                        .map(|(k, o)| (k.into_boxed_str(), o))
+                        .collect();
+                    state.key_cache.insert(sid, list);
+                    Some(sid)
+                });
+                match fast_sid {
+                    Some(sid) => KeySource::Fast(state.key_cache[&sid].clone(), sid),
+                    None => {
+                        let keys = self.json_enumerable_string_keys(context, &v)?;
+                        KeySource::Slow(keys)
                     }
                 }
-            };
+            }
+        };
+        let fast_shape = keys.fast_shape();
+        let key_count = keys.len();
 
         let stepback = state.indent.clone();
         state.indent.push_str(&state.gap);
 
         out.push('{');
         let mut any = false;
-        for (key, fast_slot) in &entries {
+        for entry_idx in 0..key_count {
+            let (key, fast_slot) = keys.entry(entry_idx);
             let holder = self.json_root_get(value_root);
             // Tentatively write this member's separator + key prefix, then
             // its value; if the property is omitted, rewind `out` to undo
@@ -513,7 +572,7 @@ impl Interpreter {
                 Some(slot) => holder
                     .as_object()
                     .filter(|o| Some(object::shape_id(*o, self.gc_heap())) == fast_shape)
-                    .map(|o| object::data_value_at(o, self.gc_heap(), *slot)),
+                    .map(|o| object::data_value_at(o, self.gc_heap(), slot)),
                 None => None,
             };
             let rendered = match fast_value {
@@ -833,15 +892,102 @@ impl Interpreter {
 /// §25.5.2.3 QuoteJSONString over UTF-16 code units so lone
 /// surrogates are escaped as `\uXXXX` (well-formed `JSON.stringify`).
 fn quote_json_string_into(s: JsString, heap: &otter_gc::GcHeap, out: &mut String) {
+    // Fast path: a Latin-1 string body's bytes are exactly its code units
+    // (each in `0..=0xFF`, none a surrogate), so it can be escaped without
+    // materialising a `Vec<u16>` — the dominant allocation for short ASCII
+    // string members like `"user_123"` / `"a"` / `"tag5"`.
+    if s.with_latin1(heap, |bytes| quote_latin1_into(bytes, out)).is_some() {
+        return;
+    }
     let units = s.to_utf16_vec(heap);
     quote_units_into(&units, out);
 }
 
 /// QuoteJSONString for a Rust `&str` member name (object keys are
-/// always well-formed UTF-8, so a code-unit round trip is moot).
+/// always well-formed UTF-8, so the bytes can be escaped in place: only
+/// ASCII `"`, `\\`, and control bytes need escaping, and every multi-byte
+/// UTF-8 sequence — being `>= 0x80` and never JSON-special — is copied
+/// verbatim, producing the same output as the UTF-16 path with no Vec.
 fn quote_json_string_str_into(s: &str, out: &mut String) {
-    let units: Vec<u16> = s.encode_utf16().collect();
-    quote_units_into(&units, out);
+    use std::fmt::Write as _;
+    let bytes = s.as_bytes();
+    out.reserve(bytes.len() + 2);
+    out.push('"');
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b >= 0x20 && b != 0x22 && b != 0x5C {
+            i += 1;
+            continue;
+        }
+        if start < i {
+            out.push_str(&s[start..i]);
+        }
+        match b {
+            0x22 => out.push_str("\\\""),
+            0x5C => out.push_str("\\\\"),
+            0x08 => out.push_str("\\b"),
+            0x0C => out.push_str("\\f"),
+            0x0A => out.push_str("\\n"),
+            0x0D => out.push_str("\\r"),
+            0x09 => out.push_str("\\t"),
+            _ => {
+                let _ = write!(out, "\\u{b:04x}");
+            }
+        }
+        i += 1;
+        start = i;
+    }
+    if start < bytes.len() {
+        out.push_str(&s[start..]);
+    }
+    out.push('"');
+}
+
+/// QuoteJSONString over a Latin-1 byte body. A byte in `0x00..=0x7F` is an
+/// ASCII code unit; `0x80..=0xFF` is the Latin-1 code point `U+0080..=U+00FF`
+/// (no surrogates possible), pushed as its `char`. ASCII runs are flushed as
+/// `&str` slices so the common pure-ASCII member stays a single `push_str`.
+fn quote_latin1_into(bytes: &[u8], out: &mut String) {
+    use std::fmt::Write as _;
+    out.reserve(bytes.len() + 2);
+    out.push('"');
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if (0x20..0x80).contains(&b) && b != 0x22 && b != 0x5C {
+            i += 1;
+            continue;
+        }
+        if start < i {
+            // SAFETY: every byte in `bytes[start..i]` is in `0x20..0x80`, i.e.
+            // printable ASCII, which is valid UTF-8.
+            out.push_str(unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) });
+        }
+        match b {
+            0x22 => out.push_str("\\\""),
+            0x5C => out.push_str("\\\\"),
+            0x08 => out.push_str("\\b"),
+            0x0C => out.push_str("\\f"),
+            0x0A => out.push_str("\\n"),
+            0x0D => out.push_str("\\r"),
+            0x09 => out.push_str("\\t"),
+            0x00..=0x1F => {
+                let _ = write!(out, "\\u{b:04x}");
+            }
+            // 0x80..=0xFF: Latin-1 code point == `char` value.
+            _ => out.push(b as char),
+        }
+        i += 1;
+        start = i;
+    }
+    if start < bytes.len() {
+        // SAFETY: trailing run is all `0x20..0x80` printable ASCII.
+        out.push_str(unsafe { std::str::from_utf8_unchecked(&bytes[start..]) });
+    }
+    out.push('"');
 }
 
 fn quote_units_into(units: &[u16], out: &mut String) {
@@ -889,16 +1035,23 @@ fn quote_units_into(units: &[u16], out: &mut String) {
     out.push('"');
 }
 
-/// ToString(Number) with the §25.5.2.2 non-finite → `null` rule.
-fn render_number(n: NumberValue) -> String {
+/// ToString(Number) with the §25.5.2.2 non-finite → `null` rule,
+/// written straight into `out` so a number member never allocates an
+/// intermediate `String` (number rendering is a per-element hot path).
+fn render_number_into(n: NumberValue, out: &mut String) {
     let f = n.as_f64();
     if !f.is_finite() {
-        return "null".to_string();
+        out.push_str("null");
+        return;
     }
     if f == 0.0 {
-        return "0".to_string();
+        out.push('0');
+        return;
     }
-    n.to_display_string()
+    let mut buf = [0u8; crate::number::ecma::ECMA_BUF_LEN];
+    let len = crate::number::ecma::f64_to_ecma_string_buf(f, &mut buf);
+    // `f64_to_ecma_string_buf` emits ASCII by construction.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[..len]) });
 }
 
 /// ToString(Number) for a PropertyList key (no `null` substitution —

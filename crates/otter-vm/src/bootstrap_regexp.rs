@@ -608,7 +608,7 @@ fn regexp_constructor_matches(
 // Prototype method bodies (delegate to existing intrinsic impls)
 // ---------------------------------------------------------------
 
-fn proto_exec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn proto_exec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let receiver = *ctx.this_value();
     let re = receiver_regexp(ctx, "RegExp.prototype.exec")?;
     let text = args.first().cloned().unwrap_or(Value::undefined());

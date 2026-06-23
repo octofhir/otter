@@ -21,6 +21,8 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-regexp.prototype.exec>
 
+use otter_gc::raw::RawGc;
+
 use crate::array::JsArray;
 use crate::regexp::JsRegExp;
 use crate::runtime_cx::NativeCtx;
@@ -374,6 +376,63 @@ pub fn native_regexp_symbol_match(
     let full_unicode = flags_str.contains('u') || flags_str.contains('v');
     set_property_runtime(ctx, &receiver, "lastIndex", Value::number_i32(0), name)?;
     let text_units = text.to_utf16_vec(ctx.heap());
+    // Fast path: a real RegExp whose `exec` is still the native intrinsic. The
+    // observable per-match protocol would build a full result object, read its
+    // `"0"` element back out, and round-trip `lastIndex` through the property
+    // machinery for every match — none of which is observable for a native
+    // RegExp (`exec` unmodified, `lastIndex` a non-configurable data slot). So
+    // collect the leftmost non-overlapping matches in one pass (which already
+    // applies the global / empty-match advancement) and slice the substrings
+    // directly. `flags` was read above (preserving that observable) and
+    // `lastIndex` stays 0, exactly as the terminal null-returning exec leaves it.
+    //
+    // Guard order matters: test `as_regexp()` (no observable side effect)
+    // before reading `exec`, so a non-RegExp receiver with an instrumented
+    // `exec` getter is left entirely to the observable slow path. Sticky (`y`)
+    // is excluded — the one-pass leftmost scan does not enforce the
+    // anchored-at-`lastIndex` semantics sticky requires.
+    if let Some(re) = receiver.as_regexp()
+        && !flags_str.contains('y')
+    {
+        let exec_fn = get_property_runtime(ctx, &receiver, "exec", name)?;
+        if let Some(native) = exec_fn.as_native_function()
+            && native.is_static_native(ctx.heap(), crate::bootstrap_regexp::proto_exec)
+        {
+            let found = re.find_from_utf16(ctx.heap(), &text_units, 0);
+            if found.is_empty() {
+                return Ok(Value::null());
+            }
+            let text_value = Value::string(text);
+            let mut out: Vec<Value> = Vec::with_capacity(found.len());
+            for m in &found {
+                let slice = &text_units[m.range.start..m.range.end];
+                let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                    for val in &out {
+                        val.trace_value_slots(visitor);
+                    }
+                    receiver.trace_value_slots(visitor);
+                    text_value.trace_value_slots(visitor);
+                };
+                let mstr = JsString::from_utf16_units_with_roots(slice, ctx.heap_mut(), &mut visit)
+                    .map_err(|_| crate::NativeError::TypeError {
+                        name,
+                        reason: "out of memory".to_string(),
+                    })?;
+                out.push(Value::string(mstr));
+            }
+            let arr = ctx
+                .array_from_elements_with_roots(
+                    out.iter().cloned(),
+                    &[&receiver, &text_value],
+                    &[out.as_slice()],
+                )
+                .map_err(|_| crate::NativeError::TypeError {
+                    name,
+                    reason: "array allocation failed".to_string(),
+                })?;
+            return Ok(Value::array(arr));
+        }
+    }
     let mut matches_out: Vec<Value> = Vec::new();
     loop {
         let result = regexp_exec_runtime(ctx, &receiver, text, name)?;

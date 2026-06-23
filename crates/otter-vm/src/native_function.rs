@@ -347,6 +347,19 @@ impl NativeFunction {
         heap.read_payload(self.inner, |body| body.prototype_override)
     }
 
+    /// `true` when this native function's `[[Call]]` is exactly the static
+    /// builtin `target`. Lets a hot caller recognise an un-monkey-patched
+    /// intrinsic (e.g. the original `RegExp.prototype.exec`) and bypass the
+    /// observable protocol; any override (a different function, or a
+    /// dynamic/closure callable) returns `false`.
+    #[must_use]
+    pub(crate) fn is_static_native(&self, heap: &otter_gc::GcHeap, target: NativeFastFn) -> bool {
+        heap.read_payload(self.inner, |body| match &body.call {
+            NativeCallStorage::Static(f) => std::ptr::fn_addr_eq(*f, target),
+            _ => false,
+        })
+    }
+
     /// Build a native function with a static name and an `Fn`
     /// payload.
     pub fn new<F>(

@@ -22,7 +22,7 @@ Fresh release binary: `target/release/otter`.
 | `sort.js` | 2.76s | 0.25–0.53s | 0.16s | open; fill-loop direct calls closed; sort runtime still open |
 | `json.js` | 0.95s | 0.93s | 0.39s | open; serializer + small-dict allocation closed, parse object shaping remains |
 | `string-ops.js` | 0.43s | 0.44s | 0.03s | open |
-| `regex.js` | 0.42s | 0.42s | 0.06s | open; case-fold + leading-assert prefilter + native-@@match fast path landed (1.63s->0.42s, match 1190->4ms); @@replace/exec fast paths remain |
+| `regex.js` | 0.36s | 0.36s | 0.23s | closed enough (~1.5x); case-fold + leading-assert prefilter + native @@match/@@replace fast paths (1.63s->0.36s, match 1190->4ms, replace 184->2ms); residual `exec` is matcher backtracking re-scan (needs required-literal/NFA) |
 
 Output parity across `benchmarks/scripts/*.js` passed after the latest JIT
 commits. GC-stress smoke passed for `fib`, `prop-access`, and `nbody`.

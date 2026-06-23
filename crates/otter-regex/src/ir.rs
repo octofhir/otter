@@ -143,6 +143,17 @@ fn compute_first_set(
             Insn::Save(_) | Insn::ClearCapture(_) | Insn::SetMark(_) | Insn::CheckProgress(_) => {
                 work.push(pc + 1)
             }
+            // Leading zero-width assertions (`^`, `$`, `\b`/`\B`) consume nothing,
+            // so the first *consumed* code point still comes from whatever follows
+            // them. Pass through to characterize it — the prefilter then skips
+            // positions whose code point cannot begin the match (e.g. the
+            // non-letters in `\b[a-z]{4,}\b`), and the assertion itself is
+            // re-checked by the matcher at each surviving candidate. Reaching
+            // `Match` through here still yields no prefilter (handled below),
+            // so an empty-matchable prefix stays unfiltered.
+            Insn::AssertStart { .. } | Insn::AssertEnd { .. } | Insn::WordBoundary(_) => {
+                work.push(pc + 1)
+            }
             Insn::Jump(t) => work.push(*t),
             Insn::Split(a, b) => {
                 work.push(*a);

@@ -37,6 +37,20 @@ use crate::{
     write_register,
 };
 
+/// Resolution of an OrdinarySet for a callable's deleted `name` /
+/// `length` along its `[[Prototype]]` (see
+/// [`Interpreter::callable_metadata_proto_set`]).
+enum MetadataProtoSet {
+    /// An inherited non-writable data slot (or setter-less accessor) —
+    /// the write is rejected.
+    Reject,
+    /// An inherited accessor with a setter — invoke it with the callable
+    /// as receiver.
+    InvokeSetter(Value),
+    /// No inherited slot blocks the write — create the own property.
+    Create,
+}
+
 impl Interpreter {
     fn store_array_accessor_property(
         &mut self,
@@ -1381,6 +1395,61 @@ impl Interpreter {
         Ok(())
     }
 
+    /// §10.1.9.2 — continue OrdinarySet for a callable whose virtual
+    /// `name` / `length` own slot is absent (it was deleted), resolving
+    /// the write along the callable's `[[Prototype]]`. The default
+    /// `%Function.prototype%` carries both as non-writable data
+    /// properties (held as native-function metadata, not a plain object
+    /// slot), so the descriptor walk uses the value-aware getter rather
+    /// than `resolve_set`. Without this, a deleted `name` / `length`
+    /// would be silently re-created as an own data property, masking the
+    /// inherited non-writable slot.
+    fn callable_metadata_proto_set(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        name: &str,
+    ) -> Result<MetadataProtoSet, VmError> {
+        let key = VmPropertyKey::String(name);
+        let mut current = self.get_prototype_for_op(&receiver)?;
+        let mut hops = 0usize;
+        while hops < object::PROTO_CHAIN_HARD_CAP {
+            if current.is_null() || current.is_undefined() {
+                return Ok(MetadataProtoSet::Create);
+            }
+            let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                context,
+                current,
+                &key,
+                0,
+                &[&receiver, &current],
+                &[],
+            )?;
+            match desc {
+                Some(d) => {
+                    return Ok(match &d.kind {
+                        object::DescriptorKind::Accessor { setter, .. } => match setter {
+                            Some(s) => MetadataProtoSet::InvokeSetter(*s),
+                            None => MetadataProtoSet::Reject,
+                        },
+                        object::DescriptorKind::Data { .. } => {
+                            if d.writable() {
+                                MetadataProtoSet::Create
+                            } else {
+                                MetadataProtoSet::Reject
+                            }
+                        }
+                    });
+                }
+                None => {
+                    current = self.get_prototype_for_op(&current)?;
+                    hops += 1;
+                }
+            }
+        }
+        Ok(MetadataProtoSet::Create)
+    }
+
     pub(crate) fn run_store_property_reg(
         &mut self,
         context: &ExecutionContext,
@@ -1579,28 +1648,63 @@ impl Interpreter {
                 context, owner, fid, name,
             )?;
             if matches!(name, "name" | "length") {
-                if let Some(desc) =
-                    self.ordinary_function_own_property_descriptor(Some(context), owner, fid, name)?
-                    && !desc.writable()
-                {
-                    self.failed_set_result(
-                        strict,
-                        format!("Cannot assign to read-only property '{name}' of function"),
-                    )?;
-                    None
-                } else {
-                    let bag = self.function_user_bag_with_stack_roots(
-                        stack,
-                        owner,
-                        fid,
-                        &[&receiver, &value],
-                    )?;
-                    if let Some(metadata_key) =
-                        function_metadata::ordinary_function_metadata_key(name)
-                    {
-                        self.function_deleted_metadata.remove(&(fid, metadata_key));
+                let own = self.ordinary_function_own_property_descriptor(
+                    Some(context),
+                    owner,
+                    fid,
+                    name,
+                )?;
+                match own {
+                    Some(desc) if !desc.writable() => {
+                        self.failed_set_result(
+                            strict,
+                            format!("Cannot assign to read-only property '{name}' of function"),
+                        )?;
+                        None
                     }
-                    Some(bag)
+                    Some(_) => {
+                        // Own writable metadata (made writable via
+                        // defineProperty): overwrite in place.
+                        let bag = self.function_user_bag_with_stack_roots(
+                            stack,
+                            owner,
+                            fid,
+                            &[&receiver, &value],
+                        )?;
+                        Some(bag)
+                    }
+                    None => match self.callable_metadata_proto_set(context, receiver, name)? {
+                        MetadataProtoSet::Reject => {
+                            self.failed_set_result(
+                                strict,
+                                format!("Cannot assign to read-only property '{name}' of function"),
+                            )?;
+                            None
+                        }
+                        MetadataProtoSet::InvokeSetter(setter) => {
+                            self.run_callable_sync(
+                                context,
+                                &setter,
+                                receiver,
+                                smallvec::smallvec![value],
+                            )?;
+                            None
+                        }
+                        MetadataProtoSet::Create => {
+                            let bag = self.function_user_bag_with_stack_roots(
+                                stack,
+                                owner,
+                                fid,
+                                &[&receiver, &value],
+                            )?;
+                            if let Some(metadata_key) =
+                                function_metadata::ordinary_function_metadata_key(name)
+                            {
+                                self.function_deleted_metadata.remove(&(fid, metadata_key));
+                            }
+                            Some(bag)
+                        }
+                    },
                 }
             } else if !has_own && !self.ordinary_function_is_extensible(fid) {
                 self.failed_set_result(
@@ -1629,6 +1733,44 @@ impl Interpreter {
                     )?;
                     None
                 }
+                // No own slot for `name`/`length` means it was deleted; the
+                // inherited %Function.prototype% slot is non-writable, so
+                // resolve the write along the [[Prototype]] rather than
+                // silently re-creating an own data property.
+                None if matches!(name, "name" | "length") => {
+                    match self.callable_metadata_proto_set(context, receiver, name)? {
+                        MetadataProtoSet::Reject => {
+                            self.failed_set_result(
+                                strict,
+                                format!(
+                                    "Cannot assign to read-only property '{name}' of function {}",
+                                    native.name(&self.gc_heap)
+                                ),
+                            )?;
+                        }
+                        MetadataProtoSet::InvokeSetter(setter) => {
+                            self.run_callable_sync(
+                                context,
+                                &setter,
+                                receiver,
+                                smallvec::smallvec![value],
+                            )?;
+                        }
+                        MetadataProtoSet::Create => {
+                            let desc = object::PropertyDescriptor::data(value, true, false, true);
+                            if !native.define_own_property(&mut self.gc_heap, name, desc) {
+                                self.failed_set_result(
+                                    strict,
+                                    format!(
+                                        "Cannot define property '{name}' on function {}",
+                                        native.name(&self.gc_heap)
+                                    ),
+                                )?;
+                            }
+                        }
+                    }
+                    None
+                }
                 _ => {
                     let enumerable =
                         function_metadata::ordinary_function_metadata_key(name).is_none();
@@ -1654,6 +1796,44 @@ impl Interpreter {
                         strict,
                         format!("Cannot assign to read-only property '{name}' of bound function"),
                     )?;
+                    None
+                }
+                // Deleted `name`/`length`: resolve along [[Prototype]]
+                // (%Function.prototype% rejects the non-writable slot)
+                // instead of re-creating an own data property.
+                None if matches!(name, "name" | "length") => {
+                    match self.callable_metadata_proto_set(context, receiver, name)? {
+                        MetadataProtoSet::Reject => {
+                            self.failed_set_result(
+                                strict,
+                                format!(
+                                    "Cannot assign to read-only property '{name}' of bound function"
+                                ),
+                            )?;
+                        }
+                        MetadataProtoSet::InvokeSetter(setter) => {
+                            self.run_callable_sync(
+                                context,
+                                &setter,
+                                receiver,
+                                smallvec::smallvec![value],
+                            )?;
+                        }
+                        MetadataProtoSet::Create => {
+                            let desc = object::PropertyDescriptor::data(value, true, true, true);
+                            if !function_metadata::bound_define_own_property(
+                                bound,
+                                &mut self.gc_heap,
+                                name,
+                                desc,
+                            ) {
+                                self.failed_set_result(
+                                    strict,
+                                    format!("Cannot define property '{name}' on bound function"),
+                                )?;
+                            }
+                        }
+                    }
                     None
                 }
                 _ => {
@@ -5253,17 +5433,29 @@ impl Interpreter {
                 .map(|c| c.cached_function_id)
         }) {
             let owner = receiver.as_closure(&self.gc_heap);
-            if function_metadata::ordinary_function_metadata_key(name).is_some()
-                && let Some(desc) =
-                    self.ordinary_function_own_property_descriptor(Some(context), owner, fid, name)?
-                && !desc.writable()
-            {
-                return self.finish_failed_set(
-                    stack,
-                    context,
-                    format!("Cannot assign to read-only property '{name}' of function"),
-                    self.current_byte_len,
-                );
+            if function_metadata::ordinary_function_metadata_key(name).is_some() {
+                match self.ordinary_function_own_property_descriptor(
+                    Some(context),
+                    owner,
+                    fid,
+                    name,
+                )? {
+                    Some(desc) if !desc.writable() => {
+                        return self.finish_failed_set(
+                            stack,
+                            context,
+                            format!("Cannot assign to read-only property '{name}' of function"),
+                            self.current_byte_len,
+                        );
+                    }
+                    // The virtual `name`/`length` was deleted: defer to the
+                    // slow store funnel, which resolves the write along the
+                    // [[Prototype]] (the inherited %Function.prototype% slot
+                    // is non-writable) instead of re-creating an own bag
+                    // entry that would mask it.
+                    None => return Ok(false),
+                    Some(_) => {}
+                }
             }
             match self.callable_bag_read(owner, fid) {
                 Some(bag) => bag,

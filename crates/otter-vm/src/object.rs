@@ -895,10 +895,22 @@ impl ObjectBody {
         self.exotic().map_or(&[], |e| e.dictionary_keys.as_slice())
     }
     /// Dictionary-mode `key → slot offset`, or `None`.
+    ///
+    /// A small dictionary keeps no hash index (see [`DICT_LINEAR_SCAN_MAX`]):
+    /// a linear scan over its few short key strings is faster than hashing and
+    /// avoids allocating/maintaining a `FxHashMap` per object. This matters for
+    /// `JSON.parse`, which builds large numbers of small dictionary objects.
     #[inline]
     fn dictionary_index_get(&self, key: &str) -> Option<u16> {
-        self.exotic()
-            .and_then(|e| e.dictionary_index.get(key).copied())
+        let exotic = self.exotic()?;
+        if exotic.dictionary_index.is_empty() {
+            return exotic
+                .dictionary_keys
+                .iter()
+                .position(|k| k == key)
+                .map(|i| i as u16);
+        }
+        exotic.dictionary_index.get(key).copied()
     }
 
     /// `true` when per-slot metadata is materialized in [`ExoticSlots::slots`]
@@ -1452,24 +1464,52 @@ pub(crate) fn shape_property_count(shape: ShapeHandle, heap: &otter_gc::GcHeap) 
 /// O(1). Mirrors the fast-property cap used by production engines.
 pub(crate) const MAX_FAST_PROPERTIES: u32 = 128;
 
+/// A dictionary object with at most this many own string keys keeps no hash
+/// index ([`ObjectBody::dictionary_index`] stays empty) and resolves keys by
+/// linear scan. Past it, the index is built once and maintained, keeping bulk
+/// addition and lookup O(1). Small objects — the common `JSON.parse` record —
+/// then never allocate the per-object index. Lookup over this many short
+/// interned keys is cheaper than a hash probe.
+pub(super) const DICT_LINEAR_SCAN_MAX: usize = 16;
+
+/// Build the hash index from the current `dictionary_keys` order. No-op when
+/// it is already populated.
+fn dict_build_index(exotic: &mut ExoticSlots) {
+    if !exotic.dictionary_index.is_empty() {
+        return;
+    }
+    exotic.dictionary_index.reserve(exotic.dictionary_keys.len());
+    for (offset, key) in exotic.dictionary_keys.iter().enumerate() {
+        exotic.dictionary_index.insert(key.clone(), offset as u16);
+    }
+}
+
 /// Push a new dictionary key, keeping [`ObjectBody::dictionary_index`]
-/// in lockstep. The caller pushes the matching slot separately; the
-/// new offset is the pre-push length (slots and keys stay aligned).
+/// in lockstep when it is active. The caller pushes the matching slot
+/// separately; the new offset is the pre-push length (slots and keys stay
+/// aligned). A small dictionary skips the index entirely (see
+/// [`DICT_LINEAR_SCAN_MAX`]); crossing the threshold builds it.
 pub(super) fn dict_push_key(body: &mut ObjectBody, key: String) {
     let exotic = body.exotic_mut();
     let offset = exotic.dictionary_keys.len() as u16;
-    exotic.dictionary_index.insert(key.clone(), offset);
+    if !exotic.dictionary_index.is_empty() || exotic.dictionary_keys.len() >= DICT_LINEAR_SCAN_MAX {
+        dict_build_index(exotic);
+        exotic.dictionary_index.insert(key.clone(), offset);
+    }
     exotic.dictionary_keys.push(key);
 }
 
 /// Replace the whole dictionary key order (shape→dictionary transition
-/// or post-delete compaction) and rebuild the index from scratch.
+/// or post-delete compaction) and rebuild the index from scratch. A small
+/// key set leaves the index empty for linear-scan lookup.
 pub(super) fn dict_set_keys(body: &mut ObjectBody, keys: Vec<String>) {
     let exotic = body.exotic_mut();
     exotic.dictionary_index.clear();
-    exotic.dictionary_index.reserve(keys.len());
-    for (offset, key) in keys.iter().enumerate() {
-        exotic.dictionary_index.insert(key.clone(), offset as u16);
+    if keys.len() >= DICT_LINEAR_SCAN_MAX {
+        exotic.dictionary_index.reserve(keys.len());
+        for (offset, key) in keys.iter().enumerate() {
+            exotic.dictionary_index.insert(key.clone(), offset as u16);
+        }
     }
     exotic.dictionary_keys = keys;
 }

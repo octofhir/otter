@@ -1,13 +1,13 @@
 {
   "test262_commit": "7e115f46ac64340827d505fa928ad436cb7ba5a6",
-  "engine_commit": "b570f9ff647bb04d6a7cdc6abc25480d64e55a34",
-  "ran_at": "2026-06-17T21:40:38.031147+00:00",
+  "engine_commit": "cf5ebe1dae494659905467abbb12f75d8ac792a3",
+  "ran_at": "2026-06-23T21:13:00.836960+00:00",
   "totals": {
     "total": 52783,
-    "passed": 50154,
-    "failed": 1371,
-    "skipped": 1247,
-    "crashed": 0,
+    "passed": 50227,
+    "failed": 1347,
+    "skipped": 1182,
+    "crashed": 16,
     "timed_out": 11,
     "oom": 0
   },
@@ -32,9 +32,9 @@
     },
     "annexB/built-ins/Function": {
       "total": 6,
-      "passed": 0,
+      "passed": 6,
       "failed": 0,
-      "skipped": 6,
+      "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -50,9 +50,9 @@
     },
     "annexB/built-ins/RegExp": {
       "total": 62,
-      "passed": 52,
-      "failed": 1,
-      "skipped": 9,
+      "passed": 53,
+      "failed": 2,
+      "skipped": 7,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -114,8 +114,8 @@
     "annexB/language/expressions": {
       "total": 26,
       "passed": 17,
-      "failed": 2,
-      "skipped": 7,
+      "failed": 9,
+      "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -1364,8 +1364,8 @@
     },
     "built-ins/AsyncFunction/AsyncFunction-is-extensible.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -5585,9 +5585,9 @@
     },
     "built-ins/Function/prototype": {
       "total": 309,
-      "passed": 270,
+      "passed": 304,
       "failed": 0,
-      "skipped": 39,
+      "skipped": 5,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -16475,9 +16475,9 @@
     },
     "built-ins/Temporal/Duration": {
       "total": 540,
-      "passed": 507,
+      "passed": 508,
       "failed": 32,
-      "skipped": 1,
+      "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -16511,9 +16511,9 @@
     },
     "built-ins/Temporal/PlainDateTime": {
       "total": 773,
-      "passed": 760,
+      "passed": 761,
       "failed": 12,
-      "skipped": 1,
+      "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -17573,55 +17573,55 @@
     },
     "built-ins/decodeURI/S15.1.3.1_A1.10_T1.js": {
       "total": 1,
-      "passed": 1,
+      "passed": 0,
       "failed": 0,
       "skipped": 0,
-      "crashed": 0,
+      "crashed": 1,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURI/S15.1.3.1_A1.11_T1.js": {
       "total": 1,
       "passed": 0,
-      "failed": 1,
+      "failed": 0,
       "skipped": 0,
-      "crashed": 0,
+      "crashed": 1,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURI/S15.1.3.1_A1.11_T2.js": {
       "total": 1,
       "passed": 0,
-      "failed": 1,
+      "failed": 0,
       "skipped": 0,
-      "crashed": 0,
+      "crashed": 1,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURI/S15.1.3.1_A1.12_T1.js": {
       "total": 1,
       "passed": 0,
-      "failed": 1,
+      "failed": 0,
       "skipped": 0,
-      "crashed": 0,
+      "crashed": 1,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURI/S15.1.3.1_A1.12_T2.js": {
       "total": 1,
       "passed": 0,
-      "failed": 1,
+      "failed": 0,
       "skipped": 0,
-      "crashed": 0,
+      "crashed": 1,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURI/S15.1.3.1_A1.12_T3.js": {
       "total": 1,
       "passed": 0,
-      "failed": 1,
+      "failed": 0,
       "skipped": 0,
-      "crashed": 0,
+      "crashed": 1,
       "timed_out": 0,
       "oom": 0
     },
@@ -17745,18 +17745,18 @@
     "built-ins/decodeURI/S15.1.3.1_A1.2_T1.js": {
       "total": 1,
       "passed": 0,
-      "failed": 1,
+      "failed": 0,
       "skipped": 0,
-      "crashed": 0,
+      "crashed": 1,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURI/S15.1.3.1_A1.2_T2.js": {
       "total": 1,
       "passed": 0,
-      "failed": 1,
+      "failed": 0,
       "skipped": 0,
-      "crashed": 0,
+      "crashed": 1,
       "timed_out": 0,
       "oom": 0
     },
@@ -18070,8 +18070,8 @@
       "total": 1,
       "passed": 0,
       "failed": 0,
-      "skipped": 1,
-      "crashed": 0,
+      "skipped": 0,
+      "crashed": 1,
       "timed_out": 0,
       "oom": 0
     },
@@ -18079,8 +18079,8 @@
       "total": 1,
       "passed": 0,
       "failed": 0,
-      "skipped": 1,
-      "crashed": 0,
+      "skipped": 0,
+      "crashed": 1,
       "timed_out": 0,
       "oom": 0
     },
@@ -18088,8 +18088,8 @@
       "total": 1,
       "passed": 0,
       "failed": 0,
-      "skipped": 1,
-      "crashed": 0,
+      "skipped": 0,
+      "crashed": 1,
       "timed_out": 0,
       "oom": 0
     },
@@ -18097,8 +18097,8 @@
       "total": 1,
       "passed": 0,
       "failed": 0,
-      "skipped": 1,
-      "crashed": 0,
+      "skipped": 0,
+      "crashed": 1,
       "timed_out": 0,
       "oom": 0
     },
@@ -18106,17 +18106,17 @@
       "total": 1,
       "passed": 0,
       "failed": 0,
-      "skipped": 1,
-      "crashed": 0,
+      "skipped": 0,
+      "crashed": 1,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURIComponent/S15.1.3.2_A1.12_T3.js": {
       "total": 1,
       "passed": 0,
-      "failed": 1,
+      "failed": 0,
       "skipped": 0,
-      "crashed": 0,
+      "crashed": 1,
       "timed_out": 0,
       "oom": 0
     },
@@ -18241,8 +18241,8 @@
       "total": 1,
       "passed": 0,
       "failed": 0,
-      "skipped": 1,
-      "crashed": 0,
+      "skipped": 0,
+      "crashed": 1,
       "timed_out": 0,
       "oom": 0
     },
@@ -18250,8 +18250,8 @@
       "total": 1,
       "passed": 0,
       "failed": 0,
-      "skipped": 1,
-      "crashed": 0,
+      "skipped": 0,
+      "crashed": 1,
       "timed_out": 0,
       "oom": 0
     },
@@ -18357,8 +18357,8 @@
     "built-ins/decodeURIComponent/S15.1.3.2_A2.1_T1.js": {
       "total": 1,
       "passed": 0,
-      "failed": 0,
-      "skipped": 1,
+      "failed": 1,
+      "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -18392,9 +18392,9 @@
     },
     "built-ins/decodeURIComponent/S15.1.3.2_A2.5_T1.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
-      "skipped": 1,
+      "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -18500,9 +18500,9 @@
     },
     "built-ins/decodeURIComponent/S15.1.3.2_A5.5.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
-      "skipped": 1,
+      "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -23594,9 +23594,9 @@
     },
     "intl402/Temporal/Duration": {
       "total": 21,
-      "passed": 19,
+      "passed": 20,
       "failed": 1,
-      "skipped": 1,
+      "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -23873,8 +23873,8 @@
     },
     "intl402/supportedLocalesOf-unicode-extensions-ignored.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -27779,9 +27779,9 @@
     },
     "language/expressions/class": {
       "total": 4059,
-      "passed": 4035,
-      "failed": 14,
-      "skipped": 10,
+      "passed": 4033,
+      "failed": 6,
+      "skipped": 20,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -38165,9 +38165,9 @@
     },
     "language/statements/class": {
       "total": 4367,
-      "passed": 4349,
-      "failed": 18,
-      "skipped": 0,
+      "passed": 4347,
+      "failed": 6,
+      "skipped": 14,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -39119,9 +39119,9 @@
     },
     "staging/decorators/accessor-as-identifier.js": {
       "total": 1,
-      "passed": 1,
+      "passed": 0,
       "failed": 0,
-      "skipped": 0,
+      "skipped": 1,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -39129,8 +39129,8 @@
     "staging/decorators/private-auto-accessor.js": {
       "total": 1,
       "passed": 0,
-      "failed": 1,
-      "skipped": 0,
+      "failed": 0,
+      "skipped": 1,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -39138,8 +39138,8 @@
     "staging/decorators/public-auto-accessor.js": {
       "total": 1,
       "passed": 0,
-      "failed": 1,
-      "skipped": 0,
+      "failed": 0,
+      "skipped": 1,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -39677,8 +39677,8 @@
     },
     "staging/sm/Array": {
       "total": 90,
-      "passed": 77,
-      "failed": 13,
+      "passed": 79,
+      "failed": 11,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39803,9 +39803,9 @@
     },
     "staging/sm/Math": {
       "total": 30,
-      "passed": 0,
-      "failed": 0,
-      "skipped": 30,
+      "passed": 29,
+      "failed": 1,
+      "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -39893,8 +39893,8 @@
     },
     "staging/sm/TypedArray": {
       "total": 96,
-      "passed": 85,
-      "failed": 11,
+      "passed": 86,
+      "failed": 10,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40037,8 +40037,8 @@
     },
     "staging/sm/object": {
       "total": 65,
-      "passed": 56,
-      "failed": 9,
+      "passed": 55,
+      "failed": 10,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40110,16 +40110,164 @@
   },
   "failing_tests": [
     {
-      "path": "built-ins/AsyncFunction/AsyncFunction-is-extensible.js",
-      "esid": "pending",
+      "path": "built-ins/decodeURI/S15.1.3.1_A1.10_T1.js",
+      "esid": "sec-decodeuri-encodeduri",
+      "outcome": "crash",
+      "reason": "engine internal error (VM_UNKNOWN): URIError"
+    },
+    {
+      "path": "built-ins/decodeURI/S15.1.3.1_A1.11_T1.js",
+      "esid": "sec-decodeuri-encodeduri",
+      "outcome": "crash",
+      "reason": "engine internal error (VM_UNKNOWN): URIError"
+    },
+    {
+      "path": "built-ins/decodeURI/S15.1.3.1_A1.11_T2.js",
+      "esid": "sec-decodeuri-encodeduri",
+      "outcome": "crash",
+      "reason": "engine internal error (VM_UNKNOWN): URIError"
+    },
+    {
+      "path": "built-ins/decodeURI/S15.1.3.1_A1.12_T1.js",
+      "esid": "sec-decodeuri-encodeduri",
+      "outcome": "crash",
+      "reason": "engine internal error (VM_UNKNOWN): URIError"
+    },
+    {
+      "path": "built-ins/decodeURI/S15.1.3.1_A1.12_T2.js",
+      "esid": "sec-decodeuri-encodeduri",
+      "outcome": "crash",
+      "reason": "engine internal error (VM_UNKNOWN): URIError"
+    },
+    {
+      "path": "built-ins/decodeURI/S15.1.3.1_A1.12_T3.js",
+      "esid": "sec-decodeuri-encodeduri",
+      "outcome": "crash",
+      "reason": "engine internal error (VM_UNKNOWN): URIError"
+    },
+    {
+      "path": "built-ins/decodeURI/S15.1.3.1_A1.2_T1.js",
+      "esid": "sec-decodeuri-encodeduri",
+      "outcome": "crash",
+      "reason": "engine internal error (VM_UNKNOWN): URIError"
+    },
+    {
+      "path": "built-ins/decodeURI/S15.1.3.1_A1.2_T2.js",
+      "esid": "sec-decodeuri-encodeduri",
+      "outcome": "crash",
+      "reason": "engine internal error (VM_UNKNOWN): URIError"
+    },
+    {
+      "path": "built-ins/decodeURI/S15.1.3.1_A2.1_T1.js",
+      "esid": "sec-decodeuri-encodeduri",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «1») to be true"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #D800 differs"
+    },
+    {
+      "path": "built-ins/decodeURI/S15.1.3.1_A3_T1.js",
+      "esid": "sec-decodeuri-encodeduri",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: decodeURI(\"%3B\") equal \"%3B\", not \";\""
+    },
+    {
+      "path": "built-ins/decodeURI/S15.1.3.1_A3_T2.js",
+      "esid": "sec-decodeuri-encodeduri",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: decodeURI(\"%3b\") equal \"%3b\", not \";\" or \"%3B\""
+    },
+    {
+      "path": "built-ins/decodeURI/S15.1.3.1_A3_T3.js",
+      "esid": "sec-decodeuri-encodeduri",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: decodeURI(\"%3B%2F%3F%3A%40%26%3D%2B%24%2C%23\") equal \"%3B%2F%3F%3A%40%26%3D%2B%24%2C%23\", not \";/?:@&=+$,#\""
+    },
+    {
+      "path": "built-ins/decodeURI/S15.1.3.1_A4_T2.js",
+      "esid": "sec-decodeuri-encodeduri",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #3: http://ru.wikipedia.org/wiki/Юникод%23Версии Юникода"
+    },
+    {
+      "path": "built-ins/decodeURI/S15.1.3.1_A4_T4.js",
+      "esid": "sec-decodeuri-encodeduri",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #2: http:%2f%2Funipro.ru"
+    },
+    {
+      "path": "built-ins/decodeURIComponent/S15.1.3.2_A1.10_T1.js",
+      "esid": "sec-decodeuricomponent-encodeduricomponent",
+      "outcome": "crash",
+      "reason": "range end index 512 out of range for slice of length 12"
+    },
+    {
+      "path": "built-ins/decodeURIComponent/S15.1.3.2_A1.11_T1.js",
+      "esid": "sec-decodeuricomponent-encodeduricomponent",
+      "outcome": "crash",
+      "reason": "engine internal error (VM_UNKNOWN): URIError"
+    },
+    {
+      "path": "built-ins/decodeURIComponent/S15.1.3.2_A1.11_T2.js",
+      "esid": "sec-decodeuricomponent-encodeduricomponent",
+      "outcome": "crash",
+      "reason": "engine internal error (VM_UNKNOWN): URIError"
+    },
+    {
+      "path": "built-ins/decodeURIComponent/S15.1.3.2_A1.12_T1.js",
+      "esid": "sec-decodeuricomponent-encodeduricomponent",
+      "outcome": "crash",
+      "reason": "engine internal error (VM_UNKNOWN): URIError"
+    },
+    {
+      "path": "built-ins/decodeURIComponent/S15.1.3.2_A1.12_T2.js",
+      "esid": "sec-decodeuricomponent-encodeduricomponent",
+      "outcome": "crash",
+      "reason": "engine internal error (VM_UNKNOWN): URIError"
+    },
+    {
+      "path": "built-ins/decodeURIComponent/S15.1.3.2_A1.12_T3.js",
+      "esid": "sec-decodeuricomponent-encodeduricomponent",
+      "outcome": "crash",
+      "reason": "engine internal error (VM_UNKNOWN): URIError"
+    },
+    {
+      "path": "built-ins/decodeURIComponent/S15.1.3.2_A1.2_T1.js",
+      "esid": "sec-decodeuricomponent-encodeduricomponent",
+      "outcome": "crash",
+      "reason": "engine internal error (VM_UNKNOWN): URIError"
+    },
+    {
+      "path": "built-ins/decodeURIComponent/S15.1.3.2_A1.2_T2.js",
+      "esid": "sec-decodeuricomponent-encodeduricomponent",
+      "outcome": "crash",
+      "reason": "engine internal error (VM_UNKNOWN): URIError"
+    },
+    {
+      "path": "built-ins/decodeURIComponent/S15.1.3.2_A2.1_T1.js",
+      "esid": "sec-decodeuricomponent-encodeduricomponent",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #D800 differs"
     },
     {
       "path": "built-ins/FinalizationRegistry/prototype/register/return-undefined-register-object.js",
       "esid": "sec-finalization-registry.prototype.register",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: FinalizationRegistry.prototype.register: type mismatch: this operation does not accept a value of this type"
+    },
+    {
+      "path": "built-ins/global/10.2.1.1.3-4-16-s.js",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
+    },
+    {
+      "path": "built-ins/global/10.2.1.1.3-4-18-s.js",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
+    },
+    {
+      "path": "built-ins/global/property-descriptor.js",
+      "esid": "sec-other-properties-of-the-global-object-globalthis",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: globalThis descriptor should not be enumerable"
     },
     {
       "path": "built-ins/Math/hypot/Math.hypot_ToNumberErr.js",
@@ -40131,6 +40279,18 @@
       "path": "built-ins/Math/round/S15.8.2.15_A7.js",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: The result of evaluating (1 / Math.round(x)) is expected to be 1 / 0 Expected SameValue(«1», «Infinity») to be true"
+    },
+    {
+      "path": "built-ins/parseFloat/S15.1.2.3_A4_T2.js",
+      "esid": "sec-parsefloat-string",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: parseFloat(\"1ex\") === 1. Actual: NaN"
+    },
+    {
+      "path": "built-ins/parseFloat/S15.1.2.3_A6.js",
+      "esid": "sec-parsefloat-string",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #002B "
     },
     {
       "path": "built-ins/RegExp/S15.10.2.8_A3_T15.js",
@@ -40482,7 +40642,7 @@
       "path": "built-ins/Temporal/Now/toStringTag/string.js",
       "esid": "sec-temporal-now-@@tostringtag",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: String: OrdinaryToPrimitive could not convert object to primitive"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: String: TypeError"
     },
     {
       "path": "built-ins/Temporal/PlainDate/prototype/since/exact-multiple-of-larger-unit.js",
@@ -41106,119 +41266,7 @@
       "path": "built-ins/Temporal/toStringTag/string.js",
       "esid": "sec-temporal-@@tostringtag",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: String: OrdinaryToPrimitive could not convert object to primitive"
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A1.11_T1.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: If B = 1110xxxx (n = 3) and (string.charAt(k + 4) and  string.charAt(k + 5)) do not represent hexadecimal digits, throw URIError"
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A1.11_T2.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: If B = 1110xxxx (n = 3) and (string.charAt(k + 7) and  string.charAt(k + 8)) do not represent hexadecimal digits, throw URIError"
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A1.12_T1.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: If B = 11110xxx (n = 4) and (string.charAt(k + 4) and string.charAt(k + 5)) do not represent hexadecimal digits, throw URIError"
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A1.12_T2.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: If B = 11110xxx (n = 4) and (string.charAt(k + 7) and string.charAt(k + 8)) do not represent hexadecimal digits, throw URIError"
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A1.12_T3.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: If B = 11110xxx (n = 4) and (string.charAt(k + 10) and string.charAt(k + 11)) do not represent hexadecimal digits, throw URIError"
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A1.2_T1.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: If string.charAt(k+1) does not represent hexadecimal digits, throw URIError"
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A1.2_T2.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: If string.charAt(k+2) does not represent hexadecimal digits, throw URIError"
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A2.1_T1.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #D800 differs"
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A3_T1.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: decodeURI(\"%3B\") equal \"%3B\", not \";\""
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A3_T2.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: decodeURI(\"%3b\") equal \"%3b\", not \";\" or \"%3B\""
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A3_T3.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: decodeURI(\"%3B%2F%3F%3A%40%26%3D%2B%24%2C%23\") equal \"%3B%2F%3F%3A%40%26%3D%2B%24%2C%23\", not \";/?:@&=+$,#\""
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A4_T2.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #3: http://ru.wikipedia.org/wiki/Юникод%23Версии Юникода"
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A4_T4.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #2: http:%2f%2Funipro.ru"
-    },
-    {
-      "path": "built-ins/decodeURIComponent/S15.1.3.2_A1.12_T3.js",
-      "esid": "sec-decodeuricomponent-encodeduricomponent",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: If B = 11110xxx (n = 4) and (string.charAt(k + 10) and string.charAt(k + 11)) do not represent hexadecimal digits, throw URIError"
-    },
-    {
-      "path": "built-ins/global/10.2.1.1.3-4-16-s.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/global/10.2.1.1.3-4-18-s.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/global/property-descriptor.js",
-      "esid": "sec-other-properties-of-the-global-object-globalthis",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: globalThis descriptor should not be enumerable"
-    },
-    {
-      "path": "built-ins/parseFloat/S15.1.2.3_A4_T2.js",
-      "esid": "sec-parsefloat-string",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: parseFloat(\"1ex\") === 1. Actual: NaN"
-    },
-    {
-      "path": "built-ins/parseFloat/S15.1.2.3_A6.js",
-      "esid": "sec-parsefloat-string",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #002B "
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: String: TypeError"
     },
     {
       "path": "built-ins/undefined/15.1.1.3-2.js",
@@ -41390,54 +41438,6 @@
       "esid": "sec-function-calls-runtime-semantics-evaluation",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "language/expressions/class/decorator/syntax/class-valid/decorator-member-expr-private-identifier.js",
-      "esid": "prod-ClassExpression",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: ClassDeclaration: decorators]"
-    },
-    {
-      "path": "language/expressions/class/decorator/syntax/valid/decorator-call-expr-identifier-reference-yield.js",
-      "esid": "prod-ClassExpression",
-      "outcome": "fail",
-      "reason": "compile: codes=[STRICT_RESERVED_IDENTIFIER_REFERENCE] messages=[SyntaxError: `yield` is a reserved word in strict mode and cannot appear as an IdentifierReference (§13.1)]"
-    },
-    {
-      "path": "language/expressions/class/decorator/syntax/valid/decorator-call-expr-identifier-reference.js",
-      "esid": "prod-ClassExpression",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: ClassDeclaration: decorators]"
-    },
-    {
-      "path": "language/expressions/class/decorator/syntax/valid/decorator-member-expr-decorator-member-expr.js",
-      "esid": "prod-ClassExpression",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: ClassDeclaration: decorators]"
-    },
-    {
-      "path": "language/expressions/class/decorator/syntax/valid/decorator-member-expr-identifier-reference-yield.js",
-      "esid": "prod-ClassExpression",
-      "outcome": "fail",
-      "reason": "compile: codes=[STRICT_RESERVED_IDENTIFIER_REFERENCE] messages=[SyntaxError: `yield` is a reserved word in strict mode and cannot appear as an IdentifierReference (§13.1)]"
-    },
-    {
-      "path": "language/expressions/class/decorator/syntax/valid/decorator-member-expr-identifier-reference.js",
-      "esid": "prod-ClassExpression",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: ClassDeclaration: decorators]"
-    },
-    {
-      "path": "language/expressions/class/decorator/syntax/valid/decorator-parenthesized-expr-identifier-reference-yield.js",
-      "esid": "prod-ClassExpression",
-      "outcome": "fail",
-      "reason": "compile: codes=[STRICT_RESERVED_IDENTIFIER_REFERENCE] messages=[SyntaxError: `yield` is a reserved word in strict mode and cannot appear as an IdentifierReference (§13.1)]"
-    },
-    {
-      "path": "language/expressions/class/decorator/syntax/valid/decorator-parenthesized-expr-identifier-reference.js",
-      "esid": "prod-ClassExpression",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: ClassDeclaration: decorators]"
     },
     {
       "path": "language/expressions/class/elements/arrow-body-direct-eval-err-contains-newtarget.js",
@@ -41627,78 +41627,6 @@
       "reason": "runtime: RangeError (STACK_OVERFLOW) maximum call stack size exceeded (limit 1024)"
     },
     {
-      "path": "language/statements/class/decorator/syntax/class-valid/decorator-member-expr-private-identifier.js",
-      "esid": "prod-ClassDeclaration",
-      "outcome": "fail",
-      "reason": "compile: codes=[TS_UNSUPPORTED] messages=[typescript Decorator is not supported in foundation]"
-    },
-    {
-      "path": "language/statements/class/decorator/syntax/valid/class-element-decorator-call-expr-identifier-reference.js",
-      "esid": "prod-ClassDeclaration",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: ClassDeclaration: decorated field]"
-    },
-    {
-      "path": "language/statements/class/decorator/syntax/valid/class-element-decorator-member-expr-decorator-member-expr.js",
-      "esid": "prod-ClassDeclaration",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: ClassDeclaration: decorated field]"
-    },
-    {
-      "path": "language/statements/class/decorator/syntax/valid/class-element-decorator-member-expr-identifier-reference.js",
-      "esid": "prod-ClassDeclaration",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: ClassDeclaration: decorated field]"
-    },
-    {
-      "path": "language/statements/class/decorator/syntax/valid/class-element-decorator-parenthesized-expr-identifier-reference.js",
-      "esid": "prod-ClassDeclaration",
-      "outcome": "fail",
-      "reason": "compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: ClassDeclaration: decorated field]"
-    },
-    {
-      "path": "language/statements/class/decorator/syntax/valid/decorator-call-expr-identifier-reference-yield.js",
-      "esid": "prod-ClassDeclaration",
-      "outcome": "fail",
-      "reason": "compile: codes=[STRICT_RESERVED_IDENTIFIER_REFERENCE] messages=[SyntaxError: `yield` is a reserved word in strict mode and cannot appear as an IdentifierReference (§13.1)]"
-    },
-    {
-      "path": "language/statements/class/decorator/syntax/valid/decorator-call-expr-identifier-reference.js",
-      "esid": "prod-ClassDeclaration",
-      "outcome": "fail",
-      "reason": "compile: codes=[TS_UNSUPPORTED] messages=[typescript Decorator is not supported in foundation]"
-    },
-    {
-      "path": "language/statements/class/decorator/syntax/valid/decorator-member-expr-decorator-member-expr.js",
-      "esid": "prod-ClassDeclaration",
-      "outcome": "fail",
-      "reason": "compile: codes=[TS_UNSUPPORTED] messages=[typescript Decorator is not supported in foundation]"
-    },
-    {
-      "path": "language/statements/class/decorator/syntax/valid/decorator-member-expr-identifier-reference-yield.js",
-      "esid": "prod-ClassDeclaration",
-      "outcome": "fail",
-      "reason": "compile: codes=[STRICT_RESERVED_IDENTIFIER_REFERENCE] messages=[SyntaxError: `yield` is a reserved word in strict mode and cannot appear as an IdentifierReference (§13.1)]"
-    },
-    {
-      "path": "language/statements/class/decorator/syntax/valid/decorator-member-expr-identifier-reference.js",
-      "esid": "prod-ClassDeclaration",
-      "outcome": "fail",
-      "reason": "compile: codes=[TS_UNSUPPORTED] messages=[typescript Decorator is not supported in foundation]"
-    },
-    {
-      "path": "language/statements/class/decorator/syntax/valid/decorator-parenthesized-expr-identifier-reference-yield.js",
-      "esid": "prod-ClassDeclaration",
-      "outcome": "fail",
-      "reason": "compile: codes=[STRICT_RESERVED_IDENTIFIER_REFERENCE] messages=[SyntaxError: `yield` is a reserved word in strict mode and cannot appear as an IdentifierReference (§13.1)]"
-    },
-    {
-      "path": "language/statements/class/decorator/syntax/valid/decorator-parenthesized-expr-identifier-reference.js",
-      "esid": "prod-ClassDeclaration",
-      "outcome": "fail",
-      "reason": "compile: codes=[TS_UNSUPPORTED] messages=[typescript Decorator is not supported in foundation]"
-    },
-    {
       "path": "language/statements/class/elements/arrow-body-direct-eval-err-contains-newtarget.js",
       "esid": "sec-performeval-rules-in-initializer",
       "outcome": "fail",
@@ -41843,10 +41771,14 @@
       "reason": "runtime: RangeError (STACK_OVERFLOW) maximum call stack size exceeded (limit 1024)"
     },
     {
-      "path": "annexB/built-ins/RegExp/legacy-accessors/input/this-subclass-constructor.js",
-      "esid": "pending",
+      "path": "annexB/built-ins/RegExp/RegExp-leading-escape-BMP.js",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: RegExp.input setter throws for subclass receiver Expected a TypeError to be thrown but no exception was thrown at all"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Code unit: d800 Expected SameValue(«\"\\\\�\"», «\"\\\\\\ud800\"») to be true"
+    },
+    {
+      "path": "annexB/built-ins/RegExp/RegExp-trailing-escape-BMP.js",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Code unit: d800 Expected SameValue(«\"a\\\\�\"», «\"a\\\\\\ud800\"») to be true"
     },
     {
       "path": "annexB/language/expressions/assignment/dstr/array-pattern-emulates-undefined.js",
@@ -41859,6 +41791,48 @@
       "esid": "sec-destructuring-binding-patterns-runtime-semantics-bindinginitialization",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «function __otter_is_htmldda() { [native code] }») to be true"
+    },
+    {
+      "path": "annexB/language/expressions/assignmenttargettype/callexpression-as-for-in-lhs.js",
+      "esid": "sec-runtime-errors-for-function-call-assignment-targets",
+      "outcome": "fail",
+      "reason": "compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression]"
+    },
+    {
+      "path": "annexB/language/expressions/assignmenttargettype/callexpression-as-for-of-lhs.js",
+      "esid": "sec-runtime-errors-for-function-call-assignment-targets",
+      "outcome": "fail",
+      "reason": "compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression]"
+    },
+    {
+      "path": "annexB/language/expressions/assignmenttargettype/callexpression-in-compound-assignment.js",
+      "esid": "sec-runtime-errors-for-function-call-assignment-targets",
+      "outcome": "fail",
+      "reason": "compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression]"
+    },
+    {
+      "path": "annexB/language/expressions/assignmenttargettype/callexpression-in-postfix-update.js",
+      "esid": "sec-runtime-errors-for-function-call-assignment-targets",
+      "outcome": "fail",
+      "reason": "compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression]"
+    },
+    {
+      "path": "annexB/language/expressions/assignmenttargettype/callexpression-in-prefix-update.js",
+      "esid": "sec-runtime-errors-for-function-call-assignment-targets",
+      "outcome": "fail",
+      "reason": "compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression]"
+    },
+    {
+      "path": "annexB/language/expressions/assignmenttargettype/callexpression.js",
+      "esid": "sec-runtime-errors-for-function-call-assignment-targets",
+      "outcome": "fail",
+      "reason": "compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression]"
+    },
+    {
+      "path": "annexB/language/expressions/assignmenttargettype/cover-callexpression-and-asyncarrowhead.js",
+      "esid": "sec-runtime-errors-for-function-call-assignment-targets",
+      "outcome": "fail",
+      "reason": "compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression]"
     },
     {
       "path": "annexB/language/function-code/block-decl-nested-blocks-with-fun-decl.js",
@@ -41893,16 +41867,6 @@
       "path": "annexB/language/statements/try/catch-redeclared-var-statement.js",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"initializer in catch\"», «\"prior to throw\"») to be true"
-    },
-    {
-      "path": "staging/decorators/private-auto-accessor.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read private member from an object whose class did not declare it"
-    },
-    {
-      "path": "staging/decorators/public-auto-accessor.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «1») to be true"
     },
     {
       "path": "staging/sm/Array/change-array-by-copy-cross-compartment-create.js",
@@ -41962,19 +41926,7 @@
       "path": "staging/sm/Array/join-no-has-trap.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: join: Object.getPrototypeOf: cannot operate on a value of type proxy"
-    },
-    {
-      "path": "staging/sm/Array/sort_holes.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«1», «0») to be true"
-    },
-    {
-      "path": "staging/sm/Array/sort_small.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [0, -11, 0, 100, 101] and expected [-11, 0, 0, 100, 101] should have the same contents. "
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: join: TypeError"
     },
     {
       "path": "staging/sm/Array/to-length.js",
@@ -42016,13 +41968,13 @@
       "path": "staging/sm/Date/dst-offset-caching-1-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10001 ms"
+      "reason": "timeout after 10008 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-2-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10000 ms"
+      "reason": "timeout after 10005 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-3-of-8.js",
@@ -42046,19 +41998,19 @@
       "path": "staging/sm/Date/dst-offset-caching-6-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10457 ms"
+      "reason": "timeout after 10005 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-7-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10025 ms"
+      "reason": "timeout after 10012 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-8-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10005 ms"
+      "reason": "timeout after 10017 ms"
     },
     {
       "path": "staging/sm/Date/non-iso.js",
@@ -42076,7 +42028,7 @@
       "path": "staging/sm/Error/constructor-ordering.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Error: uncaught exception: Test262Error: Expected SameValue(«2», «0») to be true"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Error: uncaught exception"
     },
     {
       "path": "staging/sm/Error/constructor-proto.js",
@@ -42379,6 +42331,12 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
+      "path": "staging/sm/Math/atanh-approx.js",
+      "esid": "pending",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Error: got -6.998237084679375, expected a number near -6.998237084679027 (relative error: 392)"
+    },
+    {
       "path": "staging/sm/Number/defaultvalue.js",
       "esid": "pending",
       "outcome": "fail",
@@ -42676,7 +42634,7 @@
       "path": "staging/sm/String/replace-math.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 12354 ms"
+      "reason": "timeout after 13437 ms"
     },
     {
       "path": "staging/sm/Symbol/conversions.js",
@@ -42719,12 +42677,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "staging/sm/TypedArray/map-species.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected Uint8Array {0: 0, 1: 0, 2: 0, 3: 0, 4: 0} to be structurally equal to Uint8Array {0: 254, 1: 252, 2: 250, 3: 248, 4: 246}. "
     },
     {
       "path": "staging/sm/TypedArray/of.js",
@@ -43270,7 +43222,7 @@
       "path": "staging/sm/object/15.2.3.14-01.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [0, groups, input, index] and expected [0, index, input, groups] should have the same contents. "
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [0, input, groups, index] and expected [0, index, input, groups] should have the same contents. "
     },
     {
       "path": "staging/sm/object/accessor-arguments-rest.js",
@@ -43289,6 +43241,12 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"ownKeys,getOwnPropertyDescriptor,getOwnPropertyDescriptor,get,get\"», «\"ownKeys,getOwnPropertyDescriptor,get,getOwnPropertyDescriptor,get\"») to be true"
+    },
+    {
+      "path": "staging/sm/object/entries.js",
+      "esid": "pending",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected [[\"0\", \"a\"], [\"index\", 0], [\"groups\", undefined], [\"input\", \"abc\"]] to be structurally equal to [[\"0\", \"a\"], [\"index\", 0], [\"input\", \"abc\"], [\"groups\", undefined]]. "
     },
     {
       "path": "staging/sm/object/extensibility-01.js",
@@ -43318,7 +43276,7 @@
       "path": "staging/sm/object/values.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [a, undefined, 0, abc] and expected [a, 0, abc, undefined] should have the same contents. "
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [a, abc, undefined, 0] and expected [a, 0, abc, undefined] should have the same contents. "
     },
     {
       "path": "staging/sm/regress/regress-1383630.js",
@@ -43330,7 +43288,7 @@
       "path": "staging/sm/regress/regress-1507322-deep-weakmap.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 12615 ms"
+      "reason": "timeout after 13921 ms"
     },
     {
       "path": "staging/sm/regress/regress-469625-02.js",
@@ -43456,7 +43414,7 @@
       "path": "staging/sm/statements/for-of-iterator-close-throw.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10001 ms"
+      "reason": "timeout after 10004 ms"
     },
     {
       "path": "staging/sm/statements/regress-642975.js",
@@ -48279,11 +48237,6 @@
       "path": "intl402/supportedLocalesOf-test-option-localeMatcher.js",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Invalid localeMatcher value null was not rejected. Expected a RangeError but got a TypeError (Testing with Collator.)"
-    },
-    {
-      "path": "intl402/supportedLocalesOf-unicode-extensions-ignored.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Array.prototype callback: value is not a function (Testing with RelativeTimeFormat.)"
     }
   ]
 }

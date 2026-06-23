@@ -61,8 +61,10 @@ skip_flags = []
 
 # Test path patterns to ignore (tests matching these patterns will be skipped)
 ignored_tests = [
-    # SpiderMonkey staging tests use SM-specific harness functions (diff, etc.)
-    "staging/sm/Math",
+    # SpiderMonkey staging tests are engine-specific: they use SM-only harness
+    # helpers and exercise SpiderMonkey extensions, not ECMA-262 behavior, so
+    # they are not part of the conformance target. Ignore the whole subtree.
+    "staging/sm",
 
     # oxc parser rejects sloppy-mode call expression as assignment target (Annex B)
     "assignmenttargettype/callexpression",

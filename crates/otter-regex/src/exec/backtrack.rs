@@ -291,18 +291,22 @@ impl Matcher<'_, '_> {
                                         end += 1;
                                     }
                                 } else {
-                                    // Case-sensitive ASCII fast path: a u128
-                                    // bitmap test per unit, no function call, so
-                                    // the optimizer keeps the loop tight. Units
-                                    // at or above the table fall back to the
-                                    // range set.
-                                    let bits = set.ascii_lo;
+                                    // Case-sensitive ASCII fast path: split the
+                                    // 128-bit membership bitmap into two native
+                                    // u64 halves so each per-unit test is a plain
+                                    // shift-and-mask, no function call and no
+                                    // 128-bit shift. Units at or above 128 fall
+                                    // back to the range set.
+                                    let lo = set.ascii_lo as u64;
+                                    let hi = (set.ascii_lo >> 64) as u64;
                                     while end < len {
-                                        let u = u32::from(units[end]);
-                                        let in_set = if u < 128 {
-                                            (bits >> u) & 1 != 0
+                                        let u = units[end];
+                                        let in_set = if u < 64 {
+                                            (lo >> u) & 1 != 0
+                                        } else if u < 128 {
+                                            (hi >> (u - 64)) & 1 != 0
                                         } else {
-                                            set.code_points.contains(u)
+                                            set.code_points.contains(u32::from(u))
                                         };
                                         if in_set == neg {
                                             break;

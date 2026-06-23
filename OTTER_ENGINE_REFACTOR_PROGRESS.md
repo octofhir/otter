@@ -22,7 +22,7 @@ Fresh release binary: `target/release/otter`.
 | `sort.js` | 2.76s | 0.25–0.53s | 0.16s | open; fill-loop direct calls closed; sort runtime still open |
 | `json.js` | 0.95s | 0.93s | 0.39s | open; serializer + small-dict allocation closed, parse object shaping remains |
 | `string-ops.js` | 0.43s | 0.44s | 0.03s | open |
-| `regex.js` | 1.01s | 1.01s | 0.06s | open; case-fold + leading-assert prefilter landed (match 1190->605ms), NFA path + exec fast-path remain |
+| `regex.js` | 0.42s | 0.42s | 0.06s | open; case-fold + leading-assert prefilter + native-@@match fast path landed (1.63s->0.42s, match 1190->4ms); @@replace/exec fast paths remain |
 
 Output parity across `benchmarks/scripts/*.js` passed after the latest JIT
 commits. GC-stress smoke passed for `fib`, `prop-access`, and `nbody`.
@@ -155,17 +155,26 @@ wins:
 Both verified by a stash/rebuild RegExp Test262 differential: 2004 pass, 0 new
 failures vs baseline (property-escape timeout churn aside).
 
-Remaining levers (larger / riskier):
+The native-`@@match` fast path then took the dominant `match` phase from 605ms
+to ~4ms: when the receiver is a real RegExp with the original native `exec`
+(and not sticky), collect all matches in one engine pass and slice substrings
+directly instead of looping the per-match exec protocol (result object +
+`"0"` readback + `lastIndex` round-trip). Guard order (`as_regexp` before
+reading `exec`) keeps an instrumented non-RegExp on the observable path;
+verified 0 new RegExp/String Test262 failures (incl. the `@@match` trace and
+sticky-global tests) and GC-stress clean.
 
-- Backtracking interpreter vs Node Irregexp (native-compiled) is the residual
-  architectural gap. A Thompson NFA / lazy-DFA (Pike VM) path for backref-free,
-  lookaround-free programs would bound `([a-z.]+)@(...)`-style re-scans; the
-  instruction set is already NFA-shaped (gate on no `BackRef`/`Look`, needs an
-  unfused lowering since `CharSeq`/`Repeat` break one-step-per-position).
-- Host-side `@@match`/`@@replace` run the observable `exec` protocol per match
-  (build a result object, read back `"0"`); a fast path when `exec` is the
-  native intrinsic (direct match -> substring) would cut ~25% off `match`. Spec
-  -delicate (lastIndex observability) — gate carefully.
+Remaining levers:
+
+- `@@replace` (~184ms) and direct `exec` (~190ms) now dominate. `@@replace` can
+  use the same native-exec fast path — collect matches via `engine::find` and
+  drive `GetSubstitution` from each `Match`'s captures directly, skipping the
+  per-match result object. More delicate than `@@match` (`$`-substitution,
+  named groups, functional replace), so scope carefully (e.g. start with
+  non-functional, `$`-free templates) and gate on native exec + non-sticky.
+  Direct `exec` is harder (the public API must return the full result object).
+- Residual after that is the backtracking-interpreter-vs-Irregexp architectural
+  gap (a regex->native or NFA/lazy-DFA execution path).
 
 Risk:
 

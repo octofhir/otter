@@ -22,7 +22,7 @@ Fresh release binary: `target/release/otter`.
 | `sort.js` | 2.76s | 0.25–0.53s | 0.16s | open; fill-loop direct calls closed; sort runtime still open |
 | `json.js` | 0.95s | 0.93s | 0.39s | open; serializer + small-dict allocation closed, parse object shaping remains |
 | `string-ops.js` | 0.43s | 0.44s | 0.03s | open |
-| `regex.js` | 2.21s | 2.20s | 0.03s | open |
+| `regex.js` | 1.01s | 1.01s | 0.06s | open; case-fold + leading-assert prefilter landed (match 1190->605ms), NFA path + exec fast-path remain |
 
 Output parity across `benchmarks/scripts/*.js` passed after the latest JIT
 commits. GC-stress smoke passed for `fib`, `prop-access`, and `nbody`.
@@ -139,24 +139,33 @@ Risk:
 
 ### Open 5: regex runtime throughput
 
-Benchmark: `regex.js` (27x vs Node; on == off, pure engine).
+Benchmark: `regex.js` (1.63s -> 1.01s this slice; on == off, pure engine).
 
-Profile: ~78% in the backtracking engine itself — `Matcher::run` 41%,
-`Matches::next` 26%, `class_member` 11% (already ASCII-bitmap fast-pathed).
-The gap is architectural: a backtracking interpreter vs Node's Irregexp
-(regex compiled to native code). The benchmark patterns (`\b[a-z]{4,}\b`,
-`\d+`, `([a-z.]+)@([a-z.]+)`) are all backreference-free / regular, so the
-real lever is a Thompson NFA / lazy-DFA (Pike VM) execution path for
-backref-free programs — O(n) instead of backtracking — falling back to the
-current backtracker only for patterns that need it. This is the RippleRegex
-workstream, not a contained tuning slice; the prior prefilter/bitmap commits
-already mined the incremental wins.
+Per-operation split showed `match` (`/\b[a-z]{4,}\b/gi`) dominated at
+~1190ms (vs `replace` 183, `exec` 221). Two contained, conformance-verified
+wins:
 
-Next actions:
+- Fold ASCII case into non-Unicode `/i` classes at lowering and clear the
+  per-instruction flag, so the case-insensitive class `Repeat` takes the fast
+  ASCII-bitmap scan instead of a per-character case-fold probe.
+- Pass through leading zero-width assertions (`^`, `$`, `\b`) in the first-set
+  walk, so `\b[a-z]{4,}\b` gets a `[a-z]` leftmost-scan prefilter (previously
+  none — it attempted at every position). `match` 1190ms -> 605ms.
 
-- Measure `match`, `replace`, and `exec` separately.
-- Choose a contained regex-engine improvement slice.
-- Gate on RegExp Test262 subsets before treating the benchmark as closed.
+Both verified by a stash/rebuild RegExp Test262 differential: 2004 pass, 0 new
+failures vs baseline (property-escape timeout churn aside).
+
+Remaining levers (larger / riskier):
+
+- Backtracking interpreter vs Node Irregexp (native-compiled) is the residual
+  architectural gap. A Thompson NFA / lazy-DFA (Pike VM) path for backref-free,
+  lookaround-free programs would bound `([a-z.]+)@(...)`-style re-scans; the
+  instruction set is already NFA-shaped (gate on no `BackRef`/`Look`, needs an
+  unfused lowering since `CharSeq`/`Repeat` break one-step-per-position).
+- Host-side `@@match`/`@@replace` run the observable `exec` protocol per match
+  (build a result object, read back `"0"`); a fast path when `exec` is the
+  native intrinsic (direct match -> substring) would cut ~25% off `match`. Spec
+  -delicate (lastIndex observability) — gate carefully.
 
 Risk:
 

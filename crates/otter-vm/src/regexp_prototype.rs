@@ -1730,9 +1730,8 @@ pub fn is_builtin_method(name: &str) -> bool {
 pub fn load_property(re: &JsRegExp, gc_heap: &mut otter_gc::GcHeap, name: &str) -> Value {
     match name {
         "source" => {
-            let raw = re.source(gc_heap);
-            let escaped = escape_regexp_pattern(&raw);
-            match JsString::from_str(&escaped, gc_heap) {
+            let escaped = escape_regexp_pattern_utf16(&re.pattern_utf16(gc_heap));
+            match JsString::from_utf16_units(&escaped, gc_heap) {
                 Ok(s) => Value::string(s),
                 Err(_) => Value::undefined(),
             }
@@ -1764,48 +1763,56 @@ pub fn store_property(re: &JsRegExp, gc_heap: &mut otter_gc::GcHeap, name: &str,
     }
 }
 
-/// §22.2.3.2.4 `EscapeRegExpPattern(src, flags)` — emit a string
-/// that, when re-parsed as a Pattern, matches the same set of
-/// strings as the original. Empty source maps to `"(?:)"`; bare
+/// §22.2.3.2.4 `EscapeRegExpPattern(src, flags)` — emit a code-unit
+/// sequence that, when re-parsed as a Pattern, matches the same set
+/// of strings as the original. Empty source maps to `"(?:)"`; bare
 /// `/` and line terminators are escaped; everything else passes
-/// through. Shared by `RegExp.prototype.source` /
-/// `RegExp.prototype.toString` / direct property loads.
+/// through. Operates at the UTF-16 code-unit level so lone surrogates
+/// in the pattern body (e.g. `/\u{D800}/.source`) survive — a `&str`
+/// round-trip would replace them with U+FFFD. Every escaped code unit
+/// is ASCII, so matching on raw `u16` values is exact. Shared by
+/// `RegExp.prototype.source` / `RegExp.prototype.toString` / direct
+/// property loads.
 ///
 /// <https://tc39.es/ecma262/#sec-escaperegexppattern>
-pub fn escape_regexp_pattern(raw: &str) -> String {
-    if raw.is_empty() {
-        return "(?:)".to_string();
+#[must_use]
+pub fn escape_regexp_pattern_utf16(units: &[u16]) -> Vec<u16> {
+    if units.is_empty() {
+        return "(?:)".encode_utf16().collect();
     }
-    let mut out = String::with_capacity(raw.len());
+    let mut out = Vec::with_capacity(units.len());
     let mut in_class = false;
-    let mut chars = raw.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                out.push('\\');
-                if let Some(&next) = chars.peek() {
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+        match u {
+            0x5C => {
+                // backslash: emit it plus the next code unit verbatim
+                out.push(0x5C);
+                if let Some(&next) = units.get(i + 1) {
                     out.push(next);
-                    chars.next();
+                    i += 1;
                 }
             }
-            '[' => {
+            0x5B => {
                 in_class = true;
-                out.push('[');
+                out.push(0x5B);
             }
-            ']' => {
+            0x5D => {
                 in_class = false;
-                out.push(']');
+                out.push(0x5D);
             }
-            '/' if !in_class => {
-                out.push('\\');
-                out.push('/');
+            0x2F if !in_class => {
+                out.push(0x5C);
+                out.push(0x2F);
             }
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
+            0x0A => out.extend_from_slice(&[0x5C, b'n' as u16]),
+            0x0D => out.extend_from_slice(&[0x5C, b'r' as u16]),
+            0x2028 => out.extend("\\u2028".encode_utf16()),
+            0x2029 => out.extend("\\u2029".encode_utf16()),
             other => out.push(other),
         }
+        i += 1;
     }
     out
 }

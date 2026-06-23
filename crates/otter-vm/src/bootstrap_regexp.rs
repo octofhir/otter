@@ -703,11 +703,18 @@ fn regexp_error_to_syntax_error(err: crate::regexp::RegExpError) -> NativeError 
 
 fn proto_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let re = receiver_regexp(ctx, "RegExp.prototype.toString")?;
-    let source = re.source(ctx.heap());
+    let source =
+        crate::regexp_prototype::escape_regexp_pattern_utf16(&re.pattern_utf16(ctx.heap()));
     let flags = re.flags(ctx.heap()).to_js_string();
-    let rendered = format!("/{source}/{flags}");
+    // `/` + escaped source units + `/` + flag letters, code-unit exact so
+    // lone surrogates in the pattern survive `toString`.
+    let mut rendered: Vec<u16> = Vec::with_capacity(source.len() + flags.len() + 2);
+    rendered.push(b'/' as u16);
+    rendered.extend_from_slice(&source);
+    rendered.push(b'/' as u16);
+    rendered.extend(flags.encode_utf16());
 
-    let s = JsString::from_str(&rendered, ctx.heap_mut())
+    let s = JsString::from_utf16_units(&rendered, ctx.heap_mut())
         .map_err(|_| oom("RegExp.prototype.toString"))?;
     Ok(Value::string(s))
 }
@@ -724,8 +731,8 @@ fn proto_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
 fn accessor_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let receiver = *ctx.this_value();
 
-    let raw = if let Some(re) = receiver.as_regexp() {
-        re.source(ctx.heap())
+    let raw_units = if let Some(re) = receiver.as_regexp() {
+        re.pattern_utf16(ctx.heap())
     } else if let Some(obj) = receiver.as_object() {
         let is_proto = ctx
             .interp_mut()
@@ -748,9 +755,9 @@ fn accessor_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
             reason: "this is not a RegExp".to_string(),
         });
     };
-    let escaped = crate::regexp_prototype::escape_regexp_pattern(&raw);
+    let escaped = crate::regexp_prototype::escape_regexp_pattern_utf16(&raw_units);
     Ok(Value::string(
-        JsString::from_str(&escaped, ctx.heap_mut()).map_err(|_| oom("source"))?,
+        JsString::from_utf16_units(&escaped, ctx.heap_mut()).map_err(|_| oom("source"))?,
     ))
 }
 

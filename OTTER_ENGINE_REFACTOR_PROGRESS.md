@@ -20,7 +20,7 @@ Fresh release binary: `target/release/otter`.
 | `prop-access.js` | 2.11s | 0.17s | 0.03s | open |
 | `array-ops.js` | 2.36s | 0.45s | 0.09s | open |
 | `sort.js` | 2.76s | 0.25–0.53s | 0.16s | open; fill-loop direct calls closed; sort runtime still open |
-| `json.js` | 1.39s | 1.42s | 0.23s | open |
+| `json.js` | 0.95s | 0.93s | 0.39s | open; serializer + small-dict allocation closed, parse object shaping remains |
 | `string-ops.js` | 0.43s | 0.44s | 0.03s | open |
 | `regex.js` | 2.21s | 2.20s | 0.03s | open |
 
@@ -109,13 +109,28 @@ Risk:
 
 ### Open 4: JSON runtime throughput
 
-Benchmark: `json.js`.
+Benchmark: `json.js` (5.1x -> 3.4x vs Node this slice; on == off, pure runtime).
 
-Next actions:
+Done:
 
-- Measure parse and stringify separately.
-- Optimize allocation/traversal costs, not JIT call mechanics.
-- Avoid reviving the known dict-mode fast-shape regression.
+- Stringify hot path is now allocation-free (per-shape key-list cache, Latin-1
+  / `&str` in-place quoting, number-into-buffer rendering). Micro stringify
+  773ms -> 294ms, output byte-identical, JSON Test262 unchanged.
+- Small dictionary objects no longer keep a per-object hash index (linear scan
+  under `DICT_LINEAR_SCAN_MAX`), cutting the parse `contains_key` hot spot.
+  Micro parse 681ms -> 608ms.
+
+Next lever (the remaining ~4x on parse):
+
+- `JSON.parse` builds dictionary-mode objects (`empty_dictionary_object_body`
+  + per-key `object::set`), so every parsed record allocates an `ExoticSlots`
+  box + `dictionary_keys` Vec + values Vec and pays per-key dictionary work.
+  Build **shaped** objects instead (one shared hidden class per record shape,
+  bulk slot init like the simple-constructor path). This needs `ShapeRuntime`
+  threaded into the parser (or a rooted dictionary->shape normalization in the
+  existing post-parse prototype walk). HIGH GC RISK: shape transitions allocate
+  mid-build, and JSON paths have a history of use-after-move bugs — gate on
+  full GC stress + JSON Test262 differential, do not rush.
 
 Risk:
 
@@ -124,7 +139,18 @@ Risk:
 
 ### Open 5: regex runtime throughput
 
-Benchmark: `regex.js`.
+Benchmark: `regex.js` (27x vs Node; on == off, pure engine).
+
+Profile: ~78% in the backtracking engine itself — `Matcher::run` 41%,
+`Matches::next` 26%, `class_member` 11% (already ASCII-bitmap fast-pathed).
+The gap is architectural: a backtracking interpreter vs Node's Irregexp
+(regex compiled to native code). The benchmark patterns (`\b[a-z]{4,}\b`,
+`\d+`, `([a-z.]+)@([a-z.]+)`) are all backreference-free / regular, so the
+real lever is a Thompson NFA / lazy-DFA (Pike VM) execution path for
+backref-free programs — O(n) instead of backtracking — falling back to the
+current backtracker only for patterns that need it. This is the RippleRegex
+workstream, not a contained tuning slice; the prior prefilter/bitmap commits
+already mined the incremental wins.
 
 Next actions:
 

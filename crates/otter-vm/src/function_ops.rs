@@ -227,6 +227,12 @@ impl Interpreter {
         if class.ctor_proto(&self.gc_heap).is_undefined()
             && let Some(function_prototype) = self.realm_intrinsics.function_prototype
         {
+            // Re-read `statics` from its GC-rooted register: the class
+            // construction above may have scavenged and relocated it, leaving
+            // the bare `statics` local read before the allocation stale.
+            let statics = read_register(&stack[frame_idx], statics_reg)?
+                .as_object()
+                .ok_or(VmError::TypeMismatch)?;
             object::set_prototype(statics, &mut self.gc_heap, Some(function_prototype));
         }
         // Publish the constructor to its destination register first: the
@@ -249,6 +255,13 @@ impl Interpreter {
             configurable: Some(true),
             ..Default::default()
         };
+        // Re-read `prototype` from its GC-rooted register: every allocation
+        // since it was first read (class construction, the static-prototype
+        // re-seat) may have relocated it, and walking a stale shape here is a
+        // use-after-move. The register slot is forwarded by the collector.
+        let prototype = read_register(&stack[frame_idx], proto_reg)?
+            .as_object()
+            .ok_or(VmError::TypeMismatch)?;
         let _ = self.define_own_property_partial(prototype, "constructor", constructor_desc)?;
         let frame = &mut stack[frame_idx];
         frame.advance_pc(self.current_byte_len)?;

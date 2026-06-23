@@ -32,11 +32,11 @@
 //!
 //! - GC architecture plan §6.1 (unsafe boundary).
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::compressed::{cage_base, cage_size, Cage, Gc, RawGc};
+use crate::compressed::{Cage, Gc, RawGc, cage_base, cage_size};
 use crate::ephemeron::EphemeronRegistry;
 use crate::external::{ExternalMemory, SharedExternalMemory, SharedExternalState};
 use crate::extra_roots::ExtraRoots;
@@ -46,8 +46,8 @@ use crate::handle::{GlobalHandleTable, HandleStack};
 use crate::header::{GcHeader, MarkColor};
 use crate::marking::MarkingState;
 use crate::oom::OutOfMemory;
-use crate::page::{align_up, CELL_SIZE};
-use crate::page::{page_base_from_offset, LARGE_OBJECT_THRESHOLD, PAGE_HEADER_SIZE};
+use crate::page::{CELL_SIZE, align_up};
+use crate::page::{LARGE_OBJECT_THRESHOLD, PAGE_HEADER_SIZE, page_base_from_offset};
 use crate::scavenger::ScavengeStats;
 use crate::space::{LargeObjectSpace, NewSpace, OldSpace};
 use crate::stats::{GcStats, TYPE_TAG_COUNT};

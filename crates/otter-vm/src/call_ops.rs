@@ -82,8 +82,7 @@ fn invoke_native_call_with_roots(
         .gc_heap
         .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
     let call_info = NativeCallInfo::call(this_root);
-    let mut ctx =
-        NativeCtx::new_with_call_info_and_context(interp, call_info, Some(context));
+    let mut ctx = NativeCtx::new_with_call_info_and_context(interp, call_info, Some(context));
     let raw = call.invoke(&mut ctx, args);
     let result = raw.map_err(|e| native_to_vm_error(interp, e));
     interp.gc_heap.pop_extra_roots_to(depth - 1);
@@ -510,8 +509,7 @@ impl Interpreter {
         let call = native.call_target(&self.gc_heap);
         let call_info = NativeCallInfo::construct(*this_value, Some(*new_target));
         self.record_runtime_native_call();
-        let mut ctx =
-            NativeCtx::new_with_call_info_and_context(self, call_info, Some(context));
+        let mut ctx = NativeCtx::new_with_call_info_and_context(self, call_info, Some(context));
         let raw = call.invoke(&mut ctx, args);
         let result = raw.map_err(|e| native_to_vm_error(self, e))?;
         Ok(if result.is_object_type() {

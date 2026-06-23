@@ -21,11 +21,12 @@
 
 use crate::holt_stack::HoltStack;
 use crate::{
+    ExecutionContext, Frame, Interpreter, IteratorHandle, IteratorState, NativeCall, NativeFastFn,
+    NativeFunction, Value, VmError,
     operand_decode::{const_operand, register_operand},
     read_register, regexp,
     runtime_state::RuntimeState,
-    write_register, ExecutionContext, Frame, Interpreter, IteratorHandle, IteratorState,
-    NativeCall, NativeFastFn, NativeFunction, Value, VmError,
+    write_register,
 };
 use otter_bytecode::Operand;
 use otter_gc::raw::RawGc;

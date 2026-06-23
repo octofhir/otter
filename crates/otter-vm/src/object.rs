@@ -1478,7 +1478,9 @@ fn dict_build_index(exotic: &mut ExoticSlots) {
     if !exotic.dictionary_index.is_empty() {
         return;
     }
-    exotic.dictionary_index.reserve(exotic.dictionary_keys.len());
+    exotic
+        .dictionary_index
+        .reserve(exotic.dictionary_keys.len());
     for (offset, key) in exotic.dictionary_keys.iter().enumerate() {
         exotic.dictionary_index.insert(key.clone(), offset as u16);
     }

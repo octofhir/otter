@@ -964,10 +964,9 @@ pub fn native_regexp_symbol_replace(
         let template_units = template.to_utf16_vec(ctx.heap());
         if !template_units.contains(&0x24) {
             let exec_fn = get_property_runtime(ctx, &receiver, "exec", name)?;
-            if exec_fn
-                .as_native_function()
-                .is_some_and(|nf| nf.is_static_native(ctx.heap(), crate::bootstrap_regexp::proto_exec))
-            {
+            if exec_fn.as_native_function().is_some_and(|nf| {
+                nf.is_static_native(ctx.heap(), crate::bootstrap_regexp::proto_exec)
+            }) {
                 let found = re.find_from_utf16(ctx.heap(), &s_units, 0);
                 let mut accumulated: Vec<u16> = Vec::new();
                 let mut next_source_position: usize = 0;

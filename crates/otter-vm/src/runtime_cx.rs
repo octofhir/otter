@@ -497,10 +497,13 @@ impl<'rt> NativeCtx<'rt> {
     /// build platform objects through their real constructors (e.g. the
     /// structured-clone materializer rebuilding `Date`/`RegExp`/typed arrays).
     pub fn construct(&mut self, target: Value, args: &[Value]) -> Result<Value, NativeError> {
-        let context = self.context.cloned().ok_or_else(|| NativeError::TypeError {
-            name: "construct",
-            reason: "missing execution context".to_string(),
-        })?;
+        let context = self
+            .context
+            .cloned()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "construct",
+                reason: "missing execution context".to_string(),
+            })?;
         let argv: smallvec::SmallVec<[Value; 8]> = args.iter().copied().collect();
         self.cx
             .interp

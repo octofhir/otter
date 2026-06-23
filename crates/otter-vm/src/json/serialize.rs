@@ -517,9 +517,8 @@ impl Interpreter {
                     if state.key_cache.contains_key(&sid) {
                         return Some(sid);
                     }
-                    let offs = object::with_properties(obj, heap, |p| {
-                        p.enumerable_string_data_offsets()
-                    })?;
+                    let offs =
+                        object::with_properties(obj, heap, |p| p.enumerable_string_data_offsets())?;
                     let list: std::rc::Rc<[(Box<str>, u16)]> = offs
                         .into_iter()
                         .map(|(k, o)| (k.into_boxed_str(), o))
@@ -645,9 +644,9 @@ impl Interpreter {
                 None
             };
             let rendered = match fast_value {
-                Some(value) => {
-                    self.serialize_json_known_value_into(context, state, &key, value_root, value, out)?
-                }
+                Some(value) => self.serialize_json_known_value_into(
+                    context, state, &key, value_root, value, out,
+                )?,
                 // §25.5.2.5 — an omitted element serialises as `null`.
                 None => self.serialize_json_property_into(context, state, &key, holder, out)?,
             };
@@ -917,7 +916,9 @@ fn quote_json_string_into(s: JsString, heap: &otter_gc::GcHeap, out: &mut String
     // (each in `0..=0xFF`, none a surrogate), so it can be escaped without
     // materialising a `Vec<u16>` — the dominant allocation for short ASCII
     // string members like `"user_123"` / `"a"` / `"tag5"`.
-    if s.with_latin1(heap, |bytes| quote_latin1_into(bytes, out)).is_some() {
+    if s.with_latin1(heap, |bytes| quote_latin1_into(bytes, out))
+        .is_some()
+    {
         return;
     }
     let units = s.to_utf16_vec(heap);

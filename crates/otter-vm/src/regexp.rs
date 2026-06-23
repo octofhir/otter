@@ -175,8 +175,8 @@ impl RegexCompileCache {
     }
 }
 
-use crate::number::NumberValue;
 use crate::Value;
+use crate::number::NumberValue;
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`JsRegExpBody`].
 pub const REGEXP_BODY_TYPE_TAG: u8 = 0x1e;
@@ -666,11 +666,7 @@ fn last_index_to_u32(value: &Value, heap: &otter_gc::GcHeap) -> u32 {
             .parse::<f64>()
             .unwrap_or(f64::NAN)
     } else if let Some(b) = value.as_boolean() {
-        if b {
-            1.0
-        } else {
-            0.0
-        }
+        if b { 1.0 } else { 0.0 }
     } else if value.is_null() {
         0.0
     } else {

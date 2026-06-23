@@ -5779,6 +5779,50 @@ impl Interpreter {
                 }
             }
         }
+        if let Some(native) = target.as_native_function() {
+            // §10.1.9.1 OrdinarySet over a built-in (native) function
+            // object reached as a [[Prototype]] link or proxy target.
+            // A miss continues up the function's [[Prototype]]; the
+            // write lands on the RECEIVER (e.g. `%AsyncFunction%`
+            // inheriting from `%Function%` must gain an own property
+            // rather than retargeting `%Function%`).
+            let own = match key {
+                VmPropertyKey::Symbol(sym) => {
+                    native.own_symbol_property_descriptor(&self.gc_heap, *sym)
+                }
+                _ => {
+                    let name = key
+                        .string_name()
+                        .expect("non-symbol key has string spelling");
+                    native.own_property_descriptor(&mut self.gc_heap, name)?
+                }
+            };
+            return match own {
+                Some(desc) => match desc.kind {
+                    object::DescriptorKind::Accessor { setter, .. } => {
+                        let Some(setter) = setter else {
+                            return Ok(false);
+                        };
+                        let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
+                        self.run_callable_sync(context, &setter, receiver, argv)?;
+                        Ok(true)
+                    }
+                    object::DescriptorKind::Data { .. } => {
+                        if !desc.flags.writable() {
+                            return Ok(false);
+                        }
+                        self.ordinary_set_on_receiver(context, key, value, &receiver)
+                    }
+                },
+                None => {
+                    let parent = self.get_prototype_for_op(&target)?;
+                    if parent.is_null() || parent.is_undefined() {
+                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                    }
+                    self.ordinary_set_data_value(context, parent, key, value, receiver, hops + 1)
+                }
+            };
+        }
         let fid = target.as_function().or_else(|| {
             target
                 .as_closure(&self.gc_heap)
@@ -5786,57 +5830,54 @@ impl Interpreter {
         });
         if let Some(function_id) = fid {
             let owner = target.as_closure(&self.gc_heap);
-            return match key {
-                VmPropertyKey::Symbol(sym) => {
-                    if !self.ordinary_function_has_own_symbol_property_for_extensibility(
-                        owner,
-                        function_id,
-                        *sym,
-                    ) && !self.ordinary_function_is_extensible(function_id)
-                    {
-                        return Ok(false);
-                    }
-                    let bag =
-                        self.function_user_bag_runtime_rooted(owner, function_id, &[&value], &[])?;
-                    Ok(object::set_symbol(bag, &mut self.gc_heap, *sym, value))
-                }
+            // §10.1.9.1 OrdinarySet over a function object. Locate the
+            // own descriptor, then apply receiver-phase semantics: an
+            // own miss continues the walk through the function's
+            // [[Prototype]], and a data write always lands on the
+            // RECEIVER — which differs from the function when the
+            // function itself is a [[Prototype]] link (e.g.
+            // `%AsyncFunction%` inheriting from `%Function%`, where the
+            // write must create an own property on `%AsyncFunction%`,
+            // not silently retarget `%Function%`).
+            let own = match key {
+                VmPropertyKey::Symbol(sym) => self
+                    .callable_bag_read(owner, function_id)
+                    .and_then(|bag| object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym)),
                 _ => {
-                    let key = key
+                    let name = key
                         .string_name()
                         .expect("non-symbol key has string spelling");
-                    let has_own = self
-                        .ordinary_function_has_own_string_property_for_extensibility(
-                            context,
-                            owner,
-                            function_id,
-                            key,
-                        )?;
-                    if !has_own && !self.ordinary_function_is_extensible(function_id) {
-                        return Ok(false);
+                    self.ordinary_function_own_property_descriptor(
+                        Some(context),
+                        owner,
+                        function_id,
+                        name,
+                    )?
+                }
+            };
+            return match own {
+                Some(desc) => match desc.kind {
+                    object::DescriptorKind::Accessor { setter, .. } => {
+                        let Some(setter) = setter else {
+                            return Ok(false);
+                        };
+                        let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
+                        self.run_callable_sync(context, &setter, receiver, argv)?;
+                        Ok(true)
                     }
-                    let descriptor = match self.ordinary_function_own_property_descriptor(
-                        Some(context),
-                        owner,
-                        function_id,
-                        key,
-                    )? {
-                        Some(existing) if !existing.writable() => return Ok(false),
-                        Some(existing) => object::PropertyDescriptor::data(
-                            value,
-                            true,
-                            existing.enumerable(),
-                            existing.configurable(),
-                        ),
-                        None => object::PropertyDescriptor::data(value, true, true, true),
-                    };
-                    self.ordinary_function_define_own_property(
-                        Some(context),
-                        owner,
-                        function_id,
-                        key,
-                        None,
-                        descriptor,
-                    )
+                    object::DescriptorKind::Data { .. } => {
+                        if !desc.flags.writable() {
+                            return Ok(false);
+                        }
+                        self.ordinary_set_on_receiver(context, key, value, &receiver)
+                    }
+                },
+                None => {
+                    let parent = self.get_prototype_for_op(&target)?;
+                    if parent.is_null() || parent.is_undefined() {
+                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                    }
+                    self.ordinary_set_data_value(context, parent, key, value, receiver, hops + 1)
                 }
             };
         }

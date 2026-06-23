@@ -158,13 +158,19 @@ impl Iterator for Matches<'_, '_> {
                         // `advance_scan`).
                         None => pos = self.text.len() + 1,
                     }
-                } else {
+                } else if unicode {
                     while pos < self.text.len() {
                         let (cp, _) = decode_at(self.text, pos, unicode);
                         if pf.cp_may_start(cp) {
                             break;
                         }
                         pos = advance_scan(self.text, pos, unicode);
+                    }
+                } else {
+                    // Non-Unicode: a code unit is a code point, so the scan is a
+                    // tight single-step loop with no surrogate decode.
+                    while pos < self.text.len() && !pf.cp_may_start(u32::from(self.text[pos])) {
+                        pos += 1;
                     }
                 }
             }

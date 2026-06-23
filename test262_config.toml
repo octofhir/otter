@@ -26,10 +26,6 @@ max_heap_bytes_per_test = 536870912
 # standard has removed. Everything that is shipped in the standard is
 # intentionally NOT skipped here, even if currently failing, so the gap
 # stays visible and gets fixed rather than hidden.
-#
-# NOTE: `import-defer` is implemented (static `import defer * as` plus the
-# dynamic `import.defer()` expression) and is therefore deliberately
-# absent from this list.
 skip_features = [
     # --- Module proposals / host module kinds not yet standardized ---
     # import-assertions: legacy `assert { type: ... }` syntax, removed
@@ -63,21 +59,10 @@ skip_features = [
 # by a global runner prelude.
 skip_flags = []
 
-# Test path patterns to ignore.
-#
-# POLICY: the only acceptable reason for a path ignore is a CONCRETE
-# upstream bug in a third-party crate we depend on (which we cannot fix
-# from here), each documented with the crate + symptom. Engine gaps,
-# parser limitations, and "too slow" tests are NOT hidden here — they
-# stay visible as failures/timeouts and are tracked as fix targets.
-ignored_tests = [
-    # temporal_rs upstream bug: Duration.round with roundingIncrement for
-    # weeks returns incorrect results. No fix in temporal_rs 0.2.0.
-    "Duration/prototype/round/rounding-increment-relativeto",
-
-    # temporal_rs upstream bug: PlainDateTime math precision edge case.
-    "Temporal/PlainDateTime/datetime-math",
-]
+# Test path patterns to ignore. Only documented third-party
+# upstream-crate bugs belong here; engine gaps and slow tests stay
+# visible as failures.
+ignored_tests = []
 
 # Tests known to panic/crash the VM (skipped with a warning).
 #

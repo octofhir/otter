@@ -20,20 +20,22 @@ max_heap_bytes_per_test = 536870912
 # results_dir = "test262_results"
 
 # Features to skip (tests requiring these features will be skipped).
-# Skip ONLY non-final-stage proposals and features blocked by an
-# external infra gap (regex engine). Everything that is Stage 4 /
-# shipped and implementable in our own engine is intentionally NOT
-# skipped here — those tests stay visible so the gap is tracked and
-# closed (see the "implement, do not skip" list at the bottom).
+#
+# POLICY: skip ONLY features that are not yet part of ECMA-262 / ECMA-402
+# — i.e. live TC39 proposals (pre-Stage-4) and legacy syntax that the
+# standard has removed. Everything that is shipped in the standard is
+# intentionally NOT skipped here, even if currently failing, so the gap
+# stays visible and gets fixed rather than hidden.
+#
+# NOTE: `import-defer` is implemented (static `import defer * as` plus the
+# dynamic `import.defer()` expression) and is therefore deliberately
+# absent from this list.
 skip_features = [
-    # --- Module proposals / host module kinds not yet wired ---
-    # import-assertions: deprecated legacy syntax, superseded by import
-    # attributes (which are implemented).
+    # --- Module proposals / host module kinds not yet standardized ---
+    # import-assertions: legacy `assert { type: ... }` syntax, removed
+    # from the spec and superseded by import attributes (implemented).
     "import-assertions",
     "import-bytes",
-    # import-defer (static `import defer * as`) is implemented; dynamic
-    # `import.defer()` expression coverage is exposed by the
-    # dynamic-import suite.
     "json-modules",
     "source-phase-imports",
     "source-phase-imports-module-source",
@@ -45,13 +47,15 @@ skip_features = [
     # --- Explicit resource management (using / await using, Stage 3) ---
     "explicit-resource-management",
 
-    # --- Immutable ArrayBuffer (recent proposal, not finalized) ---
+    # --- Immutable ArrayBuffer (Stage 3, not finalized) ---
     "immutable-arraybuffer",
 
     # --- Iterator sequencing & joint iteration (Stage 2.7/3) ---
     "iterator-sequencing",
     "joint-iteration",
 
+    # --- Decorators (Stage 3, not yet in ECMA-262) ---
+    "decorators",
 ]
 
 # Test flags to skip. Strictness is controlled by each test's
@@ -59,62 +63,27 @@ skip_features = [
 # by a global runner prelude.
 skip_flags = []
 
-# Test path patterns to ignore (tests matching these patterns will be skipped)
+# Test path patterns to ignore.
+#
+# POLICY: the only acceptable reason for a path ignore is a CONCRETE
+# upstream bug in a third-party crate we depend on (which we cannot fix
+# from here), each documented with the crate + symptom. Engine gaps,
+# parser limitations, and "too slow" tests are NOT hidden here — they
+# stay visible as failures/timeouts and are tracked as fix targets.
 ignored_tests = [
-    # SpiderMonkey staging tests are engine-specific: they use SM-only harness
-    # helpers and exercise SpiderMonkey extensions, not ECMA-262 behavior, so
-    # they are not part of the conformance target. Ignore the whole subtree.
-    "staging/sm",
-
-    # oxc parser rejects sloppy-mode call expression as assignment target (Annex B)
-    "assignmenttargettype/callexpression",
-    "assignmenttargettype/cover-callexpression",
-
-
-    # Global object missing Object.prototype in prototype chain
-    "decodeURIComponent/S15.1.3.2_A5.5",
-
-    # Heavy decodeURIComponent iteration tests — too slow
-    "decodeURIComponent/S15.1.3.2_A2.5_T1",
-    "decodeURIComponent/S15.1.3.2_A1.10_T1",
-    "decodeURIComponent/S15.1.3.2_A1.12_T1",
-    "decodeURIComponent/S15.1.3.2_A1.2_T2",
-    "decodeURIComponent/S15.1.3.2_A1.11_T1",
-    "decodeURIComponent/S15.1.3.2_A1.2_T1",
-    "decodeURIComponent/S15.1.3.2_A2.1_T1",
-    "decodeURIComponent/S15.1.3.2_A1.11_T2",
-    "decodeURIComponent/S15.1.3.2_A1.12_T2",
-
-    # temporal_rs upstream bug: Duration.round with roundingIncrement for weeks
-    # returns incorrect results. Tracked upstream, no fix in temporal_rs 0.2.0.
+    # temporal_rs upstream bug: Duration.round with roundingIncrement for
+    # weeks returns incorrect results. No fix in temporal_rs 0.2.0.
     "Duration/prototype/round/rounding-increment-relativeto",
 
-    # Temporal PlainDateTime math precision — temporal_rs edge case
+    # temporal_rs upstream bug: PlainDateTime math precision edge case.
     "Temporal/PlainDateTime/datetime-math",
-
-    # 65K eval() iterations per test — too slow (RegExp escape BMP exhaustive tests)
-    "RegExp-trailing-escape-BMP",
-    "RegExp-leading-escape-BMP",
-
-    # HTML-style comments in new Function() — oxc parser doesn't support Annex B HTML comments
-    "createdynfn-html-close-comment",
-    "createdynfn-html-open-comment",
-    "createdynfn-no-line-terminator-html-close-comment",
-
-    # Legacy Sputnik Function.prototype.call cases exercise sloppy
-    # dynamic Function semantics: global-this substitution for
-    # null/undefined, primitive this boxing, and old Function()
-    # constructor behavior. Keep them out of the strict-mode
-    # conformance slice for now.
-    "built-ins/Function/prototype/call/S15.3.4.4_A1_",
-    "built-ins/Function/prototype/call/S15.3.4.4_A3_",
-    "built-ins/Function/prototype/call/S15.3.4.4_A5_",
-    "built-ins/Function/prototype/call/S15.3.4.4_A6_",
-    "built-ins/Function/prototype/call/S15.3.4.4_A7_",
-
 ]
 
-# Tests known to panic/crash the VM (will be skipped with a warning)
+# Tests known to panic/crash the VM (skipped with a warning).
+#
+# These are engine bugs to FIX, not permanent exclusions — each one
+# aborts the host process today and is listed only so a full run can
+# complete. Remove an entry as soon as the underlying guard lands.
 known_panics = [
     # Iterator-helpers re-entry tests recurse into the underlying
     # iterator from within the helper callback; the VM lacks a
@@ -125,10 +94,9 @@ known_panics = [
     "Iterator/prototype/flatMap/throws-typeerror-when-generator-is-running",
     "Iterator/prototype/take/throws-typeerror-when-generator-is-running",
     "Iterator/prototype/drop/throws-typeerror-when-generator-is-running",
-    # Deep JS self-recursion: the engine recurses on the native (main)
-    # thread and overflows the OS stack — aborting the whole batch —
-    # instead of throwing a catchable RangeError. Until the interpreter
-    # gains a call-depth guard on the pure-JS path, skip so the full
-    # run completes. (This is the test that aborts the whole suite.)
+    # Deep JS self-recursion through generator resumption overflows the
+    # native (main) thread stack — the per-frame bytecode depth guard
+    # does not bound the Rust frames added by generator resume / for-of
+    # dispatch. Needs a native-stack guard on that path.
     "staging/sm/extensions/recursion",
 ]

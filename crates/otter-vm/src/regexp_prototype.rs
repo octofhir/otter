@@ -849,7 +849,7 @@ pub(crate) fn regexp_string_iterator_next_runtime(
     let mut ctx = NativeCtx::new_with_call_info_and_context(
         interp,
         crate::NativeCallInfo::call(*matcher),
-        Some(context.clone()),
+        Some(context),
     );
     let result = regexp_exec_runtime(&mut ctx, matcher, input, name)
         .map_err(|e| crate::native_to_vm_error(ctx.interp_mut(), e))?;
@@ -1870,7 +1870,7 @@ mod tests {
         let mut ctx = NativeCtx::new_with_call_info_and_context(
             interp,
             NativeCallInfo::call(*recv),
-            Some(context),
+            Some(&context),
         );
         let text = string_arg_to_jsstring_for_test(args, 0, &mut ctx).unwrap();
         match method {

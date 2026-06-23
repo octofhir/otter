@@ -149,7 +149,12 @@ impl NativeCallInfo {
 pub struct NativeCtx<'rt> {
     pub(crate) cx: RuntimeCx<'rt>,
     call_info: NativeCallInfo,
-    context: Option<ExecutionContext>,
+    // Borrowed, not owned: the caller's execution context outlives the native
+    // call, so the per-call path takes a reference instead of cloning four
+    // `Arc`s + a `FrozenVec` on every native invocation. Owned copies are made
+    // only on the rare re-entrant paths that stash the context past the call
+    // (microtask enqueue, `interp_mut_and_context`).
+    context: Option<&'rt ExecutionContext>,
 }
 
 impl<'rt> NativeCtx<'rt> {
@@ -179,7 +184,7 @@ impl<'rt> NativeCtx<'rt> {
     pub fn new_with_call_info_and_context(
         interp: &'rt mut Interpreter,
         call_info: NativeCallInfo,
-        context: Option<ExecutionContext>,
+        context: Option<&'rt ExecutionContext>,
     ) -> Self {
         Self {
             cx: RuntimeCx::new(interp),
@@ -191,7 +196,7 @@ impl<'rt> NativeCtx<'rt> {
     /// Execution context for the active native call.
     #[must_use]
     pub(crate) fn execution_context(&self) -> Option<&ExecutionContext> {
-        self.context.as_ref()
+        self.context
     }
 
     /// Borrow the owning interpreter together with the current
@@ -203,7 +208,7 @@ impl<'rt> NativeCtx<'rt> {
     /// runtime extensions) can re-enter the interpreter without
     /// reimplementing the borrow split.
     pub fn interp_mut_and_context(&mut self) -> (&mut Interpreter, Option<ExecutionContext>) {
-        (self.cx.interp, self.context.clone())
+        (self.cx.interp, self.context.cloned())
     }
 
     /// Return the JavaScript receiver for the active native call.
@@ -492,7 +497,7 @@ impl<'rt> NativeCtx<'rt> {
     /// build platform objects through their real constructors (e.g. the
     /// structured-clone materializer rebuilding `Date`/`RegExp`/typed arrays).
     pub fn construct(&mut self, target: Value, args: &[Value]) -> Result<Value, NativeError> {
-        let context = self.context.clone().ok_or_else(|| NativeError::TypeError {
+        let context = self.context.cloned().ok_or_else(|| NativeError::TypeError {
             name: "construct",
             reason: "missing execution context".to_string(),
         })?;
@@ -923,7 +928,7 @@ impl<'rt> NativeCtx<'rt> {
         }
         let context = self
             .context
-            .clone()
+            .cloned()
             .ok_or_else(|| crate::NativeError::TypeError {
                 name: "NativeCtx::queue_microtask",
                 reason: "missing execution context".to_string(),

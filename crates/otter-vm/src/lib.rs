@@ -5444,7 +5444,7 @@ impl Interpreter {
             let call_info = NativeCallInfo::call(effective_this);
             self.record_runtime_native_call();
             let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
+                NativeCtx::new_with_call_info_and_context(self, call_info, Some(&context));
             return match call.invoke(&mut ctx, effective_args.as_slice()) {
                 Ok(value) => {
                     self.settle_microtask_capability(context, result_capability, Ok(value));
@@ -12504,7 +12504,7 @@ mod tests {
         let before = interp.gc_heap_mut().stats().old_allocated_bytes;
         let call_info = NativeCallInfo::call(Value::undefined());
         let mut ctx =
-            NativeCtx::new_with_call_info_and_context(&mut interp, call_info, Some(context));
+            NativeCtx::new_with_call_info_and_context(&mut interp, call_info, Some(&context));
 
         let result = call.invoke(&mut ctx, &[]).expect("invoke iterator factory");
 

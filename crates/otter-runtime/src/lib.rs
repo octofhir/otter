@@ -2277,7 +2277,7 @@ impl Runtime {
             let mut ctx = otter_vm::NativeCtx::new_with_call_info_and_context(
                 &mut self.interp,
                 otter_vm::NativeCallInfo::call(global_value),
-                Some(context.clone()),
+                Some(&context),
             );
             let data = materialize_data(&mut ctx)
                 .map_err(map_native_error)
@@ -3273,7 +3273,7 @@ impl Runtime {
             let mut ctx = otter_vm::NativeCtx::new_with_call_info_and_context(
                 &mut self.interp,
                 otter_vm::NativeCallInfo::default_call(),
-                Some(context.clone()),
+                Some(&context),
             );
             let cache = ctx.alloc_object().map_err(gc_oom_to_error)?;
             commonjs::cjs_instantiate_file(&mut ctx, &cfg, cache, &abs, &source.text)

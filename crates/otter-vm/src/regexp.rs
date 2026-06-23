@@ -74,6 +74,18 @@ pub(crate) mod engine {
             .map_while(Result::ok)
             .collect()
     }
+
+    /// Find only the first match from `start` — the single-match path for
+    /// `exec`/`test`. The iterator is lazy, so this computes one match instead
+    /// of the whole remaining set. A step-budget abort yields `None`.
+    pub(crate) fn find_one(re: &Regex, text: &[u16], start: usize, budget: u64) -> Option<Match> {
+        let config = otter_regex::ExecConfig {
+            step_limit: Some(budget),
+        };
+        re.find_from_utf16_with_config(text, start, config)
+            .next()
+            .and_then(Result::ok)
+    }
 }
 
 /// ReDoS guard for every matcher execution. Cuts pathological backtracking
@@ -163,8 +175,8 @@ impl RegexCompileCache {
     }
 }
 
-use crate::Value;
 use crate::number::NumberValue;
+use crate::Value;
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`JsRegExpBody`].
 pub const REGEXP_BODY_TYPE_TAG: u8 = 0x1e;
@@ -473,6 +485,24 @@ impl JsRegExp {
         Self { inner }
     }
 
+    /// Find only the **first** match from a UTF-16 offset, without collecting
+    /// the rest. `RegExp.prototype.exec`/`test` returns a single match and
+    /// advances `lastIndex`, so a `/g` loop calls this once per match; using the
+    /// collecting [`Self::find_from_utf16`] there is quadratic (each call would
+    /// re-find every remaining match and discard all but the first). Step-limit
+    /// aborts surface as `None`, matching "no match at this position".
+    #[must_use]
+    pub fn find_one_from_utf16(
+        &self,
+        heap: &otter_gc::GcHeap,
+        text_units: &[u16],
+        start: usize,
+    ) -> Option<engine::Match> {
+        heap.read_payload(self.inner, |body| {
+            engine::find_one(&body.regex, text_units, start, REGEX_BACKTRACK_BUDGET)
+        })
+    }
+
     /// Run the compiled engine from a UTF-16 offset and collect
     /// owned matches. Bounded by [`REGEX_BACKTRACK_BUDGET`] so
     /// pathological ReDoS patterns abort with no matches instead of
@@ -636,7 +666,11 @@ fn last_index_to_u32(value: &Value, heap: &otter_gc::GcHeap) -> u32 {
             .parse::<f64>()
             .unwrap_or(f64::NAN)
     } else if let Some(b) = value.as_boolean() {
-        if b { 1.0 } else { 0.0 }
+        if b {
+            1.0
+        } else {
+            0.0
+        }
     } else if value.is_null() {
         0.0
     } else {

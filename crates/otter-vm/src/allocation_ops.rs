@@ -21,12 +21,11 @@
 
 use crate::holt_stack::HoltStack;
 use crate::{
-    ExecutionContext, Frame, Interpreter, IteratorHandle, IteratorState, NativeCall, NativeFastFn,
-    NativeFunction, Value, VmError,
     operand_decode::{const_operand, register_operand},
     read_register, regexp,
     runtime_state::RuntimeState,
-    write_register,
+    write_register, ExecutionContext, Frame, Interpreter, IteratorHandle, IteratorState,
+    NativeCall, NativeFastFn, NativeFunction, Value, VmError,
 };
 use otter_bytecode::Operand;
 use otter_gc::raw::RawGc;
@@ -63,6 +62,17 @@ impl Interpreter {
     }
 
     pub(crate) fn collect_runtime_roots(&self) -> Vec<*mut RawGc> {
+        // When an extra-roots provider is registered, a collection pulls the
+        // full runtime root set itself (the dispatch loop installs
+        // `ExtraRootSource for Interpreter`, which walks `trace_roots`). Eagerly
+        // snapshotting that whole set here on *every* rooted allocation — most
+        // of which never trigger a collection — is pure waste; it dominated
+        // allocation-heavy native paths such as `RegExp.prototype.exec`'s
+        // per-match result building. Hand back an empty set and let the heap
+        // pull roots lazily, exactly as `collect_allocation_roots` already does.
+        if self.gc_heap.has_extra_roots() {
+            return Vec::new();
+        }
         let mut roots = Vec::new();
         RuntimeState::new(self).trace_roots(&mut |slot| roots.push(slot));
         self.gc_heap

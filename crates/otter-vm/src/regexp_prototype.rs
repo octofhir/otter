@@ -92,10 +92,7 @@ pub(crate) fn exec_once_native(
         )?;
         return Ok(Value::null());
     }
-    let m = re
-        .find_from_utf16(ctx.heap(), &units, start)
-        .into_iter()
-        .next();
+    let m = re.find_one_from_utf16(ctx.heap(), &units, start);
     let m = match m {
         Some(m) => m,
         None => {

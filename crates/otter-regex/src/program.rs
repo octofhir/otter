@@ -47,6 +47,9 @@ pub(crate) enum Insn {
         /// `true` for case-insensitive class membership.
         ignore_case: bool,
     },
+    /// Match a fixed run of two or more case-sensitive BMP literal code units in
+    /// one dispatch (a slice comparison), instead of one `Char` per unit.
+    CharSeq(Box<[u16]>),
     /// Match any character (line terminators excluded unless `dot_all`).
     AnyChar {
         /// Whether the `s` (dotAll) flag is in effect.

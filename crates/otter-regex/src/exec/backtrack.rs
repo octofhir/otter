@@ -226,6 +226,16 @@ impl Matcher<'_, '_> {
                         }
                         _ => break None,
                     },
+                    Insn::CharSeq(seq) => {
+                        let end = pos + seq.len();
+                        let units = self.units();
+                        if end <= units.len() && units[pos..end] == **seq {
+                            pc += 1;
+                            pos = end;
+                        } else {
+                            break None;
+                        }
+                    }
                     Insn::AnyChar { dot_all } => match self.decode(pos) {
                         Some((cp, w)) if *dot_all || !is_line_terminator(cp) => {
                             pc += 1;

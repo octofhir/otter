@@ -118,6 +118,8 @@ fn compute_first_set(
                 needs_canon |= *ignore_case;
                 out.insert(*cp);
             }
+            // A fused literal run starts with its first unit.
+            Insn::CharSeq(seq) => out.insert(u32::from(seq[0])),
             Insn::Class {
                 class,
                 negate: false,
@@ -211,6 +213,24 @@ impl Emitter {
         let at = self.insns.len();
         self.insns.push(insn);
         at
+    }
+
+    /// Emit a pending literal run: nothing for an empty run, a single `Char` for
+    /// one unit, a fused `CharSeq` for two or more. Clears the run.
+    fn flush_char_run(&mut self, run: &mut Vec<u16>) {
+        match run.len() {
+            0 => {}
+            1 => {
+                self.emit(Insn::Char {
+                    cp: u32::from(run[0]),
+                    ignore_case: false,
+                });
+            }
+            _ => {
+                self.emit(Insn::CharSeq(run.as_slice().into()));
+            }
+        }
+        run.clear();
     }
 
     /// Store a class set out of line, returning its index for an `Insn::Class`.
@@ -311,9 +331,27 @@ impl Emitter {
                 });
             }
             Node::Concat(nodes) => {
+                // Fuse a run of consecutive case-sensitive BMP literals into one
+                // `CharSeq` so the matcher confirms them in a single slice
+                // comparison rather than one dispatch per character. A
+                // quantified literal is a `Repeat`/`Split` node, not a bare
+                // `Char`, so only genuine fixed runs collect here.
+                let mut run: Vec<u16> = Vec::new();
                 for n in nodes {
+                    if let Node::Char {
+                        cp,
+                        ignore_case: false,
+                    } = n
+                        && *cp < 0x1_0000
+                        && !(0xD800..=0xDFFF).contains(cp)
+                    {
+                        run.push(*cp as u16);
+                        continue;
+                    }
+                    self.flush_char_run(&mut run);
                     self.compile(n);
                 }
+                self.flush_char_run(&mut run);
             }
             Node::Alternate(alts) => self.compile_alternation(alts),
             Node::Repeat { node, quant } => self.compile_repeat(node, *quant),

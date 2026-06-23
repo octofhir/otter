@@ -22,7 +22,7 @@ use crate::classes::{ClassSet, CodePointSet};
 use crate::flags::Flags;
 use crate::parser::Parsed;
 use crate::parser::ast::{Assertion, GroupKind, Node, Quantifier};
-use crate::program::{Insn, Program};
+use crate::program::{Insn, Program, RepeatAtom};
 
 /// Lower a parsed pattern into an executable program.
 pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
@@ -40,6 +40,40 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
     // instruction dispatches from every match.
     e.compile(&parsed.root);
     e.emit(Insn::Match);
+
+    // Non-Unicode case-insensitive classes: fold ASCII case into the class set
+    // and clear the per-instruction `ignore_case` flag. The non-Unicode
+    // `ignore_case` membership test consults only `ascii_other_case`, so a class
+    // carrying both cases matches identically with a plain (case-sensitive)
+    // test — which lets the executor take the fast ASCII-bitmap path instead of
+    // a per-character case-fold probe. This is the hot path for `/i` patterns
+    // such as `[a-z]{4,}` under the `i` flag.
+    if !flags.is_unicode_mode() {
+        let Emitter {
+            insns, classes, ..
+        } = &mut e;
+        for insn in insns.iter_mut() {
+            match insn {
+                Insn::Class {
+                    class, ignore_case, ..
+                } if *ignore_case => {
+                    classes[*class as usize].fold_ascii_case();
+                    *ignore_case = false;
+                }
+                Insn::Repeat {
+                    atom:
+                        RepeatAtom::Class {
+                            class, ignore_case, ..
+                        },
+                    ..
+                } if *ignore_case => {
+                    classes[*class as usize].fold_ascii_case();
+                    *ignore_case = false;
+                }
+                _ => {}
+            }
+        }
+    }
 
     // Precompute each class's ASCII membership bitmap so the executor tests the
     // dominant ASCII range with one bit check instead of a binary search.

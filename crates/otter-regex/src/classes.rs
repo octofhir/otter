@@ -271,6 +271,33 @@ impl ClassSet {
         }
     }
 
+    /// Fold ASCII case into the member set: for every ASCII letter present, add
+    /// its opposite case. After this the plain membership test equals the
+    /// non-Unicode `ignore_case` membership test (which consults only
+    /// `ascii_other_case`), so the executor can drop the per-character
+    /// other-case probe and take the fast bitmap path for `/i` patterns.
+    ///
+    /// Only sound for non-Unicode mode: Unicode `ignore_case` additionally folds
+    /// via the full Unicode simple-fold table, which this does not expand.
+    pub(crate) fn fold_ascii_case(&mut self) {
+        let mut adds: Vec<u32> = Vec::new();
+        for r in self.code_points.ranges() {
+            let lo = *r.start();
+            if lo >= 128 {
+                continue;
+            }
+            for cp in lo..=(*r.end()).min(127) {
+                let other = crate::casefold::ascii_other_case(cp);
+                if other != cp {
+                    adds.push(other);
+                }
+            }
+        }
+        for cp in adds {
+            self.code_points.insert(cp);
+        }
+    }
+
     /// Precompute the ASCII (`0..128`) membership bitmap from `code_points`.
     /// Idempotent; the lowering pass calls it once per compiled class so the
     /// executor can test the dominant ASCII range with a single bit check.

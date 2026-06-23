@@ -124,11 +124,22 @@ fn compute_first_set(
             Insn::CharSeq(seq) => out.insert(u32::from(seq[0])),
             Insn::Class {
                 class,
-                negate: false,
+                negate,
                 ignore_case,
             } if classes[*class as usize].strings.is_empty() => {
                 needs_canon |= *ignore_case;
-                out.union_with(&classes[*class as usize].code_points);
+                // A negated class can begin a match with anything outside the
+                // set, so its start set is the complement — letting the scan
+                // skip exactly the excluded characters (e.g. the separators of
+                // `[^,\n]+`). If the pattern is case-insensitive the resulting
+                // complement is too large to canonicalize and the filter is
+                // dropped upstream.
+                let cps = &classes[*class as usize].code_points;
+                if *negate {
+                    out.union_with(&cps.negate());
+                } else {
+                    out.union_with(cps);
+                }
             }
             // A fused repeat's atom is the first thing matched. Contribute its
             // start set; if it may match zero times (`min == 0`), also follow
@@ -142,13 +153,18 @@ fn compute_first_set(
                     }
                     RepeatAtom::Class {
                         class,
-                        negate: false,
+                        negate,
                         ignore_case,
                     } if classes[*class as usize].strings.is_empty() => {
                         needs_canon |= *ignore_case;
-                        out.union_with(&classes[*class as usize].code_points);
+                        let cps = &classes[*class as usize].code_points;
+                        if *negate {
+                            out.union_with(&cps.negate());
+                        } else {
+                            out.union_with(cps);
+                        }
                     }
-                    // Negated class or `.` — uncharacterizable start.
+                    // `.` (any) — uncharacterizable start.
                     _ => return None,
                 }
                 if *min == 0 {

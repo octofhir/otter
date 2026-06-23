@@ -127,7 +127,11 @@ pub fn compile_eval_source(
     super_property_allowed: bool,
 ) -> Result<BytecodeModule, CompileError> {
     // §19.2.1.1 PerformEval parses the body with the Script goal.
-    let direct = otter_syntax::with_program_goal(
+    // A `super` reference parses cleanly and is rejected by our own
+    // semantic pass (inner `Err`), whereas oxc rejects `new.target` at
+    // parse time (outer `Err`). Flatten both into one `CompileError` so
+    // the wrap-and-retry below can recover either.
+    let direct: Result<BytecodeModule, CompileError> = match otter_syntax::with_program_goal(
         source,
         kind,
         otter_syntax::SourceGoal::Script,
@@ -144,17 +148,26 @@ pub fn compile_eval_source(
                 super_property_allowed,
             )
         },
-    )
-    .map_err(CompileError::from)?;
+    ) {
+        Ok(inner) => inner,
+        Err(parse_err) => Err(CompileError::from(parse_err)),
+    };
     match direct {
         Err(CompileError::Syntax { ref messages, .. })
-            if super_property_allowed && messages.iter().any(|m| m.contains("super")) =>
+            if (super_property_allowed && messages.iter().any(|m| m.contains("super")))
+                || (new_target_allowed && messages.iter().any(|m| m.contains("new.target"))) =>
         {
-            // §19.2.1.1 — `super` references are legal in eval code
-            // whose call site has a [[HomeObject]] (methods, field
-            // initializers). oxc has no allow-super parse switch, so
-            // re-parse the body inside a synthetic concise method and
-            // lower its statements through the ordinary eval pipeline.
+            // §19.2.1.1 — `super` references and `new.target` are legal
+            // in eval code whose call site supplies them (methods, field
+            // initializers, function bodies). oxc has no allow-super /
+            // allow-new-target parse switch for Script goal, so re-parse
+            // the body inside a synthetic concise method (which is a
+            // non-arrow function with a [[HomeObject]], so both parse)
+            // and lower its statements through the ordinary eval
+            // pipeline. The wrapper is only a parse vehicle; the
+            // extracted statements are compiled with the original eval
+            // flags, so runtime binding of `super` / `new.target`
+            // resolves against the real caller.
             let wrapped = format!("({{ __otter_eval__() {{\n{source}\n}} }});");
             otter_syntax::with_program_goal(
                 &wrapped,

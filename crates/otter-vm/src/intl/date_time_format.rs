@@ -199,6 +199,62 @@ pub(crate) fn date_time_format_resolved_options(
 /// the resolved option bag. Locale-specific punctuation is left to
 /// future ICU integration; the foundation uses ISO-like fragments
 /// joined by `, ` so the output is unambiguous and stable.
+/// Real ICU4X locale-aware rendering of a civil date/time via
+/// `icu_datetime`. Maps the resolved component flags onto a
+/// [`FieldSetBuilder`] and formats an ISO `DateTime`. Returns `None`
+/// when the locale, field set, or input is unrepresentable so the caller
+/// can fall back to the stable ISO-ish layout.
+fn icu_format_components(
+    year: i32,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    payload: &DateTimeFormatPayload,
+) -> Option<String> {
+    use icu_datetime::input::{Date, DateTime, Time};
+    use icu_datetime::options::{Length, TimePrecision};
+    use icu_datetime::{
+        DateTimeFormatter,
+        fieldsets::builder::{DateFields, FieldSetBuilder},
+    };
+
+    let locale: icu_locale::Locale = payload.locale.parse().ok()?;
+    let prefs = icu_datetime::DateTimeFormatterPreferences::from(&locale);
+
+    let mut builder = FieldSetBuilder::default();
+    builder.length = Some(Length::Medium);
+    builder.date_fields = match (payload.year, payload.month, payload.day) {
+        (true, true, true) => Some(DateFields::YMD),
+        (false, true, true) => Some(DateFields::MD),
+        (true, true, false) => Some(DateFields::YM),
+        (false, false, true) => Some(DateFields::D),
+        (false, true, false) => Some(DateFields::M),
+        (true, false, false) => Some(DateFields::Y),
+        _ => None,
+    };
+    builder.time_precision = if payload.second {
+        Some(TimePrecision::Second)
+    } else if payload.minute {
+        Some(TimePrecision::Minute)
+    } else if payload.hour {
+        Some(TimePrecision::Hour)
+    } else {
+        None
+    };
+    // Date + time without a zone — input is a plain `DateTime`, no
+    // `TimeZoneInfo` required (zone formatting lands with the timeZone
+    // option work).
+    let fieldset = builder.build_composite_datetime().ok()?;
+    let formatter = DateTimeFormatter::try_new(prefs, fieldset).ok()?;
+    let dt = DateTime {
+        date: Date::try_new_iso(year, month, day).ok()?,
+        time: Time::try_new(hour, minute, second, 0).ok()?,
+    };
+    Some(formatter.format(&dt).to_string())
+}
+
 fn format_components(
     year: i32,
     month: u8,
@@ -208,6 +264,9 @@ fn format_components(
     second: u8,
     payload: &DateTimeFormatPayload,
 ) -> String {
+    if let Some(s) = icu_format_components(year, month, day, hour, minute, second, payload) {
+        return s;
+    }
     let mut date_part = String::new();
     if payload.month {
         date_part.push_str(&format!("{:02}", month));

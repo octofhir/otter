@@ -2144,6 +2144,7 @@ dependencies = [
  "icu_experimental",
  "icu_locale",
  "icu_normalizer",
+ "icu_time",
  "indexmap",
  "num-bigint",
  "num-traits",

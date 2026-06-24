@@ -1790,10 +1790,20 @@ pub fn escape_regexp_pattern_utf16(units: &[u16]) -> Vec<u16> {
         let u = units[i];
         match u {
             0x5C => {
-                // backslash: emit it plus the next code unit verbatim
+                // Backslash: emit it, then the escaped code unit. A line
+                // terminator after `\` (an identity escape of the
+                // terminator) must still be rendered in letter / `\u` form
+                // — the already-emitted backslash makes `\n`, `\r`,
+                // ` `, ` ` — so `source` stays a one-line literal.
                 out.push(0x5C);
                 if let Some(&next) = units.get(i + 1) {
-                    out.push(next);
+                    match next {
+                        0x0A => out.push(b'n' as u16),
+                        0x0D => out.push(b'r' as u16),
+                        0x2028 => out.extend("u2028".encode_utf16()),
+                        0x2029 => out.extend("u2029".encode_utf16()),
+                        other => out.push(other),
+                    }
                     i += 1;
                 }
             }

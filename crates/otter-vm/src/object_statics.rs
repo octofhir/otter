@@ -662,6 +662,13 @@ fn native_prototype_to_locale_string(
                 .map_err(|err| object_native_error(ctx.cx.interp, "toLocaleString", err))?;
             return Ok(result);
         }
+        // §20.1.3.5 — `toLocaleString` is `Invoke(O, "toString")`; a
+        // non-callable `toString` is a TypeError, not a fall-back to the
+        // default Object.prototype.toString.
+        return Err(NativeError::TypeError {
+            name: "toLocaleString",
+            reason: "Property 'toString' is not a function".to_string(),
+        });
     }
     native_prototype_to_string(ctx, args)
 }

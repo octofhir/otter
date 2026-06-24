@@ -131,6 +131,47 @@ pub(crate) fn plural_rules_select(
     )?))
 }
 
+/// §1.1.6 `Intl.PluralRules.prototype.selectRange(start, end)` —
+/// `start`/`end` are required (a `TypeError` otherwise), coerced through
+/// `ToNumber` (a Symbol throws), and a `NaN` endpoint is a `RangeError`.
+/// The English plural-range rules collapse every category pair to
+/// `"other"`, which the foundation locale returns directly.
+pub(crate) fn plural_rules_select_range(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let _payload = require_payload(ctx, "selectRange")?;
+    let start = args.first().copied().unwrap_or_else(Value::undefined);
+    let end = args.get(1).copied().unwrap_or_else(Value::undefined);
+    if start.is_undefined() || end.is_undefined() {
+        return Err(NativeError::TypeError {
+            name: "selectRange",
+            reason: "start and end are required".to_string(),
+        });
+    }
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "selectRange",
+            reason: "missing execution context".to_string(),
+        })?;
+    let to_num = |ctx: &mut NativeCtx<'_>, v: &Value| -> Result<f64, NativeError> {
+        crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, v)
+            .map(|n| n.as_f64())
+            .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, "selectRange"))
+    };
+    let x = to_num(ctx, &start)?;
+    let y = to_num(ctx, &end)?;
+    if x.is_nan() || y.is_nan() {
+        return Err(NativeError::RangeError {
+            name: "selectRange",
+            reason: "selectRange arguments must not be NaN".to_string(),
+        });
+    }
+    Ok(Value::string(JsString::from_str("other", ctx.heap_mut())?))
+}
+
 /// §16.3.4 `Intl.PluralRules.prototype.resolvedOptions()`.
 pub(crate) fn plural_rules_resolved_options(
     ctx: &mut NativeCtx<'_>,

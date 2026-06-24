@@ -276,6 +276,7 @@ otter_macros::couch! {
     prototype = {
         methods = {
             "select"          / 1 => crate::intl::plural_rules::plural_rules_select,
+            "selectRange"     / 2 => crate::intl::plural_rules::plural_rules_select_range,
             "resolvedOptions" / 0 => crate::intl::plural_rules::plural_rules_resolved_options,
         },
     },

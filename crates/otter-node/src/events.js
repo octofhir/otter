@@ -227,7 +227,18 @@ EventEmitter.prototype.emit = function emit(type, ...args) {
     const handler = events && events.error;
     if (handler === undefined) {
       const er = args.length > 0 ? args[0] : undefined;
-      if (er instanceof Error) throw er;
+      if (er instanceof Error) {
+        const proc = globalThis.process;
+        if (proc &&
+            proc !== this &&
+            typeof proc.emit === 'function' &&
+            typeof proc.listenerCount === 'function' &&
+            proc.listenerCount('uncaughtException') > 0) {
+          proc.emit('uncaughtException', er, 'uncaughtException');
+          return false;
+        }
+        throw er;
+      }
       const err = new Error(`Unhandled error.${er ? ` (${er.message || er})` : ''}`);
       err.context = er;
       throw err;
@@ -446,6 +457,33 @@ EventEmitter.getMaxListeners = function getMaxListeners(emitterOrTarget) {
     return defaultMaxListeners;
   return originalGetMaxListeners(emitterOrTarget);
 };
+
+function installProcessEmitter() {
+  const proc = globalThis.process;
+  if (!proc || proc.__otterEventsInstalled) return;
+  EventEmitter.init.call(proc);
+  proc.addListener = EventEmitter.prototype.addListener;
+  proc.on = EventEmitter.prototype.on;
+  proc.once = EventEmitter.prototype.once;
+  proc.prependListener = EventEmitter.prototype.prependListener;
+  proc.prependOnceListener = EventEmitter.prototype.prependOnceListener;
+  proc.removeListener = EventEmitter.prototype.removeListener;
+  proc.off = EventEmitter.prototype.off;
+  proc.removeAllListeners = EventEmitter.prototype.removeAllListeners;
+  proc.emit = EventEmitter.prototype.emit;
+  proc.listenerCount = EventEmitter.prototype.listenerCount;
+  proc.listeners = EventEmitter.prototype.listeners;
+  proc.rawListeners = EventEmitter.prototype.rawListeners;
+  proc.eventNames = EventEmitter.prototype.eventNames;
+  proc.setMaxListeners = EventEmitter.prototype.setMaxListeners;
+  proc.getMaxListeners = EventEmitter.prototype.getMaxListeners;
+  Object.defineProperty(proc, '__otterEventsInstalled', {
+    value: true,
+    configurable: true,
+  });
+}
+
+installProcessEmitter();
 
 module.exports = EventEmitter;
 module.exports.EventEmitter = EventEmitter;

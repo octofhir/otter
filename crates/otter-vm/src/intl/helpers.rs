@@ -45,6 +45,61 @@ pub fn options_object(arg: Option<&Value>) -> Option<JsObject> {
     arg.and_then(|v| v.as_object())
 }
 
+/// §13.5.1 StringListFromIterable — drain `iterable` through the
+/// iterator protocol into a `Vec<String>`.
+///
+/// `undefined` yields an empty list. Each produced value must be a
+/// String; the first non-String element closes the iterator and
+/// surfaces a `TypeError`. The iterator and its `next` method are
+/// rooted on the GC iteration-anchor stack across every step so a
+/// collection triggered inside a user `next`/getter cannot reclaim
+/// them; produced values are converted to owned Rust strings inline
+/// and never held across a step.
+pub(crate) fn string_list_from_iterable(
+    ctx: &mut crate::NativeCtx<'_>,
+    iterable: Option<&Value>,
+    name: &'static str,
+) -> Result<Vec<String>, crate::NativeError> {
+    let iterable = match iterable {
+        Some(v) if !v.is_undefined() => *v,
+        _ => return Ok(Vec::new()),
+    };
+    let (interp, exec) = ctx.interp_mut_and_context();
+    let exec = exec.ok_or_else(|| crate::NativeError::TypeError {
+        name,
+        reason: "missing execution context".to_string(),
+    })?;
+    let (iterator, next_method) = interp
+        .get_iterator_sync(&exec, &iterable)
+        .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))?;
+    let it_anchor = interp.push_iteration_anchor(iterator) - 1;
+    let nm_anchor = interp.push_iteration_anchor(next_method) - 1;
+    let mut out: Vec<String> = Vec::new();
+    let result = loop {
+        let iterator = interp.iteration_anchor(it_anchor);
+        let next_method = interp.iteration_anchor(nm_anchor);
+        match interp.iterator_step_sync(&exec, &iterator, &next_method) {
+            Ok(Some(value)) => {
+                if let Some(s) = value.as_string(interp.gc_heap()) {
+                    out.push(s.to_lossy_string(interp.gc_heap()));
+                } else {
+                    // §13.5.1 step 5.b.ii — a non-String element closes
+                    // the iterator with the pending TypeError completion.
+                    let _ = interp.iterator_close_value_sync(&exec, iterator);
+                    break Err(crate::NativeError::TypeError {
+                        name,
+                        reason: "list elements must be strings".to_string(),
+                    });
+                }
+            }
+            Ok(None) => break Ok(()),
+            Err(e) => break Err(crate::native_function::vm_to_native_error(interp, e, name)),
+        }
+    };
+    interp.pop_iteration_anchors_to(it_anchor);
+    result.map(|()| out)
+}
+
 /// Read an optional string field with default fallback.
 pub fn read_string_option(
     options: Option<&JsObject>,

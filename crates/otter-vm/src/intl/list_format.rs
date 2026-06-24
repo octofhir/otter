@@ -108,42 +108,13 @@ pub(crate) fn join(items: &[String], payload: &ListFormatPayload) -> String {
     }
 }
 
-fn collect_items(
-    value: Option<&Value>,
-    gc_heap: &otter_gc::GcHeap,
-) -> Result<Vec<String>, NativeError> {
-    let Some(arr) = value.and_then(|v| v.as_array()) else {
-        return Err(NativeError::TypeError {
-            name: "format",
-            reason: "argument 0 must be an Array".to_string(),
-        });
-    };
-    let values = crate::array::with_elements(arr, gc_heap, |elements| elements.to_vec());
-    let mut out: Vec<String> = Vec::with_capacity(values.len());
-    for v in values {
-        if let Some(s) = v.as_string(gc_heap) {
-            out.push(s.to_lossy_string(gc_heap));
-        } else if let Some(n) = v.as_number() {
-            out.push(n.to_display_string());
-        } else if let Some(b) = v.as_boolean() {
-            out.push((if b { "true" } else { "false" }).to_string());
-        } else {
-            return Err(NativeError::TypeError {
-                name: "format",
-                reason: "argument 0 list elements must be strings".to_string(),
-            });
-        }
-    }
-    Ok(out)
-}
-
 /// §13.5.3 `Intl.ListFormat.prototype.format(list)`.
 pub(crate) fn list_format_format(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "format")?;
-    let items = collect_items(args.first(), ctx.heap())?;
+    let items = crate::intl::helpers::string_list_from_iterable(ctx, args.first(), "format")?;
     let rendered = join(&items, &payload);
     Ok(Value::string(JsString::from_str(
         &rendered,
@@ -158,7 +129,8 @@ pub(crate) fn list_format_format_to_parts(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "formatToParts")?;
-    let items = collect_items(args.first(), ctx.heap())?;
+    let items =
+        crate::intl::helpers::string_list_from_iterable(ctx, args.first(), "formatToParts")?;
     let parts = parts_layout(&items, &payload);
 
     let mut elements: Vec<Value> = Vec::with_capacity(parts.len());

@@ -230,8 +230,24 @@ pub fn load_property(temporal: JsTemporal, heap: &mut otter_gc::GcHeap, name: &s
         _ => return Value::undefined(),
     };
     match name {
+        // `era`/`eraYear` route through the calendar-aware `PlainDate`
+        // projection — see `get_era` for why the direct
+        // `ZonedDateTime::era` accessor is unsuitable.
+        "era" => zdt
+            .to_plain_date()
+            .era()
+            .map_or(Value::undefined(), |era| {
+                crate::temporal::helpers::str_or_undef(era.as_str(), heap)
+            }),
+        "eraYear" => zdt
+            .to_plain_date()
+            .era_year()
+            .map_or(Value::undefined(), Value::number_i32),
         "year" => Value::number_i32(zdt.year()),
         "month" => Value::number_i32(zdt.month() as i32),
+        "monthCode" => {
+            crate::temporal::helpers::str_or_undef(zdt.month_code().as_str(), heap)
+        }
         "day" => Value::number_i32(zdt.day() as i32),
         "hour" => Value::number_i32(zdt.hour() as i32),
         "minute" => Value::number_i32(zdt.minute() as i32),
@@ -241,6 +257,15 @@ pub fn load_property(temporal: JsTemporal, heap: &mut otter_gc::GcHeap, name: &s
         "nanosecond" => Value::number_i32(zdt.nanosecond() as i32),
         "dayOfWeek" => Value::number_i32(zdt.day_of_week() as i32),
         "dayOfYear" => Value::number_i32(zdt.day_of_year() as i32),
+        "weekOfYear" => zdt
+            .week_of_year()
+            .map_or(Value::undefined(), |w| Value::number_i32(w as i32)),
+        "yearOfWeek" => zdt
+            .year_of_week()
+            .map_or(Value::undefined(), Value::number_i32),
+        "hoursInDay" => zdt
+            .hours_in_day()
+            .map_or(Value::undefined(), Value::number_f64),
         "daysInWeek" => Value::number_i32(zdt.days_in_week() as i32),
         "daysInMonth" => Value::number_i32(zdt.days_in_month() as i32),
         "daysInYear" => Value::number_i32(zdt.days_in_year() as i32),
@@ -572,10 +597,19 @@ zoned_date_time_getter!(get_hours_in_day, zdt => zdt
     .map_or(Value::undefined(), Value::number_f64));
 zoned_date_time_getter!(get_epoch_milliseconds, zdt => Value::number_f64(zdt.epoch_milliseconds() as f64));
 zoned_date_time_getter!(get_offset_nanoseconds, zdt => Value::number_f64(zdt.offset_nanoseconds() as f64));
+// `era`/`eraYear` route through the calendar-aware `PlainDate`
+// projection: `temporal_rs::ZonedDateTime::era`/`era_year` evaluate the
+// calendar against the raw instant rather than the time-zone-local civil
+// date and yield `None` for non-ISO calendars, whereas the `PlainDate`
+// projection carries the resolved civil date the era is defined against.
 zoned_date_time_getter!(get_era, zdt, heap => zdt
+    .to_plain_date()
     .era()
     .map_or(Value::undefined(), |era| str_or_undef(era.as_str(), heap)));
-zoned_date_time_getter!(get_era_year, zdt => zdt.era_year().map_or(Value::undefined(), Value::number_i32));
+zoned_date_time_getter!(get_era_year, zdt => zdt
+    .to_plain_date()
+    .era_year()
+    .map_or(Value::undefined(), Value::number_i32));
 zoned_date_time_getter!(get_epoch_nanoseconds, zdt, heap => {
     match BigIntValue::from_i128(heap, zdt.epoch_nanoseconds().0) {
         Ok(b) => Value::big_int(b),

@@ -1537,6 +1537,15 @@ mod arm64 {
     }
 
     pub(super) fn compile(view: &JitFunctionView) -> Result<BaselineCode, Unsupported> {
+        if let Some(instr) = view.instructions.iter().find(|instr| {
+            matches!(
+                instr.op,
+                Op::EnterTry | Op::LeaveTry | Op::Throw | Op::EndFinally
+            )
+        }) {
+            return Err(Unsupported::Opcode(instr.op));
+        }
+
         let mut ops = Assembler::new().expect("assembler alloc");
         let bail = ops.new_dynamic_label();
         let threw = ops.new_dynamic_label();
@@ -2069,7 +2078,7 @@ mod arm64 {
                             ; lsr x10, x12, #48                  // tag
                             ; movz x11, TAG_PTR_OBJECT as u32
                             ; cmp x10, x11
-                            ; b.hs =>up_miss                     // pointer → barriered stub
+                            ; b.hs =>up_miss                     // pointer -> barriered stub
                             ; ldr w10, [x9, idx_off]             // 4-byte cell handle
                         );
                         emit_load_u64(&mut ops, 13, cage_base as u64);
@@ -2112,7 +2121,7 @@ mod arm64 {
                             ; lsr x10, x12, #48                  // tag
                             ; movz x11, TAG_PTR_OBJECT as u32
                             ; cmp x10, x11
-                            ; b.hs =>up_miss                     // pointer → barriered bridge
+                            ; b.hs =>up_miss                     // pointer -> barriered bridge
                             ; ldr w10, [x9, idx_off]             // 4-byte cell handle
                         );
                         emit_load_u64(&mut ops, 13, cage_base as u64);

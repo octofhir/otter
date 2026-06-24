@@ -297,11 +297,11 @@ impl Interpreter {
             Some(&Operand::ConstIndex(n)) => n as usize,
             _ => return Err(VmError::InvalidOperand),
         };
-        let name = context
-            .string_constant_str(name_idx)
-            .ok_or(VmError::InvalidOperand)?;
         let caller_byte_len = self.current_byte_len;
         let top_idx = stack.len() - 1;
+        let name = context
+            .string_constant_str_for_function(stack[top_idx].function_id, name_idx)
+            .ok_or(VmError::InvalidOperand)?;
         let recv_value = *read_register(&stack[top_idx], recv_reg)?;
         let mut arg_values: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc);
         for i in 0..argc {
@@ -326,7 +326,8 @@ impl Interpreter {
         // shape (accessor method, deep prototype, absent) returns `None` and
         // falls through to the full resolution below.
         if let Some(obj) = recv_value.as_object()
-            && let Some(atomized_key) = context.property_atom(name_idx)
+            && let Some(atomized_key) =
+                context.property_atom_for_function(stack[top_idx].function_id, name_idx)
             && let Some(site) =
                 context.property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
             && let Some(method) = self.resolve_method_ic(obj, atomized_key, site)
@@ -917,7 +918,7 @@ impl Interpreter {
             args.push(*read_register(&stack[frame_index], r)?);
         }
         let name = context
-            .string_constant_str(name_idx)
+            .string_constant_str_for_function(stack[frame_index].function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
         if name == "charCodeAt"
             && recv.is_string()

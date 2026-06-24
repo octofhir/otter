@@ -1459,7 +1459,45 @@ impl Interpreter {
                 let popped = self.return_running_finally(stack, value)?;
                 Ok(Some(popped))
             }
-            jit::JitExecOutcome::Threw(err) => Err(err),
+            jit::JitExecOutcome::Threw(err) => {
+                if matches!(err, VmError::Uncaught)
+                    && let Some(thrown) = self.pending_uncaught_throw.take()
+                {
+                    self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+                    let unwind = self.unwind_throw(context, stack, thrown);
+                    if unwind.is_ok() {
+                        self.pending_uncaught_frames = None;
+                    } else {
+                        self.pending_uncaught_throw = Some(thrown);
+                    }
+                    unwind?;
+                    return if stack.is_empty() {
+                        Ok(Some(Some(Value::undefined())))
+                    } else {
+                        Ok(None)
+                    };
+                }
+                if let Some(thrown) = self.vm_error_to_throwable_with_stack_roots(stack, &err) {
+                    let uncaught =
+                        if matches!(err, VmError::OutOfMemory { .. } | VmError::JsonError) {
+                            Some(err)
+                        } else {
+                            None
+                        };
+                    self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+                    let unwind = self.unwind_throw_with_uncaught(context, stack, thrown, uncaught);
+                    if unwind.is_ok() {
+                        self.pending_uncaught_frames = None;
+                    }
+                    unwind?;
+                    return if stack.is_empty() {
+                        Ok(Some(Some(Value::undefined())))
+                    } else {
+                        Ok(None)
+                    };
+                }
+                Err(err)
+            }
         }
     }
 
@@ -2082,7 +2120,9 @@ impl Interpreter {
         let Some(obj) = recv.as_object() else {
             return Ok(None);
         };
-        let Some(key) = context.property_atom(name_idx) else {
+        let Some(key) =
+            context.property_atom_for_function(stack[frame_index].function_id, name_idx)
+        else {
             return Ok(None);
         };
         // Monomorphic IC-resolved data-slot method only; misses (accessor, deep

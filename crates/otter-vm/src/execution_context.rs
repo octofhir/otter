@@ -386,10 +386,40 @@ impl ExecutionContext {
         self.atoms.string_constant_str(idx)
     }
 
+    /// Resolve a string constant in the chunk that owns `function_id`.
+    ///
+    /// JIT runtime helpers execute with an ambient caller context, but compiled
+    /// frames may belong to sibling chunks (Node shims, eval chunks, dynamic
+    /// modules). Operand constant indices are local to the function's owning
+    /// chunk, so method/property names must be resolved through that chunk's
+    /// atom table rather than `self.atoms`.
+    #[must_use]
+    pub fn string_constant_str_for_function(&self, function_id: u32, idx: u32) -> Option<&str> {
+        if self.local_function_index(function_id).is_some() {
+            return self.atoms.string_constant_str(idx);
+        }
+        self.sibling_tables(function_id)?
+            .atoms
+            .string_constant_str(idx)
+    }
+
     /// Resolve a string constant as an atomized property key.
     #[must_use]
     pub(crate) fn property_atom(&self, idx: u32) -> Option<AtomizedPropertyKey<'_>> {
         self.atoms.property_atom(idx)
+    }
+
+    /// Resolve an atomized property key in the chunk that owns `function_id`.
+    #[must_use]
+    pub(crate) fn property_atom_for_function(
+        &self,
+        function_id: u32,
+        idx: u32,
+    ) -> Option<AtomizedPropertyKey<'_>> {
+        if self.local_function_index(function_id).is_some() {
+            return self.atoms.property_atom(idx);
+        }
+        self.sibling_tables(function_id)?.atoms.property_atom(idx)
     }
 
     /// Resolve a numeric constant's raw IEEE-754 bits.

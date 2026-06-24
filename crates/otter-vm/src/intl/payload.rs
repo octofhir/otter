@@ -66,6 +66,10 @@ pub struct NumberFormatPayload {
     pub maximum_fraction_digits: u8,
     /// `useGrouping` option.
     pub use_grouping: bool,
+    /// `signDisplay` option (`"auto"` / `"always"` / `"never"` /
+    /// `"exceptZero"` / `"negative"`) — controls when a plus/minus sign
+    /// is shown.
+    pub sign_display: String,
 }
 
 /// Text-component width (`weekday`, `era`, `dayPeriod`).

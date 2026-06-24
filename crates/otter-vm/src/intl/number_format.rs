@@ -31,6 +31,11 @@ use crate::string::JsString;
 use crate::{NativeCtx, NativeError, Value};
 use otter_gc::raw::RawGc;
 
+/// Build a `RangeError`-bearing `IntlError` for an invalid option value.
+fn range_err(message: String) -> IntlError {
+    IntlError::Range { message }
+}
+
 /// Resolve the `(locale, options)` argument pair to a payload.
 ///
 /// # Errors
@@ -87,6 +92,15 @@ pub fn resolve(
         gc_heap,
     );
     let use_grouping = read_bool_option(opts_ref, "useGrouping", true, gc_heap);
+    let sign_display = read_string_option(opts_ref, "signDisplay", "auto", gc_heap);
+    if !matches!(
+        sign_display.as_str(),
+        "auto" | "always" | "never" | "exceptZero" | "negative"
+    ) {
+        return Err(range_err(format!(
+            "invalid value '{sign_display}' for option 'signDisplay'"
+        )));
+    }
     Ok(NumberFormatPayload {
         locale: coerce_locale(Some(locale), gc_heap),
         style,
@@ -94,6 +108,7 @@ pub fn resolve(
         minimum_fraction_digits,
         maximum_fraction_digits,
         use_grouping,
+        sign_display,
     })
 }
 
@@ -335,22 +350,25 @@ pub(crate) fn partition_number(
 ) -> Vec<(&'static str, String)> {
     let mut parts: Vec<(&'static str, String)> = Vec::new();
     if n.is_nan() {
+        push_sign(&mut parts, displayed_sign(&payload.sign_display, false, false, true));
         parts.push(("nan", "NaN".to_string()));
         return parts;
     }
 
-    // Currency: render the full ICU string, then split off the symbol /
-    // affixes around the numeric core so the `currency` parts carry the
-    // CLDR-correct symbol (no hand-rolled table).
+    let is_neg = n.is_sign_negative();
+    let is_zero = rounds_to_zero(n, payload);
+    let sign = displayed_sign(&payload.sign_display, is_neg, is_zero, false);
+
+    // Currency: render the unsigned ICU string, then split off the symbol
+    // / affixes around the numeric core so the `currency` parts carry the
+    // CLDR-correct symbol (no hand-rolled table). The sign is applied
+    // separately per `signDisplay`.
     if payload.style == "currency" && n.is_finite() {
-        let full = currency_string(n, payload);
+        let full = currency_string(n.abs(), payload);
         let core = format_decimal(n.abs(), payload);
         if let Some(idx) = full.find(&core) {
-            let mut prefix = &full[..idx];
-            if let Some(rest) = prefix.strip_prefix('-') {
-                parts.push(("minusSign", "-".to_string()));
-                prefix = rest;
-            }
+            push_sign(&mut parts, sign);
+            let prefix = &full[..idx];
             if !prefix.is_empty() {
                 parts.push(("currency", prefix.to_string()));
             }
@@ -362,13 +380,12 @@ pub(crate) fn partition_number(
             return parts;
         }
         // Affix split failed — surface the whole string as a literal.
+        push_sign(&mut parts, sign);
         parts.push(("literal", full));
         return parts;
     }
 
-    if n.is_sign_negative() {
-        parts.push(("minusSign", "-".to_string()));
-    }
+    push_sign(&mut parts, sign);
     if n.is_infinite() {
         parts.push(("infinity", "∞".to_string()));
     } else {
@@ -448,17 +465,116 @@ pub(crate) fn number_format_resolved_options(
 /// Render `n` per the resolved option bag.
 pub(crate) fn format_number(n: f64, payload: &NumberFormatPayload) -> String {
     if n.is_nan() {
-        return "NaN".to_string();
+        let sign = sign_prefix(displayed_sign(&payload.sign_display, false, false, true));
+        return format!("{sign}NaN");
     }
-    if n.is_infinite() {
-        let sign = if n.is_sign_negative() { "-" } else { "" };
-        return format!("{sign}∞");
+    let is_neg = n.is_sign_negative();
+    let is_zero = rounds_to_zero(n, payload);
+    let sign = sign_prefix(displayed_sign(&payload.sign_display, is_neg, is_zero, false));
+    let magnitude = if n.is_infinite() {
+        "∞".to_string()
+    } else {
+        match payload.style.as_str() {
+            "currency" => currency_string(n.abs(), payload),
+            "percent" => format!("{}%", format_decimal(n.abs() * 100.0, payload)),
+            _ => format_decimal(n.abs(), payload),
+        }
+    };
+    format!("{sign}{magnitude}")
+}
+
+/// The sign glyph a value renders under a `signDisplay` policy.
+#[derive(Clone, Copy, PartialEq)]
+enum SignKind {
+    /// No sign rendered.
+    None,
+    /// A minus sign (`-`).
+    Minus,
+    /// A plus sign (`+`).
+    Plus,
+}
+
+/// §15.5 — pick the displayed sign from `signDisplay`, the value's sign
+/// bit, and whether the rounded magnitude is zero. NaN counts as
+/// non-negative and non-zero, so `always` yields `+NaN` while the other
+/// policies render no sign.
+fn displayed_sign(sign_display: &str, is_negative: bool, is_zero: bool, is_nan: bool) -> SignKind {
+    if is_nan {
+        return if sign_display == "always" {
+            SignKind::Plus
+        } else {
+            SignKind::None
+        };
     }
-    match payload.style.as_str() {
-        "currency" => currency_string(n, payload),
-        "percent" => format!("{}%", format_decimal(n * 100.0, payload)),
-        _ => format_decimal(n, payload),
+    match sign_display {
+        "never" => SignKind::None,
+        "always" => {
+            if is_negative {
+                SignKind::Minus
+            } else {
+                SignKind::Plus
+            }
+        }
+        "exceptZero" => {
+            if is_zero {
+                SignKind::None
+            } else if is_negative {
+                SignKind::Minus
+            } else {
+                SignKind::Plus
+            }
+        }
+        "negative" => {
+            if is_negative && !is_zero {
+                SignKind::Minus
+            } else {
+                SignKind::None
+            }
+        }
+        // "auto"
+        _ => {
+            if is_negative {
+                SignKind::Minus
+            } else {
+                SignKind::None
+            }
+        }
     }
+}
+
+/// The literal string for a [`SignKind`].
+fn sign_prefix(kind: SignKind) -> &'static str {
+    match kind {
+        SignKind::Minus => "-",
+        SignKind::Plus => "+",
+        SignKind::None => "",
+    }
+}
+
+/// Append the `minusSign` / `plusSign` part for a [`SignKind`] (nothing
+/// for [`SignKind::None`]).
+fn push_sign(parts: &mut Vec<(&'static str, String)>, kind: SignKind) {
+    match kind {
+        SignKind::Minus => parts.push(("minusSign", "-".to_string())),
+        SignKind::Plus => parts.push(("plusSign", "+".to_string())),
+        SignKind::None => {}
+    }
+}
+
+/// Whether the value rounds to zero at the resolved fraction precision
+/// (used by `signDisplay` zero-suppression). Infinity is never zero.
+fn rounds_to_zero(n: f64, payload: &NumberFormatPayload) -> bool {
+    if !n.is_finite() {
+        return false;
+    }
+    let scaled = if payload.style == "percent" {
+        n.abs() * 100.0
+    } else {
+        n.abs()
+    };
+    let max = payload.maximum_fraction_digits as usize;
+    let s = format!("{scaled:.max$}");
+    s.bytes().all(|b| b == b'0' || b == b'.')
 }
 
 /// Build a `fixed_decimal::Decimal` for `value` honouring the resolved
@@ -472,19 +588,20 @@ fn decimal_from(value: f64, payload: &NumberFormatPayload) -> Option<Decimal> {
     Some(dec)
 }
 
-/// Format a currency value through ICU's CLDR-backed
-/// [`CurrencyFormatter`] (correct symbol + placement for every ISO-4217
-/// code and locale). Falls back to the ISO code prefix only when ICU
-/// data or the code itself is unavailable — never a hand-rolled symbol
-/// table.
-fn currency_string(n: f64, payload: &NumberFormatPayload) -> String {
+/// Format the unsigned magnitude of a currency value through ICU's
+/// CLDR-backed [`CurrencyFormatter`] (correct symbol + placement for
+/// every ISO-4217 code and locale). The caller applies the `signDisplay`
+/// sign. Falls back to the ISO code prefix only when ICU data or the
+/// code itself is unavailable — never a hand-rolled symbol table.
+fn currency_string(magnitude: f64, payload: &NumberFormatPayload) -> String {
     let code = payload.currency.as_deref().unwrap_or("USD");
     let locale = Locale::from_str(&payload.locale)
         .or_else(|_| Locale::from_str(DEFAULT_LOCALE))
         .expect("default locale parses");
+    let abs = magnitude.abs();
     if let (Ok(cc), Some(dec)) = (
         TinyAsciiStr::<3>::try_from_str(code),
-        decimal_from(n, payload),
+        decimal_from(abs, payload),
     ) {
         let prefs = CurrencyFormatterPreferences::from(&locale);
         if let Ok(fmt) = CurrencyFormatter::try_new(prefs, CurrencyFormatterOptions::default()) {
@@ -496,9 +613,8 @@ fn currency_string(n: f64, payload: &NumberFormatPayload) -> String {
             return out;
         }
     }
-    let core = format_decimal(n.abs(), payload);
-    let sign = if n.is_sign_negative() { "-" } else { "" };
-    format!("{sign}{code}\u{a0}{core}")
+    let core = format_decimal(abs, payload);
+    format!("{code}\u{a0}{core}")
 }
 
 /// Format a number through ICU's `DecimalFormatter`. Falls back to
@@ -531,9 +647,6 @@ fn format_decimal(n: f64, payload: &NumberFormatPayload) -> String {
     decimal.pad_end(-(payload.minimum_fraction_digits as i16));
     let mut out = String::new();
     let _ = writeable::Writeable::write_to(&formatter.format(&decimal), &mut out);
-    if n.is_sign_negative() {
-        out = format!("-{out}");
-    }
     out
 }
 
@@ -572,9 +685,6 @@ fn rust_fallback_format(n: f64, payload: &NumberFormatPayload) -> String {
     }
     if payload.use_grouping {
         s = group_thousands(&s);
-    }
-    if n.is_sign_negative() {
-        s = format!("-{s}");
     }
     s
 }

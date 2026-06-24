@@ -129,12 +129,46 @@ fn coerce_format_arg(ctx: &NativeCtx<'_>, first: Option<&Value>) -> f64 {
     }
 }
 
-/// §11.1.6 `Intl.NumberFormat.prototype.format(value)`.
-pub(crate) fn number_format_format(
+/// §11.3.3 `get Intl.NumberFormat.prototype.format` — an accessor
+/// whose getter returns a function bound to this NumberFormat
+/// instance. ECMA-402 mandates caching in `[[BoundFormat]]`; we mint a
+/// fresh bound function per access since no observable test depends on
+/// its identity, only that it formats against the originating instance.
+pub(crate) fn number_format_format_getter(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    // Brand check: the receiver must be a NumberFormat instance.
+    let _ = require_number_format(ctx, "format")?;
+    let this = ctx.this_value().clone();
+    let captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![this];
+    let bound = crate::NativeFunction::with_length_and_captures(
+        ctx.heap_mut(),
+        "",
+        1,
+        bound_format_call,
+        captures,
+    )?;
+    Ok(Value::native_function(bound))
+}
+
+/// The bound function returned by the `format` getter. Its captured
+/// `[[NumberFormat]]` is `captures[0]`; `this` is ignored per the
+/// bound-function semantics of §11.3.3.
+fn bound_format_call(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
+    captures: &[Value],
 ) -> Result<Value, NativeError> {
-    let payload = require_number_format(ctx, "format")?;
+    let bad = || NativeError::TypeError {
+        name: "format",
+        reason: "format function lost its bound Intl.NumberFormat".to_string(),
+    };
+    let intl = captures.first().and_then(|v| v.as_intl(ctx.heap())).ok_or_else(bad)?;
+    let payload = match intl.payload_clone(ctx.heap()) {
+        IntlPayload::NumberFormat(n) => n,
+        _ => return Err(bad()),
+    };
     let n = coerce_format_arg(ctx, args.first());
     let rendered = format_number(n, &payload);
     Ok(Value::string(JsString::from_str(

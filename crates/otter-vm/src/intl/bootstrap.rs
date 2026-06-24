@@ -191,10 +191,12 @@ otter_macros::couch! {
     },
     prototype = {
         methods = {
-            "format"          / 1 => crate::intl::number_format::number_format_format,
             "formatToParts"   / 1 => crate::intl::number_format::number_format_format_to_parts,
             "resolvedOptions" / 0 => crate::intl::number_format::number_format_resolved_options,
         },
+        accessors = [
+            ("format", get = crate::intl::number_format::number_format_format_getter),
+        ],
     },
     install_on = crate::intl::bootstrap::intl_host,
     string_tag = "Intl.NumberFormat",
@@ -211,10 +213,12 @@ otter_macros::couch! {
     },
     prototype = {
         methods = {
-            "format"          / 1 => crate::intl::date_time_format::date_time_format_format,
             "formatToParts"   / 1 => crate::intl::date_time_format::date_time_format_format_to_parts,
             "resolvedOptions" / 0 => crate::intl::date_time_format::date_time_format_resolved_options,
         },
+        accessors = [
+            ("format", get = crate::intl::date_time_format::date_time_format_format_getter),
+        ],
     },
     install_on = crate::intl::bootstrap::intl_host,
     string_tag = "Intl.DateTimeFormat",

@@ -51,6 +51,7 @@ fn intl_to_vm_error(interp: &crate::Interpreter, err: intl::IntlError) -> VmErro
             interp.err_unknown_intrinsic(format!("Intl.{class}.prototype.{method}").into())
         }
         intl::IntlError::BadArgument { .. } => VmError::TypeMismatch,
+        intl::IntlError::Range { message } => interp.err_range(message.into()),
         intl::IntlError::Engine { message, .. } => interp.err_uncaught((message).into()),
         intl::IntlError::OutOfMemory {
             requested_bytes,

@@ -284,11 +284,47 @@ fn require_date_time(
 }
 
 /// §12.1.5 `Intl.DateTimeFormat.prototype.format(date)`.
-pub(crate) fn date_time_format_format(
+/// §12.4.3 `get Intl.DateTimeFormat.prototype.format` — an accessor
+/// whose getter returns a function bound to this DateTimeFormat
+/// instance. ECMA-402 mandates the bound function be cached in the
+/// `[[BoundFormat]]` internal slot; we mint a fresh bound function per
+/// access since no observable test depends on its identity, only that
+/// it formats against the originating instance regardless of `this`.
+pub(crate) fn date_time_format_format_getter(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    // Brand check: the receiver must be a DateTimeFormat instance.
+    let _ = require_date_time(ctx, "format")?;
+    let this = ctx.this_value().clone();
+    let captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![this];
+    let bound = crate::NativeFunction::with_length_and_captures(
+        ctx.heap_mut(),
+        "",
+        1,
+        bound_format_call,
+        captures,
+    )?;
+    Ok(Value::native_function(bound))
+}
+
+/// The bound function returned by the `format` getter. Its captured
+/// `[[DateTimeFormat]]` is `captures[0]`; `this` is ignored per the
+/// bound-function semantics of §12.4.3.
+fn bound_format_call(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
+    captures: &[Value],
 ) -> Result<Value, NativeError> {
-    let payload = require_date_time(ctx, "format")?;
+    let bad = || NativeError::TypeError {
+        name: "format",
+        reason: "format function lost its bound Intl.DateTimeFormat".to_string(),
+    };
+    let intl = captures.first().and_then(|v| v.as_intl(ctx.heap())).ok_or_else(bad)?;
+    let payload = match intl.payload_clone(ctx.heap()) {
+        IntlPayload::DateTimeFormat(d) => d,
+        _ => return Err(bad()),
+    };
     let (y, mo, d, h, mi, s) = arg_to_civil(ctx, args.first(), "format")?;
     let formatted = format_components(y, mo, d, h, mi, s, &payload);
     Ok(Value::string(JsString::from_str(

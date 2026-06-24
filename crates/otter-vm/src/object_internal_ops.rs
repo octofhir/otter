@@ -5103,6 +5103,26 @@ impl Interpreter {
         let mut visited = BTreeSet::new();
         let mut out = Vec::new();
 
+        // §14.7.5.9 ForIn/OfHeadEvaluation — `for (x in v)` enumerates
+        // ToObject(v). A primitive has no enumerable own properties
+        // except a String's index keys (its `length` is non-enumerable);
+        // continue the prototype walk from the wrapper prototype rather
+        // than letting [[GetPrototypeOf]] reject the primitive.
+        if !current.is_object_type() {
+            if let Some(s) = current.as_string(&self.gc_heap) {
+                for idx in 0..s.len() {
+                    let name = idx.to_string();
+                    if visited.insert(name.clone()) {
+                        out.push(name);
+                    }
+                }
+            }
+            match self.intrinsic_prototype_object_for(&current) {
+                Some(proto) => current = Value::object(proto),
+                None => return Ok(out),
+            }
+        }
+
         for hops in 0..object::PROTO_CHAIN_HARD_CAP {
             if current.is_null() {
                 break;

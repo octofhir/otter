@@ -795,7 +795,7 @@ fn to_integer_or_infinity_runtime(
 /// `Get(R, "exec")` so user-overridable execs are honoured before
 /// falling back to the builtin §22.2.7.2 algorithm when `R` is a
 /// `Value::RegExp` instance.
-fn regexp_exec_runtime(
+pub(crate) fn regexp_exec_runtime(
     ctx: &mut NativeCtx<'_>,
     rx: &Value,
     s: JsString,

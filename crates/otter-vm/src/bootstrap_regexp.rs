@@ -618,7 +618,24 @@ pub(crate) fn proto_exec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
 }
 
 fn proto_test(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let result = proto_exec(ctx, args)?;
+    // §22.2.6.16 — `this` need only be an Object; the match runs through
+    // the abstract RegExpExec, which dispatches on the `exec` property,
+    // so a non-RegExp object carrying its own `exec` is honoured.
+    let receiver = *ctx.this_value();
+    if !receiver.is_object_type() {
+        return Err(NativeError::TypeError {
+            name: "RegExp.prototype.test",
+            reason: "receiver is not an object".to_string(),
+        });
+    }
+    let text = args.first().cloned().unwrap_or(Value::undefined());
+    let text_str = coerce_to_string(ctx, &text, "RegExp.prototype.test")?;
+    let result = crate::regexp_prototype::regexp_exec_runtime(
+        ctx,
+        &receiver,
+        text_str,
+        "RegExp.prototype.test",
+    )?;
     Ok(Value::boolean(!result.is_null()))
 }
 

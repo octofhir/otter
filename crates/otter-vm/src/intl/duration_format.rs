@@ -478,6 +478,8 @@ fn partition(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<String> {
                 use_grouping: !is_numeric,
                 sign_display: "auto".to_string(),
                 notation: "standard".to_string(),
+                currency_display: "symbol".to_string(),
+                currency_sign: "standard".to_string(),
             };
             let rendered = crate::intl::number_format::format_number(value, &np);
 
@@ -598,6 +600,8 @@ fn partition_parts(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<Vec<Du
                 use_grouping: !is_numeric,
                 sign_display: "auto".to_string(),
                 notation: "standard".to_string(),
+                currency_display: "symbol".to_string(),
+                currency_sign: "standard".to_string(),
             };
             let unit = UNIT_SINGULAR[i];
             let number_parts = crate::intl::number_format::partition_number(value, &np);

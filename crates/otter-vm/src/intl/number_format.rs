@@ -110,6 +110,21 @@ pub fn resolve(
             "invalid value '{notation}' for option 'notation'"
         )));
     }
+    let currency_display = read_string_option(opts_ref, "currencyDisplay", "symbol", gc_heap);
+    if !matches!(
+        currency_display.as_str(),
+        "symbol" | "narrowSymbol" | "code" | "name"
+    ) {
+        return Err(range_err(format!(
+            "invalid value '{currency_display}' for option 'currencyDisplay'"
+        )));
+    }
+    let currency_sign = read_string_option(opts_ref, "currencySign", "standard", gc_heap);
+    if !matches!(currency_sign.as_str(), "standard" | "accounting") {
+        return Err(range_err(format!(
+            "invalid value '{currency_sign}' for option 'currencySign'"
+        )));
+    }
     Ok(NumberFormatPayload {
         locale: coerce_locale(Some(locale), gc_heap),
         style,
@@ -119,6 +134,8 @@ pub fn resolve(
         use_grouping,
         sign_display,
         notation,
+        currency_display,
+        currency_sign,
     })
 }
 
@@ -380,10 +397,18 @@ pub(crate) fn partition_number(
     // CLDR-correct symbol (no hand-rolled table). The sign is applied
     // separately per `signDisplay`.
     if payload.style == "currency" && n.is_finite() {
+        // `accounting` wraps negatives in parenthesis literals instead of
+        // a minus-sign part.
+        let accounting_negative =
+            sign == SignKind::Minus && payload.currency_sign == "accounting";
         let full = currency_string(n.abs(), payload);
         let core = format_decimal(n.abs(), payload);
         if let Some(idx) = full.find(&core) {
-            push_sign(&mut parts, sign);
+            if accounting_negative {
+                parts.push(("literal", "(".to_string()));
+            } else {
+                push_sign(&mut parts, sign);
+            }
             let prefix = &full[..idx];
             if !prefix.is_empty() {
                 parts.push(("currency", prefix.to_string()));
@@ -392,6 +417,9 @@ pub(crate) fn partition_number(
             let suffix = &full[idx + core.len()..];
             if !suffix.is_empty() {
                 parts.push(("currency", suffix.to_string()));
+            }
+            if accounting_negative {
+                parts.push(("literal", ")".to_string()));
             }
             return parts;
         }
@@ -462,6 +490,21 @@ pub(crate) fn number_format_resolved_options(
         Some(c) => Some(Value::string(JsString::from_str(c, ctx.heap_mut())?)),
         None => None,
     };
+    // currencyDisplay / currencySign are only reported for currency style.
+    let (currency_display_val, currency_sign_val) = if payload.style == "currency" {
+        (
+            Some(Value::string(JsString::from_str(
+                &payload.currency_display,
+                ctx.heap_mut(),
+            )?)),
+            Some(Value::string(JsString::from_str(
+                &payload.currency_sign,
+                ctx.heap_mut(),
+            )?)),
+        )
+    } else {
+        (None, None)
+    };
     let min_fd = payload.minimum_fraction_digits as i32;
     let max_fd = payload.maximum_fraction_digits as i32;
     let use_grouping = payload.use_grouping;
@@ -471,12 +514,24 @@ pub(crate) fn number_format_resolved_options(
     if let Some(c) = &currency_val {
         value_roots.push(c);
     }
+    if let Some(c) = &currency_display_val {
+        value_roots.push(c);
+    }
+    if let Some(c) = &currency_sign_val {
+        value_roots.push(c);
+    }
     let obj = ctx.alloc_object_with_roots(&value_roots, &[])?;
     let heap = ctx.heap_mut();
     crate::object::set(obj, heap, "locale", locale);
     crate::object::set(obj, heap, "style", style);
     if let Some(c) = currency_val {
         crate::object::set(obj, heap, "currency", c);
+    }
+    if let Some(c) = currency_display_val {
+        crate::object::set(obj, heap, "currencyDisplay", c);
+    }
+    if let Some(c) = currency_sign_val {
+        crate::object::set(obj, heap, "currencySign", c);
     }
     crate::object::set(
         obj,
@@ -504,11 +559,20 @@ pub(crate) fn format_number(n: f64, payload: &NumberFormatPayload) -> String {
     }
     let is_neg = n.is_sign_negative();
     let is_zero = rounds_to_zero(n, payload);
-    let sign = sign_prefix(displayed_sign(&payload.sign_display, is_neg, is_zero, false));
+    let sign_kind = displayed_sign(&payload.sign_display, is_neg, is_zero, false);
+
+    // Currency applies the sign around the whole formatted body so the
+    // `accounting` sign can wrap negatives in the locale affixes.
+    if payload.style == "currency" && n.is_finite() {
+        let body = currency_string(n.abs(), payload);
+        return apply_currency_sign(&body, sign_kind, &payload.currency_sign);
+    }
+
+    let sign = sign_prefix(sign_kind);
     let scientific = matches!(payload.notation.as_str(), "scientific" | "engineering");
     let magnitude = if n.is_infinite() {
         "∞".to_string()
-    } else if scientific && payload.style != "currency" {
+    } else if scientific {
         let base = if payload.style == "percent" {
             n.abs() * 100.0
         } else {
@@ -528,6 +592,24 @@ pub(crate) fn format_number(n: f64, payload: &NumberFormatPayload) -> String {
         }
     };
     format!("{sign}{magnitude}")
+}
+
+/// Apply the displayed sign to an unsigned currency `body`. Under the
+/// `accounting` currency sign a negative is wrapped in parentheses (the
+/// CLDR accounting affix for en + CJK locales) rather than prefixed with
+/// a minus.
+fn apply_currency_sign(body: &str, kind: SignKind, currency_sign: &str) -> String {
+    match kind {
+        SignKind::Minus => {
+            if currency_sign == "accounting" {
+                format!("({body})")
+            } else {
+                format!("-{body}")
+            }
+        }
+        SignKind::Plus => format!("+{body}"),
+        SignKind::None => body.to_string(),
+    }
 }
 
 /// Decompose `abs` into a `(mantissa, exponent)` pair for scientific
@@ -680,7 +762,12 @@ fn currency_string(magnitude: f64, payload: &NumberFormatPayload) -> String {
         decimal_from(abs, payload),
     ) {
         let prefs = CurrencyFormatterPreferences::from(&locale);
-        if let Ok(fmt) = CurrencyFormatter::try_new(prefs, CurrencyFormatterOptions::default()) {
+        let width = if payload.currency_display == "narrowSymbol" {
+            icu_experimental::dimension::currency::options::Width::Narrow
+        } else {
+            icu_experimental::dimension::currency::options::Width::Short
+        };
+        if let Ok(fmt) = CurrencyFormatter::try_new(prefs, CurrencyFormatterOptions::from(width)) {
             let mut out = String::new();
             let _ = writeable::Writeable::write_to(
                 &fmt.format_fixed_decimal(&dec, &CurrencyCode(cc)),

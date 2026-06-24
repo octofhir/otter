@@ -73,6 +73,13 @@ pub struct NumberFormatPayload {
     /// `notation` option (`"standard"` / `"scientific"` /
     /// `"engineering"` / `"compact"`).
     pub notation: String,
+    /// `currencyDisplay` option (`"symbol"` / `"narrowSymbol"` /
+    /// `"code"` / `"name"`) — set only when `style == "currency"`.
+    pub currency_display: String,
+    /// `currencySign` option (`"standard"` / `"accounting"`) — set only
+    /// when `style == "currency"`; `"accounting"` wraps negatives in the
+    /// locale's accounting affixes.
+    pub currency_sign: String,
 }
 
 /// Text-component width (`weekday`, `era`, `dayPeriod`).

@@ -57,6 +57,21 @@ if (!Buffer) {
       `The argument '${name}' is invalid. Received ${value}`);
   }
 
+  function invalidBufferTarget(name, value) {
+    const received = value === undefined ? 'undefined'
+      : value === null ? 'null'
+      : value && typeof value === 'object' ? `an instance of ${value.constructor && value.constructor.name || 'Object'}`
+      : `type ${typeof value} (${String(value)})`;
+    return codedError(TypeError, 'ERR_INVALID_ARG_TYPE',
+      `The "${name}" argument must be an instance of Buffer or Uint8Array. Received ${received}`);
+  }
+
+  function invalidFirstBufferArg(value) {
+    const received = value === undefined ? 'undefined' : value === null ? 'null' : String(value);
+    return new TypeError('The first argument must be of type string or an instance of ' +
+      `Buffer, ArrayBuffer, or Array or an Array-like Object. Received ${received}`);
+  }
+
   function bufferOutOfBounds(name) {
     return codedError(RangeError, 'ERR_BUFFER_OUT_OF_BOUNDS',
       `"${name}" is outside of buffer bounds`);
@@ -106,7 +121,11 @@ if (!Buffer) {
         if (next >= 0xdc00 && next <= 0xdfff) {
           code = 0x10000 + ((code - 0xd800) << 10) + (next - 0xdc00);
           i++;
+        } else {
+          code = 0xfffd;
         }
+      } else if (code >= 0xd800 && code <= 0xdfff) {
+        code = 0xfffd;
       }
       if (code < 0x80) out.push(code);
       else if (code < 0x800) out.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
@@ -114,6 +133,21 @@ if (!Buffer) {
       else out.push(0xf0 | (code >> 18), 0x80 | ((code >> 12) & 0x3f), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
     }
     return out;
+  }
+
+  function utf8WriteLength(bytes, max) {
+    let n = 0;
+    while (n < bytes.length && n < max) {
+      const b = bytes[n];
+      let size;
+      if (b < 0x80) size = 1;
+      else if ((b & 0xe0) === 0xc0) size = 2;
+      else if ((b & 0xf0) === 0xe0) size = 3;
+      else size = 4;
+      if (n + size > max) break;
+      n += size;
+    }
+    return n;
   }
 
   function utf8Slice(buf, start, end) {
@@ -155,9 +189,16 @@ if (!Buffer) {
   }
 
   function base64ToBytes(str, url) {
-    let s = String(str).replace(/[^A-Za-z0-9+/\-_]/g, '');
-    if (url) s = s.replace(/-/g, '+').replace(/_/g, '/');
-    const bin = (typeof atob === 'function') ? atob(s.replace(/=+$/, '')) : '';
+    const input = String(str);
+    let s = '';
+    for (let i = 0; i < input.length; i++) {
+      const ch = input[i];
+      if (ch === '=') break;
+      if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch === '+' || ch === '/') s += ch;
+      else if (ch === '-') s += '+';
+      else if (ch === '_') s += '/';
+    }
+    const bin = (typeof atob === 'function') ? atob(s) : '';
     const out = new Array(bin.length);
     for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i) & 0xff;
     return out;
@@ -170,11 +211,21 @@ if (!Buffer) {
     return b;
   }
 
+  function inspectBuffer(buf) {
+    const max = Buffer.INSPECT_MAX_BYTES;
+    const len = Math.min(buf.length, max);
+    const parts = new Array(len);
+    for (let i = 0; i < len; i++) parts[i] = hexChars[buf[i] >> 4] + hexChars[buf[i] & 0xf];
+    let body = parts.join(' ');
+    if (buf.length > max) body += ` ... ${buf.length - max} more bytes`;
+    return `<Buffer${body ? ' ' + body : ''}>`;
+  }
+
   function bytesFromString(str, encoding) {
     const e = enc.normalize(encoding) || 'utf8';
     switch (e) {
       case 'utf8': return utf8ToBytes(str);
-      case 'ascii': { const o = []; for (let i = 0; i < str.length; i++) o.push(str.charCodeAt(i) & 0x7f); return o; }
+      case 'ascii': { const o = []; for (let i = 0; i < str.length; i++) o.push(str.charCodeAt(i) & 0xff); return o; }
       case 'latin1': { const o = []; for (let i = 0; i < str.length; i++) o.push(str.charCodeAt(i) & 0xff); return o; }
       case 'utf16le': { const o = []; for (let i = 0; i < str.length; i++) { const c = str.charCodeAt(i); o.push(c & 0xff, c >> 8); } return o; }
       case 'hex': return hexToBytes(str);
@@ -236,6 +287,8 @@ if (!Buffer) {
 
     compare(other) { return Buffer.compare(this, other); }
 
+    inspect() { return inspectBuffer(this); }
+
     write(string, offset, length, encoding) {
       if (offset === undefined) { offset = 0; length = this.length; encoding = 'utf8'; }
       else if (typeof offset === 'string') {
@@ -252,7 +305,9 @@ if (!Buffer) {
       if (e === undefined) throw unknownEncoding(encoding);
       const bytes = bytesFromString(string, e);
       const max = length === undefined ? this.length - offset : Math.min(length | 0, this.length - offset);
-      const n = Math.min(bytes.length, max);
+      let n = Math.min(bytes.length, max);
+      if (e === 'utf8') n = utf8WriteLength(bytes, n);
+      else if (e === 'utf16le' && (n & 1)) n--;
       for (let i = 0; i < n; i++) this[offset + i] = bytes[i];
       return n;
     }
@@ -304,7 +359,8 @@ if (!Buffer) {
         for (let i = offset, j = 0; i < end; i++, j = (j + 1) % bytes.length) this[i] = bytes[j];
       } else if (typeof value === 'number') {
         for (let i = offset; i < end; i++) this[i] = value & 0xff;
-      } else if (value instanceof Uint8Array && value.length) {
+      } else if (value instanceof Uint8Array) {
+        if (value.length === 0) throw invalidArgValue('value', value);
         for (let i = offset, j = 0; i < end; i++, j = (j + 1) % value.length) this[i] = value[j];
       } else if (value === null || value === undefined) {
         for (let i = offset; i < end; i++) this[i] = 0;
@@ -313,9 +369,28 @@ if (!Buffer) {
     }
 
     copy(target, targetStart, sourceStart, sourceEnd) {
-      targetStart = targetStart || 0;
-      sourceStart = sourceStart || 0;
+      if (!(target instanceof Uint8Array)) throw invalidBufferTarget('target', target);
+      targetStart = targetStart === undefined ? 0 : Math.trunc(Number(targetStart));
+      sourceStart = sourceStart === undefined ? 0 : Math.trunc(Number(sourceStart));
       sourceEnd = sourceEnd === undefined ? this.length : sourceEnd;
+      sourceEnd = Math.trunc(Number(sourceEnd));
+      if (!Number.isFinite(targetStart) || targetStart < 0) {
+        throw outOfRange('targetStart', `>= 0 && <= ${target.length}`, targetStart);
+      }
+      if (!Number.isFinite(sourceStart) || sourceStart < 0) {
+        throw outOfRange('sourceStart', `>= 0 && <= ${this.length}`, sourceStart);
+      }
+      if (!Number.isFinite(sourceEnd) || sourceEnd < 0) {
+        throw outOfRange('sourceEnd', `>= 0 && <= ${this.length}`, sourceEnd);
+      }
+      if (sourceEnd <= sourceStart) return 0;
+      if (targetStart > target.length) {
+        throw outOfRange('targetStart', `>= 0 && <= ${target.length}`, targetStart);
+      }
+      if (sourceStart > this.length) {
+        throw outOfRange('sourceStart', `>= 0 && <= ${this.length}`, sourceStart);
+      }
+      if (sourceEnd > this.length) sourceEnd = this.length;
       let n = 0;
       for (let i = sourceStart; i < sourceEnd && targetStart + n < target.length; i++) {
         target[targetStart + n] = this[i];
@@ -367,39 +442,52 @@ if (!Buffer) {
     configurable: true,
     enumerable: false,
   });
+  Object.defineProperty(Buffer.prototype, 'toLocaleString', {
+    value: Buffer.prototype.toString,
+    writable: true,
+    configurable: true,
+    enumerable: false,
+  });
 
   // ---- read/write integer methods via DataView ----
   const dv = (buf) => new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  function checkedOffset(buf, offset, size) {
+    const o = Number(offset);
+    if (!Number.isInteger(o) || o < 0 || o + size > buf.length) {
+      throw outOfRange('offset', `>= 0 && <= ${Math.max(buf.length - size, 0)}`, offset);
+    }
+    return o;
+  }
   const proto = Buffer.prototype;
   const intMethods = {
-    readUInt8(o = 0) { return dv(this).getUint8(o); },
-    readInt8(o = 0) { return dv(this).getInt8(o); },
-    readUInt16LE(o = 0) { return dv(this).getUint16(o, true); },
-    readUInt16BE(o = 0) { return dv(this).getUint16(o, false); },
-    readInt16LE(o = 0) { return dv(this).getInt16(o, true); },
-    readInt16BE(o = 0) { return dv(this).getInt16(o, false); },
-    readUInt32LE(o = 0) { return dv(this).getUint32(o, true); },
-    readUInt32BE(o = 0) { return dv(this).getUint32(o, false); },
-    readInt32LE(o = 0) { return dv(this).getInt32(o, true); },
-    readInt32BE(o = 0) { return dv(this).getInt32(o, false); },
-    readFloatLE(o = 0) { return dv(this).getFloat32(o, true); },
-    readFloatBE(o = 0) { return dv(this).getFloat32(o, false); },
-    readDoubleLE(o = 0) { return dv(this).getFloat64(o, true); },
-    readDoubleBE(o = 0) { return dv(this).getFloat64(o, false); },
-    writeUInt8(v, o = 0) { dv(this).setUint8(o, v); return o + 1; },
-    writeInt8(v, o = 0) { dv(this).setInt8(o, v); return o + 1; },
-    writeUInt16LE(v, o = 0) { dv(this).setUint16(o, v, true); return o + 2; },
-    writeUInt16BE(v, o = 0) { dv(this).setUint16(o, v, false); return o + 2; },
-    writeInt16LE(v, o = 0) { dv(this).setInt16(o, v, true); return o + 2; },
-    writeInt16BE(v, o = 0) { dv(this).setInt16(o, v, false); return o + 2; },
-    writeUInt32LE(v, o = 0) { dv(this).setUint32(o, v, true); return o + 4; },
-    writeUInt32BE(v, o = 0) { dv(this).setUint32(o, v, false); return o + 4; },
-    writeInt32LE(v, o = 0) { dv(this).setInt32(o, v, true); return o + 4; },
-    writeInt32BE(v, o = 0) { dv(this).setInt32(o, v, false); return o + 4; },
-    writeFloatLE(v, o = 0) { dv(this).setFloat32(o, v, true); return o + 4; },
-    writeFloatBE(v, o = 0) { dv(this).setFloat32(o, v, false); return o + 4; },
-    writeDoubleLE(v, o = 0) { dv(this).setFloat64(o, v, true); return o + 8; },
-    writeDoubleBE(v, o = 0) { dv(this).setFloat64(o, v, false); return o + 8; },
+    readUInt8(o = 0) { o = checkedOffset(this, o, 1); return dv(this).getUint8(o); },
+    readInt8(o = 0) { o = checkedOffset(this, o, 1); return dv(this).getInt8(o); },
+    readUInt16LE(o = 0) { o = checkedOffset(this, o, 2); return dv(this).getUint16(o, true); },
+    readUInt16BE(o = 0) { o = checkedOffset(this, o, 2); return dv(this).getUint16(o, false); },
+    readInt16LE(o = 0) { o = checkedOffset(this, o, 2); return dv(this).getInt16(o, true); },
+    readInt16BE(o = 0) { o = checkedOffset(this, o, 2); return dv(this).getInt16(o, false); },
+    readUInt32LE(o = 0) { o = checkedOffset(this, o, 4); return dv(this).getUint32(o, true); },
+    readUInt32BE(o = 0) { o = checkedOffset(this, o, 4); return dv(this).getUint32(o, false); },
+    readInt32LE(o = 0) { o = checkedOffset(this, o, 4); return dv(this).getInt32(o, true); },
+    readInt32BE(o = 0) { o = checkedOffset(this, o, 4); return dv(this).getInt32(o, false); },
+    readFloatLE(o = 0) { o = checkedOffset(this, o, 4); return dv(this).getFloat32(o, true); },
+    readFloatBE(o = 0) { o = checkedOffset(this, o, 4); return dv(this).getFloat32(o, false); },
+    readDoubleLE(o = 0) { o = checkedOffset(this, o, 8); return dv(this).getFloat64(o, true); },
+    readDoubleBE(o = 0) { o = checkedOffset(this, o, 8); return dv(this).getFloat64(o, false); },
+    writeUInt8(v, o = 0) { o = checkedOffset(this, o, 1); dv(this).setUint8(o, v); return o + 1; },
+    writeInt8(v, o = 0) { o = checkedOffset(this, o, 1); dv(this).setInt8(o, v); return o + 1; },
+    writeUInt16LE(v, o = 0) { o = checkedOffset(this, o, 2); dv(this).setUint16(o, v, true); return o + 2; },
+    writeUInt16BE(v, o = 0) { o = checkedOffset(this, o, 2); dv(this).setUint16(o, v, false); return o + 2; },
+    writeInt16LE(v, o = 0) { o = checkedOffset(this, o, 2); dv(this).setInt16(o, v, true); return o + 2; },
+    writeInt16BE(v, o = 0) { o = checkedOffset(this, o, 2); dv(this).setInt16(o, v, false); return o + 2; },
+    writeUInt32LE(v, o = 0) { o = checkedOffset(this, o, 4); dv(this).setUint32(o, v, true); return o + 4; },
+    writeUInt32BE(v, o = 0) { o = checkedOffset(this, o, 4); dv(this).setUint32(o, v, false); return o + 4; },
+    writeInt32LE(v, o = 0) { o = checkedOffset(this, o, 4); dv(this).setInt32(o, v, true); return o + 4; },
+    writeInt32BE(v, o = 0) { o = checkedOffset(this, o, 4); dv(this).setInt32(o, v, false); return o + 4; },
+    writeFloatLE(v, o = 0) { o = checkedOffset(this, o, 4); dv(this).setFloat32(o, v, true); return o + 4; },
+    writeFloatBE(v, o = 0) { o = checkedOffset(this, o, 4); dv(this).setFloat32(o, v, false); return o + 4; },
+    writeDoubleLE(v, o = 0) { o = checkedOffset(this, o, 8); dv(this).setFloat64(o, v, true); return o + 8; },
+    writeDoubleBE(v, o = 0) { o = checkedOffset(this, o, 8); dv(this).setFloat64(o, v, false); return o + 8; },
     readUIntLE(o, len) { let val = 0; let mul = 1; for (let i = 0; i < len; i++) { val += this[o + i] * mul; mul *= 256; } return val; },
     readUIntBE(o, len) { let val = 0; for (let i = 0; i < len; i++) val = val * 256 + this[o + i]; return val; },
     readIntLE(o, len) { let val = this.readUIntLE(o, len); const sub = Math.pow(2, 8 * len); if (val >= sub / 2) val -= sub; return val; },
@@ -415,12 +503,12 @@ if (!Buffer) {
   Object.defineProperty(proto, 'parent', {
     configurable: true,
     enumerable: false,
-    get() { return this.buffer; },
+    get() { return ArrayBuffer.isView(this) ? this.buffer : undefined; },
   });
   Object.defineProperty(proto, 'offset', {
     configurable: true,
     enumerable: false,
-    get() { return this.byteOffset; },
+    get() { return ArrayBuffer.isView(this) ? this.byteOffset : undefined; },
   });
 
   // ---- statics ----
@@ -429,12 +517,20 @@ if (!Buffer) {
   // assignment to such an inherited property throws in strict mode.
   const statics = {
     from(value, encodingOrOffset, length) {
-      if (typeof value === 'string') return new Buffer(bytesFromString(value, encodingOrOffset));
+      if (value === undefined || value === null) throw invalidFirstBufferArg(value);
+      if (typeof value === 'string') {
+        const e = enc.normalize(encodingOrOffset);
+        if (e === undefined) throw unknownEncoding(encodingOrOffset);
+        return new Buffer(bytesFromString(value, e));
+      }
       if (isArrayBufferLike(value) || isSharedArrayBufferLike(value)) {
         return new Buffer(value, encodingOrOffset, length);
       }
       if (value instanceof Uint8Array) { const b = new Buffer(value.length); b.set(value); return b; }
       if (Array.isArray(value) || (value && typeof value[Symbol.iterator] === 'function')) return new Buffer(Uint8Array.from(value));
+      if (value && typeof value === 'object' && (isArrayBufferLike(value.buffer) || isSharedArrayBufferLike(value.buffer))) {
+        return new Buffer(value.buffer, value.byteOffset || 0, value.length);
+      }
       if (value && typeof value === 'object' && value.type === 'Buffer' && Array.isArray(value.data)) return new Buffer(Uint8Array.from(value.data));
       if (value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, 'length')) {
         let len = Number(value.length);
@@ -448,12 +544,19 @@ if (!Buffer) {
         `Received an instance of ${value && value.constructor && value.constructor.name || 'Object'}`);
     },
     alloc(size, fill, encoding) {
+      if (typeof size !== 'number') throw invalidArgType('size', 'number', size);
       const b = new Buffer(size);
       if (fill !== undefined && fill !== 0) b.fill(fill, 0, b.length, encoding);
       return b;
     },
-    allocUnsafe(size) { return new Buffer(size); },
-    allocUnsafeSlow(size) { return new Buffer(size); },
+    allocUnsafe(size) {
+      if (typeof size !== 'number') throw invalidArgType('size', 'number', size);
+      return new Buffer(size);
+    },
+    allocUnsafeSlow(size) {
+      if (typeof size !== 'number') throw invalidArgType('size', 'number', size);
+      return new Buffer(size);
+    },
     of(...args) { return new Buffer(args); },
     isBuffer(b) { return b instanceof Buffer; },
     isEncoding(e) { return typeof e === 'string' && enc.normalize(e) !== undefined; },
@@ -488,6 +591,7 @@ if (!Buffer) {
       return statics.from(u8);
     },
     poolSize: 8192,
+    INSPECT_MAX_BYTES: 50,
   };
   for (const key of Object.keys(statics)) {
     Object.defineProperty(Buffer, key, { value: statics[key], writable: true, configurable: true, enumerable: false });

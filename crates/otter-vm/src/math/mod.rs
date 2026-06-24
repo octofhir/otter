@@ -420,20 +420,20 @@ fn impl_round(args: &[NumberValue]) -> NumberValue {
     // ES spec: half-to-positive-infinity (so .5 rounds up, -.5
     // rounds toward zero). Rust's `f64::round` rounds half-away-
     // from-zero, which differs for negative half-integers.
-    let rounded = if f.is_nan() {
-        f64::NAN
-    } else if f.is_infinite() {
+    let rounded = if f.is_nan() || f.is_infinite() || f == 0.0 {
+        // Preserves NaN, ±Infinity, and the sign of ±0.
         f
     } else {
-        // §21.3.2.28 — for x in [-0.5, 0) (and -0) the result is -0:
-        // `(f + 0.5).floor()` yields +0 there, so restore the sign of a
+        // §21.3.2.28 half-to-positive-infinity. `(f + 0.5).floor()` is
+        // imprecise: for f = 0.49999999999999994 the sum rounds up to 1
+        // and yields 1 instead of the spec's +0. Round from the integer
+        // floor and its fractional part instead, so the addition never
+        // perturbs the result.
+        let floor = f.floor();
+        let r = if f - floor >= 0.5 { floor + 1.0 } else { floor };
+        // For x in [-0.5, 0) the result is -0, so restore the sign of a
         // zero result whose input was negative.
-        let r = (f + 0.5).floor();
-        if r == 0.0 && f.is_sign_negative() {
-            -0.0
-        } else {
-            r
-        }
+        if r == 0.0 && f < 0.0 { -0.0 } else { r }
     };
     NumberValue::Double(rounded).canonicalize()
 }

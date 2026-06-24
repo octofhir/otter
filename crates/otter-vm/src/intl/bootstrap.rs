@@ -191,8 +191,10 @@ otter_macros::couch! {
     },
     prototype = {
         methods = {
-            "formatToParts"   / 1 => crate::intl::number_format::number_format_format_to_parts,
-            "resolvedOptions" / 0 => crate::intl::number_format::number_format_resolved_options,
+            "formatToParts"        / 1 => crate::intl::number_format::number_format_format_to_parts,
+            "formatRange"          / 2 => crate::intl::number_format::number_format_format_range,
+            "formatRangeToParts"   / 2 => crate::intl::number_format::number_format_format_range_to_parts,
+            "resolvedOptions"      / 0 => crate::intl::number_format::number_format_resolved_options,
         },
         accessors = [
             ("format", get = crate::intl::number_format::number_format_format_getter),

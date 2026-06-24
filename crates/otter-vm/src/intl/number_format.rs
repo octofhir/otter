@@ -207,6 +207,125 @@ pub(crate) fn number_format_format_to_parts(
     Ok(Value::array(arr))
 }
 
+/// CLDR-style separator joining the two endpoints of a non-collapsed
+/// numeric range (narrow no-break space, en dash, narrow no-break space).
+const RANGE_SEPARATOR: &str = "\u{2009}\u{2013}\u{2009}";
+
+/// Coerce a `formatRange` endpoint to an `f64`, accepting BigInt and
+/// numeric strings (an approximation of ToIntlMathematicalValue).
+/// `Infinity` survives; only `NaN` is signalled so the caller can raise
+/// the spec's `RangeError`.
+fn coerce_range_arg(ctx: &NativeCtx<'_>, value: &Value) -> f64 {
+    if let Some(bi) = value.as_big_int() {
+        return bi
+            .to_decimal_string(ctx.heap())
+            .parse::<f64>()
+            .unwrap_or(f64::NAN);
+    }
+    coerce_format_arg(ctx, Some(value))
+}
+
+/// §1.1.21 reject-undefined + NaN guard shared by `formatRange` /
+/// `formatRangeToParts`: an `undefined` endpoint is a `TypeError`
+/// (PartitionNumberRangePattern caller step 3), a `NaN` endpoint a
+/// `RangeError` (step 1).
+fn range_args(
+    ctx: &NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+) -> Result<(f64, f64), NativeError> {
+    let undef = |v: Option<&Value>| v.is_none() || v.is_some_and(|x| x.is_undefined());
+    if undef(args.first()) || undef(args.get(1)) {
+        return Err(NativeError::TypeError {
+            name,
+            reason: "start and end must not be undefined".to_string(),
+        });
+    }
+    let x = coerce_range_arg(ctx, args.first().expect("checked above"));
+    let y = coerce_range_arg(ctx, args.get(1).expect("checked above"));
+    if x.is_nan() || y.is_nan() {
+        return Err(NativeError::RangeError {
+            name,
+            reason: "range endpoints must not be NaN".to_string(),
+        });
+    }
+    Ok((x, y))
+}
+
+/// §1.1.21 `Intl.NumberFormat.prototype.formatRange(start, end)`.
+///
+/// ICU exposes no numeric-range formatter here, so render each endpoint
+/// and join with [`RANGE_SEPARATOR`]; identical-rendering endpoints
+/// collapse to the single number. CLDR's approximately-equal "~" prefix
+/// and shared-affix collapsing are not reproduced.
+pub(crate) fn number_format_format_range(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_number_format(ctx, "formatRange")?;
+    let (x, y) = range_args(ctx, args, "formatRange")?;
+    let start = format_number(x, &payload);
+    let end = format_number(y, &payload);
+    let combined = if start == end {
+        start
+    } else {
+        format!("{start}{RANGE_SEPARATOR}{end}")
+    };
+    Ok(Value::string(JsString::from_str(&combined, ctx.heap_mut())?))
+}
+
+/// §1.1.22 `Intl.NumberFormat.prototype.formatRangeToParts(start, end)`.
+///
+/// Each part carries a `source` of `"startRange"`, `"endRange"`, or
+/// `"shared"`; identical-rendering endpoints collapse to all-`"shared"`.
+pub(crate) fn number_format_format_range_to_parts(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_number_format(ctx, "formatRangeToParts")?;
+    let (x, y) = range_args(ctx, args, "formatRangeToParts")?;
+    let start_parts = partition_number(x, &payload);
+    let end_parts = partition_number(y, &payload);
+    let start_str: String = start_parts.iter().map(|(_, v)| v.as_str()).collect();
+    let end_str: String = end_parts.iter().map(|(_, v)| v.as_str()).collect();
+
+    let mut triples: Vec<(&'static str, String, &'static str)> = Vec::new();
+    if start_str == end_str {
+        for (ty, val) in start_parts {
+            triples.push((ty, val, "shared"));
+        }
+    } else {
+        for (ty, val) in &start_parts {
+            triples.push((ty, val.clone(), "startRange"));
+        }
+        triples.push(("literal", RANGE_SEPARATOR.to_string(), "shared"));
+        for (ty, val) in &end_parts {
+            triples.push((ty, val.clone(), "endRange"));
+        }
+    }
+
+    let mut elements: Vec<Value> = Vec::with_capacity(triples.len());
+    for (ty, val, src) in &triples {
+        let ty_s = Value::string(JsString::from_str(ty, ctx.heap_mut())?);
+        let val_s = Value::string(JsString::from_str(val, ctx.heap_mut())?);
+        let src_s = Value::string(JsString::from_str(src, ctx.heap_mut())?);
+        let snapshot = elements.clone();
+        let obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s, &src_s], &[&snapshot])?;
+        crate::object::set(obj, ctx.heap_mut(), "type", ty_s);
+        crate::object::set(obj, ctx.heap_mut(), "value", val_s);
+        crate::object::set(obj, ctx.heap_mut(), "source", src_s);
+        elements.push(Value::object(obj));
+    }
+    let element_roots = elements.clone();
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        for v in &element_roots {
+            v.trace_value_slots(visitor);
+        }
+    };
+    let arr = crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut visit)?;
+    Ok(Value::array(arr))
+}
+
 /// Partition a formatted number into `{type, value}` components for
 /// `formatToParts`. Locale separators follow the en-style `,` group /
 /// `.` decimal that the resolved formatter targets.

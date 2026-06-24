@@ -118,6 +118,10 @@ fn intl_construct(
             name: class,
             message,
         },
+        intl::IntlError::Range { message } => NativeError::RangeError {
+            name: class,
+            reason: message,
+        },
         intl::IntlError::OutOfMemory { .. } => NativeError::TypeError {
             name: class,
             reason: "out of memory".to_string(),

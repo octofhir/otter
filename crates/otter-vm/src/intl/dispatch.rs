@@ -50,6 +50,13 @@ pub enum IntlError {
         /// Short reason.
         reason: &'static str,
     },
+    /// Invalid option value — surfaces as a JS `RangeError` (ECMA-402
+    /// reports out-of-range option values this way).
+    #[error("{message}")]
+    Range {
+        /// Error message.
+        message: String,
+    },
     /// Pass-through for ICU engine errors.
     #[error("Intl.{class}.{method}: {message}")]
     Engine {
@@ -94,7 +101,7 @@ pub fn construct(
             IntlPayload::NumberFormat(number_format::resolve(locale, options, gc_heap)?)
         }
         IntlKind::DateTimeFormat => {
-            IntlPayload::DateTimeFormat(date_time_format::resolve(locale, options, gc_heap))
+            IntlPayload::DateTimeFormat(date_time_format::resolve(locale, options, gc_heap)?)
         }
         IntlKind::PluralRules => {
             IntlPayload::PluralRules(plural_rules::resolve(locale, options, gc_heap))

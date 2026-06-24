@@ -68,23 +68,123 @@ pub struct NumberFormatPayload {
     pub use_grouping: bool,
 }
 
-/// Resolved option bag for `Intl.DateTimeFormat`.
+/// Text-component width (`weekday`, `era`, `dayPeriod`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DtTextWidth {
+    /// `"narrow"`.
+    Narrow,
+    /// `"short"`.
+    Short,
+    /// `"long"`.
+    Long,
+}
+
+/// Numeric-component width (`year`, `day`, `hour`, `minute`, `second`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DtNumWidth {
+    /// `"numeric"`.
+    Numeric,
+    /// `"2-digit"`.
+    TwoDigit,
+}
+
+/// `month` width — numeric or textual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DtMonthWidth {
+    /// `"numeric"`.
+    Numeric,
+    /// `"2-digit"`.
+    TwoDigit,
+    /// `"narrow"`.
+    Narrow,
+    /// `"short"`.
+    Short,
+    /// `"long"`.
+    Long,
+}
+
+/// `timeZoneName` style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DtZoneName {
+    /// `"long"`.
+    Long,
+    /// `"short"`.
+    Short,
+    /// `"shortOffset"`.
+    ShortOffset,
+    /// `"longOffset"`.
+    LongOffset,
+    /// `"shortGeneric"`.
+    ShortGeneric,
+    /// `"longGeneric"`.
+    LongGeneric,
+}
+
+/// `dateStyle` / `timeStyle`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DtStyle {
+    /// `"full"`.
+    Full,
+    /// `"long"`.
+    Long,
+    /// `"medium"`.
+    Medium,
+    /// `"short"`.
+    Short,
+}
+
+/// Resolved hour cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DtHourCycle {
+    /// `"h11"`.
+    H11,
+    /// `"h12"`.
+    H12,
+    /// `"h23"`.
+    H23,
+    /// `"h24"`.
+    H24,
+}
+
+/// Resolved option bag for `Intl.DateTimeFormat`. Each component carries
+/// its requested width (`None` = absent), mirroring ECMA-402
+/// §11.1.2 `CreateDateTimeFormat`.
 #[derive(Debug, Clone)]
 pub struct DateTimeFormatPayload {
     /// Spec-resolved BCP-47 locale tag.
     pub locale: String,
-    /// Whether the `year` field is present.
-    pub year: bool,
-    /// Whether the `month` field is present (rendered as numeric).
-    pub month: bool,
-    /// Whether the `day` field is present.
-    pub day: bool,
-    /// Whether the `hour` field is present.
-    pub hour: bool,
-    /// Whether the `minute` field is present.
-    pub minute: bool,
-    /// Whether the `second` field is present.
-    pub second: bool,
+    /// `weekday` width.
+    pub weekday: Option<DtTextWidth>,
+    /// `era` width.
+    pub era: Option<DtTextWidth>,
+    /// `year` width.
+    pub year: Option<DtNumWidth>,
+    /// `month` width.
+    pub month: Option<DtMonthWidth>,
+    /// `day` width.
+    pub day: Option<DtNumWidth>,
+    /// `dayPeriod` width.
+    pub day_period: Option<DtTextWidth>,
+    /// `hour` width.
+    pub hour: Option<DtNumWidth>,
+    /// `minute` width.
+    pub minute: Option<DtNumWidth>,
+    /// `second` width.
+    pub second: Option<DtNumWidth>,
+    /// `fractionalSecondDigits` (1..=3).
+    pub fractional_second_digits: Option<u8>,
+    /// `timeZoneName` style.
+    pub time_zone_name: Option<DtZoneName>,
+    /// Resolved `hourCycle`.
+    pub hour_cycle: Option<DtHourCycle>,
+    /// `hour12` request.
+    pub hour12: Option<bool>,
+    /// `dateStyle`.
+    pub date_style: Option<DtStyle>,
+    /// `timeStyle`.
+    pub time_style: Option<DtStyle>,
+    /// `timeZone` identifier.
+    pub time_zone: Option<String>,
 }
 
 /// Resolved option bag for `Intl.PluralRules`.

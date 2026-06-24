@@ -213,8 +213,10 @@ otter_macros::couch! {
     },
     prototype = {
         methods = {
-            "formatToParts"   / 1 => crate::intl::date_time_format::date_time_format_format_to_parts,
-            "resolvedOptions" / 0 => crate::intl::date_time_format::date_time_format_resolved_options,
+            "formatToParts"        / 1 => crate::intl::date_time_format::date_time_format_format_to_parts,
+            "formatRange"          / 2 => crate::intl::date_time_format::date_time_format_format_range,
+            "formatRangeToParts"   / 2 => crate::intl::date_time_format::date_time_format_format_range_to_parts,
+            "resolvedOptions"      / 0 => crate::intl::date_time_format::date_time_format_resolved_options,
         },
         accessors = [
             ("format", get = crate::intl::date_time_format::date_time_format_format_getter),

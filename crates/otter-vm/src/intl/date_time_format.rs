@@ -438,6 +438,114 @@ pub(crate) fn date_time_format_format_to_parts(
     Ok(Value::array(arr))
 }
 
+/// CLDR-style separator joining the two endpoints of a non-collapsed
+/// date range (narrow no-break space, en dash, narrow no-break space).
+const RANGE_SEPARATOR: &str = "\u{2009}\u{2013}\u{2009}";
+
+type Civil = (i32, u8, u8, u8, u8, u8);
+
+/// §12.4.4 step 4 + endpoint coercion: reject an `undefined` start or
+/// end (`TypeError`), then resolve both through the same `ToNumber` /
+/// `TimeClip` path as `format`.
+fn range_civil(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+) -> Result<(Civil, Civil), NativeError> {
+    let undef = |v: Option<&Value>| v.is_none() || v.is_some_and(|x| x.is_undefined());
+    if undef(args.first()) || undef(args.get(1)) {
+        return Err(NativeError::TypeError {
+            name,
+            reason: "startDate and endDate must not be undefined".to_string(),
+        });
+    }
+    let start = arg_to_civil(ctx, args.first(), name)?;
+    let end = arg_to_civil(ctx, args.get(1), name)?;
+    Ok((start, end))
+}
+
+/// §12.4.4 `Intl.DateTimeFormat.prototype.formatRange(startDate, endDate)`.
+///
+/// ICU4X exposes no interval formatter, so we render each endpoint and
+/// join with [`RANGE_SEPARATOR`]; when both endpoints render identically
+/// the range collapses to the single date per PartitionDateTimeRangePattern
+/// step 13. CLDR field-collapsing of partially-shared ranges (e.g.
+/// `Jan 3 – 5, 2019`) is not reproduced.
+pub(crate) fn date_time_format_format_range(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_date_time(ctx, "formatRange")?;
+    let (s, e) = range_civil(ctx, args, "formatRange")?;
+    let start_str = format_components(s.0, s.1, s.2, s.3, s.4, s.5, &payload);
+    let end_str = format_components(e.0, e.1, e.2, e.3, e.4, e.5, &payload);
+    let combined = if start_str == end_str {
+        start_str
+    } else {
+        format!("{start_str}{RANGE_SEPARATOR}{end_str}")
+    };
+    Ok(Value::string(JsString::from_str(&combined, ctx.heap_mut())?))
+}
+
+/// §12.4.5 `Intl.DateTimeFormat.prototype.formatRangeToParts(startDate, endDate)`.
+///
+/// Each emitted part carries a `source` of `"startRange"`, `"endRange"`,
+/// or `"shared"`. When the two endpoints render identically every part
+/// is `"shared"` (the collapsed single-date case); otherwise the start
+/// parts are `"startRange"`, the joining separator is a `"shared"`
+/// literal, and the end parts are `"endRange"`.
+pub(crate) fn date_time_format_format_range_to_parts(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_date_time(ctx, "formatRangeToParts")?;
+    let (s, e) = range_civil(ctx, args, "formatRangeToParts")?;
+    let start_parts = icu_format_segments(s.0, s.1, s.2, s.3, s.4, s.5, &payload)
+        .unwrap_or_else(|| vec![("literal", format_components(s.0, s.1, s.2, s.3, s.4, s.5, &payload))]);
+    let end_parts = icu_format_segments(e.0, e.1, e.2, e.3, e.4, e.5, &payload)
+        .unwrap_or_else(|| vec![("literal", format_components(e.0, e.1, e.2, e.3, e.4, e.5, &payload))]);
+
+    let start_str: String = start_parts.iter().map(|(_, v)| v.as_str()).collect();
+    let end_str: String = end_parts.iter().map(|(_, v)| v.as_str()).collect();
+
+    // (type, value, source) triples in output order.
+    let mut triples: Vec<(&'static str, String, &'static str)> = Vec::new();
+    if start_str == end_str {
+        for (ty, val) in start_parts {
+            triples.push((ty, val, "shared"));
+        }
+    } else {
+        for (ty, val) in &start_parts {
+            triples.push((ty, val.clone(), "startRange"));
+        }
+        triples.push(("literal", RANGE_SEPARATOR.to_string(), "shared"));
+        for (ty, val) in &end_parts {
+            triples.push((ty, val.clone(), "endRange"));
+        }
+    }
+
+    let mut elements: Vec<Value> = Vec::with_capacity(triples.len());
+    for (ty, val, src) in &triples {
+        let ty_s = Value::string(JsString::from_str(ty, ctx.heap_mut())?);
+        let val_s = Value::string(JsString::from_str(val, ctx.heap_mut())?);
+        let src_s = Value::string(JsString::from_str(src, ctx.heap_mut())?);
+        let snapshot = elements.clone();
+        let obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s, &src_s], &[&snapshot])?;
+        crate::object::set(obj, ctx.heap_mut(), "type", ty_s);
+        crate::object::set(obj, ctx.heap_mut(), "value", val_s);
+        crate::object::set(obj, ctx.heap_mut(), "source", src_s);
+        elements.push(Value::object(obj));
+    }
+    let element_roots = elements.clone();
+    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        for v in &element_roots {
+            v.trace_value_slots(visitor);
+        }
+    };
+    let arr = crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut visit)?;
+    Ok(Value::array(arr))
+}
+
 /// §12.1.6 `Intl.DateTimeFormat.prototype.resolvedOptions()`.
 pub(crate) fn date_time_format_resolved_options(
     ctx: &mut NativeCtx<'_>,

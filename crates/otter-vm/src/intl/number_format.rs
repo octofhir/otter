@@ -18,6 +18,8 @@ use icu_experimental::dimension::currency::formatter::{
     CurrencyFormatter, CurrencyFormatterPreferences,
 };
 use icu_experimental::dimension::currency::options::CurrencyFormatterOptions;
+use icu_experimental::dimension::units::formatter::{UnitsFormatter, UnitsFormatterPreferences};
+use icu_experimental::dimension::units::options::{UnitsFormatterOptions, Width as UnitWidth};
 use icu_locale::Locale;
 use tinystr::TinyAsciiStr;
 
@@ -34,6 +36,31 @@ use otter_gc::raw::RawGc;
 /// Build a `RangeError`-bearing `IntlError` for an invalid option value.
 fn range_err(message: String) -> IntlError {
     IntlError::Range { message }
+}
+
+/// The sanctioned simple unit identifiers (ECMA-402 Table:
+/// Single-unit identifiers sanctioned for use in ECMA-402).
+const SANCTIONED_UNITS: &[&str] = &[
+    "acre", "bit", "byte", "celsius", "centimeter", "day", "degree", "fahrenheit",
+    "fluid-ounce", "foot", "gallon", "gigabit", "gigabyte", "gram", "hectare", "hour", "inch",
+    "kilobit", "kilobyte", "kilogram", "kilometer", "liter", "megabit", "megabyte", "meter",
+    "microsecond", "mile", "mile-scandinavian", "milliliter", "millimeter", "millisecond",
+    "minute", "month", "nanosecond", "ounce", "percent", "petabyte", "pound", "second", "stone",
+    "terabit", "terabyte", "week", "yard", "year",
+];
+
+/// §IsWellFormedUnitIdentifier — a sanctioned simple unit, or
+/// `"<numerator>-per-<denominator>"` where both are sanctioned.
+fn is_well_formed_unit(unit: &str) -> bool {
+    if SANCTIONED_UNITS.contains(&unit) {
+        return true;
+    }
+    match unit.split_once("-per-") {
+        Some((num, den)) => {
+            SANCTIONED_UNITS.contains(&num) && SANCTIONED_UNITS.contains(&den)
+        }
+        None => false,
+    }
 }
 
 /// Resolve the `(locale, options)` argument pair to a payload.
@@ -125,6 +152,29 @@ pub fn resolve(
             "invalid value '{currency_sign}' for option 'currencySign'"
         )));
     }
+    // `unit` is read and validated whenever present, regardless of style;
+    // a missing `unit` under `style: "unit"` is a TypeError.
+    let unit = read_string_option(opts_ref, "unit", "", gc_heap);
+    let unit = if unit.is_empty() { None } else { Some(unit) };
+    if let Some(u) = &unit
+        && !is_well_formed_unit(u)
+    {
+        return Err(range_err(format!("invalid unit identifier '{u}'")));
+    }
+    let unit_display = read_string_option(opts_ref, "unitDisplay", "short", gc_heap);
+    if !matches!(unit_display.as_str(), "short" | "narrow" | "long") {
+        return Err(range_err(format!(
+            "invalid value '{unit_display}' for option 'unitDisplay'"
+        )));
+    }
+    if style == "unit" && unit.is_none() {
+        return Err(IntlError::BadArgument {
+            class: "NumberFormat",
+            method: "constructor",
+            index: 1,
+            reason: "unit style requires a `unit` option",
+        });
+    }
     Ok(NumberFormatPayload {
         locale: coerce_locale(Some(locale), gc_heap),
         style,
@@ -136,6 +186,8 @@ pub fn resolve(
         notation,
         currency_display,
         currency_sign,
+        unit,
+        unit_display,
     })
 }
 
@@ -505,6 +557,17 @@ pub(crate) fn number_format_resolved_options(
     } else {
         (None, None)
     };
+    // unit / unitDisplay are only reported for unit style.
+    let (unit_val, unit_display_val) = match (&payload.unit, payload.style.as_str()) {
+        (Some(u), "unit") => (
+            Some(Value::string(JsString::from_str(u, ctx.heap_mut())?)),
+            Some(Value::string(JsString::from_str(
+                &payload.unit_display,
+                ctx.heap_mut(),
+            )?)),
+        ),
+        _ => (None, None),
+    };
     let min_fd = payload.minimum_fraction_digits as i32;
     let max_fd = payload.maximum_fraction_digits as i32;
     let use_grouping = payload.use_grouping;
@@ -520,6 +583,12 @@ pub(crate) fn number_format_resolved_options(
     if let Some(c) = &currency_sign_val {
         value_roots.push(c);
     }
+    if let Some(u) = &unit_val {
+        value_roots.push(u);
+    }
+    if let Some(u) = &unit_display_val {
+        value_roots.push(u);
+    }
     let obj = ctx.alloc_object_with_roots(&value_roots, &[])?;
     let heap = ctx.heap_mut();
     crate::object::set(obj, heap, "locale", locale);
@@ -532,6 +601,12 @@ pub(crate) fn number_format_resolved_options(
     }
     if let Some(c) = currency_sign_val {
         crate::object::set(obj, heap, "currencySign", c);
+    }
+    if let Some(u) = unit_val {
+        crate::object::set(obj, heap, "unit", u);
+    }
+    if let Some(u) = unit_display_val {
+        crate::object::set(obj, heap, "unitDisplay", u);
     }
     crate::object::set(
         obj,
@@ -587,6 +662,7 @@ pub(crate) fn format_number(n: f64, payload: &NumberFormatPayload) -> String {
     } else {
         match payload.style.as_str() {
             "currency" => currency_string(n.abs(), payload),
+            "unit" => unit_string(n.abs(), payload),
             "percent" => format!("{}%", format_decimal(n.abs() * 100.0, payload)),
             _ => format_decimal(n.abs(), payload),
         }
@@ -778,6 +854,32 @@ fn currency_string(magnitude: f64, payload: &NumberFormatPayload) -> String {
     }
     let core = format_decimal(abs, payload);
     format!("{code}\u{a0}{core}")
+}
+
+/// Format the unsigned magnitude of a unit value through ICU's
+/// [`UnitsFormatter`] (locale unit pattern + plural rules). The caller
+/// applies the `signDisplay` sign. Falls back to `"<number> <unit>"`
+/// when ICU data or the unit identifier is unavailable.
+fn unit_string(magnitude: f64, payload: &NumberFormatPayload) -> String {
+    let unit = payload.unit.as_deref().unwrap_or("");
+    let locale = Locale::from_str(&payload.locale)
+        .or_else(|_| Locale::from_str(DEFAULT_LOCALE))
+        .expect("default locale parses");
+    let width = match payload.unit_display.as_str() {
+        "long" => UnitWidth::Long,
+        "narrow" => UnitWidth::Narrow,
+        _ => UnitWidth::Short,
+    };
+    let abs = magnitude.abs();
+    if let Some(dec) = decimal_from(abs, payload) {
+        let prefs = UnitsFormatterPreferences::from(&locale);
+        if let Ok(fmt) = UnitsFormatter::try_new(prefs, unit, UnitsFormatterOptions::from(width)) {
+            let mut out = String::new();
+            let _ = writeable::Writeable::write_to(&fmt.format_fixed_decimal(&dec), &mut out);
+            return out;
+        }
+    }
+    format!("{} {unit}", format_decimal(abs, payload))
 }
 
 /// Format a number through ICU's `DecimalFormatter`. Falls back to

@@ -80,6 +80,12 @@ pub struct NumberFormatPayload {
     /// when `style == "currency"`; `"accounting"` wraps negatives in the
     /// locale's accounting affixes.
     pub currency_sign: String,
+    /// `unit` option (a sanctioned unit identifier such as
+    /// `"kilometer-per-hour"`) — set only when `style == "unit"`.
+    pub unit: Option<String>,
+    /// `unitDisplay` option (`"short"` / `"narrow"` / `"long"`) — set
+    /// only when `style == "unit"`.
+    pub unit_display: String,
 }
 
 /// Text-component width (`weekday`, `era`, `dayPeriod`).

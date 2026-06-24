@@ -285,7 +285,8 @@ function parse(qs, sep, eq, options) {
   let pairs = 1000;
   if (options && typeof options.maxKeys === 'number') {
     // -1 means "unlimited" (decremented + checked against 0).
-    pairs = options.maxKeys > 0 ? options.maxKeys : -1;
+    pairs = options.maxKeys > 0 && Number.isFinite(options.maxKeys) ?
+      Math.floor(options.maxKeys) : -1;
   }
 
   let decode = QueryString.unescape;

@@ -27,8 +27,9 @@
 //!   later atom-table probes never re-walk the rope.
 //! - Cons depth never exceeds [`MAX_ROPE_DEPTH`]; concatenations
 //!   that would exceed it flatten the deeper child eagerly.
-//! - Slicing a `Cons` flattens the parent first; slicing a `Sliced`
-//!   collapses into a single `Sliced` view (no `Sliced(Sliced(...))`).
+//! - Slicing a `Cons` materialises only the requested span; slicing a
+//!   `Sliced` collapses into a single `Sliced` view (no
+//!   `Sliced(Sliced(...))`).
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-ecmascript-language-types-string-type>
@@ -441,9 +442,12 @@ pub fn slice_string_body(
             )
         }
         SliceSource::Cons => {
-            // Flatten the cons, then re-slice the flat result.
-            let flat = flatten_string_body(heap, string, external_visit)?;
-            slice_string_body(heap, flat, start, length, external_visit)
+            // Avoid flattening the whole rope for small substrings. Parsers
+            // commonly slice thousands of short fields out of one large
+            // concatenated input string; materialising the full source for
+            // each field turns that workload into quadratic heap pressure.
+            let units = to_utf16_vec_slice(heap, string, start, length);
+            alloc_flat_string_body_with_roots(heap, JsStringId::new(0), &units, external_visit)
         }
     }
 }

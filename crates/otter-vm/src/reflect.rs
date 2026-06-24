@@ -356,9 +356,11 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-reflect.setprototypeof>
         M::SetPrototypeOf => {
             let target = expect_object_value(args.first())?;
-            let proto = match args.get(1) {
-                None => Value::null(),
-                Some(v) if v.is_object() || v.is_proxy() || v.is_null() => *v,
+            // §28.1.14 step 2 — a missing `proto` is `undefined`, which is
+            // neither an Object nor null, so it is a TypeError just like an
+            // explicit non-object/non-null argument.
+            let proto = match args.get(1).copied().unwrap_or(Value::undefined()) {
+                v if v.is_object() || v.is_proxy() || v.is_null() => v,
                 _ => return Err(VmError::TypeMismatch),
             };
             let ok = interp.set_prototype_value_proxy_aware(context, &target, &proto)?;

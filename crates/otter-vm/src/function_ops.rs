@@ -741,7 +741,14 @@ impl Interpreter {
             ));
         }
         let length = self.get_property_value_for_call(context, value, "length")?;
-        let len = to_length(&length, &self.gc_heap)?;
+        // §7.3.18 step 3 — `len = ? ToLength(? Get(obj, "length"))`. The
+        // §7.1.4 ToNumber inside ToLength fires a `valueOf` /
+        // `@@toPrimitive` hook on an object-valued `length`, so coerce
+        // with the execution context here rather than through the
+        // infallible primitive-only `to_length` (which would read an
+        // object as NaN -> 0).
+        let length_num = self.coerce_to_number(context, &length)?;
+        let len = to_length(&Value::number(length_num), &self.gc_heap)?;
         let mut values = SmallVec::new();
         for index in 0..len {
             let key = index.to_string();

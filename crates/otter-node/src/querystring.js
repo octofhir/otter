@@ -270,6 +270,53 @@ function addKeyVal(obj, key, value, keyEncoded, valEncoded, decode) {
   }
 }
 
+function parseSimple(qs, obj, pairs) {
+  let pairStart = 0;
+  let keyEnd = -1;
+
+  for (let i = 0; i < qs.length; ++i) {
+    const code = qs.charCodeAt(i);
+    if (code === 61 /* = */) {
+      if (keyEnd < pairStart) keyEnd = i;
+    } else if (code === 38 /* & */) {
+      if (pairStart < i) {
+        if (keyEnd < pairStart) {
+          addKeyVal(obj, qs.slice(pairStart, i), '', false, false, qsUnescape);
+        } else {
+          addKeyVal(
+            obj,
+            qs.slice(pairStart, keyEnd),
+            qs.slice(keyEnd + 1, i),
+            false,
+            false,
+            qsUnescape,
+          );
+        }
+      }
+      if (--pairs === 0) return obj;
+      pairStart = i + 1;
+      keyEnd = -1;
+    }
+  }
+
+  if (pairStart < qs.length) {
+    if (keyEnd < pairStart) {
+      addKeyVal(obj, qs.slice(pairStart), '', false, false, qsUnescape);
+    } else {
+      addKeyVal(
+        obj,
+        qs.slice(pairStart, keyEnd),
+        qs.slice(keyEnd + 1),
+        false,
+        false,
+        qsUnescape,
+      );
+    }
+  }
+
+  return obj;
+}
+
 function parse(qs, sep, eq, options) {
   const obj = { __proto__: null };
 
@@ -294,6 +341,18 @@ function parse(qs, sep, eq, options) {
     decode = options.decodeURIComponent;
   }
   const customDecode = decode !== qsUnescape;
+
+  if (
+    !customDecode &&
+    sepLen === 1 &&
+    eqLen === 1 &&
+    sepCodes[0] === 38 /* & */ &&
+    eqCodes[0] === 61 /* = */ &&
+    qs.indexOf('%') === -1 &&
+    qs.indexOf('+') === -1
+  ) {
+    return parseSimple(qs, obj, pairs);
+  }
 
   let lastPos = 0;
   let sepIdx = 0;

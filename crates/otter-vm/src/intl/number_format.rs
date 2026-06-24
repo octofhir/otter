@@ -785,10 +785,15 @@ fn push_unit_affix(parts: &mut Vec<(&'static str, String)>, affix: &str, trailin
             parts.push(("unit", affix[unit_start..].to_string()));
         }
     } else {
-        // Prefix: trailing whitespace touches the number.
+        // Prefix: trailing whitespace touches the number. The split point
+        // is the byte index just past the last non-whitespace char (a
+        // char boundary — `rfind` returns the char's start, which is not
+        // the boundary for a multi-byte unit label such as `時速`).
         let unit_end = affix
-            .rfind(|c: char| !c.is_whitespace())
-            .map_or(0, |i| i + 1);
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !c.is_whitespace())
+            .map_or(0, |(i, c)| i + c.len_utf8());
         if unit_end > 0 {
             parts.push(("unit", affix[..unit_end].to_string()));
         }

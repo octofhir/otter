@@ -163,7 +163,7 @@ pub(crate) fn compile_new(
         // they route through their real constructor instead of the
         // heap-only `Op::NewIntl` fast path: ListFormat, DurationFormat,
         // Locale.
-        && matches!(member.property.name.as_str(), "NumberFormat" | "DisplayNames")
+        && matches!(member.property.name.as_str(), "NumberFormat")
     {
         let class = member.property.name.as_str();
         let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;

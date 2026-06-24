@@ -122,6 +122,10 @@ fn intl_construct(
             crate::intl::collator::resolve_ctx(ctx, locale, options)
                 .map(crate::intl::payload::IntlPayload::Collator),
         ),
+        IntlKind::DisplayNames => Some(
+            crate::intl::display_names::resolve_ctx(ctx, locale, options)
+                .map(crate::intl::payload::IntlPayload::DisplayNames),
+        ),
         IntlKind::ListFormat => Some(
             crate::intl::list_format::resolve_ctx(ctx, locale, options)
                 .map(crate::intl::payload::IntlPayload::ListFormat),

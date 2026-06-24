@@ -13,7 +13,6 @@
 //!   `VmError`.
 
 use crate::Value;
-use crate::intl::display_names;
 use crate::intl::number_format;
 use crate::intl::payload::{IntlKind, IntlPayload, JsIntl};
 
@@ -111,9 +110,8 @@ pub fn construct(
         // option ladder (firing getters in spec order) and never reaches
         // this heap-only dispatcher.
         IntlKind::ListFormat => return Err(IntlError::UnknownClass("ListFormat".to_string())),
-        IntlKind::DisplayNames => {
-            IntlPayload::DisplayNames(display_names::resolve(locale, options, gc_heap))
-        }
+        // Constructed through its own `NativeCtx` option ladder.
+        IntlKind::DisplayNames => return Err(IntlError::UnknownClass("DisplayNames".to_string())),
         // Constructed through its own `NativeCtx` option ladder.
         IntlKind::Segmenter => return Err(IntlError::UnknownClass("Segmenter".to_string())),
         // `Intl.Locale` / `Intl.DurationFormat` are constructed through

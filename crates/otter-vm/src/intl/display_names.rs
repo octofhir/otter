@@ -9,21 +9,98 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#sec-intl-displaynames-objects>
 
-use crate::intl::helpers::{coerce_locale, options_object, read_string_option};
+use crate::intl::helpers::DEFAULT_LOCALE;
 use crate::intl::payload::{DisplayNamesPayload, IntlPayload};
 use crate::string::JsString;
 use crate::{NativeCtx, NativeError, Value};
 
-/// Resolve constructor options for this Intl class.
-pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> DisplayNamesPayload {
-    let opts = options_object(Some(options));
-    let opts_ref = opts.as_ref();
-    DisplayNamesPayload {
-        locale: coerce_locale(Some(locale), gc_heap),
-        kind: read_string_option(opts_ref, "type", "language", gc_heap),
-        style: read_string_option(opts_ref, "style", "long", gc_heap),
-        fallback: read_string_option(opts_ref, "fallback", "code", gc_heap),
+const CLASS: &str = "DisplayNames";
+
+/// §12.1.1 InitializeDisplayNames — fires `localeMatcher` / `style` /
+/// `type` / `fallback` / `languageDisplay` getters in spec order with
+/// ToString coercion + RangeError validation; `type` is required
+/// (TypeError when absent), and a missing options bag is a TypeError.
+/// The locale is canonicalized.
+pub fn resolve_ctx(
+    ctx: &mut NativeCtx<'_>,
+    locales: Value,
+    options: Value,
+) -> Result<DisplayNamesPayload, NativeError> {
+    use crate::intl::helpers::{get_string_option, require_options_object};
+
+    let requested = crate::intl::supported::canonicalize_locale_list(ctx, locales)?;
+    let locale = requested
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| DEFAULT_LOCALE.to_string());
+    if options.is_undefined() {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "options must be provided".to_string(),
+        });
     }
+    let options = require_options_object(options, CLASS)?;
+
+    let _matcher = get_string_option(
+        ctx,
+        options,
+        "localeMatcher",
+        CLASS,
+        &["lookup", "best fit"],
+        None,
+    )?;
+    let style = get_string_option(
+        ctx,
+        options,
+        "style",
+        CLASS,
+        &["narrow", "short", "long"],
+        Some("long"),
+    )?
+    .unwrap_or_else(|| "long".to_string());
+    let kind = get_string_option(
+        ctx,
+        options,
+        "type",
+        CLASS,
+        &[
+            "language",
+            "region",
+            "script",
+            "currency",
+            "calendar",
+            "dateTimeField",
+        ],
+        None,
+    )?
+    .ok_or_else(|| NativeError::TypeError {
+        name: CLASS,
+        reason: "the `type` option is required".to_string(),
+    })?;
+    let fallback = get_string_option(
+        ctx,
+        options,
+        "fallback",
+        CLASS,
+        &["code", "none"],
+        Some("code"),
+    )?
+    .unwrap_or_else(|| "code".to_string());
+    let _language_display = get_string_option(
+        ctx,
+        options,
+        "languageDisplay",
+        CLASS,
+        &["dialect", "standard"],
+        None,
+    )?;
+
+    Ok(DisplayNamesPayload {
+        locale,
+        kind,
+        style,
+        fallback,
+    })
 }
 
 fn require_payload(

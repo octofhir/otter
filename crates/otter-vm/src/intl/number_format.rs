@@ -695,6 +695,24 @@ pub(crate) fn partition_number(
         return parts;
     }
 
+    // Unit: render the unsigned ICU unit string, then split the number
+    // core out so the surrounding pattern text becomes `unit` parts
+    // (whitespace adjacent to the number stays a `literal`).
+    if payload.style == "unit" && n.is_finite() {
+        let full = unit_string(n.abs(), payload);
+        let core = format_decimal(n.abs(), payload);
+        if let Some(idx) = full.find(&core) {
+            push_sign(&mut parts, sign);
+            push_unit_affix(&mut parts, &full[..idx], false);
+            push_number_parts(&mut parts, &core);
+            push_unit_affix(&mut parts, &full[idx + core.len()..], true);
+            return parts;
+        }
+        push_sign(&mut parts, sign);
+        parts.push(("literal", full));
+        return parts;
+    }
+
     push_sign(&mut parts, sign);
     let scientific = matches!(payload.notation.as_str(), "scientific" | "engineering");
     if n.is_infinite() {
@@ -728,6 +746,36 @@ pub(crate) fn partition_number(
 
 /// Split a formatted unsigned decimal core (`"1,234.50"`) into
 /// `integer` / `group` / `decimal` / `fraction` parts.
+/// Emit a unit pattern affix (the text before or after the number in
+/// `"1 m"` / `"1m"`). Whitespace adjacent to the number is a `literal`
+/// part; the remaining text is the `unit` part. `trailing` selects which
+/// side of the affix touches the number (the number's side is the start
+/// of a suffix and the end of a prefix).
+fn push_unit_affix(parts: &mut Vec<(&'static str, String)>, affix: &str, trailing: bool) {
+    if affix.is_empty() {
+        return;
+    }
+    if trailing {
+        // Suffix: leading whitespace touches the number.
+        let unit_start = affix.find(|c: char| !c.is_whitespace()).unwrap_or(affix.len());
+        if unit_start > 0 {
+            parts.push(("literal", affix[..unit_start].to_string()));
+        }
+        if unit_start < affix.len() {
+            parts.push(("unit", affix[unit_start..].to_string()));
+        }
+    } else {
+        // Prefix: trailing whitespace touches the number.
+        let unit_end = affix.rfind(|c: char| !c.is_whitespace()).map_or(0, |i| i + 1);
+        if unit_end > 0 {
+            parts.push(("unit", affix[..unit_end].to_string()));
+        }
+        if unit_end < affix.len() {
+            parts.push(("literal", affix[unit_end..].to_string()));
+        }
+    }
+}
+
 fn push_number_parts(parts: &mut Vec<(&'static str, String)>, core: &str) {
     let (int_part, frac_part) = core.split_once('.').unwrap_or((core, ""));
     let mut first = true;

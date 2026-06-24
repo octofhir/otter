@@ -469,19 +469,51 @@ fn partition(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<String> {
             } else {
                 (0, 3)
             };
-            let np = NumberFormatPayload {
-                locale: payload.locale.clone(),
-                style: "decimal".to_string(),
-                currency: None,
-                minimum_fraction_digits: min_frac,
-                maximum_fraction_digits: max_frac,
-                use_grouping: !is_numeric,
-                sign_display: "auto".to_string(),
-                notation: "standard".to_string(),
-                currency_display: "symbol".to_string(),
-                currency_sign: "standard".to_string(),
-                unit: None,
-                unit_display: "short".to_string(),
+            // `long`/`short`/`narrow` styles render the value with its
+            // unit label through the NumberFormat `unit` style; the
+            // `numeric`/`2-digit` digital styles render a bare decimal.
+            const SINGULAR: [&str; 10] = [
+                "year",
+                "month",
+                "week",
+                "day",
+                "hour",
+                "minute",
+                "second",
+                "millisecond",
+                "microsecond",
+                "nanosecond",
+            ];
+            let np = if is_numeric {
+                NumberFormatPayload {
+                    locale: payload.locale.clone(),
+                    style: "decimal".to_string(),
+                    currency: None,
+                    minimum_fraction_digits: min_frac,
+                    maximum_fraction_digits: max_frac,
+                    use_grouping: false,
+                    sign_display: "auto".to_string(),
+                    notation: "standard".to_string(),
+                    currency_display: "symbol".to_string(),
+                    currency_sign: "standard".to_string(),
+                    unit: None,
+                    unit_display: "short".to_string(),
+                }
+            } else {
+                NumberFormatPayload {
+                    locale: payload.locale.clone(),
+                    style: "unit".to_string(),
+                    currency: None,
+                    minimum_fraction_digits: min_frac,
+                    maximum_fraction_digits: max_frac,
+                    use_grouping: true,
+                    sign_display: "auto".to_string(),
+                    notation: "standard".to_string(),
+                    currency_display: "symbol".to_string(),
+                    currency_sign: "standard".to_string(),
+                    unit: Some(SINGULAR[i].to_string()),
+                    unit_display: style.to_string(),
+                }
             };
             let rendered = crate::intl::number_format::format_number(value, &np);
 
@@ -593,21 +625,38 @@ fn partition_parts(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<Vec<Du
             } else {
                 (0, 3)
             };
-            let np = NumberFormatPayload {
-                locale: payload.locale.clone(),
-                style: "decimal".to_string(),
-                currency: None,
-                minimum_fraction_digits: min_frac,
-                maximum_fraction_digits: max_frac,
-                use_grouping: !is_numeric,
-                sign_display: "auto".to_string(),
-                notation: "standard".to_string(),
-                currency_display: "symbol".to_string(),
-                currency_sign: "standard".to_string(),
-                unit: None,
-                unit_display: "short".to_string(),
-            };
             let unit = UNIT_SINGULAR[i];
+            let np = if is_numeric {
+                NumberFormatPayload {
+                    locale: payload.locale.clone(),
+                    style: "decimal".to_string(),
+                    currency: None,
+                    minimum_fraction_digits: min_frac,
+                    maximum_fraction_digits: max_frac,
+                    use_grouping: false,
+                    sign_display: "auto".to_string(),
+                    notation: "standard".to_string(),
+                    currency_display: "symbol".to_string(),
+                    currency_sign: "standard".to_string(),
+                    unit: None,
+                    unit_display: "short".to_string(),
+                }
+            } else {
+                NumberFormatPayload {
+                    locale: payload.locale.clone(),
+                    style: "unit".to_string(),
+                    currency: None,
+                    minimum_fraction_digits: min_frac,
+                    maximum_fraction_digits: max_frac,
+                    use_grouping: true,
+                    sign_display: "auto".to_string(),
+                    notation: "standard".to_string(),
+                    currency_display: "symbol".to_string(),
+                    currency_sign: "standard".to_string(),
+                    unit: Some(unit.to_string()),
+                    unit_display: style.to_string(),
+                }
+            };
             let number_parts = crate::intl::number_format::partition_number(value, &np);
             let tagged = number_parts.into_iter().map(|(ty, value)| DurationPart {
                 ty,

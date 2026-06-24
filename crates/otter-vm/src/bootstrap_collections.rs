@@ -1669,13 +1669,10 @@ fn set_record_keys(
                     .map_err(|err| vm_to_native(ctx.interp_mut(), err, name))?;
                 return Ok(SetRecordKeys::Snapshot { values, index: 0 });
             }
-            if iterator_has_callable_iterator(ctx, context, &iterator, name)? {
-                let values = ctx
-                    .interp_mut()
-                    .iterator_to_list_sync(context, &iterator)
-                    .map_err(|err| vm_to_native(ctx.interp_mut(), err, name))?;
-                return Ok(SetRecordKeys::Snapshot { values, index: 0 });
-            }
+            // §24.2.1.2 GetKeysIterator returns the value of `keys()`
+            // *as* the iterator: the set methods step it through
+            // `Get(keysIter, "next")` and never read `@@iterator`. Do not
+            // route a set-like's keys iterator through GetIterator.
             if !value_is_object_like(&iterator) {
                 return Err(NativeError::TypeError {
                     name,
@@ -1795,39 +1792,6 @@ fn read_property(
             .run_callable_sync(context, &getter, *target, SmallVec::new())
             .map_err(|err| vm_to_native(interp, err, name)),
     }
-}
-
-fn iterator_has_callable_iterator(
-    ctx: &mut NativeCtx<'_>,
-    context: &crate::ExecutionContext,
-    target: &Value,
-    name: &'static str,
-) -> Result<bool, NativeError> {
-    let iterator_sym = ctx
-        .interp_mut()
-        .well_known_symbols()
-        .get(crate::symbol::WellKnown::Iterator);
-    let interp = ctx.interp_mut();
-    let outcome = interp
-        .ordinary_get_value(
-            context,
-            *target,
-            *target,
-            &VmPropertyKey::Symbol(iterator_sym),
-            0,
-        )
-        .map_err(|err| vm_to_native(interp, err, name))?;
-    let method = match outcome {
-        VmGetOutcome::Value(value) => value,
-        VmGetOutcome::InvokeGetter { getter } => interp
-            .run_callable_sync(context, &getter, *target, SmallVec::new())
-            .map_err(|err| vm_to_native(interp, err, name))?,
-    };
-    Ok(
-        !method.is_undefined()
-            && !method.is_null()
-            && ctx.interp_mut().is_callable_runtime(&method),
-    )
 }
 
 fn to_number_runtime(

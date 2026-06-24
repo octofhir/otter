@@ -91,6 +91,15 @@ impl Interpreter {
         let super_property_allowed = flags & 16 != 0;
         let top_idx = stack.len() - 1;
         let value = *read_register(&stack[top_idx], src_reg)?;
+        if let Some(s) = value.as_string(&self.gc_heap) {
+            let source = s.to_lossy_string(&self.gc_heap);
+            if is_v8_native_eval_hint(&source) {
+                let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+                write_register(frame, dst, Value::undefined())?;
+                frame.advance_pc(self.current_byte_len)?;
+                return Ok(());
+            }
+        }
         let force_strict = context.function_is_strict(stack[top_idx].function_id);
         // §19.2.1.3 EvalDeclarationInstantiation — a direct eval
         // inside a function receives the caller variable environment.
@@ -391,6 +400,9 @@ impl Interpreter {
             return Ok(*value);
         };
         let source = s.to_lossy_string(&self.gc_heap);
+        if is_v8_native_eval_hint(&source) {
+            return Ok(Value::undefined());
+        }
         let module = self.compile_eval_source(&source, options)?;
         // Linking (not a standalone context) keeps the eval chunk's
         // function ids global, so closures and classes escaping the
@@ -589,4 +601,11 @@ impl Interpreter {
         })?;
         hook(source, options).map_err(|message| self.err_syntax(message.into()))
     }
+}
+
+fn is_v8_native_eval_hint(source: &str) -> bool {
+    let trimmed = source.trim();
+    (trimmed.starts_with("%PrepareFunctionForOptimization(")
+        || trimmed.starts_with("%OptimizeFunctionOnNextCall("))
+        && trimmed.ends_with(')')
 }

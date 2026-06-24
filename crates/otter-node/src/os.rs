@@ -201,8 +201,23 @@ fn os_hostname(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Native
 }
 
 fn os_homedir(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    if let Some((syscall, code, message)) = internal_test_home_dir_error(ctx) {
+        return Err(system_error(&syscall, &code, &message));
+    }
     let h = home_dir(ctx);
     string_value(ctx, &h)
+}
+
+fn internal_test_home_dir_error(ctx: &mut NativeCtx<'_>) -> Option<(String, String, String)> {
+    let global = *ctx.interp_mut().global_this();
+    let heap = ctx.heap();
+    let store = object::get(global, heap, "__otterInternalTestBinding")?.as_object()?;
+    let os = object::get(store, heap, "os")?.as_object()?;
+    let err = object::get(os, heap, "getHomeDirectoryError")?.as_object()?;
+    let syscall = object::get(err, heap, "syscall")?.display_string(heap);
+    let code = object::get(err, heap, "code")?.display_string(heap);
+    let message = object::get(err, heap, "message")?.display_string(heap);
+    Some((syscall, code, message))
 }
 
 fn os_tmpdir(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {

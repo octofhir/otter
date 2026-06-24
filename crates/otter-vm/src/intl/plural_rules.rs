@@ -159,7 +159,9 @@ pub(crate) fn plural_rules_select_range(
     let to_num = |ctx: &mut NativeCtx<'_>, v: &Value| -> Result<f64, NativeError> {
         crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, v)
             .map(|n| n.as_f64())
-            .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, "selectRange"))
+            .map_err(|e| {
+                crate::native_function::vm_to_native_error(ctx.cx.interp, e, "selectRange")
+            })
     };
     let x = to_num(ctx, &start)?;
     let y = to_num(ctx, &end)?;

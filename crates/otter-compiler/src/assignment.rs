@@ -788,7 +788,35 @@ pub(crate) fn compile_logical_assignment(
         LogicalTarget::Prepared(_) => compile_expr(cx, &a.right, span)?,
     };
     match target {
-        LogicalTarget::Ident(_) => assign_to_target(cx, &a.left, new_value, span)?,
+        LogicalTarget::Ident(name) => {
+            // §13.15.2 PutValue on a function-expression self-name
+            // binding is immutable: the RHS has already evaluated, then
+            // strict mode throws while sloppy mode silently drops the
+            // write. (TDZ was handled by the initial read above; const
+            // bindings are rejected inside `assign_to_target`.)
+            let fn_self_target = match cx.lookup_binding(&name) {
+                Some(info) => info.fn_self_name,
+                None => cx.stack.iter().rev().skip(1).any(|frame| {
+                    frame
+                        .scopes
+                        .iter()
+                        .rev()
+                        .find_map(|scope| scope.bindings.get(&name))
+                        .is_some_and(|info| info.fn_self_name)
+                }),
+            };
+            if fn_self_target {
+                if cx.is_strict {
+                    emit_assignment_type_error(
+                        cx,
+                        &format!("Assignment to constant variable '{name}'."),
+                        span,
+                    );
+                }
+            } else {
+                assign_to_target(cx, &a.left, new_value, span)?;
+            }
+        }
         LogicalTarget::Prepared(prepared) => {
             assign_prepared_target(cx, prepared, new_value, span)?;
         }

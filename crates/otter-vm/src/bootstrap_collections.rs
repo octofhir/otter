@@ -1043,13 +1043,17 @@ fn set_proto_union(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
     let this = receiver_set(ctx, "Set.prototype.union")?;
     let other = args.first().cloned().unwrap_or(Value::undefined());
     let other_rec = get_set_record(ctx, other, "Set.prototype.union")?;
+    let context = execution_context(ctx, "Set.prototype.union")?;
+    // §24.2.4.uniON steps 4-5 — GetKeysIterator (which reads the
+    // `next` method, an observable access whose getter may mutate `this`)
+    // runs BEFORE `this`'s [[SetData]] is copied into the result, so the
+    // copy reflects any such mutation.
+    let mut keys = set_record_keys(ctx, &context, &other_rec, "Set.prototype.union")?;
     let mut result = ctx.alloc_set().map_err(|_| oom("Set.prototype.union"))?;
     for value in collections::set_values(this, ctx.heap()) {
         ctx.set_add(&mut result, value)
             .map_err(|_| oom("Set.prototype.union"))?;
     }
-    let context = execution_context(ctx, "Set.prototype.union")?;
-    let mut keys = set_record_keys(ctx, &context, &other_rec, "Set.prototype.union")?;
     while let Some(value) = set_record_next_key(ctx, &context, &mut keys, "Set.prototype.union")? {
         ctx.set_add(&mut result, normalize_set_key(value))
             .map_err(|_| oom("Set.prototype.union"))?;
@@ -1155,6 +1159,16 @@ fn set_proto_symmetric_difference(
     let this = receiver_set(ctx, "Set.prototype.symmetricDifference")?;
     let other = args.first().cloned().unwrap_or(Value::undefined());
     let other_rec = get_set_record(ctx, other, "Set.prototype.symmetricDifference")?;
+    let context = execution_context(ctx, "Set.prototype.symmetricDifference")?;
+    // §24.2.4.symmetricDifference steps 4-5 — GetKeysIterator (reading the
+    // iterator's `next`, an observable access) runs BEFORE `this`'s
+    // [[SetData]] is copied into the result.
+    let mut keys = set_record_keys(
+        ctx,
+        &context,
+        &other_rec,
+        "Set.prototype.symmetricDifference",
+    )?;
     let mut result = ctx
         .alloc_set()
         .map_err(|_| oom("Set.prototype.symmetricDifference"))?;
@@ -1162,13 +1176,6 @@ fn set_proto_symmetric_difference(
         ctx.set_add(&mut result, value)
             .map_err(|_| oom("Set.prototype.symmetricDifference"))?;
     }
-    let context = execution_context(ctx, "Set.prototype.symmetricDifference")?;
-    let mut keys = set_record_keys(
-        ctx,
-        &context,
-        &other_rec,
-        "Set.prototype.symmetricDifference",
-    )?;
     while let Some(value) = set_record_next_key(
         ctx,
         &context,

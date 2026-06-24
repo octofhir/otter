@@ -312,6 +312,30 @@ EventEmitter.getMaxListeners = function getMaxListeners(emitterOrTarget) {
 
 const kMaxEventTargetListeners = Symbol('events.maxEventTargetListeners');
 
+function eventTargetListenerMap(target) {
+  if ((typeof target !== 'object' && typeof target !== 'function') || target === null) {
+    return undefined;
+  }
+  const symbols = Object.getOwnPropertySymbols(target);
+  for (let i = 0; i < symbols.length; i++) {
+    const symbol = symbols[i];
+    if (String(symbol) !== 'Symbol(listeners)') continue;
+    const listeners = target[symbol];
+    if (listeners && typeof listeners.get === 'function') return listeners;
+  }
+  return undefined;
+}
+
+function getEventTargetListeners(target, name) {
+  const listeners = eventTargetListenerMap(target);
+  if (listeners === undefined) return undefined;
+  const list = listeners.get(String(name));
+  if (list === undefined) return [];
+  const copy = new Array(list.length);
+  for (let i = 0; i < list.length; i++) copy[i] = list[i].listener;
+  return copy;
+}
+
 EventEmitter.setMaxListeners = function setMaxListeners(n = defaultMaxListeners, ...eventTargets) {
   if (typeof n !== 'number' || n < 0 || Number.isNaN(n)) {
     const err = new RangeError(
@@ -403,7 +427,24 @@ EventEmitter.on = function on(emitter, name) {
 EventEmitter.getEventListeners = function getEventListeners(emitterOrTarget, name) {
   if (emitterOrTarget && typeof emitterOrTarget.listeners === 'function')
     return emitterOrTarget.listeners(name);
-  return [];
+  const eventTargetListeners = getEventTargetListeners(emitterOrTarget, name);
+  if (eventTargetListeners !== undefined) return eventTargetListeners;
+  const err = new TypeError('ERR_INVALID_ARG_TYPE: The "emitter" argument must be an instance of EventEmitter or EventTarget');
+  err.code = 'ERR_INVALID_ARG_TYPE';
+  throw err;
+};
+
+const originalGetMaxListeners = EventEmitter.getMaxListeners;
+EventEmitter.getMaxListeners = function getMaxListeners(emitterOrTarget) {
+  if (emitterOrTarget && typeof emitterOrTarget.getMaxListeners === 'function')
+    return emitterOrTarget.getMaxListeners();
+  if (emitterOrTarget && typeof emitterOrTarget[kMaxEventTargetListeners] === 'number')
+    return emitterOrTarget[kMaxEventTargetListeners];
+  if (typeof AbortSignal !== 'undefined' && emitterOrTarget instanceof AbortSignal)
+    return 0;
+  if (eventTargetListenerMap(emitterOrTarget) !== undefined)
+    return defaultMaxListeners;
+  return originalGetMaxListeners(emitterOrTarget);
 };
 
 module.exports = EventEmitter;

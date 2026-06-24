@@ -51,6 +51,10 @@ pub(crate) enum Assertion {
     WordBoundary {
         /// `true` for `\B` (non-boundary).
         invert: bool,
+        /// `true` when `i` is in effect here: under `u` the word-character
+        /// set then also admits the two non-ASCII code points that
+        /// case-fold into it (§22.2.2.7.3 — U+017F `ſ`→`s`, U+212A K→`k`).
+        ignore_case: bool,
     },
 }
 

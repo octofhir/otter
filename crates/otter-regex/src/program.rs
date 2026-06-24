@@ -111,8 +111,10 @@ pub(crate) enum Insn {
         /// `true` when the `m` (multiline) flag is in effect here.
         multiline: bool,
     },
-    /// `\b` / `\B` — word boundary; `true` inverts (`\B`).
-    WordBoundary(bool),
+    /// `\b` / `\B` — word boundary. `invert` selects `\B`; `ignore_case`
+    /// widens the word-character set to the two non-ASCII code points
+    /// that case-fold into it (only observable under the `u` flag).
+    WordBoundary { invert: bool, ignore_case: bool },
     /// Lookaround: run a sub-search of the body at `entry`. `behind` selects
     /// lookbehind, `negate` selects the negative form.
     Look {

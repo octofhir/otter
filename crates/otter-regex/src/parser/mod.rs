@@ -691,11 +691,17 @@ impl<'a> Parser<'a> {
         match c {
             x if x == b'b' as u16 => {
                 self.pos += 1;
-                Ok(Node::Assert(Assertion::WordBoundary { invert: false }))
+                Ok(Node::Assert(Assertion::WordBoundary {
+                    invert: false,
+                    ignore_case: self.flags.ignore_case,
+                }))
             }
             x if x == b'B' as u16 => {
                 self.pos += 1;
-                Ok(Node::Assert(Assertion::WordBoundary { invert: true }))
+                Ok(Node::Assert(Assertion::WordBoundary {
+                    invert: true,
+                    ignore_case: self.flags.ignore_case,
+                }))
             }
             x if x == b'k' as u16 => {
                 // `\k<name>` is a named backreference only when the pattern

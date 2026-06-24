@@ -433,8 +433,11 @@ impl Matcher<'_, '_> {
                             break None;
                         }
                     }
-                    Insn::WordBoundary(invert) => {
-                        if self.word_boundary(pos) != *invert {
+                    Insn::WordBoundary {
+                        invert,
+                        ignore_case,
+                    } => {
+                        if self.word_boundary(pos, *ignore_case) != *invert {
                             pc += 1;
                         } else {
                             break None;
@@ -623,9 +626,15 @@ impl Matcher<'_, '_> {
                 .is_some_and(|(cp, _)| is_line_terminator(cp))
     }
 
-    fn word_boundary(&self, pos: usize) -> bool {
-        let before = self.prev_codepoint(pos).is_some_and(is_word);
-        let after = self.decode(pos).is_some_and(|(cp, _)| is_word(cp));
+    fn word_boundary(&self, pos: usize, ignore_case: bool) -> bool {
+        // §22.2.2.7.3 — under `iu`, the word-character set also admits the
+        // two non-ASCII code points whose simple case fold lands in the
+        // ASCII word set: U+017F `ſ` (→ `s`) and U+212A K (→ `k`).
+        let is_w = |cp: u32| {
+            is_word(cp) || (ignore_case && self.program.unicode && matches!(cp, 0x017F | 0x212A))
+        };
+        let before = self.prev_codepoint(pos).is_some_and(is_w);
+        let after = self.decode(pos).is_some_and(|(cp, _)| is_w(cp));
         before != after
     }
 

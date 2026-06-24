@@ -79,7 +79,7 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
         // Very large classes (`\p{L}`, near-total ranges) keep the
         // match-time probe: expanding their closure is costly and they
         // already contain almost all of it.
-        const UNICODE_FOLD_CLASS_LIMIT: u32 = 4096;
+        const UNICODE_FOLD_CLASS_LIMIT: u32 = 1024;
         let Emitter { insns, classes, .. } = &mut e;
         for insn in insns.iter_mut() {
             let (class, ignore_case) = match insn {
@@ -212,7 +212,7 @@ fn compute_first_set(
             // re-checked by the matcher at each surviving candidate. Reaching
             // `Match` through here still yields no prefilter (handled below),
             // so an empty-matchable prefix stays unfiltered.
-            Insn::AssertStart { .. } | Insn::AssertEnd { .. } | Insn::WordBoundary(_) => {
+            Insn::AssertStart { .. } | Insn::AssertEnd { .. } | Insn::WordBoundary { .. } => {
                 work.push(pc + 1)
             }
             Insn::Jump(t) => work.push(*t),
@@ -622,7 +622,13 @@ impl Emitter {
                     Assertion::EndOfLine { multiline } => Insn::AssertEnd {
                         multiline: *multiline,
                     },
-                    Assertion::WordBoundary { invert } => Insn::WordBoundary(*invert),
+                    Assertion::WordBoundary {
+                        invert,
+                        ignore_case,
+                    } => Insn::WordBoundary {
+                        invert: *invert,
+                        ignore_case: *ignore_case,
+                    },
                 };
                 self.emit(insn);
             }

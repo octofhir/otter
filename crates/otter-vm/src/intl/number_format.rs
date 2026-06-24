@@ -127,21 +127,33 @@ fn require_number_format(
     }
 }
 
-fn coerce_format_arg(ctx: &NativeCtx<'_>, first: Option<&Value>) -> f64 {
-    if let Some(num) = first.and_then(|v| v.as_number()) {
-        num.as_f64()
-    } else if let Some(s) = first.and_then(|v| v.as_string(ctx.heap())) {
-        s.to_lossy_string(ctx.heap())
-            .trim()
-            .parse::<f64>()
-            .unwrap_or(f64::NAN)
-    } else if let Some(b) = first.and_then(|v| v.as_boolean()) {
-        if b { 1.0 } else { 0.0 }
-    } else if first.is_some_and(|v| v.is_null()) {
-        0.0
-    } else {
-        f64::NAN
+/// Coerce a `format`/`formatToParts` argument to an `f64`, an
+/// approximation of ToIntlMathematicalValue (§15.5.2): BigInt and the
+/// numeric value pass straight through; everything else (object via
+/// `valueOf`, string, boolean, null, undefined) flows through
+/// `ToNumber`, preserving a user-thrown abrupt completion.
+fn coerce_format_arg(ctx: &mut NativeCtx<'_>, first: Option<&Value>) -> Result<f64, NativeError> {
+    let Some(value) = first else {
+        return Ok(f64::NAN);
+    };
+    if let Some(num) = value.as_number() {
+        return Ok(num.as_f64());
     }
+    if let Some(bi) = value.as_big_int() {
+        return Ok(bi
+            .to_decimal_string(ctx.heap())
+            .parse::<f64>()
+            .unwrap_or(f64::NAN));
+    }
+    let value = *value;
+    let (interp, exec) = ctx.interp_mut_and_context();
+    let exec = exec.ok_or_else(|| NativeError::TypeError {
+        name: "format",
+        reason: "missing execution context".to_string(),
+    })?;
+    let n = crate::coerce::to_number_or_throw(interp, &exec, &value)
+        .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "format"))?;
+    Ok(n.as_f64())
 }
 
 /// §11.3.3 `get Intl.NumberFormat.prototype.format` — an accessor
@@ -184,7 +196,7 @@ fn bound_format_call(
         IntlPayload::NumberFormat(n) => n,
         _ => return Err(bad()),
     };
-    let n = coerce_format_arg(ctx, args.first());
+    let n = coerce_format_arg(ctx, args.first())?;
     let rendered = format_number(n, &payload);
     Ok(Value::string(JsString::from_str(
         &rendered,
@@ -198,7 +210,7 @@ pub(crate) fn number_format_format_to_parts(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let payload = require_number_format(ctx, "formatToParts")?;
-    let n = coerce_format_arg(ctx, args.first());
+    let n = coerce_format_arg(ctx, args.first())?;
     let parts = partition_number(n, &payload);
     let type_lit = |t: &str, ctx: &mut NativeCtx<'_>| JsString::from_str(t, ctx.heap_mut());
 
@@ -230,13 +242,7 @@ const RANGE_SEPARATOR: &str = "\u{2009}\u{2013}\u{2009}";
 /// numeric strings (an approximation of ToIntlMathematicalValue).
 /// `Infinity` survives; only `NaN` is signalled so the caller can raise
 /// the spec's `RangeError`.
-fn coerce_range_arg(ctx: &NativeCtx<'_>, value: &Value) -> f64 {
-    if let Some(bi) = value.as_big_int() {
-        return bi
-            .to_decimal_string(ctx.heap())
-            .parse::<f64>()
-            .unwrap_or(f64::NAN);
-    }
+fn coerce_range_arg(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<f64, NativeError> {
     coerce_format_arg(ctx, Some(value))
 }
 
@@ -245,7 +251,7 @@ fn coerce_range_arg(ctx: &NativeCtx<'_>, value: &Value) -> f64 {
 /// (PartitionNumberRangePattern caller step 3), a `NaN` endpoint a
 /// `RangeError` (step 1).
 fn range_args(
-    ctx: &NativeCtx<'_>,
+    ctx: &mut NativeCtx<'_>,
     args: &[Value],
     name: &'static str,
 ) -> Result<(f64, f64), NativeError> {
@@ -256,8 +262,8 @@ fn range_args(
             reason: "start and end must not be undefined".to_string(),
         });
     }
-    let x = coerce_range_arg(ctx, args.first().expect("checked above"));
-    let y = coerce_range_arg(ctx, args.get(1).expect("checked above"));
+    let x = coerce_range_arg(ctx, &args.first().copied().expect("checked above"))?;
+    let y = coerce_range_arg(ctx, &args.get(1).copied().expect("checked above"))?;
     if x.is_nan() || y.is_nan() {
         return Err(NativeError::RangeError {
             name,
@@ -435,7 +441,8 @@ pub(crate) fn number_format_resolved_options(
     let min_fd = payload.minimum_fraction_digits as i32;
     let max_fd = payload.maximum_fraction_digits as i32;
     let use_grouping = payload.use_grouping;
-    let mut value_roots = vec![&locale, &style];
+    let sign_display = Value::string(JsString::from_str(&payload.sign_display, ctx.heap_mut())?);
+    let mut value_roots = vec![&locale, &style, &sign_display];
     if let Some(c) = &currency_val {
         value_roots.push(c);
     }
@@ -459,6 +466,7 @@ pub(crate) fn number_format_resolved_options(
         Value::number_i32(max_fd),
     );
     crate::object::set(obj, heap, "useGrouping", Value::boolean(use_grouping));
+    crate::object::set(obj, heap, "signDisplay", sign_display);
     Ok(Value::object(obj))
 }
 

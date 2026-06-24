@@ -259,28 +259,46 @@ pub fn parse_float(input: &str) -> NumberValue {
     if s.starts_with("-Infinity") {
         return NumberValue::Double(f64::NEG_INFINITY);
     }
+    // `end` tracks how far the greedy scan has advanced; `last_valid`
+    // tracks the end of the longest prefix that is itself a complete
+    // StrDecimalLiteral. A dangling `e`, `e-`, or trailing sign advances
+    // `end` but not `last_valid`, so `parseFloat("1ex")` keeps the `"1"`
+    // prefix instead of failing on `"1e"`.
     let mut end = 0usize;
+    let mut last_valid = 0usize;
     let mut seen_digit = false;
     let mut seen_dot = false;
     let mut seen_exp = false;
+    let mut seen_exp_digit = false;
     for (i, c) in s.char_indices() {
         match c {
             '+' | '-' if i == end => {
                 end = i + c.len_utf8();
             }
             '0'..='9' => {
-                seen_digit = true;
                 end = i + c.len_utf8();
+                if seen_exp {
+                    seen_exp_digit = true;
+                } else {
+                    seen_digit = true;
+                }
+                last_valid = end;
             }
             '.' if !seen_dot && !seen_exp => {
                 seen_dot = true;
                 end = i + c.len_utf8();
+                // `"1."` is a complete literal; `".` alone (no integer
+                // part yet) only becomes valid once a fraction digit
+                // follows.
+                if seen_digit {
+                    last_valid = end;
+                }
             }
             'e' | 'E' if seen_digit && !seen_exp => {
                 seen_exp = true;
                 end = i + c.len_utf8();
             }
-            '+' | '-' if seen_exp && s[..i].ends_with(['e', 'E']) => {
+            '+' | '-' if seen_exp && !seen_exp_digit && s[..i].ends_with(['e', 'E']) => {
                 end = i + c.len_utf8();
             }
             _ => break,
@@ -289,7 +307,7 @@ pub fn parse_float(input: &str) -> NumberValue {
     if !seen_digit {
         return NumberValue::Double(f64::NAN);
     }
-    match s[..end].parse::<f64>() {
+    match s[..last_valid].parse::<f64>() {
         Ok(v) => NumberValue::from_f64(v),
         Err(_) => NumberValue::Double(f64::NAN),
     }

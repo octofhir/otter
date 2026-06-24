@@ -509,6 +509,28 @@ pub(crate) fn bind_for_in_of_head(
             assign_object_pattern(cx, obj, src_reg, span)
         }
         ForStatementLeft::StaticMemberExpression(member) => {
+            // `for (super.X of ...)` writes through the receiver per
+            // §13.3.5.3 + §6.2.5.5 step 6.b, like `super.X = V`.
+            if matches!(member.object, oxc_ast::ast::Expression::Super(_)) {
+                let home_reg = crate::class::load_synthetic_capture(
+                    cx,
+                    crate::class::super_home_binding_name(cx),
+                    span,
+                )?;
+                let this_guard = cx.alloc_scratch();
+                cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                let name_idx = cx.intern_string_constant(member.property.name.as_str());
+                cx.emit(
+                    Op::SetSuperProperty,
+                    vec![
+                        Operand::Register(home_reg),
+                        Operand::ConstIndex(name_idx),
+                        Operand::Register(src_reg),
+                    ],
+                    span,
+                );
+                return Ok(());
+            }
             let obj_reg = compile_expr(cx, &member.object, span)?;
             let name_idx = cx.intern_string_constant(member.property.name.as_str());
             let scratch = cx.alloc_scratch();
@@ -525,6 +547,26 @@ pub(crate) fn bind_for_in_of_head(
             Ok(())
         }
         ForStatementLeft::ComputedMemberExpression(member) => {
+            if matches!(member.object, oxc_ast::ast::Expression::Super(_)) {
+                let home_reg = crate::class::load_synthetic_capture(
+                    cx,
+                    crate::class::super_home_binding_name(cx),
+                    span,
+                )?;
+                let this_guard = cx.alloc_scratch();
+                cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                let key_reg = compile_expr(cx, &member.expression, span)?;
+                cx.emit(
+                    Op::SetSuperElement,
+                    vec![
+                        Operand::Register(home_reg),
+                        Operand::Register(key_reg),
+                        Operand::Register(src_reg),
+                    ],
+                    span,
+                );
+                return Ok(());
+            }
             let obj_reg = compile_expr(cx, &member.object, span)?;
             let key_reg = compile_expr(cx, &member.expression, span)?;
             cx.emit_store_element(obj_reg, key_reg, src_reg, span);

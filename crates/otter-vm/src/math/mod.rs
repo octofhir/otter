@@ -288,13 +288,23 @@ fn coerce_math_args(
                 name: "Math",
                 reason: "missing execution context".to_string(),
             })?;
-            let primitive = interp
-                .evaluate_to_primitive(&exec, slot, crate::abstract_ops::ToPrimitiveHint::Number)
-                .map_err(|e| NativeError::TypeError {
-                    name: "Math",
-                    reason: e.to_string(),
-                })?;
-            *slot = primitive;
+            match interp.evaluate_to_primitive(
+                &exec,
+                slot,
+                crate::abstract_ops::ToPrimitiveHint::Number,
+            ) {
+                Ok(primitive) => *slot = primitive,
+                // A user-thrown value (e.g. a throwing `valueOf`) must
+                // propagate intact, not be re-wrapped as a TypeError:
+                // `Math.hypot` coerces every argument and surfaces the
+                // original abrupt completion. `vm_to_native_error`
+                // preserves `VmError::Uncaught` as `NativeError::Thrown`.
+                Err(e) => {
+                    return Err(crate::native_function::vm_to_native_error(
+                        interp, e, "Math",
+                    ));
+                }
+            }
         }
     }
     Ok(out)

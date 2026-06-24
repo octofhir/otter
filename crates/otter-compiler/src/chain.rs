@@ -517,6 +517,13 @@ pub(crate) fn expression_as_chain_element<'a>(
     match expr {
         Expression::StaticMemberExpression(m) => Some(ChainObjectRef::Static(m)),
         Expression::ComputedMemberExpression(m) => Some(ChainObjectRef::Computed(m)),
+        // A `super(...)` constructor call is a complete leaf expression,
+        // not an optional-chain link (the chain's `?.` applies to its
+        // result, e.g. `super()?.a`). Route it through `compile_expr`,
+        // which lowers the SuperCall, rather than the chain-call path
+        // that would treat the bare `super` callee as an unsupported
+        // standalone expression.
+        Expression::CallExpression(c) if matches!(c.callee, Expression::Super(_)) => None,
         Expression::CallExpression(c) => Some(ChainObjectRef::Call(c)),
         Expression::PrivateFieldExpression(m) => Some(ChainObjectRef::Private(m)),
         // §13.3.9.1 — parentheses around a chain step preserve the

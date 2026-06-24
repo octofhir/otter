@@ -385,7 +385,13 @@ fn build_global_this_impl(
     // non-moving old space so every handle to it stays stable across young
     // scavenges and the large builtin-laden object is never copied.
     let global = object::alloc_object_old(heap)?;
-    object::set(global, heap, "globalThis", Value::object(global));
+    // §19.1 `globalThis` is writable + configurable but NON-enumerable.
+    object::define_own_property(
+        global,
+        heap,
+        "globalThis",
+        crate::object::PropertyDescriptor::data(Value::object(global), true, false, true),
+    );
     // §19.1 — `NaN`, `Infinity`, `undefined` are own properties of
     // the global object with writable / enumerable / configurable
     // all false. Reflective lookups (`Object.getOwnPropertyDescriptor(

@@ -19,6 +19,12 @@ enum PreparedAssignmentTarget {
     StaticMember { obj_reg: u16, name_idx: u32 },
     ComputedMember { obj_reg: u16, key_reg: u16 },
     PrivateField { obj_reg: u16, key_reg: u16 },
+    // `super.X` / `super[K]` targets: the home object and (for computed)
+    // the key are evaluated during the prepare phase so destructuring
+    // order-of-operations matches §13.15.5; the store runs through the
+    // receiver via `SetSuperProperty` / `SetSuperElement`.
+    SuperProperty { home_reg: u16, name_idx: u32 },
+    SuperElement { home_reg: u16, idx_reg: u16 },
 }
 
 /// `Op::TdzError`'s operand carries the binding's slot index purely for
@@ -858,6 +864,25 @@ pub(crate) fn assign_to_target(
             store_identifier(cx, &name, value_reg, span)
         }
         AssignmentTarget::StaticMemberExpression(member) => {
+            // `super.X` as a destructuring / for-head target writes
+            // through the receiver per §13.3.5.3 + §6.2.5.5 step 6.b,
+            // identical to the plain `super.X = V` lowering above.
+            if matches!(member.object, Expression::Super(_)) {
+                let home_reg = load_synthetic_capture(cx, super_home_binding_name(cx), span)?;
+                let this_guard = cx.alloc_scratch();
+                cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                let name_idx = cx.intern_string_constant(member.property.name.as_str());
+                cx.emit(
+                    Op::SetSuperProperty,
+                    vec![
+                        Operand::Register(home_reg),
+                        Operand::ConstIndex(name_idx),
+                        Operand::Register(value_reg),
+                    ],
+                    span,
+                );
+                return Ok(());
+            }
             let obj_reg = compile_expr(cx, &member.object, span)?;
             let name_idx = cx.intern_string_constant(member.property.name.as_str());
             let scratch = cx.alloc_scratch();
@@ -874,6 +899,24 @@ pub(crate) fn assign_to_target(
             Ok(())
         }
         AssignmentTarget::ComputedMemberExpression(member) => {
+            // `super[K]` target — receiver-targeted store via
+            // `SetSuperElement`, mirroring the `super[K] = V` path.
+            if matches!(member.object, Expression::Super(_)) {
+                let home_reg = load_synthetic_capture(cx, super_home_binding_name(cx), span)?;
+                let this_guard = cx.alloc_scratch();
+                cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                let idx_reg = compile_expr(cx, &member.expression, span)?;
+                cx.emit(
+                    Op::SetSuperElement,
+                    vec![
+                        Operand::Register(home_reg),
+                        Operand::Register(idx_reg),
+                        Operand::Register(value_reg),
+                    ],
+                    span,
+                );
+                return Ok(());
+            }
             let obj_reg = compile_expr(cx, &member.object, span)?;
             let key_reg = compile_expr(cx, &member.expression, span)?;
             cx.emit_store_element(obj_reg, key_reg, value_reg, span);
@@ -917,6 +960,16 @@ fn prepare_assignment_target(
             PreparedAssignmentTarget::Identifier(id.name.as_str().to_string()),
         )),
         AssignmentTarget::StaticMemberExpression(member) => {
+            if matches!(member.object, Expression::Super(_)) {
+                let home_reg = load_synthetic_capture(cx, super_home_binding_name(cx), span)?;
+                let this_guard = cx.alloc_scratch();
+                cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                let name_idx = cx.intern_string_constant(member.property.name.as_str());
+                return Ok(Some(PreparedAssignmentTarget::SuperProperty {
+                    home_reg,
+                    name_idx,
+                }));
+            }
             let obj_reg = compile_expr(cx, &member.object, span)?;
             let name_idx = cx.intern_string_constant(member.property.name.as_str());
             Ok(Some(PreparedAssignmentTarget::StaticMember {
@@ -925,6 +978,16 @@ fn prepare_assignment_target(
             }))
         }
         AssignmentTarget::ComputedMemberExpression(member) => {
+            if matches!(member.object, Expression::Super(_)) {
+                let home_reg = load_synthetic_capture(cx, super_home_binding_name(cx), span)?;
+                let this_guard = cx.alloc_scratch();
+                cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                let idx_reg = compile_expr(cx, &member.expression, span)?;
+                return Ok(Some(PreparedAssignmentTarget::SuperElement {
+                    home_reg,
+                    idx_reg,
+                }));
+            }
             let obj_reg = compile_expr(cx, &member.object, span)?;
             let key_reg = compile_expr(cx, &member.expression, span)?;
             Ok(Some(PreparedAssignmentTarget::ComputedMember {
@@ -991,6 +1054,30 @@ fn assign_prepared_target(
         }
         PreparedAssignmentTarget::ComputedMember { obj_reg, key_reg } => {
             cx.emit_store_element(obj_reg, key_reg, value_reg, span);
+            Ok(())
+        }
+        PreparedAssignmentTarget::SuperProperty { home_reg, name_idx } => {
+            cx.emit(
+                Op::SetSuperProperty,
+                vec![
+                    Operand::Register(home_reg),
+                    Operand::ConstIndex(name_idx),
+                    Operand::Register(value_reg),
+                ],
+                span,
+            );
+            Ok(())
+        }
+        PreparedAssignmentTarget::SuperElement { home_reg, idx_reg } => {
+            cx.emit(
+                Op::SetSuperElement,
+                vec![
+                    Operand::Register(home_reg),
+                    Operand::Register(idx_reg),
+                    Operand::Register(value_reg),
+                ],
+                span,
+            );
             Ok(())
         }
     }

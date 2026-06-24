@@ -2149,19 +2149,14 @@ fn impl_locale_compare(
     // `arg_to_string` finishes the primitive rendering (a String
     // wrapper unwraps to its `[[StringData]]`, not "[object Object]").
     let other = arg_to_string(ctx, args, 0)?;
-    let recv_units = recv.to_utf16_vec(ctx.heap());
-    let other_units = other.to_utf16_vec(ctx.heap());
-    let recv_normalized: Vec<u16> = icu_normalizer::ComposingNormalizerBorrowed::new_nfc()
-        .normalize_utf16(&recv_units)
-        .into();
-    let other_normalized: Vec<u16> = icu_normalizer::ComposingNormalizerBorrowed::new_nfc()
-        .normalize_utf16(&other_units)
-        .into();
-    let cmp = match recv_normalized.cmp(&other_normalized) {
-        std::cmp::Ordering::Less => -1,
-        std::cmp::Ordering::Equal => 0,
-        std::cmp::Ordering::Greater => 1,
-    };
+    // §22.1.3.10 — `locales`/`options` build a Collator whose ICU
+    // comparison (and whose constructor-time validation) localeCompare
+    // shares, so it matches `new Intl.Collator(locales, options).compare`.
+    let recv_s = recv.to_lossy_string(ctx.heap());
+    let other_s = other.to_lossy_string(ctx.heap());
+    let locales = args.get(1).copied().unwrap_or_else(Value::undefined);
+    let options = args.get(2).copied().unwrap_or_else(Value::undefined);
+    let cmp = crate::intl::collator::locale_compare(ctx, &recv_s, &other_s, locales, options)?;
     Ok(Value::number(crate::number::NumberValue::from_i32(cmp)))
 }
 

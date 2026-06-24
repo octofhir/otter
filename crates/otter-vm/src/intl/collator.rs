@@ -202,6 +202,21 @@ pub(crate) fn collator_resolved_options(
 /// byte-wise comparison if ICU instantiation fails (the spec
 /// requires a stable result; defaulting to byte comparison keeps
 /// the surface usable even on exotic tags).
+/// Shared `String.prototype.localeCompare` body: resolve a `Collator`
+/// from `(locales, options)` (so locale/option validation throws exactly
+/// as the `Intl.Collator` constructor does) then compare `x` and `y`
+/// through the same ICU path `Intl.Collator.prototype.compare` uses.
+pub(crate) fn locale_compare(
+    ctx: &mut NativeCtx<'_>,
+    x: &str,
+    y: &str,
+    locales: Value,
+    options: Value,
+) -> Result<i32, NativeError> {
+    let payload = resolve_ctx(ctx, locales, options)?;
+    Ok(compare_with_payload(x, y, &payload))
+}
+
 fn compare_with_payload(x: &str, y: &str, payload: &CollatorPayload) -> i32 {
     let locale = Locale::from_str(&payload.locale)
         .or_else(|_| Locale::from_str(DEFAULT_LOCALE))

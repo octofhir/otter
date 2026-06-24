@@ -14,7 +14,6 @@
 
 use crate::Value;
 use crate::intl::collator;
-use crate::intl::date_time_format;
 use crate::intl::display_names;
 use crate::intl::number_format;
 use crate::intl::payload::{IntlKind, IntlPayload, JsIntl};
@@ -96,8 +95,9 @@ pub fn construct(
         IntlKind::NumberFormat => {
             IntlPayload::NumberFormat(number_format::resolve(locale, options, gc_heap)?)
         }
+        // Constructed through its own `NativeCtx` option ladder.
         IntlKind::DateTimeFormat => {
-            IntlPayload::DateTimeFormat(date_time_format::resolve(locale, options, gc_heap)?)
+            return Err(IntlError::UnknownClass("DateTimeFormat".to_string()));
         }
         // Constructed through its own `NativeCtx` option ladder.
         IntlKind::PluralRules => {

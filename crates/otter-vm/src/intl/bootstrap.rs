@@ -134,6 +134,10 @@ fn intl_construct(
             crate::intl::plural_rules::resolve_ctx(ctx, locale, options)
                 .map(crate::intl::payload::IntlPayload::PluralRules),
         ),
+        IntlKind::DateTimeFormat => Some(
+            crate::intl::date_time_format::resolve_ctx(ctx, locale, options)
+                .map(crate::intl::payload::IntlPayload::DateTimeFormat),
+        ),
         _ => None,
     };
     if let Some(result) = ctx_payload {

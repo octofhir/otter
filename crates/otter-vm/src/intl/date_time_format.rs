@@ -13,7 +13,6 @@
 //! - <https://tc39.es/ecma402/#sec-intl-datetimeformat-objects>
 
 use crate::intl::dispatch::IntlError;
-use crate::intl::helpers::{coerce_locale, options_object, read_bool_option, read_string_option};
 use crate::intl::payload::{
     DateTimeFormatPayload, DtHourCycle, DtMonthWidth, DtNumWidth, DtStyle, DtTextWidth, DtZoneName,
     IntlPayload,
@@ -22,28 +21,10 @@ use crate::string::JsString;
 use crate::temporal::TemporalPayload;
 use crate::{NativeCtx, NativeError, Value};
 
+const CLASS: &str = "DateTimeFormat";
+
 fn range_err(message: String) -> IntlError {
     IntlError::Range { message }
-}
-
-/// Parse a string-valued option against `parse`; an absent option (`""`)
-/// yields `None`, an unrecognised value is a `RangeError`.
-fn parse_enum_option<T>(
-    opts: Option<&crate::object::JsObject>,
-    name: &str,
-    gc_heap: &otter_gc::GcHeap,
-    parse: impl Fn(&str) -> Option<T>,
-) -> Result<Option<T>, IntlError> {
-    let s = read_string_option(opts, name, "", gc_heap);
-    if s.is_empty() {
-        return Ok(None);
-    }
-    match parse(&s) {
-        Some(v) => Ok(Some(v)),
-        None => Err(range_err(format!(
-            "invalid value '{s}' for option '{name}'"
-        ))),
-    }
 }
 
 fn parse_text_width(s: &str) -> Option<DtTextWidth> {
@@ -160,51 +141,102 @@ fn hour_cycle_str(h: DtHourCycle) -> &'static str {
     }
 }
 
-/// Resolve the constructor option bag per ECMA-402 §11.1.2
-/// `CreateDateTimeFormat` — each component carries its width, and
-/// invalid option values raise a `RangeError`.
-pub fn resolve(
-    locale: &Value,
-    options: &Value,
-    gc_heap: &otter_gc::GcHeap,
-) -> Result<DateTimeFormatPayload, IntlError> {
-    let opts = options_object(Some(options));
-    let opts_ref = opts.as_ref();
+/// §11.1.2 `CreateDateTimeFormat` — spec-faithful construction firing
+/// every option getter in the observation order pinned by
+/// `constructor-options-order`, with ToString / ToNumber / ToBoolean
+/// coercion and RangeError validation, and a canonicalized locale.
+pub fn resolve_ctx(
+    ctx: &mut NativeCtx<'_>,
+    locales: Value,
+    options: Value,
+) -> Result<DateTimeFormatPayload, NativeError> {
+    use crate::intl::helpers::{
+        get_bool_option, get_number_option, get_numbering_system_option, get_string_option,
+        require_options_object,
+    };
 
-    let date_style = parse_enum_option(opts_ref, "dateStyle", gc_heap, parse_style)?;
-    let time_style = parse_enum_option(opts_ref, "timeStyle", gc_heap, parse_style)?;
-    let weekday = parse_enum_option(opts_ref, "weekday", gc_heap, parse_text_width)?;
-    let era = parse_enum_option(opts_ref, "era", gc_heap, parse_text_width)?;
-    let mut year = parse_enum_option(opts_ref, "year", gc_heap, parse_num_width)?;
-    let mut month = parse_enum_option(opts_ref, "month", gc_heap, parse_month_width)?;
-    let mut day = parse_enum_option(opts_ref, "day", gc_heap, parse_num_width)?;
-    let day_period = parse_enum_option(opts_ref, "dayPeriod", gc_heap, parse_text_width)?;
-    let hour = parse_enum_option(opts_ref, "hour", gc_heap, parse_num_width)?;
-    let minute = parse_enum_option(opts_ref, "minute", gc_heap, parse_num_width)?;
-    let second = parse_enum_option(opts_ref, "second", gc_heap, parse_num_width)?;
-    let time_zone_name = parse_enum_option(opts_ref, "timeZoneName", gc_heap, parse_zone_name)?;
-    let hour_cycle = parse_enum_option(opts_ref, "hourCycle", gc_heap, parse_hour_cycle)?;
+    let requested = crate::intl::supported::canonicalize_locale_list(ctx, locales)?;
+    let locale = requested
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| crate::intl::helpers::DEFAULT_LOCALE.to_string());
+    let options = require_options_object(options, CLASS)?;
 
-    // fractionalSecondDigits — integer 1..=3 (an out-of-range value is a
-    // RangeError; absent or non-numeric is ignored here).
-    let fractional_second_digits = opts_ref
-        .and_then(|o| crate::object::get(*o, gc_heap, "fractionalSecondDigits"))
-        .filter(|v| !v.is_undefined())
-        .map(|v| v.as_number().map(|n| n.as_f64()).unwrap_or(f64::NAN))
-        .map(|n| {
-            if (1.0..=3.0).contains(&n) {
-                Ok(n as u8)
-            } else {
-                Err(range_err(
-                    "fractionalSecondDigits must be between 1 and 3".to_string(),
-                ))
-            }
-        })
-        .transpose()?;
+    // Read a validated enum option then map it through a parser (the
+    // value list already rejects out-of-range values with a RangeError).
+    macro_rules! enum_opt {
+        ($name:expr, $values:expr, $parser:expr) => {
+            get_string_option(ctx, options, $name, CLASS, $values, None)?.and_then(|s| $parser(&s))
+        };
+    }
+    const TEXT: &[&str] = &["narrow", "short", "long"];
+    const NUM: &[&str] = &["numeric", "2-digit"];
+    const MONTH: &[&str] = &["numeric", "2-digit", "narrow", "short", "long"];
+    const STYLE: &[&str] = &["full", "long", "medium", "short"];
+    const ZONE: &[&str] = &[
+        "short",
+        "long",
+        "shortOffset",
+        "longOffset",
+        "shortGeneric",
+        "longGeneric",
+    ];
+    const HC: &[&str] = &["h11", "h12", "h23", "h24"];
 
-    let hour12 = read_bool_option_opt(opts_ref, "hour12", gc_heap);
-    let tz = read_string_option(opts_ref, "timeZone", "", gc_heap);
-    let time_zone = if tz.is_empty() { None } else { Some(tz) };
+    // localeMatcher, calendar, numberingSystem (latter two read but their
+    // ordering is invisible to the read-order test).
+    let _matcher = get_string_option(
+        ctx,
+        options,
+        "localeMatcher",
+        CLASS,
+        &["lookup", "best fit"],
+        None,
+    )?;
+    let _calendar = get_string_option(ctx, options, "calendar", CLASS, &[], None)?;
+    let _numbering_system = get_numbering_system_option(ctx, options, CLASS)?;
+
+    let hour12 = get_bool_option(ctx, options, "hour12", CLASS, None)?;
+    let hour_cycle = enum_opt!("hourCycle", HC, parse_hour_cycle);
+    let time_zone = get_string_option(ctx, options, "timeZone", CLASS, &[], None)?;
+
+    let weekday = enum_opt!("weekday", TEXT, parse_text_width);
+    let era = enum_opt!("era", TEXT, parse_text_width);
+    let mut year = enum_opt!("year", NUM, parse_num_width);
+    let mut month = enum_opt!("month", MONTH, parse_month_width);
+    let mut day = enum_opt!("day", NUM, parse_num_width);
+    let day_period = enum_opt!("dayPeriod", TEXT, parse_text_width);
+    let hour = enum_opt!("hour", NUM, parse_num_width);
+    let minute = enum_opt!("minute", NUM, parse_num_width);
+    let second = enum_opt!("second", NUM, parse_num_width);
+    // fractionalSecondDigits — integer 1..=3 (RangeError otherwise).
+    let fractional_second_digits = get_number_option(
+        ctx,
+        options,
+        "fractionalSecondDigits",
+        CLASS,
+        1.0,
+        3.0,
+        None,
+    )?
+    .map(|n| n as u8);
+    let time_zone_name = enum_opt!("timeZoneName", ZONE, parse_zone_name);
+
+    let _format_matcher = get_string_option(
+        ctx,
+        options,
+        "formatMatcher",
+        CLASS,
+        &["basic", "best fit"],
+        None,
+    )?;
+    let date_style = enum_opt!("dateStyle", STYLE, parse_style);
+    let time_style = enum_opt!("timeStyle", STYLE, parse_style);
+
+    let range_err = |msg: &str| NativeError::RangeError {
+        name: CLASS,
+        reason: msg.to_string(),
+    };
 
     // §11.1.2 — dateStyle / timeStyle are mutually exclusive with
     // explicit component options.
@@ -220,8 +252,7 @@ pub fn resolve(
         || fractional_second_digits.is_some();
     if (date_style.is_some() || time_style.is_some()) && has_components {
         return Err(range_err(
-            "dateStyle/timeStyle may not be combined with explicit date-time components"
-                .to_string(),
+            "dateStyle/timeStyle may not be combined with explicit date-time components",
         ));
     }
 
@@ -234,7 +265,7 @@ pub fn resolve(
     }
 
     Ok(DateTimeFormatPayload {
-        locale: coerce_locale(Some(locale), gc_heap),
+        locale,
         weekday,
         era,
         year,
@@ -252,20 +283,6 @@ pub fn resolve(
         time_style,
         time_zone,
     })
-}
-
-/// Read an optional boolean option (`None` when absent/undefined).
-fn read_bool_option_opt(
-    opts: Option<&crate::object::JsObject>,
-    name: &str,
-    gc_heap: &otter_gc::GcHeap,
-) -> Option<bool> {
-    let v = opts.and_then(|o| crate::object::get(*o, gc_heap, name))?;
-    if v.is_undefined() {
-        None
-    } else {
-        Some(read_bool_option(opts, name, false, gc_heap))
-    }
 }
 
 fn require_date_time(

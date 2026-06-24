@@ -165,13 +165,7 @@ pub(crate) fn compile_new(
         // Locale.
         && matches!(
             member.property.name.as_str(),
-            "Collator"
-                | "NumberFormat"
-                | "DateTimeFormat"
-                | "PluralRules"
-                | "RelativeTimeFormat"
-                | "DisplayNames"
-                | "Segmenter"
+            "Collator" | "NumberFormat" | "DateTimeFormat" | "DisplayNames"
         )
     {
         let class = member.property.name.as_str();

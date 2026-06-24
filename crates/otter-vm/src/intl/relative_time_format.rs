@@ -9,24 +9,62 @@
 
 use otter_gc::raw::RawGc;
 
-use crate::intl::helpers::{coerce_locale, options_object, read_string_option};
+use crate::intl::helpers::{
+    DEFAULT_LOCALE, get_numbering_system_option, get_string_option, require_options_object,
+};
 use crate::intl::payload::{IntlPayload, RelativeTimeFormatPayload};
 use crate::string::JsString;
 use crate::{NativeCtx, NativeError, Value};
 
-/// Resolve constructor options for this Intl class.
-pub fn resolve(
-    locale: &Value,
-    options: &Value,
-    gc_heap: &otter_gc::GcHeap,
-) -> RelativeTimeFormatPayload {
-    let opts = options_object(Some(options));
-    let opts_ref = opts.as_ref();
-    RelativeTimeFormatPayload {
-        locale: coerce_locale(Some(locale), gc_heap),
-        style: read_string_option(opts_ref, "style", "long", gc_heap),
-        numeric: read_string_option(opts_ref, "numeric", "always", gc_heap),
-    }
+const CLASS: &str = "RelativeTimeFormat";
+
+/// §18.1.1 InitializeRelativeTimeFormat — fires `localeMatcher` /
+/// `numberingSystem` / `style` / `numeric` getters in spec order with
+/// ToString coercion + RangeError validation; canonicalizes the locale.
+pub fn resolve_ctx(
+    ctx: &mut NativeCtx<'_>,
+    locales: Value,
+    options: Value,
+) -> Result<RelativeTimeFormatPayload, NativeError> {
+    let requested = crate::intl::supported::canonicalize_locale_list(ctx, locales)?;
+    let locale = requested
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| DEFAULT_LOCALE.to_string());
+    let options = require_options_object(options, CLASS)?;
+    let _matcher = get_string_option(
+        ctx,
+        options,
+        "localeMatcher",
+        CLASS,
+        &["lookup", "best fit"],
+        None,
+    )?;
+    let numbering_system = get_numbering_system_option(ctx, options, CLASS)?;
+    let style = get_string_option(
+        ctx,
+        options,
+        "style",
+        CLASS,
+        &["long", "short", "narrow"],
+        Some("long"),
+    )?
+    .unwrap_or_else(|| "long".to_string());
+    let numeric = get_string_option(
+        ctx,
+        options,
+        "numeric",
+        CLASS,
+        &["always", "auto"],
+        Some("always"),
+    )?
+    .unwrap_or_else(|| "always".to_string());
+    Ok(RelativeTimeFormatPayload {
+        locale,
+        style,
+        numeric,
+        numbering_system: numbering_system.unwrap_or_else(|| "latn".to_string()),
+    })
 }
 
 fn require_payload(
@@ -169,10 +207,15 @@ pub(crate) fn relative_time_format_resolved_options(
     let locale = Value::string(JsString::from_str(&payload.locale, ctx.heap_mut())?);
     let style = Value::string(JsString::from_str(&payload.style, ctx.heap_mut())?);
     let numeric = Value::string(JsString::from_str(&payload.numeric, ctx.heap_mut())?);
-    let obj = ctx.alloc_object_with_roots(&[&locale, &style, &numeric], &[])?;
+    let numbering_system = Value::string(JsString::from_str(
+        &payload.numbering_system,
+        ctx.heap_mut(),
+    )?);
+    let obj = ctx.alloc_object_with_roots(&[&locale, &style, &numeric, &numbering_system], &[])?;
     let heap = ctx.heap_mut();
     crate::object::set(obj, heap, "locale", locale);
     crate::object::set(obj, heap, "style", style);
     crate::object::set(obj, heap, "numeric", numeric);
+    crate::object::set(obj, heap, "numberingSystem", numbering_system);
     Ok(Value::object(obj))
 }

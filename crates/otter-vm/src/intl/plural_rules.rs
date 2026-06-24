@@ -14,36 +14,84 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#pluralrules-objects>
 
-use crate::intl::helpers::{coerce_locale, options_object, read_string_option, read_u8_option};
+use crate::intl::helpers::{
+    DEFAULT_LOCALE, get_number_option, get_string_option, require_options_object,
+};
 use crate::intl::payload::{IntlPayload, PluralRulesPayload};
 use crate::string::JsString;
 use crate::{NativeCtx, NativeError, Value};
 
-/// §15.2.1 — resolve constructor options.
-pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> PluralRulesPayload {
-    let opts = options_object(Some(options));
-    let opts_ref = opts.as_ref();
-    PluralRulesPayload {
-        locale: coerce_locale(Some(locale), gc_heap),
-        kind: read_string_option(opts_ref, "type", "cardinal", gc_heap),
-        minimum_integer_digits: read_u8_option(opts_ref, "minimumIntegerDigits", 1, 1, 21, gc_heap),
-        minimum_fraction_digits: read_u8_option(
-            opts_ref,
-            "minimumFractionDigits",
-            0,
-            0,
-            20,
-            gc_heap,
-        ),
-        maximum_fraction_digits: read_u8_option(
-            opts_ref,
-            "maximumFractionDigits",
-            3,
-            0,
-            20,
-            gc_heap,
-        ),
-    }
+const CLASS: &str = "PluralRules";
+
+/// §16.1.1 InitializePluralRules — fires `localeMatcher` / `type` and the
+/// digit-option getters in spec order with coercion + RangeError
+/// validation; canonicalizes the locale.
+pub fn resolve_ctx(
+    ctx: &mut NativeCtx<'_>,
+    locales: Value,
+    options: Value,
+) -> Result<PluralRulesPayload, NativeError> {
+    let requested = crate::intl::supported::canonicalize_locale_list(ctx, locales)?;
+    let locale = requested
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| DEFAULT_LOCALE.to_string());
+    let options = require_options_object(options, CLASS)?;
+    let _matcher = get_string_option(
+        ctx,
+        options,
+        "localeMatcher",
+        CLASS,
+        &["lookup", "best fit"],
+        None,
+    )?;
+    let kind = get_string_option(
+        ctx,
+        options,
+        "type",
+        CLASS,
+        &["cardinal", "ordinal"],
+        Some("cardinal"),
+    )?
+    .unwrap_or_else(|| "cardinal".to_string());
+    let minimum_integer_digits = get_number_option(
+        ctx,
+        options,
+        "minimumIntegerDigits",
+        CLASS,
+        1.0,
+        21.0,
+        Some(1.0),
+    )?
+    .unwrap_or(1.0) as u8;
+    let minimum_fraction_digits = get_number_option(
+        ctx,
+        options,
+        "minimumFractionDigits",
+        CLASS,
+        0.0,
+        20.0,
+        Some(0.0),
+    )?
+    .unwrap_or(0.0) as u8;
+    let default_max = minimum_fraction_digits.max(3);
+    let maximum_fraction_digits = get_number_option(
+        ctx,
+        options,
+        "maximumFractionDigits",
+        CLASS,
+        minimum_fraction_digits as f64,
+        20.0,
+        Some(default_max as f64),
+    )?
+    .unwrap_or(default_max as f64) as u8;
+    Ok(PluralRulesPayload {
+        locale,
+        kind,
+        minimum_integer_digits,
+        minimum_fraction_digits,
+        maximum_fraction_digits,
+    })
 }
 
 fn require_payload(

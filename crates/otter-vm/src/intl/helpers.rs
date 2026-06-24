@@ -218,6 +218,33 @@ pub fn get_bool_option(
     Ok(Some(v.to_boolean(ctx.heap())))
 }
 
+/// Read + validate the `numberingSystem` option: a well-formed Unicode
+/// `type` nonterminal (one or more `[3..=8]`-length alphanumeric
+/// segments joined by `-`). Returns `None` when absent; a malformed
+/// value is a `RangeError`.
+pub fn get_numbering_system_option(
+    ctx: &mut NativeCtx<'_>,
+    options: Value,
+    class: &'static str,
+) -> Result<Option<String>, NativeError> {
+    let v = option_get(ctx, options, "numberingSystem", class)?;
+    if v.is_undefined() {
+        return Ok(None);
+    }
+    let s = option_to_string(ctx, v, class)?;
+    let well_formed = !s.is_empty()
+        && s.split('-').all(|seg| {
+            (3..=8).contains(&seg.len()) && seg.bytes().all(|b| b.is_ascii_alphanumeric())
+        });
+    if !well_formed {
+        return Err(NativeError::RangeError {
+            name: class,
+            reason: format!("invalid numberingSystem '{s}'"),
+        });
+    }
+    Ok(Some(s))
+}
+
 /// `GetNumberOption(options, name, min, max, default)` — fires the
 /// getter, `ToNumber`-coerces, and `RangeError`s outside `[min, max]`
 /// or on `NaN`.

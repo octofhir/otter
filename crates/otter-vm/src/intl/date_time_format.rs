@@ -320,7 +320,10 @@ fn bound_format_call(
         name: "format",
         reason: "format function lost its bound Intl.DateTimeFormat".to_string(),
     };
-    let intl = captures.first().and_then(|v| v.as_intl(ctx.heap())).ok_or_else(bad)?;
+    let intl = captures
+        .first()
+        .and_then(|v| v.as_intl(ctx.heap()))
+        .ok_or_else(bad)?;
     let payload = match intl.payload_clone(ctx.heap()) {
         IntlPayload::DateTimeFormat(d) => d,
         _ => return Err(bad()),
@@ -484,7 +487,10 @@ pub(crate) fn date_time_format_format_range(
     } else {
         format!("{start_str}{RANGE_SEPARATOR}{end_str}")
     };
-    Ok(Value::string(JsString::from_str(&combined, ctx.heap_mut())?))
+    Ok(Value::string(JsString::from_str(
+        &combined,
+        ctx.heap_mut(),
+    )?))
 }
 
 /// §12.4.5 `Intl.DateTimeFormat.prototype.formatRangeToParts(startDate, endDate)`.
@@ -500,10 +506,20 @@ pub(crate) fn date_time_format_format_range_to_parts(
 ) -> Result<Value, NativeError> {
     let payload = require_date_time(ctx, "formatRangeToParts")?;
     let (s, e) = range_civil(ctx, args, "formatRangeToParts")?;
-    let start_parts = icu_format_segments(s.0, s.1, s.2, s.3, s.4, s.5, &payload)
-        .unwrap_or_else(|| vec![("literal", format_components(s.0, s.1, s.2, s.3, s.4, s.5, &payload))]);
-    let end_parts = icu_format_segments(e.0, e.1, e.2, e.3, e.4, e.5, &payload)
-        .unwrap_or_else(|| vec![("literal", format_components(e.0, e.1, e.2, e.3, e.4, e.5, &payload))]);
+    let start_parts =
+        icu_format_segments(s.0, s.1, s.2, s.3, s.4, s.5, &payload).unwrap_or_else(|| {
+            vec![(
+                "literal",
+                format_components(s.0, s.1, s.2, s.3, s.4, s.5, &payload),
+            )]
+        });
+    let end_parts =
+        icu_format_segments(e.0, e.1, e.2, e.3, e.4, e.5, &payload).unwrap_or_else(|| {
+            vec![(
+                "literal",
+                format_components(e.0, e.1, e.2, e.3, e.4, e.5, &payload),
+            )]
+        });
 
     let start_str: String = start_parts.iter().map(|(_, v)| v.as_str()).collect();
     let end_str: String = end_parts.iter().map(|(_, v)| v.as_str()).collect();

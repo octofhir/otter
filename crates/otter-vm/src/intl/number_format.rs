@@ -41,12 +41,51 @@ fn range_err(message: String) -> IntlError {
 /// The sanctioned simple unit identifiers (ECMA-402 Table:
 /// Single-unit identifiers sanctioned for use in ECMA-402).
 const SANCTIONED_UNITS: &[&str] = &[
-    "acre", "bit", "byte", "celsius", "centimeter", "day", "degree", "fahrenheit",
-    "fluid-ounce", "foot", "gallon", "gigabit", "gigabyte", "gram", "hectare", "hour", "inch",
-    "kilobit", "kilobyte", "kilogram", "kilometer", "liter", "megabit", "megabyte", "meter",
-    "microsecond", "mile", "mile-scandinavian", "milliliter", "millimeter", "millisecond",
-    "minute", "month", "nanosecond", "ounce", "percent", "petabyte", "pound", "second", "stone",
-    "terabit", "terabyte", "week", "yard", "year",
+    "acre",
+    "bit",
+    "byte",
+    "celsius",
+    "centimeter",
+    "day",
+    "degree",
+    "fahrenheit",
+    "fluid-ounce",
+    "foot",
+    "gallon",
+    "gigabit",
+    "gigabyte",
+    "gram",
+    "hectare",
+    "hour",
+    "inch",
+    "kilobit",
+    "kilobyte",
+    "kilogram",
+    "kilometer",
+    "liter",
+    "megabit",
+    "megabyte",
+    "meter",
+    "microsecond",
+    "mile",
+    "mile-scandinavian",
+    "milliliter",
+    "millimeter",
+    "millisecond",
+    "minute",
+    "month",
+    "nanosecond",
+    "ounce",
+    "percent",
+    "petabyte",
+    "pound",
+    "second",
+    "stone",
+    "terabit",
+    "terabyte",
+    "week",
+    "yard",
+    "year",
 ];
 
 /// §IsWellFormedUnitIdentifier — a sanctioned simple unit, or
@@ -56,9 +95,7 @@ fn is_well_formed_unit(unit: &str) -> bool {
         return true;
     }
     match unit.split_once("-per-") {
-        Some((num, den)) => {
-            SANCTIONED_UNITS.contains(&num) && SANCTIONED_UNITS.contains(&den)
-        }
+        Some((num, den)) => SANCTIONED_UNITS.contains(&num) && SANCTIONED_UNITS.contains(&den),
         None => false,
     }
 }
@@ -86,12 +123,8 @@ pub fn resolve(
                     // §IsWellFormedCurrencyCode: exactly three ASCII
                     // letters (validated before case-folding so `ß` etc.
                     // don't slip through ToUpperCase expansion).
-                    if raw.chars().count() != 3
-                        || !raw.chars().all(|c| c.is_ascii_alphabetic())
-                    {
-                        return Err(range_err(format!(
-                            "invalid currency code '{raw}'"
-                        )));
+                    if raw.chars().count() != 3 || !raw.chars().all(|c| c.is_ascii_alphabetic()) {
+                        return Err(range_err(format!("invalid currency code '{raw}'")));
                     }
                     Some(raw.to_uppercase())
                 }
@@ -280,7 +313,10 @@ fn bound_format_call(
         name: "format",
         reason: "format function lost its bound Intl.NumberFormat".to_string(),
     };
-    let intl = captures.first().and_then(|v| v.as_intl(ctx.heap())).ok_or_else(bad)?;
+    let intl = captures
+        .first()
+        .and_then(|v| v.as_intl(ctx.heap()))
+        .ok_or_else(bad)?;
     let payload = match intl.payload_clone(ctx.heap()) {
         IntlPayload::NumberFormat(n) => n,
         _ => return Err(bad()),
@@ -381,7 +417,10 @@ pub(crate) fn number_format_format_range(
     } else {
         format!("{start}{RANGE_SEPARATOR}{end}")
     };
-    Ok(Value::string(JsString::from_str(&combined, ctx.heap_mut())?))
+    Ok(Value::string(JsString::from_str(
+        &combined,
+        ctx.heap_mut(),
+    )?))
 }
 
 /// §1.1.22 `Intl.NumberFormat.prototype.formatRangeToParts(start, end)`.
@@ -445,7 +484,10 @@ pub(crate) fn partition_number(
 ) -> Vec<(&'static str, String)> {
     let mut parts: Vec<(&'static str, String)> = Vec::new();
     if n.is_nan() {
-        push_sign(&mut parts, displayed_sign(&payload.sign_display, false, false, true));
+        push_sign(
+            &mut parts,
+            displayed_sign(&payload.sign_display, false, false, true),
+        );
         parts.push(("nan", "NaN".to_string()));
         return parts;
     }
@@ -461,8 +503,7 @@ pub(crate) fn partition_number(
     if payload.style == "currency" && n.is_finite() {
         // `accounting` wraps negatives in parenthesis literals instead of
         // a minus-sign part.
-        let accounting_negative =
-            sign == SignKind::Minus && payload.currency_sign == "accounting";
+        let accounting_negative = sign == SignKind::Minus && payload.currency_sign == "accounting";
         let full = currency_string(n.abs(), payload);
         let core = format_decimal(n.abs(), payload);
         if let Some(idx) = full.find(&core) {

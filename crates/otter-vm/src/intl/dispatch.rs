@@ -18,9 +18,6 @@ use crate::intl::date_time_format;
 use crate::intl::display_names;
 use crate::intl::number_format;
 use crate::intl::payload::{IntlKind, IntlPayload, JsIntl};
-use crate::intl::plural_rules;
-use crate::intl::relative_time_format;
-use crate::intl::segmenter;
 
 /// Failure modes for `Intl.*` construction / method calls.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -102,11 +99,13 @@ pub fn construct(
         IntlKind::DateTimeFormat => {
             IntlPayload::DateTimeFormat(date_time_format::resolve(locale, options, gc_heap)?)
         }
+        // Constructed through its own `NativeCtx` option ladder.
         IntlKind::PluralRules => {
-            IntlPayload::PluralRules(plural_rules::resolve(locale, options, gc_heap))
+            return Err(IntlError::UnknownClass("PluralRules".to_string()));
         }
+        // Constructed through its own `NativeCtx` option ladder.
         IntlKind::RelativeTimeFormat => {
-            IntlPayload::RelativeTimeFormat(relative_time_format::resolve(locale, options, gc_heap))
+            return Err(IntlError::UnknownClass("RelativeTimeFormat".to_string()));
         }
         // `Intl.ListFormat` is constructed through its own `NativeCtx`
         // option ladder (firing getters in spec order) and never reaches
@@ -115,7 +114,8 @@ pub fn construct(
         IntlKind::DisplayNames => {
             IntlPayload::DisplayNames(display_names::resolve(locale, options, gc_heap))
         }
-        IntlKind::Segmenter => IntlPayload::Segmenter(segmenter::resolve(locale, options, gc_heap)),
+        // Constructed through its own `NativeCtx` option ladder.
+        IntlKind::Segmenter => return Err(IntlError::UnknownClass("Segmenter".to_string())),
         // `Intl.Locale` / `Intl.DurationFormat` are constructed through
         // their own `NativeCtx` path (they must fire option getters in
         // spec order) and never reach this heap-only dispatcher.

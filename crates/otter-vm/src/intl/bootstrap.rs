@@ -122,6 +122,18 @@ fn intl_construct(
             crate::intl::list_format::resolve_ctx(ctx, locale, options)
                 .map(crate::intl::payload::IntlPayload::ListFormat),
         ),
+        IntlKind::RelativeTimeFormat => Some(
+            crate::intl::relative_time_format::resolve_ctx(ctx, locale, options)
+                .map(crate::intl::payload::IntlPayload::RelativeTimeFormat),
+        ),
+        IntlKind::Segmenter => Some(
+            crate::intl::segmenter::resolve_ctx(ctx, locale, options)
+                .map(crate::intl::payload::IntlPayload::Segmenter),
+        ),
+        IntlKind::PluralRules => Some(
+            crate::intl::plural_rules::resolve_ctx(ctx, locale, options)
+                .map(crate::intl::payload::IntlPayload::PluralRules),
+        ),
         _ => None,
     };
     if let Some(result) = ctx_payload {

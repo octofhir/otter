@@ -231,6 +231,8 @@ pub struct RelativeTimeFormatPayload {
     pub style: String,
     /// `numeric` option (`"always"` / `"auto"`).
     pub numeric: String,
+    /// Resolved `numberingSystem`.
+    pub numbering_system: String,
 }
 
 /// Resolved option bag for `Intl.ListFormat`.

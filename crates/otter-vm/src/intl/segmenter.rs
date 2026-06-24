@@ -11,19 +11,48 @@
 
 use otter_gc::raw::RawGc;
 
-use crate::intl::helpers::{coerce_locale, options_object, read_string_option};
+use crate::intl::helpers::{DEFAULT_LOCALE, get_string_option, require_options_object};
 use crate::intl::payload::{IntlPayload, SegmenterPayload};
 use crate::string::JsString;
 use crate::{NativeCtx, NativeError, Value};
 
-/// Resolve constructor options for this Intl class.
-pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> SegmenterPayload {
-    let opts = options_object(Some(options));
-    let opts_ref = opts.as_ref();
-    SegmenterPayload {
-        locale: coerce_locale(Some(locale), gc_heap),
-        granularity: read_string_option(opts_ref, "granularity", "grapheme", gc_heap),
-    }
+const CLASS: &str = "Segmenter";
+
+/// §19.1.1 InitializeSegmenter — fires `localeMatcher` / `granularity`
+/// getters in spec order with ToString coercion + RangeError validation;
+/// canonicalizes the locale.
+pub fn resolve_ctx(
+    ctx: &mut NativeCtx<'_>,
+    locales: Value,
+    options: Value,
+) -> Result<SegmenterPayload, NativeError> {
+    let requested = crate::intl::supported::canonicalize_locale_list(ctx, locales)?;
+    let locale = requested
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| DEFAULT_LOCALE.to_string());
+    let options = require_options_object(options, CLASS)?;
+    let _matcher = get_string_option(
+        ctx,
+        options,
+        "localeMatcher",
+        CLASS,
+        &["lookup", "best fit"],
+        None,
+    )?;
+    let granularity = get_string_option(
+        ctx,
+        options,
+        "granularity",
+        CLASS,
+        &["grapheme", "word", "sentence"],
+        Some("grapheme"),
+    )?
+    .unwrap_or_else(|| "grapheme".to_string());
+    Ok(SegmenterPayload {
+        locale,
+        granularity,
+    })
 }
 
 fn require_payload(

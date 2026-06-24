@@ -23,6 +23,7 @@
 //! - <https://tc39.es/ecma262/#sec-array-exotic-objects>
 //! - [GC API](../../../docs/book/src/engine/gc-api.md)
 
+use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap};
 use std::mem;
 use std::sync::Arc;
@@ -81,8 +82,11 @@ pub(crate) struct ArrayExoticSlots {
     /// semantics in ECMA-262, but storing huge holes densely would
     /// violate the task-84 survivability gate.
     sparse_elements: Option<HashMap<usize, Value>>,
-    /// Optional non-index string-keyed own properties.
-    named_properties: Option<HashMap<String, Value>>,
+    /// Optional non-index string-keyed own properties. Insertion-ordered
+    /// (`IndexMap`) so `[[OwnPropertyKeys]]` enumerates them in
+    /// chronological creation order per §10.1.11 — e.g. a RegExp match
+    /// result reports `index`, `input`, `groups` in that fixed order.
+    named_properties: Option<IndexMap<String, Value>>,
     /// Accessor descriptors installed via
     /// `Object.defineProperty` on the array. Keyed by string key
     /// (covers both indexed and named keys). `(getter, setter)` —
@@ -90,7 +94,7 @@ pub(crate) struct ArrayExoticSlots {
     /// sparse element value for that slot; named accessors override
     /// the `named_properties` data entry. Spec: §10.4.2.1
     /// ArrayExoticObject [[DefineOwnProperty]].
-    accessors: Option<HashMap<String, (Option<Value>, Option<Value>)>>,
+    accessors: Option<IndexMap<String, (Option<Value>, Option<Value>)>>,
     /// Descriptor flags for properties installed through
     /// `Object.defineProperty`. Missing entries use the ordinary
     /// array defaults for data properties.
@@ -240,12 +244,12 @@ impl ArrayBody {
     }
 
     #[inline]
-    fn named_properties(&self) -> Option<&HashMap<String, Value>> {
+    fn named_properties(&self) -> Option<&IndexMap<String, Value>> {
         self.exotic().and_then(|e| e.named_properties.as_ref())
     }
 
     #[inline]
-    fn accessors(&self) -> Option<&HashMap<String, (Option<Value>, Option<Value>)>> {
+    fn accessors(&self) -> Option<&IndexMap<String, (Option<Value>, Option<Value>)>> {
         self.exotic().and_then(|e| e.accessors.as_ref())
     }
 
@@ -1006,7 +1010,7 @@ fn delete_array_body_index(body: &mut ArrayBody, idx: usize) {
     if let Some(exotic) = body.exotic.as_deref_mut()
         && let Some(accessors) = exotic.accessors.as_mut()
     {
-        accessors.remove(&key);
+        accessors.shift_remove(&key);
         if accessors.is_empty() {
             exotic.accessors = None;
         }
@@ -1383,7 +1387,7 @@ pub fn set_named_property(
         let map = body
             .exotic_mut()
             .named_properties
-            .get_or_insert_with(HashMap::new);
+            .get_or_insert_with(IndexMap::new);
         map.insert(key.to_string(), value);
         body.mark_dirty();
     });
@@ -1408,7 +1412,7 @@ pub(crate) fn define_named_data_property(
         let map = body
             .exotic_mut()
             .named_properties
-            .get_or_insert_with(HashMap::new);
+            .get_or_insert_with(IndexMap::new);
         map.insert(key.to_string(), value);
         body.mark_dirty();
     });
@@ -1500,7 +1504,10 @@ pub fn set_accessor(
     setter: Option<Value>,
 ) {
     heap.with_payload(arr, |body| {
-        let map = body.exotic_mut().accessors.get_or_insert_with(HashMap::new);
+        let map = body
+            .exotic_mut()
+            .accessors
+            .get_or_insert_with(IndexMap::new);
         map.insert(key.to_string(), (getter, setter));
         // Hide the underlying dense / sparse / named data slot so
         // subsequent ordinary reads see the accessor instead of the
@@ -1519,7 +1526,7 @@ pub fn set_accessor(
         if let Some(exotic) = body.exotic.as_deref_mut()
             && let Some(named) = exotic.named_properties.as_mut()
         {
-            named.remove(key);
+            named.shift_remove(key);
         }
         body.mark_dirty();
     });
@@ -1561,7 +1568,7 @@ pub fn delete_accessor(arr: JsArray, heap: &mut otter_gc::GcHeap, key: &str) -> 
             .exotic
             .as_deref_mut()
             .and_then(|exotic| exotic.accessors.as_mut())
-            .is_some_and(|m| m.remove(key).is_some());
+            .is_some_and(|m| m.shift_remove(key).is_some());
         if removed {
             body.mark_dirty();
         }
@@ -1584,7 +1591,7 @@ pub fn delete_named_property(arr: JsArray, heap: &mut otter_gc::GcHeap, key: &st
             if let Some(exotic) = body.exotic.as_deref_mut()
                 && let Some(accessors) = exotic.accessors.as_mut()
             {
-                accessors.remove(key);
+                accessors.shift_remove(key);
                 if accessors.is_empty() {
                     exotic.accessors = None;
                 }
@@ -1613,7 +1620,7 @@ pub fn delete_named_property(arr: JsArray, heap: &mut otter_gc::GcHeap, key: &st
         if let Some(exotic) = body.exotic.as_deref_mut()
             && let Some(accessors) = exotic.accessors.as_mut()
         {
-            accessors.remove(key);
+            accessors.shift_remove(key);
             if accessors.is_empty() {
                 exotic.accessors = None;
             }
@@ -1621,7 +1628,7 @@ pub fn delete_named_property(arr: JsArray, heap: &mut otter_gc::GcHeap, key: &st
         if let Some(exotic) = body.exotic.as_deref_mut()
             && let Some(props) = exotic.named_properties.as_mut()
         {
-            props.remove(key);
+            props.shift_remove(key);
             if props.is_empty() {
                 exotic.named_properties = None;
             }

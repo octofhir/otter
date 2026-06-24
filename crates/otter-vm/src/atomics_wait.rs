@@ -29,7 +29,7 @@
 //! - <https://tc39.es/ecma262/#sec-atomics.notify>
 //! - <https://tc39.es/ecma262/#sec-atomics.waitasync>
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -54,6 +54,8 @@ struct ParkState {
 type Registry = HashMap<(u64, usize), Vec<Arc<ParkSlot>>>;
 
 static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static ASYNC_REGISTRY: LazyLock<Mutex<HashMap<(u64, usize), VecDeque<()>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Outcome of [`park_until_notified`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +177,37 @@ pub fn notify_waiters(buf_id: u64, idx: usize, count: usize) -> usize {
     woken
 }
 
+/// Register a non-blocking `Atomics.waitAsync` waiter. The current foundation
+/// tracks wake counts here so `Atomics.notify` observes async waiters in the
+/// same waiter list as blocking waiters.
+pub fn register_async_waiter(buf_id: u64, idx: usize) {
+    let mut reg = ASYNC_REGISTRY
+        .lock()
+        .expect("Atomics async wait registry poisoned");
+    reg.entry((buf_id, idx)).or_default().push_back(());
+}
+
+/// Wake async waiters registered through [`register_async_waiter`].
+pub fn notify_async_waiters(buf_id: u64, idx: usize, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let mut reg = ASYNC_REGISTRY
+        .lock()
+        .expect("Atomics async wait registry poisoned");
+    let Some(waiters) = reg.get_mut(&(buf_id, idx)) else {
+        return 0;
+    };
+    let n = count.min(waiters.len());
+    for _ in 0..n {
+        waiters.pop_front();
+    }
+    if waiters.is_empty() {
+        reg.remove(&(buf_id, idx));
+    }
+    n
+}
+
 /// Cancel every currently blocked waiter and wake its owning host
 /// thread. This is a host lifecycle hook, not an ECMAScript
 /// operation: Test262 uses it when a per-test watchdog fires or when
@@ -184,6 +217,10 @@ pub fn cancel_all_waiters() -> usize {
         let mut reg = REGISTRY.lock().expect("Atomics wait registry poisoned");
         reg.drain().flat_map(|(_, slots)| slots).collect()
     };
+    ASYNC_REGISTRY
+        .lock()
+        .expect("Atomics async wait registry poisoned")
+        .clear();
     let cancelled = drained.len();
     for slot in drained {
         let mut state = slot.state.lock().expect("Atomics wait slot poisoned");

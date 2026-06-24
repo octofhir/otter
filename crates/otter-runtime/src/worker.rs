@@ -98,6 +98,8 @@ enum WorkerEvent {
     Closed,
 }
 
+const WORKER_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 struct WorkerRecord {
     id: WorkerId,
     tx: mpsc::Sender<WorkerCommand>,
@@ -784,7 +786,7 @@ fn run_js_worker(
     };
     runtime.set_allow_blocking_atomics_wait(true);
     let interrupt = runtime.interrupt_handle();
-    let _ = interrupt_tx.send(interrupt);
+    let _ = interrupt_tx.send(interrupt.clone());
     let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     if let Err(err) = install_worker_scope_natives(&mut runtime, tx.clone(), closed.clone()) {
         let _ = tx.send(WorkerEvent::Error(err.to_string()));
@@ -799,7 +801,7 @@ fn run_js_worker(
         }
     };
     while !closed.load(std::sync::atomic::Ordering::SeqCst) {
-        match rx.recv() {
+        match rx.recv_timeout(WORKER_COMMAND_POLL_INTERVAL) {
             Ok(WorkerCommand::Message(payload)) => {
                 if let Err(err) = runtime.dispatch_worker_message_event(&context, |ctx| {
                     materialize_worker_payload(ctx, &payload)
@@ -814,7 +816,10 @@ fn run_js_worker(
                     }
                 }
             }
-            Ok(WorkerCommand::Shutdown) | Err(_) => break,
+            Ok(WorkerCommand::Shutdown) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) if interrupt.is_interrupted() => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     let _ = tx.send(WorkerEvent::Closed);

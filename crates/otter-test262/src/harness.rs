@@ -128,6 +128,22 @@ var $262 = (function () {
         }
     };
 })();
+// Test262's `atomicsHelper.js` aliases `$262.agent.setTimeout` to the
+// host global. Otter's product timer global requires a runtime timer
+// scheduler, so the conformance harness installs a deterministic host
+// timer surface backed by the `$262.agent.sleep` primitive.
+globalThis.setTimeout = function setTimeout(callback, delay) {
+    var ms = Number(delay) || 0;
+    // Keep this as a scheduling yield, not a wall-clock timer. The
+    // Test262 agent helpers use setTimeout(..., 1000) as a polling
+    // backoff for reports; sleeping the full delay serializes the
+    // conformance runner without adding semantic coverage.
+    if (ms > 1) { ms = 1; }
+    $262.agent.sleep(ms);
+    Promise.resolve().then(function () { callback(); });
+    return 0;
+};
+globalThis.clearTimeout = function clearTimeout() {};
 // `print` host function (INTERPRETING.md). Async completion is detected
 // via the `$DONE` polyfill stub (appended after every include, so it wins
 // over `doneprintHandle.js`), so `print` only needs to exist as a callable

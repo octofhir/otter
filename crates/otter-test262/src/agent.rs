@@ -103,6 +103,7 @@ static PENDING_WORKER_INBOXES: LazyLock<Mutex<VecDeque<mpsc::Receiver<BroadcastM
     LazyLock::new(|| Mutex::new(VecDeque::new()));
 static AGENT_TEMP_FILES: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static NEXT_AGENT_FILE_ID: AtomicU64 = AtomicU64::new(1);
+const RECEIVE_BROADCAST_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Monotonic clock anchor — `monotonicNow()` returns
 /// milliseconds since the first call inside the process.
@@ -425,7 +426,23 @@ fn agent_receive_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     let Some(rx) = rx else {
         return Err(type_err("receiveBroadcast called outside an agent thread"));
     };
-    let result = rx.recv();
+    let interrupt = ctx.interp_mut().interrupt_handle();
+    let result = loop {
+        if interrupt.is_set() {
+            break Err(mpsc::RecvTimeoutError::Timeout);
+        }
+        match rx.recv_timeout(RECEIVE_BROADCAST_POLL_INTERVAL) {
+            Ok(msg) => break Ok(msg),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(mpsc::RecvTimeoutError::Disconnected);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if interrupt.is_set() {
+                    break Err(mpsc::RecvTimeoutError::Timeout);
+                }
+            }
+        }
+    };
     // Always put the receiver back. If it's closed, the next
     // recv() returns `Disconnected` and the caller handles it.
     AGENT_INBOXES
@@ -434,6 +451,9 @@ fn agent_receive_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
         .insert(thread_id, rx);
     let msg = match result {
         Ok(m) => m,
+        Err(mpsc::RecvTimeoutError::Timeout) if interrupt.is_set() => {
+            return Err(NativeError::Interrupted);
+        }
         Err(_) => {
             // Senders all dropped before any broadcast arrived.
             return Ok(Value::undefined());

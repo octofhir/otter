@@ -435,6 +435,24 @@ extern "C" fn jit_make_fn_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
     }
 }
 
+/// Poll the VM interrupt flag on compiled back-edges. Mirrors the
+/// interpreter's `apply_branch` interrupt check so watchdogs can cancel hot
+/// loops that have tiered up through OSR.
+extern "C" fn jit_interrupt_backedge_stub(ctx: *mut JitCtx) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    if ctx.vm.is_null() {
+        return 0;
+    }
+    let vm = unsafe { &mut *ctx.vm };
+    if vm.interrupt_handle().is_set() {
+        park_jit_error(ctx, VmError::Interrupted);
+        1
+    } else {
+        0
+    }
+}
+
 /// WhiskerIC self-patching cell for one named-property site (one per
 /// `LoadProperty` / `StoreProperty` op in the compiled function). Emitted code
 /// reads `shape` (offset 0); `0` means "empty — always miss to the stub". On a
@@ -954,10 +972,11 @@ mod arm64 {
         Unsupported, VM_OFFSET, WhiskerIcCell, jit_abort_direct_call_stub, jit_call_method_stub,
         jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
         jit_finish_direct_call_returned_stub, jit_inline_closure_upvalues_stub,
-        jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub, jit_load_upvalue_stub,
-        jit_make_fn_stub, jit_new_array_stub, jit_new_object_stub, jit_prepare_direct_call_stub,
-        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub, jit_store_element_stub,
-        jit_store_prop_stub, jit_store_upvalue_stub, jit_write_barrier_stub, reg_offset,
+        jit_interrupt_backedge_stub, jit_load_element_stub, jit_load_global_stub,
+        jit_load_prop_stub, jit_load_upvalue_stub, jit_make_fn_stub, jit_new_array_stub,
+        jit_new_object_stub, jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub,
+        jit_self_call_bail_stub, jit_store_element_stub, jit_store_prop_stub,
+        jit_store_upvalue_stub, jit_write_barrier_stub, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -1739,13 +1758,18 @@ mod arm64 {
                 }
                 Op::Jump => {
                     let rel = imm32(ops_ref, 0)?;
-                    let tgt = target_label(branch_target(instr, rel))?;
+                    let target = branch_target(instr, rel);
+                    let tgt = target_label(target)?;
+                    if target <= i64::from(instr.byte_pc) {
+                        emit_backedge_interrupt_check(&mut ops, threw);
+                    }
                     dynasm!(ops ; .arch aarch64 ; b =>tgt);
                 }
                 Op::JumpIfFalse | Op::JumpIfTrue => {
                     let rel = imm32(ops_ref, 0)?;
                     let cond = reg(ops_ref, 1)?;
-                    let tgt = target_label(branch_target(instr, rel))?;
+                    let target = branch_target(instr, rel);
+                    let tgt = target_label(target)?;
                     load_reg(&mut ops, 9, cond)?;
                     // Only boolean conditions are supported in this subset.
                     dynasm!(ops
@@ -1756,7 +1780,18 @@ mod arm64 {
                         ; b.ne =>bail
                         ; cmp w9, SPECIAL_TRUE
                     );
-                    if matches!(instr.op, Op::JumpIfFalse) {
+                    if target <= i64::from(instr.byte_pc) {
+                        let taken = ops.new_dynamic_label();
+                        let fallthrough = ops.new_dynamic_label();
+                        if matches!(instr.op, Op::JumpIfFalse) {
+                            dynasm!(ops ; .arch aarch64 ; b.ne =>taken);
+                        } else {
+                            dynasm!(ops ; .arch aarch64 ; b.eq =>taken);
+                        }
+                        dynasm!(ops ; .arch aarch64 ; b =>fallthrough ; =>taken);
+                        emit_backedge_interrupt_check(&mut ops, threw);
+                        dynasm!(ops ; .arch aarch64 ; b =>tgt ; =>fallthrough);
+                    } else if matches!(instr.op, Op::JumpIfFalse) {
                         dynasm!(ops ; .arch aarch64 ; b.ne =>tgt);
                     } else {
                         dynasm!(ops ; .arch aarch64 ; b.eq =>tgt);
@@ -2481,6 +2516,15 @@ mod arm64 {
             ; .arch aarch64
             ; blr x16
             ; cbnz x0, =>threw
+        );
+    }
+
+    fn emit_backedge_interrupt_check(ops: &mut Assembler, threw: DynamicLabel) {
+        dynasm!(ops ; .arch aarch64 ; mov x0, x20);
+        emit_call_stub(
+            ops,
+            jit_interrupt_backedge_stub as *const () as usize,
+            threw,
         );
     }
 

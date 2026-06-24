@@ -266,6 +266,17 @@ pub enum Op {
     /// callee must be a function value at this slice. The callee
     /// receives `this = undefined` (foundation default).
     Call,
+    /// Proper-tail call (§15.10.3). Same operand layout as
+    /// [`Op::Call`] (`dst, callee, argc, args...`) and the same
+    /// `this = undefined` default. Emitted by the compiler only for a
+    /// call in a strict-mode tail position that is not enclosed by a
+    /// `try`/`finally`. The dispatcher **replaces** the current frame
+    /// with the callee's frame instead of pushing a new one, so a
+    /// self-recursive tail call runs in O(1) native stack. When the
+    /// caller frame can't be discarded safely (constructor, async, or
+    /// an active handler), the dispatcher falls back to ordinary
+    /// [`Op::Call`] semantics using `dst`.
+    TailCall,
     /// Variadic call with an explicit receiver. Operands:
     /// `dst, callee, this, argc, args...`. Used by
     /// `Function.prototype.call` / `apply` lowering.
@@ -1345,6 +1356,7 @@ impl Op {
             Op::StoreUpvalueChecked => "STORE_UPVALUE_CHECKED",
             Op::FreshUpvalue => "FRESH_UPVALUE",
             Op::Call => "CALL",
+            Op::TailCall => "TAIL_CALL",
             Op::ReturnValue => "RETURN_VALUE",
             Op::ReturnUndefined => "RETURN_UNDEFINED",
             Op::NewObject => "NEW_OBJECT",
@@ -1596,7 +1608,7 @@ impl Op {
             Op::QueueMicrotask => 2,  // callee, argc — args follow
             Op::PromiseNew => 3,      // dst, executor_reg, scratch_dst
             Op::PromiseCall => 3,     // dst, name_const, argc — args follow
-            Op::Call | Op::New => 3,  // dst, callee, argc — args follow
+            Op::Call | Op::TailCall | Op::New => 3, // dst, callee, argc — args follow
             Op::MakeClass => 5,       // dst, ctor, prototype, statics, parent
             // dst, callee, this, argc — args follow.
             Op::CallWithThis | Op::BindFunction => 4,

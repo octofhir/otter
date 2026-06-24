@@ -140,6 +140,7 @@ pub(crate) fn compile_template_literal(
 pub(crate) fn compile_tagged_template(
     cx: &mut Compiler,
     t: &oxc_ast::ast::TaggedTemplateExpression<'_>,
+    tail: bool,
 ) -> Result<u16, CompileError> {
     let span = (t.span.start, t.span.end);
 
@@ -273,7 +274,15 @@ pub(crate) fn compile_tagged_template(
         call_operands.push(Operand::Register(tag_reg));
         call_operands.push(Operand::ConstIndex(arg_regs.len() as u32));
         call_operands.extend(arg_regs.into_iter().map(Operand::Register));
-        cx.emit(Op::Call, call_operands, span);
+        // A free-tag tagged template in tail position (`return f\`…\``)
+        // lowers to the proper-tail-call opcode; the caller emits the
+        // `Op::ReturnValue` fallback that runs if the VM can't discard
+        // the current frame.
+        cx.emit(
+            if tail { Op::TailCall } else { Op::Call },
+            call_operands,
+            span,
+        );
     }
     Ok(dst)
 }

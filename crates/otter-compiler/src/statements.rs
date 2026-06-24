@@ -14,6 +14,93 @@
 
 use crate::*;
 
+/// §15.10.3 — emit a complete return for `expr` evaluated in tail
+/// position, lowering an eligible call to [`Op::TailCall`] and
+/// propagating the tail position through `?:`, `&&`, `||`, `??`, the
+/// comma operator, and parentheses. Always ends every control path in a
+/// return opcode, so the caller emits nothing further.
+///
+/// Each emitted tail call is followed by an `Op::ReturnValue` reading
+/// the call's dst: in the optimised path the dispatcher discards the
+/// current frame and never reaches it, but if the runtime must fall
+/// back to an ordinary call (constructor / async / a live `finally`
+/// handler) that `ReturnValue` performs the normal return — including
+/// any `finally` — so the lowering is always correct.
+pub(crate) fn compile_tail_return(
+    cx: &mut Compiler,
+    expr: &oxc_ast::ast::Expression<'_>,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    use oxc_ast::ast::Expression;
+    match expr {
+        Expression::ParenthesizedExpression(p) => compile_tail_return(cx, &p.expression, span),
+        Expression::SequenceExpression(seq) => {
+            let n = seq.expressions.len();
+            for e in &seq.expressions[..n.saturating_sub(1)] {
+                let _ = compile_expr(cx, e, span)?;
+            }
+            match seq.expressions.last() {
+                Some(last) => compile_tail_return(cx, last, span),
+                None => {
+                    cx.emit(Op::ReturnUndefined, [], span);
+                    Ok(())
+                }
+            }
+        }
+        Expression::ConditionalExpression(c) => {
+            let test = compile_expr(cx, &c.test, span)?;
+            let to_else = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(test), span);
+            // The consequent path always ends in a return, so control
+            // never falls through into the alternate.
+            compile_tail_return(cx, &c.consequent, span)?;
+            cx.patch_branch_to_here(to_else);
+            compile_tail_return(cx, &c.alternate, span)
+        }
+        Expression::LogicalExpression(l) => {
+            let left = compile_expr(cx, &l.left, span)?;
+            // Branch to the right operand (itself in tail position) when
+            // the operator does not short-circuit on `left`; the
+            // fall-through path returns `left` directly.
+            //   a && b → take b when left is truthy
+            //   a || b → take b when left is falsy
+            //   a ?? b → take b when left is nullish
+            let to_right_op = match l.operator {
+                LogicalOperator::And => Op::JumpIfTrue,
+                LogicalOperator::Or => Op::JumpIfFalse,
+                LogicalOperator::Coalesce => Op::JumpIfNullish,
+            };
+            let to_right = cx.emit_branch_placeholder(to_right_op, Some(left), span);
+            cx.emit(Op::ReturnValue, [Operand::Register(left)], span);
+            cx.patch_branch_to_here(to_right);
+            compile_tail_return(cx, &l.right, span)
+        }
+        Expression::CallExpression(call) => {
+            if let Some(callee) = crate::calls::tail_eligible_free_callee(cx, call) {
+                let dst = crate::calls::emit_tail_free_call(cx, call, callee, span)?;
+                cx.emit(Op::ReturnValue, [Operand::Register(dst)], span);
+                Ok(())
+            } else {
+                let reg = compile_expr(cx, expr, span)?;
+                cx.emit(Op::ReturnValue, [Operand::Register(reg)], span);
+                Ok(())
+            }
+        }
+        Expression::TaggedTemplateExpression(t) => {
+            // `return f\`…\`` — a free-tag tagged template is a tail
+            // call; `compile_tagged_template` emits `Op::TailCall` and we
+            // append the fallback return.
+            let dst = crate::template::compile_tagged_template(cx, t, true)?;
+            cx.emit(Op::ReturnValue, [Operand::Register(dst)], span);
+            Ok(())
+        }
+        _ => {
+            let reg = compile_expr(cx, expr, span)?;
+            cx.emit(Op::ReturnValue, [Operand::Register(reg)], span);
+            Ok(())
+        }
+    }
+}
+
 /// Compile one statement. Returns `Some(reg)` when the statement is
 /// an `ExpressionStatement` whose value should propagate as the
 /// program's completion value; `None` otherwise.
@@ -661,20 +748,28 @@ pub(crate) fn compile_statement(
             let span = (r.span.start, r.span.end);
             match &r.argument {
                 Some(arg) => {
-                    // Evaluate the return value first, then close every
-                    // enclosing `for…of` iterator (§7.4.9) innermost-
-                    // first before the abrupt return propagates.
-                    let reg = compile_expr(cx, arg, span)?;
                     let close_regs: Vec<u16> = cx
                         .loops
                         .iter()
                         .rev()
                         .filter_map(|f| f.iterator_close_reg)
                         .collect();
-                    for creg in close_regs {
-                        cx.emit(Op::IteratorClose, [Operand::Register(creg)], span);
+                    // §15.10.3 — a strict-mode `return <call>` with no
+                    // pending `for…of` iterator close (which would have to
+                    // run *after* the value, defeating the tail position)
+                    // lowers through the proper-tail-call path.
+                    if cx.is_strict && close_regs.is_empty() {
+                        compile_tail_return(cx, arg, span)?;
+                    } else {
+                        // Evaluate the return value first, then close every
+                        // enclosing `for…of` iterator (§7.4.9) innermost-
+                        // first before the abrupt return propagates.
+                        let reg = compile_expr(cx, arg, span)?;
+                        for creg in close_regs {
+                            cx.emit(Op::IteratorClose, [Operand::Register(creg)], span);
+                        }
+                        cx.emit(Op::ReturnValue, [Operand::Register(reg)], span);
                     }
-                    cx.emit(Op::ReturnValue, [Operand::Register(reg)], span);
                 }
                 None => {
                     let close_regs: Vec<u16> = cx

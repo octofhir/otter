@@ -853,6 +853,7 @@ mod tests {
         Op::StoreUpvalue,
         Op::FreshUpvalue,
         Op::Call,
+        Op::TailCall,
         Op::CallWithThis,
         Op::BindFunction,
         Op::LoadThis,

@@ -174,8 +174,11 @@ pub(crate) fn compile_method_call(
     // arguments (ArgumentListEvaluation drains the iterables, the
     // first element is the eval text); the eval interception below
     // owns that shape.
+    // Direct eval only when `eval` is the global intrinsic — i.e. not
+    // shadowed by a binding anywhere in the lexical chain (a captured
+    // outer `var eval` counts), and not a module import.
     let is_bare_eval = matches!(callee, Expression::Identifier(id) if id.name.as_str() == "eval")
-        && cx.lookup_binding("eval").is_none()
+        && cx.binding_position("eval").is_none()
         && find_module_import_binding(cx, "eval").is_none();
     if has_spread && !is_bare_eval {
         return compile_spread_call(cx, callee, &call.arguments, span);
@@ -519,7 +522,7 @@ pub(crate) fn compile_method_call(
     // <https://tc39.es/ecma262/#sec-eval-x>
     if let Expression::Identifier(id) = callee
         && id.name.as_str() == "eval"
-        && cx.lookup_binding("eval").is_none()
+        && cx.binding_position("eval").is_none()
         && find_module_import_binding(cx, "eval").is_none()
     {
         let src_reg = if has_spread {
@@ -751,6 +754,73 @@ pub(crate) fn compile_method_call(
     operands.push(Operand::ConstIndex(arg_regs.len() as u32));
     operands.extend(arg_regs.into_iter().map(Operand::Register));
     cx.emit(Op::Call, operands, span);
+    Ok(dst)
+}
+
+/// §15.10.3 — when a `CallExpression` sits in a strict-mode tail
+/// position, return the (peeled) callee if it is a *free* call the
+/// plain [`Op::TailCall`] path can lower. Member / `super` / optional /
+/// spread / direct-`eval` calls return `None`: they either need a
+/// receiver (a different opcode) or have non-tail semantics, so the
+/// caller falls back to an ordinary call + return.
+///
+/// A `with` environment could otherwise redirect a free callee name,
+/// but tail-call lowering only runs in strict mode where `with` is a
+/// SyntaxError, so the free-identifier fast paths stay sound.
+pub(crate) fn tail_eligible_free_callee<'a>(
+    cx: &Compiler,
+    call: &'a oxc_ast::ast::CallExpression<'a>,
+) -> Option<&'a Expression<'a>> {
+    if call.optional {
+        return None;
+    }
+    let has_spread = call
+        .arguments
+        .iter()
+        .any(|arg| matches!(arg, oxc_ast::ast::Argument::SpreadElement(_)));
+    if has_spread {
+        return None;
+    }
+    let callee = peel_paren_eval(unwrap_ts_expr(&call.callee));
+    match callee {
+        Expression::Super(_)
+        | Expression::StaticMemberExpression(_)
+        | Expression::ComputedMemberExpression(_)
+        | Expression::PrivateFieldExpression(_)
+        | Expression::MetaProperty(_) => None,
+        // A direct `eval(...)` keeps its bespoke `Op::Eval` lowering
+        // (lexical-scope capture); only a *shadowed* `eval` local is a
+        // plain call eligible for tail-call lowering.
+        Expression::Identifier(id)
+            if id.name.as_str() == "eval"
+                && cx.binding_position("eval").is_none()
+                && find_module_import_binding(cx, "eval").is_none() =>
+        {
+            None
+        }
+        _ => Some(callee),
+    }
+}
+
+/// Emit an `Op::TailCall` for a free call leaf, returning the dst
+/// register the fallback `Op::ReturnValue` reads. Mirrors the free-call
+/// arm of [`compile_method_call`] but with the tail opcode.
+pub(crate) fn emit_tail_free_call(
+    cx: &mut Compiler,
+    call: &oxc_ast::ast::CallExpression<'_>,
+    callee: &Expression<'_>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    let callee_reg = compile_expr(cx, callee, span)?;
+    let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+    check_call_arity(arg_regs.len(), "Op::TailCall", span)?;
+    let dst = cx.alloc_scratch();
+    let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+    operands.push(Operand::Register(dst));
+    operands.push(Operand::Register(callee_reg));
+    operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+    operands.extend(arg_regs.into_iter().map(Operand::Register));
+    cx.emit(Op::TailCall, operands, span);
     Ok(dst)
 }
 

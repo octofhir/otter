@@ -457,7 +457,7 @@ mod tests {
                 vec![reg(0), reg(1), reg(2), reg(3)]
             }
             Op::MathCall => vec![reg(0), konst(31), konst(1), reg(2)],
-            Op::Call => vec![reg(0), reg(1), reg(2)],
+            Op::Call | Op::TailCall => vec![reg(0), reg(1), reg(2)],
             Op::QueueMicrotask => vec![reg(0), reg(1)],
             Op::PromiseNew => vec![reg(0), reg(1), reg(2)],
             Op::MakeClosure => vec![reg(0), konst(1), imm(1), imm(2)],

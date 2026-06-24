@@ -5945,6 +5945,11 @@ impl Interpreter {
                     }
                     continue;
                 }
+                Op::TailCall => {
+                    let operands = context.exec_operands(instr);
+                    self.do_tail_call(stack, context, operands)?;
+                    continue;
+                }
                 Op::CallWithThis => {
                     let operands = context.exec_operands(instr);
                     self.do_call_with_this(stack, context, operands)?;

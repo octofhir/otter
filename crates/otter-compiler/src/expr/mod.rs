@@ -163,7 +163,7 @@ pub(crate) fn compile_expr(
 
         // §13.3.11 TaggedTemplate — `tag` call with `(strings, ...exprs)`.
         // <https://tc39.es/ecma262/#sec-tagged-templates>
-        Expression::TaggedTemplateExpression(t) => compile_tagged_template(cx, t),
+        Expression::TaggedTemplateExpression(t) => compile_tagged_template(cx, t, false),
 
         // §13.3.9 Optional Chaining (`a?.b`, `a?.[k]`, `a?.()`).
         // <https://tc39.es/ecma262/#sec-optional-chains>

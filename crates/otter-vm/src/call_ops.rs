@@ -929,6 +929,74 @@ impl Interpreter {
         self.invoke(stack, context, &callee, Value::undefined(), args, dst)
     }
 
+    /// §15.10.3 PrepareForTailCall — `Op::TailCall`. Discards the
+    /// current frame and runs the callee in its place so a strict-mode
+    /// tail call uses O(1) native stack.
+    ///
+    /// Operand layout matches [`Op::Call`] (`dst, callee, argc,
+    /// args...`); `this` defaults to `undefined`. The compiler only
+    /// emits this opcode for a call in a tail position that no
+    /// `try`/`finally` encloses, so the discarded frame never has live
+    /// handlers. Frames whose completion needs post-processing
+    /// (constructors, async result frames, or any frame that still
+    /// owns a handler/cold record) fall back to ordinary
+    /// [`Self::do_call`], preserving behaviour at a small depth cost.
+    pub(crate) fn do_tail_call(
+        &mut self,
+        stack: &mut HoltStack,
+        context: &ExecutionContext,
+        operands: &[Operand],
+    ) -> Result<(), VmError> {
+        let callee_reg = register_operand(operands.get(1))?;
+        let argc = match operands.get(2) {
+            Some(&Operand::ConstIndex(n)) => n as usize,
+            _ => return Err(VmError::InvalidOperand),
+        };
+        let top_idx = stack.len() - 1;
+
+        // Snapshot everything that lives in the doomed frame, and decide
+        // whether the frame may be discarded in place.
+        let (callee, args, ret_reg) = {
+            let frame = &stack[top_idx];
+            let tco_safe = frame.return_register.is_some()
+                && frame.async_state.is_none()
+                && match self.frame_cold(frame) {
+                    None => true,
+                    Some(cold) => {
+                        cold.handlers.is_empty()
+                            && cold.construct_target.is_none()
+                            && !cold.is_derived_constructor
+                    }
+                };
+            if !tco_safe {
+                // Restore ordinary call semantics: `do_call` advances the
+                // caller pc and pushes a fresh callee frame above this one.
+                return self.do_call(stack, context, operands);
+            }
+            let callee = *read_register(frame, callee_reg)?;
+            let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc);
+            for i in 0..argc {
+                let r = register_operand(operands.get(3 + i))?;
+                args.push(*read_register(frame, r)?);
+            }
+            // `return_register` indexes the caller frame (one below this
+            // one); after the pop it becomes the new top frame, so the
+            // callee writes its result exactly where this frame would have.
+            (callee, args, frame.return_register.unwrap())
+        };
+
+        // Discard the current frame with the same cleanup `pop_frame`
+        // performs (release the cold record, return the spilled register
+        // window to the pool) but write no completion value — the tail
+        // callee produces it. The tail-called function correctly does not
+        // appear in the discarded frame's place in any later stack trace.
+        let mut popped = stack.pop().ok_or(VmError::InvalidOperand)?;
+        self.frame_release_cold(&mut popped);
+        self.reclaim_registers(&mut popped);
+
+        self.invoke(stack, context, &callee, Value::undefined(), args, ret_reg)
+    }
+
     /// Invoke `callee` with the explicit receiver `this_value` and
     /// the given argument list. Centralizes the BoundFunction
     /// unwrapping, closure `bound_this` override, and frame push so

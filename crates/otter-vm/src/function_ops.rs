@@ -32,7 +32,7 @@ use crate::{
     read_register, symbol, to_length, write_register,
 };
 
-enum BindMetadataGet {
+pub(crate) enum BindMetadataGet {
     Value(Value),
     Getter(Value),
 }
@@ -365,7 +365,7 @@ impl Interpreter {
         }
     }
 
-    fn continue_bind_function_after_name(
+    pub(crate) fn continue_bind_function_after_name(
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
@@ -824,7 +824,7 @@ impl Interpreter {
         }
         Err(self.err_type(("Symbol.species value is not a constructor".to_string()).into()))
     }
-    fn callable_bind_metadata_get(
+    pub(crate) fn callable_bind_metadata_get(
         &mut self,
         context: &ExecutionContext,
         target: &Value,

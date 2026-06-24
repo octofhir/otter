@@ -963,169 +963,21 @@ pub(crate) fn compile_spread_call(
     Ok(dst)
 }
 
-/// Lower the syntactic shapes `<expr>.call(...)`, `<expr>.apply(...)`,
-/// and `<expr>.bind(...)` directly to dedicated opcodes. Returns
-/// `None` when `method_name` is not one of the recognised triple,
-/// so the caller can fall through to the universal
-/// [`Op::CallMethodValue`] path.
+/// Legacy hook for syntactic `<expr>.call/apply/bind(...)` lowering.
 ///
-/// The shape detection is **syntactic**: the receiver expression is
-/// evaluated only once, so `getFn().call(t, 1)` invokes `getFn()`
-/// exactly once. `apply` uses the fixed-arity [`Op::CallWithThis`]
-/// path for array literals and falls back to [`Op::CallSpread`] for
-/// dynamic argument arrays so the runtime performs the observable
-/// argument-list check.
+/// These shapes are intentionally routed through [`Op::CallMethodValue`]:
+/// the property access is observable, and a receiver may install an own
+/// non-callable `call`, `apply`, or `bind` property that shadows
+/// `%Function.prototype%`. Runtime dispatch may still fast-path after
+/// ordinary `GetMethod` proves the resolved value is the intrinsic.
 pub(crate) fn try_compile_function_method(
-    cx: &mut Compiler,
-    receiver: &Expression<'_>,
-    method_name: &str,
-    arguments: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
-    span: (u32, u32),
+    _cx: &mut Compiler,
+    _receiver: &Expression<'_>,
+    _method_name: &str,
+    _arguments: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
+    _span: (u32, u32),
 ) -> Result<Option<u16>, CompileError> {
-    match method_name {
-        "call" => {
-            let callee_reg = compile_expr(cx, receiver, span)?;
-            let arg_regs = compile_call_args(cx, arguments, span)?;
-            let mut iter = arg_regs.into_iter();
-            let this_reg = match iter.next() {
-                Some(r) => r,
-                None => {
-                    let r = cx.alloc_scratch();
-                    cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
-                    r
-                }
-            };
-            let forwarded: Vec<u16> = iter.collect();
-            check_call_arity(forwarded.len(), "Op::CallWithThis", span)?;
-            let dst = cx.alloc_scratch();
-            let mut operands: Vec<Operand> = Vec::with_capacity(4 + forwarded.len());
-            operands.push(Operand::Register(dst));
-            operands.push(Operand::Register(callee_reg));
-            operands.push(Operand::Register(this_reg));
-            operands.push(Operand::ConstIndex(forwarded.len() as u32));
-            operands.extend(forwarded.into_iter().map(Operand::Register));
-            cx.emit(Op::CallWithThis, operands, span);
-            Ok(Some(dst))
-        }
-        "bind" => {
-            let callee_reg = compile_expr(cx, receiver, span)?;
-            let arg_regs = compile_call_args(cx, arguments, span)?;
-            let mut iter = arg_regs.into_iter();
-            let this_reg = match iter.next() {
-                Some(r) => r,
-                None => {
-                    let r = cx.alloc_scratch();
-                    cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
-                    r
-                }
-            };
-            let bound: Vec<u16> = iter.collect();
-            check_call_arity(bound.len(), "Op::BindFunction", span)?;
-            let dst = cx.alloc_scratch();
-            let mut operands: Vec<Operand> = Vec::with_capacity(4 + bound.len());
-            operands.push(Operand::Register(dst));
-            operands.push(Operand::Register(callee_reg));
-            operands.push(Operand::Register(this_reg));
-            operands.push(Operand::ConstIndex(bound.len() as u32));
-            operands.extend(bound.into_iter().map(Operand::Register));
-            cx.emit(Op::BindFunction, operands, span);
-            Ok(Some(dst))
-        }
-        "apply" => {
-            // `apply(thisArg, argsArray)` — accepts exactly two
-            // observable arguments per §20.2.3.1. Extra trailing
-            // arguments are evaluated but ignored by the spec, so
-            // they must remain side-effect-observable. Bail to the
-            // universal `CallMethodValue` dispatch path so the
-            // receiver isn't compiled twice and every arg gets
-            // evaluated in source order.
-            if arguments.len() > 2 {
-                return Ok(None);
-            }
-            // Spread at the top-level argument list (e.g.
-            // `fn.apply(...args)`) is dispatched via `compile_spread_call`
-            // before reaching here, so we never see `SpreadElement`
-            // as a direct argument.
-            let callee_reg = compile_expr(cx, receiver, span)?;
-            let mut args_iter = arguments.iter();
-            let this_reg = match args_iter.next() {
-                Some(other) => compile_expr(cx, other.to_expression(), span)?,
-                None => {
-                    let r = cx.alloc_scratch();
-                    cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
-                    r
-                }
-            };
-            let mut forwarded: Vec<u16> = Vec::new();
-            let mut dynamic_args: Option<u16> = None;
-            if let Some(other) = args_iter.next() {
-                let expr = unwrap_ts_expr(other.to_expression());
-                match expr {
-                    Expression::ArrayExpression(arr)
-                        if !arr.elements.iter().any(|el| {
-                            matches!(el, oxc_ast::ast::ArrayExpressionElement::SpreadElement(_))
-                        }) =>
-                    {
-                        for el in &arr.elements {
-                            match el {
-                                oxc_ast::ast::ArrayExpressionElement::SpreadElement(_) => {
-                                    unreachable!("spread excluded above")
-                                }
-                                oxc_ast::ast::ArrayExpressionElement::Elision(_) => {
-                                    let r = cx.alloc_scratch();
-                                    cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
-                                    forwarded.push(r);
-                                }
-                                el_expr => {
-                                    forwarded.push(compile_expr(
-                                        cx,
-                                        el_expr.to_expression(),
-                                        span,
-                                    )?);
-                                }
-                            }
-                        }
-                    }
-                    Expression::NullLiteral(_) => {}
-                    Expression::Identifier(id) if id.name.as_str() == "undefined" => {}
-                    _ => {
-                        // Array literals with `...spread` and any
-                        // other expression shape go through the
-                        // dynamic path so the runtime performs the
-                        // spec-required iterable coercion.
-                        dynamic_args = Some(compile_expr(cx, expr, span)?);
-                    }
-                }
-            }
-            let dst = cx.alloc_scratch();
-            if let Some(args_reg) = dynamic_args {
-                let name_idx = cx.intern_string_constant("apply");
-                cx.emit(
-                    Op::CallMethodValue,
-                    vec![
-                        Operand::Register(dst),
-                        Operand::Register(callee_reg),
-                        Operand::ConstIndex(name_idx),
-                        Operand::ConstIndex(2),
-                        Operand::Register(this_reg),
-                        Operand::Register(args_reg),
-                    ],
-                    span,
-                );
-                return Ok(Some(dst));
-            }
-            let mut operands: Vec<Operand> = Vec::with_capacity(4 + forwarded.len());
-            operands.push(Operand::Register(dst));
-            operands.push(Operand::Register(callee_reg));
-            operands.push(Operand::Register(this_reg));
-            operands.push(Operand::ConstIndex(forwarded.len() as u32));
-            operands.extend(forwarded.into_iter().map(Operand::Register));
-            check_call_arity(operands.len().saturating_sub(4), "Op::CallWithThis", span)?;
-            cx.emit(Op::CallWithThis, operands, span);
-            Ok(Some(dst))
-        }
-        _ => Ok(None),
-    }
+    Ok(None)
 }
 
 pub(crate) fn compile_call_args(

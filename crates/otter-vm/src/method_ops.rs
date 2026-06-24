@@ -23,9 +23,10 @@ use crate::{call_ops::LeanCallbackState, holt_stack::HoltStack};
 use otter_bytecode::Operand;
 use smallvec::SmallVec;
 
+use crate::function_ops::BindMetadataGet;
 use crate::{
-    BoundFunction, ExecutionContext, GeneratorResumeKind, Interpreter, JsString, NumberValue,
-    Value, VmError, VmGetOutcome, VmPropertyKey, bigint,
+    ExecutionContext, GeneratorResumeKind, Interpreter, JsString, NumberValue, PendingBindFunction,
+    PendingBindStage, Value, VmError, VmGetOutcome, VmPropertyKey, bigint,
     boolean::prototype as boolean_prototype,
     bootstrap_collections, collections_prototype, date, descriptor_value, function_metadata, math,
     native_function::VmIntrinsicFunction,
@@ -316,7 +317,6 @@ impl Interpreter {
             };
             return Err(self.err_type((format!("Cannot read properties of {label}")).into()));
         }
-
         // Method-resolution inline cache. An ordinary object's method is a data
         // slot on its own object or its prototype, so the receiver shape keys
         // the resolved method exactly like a `LoadProperty`. On a hit (or a
@@ -344,7 +344,7 @@ impl Interpreter {
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
             }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
+            stack[top_idx].advance_pc(caller_byte_len)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
 
@@ -716,6 +716,35 @@ impl Interpreter {
             write_register(frame, dst, result)?;
             return Ok(());
         }
+        if recv_value.as_function().is_some() || recv_value.as_closure(&self.gc_heap).is_some() {
+            let is_function_intrinsic = function_prototype_intrinsic_name(name);
+            if is_function_intrinsic || object_prototype_dispatch_method_name(name) {
+                let method = self
+                    .get_method_value_for_call(context, stack, recv_value, name)?
+                    .unwrap_or_else(Value::undefined);
+                if !self.is_callable_runtime(&method) {
+                    return Err(VmError::NotCallable);
+                }
+                if is_function_intrinsic
+                    && is_function_prototype_intrinsic_value(
+                        method,
+                        &self.gc_heap,
+                        function_prototype_intrinsic(name),
+                    )
+                {
+                    return self.dispatch_function_method(
+                        stack,
+                        context,
+                        &recv_value,
+                        name,
+                        arg_values,
+                        dst,
+                    );
+                }
+                stack[top_idx].advance_pc(caller_byte_len)?;
+                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            }
+        }
         // Functions / closures inherit Object.prototype-style
         // methods. Foundation routes the call through the user-
         // properties bag attached to the compiled function.
@@ -779,7 +808,21 @@ impl Interpreter {
         if self.is_callable_runtime(&recv_value)
             && !recv_value.is_proxy()
             && function_prototype_intrinsic_name(name)
-            && !self.callable_has_own_function_method_shadow(context, recv_value, name)?
+            && self.callable_has_own_function_method_shadow(context, recv_value, name)?
+        {
+            let method = self
+                .get_method_value_for_call(context, stack, recv_value, name)?
+                .unwrap_or_else(Value::undefined);
+            if !self.is_callable_runtime(&method) {
+                return Err(VmError::NotCallable);
+            }
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+        }
+
+        if self.is_callable_runtime(&recv_value)
+            && !recv_value.is_proxy()
+            && function_prototype_intrinsic_name(name)
         {
             return self.dispatch_function_method(
                 stack,
@@ -1932,41 +1975,32 @@ impl Interpreter {
                 let mut iter = args.into_iter();
                 let this_value = iter.next().unwrap_or(Value::undefined());
                 let bound_args: SmallVec<[Value; 4]> = iter.collect();
-                let owner_bag = self.callable_bag_for_value(callee);
-                let mut ctx = function_metadata::FunctionMetadataContext::new(
-                    context,
-                    &mut self.gc_heap,
-                    owner_bag,
-                    &self.function_deleted_metadata,
-                );
-                let metadata =
-                    function_metadata::bound_create_metadata(&mut ctx, callee, bound_args.len())?;
-                let callee_root = *callee;
-                let this_root = this_value;
-                let bound_args_root = bound_args.clone();
-                let roots = self.collect_allocation_roots(stack);
-                let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                    for &slot in &roots {
-                        visitor(slot);
+                let target = *callee;
+                let pc = stack[top_idx].pc;
+                match self.callable_bind_metadata_get(context, &target, "name")? {
+                    BindMetadataGet::Value(target_name) => self.continue_bind_function_after_name(
+                        stack,
+                        context,
+                        dst,
+                        target,
+                        this_value,
+                        bound_args,
+                        target_name,
+                    ),
+                    BindMetadataGet::Getter(getter) => {
+                        self.frame_ensure_cold(&mut stack[top_idx])
+                            .pending_bind_function = Some(PendingBindFunction {
+                            pc,
+                            dst,
+                            target,
+                            bound_this: this_value,
+                            bound_args,
+                            stage: PendingBindStage::Name,
+                            target_name: None,
+                        });
+                        self.invoke(stack, context, &getter, target, SmallVec::new(), dst)
                     }
-                    callee_root.trace_value_slots(visitor);
-                    this_root.trace_value_slots(visitor);
-                    for arg in &bound_args_root {
-                        arg.trace_value_slots(visitor);
-                    }
-                };
-                let bound = BoundFunction::new_with_metadata_and_roots(
-                    &mut self.gc_heap,
-                    *callee,
-                    this_value,
-                    bound_args,
-                    metadata,
-                    &mut external_visit,
-                )?;
-                let frame = &mut stack[top_idx];
-                write_register(frame, dst, Value::bound_function(bound))?;
-                frame.advance_pc(self.current_byte_len)?;
-                Ok(())
+                }
             }
             // §20.2.3.5 Function.prototype.toString — foundation
             // returns the canonical `function <name>() { [native

@@ -585,23 +585,23 @@ mod tests {
     }
 
     #[test]
-    fn fn_call_lowers_to_call_with_this() {
+    fn fn_call_uses_method_value_dispatch() {
         let module = compile_script_src("function f() { return this; } f.call({});");
         let main = module.main();
         assert!(
-            main.code.iter().any(|i| i.op == Op::CallWithThis),
-            "expected CallWithThis: {:?}",
+            main.code.iter().any(|i| i.op == Op::CallMethodValue),
+            "expected CallMethodValue: {:?}",
             main.code
         );
     }
 
     #[test]
-    fn fn_apply_with_array_literal_unpacks() {
+    fn fn_apply_with_array_literal_uses_method_value_dispatch() {
         let module = compile_script_src("function f(a, b) { return a + b; } f.apply({}, [1, 2]);");
         let main = module.main();
         assert!(
-            main.code.iter().any(|i| i.op == Op::CallWithThis),
-            "apply with literal array should lower to CallWithThis: {:?}",
+            main.code.iter().any(|i| i.op == Op::CallMethodValue),
+            "apply with literal array should lower to CallMethodValue: {:?}",
             main.code
         );
     }
@@ -618,12 +618,12 @@ mod tests {
     }
 
     #[test]
-    fn fn_bind_emits_bind_function() {
+    fn fn_bind_uses_method_value_dispatch() {
         let module = compile_script_src("function f() {} f.bind({}, 1, 2);");
         let main = module.main();
         assert!(
-            main.code.iter().any(|i| i.op == Op::BindFunction),
-            "expected BindFunction: {:?}",
+            main.code.iter().any(|i| i.op == Op::CallMethodValue),
+            "expected CallMethodValue: {:?}",
             main.code
         );
     }

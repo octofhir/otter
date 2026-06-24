@@ -23,6 +23,7 @@ function rawSpawn(command, args, options) {
   return native.spawnSyncRaw(command, args, {
     cwd: options.cwd ? String(options.cwd) : undefined,
     input,
+    env: options.env,
   });
 }
 

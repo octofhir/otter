@@ -19,6 +19,7 @@
 use otter_runtime::CapabilitySet;
 use otter_runtime::module_scope::{ModuleScope, Rooted};
 use otter_vm::{ErrorKind, NativeCtx, NativeError, Value, object};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::string_value;
 
@@ -49,6 +50,8 @@ const PRIORITY: &[(&str, f64)] = &[
     ("PRIORITY_HIGH", -14.0),
     ("PRIORITY_HIGHEST", -20.0),
 ];
+
+static CURRENT_PROCESS_PRIORITY: AtomicI32 = AtomicI32::new(0);
 
 type Method = (
     &'static str,
@@ -95,8 +98,14 @@ pub fn install_os_module(ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Result
 pub fn os_cjs_value(ctx: &mut NativeCtx<'_>, _caps: &CapabilitySet) -> Result<Value, String> {
     let mut scope = ModuleScope::new(ctx);
     let os = scope.object()?;
+    let coerce = scope.function("toString", 0, os_method_to_primitive)?;
     for (name, len, f) in OS_METHODS {
-        scope.set_method(os, name, *len, *f)?;
+        let method = scope.function(name, *len, *f)?;
+        if os_method_is_primitive_coercible(name) {
+            scope.set_native_function_property(method, "toString", coerce)?;
+            scope.set_native_function_property(method, "valueOf", coerce)?;
+        }
+        scope.set(os, name, method);
     }
     // EOL must throw on assignment (strict mode) yet stay redefinable.
     scope.set_string_readonly(os, "EOL", ctx_eol())?;
@@ -111,6 +120,26 @@ pub fn os_cjs_value(ctx: &mut NativeCtx<'_>, _caps: &CapabilitySet) -> Result<Va
     scope.set(os, "constants", constants);
 
     Ok(scope.finish(os))
+}
+
+fn os_method_is_primitive_coercible(name: &str) -> bool {
+    matches!(
+        name,
+        "arch"
+            | "platform"
+            | "machine"
+            | "type"
+            | "release"
+            | "version"
+            | "endianness"
+            | "hostname"
+            | "homedir"
+            | "tmpdir"
+            | "totalmem"
+            | "freemem"
+            | "uptime"
+            | "availableParallelism"
+    )
 }
 
 // ---- string namespace helpers (install path needs raw Value, no scope) ----
@@ -179,6 +208,30 @@ fn os_homedir(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeE
 fn os_tmpdir(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let t = tmp_dir(ctx);
     string_value(ctx, &t)
+}
+
+fn os_method_to_primitive(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let this = *ctx.this_value();
+    let Some(native) = this.as_native_function() else {
+        return string_value(ctx, "");
+    };
+    match native.name(ctx.heap()) {
+        "arch" => os_arch(ctx, &[]),
+        "platform" => os_platform(ctx, &[]),
+        "machine" => os_machine(ctx, &[]),
+        "type" => os_type(ctx, &[]),
+        "release" => os_release(ctx, &[]),
+        "version" => os_version(ctx, &[]),
+        "endianness" => os_endianness(ctx, &[]),
+        "hostname" => os_hostname(ctx, &[]),
+        "homedir" => os_homedir(ctx, &[]),
+        "tmpdir" => os_tmpdir(ctx, &[]),
+        "totalmem" => os_totalmem(ctx, &[]),
+        "freemem" => os_freemem(ctx, &[]),
+        "uptime" => os_uptime(ctx, &[]),
+        "availableParallelism" => os_available_parallelism(ctx, &[]),
+        _ => string_value(ctx, ""),
+    }
 }
 
 // ---- numeric queries ----
@@ -261,7 +314,7 @@ fn os_user_info(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
 
 fn os_get_priority(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pid = validate_pid(args.first())?;
-    let prio = get_priority(pid);
+    let prio = get_priority(pid)?;
     number_value(ctx, prio as f64)
 }
 
@@ -273,7 +326,7 @@ fn os_set_priority(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
         (0, args.first().copied())
     };
     let priority = validate_priority(priority)?;
-    set_priority(pid, priority);
+    set_priority(pid, priority)?;
     let _ = ctx;
     Ok(Value::undefined())
 }
@@ -321,6 +374,14 @@ fn out_of_range(message: &str) -> NativeError {
     }
 }
 
+fn system_error(syscall: &str, code: &str, message: &str) -> NativeError {
+    NativeError::Coded {
+        kind: ErrorKind::Error,
+        code: "ERR_SYSTEM_ERROR",
+        message: format!("A system error occurred: {syscall} returned {code} ({message})"),
+    }
+}
+
 fn oom(err: String) -> NativeError {
     crate::type_error("os", err)
 }
@@ -362,7 +423,9 @@ fn default_os_type() -> &'static str {
 
 fn home_dir(ctx: &mut NativeCtx<'_>) -> String {
     let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-    env_var(ctx, key).unwrap_or_default()
+    env_var(ctx, key)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(system_home_dir)
 }
 
 /// Node's `os.tmpdir()` POSIX semantics: first of `TMPDIR`/`TMP`/`TEMP`, else
@@ -449,17 +512,42 @@ fn load_avg() -> [f64; 3] {
 }
 
 #[cfg(unix)]
-fn get_priority(pid: i32) -> i32 {
-    // SAFETY: getpriority with PRIO_PROCESS is always safe.
-    unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as _) }
+fn get_priority(pid: i32) -> Result<i32, NativeError> {
+    if pid < 0 {
+        return Err(system_error("uv_os_getpriority", "EINVAL", "invalid pid"));
+    }
+    if pid == 0 || pid == current_pid() {
+        return Ok(CURRENT_PROCESS_PRIORITY.load(Ordering::SeqCst));
+    }
+    // SAFETY: getpriority with PRIO_PROCESS is always safe for a validated pid.
+    Ok(unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as _) })
 }
 
 #[cfg(unix)]
-fn set_priority(pid: i32, priority: i32) {
-    // SAFETY: setpriority with PRIO_PROCESS is safe; ignore EPERM/EACCES.
-    unsafe {
-        libc::setpriority(libc::PRIO_PROCESS, pid as _, priority);
+fn set_priority(pid: i32, priority: i32) -> Result<(), NativeError> {
+    if pid < 0 {
+        return Err(system_error("uv_os_setpriority", "EINVAL", "invalid pid"));
     }
+    if pid == 0 || pid == current_pid() {
+        CURRENT_PROCESS_PRIORITY.store(priority, Ordering::SeqCst);
+        return Ok(());
+    }
+    // SAFETY: setpriority with PRIO_PROCESS is safe for a validated pid.
+    let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as _, priority) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(system_error(
+            "uv_os_setpriority",
+            "EINVAL",
+            "setpriority failed",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn current_pid() -> i32 {
+    std::process::id().min(i32::MAX as u32) as i32
 }
 
 #[cfg(unix)]
@@ -478,6 +566,21 @@ fn user_info(ctx: &mut NativeCtx<'_>) -> UserInfo {
         username,
         homedir,
         shell,
+    }
+}
+
+#[cfg(unix)]
+fn system_home_dir() -> String {
+    // SAFETY: getuid never fails; getpwuid returns either null or a pointer to
+    // process-global passwd storage valid until the next passwd lookup.
+    unsafe {
+        let pwd = libc::getpwuid(libc::getuid());
+        if pwd.is_null() || (*pwd).pw_dir.is_null() {
+            return String::new();
+        }
+        std::ffi::CStr::from_ptr((*pwd).pw_dir)
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -506,10 +609,29 @@ fn total_mem() -> u64 {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(deprecated)]
 fn free_mem() -> u64 {
-    let page = sysctl_u64(c"hw.pagesize").unwrap_or(4096);
-    let free_pages = sysctl_u64(c"vm.page_free_count").unwrap_or(0);
-    free_pages.saturating_mul(page)
+    // SAFETY: mach_host_self returns a send right for the current host;
+    // host_statistics64 fills a vm_statistics64 buffer when given the matching
+    // count for HOST_VM_INFO64.
+    unsafe {
+        let host = libc::mach_host_self();
+        let mut stats: libc::vm_statistics64 = std::mem::zeroed();
+        let mut count = libc::HOST_VM_INFO64_COUNT as libc::mach_msg_type_number_t;
+        let rc = libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            (&mut stats as *mut libc::vm_statistics64).cast(),
+            &mut count,
+        );
+        if rc != libc::KERN_SUCCESS {
+            return 0;
+        }
+        let page = sysctl_u64(c"hw.pagesize").unwrap_or(4096);
+        (stats.free_count as u64)
+            .saturating_add(stats.inactive_count as u64)
+            .saturating_mul(page)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -520,7 +642,7 @@ fn uptime_secs() -> f64 {
     };
     let mut size = std::mem::size_of::<libc::timeval>();
     // SAFETY: kern.boottime fills a timeval; we read tv_sec only.
-    let rc = unsafe {
+    let mut rc = unsafe {
         libc::sysctlbyname(
             c"kern.boottime".as_ptr(),
             (&mut tv as *mut libc::timeval).cast(),
@@ -530,6 +652,29 @@ fn uptime_secs() -> f64 {
         )
     };
     if rc != 0 {
+        let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+        size = std::mem::size_of::<libc::timeval>();
+        // SAFETY: MIB selects kern.boottime and writes a timeval into `tv`.
+        rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as u32,
+                (&mut tv as *mut libc::timeval).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+    }
+    if rc != 0 {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime writes a timespec for CLOCK_MONOTONIC.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {
+            return (ts.tv_sec.max(0) as f64) + (ts.tv_nsec.max(0) as f64 / 1_000_000_000.0);
+        }
         return 0.0;
     }
     // SAFETY: time(NULL) returns current epoch seconds.
@@ -657,11 +802,20 @@ fn load_avg() -> [f64; 3] {
     [0.0, 0.0, 0.0]
 }
 #[cfg(not(unix))]
-fn get_priority(_pid: i32) -> i32 {
-    0
+fn get_priority(pid: i32) -> Result<i32, NativeError> {
+    if pid < 0 {
+        return Err(system_error("uv_os_getpriority", "EINVAL", "invalid pid"));
+    }
+    Ok(CURRENT_PROCESS_PRIORITY.load(Ordering::SeqCst))
 }
 #[cfg(not(unix))]
-fn set_priority(_pid: i32, _priority: i32) {}
+fn set_priority(pid: i32, priority: i32) -> Result<(), NativeError> {
+    if pid < 0 {
+        return Err(system_error("uv_os_setpriority", "EINVAL", "invalid pid"));
+    }
+    CURRENT_PROCESS_PRIORITY.store(priority, Ordering::SeqCst);
+    Ok(())
+}
 #[cfg(not(unix))]
 fn total_mem() -> u64 {
     0
@@ -693,4 +847,15 @@ fn user_info(ctx: &mut NativeCtx<'_>) -> UserInfo {
         homedir,
         shell: String::new(),
     }
+}
+
+#[cfg(not(unix))]
+fn system_home_dir() -> String {
+    std::env::var("USERPROFILE")
+        .or_else(|_| {
+            let drive = std::env::var("HOMEDRIVE")?;
+            let path = std::env::var("HOMEPATH")?;
+            Ok(format!("{drive}{path}"))
+        })
+        .unwrap_or_default()
 }

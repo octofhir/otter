@@ -339,9 +339,54 @@ impl Interpreter {
                 "code",
                 crate::object::PropertyDescriptor::data(Value::string(code_str), true, false, true),
             );
+            if code == "ERR_SYSTEM_ERROR" {
+                if let Ok(name_str) = JsString::from_str("SystemError", self.gc_heap_mut()) {
+                    crate::object::define_own_property(
+                        obj,
+                        &mut self.gc_heap,
+                        "name",
+                        crate::object::PropertyDescriptor::data(
+                            Value::string(name_str),
+                            true,
+                            false,
+                            true,
+                        ),
+                    );
+                }
+                if let Ok(info) = object::alloc_object_old(self.gc_heap_mut()) {
+                    if let Ok(info_code) =
+                        JsString::from_str(system_error_code(message), self.gc_heap_mut())
+                    {
+                        crate::object::set(
+                            info,
+                            &mut self.gc_heap,
+                            "code",
+                            Value::string(info_code),
+                        );
+                    }
+                    crate::object::define_own_property(
+                        obj,
+                        &mut self.gc_heap,
+                        "info",
+                        crate::object::PropertyDescriptor::data(
+                            Value::object(info),
+                            true,
+                            false,
+                            true,
+                        ),
+                    );
+                }
+            }
         }
         Some(Value::object(obj))
     }
+}
+
+fn system_error_code(message: &str) -> &str {
+    message
+        .split_once(" returned ")
+        .and_then(|(_, rest)| rest.split_once(' ').map(|(code, _)| code))
+        .unwrap_or("UNKNOWN")
 }
 
 /// Walk a live frame stack top-down and build a snapshot the

@@ -102,6 +102,45 @@ fn opt_string(ctx: &mut NativeCtx<'_>, opts: Option<Value>, key: &str) -> Option
     }
 }
 
+fn opt_env(ctx: &mut NativeCtx<'_>, opts: Option<Value>) -> Option<Vec<(String, String)>> {
+    let opts_obj = opts?.as_object()?;
+    let env = object::get(opts_obj, ctx.heap(), "env")?.as_object()?;
+    let keys: Vec<String> = object::with_properties(env, ctx.heap(), |p| {
+        p.enumerable_keys().map(str::to_string).collect()
+    });
+    let mut out = Vec::with_capacity(keys.len());
+    for key in keys {
+        if let Some(value) = object::get(env, ctx.heap(), &key)
+            && !value.is_undefined()
+            && !value.is_null()
+        {
+            out.push((key, value.display_string(ctx.heap())));
+        }
+    }
+    Some(out)
+}
+
+fn current_exec_path(ctx: &mut NativeCtx<'_>) -> Option<String> {
+    let global = *ctx.interp_mut().global_this();
+    let process = object::get(global, ctx.heap(), "process")?.as_object()?;
+    let exec_path = object::get(process, ctx.heap(), "execPath")?;
+    Some(exec_path.display_string(ctx.heap()))
+}
+
+fn should_propagate_allow_all(
+    ctx: &mut NativeCtx<'_>,
+    command: &str,
+    caps: &CapabilitySet,
+) -> bool {
+    caps.read.is_allow_all()
+        && caps.write.is_allow_all()
+        && caps.net.is_allow_all()
+        && caps.env.is_allow_all()
+        && caps.run.is_allow_all()
+        && caps.ffi.is_allow_all()
+        && current_exec_path(ctx).as_deref() == Some(command)
+}
+
 fn spawn_sync_raw(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
@@ -119,7 +158,7 @@ fn spawn_sync_raw(
         });
     }
 
-    let argv = args
+    let mut argv = args
         .get(1)
         .copied()
         .map(|v| read_string_array(ctx, v))
@@ -127,11 +166,19 @@ fn spawn_sync_raw(
     let opts = args.get(2).copied();
     let cwd = opt_string(ctx, opts, "cwd");
     let input = opt_string(ctx, opts, "input");
+    let env = opt_env(ctx, opts);
+    if should_propagate_allow_all(ctx, &command, caps) {
+        argv.insert(0, "--allow-all".to_string());
+    }
 
     let mut cmd = Command::new(&command);
     cmd.args(&argv);
     if let Some(dir) = &cwd {
         cmd.current_dir(dir);
+    }
+    if let Some(env) = env {
+        cmd.env_clear();
+        cmd.envs(env);
     }
     cmd.stdin(if input.is_some() {
         Stdio::piped()

@@ -215,6 +215,28 @@ impl<'a, 'rt> ModuleScope<'a, 'rt> {
         Ok(())
     }
 
+    /// Define an own data property on a native function built by this scope.
+    ///
+    /// # Errors
+    /// Returns an error when `func` is not a native function or the descriptor
+    /// cannot be defined.
+    pub fn set_native_function_property(
+        &mut self,
+        func: Rooted,
+        key: &str,
+        value: Rooted,
+    ) -> Result<(), String> {
+        let target = self.value(func).as_native_function().ok_or_else(|| {
+            "ModuleScope::set_native_function_property target is not native".to_string()
+        })?;
+        let desc = object::PropertyDescriptor::data(self.value(value), true, false, true);
+        if target.define_own_property(self.ctx.heap_mut(), key, desc) {
+            Ok(())
+        } else {
+            Err(format!("failed to define native function property {key}"))
+        }
+    }
+
     /// Define a string property on `obj`.
     ///
     /// # Errors

@@ -118,6 +118,10 @@ fn intl_construct(
     // (firing getters in observation order) are constructed here; the
     // remainder still use the heap-only dispatcher below.
     let ctx_payload = match kind {
+        IntlKind::Collator => Some(
+            crate::intl::collator::resolve_ctx(ctx, locale, options)
+                .map(crate::intl::payload::IntlPayload::Collator),
+        ),
         IntlKind::ListFormat => Some(
             crate::intl::list_format::resolve_ctx(ctx, locale, options)
                 .map(crate::intl::payload::IntlPayload::ListFormat),
@@ -210,9 +214,11 @@ otter_macros::couch! {
     },
     prototype = {
         methods = {
-            "compare"         / 2 => crate::intl::collator::collator_compare,
             "resolvedOptions" / 0 => crate::intl::collator::collator_resolved_options,
         },
+        accessors = [
+            ("compare", get = crate::intl::collator::collator_compare_getter),
+        ],
     },
     install_on = crate::intl::bootstrap::intl_host,
     string_tag = "Intl.Collator",

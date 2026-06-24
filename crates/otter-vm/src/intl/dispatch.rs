@@ -13,7 +13,6 @@
 //!   `VmError`.
 
 use crate::Value;
-use crate::intl::collator;
 use crate::intl::display_names;
 use crate::intl::number_format;
 use crate::intl::payload::{IntlKind, IntlPayload, JsIntl};
@@ -91,7 +90,8 @@ pub fn construct(
     let kind = IntlKind::from_class_name(class)
         .ok_or_else(|| IntlError::UnknownClass(class.to_string()))?;
     let payload = match kind {
-        IntlKind::Collator => IntlPayload::Collator(collator::resolve(locale, options, gc_heap)),
+        // Constructed through its own `NativeCtx` option ladder.
+        IntlKind::Collator => return Err(IntlError::UnknownClass("Collator".to_string())),
         IntlKind::NumberFormat => {
             IntlPayload::NumberFormat(number_format::resolve(locale, options, gc_heap)?)
         }

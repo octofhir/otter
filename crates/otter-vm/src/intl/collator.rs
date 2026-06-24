@@ -14,25 +14,81 @@ use icu_collator::options::CollatorOptions;
 use icu_collator::{Collator, CollatorPreferences};
 use icu_locale::Locale;
 
-use crate::intl::helpers::{
-    DEFAULT_LOCALE, coerce_locale, options_object, read_bool_option, read_string_option,
-};
+use crate::intl::helpers::DEFAULT_LOCALE;
 use crate::intl::payload::{CollatorPayload, IntlPayload};
 use crate::string::JsString;
 use crate::{NativeCtx, NativeError, Value};
 
-/// Resolve the constructor option bag.
-pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> CollatorPayload {
-    let opts = options_object(Some(options));
-    let opts_ref = opts.as_ref();
-    CollatorPayload {
-        locale: coerce_locale(Some(locale), gc_heap),
-        usage: read_string_option(opts_ref, "usage", "sort", gc_heap),
-        sensitivity: read_string_option(opts_ref, "sensitivity", "variant", gc_heap),
-        ignore_punctuation: read_bool_option(opts_ref, "ignorePunctuation", false, gc_heap),
-        numeric: read_bool_option(opts_ref, "numeric", false, gc_heap),
-        case_first: read_string_option(opts_ref, "caseFirst", "false", gc_heap),
-    }
+const CLASS: &str = "Collator";
+
+/// §10.1.1 InitializeCollator — fires `usage` / `localeMatcher` /
+/// `collation` / `numeric` / `caseFirst` / `sensitivity` /
+/// `ignorePunctuation` getters in spec order with ToString / ToBoolean
+/// coercion + RangeError validation; canonicalizes the locale.
+pub fn resolve_ctx(
+    ctx: &mut NativeCtx<'_>,
+    locales: Value,
+    options: Value,
+) -> Result<CollatorPayload, NativeError> {
+    use crate::intl::helpers::{
+        get_bool_option, get_numbering_system_option, get_string_option, require_options_object,
+    };
+
+    let requested = crate::intl::supported::canonicalize_locale_list(ctx, locales)?;
+    let locale = requested
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| DEFAULT_LOCALE.to_string());
+    let options = require_options_object(options, CLASS)?;
+
+    let usage = get_string_option(
+        ctx,
+        options,
+        "usage",
+        CLASS,
+        &["sort", "search"],
+        Some("sort"),
+    )?
+    .unwrap_or_else(|| "sort".to_string());
+    let _matcher = get_string_option(
+        ctx,
+        options,
+        "localeMatcher",
+        CLASS,
+        &["lookup", "best fit"],
+        None,
+    )?;
+    // `collation` is read (a Unicode `type` nonterminal) and validated,
+    // then folded into the resolved locale by ICU; we don't store it.
+    let _collation = get_numbering_system_option(ctx, options, CLASS)?;
+    let numeric = get_bool_option(ctx, options, "numeric", CLASS, None)?;
+    let case_first = get_string_option(
+        ctx,
+        options,
+        "caseFirst",
+        CLASS,
+        &["upper", "lower", "false"],
+        None,
+    )?;
+    let sensitivity = get_string_option(
+        ctx,
+        options,
+        "sensitivity",
+        CLASS,
+        &["base", "accent", "case", "variant"],
+        None,
+    )?;
+    let ignore_punctuation =
+        get_bool_option(ctx, options, "ignorePunctuation", CLASS, Some(false))?.unwrap_or(false);
+
+    Ok(CollatorPayload {
+        locale,
+        usage,
+        sensitivity: sensitivity.unwrap_or_else(|| "variant".to_string()),
+        ignore_punctuation,
+        numeric: numeric.unwrap_or(false),
+        case_first: case_first.unwrap_or_else(|| "false".to_string()),
+    })
 }
 
 fn require_collator(
@@ -65,11 +121,45 @@ fn coerce_compare_arg(value: Option<&Value>, heap: &otter_gc::GcHeap) -> Option<
 }
 
 /// §10.3.4 `Intl.Collator.prototype.compare(x, y)`.
-pub(crate) fn collator_compare(
+/// §10.3.3 `get Intl.Collator.prototype.compare` — an accessor whose
+/// getter returns a function bound to this Collator instance (name `""`,
+/// length 2).
+pub(crate) fn collator_compare_getter(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let _ = require_collator(ctx, "compare")?;
+    let this = ctx.this_value().clone();
+    let captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![this];
+    let bound = crate::NativeFunction::with_length_and_captures(
+        ctx.heap_mut(),
+        "",
+        2,
+        bound_compare_call,
+        captures,
+    )?;
+    Ok(Value::native_function(bound))
+}
+
+/// The bound function returned by the `compare` getter; its captured
+/// `[[Collator]]` is `captures[0]`.
+fn bound_compare_call(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
+    captures: &[Value],
 ) -> Result<Value, NativeError> {
-    let payload = require_collator(ctx, "compare")?;
+    let bad = || NativeError::TypeError {
+        name: "compare",
+        reason: "compare function lost its bound Intl.Collator".to_string(),
+    };
+    let intl = captures
+        .first()
+        .and_then(|v| v.as_intl(ctx.heap()))
+        .ok_or_else(bad)?;
+    let payload = match intl.payload_clone(ctx.heap()) {
+        IntlPayload::Collator(c) => c,
+        _ => return Err(bad()),
+    };
     let Some(x) = coerce_compare_arg(args.first(), ctx.heap()) else {
         return Ok(Value::number_i32(0));
     };

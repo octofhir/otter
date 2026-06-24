@@ -200,6 +200,22 @@ pub(crate) fn compile_object_literal(
                                 compile_expr(cx, expr, key_span)?
                             }
                         };
+                    // §15.4.1 — a getter's parameter list is empty
+                    // `UniqueFormalParameters`. oxc rejects a formal
+                    // parameter, but a lone rest parameter has zero formal
+                    // params and slips through, so reject it here.
+                    if matches!(p.kind, oxc_ast::ast::PropertyKind::Get)
+                        && let oxc_ast::ast::Expression::FunctionExpression(func) = &p.value
+                        && func.params.rest.is_some()
+                    {
+                        return Err(CompileError::Syntax {
+                            messages: vec![
+                                "SyntaxError: a 'get' accessor must not have any formal parameters"
+                                    .to_string(),
+                            ],
+                            diagnostics: Vec::new(),
+                        });
+                    }
                     cx.next_fn_is_method = true;
                     // §20.2.3.5 — an accessor reports its whole property
                     // definition (`get`/`set` prefix and key included).

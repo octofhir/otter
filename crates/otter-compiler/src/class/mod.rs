@@ -690,6 +690,20 @@ fn compile_class_strict(
             oxc_ast::ast::MethodDefinitionKind::Get | oxc_ast::ast::MethodDefinitionKind::Set
         );
         if is_accessor {
+            // §15.4.1 — a getter takes empty `UniqueFormalParameters`.
+            // oxc rejects a formal parameter, but a lone rest parameter
+            // (zero formal params) slips through, so reject it here.
+            if matches!(m.kind, oxc_ast::ast::MethodDefinitionKind::Get)
+                && m.value.params.rest.is_some()
+            {
+                return Err(CompileError::Syntax {
+                    messages: vec![
+                        "SyntaxError: a 'get' accessor must not have any formal parameters"
+                            .to_string(),
+                    ],
+                    diagnostics: Vec::new(),
+                });
+            }
             // Resolve the property key into a register (literal vs
             // computed expression — both paths are observed by the
             // §13.2.5 ComputedPropertyName / IdentifierName rules).

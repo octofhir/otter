@@ -131,10 +131,50 @@ fn render_format(value: f64, unit: &str, payload: &RelativeTimeFormatPayload) ->
 
 fn format_number(n: f64) -> String {
     if n.fract() == 0.0 {
-        format!("{}", n as i64)
+        // §the relative-time value is rendered through the locale number
+        // formatter; the foundation (en) applies `,` thousands grouping.
+        let int = n as i64;
+        let digits = int.abs().to_string();
+        let mut grouped = String::new();
+        let bytes = digits.as_bytes();
+        for (i, b) in bytes.iter().enumerate() {
+            if i > 0 && (bytes.len() - i) % 3 == 0 {
+                grouped.push(',');
+            }
+            grouped.push(*b as char);
+        }
+        if int < 0 {
+            format!("-{grouped}")
+        } else {
+            grouped
+        }
     } else {
         format!("{n}")
     }
+}
+
+/// §18.4.3 `IsSanctionedSingleUnitIdentifier` for the relative-time
+/// units, accepting both the singular and plural spellings.
+fn is_valid_unit(unit: &str) -> bool {
+    matches!(
+        unit,
+        "year"
+            | "years"
+            | "quarter"
+            | "quarters"
+            | "month"
+            | "months"
+            | "week"
+            | "weeks"
+            | "day"
+            | "days"
+            | "hour"
+            | "hours"
+            | "minute"
+            | "minutes"
+            | "second"
+            | "seconds"
+    )
 }
 
 /// §18.4.3 `Intl.RelativeTimeFormat.prototype.format(value, unit)`.
@@ -143,23 +183,38 @@ pub(crate) fn relative_time_format_format(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "format")?;
-    let first = args.first();
-    let value = if let Some(n) = first.and_then(|v| v.as_number()) {
-        n.as_f64()
-    } else if let Some(b) = first.and_then(|v| v.as_boolean()) {
-        if b { 1.0 } else { 0.0 }
-    } else if first.is_none() || first.is_some_and(|v| v.is_null()) {
-        0.0
-    } else {
-        f64::NAN
-    };
-    let Some(unit_str) = args.get(1).and_then(|v| v.as_string(ctx.heap())) else {
-        return Err(NativeError::TypeError {
+    // §step 3 — `value = ? ToNumber(value)` (a Symbol / BigInt throws a
+    // TypeError); a non-finite result is a RangeError.
+    let first = args.first().copied().unwrap_or_else(Value::undefined);
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
             name: "format",
-            reason: "argument 1 must be a string unit".to_string(),
+            reason: "missing execution context".to_string(),
+        })?;
+    let value = crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, &first)
+        .map(|n| n.as_f64())
+        .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, "format"))?;
+    if !value.is_finite() {
+        return Err(NativeError::RangeError {
+            name: "format",
+            reason: "value must be a finite number".to_string(),
         });
+    }
+    // §step 4 — `unit = ? ToString(unit)`, then validate against the
+    // sanctioned relative-time units (a RangeError otherwise).
+    let unit = {
+        let unit_v = args.get(1).copied().unwrap_or_else(Value::undefined);
+        crate::coerce::to_string_or_throw(ctx.cx.interp, &exec, &unit_v)
+            .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, "format"))?
     };
-    let unit = unit_str.to_lossy_string(ctx.heap());
+    if !is_valid_unit(&unit) {
+        return Err(NativeError::RangeError {
+            name: "format",
+            reason: format!("invalid unit: {unit}"),
+        });
+    }
     let rendered = render_format(value, &unit, &payload);
     Ok(Value::string(JsString::from_str(
         &rendered,

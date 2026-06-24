@@ -28,11 +28,18 @@ const fn method(
 }
 
 /// Static methods installed on the `Intl` namespace object.
-pub const INTL_NAMESPACE_METHODS: &[MethodSpec] = &[method(
-    "getCanonicalLocales",
-    1,
-    crate::intl::supported::get_canonical_locales,
-)];
+pub const INTL_NAMESPACE_METHODS: &[MethodSpec] = &[
+    method(
+        "getCanonicalLocales",
+        1,
+        crate::intl::supported::get_canonical_locales,
+    ),
+    method(
+        "supportedValuesOf",
+        1,
+        crate::intl::supported::supported_values_of,
+    ),
+];
 
 /// §8.1 — install `Intl[@@toStringTag] = "Intl"` (non-enumerable,
 /// configurable) on the namespace object.

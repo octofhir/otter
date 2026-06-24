@@ -594,7 +594,18 @@ pub(crate) fn compile_logical_assignment(
             let name = id.name.as_str().to_string();
             let load = cx.alloc_scratch();
             if let Some(info) = cx.lookup_binding(&name) {
-                cx.emit_load_storage(load, info.storage, span);
+                // §13.15.2 step 2 — `GetValue(lref)` runs before the
+                // short-circuit test, so reading a `let`/`const`/`class`
+                // binding still in its TDZ raises ReferenceError.
+                if info.initialized {
+                    cx.emit_load_storage(load, info.storage, span);
+                } else {
+                    let diag_idx = match info.storage {
+                        BindingStorage::Register { reg } => reg,
+                        BindingStorage::Upvalue { idx } => idx,
+                    };
+                    cx.emit(Op::TdzError, [Operand::Imm32(diag_idx as i32)], span);
+                }
             } else if let Some(idx) = cx.resolve_capture(&name) {
                 cx.emit_load_storage(load, BindingStorage::Upvalue { idx }, span);
             } else if cx.is_strict {

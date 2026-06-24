@@ -185,11 +185,22 @@ struct DirectEvalFinder {
     found: bool,
 }
 
+/// §13.3.6.1 — a callee that is the bare `eval` identifier, possibly
+/// wrapped in parentheses (`(eval)`, `((eval))`), is a direct eval. A
+/// non-trivial parenthesized callee such as `(1, eval)` is indirect.
+fn callee_is_direct_eval(callee: &oxc_ast::ast::Expression<'_>) -> bool {
+    match callee {
+        oxc_ast::ast::Expression::Identifier(id) => id.name.as_str() == "eval",
+        oxc_ast::ast::Expression::ParenthesizedExpression(p) => {
+            callee_is_direct_eval(&p.expression)
+        }
+        _ => false,
+    }
+}
+
 impl<'a> Visit<'a> for DirectEvalFinder {
     fn visit_call_expression(&mut self, it: &oxc_ast::ast::CallExpression<'a>) {
-        if let oxc_ast::ast::Expression::Identifier(id) = &it.callee
-            && id.name.as_str() == "eval"
-        {
+        if callee_is_direct_eval(&it.callee) {
             self.found = true;
             return;
         }

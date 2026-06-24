@@ -65,12 +65,29 @@ pub(crate) fn check_call_arity(
 ///
 /// Computed-method access, `new`, and spread arguments are
 /// deferred to later tasks.
+/// §13.3.6.1 — parenthesizing the callee of a call does NOT make an
+/// `eval` call indirect: `(eval)(x)` and `((eval))(x)` are direct eval,
+/// only `(1, eval)(x)` (a non-trivial CoverParenthesizedExpression) is
+/// indirect. oxc keeps `ParenthesizedExpression` nodes, so unwrap them
+/// when — and only when — they wrap the bare `eval` identifier, leaving
+/// every other parenthesized callee (e.g. `(obj.m)()`, `(1, eval)()`)
+/// untouched so their normal call semantics are preserved.
+fn peel_paren_eval<'a>(callee: &'a Expression<'a>) -> &'a Expression<'a> {
+    if let Expression::ParenthesizedExpression(p) = callee {
+        let inner = peel_paren_eval(&p.expression);
+        if matches!(inner, Expression::Identifier(id) if id.name.as_str() == "eval") {
+            return inner;
+        }
+    }
+    callee
+}
+
 pub(crate) fn compile_method_call(
     cx: &mut Compiler,
     call: &oxc_ast::ast::CallExpression<'_>,
 ) -> Result<u16, CompileError> {
     let span = (call.span.start, call.span.end);
-    let callee = unwrap_ts_expr(&call.callee);
+    let callee = peel_paren_eval(unwrap_ts_expr(&call.callee));
     // `super(args...)` — direct super-constructor call. Only valid
     // inside a derived-class constructor; the upvalue lookup will
     // surface a clear diagnostic when used elsewhere.

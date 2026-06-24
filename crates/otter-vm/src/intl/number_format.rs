@@ -80,11 +80,21 @@ pub fn resolve(
         "currency" => {
             match opts_ref
                 .and_then(|o| crate::object::get(*o, gc_heap, "currency"))
-                .and_then(|v| {
-                    v.as_string(gc_heap)
-                        .map(|s| s.to_lossy_string(gc_heap).to_uppercase())
-                }) {
-                Some(c) => Some(c),
+                .and_then(|v| v.as_string(gc_heap).map(|s| s.to_lossy_string(gc_heap)))
+            {
+                Some(raw) => {
+                    // §IsWellFormedCurrencyCode: exactly three ASCII
+                    // letters (validated before case-folding so `ß` etc.
+                    // don't slip through ToUpperCase expansion).
+                    if raw.chars().count() != 3
+                        || !raw.chars().all(|c| c.is_ascii_alphabetic())
+                    {
+                        return Err(range_err(format!(
+                            "invalid currency code '{raw}'"
+                        )));
+                    }
+                    Some(raw.to_uppercase())
+                }
                 None => {
                     return Err(IntlError::BadArgument {
                         class: "NumberFormat",

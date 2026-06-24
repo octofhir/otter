@@ -54,12 +54,38 @@ function debugBinding() {
   return store.debug;
 }
 
+function codedError(Base, code, message) {
+  const err = new Base(message);
+  err.code = code;
+  return err;
+}
+
+function bufferBinding() {
+  if (!store.buffer) {
+    store.buffer = {
+      __proto__: null,
+      fill(buf, value, offset, end, encoding) {
+        if (typeof offset !== 'number' || offset < 0 || offset > buf.length) {
+          throw codedError(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "offset" is out of range.');
+        }
+        if (typeof end !== 'number' || end < 0 || end > buf.length) {
+          throw codedError(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "end" is out of range.');
+        }
+        return buf.fill(value, offset, end, encoding);
+      },
+    };
+  }
+  return store.buffer;
+}
+
 function internalBinding(name) {
   switch (String(name)) {
     case 'os':
       return osBinding();
     case 'debug':
       return debugBinding();
+    case 'buffer':
+      return bufferBinding();
     default:
       return {};
   }

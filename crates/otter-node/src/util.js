@@ -62,8 +62,7 @@ const types = {
     return tagged('ArrayBuffer')(v) || tagged('SharedArrayBuffer')(v);
   },
   isTypedArray(v) {
-    const t = objToString(v).slice(8, -1);
-    return typedArrayTags.has(t);
+    return ArrayBuffer.isView(v) && !(v instanceof DataView);
   },
 };
 for (const tag of typedArrayTags) {
@@ -163,10 +162,8 @@ function formatWrappedPrimitive(value, base, options, depth, seen) {
   for (const k of keys) {
     parts.push(`${keyToString(k)}: ${formatValue(value[k], options, depth + 1, seen)}`);
   }
-  for (const sym of Object.getOwnPropertySymbols(value)) {
-    if (Object.getOwnPropertyDescriptor(value, sym).enumerable) {
-      parts.push(`${keyToString(sym)}: ${formatValue(value[sym], options, depth + 1, seen)}`);
-    }
+  for (const sym of ownEnumerableSymbols(value)) {
+    parts.push(`${keyToString(sym)}: ${formatValue(value[sym], options, depth + 1, seen)}`);
   }
   if (parts.length === 0) return prefixed;
   return reduceToSingleString(parts, `${prefixed} `, ['{', '}'], options, depth);
@@ -196,6 +193,21 @@ function keyToString(key) {
   if (typeof key === 'symbol') return `[${key.toString()}]`;
   if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key)) return key;
   return quoteString(key);
+}
+
+function ownEnumerableSymbols(obj) {
+  let symbols;
+  try {
+    symbols = Object.getOwnPropertySymbols(obj);
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const sym of symbols) {
+    const desc = Object.getOwnPropertyDescriptor(obj, sym);
+    if (desc && desc.enumerable) out.push(sym);
+  }
+  return out;
 }
 
 function indentStr(depth) {
@@ -272,10 +284,8 @@ function formatTypedArray(ta, options, depth, seen) {
     if (/^(0|[1-9]\d*)$/.test(key)) continue;
     parts.push(`${keyToString(key)}: ${formatValue(ta[key], options, depth + 1, seen)}`);
   }
-  for (const sym of Object.getOwnPropertySymbols(ta)) {
-    if (Object.getOwnPropertyDescriptor(ta, sym).enumerable) {
-      parts.push(`${keyToString(sym)}: ${formatValue(ta[sym], options, depth + 1, seen)}`);
-    }
+  for (const sym of ownEnumerableSymbols(ta)) {
+    parts.push(`${keyToString(sym)}: ${formatValue(ta[sym], options, depth + 1, seen)}`);
   }
   return reduceToSingleString(parts, prefix, ['[', ']'], options, depth);
 }
@@ -287,10 +297,8 @@ function formatObject(obj, options, depth, seen) {
   for (const key of keys) {
     parts.push(`${keyToString(key)}: ${formatValue(obj[key], options, depth + 1, seen)}`);
   }
-  for (const sym of Object.getOwnPropertySymbols(obj)) {
-    if (Object.getOwnPropertyDescriptor(obj, sym).enumerable) {
-      parts.push(`${keyToString(sym)}: ${formatValue(obj[sym], options, depth + 1, seen)}`);
-    }
+  for (const sym of ownEnumerableSymbols(obj)) {
+    parts.push(`${keyToString(sym)}: ${formatValue(obj[sym], options, depth + 1, seen)}`);
   }
   return reduceToSingleString(parts, objectPrefix(obj), ['{', '}'], options, depth);
 }
@@ -461,6 +469,13 @@ function deepEqual(a, b, strict, memo, skipProto) {
   if (strict && !skipProto && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) {
     return false;
   }
+  if (isTypedArray(a)) {
+    if (!isTypedArray(b)) return false;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (!Object.is(a[i], b[i])) return false;
+    return compareKeys(a, b, strict, memo, skipProto, true);
+  }
+
   const ta = objToString(a);
   if (ta !== objToString(b)) return false;
 
@@ -520,11 +535,6 @@ function deepEqualBody(a, b, strict, memo, skipProto) {
     if (aHasCause && !deepEqual(a.cause, b.cause, strict, memo, skipProto)) return false;
     return compareKeys(a, b, strict, memo, skipProto, false);
   }
-  if (isTypedArray(a)) {
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) if (!Object.is(a[i], b[i])) return false;
-    return compareKeys(a, b, strict, memo, skipProto, true);
-  }
   if (Array.isArray(a)) {
     if (a.length !== b.length) return false;
     for (let i = 0; i < a.length; i++) {
@@ -549,9 +559,7 @@ function deepEqualBody(a, b, strict, memo, skipProto) {
 // entries are handled by the element walk, so they are excluded here.
 function ownEnumerableKeys(obj, isArray) {
   const keys = Object.keys(obj).filter((k) => !(isArray && /^(0|[1-9]\d*)$/.test(k)));
-  for (const sym of Object.getOwnPropertySymbols(obj)) {
-    if (Object.prototype.propertyIsEnumerable.call(obj, sym)) keys.push(sym);
-  }
+  for (const sym of ownEnumerableSymbols(obj)) keys.push(sym);
   return keys;
 }
 

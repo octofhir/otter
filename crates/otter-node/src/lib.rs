@@ -24,6 +24,7 @@ pub mod diagnostics_channel;
 pub mod events;
 pub mod fs;
 pub mod globals;
+pub mod internal_errors_ext;
 pub mod internal_test_binding_ext;
 pub mod misc_modules;
 pub mod node_test;
@@ -87,6 +88,11 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         "internal/event_target",
         HostedModuleInstall::new(misc_modules::install_noop),
         misc_modules::internal_event_target_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "internal/errors",
+        HostedModuleInstall::new(internal_errors_ext::install_internal_errors_module),
+        internal_errors_ext::internal_errors_cjs_value,
     ),
     HostedModule::new_with_cjs_value(
         "internal/test/binding",

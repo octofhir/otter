@@ -28,6 +28,75 @@ if (!Buffer) {
     },
   };
 
+  function codedError(Base, code, message) {
+    const err = new Base(message);
+    err.code = code;
+    return err;
+  }
+
+  function invalidArgType(name, expected, actual) {
+    const received = actual === null ? 'null'
+      : Array.isArray(actual) ? 'an instance of Array'
+      : actual && typeof actual === 'object' ? `an instance of ${actual.constructor && actual.constructor.name || 'Object'}`
+      : `type ${typeof actual} (${String(actual)})`;
+    return codedError(TypeError, 'ERR_INVALID_ARG_TYPE',
+      `The "${name}" argument must be of type ${expected}. Received ${received}`);
+  }
+
+  function outOfRange(name, range, value) {
+    return codedError(RangeError, 'ERR_OUT_OF_RANGE',
+      `The value of "${name}" is out of range. It must be ${range}. Received ${value}`);
+  }
+
+  function unknownEncoding(encoding) {
+    return codedError(TypeError, 'ERR_UNKNOWN_ENCODING', `Unknown encoding: ${encoding}`);
+  }
+
+  function invalidArgValue(name, value) {
+    return codedError(TypeError, 'ERR_INVALID_ARG_VALUE',
+      `The argument '${name}' is invalid. Received ${value}`);
+  }
+
+  function bufferOutOfBounds(name) {
+    return codedError(RangeError, 'ERR_BUFFER_OUT_OF_BOUNDS',
+      `"${name}" is outside of buffer bounds`);
+  }
+
+  function isArrayBufferLike(value) {
+    if (!value) return false;
+    try {
+      return value instanceof ArrayBuffer && typeof value.byteLength === 'number';
+    } catch {
+      return false;
+    }
+  }
+
+  function isSharedArrayBufferLike(value) {
+    if (!value || !value.constructor || value.constructor.name !== 'SharedArrayBuffer') return false;
+    try {
+      return typeof value.byteLength === 'number';
+    } catch {
+      return false;
+    }
+  }
+
+  function arrayBufferSliceArgs(buffer, byteOffset, length) {
+    let offset = Number(byteOffset);
+    if (byteOffset === undefined || Number.isNaN(offset)) offset = 0;
+    offset = Math.trunc(offset);
+    if (!Number.isFinite(offset) || offset < 0 || offset > buffer.byteLength) {
+      throw bufferOutOfBounds('offset');
+    }
+    if (length === undefined) return [offset, undefined];
+    let len = Number(length);
+    if (Number.isNaN(len)) len = 0;
+    len = Math.trunc(len);
+    if (!Number.isFinite(len) || len < 0 || offset + len > buffer.byteLength) {
+      throw bufferOutOfBounds('length');
+    }
+    return [offset, len];
+  }
+
   function utf8ToBytes(str) {
     const out = [];
     for (let i = 0; i < str.length; i++) {
@@ -78,7 +147,7 @@ if (!Buffer) {
     return out;
   }
   function hexToBytes(str) {
-    const clean = str.replace(/[^0-9a-fA-F]/g, '');
+    const clean = String(str);
     const len = clean.length >> 1;
     const out = new Array(len);
     for (let i = 0; i < len; i++) out[i] = parseInt(clean.substr(i * 2, 2), 16);
@@ -115,13 +184,14 @@ if (!Buffer) {
     }
   }
 
-  Buffer = class Buffer extends Uint8Array {
+  const BufferImpl = class Buffer extends Uint8Array {
     constructor(arg, byteOffset, length) {
       if (typeof arg === 'number') {
         super(arg < 0 ? 0 : arg);
-      } else if (arg instanceof ArrayBuffer || (arg && arg.constructor && arg.constructor.name === 'SharedArrayBuffer')) {
-        if (length === undefined) super(arg, byteOffset || 0);
-        else super(arg, byteOffset || 0, length);
+      } else if (isArrayBufferLike(arg) || isSharedArrayBufferLike(arg)) {
+        const range = arrayBufferSliceArgs(arg, byteOffset, length);
+        if (range[1] === undefined) super(arg, range[0]);
+        else super(arg, range[0], range[1]);
       } else if (arg && (Array.isArray(arg) || ArrayBuffer.isView(arg) || typeof arg[Symbol.iterator] === 'function')) {
         super(Uint8Array.from(arg));
       } else {
@@ -178,16 +248,56 @@ if (!Buffer) {
     }
 
     fill(value, offset, end, encoding) {
-      offset = offset === undefined ? 0 : (offset | 0);
-      end = end === undefined ? this.length : (end | 0);
+      if (this.length > this.byteLength) {
+        throw codedError(RangeError, 'ERR_BUFFER_OUT_OF_BOUNDS',
+          'Attempt to access memory outside buffer bounds');
+      }
+      if (typeof offset === 'string') {
+        encoding = offset;
+        offset = 0;
+        end = this.length;
+      } else if (typeof end === 'string') {
+        encoding = end;
+        end = this.length;
+      }
+      offset = offset === undefined ? 0 : offset;
+      end = end === undefined ? this.length : end;
+      if (typeof offset !== 'number') throw invalidArgType('offset', 'number', offset);
+      if (typeof end !== 'number') throw invalidArgType('end', 'number', end);
+      if (!Number.isFinite(offset) || offset < 0 || offset > this.length) {
+        throw outOfRange('offset', `>= 0 && <= ${this.length}`, offset);
+      }
+      if (!Number.isFinite(end) || end < 0 || end > this.length) {
+        throw outOfRange('end', `>= 0 && <= ${this.length}`, end);
+      }
+      offset = offset >>> 0;
+      end = end >>> 0;
+      if (end <= offset) {
+        if (typeof value === 'string' && encoding !== undefined) {
+          if (typeof encoding !== 'string') throw invalidArgType('encoding', 'string', encoding);
+          const e0 = enc.normalize(encoding);
+          if (e0 === undefined) throw unknownEncoding(encoding);
+        }
+        return this;
+      }
       if (typeof value === 'string') {
-        const bytes = bytesFromString(value, encoding);
+        if (encoding !== undefined && typeof encoding !== 'string') {
+          throw invalidArgType('encoding', 'string', encoding);
+        }
+        const e = enc.normalize(encoding);
+        if (e === undefined) throw unknownEncoding(encoding);
+        if (e === 'hex' && value.length > 0 && !/^(?:[0-9a-fA-F]{2})+$/.test(value)) {
+          throw invalidArgValue('value', value);
+        }
+        const bytes = bytesFromString(value, e);
         if (bytes.length === 0) return this;
         for (let i = offset, j = 0; i < end; i++, j = (j + 1) % bytes.length) this[i] = bytes[j];
       } else if (typeof value === 'number') {
         for (let i = offset; i < end; i++) this[i] = value & 0xff;
       } else if (value instanceof Uint8Array && value.length) {
         for (let i = offset, j = 0; i < end; i++, j = (j + 1) % value.length) this[i] = value[j];
+      } else if (value === null || value === undefined) {
+        for (let i = offset; i < end; i++) this[i] = 0;
       }
       return this;
     }
@@ -236,6 +346,17 @@ if (!Buffer) {
     swap16() { for (let i = 0; i < this.length; i += 2) { const t = this[i]; this[i] = this[i + 1]; this[i + 1] = t; } return this; }
     swap32() { for (let i = 0; i < this.length; i += 4) { let t = this[i]; this[i] = this[i + 3]; this[i + 3] = t; t = this[i + 1]; this[i + 1] = this[i + 2]; this[i + 2] = t; } return this; }
   };
+  Buffer = function Buffer(arg, byteOffset, length) {
+    return new BufferImpl(arg, byteOffset, length);
+  };
+  Buffer.prototype = BufferImpl.prototype;
+  Object.setPrototypeOf(Buffer, BufferImpl);
+  Object.defineProperty(Buffer.prototype, 'constructor', {
+    value: Buffer,
+    writable: true,
+    configurable: true,
+    enumerable: false,
+  });
 
   // ---- read/write integer methods via DataView ----
   const dv = (buf) => new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
@@ -281,6 +402,11 @@ if (!Buffer) {
   for (const name of Object.keys(intMethods)) {
     Object.defineProperty(proto, name, { value: intMethods[name], writable: true, configurable: true, enumerable: false });
   }
+  Object.defineProperty(proto, 'parent', {
+    configurable: true,
+    enumerable: false,
+    get() { return this.buffer; },
+  });
 
   // ---- statics ----
   // Defined via defineProperty because `Buffer` inherits non-writable statics
@@ -289,13 +415,22 @@ if (!Buffer) {
   const statics = {
     from(value, encodingOrOffset, length) {
       if (typeof value === 'string') return new Buffer(bytesFromString(value, encodingOrOffset));
-      if (value instanceof ArrayBuffer || (value && value.constructor && value.constructor.name === 'SharedArrayBuffer')) {
+      if (isArrayBufferLike(value) || isSharedArrayBufferLike(value)) {
         return new Buffer(value, encodingOrOffset, length);
       }
       if (value instanceof Uint8Array) { const b = new Buffer(value.length); b.set(value); return b; }
       if (Array.isArray(value) || (value && typeof value[Symbol.iterator] === 'function')) return new Buffer(Uint8Array.from(value));
       if (value && typeof value === 'object' && value.type === 'Buffer' && Array.isArray(value.data)) return new Buffer(Uint8Array.from(value.data));
-      throw new TypeError('The first argument must be of type string or an instance of Buffer, ArrayBuffer, Array, or Array-like Object.');
+      if (value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, 'length')) {
+        let len = Number(value.length);
+        if (!Number.isFinite(len) || len < 0) len = 0;
+        const b = new Buffer(Math.trunc(len));
+        for (let i = 0; i < b.length; i++) b[i] = Number(value[i]) & 0xff;
+        return b;
+      }
+      throw codedError(TypeError, 'ERR_INVALID_ARG_TYPE',
+        'The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. ' +
+        `Received an instance of ${value && value.constructor && value.constructor.name || 'Object'}`);
     },
     alloc(size, fill, encoding) {
       const b = new Buffer(size);

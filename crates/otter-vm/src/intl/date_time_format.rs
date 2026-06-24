@@ -333,24 +333,47 @@ fn bound_format_call(
     )?))
 }
 
+/// §21.4.1.1 `TimeClip(time)` — reject non-finite or out-of-bounds
+/// epoch-millisecond values with a `RangeError`, otherwise return the
+/// integral millisecond count. The magnitude bound is `8.64e15`.
+fn time_clip(ms: f64, name: &'static str) -> Result<f64, NativeError> {
+    if !ms.is_finite() || ms.abs() > 8.64e15 {
+        return Err(NativeError::RangeError {
+            name,
+            reason: "date value is not a finite time value".to_string(),
+        });
+    }
+    Ok(ms.trunc())
+}
+
+/// §7.1.4 `ToNumber(value)` re-entry from a native — coerces objects
+/// (e.g. a `Date` via `valueOf`), strings, and booleans, preserving a
+/// user-thrown abrupt completion rather than re-wrapping it.
+fn coerce_to_number(
+    ctx: &mut NativeCtx<'_>,
+    value: &Value,
+    name: &'static str,
+) -> Result<f64, NativeError> {
+    let (interp, exec) = ctx.interp_mut_and_context();
+    let exec = exec.ok_or_else(|| NativeError::TypeError {
+        name,
+        reason: "missing execution context".to_string(),
+    })?;
+    let n = crate::coerce::to_number_or_throw(interp, &exec, value)
+        .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))?;
+    Ok(n.as_f64())
+}
+
 /// Resolve the `format`/`formatToParts` argument to civil
-/// `(year, month, day, hour, minute, second)` — a Number is epoch ms,
-/// a Temporal value uses its own fields, `undefined` is "now".
+/// `(year, month, day, hour, minute, second)` — a Temporal value uses
+/// its own fields, `undefined` is "now", and anything else is coerced
+/// through `ToNumber` (epoch ms) then `TimeClip`.
 fn arg_to_civil(
     ctx: &mut NativeCtx<'_>,
     first: Option<&Value>,
     name: &'static str,
 ) -> Result<(i32, u8, u8, u8, u8, u8), NativeError> {
-    if let Some(n) = first.and_then(|v| v.as_number()) {
-        let ms = n.as_f64();
-        if !ms.is_finite() {
-            return Err(NativeError::RangeError {
-                name,
-                reason: "date value is not a finite number".to_string(),
-            });
-        }
-        Ok(epoch_to_civil((ms as i64).div_euclid(1000)))
-    } else if let Some(t) = first.and_then(|v| v.as_temporal(ctx.heap())) {
+    if let Some(t) = first.and_then(|v| v.as_temporal(ctx.heap())) {
         match t.payload_clone(ctx.heap()) {
             TemporalPayload::PlainDateTime(pdt) => Ok((
                 pdt.year(),
@@ -376,10 +399,10 @@ fn arg_to_civil(
             .unwrap_or(0);
         Ok(epoch_to_civil(now.div_euclid(1000)))
     } else {
-        Err(NativeError::TypeError {
-            name,
-            reason: "argument 0 must be a Number or Temporal value".to_string(),
-        })
+        let value = first.expect("non-None handled above").clone();
+        let ms = coerce_to_number(ctx, &value, name)?;
+        let ms = time_clip(ms, name)?;
+        Ok(epoch_to_civil((ms as i64).div_euclid(1000)))
     }
 }
 

@@ -716,6 +716,69 @@ pub fn parse_display_calendar(
     }
 }
 
+/// Parse the `showOffset` option (`"auto"`/`"never"`) from a Temporal
+/// `toString` options argument into a [`temporal_rs::options::DisplayOffset`].
+/// Absent options or an absent `offset` default to `Auto`.
+pub fn parse_display_offset(
+    args: &[Value],
+    index: usize,
+    ctx: &mut NativeCtx<'_>,
+    class: &'static str,
+) -> Result<temporal_rs::options::DisplayOffset, NativeError> {
+    use core::str::FromStr;
+    let v = arg_or_undef(args, index);
+    if v.is_undefined() {
+        return Ok(temporal_rs::options::DisplayOffset::Auto);
+    }
+    if !v.is_object_type() {
+        return Err(NativeError::TypeError {
+            name: class,
+            reason: "options must be an object or undefined".to_string(),
+        });
+    }
+    match read_option_string(ctx, v, "offset", class)? {
+        Some(name) => {
+            temporal_rs::options::DisplayOffset::from_str(&name).map_err(|_| NativeError::RangeError {
+                name: class,
+                reason: "invalid `offset`".to_string(),
+            })
+        }
+        None => Ok(temporal_rs::options::DisplayOffset::Auto),
+    }
+}
+
+/// Parse the `timeZoneName` option (`"auto"`/`"never"`/`"critical"`) from
+/// a Temporal `toString` options argument into a
+/// [`temporal_rs::options::DisplayTimeZone`]. Absent options or an absent
+/// `timeZoneName` default to `Auto`.
+pub fn parse_display_time_zone(
+    args: &[Value],
+    index: usize,
+    ctx: &mut NativeCtx<'_>,
+    class: &'static str,
+) -> Result<temporal_rs::options::DisplayTimeZone, NativeError> {
+    use core::str::FromStr;
+    let v = arg_or_undef(args, index);
+    if v.is_undefined() {
+        return Ok(temporal_rs::options::DisplayTimeZone::Auto);
+    }
+    if !v.is_object_type() {
+        return Err(NativeError::TypeError {
+            name: class,
+            reason: "options must be an object or undefined".to_string(),
+        });
+    }
+    match read_option_string(ctx, v, "timeZoneName", class)? {
+        Some(name) => temporal_rs::options::DisplayTimeZone::from_str(&name).map_err(|_| {
+            NativeError::RangeError {
+                name: class,
+                reason: "invalid `timeZoneName`".to_string(),
+            }
+        }),
+        None => Ok(temporal_rs::options::DisplayTimeZone::Auto),
+    }
+}
+
 fn read_partial_integer(
     ctx: &mut NativeCtx<'_>,
     target: Value,

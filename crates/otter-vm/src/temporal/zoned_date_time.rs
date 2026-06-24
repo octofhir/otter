@@ -233,21 +233,16 @@ pub fn load_property(temporal: JsTemporal, heap: &mut otter_gc::GcHeap, name: &s
         // `era`/`eraYear` route through the calendar-aware `PlainDate`
         // projection — see `get_era` for why the direct
         // `ZonedDateTime::era` accessor is unsuitable.
-        "era" => zdt
-            .to_plain_date()
-            .era()
-            .map_or(Value::undefined(), |era| {
-                crate::temporal::helpers::str_or_undef(era.as_str(), heap)
-            }),
+        "era" => zdt.to_plain_date().era().map_or(Value::undefined(), |era| {
+            crate::temporal::helpers::str_or_undef(era.as_str(), heap)
+        }),
         "eraYear" => zdt
             .to_plain_date()
             .era_year()
             .map_or(Value::undefined(), Value::number_i32),
         "year" => Value::number_i32(zdt.year()),
         "month" => Value::number_i32(zdt.month() as i32),
-        "monthCode" => {
-            crate::temporal::helpers::str_or_undef(zdt.month_code().as_str(), heap)
-        }
+        "monthCode" => crate::temporal::helpers::str_or_undef(zdt.month_code().as_str(), heap),
         "day" => Value::number_i32(zdt.day() as i32),
         "hour" => Value::number_i32(zdt.hour() as i32),
         "minute" => Value::number_i32(zdt.minute() as i32),
@@ -320,14 +315,15 @@ fn duration_arg(ctx: &mut NativeCtx<'_>, v: &Value) -> Result<temporal_rs::Durat
 
 fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
+    // §Temporal.ZonedDateTime.prototype.toString reads the rounding
+    // options (smallestUnit / roundingMode / fractionalSecondDigits)
+    // first, then the three display options.
     let rounding = parse_to_string_rounding_options(args, 0, ctx, CLASS)?;
+    let calendar = crate::temporal::helpers::parse_display_calendar(args, 0, ctx, CLASS)?;
+    let offset = crate::temporal::helpers::parse_display_offset(args, 0, ctx, CLASS)?;
+    let time_zone = crate::temporal::helpers::parse_display_time_zone(args, 0, ctx, CLASS)?;
     let s = zdt
-        .to_ixdtf_string(
-            temporal_rs::options::DisplayOffset::Auto,
-            temporal_rs::options::DisplayTimeZone::Auto,
-            temporal_rs::options::DisplayCalendar::Auto,
-            rounding,
-        )
+        .to_ixdtf_string(offset, time_zone, calendar, rounding)
         .map_err(|e| temporal_err(e, CLASS))?;
     js_string_value(s, ctx)
 }

@@ -203,19 +203,14 @@ impl Interpreter {
             return result;
         }
 
-        // `usingIterator = GetMethod(items, @@iterator)`. Built-in
-        // iterables short-circuit the property round-trip via a
-        // sentinel; everything else looks `@@iterator` up directly.
-        let is_builtin_iterable = items.is_array()
-            || items.is_string()
-            || items.is_set()
-            || items.is_map()
-            || items.is_generator()
-            || items.is_iterator();
+        // §23.1.2.1 step 4 — `usingIterator = GetMethod(items,
+        // @@iterator)`. Resolve `@@iterator` through the ordinary
+        // property ladder so a user-deleted or user-overridden iterator
+        // is honored: deleting `String.prototype[@@iterator]` makes a
+        // string array-like rather than forcing the (now absent)
+        // iterator path.
         let iterator_method = if items.is_undefined() || items.is_null() {
             Value::undefined()
-        } else if is_builtin_iterable {
-            Value::boolean(true)
         } else {
             let iterator_sym = self.well_known_symbols.get(symbol::WellKnown::Iterator);
             match self.ordinary_get_value(
@@ -233,7 +228,7 @@ impl Interpreter {
         };
 
         if !iterator_method.is_undefined() && !iterator_method.is_null() {
-            if !is_builtin_iterable && !self.is_callable_runtime(&iterator_method) {
+            if !self.is_callable_runtime(&iterator_method) {
                 return Err(self.err_type(("iterator method is not callable".to_string()).into()));
             }
             // Step 6 — iterator path. `A = Construct(C)` (no length

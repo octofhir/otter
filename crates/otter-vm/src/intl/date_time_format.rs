@@ -136,6 +136,115 @@ fn hour_cycle_str(h: DtHourCycle) -> &'static str {
     }
 }
 
+/// §ToDateTimeOptions `defaults` set — which numeric components a
+/// `Temporal.*.prototype.toLocaleString` receiver fills in when the
+/// formatter carries only the bare date default (see
+/// [`apply_temporal_defaults`]).
+#[derive(Clone, Copy)]
+pub(crate) enum DefaultComponents {
+    Time,
+    DateTime,
+    YearMonth,
+    MonthDay,
+}
+
+/// Whether `payload` requested no value-bearing date/time component or
+/// style. Per §ToDateTimeOptions the `defaults` fill keys off the core
+/// fields (year/month/day, hour/minute/second) and the styles — `era` /
+/// `weekday` / `dayPeriod` alone do not suppress it. This is true both
+/// for a no-option formatter (whose bare `year/month/day` numeric
+/// default we re-derive) and for an `{ era }`-only formatter, so a
+/// Temporal receiver substitutes its type-appropriate components in
+/// either case.
+fn wants_temporal_defaults(p: &DateTimeFormatPayload) -> bool {
+    // The state a no-component formatter resolves to: numeric
+    // year/month/day, no weekday/dayPeriod/time component, no style. An
+    // `era` may also be present (it does not block the default), and is
+    // preserved across the substitution.
+    matches!(p.year, Some(DtNumWidth::Numeric))
+        && matches!(p.month, Some(DtMonthWidth::Numeric))
+        && matches!(p.day, Some(DtNumWidth::Numeric))
+        && p.weekday.is_none()
+        && p.day_period.is_none()
+        && p.hour.is_none()
+        && p.minute.is_none()
+        && p.second.is_none()
+        && p.fractional_second_digits.is_none()
+        && p.date_style.is_none()
+        && p.time_style.is_none()
+}
+
+/// The [`DefaultComponents`] a Temporal value substitutes into a
+/// bare-date-default formatter, or `None` for a non-Temporal argument.
+fn temporal_default_components(
+    value: &Value,
+    heap: &otter_gc::GcHeap,
+) -> Option<DefaultComponents> {
+    let kind = value.as_temporal(heap)?.payload_clone(heap);
+    Some(match kind {
+        TemporalPayload::PlainTime(_) => DefaultComponents::Time,
+        TemporalPayload::PlainYearMonth(_) => DefaultComponents::YearMonth,
+        TemporalPayload::PlainMonthDay(_) => DefaultComponents::MonthDay,
+        // PlainDate keeps the bare date default; PlainDateTime / Instant /
+        // ZonedDateTime extend it with the time components.
+        TemporalPayload::PlainDate(_) => return None,
+        TemporalPayload::PlainDateTime(_)
+        | TemporalPayload::Instant(_)
+        | TemporalPayload::ZonedDateTime(_) => DefaultComponents::DateTime,
+        TemporalPayload::Duration(_) => return None,
+    })
+}
+
+/// §HandleDateTimeValue — when a Temporal value is formatted through a
+/// formatter that requested no explicit components, substitute the
+/// components appropriate to the value's type. Applied identically by
+/// `DateTimeFormat.prototype.format`/`formatToParts` and by
+/// `Temporal.*.prototype.toLocaleString` so the two render alike.
+fn apply_temporal_defaults(
+    payload: &mut DateTimeFormatPayload,
+    value: &Value,
+    heap: &otter_gc::GcHeap,
+) {
+    if !wants_temporal_defaults(payload) {
+        return;
+    }
+    let Some(defaults) = temporal_default_components(value, heap) else {
+        return;
+    };
+    let num = Some(DtNumWidth::Numeric);
+    let month_num = Some(DtMonthWidth::Numeric);
+    // Set the type's core components (keeping any era / weekday /
+    // dayPeriod the caller added) and clear the ones the type omits.
+    match defaults {
+        DefaultComponents::Time => {
+            payload.year = None;
+            payload.month = None;
+            payload.day = None;
+            payload.hour = num;
+            payload.minute = num;
+            payload.second = num;
+        }
+        DefaultComponents::DateTime => {
+            payload.year = num;
+            payload.month = month_num;
+            payload.day = num;
+            payload.hour = num;
+            payload.minute = num;
+            payload.second = num;
+        }
+        DefaultComponents::YearMonth => {
+            payload.year = num;
+            payload.month = month_num;
+            payload.day = None;
+        }
+        DefaultComponents::MonthDay => {
+            payload.year = None;
+            payload.month = month_num;
+            payload.day = num;
+        }
+    }
+}
+
 /// §11.1.2 `CreateDateTimeFormat` — spec-faithful construction firing
 /// every option getter in the observation order pinned by
 /// `constructor-options-order`, with ToString / ToNumber / ToBoolean
@@ -251,9 +360,24 @@ pub fn resolve_ctx(
         ));
     }
 
-    // ToDateTimeOptions defaults: no style and no components → numeric
-    // year/month/day.
-    if date_style.is_none() && time_style.is_none() && !has_components {
+    // §ToDateTimeOptions(options, "date") `needDefaults` keys off the
+    // weekday/year/month/day (date) and dayPeriod/hour/minute/second/
+    // fractionalSecondDigits (time) component sets — `era` does NOT count
+    // (`{ era }` alone still defaults to numeric year/month/day). When
+    // neither a style nor any of those is present, fill numeric
+    // year/month/day. The `Temporal.*.prototype.toLocaleString` paths
+    // re-derive type-appropriate components at format time (see
+    // `apply_temporal_defaults`) from this bare-date default.
+    let needs_defaults = weekday.is_none()
+        && year.is_none()
+        && month.is_none()
+        && day.is_none()
+        && day_period.is_none()
+        && hour.is_none()
+        && minute.is_none()
+        && second.is_none()
+        && fractional_second_digits.is_none();
+    if date_style.is_none() && time_style.is_none() && needs_defaults {
         year = Some(DtNumWidth::Numeric);
         month = Some(DtMonthWidth::Numeric);
         day = Some(DtNumWidth::Numeric);
@@ -336,11 +460,40 @@ fn bound_format_call(
         .first()
         .and_then(|v| v.as_intl(ctx.heap()))
         .ok_or_else(bad)?;
-    let payload = match intl.payload_clone(ctx.heap()) {
+    let mut payload = match intl.payload_clone(ctx.heap()) {
         IntlPayload::DateTimeFormat(d) => d,
         _ => return Err(bad()),
     };
+    if let Some(arg) = args.first() {
+        apply_temporal_defaults(&mut payload, arg, ctx.heap());
+    }
     let (y, mo, d, h, mi, s) = arg_to_civil(ctx, args.first(), "format")?;
+    let formatted = format_components(y, mo, d, h, mi, s, &payload);
+    Ok(Value::string(JsString::from_str(
+        &formatted,
+        ctx.heap_mut(),
+    )?))
+}
+
+/// Shared `Temporal.<Type>.prototype.toLocaleString` body: resolve a
+/// fresh `DateTimeFormat` payload from `(locales, options)` then format
+/// the Temporal receiver through the same civil-field path
+/// `DateTimeFormat.prototype.format` uses, so the two render
+/// identically (the spec defines `toLocaleString` in terms of a freshly
+/// constructed `DateTimeFormat`).
+pub(crate) fn temporal_to_locale_string(
+    ctx: &mut NativeCtx<'_>,
+    receiver: Value,
+    locales: Value,
+    options: Value,
+) -> Result<Value, NativeError> {
+    let mut payload = resolve_ctx(ctx, locales, options)?;
+    // Substitute the receiver's type-appropriate components into a
+    // bare-date-default formatter — identical to the adjustment
+    // `DateTimeFormat.prototype.format` applies to the same receiver, so
+    // the two render alike.
+    apply_temporal_defaults(&mut payload, &receiver, ctx.heap());
+    let (y, mo, d, h, mi, s) = arg_to_civil_zoned(ctx, Some(&receiver), "toLocaleString")?;
     let formatted = format_components(y, mo, d, h, mi, s, &payload);
     Ok(Value::string(JsString::from_str(
         &formatted,
@@ -388,6 +541,26 @@ fn arg_to_civil(
     first: Option<&Value>,
     name: &'static str,
 ) -> Result<(i32, u8, u8, u8, u8, u8), NativeError> {
+    arg_to_civil_inner(ctx, first, name, false)
+}
+
+/// `arg_to_civil` variant used by the `Temporal.*.prototype.toLocaleString`
+/// paths, which (unlike `DateTimeFormat.prototype.format`) accept a
+/// `Temporal.ZonedDateTime` receiver.
+fn arg_to_civil_zoned(
+    ctx: &mut NativeCtx<'_>,
+    first: Option<&Value>,
+    name: &'static str,
+) -> Result<(i32, u8, u8, u8, u8, u8), NativeError> {
+    arg_to_civil_inner(ctx, first, name, true)
+}
+
+fn arg_to_civil_inner(
+    ctx: &mut NativeCtx<'_>,
+    first: Option<&Value>,
+    name: &'static str,
+    allow_zoned: bool,
+) -> Result<(i32, u8, u8, u8, u8, u8), NativeError> {
     if let Some(t) = first.and_then(|v| v.as_temporal(ctx.heap())) {
         match t.payload_clone(ctx.heap()) {
             TemporalPayload::PlainDateTime(pdt) => Ok((
@@ -399,12 +572,45 @@ fn arg_to_civil(
                 pdt.second(),
             )),
             TemporalPayload::PlainDate(pd) => Ok((pd.year(), pd.month(), pd.day(), 0, 0, 0)),
+            // §FormatDateTime rejects a ZonedDateTime through
+            // `DateTimeFormat.prototype.format` (the formatter cannot
+            // reconcile its own time zone with the value's); only the
+            // `toLocaleString` path, which builds the formatter from the
+            // value, accepts it.
+            TemporalPayload::ZonedDateTime(_) if !allow_zoned => Err(NativeError::TypeError {
+                name,
+                reason: "Temporal.ZonedDateTime is not supported by DateTimeFormat; use its toLocaleString".to_string(),
+            }),
+            TemporalPayload::ZonedDateTime(zdt) => Ok((
+                zdt.year(),
+                zdt.month(),
+                zdt.day(),
+                zdt.hour(),
+                zdt.minute(),
+                zdt.second(),
+            )),
+            // PlainTime carries no date; render against the Unix-epoch
+            // reference date the same way `DateTimeFormat.format` does.
+            TemporalPayload::PlainTime(pt) => Ok((1970, 1, 1, pt.hour(), pt.minute(), pt.second())),
+            TemporalPayload::PlainYearMonth(pym) => Ok((pym.year(), pym.month(), 1, 0, 0, 0)),
+            TemporalPayload::PlainMonthDay(pmd) => {
+                // MonthCode is `M01`..`M12`; the ISO reference year 1972
+                // is the standard anchor for a bare month/day.
+                let month = pmd
+                    .month_code()
+                    .as_str()
+                    .trim_start_matches('M')
+                    .trim_end_matches('L')
+                    .parse::<u8>()
+                    .unwrap_or(1);
+                Ok((1972, month, pmd.day(), 0, 0, 0))
+            }
             TemporalPayload::Instant(inst) => {
                 Ok(epoch_to_civil(inst.epoch_milliseconds().div_euclid(1000)))
             }
-            _ => Err(NativeError::TypeError {
+            TemporalPayload::Duration(_) => Err(NativeError::TypeError {
                 name,
-                reason: "argument 0 must be a Number, Temporal.Instant, Temporal.PlainDate, or Temporal.PlainDateTime".to_string(),
+                reason: "argument 0 must be a Number or a non-Duration Temporal value".to_string(),
             }),
         }
     } else if first.is_none() || first.is_some_and(|v| v.is_undefined()) {
@@ -428,7 +634,10 @@ pub(crate) fn date_time_format_format_to_parts(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let payload = require_date_time(ctx, "formatToParts")?;
+    let mut payload = require_date_time(ctx, "formatToParts")?;
+    if let Some(arg) = args.first() {
+        apply_temporal_defaults(&mut payload, arg, ctx.heap());
+    }
     let (y, mo, d, h, mi, s) = arg_to_civil(ctx, args.first(), "formatToParts")?;
     let parts = icu_format_segments(y, mo, d, h, mi, s, &payload)
         .unwrap_or_else(|| vec![("literal", format_components(y, mo, d, h, mi, s, &payload))]);

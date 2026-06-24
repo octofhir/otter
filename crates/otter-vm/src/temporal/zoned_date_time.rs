@@ -704,6 +704,16 @@ otter_macros::couch! {
 /// §sec-temporal.*.prototype.tolocalestring — brand-checks the receiver,
 /// then (absent the Intl formatting data path) renders the same canonical
 /// string as `toString`.
-fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    impl_to_string(ctx, &[])
+fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    // §Temporal.*.prototype.toLocaleString renders through a freshly
+    // constructed DateTimeFormat so the output matches
+    // `new Intl.DateTimeFormat(locales, options).format(this)`.
+    let _ = require_zoned_date_time(ctx)?;
+    let receiver = *ctx.this_value();
+    crate::intl::date_time_format::temporal_to_locale_string(
+        ctx,
+        receiver,
+        crate::temporal::helpers::arg_or_undef(args, 0),
+        crate::temporal::helpers::arg_or_undef(args, 1),
+    )
 }

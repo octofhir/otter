@@ -737,12 +737,12 @@ pub fn parse_display_offset(
         });
     }
     match read_option_string(ctx, v, "offset", class)? {
-        Some(name) => {
-            temporal_rs::options::DisplayOffset::from_str(&name).map_err(|_| NativeError::RangeError {
+        Some(name) => temporal_rs::options::DisplayOffset::from_str(&name).map_err(|_| {
+            NativeError::RangeError {
                 name: class,
                 reason: "invalid `offset`".to_string(),
-            })
-        }
+            }
+        }),
         None => Ok(temporal_rs::options::DisplayOffset::Auto),
     }
 }

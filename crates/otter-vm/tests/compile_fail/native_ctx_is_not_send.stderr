@@ -454,9 +454,9 @@ note: required because it appears within the type `otter_gc::compressed::Gc<JsSt
   |            ^^
   = note: required because it appears within the type `(std::string::String, otter_gc::compressed::Gc<JsStringBody>)`
   = note: required for `hashbrown::raw::RawTable<(std::string::String, otter_gc::compressed::Gc<JsStringBody>)>` to implement `Send`
-note: required because it appears within the type `hashbrown::map::HashMap<std::string::String, otter_gc::compressed::Gc<JsStringBody>, RandomState>`
+note: required because it appears within the type `hashbrown::map::HashMap<std::string::String, otter_gc::compressed::Gc<JsStringBody>, rustc_hash::FxBuildHasher>`
  --> /rust/deps/hashbrown-0.16.1/src/map.rs:185:11
-note: required because it appears within the type `HashMap<std::string::String, otter_gc::compressed::Gc<JsStringBody>>`
+note: required because it appears within the type `HashMap<std::string::String, otter_gc::compressed::Gc<JsStringBody>, rustc_hash::FxBuildHasher>`
  --> $RUST/std/src/collections/hash/map.rs
   |
   | pub struct HashMap<

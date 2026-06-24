@@ -75,7 +75,15 @@ pub(crate) fn compile_tail_return(
             compile_tail_return(cx, &l.right, span)
         }
         Expression::CallExpression(call) => {
-            if let Some(callee) = crate::calls::tail_eligible_free_callee(cx, call) {
+            if crate::calls::is_syntactic_eval_call(cx, call) {
+                // `return eval(x)` — direct eval if `eval` is still the
+                // intrinsic at runtime, otherwise a tail call to the
+                // shadowing value.
+                let callee = &call.callee;
+                let dst = crate::calls::emit_guarded_eval(cx, call, callee, span, true)?;
+                cx.emit(Op::ReturnValue, [Operand::Register(dst)], span);
+                Ok(())
+            } else if let Some(callee) = crate::calls::tail_eligible_free_callee(cx, call) {
                 let dst = crate::calls::emit_tail_free_call(cx, call, callee, span)?;
                 cx.emit(Op::ReturnValue, [Operand::Register(dst)], span);
                 Ok(())

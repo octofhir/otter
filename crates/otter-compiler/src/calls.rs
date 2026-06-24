@@ -525,13 +525,12 @@ pub(crate) fn compile_method_call(
         && cx.binding_position("eval").is_none()
         && find_module_import_binding(cx, "eval").is_none()
     {
-        let src_reg = if has_spread {
+        if has_spread {
             // Spread form: drain every argument into an array per
-            // ArgumentListEvaluation, then take element 0 as the
-            // eval text. An absent element reads as undefined, and
-            // eval(undefined) returns undefined (§19.2.1.1 step 2 —
-            // non-string input passes through), matching the
-            // empty-argument-list rule.
+            // ArgumentListEvaluation, then take element 0 as the eval
+            // text. The rare spread `eval(...)` keeps the unconditional
+            // `Op::Eval` lowering; the runtime eval-identity guard is
+            // applied only to the common non-spread fast path below.
             let arr = cx.alloc_scratch();
             cx.emit(
                 Op::NewArray,
@@ -560,73 +559,30 @@ pub(crate) fn compile_method_call(
                 [Operand::Register(idx), Operand::Imm32(0)],
                 span,
             );
-            let first = cx.alloc_scratch();
+            let src_reg = cx.alloc_scratch();
             cx.emit(
                 Op::LoadElement,
                 vec![
-                    Operand::Register(first),
+                    Operand::Register(src_reg),
                     Operand::Register(arr),
                     Operand::Register(idx),
                 ],
                 span,
             );
-            first
-        } else {
-            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            if arg_regs.is_empty() {
-                let dst = cx.alloc_scratch();
-                cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
-                return Ok(dst);
-            }
-            arg_regs[0]
-        };
-        let dst = cx.alloc_scratch();
-        // §19.2.1.3 EvalDeclarationInstantiation — a sloppy direct
-        // eval run from a parameter initializer whose body
-        // var-declares `arguments` throws SyntaxError when the
-        // calling function binds the name (the binding exists but is
-        // still uninitialized during parameter instantiation). After
-        // the parameters are bound the same eval body is legal, so
-        // only the parameter-default window arms the flag. Arrows
-        // have lexical [[ThisMode]] — the restriction never applies
-        // to an arrow variable environment.
-        let forbid_var_arguments = cx.in_param_init && cx.binds_arguments;
-        // §19.2.1.1 step 5 — `new.target` in the eval body is legal
-        // only when the call site sits inside *non-arrow* function
-        // code (arrows are transparent: the signal comes from the
-        // enclosing function), or inside a class field initializer.
-        let new_target_allowed = cx.eval_new_target_allowed
-            || cx.in_field_initializer
-            || cx.stack.iter().skip(1).any(|frame| !frame.is_arrow);
-        // Flag bits: 0 — forbid var-`arguments` (§19.2.1.3); 1 — the
-        // call site sits in a parameter initializer, where the
-        // caller's *body* lexical bindings are not yet in scope;
-        // 2 — `new.target` is legal in the eval body; 3 — the body
-        // observes `new.target` as undefined (field initializer).
-        // 4 — the call site's context carries a [[HomeObject]]
-        // (method body or field initializer), so `super.x` is legal
-        // in the eval body (§19.2.1.1 step 5).
-        let super_allowed = cx.in_field_initializer
-            || cx.lookup_binding(crate::class::SUPER_HOME_NAME).is_some()
-            || cx.resolve_capture(crate::class::SUPER_HOME_NAME).is_some()
-            || cx
-                .resolve_capture(crate::class::SUPER_STATIC_HOME_NAME)
-                .is_some();
-        let flags = i32::from(forbid_var_arguments)
-            | (i32::from(cx.in_param_init) << 1)
-            | (i32::from(new_target_allowed) << 2)
-            | (i32::from(cx.in_field_initializer) << 3)
-            | (i32::from(super_allowed) << 4);
-        cx.emit(
-            Op::Eval,
-            [
-                Operand::Register(dst),
-                Operand::Register(src_reg),
-                Operand::Imm32(flags),
-            ],
-            span,
-        );
-        return Ok(dst);
+            let dst = cx.alloc_scratch();
+            let flags = compute_eval_flags(cx);
+            cx.emit(
+                Op::Eval,
+                [
+                    Operand::Register(dst),
+                    Operand::Register(src_reg),
+                    Operand::Imm32(flags),
+                ],
+                span,
+            );
+            return Ok(dst);
+        }
+        return emit_guarded_eval(cx, call, callee, span, false);
     }
     // §19.2 global function bare-identifier calls like
     // `parseInt(...)` / `isNaN(x)` / `encodeURIComponent(s)` flow
@@ -821,6 +777,114 @@ pub(crate) fn emit_tail_free_call(
     operands.push(Operand::ConstIndex(arg_regs.len() as u32));
     operands.extend(arg_regs.into_iter().map(Operand::Register));
     cx.emit(Op::TailCall, operands, span);
+    Ok(dst)
+}
+
+/// §19.2.1.1 eval-body flag bits shared by the direct-eval lowerings.
+/// Bit 0 forbid var-`arguments`; 1 parameter-initializer window; 2
+/// `new.target` legal; 3 field-initializer (new.target undefined); 4
+/// `super.x` legal (HomeObject in scope). `&mut` because resolving the
+/// super-home capture installs the cell the eval body reads.
+pub(crate) fn compute_eval_flags(cx: &mut Compiler) -> i32 {
+    let forbid_var_arguments = cx.in_param_init && cx.binds_arguments;
+    let new_target_allowed = cx.eval_new_target_allowed
+        || cx.in_field_initializer
+        || cx.stack.iter().skip(1).any(|frame| !frame.is_arrow);
+    let super_allowed = cx.in_field_initializer
+        || cx.lookup_binding(crate::class::SUPER_HOME_NAME).is_some()
+        || cx.resolve_capture(crate::class::SUPER_HOME_NAME).is_some()
+        || cx
+            .resolve_capture(crate::class::SUPER_STATIC_HOME_NAME)
+            .is_some();
+    i32::from(forbid_var_arguments)
+        | (i32::from(cx.in_param_init) << 1)
+        | (i32::from(new_target_allowed) << 2)
+        | (i32::from(cx.in_field_initializer) << 3)
+        | (i32::from(super_allowed) << 4)
+}
+
+/// `true` for a syntactic non-spread `eval(...)` site whose callee name
+/// is unshadowed (so the static lowering would treat it as direct eval).
+/// The runtime guard in [`emit_guarded_eval`] still decides direct vs.
+/// ordinary based on the callee's actual value.
+pub(crate) fn is_syntactic_eval_call(
+    cx: &Compiler,
+    call: &oxc_ast::ast::CallExpression<'_>,
+) -> bool {
+    if call.optional {
+        return false;
+    }
+    let has_spread = call
+        .arguments
+        .iter()
+        .any(|arg| matches!(arg, oxc_ast::ast::Argument::SpreadElement(_)));
+    if has_spread {
+        return false;
+    }
+    matches!(peel_paren_eval(unwrap_ts_expr(&call.callee)), Expression::Identifier(id)
+        if id.name.as_str() == "eval"
+            && cx.binding_position("eval").is_none()
+            && find_module_import_binding(cx, "eval").is_none())
+}
+
+/// §sec-function-calls step 6.a — lower a syntactic non-spread
+/// `eval(args)` with a runtime `SameValue(func, %eval%)` guard: evaluate
+/// the `eval` reference and the arguments once, then branch on
+/// [`Op::IsEvalIntrinsic`]. When the resolved value is the real `eval`,
+/// run `Op::Eval` (direct eval with caller scope); otherwise perform an
+/// ordinary call — a tail call when `tail` is set — to the shadowing
+/// value. Both branches land their result in the same `dst`.
+pub(crate) fn emit_guarded_eval(
+    cx: &mut Compiler,
+    call: &oxc_ast::ast::CallExpression<'_>,
+    callee: &Expression<'_>,
+    span: (u32, u32),
+    tail: bool,
+) -> Result<u16, CompileError> {
+    // Evaluate the callee reference before the arguments (spec order),
+    // resolving `eval` through whatever scope applies (global, captured
+    // outer binding, `with` object, or a dynamically-introduced var).
+    let ev_reg = compile_expr(cx, callee, span)?;
+    let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+    check_call_arity(arg_regs.len(), "Op::TailCall", span)?;
+    let dst = cx.alloc_scratch();
+    let src_reg = match arg_regs.first() {
+        Some(&r) => r,
+        None => {
+            let u = cx.alloc_scratch();
+            cx.emit(Op::LoadUndefined, [Operand::Register(u)], span);
+            u
+        }
+    };
+    let flags = compute_eval_flags(cx);
+
+    let is_eval = cx.alloc_scratch();
+    cx.emit(
+        Op::IsEvalIntrinsic,
+        [Operand::Register(is_eval), Operand::Register(ev_reg)],
+        span,
+    );
+    let to_ordinary = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(is_eval), span);
+    // Direct-eval branch.
+    cx.emit(
+        Op::Eval,
+        [
+            Operand::Register(dst),
+            Operand::Register(src_reg),
+            Operand::Imm32(flags),
+        ],
+        span,
+    );
+    let to_end = cx.emit_branch_placeholder(Op::Jump, None, span);
+    // Ordinary-call branch — `eval` was shadowed at runtime.
+    cx.patch_branch_to_here(to_ordinary);
+    let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+    operands.push(Operand::Register(dst));
+    operands.push(Operand::Register(ev_reg));
+    operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+    operands.extend(arg_regs.iter().map(|&r| Operand::Register(r)));
+    cx.emit(if tail { Op::TailCall } else { Op::Call }, operands, span);
+    cx.patch_branch_to_here(to_end);
     Ok(dst)
 }
 

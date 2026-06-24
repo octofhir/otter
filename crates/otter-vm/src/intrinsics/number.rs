@@ -417,7 +417,7 @@ fn global_is_finite(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     Ok(Value::boolean(num.as_f64().is_finite()))
 }
 
-fn global_eval(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn global_eval(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let arg = args.first().cloned().unwrap_or(Value::undefined());
     // §19.2.1.1 indirect eval: sloppy, global variable environment —
     // no caller-scope restrictions apply. Errors keep their spec

@@ -854,6 +854,7 @@ mod tests {
         Op::FreshUpvalue,
         Op::Call,
         Op::TailCall,
+        Op::IsEvalIntrinsic,
         Op::CallWithThis,
         Op::BindFunction,
         Op::LoadThis,

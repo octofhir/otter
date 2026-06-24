@@ -549,6 +549,12 @@ pub enum Op {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-eval-x>
     Eval,
+    /// `r<dst> = (r<val> is the original %eval% intrinsic)`. Operands:
+    /// `dst, val`. Lets a syntactic `eval(...)` site decide at runtime
+    /// whether the resolved callee is the real `eval` (→ direct eval) or
+    /// a shadowing value (→ an ordinary call), per §sec-function-calls
+    /// step 6.a `SameValue(func, %eval%)`.
+    IsEvalIntrinsic,
 
     /// `r<dst> = new Function(arg0, arg1, …, body)`. Operands:
     /// `Register(dst), ConstIndex(argc), Register(arg0), …`.
@@ -1434,6 +1440,7 @@ impl Op {
             Op::GetTemplateObject => "GET_TEMPLATE_OBJECT",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
+            Op::IsEvalIntrinsic => "IS_EVAL_INTRINSIC",
             Op::NewFunction => "NEW_FUNCTION",
             Op::ArrayBufferCall => "ARRAY_BUFFER_CALL",
             Op::DataViewCall => "DATA_VIEW_CALL",
@@ -1495,6 +1502,7 @@ impl Op {
             | Op::MakeFunction
             | Op::MathLoad
             | Op::Await
+            | Op::IsEvalIntrinsic
             | Op::ImportNamespace
             | Op::ImportNamespaceDeferred
             | Op::ModuleNamespaceObject

@@ -8337,6 +8337,24 @@ impl Interpreter {
                     frame.advance_pc(self.current_byte_len)?;
                     continue;
                 }
+                Op::IsEvalIntrinsic => {
+                    // §sec-function-calls 6.a `SameValue(func, %eval%)`:
+                    // is `val` the original global `eval` native?
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let value = *read_register(&stack[top_idx], src)?;
+                    let is_eval = value.as_native_function().is_some_and(|n| {
+                        n.is_static_fn(&self.gc_heap, crate::intrinsics::number::global_eval)
+                    });
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, Value::boolean(is_eval))?;
+                    frame.advance_pc(self.current_byte_len)?;
+                    continue;
+                }
                 Op::MakeClosure => {
                     let operands = context.exec_operands(instr);
                     let frame = &mut stack[top_idx];

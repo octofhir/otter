@@ -228,6 +228,7 @@ const fn method(
 
 pub static PLAIN_MONTH_DAY_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("toString", 0, impl_to_string),
+    method("toLocaleString", 0, impl_to_locale_string),
     method("toJSON", 0, impl_to_json),
     method("valueOf", 0, impl_value_of),
     method("equals", 1, impl_equals),
@@ -253,4 +254,11 @@ otter_macros::couch! {
     },
     install_on = crate::temporal::native_dispatch::temporal_host,
     string_tag = "Temporal.PlainMonthDay",
+}
+
+/// §sec-temporal.*.prototype.tolocalestring — brand-checks the receiver,
+/// then (absent the Intl formatting data path) renders the same canonical
+/// string as `toString`.
+fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    impl_to_string(ctx, &[])
 }

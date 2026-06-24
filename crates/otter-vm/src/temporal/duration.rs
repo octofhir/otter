@@ -189,6 +189,13 @@ fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
     impl_to_string(ctx, &[])
 }
 
+/// §sec-temporal.duration.prototype.tolocalestring — brand-checks the
+/// receiver, then (absent the Intl `DurationFormat` data path) renders
+/// the same canonical string as `toString`.
+fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    impl_to_string(ctx, &[])
+}
+
 fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     Err(NativeError::TypeError {
         name: CLASS,
@@ -518,6 +525,7 @@ const fn method(
 
 pub static DURATION_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("toString", 0, impl_to_string),
+    method("toLocaleString", 0, impl_to_locale_string),
     method("toJSON", 0, impl_to_json),
     method("valueOf", 0, impl_value_of),
     method("add", 1, impl_add),

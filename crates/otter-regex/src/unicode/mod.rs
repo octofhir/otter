@@ -84,6 +84,10 @@ fn binary_or_general_category(name: &str) -> Option<CodePointSet> {
         }
         _ => {}
     }
+    // ECMA-262 Table 69 lists `space` as the alias of `White_Space`, but
+    // ICU4X's `new_for_ecma262` only recognises the canonical name, so
+    // normalise this one alias it misses.
+    let name = if name == "space" { "White_Space" } else { name };
     if let Some(set) = CodePointSetData::new_for_ecma262(name.as_bytes()) {
         return Some(CodePointSet::from_ranges(set.iter_ranges()));
     }

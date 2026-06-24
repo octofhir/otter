@@ -298,6 +298,47 @@ impl ClassSet {
         }
     }
 
+    /// Total number of code points the class admits, saturating. Cheap
+    /// (sums range widths); used to skip closure-folding pathologically
+    /// large `ignore_case` classes.
+    pub(crate) fn code_point_count(&self) -> u32 {
+        let mut n: u32 = 0;
+        for r in self.code_points.ranges() {
+            n = n.saturating_add((*r.end()).saturating_sub(*r.start()).saturating_add(1));
+        }
+        n
+    }
+
+    /// Fold the full Unicode simple-case closure into the member set: for
+    /// every member, add every code point that case-folds to the same
+    /// value (e.g. `K` U+004B gains `k` U+006B and the Kelvin sign
+    /// U+212A). After this the plain membership test matches Unicode
+    /// `ignore_case` semantics for both positive and negated classes, so
+    /// the executor can drop the per-character fold probe. Multi-character
+    /// folds (e.g. `ß` → `ss`) are skipped — a character class matches a
+    /// single code point.
+    pub(crate) fn fold_unicode_case(&mut self) {
+        struct Sink<'a>(&'a mut Vec<u32>);
+        impl icu_casemap::ClosureSink for Sink<'_> {
+            fn add_char(&mut self, c: char) {
+                self.0.push(c as u32);
+            }
+            fn add_string(&mut self, _: &str) {}
+        }
+        let mapper = icu_casemap::CaseMapper::new();
+        let mut adds: Vec<u32> = Vec::new();
+        for r in self.code_points.ranges() {
+            for cp in *r.start()..=*r.end() {
+                if let Some(c) = char::from_u32(cp) {
+                    mapper.add_case_closure_to(c, &mut Sink(&mut adds));
+                }
+            }
+        }
+        for cp in adds {
+            self.code_points.insert(cp);
+        }
+    }
+
     /// Precompute the ASCII (`0..128`) membership bitmap from `code_points`.
     /// Idempotent; the lowering pass calls it once per compiled class so the
     /// executor can test the dominant ASCII range with a single bit check.

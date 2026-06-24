@@ -71,6 +71,37 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
                 _ => {}
             }
         }
+    } else {
+        // Unicode case-insensitive classes: bake the full simple-case
+        // closure into the member set (so `[K]` also matches the Kelvin
+        // sign, `[k]` matches it too, etc.) and drop the per-character
+        // probe — which only folds the subject, not the class members.
+        // Very large classes (`\p{L}`, near-total ranges) keep the
+        // match-time probe: expanding their closure is costly and they
+        // already contain almost all of it.
+        const UNICODE_FOLD_CLASS_LIMIT: u32 = 4096;
+        let Emitter { insns, classes, .. } = &mut e;
+        for insn in insns.iter_mut() {
+            let (class, ignore_case) = match insn {
+                Insn::Class {
+                    class, ignore_case, ..
+                } => (class, ignore_case),
+                Insn::Repeat {
+                    atom:
+                        RepeatAtom::Class {
+                            class, ignore_case, ..
+                        },
+                    ..
+                } => (class, ignore_case),
+                _ => continue,
+            };
+            if *ignore_case
+                && classes[*class as usize].code_point_count() <= UNICODE_FOLD_CLASS_LIMIT
+            {
+                classes[*class as usize].fold_unicode_case();
+                *ignore_case = false;
+            }
+        }
     }
 
     // Precompute each class's ASCII membership bitmap so the executor tests the

@@ -84,3 +84,19 @@ fn iterable_constructor_observes_custom_array_iterator_next() {
         "#);
     assert_eq!(completion, "true");
 }
+
+#[test]
+fn oversized_typed_array_length_throws_range_error_before_allocation() {
+    let completion = run(r#"
+        try {
+            new Uint8Array(0x80000000);
+            "no throw";
+        } catch (e) {
+            e.name + ":" + e.message;
+        }
+        "#);
+    assert_eq!(
+        completion,
+        "RangeError:Invalid typed array length: 2147483648"
+    );
+}

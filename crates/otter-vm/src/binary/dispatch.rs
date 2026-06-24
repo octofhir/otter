@@ -328,6 +328,8 @@ fn typed_array_byte_len(
         .ok_or_else(|| interp.err_range(("TypedArray byte length overflow".to_string()).into()))
 }
 
+const MAX_TYPED_ARRAY_BYTE_LENGTH: usize = 0x7fff_ffff;
+
 pub(crate) fn typed_array_from_values_with_roots(
     kind: TypedArrayKind,
     values: &[Value],
@@ -370,6 +372,13 @@ fn new_zeroed_typed_array_with_roots(
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
     let byte_len = typed_array_byte_len(interp, len, kind.bytes_per_element())?;
+    if byte_len > MAX_TYPED_ARRAY_BYTE_LENGTH {
+        return Err(interp.err_coded(
+            crate::ErrorKind::RangeError,
+            "",
+            format!("Invalid typed array length: {len}"),
+        ));
+    }
     let allocated =
         JsArrayBuffer::try_new_with_roots(byte_len, interp.gc_heap_mut(), external_visit)
             .map_err(oom_to_vm)?;

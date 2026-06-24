@@ -208,7 +208,8 @@ if (!Buffer) {
       if (start < 0) start = 0;
       if (end > len) end = len;
       if (end <= start) return '';
-      const e = enc.normalize(encoding) || 'utf8';
+      const e = enc.normalize(encoding);
+      if (e === undefined) throw unknownEncoding(encoding);
       switch (e) {
         case 'utf8': return utf8Slice(this, start, end);
         case 'ascii': { let s = ''; for (let i = start; i < end; i++) s += String.fromCharCode(this[i] & 0x7f); return s; }
@@ -237,10 +238,19 @@ if (!Buffer) {
 
     write(string, offset, length, encoding) {
       if (offset === undefined) { offset = 0; length = this.length; encoding = 'utf8'; }
-      else if (typeof offset === 'string') { encoding = offset; offset = 0; length = this.length; }
+      else if (typeof offset === 'string') {
+        if (length !== undefined) throw invalidArgType('offset', 'number', offset);
+        encoding = offset; offset = 0; length = this.length;
+      }
       else if (typeof length === 'string') { encoding = length; length = this.length - offset; }
+      if (typeof offset !== 'number') throw invalidArgType('offset', 'number', offset);
+      if (!Number.isFinite(offset) || offset < 0 || offset > this.length) {
+        throw outOfRange('offset', `>= 0 && <= ${this.length}`, offset);
+      }
       offset = offset | 0;
-      const bytes = bytesFromString(string, encoding);
+      const e = enc.normalize(encoding);
+      if (e === undefined) throw unknownEncoding(encoding);
+      const bytes = bytesFromString(string, e);
       const max = length === undefined ? this.length - offset : Math.min(length | 0, this.length - offset);
       const n = Math.min(bytes.length, max);
       for (let i = 0; i < n; i++) this[offset + i] = bytes[i];
@@ -406,6 +416,11 @@ if (!Buffer) {
     configurable: true,
     enumerable: false,
     get() { return this.buffer; },
+  });
+  Object.defineProperty(proto, 'offset', {
+    configurable: true,
+    enumerable: false,
+    get() { return this.byteOffset; },
   });
 
   // ---- statics ----

@@ -365,6 +365,7 @@ pub(crate) fn pre_declare_lexical_bindings(
 pub(crate) fn pre_declare_block_lexical_bindings(
     cx: &mut Compiler,
     names: &[(String, bool)],
+    captured_names: &std::collections::HashSet<String>,
     span: (u32, u32),
 ) -> Result<(), CompileError> {
     for (name, is_const) in names {
@@ -375,7 +376,7 @@ pub(crate) fn pre_declare_block_lexical_bindings(
         // a captured binding's cell is holed in place so a closure
         // running before the declaration reads a ReferenceError.
         if let crate::scope::BindingStorage::Upvalue { idx } =
-            cx.declare_binding(name, *is_const, span)?
+            cx.declare_binding_with_capture(name, *is_const, span, captured_names.contains(name))?
         {
             let hole = cx.alloc_scratch();
             cx.emit(Op::LoadHole, [Operand::Register(hole)], span);

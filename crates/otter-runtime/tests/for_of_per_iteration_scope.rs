@@ -68,3 +68,21 @@ fn const_head_in_tdz_during_rhs() {
          threw;";
     assert_eq!(eval(src), "true");
 }
+
+#[test]
+fn later_closure_capture_does_not_capture_prior_shadowing_block_binding() {
+    let src = "const b = { length: 1024 };\n\
+         { const b = { length: 128 }; b.length; }\n\
+         const f = () => b.length;\n\
+         b.length + ',' + f();";
+    assert_eq!(eval(src), "1024,1024");
+}
+
+#[test]
+fn closure_inside_block_still_captures_shadowing_block_binding() {
+    let src = "const b = { length: 1024 };\n\
+         let f;\n\
+         { const b = { length: 128 }; f = () => b.length; }\n\
+         b.length + ',' + f();";
+    assert_eq!(eval(src), "1024,128");
+}

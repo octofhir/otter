@@ -167,7 +167,8 @@ pub(crate) fn compile_catch_clause(
     // is safe.
     let mut block_lex: Vec<(String, bool)> = Vec::new();
     crate::hoist::hoist_lexical_names(&handler.body.body, &mut block_lex);
-    crate::hoist::pre_declare_block_lexical_bindings(cx, &block_lex, span)?;
+    let block_captured = crate::capture::nested_function_refs_in_statements(&handler.body.body);
+    crate::hoist::pre_declare_block_lexical_bindings(cx, &block_lex, &block_captured, span)?;
     for inner in &handler.body.body {
         compile_statement(cx, inner)?;
     }
@@ -191,7 +192,8 @@ pub(crate) fn compile_finalizer(
         let fspan = (finalizer.span.start, finalizer.span.end);
         let mut block_lex: Vec<(String, bool)> = Vec::new();
         crate::hoist::hoist_lexical_names(&finalizer.body, &mut block_lex);
-        crate::hoist::pre_declare_block_lexical_bindings(cx, &block_lex, fspan)?;
+        let block_captured = crate::capture::nested_function_refs_in_statements(&finalizer.body);
+        crate::hoist::pre_declare_block_lexical_bindings(cx, &block_lex, &block_captured, fspan)?;
         for inner in &finalizer.body {
             compile_statement(cx, inner)?;
         }

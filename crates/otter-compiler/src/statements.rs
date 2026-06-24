@@ -204,7 +204,8 @@ pub(crate) fn compile_statement(
             // name hoists independently elsewhere.
             let mut block_lex: Vec<(String, bool)> = Vec::new();
             hoist_lexical_names(&b.body, &mut block_lex);
-            pre_declare_block_lexical_bindings(cx, &block_lex, span)?;
+            let block_captured = crate::capture::nested_function_refs_in_statements(&b.body);
+            pre_declare_block_lexical_bindings(cx, &block_lex, &block_captured, span)?;
             let saved_hoisted = cx.hoisted_function_names.clone();
             hoist_function_declarations(cx, &b.body)?;
             let mut last = None;
@@ -1370,7 +1371,8 @@ pub(crate) fn compile_switch_statement(
     for case in &s.cases {
         hoist_lexical_names(&case.consequent, &mut case_lex);
     }
-    pre_declare_block_lexical_bindings(cx, &case_lex, span)?;
+    let case_captured = crate::capture::nested_function_refs_in_statement_refs(&case_stmts);
+    pre_declare_block_lexical_bindings(cx, &case_lex, &case_captured, span)?;
     hoist_function_declarations_from(cx, &case_stmts)?;
     cx.push_loop_frame(LoopFrame::switch_body());
 

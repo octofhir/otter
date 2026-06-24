@@ -223,6 +223,30 @@ pub fn analyze_module(stmts: &[Statement<'_>]) -> HashSet<String> {
     own.names.intersection(&inner.refs).cloned().collect()
 }
 
+/// Names referenced from nested functions contained in `stmts`.
+///
+/// Used for block-scope predeclaration. Function-wide capture analysis is
+/// intentionally name-only, but a later closure that captures an outer `x`
+/// must not force an unrelated earlier `{ const x }` block binding into an
+/// upvalue cell.
+#[must_use]
+pub fn nested_function_refs_in_statements(stmts: &[Statement<'_>]) -> HashSet<String> {
+    let mut inner = InnerRefCollector::default();
+    for stmt in stmts {
+        inner.visit_statement(stmt);
+    }
+    inner.refs
+}
+
+#[must_use]
+pub fn nested_function_refs_in_statement_refs(stmts: &[&Statement<'_>]) -> HashSet<String> {
+    let mut inner = InnerRefCollector::default();
+    for stmt in stmts {
+        inner.visit_statement(stmt);
+    }
+    inner.refs
+}
+
 /// Walks a function body and collects names declared in it (params,
 /// `let` / `const` / function declarations at any block depth),
 /// excluding anything declared inside a nested function.

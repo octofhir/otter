@@ -343,6 +343,16 @@ impl FunctionContext {
         is_const: bool,
         span: (u32, u32),
     ) -> Result<BindingStorage, CompileError> {
+        self.declare_binding_with_capture(name, is_const, span, true)
+    }
+
+    pub(crate) fn declare_binding_with_capture(
+        &mut self,
+        name: &str,
+        is_const: bool,
+        span: (u32, u32),
+        allow_capture: bool,
+    ) -> Result<BindingStorage, CompileError> {
         if self
             .scopes
             .last()
@@ -355,7 +365,7 @@ impl FunctionContext {
                 span,
             });
         }
-        let storage = if let Some(idx) = self.allocate_own_upvalue(name) {
+        let storage = if allow_capture && let Some(idx) = self.allocate_own_upvalue(name) {
             BindingStorage::Upvalue { idx }
         } else {
             let reg = self.scratch;

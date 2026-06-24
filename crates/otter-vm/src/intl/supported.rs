@@ -183,13 +183,36 @@ pub(crate) fn supported_locales_of(
     let locales = args.first().copied().unwrap_or_else(Value::undefined);
     let requested = canonicalize_locale_list(ctx, locales)?;
 
-    // §CoerceOptionsToObject + GetOption "localeMatcher". A non-object
-    // options value coerces to an empty bag (no `localeMatcher`).
+    // §CoerceOptionsToObject — `undefined` is an empty bag, `null`
+    // throws (ToObject), an object is used directly, and a primitive is
+    // boxed to its wrapper so a `localeMatcher` getter on the prototype
+    // chain still fires.
     let options = args.get(1).copied().unwrap_or_else(Value::undefined);
-    if options.is_object_type() {
-        let lm = get_option_value(ctx, options, "localeMatcher", CLASS)?;
+    let options_obj: Option<Value> = if options.is_undefined() {
+        None
+    } else if options.is_null() {
+        return Err(type_err("options argument cannot be null"));
+    } else if options.is_object_type() {
+        Some(options)
+    } else {
+        let boxed = ctx
+            .cx
+            .interp
+            .box_sloppy_this_primitive_runtime_rooted(options, &[])
+            .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, CLASS))?;
+        Some(boxed)
+    };
+    if let Some(o) = options_obj {
+        let lm = get_option_value(ctx, o, "localeMatcher", CLASS)?;
         if !lm.is_undefined() {
-            let s = coerce_to_string(ctx, lm)?;
+            // §GetOption ToString — `null` stringifies to `"null"` (a
+            // RangeError on the enum check), not a TypeError.
+            let exec = ctx
+                .execution_context()
+                .cloned()
+                .ok_or_else(|| type_err("missing execution context"))?;
+            let s = crate::coerce::to_string_or_throw(ctx.cx.interp, &exec, &lm)
+                .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, CLASS))?;
             if s != "lookup" && s != "best fit" {
                 return Err(range_err("invalid localeMatcher option"));
             }

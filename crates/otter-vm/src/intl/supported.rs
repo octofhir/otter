@@ -84,21 +84,27 @@ pub fn canonicalize_locale_list(
         seen.push(validate_and_canon(&tag)?);
         return Ok(seen);
     }
-    // §9.2.1 step 3.b — `O = ? ToObject(locales)`. `null` /
-    // `undefined` fail ToObject (undefined handled above), so `null`
-    // throws a TypeError. Other primitives (number / boolean / symbol /
-    // bigint) box to a wrapper with no `length`, yielding an empty list.
+    // §9.2.1 step 3.b — `O = ? ToObject(locales)`. `null` fails ToObject
+    // (a TypeError; `undefined` handled above). A non-string primitive
+    // (number / boolean / symbol / bigint) boxes to its wrapper, whose
+    // inherited `length` / index properties are then read like an
+    // array-like.
     if locales.is_null() {
         return Err(type_err("locales argument cannot be null"));
     }
-    if !locales.is_object_type() && locales.as_array().is_none() {
-        return Ok(seen);
-    }
-    let len_v = get_option_value(ctx, locales, "length", CLASS)?;
+    let object = if locales.is_object_type() || locales.as_array().is_some() {
+        locales
+    } else {
+        ctx.cx
+            .interp
+            .box_sloppy_this_primitive_runtime_rooted(locales, &[])
+            .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, CLASS))?
+    };
+    let len_v = get_option_value(ctx, object, "length", CLASS)?;
     let len = to_length(ctx, &len_v)?;
     for k in 0..len {
         let key = k.to_string();
-        let kv = get_option_value(ctx, locales, &key, CLASS)?;
+        let kv = get_option_value(ctx, object, &key, CLASS)?;
         // §step 7.c.ii — `If Type(kValue) is not String or Object,
         // throw a TypeError` (covers undefined / null / boolean /
         // number / symbol).

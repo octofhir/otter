@@ -4,7 +4,7 @@
 //! Like `Intl.Locale`, the constructor must fire its `options` getters
 //! in spec order, so it is built through a `NativeCtx`-based
 //! constructor rather than the heap-only
-//! [`crate::intl::dispatch::construct`] path.
+//! its own `NativeCtx` constructor path.
 //!
 //! # Contents
 //! - [`duration_format_ctor`] — `new Intl.DurationFormat(locales,

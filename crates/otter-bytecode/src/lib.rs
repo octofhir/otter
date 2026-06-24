@@ -741,16 +741,6 @@ pub enum Op {
     /// the surface matches `import("./x").then(ns => ...)`.
     PromiseFulfilledOf,
 
-    /// Build a fresh `Intl.<Class>` instance. Operands:
-    /// `Register(dst), ConstIndex(class), Register(locale),
-    /// Register(options)`.
-    ///
-    /// `class` is one of `"Collator"` / `"NumberFormat"` /
-    /// `"DateTimeFormat"`. The runtime resolves the option bag at
-    /// construction time and stashes it on the resulting
-    /// `Value::Intl(JsIntl)` payload; subsequent method calls
-    /// rebuild the underlying ICU formatter / collator on demand.
-    NewIntl,
     /// `r<dst> = Temporal.<member>` (read accessor). Operand pair:
     /// `Register(dst), ConstIndex(member)`.
     TemporalLoad,
@@ -1392,7 +1382,6 @@ impl Op {
             Op::NewWeakRef => "NEW_WEAK_REF",
             Op::NewFinalizationRegistry => "NEW_FINALIZATION_REGISTRY",
             Op::TemporalLoad => "TEMPORAL_LOAD",
-            Op::NewIntl => "NEW_INTL",
             Op::SameValue => "SAME_VALUE",
             Op::IsArray => "IS_ARRAY",
             Op::ToPrimitive => "TO_PRIMITIVE",
@@ -1612,7 +1601,6 @@ impl Op {
             Op::Yield => 2,           // dst, src
             Op::SharedArrayBufferCall => 3, // dst, name_const, argc — args follow
             Op::NewFunction => 2,     // dst, argc — args follow
-            Op::NewIntl => 4,         // dst, class_const, locale_reg, options_reg
             Op::QueueMicrotask => 2,  // callee, argc — args follow
             Op::PromiseNew => 3,      // dst, executor_reg, scratch_dst
             Op::PromiseCall => 3,     // dst, name_const, argc — args follow
@@ -1698,8 +1686,6 @@ impl Op {
             // [reg, kind_const, reg]
             Op::NewCollection | Op::NewBuiltinError => pos == 1,
             Op::SetFunctionName => pos == 2,
-            // [reg, class_const, reg, reg]
-            Op::NewIntl => pos == 1,
             // [reg, name_const, src_reg, scratch_dst]
             Op::StoreProperty => pos == 1,
             // [reg, function_const, count, parent_idxs...]

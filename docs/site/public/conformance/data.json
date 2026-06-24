@@ -1,14 +1,14 @@
 {
-  "test262_commit": "7e115f46ac64340827d505fa928ad436cb7ba5a6",
-  "engine_commit": "cf5ebe1dae494659905467abbb12f75d8ac792a3",
-  "ran_at": "2026-06-23T21:13:00.836960+00:00",
+  "test262_commit": "d0c1b4555b03dd404873fd6422a4b5da00136500",
+  "engine_commit": "0782f12917a8e3dc9d062aba1024b329d9798067",
+  "ran_at": "2026-06-24T06:37:40.825300+00:00",
   "totals": {
-    "total": 52783,
-    "passed": 50227,
-    "failed": 1347,
-    "skipped": 1182,
-    "crashed": 16,
-    "timed_out": 11,
+    "total": 52676,
+    "passed": 50250,
+    "failed": 1280,
+    "skipped": 1136,
+    "crashed": 0,
+    "timed_out": 10,
     "oom": 0
   },
   "by_section": {
@@ -1120,10 +1120,10 @@
       "oom": 0
     },
     "built-ins/ArrayBuffer/prototype": {
-      "total": 172,
+      "total": 147,
       "passed": 143,
       "failed": 0,
-      "skipped": 29,
+      "skipped": 4,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -3766,10 +3766,10 @@
       "oom": 0
     },
     "built-ins/Error/prototype": {
-      "total": 65,
-      "passed": 63,
+      "total": 30,
+      "passed": 30,
       "failed": 0,
-      "skipped": 2,
+      "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -5953,19 +5953,19 @@
       "oom": 0
     },
     "built-ins/Iterator/zip": {
-      "total": 38,
+      "total": 36,
       "passed": 0,
       "failed": 0,
-      "skipped": 38,
+      "skipped": 36,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/Iterator/zipKeyed": {
-      "total": 44,
+      "total": 42,
       "passed": 0,
       "failed": 0,
-      "skipped": 44,
+      "skipped": 42,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -6728,8 +6728,8 @@
     },
     "built-ins/Math/round": {
       "total": 11,
-      "passed": 10,
-      "failed": 1,
+      "passed": 11,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16474,9 +16474,9 @@
       "oom": 0
     },
     "built-ins/Temporal/Duration": {
-      "total": 540,
-      "passed": 508,
-      "failed": 32,
+      "total": 537,
+      "passed": 507,
+      "failed": 30,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16501,18 +16501,18 @@
       "oom": 0
     },
     "built-ins/Temporal/PlainDate": {
-      "total": 652,
-      "passed": 642,
-      "failed": 10,
+      "total": 648,
+      "passed": 640,
+      "failed": 8,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/Temporal/PlainDateTime": {
-      "total": 773,
-      "passed": 761,
-      "failed": 12,
+      "total": 769,
+      "passed": 759,
+      "failed": 10,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16537,18 +16537,18 @@
       "oom": 0
     },
     "built-ins/Temporal/PlainYearMonth": {
-      "total": 509,
+      "total": 507,
       "passed": 500,
-      "failed": 9,
+      "failed": 7,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/Temporal/ZonedDateTime": {
-      "total": 901,
+      "total": 899,
       "passed": 845,
-      "failed": 56,
+      "failed": 54,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16798,10 +16798,10 @@
       "oom": 0
     },
     "built-ins/TypedArray/prototype": {
-      "total": 1404,
+      "total": 1396,
       "passed": 1396,
       "failed": 0,
-      "skipped": 8,
+      "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -16951,10 +16951,10 @@
       "oom": 0
     },
     "built-ins/TypedArrayConstructors/from": {
-      "total": 59,
+      "total": 58,
       "passed": 58,
       "failed": 0,
-      "skipped": 1,
+      "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -16969,10 +16969,10 @@
       "oom": 0
     },
     "built-ins/TypedArrayConstructors/of": {
-      "total": 27,
+      "total": 26,
       "passed": 26,
       "failed": 0,
-      "skipped": 1,
+      "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -17005,10 +17005,10 @@
       "oom": 0
     },
     "built-ins/Uint8Array/prototype": {
-      "total": 48,
+      "total": 46,
       "passed": 46,
       "failed": 0,
-      "skipped": 2,
+      "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -17573,55 +17573,55 @@
     },
     "built-ins/decodeURI/S15.1.3.1_A1.10_T1.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
       "skipped": 0,
-      "crashed": 1,
+      "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURI/S15.1.3.1_A1.11_T1.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
       "skipped": 0,
-      "crashed": 1,
+      "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURI/S15.1.3.1_A1.11_T2.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
       "skipped": 0,
-      "crashed": 1,
+      "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURI/S15.1.3.1_A1.12_T1.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
       "skipped": 0,
-      "crashed": 1,
+      "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURI/S15.1.3.1_A1.12_T2.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
       "skipped": 0,
-      "crashed": 1,
+      "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURI/S15.1.3.1_A1.12_T3.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
       "skipped": 0,
-      "crashed": 1,
+      "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
@@ -17744,19 +17744,19 @@
     },
     "built-ins/decodeURI/S15.1.3.1_A1.2_T1.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
       "skipped": 0,
-      "crashed": 1,
+      "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURI/S15.1.3.1_A1.2_T2.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
       "skipped": 0,
-      "crashed": 1,
+      "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
@@ -17861,8 +17861,8 @@
     },
     "built-ins/decodeURI/S15.1.3.1_A2.1_T1.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -17906,8 +17906,8 @@
     },
     "built-ins/decodeURI/S15.1.3.1_A3_T1.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -17915,8 +17915,8 @@
     },
     "built-ins/decodeURI/S15.1.3.1_A3_T2.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -17924,8 +17924,8 @@
     },
     "built-ins/decodeURI/S15.1.3.1_A3_T3.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -17942,8 +17942,8 @@
     },
     "built-ins/decodeURI/S15.1.3.1_A4_T2.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -17960,8 +17960,8 @@
     },
     "built-ins/decodeURI/S15.1.3.1_A4_T4.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -18068,55 +18068,55 @@
     },
     "built-ins/decodeURIComponent/S15.1.3.2_A1.10_T1.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
       "skipped": 0,
-      "crashed": 1,
+      "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURIComponent/S15.1.3.2_A1.11_T1.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
       "skipped": 0,
-      "crashed": 1,
+      "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURIComponent/S15.1.3.2_A1.11_T2.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
       "skipped": 0,
-      "crashed": 1,
+      "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURIComponent/S15.1.3.2_A1.12_T1.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
       "skipped": 0,
-      "crashed": 1,
+      "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURIComponent/S15.1.3.2_A1.12_T2.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
       "skipped": 0,
-      "crashed": 1,
+      "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURIComponent/S15.1.3.2_A1.12_T3.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
       "skipped": 0,
-      "crashed": 1,
+      "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
@@ -18239,19 +18239,19 @@
     },
     "built-ins/decodeURIComponent/S15.1.3.2_A1.2_T1.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
       "skipped": 0,
-      "crashed": 1,
+      "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURIComponent/S15.1.3.2_A1.2_T2.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
       "skipped": 0,
-      "crashed": 1,
+      "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
@@ -18356,8 +18356,8 @@
     },
     "built-ins/decodeURIComponent/S15.1.3.2_A2.1_T1.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -21144,15 +21144,6 @@
       "timed_out": 0,
       "oom": 0
     },
-    "intl402/DateTimeFormat/constructor-options-calendar-future-fallback.js": {
-      "total": 1,
-      "passed": 1,
-      "failed": 0,
-      "skipped": 0,
-      "crashed": 0,
-      "timed_out": 0,
-      "oom": 0
-    },
     "intl402/DateTimeFormat/constructor-options-calendar-invalid.js": {
       "total": 1,
       "passed": 0,
@@ -21243,6 +21234,33 @@
       "timed_out": 0,
       "oom": 0
     },
+    "intl402/DateTimeFormat/constructor-options-order-dayPeriod.js": {
+      "total": 1,
+      "passed": 0,
+      "failed": 1,
+      "skipped": 0,
+      "crashed": 0,
+      "timed_out": 0,
+      "oom": 0
+    },
+    "intl402/DateTimeFormat/constructor-options-order-fractionalSecondDigits.js": {
+      "total": 1,
+      "passed": 0,
+      "failed": 1,
+      "skipped": 0,
+      "crashed": 0,
+      "timed_out": 0,
+      "oom": 0
+    },
+    "intl402/DateTimeFormat/constructor-options-order-timedate-style.js": {
+      "total": 1,
+      "passed": 0,
+      "failed": 1,
+      "skipped": 0,
+      "crashed": 0,
+      "timed_out": 0,
+      "oom": 0
+    },
     "intl402/DateTimeFormat/constructor-options-order.js": {
       "total": 1,
       "passed": 0,
@@ -21253,6 +21271,33 @@
       "oom": 0
     },
     "intl402/DateTimeFormat/constructor-options-style-conflict.js": {
+      "total": 1,
+      "passed": 0,
+      "failed": 1,
+      "skipped": 0,
+      "crashed": 0,
+      "timed_out": 0,
+      "oom": 0
+    },
+    "intl402/DateTimeFormat/constructor-options-throwing-getters-dayPeriod.js": {
+      "total": 1,
+      "passed": 0,
+      "failed": 1,
+      "skipped": 0,
+      "crashed": 0,
+      "timed_out": 0,
+      "oom": 0
+    },
+    "intl402/DateTimeFormat/constructor-options-throwing-getters-fractionalSecondDigits.js": {
+      "total": 1,
+      "passed": 0,
+      "failed": 1,
+      "skipped": 0,
+      "crashed": 0,
+      "timed_out": 0,
+      "oom": 0
+    },
+    "intl402/DateTimeFormat/constructor-options-throwing-getters-timedate-style.js": {
       "total": 1,
       "passed": 0,
       "failed": 1,
@@ -21946,6 +21991,15 @@
       "oom": 0
     },
     "intl402/DurationFormat/constructor-locales-valid.js": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0,
+      "skipped": 0,
+      "crashed": 0,
+      "timed_out": 0,
+      "oom": 0
+    },
+    "intl402/DurationFormat/constructor-option-read-order.js": {
       "total": 1,
       "passed": 1,
       "failed": 0,
@@ -22802,8 +22856,8 @@
     },
     "intl402/NumberFormat/constructor-compactDisplay-no-compact.js": {
       "total": 1,
-      "passed": 1,
-      "failed": 0,
+      "passed": 0,
+      "failed": 1,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -22881,6 +22935,15 @@
       "timed_out": 0,
       "oom": 0
     },
+    "intl402/NumberFormat/constructor-numberingSystem-order.js": {
+      "total": 1,
+      "passed": 0,
+      "failed": 1,
+      "skipped": 0,
+      "crashed": 0,
+      "timed_out": 0,
+      "oom": 0
+    },
     "intl402/NumberFormat/constructor-option-read-order.js": {
       "total": 1,
       "passed": 0,
@@ -22900,6 +22963,42 @@
       "oom": 0
     },
     "intl402/NumberFormat/constructor-options-roundingMode-invalid.js": {
+      "total": 1,
+      "passed": 0,
+      "failed": 1,
+      "skipped": 0,
+      "crashed": 0,
+      "timed_out": 0,
+      "oom": 0
+    },
+    "intl402/NumberFormat/constructor-options-throwing-getters-rounding-increment.js": {
+      "total": 1,
+      "passed": 0,
+      "failed": 1,
+      "skipped": 0,
+      "crashed": 0,
+      "timed_out": 0,
+      "oom": 0
+    },
+    "intl402/NumberFormat/constructor-options-throwing-getters-rounding-mode.js": {
+      "total": 1,
+      "passed": 0,
+      "failed": 1,
+      "skipped": 0,
+      "crashed": 0,
+      "timed_out": 0,
+      "oom": 0
+    },
+    "intl402/NumberFormat/constructor-options-throwing-getters-rounding-priority.js": {
+      "total": 1,
+      "passed": 0,
+      "failed": 1,
+      "skipped": 0,
+      "crashed": 0,
+      "timed_out": 0,
+      "oom": 0
+    },
+    "intl402/NumberFormat/constructor-options-throwing-getters-trailing-zero-display.js": {
       "total": 1,
       "passed": 0,
       "failed": 1,
@@ -23376,15 +23475,6 @@
       "timed_out": 0,
       "oom": 0
     },
-    "intl402/PluralRules/compactDisplay-undefined-unless-notation-compact.js": {
-      "total": 1,
-      "passed": 0,
-      "failed": 1,
-      "skipped": 0,
-      "crashed": 0,
-      "timed_out": 0,
-      "oom": 0
-    },
     "intl402/PluralRules/constructor-option-read-order.js": {
       "total": 1,
       "passed": 0,
@@ -23620,8 +23710,8 @@
       "oom": 0
     },
     "intl402/Temporal/PlainDate": {
-      "total": 493,
-      "passed": 473,
+      "total": 488,
+      "passed": 468,
       "failed": 20,
       "skipped": 0,
       "crashed": 0,
@@ -23629,8 +23719,8 @@
       "oom": 0
     },
     "intl402/Temporal/PlainDateTime": {
-      "total": 483,
-      "passed": 464,
+      "total": 478,
+      "passed": 459,
       "failed": 19,
       "skipped": 0,
       "crashed": 0,
@@ -23638,8 +23728,8 @@
       "oom": 0
     },
     "intl402/Temporal/PlainMonthDay": {
-      "total": 90,
-      "passed": 76,
+      "total": 87,
+      "passed": 73,
       "failed": 14,
       "skipped": 0,
       "crashed": 0,
@@ -23656,8 +23746,8 @@
       "oom": 0
     },
     "intl402/Temporal/PlainYearMonth": {
-      "total": 327,
-      "passed": 311,
+      "total": 323,
+      "passed": 307,
       "failed": 16,
       "skipped": 0,
       "crashed": 0,
@@ -23665,9 +23755,9 @@
       "oom": 0
     },
     "intl402/Temporal/ZonedDateTime": {
-      "total": 583,
-      "passed": 480,
-      "failed": 103,
+      "total": 577,
+      "passed": 475,
+      "failed": 102,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -27014,8 +27104,8 @@
     },
     "language/computed-property-names/class": {
       "total": 29,
-      "passed": 22,
-      "failed": 7,
+      "passed": 29,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -27032,8 +27122,8 @@
     },
     "language/computed-property-names/to-name-side-effects": {
       "total": 4,
-      "passed": 2,
-      "failed": 2,
+      "passed": 4,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -27608,8 +27698,8 @@
     },
     "language/eval-code/direct": {
       "total": 286,
-      "passed": 278,
-      "failed": 8,
+      "passed": 279,
+      "failed": 7,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -27779,8 +27869,8 @@
     },
     "language/expressions/class": {
       "total": 4059,
-      "passed": 4033,
-      "failed": 6,
+      "passed": 4039,
+      "failed": 0,
       "skipped": 20,
       "crashed": 0,
       "timed_out": 0,
@@ -34348,10 +34438,10 @@
       "oom": 0
     },
     "language/module-code/ambiguous-export-bindings": {
-      "total": 10,
+      "total": 9,
       "passed": 9,
       "failed": 0,
-      "skipped": 1,
+      "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -36922,10 +37012,10 @@
       "oom": 0
     },
     "language/module-code/source-phase-import": {
-      "total": 3,
+      "total": 1,
       "passed": 0,
       "failed": 0,
-      "skipped": 3,
+      "skipped": 1,
       "crashed": 0,
       "timed_out": 0,
       "oom": 0
@@ -38165,8 +38255,8 @@
     },
     "language/statements/class": {
       "total": 4367,
-      "passed": 4347,
-      "failed": 6,
+      "passed": 4353,
+      "failed": 0,
       "skipped": 14,
       "crashed": 0,
       "timed_out": 0,
@@ -39677,8 +39767,8 @@
     },
     "staging/sm/Array": {
       "total": 90,
-      "passed": 79,
-      "failed": 11,
+      "passed": 81,
+      "failed": 9,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39749,8 +39839,8 @@
     },
     "staging/sm/Error": {
       "total": 6,
-      "passed": 2,
-      "failed": 4,
+      "passed": 5,
+      "failed": 1,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39767,8 +39857,8 @@
     },
     "staging/sm/Function": {
       "total": 53,
-      "passed": 33,
-      "failed": 20,
+      "passed": 36,
+      "failed": 17,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39776,8 +39866,8 @@
     },
     "staging/sm/Iterator": {
       "total": 174,
-      "passed": 149,
-      "failed": 25,
+      "passed": 152,
+      "failed": 22,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39848,8 +39938,8 @@
     },
     "staging/sm/Reflect": {
       "total": 17,
-      "passed": 13,
-      "failed": 4,
+      "passed": 15,
+      "failed": 2,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39857,8 +39947,8 @@
     },
     "staging/sm/RegExp": {
       "total": 91,
-      "passed": 69,
-      "failed": 22,
+      "passed": 71,
+      "failed": 20,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39866,8 +39956,8 @@
     },
     "staging/sm/Set": {
       "total": 7,
-      "passed": 1,
-      "failed": 6,
+      "passed": 7,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39875,11 +39965,11 @@
     },
     "staging/sm/String": {
       "total": 47,
-      "passed": 43,
+      "passed": 44,
       "failed": 2,
       "skipped": 1,
       "crashed": 0,
-      "timed_out": 1,
+      "timed_out": 0,
       "oom": 0
     },
     "staging/sm/Symbol": {
@@ -39929,8 +40019,8 @@
     },
     "staging/sm/class": {
       "total": 94,
-      "passed": 69,
-      "failed": 25,
+      "passed": 73,
+      "failed": 21,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39956,8 +40046,8 @@
     },
     "staging/sm/expressions": {
       "total": 42,
-      "passed": 27,
-      "failed": 15,
+      "passed": 28,
+      "failed": 14,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39992,8 +40082,8 @@
     },
     "staging/sm/global": {
       "total": 16,
-      "passed": 12,
-      "failed": 4,
+      "passed": 13,
+      "failed": 3,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40037,8 +40127,8 @@
     },
     "staging/sm/object": {
       "total": 65,
-      "passed": 55,
-      "failed": 10,
+      "passed": 60,
+      "failed": 5,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40046,8 +40136,8 @@
     },
     "staging/sm/regress": {
       "total": 106,
-      "passed": 88,
-      "failed": 17,
+      "passed": 89,
+      "failed": 16,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 1,
@@ -40055,8 +40145,8 @@
     },
     "staging/sm/statements": {
       "total": 17,
-      "passed": 10,
-      "failed": 6,
+      "passed": 14,
+      "failed": 2,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 1,
@@ -40110,144 +40200,6 @@
   },
   "failing_tests": [
     {
-      "path": "built-ins/decodeURI/S15.1.3.1_A1.10_T1.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "crash",
-      "reason": "engine internal error (VM_UNKNOWN): URIError"
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A1.11_T1.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "crash",
-      "reason": "engine internal error (VM_UNKNOWN): URIError"
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A1.11_T2.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "crash",
-      "reason": "engine internal error (VM_UNKNOWN): URIError"
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A1.12_T1.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "crash",
-      "reason": "engine internal error (VM_UNKNOWN): URIError"
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A1.12_T2.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "crash",
-      "reason": "engine internal error (VM_UNKNOWN): URIError"
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A1.12_T3.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "crash",
-      "reason": "engine internal error (VM_UNKNOWN): URIError"
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A1.2_T1.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "crash",
-      "reason": "engine internal error (VM_UNKNOWN): URIError"
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A1.2_T2.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "crash",
-      "reason": "engine internal error (VM_UNKNOWN): URIError"
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A2.1_T1.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #D800 differs"
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A3_T1.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: decodeURI(\"%3B\") equal \"%3B\", not \";\""
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A3_T2.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: decodeURI(\"%3b\") equal \"%3b\", not \";\" or \"%3B\""
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A3_T3.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: decodeURI(\"%3B%2F%3F%3A%40%26%3D%2B%24%2C%23\") equal \"%3B%2F%3F%3A%40%26%3D%2B%24%2C%23\", not \";/?:@&=+$,#\""
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A4_T2.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #3: http://ru.wikipedia.org/wiki/Юникод%23Версии Юникода"
-    },
-    {
-      "path": "built-ins/decodeURI/S15.1.3.1_A4_T4.js",
-      "esid": "sec-decodeuri-encodeduri",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #2: http:%2f%2Funipro.ru"
-    },
-    {
-      "path": "built-ins/decodeURIComponent/S15.1.3.2_A1.10_T1.js",
-      "esid": "sec-decodeuricomponent-encodeduricomponent",
-      "outcome": "crash",
-      "reason": "range end index 512 out of range for slice of length 12"
-    },
-    {
-      "path": "built-ins/decodeURIComponent/S15.1.3.2_A1.11_T1.js",
-      "esid": "sec-decodeuricomponent-encodeduricomponent",
-      "outcome": "crash",
-      "reason": "engine internal error (VM_UNKNOWN): URIError"
-    },
-    {
-      "path": "built-ins/decodeURIComponent/S15.1.3.2_A1.11_T2.js",
-      "esid": "sec-decodeuricomponent-encodeduricomponent",
-      "outcome": "crash",
-      "reason": "engine internal error (VM_UNKNOWN): URIError"
-    },
-    {
-      "path": "built-ins/decodeURIComponent/S15.1.3.2_A1.12_T1.js",
-      "esid": "sec-decodeuricomponent-encodeduricomponent",
-      "outcome": "crash",
-      "reason": "engine internal error (VM_UNKNOWN): URIError"
-    },
-    {
-      "path": "built-ins/decodeURIComponent/S15.1.3.2_A1.12_T2.js",
-      "esid": "sec-decodeuricomponent-encodeduricomponent",
-      "outcome": "crash",
-      "reason": "engine internal error (VM_UNKNOWN): URIError"
-    },
-    {
-      "path": "built-ins/decodeURIComponent/S15.1.3.2_A1.12_T3.js",
-      "esid": "sec-decodeuricomponent-encodeduricomponent",
-      "outcome": "crash",
-      "reason": "engine internal error (VM_UNKNOWN): URIError"
-    },
-    {
-      "path": "built-ins/decodeURIComponent/S15.1.3.2_A1.2_T1.js",
-      "esid": "sec-decodeuricomponent-encodeduricomponent",
-      "outcome": "crash",
-      "reason": "engine internal error (VM_UNKNOWN): URIError"
-    },
-    {
-      "path": "built-ins/decodeURIComponent/S15.1.3.2_A1.2_T2.js",
-      "esid": "sec-decodeuricomponent-encodeduricomponent",
-      "outcome": "crash",
-      "reason": "engine internal error (VM_UNKNOWN): URIError"
-    },
-    {
-      "path": "built-ins/decodeURIComponent/S15.1.3.2_A2.1_T1.js",
-      "esid": "sec-decodeuricomponent-encodeduricomponent",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #D800 differs"
-    },
-    {
       "path": "built-ins/FinalizationRegistry/prototype/register/return-undefined-register-object.js",
       "esid": "sec-finalization-registry.prototype.register",
       "outcome": "fail",
@@ -40267,18 +40219,13 @@
       "path": "built-ins/global/property-descriptor.js",
       "esid": "sec-other-properties-of-the-global-object-globalthis",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: globalThis descriptor should not be enumerable"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: obj['globalThis'] descriptor should not be enumerable"
     },
     {
       "path": "built-ins/Math/hypot/Math.hypot_ToNumberErr.js",
       "esid": "sec-math.hypot",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Math.hypot propagates an abrupt completion from coercing an argument to Number Expected a Test262Error but got a TypeError"
-    },
-    {
-      "path": "built-ins/Math/round/S15.8.2.15_A7.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: The result of evaluating (1 / Math.round(x)) is expected to be 1 / 0 Expected SameValue(«1», «Infinity») to be true"
     },
     {
       "path": "built-ins/parseFloat/S15.1.2.3_A4_T2.js",
@@ -40423,18 +40370,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: rounding a year Duration fails without largest/smallest unit Expected a RangeError to be thrown but no exception was thrown at all"
     },
     {
-      "path": "built-ins/Temporal/Duration/prototype/round/exact-multiple-of-larger-unit-plaindate.js",
-      "esid": "sec-temporal.duration.prototype.round",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: P31D weeks..months ceil: weeks result: Expected SameValue(«1», «0») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/round/exact-multiple-of-larger-unit-zoned.js",
-      "esid": "sec-temporal.duration.prototype.round",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: P7D days..weeks ceil: days result: Expected SameValue(«1», «0») to be true"
-    },
-    {
       "path": "built-ins/Temporal/Duration/prototype/round/float64-representable-integer.js",
       "esid": "sec-temporal.duration.prototype.round",
       "outcome": "fail",
@@ -40516,7 +40451,7 @@
       "path": "built-ins/Temporal/Duration/prototype/toLocaleString/prop-desc.js",
       "esid": "sec-temporal.duration.prototype.tolocalestring",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: toLocaleString should be an own property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: obj should have an own property toLocaleString"
     },
     {
       "path": "built-ins/Temporal/Duration/prototype/total/order-of-operations.js",
@@ -40588,7 +40523,7 @@
       "path": "built-ins/Temporal/Instant/prototype/toLocaleString/prop-desc.js",
       "esid": "sec-temporal.instant.prototype.tolocalestring",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: toLocaleString should be an own property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: obj should have an own property toLocaleString"
     },
     {
       "path": "built-ins/Temporal/Instant/prototype/toString/get-timezone-throws.js",
@@ -40636,19 +40571,13 @@
       "path": "built-ins/Temporal/Now/prop-desc.js",
       "esid": "sec-temporal.now",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Now descriptor should not be enumerable"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: obj['Now'] descriptor should not be enumerable"
     },
     {
       "path": "built-ins/Temporal/Now/toStringTag/string.js",
       "esid": "sec-temporal-now-@@tostringtag",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: String: TypeError"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDate/prototype/since/exact-multiple-of-larger-unit.js",
-      "esid": "sec-temporal.plaindate.prototype.since",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: P1M weeks..months ceil: weeks result: Expected SameValue(«1», «0») to be true"
     },
     {
       "path": "built-ins/Temporal/PlainDate/prototype/toLocaleString/branding.js",
@@ -40660,7 +40589,7 @@
       "path": "built-ins/Temporal/PlainDate/prototype/toLocaleString/prop-desc.js",
       "esid": "sec-temporal.plaindate.prototype.tolocalestring",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: toLocaleString should be an own property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: obj should have an own property toLocaleString"
     },
     {
       "path": "built-ins/Temporal/PlainDate/prototype/toZonedDateTime/argument-object-get-plainTime-throws.js",
@@ -40681,12 +40610,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.PlainDate: time zone must be a string identifier or a Temporal.ZonedDateTime"
     },
     {
-      "path": "built-ins/Temporal/PlainDate/prototype/until/exact-multiple-of-larger-unit.js",
-      "esid": "sec-temporal.plaindate.prototype.until",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: P1M weeks..months ceil: weeks result: Expected SameValue(«1», «0») to be true"
-    },
-    {
       "path": "built-ins/Temporal/PlainDate/prototype/with/options-wrong-type.js",
       "esid": "sec-temporal.plaindate.prototype.with",
       "outcome": "fail",
@@ -40705,12 +40628,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomPlainDate Expected SameValue(«[object Temporal.PlainDate]», «[object Temporal.PlainDate]») to be true"
     },
     {
-      "path": "built-ins/Temporal/PlainDateTime/prototype/since/exact-multiple-of-larger-unit.js",
-      "esid": "sec-temporal.plaindatetime.prototype.since",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: P1M weeks..months ceil: weeks result: Expected SameValue(«1», «0») to be true"
-    },
-    {
       "path": "built-ins/Temporal/PlainDateTime/prototype/since/float64-representable-integer.js",
       "esid": "sec-temporal.plaindatetime.prototype.since",
       "outcome": "fail",
@@ -40726,7 +40643,7 @@
       "path": "built-ins/Temporal/PlainDateTime/prototype/toLocaleString/prop-desc.js",
       "esid": "sec-temporal.plaindatetime.prototype.tolocalestring",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: toLocaleString should be an own property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: obj should have an own property toLocaleString"
     },
     {
       "path": "built-ins/Temporal/PlainDateTime/prototype/toZonedDateTime/options-read-before-algorithmic-validation.js",
@@ -40739,12 +40656,6 @@
       "esid": "sec-temporal.plaindatetime.prototype.tozoneddatetime",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [get options.disambiguation, get options.disambiguation.toString, call options.disambiguation.toString] should have the same contents. order of operations"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDateTime/prototype/until/exact-multiple-of-larger-unit.js",
-      "esid": "sec-temporal.plaindatetime.prototype.until",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: P1M weeks..months ceil: weeks result: Expected SameValue(«1», «0») to be true"
     },
     {
       "path": "built-ins/Temporal/PlainDateTime/prototype/until/float64-representable-integer.js",
@@ -40792,7 +40703,7 @@
       "path": "built-ins/Temporal/PlainMonthDay/prototype/toLocaleString/prop-desc.js",
       "esid": "sec-temporal.plainmonthday.prototype.tolocalestring",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: toLocaleString should be an own property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: obj should have an own property toLocaleString"
     },
     {
       "path": "built-ins/Temporal/PlainMonthDay/prototype/toPlainDate/order-of-operations.js",
@@ -40840,7 +40751,7 @@
       "path": "built-ins/Temporal/PlainTime/prototype/toLocaleString/prop-desc.js",
       "esid": "sec-temporal.plaintime.prototype.tolocalestring",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: toLocaleString should be an own property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: obj should have an own property toLocaleString"
     },
     {
       "path": "built-ins/Temporal/PlainTime/prototype/with/order-of-operations.js",
@@ -40873,12 +40784,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.PlainYearMonth: argument must be a Temporal.PlainYearMonth"
     },
     {
-      "path": "built-ins/Temporal/PlainYearMonth/prototype/since/exact-multiple-of-larger-unit.js",
-      "esid": "sec-temporal.plainyearmonth.prototype.since",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: P1Y months..years ceil: months result: Expected SameValue(«2», «0») to be true"
-    },
-    {
       "path": "built-ins/Temporal/PlainYearMonth/prototype/toLocaleString/branding.js",
       "esid": "sec-temporal.plainyearmonth.prototype.tolocalestring",
       "outcome": "fail",
@@ -40888,19 +40793,13 @@
       "path": "built-ins/Temporal/PlainYearMonth/prototype/toLocaleString/prop-desc.js",
       "esid": "sec-temporal.plainyearmonth.prototype.tolocalestring",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: toLocaleString should be an own property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: obj should have an own property toLocaleString"
     },
     {
       "path": "built-ins/Temporal/PlainYearMonth/prototype/toPlainDate/order-of-operations.js",
       "esid": "sec-temporal.plainyearmonth.toplaindate",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get fields.day, get fields.day.valueOf, call fields.day.valueOf, get fields.month, get fields.month.valueOf, call fields.month.valueOf, get fields.monthCode, get fields.monthCode.toString, call fields.monthCode.toString, get fields.year, get fields.year.valueOf, call fields.year.valueOf] and expected [get fields.day, get fields.day.valueOf, call fields.day.valueOf] should have the same contents. order of operations"
-    },
-    {
-      "path": "built-ins/Temporal/PlainYearMonth/prototype/until/exact-multiple-of-larger-unit.js",
-      "esid": "sec-temporal.plainyearmonth.prototype.until",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: P1Y months..years ceil: months result: Expected SameValue(«2», «0») to be true"
     },
     {
       "path": "built-ins/Temporal/PlainYearMonth/prototype/with/options-wrong-type.js",
@@ -41023,12 +40922,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read properties of undefined"
     },
     {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/since/exact-multiple-of-larger-unit.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.since",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: P7D days..weeks ceil: days result: Expected SameValue(«1», «0») to be true"
-    },
-    {
       "path": "built-ins/Temporal/ZonedDateTime/prototype/since/float64-representable-integer.js",
       "esid": "sec-temporal.zoneddatetime.prototype.since",
       "outcome": "fail",
@@ -41062,7 +40955,7 @@
       "path": "built-ins/Temporal/ZonedDateTime/prototype/toLocaleString/prop-desc.js",
       "esid": "sec-temporal.zoneddatetime.prototype.tolocalestring",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: toLocaleString should be an own property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: obj should have an own property toLocaleString"
     },
     {
       "path": "built-ins/Temporal/ZonedDateTime/prototype/toString/calendarname-always.js",
@@ -41141,12 +41034,6 @@
       "esid": "sec-temporal.zoneddatetime.protoype.tostring",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: null Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/until/exact-multiple-of-larger-unit.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.until",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: P7D days..weeks ceil: days result: Expected SameValue(«1», «0») to be true"
     },
     {
       "path": "built-ins/Temporal/ZonedDateTime/prototype/until/float64-representable-integer.js",
@@ -41275,53 +41162,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read property of null or undefined"
     },
     {
-      "path": "language/computed-property-names/class/method/constructor.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: The result of `C !== C.prototype.constructor` is `true`"
-    },
-    {
-      "path": "language/computed-property-names/class/method/generator.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [a, constructor] and expected [constructor, a] should have the same contents. "
-    },
-    {
-      "path": "language/computed-property-names/class/method/number.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [1, 2, a, c, constructor] and expected [1, 2, constructor, a, c] should have the same contents. "
-    },
-    {
-      "path": "language/computed-property-names/class/method/string.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [a, b, c, d, constructor] and expected [constructor, a, b, c, d] should have the same contents. "
-    },
-    {
-      "path": "language/computed-property-names/class/method/symbol.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [a, c, constructor] and expected [constructor, a, c] should have the same contents. "
-    },
-    {
-      "path": "language/computed-property-names/class/static/method-number-order.js",
-      "esid": "sec-runtime-semantics-classdefinitionevaluation",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [length, name, prototype, 1, 2, a, c] and expected [1, 2, length, name, prototype, a, c] should have the same contents. "
-    },
-    {
-      "path": "language/computed-property-names/class/static/method-symbol-order.js",
-      "esid": "sec-runtime-semantics-classdefinitionevaluation",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [Symbol(), Symbol()] should have the same contents. "
-    },
-    {
-      "path": "language/computed-property-names/to-name-side-effects/class.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: `compareArray(Object.getOwnPropertyNames(C.prototype), ['constructor', 'a', 'b', 'c', 'd'])` returns `true`"
-    },
-    {
-      "path": "language/computed-property-names/to-name-side-effects/numbers-class.js",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: `compareArray(Object.getOwnPropertyNames(C.prototype), ['1', '2', 'constructor', 'a', 'c'])` returns `true`"
-    },
-    {
       "path": "language/destructuring/binding/keyed-destructuring-property-reference-target-evaluation-order-with-bindings.js",
       "esid": "sec-destructuring-binding-patterns-runtime-semantics-propertybindinginitialization",
       "outcome": "fail",
@@ -41349,12 +41189,6 @@
       "esid": "sec-performeval",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: non strict mode Expected SameValue(«\"outside\"», «\"inside\"») to be true"
-    },
-    {
-      "path": "language/eval-code/direct/new.target-fn.js",
-      "esid": "sec-scripts-static-semantics-early-errors",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: compile error: Syntax { messages: [\"Unexpected new.target expression\"], diagnostics: [SyntaxDiagnostic { code: \"SYNTAX_ERROR\", message: \"Unexpected new.target expression\", range: Some((0, 10)), help: Some(\"new.target is only allowed in constructors, functions, and class field initializers\") }] }"
     },
     {
       "path": "language/eval-code/direct/var-env-func-init-local-new-delete.js",
@@ -41390,7 +41224,7 @@
       "path": "language/expressions/assignment/fn-name-lhs-cover.js",
       "esid": "sec-assignment-operators-runtime-semantics-evaluation",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: name descriptor value should be ; name value should be "
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: obj['name'] descriptor value should be ; obj['name'] value should be "
     },
     {
       "path": "language/expressions/call/11.2.3-3_3.js",
@@ -41438,42 +41272,6 @@
       "esid": "sec-function-calls-runtime-semantics-evaluation",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "language/expressions/class/elements/arrow-body-direct-eval-err-contains-newtarget.js",
-      "esid": "sec-performeval-rules-in-initializer",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: compile error: Syntax { messages: [\"Unexpected new.target expression\"], diagnostics: [SyntaxDiagnostic { code: \"SYNTAX_ERROR\", message: \"Unexpected new.target expression\", range: Some((23, 33)), help: Some(\"new.target is only allowed in constructors, functions, and class field initializers\") }] }"
-    },
-    {
-      "path": "language/expressions/class/elements/arrow-body-private-direct-eval-err-contains-newtarget.js",
-      "esid": "sec-performeval-rules-in-initializer",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: compile error: Syntax { messages: [\"Unexpected new.target expression\"], diagnostics: [SyntaxDiagnostic { code: \"SYNTAX_ERROR\", message: \"Unexpected new.target expression\", range: Some((23, 33)), help: Some(\"new.target is only allowed in constructors, functions, and class field initializers\") }] }"
-    },
-    {
-      "path": "language/expressions/class/elements/direct-eval-err-contains-newtarget.js",
-      "esid": "sec-performeval-rules-in-initializer",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: compile error: Syntax { messages: [\"Unexpected new.target expression\"], diagnostics: [SyntaxDiagnostic { code: \"SYNTAX_ERROR\", message: \"Unexpected new.target expression\", range: Some((17, 27)), help: Some(\"new.target is only allowed in constructors, functions, and class field initializers\") }] }"
-    },
-    {
-      "path": "language/expressions/class/elements/nested-direct-eval-err-contains-newtarget.js",
-      "esid": "sec-performeval-rules-in-initializer",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: compile error: Syntax { messages: [\"Unexpected new.target expression\"], diagnostics: [SyntaxDiagnostic { code: \"SYNTAX_ERROR\", message: \"Unexpected new.target expression\", range: Some((17, 27)), help: Some(\"new.target is only allowed in constructors, functions, and class field initializers\") }] }"
-    },
-    {
-      "path": "language/expressions/class/elements/nested-private-direct-eval-err-contains-newtarget.js",
-      "esid": "sec-performeval-rules-in-initializer",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: compile error: Syntax { messages: [\"Unexpected new.target expression\"], diagnostics: [SyntaxDiagnostic { code: \"SYNTAX_ERROR\", message: \"Unexpected new.target expression\", range: Some((17, 27)), help: Some(\"new.target is only allowed in constructors, functions, and class field initializers\") }] }"
-    },
-    {
-      "path": "language/expressions/class/elements/private-direct-eval-err-contains-newtarget.js",
-      "esid": "sec-performeval-rules-in-initializer",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: compile error: Syntax { messages: [\"Unexpected new.target expression\"], diagnostics: [SyntaxDiagnostic { code: \"SYNTAX_ERROR\", message: \"Unexpected new.target expression\", range: Some((17, 27)), help: Some(\"new.target is only allowed in constructors, functions, and class field initializers\") }] }"
     },
     {
       "path": "language/expressions/coalesce/tco-pos-null.js",
@@ -41625,42 +41423,6 @@
       "esid": "sec-static-semantics-hascallintailposition",
       "outcome": "fail",
       "reason": "runtime: RangeError (STACK_OVERFLOW) maximum call stack size exceeded (limit 1024)"
-    },
-    {
-      "path": "language/statements/class/elements/arrow-body-direct-eval-err-contains-newtarget.js",
-      "esid": "sec-performeval-rules-in-initializer",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: compile error: Syntax { messages: [\"Unexpected new.target expression\"], diagnostics: [SyntaxDiagnostic { code: \"SYNTAX_ERROR\", message: \"Unexpected new.target expression\", range: Some((23, 33)), help: Some(\"new.target is only allowed in constructors, functions, and class field initializers\") }] }"
-    },
-    {
-      "path": "language/statements/class/elements/arrow-body-private-direct-eval-err-contains-newtarget.js",
-      "esid": "sec-performeval-rules-in-initializer",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: compile error: Syntax { messages: [\"Unexpected new.target expression\"], diagnostics: [SyntaxDiagnostic { code: \"SYNTAX_ERROR\", message: \"Unexpected new.target expression\", range: Some((23, 33)), help: Some(\"new.target is only allowed in constructors, functions, and class field initializers\") }] }"
-    },
-    {
-      "path": "language/statements/class/elements/direct-eval-err-contains-newtarget.js",
-      "esid": "sec-performeval-rules-in-initializer",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: compile error: Syntax { messages: [\"Unexpected new.target expression\"], diagnostics: [SyntaxDiagnostic { code: \"SYNTAX_ERROR\", message: \"Unexpected new.target expression\", range: Some((17, 27)), help: Some(\"new.target is only allowed in constructors, functions, and class field initializers\") }] }"
-    },
-    {
-      "path": "language/statements/class/elements/nested-direct-eval-err-contains-newtarget.js",
-      "esid": "sec-performeval-rules-in-initializer",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: compile error: Syntax { messages: [\"Unexpected new.target expression\"], diagnostics: [SyntaxDiagnostic { code: \"SYNTAX_ERROR\", message: \"Unexpected new.target expression\", range: Some((17, 27)), help: Some(\"new.target is only allowed in constructors, functions, and class field initializers\") }] }"
-    },
-    {
-      "path": "language/statements/class/elements/nested-private-direct-eval-err-contains-newtarget.js",
-      "esid": "sec-performeval-rules-in-initializer",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: compile error: Syntax { messages: [\"Unexpected new.target expression\"], diagnostics: [SyntaxDiagnostic { code: \"SYNTAX_ERROR\", message: \"Unexpected new.target expression\", range: Some((17, 27)), help: Some(\"new.target is only allowed in constructors, functions, and class field initializers\") }] }"
-    },
-    {
-      "path": "language/statements/class/elements/private-direct-eval-err-contains-newtarget.js",
-      "esid": "sec-performeval-rules-in-initializer",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: compile error: Syntax { messages: [\"Unexpected new.target expression\"], diagnostics: [SyntaxDiagnostic { code: \"SYNTAX_ERROR\", message: \"Unexpected new.target expression\", range: Some((17, 27)), help: Some(\"new.target is only allowed in constructors, functions, and class field initializers\") }] }"
     },
     {
       "path": "language/statements/do-while/tco-body.js",
@@ -41911,22 +41673,10 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected [\"get\", Symbol(Symbol.iterator) as #2, \"get\", ref #2] to be structurally equal to [\"get\", Symbol(Symbol.iterator), \"get\", \"length\", \"get\", \"0\", \"get\", \"length\", \"get\", \"1\", \"get\", \"length\", \"get\", \"2\", \"get\", \"length\"]. "
     },
     {
-      "path": "staging/sm/Array/from_string.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: iterator method is not callable"
-    },
-    {
       "path": "staging/sm/Array/join-01.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"0funky\"», «\"0funkyfnord\"») to be true"
-    },
-    {
-      "path": "staging/sm/Array/join-no-has-trap.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: join: TypeError"
     },
     {
       "path": "staging/sm/Array/to-length.js",
@@ -41968,19 +41718,19 @@
       "path": "staging/sm/Date/dst-offset-caching-1-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10008 ms"
+      "reason": "timeout after 10024 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-2-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10005 ms"
+      "reason": "timeout after 10000 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-3-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10005 ms"
+      "reason": "timeout after 10000 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-4-of-8.js",
@@ -41998,19 +41748,19 @@
       "path": "staging/sm/Date/dst-offset-caching-6-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10005 ms"
+      "reason": "timeout after 10004 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-7-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10012 ms"
+      "reason": "timeout after 10006 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-8-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10017 ms"
+      "reason": "timeout after 10004 ms"
     },
     {
       "path": "staging/sm/Date/non-iso.js",
@@ -42031,30 +41781,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Error: uncaught exception"
     },
     {
-      "path": "staging/sm/Error/constructor-proto.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«function () { [native code] }», «function Error() { [native code] }») to be true"
-    },
-    {
-      "path": "staging/sm/Error/prototype-properties.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"constructor,message,name,stack,toString\"», «\"constructor,message,name\"») to be true"
-    },
-    {
-      "path": "staging/sm/Error/prototype.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«[object Object]», «Error») to be true"
-    },
-    {
-      "path": "staging/sm/Function/15.3.4.3-01.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: should have been set in valueOf called via ToUint32 Expected SameValue(«false», «true») to be true"
-    },
-    {
       "path": "staging/sm/Function/arguments-parameter-shadowing.js",
       "esid": "pending",
       "outcome": "fail",
@@ -42065,12 +41791,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"bound \"», «\"bound hello world\"») to be true"
-    },
-    {
-      "path": "staging/sm/Function/configurable-length-builtins.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«function hypot() { [native code] }», «0») to be true"
     },
     {
       "path": "staging/sm/Function/configurable-length.js",
@@ -42131,12 +41851,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"get [object RegExp]\"», «\"get /a/\"») to be true"
-    },
-    {
-      "path": "staging/sm/Function/function-name.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"g\"», «\"\"») to be true"
     },
     {
       "path": "staging/sm/Function/function-toString-builtin-name.js",
@@ -42211,12 +41925,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
-      "path": "staging/sm/Iterator/from/wrap-next-not-object-throws.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Iterator.prototype.next: iterator result is not an object"
-    },
-    {
       "path": "staging/sm/Iterator/from/wrap-return-closes-iterator.js",
       "esid": "pending",
       "outcome": "fail",
@@ -42265,12 +41973,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
-      "path": "staging/sm/Iterator/prototype/iterator-helper-methods-throw-on-generators.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
       "path": "staging/sm/Iterator/prototype/lazy-methods-reentry-not-close-iterator.js",
       "esid": "pending",
       "outcome": "fail",
@@ -42305,12 +42007,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "staging/sm/Iterator/prototype/take-drop-throw-eagerly-on-non-integer.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError but got a RangeError"
     },
     {
       "path": "staging/sm/Iterator/prototype/toArray/create-in-current-realm.js",
@@ -42427,12 +42123,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«function () { [native code] }», «null») to be true"
     },
     {
-      "path": "staging/sm/Reflect/argumentsList.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«0», «1») to be true"
-    },
-    {
       "path": "staging/sm/Reflect/construct.js",
       "esid": "pending",
       "outcome": "fail",
@@ -42443,12 +42133,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Reflect: Proxy defineProperty trap added a non-configurable property absent on the target"
-    },
-    {
-      "path": "staging/sm/Reflect/setPrototypeOf.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
     },
     {
       "path": "staging/sm/RegExp/RegExpExec-exec-type-check.js",
@@ -42511,12 +42195,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
-      "path": "staging/sm/RegExp/prototype.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: RegExp.prototype.toString: this is not a RegExp"
-    },
-    {
       "path": "staging/sm/RegExp/regress-yarr-regexp.js",
       "esid": "pending",
       "outcome": "fail",
@@ -42533,12 +42211,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a SyntaxError but got a TypeError"
-    },
-    {
-      "path": "staging/sm/RegExp/toString.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: RegExp.prototype.toString: this is not a RegExp"
     },
     {
       "path": "staging/sm/RegExp/unicode-back-reference.js",
@@ -42583,42 +42255,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual argument [null] shouldn't be primitive. "
     },
     {
-      "path": "staging/sm/Set/difference.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [[[get]], size, valueOf(), [[get]], has, [[get]], keys, keys(), [[get]], Symbol(Symbol.iterator), [[get]], next, next()] and expected [[[get]], size, valueOf(), [[get]], has, [[get]], keys, keys(), [[get]], next, next()] should have the same contents. "
-    },
-    {
-      "path": "staging/sm/Set/intersection.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [[[get]], size, valueOf(), [[get]], has, [[get]], keys, keys(), [[get]], Symbol(Symbol.iterator), [[get]], next, next()] and expected [[[get]], size, valueOf(), [[get]], has, [[get]], keys, keys(), [[get]], next, next()] should have the same contents. "
-    },
-    {
-      "path": "staging/sm/Set/is-disjoint-from.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [[[get]], size, valueOf(), [[get]], has, [[get]], keys, keys(), [[get]], Symbol(Symbol.iterator), [[get]], next, next()] and expected [[[get]], size, valueOf(), [[get]], has, [[get]], keys, keys(), [[get]], next, next()] should have the same contents. "
-    },
-    {
-      "path": "staging/sm/Set/is-superset-of.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [[[get]], size, valueOf(), [[get]], has, [[get]], keys, keys(), [[get]], Symbol(Symbol.iterator), [[get]], next, next()] and expected [[[get]], size, valueOf(), [[get]], has, [[get]], keys, keys(), [[get]], next, next()] should have the same contents. "
-    },
-    {
-      "path": "staging/sm/Set/symmetric-difference.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [[[get]], size, valueOf(), [[get]], has, [[get]], keys, keys(), [[get]], Symbol(Symbol.iterator), [[get]], next, next()] and expected [[[get]], size, valueOf(), [[get]], has, [[get]], keys, keys(), [[get]], next, next()] should have the same contents. "
-    },
-    {
-      "path": "staging/sm/Set/union.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [[[get]], size, valueOf(), [[get]], has, [[get]], keys, keys(), [[get]], Symbol(Symbol.iterator), [[get]], next, next()] and expected [[[get]], size, valueOf(), [[get]], has, [[get]], keys, keys(), [[get]], next, next()] should have the same contents. "
-    },
-    {
       "path": "staging/sm/String/defaultvalue.js",
       "esid": "pending",
       "outcome": "fail",
@@ -42629,12 +42265,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "staging/sm/String/replace-math.js",
-      "esid": "pending",
-      "outcome": "timeout",
-      "reason": "timeout after 13437 ms"
     },
     {
       "path": "staging/sm/Symbol/conversions.js",
@@ -42793,30 +42423,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
     },
     {
-      "path": "staging/sm/class/methodOverwrites.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Class constructor cannot be invoked without 'new'"
-    },
-    {
-      "path": "staging/sm/class/newTargetArrow.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: compile error: Syntax { messages: [\"Unexpected new.target expression\"], diagnostics: [SyntaxDiagnostic { code: \"SYNTAX_ERROR\", message: \"Unexpected new.target expression\", range: Some((4, 14)), help: Some(\"new.target is only allowed in constructors, functions, and class field initializers\") }] }"
-    },
-    {
-      "path": "staging/sm/class/newTargetEval.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: compile error: Syntax { messages: [\"Unexpected new.target expression\"], diagnostics: [SyntaxDiagnostic { code: \"SYNTAX_ERROR\", message: \"Unexpected new.target expression\", range: Some((0, 10)), help: Some(\"new.target is only allowed in constructors, functions, and class field initializers\") }] }"
-    },
-    {
-      "path": "staging/sm/class/newTargetGenerators.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: compile error: Syntax { messages: [\"Unexpected new.target expression\"], diagnostics: [SyntaxDiagnostic { code: \"SYNTAX_ERROR\", message: \"Unexpected new.target expression\", range: Some((0, 10)), help: Some(\"new.target is only allowed in constructors, functions, and class field initializers\") }] }"
-    },
-    {
       "path": "staging/sm/class/strictExecution.js",
       "esid": "pending",
       "outcome": "fail",
@@ -42970,13 +42576,7 @@
       "path": "staging/sm/expressions/short-circuit-compound-assignment-const.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«true», «function fn() {\n    fn &&= true;\n    assert.sameValue(fn, f);\n  }») to be true"
-    },
-    {
-      "path": "staging/sm/expressions/short-circuit-compound-assignment-tdz.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a ReferenceError to be thrown but no exception was thrown at all"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«function fn() {\n    fn &&= true;\n    assert.sameValue(fn, f);\n  }», «function fn() {\n    fn &&= true;\n    assert.sameValue(fn, f);\n  }») to be true"
     },
     {
       "path": "staging/sm/expressions/short-circuit-compound-assignment.js",
@@ -43129,12 +42729,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«10», «2») to be true"
     },
     {
-      "path": "staging/sm/global/parenthesized-eval-is-direct.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"global\"», «\"local\"») to be true"
-    },
-    {
       "path": "staging/sm/global/parseInt-01.js",
       "esid": "pending",
       "outcome": "fail",
@@ -43219,18 +42813,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
     },
     {
-      "path": "staging/sm/object/15.2.3.14-01.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [0, input, groups, index] and expected [0, index, input, groups] should have the same contents. "
-    },
-    {
-      "path": "staging/sm/object/accessor-arguments-rest.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a SyntaxError to be thrown but no exception was thrown at all"
-    },
-    {
       "path": "staging/sm/object/defineGetter-defineSetter.js",
       "esid": "pending",
       "outcome": "fail",
@@ -43241,12 +42823,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"ownKeys,getOwnPropertyDescriptor,getOwnPropertyDescriptor,get,get\"», «\"ownKeys,getOwnPropertyDescriptor,get,getOwnPropertyDescriptor,get\"») to be true"
-    },
-    {
-      "path": "staging/sm/object/entries.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected [[\"0\", \"a\"], [\"index\", 0], [\"groups\", undefined], [\"input\", \"abc\"]] to be structurally equal to [[\"0\", \"a\"], [\"index\", 0], [\"input\", \"abc\"], [\"groups\", undefined]]. "
     },
     {
       "path": "staging/sm/object/extensibility-01.js",
@@ -43267,18 +42843,6 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«[object Object]», «3») to be true"
     },
     {
-      "path": "staging/sm/object/toLocaleString.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "staging/sm/object/values.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [a, abc, undefined, 0] and expected [a, 0, abc, undefined] should have the same contents. "
-    },
-    {
       "path": "staging/sm/regress/regress-1383630.js",
       "esid": "pending",
       "outcome": "fail",
@@ -43288,7 +42852,7 @@
       "path": "staging/sm/regress/regress-1507322-deep-weakmap.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 13921 ms"
+      "reason": "timeout after 10003 ms"
     },
     {
       "path": "staging/sm/regress/regress-469625-02.js",
@@ -43381,40 +42945,10 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
-      "path": "staging/sm/regress/regress-672892.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: type mismatch: this operation does not accept a value of this type"
-    },
-    {
-      "path": "staging/sm/statements/for-inof-loop-const-declaration.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: type mismatch: this operation does not accept a value of this type"
-    },
-    {
-      "path": "staging/sm/statements/for-inof-name-iteration-expression-contains-index-string.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: type mismatch: this operation does not accept a value of this type"
-    },
-    {
-      "path": "staging/sm/statements/for-loop-declaration-contains-computed-name.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: type mismatch: this operation does not accept a value of this type"
-    },
-    {
-      "path": "staging/sm/statements/for-loop-declaration-contains-initializer.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: type mismatch: this operation does not accept a value of this type"
-    },
-    {
       "path": "staging/sm/statements/for-of-iterator-close-throw.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10004 ms"
+      "reason": "timeout after 10005 ms"
     },
     {
       "path": "staging/sm/statements/regress-642975.js",
@@ -43478,7 +43012,7 @@
     },
     {
       "path": "intl402/BigInt/prototype/toLocaleString/default-options-object-prototype.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"12345\"», «\"12,345\"») to be true"
     },
@@ -43492,7 +43026,7 @@
       "path": "intl402/BigInt/prototype/toLocaleString/prop-desc.js",
       "esid": "sec-bigint.prototype.tolocalestring",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: toLocaleString should be an own property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: obj should have an own property toLocaleString"
     },
     {
       "path": "intl402/BigInt/prototype/toLocaleString/returns-same-results-as-NumberFormat.js",
@@ -43514,7 +43048,7 @@
     },
     {
       "path": "intl402/Collator/constructor-options-throwing-getters.js",
-      "esid": "sec-intl.collator",
+      "esid": "sec-initializecollator",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Exception from usage getter should be propagated Expected a CustomError to be thrown but no exception was thrown at all"
     },
@@ -43547,7 +43081,7 @@
       "path": "intl402/Collator/prototype/compare/compare-function-name.js",
       "esid": "sec-Intl.Collator.prototype.compare",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: name descriptor value should be ; name value should be "
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: obj['name'] descriptor value should be ; obj['name'] value should be "
     },
     {
       "path": "intl402/Collator/prototype/compare/ignorePunctuation.js",
@@ -43585,7 +43119,7 @@
     },
     {
       "path": "intl402/Collator/prototype/resolvedOptions/ignorePunctuation-default.js",
-      "esid": "sec-intl.collator",
+      "esid": "sec-initializecollator",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Thai default ignorePunctuation to true Expected SameValue(«false», «true») to be true"
     },
@@ -43645,13 +43179,13 @@
     },
     {
       "path": "intl402/Collator/unicode-ext-seq-in-private-tag.js",
-      "esid": "sec-intl.collator",
+      "esid": "sec-initializecollator",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «\"default\"») to be true"
     },
     {
       "path": "intl402/Collator/unicode-ext-seq-with-attribute.js",
-      "esid": "sec-intl.collator",
+      "esid": "sec-initializecollator",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"de-u-co-phonebk\"», «\"de-u-attrval-co-phonebk\"») to be true"
     },
@@ -43662,7 +43196,7 @@
     },
     {
       "path": "intl402/Collator/usage-de.js",
-      "esid": "sec-intl.collator",
+      "esid": "sec-initializecollator",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: sort: compare: intrinsic called on a non-Intl.Collator receiver"
     },
@@ -43761,16 +43295,52 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: new Intl.DateTimeFormat(\"en\", {numberingSystem: \"\"}) throws RangeError Expected a RangeError to be thrown but no exception was thrown at all"
     },
     {
+      "path": "intl402/DateTimeFormat/constructor-options-order-dayPeriod.js",
+      "esid": "sec-createdatetimeformat",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [day, dayPeriod, hour] should have the same contents. "
+    },
+    {
+      "path": "intl402/DateTimeFormat/constructor-options-order-fractionalSecondDigits.js",
+      "esid": "sec-createdatetimeformat",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [localeMatcher, second, fractionalSecondDigits, timeZoneName, formatMatcher] should have the same contents. "
+    },
+    {
+      "path": "intl402/DateTimeFormat/constructor-options-order-timedate-style.js",
+      "esid": "sec-createdatetimeformat",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [localeMatcher, hour12, hourCycle, timeZone, weekday, era, year, month, day, hour, minute, second, timeZoneName, formatMatcher, dateStyle, timeStyle] should have the same contents. "
+    },
+    {
       "path": "intl402/DateTimeFormat/constructor-options-order.js",
       "esid": "sec-createdatetimeformat",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [get options.localeMatcher, get options.localeMatcher.toString, call options.localeMatcher.toString, get options.calendar, get options.calendar.toString, call options.calendar.toString, get options.numberingSystem, get options.numberingSystem.toString, call options.numberingSystem.toString, get options.hour12, get options.hourCycle, get options.hourCycle.toString, call options.hourCycle.toString, get options.timeZone, get options.timeZone.toString, call options.timeZone.toString, get options.weekday, get options.weekday.toString, call options.weekday.toString, get options.era, get options.era.toString, call options.era.toString, get options.year, get options.year.toString, call options.year.toString, get options.month, get options.month.toString, call options.month.toString, get options.day, get options.day.toString, call options.day.toString, get options.dayPeriod, get options.dayPeriod.toString, call options.dayPeriod.toString, get options.hour, get options.hour.toString, call options.hour.toString, get options.minute, get options.minute.toString, call options.minute.toString, get options.second, get options.second.toString, call options.second.toString, get options.fractionalSecondDigits, get options.fractionalSecondDigits.valueOf, call options.fractionalSecondDigits.valueOf, get options.timeZoneName, get options.timeZoneName.toString, call options.timeZoneName.toString, get options.formatMatcher, get options.formatMatcher.toString, call options.formatMatcher.toString, get options.dateStyle, get options.timeStyle] should have the same contents. "
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [localeMatcher, hour12, hourCycle, timeZone, weekday, era, year, month, day, hour, minute, second, timeZoneName, formatMatcher] should have the same contents. "
     },
     {
       "path": "intl402/DateTimeFormat/constructor-options-style-conflict.js",
       "esid": "sec-createdatetimeformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: new Intl.DateTimeFormat(\"en\", { weekday: \"short\",  dateStyle: \"short\" }) throws TypeError Expected a TypeError to be thrown but no exception was thrown at all"
+    },
+    {
+      "path": "intl402/DateTimeFormat/constructor-options-throwing-getters-dayPeriod.js",
+      "esid": "sec-createdatetimeformat",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Exception from dayPeriod getter should be propagated Expected a CustomError to be thrown but no exception was thrown at all"
+    },
+    {
+      "path": "intl402/DateTimeFormat/constructor-options-throwing-getters-fractionalSecondDigits.js",
+      "esid": "sec-createdatetimeformat",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Exception from fractionalSecondDigits getter should be propagated Expected a CustomError to be thrown but no exception was thrown at all"
+    },
+    {
+      "path": "intl402/DateTimeFormat/constructor-options-throwing-getters-timedate-style.js",
+      "esid": "sec-createdatetimeformat",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Exception from dateStyle getter should be propagated Expected a CustomError to be thrown but no exception was thrown at all"
     },
     {
       "path": "intl402/DateTimeFormat/constructor-options-throwing-getters.js",
@@ -43860,7 +43430,7 @@
     },
     {
       "path": "intl402/DateTimeFormat/prototype/format/dayPeriod-short-en.js",
-      "esid": "sec-createdatetimeformat",
+      "esid": "sec-initializedatetimeformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: format: argument 0 must be a Number or Temporal value"
     },
@@ -43868,7 +43438,7 @@
       "path": "intl402/DateTimeFormat/prototype/format/format-function-name.js",
       "esid": "sec-Intl.DateTimeFormat.prototype.format",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: name descriptor value should be ; name value should be "
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: obj['name'] descriptor value should be ; obj['name'] value should be "
     },
     {
       "path": "intl402/DateTimeFormat/prototype/format/fractionalSecondDigits.js",
@@ -44724,7 +44294,7 @@
     },
     {
       "path": "intl402/DateTimeFormat/timezone-case-insensitive.js",
-      "esid": "sec-createdatetimeformat",
+      "esid": "sec-initializedatetimeformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function"
     },
@@ -44735,13 +44305,13 @@
     },
     {
       "path": "intl402/DateTimeFormat/timezone-legacy-non-iana.js",
-      "esid": "sec-createdatetimeformat",
+      "esid": "sec-initializedatetimeformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Time zone: ACT Expected a RangeError to be thrown but no exception was thrown at all"
     },
     {
       "path": "intl402/DateTimeFormat/timezone-not-canonicalized.js",
-      "esid": "sec-createdatetimeformat",
+      "esid": "sec-initializedatetimeformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «\"Asia/Calcutta\"») to be true"
     },
@@ -44910,7 +44480,7 @@
       "path": "intl402/DisplayNames/prototype/resolvedOptions/option-languagedisplay.js",
       "esid": "sec-Intl.DisplayNames.prototype.resolvedOptions",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: languageDisplay should be an own property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: obj should have an own property languageDisplay"
     },
     {
       "path": "intl402/DisplayNames/prototype/resolvedOptions/return-object.js",
@@ -45156,7 +44726,7 @@
       "path": "intl402/Intl/supportedValuesOf/prop-desc.js",
       "esid": "sec-intl.supportedvaluesof",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: supportedValuesOf should be an own property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: obj should have an own property supportedValuesOf"
     },
     {
       "path": "intl402/Intl/supportedValuesOf/timeZones-accepted-by-DateTimeFormat.js",
@@ -45490,7 +45060,7 @@
     },
     {
       "path": "intl402/Number/prototype/toLocaleString/default-options-object-prototype.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: Number.prototype.toLocaleString: must be an integer in 2..=36"
     },
@@ -45506,115 +45076,151 @@
     },
     {
       "path": "intl402/NumberFormat/constructor-compactDisplay-compact.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
+      "path": "intl402/NumberFormat/constructor-compactDisplay-no-compact.js",
+      "esid": "sec-initializenumberformat",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [notation, compactDisplay] should have the same contents. "
+    },
+    {
       "path": "intl402/NumberFormat/constructor-locales-get-tostring.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected true but got false"
     },
     {
       "path": "intl402/NumberFormat/constructor-locales-hasproperty.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«0», «8») to be true"
     },
     {
       "path": "intl402/NumberFormat/constructor-locales-toobject.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
     },
     {
       "path": "intl402/NumberFormat/constructor-notation.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
-      "path": "intl402/NumberFormat/constructor-option-read-order.js",
-      "esid": "sec-intl.numberformat",
+      "path": "intl402/NumberFormat/constructor-numberingSystem-order.js",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [get options.localeMatcher, get options.numberingSystem, get options.style, get options.currency, get options.currencyDisplay, get options.currencySign, get options.unit, get options.unitDisplay, get options.notation, get options.minimumIntegerDigits, get options.minimumFractionDigits, get options.maximumFractionDigits, get options.minimumSignificantDigits, get options.maximumSignificantDigits, get options.roundingIncrement, get options.roundingMode, get options.roundingPriority, get options.trailingZeroDisplay, get options.compactDisplay, get options.useGrouping, get options.signDisplay] should have the same contents. Intl.NumberFormat options read order"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [localeMatcher, numberingSystem, style] should have the same contents. "
+    },
+    {
+      "path": "intl402/NumberFormat/constructor-option-read-order.js",
+      "esid": "sec-initializenumberformat",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [localeMatcher, numberingSystem, style, currency, currencyDisplay, currencySign, unit, unitDisplay, notation, minimumIntegerDigits, minimumFractionDigits, maximumFractionDigits, minimumSignificantDigits, maximumSignificantDigits, roundingIncrement, roundingMode, roundingPriority, trailingZeroDisplay, compactDisplay, useGrouping, signDisplay] should have the same contents. Intl.NumberFormat options read order"
     },
     {
       "path": "intl402/NumberFormat/constructor-options-numberingSystem-invalid.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: new Intl.NumberFormat(\"en\", {numberingSystem: \"\"}) throws RangeError Expected a RangeError to be thrown but no exception was thrown at all"
     },
     {
       "path": "intl402/NumberFormat/constructor-options-roundingMode-invalid.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: null Expected a RangeError to be thrown but no exception was thrown at all"
     },
     {
+      "path": "intl402/NumberFormat/constructor-options-throwing-getters-rounding-increment.js",
+      "esid": "sec-initializenumberformat",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a Test262Error to be thrown but no exception was thrown at all"
+    },
+    {
+      "path": "intl402/NumberFormat/constructor-options-throwing-getters-rounding-mode.js",
+      "esid": "sec-initializenumberformat",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a Test262Error to be thrown but no exception was thrown at all"
+    },
+    {
+      "path": "intl402/NumberFormat/constructor-options-throwing-getters-rounding-priority.js",
+      "esid": "sec-initializenumberformat",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a Test262Error to be thrown but no exception was thrown at all"
+    },
+    {
+      "path": "intl402/NumberFormat/constructor-options-throwing-getters-trailing-zero-display.js",
+      "esid": "sec-initializenumberformat",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a Test262Error to be thrown but no exception was thrown at all"
+    },
+    {
       "path": "intl402/NumberFormat/constructor-options-throwing-getters.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Exception from localeMatcher getter should be propagated Expected a CustomError to be thrown but no exception was thrown at all"
     },
     {
       "path": "intl402/NumberFormat/constructor-options-toobject.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
     },
     {
       "path": "intl402/NumberFormat/constructor-order.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError to be thrown but no exception was thrown at all"
     },
     {
       "path": "intl402/NumberFormat/constructor-roundingIncrement-invalid.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: 0 Expected a RangeError to be thrown but no exception was thrown at all"
     },
     {
       "path": "intl402/NumberFormat/constructor-roundingIncrement.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: has property for value undefined"
     },
     {
       "path": "intl402/NumberFormat/constructor-signDisplay-negative.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: signDisplay should be an own property"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: obj should have an own property signDisplay"
     },
     {
       "path": "intl402/NumberFormat/constructor-signDisplay.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
       "path": "intl402/NumberFormat/constructor-trailingZeroDisplay-invalid.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: empty string Expected a RangeError to be thrown but no exception was thrown at all"
     },
     {
       "path": "intl402/NumberFormat/constructor-trailingZeroDisplay.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: has property for value undefined"
     },
     {
       "path": "intl402/NumberFormat/constructor-unit.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
     },
     {
       "path": "intl402/NumberFormat/constructor-unitDisplay.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
@@ -45703,7 +45309,7 @@
       "path": "intl402/NumberFormat/prototype/format/format-function-name.js",
       "esid": "sec-Intl.NumberFormat.prototype.format",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: name descriptor value should be ; name value should be "
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: obj['name'] descriptor value should be ; obj['name'] value should be "
     },
     {
       "path": "intl402/NumberFormat/prototype/format/length.js",
@@ -46365,7 +45971,7 @@
     },
     {
       "path": "intl402/NumberFormat/test-option-useGrouping-extended.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: (omitted) Expected SameValue(«true», «\"auto\"») to be true"
     },
@@ -46376,55 +45982,49 @@
     },
     {
       "path": "intl402/NumberFormat/throws-for-maximumFractionDigits-over-limit.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Throws RangeError when maximumFractionDigits is more than 100. Expected a RangeError to be thrown but no exception was thrown at all"
     },
     {
       "path": "intl402/NumberFormat/throws-for-maximumFractionDigits-under-limit.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Throws RangeError when maximumFractionDigits is less than 0. Expected a RangeError to be thrown but no exception was thrown at all"
     },
     {
       "path": "intl402/NumberFormat/throws-for-minimumFractionDigits-over-limit.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Throws RangeError when minimumFractionDigits is more than 100. Expected a RangeError to be thrown but no exception was thrown at all"
     },
     {
       "path": "intl402/NumberFormat/throws-for-minimumFractionDigits-under-limit.js",
-      "esid": "sec-intl.numberformat",
+      "esid": "sec-initializenumberformat",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Throws RangeError when minimumFractionDigits is less than 0. Expected a RangeError to be thrown but no exception was thrown at all"
     },
     {
-      "path": "intl402/PluralRules/compactDisplay-undefined-unless-notation-compact.js",
-      "esid": "sec-intl.pluralrules",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: notation (compact, long) Expected SameValue(«undefined», «\"compact\"») to be true"
-    },
-    {
       "path": "intl402/PluralRules/constructor-option-read-order.js",
-      "esid": "sec-intl.pluralrules",
+      "esid": "sec-initializepluralrules",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [get options.localeMatcher, get options.type, get options.notation, get options.compactDisplay, get options.minimumIntegerDigits, get options.minimumFractionDigits, get options.maximumFractionDigits, get options.minimumSignificantDigits, get options.maximumSignificantDigits, get options.roundingIncrement, get options.roundingMode, get options.roundingPriority, get options.trailingZeroDisplay] should have the same contents. Intl.PluralRules options read order"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [localeMatcher, type, notation, minimumIntegerDigits, minimumFractionDigits, maximumFractionDigits, minimumSignificantDigits, maximumSignificantDigits, roundingIncrement, roundingMode, roundingPriority, trailingZeroDisplay] should have the same contents. Intl.PluralRules options read order"
     },
     {
       "path": "intl402/PluralRules/constructor-options-throwing-getters.js",
-      "esid": "sec-intl.pluralrules",
+      "esid": "sec-initializepluralrules",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Exception from localeMatcher getter should be propagated Expected a CustomError to be thrown but no exception was thrown at all"
     },
     {
       "path": "intl402/PluralRules/default-options-object-prototype.js",
-      "esid": "sec-intl.pluralrules",
+      "esid": "sec-initializepluralrules",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «\"standard\"») to be true"
     },
     {
       "path": "intl402/PluralRules/notation.js",
-      "esid": "sec-intl.pluralrules",
+      "esid": "sec-initializepluralrules",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Resolved options should have notation standard"
     },
@@ -46969,7 +46569,7 @@
     },
     {
       "path": "intl402/String/prototype/localeCompare/default-options-object-prototype.js",
-      "esid": "sec-intl.collator",
+      "esid": "sec-initializecollator",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«1», «-1») to be true"
     },
@@ -47828,12 +47428,6 @@
       "esid": "sec-temporal.zoneddatetime.prototype.monthcode",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read properties of undefined"
-    },
-    {
-      "path": "intl402/Temporal/ZonedDateTime/prototype/round/same-date-starts-twice.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.round",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: Temporal.ZonedDateTime: RangeError: ZonedDateTime is outside the expected day bounds"
     },
     {
       "path": "intl402/Temporal/ZonedDateTime/prototype/subtract/month-boundary-buddhist.js",

@@ -3,7 +3,7 @@
 //! Unlike the formatter constructors, `Intl.Locale` must fire its
 //! `options` getters in spec order, so it is built through a
 //! `NativeCtx`-based constructor (not the heap-only
-//! [`crate::intl::dispatch::construct`] path). The canonical
+//! its own `NativeCtx` constructor). The canonical
 //! `[[Locale]]` string is stored on
 //! [`crate::intl::payload::LocalePayload`]; every accessor re-parses
 //! it with `icu_locale`.

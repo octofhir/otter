@@ -12,7 +12,6 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#sec-intl-datetimeformat-objects>
 
-use crate::intl::dispatch::IntlError;
 use crate::intl::payload::{
     DateTimeFormatPayload, DtHourCycle, DtMonthWidth, DtNumWidth, DtStyle, DtTextWidth, DtZoneName,
     IntlPayload,
@@ -22,10 +21,6 @@ use crate::temporal::TemporalPayload;
 use crate::{NativeCtx, NativeError, Value};
 
 const CLASS: &str = "DateTimeFormat";
-
-fn range_err(message: String) -> IntlError {
-    IntlError::Range { message }
-}
 
 fn parse_text_width(s: &str) -> Option<DtTextWidth> {
     match s {

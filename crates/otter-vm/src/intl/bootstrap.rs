@@ -28,7 +28,7 @@
 use crate::intl::payload::IntlKind;
 use crate::js_surface::{Attr, JsSurfaceError, NamespaceBuilder, NamespaceSpec};
 use crate::object::{self, JsObject};
-use crate::{NativeCtx, NativeError, Value, intl};
+use crate::{NativeCtx, NativeError, Value};
 
 /// `install_on` resolver for the per-kind constructors: returns the
 /// `Intl` namespace object the constructor binds on.
@@ -95,9 +95,9 @@ const INTL_SPEC: NamespaceSpec = NamespaceSpec {
     attrs: Attr::global_binding(),
 };
 
-/// `Intl.<Kind>(...)` / `new Intl.<Kind>(...)` shared body. The
-/// literal `new Intl.<Kind>(...)` shape lowers to `Op::NewIntl` in the
-/// compiler; this path serves bare calls and `Reflect.construct`.
+/// `Intl.<Kind>(...)` / `new Intl.<Kind>(...)` shared constructor body:
+/// resolves the option bag through each class's `resolve_ctx` (firing
+/// JS option getters in spec order) and allocates the `JsIntl` payload.
 fn intl_construct(
     kind: IntlKind,
     requires_new: bool,
@@ -114,10 +114,14 @@ fn intl_construct(
     let locale = args.first().copied().unwrap_or_else(Value::undefined);
     let options = args.get(1).copied().unwrap_or_else(Value::undefined);
 
-    // Formatters migrated to the spec-faithful `NativeCtx` option ladder
-    // (firing getters in observation order) are constructed here; the
-    // remainder still use the heap-only dispatcher below.
+    // Every formatter resolves its option bag through the spec-faithful
+    // `NativeCtx` ladder (firing getters in observation order). `Locale`
+    // and `DurationFormat` have dedicated constructors elsewhere.
     let ctx_payload = match kind {
+        IntlKind::NumberFormat => Some(
+            crate::intl::number_format::resolve_ctx(ctx, locale, options)
+                .map(crate::intl::payload::IntlPayload::NumberFormat),
+        ),
         IntlKind::Collator => Some(
             crate::intl::collator::resolve_ctx(ctx, locale, options)
                 .map(crate::intl::payload::IntlPayload::Collator),
@@ -146,37 +150,21 @@ fn intl_construct(
             crate::intl::date_time_format::resolve_ctx(ctx, locale, options)
                 .map(crate::intl::payload::IntlPayload::DateTimeFormat),
         ),
-        _ => None,
+        // `Intl.Locale` / `Intl.DurationFormat` have their own dedicated
+        // constructors and never reach this shared helper.
+        IntlKind::Locale | IntlKind::DurationFormat => None,
     };
-    if let Some(result) = ctx_payload {
-        let payload = result?;
-        let intl = crate::intl::payload::JsIntl::new(ctx.heap_mut(), payload).map_err(|_| {
-            NativeError::TypeError {
-                name: class,
-                reason: "out of memory".to_string(),
-            }
-        })?;
-        return Ok(Value::intl(intl));
-    }
-
-    intl::construct(class, &locale, &options, ctx.heap_mut()).map_err(|err| match err {
-        intl::IntlError::Engine { message, .. } => NativeError::Thrown {
-            name: class,
-            message,
-        },
-        intl::IntlError::Range { message } => NativeError::RangeError {
-            name: class,
-            reason: message,
-        },
-        intl::IntlError::OutOfMemory { .. } => NativeError::TypeError {
+    let payload = ctx_payload.ok_or_else(|| NativeError::TypeError {
+        name: class,
+        reason: "constructor is not dispatched through the shared Intl path".to_string(),
+    })??;
+    let intl = crate::intl::payload::JsIntl::new(ctx.heap_mut(), payload).map_err(|_| {
+        NativeError::TypeError {
             name: class,
             reason: "out of memory".to_string(),
-        },
-        other => NativeError::TypeError {
-            name: class,
-            reason: other.to_string(),
-        },
-    })
+        }
+    })?;
+    Ok(Value::intl(intl))
 }
 
 fn collator_ctor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

@@ -913,7 +913,6 @@ mod tests {
         Op::EvaluateModule,
         Op::MarkModuleEvaluated,
         Op::PromiseFulfilledOf,
-        Op::NewIntl,
         Op::TemporalLoad,
         Op::NewCollection,
         Op::NewWeakRef,

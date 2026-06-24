@@ -23,19 +23,316 @@ use icu_experimental::dimension::units::options::{UnitsFormatterOptions, Width a
 use icu_locale::Locale;
 use tinystr::TinyAsciiStr;
 
-use crate::intl::dispatch::IntlError;
-use crate::intl::helpers::{
-    DEFAULT_LOCALE, coerce_locale, options_object, read_bool_option, read_string_option,
-    read_u8_option,
-};
+use crate::intl::helpers::DEFAULT_LOCALE;
 use crate::intl::payload::{IntlPayload, NumberFormatPayload};
 use crate::string::JsString;
 use crate::{NativeCtx, NativeError, Value};
 use otter_gc::raw::RawGc;
 
-/// Build a `RangeError`-bearing `IntlError` for an invalid option value.
-fn range_err(message: String) -> IntlError {
-    IntlError::Range { message }
+const CLASS: &str = "NumberFormat";
+
+/// §15.1.1 InitializeNumberFormat — reads every option through the spec
+/// `GetOption` ladder in the `constructor-option-read-order` sequence
+/// (getters fire in observation order, ToString/ToNumber/ToBoolean
+/// coercion, RangeError validation) and canonicalizes the locale.
+/// Rounding / significant-digit / trailing-zero options are read +
+/// validated (so throwing getters and `*-invalid` tests observe them)
+/// but, pending a GC-safe resolvedOptions + exact-decimal formatter, are
+/// not yet reflected in output — keeping the existing format path.
+pub fn resolve_ctx(
+    ctx: &mut NativeCtx<'_>,
+    locales: Value,
+    options: Value,
+) -> Result<NumberFormatPayload, NativeError> {
+    use crate::intl::helpers::{
+        coerce_options_object, get_number_option, get_numbering_system_option, get_string_option,
+        option_to_string,
+    };
+    use crate::temporal::helpers::get_option_value;
+
+    let requested = crate::intl::supported::canonicalize_locale_list(ctx, locales)?;
+    let locale = requested
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| DEFAULT_LOCALE.to_string());
+    let options = coerce_options_object(options, CLASS)?;
+    let range = |m: String| NativeError::RangeError {
+        name: CLASS,
+        reason: m,
+    };
+
+    let _matcher = get_string_option(
+        ctx,
+        options,
+        "localeMatcher",
+        CLASS,
+        &["lookup", "best fit"],
+        None,
+    )?;
+    let _numbering_system = get_numbering_system_option(ctx, options, CLASS)?;
+    let style = get_string_option(
+        ctx,
+        options,
+        "style",
+        CLASS,
+        &["decimal", "percent", "currency", "unit"],
+        Some("decimal"),
+    )?
+    .unwrap_or_else(|| "decimal".to_string());
+
+    // SetNumberFormatUnitOptions: currency, currencyDisplay, currencySign,
+    // unit, unitDisplay — all read in order regardless of style.
+    let currency_raw = get_string_option(ctx, options, "currency", CLASS, &[], None)?;
+    let currency_display = get_string_option(
+        ctx,
+        options,
+        "currencyDisplay",
+        CLASS,
+        &["symbol", "narrowSymbol", "code", "name"],
+        Some("symbol"),
+    )?
+    .unwrap_or_else(|| "symbol".to_string());
+    let currency_sign = get_string_option(
+        ctx,
+        options,
+        "currencySign",
+        CLASS,
+        &["standard", "accounting"],
+        Some("standard"),
+    )?
+    .unwrap_or_else(|| "standard".to_string());
+    let unit_raw = get_string_option(ctx, options, "unit", CLASS, &[], None)?;
+    let unit_display = get_string_option(
+        ctx,
+        options,
+        "unitDisplay",
+        CLASS,
+        &["short", "narrow", "long"],
+        Some("short"),
+    )?
+    .unwrap_or_else(|| "short".to_string());
+
+    let check_currency = |raw: &str| -> Result<(), NativeError> {
+        if raw.chars().count() != 3 || !raw.chars().all(|c| c.is_ascii_alphabetic()) {
+            return Err(range(format!("invalid currency code '{raw}'")));
+        }
+        Ok(())
+    };
+    let currency = match (&style, currency_raw) {
+        (s, Some(raw)) if s == "currency" => {
+            check_currency(&raw)?;
+            Some(raw.to_uppercase())
+        }
+        (s, None) if s == "currency" => {
+            return Err(NativeError::TypeError {
+                name: CLASS,
+                reason: "currency style requires a `currency` option".to_string(),
+            });
+        }
+        (_, Some(raw)) => {
+            check_currency(&raw)?;
+            None
+        }
+        _ => None,
+    };
+    let unit = match (&style, unit_raw) {
+        (s, Some(raw)) if s == "unit" => {
+            if !is_well_formed_unit(&raw) {
+                return Err(range(format!("invalid unit identifier '{raw}'")));
+            }
+            Some(raw)
+        }
+        (s, None) if s == "unit" => {
+            return Err(NativeError::TypeError {
+                name: CLASS,
+                reason: "unit style requires a `unit` option".to_string(),
+            });
+        }
+        (_, Some(raw)) => {
+            if !is_well_formed_unit(&raw) {
+                return Err(range(format!("invalid unit identifier '{raw}'")));
+            }
+            None
+        }
+        _ => None,
+    };
+
+    let notation = get_string_option(
+        ctx,
+        options,
+        "notation",
+        CLASS,
+        &["standard", "scientific", "engineering", "compact"],
+        Some("standard"),
+    )?
+    .unwrap_or_else(|| "standard".to_string());
+
+    // SetNumberFormatDigitOptions — read in spec order. The fraction
+    // digits feed the existing formatter; the rounding / significant /
+    // trailing-zero options are validated then discarded for now.
+    let (default_min, default_max) = match style.as_str() {
+        "currency" => (2u8, 2u8),
+        "percent" => (0, 0),
+        _ => (0, 3),
+    };
+    let _min_int = get_number_option(
+        ctx,
+        options,
+        "minimumIntegerDigits",
+        CLASS,
+        1.0,
+        21.0,
+        Some(1.0),
+    )?;
+    let mnfd = get_number_option(
+        ctx,
+        options,
+        "minimumFractionDigits",
+        CLASS,
+        0.0,
+        20.0,
+        None,
+    )?
+    .map(|n| n as u8);
+    let mxfd = get_number_option(
+        ctx,
+        options,
+        "maximumFractionDigits",
+        CLASS,
+        0.0,
+        20.0,
+        None,
+    )?
+    .map(|n| n as u8);
+    let _min_sig = get_number_option(
+        ctx,
+        options,
+        "minimumSignificantDigits",
+        CLASS,
+        1.0,
+        21.0,
+        None,
+    )?;
+    let _max_sig = get_number_option(
+        ctx,
+        options,
+        "maximumSignificantDigits",
+        CLASS,
+        1.0,
+        21.0,
+        None,
+    )?;
+    let (minimum_fraction_digits, maximum_fraction_digits) = match (mnfd, mxfd) {
+        (None, None) => (default_min, default_max.max(default_min)),
+        (Some(mn), None) => (mn, default_max.max(mn)),
+        (None, Some(mx)) => (default_min.min(mx), mx),
+        (Some(mn), Some(mx)) => {
+            if mx < mn {
+                return Err(range(
+                    "maximumFractionDigits is less than minimumFractionDigits".to_string(),
+                ));
+            }
+            (mn, mx)
+        }
+    };
+    let rounding_increment = get_number_option(
+        ctx,
+        options,
+        "roundingIncrement",
+        CLASS,
+        1.0,
+        5000.0,
+        Some(1.0),
+    )?
+    .unwrap_or(1.0) as u16;
+    const INCREMENTS: &[u16] = &[
+        1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000,
+    ];
+    if !INCREMENTS.contains(&rounding_increment) {
+        return Err(range(format!(
+            "invalid roundingIncrement {rounding_increment}"
+        )));
+    }
+    let _rounding_mode = get_string_option(
+        ctx,
+        options,
+        "roundingMode",
+        CLASS,
+        &[
+            "ceil",
+            "floor",
+            "expand",
+            "trunc",
+            "halfCeil",
+            "halfFloor",
+            "halfExpand",
+            "halfTrunc",
+            "halfEven",
+        ],
+        Some("halfExpand"),
+    )?;
+    let _rounding_priority = get_string_option(
+        ctx,
+        options,
+        "roundingPriority",
+        CLASS,
+        &["auto", "morePrecision", "lessPrecision"],
+        Some("auto"),
+    )?;
+    let _trailing_zero = get_string_option(
+        ctx,
+        options,
+        "trailingZeroDisplay",
+        CLASS,
+        &["auto", "stripIfInteger"],
+        Some("auto"),
+    )?;
+
+    let _compact_display = get_string_option(
+        ctx,
+        options,
+        "compactDisplay",
+        CLASS,
+        &["short", "long"],
+        Some("short"),
+    )?;
+    // useGrouping accepts a boolean or "min2"/"auto"/"always".
+    let use_grouping_val = if options.is_undefined() {
+        Value::undefined()
+    } else {
+        get_option_value(ctx, options, "useGrouping", CLASS)?
+    };
+    let use_grouping = if use_grouping_val.is_undefined() {
+        true
+    } else if let Some(b) = use_grouping_val.as_boolean() {
+        b
+    } else {
+        option_to_string(ctx, use_grouping_val, CLASS)? != "false"
+    };
+    let sign_display = get_string_option(
+        ctx,
+        options,
+        "signDisplay",
+        CLASS,
+        &["auto", "always", "never", "exceptZero", "negative"],
+        Some("auto"),
+    )?
+    .unwrap_or_else(|| "auto".to_string());
+
+    Ok(NumberFormatPayload {
+        locale,
+        style,
+        currency,
+        minimum_fraction_digits,
+        maximum_fraction_digits,
+        use_grouping,
+        sign_display,
+        notation,
+        currency_display,
+        currency_sign,
+        unit,
+        unit_display,
+    })
 }
 
 /// The sanctioned simple unit identifiers (ECMA-402 Table:
@@ -98,140 +395,6 @@ fn is_well_formed_unit(unit: &str) -> bool {
         Some((num, den)) => SANCTIONED_UNITS.contains(&num) && SANCTIONED_UNITS.contains(&den),
         None => false,
     }
-}
-
-/// Resolve the `(locale, options)` argument pair to a payload.
-///
-/// # Errors
-/// - `BadArgument` when `style == "currency"` is requested without a
-///   `currency` option.
-pub fn resolve(
-    locale: &Value,
-    options: &Value,
-    gc_heap: &otter_gc::GcHeap,
-) -> Result<NumberFormatPayload, IntlError> {
-    let opts = options_object(Some(options));
-    let opts_ref = opts.as_ref();
-    let style = read_string_option(opts_ref, "style", "decimal", gc_heap);
-    let currency = match style.as_str() {
-        "currency" => {
-            match opts_ref
-                .and_then(|o| crate::object::get(*o, gc_heap, "currency"))
-                .and_then(|v| v.as_string(gc_heap).map(|s| s.to_lossy_string(gc_heap)))
-            {
-                Some(raw) => {
-                    // §IsWellFormedCurrencyCode: exactly three ASCII
-                    // letters (validated before case-folding so `ß` etc.
-                    // don't slip through ToUpperCase expansion).
-                    if raw.chars().count() != 3 || !raw.chars().all(|c| c.is_ascii_alphabetic()) {
-                        return Err(range_err(format!("invalid currency code '{raw}'")));
-                    }
-                    Some(raw.to_uppercase())
-                }
-                None => {
-                    return Err(IntlError::BadArgument {
-                        class: "NumberFormat",
-                        method: "constructor",
-                        index: 1,
-                        reason: "currency style requires a `currency` option",
-                    });
-                }
-            }
-        }
-        _ => None,
-    };
-    let (default_min, default_max) = match style.as_str() {
-        "currency" => (2, 2),
-        "percent" => (0, 0),
-        _ => (0, 3),
-    };
-    let minimum_fraction_digits = read_u8_option(
-        opts_ref,
-        "minimumFractionDigits",
-        default_min,
-        0,
-        20,
-        gc_heap,
-    );
-    let maximum_fraction_digits = read_u8_option(
-        opts_ref,
-        "maximumFractionDigits",
-        default_max.max(minimum_fraction_digits),
-        minimum_fraction_digits,
-        20,
-        gc_heap,
-    );
-    let use_grouping = read_bool_option(opts_ref, "useGrouping", true, gc_heap);
-    let sign_display = read_string_option(opts_ref, "signDisplay", "auto", gc_heap);
-    if !matches!(
-        sign_display.as_str(),
-        "auto" | "always" | "never" | "exceptZero" | "negative"
-    ) {
-        return Err(range_err(format!(
-            "invalid value '{sign_display}' for option 'signDisplay'"
-        )));
-    }
-    let notation = read_string_option(opts_ref, "notation", "standard", gc_heap);
-    if !matches!(
-        notation.as_str(),
-        "standard" | "scientific" | "engineering" | "compact"
-    ) {
-        return Err(range_err(format!(
-            "invalid value '{notation}' for option 'notation'"
-        )));
-    }
-    let currency_display = read_string_option(opts_ref, "currencyDisplay", "symbol", gc_heap);
-    if !matches!(
-        currency_display.as_str(),
-        "symbol" | "narrowSymbol" | "code" | "name"
-    ) {
-        return Err(range_err(format!(
-            "invalid value '{currency_display}' for option 'currencyDisplay'"
-        )));
-    }
-    let currency_sign = read_string_option(opts_ref, "currencySign", "standard", gc_heap);
-    if !matches!(currency_sign.as_str(), "standard" | "accounting") {
-        return Err(range_err(format!(
-            "invalid value '{currency_sign}' for option 'currencySign'"
-        )));
-    }
-    // `unit` is read and validated whenever present, regardless of style;
-    // a missing `unit` under `style: "unit"` is a TypeError.
-    let unit = read_string_option(opts_ref, "unit", "", gc_heap);
-    let unit = if unit.is_empty() { None } else { Some(unit) };
-    if let Some(u) = &unit
-        && !is_well_formed_unit(u)
-    {
-        return Err(range_err(format!("invalid unit identifier '{u}'")));
-    }
-    let unit_display = read_string_option(opts_ref, "unitDisplay", "short", gc_heap);
-    if !matches!(unit_display.as_str(), "short" | "narrow" | "long") {
-        return Err(range_err(format!(
-            "invalid value '{unit_display}' for option 'unitDisplay'"
-        )));
-    }
-    if style == "unit" && unit.is_none() {
-        return Err(IntlError::BadArgument {
-            class: "NumberFormat",
-            method: "constructor",
-            index: 1,
-            reason: "unit style requires a `unit` option",
-        });
-    }
-    Ok(NumberFormatPayload {
-        locale: coerce_locale(Some(locale), gc_heap),
-        style,
-        currency,
-        minimum_fraction_digits,
-        maximum_fraction_digits,
-        use_grouping,
-        sign_display,
-        notation,
-        currency_display,
-        currency_sign,
-        unit,
-        unit_display,
-    })
 }
 
 fn require_number_format(

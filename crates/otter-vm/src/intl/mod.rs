@@ -12,9 +12,9 @@
 //! # Contents
 //! - [`payload`] — `IntlPayload` enum + `JsIntl` handle + per-class
 //!   resolved option bags.
-//! - [`dispatch`] — central `Op::NewIntl` constructor router.
 //! - [`helpers`] — locale / option-bag coercion utilities shared
-//!   across the three per-class modules.
+//!   across the per-class modules, including the spec `GetOption`
+//!   ladder that fires JS option getters in observation order.
 //! - [`collator`] — `Intl.Collator` static + prototype.
 //! - [`number_format`] — `Intl.NumberFormat` static + prototype.
 //! - [`date_time_format`] — `Intl.DateTimeFormat` static + prototype.
@@ -25,8 +25,9 @@
 //!   payload. Method calls re-instantiate the underlying ICU
 //!   formatter / collator on demand because the ICU types are
 //!   borrow-locked to a specific `Locale`.
-//! - All public failure modes flow through [`dispatch::IntlError`]
-//!   and are widened by the dispatcher to [`crate::VmError`].
+//! - Every class constructs through its own `NativeCtx`-based
+//!   constructor (`resolve_ctx`), so option getters fire in spec
+//!   order with proper coercion and `RangeError` validation.
 //!
 //! # Binary-size note
 //! Pulling in `icu_collator` / `icu_decimal` / `icu_datetime` with
@@ -40,7 +41,6 @@
 pub mod bootstrap;
 pub mod collator;
 pub mod date_time_format;
-pub mod dispatch;
 pub mod display_names;
 pub mod duration_format;
 pub mod helpers;
@@ -54,7 +54,6 @@ pub mod relative_time_format;
 pub mod segmenter;
 pub mod supported;
 
-pub use dispatch::{IntlError, construct};
 pub use payload::{
     CollatorPayload, DateTimeFormatPayload, INTL_BODY_TYPE_TAG, IntlBody, IntlHandle, IntlKind,
     IntlPayload, JsIntl, NumberFormatPayload, alloc_intl,

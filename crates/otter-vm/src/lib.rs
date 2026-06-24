@@ -90,7 +90,6 @@ pub mod groom;
 mod holt_stack;
 pub mod inspect;
 pub mod intl;
-mod intl_ops;
 pub mod intrinsic_install;
 pub mod intrinsics;
 mod iterator_ops;
@@ -7925,30 +7924,6 @@ impl Interpreter {
                         dst,
                         kind_idx,
                         iter_reg,
-                    )?;
-                    continue;
-                }
-                Op::NewIntl => {
-                    let dst = context
-                        .exec_register(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
-                    let class_idx = context
-                        .exec_const_index(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
-                    let locale_reg = context
-                        .exec_register(instr, 2)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
-                    let options_reg = context
-                        .exec_register(instr, 3)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_new_intl_regs(
-                        context,
-                        frame,
-                        dst,
-                        class_idx,
-                        locale_reg,
-                        options_reg,
                     )?;
                     continue;
                 }

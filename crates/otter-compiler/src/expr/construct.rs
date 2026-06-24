@@ -151,46 +151,6 @@ pub(crate) fn compile_new(
         cx.emit(Op::NewFunction, operands, new_span);
         return Ok(dst);
     }
-    // `new Intl.<Class>(locale?, options?)` — dedicated
-    // `Op::NewIntl` lowering. The callee is a static-member
-    // expression `Intl.<Class>`; we pull the class name out
-    // of the property and emit the constructor opcode.
-    if let Expression::StaticMemberExpression(member) = callee
-        && let Expression::Identifier(id) = &member.object
-        && id.name.as_str() == "Intl"
-        // NB: classes migrated to the spec-faithful `NativeCtx` option
-        // ladder (firing getters in order) are deliberately ABSENT here so
-        // they route through their real constructor instead of the
-        // heap-only `Op::NewIntl` fast path: ListFormat, DurationFormat,
-        // Locale.
-        && matches!(member.property.name.as_str(), "NumberFormat")
-    {
-        let class = member.property.name.as_str();
-        let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-        let locale_reg = arg_regs.first().copied().unwrap_or_else(|| {
-            let r = cx.alloc_scratch();
-            cx.emit(Op::LoadUndefined, [Operand::Register(r)], new_span);
-            r
-        });
-        let options_reg = arg_regs.get(1).copied().unwrap_or_else(|| {
-            let r = cx.alloc_scratch();
-            cx.emit(Op::LoadUndefined, [Operand::Register(r)], new_span);
-            r
-        });
-        let dst = cx.alloc_scratch();
-        let class_idx = cx.intern_string_constant(class);
-        cx.emit(
-            Op::NewIntl,
-            vec![
-                Operand::Register(dst),
-                Operand::ConstIndex(class_idx),
-                Operand::Register(locale_reg),
-                Operand::Register(options_reg),
-            ],
-            new_span,
-        );
-        return Ok(dst);
-    }
     // `new Map(iter?)` / `new Set(iter?)` /
     // `new WeakMap(iter?)` / `new WeakSet(iter?)` go through
     // the ordinary `Op::New` dispatch path now that the

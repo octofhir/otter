@@ -71,12 +71,15 @@ pub(crate) fn exec_once_native(
 ) -> Result<Value, NativeError> {
     let units = text.to_utf16_vec(ctx.heap());
     let len = units.len();
-    let flags = re.flags(ctx.heap());
-    // §22.2.7.2 step 4 — `lastIndex = ? ToLength(? Get(R, "lastIndex"))`.
+    // §22.2.7.2 step 3 — `lastIndex = ? ToLength(? Get(R, "lastIndex"))`.
     // The read is observable (a user `lastIndex` getter fires) even
     // when the regex is neither global nor sticky.
     let last_index_val = get_property_runtime(ctx, receiver, "lastIndex", REGEXP_EXEC_NAME)?;
     let mut start = to_length_runtime(ctx, &last_index_val, REGEXP_EXEC_NAME)? as usize;
+    // §22.2.7.2 step 4 — `flags = R.[[OriginalFlags]]`, read *after*
+    // `lastIndex`: a `lastIndex` getter may `re.compile(...)` and change
+    // the global/sticky flags, which the subsequent steps must observe.
+    let flags = re.flags(ctx.heap());
     // step 8 — a non-global, non-sticky match always starts at 0.
     if !flags.global && !flags.sticky {
         start = 0;

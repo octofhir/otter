@@ -627,7 +627,14 @@ fn proto_test(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 /// property reads.
 fn proto_compile(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let re = receiver_regexp(ctx, "RegExp.prototype.compile")?;
-    if re.prototype_override(ctx.heap()).is_some() {
+    // §B.2.4.1 — `compile` only rejects a *subclass* instance, i.e. one
+    // whose prototype differs from `%RegExp.prototype%`. A plain
+    // `new RegExp(...)` stores its (default) prototype as an override, so
+    // the mere presence of an override is not a subclass.
+    let default_proto = ctx.interp_mut().realm_intrinsics().regexp_prototype;
+    if let Some(proto) = re.prototype_override(ctx.heap())
+        && proto.as_object() != default_proto
+    {
         return Err(NativeError::TypeError {
             name: "RegExp.prototype.compile",
             reason: "cannot compile a RegExp subclass instance".to_string(),

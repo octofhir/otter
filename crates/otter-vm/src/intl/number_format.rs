@@ -492,6 +492,24 @@ fn bound_format_call(
     )?))
 }
 
+/// Shared `Number`/`BigInt`.prototype.toLocaleString body: resolve a
+/// fresh `NumberFormat` from `(locales, options)` and format `value`
+/// through the same path `NumberFormat.prototype.format` uses, so the
+/// two render identically.
+pub(crate) fn to_locale_string(
+    ctx: &mut NativeCtx<'_>,
+    value: f64,
+    locales: Value,
+    options: Value,
+) -> Result<Value, NativeError> {
+    let payload = resolve_ctx(ctx, locales, options)?;
+    let rendered = format_number(value, &payload);
+    Ok(Value::string(JsString::from_str(
+        &rendered,
+        ctx.heap_mut(),
+    )?))
+}
+
 /// §11.1.6 `Intl.NumberFormat.prototype.formatToParts(value)`.
 pub(crate) fn number_format_format_to_parts(
     ctx: &mut NativeCtx<'_>,
@@ -757,7 +775,9 @@ fn push_unit_affix(parts: &mut Vec<(&'static str, String)>, affix: &str, trailin
     }
     if trailing {
         // Suffix: leading whitespace touches the number.
-        let unit_start = affix.find(|c: char| !c.is_whitespace()).unwrap_or(affix.len());
+        let unit_start = affix
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(affix.len());
         if unit_start > 0 {
             parts.push(("literal", affix[..unit_start].to_string()));
         }
@@ -766,7 +786,9 @@ fn push_unit_affix(parts: &mut Vec<(&'static str, String)>, affix: &str, trailin
         }
     } else {
         // Prefix: trailing whitespace touches the number.
-        let unit_end = affix.rfind(|c: char| !c.is_whitespace()).map_or(0, |i| i + 1);
+        let unit_end = affix
+            .rfind(|c: char| !c.is_whitespace())
+            .map_or(0, |i| i + 1);
         if unit_end > 0 {
             parts.push(("unit", affix[..unit_end].to_string()));
         }

@@ -42,8 +42,9 @@ otter_macros::couch! {
     },
     prototype = {
         methods = {
-            "toString" / 0 => bigint_proto_to_string,
-            "valueOf"  / 0 => bigint_proto_value_of,
+            "toString"       / 0 => bigint_proto_to_string,
+            "toLocaleString" / 0 => bigint_proto_to_locale_string,
+            "valueOf"        / 0 => bigint_proto_value_of,
         },
     },
 }
@@ -196,6 +197,36 @@ fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
     let s = crate::string::JsString::from_str(&rendered, ctx.heap_mut())
         .map_err(|_| oom("BigInt.prototype.toString"))?;
     Ok(Value::string(s))
+}
+
+/// §BigInt.prototype.toLocaleString — brand-check `this`, then format
+/// through a freshly constructed Intl.NumberFormat so the output matches
+/// `new Intl.NumberFormat(locales, options).format(this)`.
+fn bigint_proto_to_locale_string(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let this = ctx.this_value();
+    let name = "BigInt.prototype.toLocaleString";
+    let b = if let Some(b) = this.as_big_int() {
+        b
+    } else if let Some(obj) = this.as_object() {
+        crate::object::bigint_data(obj, ctx.heap()).ok_or_else(|| NativeError::TypeError {
+            name,
+            reason: "this is not a BigInt".to_string(),
+        })?
+    } else {
+        return Err(NativeError::TypeError {
+            name,
+            reason: "this is not a BigInt".to_string(),
+        });
+    };
+    let value = b
+        .with_inner(ctx.heap(), |bi| num_traits::ToPrimitive::to_f64(bi))
+        .unwrap_or(f64::NAN);
+    let locales = args.first().copied().unwrap_or_else(Value::undefined);
+    let options = args.get(1).copied().unwrap_or_else(Value::undefined);
+    crate::intl::number_format::to_locale_string(ctx, value, locales, options)
 }
 
 fn bigint_proto_value_of(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {

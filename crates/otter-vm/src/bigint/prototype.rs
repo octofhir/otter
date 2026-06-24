@@ -19,5 +19,5 @@
 /// Whether `name` is an installed `BigInt.prototype` method.
 #[must_use]
 pub fn is_builtin_method(name: &str) -> bool {
-    matches!(name, "toString" | "valueOf")
+    matches!(name, "toString" | "toLocaleString" | "valueOf")
 }

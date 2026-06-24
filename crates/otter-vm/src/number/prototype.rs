@@ -223,7 +223,13 @@ pub(crate) fn fast_primitive_to_string(
 }
 
 fn number_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    to_string_radix(ctx, args, "Number.prototype.toLocaleString")
+    // §19.3.1 — brand-check `this`, then format through a freshly
+    // constructed Intl.NumberFormat so the output matches
+    // `new Intl.NumberFormat(locales, options).format(this)`.
+    let recv = this_number_value(ctx, "Number.prototype.toLocaleString")?;
+    let locales = args.first().copied().unwrap_or_else(Value::undefined);
+    let options = args.get(1).copied().unwrap_or_else(Value::undefined);
+    crate::intl::number_format::to_locale_string(ctx, recv.as_f64(), locales, options)
 }
 
 /// §21.1.3.3 `Number.prototype.toFixed(digits = 0)`.

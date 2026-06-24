@@ -70,6 +70,9 @@ pub struct NumberFormatPayload {
     /// `"exceptZero"` / `"negative"`) — controls when a plus/minus sign
     /// is shown.
     pub sign_display: String,
+    /// `notation` option (`"standard"` / `"scientific"` /
+    /// `"engineering"` / `"compact"`).
+    pub notation: String,
 }
 
 /// Text-component width (`weekday`, `era`, `dayPeriod`).

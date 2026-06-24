@@ -101,6 +101,15 @@ pub fn resolve(
             "invalid value '{sign_display}' for option 'signDisplay'"
         )));
     }
+    let notation = read_string_option(opts_ref, "notation", "standard", gc_heap);
+    if !matches!(
+        notation.as_str(),
+        "standard" | "scientific" | "engineering" | "compact"
+    ) {
+        return Err(range_err(format!(
+            "invalid value '{notation}' for option 'notation'"
+        )));
+    }
     Ok(NumberFormatPayload {
         locale: coerce_locale(Some(locale), gc_heap),
         style,
@@ -109,6 +118,7 @@ pub fn resolve(
         maximum_fraction_digits,
         use_grouping,
         sign_display,
+        notation,
     })
 }
 
@@ -392,8 +402,22 @@ pub(crate) fn partition_number(
     }
 
     push_sign(&mut parts, sign);
+    let scientific = matches!(payload.notation.as_str(), "scientific" | "engineering");
     if n.is_infinite() {
         parts.push(("infinity", "∞".to_string()));
+    } else if scientific && payload.style != "currency" {
+        let base = if payload.style == "percent" {
+            n.abs() * 100.0
+        } else {
+            n.abs()
+        };
+        let (mant, exp) = scientific_parts(base, payload.notation == "engineering");
+        push_number_parts(&mut parts, &format_decimal(mant, payload));
+        parts.push(("exponentSeparator", "E".to_string()));
+        if exp < 0 {
+            parts.push(("exponentMinusSign", "-".to_string()));
+        }
+        parts.push(("exponentInteger", exp.unsigned_abs().to_string()));
     } else {
         let value = if payload.style == "percent" {
             n.abs() * 100.0
@@ -442,7 +466,8 @@ pub(crate) fn number_format_resolved_options(
     let max_fd = payload.maximum_fraction_digits as i32;
     let use_grouping = payload.use_grouping;
     let sign_display = Value::string(JsString::from_str(&payload.sign_display, ctx.heap_mut())?);
-    let mut value_roots = vec![&locale, &style, &sign_display];
+    let notation = Value::string(JsString::from_str(&payload.notation, ctx.heap_mut())?);
+    let mut value_roots = vec![&locale, &style, &sign_display, &notation];
     if let Some(c) = &currency_val {
         value_roots.push(c);
     }
@@ -466,6 +491,7 @@ pub(crate) fn number_format_resolved_options(
         Value::number_i32(max_fd),
     );
     crate::object::set(obj, heap, "useGrouping", Value::boolean(use_grouping));
+    crate::object::set(obj, heap, "notation", notation);
     crate::object::set(obj, heap, "signDisplay", sign_display);
     Ok(Value::object(obj))
 }
@@ -479,8 +505,21 @@ pub(crate) fn format_number(n: f64, payload: &NumberFormatPayload) -> String {
     let is_neg = n.is_sign_negative();
     let is_zero = rounds_to_zero(n, payload);
     let sign = sign_prefix(displayed_sign(&payload.sign_display, is_neg, is_zero, false));
+    let scientific = matches!(payload.notation.as_str(), "scientific" | "engineering");
     let magnitude = if n.is_infinite() {
         "∞".to_string()
+    } else if scientific && payload.style != "currency" {
+        let base = if payload.style == "percent" {
+            n.abs() * 100.0
+        } else {
+            n.abs()
+        };
+        let core = render_scientific(base, payload, payload.notation == "engineering");
+        if payload.style == "percent" {
+            format!("{core}%")
+        } else {
+            core
+        }
     } else {
         match payload.style.as_str() {
             "currency" => currency_string(n.abs(), payload),
@@ -489,6 +528,35 @@ pub(crate) fn format_number(n: f64, payload: &NumberFormatPayload) -> String {
         }
     };
     format!("{sign}{magnitude}")
+}
+
+/// Decompose `abs` into a `(mantissa, exponent)` pair for scientific
+/// notation (mantissa in `[1, 10)`) or engineering notation (exponent a
+/// multiple of 3, mantissa in `[1, 1000)`).
+fn scientific_parts(abs: f64, engineering: bool) -> (f64, i32) {
+    if abs == 0.0 || !abs.is_finite() {
+        return (abs, 0);
+    }
+    let mut exp = abs.log10().floor() as i32;
+    // Correct for floating-point error at exact powers of ten.
+    let mant = abs / 10f64.powi(exp);
+    if mant >= 10.0 {
+        exp += 1;
+    } else if mant < 1.0 {
+        exp -= 1;
+    }
+    if engineering {
+        exp = exp.div_euclid(3) * 3;
+    }
+    (abs / 10f64.powi(exp), exp)
+}
+
+/// Render `abs` in scientific / engineering notation: ICU-formatted
+/// mantissa (locale decimal separator, default 0..3 fraction digits)
+/// joined to the exponent by the `E` separator.
+fn render_scientific(abs: f64, payload: &NumberFormatPayload, engineering: bool) -> String {
+    let (mant, exp) = scientific_parts(abs, engineering);
+    format!("{}E{exp}", format_decimal(mant, payload))
 }
 
 /// The sign glyph a value renders under a `signDisplay` policy.

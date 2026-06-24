@@ -86,3 +86,169 @@ pub fn read_u8_option(
         .unwrap_or(default as i64);
     v.clamp(lo as i64, hi as i64) as u8
 }
+
+// ---------------------------------------------------------------------
+// Spec-faithful `GetOption` ladder (fires JS getters + ToString /
+// ToNumber / ToBoolean coercion in observation order). Constructors that
+// must surface throwing getters and read-order use these, threaded
+// through a `NativeCtx`, instead of the heap-only readers above.
+// ---------------------------------------------------------------------
+
+use crate::{NativeCtx, NativeError};
+
+/// `GetOptionsObject(options)` — `undefined` → an absent bag (reads all
+/// yield `undefined`); a non-object is a `TypeError`.
+pub fn require_options_object(options: Value, class: &'static str) -> Result<Value, NativeError> {
+    if options.is_undefined() {
+        return Ok(Value::undefined());
+    }
+    if options.is_object_type() || options.as_array().is_some() {
+        return Ok(options);
+    }
+    Err(NativeError::TypeError {
+        name: class,
+        reason: "options must be an object".to_string(),
+    })
+}
+
+/// `[[Get]]` on the options bag (firing a getter), treating an absent
+/// (`undefined`) bag as one whose every read yields `undefined`.
+fn option_get(
+    ctx: &mut NativeCtx<'_>,
+    options: Value,
+    name: &str,
+    class: &'static str,
+) -> Result<Value, NativeError> {
+    if options.is_undefined() {
+        return Ok(Value::undefined());
+    }
+    crate::temporal::helpers::get_option_value(ctx, options, name, class)
+}
+
+/// `ToString(value)` for an option — fires `toString`/`valueOf`/
+/// `@@toPrimitive` and throws a `TypeError` on a Symbol.
+pub fn option_to_string(
+    ctx: &mut NativeCtx<'_>,
+    value: Value,
+    class: &'static str,
+) -> Result<String, NativeError> {
+    if let Some(s) = value.as_string(ctx.heap()) {
+        return Ok(s.to_lossy_string(ctx.heap()));
+    }
+    if value.is_null() {
+        return Ok("null".to_string());
+    }
+    if value.is_undefined() {
+        return Ok("undefined".to_string());
+    }
+    if let Some(b) = value.as_boolean() {
+        return Ok((if b { "true" } else { "false" }).to_string());
+    }
+    if let Some(n) = value.as_number() {
+        return Ok(n.to_display_string());
+    }
+    if value.is_object_type() {
+        let exec = ctx
+            .execution_context()
+            .cloned()
+            .ok_or_else(|| NativeError::TypeError {
+                name: class,
+                reason: "missing execution context".to_string(),
+            })?;
+        let prim = ctx
+            .cx
+            .interp
+            .to_primitive_string_hint_sync(&exec, value)
+            .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))?;
+        if let Some(s) = prim.as_string(ctx.heap()) {
+            return Ok(s.to_lossy_string(ctx.heap()));
+        }
+        if let Some(n) = prim.as_number() {
+            return Ok(n.to_display_string());
+        }
+        if let Some(b) = prim.as_boolean() {
+            return Ok((if b { "true" } else { "false" }).to_string());
+        }
+    }
+    Err(NativeError::TypeError {
+        name: class,
+        reason: "option value cannot be converted to a string".to_string(),
+    })
+}
+
+/// `GetOption(options, name, "string", values, default)` — fires the
+/// getter, `ToString`-coerces, and rejects a value outside `values`
+/// (when non-empty) with a `RangeError`. Returns `None` only when the
+/// option is absent and `default` is `None`.
+pub fn get_string_option(
+    ctx: &mut NativeCtx<'_>,
+    options: Value,
+    name: &str,
+    class: &'static str,
+    values: &[&str],
+    default: Option<&str>,
+) -> Result<Option<String>, NativeError> {
+    let v = option_get(ctx, options, name, class)?;
+    if v.is_undefined() {
+        return Ok(default.map(str::to_string));
+    }
+    let s = option_to_string(ctx, v, class)?;
+    if !values.is_empty() && !values.contains(&s.as_str()) {
+        return Err(NativeError::RangeError {
+            name: class,
+            reason: format!("invalid value '{s}' for option '{name}'"),
+        });
+    }
+    Ok(Some(s))
+}
+
+/// `GetOption(options, name, "boolean", empty, default)` — fires the
+/// getter and applies `ToBoolean`.
+pub fn get_bool_option(
+    ctx: &mut NativeCtx<'_>,
+    options: Value,
+    name: &str,
+    class: &'static str,
+    default: Option<bool>,
+) -> Result<Option<bool>, NativeError> {
+    let v = option_get(ctx, options, name, class)?;
+    if v.is_undefined() {
+        return Ok(default);
+    }
+    Ok(Some(v.to_boolean(ctx.heap())))
+}
+
+/// `GetNumberOption(options, name, min, max, default)` — fires the
+/// getter, `ToNumber`-coerces, and `RangeError`s outside `[min, max]`
+/// or on `NaN`.
+pub fn get_number_option(
+    ctx: &mut NativeCtx<'_>,
+    options: Value,
+    name: &str,
+    class: &'static str,
+    min: f64,
+    max: f64,
+    default: Option<f64>,
+) -> Result<Option<f64>, NativeError> {
+    let v = option_get(ctx, options, name, class)?;
+    if v.is_undefined() {
+        return Ok(default);
+    }
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: class,
+            reason: "missing execution context".to_string(),
+        })?;
+    let n = crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, &v)
+        .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))?
+        .as_f64();
+    if n.is_nan() || n < min || n > max {
+        return Err(NativeError::RangeError {
+            name: class,
+            reason: format!("option '{name}' must be between {min} and {max}"),
+        });
+    }
+    Ok(Some(n))
+}

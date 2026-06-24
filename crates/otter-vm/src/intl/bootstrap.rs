@@ -113,6 +113,28 @@ fn intl_construct(
     }
     let locale = args.first().copied().unwrap_or_else(Value::undefined);
     let options = args.get(1).copied().unwrap_or_else(Value::undefined);
+
+    // Formatters migrated to the spec-faithful `NativeCtx` option ladder
+    // (firing getters in observation order) are constructed here; the
+    // remainder still use the heap-only dispatcher below.
+    let ctx_payload = match kind {
+        IntlKind::ListFormat => Some(
+            crate::intl::list_format::resolve_ctx(ctx, locale, options)
+                .map(crate::intl::payload::IntlPayload::ListFormat),
+        ),
+        _ => None,
+    };
+    if let Some(result) = ctx_payload {
+        let payload = result?;
+        let intl = crate::intl::payload::JsIntl::new(ctx.heap_mut(), payload).map_err(|_| {
+            NativeError::TypeError {
+                name: class,
+                reason: "out of memory".to_string(),
+            }
+        })?;
+        return Ok(Value::intl(intl));
+    }
+
     intl::construct(class, &locale, &options, ctx.heap_mut()).map_err(|err| match err {
         intl::IntlError::Engine { message, .. } => NativeError::Thrown {
             name: class,

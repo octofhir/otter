@@ -10,20 +10,59 @@
 
 use otter_gc::raw::RawGc;
 
-use crate::intl::helpers::{coerce_locale, options_object, read_string_option};
+use crate::intl::helpers::{DEFAULT_LOCALE, get_string_option, require_options_object};
 use crate::intl::payload::{IntlPayload, ListFormatPayload};
 use crate::string::JsString;
 use crate::{NativeCtx, NativeError, Value};
 
-/// Resolve constructor options for this Intl class.
-pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> ListFormatPayload {
-    let opts = options_object(Some(options));
-    let opts_ref = opts.as_ref();
-    ListFormatPayload {
-        locale: coerce_locale(Some(locale), gc_heap),
-        kind: read_string_option(opts_ref, "type", "conjunction", gc_heap),
-        style: read_string_option(opts_ref, "style", "long", gc_heap),
-    }
+const CLASS: &str = "ListFormat";
+
+/// §13.1.1 InitializeListFormat — spec-faithful construction firing
+/// `localeMatcher` / `type` / `style` getters in order with ToString
+/// coercion + RangeError validation, and canonicalizing the locale.
+pub fn resolve_ctx(
+    ctx: &mut NativeCtx<'_>,
+    locales: Value,
+    options: Value,
+) -> Result<ListFormatPayload, NativeError> {
+    let requested = crate::intl::supported::canonicalize_locale_list(ctx, locales)?;
+    let locale = requested
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| DEFAULT_LOCALE.to_string());
+    let options = require_options_object(options, CLASS)?;
+    // §step — read in spec order: localeMatcher, type, style.
+    let _matcher = get_string_option(
+        ctx,
+        options,
+        "localeMatcher",
+        CLASS,
+        &["lookup", "best fit"],
+        None,
+    )?;
+    let kind = get_string_option(
+        ctx,
+        options,
+        "type",
+        CLASS,
+        &["conjunction", "disjunction", "unit"],
+        Some("conjunction"),
+    )?
+    .unwrap_or_else(|| "conjunction".to_string());
+    let style = get_string_option(
+        ctx,
+        options,
+        "style",
+        CLASS,
+        &["long", "short", "narrow"],
+        Some("long"),
+    )?
+    .unwrap_or_else(|| "long".to_string());
+    Ok(ListFormatPayload {
+        locale,
+        kind,
+        style,
+    })
 }
 
 fn require_payload(

@@ -158,6 +158,11 @@ pub(crate) fn compile_new(
     if let Expression::StaticMemberExpression(member) = callee
         && let Expression::Identifier(id) = &member.object
         && id.name.as_str() == "Intl"
+        // NB: classes migrated to the spec-faithful `NativeCtx` option
+        // ladder (firing getters in order) are deliberately ABSENT here so
+        // they route through their real constructor instead of the
+        // heap-only `Op::NewIntl` fast path: ListFormat, DurationFormat,
+        // Locale.
         && matches!(
             member.property.name.as_str(),
             "Collator"
@@ -165,7 +170,6 @@ pub(crate) fn compile_new(
                 | "DateTimeFormat"
                 | "PluralRules"
                 | "RelativeTimeFormat"
-                | "ListFormat"
                 | "DisplayNames"
                 | "Segmenter"
         )

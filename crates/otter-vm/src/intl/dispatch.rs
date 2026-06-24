@@ -16,7 +16,6 @@ use crate::Value;
 use crate::intl::collator;
 use crate::intl::date_time_format;
 use crate::intl::display_names;
-use crate::intl::list_format;
 use crate::intl::number_format;
 use crate::intl::payload::{IntlKind, IntlPayload, JsIntl};
 use crate::intl::plural_rules;
@@ -109,9 +108,10 @@ pub fn construct(
         IntlKind::RelativeTimeFormat => {
             IntlPayload::RelativeTimeFormat(relative_time_format::resolve(locale, options, gc_heap))
         }
-        IntlKind::ListFormat => {
-            IntlPayload::ListFormat(list_format::resolve(locale, options, gc_heap))
-        }
+        // `Intl.ListFormat` is constructed through its own `NativeCtx`
+        // option ladder (firing getters in spec order) and never reaches
+        // this heap-only dispatcher.
+        IntlKind::ListFormat => return Err(IntlError::UnknownClass("ListFormat".to_string())),
         IntlKind::DisplayNames => {
             IntlPayload::DisplayNames(display_names::resolve(locale, options, gc_heap))
         }

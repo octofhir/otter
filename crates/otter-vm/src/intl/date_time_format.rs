@@ -289,37 +289,94 @@ pub(crate) fn date_time_format_format(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let payload = require_date_time(ctx, "format")?;
-    let first = args.first();
-    let formatted = if let Some(n) = first.and_then(|v| v.as_number()) {
-        format_epoch_ms(n.as_f64() as i64, &payload)
+    let (y, mo, d, h, mi, s) = arg_to_civil(ctx, args.first(), "format")?;
+    let formatted = format_components(y, mo, d, h, mi, s, &payload);
+    Ok(Value::string(JsString::from_str(
+        &formatted,
+        ctx.heap_mut(),
+    )?))
+}
+
+/// Resolve the `format`/`formatToParts` argument to civil
+/// `(year, month, day, hour, minute, second)` — a Number is epoch ms,
+/// a Temporal value uses its own fields, `undefined` is "now".
+fn arg_to_civil(
+    ctx: &mut NativeCtx<'_>,
+    first: Option<&Value>,
+    name: &'static str,
+) -> Result<(i32, u8, u8, u8, u8, u8), NativeError> {
+    if let Some(n) = first.and_then(|v| v.as_number()) {
+        let ms = n.as_f64();
+        if !ms.is_finite() {
+            return Err(NativeError::RangeError {
+                name,
+                reason: "date value is not a finite number".to_string(),
+            });
+        }
+        Ok(epoch_to_civil((ms as i64).div_euclid(1000)))
     } else if let Some(t) = first.and_then(|v| v.as_temporal(ctx.heap())) {
         match t.payload_clone(ctx.heap()) {
-            TemporalPayload::PlainDateTime(pdt) => format_pdt(&pdt, &payload),
-            TemporalPayload::PlainDate(pd) => format_pd(&pd, &payload),
-            TemporalPayload::Instant(inst) => format_epoch_ms(inst.epoch_milliseconds(), &payload),
-            _ => {
-                return Err(NativeError::TypeError {
-                    name: "format",
-                    reason: "argument 0 must be a Number, Temporal.Instant, Temporal.PlainDate, or Temporal.PlainDateTime".to_string(),
-                });
+            TemporalPayload::PlainDateTime(pdt) => Ok((
+                pdt.year(),
+                pdt.month(),
+                pdt.day(),
+                pdt.hour(),
+                pdt.minute(),
+                pdt.second(),
+            )),
+            TemporalPayload::PlainDate(pd) => Ok((pd.year(), pd.month(), pd.day(), 0, 0, 0)),
+            TemporalPayload::Instant(inst) => {
+                Ok(epoch_to_civil(inst.epoch_milliseconds().div_euclid(1000)))
             }
+            _ => Err(NativeError::TypeError {
+                name,
+                reason: "argument 0 must be a Number, Temporal.Instant, Temporal.PlainDate, or Temporal.PlainDateTime".to_string(),
+            }),
         }
     } else if first.is_none() || first.is_some_and(|v| v.is_undefined()) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        format_epoch_ms(now, &payload)
+        Ok(epoch_to_civil(now.div_euclid(1000)))
     } else {
-        return Err(NativeError::TypeError {
-            name: "format",
+        Err(NativeError::TypeError {
+            name,
             reason: "argument 0 must be a Number or Temporal value".to_string(),
-        });
+        })
+    }
+}
+
+/// §11.5.4 `Intl.DateTimeFormat.prototype.formatToParts(date)` — the
+/// same formatting as `format`, returned as an array of
+/// `{ type, value }` records from ICU4X part-aware output.
+pub(crate) fn date_time_format_format_to_parts(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_date_time(ctx, "formatToParts")?;
+    let (y, mo, d, h, mi, s) = arg_to_civil(ctx, args.first(), "formatToParts")?;
+    let parts = icu_format_segments(y, mo, d, h, mi, s, &payload)
+        .unwrap_or_else(|| vec![("literal", format_components(y, mo, d, h, mi, s, &payload))]);
+
+    let mut elements: Vec<Value> = Vec::with_capacity(parts.len());
+    for (ty, val) in &parts {
+        let ty_s = Value::string(JsString::from_str(ty, ctx.heap_mut())?);
+        let val_s = Value::string(JsString::from_str(val, ctx.heap_mut())?);
+        let snapshot = elements.clone();
+        let obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s], &[&snapshot])?;
+        crate::object::set(obj, ctx.heap_mut(), "type", ty_s);
+        crate::object::set(obj, ctx.heap_mut(), "value", val_s);
+        elements.push(Value::object(obj));
+    }
+    let element_roots = elements.clone();
+    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        for v in &element_roots {
+            v.trace_value_slots(visitor);
+        }
     };
-    Ok(Value::string(JsString::from_str(
-        &formatted,
-        ctx.heap_mut(),
-    )?))
+    let arr = crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut visit)?;
+    Ok(Value::array(arr))
 }
 
 /// §12.1.6 `Intl.DateTimeFormat.prototype.resolvedOptions()`.
@@ -434,6 +491,7 @@ fn icu_format_components(
     builder.length = payload_length(payload);
     builder.date_fields = payload_date_fields(payload);
     builder.time_precision = payload_time_precision(payload);
+    builder.year_style = payload_year_style(payload);
     // Date + time without a zone — input is a plain `DateTime`, no
     // `TimeZoneInfo` required (zone formatting lands with the timeZone
     // option work).
@@ -444,6 +502,106 @@ fn icu_format_components(
         time: Time::try_new(hour, minute, second, 0).ok()?,
     };
     Some(formatter.format(&dt).to_string())
+}
+
+/// A `writeable::PartsWrite` sink recording `(ECMA-402 part type, text)`
+/// segments. ICU `datetime` parts (`year`, `month`, …) already coincide
+/// with the §11.5.5 field names; text outside a part is a `"literal"`.
+struct DateTimePartCollector {
+    segments: Vec<(&'static str, String)>,
+    current: &'static str,
+}
+
+impl std::fmt::Write for DateTimePartCollector {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        if s.is_empty() {
+            return Ok(());
+        }
+        if let Some(last) = self.segments.last_mut()
+            && last.0 == self.current
+        {
+            last.1.push_str(s);
+            return Ok(());
+        }
+        self.segments.push((self.current, s.to_string()));
+        Ok(())
+    }
+}
+
+impl writeable::PartsWrite for DateTimePartCollector {
+    type SubPartsWrite = Self;
+    fn with_part(
+        &mut self,
+        part: writeable::Part,
+        mut f: impl FnMut(&mut Self) -> std::fmt::Result,
+    ) -> std::fmt::Result {
+        let prev = self.current;
+        // Only a `datetime` field changes the ECMA-402 part type; the
+        // `DecimalFormatter` nests its own `decimal` sub-parts inside a
+        // numeric field (e.g. `year`), and those digits must keep the
+        // enclosing field's type rather than collapse to a literal.
+        if part.category == "datetime" {
+            self.current = ecma_part_type(part.value);
+        }
+        let r = f(self);
+        self.current = prev;
+        r
+    }
+}
+
+fn ecma_part_type(value: &str) -> &'static str {
+    match value {
+        "era" => "era",
+        "year" => "year",
+        "relatedYear" => "relatedYear",
+        "yearName" => "yearName",
+        "month" => "month",
+        "day" => "day",
+        "weekday" => "weekday",
+        "dayPeriod" => "dayPeriod",
+        "hour" => "hour",
+        "minute" => "minute",
+        "second" => "second",
+        "timeZoneName" => "timeZoneName",
+        _ => "literal",
+    }
+}
+
+/// Format a civil date/time into `(type, text)` segments via ICU4X
+/// part-aware writing. `None` on the same conditions as
+/// [`icu_format_components`].
+fn icu_format_segments(
+    year: i32,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    payload: &DateTimeFormatPayload,
+) -> Option<Vec<(&'static str, String)>> {
+    use icu_datetime::input::{Date, DateTime, Time};
+    use icu_datetime::{DateTimeFormatter, fieldsets::builder::FieldSetBuilder};
+    use writeable::Writeable;
+
+    let locale: icu_locale::Locale = payload.locale.parse().ok()?;
+    let prefs = icu_datetime::DateTimeFormatterPreferences::from(&locale);
+    let mut builder = FieldSetBuilder::default();
+    builder.length = payload_length(payload);
+    builder.date_fields = payload_date_fields(payload);
+    builder.time_precision = payload_time_precision(payload);
+    builder.year_style = payload_year_style(payload);
+    let fieldset = builder.build_composite_datetime().ok()?;
+    let formatter = DateTimeFormatter::try_new(prefs, fieldset).ok()?;
+    let dt = DateTime {
+        date: Date::try_new_iso(year, month, day).ok()?,
+        time: Time::try_new(hour, minute, second, 0).ok()?,
+    };
+    let mut sink = DateTimePartCollector {
+        segments: Vec::new(),
+        current: "literal",
+    };
+    formatter.format(&dt).write_to_parts(&mut sink).ok()?;
+    Some(sink.segments)
 }
 
 /// Overall ICU [`Length`] from the option bag (ECMA-402 has no concept;
@@ -535,6 +693,20 @@ fn payload_time_precision(
     }
 }
 
+/// `year` width / `era` presence → ICU `YearStyle`. `numeric` forces a
+/// full year, `2-digit` the short form, an `era` request adds the era.
+fn payload_year_style(p: &DateTimeFormatPayload) -> Option<icu_datetime::options::YearStyle> {
+    use icu_datetime::options::YearStyle;
+    if p.era.is_some() {
+        return Some(YearStyle::WithEra);
+    }
+    match p.year {
+        Some(DtNumWidth::Numeric) => Some(YearStyle::Full),
+        Some(DtNumWidth::TwoDigit) => Some(YearStyle::Auto),
+        None => None,
+    }
+}
+
 fn format_components(
     year: i32,
     month: u8,
@@ -585,30 +757,6 @@ fn format_components(
         (true, false) => time_part,
         (true, true) => String::new(),
     }
-}
-
-fn format_epoch_ms(ms: i64, payload: &DateTimeFormatPayload) -> String {
-    let secs = ms.div_euclid(1000);
-    let sub_ms = ms.rem_euclid(1000);
-    let _ = sub_ms;
-    let (year, month, day, hour, minute, second) = epoch_to_civil(secs);
-    format_components(year, month, day, hour, minute, second, payload)
-}
-
-fn format_pdt(pdt: &temporal_rs::PlainDateTime, payload: &DateTimeFormatPayload) -> String {
-    format_components(
-        pdt.year(),
-        pdt.month(),
-        pdt.day(),
-        pdt.hour(),
-        pdt.minute(),
-        pdt.second(),
-        payload,
-    )
-}
-
-fn format_pd(pd: &temporal_rs::PlainDate, payload: &DateTimeFormatPayload) -> String {
-    format_components(pd.year(), pd.month(), pd.day(), 0, 0, 0, payload)
 }
 
 /// Convert UTC epoch seconds to a civil `(year, month, day, hour,

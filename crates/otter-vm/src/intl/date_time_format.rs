@@ -354,10 +354,14 @@ pub fn resolve_ctx(
         || minute.is_some()
         || second.is_some()
         || fractional_second_digits.is_some();
+    // §11.1.2 step — `hasExplicitFormatComponents` with a style set is a
+    // TypeError (not a RangeError).
     if (date_style.is_some() || time_style.is_some()) && has_components {
-        return Err(range_err(
-            "dateStyle/timeStyle may not be combined with explicit date-time components",
-        ));
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "dateStyle/timeStyle may not be combined with explicit date-time components"
+                .to_string(),
+        });
     }
 
     // §ToDateTimeOptions(options, "date") `needDefaults` keys off the
@@ -481,6 +485,69 @@ fn bound_format_call(
 /// `DateTimeFormat.prototype.format` uses, so the two render
 /// identically (the spec defines `toLocaleString` in terms of a freshly
 /// constructed `DateTimeFormat`).
+/// Reject (with a `TypeError`) a resolved `DateTimeFormat` option that
+/// the Temporal receiver's fields cannot represent. The allowed sets
+/// follow the per-type `toLocaleString` operations: a date-only value
+/// forbids the time components / `timeStyle`, a time-only value forbids
+/// the date components / `dateStyle`, and no plain Temporal value
+/// carries a `timeZoneName`.
+fn validate_temporal_options(
+    payload: &DateTimeFormatPayload,
+    receiver: &Value,
+    heap: &otter_gc::GcHeap,
+) -> Result<(), NativeError> {
+    let Some(kind) = receiver.as_temporal(heap).map(|t| t.payload_clone(heap)) else {
+        return Ok(());
+    };
+    let has_date = payload.weekday.is_some()
+        || payload.era.is_some()
+        || payload.year.is_some()
+        || payload.month.is_some()
+        || payload.day.is_some()
+        || payload.date_style.is_some();
+    let has_time = payload.day_period.is_some()
+        || payload.hour.is_some()
+        || payload.minute.is_some()
+        || payload.second.is_some()
+        || payload.fractional_second_digits.is_some()
+        || payload.time_style.is_some();
+    let has_day = payload.day.is_some();
+    let has_year = payload.year.is_some();
+    let has_zone = payload.time_zone_name.is_some();
+    let err = |reason: &str| {
+        Err(NativeError::TypeError {
+            name: "toLocaleString",
+            reason: reason.to_string(),
+        })
+    };
+    match kind {
+        TemporalPayload::PlainTime(_) if has_date => {
+            err("a date component or dateStyle is not allowed for a Temporal.PlainTime")
+        }
+        TemporalPayload::PlainDate(_) if has_time => {
+            err("a time component or timeStyle is not allowed for a Temporal.PlainDate")
+        }
+        TemporalPayload::PlainYearMonth(_) if has_time || has_day => {
+            err("only year/month options are allowed for a Temporal.PlainYearMonth")
+        }
+        TemporalPayload::PlainMonthDay(_) if has_time || has_year => {
+            err("only month/day options are allowed for a Temporal.PlainMonthDay")
+        }
+        // A plain (zone-less) Temporal value cannot render a time-zone
+        // name; only a ZonedDateTime carries a zone.
+        TemporalPayload::PlainTime(_)
+        | TemporalPayload::PlainDate(_)
+        | TemporalPayload::PlainDateTime(_)
+        | TemporalPayload::PlainYearMonth(_)
+        | TemporalPayload::PlainMonthDay(_)
+            if has_zone =>
+        {
+            err("timeZoneName is not allowed for a zone-less Temporal value")
+        }
+        _ => Ok(()),
+    }
+}
+
 pub(crate) fn temporal_to_locale_string(
     ctx: &mut NativeCtx<'_>,
     receiver: Value,
@@ -491,8 +558,14 @@ pub(crate) fn temporal_to_locale_string(
     // Substitute the receiver's type-appropriate components into a
     // bare-date-default formatter — identical to the adjustment
     // `DateTimeFormat.prototype.format` applies to the same receiver, so
-    // the two render alike.
+    // the two render alike. Running before the validation below also
+    // normalizes the auto-filled date default to the receiver's own
+    // component set, so the check sees only user-specified mismatches.
     apply_temporal_defaults(&mut payload, &receiver, ctx.heap());
+    // §the per-type `toLocaleString` operations reject a resolved option
+    // the receiver's fields cannot represent (e.g. a `dateStyle` on a
+    // PlainTime, a `timeStyle` on a PlainDate) with a TypeError.
+    validate_temporal_options(&payload, &receiver, ctx.heap())?;
     let (y, mo, d, h, mi, s) = arg_to_civil_zoned(ctx, Some(&receiver), "toLocaleString")?;
     let formatted = format_components(y, mo, d, h, mi, s, &payload);
     Ok(Value::string(JsString::from_str(

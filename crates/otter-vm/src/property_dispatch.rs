@@ -4191,6 +4191,7 @@ impl Interpreter {
             || receiver.is_finalization_registry()
             || receiver.is_promise()
             || receiver.is_array_buffer()
+            || receiver.is_typed_array()
             || receiver.is_class_constructor()
             || receiver.as_native_function().is_some()
             || receiver.is_data_view();

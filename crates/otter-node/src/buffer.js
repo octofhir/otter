@@ -44,9 +44,20 @@ if (!Buffer) {
       `The "${name}" argument must be of type ${expected}. Received ${received}`);
   }
 
+  function formatBigInt(value) {
+    let s = value < 0n ? String(-value) : String(value);
+    let out = '';
+    while (s.length > 3) {
+      out = `_${s.slice(-3)}${out}`;
+      s = s.slice(0, -3);
+    }
+    return `${value < 0n ? '-' : ''}${s}${out}n`;
+  }
+
   function outOfRange(name, range, value) {
+    const received = typeof value === 'bigint' ? formatBigInt(value) : String(value);
     return codedError(RangeError, 'ERR_OUT_OF_RANGE',
-      `The value of "${name}" is out of range. It must be ${range}. Received ${value}`);
+      `The value of "${name}" is out of range. It must be ${range}. Received ${received}`);
   }
 
   function unknownEncoding(encoding) {
@@ -79,6 +90,10 @@ if (!Buffer) {
   }
 
   function bufferOutOfBounds(name) {
+    if (name === undefined) {
+      return codedError(RangeError, 'ERR_BUFFER_OUT_OF_BOUNDS',
+        'Attempt to access memory outside buffer bounds');
+    }
     return codedError(RangeError, 'ERR_BUFFER_OUT_OF_BOUNDS',
       `"${name}" is outside of buffer bounds`);
   }
@@ -564,49 +579,100 @@ if (!Buffer) {
 
   // ---- read/write integer methods via DataView ----
   const dv = (buf) => new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  function checkedOffset(buf, offset, size) {
-    const o = Number(offset);
-    if (!Number.isInteger(o) || o < 0 || o + size > buf.length) {
-      throw outOfRange('offset', `>= 0 && <= ${Math.max(buf.length - size, 0)}`, offset);
+  function checkedOffset(buf, offset, size, allowUndefined = true) {
+    if (offset === undefined) {
+      if (allowUndefined) return 0;
+      throw invalidArgType('offset', 'number', offset);
     }
-    return o;
+    if (typeof offset !== 'number') throw invalidArgType('offset', 'number', offset);
+    const max = Math.max(buf.length - size, 0);
+    if (offset === Infinity || offset === -Infinity || offset < 0) {
+      throw outOfRange('offset', `>= 0 and <= ${max}`, offset);
+    }
+    if (!Number.isInteger(offset)) throw outOfRange('offset', 'an integer', offset);
+    if (offset + size > buf.length) {
+      if (buf.length < size || offset >= buf.length) throw bufferOutOfBounds();
+      throw outOfRange('offset', `>= 0 and <= ${max}`, offset);
+    }
+    return offset;
+  }
+  function checkedByteLength(byteLength) {
+    if (typeof byteLength !== 'number') throw invalidArgType('byteLength', 'number', byteLength);
+    if (byteLength === Infinity || byteLength === -Infinity || byteLength < 1 || byteLength > 6) {
+      throw outOfRange('byteLength', '>= 1 and <= 6', byteLength);
+    }
+    if (!Number.isInteger(byteLength)) throw outOfRange('byteLength', 'an integer', byteLength);
+    return byteLength;
+  }
+  const U64 = 18446744073709551616n;
+  const I64_MIN = -9223372036854775808n;
+  const I64_MAX = 9223372036854775807n;
+  function readBigUInt64(buf, offset, little) {
+    offset = checkedOffset(buf, offset, 8);
+    let value = 0n;
+    if (little) {
+      for (let i = 7; i >= 0; i--) value = value * 256n + BigInt(buf[offset + i]);
+    } else {
+      for (let i = 0; i < 8; i++) value = value * 256n + BigInt(buf[offset + i]);
+    }
+    return value;
+  }
+  function writeBigUInt64(buf, value, offset, little) {
+    if (typeof value !== 'bigint') throw invalidArgType('value', 'bigint', value);
+    if (value < 0n || value >= U64) throw outOfRange('value', '>= 0n and < 2n ** 64n', value);
+    offset = checkedOffset(buf, offset, 8);
+    let n = value;
+    for (let i = 0; i < 8; i++) {
+      const byte = Number(n % 256n);
+      buf[offset + (little ? i : 7 - i)] = byte;
+      n = n / 256n;
+    }
+    return offset + 8;
   }
   const proto = Buffer.prototype;
   const intMethods = {
-    readUInt8(o = 0) { o = checkedOffset(this, o, 1); return dv(this).getUint8(o); },
-    readInt8(o = 0) { o = checkedOffset(this, o, 1); return dv(this).getInt8(o); },
-    readUInt16LE(o = 0) { o = checkedOffset(this, o, 2); return dv(this).getUint16(o, true); },
-    readUInt16BE(o = 0) { o = checkedOffset(this, o, 2); return dv(this).getUint16(o, false); },
-    readInt16LE(o = 0) { o = checkedOffset(this, o, 2); return dv(this).getInt16(o, true); },
-    readInt16BE(o = 0) { o = checkedOffset(this, o, 2); return dv(this).getInt16(o, false); },
-    readUInt32LE(o = 0) { o = checkedOffset(this, o, 4); return dv(this).getUint32(o, true); },
-    readUInt32BE(o = 0) { o = checkedOffset(this, o, 4); return dv(this).getUint32(o, false); },
-    readInt32LE(o = 0) { o = checkedOffset(this, o, 4); return dv(this).getInt32(o, true); },
-    readInt32BE(o = 0) { o = checkedOffset(this, o, 4); return dv(this).getInt32(o, false); },
-    readFloatLE(o = 0) { o = checkedOffset(this, o, 4); return dv(this).getFloat32(o, true); },
-    readFloatBE(o = 0) { o = checkedOffset(this, o, 4); return dv(this).getFloat32(o, false); },
-    readDoubleLE(o = 0) { o = checkedOffset(this, o, 8); return dv(this).getFloat64(o, true); },
-    readDoubleBE(o = 0) { o = checkedOffset(this, o, 8); return dv(this).getFloat64(o, false); },
-    writeUInt8(v, o = 0) { o = checkedOffset(this, o, 1); dv(this).setUint8(o, v); return o + 1; },
-    writeInt8(v, o = 0) { o = checkedOffset(this, o, 1); dv(this).setInt8(o, v); return o + 1; },
-    writeUInt16LE(v, o = 0) { o = checkedOffset(this, o, 2); dv(this).setUint16(o, v, true); return o + 2; },
-    writeUInt16BE(v, o = 0) { o = checkedOffset(this, o, 2); dv(this).setUint16(o, v, false); return o + 2; },
-    writeInt16LE(v, o = 0) { o = checkedOffset(this, o, 2); dv(this).setInt16(o, v, true); return o + 2; },
-    writeInt16BE(v, o = 0) { o = checkedOffset(this, o, 2); dv(this).setInt16(o, v, false); return o + 2; },
-    writeUInt32LE(v, o = 0) { o = checkedOffset(this, o, 4); dv(this).setUint32(o, v, true); return o + 4; },
-    writeUInt32BE(v, o = 0) { o = checkedOffset(this, o, 4); dv(this).setUint32(o, v, false); return o + 4; },
-    writeInt32LE(v, o = 0) { o = checkedOffset(this, o, 4); dv(this).setInt32(o, v, true); return o + 4; },
-    writeInt32BE(v, o = 0) { o = checkedOffset(this, o, 4); dv(this).setInt32(o, v, false); return o + 4; },
-    writeFloatLE(v, o = 0) { o = checkedOffset(this, o, 4); dv(this).setFloat32(o, v, true); return o + 4; },
-    writeFloatBE(v, o = 0) { o = checkedOffset(this, o, 4); dv(this).setFloat32(o, v, false); return o + 4; },
-    writeDoubleLE(v, o = 0) { o = checkedOffset(this, o, 8); dv(this).setFloat64(o, v, true); return o + 8; },
-    writeDoubleBE(v, o = 0) { o = checkedOffset(this, o, 8); dv(this).setFloat64(o, v, false); return o + 8; },
-    readUIntLE(o, len) { let val = 0; let mul = 1; for (let i = 0; i < len; i++) { val += this[o + i] * mul; mul *= 256; } return val; },
-    readUIntBE(o, len) { let val = 0; for (let i = 0; i < len; i++) val = val * 256 + this[o + i]; return val; },
+    readUInt8(o) { o = checkedOffset(this, o, 1); return dv(this).getUint8(o); },
+    readInt8(o) { o = checkedOffset(this, o, 1); return dv(this).getInt8(o); },
+    readUInt16LE(o) { o = checkedOffset(this, o, 2); return dv(this).getUint16(o, true); },
+    readUInt16BE(o) { o = checkedOffset(this, o, 2); return dv(this).getUint16(o, false); },
+    readInt16LE(o) { o = checkedOffset(this, o, 2); return dv(this).getInt16(o, true); },
+    readInt16BE(o) { o = checkedOffset(this, o, 2); return dv(this).getInt16(o, false); },
+    readUInt32LE(o) { o = checkedOffset(this, o, 4); return dv(this).getUint32(o, true); },
+    readUInt32BE(o) { o = checkedOffset(this, o, 4); return dv(this).getUint32(o, false); },
+    readInt32LE(o) { o = checkedOffset(this, o, 4); return dv(this).getInt32(o, true); },
+    readInt32BE(o) { o = checkedOffset(this, o, 4); return dv(this).getInt32(o, false); },
+    readFloatLE(o) { o = checkedOffset(this, o, 4); return dv(this).getFloat32(o, true); },
+    readFloatBE(o) { o = checkedOffset(this, o, 4); return dv(this).getFloat32(o, false); },
+    readDoubleLE(o) { o = checkedOffset(this, o, 8); return dv(this).getFloat64(o, true); },
+    readDoubleBE(o) { o = checkedOffset(this, o, 8); return dv(this).getFloat64(o, false); },
+    writeUInt8(v, o) { o = checkedOffset(this, o, 1); dv(this).setUint8(o, v); return o + 1; },
+    writeInt8(v, o) { o = checkedOffset(this, o, 1); dv(this).setInt8(o, v); return o + 1; },
+    writeUInt16LE(v, o) { o = checkedOffset(this, o, 2); dv(this).setUint16(o, v, true); return o + 2; },
+    writeUInt16BE(v, o) { o = checkedOffset(this, o, 2); dv(this).setUint16(o, v, false); return o + 2; },
+    writeInt16LE(v, o) { o = checkedOffset(this, o, 2); dv(this).setInt16(o, v, true); return o + 2; },
+    writeInt16BE(v, o) { o = checkedOffset(this, o, 2); dv(this).setInt16(o, v, false); return o + 2; },
+    writeUInt32LE(v, o) { o = checkedOffset(this, o, 4); dv(this).setUint32(o, v, true); return o + 4; },
+    writeUInt32BE(v, o) { o = checkedOffset(this, o, 4); dv(this).setUint32(o, v, false); return o + 4; },
+    writeInt32LE(v, o) { o = checkedOffset(this, o, 4); dv(this).setInt32(o, v, true); return o + 4; },
+    writeInt32BE(v, o) { o = checkedOffset(this, o, 4); dv(this).setInt32(o, v, false); return o + 4; },
+    writeFloatLE(v, o) { o = checkedOffset(this, o, 4); dv(this).setFloat32(o, v, true); return o + 4; },
+    writeFloatBE(v, o) { o = checkedOffset(this, o, 4); dv(this).setFloat32(o, v, false); return o + 4; },
+    writeDoubleLE(v, o) { o = checkedOffset(this, o, 8); dv(this).setFloat64(o, v, true); return o + 8; },
+    writeDoubleBE(v, o) { o = checkedOffset(this, o, 8); dv(this).setFloat64(o, v, false); return o + 8; },
+    readBigUInt64LE(o) { return readBigUInt64(this, o, true); },
+    readBigUInt64BE(o) { return readBigUInt64(this, o, false); },
+    readBigInt64LE(o) { const v = readBigUInt64(this, o, true); return v > I64_MAX ? v - U64 : v; },
+    readBigInt64BE(o) { const v = readBigUInt64(this, o, false); return v > I64_MAX ? v - U64 : v; },
+    writeBigUInt64LE(v, o) { return writeBigUInt64(this, v, o, true); },
+    writeBigUInt64BE(v, o) { return writeBigUInt64(this, v, o, false); },
+    writeBigInt64LE(v, o) { if (typeof v !== 'bigint') throw invalidArgType('value', 'bigint', v); if (v < I64_MIN || v > I64_MAX) throw outOfRange('value', `>= ${I64_MIN}n and <= ${I64_MAX}n`, v); return writeBigUInt64(this, v < 0n ? U64 + v : v, o, true); },
+    writeBigInt64BE(v, o) { if (typeof v !== 'bigint') throw invalidArgType('value', 'bigint', v); if (v < I64_MIN || v > I64_MAX) throw outOfRange('value', `>= ${I64_MIN}n and <= ${I64_MAX}n`, v); return writeBigUInt64(this, v < 0n ? U64 + v : v, o, false); },
+    readUIntLE(o, len) { len = checkedByteLength(len); o = checkedOffset(this, o, len, false); let val = 0; let mul = 1; for (let i = 0; i < len; i++) { val += this[o + i] * mul; mul *= 256; } return val; },
+    readUIntBE(o, len) { len = checkedByteLength(len); o = checkedOffset(this, o, len, false); let val = 0; for (let i = 0; i < len; i++) val = val * 256 + this[o + i]; return val; },
     readIntLE(o, len) { let val = this.readUIntLE(o, len); const sub = Math.pow(2, 8 * len); if (val >= sub / 2) val -= sub; return val; },
     readIntBE(o, len) { let val = this.readUIntBE(o, len); const sub = Math.pow(2, 8 * len); if (val >= sub / 2) val -= sub; return val; },
-    writeUIntLE(v, o, len) { let val = v; for (let i = 0; i < len; i++) { this[o + i] = val & 0xff; val = Math.floor(val / 256); } return o + len; },
-    writeUIntBE(v, o, len) { let val = v; for (let i = len - 1; i >= 0; i--) { this[o + i] = val & 0xff; val = Math.floor(val / 256); } return o + len; },
+    writeUIntLE(v, o, len) { len = checkedByteLength(len); o = checkedOffset(this, o, len, false); let val = v; for (let i = 0; i < len; i++) { this[o + i] = val & 0xff; val = Math.floor(val / 256); } return o + len; },
+    writeUIntBE(v, o, len) { len = checkedByteLength(len); o = checkedOffset(this, o, len, false); let val = v; for (let i = len - 1; i >= 0; i--) { this[o + i] = val & 0xff; val = Math.floor(val / 256); } return o + len; },
     writeIntLE(v, o, len) { let val = v < 0 ? v + Math.pow(2, 8 * len) : v; return this.writeUIntLE(val, o, len); },
     writeIntBE(v, o, len) { let val = v < 0 ? v + Math.pow(2, 8 * len) : v; return this.writeUIntBE(val, o, len); },
   };

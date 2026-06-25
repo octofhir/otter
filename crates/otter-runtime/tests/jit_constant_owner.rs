@@ -41,3 +41,33 @@ fn hot_global_and_property_loads_use_owner_constants() {
         .to_string();
     assert_eq!(completion, "ok");
 }
+
+#[test]
+fn hot_typed_array_computed_loads_route_to_prototype() {
+    let source = r#"
+        Uint8Array.prototype.total = function () {
+            return this[0] + this[1];
+        };
+
+        const bytes = new Uint8Array([20, 22]);
+        function lookup(name) {
+            return bytes[name]();
+        }
+
+        for (let i = 0; i < 80; i++) {
+            if (lookup("total") !== 42) throw new Error("bad typed array lookup");
+        }
+        "ok";
+        "#;
+
+    let mut runtime = Runtime::builder().build().expect("runtime");
+    let completion = runtime
+        .run_script(
+            SourceInput::from_javascript(source),
+            "<jit-typed-array-computed-load>",
+        )
+        .expect("script")
+        .completion_string()
+        .to_string();
+    assert_eq!(completion, "ok");
+}

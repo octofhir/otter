@@ -6,6 +6,7 @@
 // cached on `globalThis.Buffer`; subsequent shim runs reuse it.
 
 const kMaxLength = 0x7fffffff;
+let inspectMaxBytes = 50;
 
 let Buffer = (typeof globalThis !== 'undefined' && globalThis.Buffer) || null;
 
@@ -58,6 +59,22 @@ if (!Buffer) {
     const received = typeof value === 'bigint' ? formatBigInt(value) : String(value);
     return codedError(RangeError, 'ERR_OUT_OF_RANGE',
       `The value of "${name}" is out of range. It must be ${range}. Received ${received}`);
+  }
+
+  function checkedBufferSize(size) {
+    if (typeof size !== 'number') throw invalidArgType('size', 'number', size);
+    if (!Number.isFinite(size) || size < 0 || size > kMaxLength) {
+      throw outOfRange('size', `>= 0 and <= ${kMaxLength}`, size);
+    }
+    return Math.trunc(size);
+  }
+
+  function checkedInspectMaxBytes(value) {
+    if (typeof value !== 'number') throw invalidArgType('INSPECT_MAX_BYTES', 'number', value);
+    if (!Number.isFinite(value) || value < 0 || !Number.isInteger(value)) {
+      throw outOfRange('INSPECT_MAX_BYTES', '>= 0', value);
+    }
+    return value;
   }
 
   function unknownEncoding(encoding) {
@@ -339,7 +356,7 @@ if (!Buffer) {
   const BufferImpl = class extends Uint8Array {
     constructor(arg, byteOffset, length) {
       if (typeof arg === 'number') {
-        super(arg < 0 ? 0 : arg);
+        super(checkedBufferSize(arg));
       } else if (isArrayBufferLike(arg) || isSharedArrayBufferLike(arg)) {
         const range = arrayBufferSliceArgs(arg, byteOffset, length);
         if (range[1] === undefined) super(arg, range[0]);
@@ -560,6 +577,9 @@ if (!Buffer) {
     swap32() { for (let i = 0; i < this.length; i += 4) { let t = this[i]; this[i] = this[i + 3]; this[i + 3] = t; t = this[i + 1]; this[i + 1] = this[i + 2]; this[i + 2] = t; } return this; }
   };
   Buffer = function Buffer(arg, byteOffset, length) {
+    if (typeof arg === 'number' && typeof byteOffset === 'string') {
+      throw invalidArgType('string', 'string', arg);
+    }
     return new BufferImpl(arg, byteOffset, length);
   };
   Buffer.prototype = BufferImpl.prototype;
@@ -591,7 +611,7 @@ if (!Buffer) {
     }
     if (!Number.isInteger(offset)) throw outOfRange('offset', 'an integer', offset);
     if (offset + size > buf.length) {
-      if (buf.length < size || offset >= buf.length) throw bufferOutOfBounds();
+      if (buf.length < size) throw bufferOutOfBounds();
       throw outOfRange('offset', `>= 0 and <= ${max}`, offset);
     }
     return offset;
@@ -723,17 +743,17 @@ if (!Buffer) {
         `Received an instance of ${value && value.constructor && value.constructor.name || 'Object'}`);
     },
     alloc(size, fill, encoding) {
-      if (typeof size !== 'number') throw invalidArgType('size', 'number', size);
+      size = checkedBufferSize(size);
       const b = new Buffer(size);
       if (fill !== undefined && fill !== 0) b.fill(fill, 0, b.length, encoding);
       return b;
     },
     allocUnsafe(size) {
-      if (typeof size !== 'number') throw invalidArgType('size', 'number', size);
+      size = checkedBufferSize(size);
       return new Buffer(size);
     },
     allocUnsafeSlow(size) {
-      if (typeof size !== 'number') throw invalidArgType('size', 'number', size);
+      size = checkedBufferSize(size);
       return new Buffer(size);
     },
     of(...args) { return new Buffer(args); },
@@ -779,29 +799,41 @@ if (!Buffer) {
       return statics.from(u8);
     },
     poolSize: 8192,
-    INSPECT_MAX_BYTES: 50,
   };
   for (const key of Object.keys(statics)) {
     Object.defineProperty(Buffer, key, { value: statics[key], writable: true, configurable: true, enumerable: false });
   }
+  Object.defineProperty(Buffer, 'INSPECT_MAX_BYTES', {
+    get() { return inspectMaxBytes; },
+    set(value) { inspectMaxBytes = checkedInspectMaxBytes(value); },
+    configurable: true,
+    enumerable: false,
+  });
 
   if (typeof globalThis !== 'undefined') globalThis.Buffer = Buffer;
 }
 
 const constants = { MAX_LENGTH: kMaxLength, MAX_STRING_LENGTH: 0x1fffffff };
 
-function SlowBuffer(length) { return Buffer.alloc(length | 0); }
+function SlowBuffer(length) { return Buffer.allocUnsafeSlow(length); }
 SlowBuffer.prototype = Buffer.prototype;
 
-module.exports = {
+const bufferExports = {
   Buffer,
   SlowBuffer,
   constants,
   kMaxLength,
   kStringMaxLength: 0x1fffffff,
-  INSPECT_MAX_BYTES: 50,
   atob: typeof atob === 'function' ? atob : undefined,
   btoa: typeof btoa === 'function' ? btoa : undefined,
   isAscii: Buffer.isAscii,
   isUtf8: Buffer.isUtf8,
 };
+Object.defineProperty(bufferExports, 'INSPECT_MAX_BYTES', {
+  get() { return Buffer.INSPECT_MAX_BYTES; },
+  set(value) { Buffer.INSPECT_MAX_BYTES = value; },
+  configurable: true,
+  enumerable: true,
+});
+
+module.exports = bufferExports;

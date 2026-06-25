@@ -60,6 +60,7 @@ if (!Buffer) {
   function invalidBufferTarget(name, value) {
     const received = value === undefined ? 'undefined'
       : value === null ? 'null'
+      : typeof value === 'string' ? `type string ('${value}')`
       : value && typeof value === 'object' ? `an instance of ${value.constructor && value.constructor.name || 'Object'}`
       : `type ${typeof value} (${String(value)})`;
     return codedError(TypeError, 'ERR_INVALID_ARG_TYPE',
@@ -235,7 +236,7 @@ if (!Buffer) {
     }
   }
 
-  const BufferImpl = class Buffer extends Uint8Array {
+  const BufferImpl = class extends Uint8Array {
     constructor(arg, byteOffset, length) {
       if (typeof arg === 'number') {
         super(arg < 0 ? 0 : arg);
@@ -285,7 +286,34 @@ if (!Buffer) {
       return true;
     }
 
-    compare(other) { return Buffer.compare(this, other); }
+    compare(target, targetStart, targetEnd, sourceStart, sourceEnd) {
+      if (!(target instanceof Uint8Array)) throw invalidBufferTarget('target', target);
+      function offsetArg(name, value, def) {
+        if (value === undefined) return def;
+        if (typeof value !== 'number') throw invalidArgType(name, 'number', value);
+        return value;
+      }
+      targetStart = offsetArg('targetStart', targetStart, 0);
+      targetEnd = offsetArg('targetEnd', targetEnd, target.length);
+      sourceStart = offsetArg('sourceStart', sourceStart, 0);
+      sourceEnd = offsetArg('sourceEnd', sourceEnd, this.length);
+      function checkOffset(name, value, max) {
+        if (!Number.isFinite(value) || value < 0 || value > max) {
+          throw outOfRange(name, `>= 0 && <= ${max}`, value);
+        }
+        return Math.trunc(value);
+      }
+      if (!Number.isFinite(targetStart) || targetStart < 0) {
+        throw outOfRange('targetStart', `>= 0 && <= ${target.length}`, targetStart);
+      }
+      targetStart = targetStart > target.length ? Math.trunc(targetStart) : checkOffset('targetStart', targetStart, target.length);
+      targetEnd = checkOffset('targetEnd', targetEnd, target.length);
+      sourceStart = checkOffset('sourceStart', sourceStart, this.length);
+      sourceEnd = checkOffset('sourceEnd', sourceEnd, this.length);
+      if (targetEnd <= targetStart) return sourceEnd <= sourceStart ? 0 : 1;
+      if (sourceEnd <= sourceStart) return -1;
+      return Buffer.compare(this.subarray(sourceStart, sourceEnd), target.subarray(targetStart, targetEnd));
+    }
 
     inspect() { return inspectBuffer(this); }
 
@@ -577,6 +605,8 @@ if (!Buffer) {
       return out;
     },
     compare(a, b) {
+      if (!(a instanceof Uint8Array)) throw invalidBufferTarget('buf1', a);
+      if (!(b instanceof Uint8Array)) throw invalidBufferTarget('buf2', b);
       if (a === b) return 0;
       const len = Math.min(a.length, b.length);
       for (let i = 0; i < len; i++) { if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1; }

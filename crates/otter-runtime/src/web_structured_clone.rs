@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 
 use otter_gc::raw::RawGc;
-use otter_vm::binary::TypedArrayKind;
+use otter_vm::binary::{JsArrayBuffer, TypedArrayKind};
 use otter_vm::number::NumberValue;
 use otter_vm::{NativeCtx, NativeError, Value, array, collections, object};
 
@@ -32,10 +32,29 @@ use otter_vm::{NativeCtx, NativeError, Value, array, collections, object};
 /// Throws `DataCloneError` (as a native thrown error) when the graph contains a
 /// function, symbol, or other non-serializable platform object.
 pub fn structured_clone(ctx: &mut NativeCtx<'_>, value: Value) -> Result<Value, NativeError> {
+    structured_clone_with_options(ctx, value, Value::undefined())
+}
+
+/// `structuredClone(value, options)` with a basic HTML transfer-list path.
+///
+/// ArrayBuffers listed in `options.transfer` are cloned first and detached only
+/// after serialization succeeds, matching the observable ordering of the HTML
+/// algorithm for in-realm transfers.
+pub fn structured_clone_with_options(
+    ctx: &mut NativeCtx<'_>,
+    value: Value,
+    options: Value,
+) -> Result<Value, NativeError> {
+    let transfers = transfer_list(ctx, options)?;
     let base = ctx.interp_mut().module_root_depth();
     let mut memo: HashMap<RawGc, usize> = HashMap::new();
     let result = clone_to_index(ctx, value, &mut memo).map(|idx| ctx.interp_mut().module_root(idx));
     ctx.interp_mut().pop_module_roots_to(base);
+    if result.is_ok() {
+        for buffer in transfers {
+            buffer.detach(ctx.heap_mut());
+        }
+    }
     result
 }
 
@@ -59,6 +78,40 @@ fn type_error(message: String) -> NativeError {
         name: "structuredClone",
         reason: message,
     }
+}
+
+fn transfer_list(
+    ctx: &mut NativeCtx<'_>,
+    options: Value,
+) -> Result<Vec<JsArrayBuffer>, NativeError> {
+    if options.is_undefined() || options.is_null() {
+        return Ok(Vec::new());
+    }
+    let Some(obj) = options.as_object() else {
+        return Err(type_error("options must be an object".to_string()));
+    };
+    let Some(transfer) = object::get(obj, ctx.heap(), "transfer") else {
+        return Ok(Vec::new());
+    };
+    if transfer.is_undefined() || transfer.is_null() {
+        return Ok(Vec::new());
+    }
+    let Some(arr) = transfer.as_array() else {
+        return Err(type_error("options.transfer must be an Array".to_string()));
+    };
+    let len = array::len(arr, ctx.heap());
+    let mut buffers = Vec::with_capacity(len);
+    for i in 0..len {
+        let item = array::get(arr, ctx.heap(), i);
+        let Some(buffer) = item.as_array_buffer() else {
+            return Err(data_clone_error("Transfer item"));
+        };
+        if buffer.is_detached(ctx.heap()) || buffers.iter().any(|seen| buffer.ptr_eq(*seen)) {
+            return Err(data_clone_error("ArrayBuffer"));
+        }
+        buffers.push(buffer);
+    }
+    Ok(buffers)
 }
 
 /// Resolve a global constructor (`Date`, `RegExp`, `Uint8Array`, …).

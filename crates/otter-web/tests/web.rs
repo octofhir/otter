@@ -93,3 +93,30 @@ fn web_api_globals_install_and_run_through_runtime_builder() {
         "https://example.com/a?x=1|text/plain|hello|POST|200"
     );
 }
+
+#[test]
+fn structured_clone_transfer_detaches_array_buffer() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = runtime
+        .eval(SourceInput::from_javascript(
+            r#"
+            const buffer = new ArrayBuffer(4);
+            const view = new Uint8Array(buffer);
+            view[0] = 7;
+            const clone = structuredClone(buffer, { transfer: [buffer] });
+            if (clone.byteLength !== 4) throw new Error("clone length");
+            if (new Uint8Array(clone)[0] !== 7) throw new Error("clone bytes");
+            if (buffer.byteLength !== 0) throw new Error("source not detached");
+            let detached = false;
+            try {
+              new Uint8Array(buffer);
+            } catch {
+              detached = true;
+            }
+            if (!detached) throw new Error("view on detached buffer");
+            "ok";
+            "#,
+        ))
+        .unwrap();
+    assert_eq!(result.completion_string(), "ok");
+}

@@ -137,7 +137,8 @@ fn fetch(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError
 
 fn structured_clone(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let value = args.first().copied().unwrap_or_else(Value::undefined);
-    otter_runtime::web_structured_clone::structured_clone(ctx, value)
+    let options = args.get(1).copied().unwrap_or_else(Value::undefined);
+    otter_runtime::web_structured_clone::structured_clone_with_options(ctx, value, options)
 }
 
 /// Native deflate/gzip codec backing `CompressionStream`/`DecompressionStream`.

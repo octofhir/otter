@@ -269,16 +269,25 @@ impl Interpreter {
         if !abstract_ops::is_primitive(x) && !abstract_ops::is_primitive(y) {
             return Ok(abstract_ops::same_value(x, y, &self.gc_heap));
         }
-        // §7.2.13 step 11-12 — Object × primitive: ToPrimitive the
-        // object operand with the `default` hint, then recurse over
-        // the resulting primitive pair.
-        let (lhs_p, rhs_p) = if !abstract_ops::is_primitive(x) {
-            let coerced =
-                self.evaluate_to_primitive(context, x, abstract_ops::ToPrimitiveHint::Default)?;
+        // §7.2.13 step 11-12 — Object × primitive: ToPrimitive the object
+        // operand with the `default` hint, then recurse over the resulting
+        // primitive pair. Steps 11-12 only fire when the primitive is a
+        // Number, String, BigInt, or Symbol — an Object compared against
+        // `null` or `undefined` falls through to step 13 and is never equal,
+        // so it must NOT coerce the object (which would observe `valueOf`).
+        let (object, primitive, object_is_x) = if !abstract_ops::is_primitive(x) {
+            (x, y, true)
+        } else {
+            (y, x, false)
+        };
+        if primitive.is_null() || primitive.is_undefined() {
+            return Ok(false);
+        }
+        let coerced =
+            self.evaluate_to_primitive(context, object, abstract_ops::ToPrimitiveHint::Default)?;
+        let (lhs_p, rhs_p) = if object_is_x {
             (coerced, *y)
         } else {
-            let coerced =
-                self.evaluate_to_primitive(context, y, abstract_ops::ToPrimitiveHint::Default)?;
             (*x, coerced)
         };
         Ok(abstract_ops::is_loosely_equal(

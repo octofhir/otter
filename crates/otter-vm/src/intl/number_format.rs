@@ -452,7 +452,7 @@ pub(crate) fn number_format_format_getter(
 ) -> Result<Value, NativeError> {
     // Brand check: the receiver must be a NumberFormat instance.
     let _ = require_number_format(ctx, "format")?;
-    let this = ctx.this_value().clone();
+    let this = *ctx.this_value();
     let captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![this];
     let bound = crate::NativeFunction::with_length_and_captures(
         ctx.heap_mut(),

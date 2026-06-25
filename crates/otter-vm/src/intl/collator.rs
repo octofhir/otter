@@ -129,7 +129,7 @@ pub(crate) fn collator_compare_getter(
     _args: &[Value],
 ) -> Result<Value, NativeError> {
     let _ = require_collator(ctx, "compare")?;
-    let this = ctx.this_value().clone();
+    let this = *ctx.this_value();
     let captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![this];
     let bound = crate::NativeFunction::with_length_and_captures(
         ctx.heap_mut(),

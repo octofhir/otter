@@ -337,11 +337,6 @@ pub fn resolve_ctx(
     let date_style = enum_opt!("dateStyle", STYLE, parse_style);
     let time_style = enum_opt!("timeStyle", STYLE, parse_style);
 
-    let range_err = |msg: &str| NativeError::RangeError {
-        name: CLASS,
-        reason: msg.to_string(),
-    };
-
     // §11.1.2 — dateStyle / timeStyle are mutually exclusive with
     // explicit component options.
     let has_components = weekday.is_some()
@@ -436,7 +431,7 @@ pub(crate) fn date_time_format_format_getter(
 ) -> Result<Value, NativeError> {
     // Brand check: the receiver must be a DateTimeFormat instance.
     let _ = require_date_time(ctx, "format")?;
-    let this = ctx.this_value().clone();
+    let this = *ctx.this_value();
     let captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![this];
     let bound = crate::NativeFunction::with_length_and_captures(
         ctx.heap_mut(),
@@ -686,17 +681,16 @@ fn arg_to_civil_inner(
                 reason: "argument 0 must be a Number or a non-Duration Temporal value".to_string(),
             }),
         }
-    } else if first.is_none() || first.is_some_and(|v| v.is_undefined()) {
+    } else if let Some(value) = first.filter(|v| !v.is_undefined()) {
+        let ms = coerce_to_number(ctx, value, name)?;
+        let ms = time_clip(ms, name)?;
+        Ok(epoch_to_civil((ms as i64).div_euclid(1000)))
+    } else {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         Ok(epoch_to_civil(now.div_euclid(1000)))
-    } else {
-        let value = first.expect("non-None handled above").clone();
-        let ms = coerce_to_number(ctx, &value, name)?;
-        let ms = time_clip(ms, name)?;
-        Ok(epoch_to_civil((ms as i64).div_euclid(1000)))
     }
 }
 

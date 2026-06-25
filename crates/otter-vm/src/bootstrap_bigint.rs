@@ -222,7 +222,7 @@ fn bigint_proto_to_locale_string(
         });
     };
     let value = b
-        .with_inner(ctx.heap(), |bi| num_traits::ToPrimitive::to_f64(bi))
+        .with_inner(ctx.heap(), num_traits::ToPrimitive::to_f64)
         .unwrap_or(f64::NAN);
     let locales = args.first().copied().unwrap_or_else(Value::undefined);
     let options = args.get(1).copied().unwrap_or_else(Value::undefined);

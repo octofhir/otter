@@ -121,12 +121,19 @@ function formatValue(value, options, depth, seen) {
       if (typeof r === 'string') return r;
     }
     if (Array.isArray(value)) return '[Array]';
+    // A null-prototype object keeps its distinguishing tag even past the
+    // depth limit, matching Node's `[Object: null prototype]` rendering.
+    if (Object.getPrototypeOf(value) === null) return '[Object: null prototype]';
     return '[Object]';
   }
 
-  // inspect.custom hook
+  // inspect.custom hook. Expose a recurse helper on the ctx so custom
+  // inspectors (e.g. Buffer) can format nested values with these options.
   const custom = value[inspect.custom];
   if (typeof custom === 'function') {
+    if (typeof options.inspect !== 'function') {
+      options.inspect = (v) => formatValue(v, options, depth + 1, seen);
+    }
     const r = custom.call(value, options.depth, options);
     if (typeof r === 'string') return r;
     if (r !== value) return formatValue(r, options, depth, seen);

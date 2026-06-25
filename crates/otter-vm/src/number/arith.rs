@@ -37,11 +37,18 @@ pub fn sub(lhs: NumberValue, rhs: NumberValue) -> NumberValue {
 }
 
 /// `lhs * rhs`.
+///
+/// A zero product takes the sign of the operands: when exactly one operand is
+/// negative the result is `-0`, which the `Smi` path cannot represent, so it
+/// demotes to `Double(-0.0)`. Without this, `0 * -1` would yield `+0`.
 #[must_use]
 pub fn mul(lhs: NumberValue, rhs: NumberValue) -> NumberValue {
     if let (NumberValue::Smi(a), NumberValue::Smi(b)) = (lhs, rhs)
         && let Some(r) = a.checked_mul(b)
     {
+        if r == 0 && ((a < 0) ^ (b < 0)) {
+            return NumberValue::Double(-0.0);
+        }
         return NumberValue::Smi(r);
     }
     NumberValue::Double(lhs.as_f64() * rhs.as_f64()).canonicalize()
@@ -167,6 +174,25 @@ mod tests {
         // -6 % -3 === -0
         let r = rem(NumberValue::Smi(-6), NumberValue::Smi(-3));
         assert!(r.is_negative_zero());
+    }
+
+    #[test]
+    fn smi_mul_zero_takes_sign() {
+        // 0 * -1 === -0
+        let r = mul(NumberValue::Smi(0), NumberValue::Smi(-1));
+        assert!(r.is_negative_zero());
+        // -1 * 0 === -0
+        let r = mul(NumberValue::Smi(-1), NumberValue::Smi(0));
+        assert!(r.is_negative_zero());
+        // 0 * 1 === +0
+        let r = mul(NumberValue::Smi(0), NumberValue::Smi(1));
+        assert_eq!(r, NumberValue::Smi(0));
+        assert!(!r.is_negative_zero());
+        // -2 * -3 === 6 (no false -0)
+        assert_eq!(
+            mul(NumberValue::Smi(-2), NumberValue::Smi(-3)),
+            NumberValue::Smi(6)
+        );
     }
 
     #[test]

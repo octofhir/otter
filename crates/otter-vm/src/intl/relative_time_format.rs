@@ -138,7 +138,7 @@ fn format_number(n: f64) -> String {
         let mut grouped = String::new();
         let bytes = digits.as_bytes();
         for (i, b) in bytes.iter().enumerate() {
-            if i > 0 && (bytes.len() - i) % 3 == 0 {
+            if i > 0 && (bytes.len() - i).is_multiple_of(3) {
                 grouped.push(',');
             }
             grouped.push(*b as char);

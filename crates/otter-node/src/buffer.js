@@ -14,7 +14,7 @@ if (!Buffer) {
   // ---- encoding helpers ----
   const enc = {
     normalize(encoding) {
-      if (!encoding) return 'utf8';
+      if (encoding === undefined) return 'utf8';
       const e = String(encoding).toLowerCase();
       switch (e) {
         case 'utf8': case 'utf-8': return 'utf8';
@@ -45,20 +45,33 @@ if (!Buffer) {
       `The "${name}" argument must be of type ${expected}. Received ${received}`);
   }
 
-  function formatBigInt(value) {
-    let s = value < 0n ? String(-value) : String(value);
+  function addNumericSeparator(str) {
     let out = '';
-    while (s.length > 3) {
-      out = `_${s.slice(-3)}${out}`;
-      s = s.slice(0, -3);
+    let i = str.length;
+    const start = str[0] === '-' ? 1 : 0;
+    for (; i >= start + 4; i -= 3) out = `_${str.slice(i - 3, i)}${out}`;
+    return `${str.slice(0, i)}${out}`;
+  }
+
+  function formatReceived(value) {
+    if (typeof value === 'bigint') {
+      let s = String(value);
+      if (value > 2n ** 32n || value < -(2n ** 32n)) s = addNumericSeparator(s);
+      return `${s}n`;
     }
-    return `${value < 0n ? '-' : ''}${s}${out}n`;
+    if (typeof value === 'number') {
+      if (value === 0 && 1 / value < 0) return '-0';
+      if (!Number.isInteger(value)) return String(value);
+      let s = String(value);
+      if (value > 2 ** 32 || value < -(2 ** 32)) s = addNumericSeparator(s);
+      return s;
+    }
+    return String(value);
   }
 
   function outOfRange(name, range, value) {
-    const received = typeof value === 'bigint' ? formatBigInt(value) : String(value);
     return codedError(RangeError, 'ERR_OUT_OF_RANGE',
-      `The value of "${name}" is out of range. It must be ${range}. Received ${received}`);
+      `The value of "${name}" is out of range. It must be ${range}. Received ${formatReceived(value)}`);
   }
 
   function checkedBufferSize(size) {
@@ -71,7 +84,8 @@ if (!Buffer) {
 
   function checkedInspectMaxBytes(value) {
     if (typeof value !== 'number') throw invalidArgType('INSPECT_MAX_BYTES', 'number', value);
-    if (!Number.isFinite(value) || value < 0 || !Number.isInteger(value)) {
+    // Node validates `>= 0` only — non-integers and Infinity are accepted.
+    if (Number.isNaN(value) || value < 0) {
       throw outOfRange('INSPECT_MAX_BYTES', '>= 0', value);
     }
     return value;
@@ -94,12 +108,6 @@ if (!Buffer) {
       : `type ${typeof value} (${String(value)})`;
     return codedError(TypeError, 'ERR_INVALID_ARG_TYPE',
       `The "${name}" argument must be an instance of Buffer or Uint8Array. Received ${received}`);
-  }
-
-  function invalidFirstBufferArg(value) {
-    const received = value === undefined ? 'undefined' : value === null ? 'null' : String(value);
-    return new TypeError('The first argument must be of type string or an instance of ' +
-      `Buffer, ArrayBuffer, or Array or an Array-like Object. Received ${received}`);
   }
 
   function invalidState(message) {
@@ -218,11 +226,22 @@ if (!Buffer) {
     for (let i = start; i < end; i++) out += hexChars[buf[i] >> 4] + hexChars[buf[i] & 0xf];
     return out;
   }
+  function hexNibble(code) {
+    if (code >= 48 && code <= 57) return code - 48; // 0-9
+    if (code >= 97 && code <= 102) return code - 87; // a-f
+    if (code >= 65 && code <= 70) return code - 55; // A-F
+    return -1;
+  }
   function hexToBytes(str) {
     const clean = String(str);
-    const len = clean.length >> 1;
-    const out = new Array(len);
-    for (let i = 0; i < len; i++) out[i] = parseInt(clean.substr(i * 2, 2), 16);
+    const out = [];
+    for (let i = 0; i + 1 < clean.length; i += 2) {
+      const hi = hexNibble(clean.charCodeAt(i));
+      const lo = hexNibble(clean.charCodeAt(i + 1));
+      // Node's hex decoder stops at the first byte it cannot fully decode.
+      if (hi === -1 || lo === -1) break;
+      out.push((hi << 4) | lo);
+    }
     return out;
   }
 
@@ -329,14 +348,39 @@ if (!Buffer) {
     return true;
   }
 
-  function inspectBuffer(buf) {
+  function isArrayIndexKey(key) {
+    if (!/^(?:0|[1-9][0-9]*)$/.test(key)) return false;
+    return Number(key) < 0xffffffff;
+  }
+  function inspectExtraValue(value, ctx) {
+    if (ctx && typeof ctx.inspect === 'function') return ctx.inspect(value);
+    return String(value);
+  }
+  function inspectBuffer(buf, recurseTimes, ctx) {
     const max = Buffer.INSPECT_MAX_BYTES;
     const len = Math.min(buf.length, max);
     const parts = new Array(len);
     for (let i = 0; i < len; i++) parts[i] = hexChars[buf[i] >> 4] + hexChars[buf[i] & 0xf];
     let body = parts.join(' ');
-    if (buf.length > max) body += ` ... ${buf.length - max} more bytes`;
-    return `<Buffer${body ? ' ' + body : ''}>`;
+    const remaining = buf.length - max;
+    if (remaining > 0) body += `${body ? ' ' : ''}... ${remaining} more byte${remaining > 1 ? 's' : ''}`;
+    // Own enumerable non-index properties are appended, e.g.
+    // `<Buffer 31 32, prop: 123>`, mirroring Node's buffer inspector.
+    const extras = [];
+    for (const key of Object.keys(buf)) {
+      if (isArrayIndexKey(key)) continue;
+      extras.push(`${key}: ${inspectExtraValue(buf[key], ctx)}`);
+    }
+    for (const sym of Object.getOwnPropertySymbols(buf)) {
+      const desc = Object.getOwnPropertyDescriptor(buf, sym);
+      if (desc && desc.enumerable) extras.push(`[${sym.toString()}]: ${inspectExtraValue(buf[sym], ctx)}`);
+    }
+    if (extras.length) body += `${body ? ', ' : ''}${extras.join(', ')}`;
+    // The receiver's constructor name is used (so a generic call on a plain
+    // Uint8Array reads `<Uint8Array …>`), and the space after it is always
+    // emitted, making an empty buffer `<Buffer >`.
+    const name = (buf.constructor && buf.constructor.name) || 'Buffer';
+    return `<${name} ${body}>`;
   }
 
   function bytesFromString(str, encoding) {
@@ -372,11 +416,20 @@ if (!Buffer) {
 
     toString(encoding, start, end) {
       const len = this.length;
-      start = start === undefined ? 0 : (start | 0);
-      end = end === undefined ? len : (end | 0);
-      if (start < 0) start = 0;
-      if (end > len) end = len;
-      if (end <= start) return '';
+      // Node coerces start/end to integers: NaN and negative start clamp to 0,
+      // a start past the end yields '', and end is clamped to the length.
+      let s = start === undefined ? 0 : Number(start);
+      if (Number.isNaN(s)) s = 0;
+      s = Math.trunc(s);
+      if (s < 0) s = 0;
+      if (s > len) return '';
+      let e2 = end === undefined ? len : Number(end);
+      if (Number.isNaN(e2)) e2 = 0;
+      e2 = Math.trunc(e2);
+      if (e2 > len) e2 = len;
+      if (e2 <= s) return '';
+      start = s;
+      end = e2;
       const e = enc.normalize(encoding);
       if (e === undefined) throw unknownEncoding(encoding);
       switch (e) {
@@ -396,7 +449,7 @@ if (!Buffer) {
     toJSON() { return { type: 'Buffer', data: Array.prototype.slice.call(this) }; }
 
     equals(other) {
-      if (!(other instanceof Uint8Array)) throw new TypeError('The "otherBuffer" argument must be an instance of Buffer or Uint8Array.');
+      if (!(other instanceof Uint8Array)) throw argTypeError('otherBuffer', 'an instance of Buffer or Uint8Array', other);
       if (this === other) return true;
       if (this.length !== other.length) return false;
       for (let i = 0; i < this.length; i++) if (this[i] !== other[i]) return false;
@@ -432,7 +485,7 @@ if (!Buffer) {
       return Buffer.compare(this.subarray(sourceStart, sourceEnd), target.subarray(targetStart, targetEnd));
     }
 
-    inspect() { return inspectBuffer(this); }
+    inspect(recurseTimes, ctx) { return inspectBuffer(this, recurseTimes, ctx); }
 
     write(string, offset, length, encoding) {
       if (offset === undefined) { offset = 0; length = this.length; encoding = 'utf8'; }
@@ -456,6 +509,25 @@ if (!Buffer) {
       for (let i = 0; i < n; i++) this[offset + i] = bytes[i];
       return n;
     }
+
+    // Internal single-encoding writers. Unlike `write`, an out-of-bounds
+    // offset/length is a hard ERR_BUFFER_OUT_OF_BOUNDS rather than a clamp.
+    asciiWrite(string, offset, length) { return fixedWrite(this, string, offset, length, 'latin1'); }
+    latin1Write(string, offset, length) { return fixedWrite(this, string, offset, length, 'latin1'); }
+    utf8Write(string, offset, length) { return fixedWrite(this, string, offset, length, 'utf8'); }
+    base64Write(string, offset, length) { return fixedWrite(this, string, offset, length, 'base64'); }
+    base64urlWrite(string, offset, length) { return fixedWrite(this, string, offset, length, 'base64url'); }
+    hexWrite(string, offset, length) { return fixedWrite(this, string, offset, length, 'hex'); }
+    ucs2Write(string, offset, length) { return fixedWrite(this, string, offset, length, 'utf16le'); }
+
+    // Internal single-encoding slicers, mirroring Node's lib/buffer.js surface.
+    asciiSlice(start, end) { return this.toString('ascii', start, end); }
+    latin1Slice(start, end) { return this.toString('latin1', start, end); }
+    utf8Slice(start, end) { return this.toString('utf8', start, end); }
+    base64Slice(start, end) { return this.toString('base64', start, end); }
+    base64urlSlice(start, end) { return this.toString('base64url', start, end); }
+    hexSlice(start, end) { return this.toString('hex', start, end); }
+    ucs2Slice(start, end) { return this.toString('utf16le', start, end); }
 
     fill(value, offset, end, encoding) {
       if (this.length > this.byteLength) {
@@ -514,33 +586,32 @@ if (!Buffer) {
     }
 
     copy(target, targetStart, sourceStart, sourceEnd) {
-      if (!(target instanceof Uint8Array)) throw invalidBufferTarget('target', target);
-      targetStart = targetStart === undefined ? 0 : Math.trunc(Number(targetStart));
-      sourceStart = sourceStart === undefined ? 0 : Math.trunc(Number(sourceStart));
-      sourceEnd = sourceEnd === undefined ? this.length : sourceEnd;
-      sourceEnd = Math.trunc(Number(sourceEnd));
-      if (!Number.isFinite(targetStart) || targetStart < 0) {
-        throw outOfRange('targetStart', `>= 0 && <= ${target.length}`, targetStart);
-      }
-      if (!Number.isFinite(sourceStart) || sourceStart < 0) {
-        throw outOfRange('sourceStart', `>= 0 && <= ${this.length}`, sourceStart);
-      }
-      if (!Number.isFinite(sourceEnd) || sourceEnd < 0) {
-        throw outOfRange('sourceEnd', `>= 0 && <= ${this.length}`, sourceEnd);
-      }
-      if (sourceEnd <= sourceStart) return 0;
-      if (targetStart > target.length) {
-        throw outOfRange('targetStart', `>= 0 && <= ${target.length}`, targetStart);
-      }
+      if (!ArrayBuffer.isView(target)) throw invalidBufferTarget('target', target);
+      if (!(this instanceof Uint8Array)) throw invalidBufferTarget('source', this);
+      const coerce = (v, def) => {
+        if (v === undefined) return def;
+        const n = Math.trunc(Number(v));
+        return Number.isNaN(n) ? 0 : n;
+      };
+      targetStart = coerce(targetStart, 0);
+      sourceStart = coerce(sourceStart, 0);
+      sourceEnd = coerce(sourceEnd, this.length);
+      // Negative bounds report a bare `>= 0` range, matching Node's boundsError.
+      if (targetStart < 0) throw outOfRange('targetStart', '>= 0', targetStart);
+      if (sourceStart < 0) throw outOfRange('sourceStart', '>= 0', sourceStart);
+      if (sourceEnd < 0) throw outOfRange('sourceEnd', '>= 0', sourceEnd);
       if (sourceStart > this.length) {
         throw outOfRange('sourceStart', `>= 0 && <= ${this.length}`, sourceStart);
       }
       if (sourceEnd > this.length) sourceEnd = this.length;
-      let n = 0;
-      for (let i = sourceStart; i < sourceEnd && targetStart + n < target.length; i++) {
-        target[targetStart + n] = this[i];
-        n++;
-      }
+      // The target is addressed byte-wise so non-`Uint8Array` views (e.g. a
+      // `Uint16Array`) receive a packed byte copy.
+      const targetBytes = target instanceof Uint8Array
+        ? target
+        : new Uint8Array(target.buffer, target.byteOffset, target.byteLength);
+      if (targetStart >= targetBytes.length || sourceEnd <= sourceStart) return 0;
+      const n = Math.min(sourceEnd - sourceStart, targetBytes.length - targetStart);
+      for (let i = 0; i < n; i++) targetBytes[targetStart + i] = this[sourceStart + i];
       return n;
     }
 
@@ -553,29 +624,177 @@ if (!Buffer) {
     }
 
     indexOf(value, byteOffset, encoding) {
-      const hay = this;
-      let needle;
-      if (typeof value === 'number') {
-        for (let i = (byteOffset | 0); i < hay.length; i++) if (hay[i] === (value & 0xff)) return i;
-        return -1;
+      return bidirectionalIndexOf(this, value, byteOffset, encoding, true);
+    }
+
+    lastIndexOf(value, byteOffset, encoding) {
+      return bidirectionalIndexOf(this, value, byteOffset, encoding, false);
+    }
+
+    includes(value, byteOffset, encoding) { return bidirectionalIndexOf(this, value, byteOffset, encoding, true) !== -1; }
+
+    swap16() {
+      const len = this.length;
+      if (len % 2 !== 0) throw invalidBufferSize('16-bits');
+      for (let i = 0; i < len; i += 2) { const t = this[i]; this[i] = this[i + 1]; this[i + 1] = t; }
+      return this;
+    }
+    swap32() {
+      const len = this.length;
+      if (len % 4 !== 0) throw invalidBufferSize('32-bits');
+      for (let i = 0; i < len; i += 4) { let t = this[i]; this[i] = this[i + 3]; this[i + 3] = t; t = this[i + 1]; this[i + 1] = this[i + 2]; this[i + 2] = t; }
+      return this;
+    }
+    swap64() {
+      const len = this.length;
+      if (len % 8 !== 0) throw invalidBufferSize('64-bits');
+      for (let i = 0; i < len; i += 8) {
+        for (let j = 0; j < 4; j++) {
+          const t = this[i + j];
+          this[i + j] = this[i + 7 - j];
+          this[i + 7 - j] = t;
+        }
       }
-      if (typeof value === 'string') needle = bytesFromString(value, encoding);
-      else needle = value;
-      if (needle.length === 0) return 0;
-      const start = byteOffset | 0;
-      for (let i = start; i <= hay.length - needle.length; i++) {
-        let found = true;
-        for (let j = 0; j < needle.length; j++) if (hay[i + j] !== needle[j]) { found = false; break; }
-        if (found) return i;
+      return this;
+    }
+  };
+
+  function invalidBufferSize(unit) {
+    return codedError(RangeError, 'ERR_INVALID_BUFFER_SIZE', `Buffer size must be a multiple of ${unit}`);
+  }
+
+  function fixedWrite(buf, string, offset, length, encoding) {
+    if (typeof string !== 'string') throw invalidArgType('string', 'string', string);
+    offset = offset === undefined ? 0 : offset | 0;
+    const remaining = buf.length - offset;
+    length = length === undefined ? remaining : length | 0;
+    if (offset < 0 || offset > buf.length || length < 0 || length > remaining) {
+      throw bufferOutOfBounds();
+    }
+    const bytes = bytesFromString(string, encoding);
+    let n = Math.min(bytes.length, length);
+    if (encoding === 'utf8') n = utf8WriteLength(bytes, n);
+    for (let i = 0; i < n; i++) buf[offset + i] = bytes[i];
+    return n;
+  }
+
+  // ` Received ...` suffix matching Node's `invalidArgTypeHelper`.
+  function argTypeReceived(val) {
+    if (val === null) return ' Received null';
+    if (val === undefined) return ' Received undefined';
+    if (typeof val === 'function') {
+      return ` Received function ${val.name}`;
+    }
+    if (typeof val === 'object') {
+      const name = val.constructor && val.constructor.name;
+      return name ? ` Received an instance of ${name}` : ' Received [Object: null prototype]';
+    }
+    if (typeof val === 'string') {
+      const shown = val.length > 25 ? `${val.slice(0, 25)}...` : val;
+      return ` Received type string ('${shown}')`;
+    }
+    if (typeof val === 'symbol') return ` Received type symbol (${val.toString()})`;
+    return ` Received type ${typeof val} (${String(val)}${typeof val === 'bigint' ? 'n' : ''})`;
+  }
+
+  function argTypeError(name, expected, value) {
+    return codedError(TypeError, 'ERR_INVALID_ARG_TYPE',
+      `The "${name}" argument must be ${expected}.${argTypeReceived(value)}`);
+  }
+
+  const nativeIndexOf = Uint8Array.prototype.indexOf;
+  const nativeLastIndexOf = Uint8Array.prototype.lastIndexOf;
+
+  // Shared forward/backward search matching Node's bidirectionalIndexOf:
+  // a string second argument is the encoding; the offset is coerced to a
+  // number (NaN scans the whole buffer), negatives count from the end, and an
+  // empty needle resolves to the clamped offset. The first-byte scan is
+  // delegated to the native typed-array search so large buffers stay fast.
+  function bidirectionalIndexOf(buf, value, byteOffset, encoding, dir) {
+    if (!(buf instanceof Uint8Array)) {
+      throw codedError(TypeError, 'ERR_INVALID_ARG_TYPE',
+        `The "buffer" argument must be an instance of Buffer, TypedArray, or DataView.${argTypeReceived(buf)}`);
+    }
+    if (typeof byteOffset === 'string') {
+      encoding = byteOffset;
+      byteOffset = undefined;
+    } else if (byteOffset > 0x7fffffff) {
+      byteOffset = 0x7fffffff;
+    } else if (byteOffset < -0x80000000) {
+      byteOffset = -0x80000000;
+    }
+    let offset = Number(byteOffset);
+    if (Number.isNaN(offset)) offset = dir ? 0 : buf.length;
+    offset = Math.trunc(offset);
+
+    let needle;
+    if (typeof value === 'number') {
+      const target = value & 0xff;
+      if (dir) {
+        let start = offset < 0 ? buf.length + offset : offset;
+        if (start < 0) start = 0;
+        return nativeIndexOf.call(buf, target, start);
+      }
+      let start = offset < 0 ? buf.length + offset : offset;
+      if (start >= buf.length) start = buf.length - 1;
+      if (start < 0) return -1;
+      return nativeLastIndexOf.call(buf, target, start);
+    }
+    if (typeof value === 'string') {
+      const e0 = enc.normalize(encoding);
+      if (encoding !== undefined && e0 === undefined) throw unknownEncoding(encoding);
+      needle = bytesFromString(value, encoding);
+    } else if (value instanceof Uint8Array) {
+      needle = value;
+    } else {
+      throw codedError(TypeError, 'ERR_INVALID_ARG_TYPE',
+        `The "value" argument must be one of type number or string or an instance of Buffer or Uint8Array.${argTypeReceived(value)}`);
+    }
+
+    if (needle.length === 0) {
+      let empty = offset < 0 ? buf.length + offset : offset;
+      if (empty < 0) empty = 0;
+      if (empty > buf.length) empty = buf.length;
+      return empty;
+    }
+
+    // UCS-2/UTF-16LE searches operate in 16-bit units: matches only land on
+    // even byte boundaries, and a needle shorter than one code unit never
+    // matches. Mirrors Node's C++ `indexOfBuffer` UCS2 path.
+    const ucs2 = enc.normalize(encoding) === 'utf16le';
+    if (ucs2 && (buf.length < 2 || needle.length < 2)) return -1;
+    const step = ucs2 ? 2 : 1;
+    const cmpLen = ucs2 ? (needle.length & ~1) : needle.length;
+    const first = needle[0];
+    const last = buf.length - cmpLen;
+
+    const matchAt = (i) => {
+      for (let j = 1; j < cmpLen; j++) if (buf[i + j] !== needle[j]) return false;
+      return true;
+    };
+
+    if (dir) {
+      let i = offset < 0 ? buf.length + offset : offset;
+      if (i < 0) i = 0;
+      while (i <= last) {
+        const f = nativeIndexOf.call(buf, first, i);
+        if (f === -1 || f > last) return -1;
+        if ((!ucs2 || (f & 1) === 0) && matchAt(f)) return f;
+        i = ucs2 ? f + (f & 1 ? 1 : 2) : f + 1;
       }
       return -1;
     }
-
-    includes(value, byteOffset, encoding) { return this.indexOf(value, byteOffset, encoding) !== -1; }
-
-    swap16() { for (let i = 0; i < this.length; i += 2) { const t = this[i]; this[i] = this[i + 1]; this[i + 1] = t; } return this; }
-    swap32() { for (let i = 0; i < this.length; i += 4) { let t = this[i]; this[i] = this[i + 3]; this[i + 3] = t; t = this[i + 1]; this[i + 1] = this[i + 2]; this[i + 2] = t; } return this; }
-  };
+    let i = offset < 0 ? buf.length + offset : offset;
+    if (i > last) i = last;
+    if (ucs2 && (i & 1)) i -= 1;
+    while (i >= 0) {
+      const f = nativeLastIndexOf.call(buf, first, i);
+      if (f === -1) return -1;
+      if ((!ucs2 || (f & 1) === 0) && matchAt(f)) return f;
+      i = ucs2 ? f - (f & 1 ? 1 : 2) : f - 1;
+    }
+    return -1;
+  }
   Buffer = function Buffer(arg, byteOffset, length) {
     if (typeof arg === 'number' && typeof byteOffset === 'string') {
       throw invalidArgType('string', 'string', arg);
@@ -592,6 +811,13 @@ if (!Buffer) {
   });
   Object.defineProperty(Buffer.prototype, 'toLocaleString', {
     value: Buffer.prototype.toString,
+    writable: true,
+    configurable: true,
+    enumerable: false,
+  });
+  // `inspect` and the `nodejs.util.inspect.custom` symbol are the same function.
+  Object.defineProperty(Buffer.prototype, Symbol.for('nodejs.util.inspect.custom'), {
+    value: Buffer.prototype.inspect,
     writable: true,
     configurable: true,
     enumerable: false,
@@ -615,6 +841,25 @@ if (!Buffer) {
       throw outOfRange('offset', `>= 0 and <= ${max}`, offset);
     }
     return offset;
+  }
+  // Validate that an integer value fits the destination width, matching Node's
+  // `checkInt`. `byteLength` is the width minus one; widths above 4 bytes are
+  // described with `2 ** N` ranges because the exact bound is unsafe to print.
+  function checkInt(value, min, max, byteLength) {
+    if (typeof value !== 'number') throw invalidArgType('value', 'number', value);
+    if (value > max || value < min) {
+      let range;
+      if (byteLength > 3) {
+        if (min === 0) {
+          range = `>= 0 and < 2 ** ${(byteLength + 1) * 8}`;
+        } else {
+          range = `>= -(2 ** ${(byteLength + 1) * 8 - 1}) and < 2 ** ${(byteLength + 1) * 8 - 1}`;
+        }
+      } else {
+        range = `>= ${min} and <= ${max}`;
+      }
+      throw outOfRange('value', range, value);
+    }
   }
   function checkedByteLength(byteLength) {
     if (typeof byteLength !== 'number') throw invalidArgType('byteLength', 'number', byteLength);
@@ -649,6 +894,24 @@ if (!Buffer) {
     }
     return offset + 8;
   }
+  // Free-standing variable-width readers so the signed variants don't depend on
+  // `this.readUIntLE` existing — that breaks when the methods are applied
+  // generically to a plain `Uint8Array`.
+  function readUIntLEImpl(buf, o, len) {
+    len = checkedByteLength(len);
+    o = checkedOffset(buf, o, len, false);
+    let val = 0;
+    let mul = 1;
+    for (let i = 0; i < len; i++) { val += buf[o + i] * mul; mul *= 256; }
+    return val;
+  }
+  function readUIntBEImpl(buf, o, len) {
+    len = checkedByteLength(len);
+    o = checkedOffset(buf, o, len, false);
+    let val = 0;
+    for (let i = 0; i < len; i++) val = val * 256 + buf[o + i];
+    return val;
+  }
   const proto = Buffer.prototype;
   const intMethods = {
     readUInt8(o) { o = checkedOffset(this, o, 1); return dv(this).getUint8(o); },
@@ -665,16 +928,16 @@ if (!Buffer) {
     readFloatBE(o) { o = checkedOffset(this, o, 4); return dv(this).getFloat32(o, false); },
     readDoubleLE(o) { o = checkedOffset(this, o, 8); return dv(this).getFloat64(o, true); },
     readDoubleBE(o) { o = checkedOffset(this, o, 8); return dv(this).getFloat64(o, false); },
-    writeUInt8(v, o) { o = checkedOffset(this, o, 1); dv(this).setUint8(o, v); return o + 1; },
-    writeInt8(v, o) { o = checkedOffset(this, o, 1); dv(this).setInt8(o, v); return o + 1; },
-    writeUInt16LE(v, o) { o = checkedOffset(this, o, 2); dv(this).setUint16(o, v, true); return o + 2; },
-    writeUInt16BE(v, o) { o = checkedOffset(this, o, 2); dv(this).setUint16(o, v, false); return o + 2; },
-    writeInt16LE(v, o) { o = checkedOffset(this, o, 2); dv(this).setInt16(o, v, true); return o + 2; },
-    writeInt16BE(v, o) { o = checkedOffset(this, o, 2); dv(this).setInt16(o, v, false); return o + 2; },
-    writeUInt32LE(v, o) { o = checkedOffset(this, o, 4); dv(this).setUint32(o, v, true); return o + 4; },
-    writeUInt32BE(v, o) { o = checkedOffset(this, o, 4); dv(this).setUint32(o, v, false); return o + 4; },
-    writeInt32LE(v, o) { o = checkedOffset(this, o, 4); dv(this).setInt32(o, v, true); return o + 4; },
-    writeInt32BE(v, o) { o = checkedOffset(this, o, 4); dv(this).setInt32(o, v, false); return o + 4; },
+    writeUInt8(v, o) { checkInt(v, 0, 0xff, 0); o = checkedOffset(this, o, 1); dv(this).setUint8(o, v); return o + 1; },
+    writeInt8(v, o) { checkInt(v, -0x80, 0x7f, 0); o = checkedOffset(this, o, 1); dv(this).setInt8(o, v); return o + 1; },
+    writeUInt16LE(v, o) { checkInt(v, 0, 0xffff, 1); o = checkedOffset(this, o, 2); dv(this).setUint16(o, v, true); return o + 2; },
+    writeUInt16BE(v, o) { checkInt(v, 0, 0xffff, 1); o = checkedOffset(this, o, 2); dv(this).setUint16(o, v, false); return o + 2; },
+    writeInt16LE(v, o) { checkInt(v, -0x8000, 0x7fff, 1); o = checkedOffset(this, o, 2); dv(this).setInt16(o, v, true); return o + 2; },
+    writeInt16BE(v, o) { checkInt(v, -0x8000, 0x7fff, 1); o = checkedOffset(this, o, 2); dv(this).setInt16(o, v, false); return o + 2; },
+    writeUInt32LE(v, o) { checkInt(v, 0, 0xffffffff, 3); o = checkedOffset(this, o, 4); dv(this).setUint32(o, v, true); return o + 4; },
+    writeUInt32BE(v, o) { checkInt(v, 0, 0xffffffff, 3); o = checkedOffset(this, o, 4); dv(this).setUint32(o, v, false); return o + 4; },
+    writeInt32LE(v, o) { checkInt(v, -0x80000000, 0x7fffffff, 3); o = checkedOffset(this, o, 4); dv(this).setInt32(o, v, true); return o + 4; },
+    writeInt32BE(v, o) { checkInt(v, -0x80000000, 0x7fffffff, 3); o = checkedOffset(this, o, 4); dv(this).setInt32(o, v, false); return o + 4; },
     writeFloatLE(v, o) { o = checkedOffset(this, o, 4); dv(this).setFloat32(o, v, true); return o + 4; },
     writeFloatBE(v, o) { o = checkedOffset(this, o, 4); dv(this).setFloat32(o, v, false); return o + 4; },
     writeDoubleLE(v, o) { o = checkedOffset(this, o, 8); dv(this).setFloat64(o, v, true); return o + 8; },
@@ -687,17 +950,24 @@ if (!Buffer) {
     writeBigUInt64BE(v, o) { return writeBigUInt64(this, v, o, false); },
     writeBigInt64LE(v, o) { if (typeof v !== 'bigint') throw invalidArgType('value', 'bigint', v); if (v < I64_MIN || v > I64_MAX) throw outOfRange('value', `>= ${I64_MIN}n and <= ${I64_MAX}n`, v); return writeBigUInt64(this, v < 0n ? U64 + v : v, o, true); },
     writeBigInt64BE(v, o) { if (typeof v !== 'bigint') throw invalidArgType('value', 'bigint', v); if (v < I64_MIN || v > I64_MAX) throw outOfRange('value', `>= ${I64_MIN}n and <= ${I64_MAX}n`, v); return writeBigUInt64(this, v < 0n ? U64 + v : v, o, false); },
-    readUIntLE(o, len) { len = checkedByteLength(len); o = checkedOffset(this, o, len, false); let val = 0; let mul = 1; for (let i = 0; i < len; i++) { val += this[o + i] * mul; mul *= 256; } return val; },
-    readUIntBE(o, len) { len = checkedByteLength(len); o = checkedOffset(this, o, len, false); let val = 0; for (let i = 0; i < len; i++) val = val * 256 + this[o + i]; return val; },
-    readIntLE(o, len) { let val = this.readUIntLE(o, len); const sub = Math.pow(2, 8 * len); if (val >= sub / 2) val -= sub; return val; },
-    readIntBE(o, len) { let val = this.readUIntBE(o, len); const sub = Math.pow(2, 8 * len); if (val >= sub / 2) val -= sub; return val; },
-    writeUIntLE(v, o, len) { len = checkedByteLength(len); o = checkedOffset(this, o, len, false); let val = v; for (let i = 0; i < len; i++) { this[o + i] = val & 0xff; val = Math.floor(val / 256); } return o + len; },
-    writeUIntBE(v, o, len) { len = checkedByteLength(len); o = checkedOffset(this, o, len, false); let val = v; for (let i = len - 1; i >= 0; i--) { this[o + i] = val & 0xff; val = Math.floor(val / 256); } return o + len; },
-    writeIntLE(v, o, len) { let val = v < 0 ? v + Math.pow(2, 8 * len) : v; return this.writeUIntLE(val, o, len); },
-    writeIntBE(v, o, len) { let val = v < 0 ? v + Math.pow(2, 8 * len) : v; return this.writeUIntBE(val, o, len); },
+    readUIntLE(o, len) { return readUIntLEImpl(this, o, len); },
+    readUIntBE(o, len) { return readUIntBEImpl(this, o, len); },
+    readIntLE(o, len) { let val = readUIntLEImpl(this, o, len); const sub = Math.pow(2, 8 * len); if (val >= sub / 2) val -= sub; return val; },
+    readIntBE(o, len) { let val = readUIntBEImpl(this, o, len); const sub = Math.pow(2, 8 * len); if (val >= sub / 2) val -= sub; return val; },
+    writeUIntLE(v, o, len) { len = checkedByteLength(len); checkInt(v, 0, Math.pow(2, 8 * len) - 1, len - 1); o = checkedOffset(this, o, len, false); let val = v; for (let i = 0; i < len; i++) { this[o + i] = val & 0xff; val = Math.floor(val / 256); } return o + len; },
+    writeUIntBE(v, o, len) { len = checkedByteLength(len); checkInt(v, 0, Math.pow(2, 8 * len) - 1, len - 1); o = checkedOffset(this, o, len, false); let val = v; for (let i = len - 1; i >= 0; i--) { this[o + i] = val & 0xff; val = Math.floor(val / 256); } return o + len; },
+    writeIntLE(v, o, len) { len = checkedByteLength(len); checkInt(v, -Math.pow(2, 8 * len - 1), Math.pow(2, 8 * len - 1) - 1, len - 1); o = checkedOffset(this, o, len, false); let val = v < 0 ? v + Math.pow(2, 8 * len) : v; for (let i = 0; i < len; i++) { this[o + i] = val & 0xff; val = Math.floor(val / 256); } return o + len; },
+    writeIntBE(v, o, len) { len = checkedByteLength(len); checkInt(v, -Math.pow(2, 8 * len - 1), Math.pow(2, 8 * len - 1) - 1, len - 1); o = checkedOffset(this, o, len, false); let val = v < 0 ? v + Math.pow(2, 8 * len) : v; for (let i = len - 1; i >= 0; i--) { this[o + i] = val & 0xff; val = Math.floor(val / 256); } return o + len; },
   };
   for (const name of Object.keys(intMethods)) {
     Object.defineProperty(proto, name, { value: intMethods[name], writable: true, configurable: true, enumerable: false });
+  }
+  // Node exposes `Uint` spellings (`readUint8`, `writeBigUint64LE`, …) as the
+  // exact same function objects as their `UInt` counterparts.
+  for (const name of Object.keys(intMethods)) {
+    if (!name.includes('UInt')) continue;
+    const alias = name.replace('UInt', 'Uint');
+    Object.defineProperty(proto, alias, { value: intMethods[name], writable: true, configurable: true, enumerable: false });
   }
   Object.defineProperty(proto, 'parent', {
     configurable: true,
@@ -716,31 +986,46 @@ if (!Buffer) {
   // assignment to such an inherited property throws in strict mode.
   const statics = {
     from(value, encodingOrOffset, length) {
-      if (value === undefined || value === null) throw invalidFirstBufferArg(value);
       if (typeof value === 'string') {
-        const e = enc.normalize(encodingOrOffset);
-        if (e === undefined) throw unknownEncoding(encodingOrOffset);
+        // A non-string encoding argument is ignored (utf8); only a string that
+        // names an unknown encoding throws.
+        let e = 'utf8';
+        if (typeof encodingOrOffset === 'string') {
+          e = enc.normalize(encodingOrOffset);
+          if (e === undefined) throw unknownEncoding(encodingOrOffset);
+        }
         return new Buffer(bytesFromString(value, e));
       }
-      if (isArrayBufferLike(value) || isSharedArrayBufferLike(value)) {
-        return new Buffer(value, encodingOrOffset, length);
-      }
-      if (value instanceof Uint8Array) { const b = new Buffer(value.length); b.set(value); return b; }
-      if (Array.isArray(value) || (value && typeof value[Symbol.iterator] === 'function')) return new Buffer(Uint8Array.from(value));
-      if (value && typeof value === 'object' && (isArrayBufferLike(value.buffer) || isSharedArrayBufferLike(value.buffer))) {
-        return new Buffer(value.buffer, value.byteOffset || 0, value.length);
-      }
-      if (value && typeof value === 'object' && value.type === 'Buffer' && Array.isArray(value.data)) return new Buffer(Uint8Array.from(value.data));
-      if (value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, 'length')) {
-        let len = Number(value.length);
-        if (!Number.isFinite(len) || len < 0) len = 0;
-        const b = new Buffer(Math.trunc(len));
-        for (let i = 0; i < b.length; i++) b[i] = Number(value[i]) & 0xff;
-        return b;
+      if (typeof value === 'object' && value !== null) {
+        if (isArrayBufferLike(value) || isSharedArrayBufferLike(value)) {
+          return new Buffer(value, encodingOrOffset, length);
+        }
+        // A boxed/coercible value whose valueOf() differs (e.g. `new String`)
+        // is reinterpreted, matching Node's fromObject ordering.
+        const vo = typeof value.valueOf === 'function' ? value.valueOf() : undefined;
+        if (vo != null && vo !== value && (typeof vo === 'string' || typeof vo === 'object')) {
+          return statics.from(vo, encodingOrOffset, length);
+        }
+        if (value instanceof Uint8Array) { const b = new Buffer(value.length); b.set(value); return b; }
+        // Array-like (real array, typed array, or `{length}` object) and the
+        // `{buffer: <ArrayBuffer>}` shape. A non-numeric length yields empty.
+        if (value.length !== undefined || isArrayBufferLike(value.buffer) || isSharedArrayBufferLike(value.buffer)) {
+          if (typeof value.length !== 'number') return new Buffer(0);
+          let len = Math.trunc(value.length);
+          if (!Number.isFinite(len) || len < 0) len = 0;
+          const b = new Buffer(len);
+          for (let i = 0; i < len; i++) b[i] = Number(value[i]) & 0xff;
+          return b;
+        }
+        if (value.type === 'Buffer' && Array.isArray(value.data)) return new Buffer(Uint8Array.from(value.data));
+        // Last resort: a Symbol.toPrimitive that yields a string.
+        if (typeof value[Symbol.toPrimitive] === 'function') {
+          const prim = value[Symbol.toPrimitive]('string');
+          if (typeof prim === 'string') return statics.from(prim, encodingOrOffset, length);
+        }
       }
       throw codedError(TypeError, 'ERR_INVALID_ARG_TYPE',
-        'The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. ' +
-        `Received an instance of ${value && value.constructor && value.constructor.name || 'Object'}`);
+        `The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object.${argTypeReceived(value)}`);
     },
     alloc(size, fill, encoding) {
       size = checkedBufferSize(size);
@@ -766,17 +1051,37 @@ if (!Buffer) {
       }
       const e = enc.normalize(encoding) || 'utf8';
       if (e === 'base64' || e === 'base64url') return base64ByteLength(value);
+      if (e === 'hex') return value.length >>> 1;
       return bytesFromString(value, e).length;
     },
     concat(list, totalLength) {
-      if (totalLength === undefined) { totalLength = 0; for (const b of list) totalLength += b.length; }
+      if (!Array.isArray(list)) throw argTypeError('list', 'an instance of Array', list);
+      if (list.length === 0) return new Buffer(0);
+      for (let i = 0; i < list.length; i++) {
+        if (!(list[i] instanceof Uint8Array)) {
+          throw argTypeError(`list[${i}]`, 'an instance of Buffer or Uint8Array', list[i]);
+        }
+      }
+      // Use the real typed-array length (byteLength) so a spoofed `length`
+      // getter cannot size the result or expose uninitialized memory.
+      if (totalLength === undefined) {
+        totalLength = 0;
+        for (const b of list) totalLength += b.byteLength;
+      } else {
+        if (typeof totalLength !== 'number') throw invalidArgType('length', 'number', totalLength);
+        if (!Number.isInteger(totalLength)) throw outOfRange('length', 'an integer', totalLength);
+        if (totalLength < 0 || totalLength > kMaxLength) {
+          throw outOfRange('length', `>= 0 && <= ${kMaxLength}`, totalLength);
+        }
+      }
       const out = new Buffer(totalLength);
       let pos = 0;
       for (const b of list) {
         if (pos >= totalLength) break;
-        const n = Math.min(b.length, totalLength - pos);
+        const blen = b.byteLength;
+        const n = Math.min(blen, totalLength - pos);
         for (let i = 0; i < n; i++) out[pos + i] = b[i];
-        pos += b.length;
+        pos += blen;
       }
       return out;
     },
@@ -793,9 +1098,26 @@ if (!Buffer) {
     isView(v) { return ArrayBuffer.isView(v); },
     isAscii: isAsciiBytes,
     isUtf8: isUtf8Bytes,
-    copyBytesFrom(view, offset = 0, length) {
+    copyBytesFrom(view, offset, length) {
+      if (!ArrayBuffer.isView(view) || view.BYTES_PER_ELEMENT === undefined) {
+        throw invalidArgType('view', 'an instance of TypedArray', view);
+      }
+      if (offset === undefined) {
+        offset = 0;
+      } else {
+        if (typeof offset !== 'number') throw invalidArgType('offset', 'number', offset);
+        if (!Number.isInteger(offset) || offset < 0) throw outOfRange('offset', '>= 0', offset);
+      }
+      if (length !== undefined) {
+        if (typeof length !== 'number') throw invalidArgType('length', 'number', length);
+        if (!Number.isInteger(length) || length < 0) throw outOfRange('length', '>= 0', length);
+      }
+      if (view.length === 0) return new Buffer(0);
+      const available = Math.max(0, view.length - offset);
+      const count = length === undefined ? available : Math.min(length, available);
+      if (count <= 0) return new Buffer(0);
       const u8 = new Uint8Array(view.buffer, view.byteOffset + offset * view.BYTES_PER_ELEMENT,
-        (length === undefined ? view.length - offset : length) * view.BYTES_PER_ELEMENT);
+        count * view.BYTES_PER_ELEMENT);
       return statics.from(u8);
     },
     poolSize: 8192,

@@ -43,7 +43,7 @@ impl Interpreter {
         name_idx: u32,
     ) -> Result<(), VmError> {
         let name = context
-            .string_constant_str(name_idx)
+            .string_constant_str_for_function(frame.function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
         // §9.1.1.4 — the global declarative record (script lexicals)
         // shadows the object record.
@@ -76,7 +76,7 @@ impl Interpreter {
         name_idx: u32,
     ) -> Result<(), VmError> {
         let name = context
-            .string_constant_str(name_idx)
+            .string_constant_str_for_function(frame.function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
         // §13.5.3 — `typeof` still raises ReferenceError for a
         // lexical binding read inside its TDZ; only *unresolvable*

@@ -3175,7 +3175,7 @@ impl Interpreter {
     ) -> Result<u64, VmError> {
         self.record_jit_runtime_property_stub();
         let atomized_key = context
-            .property_atom(name_idx)
+            .property_atom_for_function(stack[frame_index].function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
         let receiver = *read_register(&stack[frame_index], obj_reg)?;
         if let Some(obj) = receiver.as_object()
@@ -3680,7 +3680,7 @@ impl Interpreter {
     ) -> Result<u64, VmError> {
         self.record_jit_runtime_property_stub();
         let atomized_key = context
-            .property_atom(name_idx)
+            .property_atom_for_function(stack[frame_index].function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
         let receiver = *read_register(&stack[frame_index], obj_reg)?;
         let value = *read_register(&stack[frame_index], src)?;

@@ -736,6 +736,35 @@ function debuglog() {
   return fn;
 }
 
+function utf8ToBytes(str) {
+  const out = [];
+  str = String(str);
+  for (let i = 0; i < str.length; i++) {
+    let code = str.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff && i + 1 < str.length) {
+      const next = str.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        code = 0x10000 + ((code - 0xd800) << 10) + (next - 0xdc00);
+        i++;
+      } else {
+        code = 0xfffd;
+      }
+    } else if (code >= 0xd800 && code <= 0xdfff) {
+      code = 0xfffd;
+    }
+    if (code < 0x80) out.push(code);
+    else if (code < 0x800) out.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
+    else if (code < 0x10000) out.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+    else out.push(0xf0 | (code >> 18), 0x80 | ((code >> 12) & 0x3f), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+  }
+  return out;
+}
+
+class TextEncoder {
+  get encoding() { return 'utf-8'; }
+  encode(input = '') { return new Uint8Array(utf8ToBytes(input)); }
+}
+
 const exportsObj = {
   inspect,
   format,
@@ -751,6 +780,7 @@ const exportsObj = {
   debug: debuglog,
   stripVTControlCharacters,
   styleText,
+  TextEncoder,
   isArray: Array.isArray,
   isError(e) { return e instanceof Error || objToString(e) === '[object Error]'; },
   isFunction(v) { return typeof v === 'function'; },

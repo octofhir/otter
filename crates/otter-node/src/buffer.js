@@ -36,6 +36,7 @@ if (!Buffer) {
 
   function invalidArgType(name, expected, actual) {
     const received = actual === null ? 'null'
+      : actual === undefined ? 'undefined'
       : Array.isArray(actual) ? 'an instance of Array'
       : actual && typeof actual === 'object' ? `an instance of ${actual.constructor && actual.constructor.name || 'Object'}`
       : `type ${typeof actual} (${String(actual)})`;
@@ -71,6 +72,10 @@ if (!Buffer) {
     const received = value === undefined ? 'undefined' : value === null ? 'null' : String(value);
     return new TypeError('The first argument must be of type string or an instance of ' +
       `Buffer, ArrayBuffer, or Array or an Array-like Object. Received ${received}`);
+  }
+
+  function invalidState(message) {
+    return codedError(Error, 'ERR_INVALID_STATE', message);
   }
 
   function bufferOutOfBounds(name) {
@@ -210,6 +215,86 @@ if (!Buffer) {
     let b = (typeof btoa === 'function') ? btoa(bin) : '';
     if (url) b = b.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     return b;
+  }
+
+  function base64ByteLength(str) {
+    let len = 0;
+    for (let i = 0; i < str.length; i++) {
+      const ch = str[i];
+      if (ch === '=') break;
+      if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+          (ch >= '0' && ch <= '9') || ch === '+' || ch === '/' ||
+          ch === '-' || ch === '_') {
+        len++;
+      }
+    }
+    return Math.floor((len * 3) / 4);
+  }
+
+  function bytesFromArrayBufferInput(input) {
+    try {
+      if (input instanceof ArrayBuffer) return new Uint8Array(input);
+      if (ArrayBuffer.isView(input)) {
+        return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+      }
+    } catch {
+      throw invalidState('Cannot validate a detached ArrayBuffer');
+    }
+    throw invalidArgType('input', 'ArrayBuffer, Buffer, TypedArray, or DataView', input);
+  }
+
+  function isAsciiBytes(input) {
+    const bytes = bytesFromArrayBufferInput(input);
+    for (let i = 0; i < bytes.length; i++) if (bytes[i] > 0x7f) return false;
+    return true;
+  }
+
+  function validTrail(byte) {
+    return (byte & 0xc0) === 0x80;
+  }
+
+  function isUtf8Bytes(input) {
+    const bytes = bytesFromArrayBufferInput(input);
+    for (let i = 0; i < bytes.length;) {
+      const b0 = bytes[i++];
+      if (b0 <= 0x7f) continue;
+      if (b0 >= 0xc2 && b0 <= 0xdf) {
+        if (i >= bytes.length || !validTrail(bytes[i++])) return false;
+        continue;
+      }
+      if (b0 === 0xe0) {
+        if (i + 1 >= bytes.length || bytes[i] < 0xa0 || bytes[i] > 0xbf || !validTrail(bytes[i + 1])) return false;
+        i += 2;
+        continue;
+      }
+      if ((b0 >= 0xe1 && b0 <= 0xec) || (b0 >= 0xee && b0 <= 0xef)) {
+        if (i + 1 >= bytes.length || !validTrail(bytes[i]) || !validTrail(bytes[i + 1])) return false;
+        i += 2;
+        continue;
+      }
+      if (b0 === 0xed) {
+        if (i + 1 >= bytes.length || bytes[i] < 0x80 || bytes[i] > 0x9f || !validTrail(bytes[i + 1])) return false;
+        i += 2;
+        continue;
+      }
+      if (b0 === 0xf0) {
+        if (i + 2 >= bytes.length || bytes[i] < 0x90 || bytes[i] > 0xbf || !validTrail(bytes[i + 1]) || !validTrail(bytes[i + 2])) return false;
+        i += 3;
+        continue;
+      }
+      if (b0 >= 0xf1 && b0 <= 0xf3) {
+        if (i + 2 >= bytes.length || !validTrail(bytes[i]) || !validTrail(bytes[i + 1]) || !validTrail(bytes[i + 2])) return false;
+        i += 3;
+        continue;
+      }
+      if (b0 === 0xf4) {
+        if (i + 2 >= bytes.length || bytes[i] < 0x80 || bytes[i] > 0x8f || !validTrail(bytes[i + 1]) || !validTrail(bytes[i + 2])) return false;
+        i += 3;
+        continue;
+      }
+      return false;
+    }
+    return true;
   }
 
   function inspectBuffer(buf) {
@@ -588,9 +673,14 @@ if (!Buffer) {
     of(...args) { return new Buffer(args); },
     isBuffer(b) { return b instanceof Buffer; },
     isEncoding(e) { return typeof e === 'string' && enc.normalize(e) !== undefined; },
-    byteLength(string, encoding) {
-      if (string instanceof Uint8Array || string instanceof ArrayBuffer) return string.byteLength;
-      return bytesFromString(String(string), encoding).length;
+    byteLength(value, encoding) {
+      if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return value.byteLength;
+      if (typeof value !== 'string') {
+        throw invalidArgType('string', 'string or an instance of Buffer or ArrayBuffer', value);
+      }
+      const e = enc.normalize(encoding) || 'utf8';
+      if (e === 'base64' || e === 'base64url') return base64ByteLength(value);
+      return bytesFromString(value, e).length;
     },
     concat(list, totalLength) {
       if (totalLength === undefined) { totalLength = 0; for (const b of list) totalLength += b.length; }
@@ -615,6 +705,8 @@ if (!Buffer) {
       return 0;
     },
     isView(v) { return ArrayBuffer.isView(v); },
+    isAscii: isAsciiBytes,
+    isUtf8: isUtf8Bytes,
     copyBytesFrom(view, offset = 0, length) {
       const u8 = new Uint8Array(view.buffer, view.byteOffset + offset * view.BYTES_PER_ELEMENT,
         (length === undefined ? view.length - offset : length) * view.BYTES_PER_ELEMENT);
@@ -644,5 +736,6 @@ module.exports = {
   INSPECT_MAX_BYTES: 50,
   atob: typeof atob === 'function' ? atob : undefined,
   btoa: typeof btoa === 'function' ? btoa : undefined,
-  isUtf8(input) { try { return Buffer.from(input).toString('utf8') !== undefined; } catch { return false; } },
+  isAscii: Buffer.isAscii,
+  isUtf8: Buffer.isUtf8,
 };

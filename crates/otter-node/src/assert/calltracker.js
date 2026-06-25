@@ -129,9 +129,13 @@ module.exports = function makeCallTracker(AssertionError) {
     }
 
     reset(fn) {
+      // `reset()` with no argument resets the recorded calls of every
+      // tracked function but keeps them tracked; `reset(fn)` resets one.
       if (fn === undefined) {
-        this._checks = [];
-        this._byWrapper = new Map();
+        for (const check of this._checks) {
+          check.actual = 0;
+          check.calls.length = 0;
+        }
         return;
       }
       const check = this._byWrapper.get(fn);

@@ -116,7 +116,7 @@ pub fn run_builtin_cjs_shim(
     let (interp, context) = ctx.interp_mut_and_context();
     let context = context.ok_or_else(|| "missing execution context for shim load".to_string())?;
     let wrapper = interp
-        .create_commonjs_wrapper(source)
+        .create_commonjs_wrapper(name, source)
         .map_err(|e| e.to_string())?;
     let call_args: SmallVec<[Value; 8]> =
         smallvec![exports_val, require_val, module_val, name_val, name_val,];
@@ -379,7 +379,7 @@ pub(crate) fn cjs_instantiate_file(
         runtime_type_error("require", "missing execution context for module load")
     })?;
     let wrapper = interp
-        .create_commonjs_wrapper(source)
+        .create_commonjs_wrapper(&id, source)
         .map_err(|e| vm_err(interp, e))?;
     let call_args: SmallVec<[Value; 8]> = smallvec![
         exports_val,

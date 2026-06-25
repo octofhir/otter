@@ -133,6 +133,10 @@ struct ModuleEdge {
 struct ModuleGraph {
     entry_url: String,
     nodes: BTreeMap<String, ModuleNode>,
+    /// `module_url → verbatim source text` for every real compiled
+    /// module, forwarded to the interpreter so `Error.prototype.stack`
+    /// and `util.getCallSites` can resolve frame spans to `(line, col)`.
+    module_sources: BTreeMap<String, String>,
 }
 
 impl ModuleGraph {
@@ -159,6 +163,7 @@ impl ModuleGraph {
             module,
             entry_url: self.entry_url,
             metadata,
+            module_sources: self.module_sources,
         })
     }
 }
@@ -174,6 +179,7 @@ struct ModuleGraphBuilder<'a> {
     nodes: BTreeMap<String, ModuleNode>,
     queue: Vec<(String, SourceKind, String, bool)>,
     load_count: usize,
+    module_sources: BTreeMap<String, String>,
 }
 
 impl<'a> ModuleGraphBuilder<'a> {
@@ -189,6 +195,7 @@ impl<'a> ModuleGraphBuilder<'a> {
             nodes: BTreeMap::new(),
             queue: vec![(entry_url, entry_kind, entry_text, false)],
             load_count: 0,
+            module_sources: BTreeMap::new(),
         }
     }
 
@@ -206,6 +213,7 @@ impl<'a> ModuleGraphBuilder<'a> {
         Ok(ModuleGraph {
             entry_url: self.entry_url,
             nodes: self.nodes,
+            module_sources: self.module_sources,
         })
     }
 
@@ -234,6 +242,12 @@ impl<'a> ModuleGraphBuilder<'a> {
         if self.load_count > MODULE_DEPTH_LIMIT {
             return Err(GraphError::Cycle { url });
         }
+
+        // Retain the verbatim source so the interpreter can map this
+        // module's frame spans back to `(line, column)` for
+        // `Error.prototype.stack` / `util.getCallSites`. Captured before
+        // `with_program` consumes `text`.
+        self.module_sources.insert(url.clone(), text.clone());
 
         let (compiled, deps, queued) = with_program(text, kind, |program| {
             let requests = collect_module_requests(program);
@@ -1039,6 +1053,10 @@ pub struct LinkedProgram {
     pub entry_url: String,
     /// Per-source compiler metadata for linked modules before bytecode merge.
     pub metadata: Vec<CompiledModuleMetadata>,
+    /// `module_url → verbatim source text` for every real compiled
+    /// module. The runtime registers these with the interpreter before
+    /// evaluation so frame spans resolve to `(line, column)`.
+    pub module_sources: BTreeMap<String, String>,
 }
 
 /// Top-level entry: load the dependency graph rooted at `entry_path`,

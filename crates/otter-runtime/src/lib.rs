@@ -2025,6 +2025,7 @@ impl Runtime {
             self.source_maps.record_compiled_metadata(metadata);
         }
         self.register_resolved_exports(&linked.metadata);
+        self.register_module_sources(&linked.module_sources);
         let context = self.interp.link_module(linked.module);
         for init in context.module_inits() {
             if self.interp.module_env(&init.url).is_some() {
@@ -3001,6 +3002,17 @@ impl Runtime {
         }
     }
 
+    /// Forward every linked module's verbatim source to the interpreter
+    /// so `Error.prototype.stack` and `util.getCallSites` can resolve a
+    /// frame's byte span to a `(line, column)` position. Called once per
+    /// graph load, before evaluation begins.
+    fn register_module_sources(&mut self, sources: &std::collections::BTreeMap<String, String>) {
+        for (url, text) in sources {
+            self.interp
+                .register_module_source(url.clone(), std::sync::Arc::from(text.as_str()));
+        }
+    }
+
     pub(crate) fn run_module_with_context(
         &mut self,
         entry_path: impl AsRef<Path>,
@@ -3027,6 +3039,7 @@ impl Runtime {
         // After `allocate_for_module_inits` (which resets per-run module
         // state); registering earlier would be wiped by that reset.
         self.register_resolved_exports(&linked.metadata);
+        self.register_module_sources(&linked.module_sources);
         self.module_records
             .for_each_record(|url, _function_id, _env| {
                 // Self-loop edge: <entry>'s referrer is the entry's URL

@@ -376,6 +376,63 @@ pub fn render_error_to_string(value: &Value, gc_heap: &otter_gc::GcHeap) -> Stri
     }
 }
 
+/// V8's default `Error.stackTraceLimit`: capture at most 10 frames.
+pub(crate) const DEFAULT_STACK_TRACE_LIMIT: usize = 10;
+
+/// Read the live `Error.stackTraceLimit` and translate it to a frame
+/// cap, matching V8's coercion at capture time: a non-negative finite
+/// number caps the count, `Infinity` keeps every frame, and a missing
+/// property falls back to the default 10. A non-number or a value `<= 0`
+/// (or `NaN`) disables capture entirely.
+pub(crate) fn stack_trace_limit(ctx: &mut NativeCtx<'_>) -> usize {
+    let Some(error_ctor) = ctx.global_value("Error") else {
+        return DEFAULT_STACK_TRACE_LIMIT;
+    };
+    let Some(obj) = error_ctor.as_object() else {
+        return DEFAULT_STACK_TRACE_LIMIT;
+    };
+    match crate::object::get(obj, ctx.heap(), "stackTraceLimit") {
+        None => DEFAULT_STACK_TRACE_LIMIT,
+        Some(v) => match v.as_f64() {
+            Some(n) if n.is_infinite() && n > 0.0 => usize::MAX,
+            Some(n) if n.is_finite() && n >= 1.0 => n as usize,
+            // NaN, non-positive, or non-number → no capture.
+            _ => 0,
+        },
+    }
+}
+
+/// `true` when a frame's function name is one of the interpreter's
+/// synthetic placeholders (`<main>`, `<anonymous>`, `<arrow>`, …),
+/// which V8 renders without a leading function name.
+fn is_anonymous_frame_name(name: &str) -> bool {
+    name.is_empty() || name.starts_with('<')
+}
+
+/// Append V8-style frame lines to an error's stack string. Each line is
+/// `    at <fn> (<module>:<line>:<col>)`, or `    at <module>:<line>:<col>`
+/// for anonymous/top-level frames. Line/column come from the registered
+/// module source (1-based, UTF-16 columns); when the source is unknown
+/// the module URL is emitted without a position.
+pub(crate) fn append_stack_frames(
+    out: &mut String,
+    frames: &[crate::run_control::StackFrameSnapshot],
+    interp: &crate::Interpreter,
+) {
+    use std::fmt::Write as _;
+    for frame in frames {
+        let location = match interp.source_line_col(&frame.module, frame.span.0) {
+            Some((line, col)) => format!("{}:{}:{}", frame.module, line, col),
+            None => frame.module.clone(),
+        };
+        if is_anonymous_frame_name(&frame.function_name) {
+            let _ = write!(out, "\n    at {location}");
+        } else {
+            let _ = write!(out, "\n    at {} ({location})", frame.function_name);
+        }
+    }
+}
+
 impl ErrorClassRegistry {
     /// Walk every GC-managed object held by the registry.
     ///
@@ -540,9 +597,16 @@ impl ErrorClassRegistry {
             if !has_error_data {
                 return Ok(Value::undefined());
             }
-            // step 4 — implementation-defined stack string. Otter does
-            // not capture frames, so report the error's string form.
-            let rendered = render_error_to_string(&receiver, ctx.heap());
+            // step 4 — implementation-defined stack string. The header
+            // is the error's `toString` form (`Name: message`); when
+            // construction captured a call stack, append V8-style frame
+            // lines `    at <fn> (<module>:<line>:<col>)`.
+            let mut rendered = render_error_to_string(&receiver, ctx.heap());
+            if let Some(obj) = receiver.as_object()
+                && let Some(frames) = crate::object::error_stack_frames(obj, ctx.heap())
+            {
+                append_stack_frames(&mut rendered, &frames, ctx.interp_mut());
+            }
             let s = JsString::from_str(&rendered, ctx.heap_mut()).map_err(|err| {
                 NativeError::TypeError {
                     name: "get Error.prototype.stack",
@@ -794,6 +858,20 @@ impl ErrorClassRegistry {
             }
             if let Some(cause) = cause {
                 install_error_cause(obj, cause, ctx.heap_mut());
+            }
+            // Capture the construction-site JS call stack for
+            // `Error.prototype.stack` (matches V8: frames recorded
+            // eagerly at construction, bounded by `Error.stackTraceLimit`,
+            // formatted lazily on first `.stack` access).
+            let limit = stack_trace_limit(ctx);
+            if limit > 0 {
+                let mut frames = ctx.interp_mut().capture_active_frames(&context);
+                if frames.len() > limit {
+                    frames.truncate(limit);
+                }
+                if !frames.is_empty() {
+                    object::set_error_stack_frames(obj, ctx.heap_mut(), frames);
+                }
             }
             Ok(Value::object(obj))
         }
@@ -1065,6 +1143,104 @@ impl ErrorClassRegistry {
             gc_heap,
             "isError",
             PropertyDescriptor::data(Value::native_function(is_error_native), true, false, true),
+        );
+        // V8 extension `Error.captureStackTrace(target[, constructorOpt])`:
+        // record the current call stack onto `target.stack`. When
+        // `constructorOpt` is a function, every frame at or above the
+        // topmost frame named like that function is omitted (skip-until-
+        // function), so a subclass constructor can hide its own frame.
+        fn error_capture_stack_trace(
+            ctx: &mut NativeCtx<'_>,
+            args: &[Value],
+        ) -> Result<Value, NativeError> {
+            let target = args.first().copied().unwrap_or_else(Value::undefined);
+            let Some(target_obj) = target.as_object() else {
+                return Err(NativeError::TypeError {
+                    name: "Error.captureStackTrace",
+                    reason: "target must be an object".to_string(),
+                });
+            };
+            let context =
+                ctx.execution_context()
+                    .cloned()
+                    .ok_or_else(|| NativeError::TypeError {
+                        name: "Error.captureStackTrace",
+                        reason: "missing execution context".to_string(),
+                    })?;
+            let limit = stack_trace_limit(ctx);
+            let mut frames = if limit > 0 {
+                ctx.interp_mut().capture_active_frames(&context)
+            } else {
+                Vec::new()
+            };
+            // skip-until-function: when `constructorOpt` is a function,
+            // drop every frame at or above the topmost frame belonging to
+            // it (matched by function identity, the V8 semantics). This
+            // lets a subclass constructor hide its own and inner frames.
+            if let Some(ctor) = args.get(1).copied() {
+                let skip_fid = ctor
+                    .as_function()
+                    .or_else(|| ctor.as_closure(ctx.heap()).map(|c| c.function_id()));
+                if let Some(fid) = skip_fid
+                    && let Some(pos) = frames.iter().position(|f| f.function_id == fid)
+                {
+                    frames.drain(0..=pos);
+                }
+            }
+            if frames.len() > limit {
+                frames.truncate(limit);
+            }
+            if crate::object::has_error_data(target_obj, ctx.heap()) {
+                // Target inherits the `Error.prototype.stack` getter:
+                // store frames and let it format lazily (V8 model).
+                crate::object::set_error_stack_frames(target_obj, ctx.heap_mut(), frames);
+            } else {
+                // Plain object: install an own formatted `stack` data
+                // property (the JSC-style eager shape, acceptable per the
+                // TC39 capture-stack-trace proposal).
+                let mut rendered = render_error_to_string(&target, ctx.heap());
+                append_stack_frames(&mut rendered, &frames, ctx.interp_mut());
+                let s = JsString::from_str(&rendered, ctx.heap_mut()).map_err(|err| {
+                    NativeError::TypeError {
+                        name: "Error.captureStackTrace",
+                        reason: err.to_string(),
+                    }
+                })?;
+                let _ = object::define_own_property(
+                    target_obj,
+                    ctx.heap_mut(),
+                    "stack",
+                    PropertyDescriptor::data(Value::string(s), true, false, true),
+                );
+            }
+            Ok(Value::undefined())
+        }
+        let capture_native = native_static_with_roots(
+            gc_heap,
+            "captureStackTrace",
+            2,
+            error_capture_stack_trace,
+            &[],
+        )?;
+        let _ = object::define_own_property(
+            error_ctor,
+            gc_heap,
+            "captureStackTrace",
+            PropertyDescriptor::data(Value::native_function(capture_native), true, false, true),
+        );
+        // V8 extension `Error.stackTraceLimit` (default 10): the maximum
+        // number of frames captured for `Error.prototype.stack`. Writable
+        // so user code can raise, lower, or disable (`0`) capture.
+        let _ = object::define_own_property(
+            error_ctor,
+            gc_heap,
+            "stackTraceLimit",
+            PropertyDescriptor::data(
+                Value::number(NumberValue::from_i32(DEFAULT_STACK_TRACE_LIMIT as i32)),
+                true,
+                false,
+                true,
+            ),
         );
         entries.push((
             ErrorKind::Error,

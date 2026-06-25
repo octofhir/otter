@@ -306,6 +306,10 @@ pub use otter_bytecode::NO_HANDLER_OFFSET;
 /// reuses it for catchable error frames.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StackFrameSnapshot {
+    /// Bytecode function id of the frame. Lets `Error.captureStackTrace`
+    /// match its `constructorOpt` argument by function identity rather
+    /// than by (ambiguous) name when trimming frames.
+    pub function_id: u32,
     /// Function name; `<main>` for the script entry,
     /// `<arrow>`/`<anonymous>` for function expressions.
     pub function_name: String,

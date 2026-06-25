@@ -502,16 +502,41 @@ impl Interpreter {
     /// # Errors
     /// Returns a `VmError` if the body fails to compile (surfaced as a
     /// `SyntaxError`) or if the eval/compiler hook is not installed.
-    pub fn create_commonjs_wrapper(&mut self, body: &str) -> Result<Value, VmError> {
-        let parts = vec![
-            "exports".to_string(),
-            "require".to_string(),
-            "module".to_string(),
-            "__filename".to_string(),
-            "__dirname".to_string(),
-            body.to_string(),
-        ];
-        self.build_function_constructor_from_parts(parts)
+    pub fn create_commonjs_wrapper(
+        &mut self,
+        module_url: &str,
+        body: &str,
+    ) -> Result<Value, VmError> {
+        // Node-style wrapper with the entire prologue on line 1, so a
+        // source line `N` maps to wrapped line `N`: stack-trace line
+        // numbers match the original file (only line-1 columns carry the
+        // prologue offset — the same quirk Node has).
+        let source =
+            format!("(function (exports, require, module, __filename, __dirname) {{ {body}\n}})");
+        let mut module = self.compile_eval_source(&source, EvalCompileOptions::default())?;
+        // Stamp the synthesized module + its functions with the file URL
+        // so frames captured for `Error.prototype.stack` report the file
+        // rather than the synthetic eval name.
+        module.module = module_url.to_string();
+        for function in &mut module.functions {
+            function.module_url = module_url.to_string();
+        }
+        // Register the wrapped source so frame spans resolve to
+        // `(line, column)` against it.
+        self.register_module_source(
+            module_url.to_string(),
+            std::sync::Arc::from(source.as_str()),
+        );
+        let context = self.link_module(module);
+        // Running the synthesised module's `<main>` returns the wrapper
+        // function value (the parenthesised expression is the program's
+        // completion).
+        let mut stack: HoltStack = HoltStack::new();
+        stack.push(Frame::for_function_with_heap(
+            context.main(),
+            &mut self.gc_heap,
+        )?);
+        self.dispatch_loop(&context, &mut stack)
     }
 
     /// §20.2.1.1.1 CreateDynamicFunction steps 7–20: synthesise the

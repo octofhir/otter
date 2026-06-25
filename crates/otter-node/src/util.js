@@ -4,6 +4,10 @@
 // promisify, inherits, isDeepStrictEqual, deprecate, styleText.
 // Run dependency-free through run_builtin_cjs_shim.
 
+// Native call-site capture (Rust): returns a JSON array of call-site
+// records. `getCallSites` skips its own frame and parses the result.
+const __captureCallSites = require('__otter_callsites');
+
 const objToString = (v) => Object.prototype.toString.call(v);
 
 // Node's lib/internal/errors invalidArgTypeHelper suffix, used by the
@@ -813,8 +817,19 @@ const exportsObj = {
   },
   toUSVString(s) { return String(s); },
   getSystemErrorName(err) { return `Unknown system error ${err}`; },
-  getCallSites() { return []; },
-  getCallSite() { return []; },
+  getCallSites(frameCountOrOptions, options) {
+    // Node signature: getCallSites([frameCount][, options]). We support
+    // the numeric frame count; default 10. `sourceMap` option is not yet
+    // honoured. Skip 1 frame so the first call site is the caller, not
+    // this wrapper.
+    let frameCount = 10;
+    if (typeof frameCountOrOptions === 'number') {
+      frameCount = frameCountOrOptions;
+    } else if (frameCountOrOptions && typeof frameCountOrOptions === 'object') {
+      options = frameCountOrOptions;
+    }
+    return JSON.parse(__captureCallSites(1, frameCount));
+  },
   _extend(target, source) {
     if (source === null || typeof source !== 'object') return target;
     for (const k of Object.keys(source)) target[k] = source[k];

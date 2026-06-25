@@ -596,6 +596,12 @@ struct ExoticSlots {
     date_data: Option<f64>,
     /// `[[ErrorData]]` presence marker (§20.5).
     error_data: bool,
+    /// Captured JS call-stack frames (top-of-stack first) recorded at
+    /// the moment this error object was constructed, or installed by
+    /// `Error.captureStackTrace`. Drives `Error.prototype.stack` and
+    /// `util.getCallSites`. `None` until captured; holds only owned
+    /// `String`/offset data (no GC handles), so it needs no tracing.
+    error_stack_frames: Option<Vec<crate::run_control::StackFrameSnapshot>>,
     /// `[[ParameterMap]]` presence marker for arguments-exotic objects
     /// (§10.4.4); mapping data itself lives in `host_data`.
     is_arguments_object: bool,
@@ -871,6 +877,11 @@ impl ObjectBody {
     #[inline]
     fn error_data(&self) -> bool {
         self.exotic().is_some_and(|e| e.error_data)
+    }
+    #[inline]
+    fn has_error_stack_frames(&self) -> bool {
+        self.exotic()
+            .is_some_and(|e| e.error_stack_frames.is_some())
     }
     #[inline]
     fn is_arguments_object(&self) -> bool {
@@ -2130,6 +2141,36 @@ pub fn set_error_data(obj: JsObject, heap: &mut otter_gc::GcHeap) {
 #[must_use]
 pub fn has_error_data(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
     heap.read_payload(obj, |body| body.error_data())
+}
+
+/// Record the captured JS call-stack frames for an error object
+/// (top-of-stack first). Replaces any previously captured frames, as
+/// `Error.captureStackTrace` may re-capture onto an existing target.
+pub fn set_error_stack_frames(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    frames: Vec<crate::run_control::StackFrameSnapshot>,
+) {
+    heap.with_payload(obj, |body| {
+        body.exotic_mut().error_stack_frames = Some(frames);
+    });
+}
+
+/// Read a clone of the captured stack frames, if any were recorded.
+#[must_use]
+pub fn error_stack_frames(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+) -> Option<Vec<crate::run_control::StackFrameSnapshot>> {
+    heap.read_payload(obj, |body| {
+        body.exotic().and_then(|e| e.error_stack_frames.clone())
+    })
+}
+
+/// `true` when the object carries captured stack frames.
+#[must_use]
+pub fn has_error_stack_frames(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
+    heap.read_payload(obj, |body| body.has_error_stack_frames())
 }
 
 /// Tag an object as carrying the `[[IsRawJSON]]` internal slot

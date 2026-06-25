@@ -2322,9 +2322,16 @@ impl Interpreter {
             // property setter.
             if let Some(arr) = o.as_array() {
                 if !self.array_ordinary_set_own(context, arr, &key, arg)? {
-                    return Err(self.err_type(
-                        (format!("Cannot assign to read only property '{key}'")).into(),
-                    ));
+                    // A non-extensible (sealed / frozen) array fails to
+                    // create the fresh index — V8 reports this as an
+                    // "add property" failure, distinct from assigning a
+                    // read-only existing property.
+                    let message = if crate::array::is_extensible(arr, self.gc_heap()) {
+                        format!("Cannot assign to read only property '{key}'")
+                    } else {
+                        format!("Cannot add property {key}, object is not extensible")
+                    };
+                    return Err(self.err_type(message.into()));
                 }
             } else {
                 self.array_set_property_throwing(context, o, &key, arg)?;

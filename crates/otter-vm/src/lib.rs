@@ -125,6 +125,7 @@ pub mod run_control;
 pub mod runtime_budget;
 pub mod runtime_cx;
 pub mod runtime_state;
+pub mod source_registry;
 mod static_call_ops;
 mod static_load_ops;
 pub mod string;
@@ -726,6 +727,27 @@ pub struct Interpreter {
     /// not the empty post-unwind stack. Cleared at every `run_*`
     /// entry and at every successful catch.
     pending_uncaught_frames: Option<Vec<StackFrameSnapshot>>,
+    /// Per-interpreter map of `module_url → source text` (+ line index),
+    /// populated by the runtime module loader. Lets the VM resolve a
+    /// frame's byte span to a `(line, column)` position for
+    /// `Error.prototype.stack` and `util.getCallSites` without reaching
+    /// back into the runtime layer.
+    module_sources: source_registry::SourceRegistry,
+    /// Read-only pointer to the [`HoltStack`] currently being driven by
+    /// [`Self::dispatch_loop`]. Lets inline native calls (e.g. the
+    /// `Error` constructor, `Error.captureStackTrace`) snapshot the live
+    /// JS call stack for `Error.prototype.stack` without threading the
+    /// stack through every native ABI.
+    ///
+    /// # Invariants
+    /// - Non-null only while a `dispatch_loop` frame is on the Rust
+    ///   stack; nested dispatch loops save/restore the parent pointer so
+    ///   it always names the innermost executing stack.
+    /// - Dereferenced as `&HoltStack` ONLY from inside an inline native
+    ///   call, where the owning `&mut HoltStack` in `dispatch_loop` is
+    ///   dormant (the loop is paused on the native). Never written
+    ///   through.
+    active_frame_stack: *const holt_stack::HoltStack,
     /// Per-function user-property bag (§20.2.4 Function-instance
     /// properties + ordinary [[Set]] semantics for callables).
     /// `function_id` → `JsObject` carrying anything the user wrote
@@ -1073,6 +1095,27 @@ pub struct EvalCompileOptions {
     pub super_property_allowed: bool,
 }
 
+/// One call-site record for `util.getCallSites`, serialized to JSON and
+/// reconstituted as a plain object on the JS side. Field names match
+/// Node's `CallSite` property shape.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CallSiteInfo {
+    /// Frame function name (`<anonymous>` / `<main>` for unnamed frames).
+    #[serde(rename = "functionName")]
+    pub function_name: String,
+    /// Module URL / file path the frame was compiled from.
+    #[serde(rename = "scriptName")]
+    pub script_name: String,
+    /// 1-based source line of the frame's current instruction.
+    #[serde(rename = "lineNumber")]
+    pub line_number: u32,
+    /// 1-based source column (UTF-16 units); Node's `columnNumber`.
+    #[serde(rename = "columnNumber")]
+    pub column_number: u32,
+    /// Alias of [`Self::column_number`] for Node's `column` accessor.
+    pub column: u32,
+}
+
 /// One caller-environment binding visible to a direct eval body.
 #[derive(Debug, Clone)]
 pub struct EvalCallerBinding {
@@ -1300,6 +1343,8 @@ impl Interpreter {
             pending_uncaught_throw: None,
             iteration_anchors: Vec::new(),
             pending_uncaught_frames: None,
+            module_sources: source_registry::SourceRegistry::default(),
+            active_frame_stack: std::ptr::null(),
             function_user_props: std::collections::HashMap::new(),
             function_prototype_overrides: std::collections::HashMap::new(),
             function_non_extensible: std::collections::HashSet::new(),
@@ -3898,6 +3943,101 @@ impl Interpreter {
         self.tracer = tracer;
     }
 
+    /// Register a module's verbatim source text so the VM can resolve a
+    /// frame's byte span to a `(line, column)` for `Error.prototype.stack`
+    /// and `util.getCallSites`. The runtime module loader calls this as it
+    /// loads each module fragment; replays simply rebuild the line index.
+    pub fn register_module_source(
+        &mut self,
+        module_url: impl Into<String>,
+        text: std::sync::Arc<str>,
+    ) {
+        self.module_sources.register(module_url, text);
+    }
+
+    /// Resolve a `(module_url, byte_offset)` to a 1-based `(line, column)`
+    /// position when the module's source has been registered.
+    pub(crate) fn source_line_col(&self, module_url: &str, byte_offset: u32) -> Option<(u32, u32)> {
+        self.module_sources.line_col(module_url, byte_offset)
+    }
+
+    /// Read the live `Error.stackTraceLimit` and translate it to a frame
+    /// cap, matching V8's coercion: a finite `>= 1` number caps the
+    /// count, `+Infinity` keeps every frame, a missing property falls
+    /// back to the default 10, and anything else (`<= 0`, `NaN`, a
+    /// non-number) disables capture.
+    pub(crate) fn current_stack_trace_limit(&self) -> usize {
+        let ctor = self
+            .error_classes
+            .constructor(error_classes::ErrorKind::Error);
+        match crate::object::get(ctor, &self.gc_heap, "stackTraceLimit") {
+            None => error_classes::DEFAULT_STACK_TRACE_LIMIT,
+            Some(v) => match v.as_f64() {
+                Some(n) if n.is_infinite() && n > 0.0 => usize::MAX,
+                Some(n) if n.is_finite() && n >= 1.0 => n as usize,
+                _ => 0,
+            },
+        }
+    }
+
+    /// Snapshot the live JS call stack currently driven by
+    /// [`Self::dispatch_loop`], top-of-stack first. Returns an empty
+    /// vector when no dispatch loop is active (e.g. a native invoked
+    /// outside interpretation). Used by the `Error` constructor and
+    /// `Error.captureStackTrace` to record the construction-site stack
+    /// for `Error.prototype.stack`.
+    pub(crate) fn capture_active_frames(
+        &self,
+        context: &ExecutionContext,
+    ) -> Vec<StackFrameSnapshot> {
+        if self.active_frame_stack.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: `active_frame_stack` is set by `dispatch_loop` to the
+        // `&mut HoltStack` it is driving and cleared on exit, so it is
+        // non-null only while that stack is alive on the Rust call
+        // stack. This read happens from an inline native call, where the
+        // owning `&mut` borrow in `dispatch_loop_inner` is dormant (the
+        // loop is paused on the native), so no aliasing access races the
+        // shared read. The pointer is never written through.
+        let stack = unsafe { &*self.active_frame_stack };
+        error_ops::snapshot_frames(context, stack)
+    }
+
+    /// Capture the live JS call stack as a JSON array of call-site
+    /// records for `util.getCallSites`. `skip` drops that many frames
+    /// from the top (so a JS wrapper can hide its own frame) and `count`
+    /// caps how many remain. Each record carries Node's property shape
+    /// (`functionName`, `scriptName`, `lineNumber`, `column`,
+    /// `columnNumber`); the caller `JSON.parse`s it into plain objects.
+    pub fn capture_call_sites_json(
+        &self,
+        context: &ExecutionContext,
+        skip: usize,
+        count: usize,
+    ) -> String {
+        let mut frames = self.capture_active_frames(context);
+        let skip = skip.min(frames.len());
+        frames.drain(0..skip);
+        if frames.len() > count {
+            frames.truncate(count);
+        }
+        let sites: Vec<CallSiteInfo> = frames
+            .into_iter()
+            .map(|f| {
+                let (line, column) = self.source_line_col(&f.module, f.span.0).unwrap_or((0, 0));
+                CallSiteInfo {
+                    function_name: f.function_name,
+                    script_name: f.module,
+                    line_number: line,
+                    column_number: column,
+                    column,
+                }
+            })
+            .collect();
+        serde_json::to_string(&sites).unwrap_or_else(|_| "[]".to_string())
+    }
+
     /// Enable the VM stack profiler, sampling every `interval` bytecode ticks.
     pub fn enable_cpu_profiler(&mut self, interval: u64) {
         self.cpu_profiler = Some(cpu_profile::CpuProfiler::new(interval));
@@ -5722,6 +5862,26 @@ impl Interpreter {
         }
     }
 
+    /// Thin wrapper around [`Self::dispatch_loop_tracked`] that publishes
+    /// `stack` as the interpreter's [`Self::active_frame_stack`] for the
+    /// duration of the loop, restoring the parent pointer on exit. This
+    /// is how inline native calls (the `Error` constructor,
+    /// `Error.captureStackTrace`) reach the live JS call stack — the
+    /// same role V8's isolate-owned `StackFrameIterator` plays. Nested
+    /// dispatch loops (sync callbacks, generator drives) save/restore so
+    /// the pointer always names the innermost executing stack.
+    fn dispatch_loop(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+    ) -> Result<Value, VmError> {
+        let previous = self.active_frame_stack;
+        self.active_frame_stack = stack as *const HoltStack;
+        let result = self.dispatch_loop_tracked(context, stack);
+        self.active_frame_stack = previous;
+        result
+    }
+
     /// Drive the dispatch loop, converting convertible `VmError`
     /// variants (TypeMismatch, NotCallable, TemporalDeadZone,
     /// OutOfMemory, etc.)
@@ -5735,7 +5895,7 @@ impl Interpreter {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-error-objects>
     /// - <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard>
-    fn dispatch_loop(
+    fn dispatch_loop_tracked(
         &mut self,
         context: &ExecutionContext,
         stack: &mut HoltStack,

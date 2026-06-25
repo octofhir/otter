@@ -43,6 +43,7 @@ impl Interpreter {
             owned_message,
             &value,
         )?;
+        self.capture_error_stack_frames(context, stack, obj);
         let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::object(obj))?;
         frame.advance_pc(self.current_byte_len)?;
@@ -66,10 +67,34 @@ impl Interpreter {
         let value = *read_register(frame, msg_reg)?;
         let owned_message = self.coerce_error_message(context, &value)?;
         let obj = self.make_error_instance_with_stack_roots(stack, kind, owned_message, &value)?;
+        self.capture_error_stack_frames(context, stack, obj);
         let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::object(obj))?;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
+    }
+
+    /// Record the construction-site JS call stack (top-of-stack first,
+    /// bounded by `Error.stackTraceLimit`) onto a freshly built error
+    /// instance for `Error.prototype.stack`. No-op when the limit is 0
+    /// or the stack is empty.
+    fn capture_error_stack_frames(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &HoltStack,
+        obj: object::JsObject,
+    ) {
+        let limit = self.current_stack_trace_limit();
+        if limit == 0 {
+            return;
+        }
+        let mut frames = snapshot_frames(context, stack);
+        if frames.len() > limit {
+            frames.truncate(limit);
+        }
+        if !frames.is_empty() {
+            object::set_error_stack_frames(obj, self.gc_heap_mut(), frames);
+        }
     }
 
     /// §20.5.1.1 step 3 — coerce the `message` argument through full
@@ -448,6 +473,7 @@ pub(crate) fn snapshot_frames(
                 .map(|fun| fun.module_url.clone())
                 .unwrap_or_else(|| context.module_name().to_string());
             StackFrameSnapshot {
+                function_id: f.function_id,
                 function_name,
                 module: module_url,
                 span,

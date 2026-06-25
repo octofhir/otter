@@ -3041,6 +3041,20 @@ impl Interpreter {
     /// completes; rejects in strict mode with TypeError when the
     /// resolved descriptor is non-writable / accessor-without-setter /
     /// non-extensible.
+    /// Pick the right TypeError text for a rejected `[[Set]]`: adding a
+    /// brand-new property to a non-extensible (sealed / frozen) object is
+    /// V8's "Cannot add property X, object is not extensible", distinct
+    /// from the `fallback` used when an existing property is unwritable
+    /// or accessor-only.
+    fn extensibility_aware_set_message(&self, obj: JsObject, key: &str, fallback: String) -> String {
+        let is_new = crate::object::get_own(obj, &self.gc_heap, key).is_none();
+        if is_new && !crate::object::is_extensible(obj, &self.gc_heap) {
+            format!("Cannot add property {key}, object is not extensible")
+        } else {
+            fallback
+        }
+    }
+
     pub(crate) fn ordinary_set_with_callable_setter(
         &mut self,
         context: &ExecutionContext,
@@ -3054,10 +3068,12 @@ impl Interpreter {
                 if self.ordinary_set_data_property(obj, key, value)? {
                     Ok(())
                 } else {
-                    self.failed_set_result(
-                        strict,
+                    let message = self.extensibility_aware_set_message(
+                        obj,
+                        key,
                         format!("Cannot assign to read-only property '{key}'"),
-                    )
+                    );
+                    self.failed_set_result(strict, message)
                 }
             }
             object::SetOutcome::InvokeSetter { setter } => {
@@ -3067,7 +3083,12 @@ impl Interpreter {
                 Ok(())
             }
             object::SetOutcome::Reject { .. } => {
-                self.failed_set_result(strict, format!("Cannot assign to property '{key}'"))
+                let message = self.extensibility_aware_set_message(
+                    obj,
+                    key,
+                    format!("Cannot assign to property '{key}'"),
+                );
+                self.failed_set_result(strict, message)
             }
             object::SetOutcome::ExoticParent { parent } => {
                 if !self.ordinary_set_data_value(

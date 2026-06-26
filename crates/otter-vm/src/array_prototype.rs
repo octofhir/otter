@@ -805,6 +805,55 @@ native_array!(native_keys_iter, "keys");
 native_array!(native_values_iter, "values");
 native_array!(native_entries_iter, "entries");
 
+/// `true` when `method` is exactly the original `%Array.prototype%` builtin
+/// installed for `name` — i.e. an un-monkey-patched native whose static
+/// `[[Call]]` is the matching `native_*` bridge. A reassigned method (even one
+/// with the same display name, e.g. `Array.prototype.toString =
+/// Object.prototype.toString`), a user JS closure, or a different builtin all
+/// return `false`. Only the names [`Interpreter::array_live_method_dispatch`]
+/// handles map to a target; everything else returns `false` so the caller
+/// takes the full resolution path.
+pub(crate) fn is_array_prototype_builtin(
+    method: Value,
+    heap: &otter_gc::GcHeap,
+    name: &str,
+) -> bool {
+    use crate::native_function::NativeFastFn;
+    let Some(native) = method.as_native_function() else {
+        return false;
+    };
+    let target: NativeFastFn = match name {
+        "indexOf" => native_index_of,
+        "lastIndexOf" => native_last_index_of,
+        "includes" => native_includes,
+        "join" => native_join,
+        "toString" => native_to_string,
+        "toLocaleString" => native_to_locale_string,
+        "concat" => native_concat,
+        "sort" => native_sort,
+        "push" => native_push,
+        "pop" => native_pop,
+        "shift" => native_shift,
+        "unshift" => native_unshift,
+        "at" => native_at,
+        "reverse" => native_reverse,
+        "fill" => native_fill,
+        "flat" => native_flat,
+        "copyWithin" => native_copy_within,
+        "slice" => native_slice,
+        "splice" => native_splice,
+        "toReversed" => native_to_reversed,
+        "toSpliced" => native_to_spliced,
+        "toSorted" => native_to_sorted,
+        "with" => native_with,
+        "keys" => native_keys_iter,
+        "values" => native_values_iter,
+        "entries" => native_entries_iter,
+        _ => return false,
+    };
+    native.is_static_fn(heap, target)
+}
+
 /// §7.3.18 `LengthOfArrayLike(O)` with live `Get(O, "length")` semantics.
 pub(crate) fn length_of_array_like(
     interp: &mut Interpreter,

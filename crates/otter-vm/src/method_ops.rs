@@ -40,6 +40,27 @@ use crate::{
     symbol_prototype, weak_refs, write_register,
 };
 
+/// Root set for the fast `Array.prototype.*` dispatch path: the live
+/// interpreter roots plus the receiver and argument values, which would
+/// otherwise be invisible to a scavenge triggered inside the array method
+/// (they live only in this stack frame, not in a published VM frame). Mirrors
+/// [`crate::call_ops`]'s native-call root scope.
+struct ArrayFastDispatchRoots<'a> {
+    interp_roots: otter_gc::ExtraRoots,
+    recv: Value,
+    args: &'a [Value],
+}
+
+impl otter_gc::ExtraRootSource for ArrayFastDispatchRoots<'_> {
+    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
+        self.interp_roots.visit(visitor);
+        self.recv.trace_value_slots(visitor);
+        for value in self.args {
+            value.trace_value_slots(visitor);
+        }
+    }
+}
+
 /// Clamp a `ToIntegerOrInfinity` result to an absolute index within
 /// `[0, len]` per the relative-index convention shared by §23.2.3
 /// `slice` / `subarray` (negative counts from the end, `±Infinity`
@@ -316,6 +337,16 @@ impl Interpreter {
                 "undefined"
             };
             return Err(self.err_type((format!("Cannot read properties of {label}")).into()));
+        }
+        // Ordinary dense array whose `%Array.prototype%` slot is untouched —
+        // dispatch the builtin directly (see `try_fast_array_proto_method`).
+        if let Some(result) =
+            self.try_fast_array_proto_method(context, recv_value, name, arg_values.as_slice())
+        {
+            let value = result?;
+            stack[top_idx].advance_pc(caller_byte_len)?;
+            write_register(&mut stack[top_idx], dst, value)?;
+            return Ok(());
         }
         // Method-resolution inline cache. An ordinary object's method is a data
         // slot on its own object or its prototype, so the receiver shape keys
@@ -963,6 +994,12 @@ impl Interpreter {
         let name = context
             .string_constant_str_for_function(stack[frame_index].function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
+        if let Some(result) = self.try_fast_array_proto_method(context, recv, name, args.as_slice())
+        {
+            let value = result?;
+            write_register(&mut stack[frame_index], dst, value)?;
+            return Ok(());
+        }
         if name == "charCodeAt"
             && recv.is_string()
             && let Some(result) =
@@ -990,6 +1027,57 @@ impl Interpreter {
         stack[frame_index].pc = saved_pc;
         write_register(&mut stack[frame_index], dst, result)?;
         Ok(())
+    }
+
+    /// Fast `arr.method(args)` dispatch for an ordinary dense array whose
+    /// `%Array.prototype%` slot for `method` is still the original builtin,
+    /// skipping the per-call `[[Get]]` method-resolution walk and the native
+    /// call bridge entirely.
+    ///
+    /// Returns `None` (caller falls back to the full path) unless every
+    /// condition that makes the direct dispatch observably identical holds:
+    /// the receiver is an ordinary dense array (no exotic sidecar, so no own
+    /// property can shadow the inherited method and its `[[Prototype]]` is the
+    /// realm `%Array.prototype%`); the prototype's own slot for `method` is a
+    /// native function whose name matches `method` (any user override installs
+    /// a different function — a closure fails `as_native_function`, a different
+    /// builtin fails the name check — and a `delete` removes the own slot); and
+    /// [`Self::array_live_method_dispatch`] actually handles the name. When all
+    /// hold, the resolved value can only be the canonical builtin, so calling
+    /// the live dispatcher directly preserves spec semantics.
+    ///
+    /// The receiver and arguments are rooted across the dispatch because an
+    /// array method can scavenge and they live only on this native stack frame.
+    fn try_fast_array_proto_method(
+        &mut self,
+        context: &ExecutionContext,
+        recv: Value,
+        name: &str,
+        args: &[Value],
+    ) -> Option<Result<Value, VmError>> {
+        let arr = recv.as_array()?;
+        if !crate::array::is_ordinary_dense(arr, &self.gc_heap) {
+            return None;
+        }
+        let proto = self.realm_intrinsics.array_prototype?;
+        let method = match crate::object::lookup_own(proto, &self.gc_heap, name) {
+            crate::object::PropertyLookup::Data { value, .. } => value,
+            _ => return None,
+        };
+        if !crate::array_prototype::is_array_prototype_builtin(method, &self.gc_heap, name) {
+            return None;
+        }
+        let roots = ArrayFastDispatchRoots {
+            interp_roots: otter_gc::ExtraRoots::new::<Interpreter>(self),
+            recv,
+            args,
+        };
+        let depth = self
+            .gc_heap
+            .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
+        let result = self.array_live_method_dispatch(context, name, recv, args, &[args]);
+        self.gc_heap.pop_extra_roots_to(depth - 1);
+        result
     }
 
     fn try_fast_primitive_string_char_code_at(

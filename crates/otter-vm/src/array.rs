@@ -293,6 +293,16 @@ pub(crate) fn prototype_override(arr: JsArray, heap: &GcHeap) -> Option<Value> {
     heap.read_payload(arr, |body| body.prototype_override())
 }
 
+/// `true` for an ordinary dense array — one with no exotic sidecar. Such an
+/// array carries the realm's `%Array.prototype%` as its `[[Prototype]]` (no
+/// per-instance override) and has no own named / sparse / symbol / accessor
+/// properties, so a method name resolves straight to the prototype's own slot
+/// with nothing on the instance able to shadow it. The fast method-dispatch
+/// path relies on both facts.
+pub(crate) fn is_ordinary_dense(arr: JsArray, heap: &GcHeap) -> bool {
+    heap.read_payload(arr, |body| body.exotic.is_none())
+}
+
 /// Set the Array exotic's per-instance `[[Prototype]]` override.
 ///
 /// Spec: §10.4.2 Array exotic objects still have ordinary

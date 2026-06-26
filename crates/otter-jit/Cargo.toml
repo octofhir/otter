@@ -25,5 +25,17 @@ rustc-hash = { workspace = true }
 # toolchain + latency + codegen on arm64). x86_64 emitter follows arm64.
 dynasm = "3"
 dynasmrt = "3"
+# Cranelift optimizing backend: a second emit path lowering the same typed SSA
+# graph the dynasm tier consumes. Cranelift owns instruction selection and
+# register allocation; the typed SSA graph, deopt frame states, and OSR entries
+# stay Otter-owned. Pinned to an exact version because codegen output can shift
+# between Cranelift releases, so an upgrade is a gated change
+# (CRANELIFT_TIER2.md §9). These are otter-jit-only deps — no new edge into the
+# parked compatibility shims (CLAUDE.md rule).
+cranelift-codegen = "=0.133.1"
+cranelift-frontend = "=0.133.1"
+cranelift-jit = "=0.133.1"
+cranelift-module = "=0.133.1"
+cranelift-native = "=0.133.1"
 
 [dev-dependencies]

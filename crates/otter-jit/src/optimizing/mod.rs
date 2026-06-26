@@ -26,6 +26,7 @@
 //! - [`crate::baseline`] — the fallback tier and deopt target.
 
 mod builder;
+mod clif;
 pub mod deopt;
 pub mod emit;
 pub mod ir;
@@ -96,6 +97,16 @@ pub fn compile(
     let frames = deopt::capture_frame_states(&graph, &bcl);
     let call_resume_frames = deopt::capture_call_resume_states(&graph, view, &bcl);
     let block_deopts = deopt::capture_deopt_terminators(&graph, &bcl);
+
+    // Cranelift owns its own instruction selection and register allocation, so it
+    // consumes only the typed SSA graph plus the interpreter-visible frame states
+    // and OSR pc — no SSA liveness or linear-scan pass. A graph it declines (an
+    // opcode outside its subset, an unavailable host) falls through to the dynasm
+    // backend below; which backend serves a function is decided here, per graph.
+    if let Ok(code) = clif::emit(&graph, &frames, &block_deopts, osr_pc) {
+        return Ok(std::sync::Arc::new(code));
+    }
+
     let live_uses = deopt::merge_frame_state_uses([&frames, &call_resume_frames]);
     let deopt_uses = deopt::deopt_value_uses(&live_uses);
     let liveness = liveness::analyze(&graph, &deopt_uses, &block_deopts);

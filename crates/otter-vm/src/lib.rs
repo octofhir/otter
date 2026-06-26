@@ -2020,22 +2020,45 @@ impl Interpreter {
                 None => None,
             }
         };
-        if function.makes_function
+        let self_closure = if function.makes_function
             && let Some(closure) = callee_now.and_then(|v| v.as_closure(&self.gc_heap))
         {
             self.frame_ensure_cold(callee_frame.frame_mut())
                 .callee_closure = Some(closure);
-        }
+            Some(closure)
+        } else {
+            None
+        };
+
+        // Compute the entry bits from local state rather than re-indexing the
+        // segmented frame stack three more times after publishing. The SELF
+        // binding mirrors `jit_frame_self_closure_bits` (recorded closure, else
+        // the bare interned function value); `this` is the already-resolved
+        // receiver; the upvalue base is the spine's stable `Box` data pointer,
+        // unchanged by publishing. This is the hot per-call path for compiled
+        // direct calls (recursion, property-using callees).
+        let self_closure_bits = match self_closure {
+            Some(closure) => Value::closure(closure).to_bits(),
+            None => Value::function(function.id).to_bits(),
+        };
+        let this_bits = this_for_callee.to_bits();
+        let upvalues_ptr = {
+            let spine = &callee_frame.frame_mut().upvalues;
+            if spine.is_empty() {
+                0
+            } else {
+                spine.as_ptr() as usize
+            }
+        };
 
         let frame_desc = callee_frame.publish(stack);
-        let frame_index = frame_desc.index();
         Ok(jit::JitPreparedDirectCall {
             entry_addr: plan.entry_addr,
             regs: frame_desc.value_slots().as_mut_ptr().cast::<u64>(),
-            self_closure: self.jit_frame_self_closure_bits(stack, frame_index),
-            this_value: self.jit_frame_this_bits(stack, frame_index),
-            frame_index,
-            upvalues_ptr: Self::jit_frame_upvalues_ptr(stack, frame_index),
+            self_closure: self_closure_bits,
+            this_value: this_bits,
+            frame_index: frame_desc.index(),
+            upvalues_ptr,
         })
     }
 

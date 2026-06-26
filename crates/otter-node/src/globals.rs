@@ -16,6 +16,7 @@ pub fn node_globals_installer() -> RuntimeGlobalInstaller {
 fn install(runtime: &mut Runtime) -> Result<(), OtterError> {
     // `global` aliases `globalThis` (Node compatibility).
     let global_this = runtime.global_this();
+    runtime.define_to_string_tag(global_this, "global")?;
     runtime.set_global("global", global_this);
     Ok(())
 }

@@ -1898,7 +1898,6 @@ dependencies = [
  "otter-pm-lockfile",
  "otter-pm-manifest",
  "otter-runtime",
- "otter-test",
  "otter-web",
  "oxc_diagnostics",
  "semver",
@@ -2096,16 +2095,6 @@ dependencies = [
  "oxc_span",
  "serde",
  "thiserror",
-]
-
-[[package]]
-name = "otter-test"
-version = "0.1.0"
-dependencies = [
- "otter-runtime",
- "serde",
- "serde_json",
- "toml",
 ]
 
 [[package]]

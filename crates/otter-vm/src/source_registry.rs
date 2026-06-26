@@ -6,7 +6,7 @@
 //! - [`ModuleSource`] — one module's verbatim source plus a precomputed
 //!   line-start index.
 //! - [`SourceRegistry`] — `module_url → ModuleSource` map owned by the
-//!   [`crate::Interpreter`].
+//!   [`crate::Interpreter`], with position and source-line lookup helpers.
 //!
 //! # Invariants
 //! - Line and column numbers are **1-based**, matching V8 / Node call
@@ -70,6 +70,21 @@ impl ModuleSource {
     pub fn text(&self) -> &str {
         &self.text
     }
+
+    /// Return one 1-based source line without its trailing line break.
+    pub fn line_text(&self, line_number: u32) -> Option<&str> {
+        if line_number == 0 {
+            return None;
+        }
+        let idx = (line_number - 1) as usize;
+        let start = *self.line_starts.get(idx)? as usize;
+        let end = self
+            .line_starts
+            .get(idx + 1)
+            .map(|n| *n as usize)
+            .unwrap_or(self.text.len());
+        Some(self.text[start..end].trim_end_matches(['\r', '\n']))
+    }
 }
 
 /// `module_url → ModuleSource` registry owned by the interpreter.
@@ -97,6 +112,13 @@ impl SourceRegistry {
         self.sources
             .get(module_url)
             .map(|s| s.line_col(byte_offset))
+    }
+
+    /// Look up the registered text for one 1-based source line.
+    pub fn line_text(&self, module_url: &str, line_number: u32) -> Option<&str> {
+        self.sources
+            .get(module_url)
+            .and_then(|s| s.line_text(line_number))
     }
 }
 

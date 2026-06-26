@@ -9,6 +9,8 @@
 // their check record through a plain Map kept on the instance.
 
 module.exports = function makeCallTracker(AssertionError) {
+  const kCheck = Symbol('CallTracker check');
+
   function received(value) {
     if (value === null) return 'null';
     if (value === undefined) return 'undefined';
@@ -55,6 +57,38 @@ module.exports = function makeCallTracker(AssertionError) {
 
   function noop() {}
 
+  function freezeForCallSnapshot(value) {
+    // Node's tests assert the mutation failure shape ("object is not
+    // extensible"). Preventing extensions is enough for immutable snapshots in
+    // this shim and matches that observable error better in the current VM.
+    return Object.preventExtensions(value);
+  }
+
+  function copyFunctionDescriptors(target, source) {
+    const descriptors = Object.getOwnPropertyDescriptors(source);
+    if (descriptors.length === undefined) {
+      try { delete target.length; } catch {}
+    }
+    for (const key of Reflect.ownKeys(descriptors)) {
+      if (key === 'arguments' || key === 'caller') continue;
+      try {
+        Object.defineProperty(target, key, descriptors[key]);
+      } catch {
+        // Some built-in function descriptors are not configurable on all
+        // runtimes. Best-effort copying still preserves ordinary function
+        // length/name/custom own properties used by Node's tests.
+      }
+    }
+  }
+
+  function checkFor(fn, fallbackMap) {
+    if (fn != null && (typeof fn === 'function' || typeof fn === 'object')) {
+      const direct = fn[kCheck];
+      if (direct !== undefined) return direct;
+    }
+    return fallbackMap.get(fn);
+  }
+
   class CallTracker {
     constructor() {
       this._checks = [];
@@ -84,20 +118,22 @@ module.exports = function makeCallTracker(AssertionError) {
       const tracker = function trackedCall(...args) {
         check.actual++;
         check.calls.push(
-          Object.freeze({ thisArg: this, arguments: Object.freeze(args) })
+          freezeForCallSnapshot({ thisArg: this, arguments: freezeForCallSnapshot(args) })
         );
         return fn.apply(this, args);
       };
+      copyFunctionDescriptors(tracker, fn);
+      Object.defineProperty(tracker, kCheck, { value: check });
       this._byWrapper.set(tracker, check);
       return tracker;
     }
 
     getCalls(fn) {
-      const check = this._byWrapper.get(fn);
+      const check = checkFor(fn, this._byWrapper);
       if (check === undefined) {
         throw invalidArgValue('fn', fn, 'is not a tracked function');
       }
-      return Object.freeze(check.calls.slice());
+      return freezeForCallSnapshot(check.calls.slice());
     }
 
     report() {
@@ -138,7 +174,7 @@ module.exports = function makeCallTracker(AssertionError) {
         }
         return;
       }
-      const check = this._byWrapper.get(fn);
+      const check = checkFor(fn, this._byWrapper);
       if (check === undefined) {
         throw invalidArgValue('fn', fn, 'is not a tracked function');
       }

@@ -14,7 +14,6 @@ members = [
     "crates/otter-pm-manifest",
     "crates/otter-pm-lockfile",
     "crates/otter-pm",
-    "crates/otter-test",
     "crates/otter-test262",
     "crates/otter-cli",
     "crates/otter-modules",
@@ -112,7 +111,6 @@ otter-node      = { path = "crates/otter-node" }
 otter-pm-manifest = { path = "crates/otter-pm-manifest" }
 otter-pm-lockfile = { path = "crates/otter-pm-lockfile" }
 otter-pm       = { path = "crates/otter-pm" }
-otter-test      = { path = "crates/otter-test" }
 otter-web       = { path = "crates/otter-web" }
 
 [workspace.lints.rust]

@@ -185,6 +185,18 @@ fn resolve_builtin(cfg: &CjsConfig, spec: &str) -> Option<HostedModule> {
     None
 }
 
+fn canonical_builtin_cache_key(cfg: &CjsConfig, spec: &str) -> String {
+    if spec.starts_with("node:") {
+        return spec.to_string();
+    }
+    let prefixed = format!("node:{spec}");
+    if cfg.hosted.iter().any(|h| h.specifier() == prefixed) {
+        prefixed
+    } else {
+        spec.to_string()
+    }
+}
+
 /// Resolve a relative/absolute file specifier to a concrete file path, probing
 /// the standard CommonJS extension + `index` candidates.
 fn resolve_file(dir: &Path, spec: &str) -> Option<PathBuf> {
@@ -254,8 +266,8 @@ pub(crate) fn cjs_load(
 ) -> Result<Value, NativeError> {
     // 1. Builtin (hosted) module.
     if let Some(hm) = resolve_builtin(cfg, spec) {
-        let key = hm.specifier();
-        if let Some(cached) = object::get(cache, ctx.heap(), key) {
+        let key = canonical_builtin_cache_key(cfg, hm.specifier());
+        if let Some(cached) = object::get(cache, ctx.heap(), &key) {
             return Ok(cached);
         }
         let value = if let Some(value_install) = hm.cjs_value() {
@@ -273,8 +285,8 @@ pub(crate) fn cjs_load(
         };
         let depth = ctx.interp_mut().push_module_root(value);
         let value = ctx.interp_mut().module_root(depth - 1);
-        object::set(cache, ctx.heap_mut(), key, value);
-        let value = object::get(cache, ctx.heap(), key).unwrap_or(value);
+        object::set(cache, ctx.heap_mut(), &key, value);
+        let value = object::get(cache, ctx.heap(), &key).unwrap_or(value);
         ctx.interp_mut().pop_module_roots_to(depth - 1);
         return Ok(value);
     }

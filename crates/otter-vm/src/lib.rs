@@ -1114,6 +1114,22 @@ pub struct CallSiteInfo {
     pub column_number: u32,
     /// Alias of [`Self::column_number`] for Node's `column` accessor.
     pub column: u32,
+    /// Source line text for diagnostics that need expression snippets.
+    #[serde(rename = "sourceLine", skip_serializing_if = "Option::is_none")]
+    pub source_line: Option<String>,
+    /// Previous source line text; useful when the current byte span sits in
+    /// a multi-line call argument rather than on the call expression line.
+    #[serde(rename = "sourceLineBefore", skip_serializing_if = "Option::is_none")]
+    pub source_line_before: Option<String>,
+    /// Next source line text for frames whose byte span points at an
+    /// enclosing callback/function header.
+    #[serde(rename = "sourceLineAfter", skip_serializing_if = "Option::is_none")]
+    pub source_line_after: Option<String>,
+    /// A small forward source window after the current frame line. Diagnostic
+    /// code uses this when bytecode spans point at a callback header but the
+    /// relevant expression lives inside the callback body.
+    #[serde(rename = "sourceLinesAfter", skip_serializing_if = "Vec::is_empty")]
+    pub source_lines_after: Vec<String>,
 }
 
 /// One caller-environment binding visible to a direct eval body.
@@ -3961,6 +3977,10 @@ impl Interpreter {
         self.module_sources.line_col(module_url, byte_offset)
     }
 
+    pub(crate) fn source_line_text(&self, module_url: &str, line_number: u32) -> Option<&str> {
+        self.module_sources.line_text(module_url, line_number)
+    }
+
     /// Read the live `Error.stackTraceLimit` and translate it to a frame
     /// cap, matching V8's coercion: a finite `>= 1` number caps the
     /// count, `+Infinity` keeps every frame, a missing property falls
@@ -4026,12 +4046,32 @@ impl Interpreter {
             .into_iter()
             .map(|f| {
                 let (line, column) = self.source_line_col(&f.module, f.span.0).unwrap_or((0, 0));
+                let source_line = self
+                    .source_line_text(&f.module, line)
+                    .map(ToOwned::to_owned);
+                let source_line_before = line
+                    .checked_sub(1)
+                    .and_then(|line| self.source_line_text(&f.module, line))
+                    .map(ToOwned::to_owned);
+                let source_line_after = self
+                    .source_line_text(&f.module, line.saturating_add(1))
+                    .map(ToOwned::to_owned);
+                let source_lines_after = (1..=8)
+                    .filter_map(|offset| {
+                        self.source_line_text(&f.module, line.saturating_add(offset))
+                            .map(ToOwned::to_owned)
+                    })
+                    .collect::<Vec<_>>();
                 CallSiteInfo {
                     function_name: f.function_name,
                     script_name: f.module,
                     line_number: line,
                     column_number: column,
                     column,
+                    source_line,
+                    source_line_before,
+                    source_line_after,
+                    source_lines_after,
                 }
             })
             .collect();

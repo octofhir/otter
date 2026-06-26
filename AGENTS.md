@@ -70,7 +70,7 @@ detail; do not expand it or copy the pattern into runtime/session APIs.
 ### Supporting crates
 - `crates/otter-bytecode`: bytecode representation and disassembly.
 - `crates/otter-syntax` / `crates/otter-compiler`: frontend and lowering.
-- `crates/otter-test` / `crates/otter-test262`: active test harnesses.
+- `crates/otter-test262`: active ECMAScript conformance runner.
 - `crates/otter-cli`: CLI (`otter`).
 - Future macro / module / Web API crates must be added under `crates/*`, not under legacy `crates-legacy/*`.
 

@@ -676,6 +676,20 @@ pub(crate) fn compile_method_call(
     // EvaluateCall step 5.b.
     if let Expression::ComputedMemberExpression(member) = callee {
         let receiver_reg = compile_expr(cx, &member.object, span)?;
+        if let Expression::StringLiteral(lit) = unwrap_ts_expr(&member.expression) {
+            let name_idx = cx.intern_string_constant(lit.value.as_str());
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            check_call_arity(arg_regs.len(), "Op::CallMethodValue", span)?;
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::Register(receiver_reg));
+            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::CallMethodValue, operands, span);
+            return Ok(dst);
+        }
         let idx_reg = compile_expr(cx, &member.expression, span)?;
         let callee_reg = cx.alloc_scratch();
         cx.emit(

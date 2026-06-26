@@ -32,7 +32,6 @@ use otter_node::NodeApiBuilderExt;
 use otter_pm_lockfile::Lockfile;
 use otter_pm_manifest::{PACKAGE_JSON, PackageBinManifest, PackageManifest, PackageType};
 use otter_runtime::{CapabilitySet, DiagnosticCode, OtterError, Permission};
-use otter_test::{Report, RunOptions, Suite};
 use otter_web::WebApiBuilderExt;
 use semver::{Version, VersionReq};
 
@@ -331,7 +330,7 @@ enum Command {
     Eval(EvalArgs),
     /// Compile / type-check without executing.
     Check(CheckArgs),
-    /// Run the engine test harness.
+    /// Run tests with the hosted `node:test` runner.
     Test(TestArgs),
     /// Print build/runtime feature flags.
     Info,
@@ -455,15 +454,8 @@ struct CheckArgs {
 
 #[derive(Debug, Args)]
 struct TestArgs {
-    /// Suite name.
-    #[arg(long, default_value = "engine")]
-    suite: String,
-    /// Substring filter on fixture path / declared name.
-    #[arg(long)]
-    filter: Option<String>,
-    /// Override the suite root.
-    #[arg(long)]
-    root: Option<PathBuf>,
+    /// Test files or directories. When omitted, discovers tests under `test/`.
+    paths: Vec<PathBuf>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -513,7 +505,7 @@ async fn main() -> ExitCode {
             run_eval(&args.expression, args.print, json, &caps, &startup_timer).await
         }
         (Some(Command::Check(args)), _) => run_check(&args.file, json, &caps).await,
-        (Some(Command::Test(args)), _) => run_test(args, json).await,
+        (Some(Command::Test(args)), _) => run_node_tests(args, json, &caps, &startup_timer).await,
         (Some(Command::Info), _) => run_info(json),
         // Shorthand: `otter <file> [args...]`, routed through
         // the same resolver/session path as `otter run`.
@@ -1491,6 +1483,123 @@ async fn run_check(
     Ok(ExitCode::SUCCESS)
 }
 
+async fn run_node_tests(
+    args: TestArgs,
+    json: bool,
+    caps: &CapabilitySet,
+    startup_timer: &CliStartupTimer,
+) -> Result<ExitCode, OtterError> {
+    let files = discover_node_test_files(&args.paths)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "testPlan",
+                "files": files,
+            })
+        );
+    }
+
+    let mut failed = false;
+    for file in files {
+        let otter = cli_otter_builder(caps)
+            .process_argv(process_argv_for_file(&file, &[]))
+            .module_loader(cli_loader_config_for_entry(&file).await)
+            .build()?;
+        startup_timer.mark("runtime_build");
+        let result = otter.run_file(&file).await?;
+        startup_timer.mark("runtime_run_file");
+        let exit_code = result.exit_code();
+        if exit_code != 0 {
+            failed = true;
+        }
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "testFile",
+                    "file": file,
+                    "exitCode": exit_code,
+                })
+            );
+        }
+    }
+
+    Ok(if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn discover_node_test_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>, OtterError> {
+    let roots = if paths.is_empty() {
+        vec![PathBuf::from("test")]
+    } else {
+        paths.to_vec()
+    };
+    let mut files = Vec::new();
+    for root in roots {
+        let meta = std::fs::metadata(&root).map_err(|err| pm_io_error(&root, err))?;
+        if meta.is_file() {
+            files.push(root);
+        } else if meta.is_dir() {
+            collect_node_test_files(&root, &mut files)?;
+        }
+    }
+    files.sort();
+    files.dedup();
+    if files.is_empty() {
+        return Err(pm_config_error("no test files found"));
+    }
+    Ok(files)
+}
+
+fn collect_node_test_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), OtterError> {
+    let mut entries = std::fs::read_dir(dir)
+        .map_err(|err| pm_io_error(dir, err))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| pm_io_error(dir, err))?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        let meta = entry.metadata().map_err(|err| pm_io_error(&path, err))?;
+        if meta.is_dir() {
+            collect_node_test_files(&path, out)?;
+        } else if meta.is_file() && is_node_test_file(&path) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_node_test_file(path: &Path) -> bool {
+    if !has_node_test_extension(path) {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.starts_with("test-")
+        || name.starts_with("test_")
+        || name.ends_with(".test.js")
+        || name.ends_with(".test.cjs")
+        || name.ends_with(".test.mjs")
+        || name.ends_with(".test.ts")
+        || name.ends_with(".test.cts")
+        || name.ends_with(".test.mts")
+        || path
+            .components()
+            .any(|part| part.as_os_str() == std::ffi::OsStr::new("test"))
+}
+
+fn has_node_test_extension(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("js" | "cjs" | "mjs" | "ts" | "cts" | "mts")
+    )
+}
+
 async fn run_dump(
     path: &std::path::Path,
     mode: &str,
@@ -2207,41 +2316,6 @@ fn pm_config_error(message: impl Into<String>) -> OtterError {
     }
 }
 
-async fn run_test(args: TestArgs, json: bool) -> Result<ExitCode, OtterError> {
-    let suite = match args.suite.as_str() {
-        "engine" => Suite::Engine,
-        "smoke" => Suite::Smoke,
-        "test262" => Suite::Test262,
-        other => {
-            return Err(OtterError::Config {
-                reason: otter_runtime::ConfigError::ConflictingCapabilities {
-                    message: format!("unknown suite: {other}"),
-                },
-            });
-        }
-    };
-    let root_override = args.root;
-    let loader_config = cli_loader_config_for_entry(
-        root_override
-            .as_deref()
-            .unwrap_or_else(|| suite.default_root()),
-    )
-    .await;
-    let opts = RunOptions {
-        suite,
-        filter: args.filter,
-        root_override,
-        loader_config: Some(loader_config),
-    };
-    let report = otter_test::run_suite(&opts)?;
-    print_test_report(&report, json);
-    if report.all_passed() {
-        Ok(ExitCode::SUCCESS)
-    } else {
-        Ok(ExitCode::from(1))
-    }
-}
-
 fn run_info(json: bool) -> Result<ExitCode, OtterError> {
     if json {
         let info = serde_json::json!({
@@ -2259,49 +2333,6 @@ fn run_info(json: bool) -> Result<ExitCode, OtterError> {
         );
     }
     Ok(ExitCode::SUCCESS)
-}
-
-fn print_test_report(report: &Report, json: bool) {
-    if json {
-        for record in &report.records {
-            println!("{}", serde_json::to_string(record).unwrap());
-        }
-        println!("{}", serde_json::to_string(&report.summary).unwrap());
-    } else {
-        for r in &report.records {
-            println!(
-                "{:<10} {:>5}ms  {}",
-                outcome_label(&r.outcome),
-                r.duration_ms,
-                r.name
-            );
-        }
-        let s = &report.summary;
-        println!(
-            "passed: {}  failed: {}  timeout: {}  oom: {}  cap: {}  skipped: {}  crash: {}  ({}ms)",
-            s.passed,
-            s.failed,
-            s.timeout,
-            s.oom,
-            s.capability_denied,
-            s.skipped,
-            s.crash,
-            s.duration_ms
-        );
-    }
-}
-
-fn outcome_label(outcome: &otter_test::Outcome) -> &'static str {
-    use otter_test::Outcome::*;
-    match outcome {
-        Passed => "PASS",
-        Failed { .. } => "FAIL",
-        Timeout => "TIME",
-        OutOfMemory => "OOM",
-        CapabilityDenied { .. } => "CAP",
-        Skipped { .. } => "SKIP",
-        Crash { .. } => "CRASH",
-    }
 }
 
 #[cfg(test)]
@@ -3461,80 +3492,38 @@ export let value = inner;
         .unwrap();
     }
 
-    #[tokio::test]
-    async fn test_uses_installed_package_graph_for_bare_imports() {
-        let tmp = tempfile::tempdir().unwrap();
-        let suite_root = tmp.path().join("tests");
-        tokio::fs::write(
-            tmp.path().join(PACKAGE_JSON),
-            r#"{"name":"app","dependencies":{"tool":"^1.0.0"}}"#,
-        )
-        .await
-        .unwrap();
-        tokio::fs::create_dir_all(&suite_root).await.unwrap();
-        tokio::fs::write(
-            suite_root.join("uses-tool.ts"),
-            r#"import { value } from "tool";
-function fail() { return undefined.x; }
-if (value !== 17) fail();
-"#,
-        )
-        .await
-        .unwrap();
-        tokio::fs::write(
-            tmp.path().join(otter_pm_lockfile::LOCKFILE_NAME),
-            r#"lockfile_version = 1
-
-[packages."tool@npm:^1.0.0"]
-name = "tool"
-version = "1.0.0"
-integrity = "sha512-test"
-
-[packages."tool@npm:^1.0.0".resolved]
-kind = "registry"
-reference = "https://registry.npmjs.org/tool/-/tool-1.0.0.tgz"
-
-[packages."tool@npm:^1.0.0".lifecycle]
-trust = "untrusted"
-"#,
-        )
-        .await
-        .unwrap();
-        tokio::fs::create_dir_all(tmp.path().join("node_modules/tool"))
-            .await
-            .unwrap();
-        tokio::fs::write(
-            tmp.path().join("node_modules/tool/package.json"),
-            r#"{"name":"tool","version":"1.0.0","main":"index.js"}"#,
-        )
-        .await
-        .unwrap();
-        tokio::fs::write(
-            tmp.path().join("node_modules/tool/index.js"),
-            "export let value = 17;\n",
-        )
-        .await
-        .unwrap();
-
-        let code = run_test(
-            TestArgs {
-                suite: "engine".to_string(),
-                filter: None,
-                root: Some(suite_root),
-            },
-            false,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(code, ExitCode::SUCCESS);
-    }
-
     #[test]
     fn direct_file_shorthand_parses_as_positional_without_run_subcommand() {
         let cli = Cli::try_parse_from(["otter", "app.ts"]).expect("parse shorthand");
         assert!(cli.command.is_none());
         assert_eq!(cli.args, vec!["app.ts".to_string()]);
+    }
+
+    #[test]
+    fn test_command_parses_node_test_paths() {
+        let cli =
+            Cli::try_parse_from(["otter", "test", "test/app.test.ts"]).expect("parse test command");
+        match cli.command {
+            Some(Command::Test(args)) => {
+                assert_eq!(args.paths, vec![PathBuf::from("test/app.test.ts")]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn node_test_discovery_uses_default_test_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        std::fs::create_dir_all("test/nested").unwrap();
+        std::fs::write("test/app.test.js", "test('a', () => {});\n").unwrap();
+        std::fs::write("test/nested/helper.txt", "nope\n").unwrap();
+
+        let files = discover_node_test_files(&[]).unwrap();
+        std::env::set_current_dir(previous).unwrap();
+
+        assert_eq!(files, vec![PathBuf::from("test/app.test.js")]);
     }
 
     #[tokio::test]

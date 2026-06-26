@@ -3046,7 +3046,12 @@ impl Interpreter {
     /// V8's "Cannot add property X, object is not extensible", distinct
     /// from the `fallback` used when an existing property is unwritable
     /// or accessor-only.
-    fn extensibility_aware_set_message(&self, obj: JsObject, key: &str, fallback: String) -> String {
+    fn extensibility_aware_set_message(
+        &self,
+        obj: JsObject,
+        key: &str,
+        fallback: String,
+    ) -> String {
         let is_new = crate::object::get_own(obj, &self.gc_heap, key).is_none();
         if is_new && !crate::object::is_extensible(obj, &self.gc_heap) {
             format!("Cannot add property {key}, object is not extensible")

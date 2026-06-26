@@ -99,10 +99,25 @@ function quoteString(str) {
   return `'${escaped}'`;
 }
 
+function formatString(str, options) {
+  if (options.compact === false && str.includes('\n')) {
+    const lines = str.split('\n');
+    const parts = [];
+    const limit = str.endsWith('\n') ? lines.length - 1 : lines.length;
+    for (let i = 0; i < limit; i++) {
+      const chunk = i === limit - 1 && !str.endsWith('\n') ? lines[i] : `${lines[i]}\n`;
+      const suffix = i === limit - 1 ? '' : ' +';
+      parts.push(`${i === 0 ? '' : '  '}${quoteString(chunk)}${suffix}`);
+    }
+    return parts.join('\n');
+  }
+  return quoteString(str);
+}
+
 function formatValue(value, options, depth, seen) {
   if (value === null) return 'null';
   const t = typeof value;
-  if (t === 'string') return quoteString(value);
+  if (t === 'string') return formatString(value, options);
   if (t === 'number') return Object.is(value, -0) ? '-0' : String(value);
   if (t === 'bigint') return `${value}n`;
   if (t === 'boolean' || t === 'undefined') return String(value);
@@ -157,6 +172,9 @@ function formatValue(value, options, depth, seen) {
   } finally {
     seen.delete(value);
   }
+  if (out.includes('[Circular *1]') && !out.startsWith('<ref *1> ')) {
+    out = `<ref *1> ${out}`;
+  }
   return out;
 }
 
@@ -194,10 +212,39 @@ function formatError(err, options, depth, seen) {
   }
   for (const key of Object.keys(err)) {
     if (key === 'stack' || key === 'message') continue;
-    parts.push(`${keyToString(key)}: ${formatValue(err[key], options, depth + 1, seen)}`);
+    parts.push(`${keyToString(key)}: ${formatErrorProperty(err, key, options, depth, seen)}`);
   }
   if (parts.length === 0) return base;
   return reduceToSingleString(parts, `${base} `, ['{', '}'], options, depth);
+}
+
+function formatErrorProperty(err, key, options, depth, seen) {
+  const value = err[key];
+  if (err.name === 'AssertionError' && typeof value === 'string' &&
+      (key === 'actual' || key === 'expected')) {
+    return formatAssertionStringProperty(value);
+  }
+  return formatValue(value, options, depth + 1, seen);
+}
+
+function formatAssertionStringProperty(value) {
+  if (value.includes('\n')) {
+    const lines = value.split('\n');
+    const limit = Math.min(10, value.endsWith('\n') ? lines.length - 1 : lines.length);
+    const parts = [];
+    for (let i = 0; i < limit; i++) {
+      const chunk = `${lines[i]}\n`;
+      parts.push(`${i === 0 ? '' : '    '}${quoteString(chunk)} +`);
+    }
+    if (lines.length - (value.endsWith('\n') ? 1 : 0) > limit) {
+      parts.push(`    ${quoteString('...')}`);
+    } else if (parts.length > 0) {
+      parts[parts.length - 1] = parts[parts.length - 1].slice(0, -2);
+    }
+    return parts.join('\n');
+  }
+  if (value.length > 488) return quoteString(`${value.slice(0, 488)}...`);
+  return quoteString(value);
 }
 
 function keyToString(key) {
@@ -258,6 +305,9 @@ function formatArray(arr, options, depth, seen, prefix) {
 }
 
 function objectPrefix(obj) {
+  if (objToString(obj) === '[object Arguments]') {
+    return '[Arguments] ';
+  }
   const tag = obj[Symbol.toStringTag];
   const proto = Object.getPrototypeOf(obj);
   if (proto === null) {
@@ -482,6 +532,7 @@ function deepEqual(a, b, strict, memo, skipProto) {
   }
   if (isTypedArray(a)) {
     if (!isTypedArray(b)) return false;
+    if (objToString(a) !== objToString(b)) return false;
     if (a.length !== b.length) return false;
     for (let i = 0; i < a.length; i++) if (!Object.is(a[i], b[i])) return false;
     return compareKeys(a, b, strict, memo, skipProto, true);

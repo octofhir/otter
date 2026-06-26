@@ -2180,6 +2180,41 @@ impl Runtime {
         self.interp.set_global(name, value);
     }
 
+    /// Define `value[Symbol.toStringTag]` as a non-enumerable host tag.
+    ///
+    /// Host integrations use this for Node/Web globals whose observable brand
+    /// differs from a plain object while still being ordinary host-owned
+    /// objects in the VM.
+    pub fn define_to_string_tag(
+        &mut self,
+        value: otter_vm::Value,
+        tag: &str,
+    ) -> Result<(), OtterError> {
+        let Some(obj) = value.as_object() else {
+            return Ok(());
+        };
+        let tag_value = otter_vm::JsString::from_str(tag, self.interp.gc_heap_mut())
+            .map(otter_vm::Value::string)
+            .map_err(string_oom_to_error)?;
+        let tag_sym = self
+            .interp
+            .well_known_symbols()
+            .get(otter_vm::symbol::WellKnown::ToStringTag);
+        otter_vm::object::define_own_symbol_property_partial(
+            obj,
+            self.interp.gc_heap_mut(),
+            tag_sym,
+            otter_vm::object::PartialPropertyDescriptor {
+                value: Some(tag_value),
+                writable: Some(false),
+                enumerable: Some(false),
+                configurable: Some(true),
+                ..Default::default()
+            },
+        );
+        Ok(())
+    }
+
     pub(crate) fn global_this_value(&self) -> otter_vm::Value {
         otter_vm::Value::object(*self.interp.global_this())
     }

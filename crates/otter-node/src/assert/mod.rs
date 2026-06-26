@@ -50,6 +50,19 @@ pub fn assert_cjs_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result
     )
 }
 
+/// CommonJS export: strict assert namespace (`node:assert/strict`).
+pub fn assert_strict_cjs_value(
+    ctx: &mut NativeCtx<'_>,
+    caps: &CapabilitySet,
+) -> Result<Value, String> {
+    let assert = assert_cjs_value(ctx, caps)?;
+    let (interp, exec) = ctx.interp_mut_and_context();
+    let exec = exec.ok_or_else(|| "missing execution context for assert/strict".to_string())?;
+    interp
+        .get_property(&exec, assert, "strict")
+        .map_err(|err| err.to_string())
+}
+
 /// CommonJS export for `internal/assert/myers_diff` (`--expose-internals`).
 pub fn myers_diff_cjs_value(
     ctx: &mut NativeCtx<'_>,

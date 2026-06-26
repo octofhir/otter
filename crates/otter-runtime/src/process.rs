@@ -49,6 +49,24 @@ pub(crate) fn install_global(
         .alloc_host_object_with_roots(&[], &[])
         .map_err(gc_oom_to_error)?;
     let process_root = Value::object(process);
+    let process_tag = JsString::from_str("process", interp.gc_heap_mut())
+        .map(Value::string)
+        .map_err(string_oom_to_error)?;
+    let tag_sym = interp
+        .well_known_symbols()
+        .get(otter_vm::symbol::WellKnown::ToStringTag);
+    otter_vm::object::define_own_symbol_property_partial(
+        process,
+        interp.gc_heap_mut(),
+        tag_sym,
+        otter_vm::object::PartialPropertyDescriptor {
+            value: Some(process_tag),
+            writable: Some(false),
+            enumerable: Some(false),
+            configurable: Some(true),
+            ..Default::default()
+        },
+    );
     let argv_values = process_argv
         .iter()
         .map(|arg| {

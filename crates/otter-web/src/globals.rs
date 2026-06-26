@@ -67,44 +67,51 @@ const WEB_GLOBAL_NAMES: &[&str] = &[
     "WritableStreamDefaultWriter",
 ];
 
-/// Hidden global that stages the concatenated shim source as a plain string
-/// (no parse) until a lazy accessor triggers its evaluation. Non-enumerable
-/// and deleted by the installer shim on first materialization.
-const STAGED_SOURCE_GLOBAL: &str = "__otterWebGlobalsSource";
+/// Hidden native global that returns the concatenated shim source on demand.
+/// Registering a native function costs nothing at startup; the ~52 KB source
+/// string is only materialized into the JS heap when a lazy accessor first
+/// calls it, so a cold start that never touches a Web class never pays for it.
+const SOURCE_FN_GLOBAL: &str = "__otterWebGlobalsSource";
+
+/// `__otterWebGlobalsSource()` — return the concatenated [`WEB_BOOTSTRAP`] +
+/// [`WEB_STREAMS`] source as a string. Called at most once, on the first read
+/// of any lazy Web global.
+fn web_globals_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    // `web_streams.js` depends on `TextEncoder` / `TextDecoder` from
+    // `web_bootstrap.js`; concatenating them keeps that ordering. The trailing
+    // `;` guards against either shim omitting its own statement terminator.
+    let mut source = String::with_capacity(WEB_BOOTSTRAP.len() + WEB_STREAMS.len() + 8);
+    source.push_str(WEB_BOOTSTRAP);
+    source.push_str("\n;\n");
+    source.push_str(WEB_STREAMS);
+    source.push_str("\n;\n");
+    runtime_string_value(ctx, &source)
+}
 
 /// Install the Web-platform class globals lazily.
 ///
-/// The heavy shim source is staged on the realm as a string and a small
-/// installer shim registers one lazy accessor per [`WEB_GLOBAL_NAMES`] entry.
-/// The first read of any of those names materializes the full set (matching
-/// the previous eager behaviour exactly), then replaces every accessor with
-/// the real data property the shim's `def` helper installs.
+/// A small installer shim registers one lazy accessor per [`WEB_GLOBAL_NAMES`]
+/// entry. The first read of any of those names pulls the shim source via the
+/// native [`web_globals_source`] function and evaluates it once — materializing
+/// the full set exactly as the previous eager path did — then the shim's `def`
+/// helper replaces every accessor with the real data property.
 fn install_lazy_web_globals(runtime: &mut Runtime) -> Result<(), OtterError> {
-    // `web_streams.js` depends on `TextEncoder` / `TextDecoder` from
-    // `web_bootstrap.js`; evaluating them back to back in one staged source
-    // keeps that ordering. The trailing `;` guards against either shim
-    // omitting its own statement terminator.
-    let mut staged = String::with_capacity(WEB_BOOTSTRAP.len() + WEB_STREAMS.len() + 8);
-    staged.push_str(WEB_BOOTSTRAP);
-    staged.push_str("\n;\n");
-    staged.push_str(WEB_STREAMS);
-    staged.push_str("\n;\n");
-    runtime.install_string_global(STAGED_SOURCE_GLOBAL, &staged)?;
+    runtime.install_native_global(SOURCE_FN_GLOBAL, 0, web_globals_source)?;
 
     let names = WEB_GLOBAL_NAMES
         .iter()
         .map(|n| format!("'{n}'"))
         .collect::<Vec<_>>()
         .join(",");
-    // Indirect `(0, eval)` runs the staged source in global scope. The shim
-    // sources only mutate `globalThis` (via their own `def` helper), so
-    // re-evaluation needs no surrounding lexical environment.
+    // Indirect `(0, eval)` runs the source in global scope. The shim sources
+    // only mutate `globalThis` (via their own `def` helper), so re-evaluation
+    // needs no surrounding lexical environment.
     //
-    // `ensure` removes *every* lazy accessor before evaluating the staged
-    // source: that reproduces the eager ordering exactly (a name reads as
-    // `undefined` until the source's `def` installs it) and guarantees a read
-    // during evaluation can never re-enter a lazy getter — without the upfront
-    // delete, a global referenced before its own `def` would loop forever.
+    // `ensure` removes *every* lazy accessor before evaluating the source: that
+    // reproduces the eager ordering exactly (a name reads as `undefined` until
+    // the source's `def` installs it) and guarantees a read during evaluation
+    // can never re-enter a lazy getter — without the upfront delete, a global
+    // referenced before its own `def` would loop forever.
     let shim = format!(
         "(function (g) {{\n\
          'use strict';\n\
@@ -113,8 +120,8 @@ fn install_lazy_web_globals(runtime: &mut Runtime) -> Result<(), OtterError> {
          function ensure() {{\n\
            if (done) return;\n\
            done = true;\n\
-           var src = g.{STAGED_SOURCE_GLOBAL};\n\
-           delete g.{STAGED_SOURCE_GLOBAL};\n\
+           var src = g.{SOURCE_FN_GLOBAL}();\n\
+           delete g.{SOURCE_FN_GLOBAL};\n\
            for (var i = 0; i < NAMES.length; i++) delete g[NAMES[i]];\n\
            (0, eval)(src);\n\
          }}\n\

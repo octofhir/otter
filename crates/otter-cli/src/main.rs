@@ -653,7 +653,15 @@ async fn run_file_with_cwd(
             })
         );
     }
-    Ok(ExitCode::from(result.exit_code()))
+    let code = result.exit_code();
+    // The process is exiting; freeing the multi-MB GC heap and unwinding every
+    // interpreter Drop right before the kernel reclaims the address space is
+    // pure latency. Hand the runtime to `forget` so a successful run skips that
+    // teardown. Output is already flushed (console uses line-buffered
+    // stdout/stderr) and the result has been consumed for the exit code.
+    drop(result);
+    std::mem::forget(otter);
+    Ok(ExitCode::from(code))
 }
 
 async fn run_file_with_cpu_profile(

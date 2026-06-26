@@ -72,47 +72,6 @@ enum Builder {
     },
 }
 
-/// Strict `JSON.parse`. `gc_heap` allocates both `JsString` values
-/// and `JsObject`s for parsed JSON objects.
-/// Install `object_proto` as the `[[Prototype]]` of every ordinary
-/// object reachable from a freshly parsed value.
-///
-/// The hot parser allocates objects with a null prototype because it
-/// runs without a realm handle; `JSON.parse` must instead expose
-/// results whose prototype is the realm `%Object.prototype%` (so
-/// inherited methods like `hasOwnProperty` resolve, and an own
-/// `"__proto__"` key stays an ordinary data property — §25.5.1).
-/// Parsed arrays already carry `%Array.prototype%`. The parse result
-/// is an acyclic tree, so an explicit work-stack suffices.
-pub(crate) fn install_object_prototype(
-    root: Value,
-    object_proto: Value,
-    gc_heap: &mut otter_gc::GcHeap,
-) {
-    let mut stack = vec![root];
-    while let Some(value) = stack.pop() {
-        if let Some(obj) = value.as_object() {
-            crate::object::set_prototype_value(obj, gc_heap, Some(object_proto));
-            let children: Vec<Value> = crate::object::with_properties(obj, gc_heap, |p| {
-                p.enumerable_data_iter().map(|(_, v)| v).collect()
-            });
-            stack.extend(
-                children
-                    .into_iter()
-                    .filter(|v| v.is_object() || v.as_array().is_some()),
-            );
-        } else if let Some(arr) = value.as_array() {
-            let len = crate::array::len(arr, gc_heap);
-            for idx in 0..len {
-                let elem = crate::array::get(arr, gc_heap, idx);
-                if elem.is_object() || elem.as_array().is_some() {
-                    stack.push(elem);
-                }
-            }
-        }
-    }
-}
-
 /// Source-span mirror of a parsed JSON value, used to feed the
 /// reviver `context.source` argument (ECMA-262 §25.5.1, the
 /// `json-parse-with-source` proposal). Only primitive leaves carry a
@@ -378,20 +337,26 @@ fn decode_json_string(raw: &str) -> String {
 /// applies [`install_object_prototype`] afterwards.
 pub fn parse(text: &str, gc_heap: &mut otter_gc::GcHeap) -> Result<Value, ParseError> {
     let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
-    parse_with_roots(text, gc_heap, &mut external_visit)
+    parse_with_roots(text, gc_heap, &mut external_visit, None)
 }
 
 /// Strict `JSON.parse` with an explicit GC root visitor for caller-owned
 /// runtime/native/frame roots.
+///
+/// `object_proto`, when `Some`, is installed as the `[[Prototype]]` of every
+/// ordinary object as it is constructed, so the realm `%Object.prototype%` is
+/// in place without a second tree walk over the result (§25.5.1). `None` leaves
+/// freshly parsed objects null-prototype for callers that have no realm handle.
 pub(crate) fn parse_with_roots(
     text: &str,
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
+    object_proto: Option<Value>,
 ) -> Result<Value, ParseError> {
     let bytes = text.as_bytes();
     let mut cursor = Cursor { bytes, pos: 0 };
     cursor.skip_ws();
-    let value = read_value(&mut cursor, gc_heap, external_visit)?;
+    let value = read_value(&mut cursor, gc_heap, external_visit, object_proto)?;
     cursor.skip_ws();
     if cursor.pos != bytes.len() {
         return Err(ParseError::at(cursor.pos, "unexpected trailing content"));
@@ -440,13 +405,21 @@ fn read_value(
     cursor: &mut Cursor<'_>,
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
+    object_proto: Option<Value>,
 ) -> Result<Value, ParseError> {
     let mut stack: Vec<Builder> = Vec::with_capacity(8);
-    let result = read_step(cursor, &mut stack, gc_heap, external_visit)?;
+    let result = read_step(cursor, &mut stack, gc_heap, external_visit, object_proto)?;
     let mut current = result;
     while stack.last().is_some() {
         cursor.skip_ws();
-        current = continue_container(cursor, &mut stack, current, gc_heap, external_visit)?;
+        current = continue_container(
+            cursor,
+            &mut stack,
+            current,
+            gc_heap,
+            external_visit,
+            object_proto,
+        )?;
     }
     Ok(current)
 }
@@ -459,6 +432,7 @@ fn read_step(
     stack: &mut Vec<Builder>,
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
+    object_proto: Option<Value>,
 ) -> Result<Value, ParseError> {
     cursor.skip_ws();
     let b = cursor
@@ -481,7 +455,15 @@ fn read_step(
                 cursor.pos += 1;
                 let frame = stack.pop().expect("just pushed");
                 let bytes = cursor.bytes;
-                return finish_builder(frame, stack, bytes, gc_heap, cursor.pos, external_visit);
+                return finish_builder(
+                    frame,
+                    stack,
+                    bytes,
+                    gc_heap,
+                    cursor.pos,
+                    external_visit,
+                    object_proto,
+                );
             }
             // Otherwise read the first key.
             let key = read_object_key(cursor, gc_heap)?;
@@ -492,7 +474,7 @@ fn read_step(
             cursor.expect(b':', "':' after object key")?;
             cursor.skip_ws();
             // Recurse into the value.
-            read_step(cursor, stack, gc_heap, external_visit)
+            read_step(cursor, stack, gc_heap, external_visit, object_proto)
         }
         b'[' => {
             let array_start = cursor.pos;
@@ -510,9 +492,17 @@ fn read_step(
                 cursor.pos += 1;
                 let frame = stack.pop().expect("just pushed");
                 let bytes = cursor.bytes;
-                return finish_builder(frame, stack, bytes, gc_heap, cursor.pos, external_visit);
+                return finish_builder(
+                    frame,
+                    stack,
+                    bytes,
+                    gc_heap,
+                    cursor.pos,
+                    external_visit,
+                    object_proto,
+                );
             }
-            read_step(cursor, stack, gc_heap, external_visit)
+            read_step(cursor, stack, gc_heap, external_visit, object_proto)
         }
         b'"' => Ok(Value::string(read_string(cursor, gc_heap)?)),
         b't' => {
@@ -543,6 +533,7 @@ fn continue_container(
     just_read: Value,
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
+    object_proto: Option<Value>,
 ) -> Result<Value, ParseError> {
     let frame = stack.last_mut().expect("non-empty stack");
     match frame {
@@ -561,13 +552,21 @@ fn continue_container(
                     if matches!(cursor.peek(), Some(b']')) {
                         return Err(ParseError::at(cursor.pos, "trailing comma"));
                     }
-                    read_step(cursor, stack, gc_heap, external_visit)
+                    read_step(cursor, stack, gc_heap, external_visit, object_proto)
                 }
                 Some(b']') => {
                     cursor.pos += 1;
                     let frame = stack.pop().expect("just had it");
                     let bytes = cursor.bytes;
-                    finish_builder(frame, stack, bytes, gc_heap, cursor.pos, external_visit)
+                    finish_builder(
+                        frame,
+                        stack,
+                        bytes,
+                        gc_heap,
+                        cursor.pos,
+                        external_visit,
+                        object_proto,
+                    )
                 }
                 Some(other) => Err(ParseError::at(
                     cursor.pos,
@@ -601,13 +600,21 @@ fn continue_container(
                     cursor.skip_ws();
                     cursor.expect(b':', "':' after object key")?;
                     cursor.skip_ws();
-                    read_step(cursor, stack, gc_heap, external_visit)
+                    read_step(cursor, stack, gc_heap, external_visit, object_proto)
                 }
                 Some(b'}') => {
                     cursor.pos += 1;
                     let frame = stack.pop().expect("just had it");
                     let bytes = cursor.bytes;
-                    finish_builder(frame, stack, bytes, gc_heap, cursor.pos, external_visit)
+                    finish_builder(
+                        frame,
+                        stack,
+                        bytes,
+                        gc_heap,
+                        cursor.pos,
+                        external_visit,
+                        object_proto,
+                    )
                 }
                 Some(other) => Err(ParseError::at(
                     cursor.pos,
@@ -626,6 +633,7 @@ fn finish_builder(
     gc_heap: &mut otter_gc::GcHeap,
     pos: usize,
     external_visit: &mut RootSlotVisitor<'_>,
+    object_proto: Option<Value>,
 ) -> Result<Value, ParseError> {
     match builder {
         Builder::Array {
@@ -668,6 +676,13 @@ fn finish_builder(
                 .map_err(|_| ParseError::at(pos, "JSON.parse: out of memory"))?;
             for (k, v) in entries {
                 crate::object::set(obj, gc_heap, &k, v);
+            }
+            // Install the realm `%Object.prototype%` at construction time when the
+            // caller supplied it, after the own keys are defined so an own
+            // `"__proto__"` data property is preserved (§25.5.1). This replaces a
+            // separate post-parse tree walk over the whole result.
+            if let Some(proto) = object_proto {
+                crate::object::set_prototype_value(obj, gc_heap, Some(proto));
             }
             Ok(Value::object(obj))
         }

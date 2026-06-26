@@ -159,23 +159,30 @@ pub(crate) fn call_with_roots(
     args: &[Value],
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
+    object_proto: Option<Value>,
 ) -> Result<Value, JsonError> {
     use otter_bytecode::method_id::JsonMethod;
     match method {
         JsonMethod::Stringify => json_stringify(args, gc_heap),
-        JsonMethod::Parse => json_parse_with_roots(args, gc_heap, external_visit),
+        JsonMethod::Parse => json_parse_with_roots(args, gc_heap, external_visit, object_proto),
     }
 }
 
 fn native_parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let coerced = coerce_json_parse_args(ctx, args)?;
-    let unfiltered = native_json_call(ctx, otter_bytecode::method_id::JsonMethod::Parse, &coerced)?;
-
-    // The hot parser leaves objects with a null prototype; §25.5.1
-    // results expose the realm `%Object.prototype%`.
-    if let Some(object_proto) = ctx.interp_mut().object_prototype_object_opt() {
-        parse::install_object_prototype(unfiltered, Value::object(object_proto), ctx.heap_mut());
-    }
+    // §25.5.1 results expose the realm `%Object.prototype%`. Hand it to the
+    // parser so each object is constructed with that prototype in place, instead
+    // of walking the whole result tree afterwards to install it.
+    let object_proto = ctx
+        .interp_mut()
+        .object_prototype_object_opt()
+        .map(Value::object);
+    let unfiltered = native_json_call(
+        ctx,
+        otter_bytecode::method_id::JsonMethod::Parse,
+        &coerced,
+        object_proto,
+    )?;
 
     // §25.5.1 steps 7–9 — a callable reviver drives InternalizeJSONProperty.
     let reviver = args.get(1).copied().unwrap_or_else(Value::undefined);
@@ -478,6 +485,7 @@ fn native_json_call(
     ctx: &mut NativeCtx<'_>,
     method: otter_bytecode::method_id::JsonMethod,
     args: &[Value],
+    object_proto: Option<Value>,
 ) -> Result<Value, NativeError> {
     let runtime_roots = ctx.collect_native_roots();
     let this_value = *ctx.this_value();
@@ -492,7 +500,14 @@ fn native_json_call(
             &[args],
         );
     };
-    call_with_roots(method, args, ctx.heap_mut(), &mut external_visit).map_err(|err| {
+    call_with_roots(
+        method,
+        args,
+        ctx.heap_mut(),
+        &mut external_visit,
+        object_proto,
+    )
+    .map_err(|err| {
         // §25.5.1 step 5 — `JSON.parse` reports malformed input as
         // `SyntaxError`. Every other failure (cycles, BigInt,
         // depth overflow, bad arguments, OOM) flows through
@@ -537,6 +552,7 @@ fn json_parse_with_roots(
     args: &[Value],
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
+    object_proto: Option<Value>,
 ) -> Result<Value, JsonError> {
     let Some(s) = args.first().and_then(|v| v.as_string(gc_heap)) else {
         return Err(JsonError::BadArgument {
@@ -546,7 +562,7 @@ fn json_parse_with_roots(
         });
     };
     let text = s.to_lossy_string(gc_heap);
-    let value = parse::parse_with_roots(&text, gc_heap, external_visit)?;
+    let value = parse::parse_with_roots(&text, gc_heap, external_visit, object_proto)?;
     Ok(value)
 }
 

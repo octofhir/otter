@@ -830,13 +830,16 @@ extern "C" fn jit_new_array_stub(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
 /// code, delegating to the safe [`Interpreter::jit_runtime_call_method`].
 /// Returns `0` on success, `1` when the call threw (error parked in `ctx`).
 /// At most [`MAX_INLINE_ARGS`] argument registers are passed (a0..a2 here,
-/// since `recv` and `name_idx` consume two of the eight ABI registers).
+/// since `recv` and the packed name/site consume two of the eight ABI
+/// registers). `name_and_site` packs the call-site IC id in the high 32 bits
+/// and the method-name constant index in the low 32 bits, keeping the call
+/// within the 8 argument registers.
 #[allow(clippy::too_many_arguments)]
 pub(crate) extern "C" fn jit_call_method_stub(
     ctx: *mut JitCtx,
     dst: u64,
     recv: u64,
-    name_idx: u64,
+    name_and_site: u64,
     argc: u64,
     a0: u64,
     a1: u64,
@@ -847,6 +850,8 @@ pub(crate) extern "C" fn jit_call_method_stub(
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
     let context = unsafe { &*ctx.context };
+    let name_idx = (name_and_site & 0xffff_ffff) as u32;
+    let site = (name_and_site >> 32) as usize;
     let all = [a0 as u16, a1 as u16, a2 as u16];
     let argc = (argc as usize).min(all.len());
     match vm.jit_runtime_call_method(
@@ -855,7 +860,8 @@ pub(crate) extern "C" fn jit_call_method_stub(
         ctx.frame_index,
         dst as u16,
         recv as u16,
-        name_idx as u32,
+        name_idx,
+        site,
         &all[..argc],
     ) {
         Ok(()) => 0,
@@ -3979,7 +3985,9 @@ mod arm64 {
             ; movz x1, dst as u32
             ; movz x2, recv as u32
         );
-        emit_load_u64(ops, 3, u64::from(name));
+        // Pack the call-site IC id (high 32) with the name constant index (low
+        // 32) so the bridge stays within its 8 argument registers.
+        emit_load_u64(ops, 3, (site << 32) | u64::from(name));
         dynasm!(ops ; .arch aarch64 ; movz x4, argc as u32);
         for slot in 0..MAX_METHOD_ARGS {
             let areg = if slot < argc {

@@ -560,6 +560,13 @@ pub struct Interpreter {
     /// Monomorphic `HasProperty` inline caches keyed by dense executable IC
     /// site id. These only cover ordinary own/direct-prototype data presence.
     has_property_ics: Vec<property_ic::PropertyIcEntry<property_ic::HasPropertyIc>>,
+    /// Monomorphic method-call inline caches keyed by dense executable IC site
+    /// id. Each entry records a resolved `Array.prototype.*` builtin so a hot
+    /// `arr.method(args)` site skips the per-call name resolution, the
+    /// `[[Prototype]]` slot hash, and the dispatch string-match — validated by a
+    /// `[[Prototype]]` shape + slot-identity guard. See
+    /// [`method_ops::ArrayMethodCallIc`].
+    method_call_ics: Vec<Option<method_ops::ArrayMethodCallIc>>,
     /// Cheap aggregate counters for interpreter property IC behavior.
     property_ic_stats: property_ic::PropertyIcStats,
     /// Runtime-installed baseline JIT compiler hook. The hook lives behind a VM
@@ -1323,6 +1330,7 @@ impl Interpreter {
             module_resolved_exports: std::collections::HashMap::new(),
             load_property_ics: Vec::new(),
             store_property_ics: Vec::new(),
+            method_call_ics: Vec::new(),
             has_property_ics: Vec::new(),
             property_ic_stats: property_ic::PropertyIcStats::default(),
             jit_hook: None,
@@ -2195,6 +2203,18 @@ impl Interpreter {
     ) -> Result<Option<jit::JitPreparedDirectCall>, VmError> {
         self.jit_runtime_stats.runtime_calls =
             self.jit_runtime_stats.runtime_calls.saturating_add(1);
+        // A site with a live array-method IC resolved to a native builtin last
+        // time, which can never be a compiled direct-call target — skip the IC
+        // walk and let the in-place method stub take its cached fast path. The
+        // stub self-heals the IC (clearing it) when the receiver stops being an
+        // array, so this never permanently strands a now-compiled method.
+        if self
+            .method_call_ics
+            .get(site)
+            .is_some_and(Option::is_some)
+        {
+            return Ok(None);
+        }
         let recv = *stack
             .get(frame_index)
             .ok_or_else(|| VmError::InvalidOperand)?
@@ -3126,6 +3146,9 @@ impl Interpreter {
         if self.has_property_ics.len() < site_count {
             self.has_property_ics
                 .resize(site_count, property_ic::PropertyIcEntry::Empty);
+        }
+        if self.method_call_ics.len() < site_count {
+            self.method_call_ics.resize(site_count, None);
         }
     }
 

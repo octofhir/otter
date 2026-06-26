@@ -61,6 +61,21 @@ impl otter_gc::ExtraRootSource for ArrayFastDispatchRoots<'_> {
     }
 }
 
+/// Monomorphic method-call inline cache entry for a dense-array builtin site.
+///
+/// Records the `%Array.prototype%` shape and the own-slot offset that resolved
+/// `tag`'s method, so a re-validating guard reads the slot directly (no key
+/// hash) and confirms it still holds the original builtin by function pointer.
+/// Holds no GC pointer — `proto_shape`/`proto_slot` are plain metadata and the
+/// builtin identity is checked against a stable native `fn` address — so the
+/// cache needs no tracing and can never dangle across a scavenge.
+#[derive(Clone, Copy)]
+pub(crate) struct ArrayMethodCallIc {
+    proto_shape: crate::object::ShapeId,
+    proto_slot: u16,
+    tag: crate::array_prototype::ArrayMethodTag,
+}
+
 /// Clamp a `ToIntegerOrInfinity` result to an absolute index within
 /// `[0, len]` per the relative-index convention shared by §23.2.3
 /// `slice` / `subarray` (negative counts from the end, `±Infinity`
@@ -340,9 +355,18 @@ impl Interpreter {
         }
         // Ordinary dense array whose `%Array.prototype%` slot is untouched —
         // dispatch the builtin directly (see `try_fast_array_proto_method`).
-        if let Some(result) =
-            self.try_fast_array_proto_method(context, recv_value, name, arg_values.as_slice())
-        {
+        // Resolving the call-site IC id here installs the same cache the JIT
+        // method-call stub reads (shared site space).
+        let method_site = context
+            .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
+            .unwrap_or(usize::MAX);
+        if let Some(result) = self.try_fast_array_proto_method(
+            context,
+            method_site,
+            recv_value,
+            name,
+            arg_values.as_slice(),
+        ) {
             let value = result?;
             stack[top_idx].advance_pc(caller_byte_len)?;
             write_register(&mut stack[top_idx], dst, value)?;
@@ -979,6 +1003,7 @@ impl Interpreter {
         dst: u16,
         recv_reg: u16,
         name_idx: u32,
+        site: usize,
         arg_regs: &[u16],
     ) -> Result<(), VmError> {
         self.record_jit_runtime_property_stub();
@@ -991,10 +1016,18 @@ impl Interpreter {
         for &r in arg_regs {
             args.push(*read_register(&stack[frame_index], r)?);
         }
+        // Cached dense-array builtin: a guard hit dispatches without resolving
+        // the method name, hashing the prototype slot, or string-matching.
+        if let Some(result) = self.try_array_method_call_ic(context, site, recv, args.as_slice()) {
+            let value = result?;
+            write_register(&mut stack[frame_index], dst, value)?;
+            return Ok(());
+        }
         let name = context
             .string_constant_str_for_function(stack[frame_index].function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
-        if let Some(result) = self.try_fast_array_proto_method(context, recv, name, args.as_slice())
+        if let Some(result) =
+            self.try_fast_array_proto_method(context, site, recv, name, args.as_slice())
         {
             let value = result?;
             write_register(&mut stack[frame_index], dst, value)?;
@@ -1051,6 +1084,7 @@ impl Interpreter {
     fn try_fast_array_proto_method(
         &mut self,
         context: &ExecutionContext,
+        site: usize,
         recv: Value,
         name: &str,
         args: &[Value],
@@ -1060,13 +1094,78 @@ impl Interpreter {
             return None;
         }
         let proto = self.realm_intrinsics.array_prototype?;
-        let method = match crate::object::lookup_own(proto, &self.gc_heap, name) {
+        let (hit, lookup) = crate::object::lookup_own_slot(proto, &self.gc_heap, name);
+        let method = match lookup {
             crate::object::PropertyLookup::Data { value, .. } => value,
             _ => return None,
         };
         if !crate::array_prototype::is_array_prototype_builtin(method, &self.gc_heap, name) {
             return None;
         }
+        let tag = crate::array_prototype::ArrayMethodTag::from_name(name)?;
+        // Install the call-site IC so subsequent calls skip name resolution and
+        // the slot hash. The cached slot offset is only sound while the
+        // prototype keeps the recorded shape (guarded on the fast path).
+        if let Some(hit) = hit
+            && site < self.method_call_ics.len()
+        {
+            self.method_call_ics[site] = Some(ArrayMethodCallIc {
+                proto_shape: hit.shape_id,
+                proto_slot: hit.slot,
+                tag,
+            });
+        }
+        Some(self.dispatch_array_builtin_rooted(context, tag, recv, args))
+    }
+
+    /// Fast `arr.method(args)` dispatch through the call-site method IC.
+    ///
+    /// Returns `None` (caller falls back to the full resolution, which may
+    /// re-install the IC) unless the receiver is still an ordinary dense array
+    /// and the realm `%Array.prototype%` still carries the recorded builtin at
+    /// the cached shape + slot. On a hit the resolved value can only be the
+    /// canonical builtin, so dispatching the cached tag directly preserves spec
+    /// semantics — identical to [`Self::try_fast_array_proto_method`] but
+    /// without the per-call name lookup.
+    fn try_array_method_call_ic(
+        &mut self,
+        context: &ExecutionContext,
+        site: usize,
+        recv: Value,
+        args: &[Value],
+    ) -> Option<Result<Value, VmError>> {
+        let ic = (*self.method_call_ics.get(site)?).as_ref().copied()?;
+        let Some(arr) = recv.as_array() else {
+            // The receiver is no longer an array: drop the cache so the direct
+            // compiled-call path (skipped while the IC was live) resumes for
+            // whatever this site now sees.
+            self.method_call_ics[site] = None;
+            return None;
+        };
+        if !crate::array::is_ordinary_dense(arr, &self.gc_heap) {
+            return None;
+        }
+        let proto = self.realm_intrinsics.array_prototype?;
+        if crate::object::shape_id(proto, &self.gc_heap) != ic.proto_shape {
+            return None;
+        }
+        let method = crate::object::data_slot_value_at(proto, &self.gc_heap, ic.proto_slot)?;
+        if !ic.tag.matches_builtin(method, &self.gc_heap) {
+            return None;
+        }
+        Some(self.dispatch_array_builtin_rooted(context, ic.tag, recv, args))
+    }
+
+    /// Run a resolved `Array.prototype` builtin with the receiver and arguments
+    /// rooted across the dispatch (an array method can scavenge and they live
+    /// only on this native stack frame).
+    fn dispatch_array_builtin_rooted(
+        &mut self,
+        context: &ExecutionContext,
+        tag: crate::array_prototype::ArrayMethodTag,
+        recv: Value,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
         let roots = ArrayFastDispatchRoots {
             interp_roots: otter_gc::ExtraRoots::new::<Interpreter>(self),
             recv,
@@ -1075,7 +1174,7 @@ impl Interpreter {
         let depth = self
             .gc_heap
             .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
-        let result = self.array_live_method_dispatch(context, name, recv, args, &[args]);
+        let result = self.array_live_method_dispatch(context, tag, recv, args, &[args]);
         self.gc_heap.pop_extra_roots_to(depth - 1);
         result
     }

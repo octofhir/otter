@@ -2105,7 +2105,8 @@ mod arm64 {
                     ; movz x1, dst_reg as u32
                     ; movz x2, *recv_reg as u32
                 );
-                emit_load_u64(ops, 3, u64::from(*name));
+                // Pack call-site IC id (high 32) with the name index (low 32).
+                emit_load_u64(ops, 3, (*site << 32) | u64::from(*name));
                 dynasm!(ops ; .arch aarch64 ; movz x4, arg_regs.len() as u32);
                 for slot in 0..3 {
                     let arg = arg_regs.get(slot).copied().unwrap_or(0);

@@ -759,16 +759,16 @@ fn native_array_method(
             reason: "Array.prototype method requires an execution context".to_string(),
         });
     };
-    let interp = ctx.interp_mut();
-    match interp.array_live_method_dispatch(&exec, name, receiver, args, &[args]) {
-        Some(result) => {
-            result.map_err(|err| crate::native_function::vm_to_native_error(interp, err, name))
-        }
-        None => Err(NativeError::TypeError {
+    let Some(tag) = ArrayMethodTag::from_name(name) else {
+        return Err(NativeError::TypeError {
             name,
             reason: "unknown Array.prototype method".to_string(),
-        }),
-    }
+        });
+    };
+    let interp = ctx.interp_mut();
+    interp
+        .array_live_method_dispatch(&exec, tag, receiver, args, &[args])
+        .map_err(|err| crate::native_function::vm_to_native_error(interp, err, name))
 }
 macro_rules! native_array {
     ($fn_name:ident, $js_name:literal) => {
@@ -813,6 +813,146 @@ native_array!(native_entries_iter, "entries");
 /// return `false`. Only the names [`Interpreter::array_live_method_dispatch`]
 /// handles map to a target; everything else returns `false` so the caller
 /// takes the full resolution path.
+/// Canonical `Array.prototype` method handled by
+/// [`Interpreter::array_live_method_dispatch`]. A method-call site caches this
+/// tag once resolved so subsequent calls skip the name lookup, the
+/// `[[Prototype]]` slot hash, and the dispatch string-match: the tag carries
+/// both the original builtin function pointer (for the identity guard) and the
+/// `&'static` name (for the live dispatcher). The set mirrors
+/// [`is_array_prototype_builtin`] and the `array_live_method_dispatch` arms.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ArrayMethodTag {
+    IndexOf,
+    LastIndexOf,
+    Includes,
+    Join,
+    ToString,
+    ToLocaleString,
+    Concat,
+    Sort,
+    Push,
+    Pop,
+    Shift,
+    Unshift,
+    At,
+    Reverse,
+    Fill,
+    Flat,
+    CopyWithin,
+    Slice,
+    Splice,
+    ToReversed,
+    ToSpliced,
+    ToSorted,
+    With,
+    Keys,
+    Values,
+    Entries,
+}
+
+impl ArrayMethodTag {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "indexOf" => Self::IndexOf,
+            "lastIndexOf" => Self::LastIndexOf,
+            "includes" => Self::Includes,
+            "join" => Self::Join,
+            "toString" => Self::ToString,
+            "toLocaleString" => Self::ToLocaleString,
+            "concat" => Self::Concat,
+            "sort" => Self::Sort,
+            "push" => Self::Push,
+            "pop" => Self::Pop,
+            "shift" => Self::Shift,
+            "unshift" => Self::Unshift,
+            "at" => Self::At,
+            "reverse" => Self::Reverse,
+            "fill" => Self::Fill,
+            "flat" => Self::Flat,
+            "copyWithin" => Self::CopyWithin,
+            "slice" => Self::Slice,
+            "splice" => Self::Splice,
+            "toReversed" => Self::ToReversed,
+            "toSpliced" => Self::ToSpliced,
+            "toSorted" => Self::ToSorted,
+            "with" => Self::With,
+            "keys" => Self::Keys,
+            "values" => Self::Values,
+            "entries" => Self::Entries,
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::IndexOf => "indexOf",
+            Self::LastIndexOf => "lastIndexOf",
+            Self::Includes => "includes",
+            Self::Join => "join",
+            Self::ToString => "toString",
+            Self::ToLocaleString => "toLocaleString",
+            Self::Concat => "concat",
+            Self::Sort => "sort",
+            Self::Push => "push",
+            Self::Pop => "pop",
+            Self::Shift => "shift",
+            Self::Unshift => "unshift",
+            Self::At => "at",
+            Self::Reverse => "reverse",
+            Self::Fill => "fill",
+            Self::Flat => "flat",
+            Self::CopyWithin => "copyWithin",
+            Self::Slice => "slice",
+            Self::Splice => "splice",
+            Self::ToReversed => "toReversed",
+            Self::ToSpliced => "toSpliced",
+            Self::ToSorted => "toSorted",
+            Self::With => "with",
+            Self::Keys => "keys",
+            Self::Values => "values",
+            Self::Entries => "entries",
+        }
+    }
+
+    fn native_fn(self) -> crate::native_function::NativeFastFn {
+        match self {
+            Self::IndexOf => native_index_of,
+            Self::LastIndexOf => native_last_index_of,
+            Self::Includes => native_includes,
+            Self::Join => native_join,
+            Self::ToString => native_to_string,
+            Self::ToLocaleString => native_to_locale_string,
+            Self::Concat => native_concat,
+            Self::Sort => native_sort,
+            Self::Push => native_push,
+            Self::Pop => native_pop,
+            Self::Shift => native_shift,
+            Self::Unshift => native_unshift,
+            Self::At => native_at,
+            Self::Reverse => native_reverse,
+            Self::Fill => native_fill,
+            Self::Flat => native_flat,
+            Self::CopyWithin => native_copy_within,
+            Self::Slice => native_slice,
+            Self::Splice => native_splice,
+            Self::ToReversed => native_to_reversed,
+            Self::ToSpliced => native_to_spliced,
+            Self::ToSorted => native_to_sorted,
+            Self::With => native_with,
+            Self::Keys => native_keys_iter,
+            Self::Values => native_values_iter,
+            Self::Entries => native_entries_iter,
+        }
+    }
+
+    /// `true` when `method` is still the original builtin function for this tag.
+    pub(crate) fn matches_builtin(self, method: Value, heap: &otter_gc::GcHeap) -> bool {
+        method
+            .as_native_function()
+            .is_some_and(|native| native.is_static_fn(heap, self.native_fn()))
+    }
+}
+
 pub(crate) fn is_array_prototype_builtin(
     method: Value,
     heap: &otter_gc::GcHeap,
@@ -1090,63 +1230,63 @@ impl Interpreter {
     pub(crate) fn array_live_method_dispatch(
         &mut self,
         context: &ExecutionContext,
-        name: &str,
+        tag: ArrayMethodTag,
         receiver: Value,
         args: &[Value],
         roots: &[&[Value]],
-    ) -> Option<Result<Value, VmError>> {
-        match name {
-            "indexOf" | "lastIndexOf" | "includes" => {
+    ) -> Result<Value, VmError> {
+        use ArrayMethodTag as T;
+        match tag {
+            T::IndexOf | T::LastIndexOf | T::Includes => {
                 let search = args.first().copied().unwrap_or_else(Value::undefined);
                 let from_arg = args.get(1).copied();
-                Some(self.array_indexed_search(context, receiver, name, search, from_arg, roots))
+                self.array_indexed_search(context, receiver, tag.name(), search, from_arg, roots)
             }
-            "join" => {
+            T::Join => {
                 let separator_arg = args.first().copied();
-                Some(self.array_join(context, receiver, separator_arg, roots))
+                self.array_join(context, receiver, separator_arg, roots)
             }
-            "toString" => Some(self.array_to_string(context, receiver, roots)),
-            "toLocaleString" => Some(self.array_to_locale_string(context, receiver, roots)),
-            "concat" => Some(self.array_concat(context, receiver, args, roots)),
-            "sort" => {
+            T::ToString => self.array_to_string(context, receiver, roots),
+            T::ToLocaleString => self.array_to_locale_string(context, receiver, roots),
+            T::Concat => self.array_concat(context, receiver, args, roots),
+            T::Sort => {
                 let comparefn = args.first().copied().unwrap_or_else(Value::undefined);
-                Some(self.array_sort(context, receiver, comparefn, roots))
+                self.array_sort(context, receiver, comparefn, roots)
             }
-            "push" => Some(self.array_push(context, receiver, args, roots)),
-            "pop" => Some(self.array_pop(context, receiver, roots)),
-            "shift" => Some(self.array_shift(context, receiver, roots)),
-            "unshift" => Some(self.array_unshift(context, receiver, args, roots)),
-            "at" => {
+            T::Push => self.array_push(context, receiver, args, roots),
+            T::Pop => self.array_pop(context, receiver, roots),
+            T::Shift => self.array_shift(context, receiver, roots),
+            T::Unshift => self.array_unshift(context, receiver, args, roots),
+            T::At => {
                 let index = args.first().copied().unwrap_or_else(Value::undefined);
-                Some(self.array_at(context, receiver, index, roots))
+                self.array_at(context, receiver, index, roots)
             }
-            "reverse" => Some(self.array_reverse(context, receiver, roots)),
-            "fill" => {
+            T::Reverse => self.array_reverse(context, receiver, roots),
+            T::Fill => {
                 let value = args.first().copied().unwrap_or_else(Value::undefined);
-                Some(self.array_fill(context, receiver, value, args, roots))
+                self.array_fill(context, receiver, value, args, roots)
             }
-            "flat" => {
+            T::Flat => {
                 let depth = args.first().copied().unwrap_or_else(Value::undefined);
-                Some(self.array_flat(context, receiver, depth, roots))
+                self.array_flat(context, receiver, depth, roots)
             }
-            "copyWithin" => Some(self.array_copy_within(context, receiver, args, roots)),
-            "slice" => Some(self.array_slice(context, receiver, args, roots)),
-            "splice" => Some(self.array_splice(context, receiver, args, roots)),
-            "toReversed" => Some(self.array_to_reversed(context, receiver, roots)),
-            "toSpliced" => Some(self.array_to_spliced(context, receiver, args, roots)),
-            "toSorted" => {
+            T::CopyWithin => self.array_copy_within(context, receiver, args, roots),
+            T::Slice => self.array_slice(context, receiver, args, roots),
+            T::Splice => self.array_splice(context, receiver, args, roots),
+            T::ToReversed => self.array_to_reversed(context, receiver, roots),
+            T::ToSpliced => self.array_to_spliced(context, receiver, args, roots),
+            T::ToSorted => {
                 let comparefn = args.first().copied().unwrap_or_else(Value::undefined);
-                Some(self.array_to_sorted(context, receiver, comparefn, roots))
+                self.array_to_sorted(context, receiver, comparefn, roots)
             }
-            "with" => {
+            T::With => {
                 let index = args.first().copied().unwrap_or_else(Value::undefined);
                 let value = args.get(1).copied().unwrap_or_else(Value::undefined);
-                Some(self.array_with(context, receiver, index, value, roots))
+                self.array_with(context, receiver, index, value, roots)
             }
-            "keys" => Some(self.array_iterator_method(context, receiver, "keys", roots)),
-            "values" => Some(self.array_iterator_method(context, receiver, "values", roots)),
-            "entries" => Some(self.array_iterator_method(context, receiver, "entries", roots)),
-            _ => None,
+            T::Keys => self.array_iterator_method(context, receiver, "keys", roots),
+            T::Values => self.array_iterator_method(context, receiver, "values", roots),
+            T::Entries => self.array_iterator_method(context, receiver, "entries", roots),
         }
     }
 

@@ -1652,6 +1652,27 @@ pub(crate) fn lookup_own_slot(
     })
 }
 
+/// Read the data value at a known own-slot offset without re-resolving the
+/// key. Returns `None` when the offset is an accessor or out of range. Callers
+/// must first confirm the object's [`shape_id`] still matches the one the slot
+/// offset was captured under, so the offset still names the same key.
+#[must_use]
+pub(crate) fn data_slot_value_at(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    slot: u16,
+) -> Option<Value> {
+    heap.read_payload(obj, |body| {
+        if slot as usize >= body_property_count(heap, body) {
+            return None;
+        }
+        match body.slot_lookup_at(heap, slot as usize) {
+            PropertyLookup::Data { value, .. } => Some(value),
+            _ => None,
+        }
+    })
+}
+
 /// Atom-aware own-property probe for named property bytecodes.
 #[must_use]
 pub(crate) fn lookup_own_atom(

@@ -521,6 +521,104 @@ extern "C" fn jit_load_prop_stub(
     }
 }
 
+/// Frameless `LoadProperty` miss handler for a self-recursive callee running on
+/// the flat register window (no `HoltStack` frame). Resolves the own-data IC
+/// directly against `ctx.regs`; returns `0` on an inline-eligible hit (value
+/// written, cell self-patched), `2` when the load needs the full `[[Get]]`
+/// ladder (caller bails to the interpreter), `1` on throw. `function_id` is
+/// baked by the emitter (the window has no frame to read it from).
+extern "C" fn jit_load_prop_window_stub(
+    ctx: *mut JitCtx,
+    dst: u64,
+    obj: u64,
+    name_idx: u64,
+    site: u64,
+    cell: u64,
+    function_id: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract; `ctx.regs` is the GC-traced
+    // register window of the executing (framed or frameless) callee.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let context = unsafe { &*ctx.context };
+    match unsafe {
+        vm.jit_runtime_load_property_window(
+            context,
+            ctx.regs,
+            function_id as u32,
+            dst as u16,
+            obj as u16,
+            name_idx as u32,
+            site as usize,
+        )
+    } {
+        Ok(Some(fill)) => {
+            if cell != 0 && fill != 0 {
+                let cell = cell as *mut WhiskerIcCell;
+                // SAFETY: stable per-site cell address baked into this code.
+                unsafe {
+                    (*cell).value_byte = (fill >> 32) as u32;
+                    (*cell).shape = fill as u32;
+                }
+            }
+            0
+        }
+        Ok(None) => 2,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
+/// Frameless `StoreProperty` miss handler — the [`jit_load_prop_window_stub`]
+/// counterpart. Resolves an existing-own-data store (with barrier) against
+/// `ctx.regs`; returns `0` on hit (cell self-patched), `2` when the store needs
+/// the full `[[Set]]` ladder (transition / accessor / reject → caller bails),
+/// `1` on throw.
+extern "C" fn jit_store_prop_window_stub(
+    ctx: *mut JitCtx,
+    obj: u64,
+    name_idx: u64,
+    src: u64,
+    site: u64,
+    cell: u64,
+    function_id: u64,
+) -> u64 {
+    // SAFETY: as `jit_load_prop_window_stub`.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let context = unsafe { &*ctx.context };
+    match unsafe {
+        vm.jit_runtime_store_property_window(
+            context,
+            ctx.regs,
+            function_id as u32,
+            obj as u16,
+            name_idx as u32,
+            src as u16,
+            site as usize,
+        )
+    } {
+        Ok(Some(fill)) => {
+            if cell != 0 && fill != 0 {
+                let cell = cell as *mut WhiskerIcCell;
+                // SAFETY: stable per-site cell address baked into this code.
+                unsafe {
+                    (*cell).value_byte = (fill >> 32) as u32;
+                    (*cell).shape = fill as u32;
+                }
+            }
+            0
+        }
+        Ok(None) => 2,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
 /// Bridge stub: perform a named `StoreProperty` from compiled code, delegating
 /// to the safe [`Interpreter::jit_runtime_store_property`]. Returns `0` on
 /// success, `1` when the write threw (error parked in `ctx`). `cell` is this
@@ -581,6 +679,17 @@ extern "C" fn jit_write_barrier_stub(ctx: *mut JitCtx, obj: u64, src: u64) -> u6
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
     vm.jit_runtime_write_barrier(stack, ctx.frame_index, obj as u16, src as u16);
+    0
+}
+
+/// Frameless write barrier — reads the parent/child from `ctx.regs` so an
+/// inline `StoreProperty` of a pointer value works without a `HoltStack` frame
+/// (used by frameless-eligible bodies, framed or frameless).
+extern "C" fn jit_write_barrier_window_stub(ctx: *mut JitCtx, obj: u64, src: u64) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract; `ctx.regs` is GC-traced.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    unsafe { vm.jit_runtime_write_barrier_window(ctx.regs, obj as u16, src as u16) };
     0
 }
 
@@ -973,10 +1082,11 @@ mod arm64 {
         jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
         jit_finish_direct_call_returned_stub, jit_inline_closure_upvalues_stub,
         jit_interrupt_backedge_stub, jit_load_element_stub, jit_load_global_stub,
-        jit_load_prop_stub, jit_load_upvalue_stub, jit_make_fn_stub, jit_new_array_stub,
-        jit_new_object_stub, jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub,
-        jit_self_call_bail_stub, jit_store_element_stub, jit_store_prop_stub,
-        jit_store_upvalue_stub, jit_write_barrier_stub, reg_offset,
+        jit_load_prop_stub, jit_load_prop_window_stub, jit_load_upvalue_stub, jit_make_fn_stub,
+        jit_new_array_stub, jit_new_object_stub, jit_prepare_direct_call_stub,
+        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub, jit_store_element_stub,
+        jit_store_prop_stub, jit_store_prop_window_stub, jit_store_upvalue_stub,
+        jit_write_barrier_stub, jit_write_barrier_window_stub, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -2296,7 +2406,25 @@ mod arm64 {
                     emit_load_u64(&mut ops, 3, u64::from(name));
                     emit_load_u64(&mut ops, 4, site);
                     emit_load_u64(&mut ops, 5, cell_addr as u64);
-                    emit_call_stub(&mut ops, jit_load_prop_stub as *const () as usize, threw);
+                    if self_call_safe {
+                        // Frameless-eligible body: the miss handler resolves the
+                        // own-data IC against the register window (works framed
+                        // or frameless) and signals a bail for the rare slow
+                        // `[[Get]]`, so no `frame_index`-keyed stub is needed and
+                        // this body's self-calls can run frameless.
+                        emit_load_u64(&mut ops, 6, u64::from(view.function_id));
+                        emit_load_u64(&mut ops, 16, jit_load_prop_window_stub as *const () as u64);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; blr x16
+                            ; cmp x0, #1
+                            ; b.eq =>threw
+                            ; cmp x0, #2
+                            ; b.eq =>bail
+                        );
+                    } else {
+                        emit_call_stub(&mut ops, jit_load_prop_stub as *const () as usize, threw);
+                    }
                     dynasm!(ops ; .arch aarch64 ; =>done);
                 }
                 Op::StoreProperty => {
@@ -2361,18 +2489,22 @@ mod arm64 {
                             ; cmp x10, x11
                             ; b.lo =>done              // primitive → no barrier
                         );
-                        // Pointer value: card-mark the parent header.
+                        // Pointer value: card-mark the parent header. A
+                        // frameless-eligible body uses the window barrier (reads
+                        // the parent/child from the register window) so it is
+                        // sound with no `HoltStack` frame.
                         dynasm!(ops
                             ; .arch aarch64
                             ; mov x0, x20
                             ; movz x1, obj as u32
                             ; movz x2, src as u32
                         );
-                        emit_call_stub(
-                            &mut ops,
-                            jit_write_barrier_stub as *const () as usize,
-                            threw,
-                        );
+                        let barrier = if self_call_safe {
+                            jit_write_barrier_window_stub as *const () as usize
+                        } else {
+                            jit_write_barrier_stub as *const () as usize
+                        };
+                        emit_call_stub(&mut ops, barrier, threw);
                         dynasm!(ops ; .arch aarch64 ; b =>done);
                     }
 
@@ -2388,7 +2520,20 @@ mod arm64 {
                     dynasm!(ops ; .arch aarch64 ; movz x3, src as u32);
                     emit_load_u64(&mut ops, 4, site);
                     emit_load_u64(&mut ops, 5, cell_addr as u64);
-                    emit_call_stub(&mut ops, jit_store_prop_stub as *const () as usize, threw);
+                    if self_call_safe {
+                        emit_load_u64(&mut ops, 6, u64::from(view.function_id));
+                        emit_load_u64(&mut ops, 16, jit_store_prop_window_stub as *const () as u64);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; blr x16
+                            ; cmp x0, #1
+                            ; b.eq =>threw
+                            ; cmp x0, #2
+                            ; b.eq =>bail
+                        );
+                    } else {
+                        emit_call_stub(&mut ops, jit_store_prop_stub as *const () as usize, threw);
+                    }
                     dynasm!(ops ; .arch aarch64 ; =>done);
                 }
                 Op::BitwiseOr => emit_int_binop(&mut ops, ops_ref, bail, IntBinOp::Or)?,
@@ -2569,6 +2714,7 @@ mod arm64 {
                 | Op::LoadNumber
                 | Op::LoadLocal
                 | Op::LoadUndefined
+                | Op::LoadNull
                 | Op::LoadHole
                 | Op::LoadTrue
                 | Op::LoadFalse
@@ -3607,6 +3753,13 @@ mod arm64 {
             is_inline_pure_op(instr.op)
                 || instr.op == Op::Call
                 || (instr.op == Op::MakeFunction && instr.make_self)
+                // Property access runs frameless: the inline IC hit reads/writes
+                // the register window directly, and the cold miss routes to the
+                // window stub which resolves the own-data IC against the window
+                // or bails for the slow `[[Get]]`/`[[Set]]` ladder. No op in the
+                // body addresses registers through `JitCtx.frame_index`.
+                || instr.op == Op::LoadProperty
+                || instr.op == Op::StoreProperty
         })
     }
 

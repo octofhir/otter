@@ -3259,6 +3259,154 @@ impl Interpreter {
         result.map(|()| 0)
     }
 
+    /// Frameless `LoadProperty`: resolve an own-data monomorphic load directly
+    /// against the register window `regs`, with no `HoltStack` frame. Used by a
+    /// self-recursive callee that runs frameless on the flat JIT register stack.
+    ///
+    /// Returns `Ok(Some(fill))` when handled — the value is written into
+    /// `regs[dst]` and `fill` is the WhiskerIC cell-fill (`0` = no inline) — or
+    /// `Ok(None)` when the load needs the full `[[Get]]` ladder (non-object,
+    /// accessor, prototype hop, or non-cacheable), in which case the caller
+    /// bails to the interpreter and resumes there. The own-data IC warms from
+    /// the framed top-level execution before any frameless child runs, so the
+    /// steady state is the inline hit (this stub is the cold miss).
+    ///
+    /// # Safety
+    /// `regs` must point at a live, GC-traced register window with at least
+    /// `max(dst, obj_reg) + 1` slots (the flat JIT register stack is scanned for
+    /// the call's duration, so the receiver and result stay rooted).
+    pub unsafe fn jit_runtime_load_property_window(
+        &mut self,
+        context: &ExecutionContext,
+        regs: *mut u64,
+        function_id: u32,
+        dst: u16,
+        obj_reg: u16,
+        name_idx: u32,
+        site: usize,
+    ) -> Result<Option<u64>, VmError> {
+        self.record_jit_runtime_property_stub();
+        let atomized_key = context
+            .property_atom_for_function(function_id, name_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        let receiver = Value::from_bits(unsafe { *regs.add(obj_reg as usize) });
+        let Some(obj) = receiver.as_object() else {
+            return Ok(None);
+        };
+        if site >= self.load_property_ics.len() || self.load_property_ics[site].is_megamorphic() {
+            return Ok(None);
+        }
+        let mut hit_value: Option<Value> = None;
+        for ic in self.load_property_ics[site].entries() {
+            if let Some(value) = ic.load(obj, &self.gc_heap, atomized_key) {
+                hit_value = Some(value);
+                break;
+            }
+        }
+        if let Some(value) = hit_value {
+            self.property_ic_stats.record_hit(PropertyIcKind::Load);
+            unsafe {
+                *regs.add(dst as usize) = value.to_bits();
+            }
+            return Ok(Some(self.whisker_load_cell_fill(site)));
+        }
+        if self.load_property_ics[site].entry_count() > 0 {
+            self.load_property_ics[site]
+                .record_guard_miss_with_stats(&mut self.property_ic_stats, PropertyIcKind::Load);
+        } else {
+            self.load_property_ics[site]
+                .record_uncached_miss_with_stats(&mut self.property_ic_stats, PropertyIcKind::Load);
+        }
+        if !self.load_property_ics[site].is_megamorphic()
+            && let Some((ic, value)) =
+                LoadPropertyIc::install_candidate(obj, &self.gc_heap, atomized_key)
+        {
+            self.load_property_ics[site].install_with_stats(
+                &mut self.property_ic_stats,
+                PropertyIcKind::Load,
+                ic,
+            );
+            unsafe {
+                *regs.add(dst as usize) = value.to_bits();
+            }
+            return Ok(Some(self.whisker_load_cell_fill(site)));
+        }
+        Ok(None)
+    }
+
+    /// Frameless `StoreProperty` — the [`Self::jit_runtime_load_property_window`]
+    /// counterpart. Resolves an existing-own-data monomorphic store (including
+    /// the generational write barrier, which the IC's `store` applies) directly
+    /// against the register window. Returns `Ok(Some(fill))` when handled, or
+    /// `Ok(None)` for a transition / accessor / reject that needs the full
+    /// `[[Set]]` ladder (caller bails).
+    ///
+    /// # Safety
+    /// As [`Self::jit_runtime_load_property_window`].
+    pub unsafe fn jit_runtime_store_property_window(
+        &mut self,
+        context: &ExecutionContext,
+        regs: *mut u64,
+        function_id: u32,
+        obj_reg: u16,
+        name_idx: u32,
+        src: u16,
+        site: usize,
+    ) -> Result<Option<u64>, VmError> {
+        self.record_jit_runtime_property_stub();
+        let atomized_key = context
+            .property_atom_for_function(function_id, name_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        let receiver = Value::from_bits(unsafe { *regs.add(obj_reg as usize) });
+        let value = Value::from_bits(unsafe { *regs.add(src as usize) });
+        let Some(obj) = receiver.as_object() else {
+            return Ok(None);
+        };
+        if site >= self.store_property_ics.len()
+            || !object::supports_fast_property_ic(obj, &self.gc_heap)
+        {
+            return Ok(None);
+        }
+        let entries_len = self.store_property_ics[site].entry_count();
+        for idx in 0..entries_len {
+            let ic = self.store_property_ics[site].entries()[idx].clone();
+            if ic
+                .store(obj, &mut self.gc_heap, atomized_key, &value)
+                .is_some()
+            {
+                self.property_ic_stats.record_hit(PropertyIcKind::Store);
+                return Ok(Some(self.whisker_store_cell_fill(site)));
+            }
+        }
+        if entries_len > 0 {
+            self.store_property_ics[site]
+                .record_guard_miss_with_stats(&mut self.property_ic_stats, PropertyIcKind::Store);
+        } else {
+            self.store_property_ics[site].record_uncached_miss_with_stats(
+                &mut self.property_ic_stats,
+                PropertyIcKind::Store,
+            );
+        }
+        if !self.store_property_ics[site].is_megamorphic()
+            && let Some(ic) = StorePropertyIc::existing_own_data_install_candidate(
+                obj,
+                &self.gc_heap,
+                atomized_key,
+            )
+            && ic
+                .store(obj, &mut self.gc_heap, atomized_key, &value)
+                .is_some()
+        {
+            self.store_property_ics[site].install_with_stats(
+                &mut self.property_ic_stats,
+                PropertyIcKind::Store,
+                ic,
+            );
+            return Ok(Some(self.whisker_store_cell_fill(site)));
+        }
+        Ok(None)
+    }
+
     /// Packed WhiskerIC inline-load cell fill for `site`, or `0` for "no inline".
     ///
     /// Low 32 bits = the cached shape-handle compressed offset (a stable guard
@@ -3820,6 +3968,28 @@ impl Interpreter {
             self.gc_heap.record_write(obj, value);
         } else if let Some(arr) = receiver.as_array() {
             self.gc_heap.record_write(arr, value);
+        }
+    }
+
+    /// Frameless generational write barrier — the
+    /// [`Self::jit_runtime_write_barrier`] counterpart that reads the parent and
+    /// child from the register window instead of a `HoltStack` frame.
+    ///
+    /// # Safety
+    /// `regs` must point at a live, GC-traced register window covering
+    /// `max(obj_reg, src) + 1` slots.
+    pub unsafe fn jit_runtime_write_barrier_window(
+        &mut self,
+        regs: *mut u64,
+        obj_reg: u16,
+        src: u16,
+    ) {
+        let receiver = Value::from_bits(unsafe { *regs.add(obj_reg as usize) });
+        let value = Value::from_bits(unsafe { *regs.add(src as usize) });
+        if let Some(obj) = receiver.as_object() {
+            self.gc_heap.record_write(obj, &value);
+        } else if let Some(arr) = receiver.as_array() {
+            self.gc_heap.record_write(arr, &value);
         }
     }
 

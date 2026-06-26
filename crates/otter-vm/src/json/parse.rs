@@ -846,6 +846,15 @@ fn read_string(
     if b == b'"' {
         let slice = &cursor.bytes[start..cursor.pos];
         cursor.pos += 1;
+        // Escape-free common case. An all-ASCII span is valid UTF-8 by
+        // construction and maps one byte per Latin-1 code unit, so build the
+        // body straight from the bytes — skipping both the `from_utf8`
+        // validation here and the redundant ASCII re-scan inside `from_str`.
+        // A span carrying high bytes still needs UTF-8 validation first.
+        if slice.is_ascii() {
+            return JsString::from_latin1(slice, heap)
+                .map_err(|_| ParseError::at(start, "out of memory while interning string"));
+        }
         let text = std::str::from_utf8(slice)
             .map_err(|_| ParseError::at(start, "invalid utf-8 in string"))?;
         return JsString::from_str(text, heap)

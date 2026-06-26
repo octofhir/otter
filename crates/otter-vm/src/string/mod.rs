@@ -367,6 +367,21 @@ impl JsString {
     /// Lone surrogates round-trip via `String::from_utf16_lossy`.
     #[must_use]
     pub fn to_lossy_string(self, heap: &GcHeap) -> String {
+        // A Latin-1 body maps one byte per code point, so it never carries a
+        // surrogate: an all-ASCII body is already valid UTF-8 (a single memcpy),
+        // and any other Latin-1 body widens byte→char directly. Both avoid the
+        // general path's widen-to-`u16`-then-narrow-`char` round trip — the
+        // dominant cost when, e.g., `JSON.parse` lifts a large ASCII input.
+        if let Some(s) = self.with_latin1(heap, |bytes| {
+            if bytes.is_ascii() {
+                // SAFETY: ASCII bytes are valid UTF-8.
+                unsafe { String::from_utf8_unchecked(bytes.to_vec()) }
+            } else {
+                bytes.iter().map(|&b| b as char).collect()
+            }
+        }) {
+            return s;
+        }
         let units = gc_body::to_utf16_vec(heap, self.handle);
         String::from_utf16_lossy(&units)
     }

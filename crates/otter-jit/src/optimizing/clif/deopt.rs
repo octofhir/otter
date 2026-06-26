@@ -28,12 +28,16 @@ use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, types};
 use cranelift_frontend::FunctionBuilder;
 
 /// Memory-access flags a function reuses: `trusted` (aligned, non-trapping) for
-/// the frame register window, `plain` for the `f64`↔`i64` boxing bitcast. The
+/// mutable accesses (the frame register window, element data); `readonly` adds
+/// the immutable flag for loads of never-written fields (object/buffer metadata),
+/// which lets Cranelift's GVN/LICM dedup and hoist them out of loops across the
+/// intervening element stores; `plain` for the `f64`↔`i64` boxing bitcast. The
 /// instruction builder interns these into the DFG itself, so they are passed by
 /// value.
 #[derive(Clone, Copy)]
 pub(super) struct Flags {
     pub trusted: MemFlagsData,
+    pub readonly: MemFlagsData,
     pub plain: MemFlagsData,
 }
 

@@ -119,6 +119,7 @@ impl<'a, 'f> Lower<'a, 'f> {
     ) -> Self {
         let flags = Flags {
             trusted: MemFlagsData::trusted(),
+            readonly: MemFlagsData::trusted().with_readonly(),
             plain: MemFlagsData::new(),
         };
         Self {
@@ -505,9 +506,16 @@ impl<'a, 'f> Lower<'a, 'f> {
         Ok(narrow)
     }
 
-    /// A trusted load of `ty` at `ptr + off`.
+    /// A trusted load of `ty` at `ptr + off` (mutable memory).
     fn ld(&mut self, ty: cranelift_codegen::ir::Type, ptr: Value, off: u32) -> Value {
         self.b.ins().load(ty, self.flags.trusted, ptr, off as i32)
+    }
+
+    /// A readonly load of `ty` at `ptr + off`: a never-written field (object /
+    /// buffer metadata). The `readonly` flag lets Cranelift GVN/LICM dedup and
+    /// hoist it across element stores and out of loops.
+    fn ldro(&mut self, ty: cranelift_codegen::ir::Type, ptr: Value, off: u32) -> Value {
+        self.b.ins().load(ty, self.flags.readonly, ptr, off as i32)
     }
 
     /// Decompress a tagged object receiver into its GC pointer and GC-header type
@@ -524,7 +532,7 @@ impl<'a, 'f> Lower<'a, 'f> {
         let off = self.b.ins().uextend(types::I64, low);
         let cage = self.b.ins().iconst(types::I64, self.view.cage_base as i64);
         let ptr = self.b.ins().iadd(cage, off);
-        let tag = self.ld(types::I8, ptr, 0);
+        let tag = self.ldro(types::I8, ptr, 0);
         Ok((ptr, tag))
     }
 
@@ -806,37 +814,37 @@ impl<'a, 'f> Lower<'a, 'f> {
         len_word: u32,
     ) -> Result<(Value, Value, Value, Value), Unsupported> {
         let l = self.view.ta_layout;
-        let tracking = self.ld(types::I8, ptr, l.ta_length_tracking_byte);
+        let tracking = self.ldro(types::I8, ptr, l.ta_length_tracking_byte);
         let is_tracking = self.b.ins().icmp_imm(IntCC::NotEqual, tracking, 0);
         self.guard(nid, is_tracking)?;
         // Spec length bound: reading/writing at or beyond the logical element
         // count must defer to the interpreter, not touch raw buffer bytes.
-        let len = self.ld(types::I64, ptr, l.ta_length_byte);
+        let len = self.ldro(types::I64, ptr, l.ta_length_byte);
         let oob = self
             .b
             .ins()
             .icmp(IntCC::UnsignedGreaterThanOrEqual, index, len);
         self.guard(nid, oob)?;
-        let disc = self.ld(types::I32, ptr, l.buffer_disc_byte);
+        let disc = self.ldro(types::I32, ptr, l.buffer_disc_byte);
         let not_local = self
             .b
             .ins()
             .icmp_imm(IntCC::NotEqual, disc, i64::from(l.buffer_local_tag));
         self.guard(nid, not_local)?;
-        let handle = self.ld(types::I32, ptr, l.buffer_handle_byte);
+        let handle = self.ldro(types::I32, ptr, l.buffer_handle_byte);
         let hoff = self.b.ins().uextend(types::I64, handle);
         let cage = self.b.ins().iconst(types::I64, self.view.cage_base as i64);
         let bufptr = self.b.ins().iadd(cage, hoff);
-        let btag = self.ld(types::I8, bufptr, 0);
+        let btag = self.ldro(types::I8, bufptr, 0);
         let not_buf = self
             .b
             .ins()
             .icmp_imm(IntCC::NotEqual, btag, i64::from(l.local_buffer_type_tag));
         self.guard(nid, not_buf)?;
-        let bytes_ptr = self.ld(types::I64, bufptr, l.buf_bytes_byte + ptr_word);
-        let bytes_len = self.ld(types::I64, bufptr, l.buf_bytes_byte + len_word);
-        let byte_off = self.ld(types::I64, ptr, l.ta_byte_offset_byte);
-        let kind = self.ld(types::I32, ptr, l.ta_kind_byte);
+        let bytes_ptr = self.ldro(types::I64, bufptr, l.buf_bytes_byte + ptr_word);
+        let bytes_len = self.ldro(types::I64, bufptr, l.buf_bytes_byte + len_word);
+        let byte_off = self.ldro(types::I64, ptr, l.ta_byte_offset_byte);
+        let kind = self.ldro(types::I32, ptr, l.ta_kind_byte);
         Ok((bytes_ptr, bytes_len, byte_off, kind))
     }
 }

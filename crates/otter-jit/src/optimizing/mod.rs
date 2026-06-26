@@ -103,7 +103,7 @@ pub fn compile(
     // and OSR pc — no SSA liveness or linear-scan pass. A graph it declines (an
     // opcode outside its subset, an unavailable host) falls through to the dynasm
     // backend below; which backend serves a function is decided here, per graph.
-    if let Ok(code) = clif::emit(&graph, &frames, &block_deopts, osr_pc) {
+    if let Ok(code) = clif::emit(view, &graph, &frames, &block_deopts, osr_pc) {
         return Ok(std::sync::Arc::new(code));
     }
 

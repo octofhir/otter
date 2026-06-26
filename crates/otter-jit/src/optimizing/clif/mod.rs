@@ -59,6 +59,8 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::default_libcall_names;
 use rustc_hash::FxHashMap;
 
+use otter_vm::JitFunctionView;
+
 use super::Unsupported;
 use super::deopt::DeoptPoint;
 use super::ir::{Graph, NodeId, NodeKind, Terminator};
@@ -175,9 +177,12 @@ fn check_supported(graph: &Graph) -> Result<(), Unsupported> {
                 | NodeKind::Float64Mul(_, _)
                 | NodeKind::Float64Div(_, _)
                 | NodeKind::Float64Compare(_, _, _)
+                | NodeKind::LoadElement(_, _)
+                | NodeKind::StoreElement(_, _, _)
+                | NodeKind::LoadArrayLength(_)
         );
         if !ok {
-            return Err(Unsupported::Unlowered("clif: node kind outside S0 subset"));
+            return Err(Unsupported::Unlowered("clif: node kind outside subset"));
         }
     }
     Ok(())
@@ -216,6 +221,7 @@ fn make_module() -> Result<JITModule, Unsupported> {
 /// the graph's single entry the same way — the builder roots an OSR graph at a
 /// synthetic, register-seeding entry block (see the module docs).
 pub(in crate::optimizing) fn emit(
+    view: &JitFunctionView,
     graph: &Graph,
     frames: &FxHashMap<NodeId, DeoptPoint>,
     block_deopts: &FxHashMap<BlockId, DeoptPoint>,
@@ -245,7 +251,8 @@ pub(in crate::optimizing) fn emit(
     }
 
     let mut module = make_module()?;
-    let (func_id, code_len) = lower::compile_function(&mut module, graph, frames, block_deopts)?;
+    let (func_id, code_len) =
+        lower::compile_function(&mut module, view, graph, frames, block_deopts)?;
 
     module
         .finalize_definitions()
@@ -360,7 +367,7 @@ mod tests {
         let bcl = deopt::bytecode_liveness(v);
         let frames = deopt::capture_frame_states(&g, &bcl);
         let block_deopts = deopt::capture_deopt_terminators(&g, &bcl);
-        let code = super::emit(&g, &frames, &block_deopts, None).expect("clif emits");
+        let code = super::emit(v, &g, &frames, &block_deopts, None).expect("clif emits");
         let entry = code.entry_addr().expect("function-entry address");
 
         let mut regs = vec![0u64; 64];
@@ -479,12 +486,12 @@ mod tests {
 
         // Warm up, then time a batch.
         for _ in 0..10 {
-            let _ = super::emit(&g, &frames, &block_deopts, None).expect("emits");
+            let _ = super::emit(&v, &g, &frames, &block_deopts, None).expect("emits");
         }
         let iters = 200;
         let start = std::time::Instant::now();
         for _ in 0..iters {
-            let _ = super::emit(&g, &frames, &block_deopts, None).expect("emits");
+            let _ = super::emit(&v, &g, &frames, &block_deopts, None).expect("emits");
         }
         let per = start.elapsed() / iters;
         eprintln!("clif compile_time_per_function (counting loop): {per:?}");

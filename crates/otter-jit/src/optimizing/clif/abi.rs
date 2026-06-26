@@ -31,6 +31,9 @@ use crate::optimizing::ir::Repr;
 pub(super) const TAG_INT32: u64 = crate::baseline::TAG_INT32;
 /// NaN-box tag for special immediates (undefined/null/hole/boolean).
 pub(super) const TAG_SPECIAL: u64 = crate::baseline::TAG_SPECIAL;
+/// NaN-box tag for object-class heap pointers (`value/tag.rs`). The low 32 bits
+/// are a `Gc` offset added to the cage base to decompress the pointer.
+pub(super) const TAG_PTR_OBJECT: u64 = crate::baseline::TAG_PTR_OBJECT;
 /// NaN-box high-16 for the canonical quiet NaN double. A non-int double result
 /// whose own bits land in the tagged range is canonicalised to this so it stays
 /// a valid `Number(NaN)` and never aliases a tag.
@@ -46,6 +49,9 @@ pub(super) const UNDEFINED_BITS: u64 = TAG_SPECIAL << 48;
 pub(super) const FALSE_BITS: u64 = (TAG_SPECIAL << 48) | SPECIAL_FALSE;
 /// Boxed `true` bit pattern.
 pub(super) const TRUE_BITS: u64 = (TAG_SPECIAL << 48) | SPECIAL_TRUE;
+/// Boxed array/`this` hole sentinel bit pattern (a dense-array element slot that
+/// is a hole misses the inline fast path and deopts).
+pub(super) const HOLE_BITS: u64 = (TAG_SPECIAL << 48) | crate::baseline::SPECIAL_HOLE;
 
 /// `JitRet.status` for a normal return (`Returned(value)`).
 pub(super) const STATUS_RETURNED: i64 = crate::baseline::STATUS_RETURNED as i64;
@@ -56,6 +62,11 @@ pub(super) const STATUS_BAILED: i64 = crate::baseline::STATUS_BAILED as i64;
 pub(super) const REGS_OFFSET: i32 = 0;
 /// Byte offset of `JitCtx.bail_pc`, where a side exit stamps the resume byte-PC.
 pub(super) const BAIL_PC_OFFSET: i32 = crate::baseline::BAIL_PC_OFFSET as i32;
+/// Byte offset of `JitCtx.array_index_accessor_protector_ptr`. A dense-array
+/// element store reads through it at the store site (a re-entered call can
+/// invalidate the protector), deopting when the protector is live.
+pub(super) const ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET: u32 =
+    crate::baseline::ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET;
 
 /// Cranelift value type a typed-SSA value of `repr` is materialized in.
 ///

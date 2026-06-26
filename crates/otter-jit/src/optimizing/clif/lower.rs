@@ -34,8 +34,12 @@ use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Module};
 use rustc_hash::FxHashMap;
 
+use otter_vm::JitFunctionView;
+
 use super::Unsupported;
-use super::abi::{clif_type, REGS_OFFSET, STATUS_RETURNED, TAG_INT32, UNDEFINED_BITS};
+use super::abi::{
+    clif_type, HOLE_BITS, REGS_OFFSET, STATUS_RETURNED, TAG_INT32, TAG_PTR_OBJECT, UNDEFINED_BITS,
+};
 use super::deopt::{Flags, box_tagged, emit_bail};
 use crate::optimizing::deopt::DeoptPoint;
 use crate::optimizing::ir::{
@@ -46,6 +50,7 @@ use crate::optimizing::ir::{
 /// returning its `FuncId` and the finalized code size in bytes.
 pub(super) fn compile_function(
     module: &mut JITModule,
+    view: &JitFunctionView,
     graph: &Graph,
     frames: &FxHashMap<NodeId, DeoptPoint>,
     block_deopts: &FxHashMap<BlockId, DeoptPoint>,
@@ -65,7 +70,7 @@ pub(super) fn compile_function(
     let mut fbctx = FunctionBuilderContext::new();
     {
         let mut builder = FunctionBuilder::new(&mut cctx.func, &mut fbctx);
-        let mut lower = Lower::new(&mut builder, graph, frames, block_deopts);
+        let mut lower = Lower::new(&mut builder, view, graph, frames, block_deopts);
         lower.run()?;
         builder.finalize();
     }
@@ -83,6 +88,7 @@ pub(super) fn compile_function(
 /// Per-function lowering state.
 struct Lower<'a, 'f> {
     b: &'a mut FunctionBuilder<'f>,
+    view: &'a JitFunctionView,
     graph: &'a Graph,
     frames: &'a FxHashMap<NodeId, DeoptPoint>,
     block_deopts: &'a FxHashMap<BlockId, DeoptPoint>,
@@ -106,6 +112,7 @@ struct Lower<'a, 'f> {
 impl<'a, 'f> Lower<'a, 'f> {
     fn new(
         b: &'a mut FunctionBuilder<'f>,
+        view: &'a JitFunctionView,
         graph: &'a Graph,
         frames: &'a FxHashMap<NodeId, DeoptPoint>,
         block_deopts: &'a FxHashMap<BlockId, DeoptPoint>,
@@ -116,6 +123,7 @@ impl<'a, 'f> Lower<'a, 'f> {
         };
         Self {
             b,
+            view,
             graph,
             frames,
             block_deopts,
@@ -404,7 +412,13 @@ impl<'a, 'f> Lower<'a, 'f> {
                 let (x, y) = (self.val(*a)?, self.val(*b)?);
                 Some(self.b.ins().fcmp(float_cc(*op), x, y))
             }
-            _ => return Err(Unsupported::Unlowered("clif: node kind outside S0 subset")),
+            NodeKind::LoadArrayLength(recv) => Some(self.lower_array_length(nid, *recv)?),
+            NodeKind::LoadElement(recv, idx) => Some(self.lower_load_element(nid, *recv, *idx)?),
+            NodeKind::StoreElement(recv, idx, val) => {
+                self.lower_store_element(nid, *recv, *idx, *val)?;
+                None
+            }
+            _ => return Err(Unsupported::Unlowered("clif: node kind outside subset")),
         };
         if let Some(v) = result {
             self.values[nid as usize] = Some(v);
@@ -490,6 +504,371 @@ impl<'a, 'f> Lower<'a, 'f> {
         self.guard(nid, overflow)?;
         Ok(narrow)
     }
+
+    /// A trusted load of `ty` at `ptr + off`.
+    fn ld(&mut self, ty: cranelift_codegen::ir::Type, ptr: Value, off: u32) -> Value {
+        self.b.ins().load(ty, self.flags.trusted, ptr, off as i32)
+    }
+
+    /// Decompress a tagged object receiver into its GC pointer and GC-header type
+    /// tag, deopting at `nid` when the receiver is not an object pointer. Returns
+    /// `(gc_ptr: i64, type_tag: i8)`. The builder is left on the success path.
+    fn recv_body(&mut self, nid: NodeId, recv: NodeId) -> Result<(Value, Value), Unsupported> {
+        let v = self.val(recv)?;
+        let top16 = self.b.ins().ushr_imm(v, 48);
+        let is_obj = self.b.ins().icmp_imm(IntCC::Equal, top16, TAG_PTR_OBJECT as i64);
+        let not_obj = self.b.ins().icmp_imm(IntCC::Equal, is_obj, 0);
+        self.guard(nid, not_obj)?;
+        // Decompress: GcHeader ptr = cage_base + low32(value).
+        let low = self.b.ins().ireduce(types::I32, v);
+        let off = self.b.ins().uextend(types::I64, low);
+        let cage = self.b.ins().iconst(types::I64, self.view.cage_base as i64);
+        let ptr = self.b.ins().iadd(cage, off);
+        let tag = self.ld(types::I8, ptr, 0);
+        Ok((ptr, tag))
+    }
+
+    /// `LoadArrayLength`: deopt unless the receiver is a dense Array whose length
+    /// fits int32, then return that length unboxed.
+    fn lower_array_length(&mut self, nid: NodeId, recv: NodeId) -> Result<Value, Unsupported> {
+        let array_tag = i64::from(self.view.ta_layout.array_type_tag);
+        let length_byte = self.view.ta_layout.array_length_byte;
+        let (ptr, tag) = self.recv_body(nid, recv)?;
+        let not_arr = self.b.ins().icmp_imm(IntCC::NotEqual, tag, array_tag);
+        self.guard(nid, not_arr)?;
+        let len = self.ld(types::I64, ptr, length_byte);
+        let too_big = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThan, len, i64::from(i32::MAX));
+        self.guard(nid, too_big)?;
+        Ok(self.b.ins().ireduce(types::I32, len))
+    }
+
+    /// `LoadElement`: speculative dense-array / typed-array `recv[idx]`. Any miss
+    /// (non-object, wrong body, OOB, hole, unsupported kind) deopts at `nid`.
+    /// Result is the tagged element value, produced as the `done` block parameter.
+    fn lower_load_element(
+        &mut self,
+        nid: NodeId,
+        recv: NodeId,
+        idx: NodeId,
+    ) -> Result<Value, Unsupported> {
+        let l = self.view.ta_layout;
+        let (ptr_word, len_word) = vec_layout_offsets();
+        let (ptr, tag) = self.recv_body(nid, recv)?;
+        let idxv = self.val(idx)?;
+        let index = self.b.ins().uextend(types::I64, idxv);
+
+        let done = self.b.create_block();
+        let result = self.b.append_block_param(done, types::I64);
+        let array_blk = self.b.create_block();
+        let chk_ta = self.b.create_block();
+        let ta_blk = self.b.create_block();
+        let f64_blk = self.b.create_block();
+        let chk_i32 = self.b.create_block();
+        let i32_blk = self.b.create_block();
+        let deopt = self.deopt_block(nid)?;
+
+        let is_array = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, tag, i64::from(l.array_type_tag));
+        self.b.ins().brif(is_array, array_blk, &[], chk_ta, &[]);
+
+        // Ordinary dense array: bounds-check the elements `Vec`, load the raw
+        // `Value`, deopt on a hole.
+        self.b.switch_to_block(array_blk);
+        let alen = self.ld(types::I64, ptr, l.array_elements_byte + len_word);
+        let oob = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, index, alen);
+        self.guard(nid, oob)?;
+        let data = self.ld(types::I64, ptr, l.array_elements_byte + ptr_word);
+        let elptr = self.scaled_addr(data, index, 3);
+        let elem = self.ld(types::I64, elptr, 0);
+        let hole = self.b.ins().iconst(types::I64, HOLE_BITS as i64);
+        let is_hole = self.b.ins().icmp(IntCC::Equal, elem, hole);
+        self.guard(nid, is_hole)?;
+        self.b.ins().jump(done, &[BlockArg::from(elem)]);
+
+        // Not a dense array: must be a typed array, else deopt.
+        self.b.switch_to_block(chk_ta);
+        let is_ta = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, tag, i64::from(l.ta_type_tag));
+        self.b.ins().brif(is_ta, ta_blk, &[], deopt, &[]);
+
+        // Typed array: walk to the backing `Vec<u8>`, then split on element kind.
+        self.b.switch_to_block(ta_blk);
+        let (bytes_ptr, bytes_len, byte_off, kind) =
+            self.ta_buffer(nid, ptr, index, ptr_word, len_word)?;
+        let is_f64 = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, kind, i64::from(l.kind_float64));
+        self.b.ins().brif(is_f64, f64_blk, &[], chk_i32, &[]);
+
+        self.b.switch_to_block(chk_i32);
+        let is_i32 = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, kind, i64::from(l.kind_int32));
+        self.b.ins().brif(is_i32, i32_blk, &[], deopt, &[]);
+
+        // Float64 element: byte-range check, load the `f64`, NaN-box it.
+        self.b.switch_to_block(f64_blk);
+        let eoff = self.elem_byte_off(index, byte_off, 3);
+        let end = self.b.ins().iadd_imm(eoff, 8);
+        let over = self.b.ins().icmp(IntCC::UnsignedGreaterThan, end, bytes_len);
+        self.guard(nid, over)?;
+        let addr = self.b.ins().iadd(bytes_ptr, eoff);
+        let d = self.ld(types::F64, addr, 0);
+        let boxed = box_tagged(self.b, self.flags, d, Repr::Float64);
+        self.b.ins().jump(done, &[BlockArg::from(boxed)]);
+
+        // Int32 element: byte-range check, load the `i32`, box it.
+        self.b.switch_to_block(i32_blk);
+        let eoff = self.elem_byte_off(index, byte_off, 2);
+        let end = self.b.ins().iadd_imm(eoff, 4);
+        let over = self.b.ins().icmp(IntCC::UnsignedGreaterThan, end, bytes_len);
+        self.guard(nid, over)?;
+        let addr = self.b.ins().iadd(bytes_ptr, eoff);
+        let w = self.ld(types::I32, addr, 0);
+        let boxed = box_tagged(self.b, self.flags, w, Repr::Int32);
+        self.b.ins().jump(done, &[BlockArg::from(boxed)]);
+
+        self.b.switch_to_block(done);
+        Ok(result)
+    }
+
+    /// `StoreElement`: speculative dense-array / typed-array `recv[idx] = value`.
+    /// Every miss deopts at `nid`. Side-effect only.
+    fn lower_store_element(
+        &mut self,
+        nid: NodeId,
+        recv: NodeId,
+        idx: NodeId,
+        val: NodeId,
+    ) -> Result<(), Unsupported> {
+        let l = self.view.ta_layout;
+        let (ptr_word, len_word) = vec_layout_offsets();
+        let vrepr = self.graph.node(val).repr;
+        let (ptr, tag) = self.recv_body(nid, recv)?;
+        let idxv = self.val(idx)?;
+        let index = self.b.ins().uextend(types::I64, idxv);
+
+        let done = self.b.create_block();
+        let array_blk = self.b.create_block();
+        let ta_blk = self.b.create_block();
+        let f64_blk = self.b.create_block();
+        let chk_i32 = self.b.create_block();
+        let i32_blk = self.b.create_block();
+        let deopt = self.deopt_block(nid)?;
+
+        let is_array = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, tag, i64::from(l.array_type_tag));
+        self.b.ins().brif(is_array, array_blk, &[], ta_blk, &[]);
+
+        // Dense array: a live array-index protector, an exotic sidecar, or an
+        // out-of-bounds index all make the store observable / spec-bound — deopt.
+        self.b.switch_to_block(array_blk);
+        let prot_ptr = self.ld(
+            types::I64,
+            self.ctx_ptr,
+            super::abi::ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET,
+        );
+        let prot = self.ld(types::I8, prot_ptr, 0);
+        let prot_live = self.b.ins().icmp_imm(IntCC::NotEqual, prot, 0);
+        self.guard(nid, prot_live)?;
+        let exotic = self.ld(types::I64, ptr, l.array_exotic_byte);
+        let has_exotic = self.b.ins().icmp_imm(IntCC::NotEqual, exotic, 0);
+        self.guard(nid, has_exotic)?;
+        let elen = self.ld(types::I64, ptr, l.array_elements_byte + len_word);
+        let oob = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, index, elen);
+        self.guard(nid, oob)?;
+        let llen = self.ld(types::I64, ptr, l.array_length_byte);
+        let oob2 = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, index, llen);
+        self.guard(nid, oob2)?;
+        let data = self.ld(types::I64, ptr, l.array_elements_byte + ptr_word);
+        let slot = self.scaled_addr(data, index, 3);
+        let boxed = self.boxed_val(val, vrepr)?;
+        self.b.ins().store(self.flags.trusted, boxed, slot, 0);
+        self.b.ins().jump(done, &[]);
+
+        // Typed array: walk to the backing `Vec<u8>`, split on kind, store raw.
+        self.b.switch_to_block(ta_blk);
+        let is_ta = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, tag, i64::from(l.ta_type_tag));
+        let ta_walk = self.b.create_block();
+        self.b.ins().brif(is_ta, ta_walk, &[], deopt, &[]);
+        self.b.switch_to_block(ta_walk);
+        let (bytes_ptr, bytes_len, byte_off, kind) =
+            self.ta_buffer(nid, ptr, index, ptr_word, len_word)?;
+        let is_f64 = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, kind, i64::from(l.kind_float64));
+        self.b.ins().brif(is_f64, f64_blk, &[], chk_i32, &[]);
+
+        self.b.switch_to_block(chk_i32);
+        let is_i32 = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, kind, i64::from(l.kind_int32));
+        self.b.ins().brif(is_i32, i32_blk, &[], deopt, &[]);
+
+        // Float64 store: range-check, coerce the value to `f64`, store.
+        self.b.switch_to_block(f64_blk);
+        let eoff = self.elem_byte_off(index, byte_off, 3);
+        let end = self.b.ins().iadd_imm(eoff, 8);
+        let over = self.b.ins().icmp(IntCC::UnsignedGreaterThan, end, bytes_len);
+        self.guard(nid, over)?;
+        let addr = self.b.ins().iadd(bytes_ptr, eoff);
+        let d = self.value_as_f64(val, vrepr)?;
+        self.b.ins().store(self.flags.trusted, d, addr, 0);
+        self.b.ins().jump(done, &[]);
+
+        // Int32 store: range-check, store the low 32 bits (an `f64` value misses).
+        self.b.switch_to_block(i32_blk);
+        let w = match vrepr {
+            Repr::Int32 => self.val(val)?,
+            _ => {
+                self.b.ins().jump(deopt, &[]);
+                self.b.switch_to_block(done);
+                return Ok(());
+            }
+        };
+        let eoff = self.elem_byte_off(index, byte_off, 2);
+        let end = self.b.ins().iadd_imm(eoff, 4);
+        let over = self.b.ins().icmp(IntCC::UnsignedGreaterThan, end, bytes_len);
+        self.guard(nid, over)?;
+        let addr = self.b.ins().iadd(bytes_ptr, eoff);
+        self.b.ins().store(self.flags.trusted, w, addr, 0);
+        self.b.ins().jump(done, &[]);
+
+        self.b.switch_to_block(done);
+        Ok(())
+    }
+
+    /// `bytes_ptr + ((index << shift) + byte_off)` byte offset within a typed
+    /// array's backing buffer.
+    fn elem_byte_off(&mut self, index: Value, byte_off: Value, shift: i64) -> Value {
+        let scaled = self.b.ins().ishl_imm(index, shift);
+        self.b.ins().iadd(scaled, byte_off)
+    }
+
+    /// `base + (index << shift)` as an i64 address.
+    fn scaled_addr(&mut self, base: Value, index: Value, shift: i64) -> Value {
+        let scaled = self.b.ins().ishl_imm(index, shift);
+        self.b.ins().iadd(base, scaled)
+    }
+
+    /// Box an SSA value (by its repr) to its tagged `Value` for a dense-array
+    /// element store. The value is always a primitive, so no write barrier.
+    fn boxed_val(&mut self, val: NodeId, repr: Repr) -> Result<Value, Unsupported> {
+        let v = self.val(val)?;
+        Ok(box_tagged(self.b, self.flags, v, repr))
+    }
+
+    /// Coerce an SSA value to `f64` for a `Float64Array` store (an int32 widens).
+    fn value_as_f64(&mut self, val: NodeId, repr: Repr) -> Result<Value, Unsupported> {
+        let v = self.val(val)?;
+        match repr {
+            Repr::Float64 => Ok(v),
+            Repr::Int32 => Ok(self.b.ins().fcvt_from_sint(types::F64, v)),
+            _ => Err(Unsupported::Unlowered("clif: store-element value not numeric")),
+        }
+    }
+
+    /// Walk a typed-array body to its backing `Vec<u8>`: guard not length-tracking,
+    /// bounds-check the element count, guard the buffer is a local buffer of the
+    /// right body type, and return `(bytes_ptr, bytes_len, byte_offset, kind)`.
+    /// Any miss deopts at `nid`.
+    fn ta_buffer(
+        &mut self,
+        nid: NodeId,
+        ptr: Value,
+        index: Value,
+        ptr_word: u32,
+        len_word: u32,
+    ) -> Result<(Value, Value, Value, Value), Unsupported> {
+        let l = self.view.ta_layout;
+        let tracking = self.ld(types::I8, ptr, l.ta_length_tracking_byte);
+        let is_tracking = self.b.ins().icmp_imm(IntCC::NotEqual, tracking, 0);
+        self.guard(nid, is_tracking)?;
+        // Spec length bound: reading/writing at or beyond the logical element
+        // count must defer to the interpreter, not touch raw buffer bytes.
+        let len = self.ld(types::I64, ptr, l.ta_length_byte);
+        let oob = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, index, len);
+        self.guard(nid, oob)?;
+        let disc = self.ld(types::I32, ptr, l.buffer_disc_byte);
+        let not_local = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, disc, i64::from(l.buffer_local_tag));
+        self.guard(nid, not_local)?;
+        let handle = self.ld(types::I32, ptr, l.buffer_handle_byte);
+        let hoff = self.b.ins().uextend(types::I64, handle);
+        let cage = self.b.ins().iconst(types::I64, self.view.cage_base as i64);
+        let bufptr = self.b.ins().iadd(cage, hoff);
+        let btag = self.ld(types::I8, bufptr, 0);
+        let not_buf = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, btag, i64::from(l.local_buffer_type_tag));
+        self.guard(nid, not_buf)?;
+        let bytes_ptr = self.ld(types::I64, bufptr, l.buf_bytes_byte + ptr_word);
+        let bytes_len = self.ld(types::I64, bufptr, l.buf_bytes_byte + len_word);
+        let byte_off = self.ld(types::I64, ptr, l.ta_byte_offset_byte);
+        let kind = self.ld(types::I32, ptr, l.ta_kind_byte);
+        Ok((bytes_ptr, bytes_len, byte_off, kind))
+    }
+}
+
+/// Byte offsets of a `Vec`'s data-pointer and length words, probed by value
+/// identity (the standard library does not promise field order). Mirrors the
+/// dynasm tier so both backends read the same `Vec<Value>` / `Vec<u8>` storage.
+fn vec_layout_offsets() -> (u32, u32) {
+    static CACHE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let mut v: Vec<u8> = Vec::with_capacity(4);
+        v.push(0xA5);
+        let ptr = v.as_ptr() as usize;
+        let len = v.len();
+        assert_eq!(std::mem::size_of::<Vec<u8>>(), 24);
+        // SAFETY: copy the Vec's three machine words by value; they are compared
+        // to known pointer/length values, never dereferenced.
+        let words: [usize; 3] = unsafe { std::mem::transmute_copy(&v) };
+        let mut ptr_off = None;
+        let mut len_off = None;
+        for (i, &w) in words.iter().enumerate() {
+            if w == ptr {
+                ptr_off = Some((i * 8) as u32);
+            } else if w == len {
+                len_off = Some((i * 8) as u32);
+            }
+        }
+        (
+            ptr_off.expect("Vec data-pointer word not found"),
+            len_off.expect("Vec length word not found"),
+        )
+    })
 }
 
 /// Map a typed-SSA comparison to a signed integer condition code.

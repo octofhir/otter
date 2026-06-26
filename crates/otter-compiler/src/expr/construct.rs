@@ -16,6 +16,10 @@ pub(crate) fn compile_new(
 ) -> Result<u16, CompileError> {
     let _ = span;
     let new_span = (new_expr.span.start, new_expr.span.end);
+    // Callee + argument temps die once the construct opcode reads them
+    // into the callee frame (`dst` is written on return), so recycle the
+    // whole range into `dst`. See `FunctionContext::reset_scratch`.
+    let mark = cx.scratch;
     let callee = unwrap_ts_expr(&new_expr.callee);
     // §13.3.5 — a `new C(...args)` whose arguments include a SpreadElement
     // must build its argument list dynamically. Route it straight to the
@@ -29,6 +33,7 @@ pub(crate) fn compile_new(
     {
         let callee_reg = compile_expr(cx, callee, new_span)?;
         let args_reg = compile_spread_call_args(cx, &new_expr.arguments, new_span)?;
+        cx.reset_scratch(mark);
         let dst = cx.alloc_scratch();
         cx.emit(
             Op::NewSpread,
@@ -88,6 +93,7 @@ pub(crate) fn compile_new(
         && find_module_import_binding(cx, "Array").is_none()
     {
         let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+        cx.reset_scratch(mark);
         let dst = cx.alloc_scratch();
         let mut operands: Vec<Operand> = Vec::with_capacity(2 + arg_regs.len());
         operands.push(Operand::Register(dst));
@@ -143,6 +149,7 @@ pub(crate) fn compile_new(
         && find_module_import_binding(cx, "Function").is_none()
     {
         let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+        cx.reset_scratch(mark);
         let dst = cx.alloc_scratch();
         let mut operands: Vec<Operand> = Vec::with_capacity(2 + arg_regs.len());
         operands.push(Operand::Register(dst));
@@ -179,6 +186,7 @@ pub(crate) fn compile_new(
     // early-return path above).
     let callee_reg = compile_expr(cx, callee, new_span)?;
     let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+    cx.reset_scratch(mark);
     let dst = cx.alloc_scratch();
     let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
     operands.push(Operand::Register(dst));

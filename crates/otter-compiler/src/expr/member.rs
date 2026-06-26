@@ -127,8 +127,10 @@ pub(crate) fn compile_static_member(
         );
         return Ok(dst);
     }
+    let mark = cx.scratch;
     let receiver = compile_expr(cx, &m.object, span)?;
     let name_idx = cx.intern_string_constant(m.property.name.as_str());
+    cx.reset_scratch(mark);
     let dst = cx.alloc_scratch();
     cx.emit(
         Op::LoadProperty,
@@ -176,8 +178,10 @@ pub(crate) fn compile_computed_member(
         );
         return Ok(dst);
     }
+    let mark = cx.scratch;
     let recv = compile_expr(cx, &m.object, span)?;
     let idx = compile_expr(cx, &m.expression, span)?;
+    cx.reset_scratch(mark);
     let dst = cx.alloc_scratch();
     cx.emit(
         Op::LoadElement,

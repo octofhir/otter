@@ -238,8 +238,11 @@ pub(crate) fn compile_unary(
             return Ok(dst);
         }
     }
+    // The operand (and its ToPrimitive temp) is dead once the unary op
+    // has read it, so recycle the range into `dst`. See
+    // `FunctionContext::reset_scratch`.
+    let mark = cx.scratch;
     let inner = compile_expr(cx, &u.argument, span)?;
-    let dst = cx.alloc_scratch();
     let op = match u.operator {
         UnaryOperator::UnaryNegation => Op::Neg,
         UnaryOperator::UnaryPlus => Op::ToNumber,
@@ -269,6 +272,8 @@ pub(crate) fn compile_unary(
         }
         _ => inner,
     };
+    cx.reset_scratch(mark);
+    let dst = cx.alloc_scratch();
     cx.emit(
         op,
         [Operand::Register(dst), Operand::Register(inner_in)],

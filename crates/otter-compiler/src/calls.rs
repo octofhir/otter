@@ -87,6 +87,12 @@ pub(crate) fn compile_method_call(
     call: &oxc_ast::ast::CallExpression<'_>,
 ) -> Result<u16, CompileError> {
     let span = (call.span.start, call.span.end);
+    // Callee + argument temps are dead once the call opcode has read
+    // them into the callee frame (the destination is written only on
+    // return), so straight-line call arms recycle the whole range into
+    // `dst`. See `FunctionContext::reset_scratch`. Branch-carrying arms
+    // (`with`-probe, guarded `eval`) keep their temps and are skipped.
+    let call_mark = cx.scratch;
     let callee = peel_paren_eval(unwrap_ts_expr(&call.callee));
     // `super(args...)` — direct super-constructor call. Only valid
     // inside a derived-class constructor; the upvalue lookup will
@@ -629,6 +635,7 @@ pub(crate) fn compile_method_call(
         let name_idx = cx.intern_string_constant(method_name);
         let arg_regs = compile_call_args(cx, &call.arguments, span)?;
         check_call_arity(arg_regs.len(), "Op::CallMethodValue", span)?;
+        cx.reset_scratch(call_mark);
         let dst = cx.alloc_scratch();
         let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
         operands.push(Operand::Register(dst));
@@ -660,6 +667,7 @@ pub(crate) fn compile_method_call(
         );
         let arg_regs = compile_call_args(cx, &call.arguments, span)?;
         check_call_arity(arg_regs.len(), "Op::CallMethodValue", span)?;
+        cx.reset_scratch(call_mark);
         let dst = cx.alloc_scratch();
         let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
         operands.push(Operand::Register(dst));
@@ -680,6 +688,7 @@ pub(crate) fn compile_method_call(
             let name_idx = cx.intern_string_constant(lit.value.as_str());
             let arg_regs = compile_call_args(cx, &call.arguments, span)?;
             check_call_arity(arg_regs.len(), "Op::CallMethodValue", span)?;
+            cx.reset_scratch(call_mark);
             let dst = cx.alloc_scratch();
             let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
             operands.push(Operand::Register(dst));
@@ -703,6 +712,7 @@ pub(crate) fn compile_method_call(
         );
         let arg_regs = compile_call_args(cx, &call.arguments, span)?;
         check_call_arity(arg_regs.len(), "Op::CallWithThis", span)?;
+        cx.reset_scratch(call_mark);
         let dst = cx.alloc_scratch();
         let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
         operands.push(Operand::Register(dst));
@@ -717,6 +727,7 @@ pub(crate) fn compile_method_call(
     let callee_reg = compile_expr(cx, callee, span)?;
     let arg_regs = compile_call_args(cx, &call.arguments, span)?;
     check_call_arity(arg_regs.len(), "Op::Call", span)?;
+    cx.reset_scratch(call_mark);
     let dst = cx.alloc_scratch();
     let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
     operands.push(Operand::Register(dst));

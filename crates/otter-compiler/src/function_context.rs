@@ -266,6 +266,30 @@ impl FunctionContext {
         r
     }
 
+    /// Free every temporary register at or above `mark`, rolling the
+    /// scratch watermark back to `mark`. Expression combinators capture
+    /// `mark = self.scratch` on entry, evaluate their operands (which
+    /// bump scratch upward), then — immediately before emitting the
+    /// single result-producing instruction — call this and allocate the
+    /// destination at `mark`, so sibling subexpressions reuse the same
+    /// low register range instead of stacking new ones. That overlap is
+    /// what shrinks the frame's `scratch_peak` (and hence its register
+    /// count), not just the bytecode's register numbering.
+    ///
+    /// Sound because (a) expression lowering never declares a persistent
+    /// binding — those are statement-level and always sit below `mark` —
+    /// so no live value beneath the result is clobbered, and (b) every
+    /// result opcode reads all of its source operands before writing its
+    /// destination, so a destination that aliases a just-freed operand
+    /// register is read-before-write safe.
+    pub(crate) fn reset_scratch(&mut self, mark: u16) {
+        debug_assert!(
+            mark <= self.scratch,
+            "reset_scratch above current watermark"
+        );
+        self.scratch = mark;
+    }
+
     /// Final register-window size: the high-water mark survives
     /// scratch recycling (`cx.scratch = mark` rollbacks).
     pub(crate) fn scratch_window(&self) -> u16 {

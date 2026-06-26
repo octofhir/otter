@@ -190,6 +190,10 @@ pub(crate) fn compile_binary(
     let rhs_prim = expr_is_primitive(&b.right);
     let lhs_num = expr_is_numeric(&b.left);
     let rhs_num = expr_is_numeric(&b.right);
+    // Operand temps (and their coercion temps) are dead once the
+    // result opcode below has read them, so recycle the whole range
+    // into the destination register. See `FunctionContext::reset_scratch`.
+    let mark = cx.scratch;
     let lhs = compile_expr(cx, &b.left, span)?;
     let rhs = compile_expr(cx, &b.right, span)?;
     let op = match b.operator {
@@ -333,6 +337,7 @@ pub(crate) fn compile_binary(
         }
         _ => (lhs, rhs),
     };
+    cx.reset_scratch(mark);
     let dst = cx.alloc_scratch();
     cx.emit(
         op,

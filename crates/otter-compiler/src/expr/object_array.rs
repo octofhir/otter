@@ -132,8 +132,15 @@ pub(crate) fn compile_object_literal(
         cx.emit_store_storage(dst, storage, span);
         cx.mark_initialized(crate::class::SUPER_HOME_NAME);
     }
+    // Each property's key/value temps are dead once its store opcode
+    // has folded them into `dst`, so recycle the whole range at the top
+    // of every iteration (this also covers the `continue` arms below).
+    // `dst` and the optional `__class_home` cell sit below this mark and
+    // stay live. See `FunctionContext::reset_scratch`.
+    let prop_mark = cx.scratch;
     let mut seen_proto = false;
     for prop in &obj.properties {
+        cx.reset_scratch(prop_mark);
         match prop {
             oxc_ast::ast::ObjectPropertyKind::ObjectProperty(p) => {
                 let key_span = (p.span.start, p.span.end);

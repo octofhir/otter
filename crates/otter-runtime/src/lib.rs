@@ -2180,6 +2180,26 @@ impl Runtime {
         self.interp.set_global(name, value);
     }
 
+    /// Install a string-valued global property without an extra parse pass.
+    ///
+    /// Host installers use this to stage large bootstrap sources on the realm
+    /// as plain string data (rather than `eval`ing them eagerly), so the heavy
+    /// parse + lower only runs when the staged source is later evaluated.
+    ///
+    /// # Errors
+    /// Returns [`OtterError::Internal`] when the backing string allocation
+    /// exceeds the configured heap cap.
+    pub fn install_string_global(&mut self, name: &str, value: &str) -> Result<(), OtterError> {
+        let s = otter_vm::JsString::from_str(value, self.interp.gc_heap_mut()).map_err(|err| {
+            OtterError::Internal {
+                code: DiagnosticCode::StringAlloc.as_str().to_string(),
+                message: err.to_string(),
+            }
+        })?;
+        self.interp.set_global(name, otter_vm::Value::string(s));
+        Ok(())
+    }
+
     /// Define `value[Symbol.toStringTag]` as a non-enumerable host tag.
     ///
     /// Host integrations use this for Node/Web globals whose observable brand

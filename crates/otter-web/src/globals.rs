@@ -24,6 +24,123 @@ const WEB_BOOTSTRAP: &str = include_str!("web_bootstrap.js");
 /// [`WEB_BOOTSTRAP`] (depends on its `TextEncoder` / `TextDecoder`).
 const WEB_STREAMS: &str = include_str!("web_streams.js");
 
+/// Every global the [`WEB_BOOTSTRAP`] + [`WEB_STREAMS`] sources attach to
+/// `globalThis` via their `def(name, value)` helper. Each name is installed
+/// as a lazy accessor so the ~52 KB of shim source is only parsed + compiled
+/// + executed when one of these globals is first touched — the common cold
+/// start (a script that never uses a Web class) skips it entirely.
+///
+/// This list must stay in lockstep with the `def('...')` calls in both shim
+/// files; [`tests::lazy_global_names_match_shim_def_calls`] enforces that.
+const WEB_GLOBAL_NAMES: &[&str] = &[
+    // web_bootstrap.js
+    "AbortController",
+    "AbortSignal",
+    "BroadcastChannel",
+    "CloseEvent",
+    "CustomEvent",
+    "DOMException",
+    "ErrorEvent",
+    "Event",
+    "EventTarget",
+    "File",
+    "FormData",
+    "MessageChannel",
+    "MessageEvent",
+    "MessagePort",
+    "performance",
+    "ProgressEvent",
+    "TextDecoder",
+    "TextEncoder",
+    "URLSearchParams",
+    // web_streams.js
+    "CompressionStream",
+    "DecompressionStream",
+    "ReadableStream",
+    "ReadableStreamDefaultController",
+    "ReadableStreamDefaultReader",
+    "TextDecoderStream",
+    "TextEncoderStream",
+    "TransformStream",
+    "WritableStream",
+    "WritableStreamDefaultController",
+    "WritableStreamDefaultWriter",
+];
+
+/// Hidden global that stages the concatenated shim source as a plain string
+/// (no parse) until a lazy accessor triggers its evaluation. Non-enumerable
+/// and deleted by the installer shim on first materialization.
+const STAGED_SOURCE_GLOBAL: &str = "__otterWebGlobalsSource";
+
+/// Install the Web-platform class globals lazily.
+///
+/// The heavy shim source is staged on the realm as a string and a small
+/// installer shim registers one lazy accessor per [`WEB_GLOBAL_NAMES`] entry.
+/// The first read of any of those names materializes the full set (matching
+/// the previous eager behaviour exactly), then replaces every accessor with
+/// the real data property the shim's `def` helper installs.
+fn install_lazy_web_globals(runtime: &mut Runtime) -> Result<(), OtterError> {
+    // `web_streams.js` depends on `TextEncoder` / `TextDecoder` from
+    // `web_bootstrap.js`; evaluating them back to back in one staged source
+    // keeps that ordering. The trailing `;` guards against either shim
+    // omitting its own statement terminator.
+    let mut staged = String::with_capacity(WEB_BOOTSTRAP.len() + WEB_STREAMS.len() + 8);
+    staged.push_str(WEB_BOOTSTRAP);
+    staged.push_str("\n;\n");
+    staged.push_str(WEB_STREAMS);
+    staged.push_str("\n;\n");
+    runtime.install_string_global(STAGED_SOURCE_GLOBAL, &staged)?;
+
+    let names = WEB_GLOBAL_NAMES
+        .iter()
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    // Indirect `(0, eval)` runs the staged source in global scope. The shim
+    // sources only mutate `globalThis` (via their own `def` helper), so
+    // re-evaluation needs no surrounding lexical environment.
+    //
+    // `ensure` removes *every* lazy accessor before evaluating the staged
+    // source: that reproduces the eager ordering exactly (a name reads as
+    // `undefined` until the source's `def` installs it) and guarantees a read
+    // during evaluation can never re-enter a lazy getter — without the upfront
+    // delete, a global referenced before its own `def` would loop forever.
+    let shim = format!(
+        "(function (g) {{\n\
+         'use strict';\n\
+         var NAMES = [{names}];\n\
+         var done = false;\n\
+         function ensure() {{\n\
+           if (done) return;\n\
+           done = true;\n\
+           var src = g.{STAGED_SOURCE_GLOBAL};\n\
+           delete g.{STAGED_SOURCE_GLOBAL};\n\
+           for (var i = 0; i < NAMES.length; i++) delete g[NAMES[i]];\n\
+           (0, eval)(src);\n\
+         }}\n\
+         for (var i = 0; i < NAMES.length; i++) {{\n\
+           (function (name) {{\n\
+             Object.defineProperty(g, name, {{\n\
+               configurable: true,\n\
+               enumerable: false,\n\
+               get: function () {{ ensure(); return g[name]; }},\n\
+               set: function (v) {{\n\
+                 Object.defineProperty(g, name, {{ value: v, writable: true, enumerable: false, configurable: true }});\n\
+               }},\n\
+             }});\n\
+           }})(NAMES[i]);\n\
+         }}\n\
+         }})(globalThis);\n"
+    );
+    runtime
+        .eval(SourceInput::from_javascript(shim))
+        .map_err(|err| OtterError::Internal {
+            code: "WEB_LAZY_INSTALL".to_string(),
+            message: format!("web globals lazy install failed: {err}"),
+        })?;
+    Ok(())
+}
+
 /// Installer for the Web function globals. Registered by `with_web_apis`.
 #[must_use]
 pub fn web_globals_installer() -> RuntimeGlobalInstaller {
@@ -37,18 +154,7 @@ fn install(runtime: &mut Runtime) -> Result<(), OtterError> {
     runtime.install_native_global("structuredClone", 1, structured_clone)?;
     runtime.install_native_global("fetch", 1, fetch)?;
     runtime.install_native_global("__otterStreamCodec", 3, stream_codec)?;
-    runtime
-        .eval(SourceInput::from_javascript(WEB_BOOTSTRAP.to_string()))
-        .map_err(|err| OtterError::Internal {
-            code: "WEB_BOOTSTRAP".to_string(),
-            message: format!("web globals bootstrap failed: {err}"),
-        })?;
-    runtime
-        .eval(SourceInput::from_javascript(WEB_STREAMS.to_string()))
-        .map_err(|err| OtterError::Internal {
-            code: "WEB_STREAMS".to_string(),
-            message: format!("web streams bootstrap failed: {err}"),
-        })?;
+    install_lazy_web_globals(runtime)?;
     Ok(())
 }
 
@@ -212,4 +318,44 @@ fn stream_codec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
         .global_value("Uint8Array")
         .ok_or_else(|| runtime_type_error("CompressionStream", "Uint8Array is unavailable"))?;
     ctx.construct(ctor, &[Value::array_buffer(buffer)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WEB_BOOTSTRAP, WEB_GLOBAL_NAMES, WEB_STREAMS};
+    use std::collections::BTreeSet;
+
+    /// Scan a shim source for the `def('<name>')` calls that attach a global.
+    /// This is a literal substring scan (not a JS parse) used purely to keep
+    /// [`WEB_GLOBAL_NAMES`] in lockstep with the shim sources.
+    fn def_names(src: &str) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let bytes = src.as_bytes();
+        let needle = b"def('";
+        let mut i = 0;
+        while i + needle.len() < bytes.len() {
+            if &bytes[i..i + needle.len()] == needle {
+                let start = i + needle.len();
+                if let Some(end_rel) = src[start..].find('\'') {
+                    out.insert(src[start..start + end_rel].to_string());
+                }
+                i = start;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn lazy_global_names_match_shim_def_calls() {
+        let mut from_shims = def_names(WEB_BOOTSTRAP);
+        from_shims.extend(def_names(WEB_STREAMS));
+        let listed: BTreeSet<String> =
+            WEB_GLOBAL_NAMES.iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(
+            from_shims, listed,
+            "WEB_GLOBAL_NAMES must match the def('...') globals installed by the shim sources"
+        );
+    }
 }

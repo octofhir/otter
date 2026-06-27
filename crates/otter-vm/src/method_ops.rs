@@ -86,10 +86,7 @@ impl otter_gc::ExtraRootSource for CollectionFastDispatchRoots<'_> {
 /// prototype: either implicit (`None` — the default) or an explicit override
 /// that still points at `expected`. Any other object is a user-installed
 /// prototype that could shadow the builtin, so the direct dispatch bails.
-fn prototype_override_is(
-    override_value: Option<Value>,
-    expected: crate::object::JsObject,
-) -> bool {
+fn prototype_override_is(override_value: Option<Value>, expected: crate::object::JsObject) -> bool {
     match override_value {
         None => true,
         Some(value) => value.as_object() == Some(expected),
@@ -383,6 +380,9 @@ impl Interpreter {
         };
         let caller_byte_len = self.current_byte_len;
         let top_idx = stack.len() - 1;
+        if let Some(result) = self.continue_pending_bind_function(stack, context, dst) {
+            return result;
+        }
         let name = context
             .string_constant_str_for_function(stack[top_idx].function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
@@ -1086,7 +1086,7 @@ impl Interpreter {
         site: usize,
         arg_regs: &[u16],
     ) -> Result<(), VmError> {
-        self.record_jit_runtime_property_stub();
+        self.record_jit_runtime_method_stub();
         let recv = *read_register(&stack[frame_index], recv_reg)?;
         if recv.is_nullish() {
             let label = if recv.is_null() { "null" } else { "undefined" };
@@ -1282,7 +1282,8 @@ impl Interpreter {
             let PropertyLookup::Data { value: method, .. } = lookup else {
                 return None;
             };
-            if !crate::bootstrap_collections::is_map_prototype_builtin(method, &self.gc_heap, name) {
+            if !crate::bootstrap_collections::is_map_prototype_builtin(method, &self.gc_heap, name)
+            {
                 return None;
             }
             match name {
@@ -1305,7 +1306,8 @@ impl Interpreter {
             let PropertyLookup::Data { value: method, .. } = lookup else {
                 return None;
             };
-            if !crate::bootstrap_collections::is_set_prototype_builtin(method, &self.gc_heap, name) {
+            if !crate::bootstrap_collections::is_set_prototype_builtin(method, &self.gc_heap, name)
+            {
                 return None;
             }
             match name {

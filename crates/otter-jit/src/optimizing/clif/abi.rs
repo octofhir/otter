@@ -59,6 +59,8 @@ pub(super) const HOLE_BITS: u64 = (TAG_SPECIAL << 48) | crate::baseline::SPECIAL
 pub(super) const STATUS_RETURNED: i64 = crate::baseline::STATUS_RETURNED as i64;
 /// `JitRet.status` for a guard bail (`Bailed(bail_pc)`).
 pub(super) const STATUS_BAILED: i64 = crate::baseline::STATUS_BAILED as i64;
+/// `JitRet.status` for a parked VM error.
+pub(super) const STATUS_THREW: i64 = crate::baseline::STATUS_THREW as i64;
 
 /// Byte offset of the register-window base pointer within `JitCtx` (field 0).
 pub(super) const REGS_OFFSET: i32 = 0;

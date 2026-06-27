@@ -6,7 +6,7 @@ frame=1 fn=<main> pc=000037 op=LOAD_UNDEFINED  r1
 frame=1 fn=<main> pc=000042 op=LOAD_UNDEFINED  r1
 frame=1 fn=<main> pc=000047 op=ENTER_TRY  i32:56 i32:-2147483648 r2
 frame=1 fn=<main> pc=000062 op=LOAD_GLOBAL_OR_THROW  r3 k[0]
-frame=1 fn=<main> pc=000072 op=CALL  r4 r3 k[0]
+frame=1 fn=<main> pc=000072 op=CALL  r3 r3 k[0]
 frame=2 fn=boom pc=000000 op=MAKE_FUNCTION  r1 k[1]
 frame=2 fn=boom pc=000010 op=STORE_LOCAL  r1 i32:0
 frame=2 fn=boom pc=000020 op=LOAD_STRING  r2 k[2]
@@ -14,7 +14,7 @@ frame=2 fn=boom pc=000030 op=NEW_ERROR  r3 r2
 frame=2 fn=boom pc=000038 op=THROW  r3
 frame=1 fn=<main> pc=000104 op=LOAD_UNDEFINED  r1
 frame=1 fn=<main> pc=000109 op=STORE_UPVALUE  r2 i32:0
-frame=1 fn=<main> pc=000119 op=LOAD_UPVALUE  r5 i32:0
-frame=1 fn=<main> pc=000129 op=LOAD_PROPERTY  r6 r5 k[3]
-frame=1 fn=<main> pc=000142 op=STORE_LOCAL  r6 i32:1
+frame=1 fn=<main> pc=000119 op=LOAD_UPVALUE  r4 i32:0
+frame=1 fn=<main> pc=000129 op=LOAD_PROPERTY  r4 r4 k[3]
+frame=1 fn=<main> pc=000142 op=STORE_LOCAL  r4 i32:1
 frame=1 fn=<main> pc=000152 op=RETURN  r1

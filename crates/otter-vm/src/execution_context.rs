@@ -262,8 +262,7 @@ impl ExecutionContext {
             if instr.op == otter_bytecode::Op::LoadProperty
                 && let Some(&otter_bytecode::Operand::ConstIndex(idx)) = instr.operands.get(2)
                 && self
-                    .atoms
-                    .string_constant_str(idx)
+                    .string_constant_str_for_function(function_id, idx)
                     .is_some_and(|name| name == "length")
             {
                 instr.load_array_length = true;

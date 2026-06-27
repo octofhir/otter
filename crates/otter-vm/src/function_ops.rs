@@ -286,43 +286,12 @@ impl Interpreter {
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
-        let top_idx = stack.len() - 1;
-        let pc = stack[top_idx].pc;
-        let pending = self
-            .frame_cold(&stack[top_idx])
-            .and_then(|c| c.pending_bind_function.as_ref())
-            .filter(|state| state.pc == pc && state.dst == dst)
-            .cloned();
-        if let Some(state) = pending {
-            let produced = *read_register(&stack[top_idx], dst)?;
-            return match state.stage {
-                PendingBindStage::Name => self.continue_bind_function_after_name(
-                    stack,
-                    context,
-                    dst,
-                    state.target,
-                    state.bound_this,
-                    state.bound_args,
-                    produced,
-                ),
-                PendingBindStage::Length => {
-                    let target_name = state.target_name.ok_or(VmError::InvalidOperand)?;
-                    if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
-                        cold.pending_bind_function = None;
-                    }
-                    self.finish_bind_function(
-                        stack,
-                        dst,
-                        state.target,
-                        state.bound_this,
-                        state.bound_args,
-                        target_name,
-                        produced,
-                    )
-                }
-            };
+        if let Some(result) = self.continue_pending_bind_function(stack, context, dst) {
+            return result;
         }
 
+        let top_idx = stack.len() - 1;
+        let pc = stack[top_idx].pc;
         let callee_reg = register_operand(operands.get(1))?;
         let this_reg = register_operand(operands.get(2))?;
         let argc = match operands.get(3) {
@@ -363,6 +332,54 @@ impl Interpreter {
                 self.invoke(stack, context, &getter, target, SmallVec::new(), dst)
             }
         }
+    }
+
+    pub(crate) fn continue_pending_bind_function(
+        &mut self,
+        stack: &mut HoltStack,
+        context: &ExecutionContext,
+        dst: u16,
+    ) -> Option<Result<(), VmError>> {
+        let top_idx = stack.len() - 1;
+        let pc = stack[top_idx].pc;
+        let state = self
+            .frame_cold(&stack[top_idx])
+            .and_then(|c| c.pending_bind_function.as_ref())
+            .filter(|state| state.pc == pc && state.dst == dst)
+            .cloned()?;
+        let produced = match read_register(&stack[top_idx], dst) {
+            Ok(value) => *value,
+            Err(err) => return Some(Err(err)),
+        };
+        Some(match state.stage {
+            PendingBindStage::Name => self.continue_bind_function_after_name(
+                stack,
+                context,
+                dst,
+                state.target,
+                state.bound_this,
+                state.bound_args,
+                produced,
+            ),
+            PendingBindStage::Length => {
+                let target_name = match state.target_name {
+                    Some(value) => value,
+                    None => return Some(Err(VmError::InvalidOperand)),
+                };
+                if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+                    cold.pending_bind_function = None;
+                }
+                self.finish_bind_function(
+                    stack,
+                    dst,
+                    state.target,
+                    state.bound_this,
+                    state.bound_args,
+                    target_name,
+                    produced,
+                )
+            }
+        })
     }
 
     pub(crate) fn continue_bind_function_after_name(

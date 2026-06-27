@@ -36,10 +36,12 @@
 //! - [`CraneliftCode`] — the finalized module and its entry/OSR addresses.
 //!
 //! # Invariants
-//! - The numeric subset has no `Call` and allocates nothing: there are no
-//!   safepoints, so no Cranelift stackmaps are required. Boxed `Value`s live only
-//!   in the frame window (which the VM traces); unboxed numbers and boxed-double
-//!   bit patterns are non-pointers (CRANELIFT_TIER2.md §6).
+//! - The numeric subset has no allocating or re-entrant JS calls. It does emit a
+//!   leaf/no-alloc backedge poll for interrupts and runtime budgets; Cranelift
+//!   preserves live SSA values around that host-ABI call. No GC safepoint or
+//!   stackmap is required. Boxed `Value`s live only in the frame window (which
+//!   the VM traces); unboxed numbers and boxed-double bit patterns are
+//!   non-pointers (CRANELIFT_TIER2.md §6).
 //! - Finalized code is immutable; [`CraneliftCode`] captures raw entry addresses
 //!   at construction and never mutates the module afterward, which is what makes
 //!   sharing it across threads sound.

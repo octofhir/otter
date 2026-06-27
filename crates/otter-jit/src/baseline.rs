@@ -4,8 +4,9 @@
 //! register allocation, and no deopt** — one linear pass, one emit routine per
 //! supported opcode, branch fixups via dynasm dynamic labels. Operands and
 //! results flow through the executing frame's register window; compiled code
-//! re-enters the VM for `Call` and `MakeFunction` through safe bridge methods
-//! on [`otter_vm::Interpreter`].
+//! reaches the VM through named runtime stubs on [`otter_vm::Interpreter`] for
+//! calls, allocation helpers, property fallbacks, and cooperative backedge
+//! polling.
 //!
 //! # ABI
 //! Compiled functions are `extern "C" fn(*mut JitCtx) -> JitRet`. The entry
@@ -437,21 +438,22 @@ extern "C" fn jit_make_fn_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
     }
 }
 
-/// Poll the VM interrupt flag on compiled back-edges. Mirrors the
-/// interpreter's `apply_branch` interrupt check so watchdogs can cancel hot
-/// loops that have tiered up through OSR.
-extern "C" fn jit_interrupt_backedge_stub(ctx: *mut JitCtx) -> u64 {
+/// Poll VM interrupts and runtime budget on compiled back-edges. Mirrors the
+/// interpreter's cooperative checkpoint so watchdogs and budget rejection apply
+/// equally after a loop tiers up through OSR.
+pub(crate) extern "C" fn jit_backedge_poll_stub(ctx: *mut JitCtx) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     if ctx.vm.is_null() {
         return 0;
     }
     let vm = unsafe { &mut *ctx.vm };
-    if vm.interrupt_handle().is_set() {
-        park_jit_error(ctx, VmError::Interrupted);
-        1
-    } else {
-        0
+    match vm.jit_backedge_poll() {
+        Ok(()) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
     }
 }
 
@@ -520,6 +522,7 @@ extern "C" fn jit_load_prop_stub(
     name_idx: u64,
     site: u64,
     cell: u64,
+    function_id: u64,
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
@@ -530,6 +533,7 @@ extern "C" fn jit_load_prop_stub(
         context,
         stack,
         ctx.frame_index,
+        function_id as u32,
         dst as u16,
         obj as u16,
         name_idx as u32,
@@ -755,13 +759,25 @@ extern "C" fn jit_load_element_stub(ctx: *mut JitCtx, dst: u64, recv: u64, idx: 
 /// the safe [`Interpreter::jit_runtime_load_global`]. Returns `0` on success,
 /// `1` when the read threw (unbound identifier / throwing accessor; error
 /// parked in `ctx`).
-extern "C" fn jit_load_global_stub(ctx: *mut JitCtx, dst: u64, name_idx: u64) -> u64 {
+extern "C" fn jit_load_global_stub(
+    ctx: *mut JitCtx,
+    dst: u64,
+    name_idx: u64,
+    function_id: u64,
+) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
     let context = unsafe { &*ctx.context };
-    match vm.jit_runtime_load_global(context, stack, ctx.frame_index, dst as u16, name_idx as u32) {
+    match vm.jit_runtime_load_global(
+        context,
+        stack,
+        ctx.frame_index,
+        function_id as u32,
+        dst as u16,
+        name_idx as u32,
+    ) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -809,13 +825,19 @@ extern "C" fn jit_store_upvalue_stub(ctx: *mut JitCtx, src: u64, idx: u64) -> u6
 /// construction, string constant, checked upvalue store, addition, remainder,
 /// unsigned shift) at `byte_pc` through [`Interpreter::jit_runtime_delegate_op`].
 /// Returns `0` on success, `1` on throw (error parked in `ctx`).
-extern "C" fn jit_delegate_op_stub(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
+extern "C" fn jit_delegate_op_stub(ctx: *mut JitCtx, byte_pc: u64, function_id: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
     let context = unsafe { &*ctx.context };
-    match vm.jit_runtime_delegate_op(context, stack, ctx.frame_index, byte_pc as u32) {
+    match vm.jit_runtime_delegate_op(
+        context,
+        stack,
+        ctx.frame_index,
+        function_id as u32,
+        byte_pc as u32,
+    ) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -1157,15 +1179,14 @@ mod arm64 {
         SPECIAL_NULL, SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
         TAG_FUNCTION_ID, TAG_INT32, TAG_NAN, TAG_PTR_FUNCTION, TAG_PTR_OBJECT, TAG_SPECIAL,
         THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET,
-        Unsupported, VM_OFFSET, WhiskerIcCell, jit_abort_direct_call_stub, jit_call_method_stub,
-        jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
+        Unsupported, VM_OFFSET, WhiskerIcCell, jit_abort_direct_call_stub, jit_backedge_poll_stub,
+        jit_call_method_stub, jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
         jit_finish_direct_call_returned_stub, jit_inline_closure_upvalues_stub,
-        jit_interrupt_backedge_stub, jit_load_element_stub, jit_load_global_stub,
-        jit_load_prop_stub, jit_load_prop_window_stub, jit_load_upvalue_stub, jit_make_fn_stub,
-        jit_new_array_stub, jit_new_object_stub, jit_prepare_direct_call_stub,
-        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub, jit_store_element_stub,
-        jit_store_prop_stub, jit_store_prop_window_stub, jit_store_upvalue_stub,
-        jit_write_barrier_stub, jit_write_barrier_window_stub, reg_offset,
+        jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub, jit_load_prop_window_stub,
+        jit_load_upvalue_stub, jit_make_fn_stub, jit_new_array_stub, jit_new_object_stub,
+        jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
+        jit_store_element_stub, jit_store_prop_stub, jit_store_prop_window_stub,
+        jit_store_upvalue_stub, jit_write_barrier_stub, jit_write_barrier_window_stub, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -1322,6 +1343,7 @@ mod arm64 {
         ops: &mut Assembler,
         operands: &[Operand],
         byte_pc: u32,
+        function_id: u32,
         threw: DynamicLabel,
     ) -> Result<(), Unsupported> {
         let (dst, lhs, rhs) = reg3(operands)?;
@@ -1352,6 +1374,7 @@ mod arm64 {
         store_reg(ops, 13, dst)?;
         dynasm!(ops ; .arch aarch64 ; b =>done ; =>runtime_path ; mov x0, x20);
         emit_load_u64(ops, 1, u64::from(byte_pc));
+        emit_load_u64(ops, 2, u64::from(function_id));
         emit_call_stub(ops, jit_delegate_op_stub as *const () as usize, threw);
         dynasm!(ops ; .arch aarch64 ; =>done);
         Ok(())
@@ -1905,7 +1928,13 @@ mod arm64 {
                     load_reg(&mut ops, 9, src)?;
                     store_reg(&mut ops, 9, idx)?;
                 }
-                Op::Add => emit_add_with_runtime_fallback(&mut ops, ops_ref, instr.byte_pc, threw)?,
+                Op::Add => emit_add_with_runtime_fallback(
+                    &mut ops,
+                    ops_ref,
+                    instr.byte_pc,
+                    view.function_id,
+                    threw,
+                )?,
                 Op::Sub | Op::Mul | Op::Div if enable_fres => {
                     emit_float_binop_res(&mut ops, ops_ref, bail, instr.op, &mut fres)?;
                 }
@@ -2202,6 +2231,7 @@ mod arm64 {
                     let name = const_index(ops_ref, 1)?;
                     dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
                     emit_load_u64(&mut ops, 2, u64::from(name));
+                    emit_load_u64(&mut ops, 3, u64::from(view.function_id));
                     emit_call_stub(&mut ops, jit_load_global_stub as *const () as usize, threw);
                 }
                 // `dst = upvalue[idx]` (captured binding). Inline: read the cell
@@ -2328,6 +2358,7 @@ mod arm64 {
 
                     dynasm!(ops ; .arch aarch64 ; =>up_miss ; mov x0, x20);
                     emit_load_u64(&mut ops, 1, u64::from(instr.byte_pc));
+                    emit_load_u64(&mut ops, 2, u64::from(view.function_id));
                     emit_call_stub(&mut ops, jit_delegate_op_stub as *const () as usize, threw);
                     dynasm!(ops ; .arch aarch64 ; =>up_done);
                 }
@@ -2431,9 +2462,10 @@ mod arm64 {
                     // value slab slot at the cell's byte offset. No allocation /
                     // call → no safepoint; the object pointer is recomputed from
                     // the (rooted) frame slot each time, never held across one.
-                    // An empty cell (`shape == 0`) or any guard miss falls
-                    // through to the shared stub, which fills the cell once the
-                    // site is warm + monomorphic.
+                    // Shape `0` is reserved as the empty-cell sentinel. Some
+                    // live shapes can currently have offset 0, so those shapes
+                    // deliberately miss to the stub until the cell grows an
+                    // explicit valid bit.
                     if cage_base != 0 {
                         let obj_off = reg_offset(obj)?;
                         let dst_off = reg_offset(dst)?;
@@ -2456,12 +2488,13 @@ mod arm64 {
                             ; cmp w14, OBJECT_BODY_TYPE_TAG
                             ; b.ne =>miss
                             ; ldr w14, [x13, shape_byte] // receiver shape handle
+                            ; cbz w14, =>miss
                         );
                         emit_load_u64(&mut ops, 15, cell_addr as u64);
-                        // Walk the IC ways: each empty way holds shape 0, which a
-                        // live receiver shape (w14, non-zero) never equals, so
-                        // empty ways skip for free. A hit loads that way's value
-                        // byte into w17 and shares the slab read.
+                        // Walk the IC ways. The `cbz` above prevents empty ways
+                        // (`shape == 0`) from matching a live shape-0 object.
+                        // A hit loads that way's value byte into w17 and shares
+                        // the slab read.
                         let do_load = ops.new_dynamic_label();
                         for way in 0..IC_WAYS as u32 {
                             let shape_off = way * 8;
@@ -2501,13 +2534,13 @@ mod arm64 {
                     emit_load_u64(&mut ops, 3, u64::from(name));
                     emit_load_u64(&mut ops, 4, site);
                     emit_load_u64(&mut ops, 5, cell_addr as u64);
+                    emit_load_u64(&mut ops, 6, u64::from(view.function_id));
                     if self_call_safe {
                         // Frameless-eligible body: the miss handler resolves the
                         // own-data IC against the register window (works framed
                         // or frameless) and signals a bail for the rare slow
                         // `[[Get]]`, so no `frame_index`-keyed stub is needed and
                         // this body's self-calls can run frameless.
-                        emit_load_u64(&mut ops, 6, u64::from(view.function_id));
                         emit_load_u64(&mut ops, 16, jit_load_prop_window_stub as *const () as u64);
                         dynasm!(ops
                             ; .arch aarch64
@@ -2543,7 +2576,8 @@ mod arm64 {
                     // value-tag-gated write barrier (primitive stores skip it).
                     // No allocation → no safepoint; the object pointer is
                     // recomputed from the (rooted) frame slot, never held
-                    // across one. Empty cell / guard miss → shared stub.
+                    // across one. Shape-0 receiver / empty cell / guard miss →
+                    // shared stub.
                     if cage_base != 0 {
                         let obj_off = reg_offset(obj)?;
                         let src_off = reg_offset(src)?;
@@ -2566,6 +2600,7 @@ mod arm64 {
                             ; cmp w14, OBJECT_BODY_TYPE_TAG
                             ; b.ne =>miss
                             ; ldr w14, [x13, shape_byte] // receiver shape handle
+                            ; cbz w14, =>miss
                         );
                         emit_load_u64(&mut ops, 15, cell_addr as u64);
                         // N-way IC walk (see `LoadProperty`): match a way's shape,
@@ -2684,6 +2719,7 @@ mod arm64 {
                 | Op::DefineOwnProperty => {
                     dynasm!(ops ; .arch aarch64 ; mov x0, x20);
                     emit_load_u64(&mut ops, 1, u64::from(instr.byte_pc));
+                    emit_load_u64(&mut ops, 2, u64::from(view.function_id));
                     emit_call_stub(&mut ops, jit_delegate_op_stub as *const () as usize, threw);
                 }
                 _other => {
@@ -2784,11 +2820,7 @@ mod arm64 {
 
     fn emit_backedge_interrupt_check(ops: &mut Assembler, threw: DynamicLabel) {
         dynasm!(ops ; .arch aarch64 ; mov x0, x20);
-        emit_call_stub(
-            ops,
-            jit_interrupt_backedge_stub as *const () as usize,
-            threw,
-        );
+        emit_call_stub(ops, jit_backedge_poll_stub as *const () as usize, threw);
     }
 
     /// Largest callee register window the inliner accepts. Bounds the per-site

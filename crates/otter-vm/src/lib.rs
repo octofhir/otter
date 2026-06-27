@@ -103,6 +103,7 @@ mod method_ops;
 pub mod microtask;
 mod module_ops;
 mod module_records;
+pub mod native_abi;
 pub mod native_function;
 pub mod number;
 pub mod object;
@@ -190,6 +191,14 @@ pub use js_surface::{
     PropertySpec,
 };
 pub use microtask::{Microtask, MicrotaskError, MicrotaskKind, MicrotaskQueue};
+pub use native_abi::{
+    FrameStateId, NO_FRAME_STATE, NO_SAFEPOINT, NativeFrameFlags, NativeFrameHeader,
+    NativeFrameKind, RuntimeStubClass, RuntimeStubDescriptor, RuntimeStubId, RuntimeStubResult,
+    RuntimeStubStatus, STUB_JIT_PREPARE_DIRECT_CALL, STUB_JIT_PREPARE_DIRECT_METHOD_CALL,
+    STUB_JIT_PROPERTY_FALLBACK, STUB_JIT_RUNTIME_CALL, STUB_JIT_RUNTIME_CALL_METHOD, SafepointId,
+    SafepointRecord, TaggedLocation, TaggedLocationKind, VARIADIC_STUB_ARGUMENTS,
+    validate_stub_descriptor,
+};
 pub use native_function::{
     NativeCall, NativeError, NativeFastFn, NativeFn, NativeFunction, VmIntrinsicFunction,
     native_value, native_value_static, native_value_with_captures,
@@ -313,6 +322,14 @@ pub struct JitRuntimeStats {
     pub osr_attempts: u64,
     /// JIT property/method/element/global/upvalue runtime stub calls.
     pub runtime_property_stubs: u64,
+    /// ABI-classified runtime stub transitions from compiled code.
+    pub runtime_stub_transitions: u64,
+    /// ABI-classified leaf runtime stubs. These are the desired hot-path shape.
+    pub leaf_stub_transitions: u64,
+    /// ABI-classified allocating runtime stubs that require a safepoint.
+    pub alloc_stub_transitions: u64,
+    /// ABI-classified re-entrant runtime stubs that may call JS/native code.
+    pub reentrant_stub_transitions: u64,
 }
 
 /// Observed-callee state for one bytecode `Op::Call` site, the feedback the
@@ -1987,6 +2004,7 @@ impl Interpreter {
         callee_reg: u16,
         arg_regs: &[u16],
     ) -> Result<(), VmError> {
+        self.record_jit_runtime_stub_descriptor(native_abi::STUB_JIT_RUNTIME_CALL);
         self.jit_runtime_stats.runtime_calls =
             self.jit_runtime_stats.runtime_calls.saturating_add(1);
         let frame = stack
@@ -2196,6 +2214,7 @@ impl Interpreter {
         callee_reg: u16,
         arg_regs: &[u16],
     ) -> Result<Option<jit::JitPreparedDirectCall>, VmError> {
+        self.record_jit_runtime_stub_descriptor(native_abi::STUB_JIT_PREPARE_DIRECT_CALL);
         self.jit_runtime_stats.runtime_calls =
             self.jit_runtime_stats.runtime_calls.saturating_add(1);
         let frame = stack
@@ -2314,6 +2333,7 @@ impl Interpreter {
         site: usize,
         arg_regs: &[u16],
     ) -> Result<Option<jit::JitPreparedDirectCall>, VmError> {
+        self.record_jit_runtime_stub_descriptor(native_abi::STUB_JIT_PREPARE_DIRECT_METHOD_CALL);
         self.jit_runtime_stats.runtime_calls =
             self.jit_runtime_stats.runtime_calls.saturating_add(1);
         // A site with a live array-method IC resolved to a native builtin last
@@ -2927,7 +2947,14 @@ impl Interpreter {
             };
             shape = self
                 .shape_runtime
-                .child_with_roots(&mut self.gc_heap, shape, key, flags, false, &mut external_visit)
+                .child_with_roots(
+                    &mut self.gc_heap,
+                    shape,
+                    key,
+                    flags,
+                    false,
+                    &mut external_visit,
+                )
                 .ok()?;
         }
         Some(shape)
@@ -2944,7 +2971,11 @@ impl Interpreter {
     /// slot lands in definition order, the whole run is straight-line (no
     /// branch), and there are at most four properties (the register-passed value
     /// budget). Anything else is left unplanned and lowers on the baseline.
-    fn bake_object_literals(&mut self, view: &mut jit::JitFunctionView, context: &ExecutionContext) {
+    fn bake_object_literals(
+        &mut self,
+        view: &mut jit::JitFunctionView,
+        context: &ExecutionContext,
+    ) {
         use otter_bytecode::{Op, Operand};
         const MAX_PROPS: usize = 4;
         let reg_op = |instr: &jit::JitInstrView, i: usize| match instr.operands.get(i) {
@@ -2983,7 +3014,8 @@ impl Interpreter {
                 // `LoadString key` immediately followed by `DefineDataProperty
                 // obj, key, value`.
                 if instr.op == Op::DefineDataProperty && reg_op(instr, 0) == Some(obj_reg) {
-                    let (Some(key_reg), Some(val_reg)) = (reg_op(instr, 1), reg_op(instr, 2)) else {
+                    let (Some(key_reg), Some(val_reg)) = (reg_op(instr, 1), reg_op(instr, 2))
+                    else {
                         ok = false;
                         break;
                     };
@@ -3532,11 +3564,63 @@ impl Interpreter {
         self.runtime_budget_stats.record_host_op_enqueued();
     }
 
+    /// Poll interrupts and runtime budget from compiled loop backedges.
+    ///
+    /// Baseline code reaches this through a leaf VM-native runtime stub. The
+    /// interpreter charges every opcode; compiled code has no per-op VM tick, so
+    /// it charges one reduction per backedge and then reuses the same budget
+    /// checkpoint. This keeps timeout/budget semantics independent of whether a
+    /// hot loop has OSR'd into native code.
+    pub fn jit_backedge_poll(&mut self) -> Result<(), VmError> {
+        self.record_jit_runtime_stub_descriptor(native_abi::STUB_JIT_BACKEDGE_POLL);
+        self.runtime_budget_stats.record_reductions(1);
+        if self.interrupt_handle().is_set() {
+            return Err(VmError::Interrupted);
+        }
+        self.enforce_runtime_budget_checkpoint()
+    }
+
     pub(crate) fn record_jit_runtime_property_stub(&mut self) {
+        self.record_jit_runtime_stub_descriptor(native_abi::STUB_JIT_PROPERTY_FALLBACK);
         self.jit_runtime_stats.runtime_property_stubs = self
             .jit_runtime_stats
             .runtime_property_stubs
             .saturating_add(1);
+    }
+
+    pub(crate) fn record_jit_runtime_method_stub(&mut self) {
+        self.record_jit_runtime_stub_descriptor(native_abi::STUB_JIT_RUNTIME_CALL_METHOD);
+        self.jit_runtime_stats.runtime_property_stubs = self
+            .jit_runtime_stats
+            .runtime_property_stubs
+            .saturating_add(1);
+    }
+
+    fn record_jit_runtime_stub_descriptor(&mut self, desc: native_abi::RuntimeStubDescriptor) {
+        self.jit_runtime_stats.runtime_stub_transitions = self
+            .jit_runtime_stats
+            .runtime_stub_transitions
+            .saturating_add(1);
+        match desc.class {
+            native_abi::RuntimeStubClass::LeafNoAlloc => {
+                self.jit_runtime_stats.leaf_stub_transitions = self
+                    .jit_runtime_stats
+                    .leaf_stub_transitions
+                    .saturating_add(1);
+            }
+            native_abi::RuntimeStubClass::Alloc => {
+                self.jit_runtime_stats.alloc_stub_transitions = self
+                    .jit_runtime_stats
+                    .alloc_stub_transitions
+                    .saturating_add(1);
+            }
+            native_abi::RuntimeStubClass::Reentrant => {
+                self.jit_runtime_stats.reentrant_stub_transitions = self
+                    .jit_runtime_stats
+                    .reentrant_stub_transitions
+                    .saturating_add(1);
+            }
+        }
     }
 
     fn record_runtime_microtask_drain_started(&mut self) {
@@ -6611,30 +6695,29 @@ impl Interpreter {
                     (context, function, idx)
                 } else {
                     let mut foreign = false;
-                    let context: &ExecutionContext =
-                        if entry_context.covers_function(function_id) {
-                            entry_context
-                        } else {
-                            foreign = true;
-                            let cached_covers = foreign_context
-                                .as_ref()
-                                .is_some_and(|c| c.covers_function(function_id));
-                            if !cached_covers {
-                                foreign_context = match entry_context.for_function(function_id) {
-                                    Some(code_space::ResolvedCtx::Owned(owned)) => {
-                                        // Foreign chunks linked after this loop
-                                        // started (eval during this turn) carry
-                                        // IC sites past the entry chunk's range.
-                                        self.ensure_property_ic_capacity(&owned);
-                                        Some(owned)
-                                    }
-                                    _ => None,
-                                };
-                            }
-                            foreign_context
-                                .as_ref()
-                                .ok_or_else(|| VmError::InvalidOperand)?
-                        };
+                    let context: &ExecutionContext = if entry_context.covers_function(function_id) {
+                        entry_context
+                    } else {
+                        foreign = true;
+                        let cached_covers = foreign_context
+                            .as_ref()
+                            .is_some_and(|c| c.covers_function(function_id));
+                        if !cached_covers {
+                            foreign_context = match entry_context.for_function(function_id) {
+                                Some(code_space::ResolvedCtx::Owned(owned)) => {
+                                    // Foreign chunks linked after this loop
+                                    // started (eval during this turn) carry
+                                    // IC sites past the entry chunk's range.
+                                    self.ensure_property_ic_capacity(&owned);
+                                    Some(owned)
+                                }
+                                _ => None,
+                            };
+                        }
+                        foreign_context
+                            .as_ref()
+                            .ok_or_else(|| VmError::InvalidOperand)?
+                    };
                     let function = context
                         .exec_function(function_id)
                         .ok_or_else(|| VmError::InvalidOperand)?;
@@ -6659,9 +6742,7 @@ impl Interpreter {
                     cache_function = function as *const ExecutableFunction;
                     (context, function, idx)
                 };
-            let instr = function
-                .instr_at_index(idx)
-                .ok_or(VmError::MissingReturn)?;
+            let instr = function.instr_at_index(idx).ok_or(VmError::MissingReturn)?;
             let op = instr.op();
             // Per-tick fields: on a hit these are the only cache writes.
             cache_idx = idx;

@@ -28,7 +28,9 @@
 //! - [`super::deopt`] — boxing and the side-exit bail.
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{Block, BlockArg, InstBuilder, MemFlagsData, Value, types};
+use cranelift_codegen::ir::{
+    AbiParam, Block, BlockArg, InstBuilder, MemFlagsData, SigRef, Signature, Value, types,
+};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Module};
@@ -38,8 +40,8 @@ use otter_vm::JitFunctionView;
 
 use super::Unsupported;
 use super::abi::{
-    HOLE_BITS, NULL_BITS, REGS_OFFSET, STATUS_RETURNED, TAG_INT32, TAG_PTR_OBJECT, UNDEFINED_BITS,
-    clif_type,
+    HOLE_BITS, NULL_BITS, REGS_OFFSET, STATUS_RETURNED, STATUS_THREW, TAG_INT32, TAG_PTR_OBJECT,
+    UNDEFINED_BITS, clif_type,
 };
 use super::deopt::{Flags, box_tagged, emit_bail};
 use crate::optimizing::deopt::DeoptPoint;
@@ -105,6 +107,8 @@ struct Lower<'a, 'f> {
     regs_base: Value,
     /// The `*mut JitCtx` entry parameter.
     ctx_ptr: Value,
+    /// Imported function signature for `jit_backedge_poll_stub(ctx) -> status`.
+    backedge_poll_sig: SigRef,
     /// Interned memory-access flags reused across this function.
     flags: Flags,
 }
@@ -117,6 +121,10 @@ impl<'a, 'f> Lower<'a, 'f> {
         frames: &'a FxHashMap<NodeId, DeoptPoint>,
         block_deopts: &'a FxHashMap<BlockId, DeoptPoint>,
     ) -> Self {
+        let mut poll_sig = Signature::new(b.func.signature.call_conv);
+        poll_sig.params.push(AbiParam::new(types::I64));
+        poll_sig.returns.push(AbiParam::new(types::I64));
+        let backedge_poll_sig = b.func.import_signature(poll_sig);
         let flags = Flags {
             trusted: MemFlagsData::trusted(),
             readonly: MemFlagsData::trusted().with_readonly(),
@@ -135,6 +143,7 @@ impl<'a, 'f> Lower<'a, 'f> {
             // Placeholders; set once the entry block exists.
             regs_base: Value::from_u32(0),
             ctx_ptr: Value::from_u32(0),
+            backedge_poll_sig,
             flags,
         }
     }
@@ -205,6 +214,9 @@ impl<'a, 'f> Lower<'a, 'f> {
                 self.b.ins().return_(&[boxed, status]);
             }
             Some(Terminator::Jump(target)) => {
+                if self.is_backedge(bid, target) {
+                    self.emit_backedge_poll();
+                }
                 let args = self.edge_args(bid, target)?;
                 let tb = self.clif_block(target)?;
                 self.b.ins().jump(tb, &args);
@@ -215,11 +227,25 @@ impl<'a, 'f> Lower<'a, 'f> {
                 on_false,
             }) => {
                 let cv = self.val(cond)?;
+                let true_edge = self.b.create_block();
+                let false_edge = self.b.create_block();
+                self.b.ins().brif(cv, true_edge, &[], false_edge, &[]);
+
+                self.b.switch_to_block(true_edge);
+                if self.is_backedge(bid, on_true) {
+                    self.emit_backedge_poll();
+                }
                 let true_args = self.edge_args(bid, on_true)?;
-                let false_args = self.edge_args(bid, on_false)?;
                 let tb = self.clif_block(on_true)?;
+                self.b.ins().jump(tb, &true_args);
+
+                self.b.switch_to_block(false_edge);
+                if self.is_backedge(bid, on_false) {
+                    self.emit_backedge_poll();
+                }
+                let false_args = self.edge_args(bid, on_false)?;
                 let fb = self.clif_block(on_false)?;
-                self.b.ins().brif(cv, tb, &true_args, fb, &false_args);
+                self.b.ins().jump(fb, &false_args);
             }
             Some(Terminator::Deopt(_)) => {
                 let point = self
@@ -279,6 +305,34 @@ impl<'a, 'f> Lower<'a, 'f> {
 
     fn clif_block(&self, bid: BlockId) -> Result<Block, Unsupported> {
         self.clif_blocks[bid as usize].ok_or(Unsupported::Unlowered("clif: branch to dead block"))
+    }
+
+    fn is_backedge(&self, from: BlockId, to: BlockId) -> bool {
+        self.graph.block(to).start_pc <= self.graph.block(from).start_pc
+    }
+
+    fn emit_backedge_poll(&mut self) {
+        let callee = self.b.ins().iconst(
+            types::I64,
+            crate::baseline::jit_backedge_poll_stub as *const () as i64,
+        );
+        let call = self
+            .b
+            .ins()
+            .call_indirect(self.backedge_poll_sig, callee, &[self.ctx_ptr]);
+        let status = self.b.inst_results(call)[0];
+        let failed = self.b.ins().icmp_imm(IntCC::NotEqual, status, 0);
+        let threw = self.b.create_block();
+        let cont = self.b.create_block();
+        self.b.ins().brif(failed, threw, &[], cont, &[]);
+
+        self.b.switch_to_block(threw);
+        self.b.set_cold_block(threw);
+        let value = self.b.ins().iconst(types::I64, 0);
+        let status = self.b.ins().iconst(types::I64, STATUS_THREW);
+        self.b.ins().return_(&[value, status]);
+
+        self.b.switch_to_block(cont);
     }
 
     /// The cold side-exit block for deopt-capable node `nid`, created on demand.

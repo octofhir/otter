@@ -184,6 +184,12 @@ These are Tier1 closure items, but not necessarily compiler features:
 Tier1 closure is a sequencing gate, not the end of the engine plan. The items
 below remain committed scope after Tier1 is stable.
 
+The ABI-first refactor is tracked in
+[`NATIVE_VM_ABI_PLAN.md`](./NATIVE_VM_ABI_PLAN.md). Treat that document as the
+source of truth for native frame layout, runtime stub classes, safepoints, and
+the object/string/collection fast-path contract. New JIT work should converge on
+that ABI instead of adding private frame or native-call conventions.
+
 ### Tier2: broaden DiveJIT
 
 DiveJIT already exists as the optimizing tier. After Tier1, broaden it from the

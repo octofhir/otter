@@ -53,8 +53,8 @@ fn global_this_default_snapshot() {
     // Snapshot of current realm. Drift discussion:
     //
     // - Every default global is `{ writable: true, enumerable: false,
-    //   configurable: true }` per §17 / §19.{2,4}. The only enumerable
-    //   own property is `globalThis` itself (§19.4.1).
+    //   configurable: true }` per §17 / §19.{2,4}, including
+    //   `globalThis` itself (§19.1).
     // - Constructors that carry a real `[[Call]]` / `[[Construct]]`
     //   surface report `typeof === "function"`; namespace objects
     //   and internal prototype markers remain object-typed.
@@ -125,7 +125,7 @@ encodeURI w.c function
 encodeURIComponent w.c function
 escape w.c function
 eval w.c function
-globalThis wec object
+globalThis w.c object
 isFinite w.c function
 isNaN w.c function
 parseFloat w.c function

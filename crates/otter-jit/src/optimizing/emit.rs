@@ -172,12 +172,12 @@ pub(super) fn emit(
 
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
+    use super::super::builder::graph_allows_frameless_self_call;
     use super::{
         Allocation, BlockId, CmpOp, DeoptPoint, EdgeMoves, Float64UnaryOp, GP_REGS, Graph,
         Liveness, Location, NodeId, NodeKind, OptimizedCode, OsrEntry, Repr, Terminator,
         Unsupported,
     };
-    use super::super::builder::graph_allows_frameless_self_call;
     use crate::CompiledCode;
     use crate::baseline::{
         ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET, BAIL_PC_OFFSET, CONTEXT_OFFSET,
@@ -188,7 +188,7 @@ mod arm64 {
         STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_FUNCTION_ID, TAG_INT32, TAG_PTR_FUNCTION,
         TAG_PTR_OBJECT, TAG_SPECIAL, THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET,
         UPVALUES_PTR_OFFSET, VM_OFFSET, jit_abort_direct_call_stub, jit_alloc_object_literal_stub,
-        jit_call_method_stub, jit_finish_direct_call_bailed_stub,
+        jit_backedge_poll_stub, jit_call_method_stub, jit_finish_direct_call_bailed_stub,
         jit_finish_direct_call_returned_stub, jit_prepare_direct_call_stub,
         jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
     };
@@ -250,6 +250,38 @@ mod arm64 {
         }
         if l3 != 0 {
             dynasm!(ops ; .arch aarch64 ; movk X(xr), l3, lsl #48);
+        }
+    }
+
+    fn is_backedge(graph: &Graph, from: BlockId, to: BlockId) -> bool {
+        graph.blocks[to as usize].start_pc <= graph.blocks[from as usize].start_pc
+    }
+
+    fn emit_backedge_poll(ops: &mut Assembler, threw: DynamicLabel, save_base: u32) {
+        for i in 0..GP_REGS {
+            let reg = phys(i);
+            let off = save_base + i * 8;
+            dynasm!(ops ; .arch aarch64 ; str X(reg), [sp, off]);
+        }
+        for i in 0..super::FP_REGS {
+            let off = save_base + (GP_REGS + i) * 8;
+            dynasm!(ops ; .arch aarch64 ; str D(phys_fp(i)), [sp, off]);
+        }
+        dynasm!(ops ; .arch aarch64 ; mov x0, x20);
+        emit_load_u64(ops, 16, jit_backedge_poll_stub as *const () as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; cbnz x0, =>threw
+        );
+        for i in 0..super::FP_REGS {
+            let off = save_base + (GP_REGS + i) * 8;
+            dynasm!(ops ; .arch aarch64 ; ldr D(phys_fp(i)), [sp, off]);
+        }
+        for i in 0..GP_REGS {
+            let reg = phys(i);
+            let off = save_base + i * 8;
+            dynasm!(ops ; .arch aarch64 ; ldr X(reg), [sp, off]);
         }
     }
 
@@ -1202,8 +1234,13 @@ mod arm64 {
         let mut ops = Assembler::new().expect("assembler alloc");
 
         // Spill area: one frame slot per value spill slot plus one parallel-move
-        // cycle-break scratch slot (`Spill(spill_slots)`), rounded to 16 bytes.
-        let spill_bytes = align16((alloc.spill_slots + 1) * 8);
+        // cycle-break scratch slot (`Spill(spill_slots)`). Backedge polls call a
+        // Rust ABI leaf stub, so reserve an additional conservative save area
+        // for every optimizing-tier caller-saved allocatable GP/FP register.
+        let value_spill_bytes = align16((alloc.spill_slots + 1) * 8);
+        let poll_save_base = value_spill_bytes;
+        let poll_save_bytes = (GP_REGS + super::FP_REGS) * 8;
+        let spill_bytes = align16(value_spill_bytes + poll_save_bytes);
 
         // One dynamic label per block, addressed by BlockId.
         let block_labels: Vec<DynamicLabel> = (0..graph.blocks.len())
@@ -1298,6 +1335,9 @@ mod arm64 {
                     emit_epilogue(&mut ops, spill_bytes);
                 }
                 Terminator::Jump(target) => {
+                    if is_backedge(graph, b, *target) {
+                        emit_backedge_poll(&mut ops, threw, poll_save_base);
+                    }
                     let moves = edge_moves_for(b, *target);
                     emit_edge(&mut ops, graph, alloc, moves, b, *target)?;
                     // Omit the branch only when the target is the very next block
@@ -1339,10 +1379,16 @@ mod arm64 {
                     // explicit branch (it can never fall through). `cond` was
                     // already tested, so the edge boxing may clobber box_scratch.
                     let _ = next_block;
+                    if is_backedge(graph, b, *on_true) {
+                        emit_backedge_poll(&mut ops, threw, poll_save_base);
+                    }
                     emit_edge(&mut ops, graph, alloc, true_moves, b, *on_true)?;
                     dynasm!(&mut ops ; .arch aarch64 ; b =>block_labels[*on_true as usize]);
                     // False trampoline: run the false edge's moves then branch.
                     dynasm!(&mut ops ; .arch aarch64 ; =>false_setup);
+                    if is_backedge(graph, b, *on_false) {
+                        emit_backedge_poll(&mut ops, threw, poll_save_base);
+                    }
                     emit_edge(&mut ops, graph, alloc, false_moves, b, *on_false)?;
                     dynasm!(&mut ops ; .arch aarch64 ; b =>block_labels[*on_false as usize]);
                 }
@@ -2109,11 +2155,7 @@ mod arm64 {
                     ; movz x3, inputs.len() as u32
                 );
                 emit_load_u64(ops, 2, u64::from(*shape_offset));
-                emit_load_u64(
-                    ops,
-                    16,
-                    jit_alloc_object_literal_stub as *const () as u64,
-                );
+                emit_load_u64(ops, 16, jit_alloc_object_literal_stub as *const () as u64);
                 dynasm!(ops
                     ; .arch aarch64
                     ; blr x16

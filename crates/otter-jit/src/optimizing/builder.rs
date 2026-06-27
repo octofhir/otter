@@ -717,10 +717,11 @@ impl<'a> Builder<'a> {
             {
                 continue;
             }
-            let active_define = self
-                .active_literal
-                .as_ref()
-                .and_then(|a| a.define_slot.get(&byte_pc).map(|&s| (s, byte_pc == a.last_define_pc)));
+            let active_define = self.active_literal.as_ref().and_then(|a| {
+                a.define_slot
+                    .get(&byte_pc)
+                    .map(|&s| (s, byte_pc == a.last_define_pc))
+            });
             if let Some((slot, is_last)) = active_define {
                 let value_reg = reg(&operands, 2)?;
                 let value = self.read_variable(value_reg, block);

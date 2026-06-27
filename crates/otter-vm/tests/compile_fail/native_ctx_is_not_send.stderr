@@ -5,12 +5,12 @@ error[E0277]: `*const otter_vm::holt_stack::HoltStack` cannot be sent between th
   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*const otter_vm::holt_stack::HoltStack` cannot be sent between threads safely
   |
   = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `*const otter_vm::holt_stack::HoltStack`
-note: required because it appears within the type `Interpreter`
+note: required because it appears within the type `otter_vm::Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
  --> src/runtime_cx.rs
   |
@@ -77,12 +77,12 @@ note: required because it appears within the type `otter_gc::compressed::Gc<Obje
   |
   | pub struct Gc<T: ?Sized> {
   |            ^^
-note: required because it appears within the type `Interpreter`
+note: required because it appears within the type `otter_vm::Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
  --> src/runtime_cx.rs
   |
@@ -121,12 +121,12 @@ note: required because it appears within the type `otter_vm::object::shape_runti
   |
   | pub(crate) struct ShapeRuntime {
   |                   ^^^^^^^^^^^^
-note: required because it appears within the type `Interpreter`
+note: required because it appears within the type `otter_vm::Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
  --> src/runtime_cx.rs
   |
@@ -161,12 +161,12 @@ note: required because it appears within the type `Option<Box<(dyn StepTracer + 
   |
   | pub enum Option<T> {
   |          ^^^^^^
-note: required because it appears within the type `Interpreter`
+note: required because it appears within the type `otter_vm::Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
  --> src/runtime_cx.rs
   |
@@ -206,12 +206,12 @@ note: required because it appears within the type `otter_vm::object::shape_runti
   |
   | pub(crate) struct ShapeRuntime {
   |                   ^^^^^^^^^^^^
-note: required because it appears within the type `Interpreter`
+note: required because it appears within the type `otter_vm::Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
  --> src/runtime_cx.rs
   |
@@ -260,12 +260,12 @@ note: required because it appears within the type `otter_gc::heap::GcHeap`
   |
   | pub struct GcHeap {
   |            ^^^^^^
-note: required because it appears within the type `Interpreter`
+note: required because it appears within the type `otter_vm::Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
  --> src/runtime_cx.rs
   |
@@ -314,12 +314,12 @@ note: required because it appears within the type `otter_gc::heap::GcHeap`
   |
   | pub struct GcHeap {
   |            ^^^^^^
-note: required because it appears within the type `Interpreter`
+note: required because it appears within the type `otter_vm::Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
  --> src/runtime_cx.rs
   |
@@ -378,12 +378,12 @@ note: required because it appears within the type `Vec<otter_vm::call_ops::LeanC
   |
   | pub struct Vec<T, #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global> {
   |            ^^^
-note: required because it appears within the type `Interpreter`
+note: required because it appears within the type `otter_vm::Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
  --> src/runtime_cx.rs
   |
@@ -442,12 +442,12 @@ note: required because it appears within the type `Vec<otter_vm::call_ops::LeanC
   |
   | pub struct Vec<T, #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global> {
   |            ^^^
-note: required because it appears within the type `Interpreter`
+note: required because it appears within the type `otter_vm::Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
  --> src/runtime_cx.rs
   |
@@ -495,12 +495,12 @@ note: required because it appears within the type `otter_vm::object::shape_runti
   |
   | pub(crate) struct ShapeRuntime {
   |                   ^^^^^^^^^^^^
-note: required because it appears within the type `Interpreter`
+note: required because it appears within the type `otter_vm::Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
  --> src/runtime_cx.rs
   |
@@ -555,12 +555,12 @@ note: required because it appears within the type `Vec<otter_vm::holt_stack::Hol
   |
   | pub struct Vec<T, #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global> {
   |            ^^^
-note: required because it appears within the type `Interpreter`
+note: required because it appears within the type `otter_vm::Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
  --> src/runtime_cx.rs
   |
@@ -619,12 +619,12 @@ note: required because it appears within the type `WellKnownSymbols`
   |
   | pub struct WellKnownSymbols {
   |            ^^^^^^^^^^^^^^^^
-note: required because it appears within the type `Interpreter`
+note: required because it appears within the type `otter_vm::Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
  --> src/runtime_cx.rs
   |
@@ -693,12 +693,12 @@ note: required because it appears within the type `MicrotaskQueue`
   |
   | pub struct MicrotaskQueue {
   |            ^^^^^^^^^^^^^^
-note: required because it appears within the type `Interpreter`
+note: required because it appears within the type `otter_vm::Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
  --> src/runtime_cx.rs
   |
@@ -767,12 +767,12 @@ note: required because it appears within the type `ColdFramePool`
   |
   | pub struct ColdFramePool {
   |            ^^^^^^^^^^^^^
-note: required because it appears within the type `Interpreter`
+note: required because it appears within the type `otter_vm::Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
  --> src/runtime_cx.rs
   |
@@ -840,12 +840,12 @@ note: required because it appears within the type `HashMap<Arc<str>, otter_vm::m
   |
   | pub struct HashMap<
   |            ^^^^^^^
-note: required because it appears within the type `Interpreter`
+note: required because it appears within the type `otter_vm::Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
  --> src/runtime_cx.rs
   |

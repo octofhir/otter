@@ -42,8 +42,25 @@ impl Interpreter {
         dst: u16,
         name_idx: u32,
     ) -> Result<(), VmError> {
+        self.run_load_global_or_throw_reg_for_function(
+            context,
+            frame,
+            frame.function_id,
+            dst,
+            name_idx,
+        )
+    }
+
+    pub(crate) fn run_load_global_or_throw_reg_for_function(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut Frame,
+        function_id: u32,
+        dst: u16,
+        name_idx: u32,
+    ) -> Result<(), VmError> {
         let name = context
-            .string_constant_str_for_function(frame.function_id, name_idx)
+            .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
         // §9.1.1.4 — the global declarative record (script lexicals)
         // shadows the object record.

@@ -3194,6 +3194,7 @@ impl Interpreter {
         context: &ExecutionContext,
         stack: &mut HoltStack,
         frame_index: usize,
+        function_id: u32,
         dst: u16,
         obj_reg: u16,
         name_idx: u32,
@@ -3201,7 +3202,7 @@ impl Interpreter {
     ) -> Result<u64, VmError> {
         self.record_jit_runtime_property_stub();
         let atomized_key = context
-            .property_atom_for_function(stack[frame_index].function_id, name_idx)
+            .property_atom_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
         let receiver = *read_register(&stack[frame_index], obj_reg)?;
         if let Some(obj) = receiver.as_object()
@@ -3224,9 +3225,7 @@ impl Interpreter {
                 // (former) compile-time bake, but resolved at runtime so a site
                 // that was cold when its function tiered up (OSR off an earlier
                 // loop) still inlines once warm.
-                return Ok(
-                    self.whisker_load_cell_fill(site, object::shape(obj, &self.gc_heap).offset())
-                );
+                return Ok(self.whisker_load_cell_fill(site, obj, atomized_key));
             }
             if self.load_property_ics[site].entry_count() > 0 {
                 self.load_property_ics[site].record_guard_miss_with_stats(
@@ -3249,9 +3248,7 @@ impl Interpreter {
                     ic,
                 );
                 write_register(&mut stack[frame_index], dst, value)?;
-                return Ok(
-                    self.whisker_load_cell_fill(site, object::shape(obj, &self.gc_heap).offset())
-                );
+                return Ok(self.whisker_load_cell_fill(site, obj, atomized_key));
             }
         }
         // Slow path: full `[[Get]]` (proto walk / accessor / non-object). It
@@ -3312,10 +3309,7 @@ impl Interpreter {
             unsafe {
                 *regs.add(dst as usize) = value.to_bits();
             }
-            return Ok(Some(self.whisker_load_cell_fill(
-                site,
-                object::shape(obj, &self.gc_heap).offset(),
-            )));
+            return Ok(Some(self.whisker_load_cell_fill(site, obj, atomized_key)));
         }
         if self.load_property_ics[site].entry_count() > 0 {
             self.load_property_ics[site]
@@ -3336,10 +3330,7 @@ impl Interpreter {
             unsafe {
                 *regs.add(dst as usize) = value.to_bits();
             }
-            return Ok(Some(self.whisker_load_cell_fill(
-                site,
-                object::shape(obj, &self.gc_heap).offset(),
-            )));
+            return Ok(Some(self.whisker_load_cell_fill(site, obj, atomized_key)));
         }
         Ok(None)
     }
@@ -3431,13 +3422,21 @@ impl Interpreter {
     /// inside the object's contiguous value slab. Only a warm, single-entry
     /// `OwnData` IC qualifies; everything else returns `0`, leaving the emitted
     /// site on the stub.
-    fn whisker_load_cell_fill(&self, site: usize, recv_shape: u32) -> u64 {
+    fn whisker_load_cell_fill(
+        &self,
+        site: usize,
+        obj: JsObject,
+        atomized_key: AtomizedPropertyKey<'_>,
+    ) -> u64 {
+        let recv_shape = object::shape(obj, &self.gc_heap).offset();
         if recv_shape == 0 {
             return 0;
         }
         for ic in self.load_property_ics[site].entries() {
             if let LoadPropertyIc::OwnData { hit } = ic
                 && hit.shape.offset() == recv_shape
+                && hit.atom_id == atomized_key.atom().id()
+                && object::load_own_data_slot_atom(obj, &self.gc_heap, atomized_key, *hit).is_some()
             {
                 let value_byte = u32::from(hit.slot) * std::mem::size_of::<Value>() as u32;
                 return (u64::from(value_byte) << 32) | u64::from(hit.shape.offset());
@@ -3487,13 +3486,20 @@ impl Interpreter {
         context: &ExecutionContext,
         stack: &mut HoltStack,
         frame_index: usize,
+        function_id: u32,
         dst: u16,
         name_idx: u32,
     ) -> Result<(), VmError> {
         self.record_jit_runtime_property_stub();
         let saved_pc = stack[frame_index].pc;
         let frame = &mut stack[frame_index];
-        let result = self.run_load_global_or_throw_reg(context, frame, dst, name_idx);
+        let result = self.run_load_global_or_throw_reg_for_function(
+            context,
+            frame,
+            function_id,
+            dst,
+            name_idx,
+        );
         stack[frame_index].pc = saved_pc;
         result
     }
@@ -3574,10 +3580,12 @@ impl Interpreter {
         context: &ExecutionContext,
         stack: &mut HoltStack,
         frame_index: usize,
+        function_id: u32,
         byte_pc: u32,
     ) -> Result<(), VmError> {
-        let fid = stack[frame_index].function_id;
-        let func = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
+        let func = context
+            .exec_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
         let instr = func
             .instr_at_byte_pc(byte_pc)
             .ok_or(VmError::InvalidOperand)?;

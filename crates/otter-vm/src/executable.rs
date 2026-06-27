@@ -281,6 +281,27 @@ impl ExecutableFunction {
         }
         self.code.get(idx as usize)
     }
+
+    /// Resolve a byte-offset PC to its dense `code` index via the
+    /// `byte_to_instr` boundary map. The dispatch loop caches this index
+    /// per frame and advances it by one on straight-line ticks, so the
+    /// `byte_pc` → index lookup is paid only on entry, branches, and
+    /// call/return — not on every instruction. Returns `None` on the same
+    /// corrupt-bytecode conditions as [`Self::instr_at_byte_pc`].
+    #[must_use]
+    pub(crate) fn instr_index_at_byte_pc(&self, byte_pc: u32) -> Option<usize> {
+        let idx = *self.byte_to_instr.get(byte_pc as usize)?;
+        if idx == NO_INSTR_AT_BYTE {
+            return None;
+        }
+        (idx as usize).lt(&self.code.len()).then_some(idx as usize)
+    }
+
+    /// Fetch an instruction by its dense `code` index.
+    #[must_use]
+    pub(crate) fn instr_at_index(&self, index: usize) -> Option<&ExecInstr> {
+        self.code.get(index)
+    }
 }
 
 /// One executable function body.

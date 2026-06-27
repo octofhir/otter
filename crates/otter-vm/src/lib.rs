@@ -6518,6 +6518,32 @@ impl Interpreter {
         // so the per-op checkpoint only needs to run when enforcement is on.
         // In the default Observe mode this collapses to a not-taken branch.
         let enforce_budget = self.runtime_budget.rejects_on_exceedance();
+        // Per-frame dispatch cache. The owning chunk context, the executable
+        // function body, and the dense instruction index are invariants of the
+        // top frame — they change only when the frame does (call / return /
+        // tail-call / unwind). The previous design re-derived all three on every
+        // instruction: chunk resolution, an `exec_function` table lookup, and a
+        // `byte_pc` → index map probe. This caches them keyed on `(function_id,
+        // depth)`, which together pin the exact live frame: a straight-line tick
+        // reuses the context + function pointer and advances the instruction
+        // index by one (`pc == next_pc`), reducing per-op resolution to nothing.
+        // Branches inside the frame still re-probe `byte_pc` → index (one O(1)
+        // map lookup); only frame transitions pay the full re-resolution.
+        //
+        // SAFETY: `function` is a raw pointer into the chunk's `Arc`-owned
+        // executable. Compiled code is never GC-managed and never moves, and the
+        // owning context (`entry_context`, a borrow that outlives the loop, or
+        // `foreign_context`, kept live below) stays alive while `function_id` is
+        // unchanged — so the pointer is valid for every reuse.
+        struct FrameDispatchCache {
+            function_id: u32,
+            depth: usize,
+            foreign: bool,
+            function: *const ExecutableFunction,
+            idx: usize,
+            next_pc: u32,
+        }
+        let mut frame_cache: Option<FrameDispatchCache> = None;
         loop {
             if self.interrupt.is_set() {
                 return Err(VmError::Interrupted);
@@ -6536,37 +6562,88 @@ impl Interpreter {
                 return Ok(Value::undefined());
             }
             let top_idx = stack.len() - 1;
+            let depth = stack.len();
             let function_id = stack[top_idx].function_id;
-            let context: &ExecutionContext = if entry_context.covers_function(function_id) {
-                entry_context
-            } else {
-                let cached_covers = foreign_context
-                    .as_ref()
-                    .is_some_and(|c| c.covers_function(function_id));
-                if !cached_covers {
-                    foreign_context = match entry_context.for_function(function_id) {
-                        Some(code_space::ResolvedCtx::Owned(owned)) => {
-                            // Foreign chunks linked after this loop
-                            // started (eval during this turn) carry
-                            // IC sites past the entry chunk's range.
-                            self.ensure_property_ic_capacity(&owned);
-                            Some(owned)
-                        }
-                        _ => None,
-                    };
-                }
-                foreign_context
-                    .as_ref()
-                    .ok_or_else(|| VmError::InvalidOperand)?
-            };
-            let function = context
-                .exec_function(function_id)
-                .ok_or_else(|| VmError::InvalidOperand)?;
             let pc = stack[top_idx].pc;
+            // Reuse the cached frame state when the top frame is the same one as
+            // the previous tick (same id *and* depth pin the exact live frame —
+            // tail-call keeps the depth but swaps the id, recursion keeps the id
+            // but changes the depth, so both guards are needed). On a hit the
+            // sequential fast path (`pc == next_pc`) costs an integer increment;
+            // an in-frame branch re-probes the index map.
+            let (context, function, idx, foreign): (
+                &ExecutionContext,
+                &ExecutableFunction,
+                usize,
+                bool,
+            ) = match &frame_cache {
+                Some(cache) if cache.function_id == function_id && cache.depth == depth => {
+                    let context: &ExecutionContext = if cache.foreign {
+                        foreign_context
+                            .as_ref()
+                            .ok_or_else(|| VmError::InvalidOperand)?
+                    } else {
+                        entry_context
+                    };
+                    // SAFETY: see `FrameDispatchCache` — the pointer addresses
+                    // never-moving compiled code in a still-live chunk context.
+                    let function: &ExecutableFunction = unsafe { &*cache.function };
+                    let idx = if pc == cache.next_pc {
+                        cache.idx + 1
+                    } else {
+                        function
+                            .instr_index_at_byte_pc(pc)
+                            .ok_or(VmError::MissingReturn)?
+                    };
+                    (context, function, idx, cache.foreign)
+                }
+                _ => {
+                    let mut foreign = false;
+                    let context: &ExecutionContext =
+                        if entry_context.covers_function(function_id) {
+                            entry_context
+                        } else {
+                            foreign = true;
+                            let cached_covers = foreign_context
+                                .as_ref()
+                                .is_some_and(|c| c.covers_function(function_id));
+                            if !cached_covers {
+                                foreign_context = match entry_context.for_function(function_id) {
+                                    Some(code_space::ResolvedCtx::Owned(owned)) => {
+                                        // Foreign chunks linked after this loop
+                                        // started (eval during this turn) carry
+                                        // IC sites past the entry chunk's range.
+                                        self.ensure_property_ic_capacity(&owned);
+                                        Some(owned)
+                                    }
+                                    _ => None,
+                                };
+                            }
+                            foreign_context
+                                .as_ref()
+                                .ok_or_else(|| VmError::InvalidOperand)?
+                        };
+                    let function = context
+                        .exec_function(function_id)
+                        .ok_or_else(|| VmError::InvalidOperand)?;
+                    let idx = function
+                        .instr_index_at_byte_pc(pc)
+                        .ok_or(VmError::MissingReturn)?;
+                    (context, function, idx, foreign)
+                }
+            };
             let instr = function
-                .instr_at_byte_pc(pc)
+                .instr_at_index(idx)
                 .ok_or(VmError::MissingReturn)?;
             let op = instr.op();
+            frame_cache = Some(FrameDispatchCache {
+                function_id,
+                depth,
+                foreign,
+                function: function as *const ExecutableFunction,
+                idx,
+                next_pc: pc.wrapping_add(instr.byte_len()),
+            });
             self.current_byte_len = instr.byte_len();
             self.current_function_id = function_id;
             self.current_byte_pc = pc;

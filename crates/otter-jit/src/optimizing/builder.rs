@@ -76,6 +76,18 @@ fn reject_call_object_mix(graph: &Graph) -> Result<(), Unsupported> {
     if !has_call {
         return Ok(());
     }
+    // A body whose every call is a frameless self-recursion and whose every
+    // object op is a primitive slot access (no element / array-length / method
+    // runtime stub) allocates nothing and bridges no frame: the recursive call
+    // pushes a register window without spilling, and the inline slot ops touch
+    // only already-allocated receivers held live across the call. The "call
+    // churns object stubs and runs slower than the baseline IC" cost model that
+    // motivates this reject does not apply — the optimizing tier's typed
+    // arithmetic plus baked slot offsets beat the baseline here (e.g. a
+    // self-recursive tree walk that reads/writes primitive node fields).
+    if graph_allows_frameless_self_call(graph) && all_calls_are_self(graph) {
+        return Ok(());
+    }
     let has_runtime_object_op = graph.nodes.iter().any(|node| {
         matches!(
             node.kind,
@@ -90,6 +102,66 @@ fn reject_call_object_mix(graph: &Graph) -> Result<(), Unsupported> {
         return Err(Unsupported::Unlowered("call plus object fast path"));
     }
     Ok(())
+}
+
+/// Whether every body node belongs to the frameless-self-recursion subset:
+/// operations a self-recursive call can be emitted around without
+/// materializing and reloading the interpreter frame.
+///
+/// The subset is exactly the non-allocating ops. Beyond the typed-arithmetic
+/// and constant nodes, it admits the primitive slot accesses
+/// (`CheckShape` / `LoadSlot` / `StoreSlot`): a body restricted to these reads
+/// and writes already-allocated objects' primitive fields, so it allocates
+/// nothing. No GC can move the tagged receivers held live across the recursive
+/// call, and a primitive `StoreSlot` needs no generational write barrier —
+/// which is what makes the frameless self-call (no spill / reload around the
+/// recursive `bl`) sound. Element / array-length / method ops are deliberately
+/// excluded: they can allocate (array growth) or recurse through a runtime
+/// bridge that may GC.
+pub(super) fn graph_allows_frameless_self_call(graph: &Graph) -> bool {
+    graph.blocks.iter().all(|block| {
+        block.body.iter().all(|&nid| {
+            matches!(
+                graph.node(nid).kind,
+                NodeKind::Param(_)
+                    | NodeKind::Phi(_)
+                    | NodeKind::ConstUndefined
+                    | NodeKind::ConstNull
+                    | NodeKind::ConstBool(_)
+                    | NodeKind::SelfClosure
+                    | NodeKind::ConstInt32(_)
+                    | NodeKind::CheckInt32(_)
+                    | NodeKind::Int32Add(_, _)
+                    | NodeKind::Int32Sub(_, _)
+                    | NodeKind::Int32Mul(_, _)
+                    | NodeKind::TaggedIsNull { .. }
+                    | NodeKind::Int32BitOr(_, _)
+                    | NodeKind::Int32BitAnd(_, _)
+                    | NodeKind::Int32BitXor(_, _)
+                    | NodeKind::Int32Shl(_, _)
+                    | NodeKind::Int32Shr(_, _)
+                    | NodeKind::Int32UshrToFloat64(_, _)
+                    | NodeKind::Int32Compare(_, _, _)
+                    | NodeKind::CheckShape(_, _)
+                    | NodeKind::LoadSlot(_, _)
+                    | NodeKind::StoreSlot(_, _, _)
+                    | NodeKind::Call { .. }
+            )
+        })
+    })
+}
+
+/// Whether every `Call` site denotes the running function itself (a
+/// `SelfClosure` callee) — i.e. every call is a self-recursion, the precondition
+/// for emitting all of them frameless.
+pub(super) fn all_calls_are_self(graph: &Graph) -> bool {
+    graph.nodes.iter().all(|node| match &node.kind {
+        NodeKind::Call { inputs, .. } => matches!(
+            inputs.first().map(|c| &graph.node(*c).kind),
+            Some(NodeKind::SelfClosure)
+        ),
+        _ => true,
+    })
 }
 
 /// Target byte-PC of a relative branch. Mirrors the interpreter / baseline:

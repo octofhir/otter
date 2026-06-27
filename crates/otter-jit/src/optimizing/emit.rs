@@ -177,6 +177,7 @@ mod arm64 {
         Liveness, Location, NodeId, NodeKind, OptimizedCode, OsrEntry, Repr, Terminator,
         Unsupported,
     };
+    use super::super::builder::graph_allows_frameless_self_call;
     use crate::CompiledCode;
     use crate::baseline::{
         ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET, BAIL_PC_OFFSET, CONTEXT_OFFSET,
@@ -2352,36 +2353,6 @@ mod arm64 {
                 Ok(())
             }
         }
-    }
-
-    fn graph_allows_frameless_self_call(graph: &Graph) -> bool {
-        graph.blocks.iter().all(|block| {
-            block.body.iter().all(|&nid| {
-                matches!(
-                    graph.node(nid).kind,
-                    NodeKind::Param(_)
-                        | NodeKind::Phi(_)
-                        | NodeKind::ConstUndefined
-                        | NodeKind::ConstNull
-                        | NodeKind::ConstBool(_)
-                        | NodeKind::SelfClosure
-                        | NodeKind::ConstInt32(_)
-                        | NodeKind::CheckInt32(_)
-                        | NodeKind::Int32Add(_, _)
-                        | NodeKind::Int32Sub(_, _)
-                        | NodeKind::Int32Mul(_, _)
-                        | NodeKind::TaggedIsNull { .. }
-                        | NodeKind::Int32BitOr(_, _)
-                        | NodeKind::Int32BitAnd(_, _)
-                        | NodeKind::Int32BitXor(_, _)
-                        | NodeKind::Int32Shl(_, _)
-                        | NodeKind::Int32Shr(_, _)
-                        | NodeKind::Int32UshrToFloat64(_, _)
-                        | NodeKind::Int32Compare(_, _, _)
-                        | NodeKind::Call { .. }
-                )
-            })
-        })
     }
 
     #[allow(clippy::too_many_arguments)]

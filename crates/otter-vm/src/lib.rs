@@ -589,12 +589,12 @@ pub struct Interpreter {
     /// site id. These only cover ordinary own/direct-prototype data presence.
     has_property_ics: Vec<property_ic::PropertyIcEntry<property_ic::HasPropertyIc>>,
     /// Monomorphic method-call inline caches keyed by dense executable IC site
-    /// id. Each entry records a resolved `Array.prototype.*` builtin so a hot
-    /// `arr.method(args)` site skips the per-call name resolution, the
-    /// `[[Prototype]]` slot hash, and the dispatch string-match — validated by a
-    /// `[[Prototype]]` shape + slot-identity guard. See
-    /// [`method_ops::ArrayMethodCallIc`].
-    method_call_ics: Vec<Option<method_ops::ArrayMethodCallIc>>,
+    /// id. Each entry records a resolved prototype builtin (`Array`, `Map`, or
+    /// `Set`) so a hot `recv.method(args)` site skips the per-call name
+    /// resolution, prototype slot hash, and dispatch string-match — validated
+    /// by a prototype shape + slot-identity guard. See
+    /// [`method_ops::MethodCallIc`].
+    method_call_ics: Vec<Option<method_ops::MethodCallIc>>,
     /// Cheap aggregate counters for interpreter property IC behavior.
     property_ic_stats: property_ic::PropertyIcStats,
     /// Runtime-installed baseline JIT compiler hook. The hook lives behind a VM
@@ -2336,11 +2336,12 @@ impl Interpreter {
         self.record_jit_runtime_stub_descriptor(native_abi::STUB_JIT_PREPARE_DIRECT_METHOD_CALL);
         self.jit_runtime_stats.runtime_calls =
             self.jit_runtime_stats.runtime_calls.saturating_add(1);
-        // A site with a live array-method IC resolved to a native builtin last
-        // time, which can never be a compiled direct-call target — skip the IC
-        // walk and let the in-place method stub take its cached fast path. The
-        // stub self-heals the IC (clearing it) when the receiver stops being an
-        // array, so this never permanently strands a now-compiled method.
+        // A site with a live native prototype-method IC resolved to a builtin
+        // last time, which can never be a compiled direct-call target — skip
+        // the IC walk and let the in-place method stub take its cached fast
+        // path. The stub self-heals the IC (clearing it) when the receiver
+        // family changes, so this never permanently strands a now-compiled
+        // method.
         if self.method_call_ics.get(site).is_some_and(Option::is_some) {
             return Ok(None);
         }

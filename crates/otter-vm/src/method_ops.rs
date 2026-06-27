@@ -105,6 +105,69 @@ enum CollectionFastOp {
     SetDelete,
 }
 
+impl CollectionFastOp {
+    fn from_map_name(name: &str) -> Option<Self> {
+        match name {
+            "get" => Some(Self::MapGet),
+            "set" => Some(Self::MapSet),
+            "has" => Some(Self::MapHas),
+            "delete" => Some(Self::MapDelete),
+            _ => None,
+        }
+    }
+
+    fn from_set_name(name: &str) -> Option<Self> {
+        match name {
+            "add" => Some(Self::SetAdd),
+            "has" => Some(Self::SetHas),
+            "delete" => Some(Self::SetDelete),
+            _ => None,
+        }
+    }
+
+    fn is_map(self) -> bool {
+        matches!(
+            self,
+            Self::MapGet | Self::MapSet | Self::MapHas | Self::MapDelete
+        )
+    }
+
+    fn is_set(self) -> bool {
+        matches!(self, Self::SetAdd | Self::SetHas | Self::SetDelete)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::MapGet => "get",
+            Self::MapSet => "set",
+            Self::MapHas => "has",
+            Self::MapDelete => "delete",
+            Self::SetAdd => "add",
+            Self::SetHas => "has",
+            Self::SetDelete => "delete",
+        }
+    }
+
+    fn matches_builtin(self, method: Value, heap: &otter_gc::GcHeap) -> bool {
+        if self.is_map() {
+            crate::bootstrap_collections::is_map_prototype_builtin(method, heap, self.name())
+        } else {
+            crate::bootstrap_collections::is_set_prototype_builtin(method, heap, self.name())
+        }
+    }
+}
+
+/// Monomorphic method-call inline cache entry.
+///
+/// Entries keep only non-GC metadata: prototype shape, prototype slot, and a
+/// stable builtin tag/op. The hot guard re-reads the slot from the realm
+/// prototype and validates the builtin by native function identity.
+#[derive(Clone, Copy)]
+pub(crate) enum MethodCallIc {
+    Array(ArrayMethodCallIc),
+    Collection(CollectionMethodCallIc),
+}
+
 /// Monomorphic method-call inline cache entry for a dense-array builtin site.
 ///
 /// Records the `%Array.prototype%` shape and the own-slot offset that resolved
@@ -118,6 +181,18 @@ pub(crate) struct ArrayMethodCallIc {
     proto_shape: crate::object::ShapeId,
     proto_slot: u16,
     tag: crate::array_prototype::ArrayMethodTag,
+}
+
+/// Monomorphic method-call inline cache entry for a Map/Set builtin site.
+///
+/// The receiver family and prototype/expando guards are checked before the
+/// cached slot is trusted. Shape + slot are enough to skip the prototype slot
+/// lookup and method-name dispatch on the steady-state hot path.
+#[derive(Clone, Copy)]
+pub(crate) struct CollectionMethodCallIc {
+    proto_shape: crate::object::ShapeId,
+    proto_slot: u16,
+    op: CollectionFastOp,
 }
 
 /// Clamp a `ToIntegerOrInfinity` result to an absolute index within
@@ -383,9 +458,6 @@ impl Interpreter {
         if let Some(result) = self.continue_pending_bind_function(stack, context, dst) {
             return result;
         }
-        let name = context
-            .string_constant_str_for_function(stack[top_idx].function_id, name_idx)
-            .ok_or(VmError::InvalidOperand)?;
         let recv_value = *read_register(&stack[top_idx], recv_reg)?;
         let mut arg_values: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc);
         for i in 0..argc {
@@ -407,6 +479,25 @@ impl Interpreter {
         let method_site = context
             .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
             .unwrap_or(usize::MAX);
+        if let Some(result) =
+            self.try_array_method_call_ic(context, method_site, recv_value, arg_values.as_slice())
+        {
+            let value = result?;
+            stack[top_idx].advance_pc(caller_byte_len)?;
+            write_register(&mut stack[top_idx], dst, value)?;
+            return Ok(());
+        }
+        if let Some(result) =
+            self.try_collection_method_call_ic(method_site, recv_value, arg_values.as_slice())
+        {
+            let value = result?;
+            stack[top_idx].advance_pc(caller_byte_len)?;
+            write_register(&mut stack[top_idx], dst, value)?;
+            return Ok(());
+        }
+        let name = context
+            .string_constant_str_for_function(stack[top_idx].function_id, name_idx)
+            .ok_or(VmError::InvalidOperand)?;
         if let Some(result) = self.try_fast_array_proto_method(
             context,
             method_site,
@@ -422,9 +513,12 @@ impl Interpreter {
         // Ordinary Map/Set whose realm prototype slot is the untouched builtin —
         // dispatch the collection primitive directly, skipping both the
         // method-resolution walk and the native call bridge.
-        if let Some(result) =
-            self.try_fast_collection_proto_method(recv_value, name, arg_values.as_slice())
-        {
+        if let Some(result) = self.try_fast_collection_proto_method(
+            method_site,
+            recv_value,
+            name,
+            arg_values.as_slice(),
+        ) {
             let value = result?;
             stack[top_idx].advance_pc(caller_byte_len)?;
             write_register(&mut stack[top_idx], dst, value)?;
@@ -1103,11 +1197,23 @@ impl Interpreter {
             write_register(&mut stack[frame_index], dst, value)?;
             return Ok(());
         }
+        if let Some(result) = self.try_collection_method_call_ic(site, recv, args.as_slice()) {
+            let value = result?;
+            write_register(&mut stack[frame_index], dst, value)?;
+            return Ok(());
+        }
         let name = context
             .string_constant_str_for_function(stack[frame_index].function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
         if let Some(result) =
             self.try_fast_array_proto_method(context, site, recv, name, args.as_slice())
+        {
+            let value = result?;
+            write_register(&mut stack[frame_index], dst, value)?;
+            return Ok(());
+        }
+        if let Some(result) =
+            self.try_fast_collection_proto_method(site, recv, name, args.as_slice())
         {
             let value = result?;
             write_register(&mut stack[frame_index], dst, value)?;
@@ -1198,11 +1304,11 @@ impl Interpreter {
         if let Some(hit) = hit
             && site < self.method_call_ics.len()
         {
-            self.method_call_ics[site] = Some(ArrayMethodCallIc {
+            self.method_call_ics[site] = Some(MethodCallIc::Array(ArrayMethodCallIc {
                 proto_shape: hit.shape_id,
                 proto_slot: hit.slot,
                 tag,
-            });
+            }));
         }
         Some(self.dispatch_array_builtin_rooted(context, tag, recv, args))
     }
@@ -1223,7 +1329,10 @@ impl Interpreter {
         recv: Value,
         args: &[Value],
     ) -> Option<Result<Value, VmError>> {
-        let ic = (*self.method_call_ics.get(site)?).as_ref().copied()?;
+        let ic = match (*self.method_call_ics.get(site)?).as_ref().copied()? {
+            MethodCallIc::Array(ic) => ic,
+            MethodCallIc::Collection(_) => return None,
+        };
         let Some(arr) = recv.as_array() else {
             // The receiver is no longer an array: drop the cache so the direct
             // compiled-call path (skipped while the IC was live) resumes for
@@ -1245,6 +1354,64 @@ impl Interpreter {
         Some(self.dispatch_array_builtin_rooted(context, ic.tag, recv, args))
     }
 
+    /// Fast Map/Set builtin dispatch through the call-site method IC.
+    ///
+    /// The hit path avoids the method-name constant fetch, prototype slot hash,
+    /// and operation string-match. It still validates all observable guards:
+    /// receiver family, canonical prototype/no expando, prototype shape, and
+    /// builtin identity at the cached slot.
+    fn try_collection_method_call_ic(
+        &mut self,
+        site: usize,
+        recv: Value,
+        args: &[Value],
+    ) -> Option<Result<Value, VmError>> {
+        let ic = match (*self.method_call_ics.get(site)?).as_ref().copied()? {
+            MethodCallIc::Collection(ic) => ic,
+            MethodCallIc::Array(_) => return None,
+        };
+        let proto = if let Some(map) = recv.as_map() {
+            if !ic.op.is_map() {
+                self.method_call_ics[site] = None;
+                return None;
+            }
+            let proto = self.realm_intrinsics.map_prototype?;
+            if !prototype_override_is(
+                crate::collections::map_prototype_override(map, &self.gc_heap),
+                proto,
+            ) || crate::collections::map_expando(map, &self.gc_heap).is_some()
+            {
+                return None;
+            }
+            proto
+        } else if let Some(set) = recv.as_set() {
+            if !ic.op.is_set() {
+                self.method_call_ics[site] = None;
+                return None;
+            }
+            let proto = self.realm_intrinsics.set_prototype?;
+            if !prototype_override_is(
+                crate::collections::set_prototype_override(set, &self.gc_heap),
+                proto,
+            ) || crate::collections::set_expando(set, &self.gc_heap).is_some()
+            {
+                return None;
+            }
+            proto
+        } else {
+            self.method_call_ics[site] = None;
+            return None;
+        };
+        if crate::object::shape_id(proto, &self.gc_heap) != ic.proto_shape {
+            return None;
+        }
+        let method = crate::object::data_slot_value_at(proto, &self.gc_heap, ic.proto_slot)?;
+        if !ic.op.matches_builtin(method, &self.gc_heap) {
+            return None;
+        }
+        Some(self.dispatch_collection_builtin_rooted(ic.op, recv, args))
+    }
+
     /// Direct `map.get/set/has/delete` and `set.add/has/delete` dispatch on an
     /// ordinary Map/Set whose realm prototype slot still holds the original
     /// builtin — skipping the per-call method-resolution walk
@@ -1261,12 +1428,13 @@ impl Interpreter {
     /// user override or deletion fails the function-pointer guard).
     fn try_fast_collection_proto_method(
         &mut self,
+        site: usize,
         recv: Value,
         name: &str,
         args: &[Value],
     ) -> Option<Result<Value, VmError>> {
         use crate::object::PropertyLookup;
-        let op = if let Some(map) = recv.as_map() {
+        let (hit, op) = if let Some(map) = recv.as_map() {
             let proto = self.realm_intrinsics.map_prototype?;
             // Accept the canonical prototype whether it is the implicit default
             // (`None`) or the explicit `[[Prototype]]` recorded at construction;
@@ -1278,7 +1446,7 @@ impl Interpreter {
             {
                 return None;
             }
-            let (_, lookup) = crate::object::lookup_own_slot(proto, &self.gc_heap, name);
+            let (hit, lookup) = crate::object::lookup_own_slot(proto, &self.gc_heap, name);
             let PropertyLookup::Data { value: method, .. } = lookup else {
                 return None;
             };
@@ -1286,13 +1454,8 @@ impl Interpreter {
             {
                 return None;
             }
-            match name {
-                "get" => CollectionFastOp::MapGet,
-                "set" => CollectionFastOp::MapSet,
-                "has" => CollectionFastOp::MapHas,
-                "delete" => CollectionFastOp::MapDelete,
-                _ => return None,
-            }
+            let op = CollectionFastOp::from_map_name(name)?;
+            (hit, op)
         } else if let Some(set) = recv.as_set() {
             let proto = self.realm_intrinsics.set_prototype?;
             if !prototype_override_is(
@@ -1302,7 +1465,7 @@ impl Interpreter {
             {
                 return None;
             }
-            let (_, lookup) = crate::object::lookup_own_slot(proto, &self.gc_heap, name);
+            let (hit, lookup) = crate::object::lookup_own_slot(proto, &self.gc_heap, name);
             let PropertyLookup::Data { value: method, .. } = lookup else {
                 return None;
             };
@@ -1310,15 +1473,20 @@ impl Interpreter {
             {
                 return None;
             }
-            match name {
-                "add" => CollectionFastOp::SetAdd,
-                "has" => CollectionFastOp::SetHas,
-                "delete" => CollectionFastOp::SetDelete,
-                _ => return None,
-            }
+            let op = CollectionFastOp::from_set_name(name)?;
+            (hit, op)
         } else {
             return None;
         };
+        if let Some(hit) = hit
+            && site < self.method_call_ics.len()
+        {
+            self.method_call_ics[site] = Some(MethodCallIc::Collection(CollectionMethodCallIc {
+                proto_shape: hit.shape_id,
+                proto_slot: hit.slot,
+                op,
+            }));
+        }
         Some(self.dispatch_collection_builtin_rooted(op, recv, args))
     }
 

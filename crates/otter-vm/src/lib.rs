@@ -6544,15 +6544,19 @@ impl Interpreter {
         // owning context (`entry_context`, a borrow that outlives the loop, or
         // `foreign_context`, kept live below) stays alive while `function_id` is
         // unchanged — so the pointer is valid for every reuse.
-        struct FrameDispatchCache {
-            function_id: u32,
-            depth: usize,
-            foreign: bool,
-            function: *const ExecutableFunction,
-            idx: usize,
-            next_pc: u32,
-        }
-        let mut frame_cache: Option<FrameDispatchCache> = None;
+        // Held as flat register-resident locals rather than an `Option<struct>`
+        // so a cache hit rewrites only the two fields that actually change
+        // (`cache_idx` / `cache_next_pc`); the chunk selection and function
+        // pointer are touched only on a miss. `cache_function` is null until the
+        // first resolution and is dereferenced solely on the hit path, which the
+        // `(function_id, depth)` guard gates.
+        let mut cache_valid = false;
+        let mut cache_function_id: u32 = u32::MAX;
+        let mut cache_depth: usize = 0;
+        let mut cache_foreign = false;
+        let mut cache_function: *const ExecutableFunction = std::ptr::null();
+        let mut cache_idx: usize = 0;
+        let mut cache_next_pc: u32 = u32::MAX;
         loop {
             if self.interrupt.is_set() {
                 return Err(VmError::Interrupted);
@@ -6584,33 +6588,28 @@ impl Interpreter {
             // but changes the depth, so both guards are needed). On a hit the
             // sequential fast path (`pc == next_pc`) costs an integer increment;
             // an in-frame branch re-probes the index map.
-            let (context, function, idx, foreign): (
-                &ExecutionContext,
-                &ExecutableFunction,
-                usize,
-                bool,
-            ) = match &frame_cache {
-                Some(cache) if cache.function_id == function_id && cache.depth == depth => {
-                    let context: &ExecutionContext = if cache.foreign {
+            let (context, function, idx): (&ExecutionContext, &ExecutableFunction, usize) =
+                if cache_valid && cache_function_id == function_id && cache_depth == depth {
+                    let context: &ExecutionContext = if cache_foreign {
                         foreign_context
                             .as_ref()
                             .ok_or_else(|| VmError::InvalidOperand)?
                     } else {
                         entry_context
                     };
-                    // SAFETY: see `FrameDispatchCache` — the pointer addresses
-                    // never-moving compiled code in a still-live chunk context.
-                    let function: &ExecutableFunction = unsafe { &*cache.function };
-                    let idx = if pc == cache.next_pc {
-                        cache.idx + 1
+                    // SAFETY: the pointer addresses never-moving compiled code in
+                    // a still-live chunk context (see the cache comment); the
+                    // `(function_id, depth)` guard proves it was filled.
+                    let function: &ExecutableFunction = unsafe { &*cache_function };
+                    let idx = if pc == cache_next_pc {
+                        cache_idx + 1
                     } else {
                         function
                             .instr_index_at_byte_pc(pc)
                             .ok_or(VmError::MissingReturn)?
                     };
-                    (context, function, idx, cache.foreign)
-                }
-                _ => {
+                    (context, function, idx)
+                } else {
                     let mut foreign = false;
                     let context: &ExecutionContext =
                         if entry_context.covers_function(function_id) {
@@ -6652,21 +6651,21 @@ impl Interpreter {
                     if depth32 > self.runtime_budget_stats.max_stack_depth_observed {
                         self.runtime_budget_stats.max_stack_depth_observed = depth32;
                     }
-                    (context, function, idx, foreign)
-                }
-            };
+                    // Refresh the miss-only fields of the cache.
+                    cache_valid = true;
+                    cache_function_id = function_id;
+                    cache_depth = depth;
+                    cache_foreign = foreign;
+                    cache_function = function as *const ExecutableFunction;
+                    (context, function, idx)
+                };
             let instr = function
                 .instr_at_index(idx)
                 .ok_or(VmError::MissingReturn)?;
             let op = instr.op();
-            frame_cache = Some(FrameDispatchCache {
-                function_id,
-                depth,
-                foreign,
-                function: function as *const ExecutableFunction,
-                idx,
-                next_pc: pc.wrapping_add(instr.byte_len()),
-            });
+            // Per-tick fields: on a hit these are the only cache writes.
+            cache_idx = idx;
+            cache_next_pc = pc.wrapping_add(instr.byte_len());
             self.current_byte_len = instr.byte_len();
             // `current_function_id` / `current_byte_pc` exist only to key the
             // optimizing-tier arithmetic type-feedback cell (`note_arith`),

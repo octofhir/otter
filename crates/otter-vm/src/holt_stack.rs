@@ -291,6 +291,34 @@ impl HoltStack {
         self.frames.last_mut()
     }
 
+    /// Shared reference to the top frame without a bounds check.
+    ///
+    /// # Safety
+    /// The stack must be non-empty. The dispatch loop calls this only after its
+    /// `is_empty()` guard at the top of each tick, so a live top frame is
+    /// guaranteed; the reserved buffer never reallocates, so the reference stays
+    /// put until the next push/pop. Avoids the `Index`/`last` bounds check on the
+    /// hottest per-instruction read.
+    #[inline]
+    #[must_use]
+    pub unsafe fn top_unchecked(&self) -> &Frame {
+        let len = self.frames.len();
+        debug_assert!(len > 0, "top_unchecked on empty stack");
+        unsafe { self.frames.get_unchecked(len - 1) }
+    }
+
+    /// Mutable counterpart to [`Self::top_unchecked`].
+    ///
+    /// # Safety
+    /// Same contract: the stack must be non-empty.
+    #[inline]
+    #[must_use]
+    pub unsafe fn top_unchecked_mut(&mut self) -> &mut Frame {
+        let len = self.frames.len();
+        debug_assert!(len > 0, "top_unchecked_mut on empty stack");
+        unsafe { self.frames.get_unchecked_mut(len - 1) }
+    }
+
     /// Shared reference to the frame at index `i` (`0` is the bottom `<main>`
     /// frame), or `None` if out of range.
     #[inline]

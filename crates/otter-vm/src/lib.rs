@@ -6561,10 +6561,14 @@ impl Interpreter {
                 // it as completion.
                 return Ok(Value::undefined());
             }
-            let top_idx = stack.len() - 1;
             let depth = stack.len();
-            let function_id = stack[top_idx].function_id;
-            let pc = stack[top_idx].pc;
+            let top_idx = depth - 1;
+            // SAFETY: the `is_empty()` guard above proves a live top frame this
+            // tick; one unchecked read serves both fields.
+            let (function_id, pc) = {
+                let top = unsafe { stack.top_unchecked() };
+                (top.function_id, top.pc)
+            };
             // Reuse the cached frame state when the top frame is the same one as
             // the previous tick (same id *and* depth pin the exact live frame —
             // tail-call keeps the depth but swaps the id, recursion keeps the id

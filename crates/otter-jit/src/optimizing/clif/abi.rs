@@ -45,6 +45,8 @@ pub(super) const SPECIAL_TRUE: u64 = crate::baseline::SPECIAL_TRUE as u64;
 
 /// Boxed `undefined` bit pattern (`TAG_SPECIAL << 48`).
 pub(super) const UNDEFINED_BITS: u64 = TAG_SPECIAL << 48;
+/// Boxed `null` bit pattern.
+pub(super) const NULL_BITS: u64 = (TAG_SPECIAL << 48) | crate::baseline::SPECIAL_NULL;
 /// Boxed `false` bit pattern.
 pub(super) const FALSE_BITS: u64 = (TAG_SPECIAL << 48) | SPECIAL_FALSE;
 /// Boxed `true` bit pattern.

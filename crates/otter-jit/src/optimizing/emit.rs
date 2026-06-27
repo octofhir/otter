@@ -164,8 +164,8 @@ mod arm64 {
         DIRECT_ENTRY_OFFSET, DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET,
         DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET,
         JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG, OBJECT_BODY_TYPE_TAG, REG_STACK_BASE_OFFSET,
-        REG_TOP_PTR_OFFSET, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED,
-        STATUS_RETURNED, STATUS_THREW, TAG_FUNCTION_ID, TAG_INT32, TAG_PTR_FUNCTION,
+        REG_TOP_PTR_OFFSET, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_NULL, SPECIAL_TRUE, STACK_OFFSET,
+        STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_FUNCTION_ID, TAG_INT32, TAG_PTR_FUNCTION,
         TAG_PTR_OBJECT, TAG_SPECIAL, THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET,
         UPVALUES_PTR_OFFSET, VM_OFFSET, jit_abort_direct_call_stub, jit_call_method_stub,
         jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
@@ -368,6 +368,10 @@ mod arm64 {
         match kind {
             NodeKind::ConstUndefined => {
                 emit_load_u64(ops, gp_dst, TAG_SPECIAL << 48);
+                true
+            }
+            NodeKind::ConstNull => {
+                emit_load_u64(ops, gp_dst, (TAG_SPECIAL << 48) | SPECIAL_NULL);
                 true
             }
             NodeKind::ConstBool(value) => {
@@ -1448,6 +1452,13 @@ mod arm64 {
                 }
                 Ok(())
             }
+            NodeKind::ConstNull => {
+                if let Some(loc) = dst {
+                    emit_load_u64(ops, box_scratch, (TAG_SPECIAL << 48) | SPECIAL_NULL);
+                    store_loc(ops, loc, box_scratch);
+                }
+                Ok(())
+            }
             NodeKind::ConstBool(b) => {
                 if let Some(loc) = dst {
                     let special = if *b { SPECIAL_TRUE } else { SPECIAL_FALSE };
@@ -1692,6 +1703,15 @@ mod arm64 {
                 }
                 Ok(())
             }
+            NodeKind::Float64ToInt32(operand) => {
+                let oloc = require_loc(alloc, *operand)?;
+                if let Some(loc) = dst {
+                    load_fp_loc(ops, FP_LOAD_SCRATCH, oloc);
+                    dynasm!(ops ; .arch aarch64 ; fjcvtzs W(box_scratch), D(FP_LOAD_SCRATCH));
+                    store_loc(ops, loc, box_scratch);
+                }
+                Ok(())
+            }
             NodeKind::Float64Add(a, b)
             | NodeKind::Float64Sub(a, b)
             | NodeKind::Float64Mul(a, b)
@@ -1739,6 +1759,21 @@ mod arm64 {
                 }
                 Ok(())
             }
+            NodeKind::TaggedIsNull { value, negate } => {
+                let vloc = require_loc(alloc, *value)?;
+                load_loc(ops, box_scratch, vloc);
+                emit_load_u64(ops, MOVE_SCRATCH, (TAG_SPECIAL << 48) | SPECIAL_NULL);
+                dynasm!(ops ; .arch aarch64 ; cmp X(box_scratch), X(MOVE_SCRATCH));
+                if let Some(loc) = dst {
+                    if *negate {
+                        dynasm!(ops ; .arch aarch64 ; cset W(box_scratch), ne);
+                    } else {
+                        dynasm!(ops ; .arch aarch64 ; cset W(box_scratch), eq);
+                    }
+                    store_loc(ops, loc, box_scratch);
+                }
+                Ok(())
+            }
             NodeKind::CheckShape(obj, shape_offset) => {
                 // Guard the receiver is an ordinary object of the baked shape:
                 // pointer tag, GC type tag, then receiver-shape == baked shape. A
@@ -1771,7 +1806,50 @@ mod arm64 {
                     ; ldr w17, [x16, shape_byte]
                 );
                 emit_load_u64(ops, MOVE_SCRATCH, u64::from(*shape_offset));
-                dynasm!(ops ; .arch aarch64 ; cmp W(box_scratch), W(MOVE_SCRATCH) ; b.ne =>exit);
+                dynasm!(ops ; .arch aarch64 ; cmp w17, W(MOVE_SCRATCH) ; b.ne =>exit);
+                Ok(())
+            }
+            NodeKind::CheckFunctionIdentity {
+                callee,
+                function_id,
+            } => {
+                let callee_loc = require_loc(alloc, *callee)?;
+                let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
+                let fid_immediate = ops.new_dynamic_label();
+                let fid_compare = ops.new_dynamic_label();
+                load_loc(ops, box_scratch, callee_loc);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; lsr x0, X(box_scratch), #48
+                    ; movz x1, TAG_FUNCTION_ID as u32
+                    ; cmp x0, x1
+                    ; b.eq =>fid_immediate
+                    ; movz x1, TAG_PTR_FUNCTION as u32
+                    ; cmp x0, x1
+                    ; b.ne =>exit
+                    ; mov w2, W(box_scratch)
+                );
+                emit_load_u64(ops, 3, view.cage_base as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; add x3, x3, x2
+                    ; ldrb w0, [x3]
+                    ; cmp w0, JS_CLOSURE_BODY_TYPE_TAG
+                    ; b.ne =>exit
+                    ; ldr w4, [x3, view.closure_fid_byte]
+                    ; b =>fid_compare
+                    ; =>fid_immediate
+                    ; mov w4, W(box_scratch)
+                    ; =>fid_compare
+                    ; movz w5, function_id & 0xffff
+                    ; movk w5, (function_id >> 16) & 0xffff, lsl #16
+                    ; cmp w4, w5
+                    ; b.ne =>exit
+                );
+                if let Some(loc) = dst {
+                    load_loc(ops, box_scratch, callee_loc);
+                    store_loc(ops, loc, box_scratch);
+                }
                 Ok(())
             }
             NodeKind::CheckMethodIdentity {
@@ -1779,6 +1857,7 @@ mod arm64 {
                 recv_shape,
                 proto_shape,
                 method_value_byte,
+                method_on_receiver,
                 method_fid,
             } => {
                 let recv_loc = require_loc(alloc, *recv)?;
@@ -1789,66 +1868,74 @@ mod arm64 {
                 let fid_compare = ops.new_dynamic_label();
                 dynasm!(ops
                     ; .arch aarch64
-                    ; lsr x10, X(box_scratch), #48
-                    ; movz x11, TAG_PTR_OBJECT as u32
-                    ; cmp x10, x11
+                    ; lsr x0, X(box_scratch), #48
+                    ; movz x1, TAG_PTR_OBJECT as u32
+                    ; cmp x0, x1
                     ; b.ne =>exit
-                    ; mov w12, W(box_scratch)
+                    ; mov w2, W(box_scratch)
                 );
-                emit_load_u64(ops, 13, view.cage_base as u64);
+                emit_load_u64(ops, 3, view.cage_base as u64);
                 dynasm!(ops
                     ; .arch aarch64
-                    ; add x13, x13, x12
-                    ; ldrb w14, [x13]
-                    ; cmp w14, OBJECT_BODY_TYPE_TAG
+                    ; add x3, x3, x2
+                    ; ldrb w4, [x3]
+                    ; cmp w4, OBJECT_BODY_TYPE_TAG
                     ; b.ne =>exit
-                    ; ldr w14, [x13, view.object_shape_byte]
-                    ; movz w15, recv_shape & 0xffff
-                    ; movk w15, (recv_shape >> 16) & 0xffff, lsl #16
-                    ; cmp w14, w15
+                    ; ldr w4, [x3, view.object_shape_byte]
+                    ; movz w5, recv_shape & 0xffff
+                    ; movk w5, (recv_shape >> 16) & 0xffff, lsl #16
+                    ; cmp w4, w5
                     ; b.ne =>exit
-                    ; ldr w9, [x13, view.jit_proto_byte]
-                    ; cbz w9, =>exit
                 );
-                emit_load_u64(ops, 12, view.cage_base as u64);
+                if !*method_on_receiver {
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr w2, [x3, view.jit_proto_byte]
+                        ; cbz w2, =>exit
+                    );
+                    emit_load_u64(ops, 3, view.cage_base as u64);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; add x3, x3, x2
+                        ; ldrb w4, [x3]
+                        ; cmp w4, OBJECT_BODY_TYPE_TAG
+                        ; b.ne =>exit
+                        ; ldr w4, [x3, view.object_shape_byte]
+                        ; movz w5, proto_shape & 0xffff
+                        ; movk w5, (proto_shape >> 16) & 0xffff, lsl #16
+                        ; cmp w4, w5
+                        ; b.ne =>exit
+                    );
+                }
                 dynasm!(ops
                     ; .arch aarch64
-                    ; add x13, x12, x9
-                    ; ldrb w14, [x13]
-                    ; cmp w14, OBJECT_BODY_TYPE_TAG
-                    ; b.ne =>exit
-                    ; ldr w14, [x13, view.object_shape_byte]
-                    ; movz w15, proto_shape & 0xffff
-                    ; movk w15, (proto_shape >> 16) & 0xffff, lsl #16
-                    ; cmp w14, w15
-                    ; b.ne =>exit
-                    ; ldr x13, [x13, view.object_values_ptr_byte]
-                    ; cbz x13, =>exit
-                    ; ldr x9, [x13, *method_value_byte]
-                    ; lsr x10, x9, #48
-                    ; movz x11, TAG_FUNCTION_ID as u32
-                    ; cmp x10, x11
+                    ; ldr x3, [x3, view.object_values_ptr_byte]
+                    ; cbz x3, =>exit
+                    ; ldr x4, [x3, *method_value_byte]
+                    ; lsr x0, x4, #48
+                    ; movz x1, TAG_FUNCTION_ID as u32
+                    ; cmp x0, x1
                     ; b.eq =>fid_immediate
-                    ; movz x11, TAG_PTR_FUNCTION as u32
-                    ; cmp x10, x11
+                    ; movz x1, TAG_PTR_FUNCTION as u32
+                    ; cmp x0, x1
                     ; b.ne =>exit
-                    ; mov w12, w9
+                    ; mov w2, w4
                 );
-                emit_load_u64(ops, 11, view.cage_base as u64);
+                emit_load_u64(ops, 3, view.cage_base as u64);
                 dynasm!(ops
                     ; .arch aarch64
-                    ; add x11, x11, x12
-                    ; ldrb w14, [x11]
-                    ; cmp w14, JS_CLOSURE_BODY_TYPE_TAG
+                    ; add x3, x3, x2
+                    ; ldrb w0, [x3]
+                    ; cmp w0, JS_CLOSURE_BODY_TYPE_TAG
                     ; b.ne =>exit
-                    ; ldr w14, [x11, view.closure_fid_byte]
+                    ; ldr w4, [x3, view.closure_fid_byte]
                     ; b =>fid_compare
                     ; =>fid_immediate
-                    ; mov w14, w9
+                    ; mov w4, w4
                     ; =>fid_compare
-                    ; movz w15, method_fid & 0xffff
-                    ; movk w15, (method_fid >> 16) & 0xffff, lsl #16
-                    ; cmp w14, w15
+                    ; movz w5, method_fid & 0xffff
+                    ; movk w5, (method_fid >> 16) & 0xffff, lsl #16
+                    ; cmp w4, w5
                     ; b.ne =>exit
                 );
                 if let Some(loc) = dst {
@@ -2175,6 +2262,55 @@ mod arm64 {
                 }
                 Ok(())
             }
+            NodeKind::InlineUpvalue { closure, index } => {
+                // Read an inlined closure callee's own captured upvalue. Decode
+                // the live closure body from the (fid-guarded) callee value, take
+                // its spine pointer, then the per-index compressed cell handle —
+                // the context-spine `LoadUpvalue` sequence with the spine sourced
+                // from the closure instead of `JitCtx.upvalues_ptr`.
+                let closure_loc = require_loc(alloc, *closure)?;
+                let idx_off = index
+                    .checked_mul(UPVALUE_CELL_SIZE)
+                    .ok_or(Unsupported::OperandShape("upvalue index"))?;
+                if idx_off > 32760 {
+                    return Err(Unsupported::OperandShape("upvalue index"));
+                }
+                let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
+                load_loc(ops, box_scratch, closure_loc);
+                // A heap closure (the only form that carries captures) is tagged
+                // `TAG_PTR_FUNCTION`; a bare function-id immediate has no spine.
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; lsr x0, X(box_scratch), #48
+                    ; movz x1, TAG_PTR_FUNCTION as u32
+                    ; cmp x0, x1
+                    ; b.ne =>exit
+                    ; mov w2, W(box_scratch)
+                );
+                emit_load_u64(ops, 3, view.cage_base as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; add x3, x3, x2
+                    ; ldrb w0, [x3]
+                    ; cmp w0, JS_CLOSURE_BODY_TYPE_TAG
+                    ; b.ne =>exit
+                    ; ldr x16, [x3, view.closure_upvalues_ptr_byte]
+                    ; cbz x16, =>exit
+                    ; ldr w17, [x16, idx_off]
+                );
+                emit_load_u64(ops, 16, view.cage_base as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; add x16, x16, x17
+                    ; ldr X(box_scratch), [x16, UPVALUE_VALUE_OFFSET]
+                );
+                emit_load_u64(ops, MOVE_SCRATCH, (TAG_SPECIAL << 48) | SPECIAL_HOLE);
+                dynasm!(ops ; .arch aarch64 ; cmp X(box_scratch), X(MOVE_SCRATCH) ; b.eq =>exit);
+                if let Some(loc) = dst {
+                    store_loc(ops, loc, box_scratch);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -2186,6 +2322,7 @@ mod arm64 {
                     NodeKind::Param(_)
                         | NodeKind::Phi(_)
                         | NodeKind::ConstUndefined
+                        | NodeKind::ConstNull
                         | NodeKind::ConstBool(_)
                         | NodeKind::SelfClosure
                         | NodeKind::ConstInt32(_)
@@ -2193,6 +2330,7 @@ mod arm64 {
                         | NodeKind::Int32Add(_, _)
                         | NodeKind::Int32Sub(_, _)
                         | NodeKind::Int32Mul(_, _)
+                        | NodeKind::TaggedIsNull { .. }
                         | NodeKind::Int32BitOr(_, _)
                         | NodeKind::Int32BitAnd(_, _)
                         | NodeKind::Int32BitXor(_, _)
@@ -2471,6 +2609,7 @@ mod tests {
             object_values_ptr_byte: 16,
             jit_proto_byte: 12,
             closure_fid_byte: 8,
+            closure_upvalues_ptr_byte: 16,
             instructions,
             inline_callees: Default::default(),
             inline_methods: Default::default(),
@@ -2630,6 +2769,37 @@ mod tests {
         let (status, value) = run(&ushr_zero(), &[boxi(-1)]);
         assert_eq!(status, 0, "returns, no bail");
         assert_eq!(f64::from_bits(value), 4_294_967_295.0);
+    }
+
+    fn bit_or_zero() -> JitFunctionView {
+        view(
+            1,
+            4,
+            &[
+                (Op::LoadInt32, vec![r(1), imm(0)], 0),
+                (
+                    Op::BitwiseOr,
+                    vec![r(2), r(0), r(1)],
+                    ARITH_INT32 | ARITH_FLOAT64,
+                ),
+                (Op::ReturnValue, vec![r(2)], 0),
+            ],
+        )
+    }
+
+    #[test]
+    fn float64_to_int32_bitwise_or_returns_js_to_int32() {
+        for (input, expected) in [
+            (2_500_000.0, 2_500_000),
+            (4_294_967_297.0, 1),
+            (-1.5, -1),
+            (f64::NAN, 0),
+            (f64::INFINITY, 0),
+        ] {
+            let (status, value) = run(&bit_or_zero(), &[input.to_bits()]);
+            assert_eq!(status, 0, "{input:?} returns, no bail");
+            assert_eq!(unboxi(value), expected, "ToInt32({input:?})");
+        }
     }
 
     /// `f(n){ let x=0.0; let i=0; while(i<n){ x = x + 1.5; i = i+1 } return x }`

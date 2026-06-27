@@ -94,6 +94,13 @@ pub struct JitFunctionView {
     /// method-inline guard reads `[closure_ptr + closure_fid_byte]` to compare
     /// a resolved prototype method against the baked target id.
     pub closure_fid_byte: u32,
+    /// Byte offset from a decompressed closure pointer to the data pointer of
+    /// its captured upvalue spine (`HEADER_SIZE + offset_of!(JsClosureBody,
+    /// upvalues)`; the `Vec<UpvalueCell>` stores its backing pointer in its
+    /// first word). An inlined closure body reads `[closure_ptr +
+    /// closure_upvalues_ptr_byte]` to reach the spine, then the per-index
+    /// compressed cell handle, mirroring the context-spine [`LoadUpvalue`] path.
+    pub closure_upvalues_ptr_byte: u32,
     /// Instruction stream in byte-PC order.
     pub instructions: Vec<JitInstrView>,
     /// Inline-candidate callees for baseline leaf-inlining, keyed by the
@@ -154,6 +161,9 @@ pub struct JitInlineMethod {
     /// Byte offset inside the prototype object's value slab for the method
     /// slot, baked from the prototype shape.
     pub method_value_byte: u32,
+    /// `true` when the method slot is an own property on the receiver rather
+    /// than a property on the receiver's prototype.
+    pub method_on_receiver: bool,
     /// Method formal parameter count (excluding `this`); must equal argc.
     pub param_count: u16,
     /// Method register-window length; the body runs in a scratch block of this
@@ -276,10 +286,10 @@ pub struct JitInstrView {
     /// Operands in declaration order. Branch immediates are already rewritten
     /// to byte-offset deltas in VM dispatch coordinates.
     pub operands: Vec<Operand>,
-    /// `true` for a `MakeFunction` whose target is the function being compiled
-    /// (the named-function SELF binding). The emitter materializes it as a
-    /// direct read of the frame's own closure (carried in `JitCtx`) instead of
-    /// a Rust round-trip through `jit_runtime_make_function`.
+    /// `true` for a `MakeFunction` / `MakeClosure` whose target is the function
+    /// being compiled (the named-function SELF binding). The emitter
+    /// materializes it as a direct read of the frame's own closure (carried in
+    /// `JitCtx`) instead of a Rust round-trip through the closure builder.
     pub make_self: bool,
     /// `true` when this instruction is a named-property read of literal
     /// `"length"`. The emitter uses it to try the Array exotic length fast

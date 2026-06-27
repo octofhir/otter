@@ -246,13 +246,15 @@ impl ExecutionContext {
         let mut view = self
             .exec_function(function_id)
             .map(ExecutableFunction::jit_view)?;
-        // Mark each `MakeFunction` whose constant resolves to the function being
-        // compiled: it materializes the named-function SELF binding, which the
-        // emitter can read straight from the frame's own closure instead of a
-        // Rust round-trip. Operand 1 is the function-id constant index.
+        // Mark each self-binding maker whose constant resolves to the function
+        // being compiled: it materializes the named-function SELF binding, which
+        // the emitter can read straight from the frame's own closure instead of
+        // a Rust round-trip. Operand 1 is the function-id constant index.
         for instr in &mut view.instructions {
-            if instr.op == otter_bytecode::Op::MakeFunction
-                && let Some(&otter_bytecode::Operand::ConstIndex(idx)) = instr.operands.get(1)
+            if matches!(
+                instr.op,
+                otter_bytecode::Op::MakeFunction | otter_bytecode::Op::MakeClosure
+            ) && let Some(&otter_bytecode::Operand::ConstIndex(idx)) = instr.operands.get(1)
                 && self.function_id_constant(idx) == Some(function_id)
             {
                 instr.make_self = true;

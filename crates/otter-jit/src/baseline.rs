@@ -291,6 +291,7 @@ pub(crate) extern "C" fn jit_prepare_direct_method_call_stub(
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
     let context = unsafe { &*ctx.context };
+    let call_byte_pc = ctx.bail_pc;
     let all = [a0 as u16, a1 as u16, a2 as u16];
     let argc = (argc as usize).min(all.len());
     match vm.jit_prepare_direct_method_call(
@@ -299,6 +300,7 @@ pub(crate) extern "C" fn jit_prepare_direct_method_call_stub(
         ctx.frame_index,
         recv as u16,
         name_idx as u32,
+        call_byte_pc,
         site as usize,
         &all[..argc],
     ) {
@@ -850,6 +852,7 @@ pub(crate) extern "C" fn jit_call_method_stub(
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
     let context = unsafe { &*ctx.context };
+    let call_byte_pc = ctx.bail_pc;
     let name_idx = (name_and_site & 0xffff_ffff) as u32;
     let site = (name_and_site >> 32) as usize;
     let all = [a0 as u16, a1 as u16, a2 as u16];
@@ -861,6 +864,7 @@ pub(crate) extern "C" fn jit_call_method_stub(
         dst as u16,
         recv as u16,
         name_idx,
+        call_byte_pc,
         site,
         &all[..argc],
     ) {
@@ -1922,11 +1926,11 @@ mod arm64 {
                         dynasm!(ops ; .arch aarch64 ; b.eq =>tgt);
                     }
                 }
-                Op::MakeFunction if instr.make_self => {
+                Op::MakeFunction | Op::MakeClosure if instr.make_self => {
                     // SELF binding: the closure value is precomputed in
                     // `JitCtx.self_closure` (offset 8 from x20), so read it
                     // straight into `dst` — no Rust round-trip through
-                    // `jit_make_fn_stub`/`run_make_function_reg`.
+                    // the function/closure builder.
                     let dst = reg(ops_ref, 0)?;
                     dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, #8]);
                     store_reg(&mut ops, 9, dst)?;
@@ -2696,7 +2700,7 @@ mod arm64 {
     /// Largest argument count an inlined call accepts.
     const INLINE_MAX_ARGS: usize = 8;
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum InlineCallKind {
         Plain,
         ClosureUpvalues,
@@ -2753,6 +2757,161 @@ mod arm64 {
         )
     }
 
+    fn inline_plain_op_allowed(instr: &otter_vm::JitInstrView) -> bool {
+        is_inline_pure_op(instr.op)
+            || (matches!(instr.op, Op::MakeFunction | Op::MakeClosure) && instr.make_self)
+    }
+
+    fn self_bindings_are_dead(callee: &JitInlineCallee) -> bool {
+        let mut pending = Vec::<u16>::new();
+
+        for instr in &callee.instructions {
+            let operands = instr.operands.as_slice();
+            let mut ok = true;
+            match instr.op {
+                Op::LoadLocal | Op::StoreLocal => {}
+                Op::ToPrimitive | Op::ToNumeric => {
+                    ok &= reg(operands, 1)
+                        .ok()
+                        .is_some_and(|regn| !pending.contains(&regn));
+                }
+                Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Rem
+                | Op::BitwiseOr
+                | Op::BitwiseAnd
+                | Op::BitwiseXor
+                | Op::Shl
+                | Op::Shr
+                | Op::Ushr
+                | Op::LessThan
+                | Op::LessEq
+                | Op::GreaterThan
+                | Op::GreaterEq
+                | Op::Equal
+                | Op::NotEqual => {
+                    ok &= reg(operands, 1)
+                        .ok()
+                        .is_some_and(|regn| !pending.contains(&regn));
+                    ok &= reg(operands, 2)
+                        .ok()
+                        .is_some_and(|regn| !pending.contains(&regn));
+                }
+                Op::Return | Op::ReturnValue => {
+                    ok &= reg(operands, 0)
+                        .ok()
+                        .is_some_and(|regn| !pending.contains(&regn));
+                }
+                Op::JumpIfFalse | Op::JumpIfTrue => {
+                    ok &= reg(operands, 1)
+                        .ok()
+                        .is_some_and(|regn| !pending.contains(&regn));
+                }
+                Op::StoreUpvalue | Op::StoreUpvalueChecked => {
+                    ok &= reg(operands, 0)
+                        .ok()
+                        .is_some_and(|regn| !pending.contains(&regn));
+                }
+                Op::MakeFunction | Op::MakeClosure if instr.make_self => {}
+                Op::LoadUpvalue => {}
+                op if is_inline_pure_op(op) => {}
+                _ => {
+                    if std::env::var_os("OTTER_JIT_TRACE").is_some() {
+                        eprintln!(
+                            "[otter-jit] dead-self skip callee {} pc {} op {:?} make_self={} pending={pending:?}",
+                            callee.function_id, instr.byte_pc, instr.op, instr.make_self,
+                        );
+                    }
+                    return false;
+                }
+            }
+            if !ok {
+                if std::env::var_os("OTTER_JIT_TRACE").is_some() {
+                    eprintln!(
+                        "[otter-jit] dead-self read callee {} pc {} op {:?} pending={pending:?}",
+                        callee.function_id, instr.byte_pc, instr.op,
+                    );
+                }
+                return false;
+            }
+
+            match instr.op {
+                Op::LoadInt32
+                | Op::LoadNumber
+                | Op::LoadUndefined
+                | Op::LoadNull
+                | Op::LoadHole
+                | Op::LoadTrue
+                | Op::LoadFalse
+                | Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Rem
+                | Op::BitwiseOr
+                | Op::BitwiseAnd
+                | Op::BitwiseXor
+                | Op::Shl
+                | Op::Shr
+                | Op::Ushr
+                | Op::LessThan
+                | Op::LessEq
+                | Op::GreaterThan
+                | Op::GreaterEq
+                | Op::Equal
+                | Op::NotEqual
+                | Op::ToPrimitive
+                | Op::ToNumeric => {
+                    if let Ok(dst) = reg(operands, 0) {
+                        pending.retain(|&seen| seen != dst);
+                    }
+                }
+                Op::LoadLocal => {
+                    let Ok(dst) = reg(operands, 0) else {
+                        return false;
+                    };
+                    let Ok(src) = local_index(operands, 1) else {
+                        return false;
+                    };
+                    let src_is_self = pending.contains(&src);
+                    pending.retain(|&seen| seen != dst);
+                    if src_is_self {
+                        pending.push(dst);
+                    }
+                }
+                Op::StoreLocal => {
+                    let Ok(src) = reg(operands, 0) else {
+                        return false;
+                    };
+                    let Ok(dst) = local_index(operands, 1) else {
+                        return false;
+                    };
+                    let src_is_self = pending.contains(&src);
+                    pending.retain(|&seen| seen != dst);
+                    if src_is_self {
+                        pending.push(dst);
+                    }
+                }
+                Op::LoadUpvalue => {
+                    if let Ok(dst) = reg(operands, 0) {
+                        pending.retain(|&seen| seen != dst);
+                    }
+                }
+                Op::MakeFunction | Op::MakeClosure if instr.make_self => {
+                    let Ok(dst) = reg(operands, 0) else {
+                        return false;
+                    };
+                    pending.retain(|&seen| seen != dst);
+                    pending.push(dst);
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
     fn classify_inline_call(callee: &JitInlineCallee) -> Option<InlineCallKind> {
         let has_upvalue_op = callee.instructions.iter().any(|instr| {
             matches!(
@@ -2761,11 +2920,29 @@ mod arm64 {
             )
         });
         if !has_upvalue_op {
-            return callee
-                .instructions
-                .iter()
-                .all(|instr| is_inline_pure_op(instr.op))
-                .then_some(InlineCallKind::Plain);
+            let ops_ok = callee.instructions.iter().all(inline_plain_op_allowed);
+            let dead_self = self_bindings_are_dead(callee);
+            if std::env::var_os("OTTER_JIT_TRACE").is_some() && (!ops_ok || !dead_self) {
+                let bad_op = callee
+                    .instructions
+                    .iter()
+                    .find(|instr| !inline_plain_op_allowed(instr))
+                    .map(|instr| (instr.byte_pc, instr.op));
+                eprintln!(
+                    "[otter-jit] inline call classify skip callee {}: ops_ok={ops_ok} dead_self={dead_self} bad_op={bad_op:?}",
+                    callee.function_id
+                );
+            }
+            return (ops_ok && dead_self).then_some(InlineCallKind::Plain);
+        }
+        if !self_bindings_are_dead(callee) {
+            if std::env::var_os("OTTER_JIT_TRACE").is_some() {
+                eprintln!(
+                    "[otter-jit] inline call classify skip callee {}: live self binding",
+                    callee.function_id
+                );
+            }
+            return None;
         }
 
         let mut regs = vec![InlineKnown::Unknown; usize::from(callee.register_count)];
@@ -2913,6 +3090,7 @@ mod arm64 {
                 emit_load_u64(ops, 9, (TAG_INT32 << 48) | u64::from(v as u32));
                 store_reg(ops, 9, dst)?;
             }
+            Op::MakeFunction | Op::MakeClosure if instr.make_self => {}
             Op::LoadNumber => {
                 let dst = reg(ops_ref, 0)?;
                 let Some(value) = instr.load_number else {
@@ -3115,6 +3293,12 @@ mod arm64 {
         let callee_reg = reg(call_operands, 1)?;
         let argc = const_index(call_operands, 2)? as usize;
         let Some(kind) = classify_inline_call(callee) else {
+            if std::env::var_os("OTTER_JIT_TRACE").is_some() {
+                eprintln!(
+                    "[otter-jit] inline call skip callee {}: classify",
+                    callee.function_id
+                );
+            }
             return Ok(false);
         };
 
@@ -3124,6 +3308,16 @@ mod arm64 {
             || callee.instructions.len() > INLINE_MAX_INSTRS
             || (kind == InlineCallKind::ClosureUpvalues && cage_base == 0)
         {
+            if std::env::var_os("OTTER_JIT_TRACE").is_some() {
+                eprintln!(
+                    "[otter-jit] inline call skip callee {}: shape argc={argc} params={} regs={} instrs={} kind={kind:?} cage_base={}",
+                    callee.function_id,
+                    callee.param_count,
+                    callee.register_count,
+                    callee.instructions.len(),
+                    cage_base,
+                );
+            }
             return Ok(false);
         }
 
@@ -3488,27 +3682,35 @@ mod arm64 {
             ; movk w15, (method.recv_shape >> 16) & 0xffff, lsl #16
             ; cmp w14, w15
             ; b.ne =>fallback
-            // Flat prototype: load the compressed handle, bail on null, then
-            // decompress and guard the prototype object's shape.
-            ; ldr w9, [x13, jit_proto_byte]
-            ; cbz w9, =>fallback
         );
-        emit_load_u64(ops, 12, cage_base as u64);
+        if !method.method_on_receiver {
+            dynasm!(ops
+                ; .arch aarch64
+                // Flat prototype: load the compressed handle, bail on null,
+                // then decompress and guard the prototype object's shape.
+                ; ldr w9, [x13, jit_proto_byte]
+                ; cbz w9, =>fallback
+            );
+            emit_load_u64(ops, 12, cage_base as u64);
+            dynasm!(ops
+                ; .arch aarch64
+                ; add x13, x12, x9
+                ; ldrb w14, [x13]
+                ; cmp w14, OBJECT_BODY_TYPE_TAG
+                ; b.ne =>fallback
+                ; ldr w14, [x13, object_shape_byte]
+                ; movz w15, method.proto_shape & 0xffff
+                ; movk w15, (method.proto_shape >> 16) & 0xffff, lsl #16
+                ; cmp w14, w15
+                ; b.ne =>fallback
+            );
+        }
         dynasm!(ops
             ; .arch aarch64
-            ; add x13, x12, x9
-            ; ldrb w14, [x13]
-            ; cmp w14, OBJECT_BODY_TYPE_TAG
-            ; b.ne =>fallback
-            ; ldr w14, [x13, object_shape_byte]
-            ; movz w15, method.proto_shape & 0xffff
-            ; movk w15, (method.proto_shape >> 16) & 0xffff, lsl #16
-            ; cmp w14, w15
-            ; b.ne =>fallback
-            // Method slot: load the 64-bit Value from the prototype's value
-            // slab. A resolved method is either a closure-less bytecode
-            // reference (`TAG_FUNCTION_ID`, fid in the low 32 bits) or a
-            // closure pointer (`TAG_PTR_FUNCTION` → `JsClosureBody`, fid read
+            // Method slot: load the 64-bit Value from the receiver's or
+            // prototype's value slab. A resolved method is either a closure-less
+            // bytecode reference (`TAG_FUNCTION_ID`, fid in the low 32 bits) or
+            // a closure pointer (`TAG_PTR_FUNCTION` → `JsClosureBody`, fid read
             // from its body). Decode the function id into w14 either way, then
             // compare to the baked id; anything else falls back.
             ; ldr x13, [x13, object_values_ptr_byte]
@@ -3758,7 +3960,7 @@ mod arm64 {
         view.instructions.iter().all(|instr| {
             is_inline_pure_op(instr.op)
                 || instr.op == Op::Call
-                || (instr.op == Op::MakeFunction && instr.make_self)
+                || (matches!(instr.op, Op::MakeFunction | Op::MakeClosure) && instr.make_self)
                 // Property access runs frameless: the inline IC hit reads/writes
                 // the register window directly, and the cold miss routes to the
                 // window stub which resolves the own-data IC against the window
@@ -4623,6 +4825,7 @@ mod tests {
             object_values_ptr_byte: 16,
             jit_proto_byte: 12,
             closure_fid_byte: 8,
+            closure_upvalues_ptr_byte: 16,
             instructions,
             inline_callees: Default::default(),
             inline_methods: Default::default(),

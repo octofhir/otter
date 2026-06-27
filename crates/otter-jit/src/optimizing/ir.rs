@@ -105,6 +105,8 @@ pub enum NodeKind {
     ConstBool(bool),
     /// Boxed `undefined`.
     ConstUndefined,
+    /// Boxed `null`.
+    ConstNull,
     /// The running function's own closure (`MakeFunction` self-binding), read
     /// from the entry context. A tagged value never used as a numeric operand in
     /// this subset (a use that needs it as a number deoptimizes); present so the
@@ -132,6 +134,11 @@ pub enum NodeKind {
     /// Widen an unboxed `int32` to `f64` (arm64 `scvtf`). Used to bring an
     /// int32-typed operand into a `Float64` arithmetic site without a guard.
     Int32ToFloat64(NodeId),
+    /// JavaScript `ToInt32` on an unboxed `f64`. Used by bitwise / shift
+    /// operators after arithmetic widening: unlike `CheckInt32`, this is a
+    /// coercion and is total for every number (`NaN` / infinities become `0`,
+    /// finite values truncate and wrap modulo 2^32). Result [`Repr::Int32`].
+    Float64ToInt32(NodeId),
     /// `f64 + f64` (no overflow — IEEE arithmetic is total). Result
     /// [`Repr::Float64`].
     Float64Add(NodeId, NodeId),
@@ -144,6 +151,14 @@ pub enum NodeKind {
     /// `f64 <cmp> f64`. Result [`Repr::Bool`]. IEEE ordered comparison
     /// (a `NaN` operand yields `false` for every relation, matching JS).
     Float64Compare(CmpOp, NodeId, NodeId),
+    /// Strict identity check against the boxed `null` immediate. `negate=false`
+    /// is `value === null`; `negate=true` is `value !== null`.
+    TaggedIsNull {
+        /// Tagged value to compare with `null`.
+        value: NodeId,
+        /// Invert the predicate for strict `!== null`.
+        negate: bool,
+    },
     /// `int32 | int32`. Result [`Repr::Int32`]. Total (no deopt).
     Int32BitOr(NodeId, NodeId),
     /// `int32 & int32`.
@@ -183,6 +198,16 @@ pub enum NodeKind {
         /// SSA inputs `(callee, args...)`, matching the register metadata above.
         inputs: Vec<NodeId>,
     },
+    /// Guard that a direct-call callee still denotes the monomorphic bytecode
+    /// function whose body was inlined at the call site. Result is the original
+    /// tagged callee value; the inlined body itself does not consume it, but the
+    /// guard pins the speculative dependency and owns deopt at the call PC.
+    CheckFunctionIdentity {
+        /// Callee value observed at the call site.
+        callee: NodeId,
+        /// Expected bytecode function id.
+        function_id: u32,
+    },
     /// Bytecode method call. Inputs are `(receiver, args...)`; the property name
     /// and IC site are bytecode metadata. A monomorphic compiled method uses the
     /// direct-call protocol; every ineligible receiver/method falls back to the
@@ -213,6 +238,8 @@ pub enum NodeKind {
         proto_shape: u32,
         /// Byte offset of the method slot in the prototype value slab.
         method_value_byte: u32,
+        /// Whether the method slot is an own property on the receiver.
+        method_on_receiver: bool,
         /// Expected bytecode function id.
         method_fid: u32,
     },
@@ -246,6 +273,20 @@ pub enum NodeKind {
     /// Speculative Array `.length` read. The receiver must be a dense Array body
     /// and the length must fit int32; otherwise deopt. Result [`Repr::Int32`].
     LoadArrayLength(NodeId),
+    /// Read upvalue `index` from an *inlined closure callee's* own spine, rather
+    /// than the running function's context spine (that is [`LoadUpvalue`]). The
+    /// `closure` input is the call-site callee value the surrounding
+    /// [`CheckFunctionIdentity`] pinned to a single bytecode function id; the
+    /// emitter decodes the live closure body each time and reads the captured
+    /// cell, so any closure of that id (whatever it captured) loads correctly
+    /// without baking a GC pointer. Missing spine / TDZ hole deoptimizes. Result
+    /// [`Repr::Tagged`].
+    InlineUpvalue {
+        /// Call-site callee value (a fid-guarded closure).
+        closure: NodeId,
+        /// Upvalue index within the closure's own spine.
+        index: u32,
+    },
 }
 
 impl NodeKind {
@@ -259,8 +300,11 @@ impl NodeKind {
             NodeKind::CheckInt32(a)
             | NodeKind::CheckNumber(a)
             | NodeKind::Int32ToFloat64(a)
+            | NodeKind::Float64ToInt32(a)
+            | NodeKind::TaggedIsNull { value: a, .. }
             | NodeKind::CheckShape(a, _)
             | NodeKind::LoadSlot(a, _)
+            | NodeKind::InlineUpvalue { closure: a, .. }
             | NodeKind::LoadArrayLength(a) => {
                 vec![*a]
             }
@@ -288,6 +332,7 @@ impl NodeKind {
             | NodeKind::ConstF64(_)
             | NodeKind::ConstBool(_)
             | NodeKind::ConstUndefined
+            | NodeKind::ConstNull
             | NodeKind::SelfClosure
             | NodeKind::LoadUpvalue(_)
             | NodeKind::LoadThis
@@ -299,6 +344,7 @@ impl NodeKind {
                 inputs.extend(args.iter().copied());
                 inputs
             }
+            NodeKind::CheckFunctionIdentity { callee, .. } => vec![*callee],
             NodeKind::CheckMethodIdentity { recv, .. } => vec![*recv],
         }
     }
@@ -316,8 +362,11 @@ impl NodeKind {
             NodeKind::CheckInt32(a)
             | NodeKind::CheckNumber(a)
             | NodeKind::Int32ToFloat64(a)
+            | NodeKind::Float64ToInt32(a)
+            | NodeKind::TaggedIsNull { value: a, .. }
             | NodeKind::CheckShape(a, _)
             | NodeKind::LoadSlot(a, _)
+            | NodeKind::InlineUpvalue { closure: a, .. }
             | NodeKind::LoadArrayLength(a) => fix(a),
             NodeKind::Int32Add(a, b)
             | NodeKind::Int32Sub(a, b)
@@ -353,12 +402,14 @@ impl NodeKind {
             | NodeKind::ConstF64(_)
             | NodeKind::ConstBool(_)
             | NodeKind::ConstUndefined
+            | NodeKind::ConstNull
             | NodeKind::SelfClosure => {}
             NodeKind::Call { inputs, .. } => inputs.iter_mut().for_each(fix),
             NodeKind::CallMethod { recv, args, .. } => {
                 fix(recv);
                 args.iter_mut().for_each(fix);
             }
+            NodeKind::CheckFunctionIdentity { callee, .. } => fix(callee),
             NodeKind::CheckMethodIdentity { recv, .. } => fix(recv),
         }
     }
@@ -369,6 +420,7 @@ impl NodeKind {
         match self {
             NodeKind::ConstInt32(_)
             | NodeKind::CheckInt32(_)
+            | NodeKind::Float64ToInt32(_)
             | NodeKind::LoadArrayLength(_)
             | NodeKind::Int32Add(_, _)
             | NodeKind::Int32Sub(_, _)
@@ -386,23 +438,28 @@ impl NodeKind {
             | NodeKind::Float64Mul(_, _)
             | NodeKind::Float64Div(_, _)
             | NodeKind::Int32UshrToFloat64(_, _) => Repr::Float64,
-            NodeKind::Int32Compare(_, _, _) | NodeKind::Float64Compare(_, _, _) => Repr::Bool,
+            NodeKind::Int32Compare(_, _, _)
+            | NodeKind::Float64Compare(_, _, _)
+            | NodeKind::TaggedIsNull { .. } => Repr::Bool,
             // Register-carried values are tagged at block boundaries; a phi
             // therefore lives in tagged form (lowering boxes typed inputs).
             NodeKind::Param(_)
             | NodeKind::ConstBool(_)
             | NodeKind::ConstUndefined
+            | NodeKind::ConstNull
             | NodeKind::SelfClosure
             | NodeKind::Phi(_)
             | NodeKind::LoadUpvalue(_)
             | NodeKind::Call { .. }
             | NodeKind::CallMethod { .. }
+            | NodeKind::CheckFunctionIdentity { .. }
             | NodeKind::CheckMethodIdentity { .. }
             | NodeKind::CheckShape(_, _)
             | NodeKind::LoadSlot(_, _)
             | NodeKind::StoreSlot(_, _, _)
             | NodeKind::LoadElement(_, _)
             | NodeKind::StoreElement(_, _, _)
+            | NodeKind::InlineUpvalue { .. }
             | NodeKind::LoadThis
             | NodeKind::LoadHole => Repr::Tagged,
         }

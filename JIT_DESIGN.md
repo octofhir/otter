@@ -45,23 +45,40 @@ The latest verified release baseline is tracked in [`plan.md`](plan.md) and
 
 ## Current Performance Shape
 
-Numeric/OSR-heavy Tier1 benchmarks are no longer the blocker:
+Verified 2026-06-26 (`target/release/otter`, `OTTER_JIT=1`, min over 6 runs)
+against Node v24.16.0 — `× = otter/node`, `<1.00` means otter is faster:
 
-- `mandelbrot.js`: closed against Node on the current machine.
-- `nbody.js`, `fib.js`, `typed-array.js`: close enough for Tier1; do not trade
-  regressions here for wins elsewhere.
+| script | node × | status |
+| --- | --- | --- |
+| regex.js | 0.79× | closed (beats Node) |
+| mandelbrot.js | 0.93× | closed (beats Node) |
+| array-ops.js | 1.43× | hold — do not regress |
+| sort.js | 1.56× | hold — do not regress |
+| nbody.js | 2.23× | codegen-bound (Tier2 lever) |
+| fib.js | 2.33× | codegen-bound (Tier2 lever) |
+| typed-array.js | 2.71× | codegen-bound (Tier2 lever) |
+| typescript-sample.ts | 3.22× | mixed |
+| json.js | 3.73× | runtime subsystem |
+| prop-access.js | 3.93× | IC + codegen |
+| string-ops.js | 3.96× | runtime subsystem |
+| tree-traversal.js | 12.62× | runtime subsystem (alloc/GC) |
 
-Open Tier1 gaps:
+`mandelbrot` and `regex` now beat Node. The residual 2–3× on
+`fib`/`nbody`/`typed-array` is codegen quality (hand-emitted arm64, 7 GP / 6 FP
+regs, linear-scan) — the motivating case for the Cranelift Tier2 backend (see
+[`CRANELIFT_TIER2.md`](./CRANELIFT_TIER2.md)).
 
-- `array-ops.js` and `sort.js`: callback/comparator-heavy builtin paths.
+Open Tier1 gaps (compiler-relevant first):
+
 - `prop-access.js`: residual object/method fallback or overhead.
+- `array-ops.js` and `sort.js`: callback/comparator-heavy builtin paths (hold).
+
+Runtime-subsystem closure items (not backend work — assign separately):
+
 - `string-ops.js`: string runtime/builtin throughput.
 - `json.js`: JSON parser/stringifier allocation/traversal throughput.
-- `regex.js`: regex engine throughput.
-
-The next JIT-relevant work is callback/comparator and residual object/method
-overhead. String, JSON, and regex may be runtime subsystem work rather than
-compiler work, but they remain Tier1 closure items until explicitly assigned.
+- `tree-traversal.js`: allocation/GC throughput (22.5× → 12.6× via rope-slice
+  and module-load fixes; still the worst gap).
 
 ## Core Invariants
 
@@ -185,6 +202,9 @@ This work must continue the current exact-deopt discipline. No optimizer slice
 may replace exact PC/frame-state deopt with entry bails or interpreter replay.
 
 ### Cranelift backend
+
+> Full design plan: [`CRANELIFT_TIER2.md`](./CRANELIFT_TIER2.md) (planning only;
+> implementation gated behind Tier1 closure).
 
 The current Tier1 backend is hand-emitted arm64 dynasm because it gives direct
 control over the VM ABI while the deopt/OSR model is still settling. That is not

@@ -158,10 +158,12 @@ fn check_supported(graph: &Graph) -> Result<(), Unsupported> {
                 | NodeKind::ConstF64(_)
                 | NodeKind::ConstBool(_)
                 | NodeKind::ConstUndefined
+                | NodeKind::ConstNull
                 | NodeKind::Phi(_)
                 | NodeKind::CheckInt32(_)
                 | NodeKind::CheckNumber(_)
                 | NodeKind::Int32ToFloat64(_)
+                | NodeKind::Float64ToInt32(_)
                 | NodeKind::Int32Add(_, _)
                 | NodeKind::Int32Sub(_, _)
                 | NodeKind::Int32Mul(_, _)
@@ -177,6 +179,7 @@ fn check_supported(graph: &Graph) -> Result<(), Unsupported> {
                 | NodeKind::Float64Mul(_, _)
                 | NodeKind::Float64Div(_, _)
                 | NodeKind::Float64Compare(_, _, _)
+                | NodeKind::TaggedIsNull { .. }
                 | NodeKind::LoadElement(_, _)
                 | NodeKind::StoreElement(_, _, _)
                 | NodeKind::LoadArrayLength(_)
@@ -202,8 +205,8 @@ fn make_module() -> Result<JITModule, Unsupported> {
     flags
         .set("is_pic", "false")
         .map_err(|_| Unsupported::Unlowered("clif: flag is_pic"))?;
-    let isa_builder =
-        cranelift_native::builder().map_err(|_| Unsupported::Unlowered("clif: host unsupported"))?;
+    let isa_builder = cranelift_native::builder()
+        .map_err(|_| Unsupported::Unlowered("clif: host unsupported"))?;
     let isa = isa_builder
         .finish(settings::Flags::new(flags))
         .map_err(|_| Unsupported::Unlowered("clif: isa finish"))?;
@@ -287,7 +290,7 @@ mod tests {
     //! resume PC, and the restored frame on a deopt.
 
     use otter_bytecode::{Op, Operand};
-    use otter_vm::jit_feedback::ARITH_INT32;
+    use otter_vm::jit_feedback::{ARITH_FLOAT64, ARITH_INT32};
     use otter_vm::{JitFunctionCode, JitFunctionView};
 
     use crate::baseline::BAIL_PC_OFFSET;
@@ -354,6 +357,7 @@ mod tests {
             object_values_ptr_byte: 16,
             jit_proto_byte: 12,
             closure_fid_byte: 8,
+            closure_upvalues_ptr_byte: 16,
             instructions,
             inline_callees: Default::default(),
             inline_methods: Default::default(),
@@ -416,7 +420,10 @@ mod tests {
         // A double param fails the `CheckInt32` guard on the `Add` at byte-pc 0.
         let (status, _, bail_pc, regs) = run(&add_self(), &[boxf(3.5)]);
         assert_eq!(status, 1, "guard miss bails");
-        assert_eq!(bail_pc, 0, "resumes at the arithmetic instruction's exact PC");
+        assert_eq!(
+            bail_pc, 0,
+            "resumes at the arithmetic instruction's exact PC"
+        );
         assert_eq!(
             regs[0],
             boxf(3.5),
@@ -430,6 +437,34 @@ mod tests {
         let (status, _, bail_pc, _) = run(&add_self(), &[boxi(i32::MAX)]);
         assert_eq!(status, 1, "overflow bails");
         assert_eq!(bail_pc, 0, "resumes at the add's exact PC");
+    }
+
+    #[test]
+    fn float64_to_int32_bitwise_or_returns_js_to_int32() {
+        let bit_or_zero = view(
+            1,
+            3,
+            &[
+                (Op::LoadInt32, vec![r(1), imm(0)], 0),
+                (
+                    Op::BitwiseOr,
+                    vec![r(2), r(0), r(1)],
+                    ARITH_INT32 | ARITH_FLOAT64,
+                ),
+                (Op::ReturnValue, vec![r(2)], 0),
+            ],
+        );
+        for (input, expected) in [
+            (2_500_000.0, 2_500_000),
+            (4_294_967_297.0, 1),
+            (-1.5, -1),
+            (f64::NAN, 0),
+            (f64::INFINITY, 0),
+        ] {
+            let (status, value, _, _) = run(&bit_or_zero, &[boxf(input)]);
+            assert_eq!(status, 0, "{input:?} returns, no bail");
+            assert_eq!(unboxi(value), expected, "ToInt32({input:?})");
+        }
     }
 
     /// `f(n){ i=0; acc=0; while (i<n){ acc+=i; i+=1 } return acc }` — a counting

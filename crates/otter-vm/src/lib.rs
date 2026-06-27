@@ -353,6 +353,7 @@ pub(crate) enum MethodCallFeedback {
         recv_shape: object::ShapeHandle,
         proto_shape: object::ShapeHandle,
         method_value_byte: u32,
+        method_on_receiver: bool,
     },
     /// Receiver shape, prototype shape, method slot, or resolved method
     /// varied; not inlinable.
@@ -372,6 +373,8 @@ pub(crate) struct MethodSite {
     proto_shape: object::ShapeHandle,
     /// Byte offset of the method slot within the prototype value slab.
     method_value_byte: u32,
+    /// Whether the method slot lives directly on the receiver.
+    method_on_receiver: bool,
 }
 
 /// Match-based dispatch loop. The harness baseline; slice tasks may
@@ -597,6 +600,12 @@ pub struct Interpreter {
     /// unboxed `Int32` / `Float64` lowering and insert the matching guard. Only
     /// mutated when a JIT hook is installed.
     jit_arith_feedback: rustc_hash::FxHashMap<(u32, u32), jit_feedback::ArithFeedback>,
+    /// Arithmetic bytecode sites that already overflow-deoptimized once and
+    /// should be recompiled through the optimizing tier's float path. Keyed by
+    /// `(function_id, byte_pc)`. This is compile policy, not observed operand
+    /// feedback: operands may still be int32-only while the result no longer
+    /// fits int32.
+    jit_arith_widen_float: rustc_hash::FxHashSet<(u32, u32)>,
     /// OSR targets that bailed, had no trampoline, or whose function is
     /// uncompilable; OSR is not retried for them. Keyed by `(function_id,
     /// loop_header_pc)` so a bail in one loop disables only *that* loop header,
@@ -1338,6 +1347,7 @@ impl Interpreter {
             jit_call_site_feedback: rustc_hash::FxHashMap::default(),
             jit_method_site_feedback: rustc_hash::FxHashMap::default(),
             jit_arith_feedback: rustc_hash::FxHashMap::default(),
+            jit_arith_widen_float: rustc_hash::FxHashSet::default(),
             jit_osr_disabled: rustc_hash::FxHashSet::default(),
             jit_osr_counts: rustc_hash::FxHashMap::default(),
             jit_osr_threshold: std::env::var("OTTER_JIT_OSR_THRESHOLD")
@@ -1522,6 +1532,7 @@ impl Interpreter {
         match self.run_compiled_frame(stack, context, top_idx, &code) {
             jit::JitExecOutcome::Bailed(pc) => {
                 stack[top_idx].pc = pc;
+                self.reoptimize_arith_overflow_bail(context, stack[top_idx].function_id, pc);
                 Ok(None)
             }
             jit::JitExecOutcome::Returned(value) => {
@@ -1686,6 +1697,9 @@ impl Interpreter {
                 // there; that should not permanently suppress the header on the
                 // next hot iteration.
                 stack[top_idx].pc = pc;
+                if self.reoptimize_arith_overflow_bail(context, fid, pc) {
+                    return Ok(None);
+                }
                 if Self::osr_bail_inside_target_loop(context, fid, osr_pc, pc) {
                     self.jit_osr_disabled.insert((fid, osr_pc));
                 }
@@ -1735,6 +1749,48 @@ impl Interpreter {
         osr_pc <= bail_pc && bail_pc <= loop_end
     }
 
+    /// Treat the first compiled `Add` / `Sub` / `Mul` bail at a byte-PC as an
+    /// int32-result overflow and recompile that function with the site widened
+    /// to float arithmetic. The interpreter feedback only records operand
+    /// representations, so an accumulator can keep looking int32-only while its
+    /// result has grown past the int32 range. Widening once avoids permanently
+    /// disabling an otherwise valid hot loop; a second bail at the same site is
+    /// left to the normal deopt/disable path.
+    fn reoptimize_arith_overflow_bail(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+        bail_pc: u32,
+    ) -> bool {
+        let Some(function) = context.exec_function(fid) else {
+            return false;
+        };
+        let Some(instr) = function.instr_at_byte_pc(bail_pc) else {
+            return false;
+        };
+        if !matches!(instr.op(), Op::Add | Op::Sub | Op::Mul) {
+            return false;
+        }
+        if !self.jit_arith_widen_float.insert((fid, bail_pc)) {
+            return false;
+        }
+        self.invalidate_jit_function(fid);
+        true
+    }
+
+    /// Drop every installed optimizing-tier body for `fid` so the next tier-up
+    /// sees the latest compile policy / feedback snapshot.
+    fn invalidate_jit_function(&mut self, fid: u32) {
+        self.jit_code.remove(&fid);
+        self.jit_code_cache = None;
+        self.jit_osr_code
+            .retain(|(entry_fid, _), _| *entry_fid != fid);
+        self.jit_osr_disabled
+            .retain(|(entry_fid, _)| *entry_fid != fid);
+        self.jit_osr_counts
+            .retain(|(entry_fid, _), _| *entry_fid != fid);
+    }
+
     /// Tier-up entry point for a synchronously-entered call frame (the
     /// [`Self::run_callable_sync`] path), where the callee frame is the sole
     /// entry on its own `stack`. Mirrors [`Self::maybe_dispatch_jit`] but, on a
@@ -1758,6 +1814,7 @@ impl Interpreter {
         match self.run_compiled_frame(stack, context, top_idx, &code) {
             jit::JitExecOutcome::Bailed(pc) => {
                 stack[top_idx].pc = pc;
+                self.reoptimize_arith_overflow_bail(context, stack[top_idx].function_id, pc);
                 Ok(None)
             }
             jit::JitExecOutcome::Returned(value) => Ok(Some(value)),
@@ -2198,6 +2255,7 @@ impl Interpreter {
         frame_index: usize,
         recv_reg: u16,
         name_idx: u32,
+        call_byte_pc: u32,
         site: usize,
         arg_regs: &[u16],
     ) -> Result<Option<jit::JitPreparedDirectCall>, VmError> {
@@ -2208,11 +2266,7 @@ impl Interpreter {
         // walk and let the in-place method stub take its cached fast path. The
         // stub self-heals the IC (clearing it) when the receiver stops being an
         // array, so this never permanently strands a now-compiled method.
-        if self
-            .method_call_ics
-            .get(site)
-            .is_some_and(Option::is_some)
-        {
+        if self.method_call_ics.get(site).is_some_and(Option::is_some) {
             return Ok(None);
         }
         let recv = *stack
@@ -2239,6 +2293,15 @@ impl Interpreter {
         else {
             return Ok(None);
         };
+        if self.jit_hook.is_some() {
+            let caller_fid = stack
+                .get(frame_index)
+                .ok_or_else(|| VmError::InvalidOperand)?
+                .function_id;
+            if let Some(site) = self.method_site_for_receiver(context, caller_fid, name_idx, recv) {
+                self.note_method_target(caller_fid, call_byte_pc, function_id, site);
+            }
+        }
         if new_target.is_some() || derived_this.is_some() || eval_env.is_some() {
             return Ok(None);
         }
@@ -2656,6 +2719,23 @@ impl Interpreter {
         self.bake_property_feedback(&mut view);
         self.bake_inline_callees(&mut view, context, fid);
         let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
+        if trace {
+            let method_feedback = self
+                .jit_method_site_feedback
+                .iter()
+                .filter(|&(&(caller_fid, _), _)| caller_fid == fid)
+                .count();
+            eprintln!(
+                "[otter-jit] view fid {fid}: call_feedback={} method_feedback={} inline_callees={} inline_methods={}",
+                self.jit_call_site_feedback
+                    .iter()
+                    .filter(|&(&(caller_fid, _), _)| caller_fid == fid)
+                    .count(),
+                method_feedback,
+                view.inline_callees.len(),
+                view.inline_methods.len()
+            );
+        }
         let (regs, params) = (view.register_count, view.param_count);
         let hook = self.jit_hook.as_ref()?.clone();
         let status = hook.compile_function(jit::JitCompileRequest {
@@ -2723,11 +2803,13 @@ impl Interpreter {
     /// byte-PC. Sites the interpreter never observed stay `0` (unknown), which
     /// the optimizing tier lowers generically.
     fn bake_arith_feedback(&self, view: &mut jit::JitFunctionView, fid: u32) {
-        if self.jit_arith_feedback.is_empty() {
+        if self.jit_arith_feedback.is_empty() && self.jit_arith_widen_float.is_empty() {
             return;
         }
         for instr in &mut view.instructions {
-            if let Some(fb) = self.jit_arith_feedback.get(&(fid, instr.byte_pc)) {
+            if self.jit_arith_widen_float.contains(&(fid, instr.byte_pc)) {
+                instr.arith_feedback = jit_feedback::ARITH_INT32 | jit_feedback::ARITH_FLOAT64;
+            } else if let Some(fb) = self.jit_arith_feedback.get(&(fid, instr.byte_pc)) {
                 instr.arith_feedback = fb.bits();
             }
         }
@@ -2825,6 +2907,7 @@ impl Interpreter {
                     recv_shape: site.recv_shape,
                     proto_shape: site.proto_shape,
                     method_value_byte: site.method_value_byte,
+                    method_on_receiver: site.method_on_receiver,
                 });
                 true
             }
@@ -2834,11 +2917,13 @@ impl Interpreter {
                     recv_shape: seen_shape,
                     proto_shape: seen_proto_shape,
                     method_value_byte: seen_value_byte,
+                    method_on_receiver: seen_method_on_receiver,
                 } = *slot.get()
                     && (seen_fid != method_fid
                         || seen_shape.offset() != site.recv_shape.offset()
                         || seen_proto_shape.offset() != site.proto_shape.offset()
-                        || seen_value_byte != site.method_value_byte)
+                        || seen_value_byte != site.method_value_byte
+                        || seen_method_on_receiver != site.method_on_receiver)
                 {
                     slot.insert(MethodCallFeedback::Poly);
                 }
@@ -2850,6 +2935,41 @@ impl Interpreter {
         }
     }
 
+    pub(crate) fn method_site_for_receiver(
+        &mut self,
+        context: &ExecutionContext,
+        caller_fid: u32,
+        name_idx: u32,
+        recv: Value,
+    ) -> Option<MethodSite> {
+        let name = context.property_atom_for_function(caller_fid, name_idx)?;
+        let recv = recv.as_object()?;
+        let recv_shape = crate::object::shape(recv, &self.gc_heap);
+        if recv_shape.is_null() {
+            return None;
+        }
+        if let Some(slot) = self.shape_offset_of(recv_shape, name.name()) {
+            return Some(MethodSite {
+                recv_shape,
+                proto_shape: self.shape_root(),
+                method_value_byte: slot * std::mem::size_of::<Value>() as u32,
+                method_on_receiver: true,
+            });
+        }
+        let proto = crate::object::prototype(recv, &self.gc_heap)?;
+        let proto_shape = crate::object::shape(proto, &self.gc_heap);
+        if proto_shape.is_null() {
+            return None;
+        }
+        self.shape_offset_of(proto_shape, name.name())
+            .map(|slot| MethodSite {
+                recv_shape,
+                proto_shape,
+                method_value_byte: slot * std::mem::size_of::<Value>() as u32,
+                method_on_receiver: false,
+            })
+    }
+
     /// Drop any compiled body for `fid` (and re-arm its OSR headers) so the next
     /// tier-up recompiles it. Called when call/method feedback for one of its
     /// sites first matures: a function whose hot loop calls out is often compiled
@@ -2858,10 +2978,11 @@ impl Interpreter {
     /// lets those sites inline. The currently-running body, if any, stays alive
     /// through its `Arc` until the frame returns.
     fn evict_compiled_for_reopt(&mut self, fid: u32) {
-        if self.jit_code.remove(&fid).is_some() {
-            self.jit_code_cache = None;
-            self.jit_osr_disabled.retain(|&(f, _)| f != fid);
-        }
+        self.jit_code.remove(&fid);
+        self.jit_code_cache = None;
+        self.jit_osr_code.retain(|&(f, _), _| f != fid);
+        self.jit_osr_disabled.retain(|&(f, _)| f != fid);
+        self.jit_osr_counts.retain(|&(f, _), _| f != fid);
     }
 
     /// Bake inline-candidate callee bodies for `fid`'s monomorphic `Op::Call`
@@ -2879,14 +3000,23 @@ impl Interpreter {
         context: &ExecutionContext,
         fid: u32,
     ) {
+        let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
         for (&(caller_fid, byte_pc), state) in &self.jit_call_site_feedback {
             if caller_fid != fid {
                 continue;
             }
             let CallTargetFeedback::Mono(callee_fid) = *state else {
+                if trace {
+                    eprintln!("[otter-jit] inline callee skip fid {fid} pc {byte_pc}: poly");
+                }
                 continue;
             };
             let Some(callee) = context.exec_function(callee_fid) else {
+                if trace {
+                    eprintln!(
+                        "[otter-jit] inline callee skip fid {fid} pc {byte_pc}: missing callee {callee_fid}"
+                    );
+                }
                 continue;
             };
             if callee.is_generator
@@ -2896,13 +3026,35 @@ impl Interpreter {
                 || callee.has_rest
                 || callee.contains_direct_eval
                 || callee.is_derived_constructor
-                || callee.makes_function
             {
+                if trace {
+                    eprintln!(
+                        "[otter-jit] inline callee skip fid {fid} pc {byte_pc}: ineligible callee {callee_fid} flags gen={} async={} async_gen={} args={} rest={} eval={} derived={} makes_fn={}",
+                        callee.is_generator,
+                        callee.is_async,
+                        callee.is_async_generator,
+                        callee.needs_arguments,
+                        callee.has_rest,
+                        callee.contains_direct_eval,
+                        callee.is_derived_constructor,
+                        callee.makes_function,
+                    );
+                }
                 continue;
             }
             let Some(callee_view) = context.jit_function_view(callee_fid) else {
+                if trace {
+                    eprintln!(
+                        "[otter-jit] inline callee skip fid {fid} pc {byte_pc}: missing view {callee_fid}"
+                    );
+                }
                 continue;
             };
+            if trace {
+                eprintln!(
+                    "[otter-jit] inline callee bake fid {fid} pc {byte_pc}: callee {callee_fid}"
+                );
+            }
             view.inline_callees.insert(
                 byte_pc,
                 jit::JitInlineCallee {
@@ -2917,7 +3069,14 @@ impl Interpreter {
         // Method-call sites: snapshot the monomorphic ones first so the per-site
         // `shape_offset_of` (which needs `&mut self`) does not alias the feedback
         // map borrow.
-        let method_sites: Vec<(u32, u32, object::ShapeHandle, object::ShapeHandle, u32)> = self
+        let method_sites: Vec<(
+            u32,
+            u32,
+            object::ShapeHandle,
+            object::ShapeHandle,
+            u32,
+            bool,
+        )> = self
             .jit_method_site_feedback
             .iter()
             .filter_map(|(&(caller_fid, byte_pc), state)| match *state {
@@ -2926,17 +3085,21 @@ impl Interpreter {
                     recv_shape,
                     proto_shape,
                     method_value_byte,
+                    method_on_receiver,
                 } if caller_fid == fid => Some((
                     byte_pc,
                     method_fid,
                     recv_shape,
                     proto_shape,
                     method_value_byte,
+                    method_on_receiver,
                 )),
                 _ => None,
             })
             .collect();
-        for (byte_pc, method_fid, recv_shape, proto_shape, method_value_byte) in method_sites {
+        for (byte_pc, method_fid, recv_shape, proto_shape, method_value_byte, method_on_receiver) in
+            method_sites
+        {
             let Some(method) = context.exec_function(method_fid) else {
                 continue;
             };
@@ -2998,6 +3161,7 @@ impl Interpreter {
                     recv_shape: recv_shape.offset(),
                     proto_shape: proto_shape.offset(),
                     method_value_byte,
+                    method_on_receiver,
                     param_count: method_view.param_count,
                     register_count: method_view.register_count,
                     instructions: method_view.instructions,
@@ -6250,39 +6414,25 @@ impl Interpreter {
                     // during the call, so the prototype shape and method slot are
                     // resolved here while it is still valid).
                     let method_site = if self.jit_hook.is_some() {
-                        let shapes = register_operand(context.exec_operand(instr, 1))
+                        register_operand(context.exec_operand(instr, 1))
                             .ok()
                             .and_then(|r| {
                                 stack
                                     .get(top_idx)
                                     .and_then(|f| f.registers.get(r as usize).copied())
                             })
-                            .and_then(|v| v.as_object())
                             .and_then(|recv| {
-                                let recv_shape = crate::object::shape(recv, &self.gc_heap);
-                                if recv_shape.is_null() {
-                                    return None;
-                                }
-                                let proto = crate::object::prototype(recv, &self.gc_heap)?;
-                                let proto_shape = crate::object::shape(proto, &self.gc_heap);
-                                if proto_shape.is_null() {
-                                    return None;
-                                }
-                                Some((recv_shape, proto_shape))
-                            });
-                        let name = const_operand(context.exec_operand(instr, 2))
-                            .ok()
-                            .and_then(|idx| context.property_atom(idx));
-                        match (shapes, name) {
-                            (Some((recv_shape, proto_shape)), Some(name)) => self
-                                .shape_offset_of(proto_shape, name.name())
-                                .map(|slot| MethodSite {
-                                    recv_shape,
-                                    proto_shape,
-                                    method_value_byte: slot * std::mem::size_of::<Value>() as u32,
-                                }),
-                            _ => None,
-                        }
+                                const_operand(context.exec_operand(instr, 2)).ok().and_then(
+                                    |name_idx| {
+                                        self.method_site_for_receiver(
+                                            context,
+                                            function_id,
+                                            name_idx,
+                                            recv,
+                                        )
+                                    },
+                                )
+                            })
                     } else {
                         None
                     };
@@ -14892,5 +15042,19 @@ mod tests {
         assert_eq!(view.instructions[0].arith_feedback, int_site.bits());
         assert_eq!(view.instructions[1].arith_feedback, num_site.bits());
         assert_eq!(view.instructions[2].arith_feedback, 0);
+
+        // A widened overflow site forces numeric mixed feedback even if the
+        // interpreter never observed a double operand there.
+        interp.jit_arith_widen_float.insert((5, 48));
+        for instr in &mut view.instructions {
+            instr.arith_feedback = 0;
+        }
+        interp.bake_arith_feedback(&mut view, 5);
+        assert_eq!(view.instructions[0].arith_feedback, int_site.bits());
+        assert_eq!(view.instructions[1].arith_feedback, num_site.bits());
+        assert_eq!(
+            view.instructions[2].arith_feedback,
+            jit_feedback::ARITH_INT32 | jit_feedback::ARITH_FLOAT64
+        );
     }
 }

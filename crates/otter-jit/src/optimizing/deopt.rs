@@ -363,8 +363,10 @@ fn can_deopt(kind: &NodeKind) -> bool {
         NodeKind::CheckInt32(_)
             | NodeKind::CheckNumber(_)
             | NodeKind::CheckShape(_, _)
+            | NodeKind::CheckFunctionIdentity { .. }
             | NodeKind::CheckMethodIdentity { .. }
             | NodeKind::LoadUpvalue(_)
+            | NodeKind::InlineUpvalue { .. }
             | NodeKind::Call { .. }
             | NodeKind::CallMethod { .. }
             | NodeKind::LoadElement(_, _)
@@ -834,6 +836,7 @@ mod tests {
             object_values_ptr_byte: 16,
             jit_proto_byte: 12,
             closure_fid_byte: 8,
+            closure_upvalues_ptr_byte: 16,
             instructions,
             inline_callees: Default::default(),
             inline_methods: Default::default(),

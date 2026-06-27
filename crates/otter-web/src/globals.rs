@@ -358,8 +358,7 @@ mod tests {
     fn lazy_global_names_match_shim_def_calls() {
         let mut from_shims = def_names(WEB_BOOTSTRAP);
         from_shims.extend(def_names(WEB_STREAMS));
-        let listed: BTreeSet<String> =
-            WEB_GLOBAL_NAMES.iter().map(|s| (*s).to_string()).collect();
+        let listed: BTreeSet<String> = WEB_GLOBAL_NAMES.iter().map(|s| (*s).to_string()).collect();
         assert_eq!(
             from_shims, listed,
             "WEB_GLOBAL_NAMES must match the def('...') globals installed by the shim sources"

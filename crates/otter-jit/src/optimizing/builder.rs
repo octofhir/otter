@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use otter_bytecode::{Op, Operand};
 use otter_vm::jit_feedback::ArithFeedback;
-use otter_vm::{JitFunctionView, JitInlineMethod};
+use otter_vm::{JitFunctionView, JitInlineCallee, JitInlineMethod};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::Unsupported;
@@ -47,7 +47,49 @@ pub(super) fn build(view: &JitFunctionView, osr_pc: Option<u32>) -> Result<Graph
     let cfg = Cfg::discover(view)?;
     let mut builder = Builder::new(view, cfg, osr_pc)?;
     builder.run()?;
+    reject_call_object_mix(&builder.graph)?;
     Ok(builder.graph)
+}
+
+/// Decline a graph that mixes a remaining runtime call with a runtime
+/// object/array memory op the optimizing tier can only lower through a
+/// materialize-frame stub.
+///
+/// The optimizing tier wins on arithmetic-dominated loops whose callees were
+/// spliced inline; it loses to the baseline on loops dominated by un-inlined
+/// runtime calls, because every [`NodeKind::Call`] / [`NodeKind::CallMethod`]
+/// site must spill and reload the whole frame around the bridge. When such a
+/// call coexists with a runtime property/element op (an un-baked store slot,
+/// element access, array-length read, or an un-inlined method call) the
+/// compiled body churns those stubs on the hot path and runs slower than the
+/// baseline's tuned IC sequence — so we keep the baseline.
+///
+/// A bare [`NodeKind::CheckShape`] does **not** count: it is the cheap inline
+/// identity guard an inlined method leaves behind (its property loads are
+/// sealed `LoadSlot`s at baked offsets), not a runtime stub. Gating on it would
+/// reject exactly the fully-inlined method bodies this tier exists to optimize.
+fn reject_call_object_mix(graph: &Graph) -> Result<(), Unsupported> {
+    let has_call = graph
+        .nodes
+        .iter()
+        .any(|node| matches!(node.kind, NodeKind::Call { .. }));
+    if !has_call {
+        return Ok(());
+    }
+    let has_runtime_object_op = graph.nodes.iter().any(|node| {
+        matches!(
+            node.kind,
+            NodeKind::StoreSlot(_, _, _)
+                | NodeKind::LoadElement(_, _)
+                | NodeKind::StoreElement(_, _, _)
+                | NodeKind::LoadArrayLength(_)
+                | NodeKind::CallMethod { .. }
+        )
+    });
+    if has_runtime_object_op {
+        return Err(Unsupported::Unlowered("call plus object fast path"));
+    }
+    Ok(())
 }
 
 /// Target byte-PC of a relative branch. Mirrors the interpreter / baseline:
@@ -354,6 +396,15 @@ impl<'a> Builder<'a> {
         feedback.is_empty() && self.is_osr_target()
     }
 
+    fn operand_is_float64(&mut self, block: BlockId, reg: u16) -> bool {
+        let node = self.read_variable(reg, block);
+        self.graph.node(node).repr == Repr::Float64
+    }
+
+    fn node_is_float64(&self, node: NodeId) -> bool {
+        self.graph.node(node).repr == Repr::Float64
+    }
+
     /// Seal every unsealed block whose predecessors are all filled, to a
     /// fixpoint. Sealing a block finalizes its incomplete phis.
     fn seal_ready(&mut self) {
@@ -561,9 +612,9 @@ impl<'a> Builder<'a> {
             match op {
                 // The leading named-function self-binding. The closure value is
                 // never a numeric operand in this subset; only `make_self`
-                // (no allocation) is accepted — any other `MakeFunction`
+                // (no allocation) is accepted — any other function/closure maker
                 // allocates and bails to the baseline.
-                Op::MakeFunction if make_self => {
+                Op::MakeFunction | Op::MakeClosure if make_self => {
                     let dst = reg(&operands, 0)?;
                     let node = self.graph.add_node(NodeKind::SelfClosure, block, byte_pc);
                     self.def_register(dst, block, node, byte_pc);
@@ -769,6 +820,13 @@ impl<'a> Builder<'a> {
                         arg_regs.push(arg_reg);
                         inputs.push(self.read_variable(arg_reg, block));
                     }
+                    if let Some(callee) = self.view.inline_callees.get(&byte_pc).cloned()
+                        && let Some(result) = self
+                            .try_inline_direct_call(block, byte_pc, callee_reg, &callee, &inputs)?
+                    {
+                        self.def_register(dst, block, result, byte_pc);
+                        continue;
+                    }
                     let call = self.graph.add_node(
                         NodeKind::Call {
                             callee_reg,
@@ -791,23 +849,11 @@ impl<'a> Builder<'a> {
                     if argc > MAX_METHOD_ARGS {
                         return Err(Unsupported::OperandShape("method call arg count"));
                     }
-                    let Some(method) = self.view.inline_methods.get(&byte_pc).cloned() else {
-                        self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
-                        return Ok(());
-                    };
                     let Some(site) = property_ic_site else {
                         self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
                         return Ok(());
                     };
                     let recv = self.read_variable(recv_reg, block);
-                    let unsafe_receiver = matches!(
-                        &self.graph.node(recv).kind,
-                        NodeKind::ConstUndefined | NodeKind::LoadHole | NodeKind::Phi(_)
-                    );
-                    if unsafe_receiver {
-                        self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
-                        return Ok(());
-                    }
                     let mut args = Vec::with_capacity(argc);
                     let mut arg_regs = Vec::with_capacity(argc);
                     for slot in 0..argc {
@@ -815,11 +861,23 @@ impl<'a> Builder<'a> {
                         arg_regs.push(arg_reg);
                         args.push(self.read_variable(arg_reg, block));
                     }
-                    if let Some(result) =
-                        self.try_inline_method(block, byte_pc, recv, &method, argc, &args)?
-                    {
-                        self.def_register(dst, block, result, byte_pc);
-                        continue;
+                    if let Some(method) = self.view.inline_methods.get(&byte_pc).cloned() {
+                        let unsafe_receiver = matches!(
+                            &self.graph.node(recv).kind,
+                            NodeKind::ConstUndefined | NodeKind::LoadHole
+                        );
+                        if unsafe_receiver {
+                            self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
+                            return Ok(());
+                        }
+                        if let Some(result) =
+                            self.try_inline_method(block, byte_pc, recv, &method, argc, &args)?
+                        {
+                            self.def_register(dst, block, result, byte_pc);
+                            continue;
+                        }
+                    } else if self.block_is_in_loop(block) {
+                        return Err(Unsupported::Opcode(op));
                     }
                     let call = self.graph.add_node(
                         NodeKind::CallMethod {
@@ -842,6 +900,13 @@ impl<'a> Builder<'a> {
                     let node = self
                         .graph
                         .add_node(NodeKind::ConstUndefined, block, byte_pc);
+                    self.graph.set_frame_dst(node, dst);
+                    self.push_body(block, node);
+                    self.def_register(dst, block, node, byte_pc);
+                }
+                Op::LoadNull => {
+                    let dst = reg(&operands, 0)?;
+                    let node = self.graph.add_node(NodeKind::ConstNull, block, byte_pc);
                     self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
                     self.def_register(dst, block, node, byte_pc);
@@ -1127,7 +1192,7 @@ impl<'a> Builder<'a> {
         byte_pc: u32,
     ) -> Result<NodeId, Unsupported> {
         let fb = ArithFeedback::from_bits(feedback);
-        if !fb.is_int32_only() && !self.allow_empty_feedback_for_osr(fb) {
+        if !fb.is_numeric_only() && !self.allow_empty_feedback_for_osr(fb) {
             return Err(Unsupported::TypeFeedback(feedback));
         }
         let l = self.int32_operand(block, lhs, feedback, byte_pc)?;
@@ -1152,17 +1217,38 @@ impl<'a> Builder<'a> {
         byte_pc: u32,
     ) -> Result<NodeId, Unsupported> {
         let feedback = ArithFeedback::from_bits(raw_feedback);
-        if !feedback.is_int32_only() && !self.allow_empty_feedback_for_osr(feedback) {
+        if !feedback.is_numeric_only() && !self.allow_empty_feedback_for_osr(feedback) {
             return Err(Unsupported::TypeFeedback(raw_feedback));
         }
-        if self.graph.node(node).repr == Repr::Int32 {
-            return Ok(node);
+        match self.graph.node(node).repr {
+            Repr::Int32 => Ok(node),
+            Repr::Float64 => {
+                let truncate = self
+                    .graph
+                    .add_node(NodeKind::Float64ToInt32(node), block, byte_pc);
+                self.push_body(block, truncate);
+                Ok(truncate)
+            }
+            Repr::Tagged | Repr::Bool if feedback.is_int32_only() => {
+                let check = self
+                    .graph
+                    .add_node(NodeKind::CheckInt32(node), block, byte_pc);
+                self.push_body(block, check);
+                Ok(check)
+            }
+            Repr::Tagged => {
+                let number = self
+                    .graph
+                    .add_node(NodeKind::CheckNumber(node), block, byte_pc);
+                self.push_body(block, number);
+                let truncate =
+                    self.graph
+                        .add_node(NodeKind::Float64ToInt32(number), block, byte_pc);
+                self.push_body(block, truncate);
+                Ok(truncate)
+            }
+            Repr::Bool => Err(Unsupported::Unlowered("bitwise bool operand")),
         }
-        let check = self
-            .graph
-            .add_node(NodeKind::CheckInt32(node), block, byte_pc);
-        self.push_body(block, check);
-        Ok(check)
     }
 
     fn float_node_operand(&mut self, block: BlockId, node: NodeId, byte_pc: u32) -> NodeId {
@@ -1195,7 +1281,8 @@ impl<'a> Builder<'a> {
         byte_pc: u32,
     ) -> Result<NodeId, Unsupported> {
         let fb = ArithFeedback::from_bits(feedback);
-        if fb.is_int32_only() && !matches!(op, Op::Div) {
+        let has_float_operand = self.node_is_float64(lhs) || self.node_is_float64(rhs);
+        if fb.is_int32_only() && !has_float_operand && !matches!(op, Op::Div) {
             let l = self.int32_node_operand(block, lhs, feedback, byte_pc)?;
             let r = self.int32_node_operand(block, rhs, feedback, byte_pc)?;
             let kind = match op {
@@ -1231,7 +1318,7 @@ impl<'a> Builder<'a> {
         byte_pc: u32,
     ) -> Result<NodeId, Unsupported> {
         let fb = ArithFeedback::from_bits(feedback);
-        if !fb.is_int32_only() && !self.allow_empty_feedback_for_osr(fb) {
+        if !fb.is_numeric_only() && !self.allow_empty_feedback_for_osr(fb) {
             return Err(Unsupported::TypeFeedback(feedback));
         }
         let l = self.int32_node_operand(block, lhs, feedback, byte_pc)?;
@@ -1276,6 +1363,281 @@ impl<'a> Builder<'a> {
         true
     }
 
+    fn try_inline_direct_call(
+        &mut self,
+        block: BlockId,
+        call_pc: u32,
+        _callee_reg: u16,
+        callee: &JitInlineCallee,
+        inputs: &[NodeId],
+    ) -> Result<Option<NodeId>, Unsupported> {
+        const MAX_INLINE_CALL_REGS: u16 = 64;
+        const MAX_INLINE_CALL_INSTRS: usize = 48;
+        let argc = inputs.len().saturating_sub(1);
+        if argc != usize::from(callee.param_count)
+            || callee.register_count > MAX_INLINE_CALL_REGS
+            || callee.instructions.len() > MAX_INLINE_CALL_INSTRS
+            || !callee.instructions.iter().all(|instr| {
+                matches!(
+                    instr.op,
+                    Op::MakeFunction
+                        | Op::MakeClosure
+                        | Op::LoadInt32
+                        | Op::LoadNumber
+                        | Op::LoadTrue
+                        | Op::LoadFalse
+                        | Op::LoadUndefined
+                        | Op::LoadHole
+                        | Op::LoadLocal
+                        | Op::LoadUpvalue
+                        | Op::StoreLocal
+                        | Op::ToPrimitive
+                        | Op::ToNumeric
+                        | Op::Add
+                        | Op::Sub
+                        | Op::Mul
+                        | Op::Div
+                        | Op::BitwiseOr
+                        | Op::BitwiseAnd
+                        | Op::BitwiseXor
+                        | Op::Shl
+                        | Op::Shr
+                        | Op::Ushr
+                        | Op::Increment
+                        | Op::Return
+                        | Op::ReturnValue
+                        | Op::ReturnUndefined
+                )
+            })
+        {
+            return Ok(None);
+        }
+
+        let start_nodes = self.graph.nodes.len();
+        let start_body = self.graph.blocks[block as usize].body.len();
+        macro_rules! decline_inline {
+            () => {{
+                self.graph.nodes.truncate(start_nodes);
+                self.graph.blocks[block as usize].body.truncate(start_body);
+                return Ok(None);
+            }};
+        }
+
+        let Some(&callee_value) = inputs.first() else {
+            return Ok(None);
+        };
+        let guard = self.graph.add_node(
+            NodeKind::CheckFunctionIdentity {
+                callee: callee_value,
+                function_id: callee.function_id,
+            },
+            block,
+            call_pc,
+        );
+        self.push_body(block, guard);
+
+        let mut regs: Vec<Option<NodeId>> = vec![None; callee.register_count as usize];
+        for (slot, &arg) in inputs.iter().skip(1).enumerate() {
+            if slot < regs.len() {
+                regs[slot] = Some(arg);
+            }
+        }
+        let read = |regs: &[Option<NodeId>], regn: u16| -> Result<NodeId, Unsupported> {
+            regs.get(regn as usize)
+                .copied()
+                .flatten()
+                .ok_or(Unsupported::OperandShape("inline call register"))
+        };
+        let write =
+            |regs: &mut [Option<NodeId>], regn: u16, node: NodeId| -> Result<(), Unsupported> {
+                let Some(slot) = regs.get_mut(regn as usize) else {
+                    return Err(Unsupported::OperandShape("inline call register"));
+                };
+                *slot = Some(node);
+                Ok(())
+            };
+        macro_rules! read_inline {
+            ($regn:expr) => {
+                match read(&regs, $regn) {
+                    Ok(node) => node,
+                    Err(_) => decline_inline!(),
+                }
+            };
+        }
+        macro_rules! write_inline {
+            ($regn:expr, $node:expr) => {
+                if write(&mut regs, $regn, $node).is_err() {
+                    decline_inline!();
+                }
+            };
+        }
+
+        let mut returned = None;
+        for instr in &callee.instructions {
+            let op = instr.op;
+            let operands = instr.operands.as_slice();
+            match op {
+                // The callee's own self-name binding (`function f(){…}` makes `f`
+                // visible in its body). Bind the dst register to the guarded
+                // callee value so a following `StoreLocal`/`LoadLocal` of the name
+                // resolves instead of declining the inline.
+                Op::MakeFunction | Op::MakeClosure if instr.make_self => {
+                    let dst = reg(operands, 0)?;
+                    write_inline!(dst, callee_value);
+                }
+                Op::LoadInt32 => {
+                    let dst = reg(operands, 0)?;
+                    let value = imm32(operands, 1)?;
+                    let node = self
+                        .graph
+                        .add_node(NodeKind::ConstInt32(value), block, call_pc);
+                    self.push_body(block, node);
+                    write_inline!(dst, node);
+                }
+                Op::LoadNumber => {
+                    let dst = reg(operands, 0)?;
+                    let Some(value) = instr.load_number else {
+                        decline_inline!();
+                    };
+                    let node = self
+                        .graph
+                        .add_node(NodeKind::ConstF64(value), block, call_pc);
+                    self.push_body(block, node);
+                    write_inline!(dst, node);
+                }
+                Op::LoadTrue | Op::LoadFalse => {
+                    let dst = reg(operands, 0)?;
+                    let node = self.graph.add_node(
+                        NodeKind::ConstBool(matches!(op, Op::LoadTrue)),
+                        block,
+                        call_pc,
+                    );
+                    self.push_body(block, node);
+                    write_inline!(dst, node);
+                }
+                Op::LoadUndefined | Op::LoadHole => {
+                    let dst = reg(operands, 0)?;
+                    let kind = if matches!(op, Op::LoadUndefined) {
+                        NodeKind::ConstUndefined
+                    } else {
+                        NodeKind::LoadHole
+                    };
+                    let node = self.graph.add_node(kind, block, call_pc);
+                    self.push_body(block, node);
+                    write_inline!(dst, node);
+                }
+                Op::LoadLocal => {
+                    let dst = reg(operands, 0)?;
+                    let src = u16::try_from(imm32(operands, 1)?)
+                        .map_err(|_| Unsupported::OperandShape("inline local index"))?;
+                    let node = read_inline!(src);
+                    write_inline!(dst, node);
+                }
+                // A captured binding of the inlined closure: read from the
+                // callee's own spine via the fid-guarded callee value, not the
+                // running context. `cage_base == 0` (no live IC tables) can't
+                // decode the closure body, so decline the splice.
+                Op::LoadUpvalue => {
+                    let dst = reg(operands, 0)?;
+                    let idx = imm32(operands, 1)?;
+                    if idx < 0 || self.view.cage_base == 0 {
+                        decline_inline!();
+                    }
+                    let node = self.graph.add_node(
+                        NodeKind::InlineUpvalue {
+                            closure: callee_value,
+                            index: idx as u32,
+                        },
+                        block,
+                        call_pc,
+                    );
+                    self.push_body(block, node);
+                    write_inline!(dst, node);
+                }
+                Op::StoreLocal => {
+                    let src = reg(operands, 0)?;
+                    let dst = u16::try_from(imm32(operands, 1)?)
+                        .map_err(|_| Unsupported::OperandShape("inline local index"))?;
+                    let node = read_inline!(src);
+                    write_inline!(dst, node);
+                }
+                Op::ToPrimitive | Op::ToNumeric => {
+                    let dst = reg(operands, 0)?;
+                    let src = reg(operands, 1)?;
+                    let node = read_inline!(src);
+                    write_inline!(dst, node);
+                }
+                Op::Add | Op::Sub | Op::Mul | Op::Div => {
+                    let dst = reg(operands, 0)?;
+                    let lhs = read_inline!(reg(operands, 1)?);
+                    let rhs = read_inline!(reg(operands, 2)?);
+                    let node =
+                        self.arith_node_binop(block, op, lhs, rhs, instr.arith_feedback, call_pc)?;
+                    self.push_body(block, node);
+                    write_inline!(dst, node);
+                }
+                Op::BitwiseOr | Op::BitwiseAnd | Op::BitwiseXor | Op::Shl | Op::Shr | Op::Ushr => {
+                    let dst = reg(operands, 0)?;
+                    let lhs = read_inline!(reg(operands, 1)?);
+                    let rhs = read_inline!(reg(operands, 2)?);
+                    let node = self.bitwise_node_binop(
+                        block,
+                        op,
+                        lhs,
+                        rhs,
+                        instr.arith_feedback,
+                        call_pc,
+                    )?;
+                    self.push_body(block, node);
+                    write_inline!(dst, node);
+                }
+                Op::Increment => {
+                    let dst = reg(operands, 0)?;
+                    let src = read_inline!(reg(operands, 1)?);
+                    let delta = match operands.get(2) {
+                        Some(Operand::Imm32(v)) => *v,
+                        None => 1,
+                        _ => return Err(Unsupported::OperandShape("increment delta")),
+                    };
+                    let step = self
+                        .graph
+                        .add_node(NodeKind::ConstInt32(delta), block, call_pc);
+                    self.push_body(block, step);
+                    let node = self.arith_node_binop(
+                        block,
+                        Op::Add,
+                        src,
+                        step,
+                        instr.arith_feedback,
+                        call_pc,
+                    )?;
+                    self.push_body(block, node);
+                    write_inline!(dst, node);
+                }
+                Op::Return | Op::ReturnValue => {
+                    let src = reg(operands, 0)?;
+                    returned = Some(read_inline!(src));
+                    break;
+                }
+                Op::ReturnUndefined => {
+                    let node = self
+                        .graph
+                        .add_node(NodeKind::ConstUndefined, block, call_pc);
+                    self.push_body(block, node);
+                    returned = Some(node);
+                    break;
+                }
+                _ => decline_inline!(),
+            }
+        }
+
+        if returned.is_none() {
+            self.graph.nodes.truncate(start_nodes);
+            self.graph.blocks[block as usize].body.truncate(start_body);
+        }
+        Ok(returned)
+    }
+
     fn try_inline_method(
         &mut self,
         block: BlockId,
@@ -1311,6 +1673,7 @@ impl<'a> Builder<'a> {
                 recv_shape: method.recv_shape,
                 proto_shape: method.proto_shape,
                 method_value_byte: method.method_value_byte,
+                method_on_receiver: method.method_on_receiver,
                 method_fid: method.method_fid,
             },
             block,
@@ -1546,7 +1909,9 @@ impl<'a> Builder<'a> {
         let fb = ArithFeedback::from_bits(feedback);
         // `Div` of two int32s is generally non-integer (`5/2`), so it always
         // takes the float path; the other three stay int32 when the operands are.
-        if fb.is_int32_only() && !matches!(op, Op::Div) {
+        let has_float_operand =
+            self.operand_is_float64(block, lhs) || self.operand_is_float64(block, rhs);
+        if fb.is_int32_only() && !has_float_operand && !matches!(op, Op::Div) {
             return self.int32_binop(block, op, lhs, rhs, feedback, byte_pc);
         }
         if !fb.is_numeric_only() && !self.allow_empty_feedback_for_osr(fb) {
@@ -1576,8 +1941,31 @@ impl<'a> Builder<'a> {
         feedback: u8,
         byte_pc: u32,
     ) -> Result<NodeId, Unsupported> {
+        let lhs_node = self.read_variable(lhs, block);
+        let rhs_node = self.read_variable(rhs, block);
+        let lhs_is_null = matches!(self.graph.node(lhs_node).kind, NodeKind::ConstNull);
+        let rhs_is_null = matches!(self.graph.node(rhs_node).kind, NodeKind::ConstNull);
+        if matches!(cmp, CmpOp::Eq | CmpOp::Ne) && (lhs_is_null || rhs_is_null) {
+            if lhs_is_null && rhs_is_null {
+                return Ok(self.graph.add_node(
+                    NodeKind::ConstBool(matches!(cmp, CmpOp::Eq)),
+                    block,
+                    byte_pc,
+                ));
+            }
+            let value = if lhs_is_null { rhs_node } else { lhs_node };
+            return Ok(self.graph.add_node(
+                NodeKind::TaggedIsNull {
+                    value,
+                    negate: matches!(cmp, CmpOp::Ne),
+                },
+                block,
+                byte_pc,
+            ));
+        }
         let fb = ArithFeedback::from_bits(feedback);
-        if fb.is_int32_only() {
+        let has_float_operand = self.node_is_float64(lhs_node) || self.node_is_float64(rhs_node);
+        if fb.is_int32_only() && !has_float_operand {
             let l = self.int32_operand(block, lhs, feedback, byte_pc)?;
             let r = self.int32_operand(block, rhs, feedback, byte_pc)?;
             return Ok(self
@@ -1606,7 +1994,8 @@ impl<'a> Builder<'a> {
         byte_pc: u32,
     ) -> Result<NodeId, Unsupported> {
         let fb = ArithFeedback::from_bits(feedback);
-        if fb.is_int32_only() || self.allow_empty_feedback_for_osr(fb) {
+        let has_float_operand = self.operand_is_float64(block, src);
+        if (fb.is_int32_only() || self.allow_empty_feedback_for_osr(fb)) && !has_float_operand {
             let s = self.int32_operand(block, src, feedback, byte_pc)?;
             let step = self
                 .graph
@@ -1616,7 +2005,7 @@ impl<'a> Builder<'a> {
                 .graph
                 .add_node(NodeKind::Int32Add(s, step), block, byte_pc));
         }
-        if !fb.is_numeric_only() {
+        if !fb.is_numeric_only() && !self.allow_empty_feedback_for_osr(fb) {
             return Err(Unsupported::TypeFeedback(feedback));
         }
         let s = self.float_operand(block, src, byte_pc);
@@ -1629,9 +2018,9 @@ impl<'a> Builder<'a> {
             .add_node(NodeKind::Float64Add(s, step), block, byte_pc))
     }
 
-    /// Resolve a register operand to an [`Repr::Int32`] node, inserting a
-    /// `CheckInt32` guard when the value is still tagged. A site whose feedback
-    /// proves it is not int32-only bails the function.
+    /// Resolve a register operand to an [`Repr::Int32`] node for integer
+    /// arithmetic. Int32-only sites keep the cheaper `CheckInt32` guard; numeric
+    /// sites that already widened to float perform JavaScript `ToInt32` instead.
     fn int32_operand(
         &mut self,
         block: BlockId,
@@ -1640,18 +2029,39 @@ impl<'a> Builder<'a> {
         byte_pc: u32,
     ) -> Result<NodeId, Unsupported> {
         let feedback = ArithFeedback::from_bits(raw_feedback);
-        if !feedback.is_int32_only() && !self.allow_empty_feedback_for_osr(feedback) {
+        if !feedback.is_numeric_only() && !self.allow_empty_feedback_for_osr(feedback) {
             return Err(Unsupported::TypeFeedback(raw_feedback));
         }
         let node = self.read_variable(operand_reg, block);
-        if self.graph.node(node).repr == Repr::Int32 {
-            return Ok(node);
+        match self.graph.node(node).repr {
+            Repr::Int32 => Ok(node),
+            Repr::Float64 => {
+                let truncate = self
+                    .graph
+                    .add_node(NodeKind::Float64ToInt32(node), block, byte_pc);
+                self.push_body(block, truncate);
+                Ok(truncate)
+            }
+            Repr::Tagged | Repr::Bool if feedback.is_int32_only() => {
+                let check = self
+                    .graph
+                    .add_node(NodeKind::CheckInt32(node), block, byte_pc);
+                self.push_body(block, check);
+                Ok(check)
+            }
+            Repr::Tagged => {
+                let number = self
+                    .graph
+                    .add_node(NodeKind::CheckNumber(node), block, byte_pc);
+                self.push_body(block, number);
+                let truncate =
+                    self.graph
+                        .add_node(NodeKind::Float64ToInt32(number), block, byte_pc);
+                self.push_body(block, truncate);
+                Ok(truncate)
+            }
+            Repr::Bool => Err(Unsupported::Unlowered("bitwise bool operand")),
         }
-        let check = self
-            .graph
-            .add_node(NodeKind::CheckInt32(node), block, byte_pc);
-        self.push_body(block, check);
-        Ok(check)
     }
 
     /// Resolve a register operand to an [`Repr::Float64`] node for a numeric
@@ -1814,6 +2224,7 @@ mod tests {
             object_values_ptr_byte: 16,
             jit_proto_byte: 12,
             closure_fid_byte: 8,
+            closure_upvalues_ptr_byte: 16,
             instructions,
             inline_callees: Default::default(),
             inline_methods: Default::default(),
@@ -1836,6 +2247,64 @@ mod tests {
     }
 
     #[test]
+    fn monomorphic_tiny_direct_call_inlines_into_graph() {
+        let mut v = view(
+            3,
+            4,
+            &[
+                (
+                    Op::Call,
+                    vec![r(3), r(0), Operand::ConstIndex(2), r(1), r(2)],
+                    0,
+                ),
+                (Op::ReturnValue, vec![r(3)], 0),
+            ],
+        );
+        v.inline_callees.insert(
+            0,
+            JitInlineCallee {
+                function_id: 42,
+                param_count: 2,
+                register_count: 4,
+                instructions: vec![
+                    otter_vm::JitInstrView {
+                        op: Op::Add,
+                        byte_pc: 0,
+                        byte_len: STRIDE,
+                        property_ic_site: None,
+                        operands: vec![r(2), r(0), r(1)],
+                        make_self: false,
+                        load_array_length: false,
+                        load_number: None,
+                        property_feedback: None,
+                        arith_feedback: ARITH_INT32,
+                    },
+                    otter_vm::JitInstrView {
+                        op: Op::ReturnValue,
+                        byte_pc: STRIDE,
+                        byte_len: STRIDE,
+                        property_ic_site: None,
+                        operands: vec![r(2)],
+                        make_self: false,
+                        load_array_length: false,
+                        load_number: None,
+                        property_feedback: None,
+                        arith_feedback: 0,
+                    },
+                ],
+            },
+        );
+
+        let g = build_full(&v).expect("direct call inlines");
+        assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::Call { .. })), 0);
+        assert_eq!(
+            count_kind(&g, |k| matches!(k, NodeKind::CheckFunctionIdentity { .. })),
+            1
+        );
+        assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::Int32Add(_, _))), 1);
+    }
+
+    #[test]
     fn monomorphic_tiny_method_inlines_into_graph() {
         let method_load_pc = 4;
         let mut prop_offsets = FxHashMap::default();
@@ -1845,6 +2314,7 @@ mod tests {
             recv_shape: 100,
             proto_shape: 200,
             method_value_byte: 8,
+            method_on_receiver: false,
             param_count: 0,
             register_count: 2,
             instructions: vec![
@@ -1916,6 +2386,245 @@ mod tests {
     }
 
     #[test]
+    fn missing_inline_method_lowers_to_runtime_method_call() {
+        let mut v = view(
+            1,
+            3,
+            &[
+                (
+                    Op::CallMethodValue,
+                    vec![r(1), r(0), Operand::ConstIndex(0), Operand::ConstIndex(0)],
+                    0,
+                ),
+                (Op::ReturnValue, vec![r(1)], 0),
+            ],
+        );
+        v.instructions[0].property_ic_site = Some(7);
+
+        let g = build_full(&v).expect("generic method call builds");
+        assert_eq!(
+            count_kind(&g, |k| matches!(k, NodeKind::CallMethod { .. })),
+            1
+        );
+        assert_eq!(
+            count_kind(&g, |k| matches!(k, NodeKind::CheckMethodIdentity { .. })),
+            0
+        );
+    }
+
+    /// Build a callee `JitInstrView` for an inline-candidate body.
+    fn cinstr(op: Op, operands: Vec<Operand>, make_self: bool, fb: u8) -> otter_vm::JitInstrView {
+        otter_vm::JitInstrView {
+            op,
+            byte_pc: 0,
+            byte_len: STRIDE,
+            property_ic_site: None,
+            operands,
+            make_self,
+            load_array_length: false,
+            load_number: None,
+            property_feedback: None,
+            arith_feedback: fb,
+        }
+    }
+
+    #[test]
+    fn direct_call_inline_binds_callee_self_name() {
+        // The callee's leading self-name binding (`MakeFunction make_self` +
+        // `StoreLocal` of that register) must not abort the splice: a value has
+        // to flow into the self register so the store resolves.
+        let mut v = view(
+            1,
+            3,
+            &[
+                (Op::Call, vec![r(2), r(0), Operand::ConstIndex(1), r(1)], 0),
+                (Op::ReturnValue, vec![r(2)], 0),
+            ],
+        );
+        v.inline_callees.insert(
+            0,
+            JitInlineCallee {
+                function_id: 7,
+                param_count: 1,
+                register_count: 4,
+                instructions: vec![
+                    cinstr(
+                        Op::MakeFunction,
+                        vec![r(3), Operand::ConstIndex(0)],
+                        true,
+                        0,
+                    ),
+                    cinstr(Op::StoreLocal, vec![r(3), imm(2)], false, 0),
+                    cinstr(Op::ReturnValue, vec![r(0)], false, 0),
+                ],
+            },
+        );
+
+        let g = build_full(&v).expect("self-binding callee inlines");
+        assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::Call { .. })), 0);
+        assert_eq!(
+            count_kind(&g, |k| matches!(k, NodeKind::CheckFunctionIdentity { .. })),
+            1
+        );
+    }
+
+    #[test]
+    fn closure_callee_inlines_upvalue_read() {
+        // A monomorphic closure callee (`return x * k`, `k` captured) splices its
+        // body: the captured read becomes an `InlineUpvalue` off the fid-guarded
+        // callee value, never a runtime `Call`.
+        let mut v = view(
+            1,
+            3,
+            &[
+                (Op::Call, vec![r(2), r(0), Operand::ConstIndex(1), r(1)], 0),
+                (Op::ReturnValue, vec![r(2)], 0),
+            ],
+        );
+        v.cage_base = 1;
+        v.inline_callees.insert(
+            0,
+            JitInlineCallee {
+                function_id: 11,
+                param_count: 1,
+                register_count: 3,
+                instructions: vec![
+                    cinstr(Op::LoadUpvalue, vec![r(2), imm(0)], false, 0),
+                    cinstr(Op::Mul, vec![r(2), r(0), r(2)], false, ARITH_INT32),
+                    cinstr(Op::ReturnValue, vec![r(2)], false, 0),
+                ],
+            },
+        );
+
+        let g = build_full(&v).expect("closure callee inlines");
+        assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::Call { .. })), 0);
+        assert_eq!(
+            count_kind(&g, |k| matches!(k, NodeKind::InlineUpvalue { .. })),
+            1
+        );
+        assert_eq!(
+            count_kind(&g, |k| matches!(k, NodeKind::CheckFunctionIdentity { .. })),
+            1
+        );
+        assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::Int32Mul(_, _))), 1);
+    }
+
+    #[test]
+    fn remaining_call_with_runtime_object_op_declines() {
+        // A runtime `Call` left in the graph beside a runtime object op (here an
+        // un-inlined method call) is the mix the optimizing tier still loses to
+        // the baseline on, so it declines.
+        let mut v = view(
+            2,
+            4,
+            &[
+                (Op::Call, vec![r(2), r(0), Operand::ConstIndex(1), r(1)], 0),
+                (
+                    Op::CallMethodValue,
+                    vec![r(3), r(2), Operand::ConstIndex(0), Operand::ConstIndex(0)],
+                    0,
+                ),
+                (Op::ReturnValue, vec![r(3)], 0),
+            ],
+        );
+        v.instructions[1].property_ic_site = Some(7);
+
+        let err = build_full(&v).expect_err("call + runtime object op declines");
+        assert!(matches!(
+            err,
+            Unsupported::Unlowered("call plus object fast path")
+        ));
+    }
+
+    #[test]
+    fn remaining_call_with_shape_guard_compiles() {
+        // A runtime `Call` beside only a shape-guarded property load (a cheap
+        // `CheckShape` + sealed `LoadSlot`, no runtime object stub) is allowed:
+        // the guard is not the runtime object op the decline guards against.
+        let mut v = view(
+            2,
+            4,
+            &[
+                (Op::Call, vec![r(2), r(0), Operand::ConstIndex(1), r(1)], 0),
+                (
+                    Op::LoadProperty,
+                    vec![r(3), r(2), Operand::ConstIndex(0)],
+                    0,
+                ),
+                (Op::ReturnValue, vec![r(3)], 0),
+            ],
+        );
+        v.cage_base = 1;
+        v.instructions[1].property_feedback = Some((100, 8));
+
+        let g = build_full(&v).expect("call + shape guard compiles");
+        assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::Call { .. })), 1);
+        assert_eq!(
+            count_kind(&g, |k| matches!(k, NodeKind::CheckShape(_, _))),
+            1
+        );
+    }
+
+    #[test]
+    fn missing_inline_method_inside_loop_declines() {
+        let mut v = view(
+            1,
+            5,
+            &[
+                (Op::LoadInt32, vec![r(1), imm(0)], 0),
+                (Op::LessThan, vec![r(2), r(1), r(0)], ARITH_INT32),
+                (Op::JumpIfFalse, vec![imm(rel(2, 6)), r(2)], 0),
+                (
+                    Op::CallMethodValue,
+                    vec![r(3), r(4), Operand::ConstIndex(0), Operand::ConstIndex(0)],
+                    0,
+                ),
+                (Op::Increment, vec![r(1), r(1), imm(1)], ARITH_INT32),
+                (Op::Jump, vec![imm(rel(5, 1))], 0),
+                (Op::ReturnValue, vec![r(1)], 0),
+            ],
+        );
+        v.instructions[3].property_ic_site = Some(7);
+
+        assert_eq!(
+            build_full(&v).unwrap_err(),
+            Unsupported::Opcode(Op::CallMethodValue)
+        );
+    }
+
+    #[test]
+    fn strict_null_compare_lowers_to_tagged_null_predicate() {
+        let g = build_full(&view(
+            1,
+            4,
+            &[
+                (Op::LoadNull, vec![r(1)], 0),
+                (Op::Equal, vec![r(2), r(0), r(1)], 0),
+                (Op::NotEqual, vec![r(3), r(0), r(1)], 0),
+                (Op::ReturnValue, vec![r(2)], 0),
+            ],
+        ))
+        .expect("null identity compare builds");
+
+        assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::ConstNull)), 1);
+        assert_eq!(
+            count_kind(&g, |k| matches!(
+                k,
+                NodeKind::TaggedIsNull { negate: false, .. }
+            )),
+            1
+        );
+        assert_eq!(
+            count_kind(&g, |k| matches!(
+                k,
+                NodeKind::TaggedIsNull { negate: true, .. }
+            )),
+            1
+        );
+        assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::CheckNumber(_))), 0);
+    }
+
+    #[test]
     fn straight_line_int_add_guards_param_only() {
         // r2 = r0 + 1; return r2   (r0 is a parameter, 1 is an int32 const)
         let g = build_full(&view(
@@ -1934,6 +2643,57 @@ mod tests {
         // Only the tagged parameter needs a guard; the int32 const does not.
         assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::CheckInt32(_))), 1);
         assert!(matches!(g.blocks[0].term, Some(Terminator::Return(_))));
+    }
+
+    #[test]
+    fn existing_float_operand_overrides_int32_feedback() {
+        let mut v = view(
+            0,
+            4,
+            &[
+                (Op::LoadNumber, vec![r(0), Operand::ConstIndex(0)], 0),
+                (Op::LoadInt32, vec![r(1), imm(1)], 0),
+                (Op::Add, vec![r(2), r(0), r(1)], ARITH_INT32),
+                (Op::ReturnValue, vec![r(2)], 0),
+            ],
+        );
+        v.instructions[0].load_number = Some(1.5);
+        let g = build_full(&v).expect("float add builds despite stale int32 feedback");
+
+        assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::Float64Add(..))), 1);
+        assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::Int32Add(..))), 0);
+        assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::CheckInt32(_))), 0);
+        assert_eq!(
+            count_kind(&g, |k| matches!(k, NodeKind::Int32ToFloat64(_))),
+            1
+        );
+    }
+
+    #[test]
+    fn bitwise_float_operand_lowers_through_to_int32() {
+        let mut v = view(
+            0,
+            4,
+            &[
+                (Op::LoadNumber, vec![r(0), Operand::ConstIndex(0)], 0),
+                (Op::LoadInt32, vec![r(1), imm(0)], 0),
+                (
+                    Op::BitwiseOr,
+                    vec![r(2), r(0), r(1)],
+                    ARITH_INT32 | ARITH_FLOAT64,
+                ),
+                (Op::ReturnValue, vec![r(2)], 0),
+            ],
+        );
+        v.instructions[0].load_number = Some(2_500_000.0);
+        let g = build_full(&v).expect("bitwise float coercion builds");
+
+        assert_eq!(
+            count_kind(&g, |k| matches!(k, NodeKind::Float64ToInt32(_))),
+            1
+        );
+        assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::Int32BitOr(..))), 1);
+        assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::CheckInt32(_))), 0);
     }
 
     #[test]

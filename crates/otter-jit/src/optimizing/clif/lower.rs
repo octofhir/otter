@@ -38,13 +38,12 @@ use otter_vm::JitFunctionView;
 
 use super::Unsupported;
 use super::abi::{
-    clif_type, HOLE_BITS, REGS_OFFSET, STATUS_RETURNED, TAG_INT32, TAG_PTR_OBJECT, UNDEFINED_BITS,
+    HOLE_BITS, NULL_BITS, REGS_OFFSET, STATUS_RETURNED, TAG_INT32, TAG_PTR_OBJECT, UNDEFINED_BITS,
+    clif_type,
 };
 use super::deopt::{Flags, box_tagged, emit_bail};
 use crate::optimizing::deopt::DeoptPoint;
-use crate::optimizing::ir::{
-    BlockId, CmpOp, Graph, NodeId, NodeKind, Repr, Terminator,
-};
+use crate::optimizing::ir::{BlockId, CmpOp, Graph, NodeId, NodeKind, Repr, Terminator};
 
 /// Declare, lower, and define `graph` as a single Cranelift function in `module`,
 /// returning its `FuncId` and the finalized code size in bytes.
@@ -56,7 +55,8 @@ pub(super) fn compile_function(
     block_deopts: &FxHashMap<BlockId, DeoptPoint>,
 ) -> Result<(FuncId, usize), Unsupported> {
     let mut sig = module.make_signature();
-    sig.params.push(cranelift_codegen::ir::AbiParam::new(types::I64));
+    sig.params
+        .push(cranelift_codegen::ir::AbiParam::new(types::I64));
     sig.returns
         .push(cranelift_codegen::ir::AbiParam::new(types::I64));
     sig.returns
@@ -354,13 +354,17 @@ impl<'a, 'f> Lower<'a, 'f> {
                 };
                 Some(self.b.ins().iconst(types::I64, bits as i64))
             }
-            NodeKind::ConstUndefined => Some(self.b.ins().iconst(types::I64, UNDEFINED_BITS as i64)),
+            NodeKind::ConstUndefined => {
+                Some(self.b.ins().iconst(types::I64, UNDEFINED_BITS as i64))
+            }
+            NodeKind::ConstNull => Some(self.b.ins().iconst(types::I64, NULL_BITS as i64)),
             NodeKind::CheckInt32(operand) => Some(self.lower_check_int32(nid, *operand)?),
             NodeKind::CheckNumber(operand) => Some(self.lower_check_number(nid, *operand)?),
             NodeKind::Int32ToFloat64(operand) => {
                 let v = self.val(*operand)?;
                 Some(self.b.ins().fcvt_from_sint(types::F64, v))
             }
+            NodeKind::Float64ToInt32(operand) => Some(self.lower_float64_to_int32(*operand)?),
             NodeKind::Int32Add(a, b) | NodeKind::Int32Sub(a, b) | NodeKind::Int32Mul(a, b) => {
                 Some(self.lower_int32_overflow(nid, &node.kind, *a, *b)?)
             }
@@ -413,6 +417,16 @@ impl<'a, 'f> Lower<'a, 'f> {
                 let (x, y) = (self.val(*a)?, self.val(*b)?);
                 Some(self.b.ins().fcmp(float_cc(*op), x, y))
             }
+            NodeKind::TaggedIsNull { value, negate } => {
+                let v = self.val(*value)?;
+                let null = self.b.ins().iconst(types::I64, NULL_BITS as i64);
+                let cc = if *negate {
+                    IntCC::NotEqual
+                } else {
+                    IntCC::Equal
+                };
+                Some(self.b.ins().icmp(cc, v, null))
+            }
             NodeKind::LoadArrayLength(recv) => Some(self.lower_array_length(nid, *recv)?),
             NodeKind::LoadElement(recv, idx) => Some(self.lower_load_element(nid, *recv, *idx)?),
             NodeKind::StoreElement(recv, idx, val) => {
@@ -442,7 +456,9 @@ impl<'a, 'f> Lower<'a, 'f> {
                 self.guard(nid, not_int)?;
                 Ok(self.b.ins().ireduce(types::I32, v))
             }
-            _ => Err(Unsupported::Unlowered("clif: check-int32 operand not tagged")),
+            _ => Err(Unsupported::Unlowered(
+                "clif: check-int32 operand not tagged",
+            )),
         }
     }
 
@@ -477,6 +493,77 @@ impl<'a, 'f> Lower<'a, 'f> {
             }
             Repr::Bool => Err(Unsupported::Unlowered("clif: check-number operand bool")),
         }
+    }
+
+    /// ECMAScript `ToInt32` for an unboxed `f64`, implemented from IEEE-754 bits:
+    /// truncate toward zero, take modulo 2^32, then interpret the low bits as
+    /// signed int32. NaN, infinities, ±0, and values whose integer part is a
+    /// multiple of 2^32 produce +0.
+    fn lower_float64_to_int32(&mut self, operand: NodeId) -> Result<Value, Unsupported> {
+        if self.graph.node(operand).repr != Repr::Float64 {
+            return Err(Unsupported::Unlowered("clif: to-int32 operand not float64"));
+        }
+        let v = self.val(operand)?;
+        let bits = self.b.ins().bitcast(types::I64, self.flags.plain, v);
+        let sign = self.b.ins().icmp_imm(IntCC::SignedLessThan, bits, 0);
+        let exp = {
+            let shifted = self.b.ins().ushr_imm(bits, 52);
+            self.b.ins().band_imm(shifted, 0x7ff)
+        };
+        let exp_small = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::UnsignedLessThanOrEqual, exp, 1022);
+        let exp_nan_inf = self.b.ins().icmp_imm(IntCC::Equal, exp, 0x7ff);
+        let exp_huge_zero = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, exp, 1107);
+        let zeroish_a = self.b.ins().bor(exp_small, exp_nan_inf);
+        let zeroish = self.b.ins().bor(zeroish_a, exp_huge_zero);
+        let zero = self.b.ins().iconst(types::I32, 0);
+        let mantissa = {
+            let mant = self.b.ins().band_imm(bits, 0x000f_ffff_ffff_ffff);
+            self.b.ins().bor_imm(mant, 1_i64 << 52)
+        };
+
+        let zero_block = self.b.create_block();
+        let left_block = self.b.create_block();
+        let right_block = self.b.create_block();
+        let done = self.b.create_block();
+        let done_arg = self.b.append_block_param(done, types::I32);
+
+        let left_shift = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, exp, 1075);
+        let dispatch = self.b.create_block();
+        self.b.ins().brif(zeroish, zero_block, &[], dispatch, &[]);
+
+        self.b.switch_to_block(dispatch);
+        self.b
+            .ins()
+            .brif(left_shift, left_block, &[], right_block, &[]);
+
+        self.b.switch_to_block(zero_block);
+        self.b.ins().jump(done, &[BlockArg::from(zero)]);
+
+        self.b.switch_to_block(left_block);
+        let shift = self.b.ins().iadd_imm(exp, -1075);
+        let shifted = self.b.ins().ishl(mantissa, shift);
+        let low = self.b.ins().ireduce(types::I32, shifted);
+        self.b.ins().jump(done, &[BlockArg::from(low)]);
+
+        self.b.switch_to_block(right_block);
+        let right_base = self.b.ins().iconst(types::I64, 1075);
+        let shift = self.b.ins().isub(right_base, exp);
+        let shifted = self.b.ins().ushr(mantissa, shift);
+        let low = self.b.ins().ireduce(types::I32, shifted);
+        self.b.ins().jump(done, &[BlockArg::from(low)]);
+
+        self.b.switch_to_block(done);
+        let neg = self.b.ins().isub(zero, done_arg);
+        Ok(self.b.ins().select(sign, neg, done_arg))
     }
 
     /// `Int32Add`/`Sub`/`Mul` with signed-overflow deopt: compute in `i64`,
@@ -524,7 +611,10 @@ impl<'a, 'f> Lower<'a, 'f> {
     fn recv_body(&mut self, nid: NodeId, recv: NodeId) -> Result<(Value, Value), Unsupported> {
         let v = self.val(recv)?;
         let top16 = self.b.ins().ushr_imm(v, 48);
-        let is_obj = self.b.ins().icmp_imm(IntCC::Equal, top16, TAG_PTR_OBJECT as i64);
+        let is_obj = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, top16, TAG_PTR_OBJECT as i64);
         let not_obj = self.b.ins().icmp_imm(IntCC::Equal, is_obj, 0);
         self.guard(nid, not_obj)?;
         // Decompress: GcHeader ptr = cage_base + low32(value).
@@ -630,7 +720,10 @@ impl<'a, 'f> Lower<'a, 'f> {
         self.b.switch_to_block(f64_blk);
         let eoff = self.elem_byte_off(index, byte_off, 3);
         let end = self.b.ins().iadd_imm(eoff, 8);
-        let over = self.b.ins().icmp(IntCC::UnsignedGreaterThan, end, bytes_len);
+        let over = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThan, end, bytes_len);
         self.guard(nid, over)?;
         let addr = self.b.ins().iadd(bytes_ptr, eoff);
         let d = self.ld(types::F64, addr, 0);
@@ -641,7 +734,10 @@ impl<'a, 'f> Lower<'a, 'f> {
         self.b.switch_to_block(i32_blk);
         let eoff = self.elem_byte_off(index, byte_off, 2);
         let end = self.b.ins().iadd_imm(eoff, 4);
-        let over = self.b.ins().icmp(IntCC::UnsignedGreaterThan, end, bytes_len);
+        let over = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThan, end, bytes_len);
         self.guard(nid, over)?;
         let addr = self.b.ins().iadd(bytes_ptr, eoff);
         let w = self.ld(types::I32, addr, 0);
@@ -742,7 +838,10 @@ impl<'a, 'f> Lower<'a, 'f> {
         self.b.switch_to_block(f64_blk);
         let eoff = self.elem_byte_off(index, byte_off, 3);
         let end = self.b.ins().iadd_imm(eoff, 8);
-        let over = self.b.ins().icmp(IntCC::UnsignedGreaterThan, end, bytes_len);
+        let over = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThan, end, bytes_len);
         self.guard(nid, over)?;
         let addr = self.b.ins().iadd(bytes_ptr, eoff);
         let d = self.value_as_f64(val, vrepr)?;
@@ -761,7 +860,10 @@ impl<'a, 'f> Lower<'a, 'f> {
         };
         let eoff = self.elem_byte_off(index, byte_off, 2);
         let end = self.b.ins().iadd_imm(eoff, 4);
-        let over = self.b.ins().icmp(IntCC::UnsignedGreaterThan, end, bytes_len);
+        let over = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThan, end, bytes_len);
         self.guard(nid, over)?;
         let addr = self.b.ins().iadd(bytes_ptr, eoff);
         self.b.ins().store(self.flags.trusted, w, addr, 0);
@@ -797,7 +899,9 @@ impl<'a, 'f> Lower<'a, 'f> {
         match repr {
             Repr::Float64 => Ok(v),
             Repr::Int32 => Ok(self.b.ins().fcvt_from_sint(types::F64, v)),
-            _ => Err(Unsupported::Unlowered("clif: store-element value not numeric")),
+            _ => Err(Unsupported::Unlowered(
+                "clif: store-element value not numeric",
+            )),
         }
     }
 
@@ -836,10 +940,10 @@ impl<'a, 'f> Lower<'a, 'f> {
         let cage = self.b.ins().iconst(types::I64, self.view.cage_base as i64);
         let bufptr = self.b.ins().iadd(cage, hoff);
         let btag = self.ldro(types::I8, bufptr, 0);
-        let not_buf = self
-            .b
-            .ins()
-            .icmp_imm(IntCC::NotEqual, btag, i64::from(l.local_buffer_type_tag));
+        let not_buf =
+            self.b
+                .ins()
+                .icmp_imm(IntCC::NotEqual, btag, i64::from(l.local_buffer_type_tag));
         self.guard(nid, not_buf)?;
         let bytes_ptr = self.ldro(types::I64, bufptr, l.buf_bytes_byte + ptr_word);
         let bytes_len = self.ldro(types::I64, bufptr, l.buf_bytes_byte + len_word);

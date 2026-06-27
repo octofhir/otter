@@ -41,9 +41,7 @@ pub(super) struct Flags {
     pub plain: MemFlagsData,
 }
 
-use super::abi::{
-    BAIL_PC_OFFSET, FALSE_BITS, STATUS_BAILED, TAG_INT32, TAG_NAN, TRUE_BITS,
-};
+use super::abi::{BAIL_PC_OFFSET, FALSE_BITS, STATUS_BAILED, TAG_INT32, TAG_NAN, TRUE_BITS};
 use crate::optimizing::deopt::DeoptPoint;
 use crate::optimizing::ir::{Graph, Repr};
 
@@ -95,8 +93,9 @@ pub(super) fn emit_bail(
     values: &[Option<Value>],
 ) -> Result<(), super::Unsupported> {
     for &(regn, value) in &point.registers {
-        let v = values[value as usize]
-            .ok_or(super::Unsupported::Unlowered("clif: deopt value without home"))?;
+        let v = values[value as usize].ok_or(super::Unsupported::Unlowered(
+            "clif: deopt value without home",
+        ))?;
         let boxed = box_tagged(b, flags, v, graph.node(value).repr);
         let off = i32::from(regn) * 8;
         b.ins().store(flags.trusted, boxed, regs_base, off);

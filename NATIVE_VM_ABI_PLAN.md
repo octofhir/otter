@@ -274,10 +274,11 @@ Status: started. `Map.get`, `Map.has`, and `Set.has` now have explicit
 that are already flat/hashable. Leaf probes return the shared
 `RuntimeStubResult` (`Ok(Value)` / `Miss`) instead of a local Rust-only shortcut,
 and live in `runtime_stubs` as reusable raw-`Value`-bits entrypoints instead of
-being embedded in interpreter method dispatch, so the same result ABI can be
-reused by future direct JIT calls. Compiled code still reaches this through the
-current method runtime stub; direct machine calls to the leaf descriptors remain
-open.
+being embedded in interpreter method dispatch. Each leaf probe now has a
+callable ABI entry pairing its descriptor with a typed `LeafNoAllocStub2`
+function pointer, so the same result/call ABI can be reused by future direct JIT
+calls. Compiled code still reaches this through the current method runtime stub;
+direct machine calls to the leaf entries remain open.
 
 Tasks:
 

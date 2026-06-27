@@ -19,8 +19,50 @@
 //! - [`crate::native_abi`]
 //! - [`crate::method_ops`]
 
-use crate::native_abi::RuntimeStubResult;
+use crate::native_abi::{
+    NO_SAFEPOINT, RuntimeStubDescriptor, RuntimeStubResult, STUB_COLLECTION_MAP_GET_LEAF,
+    STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_SET_HAS_LEAF, validate_stub_descriptor,
+};
 use crate::{Value, collections};
+
+/// Two-argument leaf/no-allocation runtime stub ABI.
+pub type LeafNoAllocStub2Fn = fn(&otter_gc::GcHeap, u64, u64) -> RuntimeStubResult;
+
+/// Callable leaf/no-allocation stub entry with its ABI descriptor.
+#[derive(Clone, Copy)]
+pub struct LeafNoAllocStub2 {
+    /// Passive descriptor shared with profiler/JIT metadata.
+    pub descriptor: RuntimeStubDescriptor,
+    /// Machine-callable Rust entrypoint with the descriptor's fixed ABI shape.
+    pub entry: LeafNoAllocStub2Fn,
+}
+
+impl LeafNoAllocStub2 {
+    /// `true` when descriptor metadata matches this callable ABI shape.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        validate_stub_descriptor(self.descriptor, NO_SAFEPOINT)
+            && self.descriptor.argument_count == 2
+    }
+}
+
+/// Callable ABI entry for `Map.prototype.get`.
+pub const COLLECTION_MAP_GET_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_COLLECTION_MAP_GET_LEAF,
+    entry: collection_map_get_leaf,
+};
+
+/// Callable ABI entry for `Map.prototype.has`.
+pub const COLLECTION_MAP_HAS_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_COLLECTION_MAP_HAS_LEAF,
+    entry: collection_map_has_leaf,
+};
+
+/// Callable ABI entry for `Set.prototype.has`.
+pub const COLLECTION_SET_HAS_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_COLLECTION_SET_HAS_LEAF,
+    entry: collection_set_has_leaf,
+};
 
 /// Leaf `Map.prototype.get` probe.
 ///
@@ -99,6 +141,13 @@ mod tests {
 
     fn n(i: i32) -> Value {
         Value::number_i32(i)
+    }
+
+    #[test]
+    fn leaf_stub_entries_match_descriptors() {
+        assert!(COLLECTION_MAP_GET_LEAF.is_valid());
+        assert!(COLLECTION_MAP_HAS_LEAF.is_valid());
+        assert!(COLLECTION_SET_HAS_LEAF.is_valid());
     }
 
     #[test]

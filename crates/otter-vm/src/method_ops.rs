@@ -156,11 +156,11 @@ impl CollectionFastOp {
         }
     }
 
-    fn leaf_descriptor(self) -> Option<crate::native_abi::RuntimeStubDescriptor> {
+    fn leaf_stub(self) -> Option<crate::runtime_stubs::LeafNoAllocStub2> {
         match self {
-            Self::MapGet => Some(crate::native_abi::STUB_COLLECTION_MAP_GET_LEAF),
-            Self::MapHas => Some(crate::native_abi::STUB_COLLECTION_MAP_HAS_LEAF),
-            Self::SetHas => Some(crate::native_abi::STUB_COLLECTION_SET_HAS_LEAF),
+            Self::MapGet => Some(crate::runtime_stubs::COLLECTION_MAP_GET_LEAF),
+            Self::MapHas => Some(crate::runtime_stubs::COLLECTION_MAP_HAS_LEAF),
+            Self::SetHas => Some(crate::runtime_stubs::COLLECTION_SET_HAS_LEAF),
             Self::MapSet | Self::MapDelete | Self::SetAdd | Self::SetDelete => None,
         }
     }
@@ -1509,9 +1509,9 @@ impl Interpreter {
         recv: Value,
         args: &[Value],
     ) -> Result<Value, VmError> {
-        if op.leaf_descriptor().is_some()
+        if let Some(stub) = op.leaf_stub()
             && let Some(value) = self
-                .try_dispatch_collection_builtin_leaf_no_alloc(op, recv, args)
+                .dispatch_collection_builtin_leaf_no_alloc(stub, recv, args)
                 .into_value()
         {
             return Ok(value);
@@ -1525,34 +1525,14 @@ impl Interpreter {
     /// mutate collection state. If the key would need materialisation for
     /// efficient SameValueZero comparison, return `Miss` and let the rooted
     /// allocating path handle it.
-    fn try_dispatch_collection_builtin_leaf_no_alloc(
+    fn dispatch_collection_builtin_leaf_no_alloc(
         &self,
-        op: CollectionFastOp,
+        stub: crate::runtime_stubs::LeafNoAllocStub2,
         recv: Value,
         args: &[Value],
     ) -> crate::native_abi::RuntimeStubResult {
         let key = args.first().copied().unwrap_or_else(Value::undefined);
-        match op {
-            CollectionFastOp::MapGet => crate::runtime_stubs::collection_map_get_leaf(
-                &self.gc_heap,
-                recv.to_abi_bits(),
-                key.to_abi_bits(),
-            ),
-            CollectionFastOp::MapHas => crate::runtime_stubs::collection_map_has_leaf(
-                &self.gc_heap,
-                recv.to_abi_bits(),
-                key.to_abi_bits(),
-            ),
-            CollectionFastOp::SetHas => crate::runtime_stubs::collection_set_has_leaf(
-                &self.gc_heap,
-                recv.to_abi_bits(),
-                key.to_abi_bits(),
-            ),
-            CollectionFastOp::MapSet
-            | CollectionFastOp::MapDelete
-            | CollectionFastOp::SetAdd
-            | CollectionFastOp::SetDelete => crate::native_abi::RuntimeStubResult::miss(),
-        }
+        (stub.entry)(&self.gc_heap, recv.to_abi_bits(), key.to_abi_bits())
     }
 
     /// Run the resolved Map/Set builtin with the receiver and arguments rooted

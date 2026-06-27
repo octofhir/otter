@@ -1671,8 +1671,11 @@ impl Interpreter {
             }
         };
         let Some(code) = code else {
-            // Uncompilable body: never retry OSR for any header of it.
-            self.jit_osr_disabled.insert((fid, u32::MAX));
+            // This header's OSR region is uncompilable (its slice holds an
+            // unsupported opcode — e.g. an object-valued `StoreElement`). The
+            // region is built from `osr_pc`, so a different hot loop in the same
+            // function can still compile; disable only this header, not the body.
+            self.jit_osr_disabled.insert((fid, osr_pc));
             return Ok(None);
         };
         let ptrs = jit::JitReentryPtrs {

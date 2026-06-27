@@ -219,6 +219,15 @@ impl ExecutableFunction {
             closure_fid_byte: otter_gc::header::HEADER_SIZE as u32
                 + std::mem::offset_of!(crate::closure::JsClosureBody, function_id) as u32,
             closure_upvalues_ptr_byte: closure_upvalues_ptr_byte(),
+            collection_layout: crate::jit::JitCollectionLayout {
+                map_type_tag: crate::collections::MAP_BODY_TYPE_TAG,
+                set_type_tag: crate::collections::SET_BODY_TYPE_TAG,
+                guard_flags_byte: otter_gc::header::HEADER_SIZE as u32
+                    + crate::collections::MAP_BODY_JIT_GUARD_FLAGS_OFFSET as u32,
+                native_function_type_tag: crate::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG,
+            },
+            native_static_fn_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::native_function::NATIVE_FUNCTION_BODY_JIT_STATIC_FN_OFFSET as u32,
             instructions: self
                 .code
                 .iter()
@@ -252,6 +261,7 @@ impl ExecutableFunction {
             // carries none.
             inline_callees: rustc_hash::FxHashMap::default(),
             inline_methods: rustc_hash::FxHashMap::default(),
+            collection_leaf_methods: rustc_hash::FxHashMap::default(),
         }
     }
 

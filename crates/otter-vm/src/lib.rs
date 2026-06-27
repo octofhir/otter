@@ -182,9 +182,10 @@ pub use dynamic_import::{DynamicImportLoader, DynamicImportLoaderHandle, Dynamic
 pub use error_classes::{ErrorClassRegistry, ErrorKind};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
-    JitCompileError, JitCompileRequest, JitCompileStatus, JitCompilerHook, JitExecOutcome,
-    JitFrameStack, JitFunctionCode, JitFunctionView, JitInlineCallee, JitInlineMethod,
-    JitInstrView, JitReentryPtrs, JitTypedArrayLayout,
+    JitCollectionLayout, JitCollectionLeafMethod, JitCompileError, JitCompileRequest,
+    JitCompileStatus, JitCompilerHook, JitExecOutcome, JitFrameStack, JitFunctionCode,
+    JitFunctionView, JitInlineCallee, JitInlineMethod, JitInstrView, JitReentryPtrs,
+    JitTypedArrayLayout,
 };
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,
@@ -2796,6 +2797,7 @@ impl Interpreter {
         self.bake_property_feedback(&mut view);
         self.bake_object_literals(&mut view, context);
         self.bake_inline_callees(&mut view, context, fid);
+        self.bake_collection_leaf_methods(&mut view);
         let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
         if trace {
             let method_feedback = self
@@ -3465,6 +3467,27 @@ impl Interpreter {
                     prop_offsets,
                 },
             );
+        }
+    }
+
+    /// Bake JIT-readable collection leaf method IC metadata.
+    ///
+    /// The emitted baseline guard still validates receiver type, no
+    /// prototype/expando override, prototype shape, and builtin identity at the
+    /// slot. Baking only makes those fields machine-readable so the hot path no
+    /// longer crosses into Rust just to resolve a `RuntimeStubId`.
+    fn bake_collection_leaf_methods(&self, view: &mut jit::JitFunctionView) {
+        for instr in &view.instructions {
+            if instr.op != Op::CallMethodValue {
+                continue;
+            }
+            let Some(site) = instr.property_ic_site else {
+                continue;
+            };
+            let Some(feedback) = self.jit_collection_leaf_method_feedback(site) else {
+                continue;
+            };
+            view.collection_leaf_methods.insert(instr.byte_pc, feedback);
         }
     }
 
@@ -15473,6 +15496,8 @@ mod tests {
             jit_proto_byte: 0,
             closure_fid_byte: 0,
             closure_upvalues_ptr_byte: 0,
+            collection_layout: jit::JitCollectionLayout::default(),
+            native_static_fn_byte: 0,
             instructions: vec![16u32, 32, 48]
                 .into_iter()
                 .map(|byte_pc| jit::JitInstrView {
@@ -15491,6 +15516,7 @@ mod tests {
                 .collect(),
             inline_callees: rustc_hash::FxHashMap::default(),
             inline_methods: rustc_hash::FxHashMap::default(),
+            collection_leaf_methods: rustc_hash::FxHashMap::default(),
         };
         interp.bake_arith_feedback(&mut view, 5);
         assert_eq!(view.instructions[0].arith_feedback, int_site.bits());

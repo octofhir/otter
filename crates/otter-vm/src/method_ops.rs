@@ -1349,6 +1349,52 @@ impl Interpreter {
             .and_then(|target| target.leaf_stub_id))
     }
 
+    /// Snapshot a collection leaf method IC into JIT-readable guard metadata.
+    ///
+    /// This is intentionally stricter than the runtime IC guard: explicit
+    /// prototype overrides, even if they point back to the canonical prototype,
+    /// are left to the normal fallback path because generated code only checks
+    /// the collection body's no-override/no-expando guard flags.
+    pub(crate) fn jit_collection_leaf_method_feedback(
+        &self,
+        site: usize,
+    ) -> Option<crate::jit::JitCollectionLeafMethod> {
+        let ic = match (*self.method_call_ics.get(site)?).as_ref().copied()? {
+            MethodCallIc::Collection(ic) => ic,
+            MethodCallIc::Array(_) => return None,
+        };
+        let stub_id = ic.leaf_stub_id?;
+        let (proto, receiver_type_tag) = if ic.op.is_map() {
+            (
+                self.realm_intrinsics.map_prototype?,
+                crate::collections::MAP_BODY_TYPE_TAG,
+            )
+        } else {
+            (
+                self.realm_intrinsics.set_prototype?,
+                crate::collections::SET_BODY_TYPE_TAG,
+            )
+        };
+        if crate::object::shape_id(proto, &self.gc_heap) != ic.proto_shape {
+            return None;
+        }
+        let method = crate::object::data_slot_value_at(proto, &self.gc_heap, ic.proto_slot)?;
+        if !ic.op.matches_builtin(method, &self.gc_heap) {
+            return None;
+        }
+        let builtin_fn_addr = method
+            .as_native_function()
+            .and_then(|native| native.jit_static_fn_addr(&self.gc_heap))?;
+        Some(crate::jit::JitCollectionLeafMethod {
+            receiver_type_tag,
+            proto_offset: proto.offset(),
+            proto_shape: crate::object::shape(proto, &self.gc_heap).offset(),
+            method_value_byte: u32::from(ic.proto_slot) * std::mem::size_of::<Value>() as u32,
+            builtin_fn_addr,
+            leaf_stub_id: stub_id,
+        })
+    }
+
     /// Fast `arr.method(args)` dispatch for an ordinary dense array whose
     /// `%Array.prototype%` slot for `method` is still the original builtin,
     /// skipping the per-call `[[Get]]` method-resolution walk and the native

@@ -101,6 +101,12 @@ pub struct JitFunctionView {
     /// closure_upvalues_ptr_byte]` to reach the spine, then the per-index
     /// compressed cell handle, mirroring the context-spine [`LoadUpvalue`] path.
     pub closure_upvalues_ptr_byte: u32,
+    /// Ready-to-use byte offsets and type tags for baseline collection method
+    /// IC guards.
+    pub collection_layout: JitCollectionLayout,
+    /// Byte offset from a decompressed native-function pointer to its
+    /// machine-readable static builtin identity.
+    pub native_static_fn_byte: u32,
     /// Instruction stream in byte-PC order.
     pub instructions: Vec<JitInstrView>,
     /// Inline-candidate callees for baseline leaf-inlining, keyed by the
@@ -117,6 +123,41 @@ pub struct JitFunctionView {
     /// is a tiny body of sealed property loads/stores and pure ops; baked by
     /// `Interpreter::bake_inline_callees`.
     pub inline_methods: rustc_hash::FxHashMap<u32, JitInlineMethod>,
+    /// Leaf collection method-call feedback keyed by the caller's
+    /// `Op::CallMethodValue` byte-PC. These entries are fully JIT-readable:
+    /// generated code can validate the receiver/prototype/builtin guards and
+    /// call the VM-native leaf stub without a Rust resolver bridge.
+    pub collection_leaf_methods: rustc_hash::FxHashMap<u32, JitCollectionLeafMethod>,
+}
+
+/// Static collection body layout used by JIT-readable method IC guards.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JitCollectionLayout {
+    /// `GcHeader::type_tag` for `Map` bodies.
+    pub map_type_tag: u8,
+    /// `GcHeader::type_tag` for `Set` bodies.
+    pub set_type_tag: u8,
+    /// Byte offset from a decompressed Map/Set pointer to the guard flags word.
+    pub guard_flags_byte: u32,
+    /// `GcHeader::type_tag` for native-function bodies.
+    pub native_function_type_tag: u8,
+}
+
+/// JIT-readable leaf collection method IC entry.
+#[derive(Debug, Clone, Copy)]
+pub struct JitCollectionLeafMethod {
+    /// Expected receiver body type tag (`Map` or `Set`).
+    pub receiver_type_tag: u8,
+    /// Compressed offset of the realm prototype object holding the builtin.
+    pub proto_offset: u32,
+    /// Expected prototype shape handle compressed offset.
+    pub proto_shape: u32,
+    /// Byte offset inside the prototype object's value slab for the method.
+    pub method_value_byte: u32,
+    /// Raw static native builtin function address expected in the method slot.
+    pub builtin_fn_addr: usize,
+    /// VM-native leaf stub descriptor id to call after guards pass.
+    pub leaf_stub_id: crate::native_abi::RuntimeStubId,
 }
 
 /// A callee the baseline may splice into a caller's `Op::Call` site instead of

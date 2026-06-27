@@ -361,9 +361,12 @@ mod tests {
             jit_proto_byte: 12,
             closure_fid_byte: 8,
             closure_upvalues_ptr_byte: 16,
+            collection_layout: Default::default(),
+            native_static_fn_byte: 0,
             instructions,
             inline_callees: Default::default(),
             inline_methods: Default::default(),
+            collection_leaf_methods: Default::default(),
         }
     }
 

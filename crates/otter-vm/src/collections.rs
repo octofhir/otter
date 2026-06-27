@@ -195,10 +195,22 @@ impl From<otter_gc::OutOfMemory> for CollectionError {
 /// deletes, clears, and later additions correctly.
 pub type JsMap = otter_gc::Gc<MapBody>;
 
+const COLLECTION_JIT_FLAG_PROTO_OVERRIDE: u32 = 1 << 0;
+const COLLECTION_JIT_FLAG_EXPANDO: u32 = 1 << 1;
+
 #[derive(Debug, Default, otter_macros::Pelt)]
 #[pelt(tag = MAP_BODY_TYPE_TAG)]
+#[repr(C)]
 /// GC-allocated storage backing every [`JsMap`] handle.
 pub struct MapBody {
+    /// Machine-readable receiver guard flags for baseline method ICs.
+    ///
+    /// Bit 0 means the Map has an explicit prototype override. Bit 1 means it
+    /// has an ordinary expando bag that may shadow prototype methods. The
+    /// canonical fast path requires both bits to be zero and falls back to the
+    /// full method path otherwise.
+    #[pelt(skip)]
+    jit_guard_flags: u32,
     entries: Vec<MapEntry>,
     prototype_override: Option<Value>,
     /// Lazy ordinary own-property bag. Maps are ordinary extensible
@@ -215,6 +227,11 @@ pub struct MapBody {
     #[pelt(skip)]
     index: rustc_hash::FxHashMap<u64, smallvec::SmallVec<[u32; 2]>>,
 }
+
+pub(crate) const MAP_BODY_JIT_GUARD_FLAGS_OFFSET: usize =
+    std::mem::offset_of!(MapBody, jit_guard_flags);
+
+const _: () = assert!(MAP_BODY_JIT_GUARD_FLAGS_OFFSET.is_multiple_of(4));
 
 #[derive(Debug)]
 struct MapEntry {
@@ -365,6 +382,11 @@ pub(crate) fn set_map_prototype_override(
 ) {
     let barrier_value = proto;
     heap.with_payload(map, |body| {
+        if proto.is_some() {
+            body.jit_guard_flags |= COLLECTION_JIT_FLAG_PROTO_OVERRIDE;
+        } else {
+            body.jit_guard_flags &= !COLLECTION_JIT_FLAG_PROTO_OVERRIDE;
+        }
         body.prototype_override = proto;
     });
     if let Some(value) = &barrier_value {
@@ -383,7 +405,10 @@ pub(crate) fn map_set_expando(
     heap: &mut otter_gc::GcHeap,
     bag: crate::object::JsObject,
 ) {
-    heap.with_payload(map, |body| body.expando = Some(bag));
+    heap.with_payload(map, |body| {
+        body.jit_guard_flags |= COLLECTION_JIT_FLAG_EXPANDO;
+        body.expando = Some(bag);
+    });
     heap.write_barrier(map, bag);
 }
 
@@ -574,8 +599,13 @@ pub type JsSet = otter_gc::Gc<SetBody>;
 
 #[derive(Debug, Default, otter_macros::Pelt)]
 #[pelt(tag = SET_BODY_TYPE_TAG)]
+#[repr(C)]
 /// GC-allocated storage backing every [`JsSet`] handle.
 pub struct SetBody {
+    /// Machine-readable receiver guard flags for baseline method ICs. Same bit
+    /// layout as [`MapBody::jit_guard_flags`].
+    #[pelt(skip)]
+    jit_guard_flags: u32,
     /// Insertion-ordered `[[SetData]]` list. Deleted entries become
     /// tombstones so active iterators and `forEach` observe later
     /// additions before exhaustion.
@@ -588,6 +618,11 @@ pub struct SetBody {
     #[pelt(skip)]
     index: rustc_hash::FxHashMap<u64, smallvec::SmallVec<[u32; 2]>>,
 }
+
+pub(crate) const SET_BODY_JIT_GUARD_FLAGS_OFFSET: usize =
+    std::mem::offset_of!(SetBody, jit_guard_flags);
+
+const _: () = assert!(SET_BODY_JIT_GUARD_FLAGS_OFFSET == MAP_BODY_JIT_GUARD_FLAGS_OFFSET);
 
 #[derive(Debug)]
 struct SetEntry {
@@ -688,7 +723,10 @@ pub(crate) fn set_set_expando(
     heap: &mut otter_gc::GcHeap,
     bag: crate::object::JsObject,
 ) {
-    heap.with_payload(set, |body| body.expando = Some(bag));
+    heap.with_payload(set, |body| {
+        body.jit_guard_flags |= COLLECTION_JIT_FLAG_EXPANDO;
+        body.expando = Some(bag);
+    });
     heap.write_barrier(set, bag);
 }
 
@@ -699,6 +737,11 @@ pub(crate) fn set_set_prototype_override(
 ) {
     let barrier_value = proto;
     heap.with_payload(set, |body| {
+        if proto.is_some() {
+            body.jit_guard_flags |= COLLECTION_JIT_FLAG_PROTO_OVERRIDE;
+        } else {
+            body.jit_guard_flags &= !COLLECTION_JIT_FLAG_PROTO_OVERRIDE;
+        }
         body.prototype_override = proto;
     });
     if let Some(value) = &barrier_value {

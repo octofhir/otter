@@ -167,8 +167,6 @@ pub(crate) struct JitRet {
 pub(crate) const STATUS_RETURNED: u64 = 0;
 pub(crate) const STATUS_BAILED: u64 = 1;
 pub(crate) const STATUS_THREW: u64 = 2;
-const COLLECTION_LEAF_RESOLVE_MISS: u64 = 0;
-const COLLECTION_LEAF_RESOLVE_THROW: u64 = u64::MAX;
 
 /// Byte offset of [`JitCtx::bail_pc`] — where compiled code stamps the current
 /// instruction's byte-PC before each op so a bail resumes at the exact site.
@@ -973,33 +971,6 @@ pub(crate) extern "C" fn jit_call_method_stub(
     }
 }
 
-/// Bridge stub: resolve the guarded collection leaf method IC from compiled
-/// code. Returns a nonzero [`otter_vm::RuntimeStubId`] on hit, `0` on guard
-/// miss, and `u64::MAX` on structural VM error with the error parked in `ctx`.
-pub(crate) extern "C" fn jit_resolve_collection_leaf_method_stub(
-    ctx: *mut JitCtx,
-    recv: u64,
-    site: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &*ctx.stack };
-    match vm.jit_runtime_resolve_collection_leaf_method_stub(
-        stack,
-        ctx.frame_index,
-        recv as u16,
-        site as usize,
-    ) {
-        Ok(Some(stub_id)) => u64::from(stub_id),
-        Ok(None) => COLLECTION_LEAF_RESOLVE_MISS,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            COLLECTION_LEAF_RESOLVE_THROW
-        }
-    }
-}
-
 /// Bridge stub: perform a computed `StoreElement` (`recv[idx] = src`) from
 /// compiled code, delegating to the safe
 /// [`Interpreter::jit_runtime_store_element`]. Returns `0` on success, `1` when
@@ -1206,22 +1177,21 @@ fn reg_offset(idx: u16) -> Result<u32, Unsupported> {
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
     use super::{
-        ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET, BAIL_PC_OFFSET, BaselineCode,
-        COLLECTION_LEAF_RESOLVE_THROW, CONTEXT_OFFSET, DIRECT_ENTRY_OFFSET,
-        DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET,
-        DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET, GC_HEAP_OFFSET, IC_WAYS,
-        JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS, OBJECT_BODY_TYPE_TAG, Op,
-        Operand, REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET, SPECIAL_FALSE, SPECIAL_HOLE,
-        SPECIAL_NULL, SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
-        TAG_FUNCTION_ID, TAG_INT32, TAG_NAN, TAG_PTR_FUNCTION, TAG_PTR_OBJECT, TAG_SPECIAL,
-        THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET,
-        Unsupported, VM_OFFSET, WhiskerIcCell, jit_abort_direct_call_stub, jit_backedge_poll_stub,
-        jit_call_method_stub, jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
-        jit_finish_direct_call_returned_stub, jit_inline_closure_upvalues_stub,
-        jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub, jit_load_prop_window_stub,
-        jit_load_upvalue_stub, jit_make_fn_stub, jit_new_array_stub, jit_new_object_stub,
-        jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub,
-        jit_resolve_collection_leaf_method_stub, jit_self_call_bail_stub, jit_store_element_stub,
+        ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET, BAIL_PC_OFFSET, BaselineCode, CONTEXT_OFFSET,
+        DIRECT_ENTRY_OFFSET, DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET,
+        DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET,
+        GC_HEAP_OFFSET, IC_WAYS, JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS,
+        OBJECT_BODY_TYPE_TAG, Op, Operand, REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET,
+        SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_NULL, SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED,
+        STATUS_RETURNED, STATUS_THREW, TAG_FUNCTION_ID, TAG_INT32, TAG_NAN, TAG_PTR_FUNCTION,
+        TAG_PTR_OBJECT, TAG_SPECIAL, THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET,
+        UPVALUES_PTR_OFFSET, Unsupported, VM_OFFSET, WhiskerIcCell, jit_abort_direct_call_stub,
+        jit_backedge_poll_stub, jit_call_method_stub, jit_delegate_op_stub,
+        jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
+        jit_inline_closure_upvalues_stub, jit_load_element_stub, jit_load_global_stub,
+        jit_load_prop_stub, jit_load_prop_window_stub, jit_load_upvalue_stub, jit_make_fn_stub,
+        jit_new_array_stub, jit_new_object_stub, jit_prepare_direct_call_stub,
+        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub, jit_store_element_stub,
         jit_store_prop_stub, jit_store_prop_window_stub, jit_store_upvalue_stub,
         jit_write_barrier_stub, jit_write_barrier_window_stub, leaf_no_alloc_stub2_trampoline_pair,
         reg_offset,
@@ -1229,7 +1199,10 @@ mod arm64 {
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
     use otter_vm::Interpreter;
-    use otter_vm::{JitFunctionView, JitInlineCallee, JitInlineMethod, JitTypedArrayLayout};
+    use otter_vm::{
+        JitCollectionLeafMethod, JitFunctionView, JitInlineCallee, JitInlineMethod,
+        JitTypedArrayLayout,
+    };
     use std::collections::{BTreeMap, BTreeSet};
 
     /// Comparison flavors that emit a `cset` from integer `cmp` flags.
@@ -2143,7 +2116,14 @@ mod arm64 {
                         None => false,
                     };
                     if !inlined {
-                        emit_method_call(&mut ops, ops_ref, site, threw)?;
+                        emit_method_call(
+                            &mut ops,
+                            ops_ref,
+                            site,
+                            view.collection_leaf_methods.get(&instr.byte_pc),
+                            Some(view),
+                            threw,
+                        )?;
                     }
                 }
                 // `recv[idx]` — inline dense-`Array` (raw `Value`) and
@@ -3962,7 +3942,7 @@ mod arm64 {
         // Ineligible at run time (method changed / shape mismatch): the full
         // in-place method call, which restores nothing (sp untouched here).
         dynasm!(ops ; .arch aarch64 ; =>fallback);
-        emit_method_call(ops, call_operands, site, threw)?;
+        emit_method_call(ops, call_operands, site, None, None, threw)?;
         dynasm!(ops ; .arch aarch64 ; =>after);
         Ok(true)
     }
@@ -4329,6 +4309,99 @@ mod arm64 {
         store_reg(ops, 0, dst)
     }
 
+    fn emit_collection_leaf_method_guarded_call(
+        ops: &mut Assembler,
+        operands: &[Operand],
+        leaf: &JitCollectionLeafMethod,
+        view: &JitFunctionView,
+        miss: DynamicLabel,
+        done: DynamicLabel,
+    ) -> Result<bool, Unsupported> {
+        if view.cage_base == 0 {
+            return Ok(false);
+        }
+
+        let dst = reg(operands, 0)?;
+        let recv = reg(operands, 1)?;
+        let argc = const_index(operands, 3)? as usize;
+        let key = if argc == 0 {
+            None
+        } else {
+            Some(reg(operands, 4)?)
+        };
+        let guard_flags_byte = view.collection_layout.guard_flags_byte;
+        let object_shape_byte = view.object_shape_byte;
+        let object_values_ptr_byte = view.object_values_ptr_byte;
+        let native_static_fn_byte = view.native_static_fn_byte;
+        let method_value_byte = leaf.method_value_byte;
+        let receiver_type_tag = u32::from(leaf.receiver_type_tag);
+        let native_function_type_tag = u32::from(view.collection_layout.native_function_type_tag);
+
+        load_reg(ops, 9, recv)?;
+        dynasm!(ops
+            ; .arch aarch64
+            ; lsr x10, x9, #48
+            ; movz x11, TAG_PTR_OBJECT as u32
+            ; cmp x10, x11
+            ; b.ne =>miss
+            ; mov w12, w9
+        );
+        emit_load_u64(ops, 13, view.cage_base as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x13, x13, x12
+            ; ldrb w14, [x13]
+            ; cmp w14, receiver_type_tag
+            ; b.ne =>miss
+            ; ldr w14, [x13, guard_flags_byte]
+            ; cbnz w14, =>miss
+        );
+
+        emit_load_u64(ops, 15, view.cage_base as u64);
+        emit_load_u64(ops, 12, u64::from(leaf.proto_offset));
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x15, x15, x12
+            ; ldrb w14, [x15]
+            ; cmp w14, OBJECT_BODY_TYPE_TAG
+            ; b.ne =>miss
+            ; ldr w14, [x15, object_shape_byte]
+        );
+        emit_load_u64(ops, 12, u64::from(leaf.proto_shape));
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp w14, w12
+            ; b.ne =>miss
+            ; ldr x15, [x15, object_values_ptr_byte]
+            ; cbz x15, =>miss
+            ; ldr x9, [x15, method_value_byte]
+            ; lsr x10, x9, #48
+            ; movz x11, TAG_PTR_FUNCTION as u32
+            ; cmp x10, x11
+            ; b.ne =>miss
+            ; mov w12, w9
+        );
+        emit_load_u64(ops, 13, view.cage_base as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x13, x13, x12
+            ; ldrb w14, [x13]
+            ; cmp w14, native_function_type_tag
+            ; b.ne =>miss
+            ; ldr x14, [x13, native_static_fn_byte]
+        );
+        emit_load_u64(ops, 15, leaf.builtin_fn_addr as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp x14, x15
+            ; b.ne =>miss
+        );
+        emit_load_u64(ops, 11, u64::from(leaf.leaf_stub_id));
+        emit_leaf_no_alloc_stub2_pair_call(ops, 11, dst, recv, key, miss)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done);
+        Ok(true)
+    }
+
     /// Emit a direct `CallMethodValue`: resolve the method through the call
     /// site's monomorphic IC and direct-branch to its compiled entry, exactly
     /// like [`emit_call`]; on an ineligible resolution fall back to the in-place
@@ -4338,6 +4411,8 @@ mod arm64 {
         ops: &mut Assembler,
         operands: &[Operand],
         site: u64,
+        leaf: Option<&JitCollectionLeafMethod>,
+        view: Option<&JitFunctionView>,
         threw: DynamicLabel,
     ) -> Result<(), Unsupported> {
         const MAX_METHOD_ARGS: usize = 3;
@@ -4353,46 +4428,13 @@ mod arm64 {
         let after_leaf = ops.new_dynamic_label();
         let done = ops.new_dynamic_label();
 
-        // First ask the VM to validate the collection method-call IC guards.
-        // The generated code performs the leaf body call itself through the
-        // VM-native pair-result ABI; misses keep the existing direct/full path.
-        dynasm!(ops
-            ; .arch aarch64
-            ; mov x0, x20
-            ; movz x1, recv as u32
-        );
-        emit_load_u64(ops, 2, site);
-        emit_load_u64(
-            ops,
-            16,
-            jit_resolve_collection_leaf_method_stub as *const () as u64,
-        );
-        emit_load_u64(ops, 12, COLLECTION_LEAF_RESOLVE_THROW);
-        dynasm!(ops
-            ; .arch aarch64
-            ; blr x16
-            ; cmp x0, x12
-            ; b.eq =>threw
-            ; cbz x0, =>after_leaf
-            ; mov x11, x0
-        );
-        emit_leaf_no_alloc_stub2_pair_call(
-            ops,
-            11,
-            dst,
-            recv,
-            if argc == 0 {
-                None
-            } else {
-                Some(reg(operands, 4)?)
-            },
-            after_leaf,
-        )?;
-        dynasm!(ops
-            ; .arch aarch64
-            ; b =>done
-            ; =>after_leaf
-        );
+        if let (Some(leaf), Some(view)) = (leaf, view)
+            && emit_collection_leaf_method_guarded_call(
+                ops, operands, leaf, view, after_leaf, done,
+            )?
+        {
+            dynasm!(ops ; .arch aarch64 ; =>after_leaf);
+        }
 
         // jit_prepare_direct_method_call_stub(ctx, recv, name, site, argc, a0..a2)
         // -> 0 = direct prepared, 1 = throw, 2 = ineligible → in-place fallback.
@@ -5079,9 +5121,12 @@ mod tests {
             jit_proto_byte: 12,
             closure_fid_byte: 8,
             closure_upvalues_ptr_byte: 16,
+            collection_layout: Default::default(),
+            native_static_fn_byte: 0,
             instructions,
             inline_callees: Default::default(),
             inline_methods: Default::default(),
+            collection_leaf_methods: Default::default(),
         }
     }
 

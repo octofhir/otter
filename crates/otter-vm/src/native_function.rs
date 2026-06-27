@@ -196,7 +196,15 @@ pub type NativeTraceFn = dyn Fn(&mut SlotVisitor<'_>);
 /// Heap payload for [`Value::NativeFunction`].
 #[derive(otter_macros::Pelt)]
 #[pelt(tag = NATIVE_FUNCTION_BODY_TYPE_TAG)]
+#[repr(C)]
 pub struct NativeFunctionBody {
+    /// Machine-readable static function identity for JIT builtin guards.
+    ///
+    /// Zero means the callable is not backed by [`NativeCallStorage::Static`].
+    /// Static builtins store their raw function entry address here so generated
+    /// code can validate prototype method slots without decoding the Rust enum.
+    #[pelt(skip)]
+    jit_static_fn: usize,
     /// Display name (used in stack traces and `Function.prototype.
     /// toString` once that lands).
     #[pelt(skip)]
@@ -238,6 +246,11 @@ pub struct NativeFunctionBody {
     /// be a callable (a NativeFunction such as `%TypedArray%`).
     prototype_override: Option<Value>,
 }
+
+pub(crate) const NATIVE_FUNCTION_BODY_JIT_STATIC_FN_OFFSET: usize =
+    std::mem::offset_of!(NativeFunctionBody, jit_static_fn);
+
+const _: () = assert!(NATIVE_FUNCTION_BODY_JIT_STATIC_FN_OFFSET == 0);
 
 fn trace_native_trace_hook(trace: &Option<Arc<NativeTraceFn>>, visitor: &mut SlotVisitor<'_>) {
     if let Some(t) = trace {
@@ -310,6 +323,12 @@ impl NativeFunction {
         Ok(Self {
             inner: heap.alloc_with_roots(
                 NativeFunctionBody {
+                    jit_static_fn: match call {
+                        NativeCallStorage::Static(f) => f as *const () as usize,
+                        NativeCallStorage::VmIntrinsic(_)
+                        | NativeCallStorage::Dynamic(_)
+                        | NativeCallStorage::LocalDynamic(_) => 0,
+                    },
                     name,
                     length,
                     call,
@@ -937,6 +956,14 @@ impl NativeFunction {
         heap.read_payload(self.inner, |body| match body.call {
             NativeCallStorage::Static(call) => std::ptr::fn_addr_eq(call, expected),
             _ => false,
+        })
+    }
+
+    /// Raw static function address for JIT builtin guards.
+    #[must_use]
+    pub(crate) fn jit_static_fn_addr(&self, heap: &otter_gc::GcHeap) -> Option<usize> {
+        heap.read_payload(self.inner, |body| {
+            (body.jit_static_fn != 0).then_some(body.jit_static_fn)
         })
     }
 

@@ -384,10 +384,11 @@ Exit criteria:
 - [x] JIT backedge interrupt/runtime-budget poll stub.
 - [x] First `LeafNoAlloc` runtime stub.
 - [x] Baseline pair-result call sequence for collection `LeafNoAlloc` stubs.
+- [x] JIT-readable collection method IC leaf guards.
 - [ ] First `AllocStub` runtime stub with GC-stress coverage.
 - [ ] JIT call path to stubs without `NativeCtx`.
-- [ ] Map/Set feedback model.
-- [ ] Compiled `Map.get` / `Map.has` hot loop.
+- [x] Map/Set feedback model for leaf lookup stubs.
+- [x] Compiled `Map.get` / `Map.has` hot loop.
 - [ ] Compiled `Map.set` / `Set.add` hot loop.
 - [ ] String concat specialized node.
 - [ ] Shared object header design.
@@ -441,3 +442,22 @@ non-`Ok` status continue through the existing direct/full method fallback.
 Remaining bridge: receiver/prototype/builtin guard resolution is still in Rust.
 Next slice should make method IC guard metadata JIT-readable so this resolver
 bridge can be removed.
+
+### 2026-06-27: JIT-readable collection leaf guards
+
+Touched surface: runtime stubs, object/function layout metadata, and JIT/runtime
+ABI.
+
+Collection leaf method ICs now bake a `JitCollectionLeafMethod` DTO into the
+compile snapshot. Baseline code validates the receiver family, no
+prototype/expando override flags, prototype shape, method slot, and native
+builtin identity directly in machine code before calling the pair-result leaf
+stub. This removes the `jit_resolve_collection_leaf_method_stub` bridge from the
+steady-state baseline path; misses fall through to the existing direct/full
+method fallback.
+
+The guard is deliberately stricter than the Rust IC for explicit prototype
+overrides: even an override pointing back to the canonical prototype misses the
+machine guard and uses fallback. That preserves semantics while keeping the
+first machine-readable guard compact. The next ABI slice should turn
+`Map.set`/`Set.add` into `AllocStub` entries with safepoint metadata.

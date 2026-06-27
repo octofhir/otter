@@ -1532,38 +1532,22 @@ impl Interpreter {
         args: &[Value],
     ) -> crate::native_abi::RuntimeStubResult {
         let key = args.first().copied().unwrap_or_else(Value::undefined);
-        if key
-            .as_string(&self.gc_heap)
-            .is_some_and(|s| !s.is_flat_or_latin1(&self.gc_heap))
-        {
-            return crate::native_abi::RuntimeStubResult::miss();
-        }
         match op {
-            CollectionFastOp::MapGet => {
-                let Some(map) = recv.as_map() else {
-                    return crate::native_abi::RuntimeStubResult::miss();
-                };
-                crate::native_abi::RuntimeStubResult::ok_value(
-                    crate::collections::map_get(map, &self.gc_heap, &key)
-                        .unwrap_or_else(Value::undefined),
-                )
-            }
-            CollectionFastOp::MapHas => {
-                let Some(map) = recv.as_map() else {
-                    return crate::native_abi::RuntimeStubResult::miss();
-                };
-                crate::native_abi::RuntimeStubResult::ok_value(Value::boolean(
-                    crate::collections::map_has(map, &self.gc_heap, &key),
-                ))
-            }
-            CollectionFastOp::SetHas => {
-                let Some(set) = recv.as_set() else {
-                    return crate::native_abi::RuntimeStubResult::miss();
-                };
-                crate::native_abi::RuntimeStubResult::ok_value(Value::boolean(
-                    crate::collections::set_has(set, &self.gc_heap, &key),
-                ))
-            }
+            CollectionFastOp::MapGet => crate::runtime_stubs::collection_map_get_leaf(
+                &self.gc_heap,
+                recv.to_abi_bits(),
+                key.to_abi_bits(),
+            ),
+            CollectionFastOp::MapHas => crate::runtime_stubs::collection_map_has_leaf(
+                &self.gc_heap,
+                recv.to_abi_bits(),
+                key.to_abi_bits(),
+            ),
+            CollectionFastOp::SetHas => crate::runtime_stubs::collection_set_has_leaf(
+                &self.gc_heap,
+                recv.to_abi_bits(),
+                key.to_abi_bits(),
+            ),
             CollectionFastOp::MapSet
             | CollectionFastOp::MapDelete
             | CollectionFastOp::SetAdd

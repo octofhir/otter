@@ -808,10 +808,50 @@ fn to_utf16_vec_slice(heap: &GcHeap, parent: JsStringHandle, start: u32, length:
     out
 }
 
+/// Borrowed view over a directly-stored (non-cons, non-sliced) flat body's
+/// code units. Lets two flat bodies compare content in place instead of each
+/// allocating a throwaway `to_utf16_vec`.
+enum FlatContent<'a> {
+    Latin1(&'a [u8]),
+    Wide(&'a [u16]),
+}
+
+/// Content view for the four directly-stored variants; `None` for `Cons` /
+/// `Sliced`, which carry no contiguous own buffer.
+fn flat_content(repr: &JsStringBodyRepr, len: usize) -> Option<FlatContent<'_>> {
+    match repr {
+        JsStringBodyRepr::InlineLatin1(buf) => Some(FlatContent::Latin1(&buf[..len])),
+        JsStringBodyRepr::Latin1(bytes) => Some(FlatContent::Latin1(bytes.as_slice())),
+        JsStringBodyRepr::InlineFlat(buf) => Some(FlatContent::Wide(&buf[..len])),
+        JsStringBodyRepr::Flat(units) => Some(FlatContent::Wide(units.as_slice())),
+        JsStringBodyRepr::Cons { .. } | JsStringBodyRepr::Sliced { .. } => None,
+    }
+}
+
+impl FlatContent<'_> {
+    /// Code-unit equality across any pairing of Latin-1 / WTF-16 storage. A
+    /// Latin-1 byte zero-extends to its `u16` code unit.
+    fn content_eq(&self, other: &FlatContent<'_>) -> bool {
+        match (self, other) {
+            (FlatContent::Latin1(a), FlatContent::Latin1(b)) => a == b,
+            (FlatContent::Wide(a), FlatContent::Wide(b)) => a == b,
+            (FlatContent::Latin1(bytes), FlatContent::Wide(units))
+            | (FlatContent::Wide(units), FlatContent::Latin1(bytes)) => {
+                bytes.len() == units.len()
+                    && bytes
+                        .iter()
+                        .zip(units.iter())
+                        .all(|(&byte, &unit)| u16::from(byte) == unit)
+            }
+        }
+    }
+}
+
 /// Two-string equality on UTF-16 code units. Fast paths:
 /// - identity (`Gc::eq`);
 /// - length mismatch returns `false` immediately;
-/// - hash mismatch returns `false` immediately.
+/// - hash mismatch returns `false` immediately;
+/// - both sides flat: direct in-place content compare (no materialisation).
 #[must_use]
 pub fn equals_string_bodies(heap: &GcHeap, a: JsStringHandle, b: JsStringHandle) -> bool {
     if a == b {
@@ -844,6 +884,18 @@ pub fn equals_string_bodies(heap: &GcHeap, a: JsStringHandle, b: JsStringHandle)
     // through to the body walk.
     if !a_is_cons && !b_is_cons && a_hash != b_hash {
         return false;
+    }
+    // Direct content compare when both bodies are flat (inline or side
+    // storage) — the dominant case for interned/flattened keys (e.g. Map/Set
+    // lookups), avoiding two throwaway `to_utf16_vec` allocations. `Cons` /
+    // `Sliced` bodies return `None` and fall through to the materialising walk.
+    if let Some(answer) = heap.read_payload(a, |ba| {
+        let va = flat_content(&ba.repr, a_len as usize)?;
+        heap.read_payload(b, |bb| {
+            flat_content(&bb.repr, b_len as usize).map(|vb| va.content_eq(&vb))
+        })
+    }) {
+        return answer;
     }
     to_utf16_vec(heap, a) == to_utf16_vec(heap, b)
 }

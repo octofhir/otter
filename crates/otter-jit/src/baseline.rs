@@ -455,21 +455,56 @@ extern "C" fn jit_interrupt_backedge_stub(ctx: *mut JitCtx) -> u64 {
     }
 }
 
-/// WhiskerIC self-patching cell for one named-property site (one per
-/// `LoadProperty` / `StoreProperty` op in the compiled function). Emitted code
-/// reads `shape` (offset 0); `0` means "empty — always miss to the stub". On a
-/// monomorphic own-data inline-slot hit the stub fills `value_byte` then
-/// `shape`, so the next execution inlines the access (shape guard +
-/// fixed-offset slot read/write, no VM round-trip). The cell holds only
-/// compressed offsets (no GC pointers), so it needs no tracing, and a shape
-/// offset is a stable token (shapes are immortal and pinned in old space).
+/// Number of shapes a WhiskerIC site caches inline before it is megamorphic and
+/// always misses to the stub. Four matches the polymorphism most real sites
+/// reach (V8 / JSC use the same width); a bimorphic site (e.g. two object
+/// layouts alternating through one loop) then stays fully inline instead of
+/// thrashing a single cell.
+const IC_WAYS: usize = 4;
+
+/// One cached `(shape → slot)` mapping in a [`WhiskerIcCell`].
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct WhiskerIcCell {
+struct WhiskerIcWay {
     /// Cached receiver shape-handle compressed offset; `0` == empty.
     shape: u32,
     /// Byte offset from the value slab pointer to the value slot.
     value_byte: u32,
+}
+
+/// WhiskerIC self-patching cell for one named-property site (one per
+/// `LoadProperty` / `StoreProperty` op in the compiled function). Emitted code
+/// walks the [`IC_WAYS`] ways comparing each `shape` (a `0` shape never matches
+/// a live receiver, so empty ways are skipped for free); on a hit it reads the
+/// matched way's `value_byte`. On a monomorphic own-data inline-slot miss the
+/// stub fills the next empty way, so a poly site caches every shape it sees up
+/// to the width. The cell holds only compressed offsets (no GC pointers), so it
+/// needs no tracing, and a shape offset is a stable token (shapes are immortal
+/// and pinned in old space).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct WhiskerIcCell {
+    ways: [WhiskerIcWay; IC_WAYS],
+}
+
+/// Self-patch one IC cell with a resolved `(shape, value_byte)` mapping: fill
+/// the first empty way, or evict way 0 when all are full (the site is more
+/// polymorphic than the cache is wide). Writes `value_byte` before `shape` so a
+/// concurrent inline guard never reads a live shape against a stale offset.
+///
+/// # Safety
+/// `cell` must be a valid, stable [`WhiskerIcCell`] pointer (a site's cell from
+/// the owning `BaselineCode` backing slice).
+unsafe fn whisker_ic_fill(cell: *mut WhiskerIcCell, shape: u32, value_byte: u32) {
+    unsafe {
+        let ways = &mut (*cell).ways;
+        let slot = ways
+            .iter()
+            .position(|w| w.shape == 0 || w.shape == shape)
+            .unwrap_or(0);
+        ways[slot].value_byte = value_byte;
+        ways[slot].shape = shape;
+    }
 }
 
 /// Bridge stub: perform a named `LoadProperty` from compiled code, delegating
@@ -510,8 +545,7 @@ extern "C" fn jit_load_prop_stub(
                 // emitted code from the owning `BaselineCode::load_ic_cells`
                 // slice, which outlives every execution of this code.
                 unsafe {
-                    (*cell).value_byte = (fill >> 32) as u32;
-                    (*cell).shape = fill as u32;
+                    whisker_ic_fill(cell, fill as u32, (fill >> 32) as u32);
                 }
             }
             0
@@ -559,8 +593,7 @@ extern "C" fn jit_load_prop_window_stub(
                 let cell = cell as *mut WhiskerIcCell;
                 // SAFETY: stable per-site cell address baked into this code.
                 unsafe {
-                    (*cell).value_byte = (fill >> 32) as u32;
-                    (*cell).shape = fill as u32;
+                    whisker_ic_fill(cell, fill as u32, (fill >> 32) as u32);
                 }
             }
             0
@@ -607,8 +640,7 @@ extern "C" fn jit_store_prop_window_stub(
                 let cell = cell as *mut WhiskerIcCell;
                 // SAFETY: stable per-site cell address baked into this code.
                 unsafe {
-                    (*cell).value_byte = (fill >> 32) as u32;
-                    (*cell).shape = fill as u32;
+                    whisker_ic_fill(cell, fill as u32, (fill >> 32) as u32);
                 }
             }
             0
@@ -658,8 +690,7 @@ extern "C" fn jit_store_prop_stub(
                 // emitted code from `BaselineCode::store_ic_cells`, which
                 // outlives every execution of this code.
                 unsafe {
-                    (*cell).value_byte = (fill >> 32) as u32;
-                    (*cell).shape = fill as u32;
+                    whisker_ic_fill(cell, fill as u32, (fill >> 32) as u32);
                 }
             }
             0
@@ -1082,7 +1113,7 @@ mod arm64 {
     use super::{
         ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET, BAIL_PC_OFFSET, BaselineCode, CONTEXT_OFFSET,
         DIRECT_ENTRY_OFFSET, DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET,
-        DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET,
+        DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET, IC_WAYS,
         JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS, OBJECT_BODY_TYPE_TAG, Op,
         Operand, REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET, SPECIAL_FALSE, SPECIAL_HOLE,
         SPECIAL_NULL, SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
@@ -2389,13 +2420,29 @@ mod arm64 {
                             ; ldr w14, [x13, shape_byte] // receiver shape handle
                         );
                         emit_load_u64(&mut ops, 15, cell_addr as u64);
+                        // Walk the IC ways: each empty way holds shape 0, which a
+                        // live receiver shape (w14, non-zero) never equals, so
+                        // empty ways skip for free. A hit loads that way's value
+                        // byte into w17 and shares the slab read.
+                        let do_load = ops.new_dynamic_label();
+                        for way in 0..IC_WAYS as u32 {
+                            let shape_off = way * 8;
+                            let vbyte_off = shape_off + 4;
+                            let next = ops.new_dynamic_label();
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; ldr w16, [x15, shape_off]
+                                ; cmp w14, w16
+                                ; b.ne =>next
+                                ; ldr w17, [x15, vbyte_off]
+                                ; b =>do_load
+                                ; =>next
+                            );
+                        }
                         dynasm!(ops
                             ; .arch aarch64
-                            ; ldr w16, [x15]           // cached shape (0 = empty)
-                            ; cbz w16, =>miss
-                            ; cmp w14, w16
-                            ; b.ne =>miss
-                            ; ldr w17, [x15, #4]       // cached value byte offset
+                            ; b =>miss
+                            ; =>do_load
                             ; ldr x13, [x13, values_ptr_byte] // value slab base
                             ; cbz x13, =>miss
                             ; ldr x9, [x13, x17]       // slab slot value
@@ -2483,13 +2530,27 @@ mod arm64 {
                             ; ldr w14, [x13, shape_byte] // receiver shape handle
                         );
                         emit_load_u64(&mut ops, 15, cell_addr as u64);
+                        // N-way IC walk (see `LoadProperty`): match a way's shape,
+                        // load its value byte into w17, then share the slab write.
+                        let do_store = ops.new_dynamic_label();
+                        for way in 0..IC_WAYS as u32 {
+                            let shape_off = way * 8;
+                            let vbyte_off = shape_off + 4;
+                            let next = ops.new_dynamic_label();
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; ldr w16, [x15, shape_off]
+                                ; cmp w14, w16
+                                ; b.ne =>next
+                                ; ldr w17, [x15, vbyte_off]
+                                ; b =>do_store
+                                ; =>next
+                            );
+                        }
                         dynasm!(ops
                             ; .arch aarch64
-                            ; ldr w16, [x15]           // cached shape (0 = empty)
-                            ; cbz w16, =>miss
-                            ; cmp w14, w16
-                            ; b.ne =>miss
-                            ; ldr w17, [x15, #4]       // cached value byte offset
+                            ; b =>miss
+                            ; =>do_store
                             ; ldr x9, [x19, src_off]   // value to store
                             ; ldr x13, [x13, values_ptr_byte] // value slab base
                             ; cbz x13, =>miss

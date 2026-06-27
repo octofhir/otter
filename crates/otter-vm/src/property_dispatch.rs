@@ -3224,7 +3224,9 @@ impl Interpreter {
                 // (former) compile-time bake, but resolved at runtime so a site
                 // that was cold when its function tiered up (OSR off an earlier
                 // loop) still inlines once warm.
-                return Ok(self.whisker_load_cell_fill(site));
+                return Ok(
+                    self.whisker_load_cell_fill(site, object::shape(obj, &self.gc_heap).offset())
+                );
             }
             if self.load_property_ics[site].entry_count() > 0 {
                 self.load_property_ics[site].record_guard_miss_with_stats(
@@ -3247,7 +3249,9 @@ impl Interpreter {
                     ic,
                 );
                 write_register(&mut stack[frame_index], dst, value)?;
-                return Ok(self.whisker_load_cell_fill(site));
+                return Ok(
+                    self.whisker_load_cell_fill(site, object::shape(obj, &self.gc_heap).offset())
+                );
             }
         }
         // Slow path: full `[[Get]]` (proto walk / accessor / non-object). It
@@ -3308,7 +3312,10 @@ impl Interpreter {
             unsafe {
                 *regs.add(dst as usize) = value.to_bits();
             }
-            return Ok(Some(self.whisker_load_cell_fill(site)));
+            return Ok(Some(self.whisker_load_cell_fill(
+                site,
+                object::shape(obj, &self.gc_heap).offset(),
+            )));
         }
         if self.load_property_ics[site].entry_count() > 0 {
             self.load_property_ics[site]
@@ -3329,7 +3336,10 @@ impl Interpreter {
             unsafe {
                 *regs.add(dst as usize) = value.to_bits();
             }
-            return Ok(Some(self.whisker_load_cell_fill(site)));
+            return Ok(Some(self.whisker_load_cell_fill(
+                site,
+                object::shape(obj, &self.gc_heap).offset(),
+            )));
         }
         Ok(None)
     }
@@ -3375,7 +3385,10 @@ impl Interpreter {
                 .is_some()
             {
                 self.property_ic_stats.record_hit(PropertyIcKind::Store);
-                return Ok(Some(self.whisker_store_cell_fill(site)));
+                return Ok(Some(self.whisker_store_cell_fill(
+                    site,
+                    object::shape(obj, &self.gc_heap).offset(),
+                )));
             }
         }
         if entries_len > 0 {
@@ -3402,7 +3415,10 @@ impl Interpreter {
                 PropertyIcKind::Store,
                 ic,
             );
-            return Ok(Some(self.whisker_store_cell_fill(site)));
+            return Ok(Some(self.whisker_store_cell_fill(
+                site,
+                object::shape(obj, &self.gc_heap).offset(),
+            )));
         }
         Ok(None)
     }
@@ -3415,19 +3431,19 @@ impl Interpreter {
     /// inside the object's contiguous value slab. Only a warm, single-entry
     /// `OwnData` IC qualifies; everything else returns `0`, leaving the emitted
     /// site on the stub.
-    fn whisker_load_cell_fill(&self, site: usize) -> u64 {
-        let entry = &self.load_property_ics[site];
-        if entry.entry_count() != 1 {
+    fn whisker_load_cell_fill(&self, site: usize, recv_shape: u32) -> u64 {
+        if recv_shape == 0 {
             return 0;
         }
-        let LoadPropertyIc::OwnData { hit } = &entry.entries()[0] else {
-            return 0;
-        };
-        if hit.shape.is_null() {
-            return 0;
+        for ic in self.load_property_ics[site].entries() {
+            if let LoadPropertyIc::OwnData { hit } = ic
+                && hit.shape.offset() == recv_shape
+            {
+                let value_byte = u32::from(hit.slot) * std::mem::size_of::<Value>() as u32;
+                return (u64::from(value_byte) << 32) | u64::from(hit.shape.offset());
+            }
         }
-        let value_byte = u32::from(hit.slot) * std::mem::size_of::<Value>() as u32;
-        (u64::from(value_byte) << 32) | u64::from(hit.shape.offset())
+        0
     }
 
     /// JIT bridge for a computed `LoadElement` (`recv[idx]`) from compiled code.
@@ -3882,7 +3898,9 @@ impl Interpreter {
                 // emitted site can self-patch its WhiskerIC cell and inline
                 // subsequent stores (shape guard + slot write + value-gated
                 // barrier) without re-entering this stub.
-                return Ok(self.whisker_store_cell_fill(site));
+                return Ok(
+                    self.whisker_store_cell_fill(site, object::shape(obj, &self.gc_heap).offset())
+                );
             }
             if entries_len > 0 {
                 self.store_property_ics[site].record_guard_miss_with_stats(
@@ -3910,7 +3928,9 @@ impl Interpreter {
                     PropertyIcKind::Store,
                     ic,
                 );
-                return Ok(self.whisker_store_cell_fill(site));
+                return Ok(
+                    self.whisker_store_cell_fill(site, object::shape(obj, &self.gc_heap).offset())
+                );
             }
         }
         // Slow path: full `[[Set]]` (transition / accessor / reject). It
@@ -3930,19 +3950,19 @@ impl Interpreter {
     /// value slab, so it stays on the stub. The shape guard the emitted site
     /// keeps also guarantees the slot is the writable data slot the IC captured
     /// (a shape encodes per-slot flags and key), so the inline write is sound.
-    fn whisker_store_cell_fill(&self, site: usize) -> u64 {
-        let entry = &self.store_property_ics[site];
-        if entry.entry_count() != 1 {
+    fn whisker_store_cell_fill(&self, site: usize, recv_shape: u32) -> u64 {
+        if recv_shape == 0 {
             return 0;
         }
-        let StorePropertyIc::ExistingOwnDataStore { hit } = &entry.entries()[0] else {
-            return 0;
-        };
-        if hit.shape.is_null() {
-            return 0;
+        for ic in self.store_property_ics[site].entries() {
+            if let StorePropertyIc::ExistingOwnDataStore { hit } = ic
+                && hit.shape.offset() == recv_shape
+            {
+                let value_byte = u32::from(hit.slot) * std::mem::size_of::<Value>() as u32;
+                return (u64::from(value_byte) << 32) | u64::from(hit.shape.offset());
+            }
         }
-        let value_byte = u32::from(hit.slot) * std::mem::size_of::<Value>() as u32;
-        (u64::from(value_byte) << 32) | u64::from(hit.shape.offset())
+        0
     }
 
     /// JIT bridge: run the GC write barrier after an inline `StoreProperty`

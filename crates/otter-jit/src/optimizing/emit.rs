@@ -104,6 +104,24 @@ impl otter_vm::JitFunctionCode for OptimizedCode {
         self.code.len()
     }
 
+    fn osr_only(&self) -> bool {
+        self.entry_via_osr_only
+    }
+
+    fn entry_addr(&self) -> Option<usize> {
+        // A whole-function optimized body shares the baseline's `JitEntry` ABI,
+        // so it can be a direct-call target: a caller's `Op::Call` enters it at
+        // PC 0 without the generic call bridge. An `entry_via_osr_only` body has
+        // an un-runnable prologue (it only exists for its loop OSR trampolines),
+        // so it has no callable entry.
+        if self.entry_via_osr_only {
+            return None;
+        }
+        // SAFETY: the mapping is live for `self`; callers keep the owning code
+        // object installed while using this address.
+        Some(unsafe { self.code.entry_ptr() as usize })
+    }
+
     fn run_entry(&self, _ptrs: otter_vm::JitReentryPtrs) -> otter_vm::JitExecOutcome {
         if self.entry_via_osr_only {
             // The compiled code has an un-compilable prologue / epilogue: never

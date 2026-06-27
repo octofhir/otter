@@ -476,6 +476,70 @@ pub fn flatten_string_body(
     alloc_flat_string_body_with_roots(heap, JsStringId::new(0), &units, external_visit)
 }
 
+/// Flatten a cons rope / slice view **in place**: materialize its contents once
+/// and rewrite the body's `repr` to a flat body (Latin-1 when every unit fits in
+/// a byte, else WTF-16). A no-op for already-flat bodies.
+///
+/// This is the rope-flattening that production engines (V8, JSC) perform on
+/// first content access: a string built incrementally (`s += chunk`) is a rope,
+/// and every scan over it (`indexOf`, `includes`, `split`, …) would otherwise
+/// re-walk and re-materialize the whole rope. Flattening the shared body once
+/// makes every later access — and every later call on the same handle — hit the
+/// O(1) flat / Latin-1 fast paths with no allocation. The body keeps its `id`,
+/// `len`, and `hash` (content is unchanged), so every existing handle and
+/// interner entry stays valid; the old child handles simply become unreachable.
+pub fn flatten_in_place(
+    heap: &mut GcHeap,
+    string: JsStringHandle,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let is_indirect = heap.read_payload(string, |b| {
+        matches!(
+            b.repr,
+            JsStringBodyRepr::Cons { .. } | JsStringBodyRepr::Sliced { .. }
+        )
+    });
+    if !is_indirect {
+        return Ok(());
+    }
+    let units = to_utf16_vec(heap, string);
+    let latin1 = units.iter().all(|&u| u <= 0xFF);
+    // Reserving side storage can scavenge; keep `string` rooted so its handle is
+    // forwarded, then mutate the relocated body.
+    let mut rooted = string;
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        let p = &mut rooted as *mut JsStringHandle as *mut RawGc;
+        visitor(p);
+        external_visit(visitor);
+    };
+    let repr = if latin1 {
+        if units.len() > INLINE_LATIN1_CAP {
+            heap.reserve_bytes_with_roots(units.len() as u64, &mut visit)?;
+        }
+        let bytes: Vec<u8> = units.iter().map(|&u| u as u8).collect();
+        if bytes.len() <= INLINE_LATIN1_CAP {
+            let mut inline = [0u8; INLINE_LATIN1_CAP];
+            inline[..bytes.len()].copy_from_slice(&bytes);
+            JsStringBodyRepr::InlineLatin1(inline)
+        } else {
+            JsStringBodyRepr::Latin1(bytes)
+        }
+    } else {
+        if units.len() > INLINE_FLAT_CAP {
+            heap.reserve_bytes_with_roots((units.len() as u64).saturating_mul(2), &mut visit)?;
+        }
+        if units.len() <= INLINE_FLAT_CAP {
+            let mut inline = [0u16; INLINE_FLAT_CAP];
+            inline[..units.len()].copy_from_slice(&units);
+            JsStringBodyRepr::InlineFlat(inline)
+        } else {
+            JsStringBodyRepr::Flat(units)
+        }
+    };
+    heap.with_payload(rooted, |b| b.repr = repr);
+    Ok(())
+}
+
 /// Compare a JS string against a UTF-8 `&str` for code-unit equality
 /// **without allocating** for the common single-segment case.
 ///

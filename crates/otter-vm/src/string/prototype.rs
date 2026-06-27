@@ -579,6 +579,10 @@ fn impl_index_of(
     let recv = receiver_string(ctx, receiver)?;
     let needle = arg_to_string(ctx, args, 0)?;
     let from = arg_u32_or(ctx, args, 1, 0)?;
+    // Flatten the haystack once so this and later scans use the Latin-1 / flat
+    // fast path instead of re-materializing a rope on every call.
+    recv.flatten_in_place(ctx.heap_mut())
+        .map_err(|_| type_error("String.prototype", "out of memory"))?;
     let pos = recv
         .index_of(needle, from, None, ctx.heap_mut())
         .map_err(|Interrupted| type_error("String.prototype", "interrupted"))?;
@@ -651,6 +655,8 @@ fn impl_includes(
     }
     let needle = value_to_string(ctx, search, "String.prototype.includes")?;
     let from = arg_u32_or(ctx, args, 1, 0)?;
+    recv.flatten_in_place(ctx.heap_mut())
+        .map_err(|_| type_error("String.prototype", "out of memory"))?;
     let pos = recv
         .index_of(needle, from, None, ctx.heap_mut())
         .map_err(|Interrupted| type_error("String.prototype", "interrupted"))?;
@@ -2125,6 +2131,8 @@ fn impl_last_index_of(
         }
         _ => len,
     };
+    recv.flatten_in_place(ctx.heap_mut())
+        .map_err(|_| type_error("String.prototype", "out of memory"))?;
     let pos = recv
         .last_index_of(needle, position, None, ctx.heap_mut())
         .map_err(|Interrupted| type_error("String.prototype", "interrupted"))?;

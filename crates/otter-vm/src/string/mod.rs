@@ -336,6 +336,18 @@ impl JsString {
         })
     }
 
+    /// Flatten a rope / slice body **in place** so this handle (and every other
+    /// handle to the same body) reads as a flat string thereafter. A no-op for
+    /// already-flat strings. Used before repeated scans (`indexOf`, `includes`,
+    /// `split`) so the body materializes once instead of on every call.
+    ///
+    /// # Errors
+    /// Surfaces [`OutOfMemory`] verbatim.
+    pub fn flatten_in_place(self, heap: &mut GcHeap) -> Result<(), OutOfMemory> {
+        let mut roots = no_extra_roots;
+        gc_body::flatten_in_place(heap, self.handle, &mut roots)
+    }
+
     /// Body handle for the legacy bridge. Phase B: the wrapper *is*
     /// the handle, so this is a copy.
     ///

@@ -283,7 +283,10 @@ descriptor-id lookup/invocation path for fixed two-argument leaf entries.
 Leaf entries now use an explicit native ABI (`extern "C"` heap pointer plus raw
 boxed value bits) rather than Rust's default function ABI, and a generic
 `leaf_no_alloc_stub2_trampoline` lets generated code call a dynamic
-`RuntimeStubId` before later specializing to a direct entry address. Compiled
+`RuntimeStubId` before later specializing to a direct entry address. Leaf
+results also have a two-register `RuntimeStubResultPair` form so generated code
+does not need a hidden structure-return pointer just to inspect `Ok` / `Miss`,
+and `JitCtx` now carries an opaque heap pointer for direct leaf calls. Compiled
 code still reaches this through the current method runtime stub; baseline
 compiled `CallMethodValue` now tries a narrow collection-leaf bridge before the
 generic method bridge, so hot `Map.get` / `Map.has` / `Set.has` sites can return

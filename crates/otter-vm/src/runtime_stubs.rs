@@ -20,7 +20,7 @@
 //! - [`crate::method_ops`]
 
 use crate::native_abi::{
-    NO_SAFEPOINT, RuntimeStubDescriptor, RuntimeStubId, RuntimeStubResult,
+    NO_SAFEPOINT, RuntimeStubDescriptor, RuntimeStubId, RuntimeStubResult, RuntimeStubResultPair,
     STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_SET_HAS_LEAF,
     validate_stub_descriptor,
 };
@@ -135,6 +135,17 @@ pub extern "C" fn leaf_no_alloc_stub2_trampoline(
         return RuntimeStubResult::miss();
     };
     stub.invoke_raw(heap, a0_bits, a1_bits)
+}
+
+/// Two-register result variant of [`leaf_no_alloc_stub2_trampoline`].
+#[must_use]
+pub extern "C" fn leaf_no_alloc_stub2_trampoline_pair(
+    heap: *const otter_gc::GcHeap,
+    id: RuntimeStubId,
+    a0_bits: u64,
+    a1_bits: u64,
+) -> RuntimeStubResultPair {
+    RuntimeStubResultPair::from_result(leaf_no_alloc_stub2_trampoline(heap, id, a0_bits, a1_bits))
 }
 
 /// Leaf `Map.prototype.get` probe.
@@ -279,6 +290,15 @@ mod tests {
         );
         assert_eq!(result.status, RuntimeStubStatus::Ok);
         assert_eq!(result.into_value(), Some(n(42)));
+
+        let pair = leaf_no_alloc_stub2_trampoline_pair(
+            &heap as *const otter_gc::GcHeap,
+            STUB_COLLECTION_MAP_GET_LEAF.id,
+            Value::map(map).to_abi_bits(),
+            Value::string(key).to_abi_bits(),
+        );
+        assert_eq!(pair.status(), RuntimeStubStatus::Ok);
+        assert_eq!(pair.into_result().into_value(), Some(n(42)));
     }
 
     #[test]

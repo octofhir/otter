@@ -334,6 +334,62 @@ impl RuntimeStubResult {
     }
 }
 
+/// Two-register runtime-stub result ABI.
+///
+/// This is the machine-code-friendly form for leaf stubs on AArch64/x86_64:
+/// `value_bits` occupies the first result register and `status_payload` the
+/// second. The low 8 bits of `status_payload` are [`RuntimeStubStatus`]; the
+/// remaining high bits carry the payload. General re-entrant stubs can keep
+/// using [`RuntimeStubResult`] until they need the same direct-call ABI.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeStubResultPair {
+    /// Raw boxed [`crate::Value`] bits when status is `Ok`.
+    pub value_bits: u64,
+    /// Low 8 bits: status. High 56 bits: payload.
+    pub status_payload: u64,
+}
+
+impl RuntimeStubResultPair {
+    /// Pack a full runtime-stub result into the two-register ABI.
+    #[must_use]
+    pub const fn from_result(result: RuntimeStubResult) -> Self {
+        Self {
+            value_bits: result.value_bits,
+            status_payload: ((result.payload & 0x00ff_ffff_ffff_ffff) << 8) | result.status as u64,
+        }
+    }
+
+    /// Extract the status byte.
+    #[must_use]
+    pub const fn status(self) -> RuntimeStubStatus {
+        match (self.status_payload & 0xff) as u8 {
+            0 => RuntimeStubStatus::Ok,
+            1 => RuntimeStubStatus::Miss,
+            2 => RuntimeStubStatus::Throw,
+            3 => RuntimeStubStatus::Deopt,
+            4 => RuntimeStubStatus::OutOfMemory,
+            _ => RuntimeStubStatus::Interrupt,
+        }
+    }
+
+    /// Extract the packed payload.
+    #[must_use]
+    pub const fn payload(self) -> u64 {
+        self.status_payload >> 8
+    }
+
+    /// Convert back to the full Rust-facing result record.
+    #[must_use]
+    pub const fn into_result(self) -> RuntimeStubResult {
+        RuntimeStubResult {
+            status: self.status(),
+            value_bits: self.value_bits,
+            payload: self.payload(),
+        }
+    }
+}
+
 /// Storage class for one tagged value location at a safepoint.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,6 +501,7 @@ mod tests {
     fn abi_records_stay_small() {
         assert!(std::mem::size_of::<NativeFrameHeader>() <= 40);
         assert!(std::mem::size_of::<RuntimeStubResult>() <= 24);
+        assert_eq!(std::mem::size_of::<RuntimeStubResultPair>(), 16);
         assert!(std::mem::size_of::<TaggedLocation>() <= 4);
     }
 
@@ -461,5 +518,14 @@ mod tests {
         let result = RuntimeStubResult::miss();
         assert_eq!(result.status, RuntimeStubStatus::Miss);
         assert_eq!(result.into_value(), None);
+    }
+
+    #[test]
+    fn stub_result_pair_round_trips_result() {
+        let result = RuntimeStubResult::deopt(17);
+        let pair = RuntimeStubResultPair::from_result(result);
+        assert_eq!(pair.status(), RuntimeStubStatus::Deopt);
+        assert_eq!(pair.payload(), 17);
+        assert_eq!(pair.into_result(), result);
     }
 }

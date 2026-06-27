@@ -152,6 +152,8 @@ pub struct JitCtx {
     /// read through this pointer at the store site, not at entry, because a
     /// re-entered VM call can invalidate the protector before later stores.
     array_index_accessor_protector_ptr: *const bool,
+    /// Opaque heap pointer for native leaf runtime stubs.
+    gc_heap: *const std::ffi::c_void,
 }
 
 /// Two-word return of compiled code (`x0`/`x1` on arm64).
@@ -186,6 +188,8 @@ pub(crate) const REG_STACK_BASE_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_s
 pub(crate) const REG_TOP_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_top_ptr) as u32;
 pub(crate) const ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, array_index_accessor_protector_ptr) as u32;
+#[allow(dead_code)]
+pub(crate) const GC_HEAP_OFFSET: u32 = std::mem::offset_of!(JitCtx, gc_heap) as u32;
 /// Size of one `UpvalueCell` (a 4-byte compressed `Gc<UpvalueCellBody>`).
 pub(crate) const UPVALUE_CELL_SIZE: u32 = 4;
 /// Byte offset of the single `Value` inside an `UpvalueCellBody` from its
@@ -1158,6 +1162,7 @@ pub(crate) unsafe fn enter_compiled(ptrs: JitReentryPtrs, entry: *const u8) -> J
         let reg_top_ptr = unsafe { (*vm).jit_reg_top_ptr() };
         let array_index_accessor_protector_ptr =
             unsafe { (*vm).jit_array_index_accessor_protector_ptr() };
+        let gc_heap = unsafe { (*vm).jit_gc_heap_ptr() };
         let mut error = None;
         let mut ctx = JitCtx {
             regs,
@@ -1179,6 +1184,7 @@ pub(crate) unsafe fn enter_compiled(ptrs: JitReentryPtrs, entry: *const u8) -> J
             reg_stack_base,
             reg_top_ptr,
             array_index_accessor_protector_ptr,
+            gc_heap,
         };
         // SAFETY: the mapping is live and `entry` was emitted with the
         // `JitEntry` ABI.
@@ -5090,6 +5096,7 @@ mod tests {
             reg_stack_base: std::ptr::null_mut(),
             reg_top_ptr: std::ptr::null_mut(),
             array_index_accessor_protector_ptr: &array_index_accessor_protector,
+            gc_heap: std::ptr::null(),
         };
         // SAFETY: integer-only function; never dereferences the null vm/stack.
         let entry: JitEntry = unsafe { std::mem::transmute(code.code.entry_ptr()) };

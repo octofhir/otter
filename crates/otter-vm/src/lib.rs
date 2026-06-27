@@ -195,10 +195,10 @@ pub use microtask::{Microtask, MicrotaskError, MicrotaskKind, MicrotaskQueue};
 pub use native_abi::{
     FrameStateId, NO_FRAME_STATE, NO_SAFEPOINT, NativeFrameFlags, NativeFrameHeader,
     NativeFrameKind, RuntimeStubClass, RuntimeStubDescriptor, RuntimeStubId, RuntimeStubResult,
-    RuntimeStubStatus, STUB_JIT_PREPARE_DIRECT_CALL, STUB_JIT_PREPARE_DIRECT_METHOD_CALL,
-    STUB_JIT_PROPERTY_FALLBACK, STUB_JIT_RUNTIME_CALL, STUB_JIT_RUNTIME_CALL_METHOD, SafepointId,
-    SafepointRecord, TaggedLocation, TaggedLocationKind, VARIADIC_STUB_ARGUMENTS,
-    validate_stub_descriptor,
+    RuntimeStubResultPair, RuntimeStubStatus, STUB_JIT_PREPARE_DIRECT_CALL,
+    STUB_JIT_PREPARE_DIRECT_METHOD_CALL, STUB_JIT_PROPERTY_FALLBACK, STUB_JIT_RUNTIME_CALL,
+    STUB_JIT_RUNTIME_CALL_METHOD, SafepointId, SafepointRecord, TaggedLocation, TaggedLocationKind,
+    VARIADIC_STUB_ARGUMENTS, validate_stub_descriptor,
 };
 pub use native_function::{
     NativeCall, NativeError, NativeFastFn, NativeFn, NativeFunction, VmIntrinsicFunction,
@@ -5773,6 +5773,14 @@ impl Interpreter {
     /// compiled entry can invalidate the protector before a later store.
     pub fn jit_array_index_accessor_protector_ptr(&mut self) -> *const bool {
         &self.array_index_accessor_protector
+    }
+
+    /// Opaque heap pointer for native leaf runtime stubs.
+    ///
+    /// Compiled code may pass this to `LeafNoAlloc` ABI entries only. Those
+    /// entries must not allocate, trigger GC, or retain the pointer.
+    pub fn jit_gc_heap_ptr(&self) -> *const std::ffi::c_void {
+        std::ptr::addr_of!(self.gc_heap).cast::<std::ffi::c_void>()
     }
 
     /// Capacity of the flat JIT register stack in slots — the overflow bound

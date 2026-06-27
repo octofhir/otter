@@ -109,6 +109,11 @@ impl<'a> RuntimeState<'a> {
         for value in interp.string_constants_for_trace() {
             value.trace_value_slots(visitor);
         }
+        // Cached small-integer decimal strings (`SmallStrings`-style). Immutable
+        // shared handles that must move with the heap.
+        for value in interp.small_int_strings_for_trace() {
+            value.trace_value_slots(visitor);
+        }
         // Immutable BigInt constants use the same bytecode-literal cache shape
         // as strings. The cached primitive handle must move with the heap.
         for value in interp.bigint_constants_for_trace() {

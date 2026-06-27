@@ -178,10 +178,24 @@ fn to_string_radix(
         }
     };
     if radix == 10 {
-        return Ok(Value::string(super::ecma::number_to_string(
-            recv.as_f64(),
-            ctx.heap_mut(),
-        )?));
+        let f = recv.as_f64();
+        // Serve small non-negative integers from the shared `SmallStrings`
+        // cache so hot `(n).toString()` loops reuse one handle instead of
+        // allocating a fresh string every call.
+        if f >= 0.0
+            && f < crate::Interpreter::SMALL_INT_STRING_CACHE as f64
+            && f.fract() == 0.0
+        {
+            let interp = ctx.interp_mut();
+            match interp.small_int_string(f as i32) {
+                Ok(Some(s)) => return Ok(Value::string(s)),
+                Ok(None) => {}
+                Err(err) => {
+                    return Err(crate::native_function::vm_to_native_error(interp, err, name));
+                }
+            }
+        }
+        return Ok(Value::string(super::ecma::number_to_string(f, ctx.heap_mut())?));
     }
     let rendered = super::dragon4::number_to_string_radix(recv.as_f64(), radix);
     Ok(Value::string(JsString::from_str(

@@ -391,6 +391,14 @@ pub struct Interpreter {
     /// executions. Values are traced from [`RuntimeState::trace_roots`] so a
     /// moving collection can rewrite cached handles in place.
     string_constant_cache: rustc_hash::FxHashMap<(usize, u32), Value>,
+    /// Decimal strings for small non-negative integers, served on demand
+    /// (JSC `SmallStrings` / V8 number-string-cache idea, adapted). Integer →
+    /// string is one of the most repeated allocations in real code (`"" + n`,
+    /// `(n).toString()`, integer keys); caching `0..SMALL_INT_STRING_CACHE`
+    /// returns one immutable shared handle instead of allocating a fresh string
+    /// body every conversion. Lazily filled; entries are traced from
+    /// [`RuntimeState::trace_roots`] so a moving collection rewrites them.
+    small_int_string_cache: Box<[Option<Value>]>,
     /// Per-context BigInt constant cache. BigInt primitives are immutable and
     /// have numeric, not object-identity, semantics, so `LoadBigInt` can parse
     /// and allocate each bytecode literal once per linked chunk identity and
@@ -897,6 +905,48 @@ impl Interpreter {
         self.string_constant_cache.values()
     }
 
+    /// Upper bound (exclusive) of the cached small-integer decimal strings.
+    pub(crate) const SMALL_INT_STRING_CACHE: i32 = 1024;
+
+    /// GC-traced cached small-integer decimal strings.
+    pub(crate) fn small_int_strings_for_trace(&self) -> impl Iterator<Item = &Value> {
+        self.small_int_string_cache.iter().flatten()
+    }
+
+    /// Decimal string for a small non-negative integer, served from the
+    /// `SmallStrings`-style cache. Allocates and caches on first use; returns
+    /// the shared immutable handle thereafter. `None` for inputs outside
+    /// `0..SMALL_INT_STRING_CACHE` (the caller falls back to `number_to_string`).
+    pub(crate) fn small_int_string(&mut self, i: i32) -> Result<Option<JsString>, VmError> {
+        if i < 0 || i >= Self::SMALL_INT_STRING_CACHE {
+            return Ok(None);
+        }
+        if let Some(cached) = self.small_int_string_cache[i as usize] {
+            return Ok(cached.as_string(&self.gc_heap));
+        }
+        let s = number::ecma::number_to_string(f64::from(i), &mut self.gc_heap)
+            .map_err(VmError::from)?;
+        self.small_int_string_cache[i as usize] = Some(Value::string(s));
+        Ok(Some(s))
+    }
+
+    /// `ToString` of a primitive operand for string concatenation, routing small
+    /// non-negative integers through the [`Self::small_int_string`] cache to
+    /// avoid re-allocating their decimal text on every concatenation.
+    pub(crate) fn to_js_string_for_concat(&mut self, value: Value) -> Result<JsString, VmError> {
+        if let Some(n) = value.as_number() {
+            let f = n.as_f64();
+            if f >= 0.0
+                && f < Self::SMALL_INT_STRING_CACHE as f64
+                && f.fract() == 0.0
+                && let Some(s) = self.small_int_string(f as i32)?
+            {
+                return Ok(s);
+            }
+        }
+        conversion::to_js_string_primitive(&value, self.gc_heap_mut())
+    }
+
     /// Root-tracing view of cached BigInt constants.
     pub(crate) fn bigint_constants_for_trace(&self) -> impl Iterator<Item = &Value> {
         self.bigint_constant_cache.values()
@@ -1308,6 +1358,8 @@ impl Interpreter {
         let mut interp = Self {
             template_objects: rustc_hash::FxHashMap::default(),
             string_constant_cache: rustc_hash::FxHashMap::default(),
+            small_int_string_cache: vec![None; Self::SMALL_INT_STRING_CACHE as usize]
+                .into_boxed_slice(),
             bigint_constant_cache: rustc_hash::FxHashMap::default(),
             lean_callback_roots: Vec::new(),
             pending_error_detail: std::cell::RefCell::new(None),

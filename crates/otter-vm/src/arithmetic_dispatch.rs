@@ -27,7 +27,7 @@
 use otter_bytecode::Op;
 
 use crate::{
-    Frame, Interpreter, JsString, NumberValue, Value, VmError, abstract_ops, bigint, conversion,
+    Frame, Interpreter, JsString, NumberValue, Value, VmError, abstract_ops, bigint,
     number, oom_to_vm, read_register, write_register,
 };
 
@@ -88,8 +88,8 @@ impl Interpreter {
         // primitive is a String, concatenate; otherwise apply ToNumeric
         // to each primitive and fold via the numeric / BigInt rules.
         let result = if lhs.is_string() || rhs.is_string() {
-            let l_str = conversion::to_js_string_primitive(&lhs, self.gc_heap_mut())?;
-            let r_str = conversion::to_js_string_primitive(&rhs, self.gc_heap_mut())?;
+            let l_str = self.to_js_string_for_concat(lhs)?;
+            let r_str = self.to_js_string_for_concat(rhs)?;
             Value::string(JsString::concat(l_str, r_str, self.gc_heap_mut())?)
         } else {
             let lk =

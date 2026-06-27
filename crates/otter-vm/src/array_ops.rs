@@ -26,7 +26,7 @@ use crate::{
     operand_decode::register_operand, read_register, symbol, to_length, write_register,
 };
 
-const MAX_DENSE_ARRAY_CONSTRUCT_HOLES: u32 = 65_536;
+const MAX_DENSE_ARRAY_CONSTRUCT_HOLES: u32 = 1_048_576;
 
 impl Interpreter {
     pub(crate) fn run_array_static_operands(

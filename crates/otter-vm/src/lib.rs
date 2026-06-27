@@ -6629,6 +6629,16 @@ impl Interpreter {
                     let idx = function
                         .instr_index_at_byte_pc(pc)
                         .ok_or(VmError::MissingReturn)?;
+                    // The frame depth changes only across a frame transition,
+                    // which is exactly what misses the cache (push deepens,
+                    // return shallows, and the deepest frame is always freshly
+                    // pushed → a miss). Sampling the max here instead of on every
+                    // instruction keeps `maxStackDepthObserved` exact while taking
+                    // the comparison off the straight-line hot path.
+                    let depth32 = u32::try_from(depth).unwrap_or(u32::MAX);
+                    if depth32 > self.runtime_budget_stats.max_stack_depth_observed {
+                        self.runtime_budget_stats.max_stack_depth_observed = depth32;
+                    }
                     (context, function, idx, foreign)
                 }
             };
@@ -6645,24 +6655,22 @@ impl Interpreter {
                 next_pc: pc.wrapping_add(instr.byte_len()),
             });
             self.current_byte_len = instr.byte_len();
-            self.current_function_id = function_id;
-            self.current_byte_pc = pc;
-            // Inlined runtime metering on the dispatch hot path. The three
-            // former per-op method calls collapse into `record_reductions`
-            // (`#[inline]`), an inlined monotonic stack-depth max, and a
-            // budget checkpoint gated on `enforce_budget`. Semantics are
-            // exact — reductions accumulate identically and max stack depth
-            // is unchanged; the checkpoint is skipped only in Observe mode
-            // (where it was already a cheap early return).
-            {
-                let units = runtime_budget::opcode_reductions(op);
-                let stats = &mut self.runtime_budget_stats;
-                stats.record_reductions(units);
-                let depth = u32::try_from(stack.len()).unwrap_or(u32::MAX);
-                if depth > stats.max_stack_depth_observed {
-                    stats.max_stack_depth_observed = depth;
-                }
+            // `current_function_id` / `current_byte_pc` exist only to key the
+            // optimizing-tier arithmetic type-feedback cell (`note_arith`),
+            // which the arith opcode helpers record only when a JIT hook is
+            // installed. With no hook there is no reader, so skip the two
+            // per-instruction stores entirely on the interpreter-only path.
+            if self.jit_hook.is_some() {
+                self.current_function_id = function_id;
+                self.current_byte_pc = pc;
             }
+            // Per-instruction reduction metering. Reductions accumulate exactly
+            // as before; the max-stack-depth sample moved to the frame-resolution
+            // miss branch (depth changes only across frame transitions), and the
+            // budget checkpoint below stays gated on `enforce_budget` (a not-taken
+            // branch in the default Observe mode).
+            self.runtime_budget_stats
+                .record_reductions(runtime_budget::opcode_reductions(op));
             if enforce_budget {
                 self.enforce_runtime_budget_checkpoint()?;
             }

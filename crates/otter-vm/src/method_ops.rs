@@ -1300,16 +1300,16 @@ impl Interpreter {
         site: usize,
         arg_regs: &[u16],
     ) -> Result<bool, VmError> {
+        let Some(stub_id) = self.jit_runtime_resolve_collection_leaf_method_stub(
+            stack,
+            frame_index,
+            recv_reg,
+            site,
+        )?
+        else {
+            return Ok(false);
+        };
         let recv = *read_register(&stack[frame_index], recv_reg)?;
-        if recv.is_nullish() {
-            return Ok(false);
-        }
-        let Some(target) = self.collection_method_call_ic_target(site, recv) else {
-            return Ok(false);
-        };
-        let Some(stub_id) = target.leaf_stub_id else {
-            return Ok(false);
-        };
         let key = if let Some(&reg) = arg_regs.first() {
             *read_register(&stack[frame_index], reg)?
         } else {
@@ -1326,6 +1326,27 @@ impl Interpreter {
         };
         write_register(&mut stack[frame_index], dst, value)?;
         Ok(true)
+    }
+
+    /// JIT bridge for the guarded collection method IC only.
+    ///
+    /// Returns the leaf stub descriptor id when receiver/prototype/builtin
+    /// guards validate. The caller is responsible for invoking the returned
+    /// VM-native leaf ABI entry against raw register-window values.
+    pub fn jit_runtime_resolve_collection_leaf_method_stub(
+        &mut self,
+        stack: &HoltStack,
+        frame_index: usize,
+        recv_reg: u16,
+        site: usize,
+    ) -> Result<Option<RuntimeStubId>, VmError> {
+        let recv = *read_register(&stack[frame_index], recv_reg)?;
+        if recv.is_nullish() {
+            return Ok(None);
+        }
+        Ok(self
+            .collection_method_call_ic_target(site, recv)
+            .and_then(|target| target.leaf_stub_id))
     }
 
     /// Fast `arr.method(args)` dispatch for an ordinary dense array whose

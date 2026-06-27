@@ -383,6 +383,7 @@ Exit criteria:
 - [x] Stub result and stub class ABI.
 - [x] JIT backedge interrupt/runtime-budget poll stub.
 - [x] First `LeafNoAlloc` runtime stub.
+- [x] Baseline pair-result call sequence for collection `LeafNoAlloc` stubs.
 - [ ] First `AllocStub` runtime stub with GC-stress coverage.
 - [ ] JIT call path to stubs without `NativeCtx`.
 - [ ] Map/Set feedback model.
@@ -422,3 +423,21 @@ Required checks scale with touched surface:
 - No per-feature runtime kill switches.
 - No new public runtime boundary exposing raw `Rc`, `RefCell`, raw heap handles,
   or untracked GC pointers.
+
+## Slice Notes
+
+### 2026-06-27: Baseline collection leaf pair calls
+
+Touched surface: runtime stubs and JIT/runtime ABI.
+
+Baseline `CallMethodValue` now splits the collection leaf method path into two
+steps: a small VM bridge validates the existing method IC guards and returns the
+`RuntimeStubId`, then generated code reads `JitCtx.gc_heap`, loads receiver/key
+raw `Value` bits from the frame register window, calls
+`leaf_no_alloc_stub2_trampoline_pair`, checks the low status byte, and writes
+the returned value bits directly to `dst` on `Ok`. `Miss` and any unexpected
+non-`Ok` status continue through the existing direct/full method fallback.
+
+Remaining bridge: receiver/prototype/builtin guard resolution is still in Rust.
+Next slice should make method IC guard metadata JIT-readable so this resolver
+bridge can be removed.

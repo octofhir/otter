@@ -38,7 +38,7 @@
 use otter_bytecode::{Op, Operand};
 use otter_vm::{
     ExecutionContext, Interpreter, JitExecOutcome, JitFrameStack, JitFunctionCode, JitFunctionView,
-    JitReentryPtrs, Value, VmError,
+    JitReentryPtrs, Value, VmError, runtime_stubs::leaf_no_alloc_stub2_trampoline_pair,
 };
 
 use crate::CompiledCode;
@@ -167,6 +167,8 @@ pub(crate) struct JitRet {
 pub(crate) const STATUS_RETURNED: u64 = 0;
 pub(crate) const STATUS_BAILED: u64 = 1;
 pub(crate) const STATUS_THREW: u64 = 2;
+const COLLECTION_LEAF_RESOLVE_MISS: u64 = 0;
+const COLLECTION_LEAF_RESOLVE_THROW: u64 = u64::MAX;
 
 /// Byte offset of [`JitCtx::bail_pc`] — where compiled code stamps the current
 /// instruction's byte-PC before each op so a bail resumes at the exact site.
@@ -971,38 +973,29 @@ pub(crate) extern "C" fn jit_call_method_stub(
     }
 }
 
-/// Bridge stub: try the guarded leaf/no-allocation collection method path from
-/// compiled code. Returns `0` on hit, `1` on throw, `2` on guard/stub miss.
-#[allow(clippy::too_many_arguments)]
-pub(crate) extern "C" fn jit_try_collection_leaf_method_stub(
+/// Bridge stub: resolve the guarded collection leaf method IC from compiled
+/// code. Returns a nonzero [`otter_vm::RuntimeStubId`] on hit, `0` on guard
+/// miss, and `u64::MAX` on structural VM error with the error parked in `ctx`.
+pub(crate) extern "C" fn jit_resolve_collection_leaf_method_stub(
     ctx: *mut JitCtx,
-    dst: u64,
     recv: u64,
     site: u64,
-    argc: u64,
-    a0: u64,
-    a1: u64,
-    a2: u64,
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let all = [a0 as u16, a1 as u16, a2 as u16];
-    let argc = (argc as usize).min(all.len());
-    match vm.jit_runtime_try_collection_leaf_method(
+    let stack = unsafe { &*ctx.stack };
+    match vm.jit_runtime_resolve_collection_leaf_method_stub(
         stack,
         ctx.frame_index,
-        dst as u16,
         recv as u16,
         site as usize,
-        &all[..argc],
     ) {
-        Ok(true) => 0,
-        Ok(false) => 2,
+        Ok(Some(stub_id)) => u64::from(stub_id),
+        Ok(None) => COLLECTION_LEAF_RESOLVE_MISS,
         Err(err) => {
             park_jit_error(ctx, err);
-            1
+            COLLECTION_LEAF_RESOLVE_THROW
         }
     }
 }
@@ -1213,9 +1206,10 @@ fn reg_offset(idx: u16) -> Result<u32, Unsupported> {
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
     use super::{
-        ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET, BAIL_PC_OFFSET, BaselineCode, CONTEXT_OFFSET,
-        DIRECT_ENTRY_OFFSET, DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET,
-        DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET, IC_WAYS,
+        ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET, BAIL_PC_OFFSET, BaselineCode,
+        COLLECTION_LEAF_RESOLVE_THROW, CONTEXT_OFFSET, DIRECT_ENTRY_OFFSET,
+        DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET,
+        DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET, GC_HEAP_OFFSET, IC_WAYS,
         JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS, OBJECT_BODY_TYPE_TAG, Op,
         Operand, REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET, SPECIAL_FALSE, SPECIAL_HOLE,
         SPECIAL_NULL, SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
@@ -1226,10 +1220,11 @@ mod arm64 {
         jit_finish_direct_call_returned_stub, jit_inline_closure_upvalues_stub,
         jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub, jit_load_prop_window_stub,
         jit_load_upvalue_stub, jit_make_fn_stub, jit_new_array_stub, jit_new_object_stub,
-        jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
-        jit_store_element_stub, jit_store_prop_stub, jit_store_prop_window_stub,
-        jit_store_upvalue_stub, jit_try_collection_leaf_method_stub, jit_write_barrier_stub,
-        jit_write_barrier_window_stub, reg_offset,
+        jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub,
+        jit_resolve_collection_leaf_method_stub, jit_self_call_bail_stub, jit_store_element_stub,
+        jit_store_prop_stub, jit_store_prop_window_stub, jit_store_upvalue_stub,
+        jit_write_barrier_stub, jit_write_barrier_window_stub, leaf_no_alloc_stub2_trampoline_pair,
+        reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -4293,6 +4288,47 @@ mod arm64 {
         dynasm!(ops ; .arch aarch64 ; b =>threw);
     }
 
+    /// Emit the reusable baseline ABI call sequence for
+    /// `leaf_no_alloc_stub2_trampoline_pair`.
+    ///
+    /// Inputs are the current `JitCtx` in `x20`, frame register window in
+    /// `x19`, and a previously resolved nonzero `RuntimeStubId` in
+    /// `stub_id_x`. The helper reads the opaque GC heap pointer from `JitCtx`,
+    /// passes raw boxed receiver/key bits from the frame window, writes `dst`
+    /// on `Ok`, and branches to `miss` for every non-`Ok` status.
+    fn emit_leaf_no_alloc_stub2_pair_call(
+        ops: &mut Assembler,
+        stub_id_x: u32,
+        dst: u16,
+        recv: u16,
+        key: Option<u16>,
+        miss: DynamicLabel,
+    ) -> Result<(), Unsupported> {
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x0, [x20, GC_HEAP_OFFSET]
+            ; mov x1, X(stub_id_x)
+        );
+        load_reg(ops, 2, recv)?;
+        if let Some(key) = key {
+            load_reg(ops, 3, key)?;
+        } else {
+            emit_load_u64(ops, 3, TAG_SPECIAL << 48);
+        }
+        emit_load_u64(
+            ops,
+            16,
+            leaf_no_alloc_stub2_trampoline_pair as *const () as u64,
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; and x1, x1, #0xff
+            ; cbnz x1, =>miss
+        );
+        store_reg(ops, 0, dst)
+    }
+
     /// Emit a direct `CallMethodValue`: resolve the method through the call
     /// site's monomorphic IC and direct-branch to its compiled entry, exactly
     /// like [`emit_call`]; on an ineligible resolution fall back to the in-place
@@ -4317,38 +4353,43 @@ mod arm64 {
         let after_leaf = ops.new_dynamic_label();
         let done = ops.new_dynamic_label();
 
-        // First try a live collection method-call IC with a leaf/no-alloc
-        // runtime stub. Hit writes `dst`; miss keeps the existing direct/full
-        // method-call path.
+        // First ask the VM to validate the collection method-call IC guards.
+        // The generated code performs the leaf body call itself through the
+        // VM-native pair-result ABI; misses keep the existing direct/full path.
         dynasm!(ops
             ; .arch aarch64
             ; mov x0, x20
-            ; movz x1, dst as u32
-            ; movz x2, recv as u32
+            ; movz x1, recv as u32
         );
-        emit_load_u64(ops, 3, site);
-        dynasm!(ops ; .arch aarch64 ; movz x4, argc as u32);
-        for slot in 0..MAX_METHOD_ARGS {
-            let areg = if slot < argc {
-                reg(operands, 4 + slot)?
-            } else {
-                0
-            };
-            let xn = 5 + slot as u32;
-            dynasm!(ops ; .arch aarch64 ; movz X(xn), areg as u32);
-        }
+        emit_load_u64(ops, 2, site);
         emit_load_u64(
             ops,
             16,
-            jit_try_collection_leaf_method_stub as *const () as u64,
+            jit_resolve_collection_leaf_method_stub as *const () as u64,
         );
+        emit_load_u64(ops, 12, COLLECTION_LEAF_RESOLVE_THROW);
         dynasm!(ops
             ; .arch aarch64
             ; blr x16
-            ; cmp x0, #1
+            ; cmp x0, x12
             ; b.eq =>threw
-            ; cmp x0, #2
-            ; b.eq =>after_leaf
+            ; cbz x0, =>after_leaf
+            ; mov x11, x0
+        );
+        emit_leaf_no_alloc_stub2_pair_call(
+            ops,
+            11,
+            dst,
+            recv,
+            if argc == 0 {
+                None
+            } else {
+                Some(reg(operands, 4)?)
+            },
+            after_leaf,
+        )?;
+        dynasm!(ops
+            ; .arch aarch64
             ; b =>done
             ; =>after_leaf
         );

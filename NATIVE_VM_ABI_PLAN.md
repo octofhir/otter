@@ -311,7 +311,12 @@ packet is also explicit now: `RuntimeStubAllocContext` carries only erased
 VM/stack/context pointers, the current frame index, and the raw tagged frame-slot
 window. The fixed `AllocStub3Fn` shape takes this context plus a safepoint id and
 three raw `Value` arguments, still without exposing or constructing a generic
-`NativeCtx`.
+`NativeCtx`. `runtime_stubs` can now validate and publish an allocating
+safepoint backed by that frame-slot window through `AllocSafepointFrameRoots`,
+rejecting unsupported register/spill maps until native frame locations are
+publishable. This gives the next executable `Map.set` / `Set.add` stub a
+machine-callable rooting contract without retaining raw untracked values across
+allocation.
 
 Tasks:
 
@@ -408,6 +413,7 @@ Exit criteria:
 - [x] AllocStub descriptor/call-shape scaffold for `Map.set` / `Set.add`.
 - [x] Baseline frame-slot safepoint records for collection `AllocStub` sites.
 - [x] Explicit `RuntimeStubAllocContext` and `AllocStub3Fn` ABI shape.
+- [x] Frame-slot root publisher for `AllocStub` safepoints.
 - [ ] First `AllocStub` runtime stub with GC-stress coverage.
 - [ ] JIT call path to stubs without `NativeCtx`.
 - [x] Map/Set feedback model for leaf lookup stubs.
@@ -535,3 +541,19 @@ RuntimeStubResultPair`.
 This remains an ABI scaffold only. No `Map.set` / `Set.add` executable entry is
 installed until generated code publishes the safepoint around the call and GC
 stress can validate moving-root updates.
+
+### 2026-06-28: AllocStub frame-slot root publisher
+
+Touched surface: runtime stubs and GC safepoint ABI metadata.
+
+`runtime_stubs` now has `AllocSafepointFrameRoots`, an `ExtraRootSource` backed
+by `RuntimeStubAllocContext.frame_slots` plus a `SafepointRecord`. The validator
+requires a concrete safepoint id, a non-empty frame-slot window, and frame-slot
+locations within bounds; register and spill-slot maps deliberately fail until
+the native frame layout can publish those locations. This makes the allocating
+stub ABI root/update live frame values through safepoint metadata without
+constructing `NativeCtx`.
+
+This is still not an executable `Map.set` / `Set.add` fast path. The next slice
+should use this publisher inside the concrete collection `AllocStub3` entries,
+then add GC-stress coverage before baseline machine code starts calling them.

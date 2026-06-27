@@ -16,6 +16,8 @@
 //! - Results are returned as [`crate::native_abi::RuntimeStubResult`].
 //! - `LeafNoAlloc` stubs must not allocate, trigger GC, call JS, flatten
 //!   strings, or mutate heap state.
+//! - `Alloc` stubs must publish their current safepoint roots before any
+//!   allocation and must not hold untracked raw `Value` bits across GC.
 //!
 //! # See also
 //! - [`crate::native_abi`]
@@ -25,7 +27,7 @@ use crate::native_abi::{
     NO_SAFEPOINT, RuntimeStubAllocContext, RuntimeStubDescriptor, RuntimeStubId, RuntimeStubResult,
     RuntimeStubResultPair, STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_LEAF,
     STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
-    SafepointId, validate_stub_descriptor,
+    SafepointId, SafepointRecord, TaggedLocationKind, validate_stub_descriptor,
 };
 use crate::{Value, collections};
 
@@ -105,6 +107,117 @@ impl AllocStub3 {
     #[must_use]
     pub const fn is_valid_for_safepoint(self, safepoint: SafepointId) -> bool {
         validate_stub_descriptor(self.descriptor, safepoint) && self.descriptor.argument_count == 3
+    }
+}
+
+/// Validation failure for publishing an allocating-stub safepoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocSafepointRootError {
+    /// Allocating stubs must name a concrete safepoint.
+    NoSafepoint,
+    /// The context packet does not include a frame-slot root window.
+    MissingFrameSlots,
+    /// The safepoint names a root class this frame-window publisher cannot
+    /// trace yet.
+    UnsupportedLocation {
+        /// Unsupported location class.
+        kind: TaggedLocationKind,
+        /// Location index from the safepoint map.
+        index: u16,
+    },
+    /// A frame-slot root points outside the context packet's slot window.
+    FrameSlotOutOfBounds {
+        /// Safepoint frame-slot index.
+        index: u16,
+        /// Slot count supplied by the context packet.
+        frame_slot_count: u16,
+    },
+}
+
+/// Validate that `safepoint` can be published from `ctx`'s frame-slot window.
+///
+/// Baseline v1 spills every tagged value live at an allocating collection call
+/// into the interpreter-visible register window. Register and native-spill
+/// stack maps are intentionally rejected until the machine frame layout can
+/// publish those locations directly.
+pub fn validate_alloc_safepoint_frame_roots(
+    ctx: &RuntimeStubAllocContext,
+    safepoint: &SafepointRecord,
+) -> Result<(), AllocSafepointRootError> {
+    if safepoint.id == NO_SAFEPOINT {
+        return Err(AllocSafepointRootError::NoSafepoint);
+    }
+    if !ctx.has_frame_slots() {
+        return Err(AllocSafepointRootError::MissingFrameSlots);
+    }
+    for location in &safepoint.tagged_locations {
+        match location.kind {
+            TaggedLocationKind::FrameSlot => {
+                if location.index >= ctx.frame_slot_count {
+                    return Err(AllocSafepointRootError::FrameSlotOutOfBounds {
+                        index: location.index,
+                        frame_slot_count: ctx.frame_slot_count,
+                    });
+                }
+            }
+            kind => {
+                return Err(AllocSafepointRootError::UnsupportedLocation {
+                    kind,
+                    index: location.index,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Root publisher for an allocating runtime-stub safepoint backed by frame slots.
+///
+/// This type is the VM-native equivalent of the ad hoc native-call root scopes:
+/// it exposes the active frame-window slots named by a [`SafepointRecord`] to
+/// the moving collector, so a GC can both trace and rewrite those slots while an
+/// `Alloc` stub is executing.
+pub struct AllocSafepointFrameRoots<'a> {
+    ctx: &'a RuntimeStubAllocContext,
+    safepoint: &'a SafepointRecord,
+}
+
+impl<'a> AllocSafepointFrameRoots<'a> {
+    /// Build a frame-slot root publisher for a validated safepoint.
+    ///
+    /// # Safety
+    ///
+    /// `ctx.frame_slots` must point at `ctx.frame_slot_count` live, writable
+    /// `Value` ABI slots for the duration of any heap registration created from
+    /// this value. The slots must remain pinned in memory while a GC may trace
+    /// and update them.
+    pub unsafe fn new(
+        ctx: &'a RuntimeStubAllocContext,
+        safepoint: &'a SafepointRecord,
+    ) -> Result<Self, AllocSafepointRootError> {
+        validate_alloc_safepoint_frame_roots(ctx, safepoint)?;
+        Ok(Self { ctx, safepoint })
+    }
+
+    /// Safepoint id being published.
+    #[must_use]
+    pub fn safepoint_id(&self) -> SafepointId {
+        self.safepoint.id
+    }
+}
+
+impl otter_gc::ExtraRootSource for AllocSafepointFrameRoots<'_> {
+    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
+        for location in &self.safepoint.tagged_locations {
+            debug_assert_eq!(location.kind, TaggedLocationKind::FrameSlot);
+            debug_assert!(location.index < self.ctx.frame_slot_count);
+            // SAFETY: construction validates non-null frame slots, rejects
+            // out-of-bounds locations, and requires callers to keep the
+            // writable frame window alive while this root source is registered.
+            let value =
+                unsafe { &*(self.ctx.frame_slots.add(location.index as usize) as *const Value) };
+            value.trace_value_slots(visitor);
+        }
     }
 }
 
@@ -300,7 +413,10 @@ fn leaf_key_is_materialized(heap: &otter_gc::GcHeap, key: Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_abi::RuntimeStubStatus;
+    use crate::native_abi::{
+        NO_FRAME_STATE, RuntimeStubStatus, TaggedLocation, TaggedLocationKind,
+    };
+    use otter_gc::ExtraRootSource;
 
     fn n(i: i32) -> Value {
         Value::number_i32(i)
@@ -364,6 +480,98 @@ mod tests {
         let result = entry(&mut ctx, 9, 1, 2, 3);
         assert_eq!(result.status(), RuntimeStubStatus::Ok);
         assert_eq!(result.value_bits, 1);
+    }
+
+    #[test]
+    fn alloc_safepoint_frame_roots_publish_value_slots() {
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let map = collections::alloc_map(&mut heap).expect("map");
+        let mut slots = [Value::map(map).to_abi_bits(), n(7).to_abi_bits()];
+        let ctx = RuntimeStubAllocContext::new(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            0,
+            slots.as_mut_ptr(),
+            slots.len() as u16,
+        );
+        let safepoint = SafepointRecord {
+            id: 12,
+            frame_state: NO_FRAME_STATE,
+            tagged_locations: vec![TaggedLocation::frame_slot(0), TaggedLocation::frame_slot(1)],
+        };
+
+        assert_eq!(
+            validate_alloc_safepoint_frame_roots(&ctx, &safepoint),
+            Ok(())
+        );
+        // SAFETY: `slots` is a live writable `Value` bit window for the root
+        // publisher's full lifetime.
+        let roots = unsafe { AllocSafepointFrameRoots::new(&ctx, &safepoint) }.expect("roots");
+        assert_eq!(roots.safepoint_id(), 12);
+
+        let mut seen = Vec::new();
+        roots.visit_extra_roots(&mut |slot| seen.push(slot));
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0], slots.as_mut_ptr().cast::<otter_gc::raw::RawGc>());
+    }
+
+    #[test]
+    fn alloc_safepoint_frame_roots_reject_invalid_maps() {
+        let mut slots = [Value::undefined().to_abi_bits()];
+        let ctx = RuntimeStubAllocContext::new(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            0,
+            slots.as_mut_ptr(),
+            slots.len() as u16,
+        );
+        let no_safepoint = SafepointRecord {
+            id: NO_SAFEPOINT,
+            frame_state: NO_FRAME_STATE,
+            tagged_locations: vec![TaggedLocation::frame_slot(0)],
+        };
+        assert_eq!(
+            validate_alloc_safepoint_frame_roots(&ctx, &no_safepoint),
+            Err(AllocSafepointRootError::NoSafepoint)
+        );
+
+        let missing_slots_ctx = RuntimeStubAllocContext::new(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+        );
+        let valid_safepoint = SafepointRecord::frame_slot_window(1, NO_FRAME_STATE, 1);
+        assert_eq!(
+            validate_alloc_safepoint_frame_roots(&missing_slots_ctx, &valid_safepoint),
+            Err(AllocSafepointRootError::MissingFrameSlots)
+        );
+
+        let out_of_bounds = SafepointRecord::frame_slot_window(2, NO_FRAME_STATE, 2);
+        assert_eq!(
+            validate_alloc_safepoint_frame_roots(&ctx, &out_of_bounds),
+            Err(AllocSafepointRootError::FrameSlotOutOfBounds {
+                index: 1,
+                frame_slot_count: 1,
+            })
+        );
+
+        let unsupported = SafepointRecord {
+            id: 3,
+            frame_state: NO_FRAME_STATE,
+            tagged_locations: vec![TaggedLocation::machine_register(0)],
+        };
+        assert_eq!(
+            validate_alloc_safepoint_frame_roots(&ctx, &unsupported),
+            Err(AllocSafepointRootError::UnsupportedLocation {
+                kind: TaggedLocationKind::MachineRegister,
+                index: 0,
+            })
+        );
     }
 
     #[test]

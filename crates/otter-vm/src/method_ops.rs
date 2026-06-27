@@ -24,6 +24,7 @@ use otter_bytecode::Operand;
 use smallvec::SmallVec;
 
 use crate::function_ops::BindMetadataGet;
+use crate::native_abi::RuntimeStubId;
 use crate::{
     ExecutionContext, GeneratorResumeKind, Interpreter, JsString, NumberValue, PendingBindFunction,
     PendingBindStage, Value, VmError, VmGetOutcome, VmPropertyKey, bigint,
@@ -156,12 +157,28 @@ impl CollectionFastOp {
         }
     }
 
-    fn leaf_stub(self) -> Option<crate::runtime_stubs::LeafNoAllocStub2> {
+    fn leaf_stub_id(self) -> Option<RuntimeStubId> {
         match self {
-            Self::MapGet => Some(crate::runtime_stubs::COLLECTION_MAP_GET_LEAF),
-            Self::MapHas => Some(crate::runtime_stubs::COLLECTION_MAP_HAS_LEAF),
-            Self::SetHas => Some(crate::runtime_stubs::COLLECTION_SET_HAS_LEAF),
+            Self::MapGet => Some(crate::native_abi::STUB_COLLECTION_MAP_GET_LEAF.id),
+            Self::MapHas => Some(crate::native_abi::STUB_COLLECTION_MAP_HAS_LEAF.id),
+            Self::SetHas => Some(crate::native_abi::STUB_COLLECTION_SET_HAS_LEAF.id),
             Self::MapSet | Self::MapDelete | Self::SetAdd | Self::SetDelete => None,
+        }
+    }
+}
+
+/// Resolved collection builtin target carried by method-call feedback.
+#[derive(Clone, Copy)]
+struct CollectionFastTarget {
+    op: CollectionFastOp,
+    leaf_stub_id: Option<RuntimeStubId>,
+}
+
+impl CollectionFastTarget {
+    fn new(op: CollectionFastOp) -> Self {
+        Self {
+            op,
+            leaf_stub_id: op.leaf_stub_id(),
         }
     }
 }
@@ -202,6 +219,7 @@ pub(crate) struct CollectionMethodCallIc {
     proto_shape: crate::object::ShapeId,
     proto_slot: u16,
     op: CollectionFastOp,
+    leaf_stub_id: Option<RuntimeStubId>,
 }
 
 /// Clamp a `ToIntegerOrInfinity` result to an absolute index within
@@ -1286,10 +1304,10 @@ impl Interpreter {
         if recv.is_nullish() {
             return Ok(false);
         }
-        let Some(op) = self.collection_method_call_ic_op(site, recv) else {
+        let Some(target) = self.collection_method_call_ic_target(site, recv) else {
             return Ok(false);
         };
-        let Some(stub) = op.leaf_stub() else {
+        let Some(stub_id) = target.leaf_stub_id else {
             return Ok(false);
         };
         let key = if let Some(&reg) = arg_regs.first() {
@@ -1297,7 +1315,8 @@ impl Interpreter {
         } else {
             Value::undefined()
         };
-        let result = (stub.entry)(&self.gc_heap, recv.to_abi_bits(), key.to_abi_bits());
+        let result =
+            crate::runtime_stubs::invoke_leaf_no_alloc_stub2(&self.gc_heap, stub_id, recv, key);
         let Some(value) = result.into_value() else {
             return Ok(false);
         };
@@ -1414,15 +1433,15 @@ impl Interpreter {
         recv: Value,
         args: &[Value],
     ) -> Option<Result<Value, VmError>> {
-        let op = self.collection_method_call_ic_op(site, recv)?;
-        Some(self.dispatch_collection_builtin(op, recv, args))
+        let target = self.collection_method_call_ic_target(site, recv)?;
+        Some(self.dispatch_collection_builtin(target, recv, args))
     }
 
-    fn collection_method_call_ic_op(
+    fn collection_method_call_ic_target(
         &mut self,
         site: usize,
         recv: Value,
-    ) -> Option<CollectionFastOp> {
+    ) -> Option<CollectionFastTarget> {
         let ic = match (*self.method_call_ics.get(site)?).as_ref().copied()? {
             MethodCallIc::Collection(ic) => ic,
             MethodCallIc::Array(_) => return None,
@@ -1466,7 +1485,10 @@ impl Interpreter {
         if !ic.op.matches_builtin(method, &self.gc_heap) {
             return None;
         }
-        Some(ic.op)
+        Some(CollectionFastTarget {
+            op: ic.op,
+            leaf_stub_id: ic.leaf_stub_id,
+        })
     }
 
     /// Direct `map.get/set/has/delete` and `set.add/has/delete` dispatch on an
@@ -1542,9 +1564,10 @@ impl Interpreter {
                 proto_shape: hit.shape_id,
                 proto_slot: hit.slot,
                 op,
+                leaf_stub_id: op.leaf_stub_id(),
             }));
         }
-        Some(self.dispatch_collection_builtin(op, recv, args))
+        Some(self.dispatch_collection_builtin(CollectionFastTarget::new(op), recv, args))
     }
 
     /// Run a resolved Map/Set builtin, taking a leaf no-allocation path for
@@ -1553,18 +1576,18 @@ impl Interpreter {
     /// rooted path below.
     fn dispatch_collection_builtin(
         &mut self,
-        op: CollectionFastOp,
+        target: CollectionFastTarget,
         recv: Value,
         args: &[Value],
     ) -> Result<Value, VmError> {
-        if let Some(stub) = op.leaf_stub()
+        if let Some(stub_id) = target.leaf_stub_id
             && let Some(value) = self
-                .dispatch_collection_builtin_leaf_no_alloc(stub, recv, args)
+                .dispatch_collection_builtin_leaf_no_alloc(stub_id, recv, args)
                 .into_value()
         {
             return Ok(value);
         }
-        self.dispatch_collection_builtin_rooted(op, recv, args)
+        self.dispatch_collection_builtin_rooted(target.op, recv, args)
     }
 
     /// Leaf Map/Set lookup dispatch.
@@ -1575,12 +1598,12 @@ impl Interpreter {
     /// allocating path handle it.
     fn dispatch_collection_builtin_leaf_no_alloc(
         &self,
-        stub: crate::runtime_stubs::LeafNoAllocStub2,
+        stub_id: RuntimeStubId,
         recv: Value,
         args: &[Value],
     ) -> crate::native_abi::RuntimeStubResult {
         let key = args.first().copied().unwrap_or_else(Value::undefined);
-        (stub.entry)(&self.gc_heap, recv.to_abi_bits(), key.to_abi_bits())
+        crate::runtime_stubs::invoke_leaf_no_alloc_stub2(&self.gc_heap, stub_id, recv, key)
     }
 
     /// Run the resolved Map/Set builtin with the receiver and arguments rooted

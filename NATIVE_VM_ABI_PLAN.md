@@ -277,12 +277,14 @@ and live in `runtime_stubs` as reusable raw-`Value`-bits entrypoints instead of
 being embedded in interpreter method dispatch. Each leaf probe now has a
 callable ABI entry pairing its descriptor with a typed `LeafNoAllocStub2`
 function pointer, so the same result/call ABI can be reused by future direct JIT
-calls. Compiled code still reaches this through the current method runtime stub;
+calls. Method-call feedback now carries the resolved leaf `RuntimeStubId`, not
+just the high-level collection operation, and `runtime_stubs` provides a single
+descriptor-id lookup/invocation path for fixed two-argument leaf entries.
+Compiled code still reaches this through the current method runtime stub;
 baseline compiled `CallMethodValue` now tries a narrow collection-leaf bridge
-before the generic method bridge, so hot `Map.get` / `Map.has` / `Set.has`
-sites can return through the reusable leaf ABI without building the full
-method-call argument path. Fully direct machine calls to the leaf entries remain
-open.
+before the generic method bridge, so hot `Map.get` / `Map.has` / `Set.has` sites
+can return through the reusable leaf ABI without building the full method-call
+argument path. Fully direct machine calls to the leaf entries remain open.
 
 Tasks:
 

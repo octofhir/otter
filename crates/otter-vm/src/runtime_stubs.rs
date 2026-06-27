@@ -20,8 +20,9 @@
 //! - [`crate::method_ops`]
 
 use crate::native_abi::{
-    NO_SAFEPOINT, RuntimeStubDescriptor, RuntimeStubResult, STUB_COLLECTION_MAP_GET_LEAF,
-    STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_SET_HAS_LEAF, validate_stub_descriptor,
+    NO_SAFEPOINT, RuntimeStubDescriptor, RuntimeStubId, RuntimeStubResult,
+    STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_SET_HAS_LEAF,
+    validate_stub_descriptor,
 };
 use crate::{Value, collections};
 
@@ -63,6 +64,37 @@ pub const COLLECTION_SET_HAS_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     descriptor: STUB_COLLECTION_SET_HAS_LEAF,
     entry: collection_set_has_leaf,
 };
+
+/// Resolve a fixed two-argument leaf/no-allocation stub by ABI descriptor id.
+#[must_use]
+pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocStub2> {
+    match id {
+        id if id == STUB_COLLECTION_MAP_GET_LEAF.id => Some(COLLECTION_MAP_GET_LEAF),
+        id if id == STUB_COLLECTION_MAP_HAS_LEAF.id => Some(COLLECTION_MAP_HAS_LEAF),
+        id if id == STUB_COLLECTION_SET_HAS_LEAF.id => Some(COLLECTION_SET_HAS_LEAF),
+        _ => None,
+    }
+}
+
+/// Invoke a fixed two-argument leaf/no-allocation stub by ABI descriptor id.
+///
+/// This is the reusable VM-side equivalent of the machine-code call sequence a
+/// native tier will eventually emit directly: resolve descriptor id, pass raw
+/// boxed value bits, receive a fixed [`RuntimeStubResult`]. It intentionally
+/// takes no root scope or safepoint because the descriptor class is
+/// `LeafNoAlloc`.
+#[must_use]
+pub fn invoke_leaf_no_alloc_stub2(
+    heap: &otter_gc::GcHeap,
+    id: RuntimeStubId,
+    a0: Value,
+    a1: Value,
+) -> RuntimeStubResult {
+    let Some(stub) = leaf_no_alloc_stub2_by_id(id) else {
+        return RuntimeStubResult::miss();
+    };
+    (stub.entry)(heap, a0.to_abi_bits(), a1.to_abi_bits())
+}
 
 /// Leaf `Map.prototype.get` probe.
 ///
@@ -148,6 +180,11 @@ mod tests {
         assert!(COLLECTION_MAP_GET_LEAF.is_valid());
         assert!(COLLECTION_MAP_HAS_LEAF.is_valid());
         assert!(COLLECTION_SET_HAS_LEAF.is_valid());
+        assert_eq!(
+            leaf_no_alloc_stub2_by_id(STUB_COLLECTION_MAP_GET_LEAF.id).map(|stub| stub.descriptor),
+            Some(STUB_COLLECTION_MAP_GET_LEAF)
+        );
+        assert!(leaf_no_alloc_stub2_by_id(u32::MAX).is_none());
     }
 
     #[test]
@@ -161,6 +198,15 @@ mod tests {
             &heap,
             Value::map(map).to_abi_bits(),
             Value::string(key).to_abi_bits(),
+        );
+        assert_eq!(result.status, RuntimeStubStatus::Ok);
+        assert_eq!(result.into_value(), Some(n(42)));
+
+        let result = invoke_leaf_no_alloc_stub2(
+            &heap,
+            STUB_COLLECTION_MAP_GET_LEAF.id,
+            Value::map(map),
+            Value::string(key),
         );
         assert_eq!(result.status, RuntimeStubStatus::Ok);
         assert_eq!(result.into_value(), Some(n(42)));

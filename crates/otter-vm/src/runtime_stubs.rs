@@ -27,7 +27,11 @@ use crate::native_abi::{
 use crate::{Value, collections};
 
 /// Two-argument leaf/no-allocation runtime stub ABI.
-pub type LeafNoAllocStub2Fn = fn(&otter_gc::GcHeap, u64, u64) -> RuntimeStubResult;
+///
+/// The heap pointer is opaque to generated code. It must name the current
+/// isolate heap and must remain valid for the duration of the call. The callee
+/// must not allocate, trigger GC, or retain the pointer.
+pub type LeafNoAllocStub2Fn = extern "C" fn(*const otter_gc::GcHeap, u64, u64) -> RuntimeStubResult;
 
 /// Callable leaf/no-allocation stub entry with its ABI descriptor.
 #[derive(Clone, Copy)]
@@ -44,6 +48,23 @@ impl LeafNoAllocStub2 {
     pub const fn is_valid(self) -> bool {
         validate_stub_descriptor(self.descriptor, NO_SAFEPOINT)
             && self.descriptor.argument_count == 2
+    }
+
+    /// Raw native entry address for generated code.
+    #[must_use]
+    pub fn entry_addr(self) -> usize {
+        self.entry as usize
+    }
+
+    /// Invoke this entry with raw ABI bits.
+    #[must_use]
+    pub fn invoke_raw(
+        self,
+        heap: *const otter_gc::GcHeap,
+        a0_bits: u64,
+        a1_bits: u64,
+    ) -> RuntimeStubResult {
+        (self.entry)(heap, a0_bits, a1_bits)
     }
 }
 
@@ -90,10 +111,30 @@ pub fn invoke_leaf_no_alloc_stub2(
     a0: Value,
     a1: Value,
 ) -> RuntimeStubResult {
+    leaf_no_alloc_stub2_trampoline(
+        heap as *const otter_gc::GcHeap,
+        id,
+        a0.to_abi_bits(),
+        a1.to_abi_bits(),
+    )
+}
+
+/// Generic native trampoline for fixed two-argument leaf/no-allocation stubs.
+///
+/// Generated code can call this while it still carries a dynamic
+/// [`RuntimeStubId`] in feedback. A later codegen slice can resolve the id at
+/// compile time and call [`LeafNoAllocStub2::entry_addr`] directly.
+#[must_use]
+pub extern "C" fn leaf_no_alloc_stub2_trampoline(
+    heap: *const otter_gc::GcHeap,
+    id: RuntimeStubId,
+    a0_bits: u64,
+    a1_bits: u64,
+) -> RuntimeStubResult {
     let Some(stub) = leaf_no_alloc_stub2_by_id(id) else {
         return RuntimeStubResult::miss();
     };
-    (stub.entry)(heap, a0.to_abi_bits(), a1.to_abi_bits())
+    stub.invoke_raw(heap, a0_bits, a1_bits)
 }
 
 /// Leaf `Map.prototype.get` probe.
@@ -101,11 +142,14 @@ pub fn invoke_leaf_no_alloc_stub2(
 /// Returns `Miss` when the receiver is not a Map or the key would need string
 /// materialisation/flattening before a no-GC lookup is safe.
 #[must_use]
-pub fn collection_map_get_leaf(
-    heap: &otter_gc::GcHeap,
+pub extern "C" fn collection_map_get_leaf(
+    heap: *const otter_gc::GcHeap,
     recv_bits: u64,
     key_bits: u64,
 ) -> RuntimeStubResult {
+    let Some(heap) = heap_ref(heap) else {
+        return RuntimeStubResult::miss();
+    };
     let recv = Value::from_abi_bits(recv_bits);
     let key = Value::from_abi_bits(key_bits);
     if !leaf_key_is_materialized(heap, key) {
@@ -124,11 +168,14 @@ pub fn collection_map_get_leaf(
 /// Returns `Miss` when the receiver is not a Map or the key would need string
 /// materialisation/flattening before a no-GC lookup is safe.
 #[must_use]
-pub fn collection_map_has_leaf(
-    heap: &otter_gc::GcHeap,
+pub extern "C" fn collection_map_has_leaf(
+    heap: *const otter_gc::GcHeap,
     recv_bits: u64,
     key_bits: u64,
 ) -> RuntimeStubResult {
+    let Some(heap) = heap_ref(heap) else {
+        return RuntimeStubResult::miss();
+    };
     let recv = Value::from_abi_bits(recv_bits);
     let key = Value::from_abi_bits(key_bits);
     if !leaf_key_is_materialized(heap, key) {
@@ -145,11 +192,14 @@ pub fn collection_map_has_leaf(
 /// Returns `Miss` when the receiver is not a Set or the key would need string
 /// materialisation/flattening before a no-GC lookup is safe.
 #[must_use]
-pub fn collection_set_has_leaf(
-    heap: &otter_gc::GcHeap,
+pub extern "C" fn collection_set_has_leaf(
+    heap: *const otter_gc::GcHeap,
     recv_bits: u64,
     key_bits: u64,
 ) -> RuntimeStubResult {
+    let Some(heap) = heap_ref(heap) else {
+        return RuntimeStubResult::miss();
+    };
     let recv = Value::from_abi_bits(recv_bits);
     let key = Value::from_abi_bits(key_bits);
     if !leaf_key_is_materialized(heap, key) {
@@ -159,6 +209,16 @@ pub fn collection_set_has_leaf(
         return RuntimeStubResult::miss();
     };
     RuntimeStubResult::ok_value(Value::boolean(collections::set_has(set, heap, &key)))
+}
+
+fn heap_ref(heap: *const otter_gc::GcHeap) -> Option<&'static otter_gc::GcHeap> {
+    if heap.is_null() {
+        return None;
+    }
+    // SAFETY: runtime stub callers pass the current isolate heap pointer and
+    // leaf stubs neither allocate nor retain it. The returned reference is used
+    // only for this call.
+    Some(unsafe { &*heap })
 }
 
 fn leaf_key_is_materialized(heap: &otter_gc::GcHeap, key: Value) -> bool {
@@ -195,7 +255,7 @@ mod tests {
         collections::map_set(map, &mut heap, Value::string(key), n(42)).expect("set");
 
         let result = collection_map_get_leaf(
-            &heap,
+            &heap as *const otter_gc::GcHeap,
             Value::map(map).to_abi_bits(),
             Value::string(key).to_abi_bits(),
         );
@@ -210,6 +270,15 @@ mod tests {
         );
         assert_eq!(result.status, RuntimeStubStatus::Ok);
         assert_eq!(result.into_value(), Some(n(42)));
+
+        let result = leaf_no_alloc_stub2_trampoline(
+            &heap as *const otter_gc::GcHeap,
+            STUB_COLLECTION_MAP_GET_LEAF.id,
+            Value::map(map).to_abi_bits(),
+            Value::string(key).to_abi_bits(),
+        );
+        assert_eq!(result.status, RuntimeStubStatus::Ok);
+        assert_eq!(result.into_value(), Some(n(42)));
     }
 
     #[test]
@@ -221,7 +290,7 @@ mod tests {
         let rope = crate::string::JsString::concat(left, right, &mut heap).expect("rope");
 
         let result = collection_map_has_leaf(
-            &heap,
+            &heap as *const otter_gc::GcHeap,
             Value::map(map).to_abi_bits(),
             Value::string(rope).to_abi_bits(),
         );
@@ -235,9 +304,23 @@ mod tests {
         let set = collections::alloc_set(&mut heap).expect("set");
         collections::set_add(set, &mut heap, n(7)).expect("add");
 
-        let result =
-            collection_set_has_leaf(&heap, Value::set(set).to_abi_bits(), n(7).to_abi_bits());
+        let result = collection_set_has_leaf(
+            &heap as *const otter_gc::GcHeap,
+            Value::set(set).to_abi_bits(),
+            n(7).to_abi_bits(),
+        );
         assert_eq!(result.status, RuntimeStubStatus::Ok);
         assert_eq!(result.into_value(), Some(Value::boolean(true)));
+    }
+
+    #[test]
+    fn leaf_stub_entries_miss_null_heap() {
+        let result = collection_map_get_leaf(
+            std::ptr::null(),
+            Value::undefined().to_abi_bits(),
+            Value::undefined().to_abi_bits(),
+        );
+        assert_eq!(result.status, RuntimeStubStatus::Miss);
+        assert_eq!(result.into_value(), None);
     }
 }

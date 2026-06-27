@@ -66,6 +66,12 @@ pub(crate) struct RealmIntrinsics {
     /// step 3a) can return `undefined` instead of throwing when invoked
     /// with the prototype itself as the `this` value.
     pub regexp_prototype: Option<JsObject>,
+    /// `%String.prototype%`. Lets a primitive-string method call resolve its
+    /// builtin method through the shape-guarded own-data IC on this object
+    /// instead of re-walking the constructor → prototype chain every call.
+    pub string_prototype: Option<JsObject>,
+    /// `%Number.prototype%`, for the same primitive-method IC on numbers.
+    pub number_prototype: Option<JsObject>,
 }
 
 impl RealmIntrinsics {
@@ -78,6 +84,8 @@ impl RealmIntrinsics {
         self.array_prototype = resolve_prototype(global, heap, "Array");
         self.promise_prototype = resolve_prototype(global, heap, "Promise");
         self.regexp_prototype = resolve_prototype(global, heap, "RegExp");
+        self.string_prototype = resolve_prototype(global, heap, "String");
+        self.number_prototype = resolve_prototype(global, heap, "Number");
     }
 
     /// Trace cached prototype handles as root slots.
@@ -88,6 +96,8 @@ impl RealmIntrinsics {
             &self.array_prototype,
             &self.promise_prototype,
             &self.regexp_prototype,
+            &self.string_prototype,
+            &self.number_prototype,
         ]
         .into_iter()
         .filter_map(Option::as_ref)

@@ -631,6 +631,27 @@ impl Interpreter {
         }
         // §7.3.11 GetMethod + §7.3.14 Call.
         if self.has_plain_builtin_method(recv_value, name) {
+            // Primitive-method inline cache. A builtin method on a primitive
+            // string / number is an own-data slot of `%String.prototype%` /
+            // `%Number.prototype%`; the primitive itself owns no property of
+            // that name (`has_plain_builtin_method` established it is a builtin
+            // method name, not `length` / an index). Resolving through the
+            // shape-guarded own-data IC on the well-known prototype skips the
+            // per-call ToObject → constructor → prototype walk and the named
+            // `[[Get]]` lookup. A method addition changes the prototype shape
+            // (guard miss → re-resolve); an in-place override is read live from
+            // the slot — both stay correct.
+            if let Some(proto) = self.primitive_method_proto(recv_value)
+                && let Some(atomized_key) =
+                    context.property_atom_for_function(stack[top_idx].function_id, name_idx)
+                && let Some(site) =
+                    context.property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
+                && let Some(method) = self.resolve_method_ic(proto, atomized_key, site)
+                && self.is_callable_runtime(&method)
+            {
+                stack[top_idx].advance_pc(self.current_byte_len)?;
+                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            }
             let method = self
                 .get_method_value_for_call(context, stack, recv_value, name)?
                 .unwrap_or_else(Value::undefined);
@@ -1247,6 +1268,20 @@ impl Interpreter {
     /// property is not an IC-cacheable data slot — an accessor, a deeper
     /// prototype hop, or absent — so the caller falls back to the full
     /// `[[Get]]` method-resolution path that handles those cases.
+    /// Well-known prototype object whose own-data method slots back a primitive
+    /// receiver's builtin methods: `%String.prototype%` for a string,
+    /// `%Number.prototype%` for a number. `None` for any other receiver (no
+    /// primitive-method IC applies).
+    fn primitive_method_proto(&self, recv: Value) -> Option<crate::object::JsObject> {
+        if recv.is_string() {
+            self.realm_intrinsics.string_prototype
+        } else if recv.is_number() {
+            self.realm_intrinsics.number_prototype
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn resolve_method_ic(
         &mut self,
         obj: crate::object::JsObject,

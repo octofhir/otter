@@ -258,14 +258,17 @@ pub const STUB_COLLECTION_SET_HAS_LEAF: RuntimeStubDescriptor = RuntimeStubDescr
 pub enum RuntimeStubStatus {
     /// Stub completed and `value_bits` carries the JS result.
     Ok = 0,
+    /// Guarded fast path was not applicable; caller should use the next slower
+    /// ABI path with equivalent semantics.
+    Miss = 1,
     /// Stub threw; `payload` identifies the parked VM error payload.
-    Throw = 1,
+    Throw = 2,
     /// Stub requests deopt; `payload` identifies the target frame state.
-    Deopt = 2,
+    Deopt = 3,
     /// Allocation failed.
-    OutOfMemory = 3,
+    OutOfMemory = 4,
     /// Runtime interrupt or budget stop.
-    Interrupt = 4,
+    Interrupt = 5,
 }
 
 /// Fixed-width result returned by machine-callable runtime stubs.
@@ -291,6 +294,22 @@ impl RuntimeStubResult {
         }
     }
 
+    /// Successful stub result from a boxed VM [`crate::Value`].
+    #[must_use]
+    pub(crate) const fn ok_value(value: crate::Value) -> Self {
+        Self::ok_bits(value.to_abi_bits())
+    }
+
+    /// Guard miss: the caller should run the next slower ABI-compatible path.
+    #[must_use]
+    pub const fn miss() -> Self {
+        Self {
+            status: RuntimeStubStatus::Miss,
+            value_bits: 0,
+            payload: 0,
+        }
+    }
+
     /// Deopt request targeting `frame_state`.
     #[must_use]
     pub const fn deopt(frame_state: FrameStateId) -> Self {
@@ -298,6 +317,19 @@ impl RuntimeStubResult {
             status: RuntimeStubStatus::Deopt,
             value_bits: 0,
             payload: frame_state as u64,
+        }
+    }
+
+    /// Extract the successful boxed VM value.
+    #[must_use]
+    pub(crate) const fn into_value(self) -> Option<crate::Value> {
+        match self.status {
+            RuntimeStubStatus::Ok => Some(crate::Value::from_abi_bits(self.value_bits)),
+            RuntimeStubStatus::Miss
+            | RuntimeStubStatus::Throw
+            | RuntimeStubStatus::Deopt
+            | RuntimeStubStatus::OutOfMemory
+            | RuntimeStubStatus::Interrupt => None,
         }
     }
 }
@@ -414,5 +446,20 @@ mod tests {
         assert!(std::mem::size_of::<NativeFrameHeader>() <= 40);
         assert!(std::mem::size_of::<RuntimeStubResult>() <= 24);
         assert!(std::mem::size_of::<TaggedLocation>() <= 4);
+    }
+
+    #[test]
+    fn stub_result_round_trips_values() {
+        let value = crate::Value::number_i32(42);
+        let result = RuntimeStubResult::ok_value(value);
+        assert_eq!(result.status, RuntimeStubStatus::Ok);
+        assert_eq!(result.into_value(), Some(value));
+    }
+
+    #[test]
+    fn stub_result_miss_has_no_value() {
+        let result = RuntimeStubResult::miss();
+        assert_eq!(result.status, RuntimeStubStatus::Miss);
+        assert_eq!(result.into_value(), None);
     }
 }

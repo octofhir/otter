@@ -1510,7 +1510,9 @@ impl Interpreter {
         args: &[Value],
     ) -> Result<Value, VmError> {
         if op.leaf_descriptor().is_some()
-            && let Some(value) = self.try_dispatch_collection_builtin_leaf_no_alloc(op, recv, args)
+            && let Some(value) = self
+                .try_dispatch_collection_builtin_leaf_no_alloc(op, recv, args)
+                .into_value()
         {
             return Ok(value);
         }
@@ -1521,49 +1523,51 @@ impl Interpreter {
     ///
     /// This path must not allocate, trigger GC, flatten strings, call JS, or
     /// mutate collection state. If the key would need materialisation for
-    /// efficient SameValueZero comparison, return `None` and let the rooted
+    /// efficient SameValueZero comparison, return `Miss` and let the rooted
     /// allocating path handle it.
     fn try_dispatch_collection_builtin_leaf_no_alloc(
         &self,
         op: CollectionFastOp,
         recv: Value,
         args: &[Value],
-    ) -> Option<Value> {
+    ) -> crate::native_abi::RuntimeStubResult {
         let key = args.first().copied().unwrap_or_else(Value::undefined);
         if key
             .as_string(&self.gc_heap)
             .is_some_and(|s| !s.is_flat_or_latin1(&self.gc_heap))
         {
-            return None;
+            return crate::native_abi::RuntimeStubResult::miss();
         }
         match op {
             CollectionFastOp::MapGet => {
-                let map = recv.as_map()?;
-                Some(
+                let Some(map) = recv.as_map() else {
+                    return crate::native_abi::RuntimeStubResult::miss();
+                };
+                crate::native_abi::RuntimeStubResult::ok_value(
                     crate::collections::map_get(map, &self.gc_heap, &key)
                         .unwrap_or_else(Value::undefined),
                 )
             }
             CollectionFastOp::MapHas => {
-                let map = recv.as_map()?;
-                Some(Value::boolean(crate::collections::map_has(
-                    map,
-                    &self.gc_heap,
-                    &key,
-                )))
+                let Some(map) = recv.as_map() else {
+                    return crate::native_abi::RuntimeStubResult::miss();
+                };
+                crate::native_abi::RuntimeStubResult::ok_value(Value::boolean(
+                    crate::collections::map_has(map, &self.gc_heap, &key),
+                ))
             }
             CollectionFastOp::SetHas => {
-                let set = recv.as_set()?;
-                Some(Value::boolean(crate::collections::set_has(
-                    set,
-                    &self.gc_heap,
-                    &key,
-                )))
+                let Some(set) = recv.as_set() else {
+                    return crate::native_abi::RuntimeStubResult::miss();
+                };
+                crate::native_abi::RuntimeStubResult::ok_value(Value::boolean(
+                    crate::collections::set_has(set, &self.gc_heap, &key),
+                ))
             }
             CollectionFastOp::MapSet
             | CollectionFastOp::MapDelete
             | CollectionFastOp::SetAdd
-            | CollectionFastOp::SetDelete => None,
+            | CollectionFastOp::SetDelete => crate::native_abi::RuntimeStubResult::miss(),
         }
     }
 

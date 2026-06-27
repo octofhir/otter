@@ -271,9 +271,11 @@ Exit criteria:
 
 Status: started. `Map.get`, `Map.has`, and `Set.has` now have explicit
 `LeafNoAlloc` ABI descriptors and a guarded no-root/no-GC dispatch path for keys
-that are already flat/hashable. Compiled code still reaches this through the
-current method runtime stub; direct machine calls to the leaf descriptors remain
-open.
+that are already flat/hashable. Leaf probes return the shared
+`RuntimeStubResult` (`Ok(Value)` / `Miss`) instead of a local Rust-only shortcut,
+so the same result ABI can be reused by future direct JIT calls. Compiled code
+still reaches this through the current method runtime stub; direct machine calls
+to the leaf descriptors remain open.
 
 Tasks:
 

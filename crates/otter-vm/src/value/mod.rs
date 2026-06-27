@@ -207,6 +207,22 @@ pub enum ValueKind {
 }
 
 impl Value {
+    /// Raw NaN-box bits for VM-native ABI records and runtime-stub results.
+    #[must_use]
+    pub(crate) const fn to_abi_bits(self) -> u64 {
+        self.0
+    }
+
+    /// Rebuild a [`Value`] from raw VM-native ABI bits.
+    ///
+    /// Callers must only pass bit patterns produced by [`Self::to_abi_bits`]
+    /// or by generated code that follows the value layout contract in this
+    /// module.
+    #[must_use]
+    pub(crate) const fn from_abi_bits(bits: u64) -> Self {
+        Value(bits, _NOT_SEND)
+    }
+
     // -----------------------------------------------------------------------
     // Canonical immediates
     // -----------------------------------------------------------------------

@@ -306,7 +306,12 @@ place: `JitFunctionView` carries baked `SafepointRecord`s keyed by
 `SafepointId`, and `JitCollectionAllocMethod` names the safepoint to publish for
 its call site. Baseline v1 records the full interpreter-visible register window
 as tagged frame-slot roots, matching the current rooted frame model while leaving
-finer liveness/register/spill maps for a later slice.
+finer liveness/register/spill maps for a later slice. The allocating-stub call
+packet is also explicit now: `RuntimeStubAllocContext` carries only erased
+VM/stack/context pointers, the current frame index, and the raw tagged frame-slot
+window. The fixed `AllocStub3Fn` shape takes this context plus a safepoint id and
+three raw `Value` arguments, still without exposing or constructing a generic
+`NativeCtx`.
 
 Tasks:
 
@@ -402,6 +407,7 @@ Exit criteria:
 - [x] JIT-readable collection method IC leaf guards.
 - [x] AllocStub descriptor/call-shape scaffold for `Map.set` / `Set.add`.
 - [x] Baseline frame-slot safepoint records for collection `AllocStub` sites.
+- [x] Explicit `RuntimeStubAllocContext` and `AllocStub3Fn` ABI shape.
 - [ ] First `AllocStub` runtime stub with GC-stress coverage.
 - [ ] JIT call path to stubs without `NativeCtx`.
 - [x] Map/Set feedback model for leaf lookup stubs.
@@ -513,3 +519,19 @@ enabled.
 The next slice can use this metadata to publish the active safepoint around an
 allocating runtime-stub call. Only after that should `collection_map_set_alloc`
 or `collection_set_add_alloc` grow an executable entrypoint.
+
+### 2026-06-28: AllocStub call context packet
+
+Touched surface: runtime stubs, GC safepoint ABI metadata, and JIT/runtime ABI.
+
+`RuntimeStubAllocContext` defines the C-layout context packet for allocating
+runtime stubs. It carries the erased VM reentry pointers, current frame index,
+and raw tagged frame-slot window, giving a future stub enough information to
+publish/update roots through the safepoint map without constructing `NativeCtx`.
+`runtime_stubs` now names the concrete `AllocStub3Fn` entry shape:
+`(alloc_ctx, safepoint_id, receiver_bits, arg0_bits, arg1_bits) ->
+RuntimeStubResultPair`.
+
+This remains an ABI scaffold only. No `Map.set` / `Set.add` executable entry is
+installed until generated code publishes the safepoint around the call and GC
+stress can validate moving-root updates.

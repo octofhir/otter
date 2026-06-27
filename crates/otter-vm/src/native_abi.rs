@@ -167,6 +167,64 @@ pub struct RuntimeStubDescriptor {
     pub argument_count: u8,
 }
 
+/// VM-native allocation/rooting context passed to allocating runtime stubs.
+///
+/// This is the fixed machine-call packet for `AllocStub` entries. It is not a
+/// generic native-call context: it contains only the active VM reentry pointers
+/// and the current frame register window that a safepoint map can trace/update.
+/// Generated code builds this packet from its `JitCtx` immediately before an
+/// allocating stub call and must not retain it after the call returns.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeStubAllocContext {
+    /// Erased `*mut Interpreter`.
+    pub vm: *mut std::ffi::c_void,
+    /// Erased `*mut JitFrameStack`.
+    pub stack: *mut std::ffi::c_void,
+    /// Erased `*const ExecutionContext`.
+    pub context: *const std::ffi::c_void,
+    /// Current frame index within `stack`.
+    pub frame_index: usize,
+    /// Base of the current frame's tagged register window as raw `Value` bits.
+    pub frame_slots: *mut u64,
+    /// Number of tagged frame slots starting at [`Self::frame_slots`].
+    pub frame_slot_count: u16,
+    /// Reserved for flags without changing the ABI shape.
+    pub reserved0: u16,
+    /// Reserved for future safepoint/deopt metadata width.
+    pub reserved1: u32,
+}
+
+impl RuntimeStubAllocContext {
+    /// Build a context packet for an allocating runtime-stub call.
+    #[must_use]
+    pub const fn new(
+        vm: *mut std::ffi::c_void,
+        stack: *mut std::ffi::c_void,
+        context: *const std::ffi::c_void,
+        frame_index: usize,
+        frame_slots: *mut u64,
+        frame_slot_count: u16,
+    ) -> Self {
+        Self {
+            vm,
+            stack,
+            context,
+            frame_index,
+            frame_slots,
+            frame_slot_count,
+            reserved0: 0,
+            reserved1: 0,
+        }
+    }
+
+    /// Whether this packet names a concrete frame-slot root window.
+    #[must_use]
+    pub const fn has_frame_slots(self) -> bool {
+        !self.frame_slots.is_null() && self.frame_slot_count != 0
+    }
+}
+
 /// Current compiled `Op::Call` bridge. Re-entrant because it can invoke
 /// arbitrary JS or native callables.
 pub const STUB_JIT_RUNTIME_CALL: RuntimeStubDescriptor = RuntimeStubDescriptor {
@@ -548,9 +606,34 @@ mod tests {
     #[test]
     fn abi_records_stay_small() {
         assert!(std::mem::size_of::<NativeFrameHeader>() <= 40);
+        assert!(std::mem::size_of::<RuntimeStubAllocContext>() <= 64);
         assert!(std::mem::size_of::<RuntimeStubResult>() <= 24);
         assert_eq!(std::mem::size_of::<RuntimeStubResultPair>(), 16);
         assert!(std::mem::size_of::<TaggedLocation>() <= 4);
+    }
+
+    #[test]
+    fn alloc_context_layout_is_machine_readable() {
+        assert_eq!(std::mem::offset_of!(RuntimeStubAllocContext, vm), 0);
+        assert_eq!(
+            std::mem::offset_of!(RuntimeStubAllocContext, stack),
+            std::mem::size_of::<usize>()
+        );
+        assert!(
+            std::mem::offset_of!(RuntimeStubAllocContext, frame_slots)
+                > std::mem::offset_of!(RuntimeStubAllocContext, frame_index)
+        );
+        let mut slots = [0_u64; 2];
+        let ctx = RuntimeStubAllocContext::new(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            7,
+            slots.as_mut_ptr(),
+            slots.len() as u16,
+        );
+        assert_eq!(ctx.frame_index, 7);
+        assert!(ctx.has_frame_slots());
     }
 
     #[test]

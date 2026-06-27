@@ -195,10 +195,10 @@ pub use js_surface::{
 pub use microtask::{Microtask, MicrotaskError, MicrotaskKind, MicrotaskQueue};
 pub use native_abi::{
     FrameStateId, NO_FRAME_STATE, NO_SAFEPOINT, NativeFrameFlags, NativeFrameHeader,
-    NativeFrameKind, RuntimeStubClass, RuntimeStubDescriptor, RuntimeStubId, RuntimeStubResult,
-    RuntimeStubResultPair, RuntimeStubStatus, STUB_COLLECTION_MAP_GET_LEAF,
-    STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC,
-    STUB_COLLECTION_SET_HAS_LEAF, STUB_JIT_PREPARE_DIRECT_CALL,
+    NativeFrameKind, RuntimeStubAllocContext, RuntimeStubClass, RuntimeStubDescriptor,
+    RuntimeStubId, RuntimeStubResult, RuntimeStubResultPair, RuntimeStubStatus,
+    STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC,
+    STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_HAS_LEAF, STUB_JIT_PREPARE_DIRECT_CALL,
     STUB_JIT_PREPARE_DIRECT_METHOD_CALL, STUB_JIT_PROPERTY_FALLBACK, STUB_JIT_RUNTIME_CALL,
     STUB_JIT_RUNTIME_CALL_METHOD, SafepointId, SafepointRecord, TaggedLocation, TaggedLocationKind,
     VARIADIC_STUB_ARGUMENTS, validate_stub_descriptor,

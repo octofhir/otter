@@ -22,10 +22,10 @@
 //! - [`crate::method_ops`]
 
 use crate::native_abi::{
-    NO_SAFEPOINT, RuntimeStubDescriptor, RuntimeStubId, RuntimeStubResult, RuntimeStubResultPair,
-    STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC,
-    STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_HAS_LEAF, SafepointId,
-    validate_stub_descriptor,
+    NO_SAFEPOINT, RuntimeStubAllocContext, RuntimeStubDescriptor, RuntimeStubId, RuntimeStubResult,
+    RuntimeStubResultPair, STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_LEAF,
+    STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
+    SafepointId, validate_stub_descriptor,
 };
 use crate::{Value, collections};
 
@@ -71,7 +71,21 @@ impl LeafNoAllocStub2 {
     }
 }
 
-/// Fixed three-value allocating runtime stub ABI descriptor.
+/// Machine-callable fixed three-value allocating runtime stub entry shape.
+///
+/// Generated code supplies the VM-native allocation/rooting context separately
+/// from the raw `Value` arguments:
+/// `(alloc_ctx, safepoint_id, receiver_bits, arg0_bits, arg1_bits)`.
+/// `safepoint_id` must identify a precise map for the current call site.
+pub type AllocStub3Fn = extern "C" fn(
+    *mut RuntimeStubAllocContext,
+    SafepointId,
+    u64,
+    u64,
+    u64,
+) -> RuntimeStubResultPair;
+
+/// Fixed three-value allocating runtime stub descriptor.
 ///
 /// Generated code supplies the VM-native allocation/rooting context separately
 /// from the raw `Value` arguments:
@@ -319,6 +333,37 @@ mod tests {
             Some(STUB_COLLECTION_SET_ADD_ALLOC)
         );
         assert!(alloc_stub3_by_id(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn alloc_stub3_fn_uses_alloc_context_and_pair_result() {
+        extern "C" fn probe(
+            ctx: *mut RuntimeStubAllocContext,
+            safepoint: SafepointId,
+            recv_bits: u64,
+            arg0_bits: u64,
+            arg1_bits: u64,
+        ) -> RuntimeStubResultPair {
+            if ctx.is_null() || safepoint != 9 || recv_bits != 1 || arg0_bits != 2 || arg1_bits != 3
+            {
+                return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+            }
+            RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(recv_bits))
+        }
+
+        let entry: AllocStub3Fn = probe;
+        let mut slots = [Value::undefined().to_abi_bits()];
+        let mut ctx = RuntimeStubAllocContext::new(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            0,
+            slots.as_mut_ptr(),
+            slots.len() as u16,
+        );
+        let result = entry(&mut ctx, 9, 1, 2, 3);
+        assert_eq!(result.status(), RuntimeStubStatus::Ok);
+        assert_eq!(result.value_bits, 1);
     }
 
     #[test]

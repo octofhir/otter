@@ -269,7 +269,11 @@ Exit criteria:
 
 ### Phase 2: Runtime stub ABI v1
 
-Status: not started.
+Status: started. `Map.get`, `Map.has`, and `Set.has` now have explicit
+`LeafNoAlloc` ABI descriptors and a guarded no-root/no-GC dispatch path for keys
+that are already flat/hashable. Compiled code still reaches this through the
+current method runtime stub; direct machine calls to the leaf descriptors remain
+open.
 
 Tasks:
 
@@ -360,7 +364,7 @@ Exit criteria:
 - [x] Native frame/safepoint metadata structs.
 - [x] Stub result and stub class ABI.
 - [x] JIT backedge interrupt/runtime-budget poll stub.
-- [ ] First `LeafNoAlloc` runtime stub.
+- [x] First `LeafNoAlloc` runtime stub.
 - [ ] First `AllocStub` runtime stub with GC-stress coverage.
 - [ ] JIT call path to stubs without `NativeCtx`.
 - [ ] Map/Set feedback model.

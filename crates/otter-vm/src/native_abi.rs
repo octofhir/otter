@@ -224,6 +224,34 @@ pub const STUB_JIT_BACKEDGE_POLL: RuntimeStubDescriptor = RuntimeStubDescriptor 
     argument_count: 1,
 };
 
+/// Leaf `Map.prototype.get` probe used after method/prototype guards have
+/// proven the receiver and builtin identity. The key must already be in a
+/// representation that does not require flattening/materialisation.
+pub const STUB_COLLECTION_MAP_GET_LEAF: RuntimeStubDescriptor = RuntimeStubDescriptor {
+    id: 7,
+    name: "collection_map_get_leaf",
+    class: RuntimeStubClass::LeafNoAlloc,
+    argument_count: 2,
+};
+
+/// Leaf `Map.prototype.has` probe with the same no-flatten/no-GC contract as
+/// [`STUB_COLLECTION_MAP_GET_LEAF`].
+pub const STUB_COLLECTION_MAP_HAS_LEAF: RuntimeStubDescriptor = RuntimeStubDescriptor {
+    id: 8,
+    name: "collection_map_has_leaf",
+    class: RuntimeStubClass::LeafNoAlloc,
+    argument_count: 2,
+};
+
+/// Leaf `Set.prototype.has` probe with the same no-flatten/no-GC contract as
+/// [`STUB_COLLECTION_MAP_GET_LEAF`].
+pub const STUB_COLLECTION_SET_HAS_LEAF: RuntimeStubDescriptor = RuntimeStubDescriptor {
+    id: 9,
+    name: "collection_set_has_leaf",
+    class: RuntimeStubClass::LeafNoAlloc,
+    argument_count: 2,
+};
+
 /// Status code returned by a runtime stub.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

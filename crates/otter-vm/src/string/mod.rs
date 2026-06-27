@@ -413,6 +413,21 @@ impl JsString {
         })
     }
 
+    /// `true` when content comparisons can read this body in place without
+    /// materialising a temporary UTF-16 vector.
+    #[must_use]
+    pub fn is_flat_or_latin1(self, heap: &GcHeap) -> bool {
+        heap.read_payload(self.handle, |body| {
+            matches!(
+                body.repr,
+                JsStringBodyRepr::InlineFlat(_)
+                    | JsStringBodyRepr::Flat(_)
+                    | JsStringBodyRepr::InlineLatin1(_)
+                    | JsStringBodyRepr::Latin1(_)
+            )
+        })
+    }
+
     /// Code-unit at `index`, or `None` for out-of-range. Walks the
     /// body iteratively — no allocation.
     #[must_use]

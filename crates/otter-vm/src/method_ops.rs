@@ -155,6 +155,15 @@ impl CollectionFastOp {
             crate::bootstrap_collections::is_set_prototype_builtin(method, heap, self.name())
         }
     }
+
+    fn leaf_descriptor(self) -> Option<crate::native_abi::RuntimeStubDescriptor> {
+        match self {
+            Self::MapGet => Some(crate::native_abi::STUB_COLLECTION_MAP_GET_LEAF),
+            Self::MapHas => Some(crate::native_abi::STUB_COLLECTION_MAP_HAS_LEAF),
+            Self::SetHas => Some(crate::native_abi::STUB_COLLECTION_SET_HAS_LEAF),
+            Self::MapSet | Self::MapDelete | Self::SetAdd | Self::SetDelete => None,
+        }
+    }
 }
 
 /// Monomorphic method-call inline cache entry.
@@ -1409,7 +1418,7 @@ impl Interpreter {
         if !ic.op.matches_builtin(method, &self.gc_heap) {
             return None;
         }
-        Some(self.dispatch_collection_builtin_rooted(ic.op, recv, args))
+        Some(self.dispatch_collection_builtin(ic.op, recv, args))
     }
 
     /// Direct `map.get/set/has/delete` and `set.add/has/delete` dispatch on an
@@ -1487,7 +1496,75 @@ impl Interpreter {
                 op,
             }));
         }
-        Some(self.dispatch_collection_builtin_rooted(op, recv, args))
+        Some(self.dispatch_collection_builtin(op, recv, args))
+    }
+
+    /// Run a resolved Map/Set builtin, taking a leaf no-allocation path for
+    /// lookup operations whose key is already representable without
+    /// flattening. All allocating or materialising cases fall back to the
+    /// rooted path below.
+    fn dispatch_collection_builtin(
+        &mut self,
+        op: CollectionFastOp,
+        recv: Value,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        if op.leaf_descriptor().is_some()
+            && let Some(value) = self.try_dispatch_collection_builtin_leaf_no_alloc(op, recv, args)
+        {
+            return Ok(value);
+        }
+        self.dispatch_collection_builtin_rooted(op, recv, args)
+    }
+
+    /// Leaf Map/Set lookup dispatch.
+    ///
+    /// This path must not allocate, trigger GC, flatten strings, call JS, or
+    /// mutate collection state. If the key would need materialisation for
+    /// efficient SameValueZero comparison, return `None` and let the rooted
+    /// allocating path handle it.
+    fn try_dispatch_collection_builtin_leaf_no_alloc(
+        &self,
+        op: CollectionFastOp,
+        recv: Value,
+        args: &[Value],
+    ) -> Option<Value> {
+        let key = args.first().copied().unwrap_or_else(Value::undefined);
+        if key
+            .as_string(&self.gc_heap)
+            .is_some_and(|s| !s.is_flat_or_latin1(&self.gc_heap))
+        {
+            return None;
+        }
+        match op {
+            CollectionFastOp::MapGet => {
+                let map = recv.as_map()?;
+                Some(
+                    crate::collections::map_get(map, &self.gc_heap, &key)
+                        .unwrap_or_else(Value::undefined),
+                )
+            }
+            CollectionFastOp::MapHas => {
+                let map = recv.as_map()?;
+                Some(Value::boolean(crate::collections::map_has(
+                    map,
+                    &self.gc_heap,
+                    &key,
+                )))
+            }
+            CollectionFastOp::SetHas => {
+                let set = recv.as_set()?;
+                Some(Value::boolean(crate::collections::set_has(
+                    set,
+                    &self.gc_heap,
+                    &key,
+                )))
+            }
+            CollectionFastOp::MapSet
+            | CollectionFastOp::MapDelete
+            | CollectionFastOp::SetAdd
+            | CollectionFastOp::SetDelete => None,
+        }
     }
 
     /// Run the resolved Map/Set builtin with the receiver and arguments rooted

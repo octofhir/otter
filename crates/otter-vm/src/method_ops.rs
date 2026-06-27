@@ -1414,6 +1414,7 @@ impl Interpreter {
     pub(crate) fn jit_collection_alloc_method_feedback(
         &self,
         site: usize,
+        safepoint_id: crate::native_abi::SafepointId,
     ) -> Option<crate::jit::JitCollectionAllocMethod> {
         let ic = match (*self.method_call_ics.get(site)?).as_ref().copied()? {
             MethodCallIc::Collection(ic) => ic,
@@ -1448,6 +1449,7 @@ impl Interpreter {
             method_value_byte: u32::from(ic.proto_slot) * std::mem::size_of::<Value>() as u32,
             builtin_fn_addr,
             alloc_stub_id: stub_id,
+            safepoint_id,
             value_arg_count: 3,
         })
     }

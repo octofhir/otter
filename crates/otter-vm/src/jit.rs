@@ -33,6 +33,8 @@ use std::sync::Arc;
 
 use otter_bytecode::{Op, Operand};
 
+use crate::native_abi::{SafepointId, SafepointRecord};
+
 /// Owned compile request for one bytecode function.
 #[derive(Debug, Clone)]
 pub struct JitCompileRequest {
@@ -134,6 +136,11 @@ pub struct JitFunctionView {
     /// allocating stub id. Generated code must still attach an exact safepoint
     /// for the call site before it may invoke the stub.
     pub collection_alloc_methods: rustc_hash::FxHashMap<u32, JitCollectionAllocMethod>,
+    /// Safepoint records baked for allocating runtime-stub call sites, keyed by
+    /// `SafepointId`. Baseline v1 uses frame-slot roots for the full register
+    /// window, so allocating stubs can trigger moving GC without keeping raw
+    /// untracked `Value` bits live only in machine registers.
+    pub safepoints: rustc_hash::FxHashMap<SafepointId, SafepointRecord>,
 }
 
 /// Static collection body layout used by JIT-readable method IC guards.
@@ -182,6 +189,8 @@ pub struct JitCollectionAllocMethod {
     /// VM-native allocating stub descriptor id to call after guards pass and a
     /// precise safepoint is published for the current frame.
     pub alloc_stub_id: crate::native_abi::RuntimeStubId,
+    /// Safepoint record to publish when calling the allocating stub.
+    pub safepoint_id: crate::native_abi::SafepointId,
     /// Number of raw boxed `Value` arguments in the uniform mutation ABI. The
     /// current collection mutation shape is `(receiver, arg0, arg1_or_undefined)`.
     pub value_arg_count: u8,

@@ -478,6 +478,27 @@ pub struct SafepointRecord {
 }
 
 impl SafepointRecord {
+    /// Build a safepoint that treats the interpreter-visible register window as
+    /// the tagged root set.
+    ///
+    /// Baseline v1 keeps GC-bearing values in frame slots at allocation
+    /// boundaries, so this is the first machine-stub-safe map before finer
+    /// liveness and register/spill maps are available.
+    #[must_use]
+    pub fn frame_slot_window(
+        id: SafepointId,
+        frame_state: FrameStateId,
+        register_count: u16,
+    ) -> Self {
+        Self {
+            id,
+            frame_state,
+            tagged_locations: (0..register_count)
+                .map(TaggedLocation::frame_slot)
+                .collect(),
+        }
+    }
+
     /// Whether this safepoint can reconstruct an interpreter-visible frame state.
     #[must_use]
     pub fn has_deopt_state(&self) -> bool {
@@ -538,6 +559,23 @@ mod tests {
         let result = RuntimeStubResult::ok_value(value);
         assert_eq!(result.status, RuntimeStubStatus::Ok);
         assert_eq!(result.into_value(), Some(value));
+    }
+
+    #[test]
+    fn frame_slot_window_safepoint_covers_registers() {
+        let record = SafepointRecord::frame_slot_window(3, NO_FRAME_STATE, 4);
+        assert_eq!(record.id, 3);
+        assert_eq!(record.frame_state, NO_FRAME_STATE);
+        assert!(!record.has_deopt_state());
+        assert_eq!(
+            record.tagged_locations,
+            vec![
+                TaggedLocation::frame_slot(0),
+                TaggedLocation::frame_slot(1),
+                TaggedLocation::frame_slot(2),
+                TaggedLocation::frame_slot(3),
+            ]
+        );
     }
 
     #[test]

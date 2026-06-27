@@ -3507,9 +3507,24 @@ impl Interpreter {
             let Some(site) = instr.property_ic_site else {
                 continue;
             };
-            let Some(feedback) = self.jit_collection_alloc_method_feedback(site) else {
+            let safepoint_id = view.safepoints.len() as native_abi::SafepointId;
+            let Some(feedback) = self.jit_collection_alloc_method_feedback(site, safepoint_id)
+            else {
                 continue;
             };
+            if !crate::runtime_stubs::alloc_stub3_by_id(feedback.alloc_stub_id)
+                .is_some_and(|stub| stub.is_valid_for_safepoint(safepoint_id))
+            {
+                continue;
+            }
+            view.safepoints.insert(
+                safepoint_id,
+                native_abi::SafepointRecord::frame_slot_window(
+                    safepoint_id,
+                    native_abi::NO_FRAME_STATE,
+                    view.register_count,
+                ),
+            );
             view.collection_alloc_methods
                 .insert(instr.byte_pc, feedback);
         }
@@ -15542,6 +15557,7 @@ mod tests {
             inline_methods: rustc_hash::FxHashMap::default(),
             collection_leaf_methods: rustc_hash::FxHashMap::default(),
             collection_alloc_methods: rustc_hash::FxHashMap::default(),
+            safepoints: rustc_hash::FxHashMap::default(),
         };
         interp.bake_arith_feedback(&mut view, 5);
         assert_eq!(view.instructions[0].arith_feedback, int_site.bits());

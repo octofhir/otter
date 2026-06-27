@@ -254,6 +254,7 @@ mod tests {
             inline_methods: Default::default(),
             collection_leaf_methods: Default::default(),
             collection_alloc_methods: Default::default(),
+            safepoints: Default::default(),
         }
     }
 

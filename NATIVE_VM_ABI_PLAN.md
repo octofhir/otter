@@ -301,7 +301,12 @@ carry `JitCollectionAllocMethod` feedback for warmed `Map.set` / `Set.add`
 sites: receiver/prototype/builtin guards plus the allocating stub id. Baseline
 codegen intentionally does not call these stubs yet; the existing rooted
 fallback remains the only executing mutation path until exact safepoint/root maps
-are published at the machine call site.
+are published at the machine call site. The first safepoint-map slice is now in
+place: `JitFunctionView` carries baked `SafepointRecord`s keyed by
+`SafepointId`, and `JitCollectionAllocMethod` names the safepoint to publish for
+its call site. Baseline v1 records the full interpreter-visible register window
+as tagged frame-slot roots, matching the current rooted frame model while leaving
+finer liveness/register/spill maps for a later slice.
 
 Tasks:
 
@@ -396,6 +401,7 @@ Exit criteria:
 - [x] Baseline pair-result call sequence for collection `LeafNoAlloc` stubs.
 - [x] JIT-readable collection method IC leaf guards.
 - [x] AllocStub descriptor/call-shape scaffold for `Map.set` / `Set.add`.
+- [x] Baseline frame-slot safepoint records for collection `AllocStub` sites.
 - [ ] First `AllocStub` runtime stub with GC-stress coverage.
 - [ ] JIT call path to stubs without `NativeCtx`.
 - [x] Map/Set feedback model for leaf lookup stubs.
@@ -491,3 +497,19 @@ the same receiver/prototype/builtin guard metadata used by leaf methods. Baselin
 still falls through to the existing rooted dispatch for actual allocation and
 GC. The next slice should add a real safepoint record for baseline method-call
 sites and only then attach a machine-callable allocating entry.
+
+### 2026-06-28: Collection AllocStub safepoint records
+
+Touched surface: GC safepoint ABI metadata and JIT/runtime ABI.
+
+Allocating collection method feedback now carries a `SafepointId`, and
+`JitFunctionView` includes the corresponding `SafepointRecord`. For baseline v1
+the record maps every interpreter-visible register in the frame window as a
+tagged `FrameSlot` root. This is deliberately wider than final liveness maps but
+it is precise about storage class and keeps moving-GC correctness tied to the
+shared frame-window root model before any machine-callable mutation stub is
+enabled.
+
+The next slice can use this metadata to publish the active safepoint around an
+allocating runtime-stub call. Only after that should `collection_map_set_alloc`
+or `collection_set_add_alloc` grow an executable entrypoint.

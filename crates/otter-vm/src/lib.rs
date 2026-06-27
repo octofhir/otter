@@ -6518,6 +6518,15 @@ impl Interpreter {
         // so the per-op checkpoint only needs to run when enforcement is on.
         // In the default Observe mode this collapses to a not-taken branch.
         let enforce_budget = self.runtime_budget.rejects_on_exceedance();
+        // Like `enforce_budget`, these installation states are fixed for the
+        // duration of a dispatch run — a JIT hook, CPU profiler, or step tracer
+        // is attached between turns, never mid-loop. Hoisting the `is_some`
+        // probes into loop-invariant bools turns three per-instruction
+        // `self`-field loads into register-resident branches that collapse to
+        // not-taken in the common (no hook / no profiler / no tracer) case.
+        let jit_installed = self.jit_hook.is_some();
+        let has_profiler = self.cpu_profiler.is_some();
+        let has_tracer = self.tracer.is_some();
         // Per-frame dispatch cache. The owning chunk context, the executable
         // function body, and the dense instruction index are invariants of the
         // top frame — they change only when the frame does (call / return /
@@ -6664,7 +6673,7 @@ impl Interpreter {
             // which the arith opcode helpers record only when a JIT hook is
             // installed. With no hook there is no reader, so skip the two
             // per-instruction stores entirely on the interpreter-only path.
-            if self.jit_hook.is_some() {
+            if jit_installed {
                 self.current_function_id = function_id;
                 self.current_byte_pc = pc;
             }
@@ -6679,14 +6688,14 @@ impl Interpreter {
                 self.enforce_runtime_budget_checkpoint()?;
             }
 
-            if let Some(profiler) = self.cpu_profiler.as_mut() {
+            if has_profiler && let Some(profiler) = self.cpu_profiler.as_mut() {
                 profiler.maybe_sample(context, stack);
             }
 
-            // Step-trace hook. The hot path checks one `Option` slot
-            // per instruction; the body only runs when an embedder
-            // installed a tracer through `Interpreter::set_tracer`.
-            if self.tracer.is_some() {
+            // Step-trace hook. The hot path checks one loop-invariant bool
+            // per instruction; the body only runs when an embedder installed
+            // a tracer through `Interpreter::set_tracer`.
+            if has_tracer {
                 let function_name = context
                     .function(function_id)
                     .map(|f| f.name.as_str())
@@ -6734,7 +6743,7 @@ impl Interpreter {
                     self.do_call(stack, context, operands)?;
                     // Tier-up hook: only when a bytecode callee frame was just
                     // pushed and a JIT is installed. Cheap (one bool) when off.
-                    if self.jit_hook.is_some() && stack.len() > depth_before {
+                    if jit_installed && stack.len() > depth_before {
                         // Record the observed callee for leaf-inlining feedback
                         // before the tier-up hook may consume the freshly pushed
                         // frame.
@@ -6765,7 +6774,7 @@ impl Interpreter {
                     // under the new callee frame; the receiver handle may move
                     // during the call, so the prototype shape and method slot are
                     // resolved here while it is still valid).
-                    let method_site = if self.jit_hook.is_some() {
+                    let method_site = if jit_installed {
                         register_operand(context.exec_operand(instr, 1))
                             .ok()
                             .and_then(|r| {
@@ -6791,7 +6800,7 @@ impl Interpreter {
                     self.do_call_method_value(stack, context, operands)?;
                     // Tier-up hook, mirroring `Op::Call`: a bytecode method
                     // callee pushed via `invoke` lands as a fresh pc==0 frame.
-                    if self.jit_hook.is_some() && stack.len() > depth_before {
+                    if jit_installed && stack.len() > depth_before {
                         let method_fid = stack[stack.len() - 1].function_id;
                         if let Some(site) = method_site {
                             self.note_method_target(function_id, pc, method_fid, site);
@@ -6813,7 +6822,7 @@ impl Interpreter {
                     self.do_construct(stack, context, operands)?;
                     // Tier-up hook, mirroring `Op::Call`: a bytecode
                     // constructor frame pushed by `new` can enter JIT at pc=0.
-                    if self.jit_hook.is_some()
+                    if jit_installed
                         && stack.len() > depth_before
                         && let Some(Some(value)) = self.maybe_dispatch_jit(stack, context)?
                     {
@@ -8521,7 +8530,7 @@ impl Interpreter {
                     // updated operand against the int32 step. A counting loop's
                     // `i++` thus reads as int32-only and lowers to a guarded
                     // `Int32Add`.
-                    if self.jit_hook.is_some() {
+                    if jit_installed {
                         self.note_arith(value, Value::number_i32(delta));
                     }
                     let primitive = self.evaluate_to_primitive(

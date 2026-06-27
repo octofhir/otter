@@ -72,6 +72,12 @@ pub(crate) struct RealmIntrinsics {
     pub string_prototype: Option<JsObject>,
     /// `%Number.prototype%`, for the same primitive-method IC on numbers.
     pub number_prototype: Option<JsObject>,
+    /// `%Map.prototype%`. Lets `map.get/set/has/delete` on an ordinary Map
+    /// dispatch the builtin directly once the slot is confirmed pristine,
+    /// skipping the per-call method-resolution walk and the native bridge.
+    pub map_prototype: Option<JsObject>,
+    /// `%Set.prototype%`, for the same direct dispatch of `set.add/has/delete`.
+    pub set_prototype: Option<JsObject>,
 }
 
 impl RealmIntrinsics {
@@ -86,6 +92,8 @@ impl RealmIntrinsics {
         self.regexp_prototype = resolve_prototype(global, heap, "RegExp");
         self.string_prototype = resolve_prototype(global, heap, "String");
         self.number_prototype = resolve_prototype(global, heap, "Number");
+        self.map_prototype = resolve_prototype(global, heap, "Map");
+        self.set_prototype = resolve_prototype(global, heap, "Set");
     }
 
     /// Trace cached prototype handles as root slots.
@@ -98,6 +106,8 @@ impl RealmIntrinsics {
             &self.regexp_prototype,
             &self.string_prototype,
             &self.number_prototype,
+            &self.map_prototype,
+            &self.set_prototype,
         ]
         .into_iter()
         .filter_map(Option::as_ref)

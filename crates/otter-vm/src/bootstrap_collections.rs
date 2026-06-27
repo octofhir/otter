@@ -697,6 +697,49 @@ fn read_indexed_property(
 // Map prototype method bodies
 // ---------------------------------------------------------------
 
+/// `true` when `method` is still the original `%Map.prototype%` builtin for
+/// `name` (get/set/has/delete). Any user override installs a different function
+/// (a closure fails `as_native_function`; a different builtin fails the
+/// pointer check) and `delete` removes the slot, so a match means the resolved
+/// value can only be the canonical builtin — the precondition the direct Map
+/// dispatch relies on.
+pub(crate) fn is_map_prototype_builtin(
+    method: Value,
+    heap: &otter_gc::GcHeap,
+    name: &str,
+) -> bool {
+    let Some(native) = method.as_native_function() else {
+        return false;
+    };
+    let target: crate::native_function::NativeFastFn = match name {
+        "get" => map_proto_get,
+        "set" => map_proto_set,
+        "has" => map_proto_has,
+        "delete" => map_proto_delete,
+        _ => return false,
+    };
+    native.is_static_fn(heap, target)
+}
+
+/// `true` when `method` is still the original `%Set.prototype%` builtin for
+/// `name` (add/has/delete). See [`is_map_prototype_builtin`].
+pub(crate) fn is_set_prototype_builtin(
+    method: Value,
+    heap: &otter_gc::GcHeap,
+    name: &str,
+) -> bool {
+    let Some(native) = method.as_native_function() else {
+        return false;
+    };
+    let target: crate::native_function::NativeFastFn = match name {
+        "add" => set_proto_add,
+        "has" => set_proto_has,
+        "delete" => set_proto_delete,
+        _ => return false,
+    };
+    native.is_static_fn(heap, target)
+}
+
 /// Realise a string key's rope/slice body into a flat body in place.
 ///
 /// Map/Set keys are routinely built by concatenation (`"k" + i`), which

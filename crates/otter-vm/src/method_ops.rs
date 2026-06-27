@@ -61,6 +61,53 @@ impl otter_gc::ExtraRootSource for ArrayFastDispatchRoots<'_> {
     }
 }
 
+/// Root scope for the direct Map/Set builtin dispatch. The receiver handle and
+/// the argument values live only in this native stack frame, so a scavenge
+/// triggered by an inserting `set` / `add` would otherwise miss them; rooting
+/// `recv` also lets the caller read the forwarded receiver back after the call
+/// (the spec returns the collection from `Map.prototype.set` / `Set.prototype.add`).
+struct CollectionFastDispatchRoots<'a> {
+    interp_roots: otter_gc::ExtraRoots,
+    recv: Value,
+    args: &'a [Value],
+}
+
+impl otter_gc::ExtraRootSource for CollectionFastDispatchRoots<'_> {
+    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
+        self.interp_roots.visit(visitor);
+        self.recv.trace_value_slots(visitor);
+        for value in self.args {
+            value.trace_value_slots(visitor);
+        }
+    }
+}
+
+/// `true` when a collection's recorded `[[Prototype]]` is the canonical realm
+/// prototype: either implicit (`None` — the default) or an explicit override
+/// that still points at `expected`. Any other object is a user-installed
+/// prototype that could shadow the builtin, so the direct dispatch bails.
+fn prototype_override_is(
+    override_value: Option<Value>,
+    expected: crate::object::JsObject,
+) -> bool {
+    match override_value {
+        None => true,
+        Some(value) => value.as_object() == Some(expected),
+    }
+}
+
+/// Which Map/Set builtin the direct dispatch resolved to.
+#[derive(Clone, Copy)]
+enum CollectionFastOp {
+    MapGet,
+    MapSet,
+    MapHas,
+    MapDelete,
+    SetAdd,
+    SetHas,
+    SetDelete,
+}
+
 /// Monomorphic method-call inline cache entry for a dense-array builtin site.
 ///
 /// Records the `%Array.prototype%` shape and the own-slot offset that resolved
@@ -367,6 +414,17 @@ impl Interpreter {
             name,
             arg_values.as_slice(),
         ) {
+            let value = result?;
+            stack[top_idx].advance_pc(caller_byte_len)?;
+            write_register(&mut stack[top_idx], dst, value)?;
+            return Ok(());
+        }
+        // Ordinary Map/Set whose realm prototype slot is the untouched builtin —
+        // dispatch the collection primitive directly, skipping both the
+        // method-resolution walk and the native call bridge.
+        if let Some(result) =
+            self.try_fast_collection_proto_method(recv_value, name, arg_values.as_slice())
+        {
             let value = result?;
             stack[top_idx].advance_pc(caller_byte_len)?;
             write_register(&mut stack[top_idx], dst, value)?;
@@ -1185,6 +1243,164 @@ impl Interpreter {
             return None;
         }
         Some(self.dispatch_array_builtin_rooted(context, ic.tag, recv, args))
+    }
+
+    /// Direct `map.get/set/has/delete` and `set.add/has/delete` dispatch on an
+    /// ordinary Map/Set whose realm prototype slot still holds the original
+    /// builtin — skipping the per-call method-resolution walk
+    /// (`get_method_value_for_call` → `ordinary_get_value` → constructor →
+    /// prototype) **and** the native call bridge (`invoke` →
+    /// `invoke_native_call_with_roots` → `NativeCtx`) entirely, calling the
+    /// `collections::*` primitive straight through.
+    ///
+    /// Returns `None` (caller falls back to the full path) unless every
+    /// condition that makes the direct call observably identical holds: the
+    /// receiver is an ordinary Map/Set with no per-instance prototype override
+    /// and no own expando (either could shadow the inherited method), and the
+    /// realm prototype's own slot for `name` is still the canonical builtin (a
+    /// user override or deletion fails the function-pointer guard).
+    fn try_fast_collection_proto_method(
+        &mut self,
+        recv: Value,
+        name: &str,
+        args: &[Value],
+    ) -> Option<Result<Value, VmError>> {
+        use crate::object::PropertyLookup;
+        let op = if let Some(map) = recv.as_map() {
+            let proto = self.realm_intrinsics.map_prototype?;
+            // Accept the canonical prototype whether it is the implicit default
+            // (`None`) or the explicit `[[Prototype]]` recorded at construction;
+            // a user-installed prototype is a different object and bails.
+            if !prototype_override_is(
+                crate::collections::map_prototype_override(map, &self.gc_heap),
+                proto,
+            ) || crate::collections::map_expando(map, &self.gc_heap).is_some()
+            {
+                return None;
+            }
+            let (_, lookup) = crate::object::lookup_own_slot(proto, &self.gc_heap, name);
+            let PropertyLookup::Data { value: method, .. } = lookup else {
+                return None;
+            };
+            if !crate::bootstrap_collections::is_map_prototype_builtin(method, &self.gc_heap, name) {
+                return None;
+            }
+            match name {
+                "get" => CollectionFastOp::MapGet,
+                "set" => CollectionFastOp::MapSet,
+                "has" => CollectionFastOp::MapHas,
+                "delete" => CollectionFastOp::MapDelete,
+                _ => return None,
+            }
+        } else if let Some(set) = recv.as_set() {
+            let proto = self.realm_intrinsics.set_prototype?;
+            if !prototype_override_is(
+                crate::collections::set_prototype_override(set, &self.gc_heap),
+                proto,
+            ) || crate::collections::set_expando(set, &self.gc_heap).is_some()
+            {
+                return None;
+            }
+            let (_, lookup) = crate::object::lookup_own_slot(proto, &self.gc_heap, name);
+            let PropertyLookup::Data { value: method, .. } = lookup else {
+                return None;
+            };
+            if !crate::bootstrap_collections::is_set_prototype_builtin(method, &self.gc_heap, name) {
+                return None;
+            }
+            match name {
+                "add" => CollectionFastOp::SetAdd,
+                "has" => CollectionFastOp::SetHas,
+                "delete" => CollectionFastOp::SetDelete,
+                _ => return None,
+            }
+        } else {
+            return None;
+        };
+        Some(self.dispatch_collection_builtin_rooted(op, recv, args))
+    }
+
+    /// Run the resolved Map/Set builtin with the receiver and arguments rooted
+    /// (an inserting `set` / `add` can scavenge). Flattens a string key in place
+    /// so the per-entry SameValueZero compare runs flat (see
+    /// `equals_string_bodies`); for the inserting ops the forwarded receiver is
+    /// read back from the root slot to return the relocated collection.
+    fn dispatch_collection_builtin_rooted(
+        &mut self,
+        op: CollectionFastOp,
+        recv: Value,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        let key = args.first().copied().unwrap_or_else(Value::undefined);
+        let roots = CollectionFastDispatchRoots {
+            interp_roots: otter_gc::ExtraRoots::new::<Interpreter>(self),
+            recv,
+            args,
+        };
+        let depth = self
+            .gc_heap
+            .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
+        // Flatten the string key once so stored keys stay flat and lookups
+        // compare flat-vs-flat instead of re-materializing a rope per probe.
+        if let Some(s) = key.as_string(&self.gc_heap) {
+            let _ = s.flatten_in_place(&mut self.gc_heap);
+        }
+        let result = (|| -> Result<Value, VmError> {
+            match op {
+                CollectionFastOp::MapGet => {
+                    let map = roots.recv.as_map().ok_or(VmError::InvalidOperand)?;
+                    Ok(crate::collections::map_get(map, &self.gc_heap, &key)
+                        .unwrap_or_else(Value::undefined))
+                }
+                CollectionFastOp::MapHas => {
+                    let map = roots.recv.as_map().ok_or(VmError::InvalidOperand)?;
+                    Ok(Value::boolean(crate::collections::map_has(
+                        map,
+                        &self.gc_heap,
+                        &key,
+                    )))
+                }
+                CollectionFastOp::MapDelete => {
+                    let map = roots.recv.as_map().ok_or(VmError::InvalidOperand)?;
+                    Ok(Value::boolean(crate::collections::map_delete(
+                        map,
+                        &mut self.gc_heap,
+                        &key,
+                    )))
+                }
+                CollectionFastOp::MapSet => {
+                    let map = roots.recv.as_map().ok_or(VmError::InvalidOperand)?;
+                    let value = args.get(1).copied().unwrap_or_else(Value::undefined);
+                    crate::collections::map_set(map, &mut self.gc_heap, key, value)
+                        .map_err(VmError::from)?;
+                    Ok(roots.recv)
+                }
+                CollectionFastOp::SetHas => {
+                    let set = roots.recv.as_set().ok_or(VmError::InvalidOperand)?;
+                    Ok(Value::boolean(crate::collections::set_has(
+                        set,
+                        &self.gc_heap,
+                        &key,
+                    )))
+                }
+                CollectionFastOp::SetDelete => {
+                    let set = roots.recv.as_set().ok_or(VmError::InvalidOperand)?;
+                    Ok(Value::boolean(crate::collections::set_delete(
+                        set,
+                        &mut self.gc_heap,
+                        &key,
+                    )))
+                }
+                CollectionFastOp::SetAdd => {
+                    let set = roots.recv.as_set().ok_or(VmError::InvalidOperand)?;
+                    crate::collections::set_add(set, &mut self.gc_heap, key)
+                        .map_err(VmError::from)?;
+                    Ok(roots.recv)
+                }
+            }
+        })();
+        self.gc_heap.pop_extra_roots_to(depth - 1);
+        result
     }
 
     /// Run a resolved `Array.prototype` builtin with the receiver and arguments

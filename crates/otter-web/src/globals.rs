@@ -28,7 +28,7 @@ const WEB_STREAMS: &str = include_str!("web_streams.js");
 /// `globalThis` via their `def(name, value)` helper. Each name is installed
 /// as a lazy accessor so the ~52 KB of shim source is only parsed + compiled
 /// + executed when one of these globals is first touched — the common cold
-/// start (a script that never uses a Web class) skips it entirely.
+///   start (a script that never uses a Web class) skips it entirely.
 ///
 /// This list must stay in lockstep with the `def('...')` calls in both shim
 /// files; [`tests::lazy_global_names_match_shim_def_calls`] enforces that.

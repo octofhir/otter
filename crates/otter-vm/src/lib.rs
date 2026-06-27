@@ -936,7 +936,7 @@ impl Interpreter {
     /// the shared immutable handle thereafter. `None` for inputs outside
     /// `0..SMALL_INT_STRING_CACHE` (the caller falls back to `number_to_string`).
     pub(crate) fn small_int_string(&mut self, i: i32) -> Result<Option<JsString>, VmError> {
-        if i < 0 || i >= Self::SMALL_INT_STRING_CACHE {
+        if !(0..Self::SMALL_INT_STRING_CACHE).contains(&i) {
             return Ok(None);
         }
         if let Some(cached) = self.small_int_string_cache[i as usize] {
@@ -951,7 +951,7 @@ impl Interpreter {
     /// `ToString` of a primitive operand for string concatenation, routing small
     /// non-negative integers through the [`Self::small_int_string`] cache to
     /// avoid re-allocating their decimal text on every concatenation.
-    pub(crate) fn to_js_string_for_concat(&mut self, value: Value) -> Result<JsString, VmError> {
+    pub(crate) fn js_string_for_concat(&mut self, value: Value) -> Result<JsString, VmError> {
         if let Some(n) = value.as_number() {
             let f = n.as_f64();
             if f >= 0.0

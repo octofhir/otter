@@ -182,10 +182,10 @@ pub use dynamic_import::{DynamicImportLoader, DynamicImportLoaderHandle, Dynamic
 pub use error_classes::{ErrorClassRegistry, ErrorKind};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
-    JitCollectionLayout, JitCollectionLeafMethod, JitCompileError, JitCompileRequest,
-    JitCompileStatus, JitCompilerHook, JitExecOutcome, JitFrameStack, JitFunctionCode,
-    JitFunctionView, JitInlineCallee, JitInlineMethod, JitInstrView, JitReentryPtrs,
-    JitTypedArrayLayout,
+    JitCollectionAllocMethod, JitCollectionLayout, JitCollectionLeafMethod, JitCompileError,
+    JitCompileRequest, JitCompileStatus, JitCompilerHook, JitExecOutcome, JitFrameStack,
+    JitFunctionCode, JitFunctionView, JitInlineCallee, JitInlineMethod, JitInstrView,
+    JitReentryPtrs, JitTypedArrayLayout,
 };
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,
@@ -196,7 +196,9 @@ pub use microtask::{Microtask, MicrotaskError, MicrotaskKind, MicrotaskQueue};
 pub use native_abi::{
     FrameStateId, NO_FRAME_STATE, NO_SAFEPOINT, NativeFrameFlags, NativeFrameHeader,
     NativeFrameKind, RuntimeStubClass, RuntimeStubDescriptor, RuntimeStubId, RuntimeStubResult,
-    RuntimeStubResultPair, RuntimeStubStatus, STUB_JIT_PREPARE_DIRECT_CALL,
+    RuntimeStubResultPair, RuntimeStubStatus, STUB_COLLECTION_MAP_GET_LEAF,
+    STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC,
+    STUB_COLLECTION_SET_HAS_LEAF, STUB_JIT_PREPARE_DIRECT_CALL,
     STUB_JIT_PREPARE_DIRECT_METHOD_CALL, STUB_JIT_PROPERTY_FALLBACK, STUB_JIT_RUNTIME_CALL,
     STUB_JIT_RUNTIME_CALL_METHOD, SafepointId, SafepointRecord, TaggedLocation, TaggedLocationKind,
     VARIADIC_STUB_ARGUMENTS, validate_stub_descriptor,
@@ -2798,6 +2800,7 @@ impl Interpreter {
         self.bake_object_literals(&mut view, context);
         self.bake_inline_callees(&mut view, context, fid);
         self.bake_collection_leaf_methods(&mut view);
+        self.bake_collection_alloc_methods(&mut view);
         let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
         if trace {
             let method_feedback = self
@@ -3488,6 +3491,27 @@ impl Interpreter {
                 continue;
             };
             view.collection_leaf_methods.insert(instr.byte_pc, feedback);
+        }
+    }
+
+    /// Bake JIT-readable collection allocating method IC metadata.
+    ///
+    /// This only publishes guard metadata and the target `AllocStub` descriptor
+    /// id. Baseline codegen must continue using the rooted fallback until it can
+    /// attach exact safepoint maps to the machine call site.
+    fn bake_collection_alloc_methods(&self, view: &mut jit::JitFunctionView) {
+        for instr in &view.instructions {
+            if instr.op != Op::CallMethodValue {
+                continue;
+            }
+            let Some(site) = instr.property_ic_site else {
+                continue;
+            };
+            let Some(feedback) = self.jit_collection_alloc_method_feedback(site) else {
+                continue;
+            };
+            view.collection_alloc_methods
+                .insert(instr.byte_pc, feedback);
         }
     }
 
@@ -15517,6 +15541,7 @@ mod tests {
             inline_callees: rustc_hash::FxHashMap::default(),
             inline_methods: rustc_hash::FxHashMap::default(),
             collection_leaf_methods: rustc_hash::FxHashMap::default(),
+            collection_alloc_methods: rustc_hash::FxHashMap::default(),
         };
         interp.bake_arith_feedback(&mut view, 5);
         assert_eq!(view.instructions[0].arith_feedback, int_site.bits());

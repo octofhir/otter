@@ -252,6 +252,31 @@ pub const STUB_COLLECTION_SET_HAS_LEAF: RuntimeStubDescriptor = RuntimeStubDescr
     argument_count: 2,
 };
 
+/// Allocating `Map.prototype.set` mutation stub.
+///
+/// The fixed value-argument shape is `(receiver, key, value)`. Machine callers
+/// must also pass the current VM-native frame/context pointer and a non-sentinel
+/// safepoint id so a moving GC can trace and rewrite all live tagged values.
+pub const STUB_COLLECTION_MAP_SET_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
+    id: 10,
+    name: "collection_map_set_alloc",
+    class: RuntimeStubClass::Alloc,
+    argument_count: 3,
+};
+
+/// Allocating `Set.prototype.add` mutation stub.
+///
+/// Uses the same three-value ABI shape as [`STUB_COLLECTION_MAP_SET_ALLOC`]:
+/// `(receiver, value, unused)`. Keeping the collection mutation stubs uniform
+/// lets generated method-call code pass receiver plus two argument slots without
+/// a per-builtin bridge shape.
+pub const STUB_COLLECTION_SET_ADD_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
+    id: 11,
+    name: "collection_set_add_alloc",
+    class: RuntimeStubClass::Alloc,
+    argument_count: 3,
+};
+
 /// Status code returned by a runtime stub.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -487,14 +512,16 @@ mod tests {
 
     #[test]
     fn allocating_stub_must_name_safepoint() {
-        let desc = RuntimeStubDescriptor {
-            id: 2,
-            name: "map_set_alloc",
-            class: RuntimeStubClass::Alloc,
-            argument_count: 3,
-        };
-        assert!(!validate_stub_descriptor(desc, NO_SAFEPOINT));
-        assert!(validate_stub_descriptor(desc, 9));
+        assert!(!validate_stub_descriptor(
+            STUB_COLLECTION_MAP_SET_ALLOC,
+            NO_SAFEPOINT
+        ));
+        assert!(validate_stub_descriptor(STUB_COLLECTION_MAP_SET_ALLOC, 9));
+        assert!(!validate_stub_descriptor(
+            STUB_COLLECTION_SET_ADD_ALLOC,
+            NO_SAFEPOINT
+        ));
+        assert!(validate_stub_descriptor(STUB_COLLECTION_SET_ADD_ALLOC, 9));
     }
 
     #[test]

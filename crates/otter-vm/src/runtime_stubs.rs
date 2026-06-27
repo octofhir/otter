@@ -8,6 +8,8 @@
 //! # Contents
 //! - Leaf/no-allocation collection probes for `Map.get`, `Map.has`, and
 //!   `Set.has`.
+//! - Allocating collection mutation ABI descriptors for `Map.set` and
+//!   `Set.add`.
 //!
 //! # Invariants
 //! - Arguments are boxed [`crate::Value`] raw ABI bits.
@@ -21,7 +23,8 @@
 
 use crate::native_abi::{
     NO_SAFEPOINT, RuntimeStubDescriptor, RuntimeStubId, RuntimeStubResult, RuntimeStubResultPair,
-    STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_SET_HAS_LEAF,
+    STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC,
+    STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_HAS_LEAF, SafepointId,
     validate_stub_descriptor,
 };
 use crate::{Value, collections};
@@ -68,6 +71,29 @@ impl LeafNoAllocStub2 {
     }
 }
 
+/// Fixed three-value allocating runtime stub ABI descriptor.
+///
+/// Generated code supplies the VM-native allocation/rooting context separately
+/// from the raw `Value` arguments:
+/// `(alloc_ctx, safepoint_id, receiver_bits, arg0_bits, arg1_bits)`.
+/// `safepoint_id` must identify a precise map for the current call site. This
+/// scaffold intentionally carries no Rust entrypoint yet; calling these stubs
+/// before the frame/safepoint publisher exists would be unsound for moving GC.
+#[derive(Clone, Copy)]
+pub struct AllocStub3 {
+    /// Passive descriptor shared with profiler/JIT metadata.
+    pub descriptor: RuntimeStubDescriptor,
+}
+
+impl AllocStub3 {
+    /// `true` when descriptor metadata matches this callable ABI shape for a
+    /// concrete allocating call site.
+    #[must_use]
+    pub const fn is_valid_for_safepoint(self, safepoint: SafepointId) -> bool {
+        validate_stub_descriptor(self.descriptor, safepoint) && self.descriptor.argument_count == 3
+    }
+}
+
 /// Callable ABI entry for `Map.prototype.get`.
 pub const COLLECTION_MAP_GET_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     descriptor: STUB_COLLECTION_MAP_GET_LEAF,
@@ -86,6 +112,16 @@ pub const COLLECTION_SET_HAS_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     entry: collection_set_has_leaf,
 };
 
+/// ABI descriptor for `Map.prototype.set` collection mutation.
+pub const COLLECTION_MAP_SET_ALLOC: AllocStub3 = AllocStub3 {
+    descriptor: STUB_COLLECTION_MAP_SET_ALLOC,
+};
+
+/// ABI descriptor for `Set.prototype.add` collection mutation.
+pub const COLLECTION_SET_ADD_ALLOC: AllocStub3 = AllocStub3 {
+    descriptor: STUB_COLLECTION_SET_ADD_ALLOC,
+};
+
 /// Resolve a fixed two-argument leaf/no-allocation stub by ABI descriptor id.
 #[must_use]
 pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocStub2> {
@@ -93,6 +129,16 @@ pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocS
         id if id == STUB_COLLECTION_MAP_GET_LEAF.id => Some(COLLECTION_MAP_GET_LEAF),
         id if id == STUB_COLLECTION_MAP_HAS_LEAF.id => Some(COLLECTION_MAP_HAS_LEAF),
         id if id == STUB_COLLECTION_SET_HAS_LEAF.id => Some(COLLECTION_SET_HAS_LEAF),
+        _ => None,
+    }
+}
+
+/// Resolve a fixed three-value allocating stub descriptor by ABI descriptor id.
+#[must_use]
+pub const fn alloc_stub3_by_id(id: RuntimeStubId) -> Option<AllocStub3> {
+    match id {
+        id if id == STUB_COLLECTION_MAP_SET_ALLOC.id => Some(COLLECTION_MAP_SET_ALLOC),
+        id if id == STUB_COLLECTION_SET_ADD_ALLOC.id => Some(COLLECTION_SET_ADD_ALLOC),
         _ => None,
     }
 }
@@ -256,6 +302,23 @@ mod tests {
             Some(STUB_COLLECTION_MAP_GET_LEAF)
         );
         assert!(leaf_no_alloc_stub2_by_id(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn alloc_stub_descriptors_require_safepoints() {
+        assert!(!COLLECTION_MAP_SET_ALLOC.is_valid_for_safepoint(NO_SAFEPOINT));
+        assert!(COLLECTION_MAP_SET_ALLOC.is_valid_for_safepoint(1));
+        assert!(!COLLECTION_SET_ADD_ALLOC.is_valid_for_safepoint(NO_SAFEPOINT));
+        assert!(COLLECTION_SET_ADD_ALLOC.is_valid_for_safepoint(1));
+        assert_eq!(
+            alloc_stub3_by_id(STUB_COLLECTION_MAP_SET_ALLOC.id).map(|stub| stub.descriptor),
+            Some(STUB_COLLECTION_MAP_SET_ALLOC)
+        );
+        assert_eq!(
+            alloc_stub3_by_id(STUB_COLLECTION_SET_ADD_ALLOC.id).map(|stub| stub.descriptor),
+            Some(STUB_COLLECTION_SET_ADD_ALLOC)
+        );
+        assert!(alloc_stub3_by_id(u32::MAX).is_none());
     }
 
     #[test]

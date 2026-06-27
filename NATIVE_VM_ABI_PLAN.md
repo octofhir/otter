@@ -292,6 +292,16 @@ compiled `CallMethodValue` now tries a narrow collection-leaf bridge before the
 generic method bridge, so hot `Map.get` / `Map.has` / `Set.has` sites can return
 through the reusable leaf ABI without building the full method-call argument
 path. Fully direct machine calls to the leaf entries remain open.
+`Map.prototype.set` and `Set.prototype.add` now also have concrete `AllocStub`
+descriptors (`collection_map_set_alloc`, `collection_set_add_alloc`) and a
+uniform three-value mutation ABI shape (`receiver`, `arg0`, `arg1_or_undefined`).
+`runtime_stubs` can resolve these descriptor ids as allocating ABI records and
+validates that callers name a non-sentinel safepoint. JIT compile snapshots now
+carry `JitCollectionAllocMethod` feedback for warmed `Map.set` / `Set.add`
+sites: receiver/prototype/builtin guards plus the allocating stub id. Baseline
+codegen intentionally does not call these stubs yet; the existing rooted
+fallback remains the only executing mutation path until exact safepoint/root maps
+are published at the machine call site.
 
 Tasks:
 
@@ -385,6 +395,7 @@ Exit criteria:
 - [x] First `LeafNoAlloc` runtime stub.
 - [x] Baseline pair-result call sequence for collection `LeafNoAlloc` stubs.
 - [x] JIT-readable collection method IC leaf guards.
+- [x] AllocStub descriptor/call-shape scaffold for `Map.set` / `Set.add`.
 - [ ] First `AllocStub` runtime stub with GC-stress coverage.
 - [ ] JIT call path to stubs without `NativeCtx`.
 - [x] Map/Set feedback model for leaf lookup stubs.
@@ -461,3 +472,22 @@ overrides: even an override pointing back to the canonical prototype misses the
 machine guard and uses fallback. That preserves semantics while keeping the
 first machine-readable guard compact. The next ABI slice should turn
 `Map.set`/`Set.add` into `AllocStub` entries with safepoint metadata.
+
+### 2026-06-28: Collection AllocStub ABI scaffold
+
+Touched surface: runtime stubs, GC safepoint ABI metadata, and JIT/runtime ABI.
+
+`Map.prototype.set` and `Set.prototype.add` now have explicit `AllocStub`
+descriptors with stable runtime stub ids and a fixed machine-call value shape:
+`receiver`, `arg0`, `arg1_or_undefined`. The descriptor layer enforces that
+allocating stubs cannot be validated with `NO_SAFEPOINT`, and `runtime_stubs`
+exposes an `AllocStub3` resolver record without an executable entrypoint. This
+keeps the architecture moving without introducing an unsafe mutation fast path
+before compiled frames can publish exact roots.
+
+Collection method ICs now record the allocating stub id for `Map.set` /
+`Set.add`, and compile snapshots can bake a `JitCollectionAllocMethod` DTO with
+the same receiver/prototype/builtin guard metadata used by leaf methods. Baseline
+still falls through to the existing rooted dispatch for actual allocation and
+GC. The next slice should add a real safepoint record for baseline method-call
+sites and only then attach a machine-callable allocating entry.

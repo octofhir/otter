@@ -165,6 +165,14 @@ impl CollectionFastOp {
             Self::MapSet | Self::MapDelete | Self::SetAdd | Self::SetDelete => None,
         }
     }
+
+    fn alloc_stub_id(self) -> Option<RuntimeStubId> {
+        match self {
+            Self::MapSet => Some(crate::native_abi::STUB_COLLECTION_MAP_SET_ALLOC.id),
+            Self::SetAdd => Some(crate::native_abi::STUB_COLLECTION_SET_ADD_ALLOC.id),
+            Self::MapGet | Self::MapHas | Self::MapDelete | Self::SetHas | Self::SetDelete => None,
+        }
+    }
 }
 
 /// Resolved collection builtin target carried by method-call feedback.
@@ -220,6 +228,7 @@ pub(crate) struct CollectionMethodCallIc {
     proto_slot: u16,
     op: CollectionFastOp,
     leaf_stub_id: Option<RuntimeStubId>,
+    alloc_stub_id: Option<RuntimeStubId>,
 }
 
 /// Clamp a `ToIntegerOrInfinity` result to an absolute index within
@@ -1395,6 +1404,54 @@ impl Interpreter {
         })
     }
 
+    /// Snapshot a collection allocating method IC into JIT-readable guard
+    /// metadata.
+    ///
+    /// This deliberately carries no safepoint id. The backend owns
+    /// instruction-level safepoint creation and must only call the descriptor's
+    /// allocating ABI entry after publishing a precise root map for receiver,
+    /// arguments, live frame slots, and tagged machine values.
+    pub(crate) fn jit_collection_alloc_method_feedback(
+        &self,
+        site: usize,
+    ) -> Option<crate::jit::JitCollectionAllocMethod> {
+        let ic = match (*self.method_call_ics.get(site)?).as_ref().copied()? {
+            MethodCallIc::Collection(ic) => ic,
+            MethodCallIc::Array(_) => return None,
+        };
+        let stub_id = ic.alloc_stub_id?;
+        let (proto, receiver_type_tag) = if ic.op.is_map() {
+            (
+                self.realm_intrinsics.map_prototype?,
+                crate::collections::MAP_BODY_TYPE_TAG,
+            )
+        } else {
+            (
+                self.realm_intrinsics.set_prototype?,
+                crate::collections::SET_BODY_TYPE_TAG,
+            )
+        };
+        if crate::object::shape_id(proto, &self.gc_heap) != ic.proto_shape {
+            return None;
+        }
+        let method = crate::object::data_slot_value_at(proto, &self.gc_heap, ic.proto_slot)?;
+        if !ic.op.matches_builtin(method, &self.gc_heap) {
+            return None;
+        }
+        let builtin_fn_addr = method
+            .as_native_function()
+            .and_then(|native| native.jit_static_fn_addr(&self.gc_heap))?;
+        Some(crate::jit::JitCollectionAllocMethod {
+            receiver_type_tag,
+            proto_offset: proto.offset(),
+            proto_shape: crate::object::shape(proto, &self.gc_heap).offset(),
+            method_value_byte: u32::from(ic.proto_slot) * std::mem::size_of::<Value>() as u32,
+            builtin_fn_addr,
+            alloc_stub_id: stub_id,
+            value_arg_count: 3,
+        })
+    }
+
     /// Fast `arr.method(args)` dispatch for an ordinary dense array whose
     /// `%Array.prototype%` slot for `method` is still the original builtin,
     /// skipping the per-call `[[Get]]` method-resolution walk and the native
@@ -1636,6 +1693,7 @@ impl Interpreter {
                 proto_slot: hit.slot,
                 op,
                 leaf_stub_id: op.leaf_stub_id(),
+                alloc_stub_id: op.alloc_stub_id(),
             }));
         }
         Some(self.dispatch_collection_builtin(CollectionFastTarget::new(op), recv, args))

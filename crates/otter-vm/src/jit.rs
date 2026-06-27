@@ -128,6 +128,12 @@ pub struct JitFunctionView {
     /// generated code can validate the receiver/prototype/builtin guards and
     /// call the VM-native leaf stub without a Rust resolver bridge.
     pub collection_leaf_methods: rustc_hash::FxHashMap<u32, JitCollectionLeafMethod>,
+    /// Allocating collection method-call feedback keyed by the caller's
+    /// `Op::CallMethodValue` byte-PC. These entries carry the same
+    /// receiver/prototype/builtin guards as leaf feedback plus the target
+    /// allocating stub id. Generated code must still attach an exact safepoint
+    /// for the call site before it may invoke the stub.
+    pub collection_alloc_methods: rustc_hash::FxHashMap<u32, JitCollectionAllocMethod>,
 }
 
 /// Static collection body layout used by JIT-readable method IC guards.
@@ -158,6 +164,27 @@ pub struct JitCollectionLeafMethod {
     pub builtin_fn_addr: usize,
     /// VM-native leaf stub descriptor id to call after guards pass.
     pub leaf_stub_id: crate::native_abi::RuntimeStubId,
+}
+
+/// JIT-readable allocating collection method IC entry.
+#[derive(Debug, Clone, Copy)]
+pub struct JitCollectionAllocMethod {
+    /// Expected receiver body type tag (`Map` or `Set`).
+    pub receiver_type_tag: u8,
+    /// Compressed offset of the realm prototype object holding the builtin.
+    pub proto_offset: u32,
+    /// Expected prototype shape handle compressed offset.
+    pub proto_shape: u32,
+    /// Byte offset inside the prototype object's value slab for the method.
+    pub method_value_byte: u32,
+    /// Raw static native builtin function address expected in the method slot.
+    pub builtin_fn_addr: usize,
+    /// VM-native allocating stub descriptor id to call after guards pass and a
+    /// precise safepoint is published for the current frame.
+    pub alloc_stub_id: crate::native_abi::RuntimeStubId,
+    /// Number of raw boxed `Value` arguments in the uniform mutation ABI. The
+    /// current collection mutation shape is `(receiver, arg0, arg1_or_undefined)`.
+    pub value_arg_count: u8,
 }
 
 /// A callee the baseline may splice into a caller's `Op::Call` site instead of

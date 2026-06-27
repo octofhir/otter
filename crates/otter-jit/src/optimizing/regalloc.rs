@@ -1013,6 +1013,7 @@ mod tests {
             inline_callees: Default::default(),
             inline_methods: Default::default(),
             collection_leaf_methods: Default::default(),
+            collection_alloc_methods: Default::default(),
         }
     }
 

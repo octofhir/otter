@@ -297,6 +297,22 @@ pub enum NodeKind {
     /// so no deopt of its own; the operand's widening guard owns non-number
     /// inputs. Result [`Repr::Float64`].
     Float64Unary(Float64UnaryOp, NodeId),
+    /// Allocate an object literal (`NewObject` + a source-order run of
+    /// `DefineDataProperty` with constant string keys) directly in its final
+    /// hidden class. `shape_offset` is the compressed `Gc` offset of the shape
+    /// the literal's object ends up in after all properties are defined (baked
+    /// by replaying the shape transitions at compile time). `inputs` are the SSA
+    /// property values in slot order. The emitter materializes a call safepoint
+    /// (the allocation can GC), boxes each value, and calls a runtime helper that
+    /// allocates the shaped object, bulk-initializes its slots (write barriers in
+    /// Rust), and installs `%Object.prototype%`. Result [`Repr::Tagged`] — the
+    /// new object. Throws only on OOM (propagated like a `Call`).
+    AllocObjectLiteral {
+        /// Final hidden-class shape, as a compressed `Gc<ShapeBody>` offset.
+        shape_offset: u32,
+        /// Property values in slot (source-definition) order.
+        inputs: Vec<NodeId>,
+    },
     /// Read upvalue `index` from an *inlined closure callee's* own spine, rather
     /// than the running function's context spine (that is [`LoadUpvalue`]). The
     /// `closure` input is the call-site callee value the surrounding
@@ -363,6 +379,7 @@ impl NodeKind {
             | NodeKind::LoadThis
             | NodeKind::LoadHole => Vec::new(),
             NodeKind::Call { inputs, .. } => inputs.clone(),
+            NodeKind::AllocObjectLiteral { inputs, .. } => inputs.clone(),
             NodeKind::CallMethod { recv, args, .. } => {
                 let mut inputs = Vec::with_capacity(args.len() + 1);
                 inputs.push(*recv);
@@ -431,6 +448,7 @@ impl NodeKind {
             | NodeKind::ConstNull
             | NodeKind::SelfClosure => {}
             NodeKind::Call { inputs, .. } => inputs.iter_mut().for_each(fix),
+            NodeKind::AllocObjectLiteral { inputs, .. } => inputs.iter_mut().for_each(fix),
             NodeKind::CallMethod { recv, args, .. } => {
                 fix(recv);
                 args.iter_mut().for_each(fix);
@@ -478,6 +496,7 @@ impl NodeKind {
             | NodeKind::Phi(_)
             | NodeKind::LoadUpvalue(_)
             | NodeKind::Call { .. }
+            | NodeKind::AllocObjectLiteral { .. }
             | NodeKind::CallMethod { .. }
             | NodeKind::CheckFunctionIdentity { .. }
             | NodeKind::CheckMethodIdentity { .. }

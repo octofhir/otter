@@ -987,6 +987,7 @@ mod tests {
                 load_array_length: false,
                 load_number: None,
                 property_feedback: None,
+                object_literal: None,
                 arith_feedback: *fb,
             })
             .collect();

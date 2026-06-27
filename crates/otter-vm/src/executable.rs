@@ -244,6 +244,7 @@ impl ExecutableFunction {
                     // Baked by `Interpreter::bake_property_feedback` from the
                     // live per-site property IC; the raw snapshot carries none.
                     property_feedback: None,
+                    object_literal: None,
                 })
                 .collect(),
             // Baked by `Interpreter::bake_inline_callees` (it holds the live

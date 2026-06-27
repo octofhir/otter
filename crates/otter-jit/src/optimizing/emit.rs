@@ -187,9 +187,10 @@ mod arm64 {
         REG_TOP_PTR_OFFSET, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_NULL, SPECIAL_TRUE, STACK_OFFSET,
         STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_FUNCTION_ID, TAG_INT32, TAG_PTR_FUNCTION,
         TAG_PTR_OBJECT, TAG_SPECIAL, THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET,
-        UPVALUES_PTR_OFFSET, VM_OFFSET, jit_abort_direct_call_stub, jit_call_method_stub,
-        jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
-        jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
+        UPVALUES_PTR_OFFSET, VM_OFFSET, jit_abort_direct_call_stub, jit_alloc_object_literal_stub,
+        jit_call_method_stub, jit_finish_direct_call_bailed_stub,
+        jit_finish_direct_call_returned_stub, jit_prepare_direct_call_stub,
+        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
     };
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
     use otter_vm::{Interpreter, JitFunctionView};
@@ -2071,6 +2072,66 @@ mod arm64 {
                 dynasm!(ops ; .arch aarch64 ; str x17, [x16, slot_byte]);
                 Ok(())
             }
+            NodeKind::AllocObjectLiteral {
+                shape_offset,
+                inputs,
+            } => {
+                // An object literal allocation: a call safepoint (the allocation
+                // can scavenge), then a runtime helper that allocates the object
+                // directly in its baked final hidden class and bulk-initializes
+                // its slots with the boxed property values (write barriers in
+                // Rust). The property values are passed by value in x4..x7, boxed
+                // from their SSA locations — the bytecode registers they came from
+                // may have been reused by later properties, so they cannot be read
+                // back from the frame window.
+                let point = frames.get(&nid).ok_or(Unsupported::Unlowered(
+                    "object literal without safepoint state",
+                ))?;
+                let dst_reg = node
+                    .frame_dst
+                    .ok_or(Unsupported::Unlowered("object literal without frame dst"))?;
+                if inputs.len() > 4 {
+                    return Err(Unsupported::OperandShape("object literal property count"));
+                }
+                emit_frame_materialize(ops, graph, alloc, point, box_scratch)?;
+                // Box each property value into x4..x7 before setting the leading
+                // ABI argument registers (x0..x3), so boxing's scratch use cannot
+                // clobber them.
+                for (slot, &inp) in inputs.iter().enumerate() {
+                    let loc = require_loc(alloc, inp)?;
+                    let repr = graph.node(inp).kind.repr();
+                    box_into_gp(ops, 4 + slot as u32, repr, loc, box_scratch);
+                }
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; mov x0, x20
+                    ; movz x1, u32::from(dst_reg)
+                    ; movz x3, inputs.len() as u32
+                );
+                emit_load_u64(ops, 2, u64::from(*shape_offset));
+                emit_load_u64(
+                    ops,
+                    16,
+                    jit_alloc_object_literal_stub as *const () as u64,
+                );
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; blr x16
+                    ; cmp x0, #1
+                    ; b.eq =>threw
+                );
+                let resume = call_resume_frames.get(&nid).unwrap_or(point);
+                emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
+                if value_is_used_after(graph, call_resume_frames, nid)
+                    && let Some(loc) = dst
+                    && !resume.registers.iter().any(|&(r, _)| r == dst_reg)
+                {
+                    let off = u32::from(dst_reg) * 8;
+                    dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
+                    store_loc(ops, loc, box_scratch);
+                }
+                Ok(())
+            }
             NodeKind::Call {
                 callee_reg,
                 arg_regs,
@@ -2602,6 +2663,7 @@ mod tests {
                 load_array_length: false,
                 load_number: None,
                 property_feedback: None,
+                object_literal: None,
                 arith_feedback: *fb,
             })
             .collect();

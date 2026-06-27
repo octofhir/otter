@@ -331,6 +331,28 @@ struct Builder<'a> {
     /// Phis created in still-unsealed blocks, pending operand fill-in at seal
     /// time: `block → [(register, phi node)]`.
     incomplete_phis: FxHashMap<BlockId, Vec<(u16, NodeId)>>,
+    /// The object literal currently being folded: set when a `NewObject` with a
+    /// baked [`crate::ObjectLiteralPlan`] is reached, cleared when its final
+    /// `DefineDataProperty` emits the `AllocObjectLiteral`. While set, the
+    /// literal's key `LoadString`s are skipped and each `DefineDataProperty`
+    /// captures its value SSA instead of running.
+    active_literal: Option<ActiveLiteral>,
+}
+
+/// In-flight state for folding one object literal in the builder.
+struct ActiveLiteral {
+    /// Register the literal's object is written to.
+    obj_reg: u16,
+    /// Final hidden-class shape, compressed `Gc` offset.
+    shape_offset: u32,
+    /// Byte-PC → slot index for each `DefineDataProperty` to capture.
+    define_slot: FxHashMap<u32, usize>,
+    /// Byte-PCs of the key `LoadString`s to skip.
+    key_pcs: FxHashSet<u32>,
+    /// Byte-PC of the final define (where `AllocObjectLiteral` is emitted).
+    last_define_pc: u32,
+    /// Captured property-value SSA nodes in slot order (filled at each define).
+    captured: Vec<Option<NodeId>>,
 }
 
 impl<'a> Builder<'a> {
@@ -385,6 +407,7 @@ impl<'a> Builder<'a> {
             active_blocks,
             current_def: vec![FxHashMap::default(); reg_count],
             incomplete_phis: FxHashMap::default(),
+            active_literal: None,
         })
     }
 
@@ -680,7 +703,82 @@ impl<'a> Builder<'a> {
             let load_array_length = instr.load_array_length;
             let property_feedback = instr.property_feedback;
             let property_ic_site = instr.property_ic_site;
+            let object_literal = instr.object_literal.clone();
             let operands = instr.operands.clone();
+
+            // Object-literal folding. While a literal is active, its key
+            // `LoadString`s carry no value (the key is implied by the baked
+            // shape) and each `DefineDataProperty` captures its value SSA rather
+            // than running; the final define emits a single `AllocObjectLiteral`.
+            if self
+                .active_literal
+                .as_ref()
+                .is_some_and(|a| a.key_pcs.contains(&byte_pc))
+            {
+                continue;
+            }
+            let active_define = self
+                .active_literal
+                .as_ref()
+                .and_then(|a| a.define_slot.get(&byte_pc).map(|&s| (s, byte_pc == a.last_define_pc)));
+            if let Some((slot, is_last)) = active_define {
+                let value_reg = reg(&operands, 2)?;
+                let value = self.read_variable(value_reg, block);
+                self.active_literal
+                    .as_mut()
+                    .expect("active literal")
+                    .captured[slot] = Some(value);
+                if is_last {
+                    let active = self.active_literal.take().expect("active literal");
+                    let inputs: Vec<NodeId> = active
+                        .captured
+                        .iter()
+                        .map(|c| c.expect("every literal slot captured before the final define"))
+                        .collect();
+                    let node = self.graph.add_node(
+                        NodeKind::AllocObjectLiteral {
+                            shape_offset: active.shape_offset,
+                            inputs,
+                        },
+                        block,
+                        byte_pc,
+                    );
+                    self.graph.set_frame_dst(node, active.obj_reg);
+                    self.push_body(block, node);
+                    self.def_register(active.obj_reg, block, node, byte_pc);
+                }
+                continue;
+            }
+            if let Some(plan) = object_literal {
+                // A second literal opening before the current one closes (a
+                // nested literal) is not folded here; keep it simple and decline.
+                if self.active_literal.is_some() {
+                    return Err(Unsupported::Unlowered("nested object literal"));
+                }
+                let last_define_pc = plan
+                    .defines
+                    .last()
+                    .map(|p| p.define_pc)
+                    .ok_or(Unsupported::Unlowered("object literal without properties"))?;
+                let define_slot = plan
+                    .defines
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, p)| (p.define_pc, slot))
+                    .collect();
+                self.active_literal = Some(ActiveLiteral {
+                    obj_reg: plan.obj_reg,
+                    shape_offset: plan.shape_offset,
+                    define_slot,
+                    key_pcs: plan.key_pcs.iter().copied().collect(),
+                    last_define_pc,
+                    captured: vec![None; plan.defines.len()],
+                });
+                // The `NewObject` itself emits nothing; the object materializes at
+                // the final define.
+                continue;
+            }
+
             match op {
                 // The leading named-function self-binding. The closure value is
                 // never a numeric operand in this subset; only `make_self`
@@ -2309,6 +2407,7 @@ mod tests {
                 load_array_length: false,
                 load_number: None,
                 property_feedback: None,
+                object_literal: None,
                 arith_feedback: *fb,
             })
             .collect();
@@ -2380,6 +2479,7 @@ mod tests {
                         load_array_length: false,
                         load_number: None,
                         property_feedback: None,
+                        object_literal: None,
                         arith_feedback: ARITH_INT32,
                     },
                     otter_vm::JitInstrView {
@@ -2392,6 +2492,7 @@ mod tests {
                         load_array_length: false,
                         load_number: None,
                         property_feedback: None,
+                        object_literal: None,
                         arith_feedback: 0,
                     },
                 ],
@@ -2431,6 +2532,7 @@ mod tests {
                     load_array_length: false,
                     load_number: None,
                     property_feedback: None,
+                    object_literal: None,
                     arith_feedback: 0,
                 },
                 otter_vm::JitInstrView {
@@ -2443,6 +2545,7 @@ mod tests {
                     load_array_length: false,
                     load_number: None,
                     property_feedback: None,
+                    object_literal: None,
                     arith_feedback: 0,
                 },
                 otter_vm::JitInstrView {
@@ -2455,6 +2558,7 @@ mod tests {
                     load_array_length: false,
                     load_number: None,
                     property_feedback: None,
+                    object_literal: None,
                     arith_feedback: 0,
                 },
             ],
@@ -2527,6 +2631,7 @@ mod tests {
             load_array_length: false,
             load_number: None,
             property_feedback: None,
+            object_literal: None,
             arith_feedback: fb,
         }
     }

@@ -841,6 +841,44 @@ extern "C" fn jit_new_object_stub(ctx: *mut JitCtx, dst: u64) -> u64 {
     }
 }
 
+/// Bridge stub: allocate an object literal directly in its baked final hidden
+/// class for the optimizing tier's `AllocObjectLiteral`. The property values are
+/// passed by value (already NaN-boxed) in `v0..v3`; `count` selects how many are
+/// live. The VM allocates the shaped object, roots the values across the
+/// allocation, bulk-initializes its slots, and installs `%Object.prototype%`.
+/// Returns `0` on success, `1` when the allocation threw (OOM, parked in `ctx`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) extern "C" fn jit_alloc_object_literal_stub(
+    ctx: *mut JitCtx,
+    dst: u64,
+    shape_offset: u64,
+    count: u64,
+    v0: u64,
+    v1: u64,
+    v2: u64,
+    v3: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let all = [v0, v1, v2, v3];
+    let count = (count as usize).min(all.len());
+    match vm.jit_runtime_alloc_object_literal(
+        stack,
+        ctx.frame_index,
+        dst as u16,
+        shape_offset as u32,
+        &all[..count],
+    ) {
+        Ok(()) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
 /// Bridge stub: allocate an array literal for `NewArray` from compiled code.
 /// The VM decodes the variable source-register list at `byte_pc` and uses the
 /// stack-rooted array allocator, matching interpreter GC semantics.
@@ -4868,6 +4906,7 @@ mod tests {
                 load_array_length: false,
                 load_number: None,
                 property_feedback: None,
+                object_literal: None,
                 arith_feedback: 0,
             })
             .collect();

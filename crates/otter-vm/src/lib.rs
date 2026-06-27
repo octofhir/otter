@@ -2720,6 +2720,7 @@ impl Interpreter {
         Self::bake_typed_array_layout(&mut view);
         self.bake_arith_feedback(&mut view, fid);
         self.bake_property_feedback(&mut view);
+        self.bake_object_literals(&mut view, context);
         self.bake_inline_callees(&mut view, context, fid);
         let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
         if trace {
@@ -2855,6 +2856,213 @@ impl Interpreter {
                 _ => None,
             };
         }
+    }
+
+    /// Replay an object literal's shape transitions from the empty root,
+    /// returning the hidden class the literal's object ends up in after its
+    /// `keys` are defined in order with default data attributes — the same
+    /// transitions `set_property` performs at construction time. `None` if any
+    /// transition fails to allocate.
+    fn shape_after_keys(&mut self, keys: &[&str]) -> Option<object::ShapeHandle> {
+        let roots = self.collect_runtime_roots_without_shape_runtime();
+        let mut shape = self.shape_runtime.root();
+        let flags = object::PropertyFlags::data_default();
+        for &key in keys {
+            let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                for &slot in &roots {
+                    visitor(slot);
+                }
+            };
+            shape = self
+                .shape_runtime
+                .child_with_roots(&mut self.gc_heap, shape, key, flags, false, &mut external_visit)
+                .ok()?;
+        }
+        Some(shape)
+    }
+
+    /// Bake object-literal allocation plans into `view`: for each `NewObject`
+    /// that begins a single-block run of `DefineDataProperty` with constant
+    /// string keys, record the literal's final hidden class (computed by
+    /// replaying its shape transitions) so the optimizing tier can allocate it in
+    /// one shaped allocation instead of per-property shape walks.
+    ///
+    /// A plan is recorded only for a literal that is provably the simple case:
+    /// every property is a distinct, non-`__proto__`, non-index string key whose
+    /// slot lands in definition order, the whole run is straight-line (no
+    /// branch), and there are at most four properties (the register-passed value
+    /// budget). Anything else is left unplanned and lowers on the baseline.
+    fn bake_object_literals(&mut self, view: &mut jit::JitFunctionView, context: &ExecutionContext) {
+        use otter_bytecode::{Op, Operand};
+        const MAX_PROPS: usize = 4;
+        let reg_op = |instr: &jit::JitInstrView, i: usize| match instr.operands.get(i) {
+            Some(Operand::Register(r)) => Some(*r),
+            _ => None,
+        };
+        let const_op = |instr: &jit::JitInstrView, i: usize| match instr.operands.get(i) {
+            Some(Operand::ConstIndex(n)) => Some(*n),
+            _ => None,
+        };
+        let uses_reg = |instr: &jit::JitInstrView, reg: u16| {
+            instr
+                .operands
+                .iter()
+                .any(|o| matches!(o, Operand::Register(r) if *r == reg))
+        };
+
+        let fid = view.function_id;
+        let mut plans: Vec<(usize, jit::ObjectLiteralPlan)> = Vec::new();
+        let instrs = &view.instructions;
+        for i in 0..instrs.len() {
+            if instrs[i].op != Op::NewObject {
+                continue;
+            }
+            let Some(obj_reg) = reg_op(&instrs[i], 0) else {
+                continue;
+            };
+            let mut defines: Vec<jit::ObjectLiteralProp> = Vec::new();
+            let mut key_pcs: Vec<u32> = Vec::new();
+            let mut keys: Vec<String> = Vec::new();
+            let mut ok = true;
+            let mut j = i + 1;
+            while j < instrs.len() {
+                let instr = &instrs[j];
+                // A `__proto__`-free data property defined on this literal:
+                // `LoadString key` immediately followed by `DefineDataProperty
+                // obj, key, value`.
+                if instr.op == Op::DefineDataProperty && reg_op(instr, 0) == Some(obj_reg) {
+                    let (Some(key_reg), Some(val_reg)) = (reg_op(instr, 1), reg_op(instr, 2)) else {
+                        ok = false;
+                        break;
+                    };
+                    if j == 0 {
+                        ok = false;
+                        break;
+                    }
+                    let prev = &instrs[j - 1];
+                    if prev.op != Op::LoadString || reg_op(prev, 0) != Some(key_reg) {
+                        ok = false;
+                        break;
+                    }
+                    let Some(kidx) = const_op(prev, 1) else {
+                        ok = false;
+                        break;
+                    };
+                    let Some(key) = context.string_constant_str_for_function(fid, kidx) else {
+                        ok = false;
+                        break;
+                    };
+                    // `__proto__` mutates the prototype, not a slot, so its shape
+                    // does not match a replayed data transition. A duplicate key
+                    // would not advance the slot count. Both abort the plan.
+                    if key == "__proto__" || keys.iter().any(|k| k == key) {
+                        ok = false;
+                        break;
+                    }
+                    keys.push(key.to_string());
+                    defines.push(jit::ObjectLiteralProp {
+                        define_pc: instr.byte_pc,
+                        value_reg: val_reg,
+                    });
+                    key_pcs.push(prev.byte_pc);
+                    j += 1;
+                    continue;
+                }
+                // The literal ends when the object first escapes (is read), and a
+                // branch would split the run across blocks — neither is foldable.
+                if uses_reg(instr, obj_reg) {
+                    break;
+                }
+                if matches!(instr.op, Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse) {
+                    ok = false;
+                    break;
+                }
+                j += 1;
+            }
+            if !ok || keys.is_empty() || keys.len() > MAX_PROPS {
+                continue;
+            }
+            let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+            let Some(shape) = self.shape_after_keys(&key_refs) else {
+                continue;
+            };
+            // The replayed shape must assign each key the slot matching its
+            // definition order, so the bulk slot-initializer fills values that
+            // line up with the literal's value list.
+            let mut valid = true;
+            for (idx, key) in key_refs.iter().enumerate() {
+                if self.shape_offset_of(shape, key) != Some(idx as u32) {
+                    valid = false;
+                    break;
+                }
+            }
+            if !valid {
+                continue;
+            }
+            plans.push((
+                i,
+                jit::ObjectLiteralPlan {
+                    obj_reg,
+                    shape_offset: shape.offset(),
+                    defines,
+                    key_pcs,
+                },
+            ));
+        }
+        for (i, plan) in plans {
+            view.instructions[i].object_literal = Some(plan);
+        }
+    }
+
+    /// JIT bridge: allocate an object literal directly in its baked final hidden
+    /// class for the optimizing tier's `AllocObjectLiteral`. `values_bits` are
+    /// the NaN-boxed property values in slot order (passed by value from compiled
+    /// code). The values are rooted across the allocation, then bulk-written into
+    /// the shaped object's slots (generational write barriers applied in
+    /// [`object::initialize_shaped_data_slots`]), and `%Object.prototype%` is
+    /// installed — matching the interpreter's per-property construction result.
+    ///
+    /// # Errors
+    /// Propagates allocation failure (heap-cap `RangeError` / cage exhaustion).
+    pub fn jit_runtime_alloc_object_literal(
+        &mut self,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        dst: u16,
+        shape_offset: u32,
+        values_bits: &[u64],
+    ) -> Result<(), VmError> {
+        // Decode the boxed values out of the transient JIT argument registers
+        // before any allocation can run a scavenge.
+        let values: smallvec::SmallVec<[Value; 4]> =
+            values_bits.iter().map(|&b| Value::from_bits(b)).collect();
+        // SAFETY: `shape_offset` is a compressed `Gc<ShapeBody>` offset baked from
+        // a live shape during compilation; shapes are interned for the isolate's
+        // life, so the offset still decompresses to that shape. The cage is
+        // initialised (we are executing JS).
+        let shape = unsafe { object::ShapeHandle::from_offset(shape_offset) };
+        let roots = self.collect_allocation_roots(stack);
+        let obj = {
+            let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                for &slot in &roots {
+                    visitor(slot);
+                }
+                for value in values.iter() {
+                    value.trace_value_slots(visitor);
+                }
+            };
+            object::alloc_object_with_shape_roots(&mut self.gc_heap, shape, &mut external_visit)
+                .map_err(VmError::from)?
+        };
+        // The slow alloc path above may have scavenged; read the relocated realm
+        // prototype handle afterwards (mirrors `run_new_object_reg`).
+        if let Some(proto) = self.object_prototype_object_opt() {
+            object::set_prototype(obj, &mut self.gc_heap, Some(proto));
+        }
+        object::initialize_shaped_data_slots(obj, &mut self.gc_heap, &values);
+        let frame = &mut stack[frame_index];
+        write_register(frame, dst, Value::object(obj))?;
+        Ok(())
     }
 
     /// Record a `Mono`/`Poly` observation for one `Op::Call` site, the feedback
@@ -10217,6 +10425,7 @@ mod tests {
             load_number: None,
             arith_feedback: 0,
             property_feedback: None,
+            object_literal: None,
         }
     }
 
@@ -15037,6 +15246,7 @@ mod tests {
                     load_number: None,
                     arith_feedback: 0,
                     property_feedback: None,
+                    object_literal: None,
                 })
                 .collect(),
             inline_callees: rustc_hash::FxHashMap::default(),

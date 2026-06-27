@@ -319,6 +319,44 @@ pub struct JitInstrView {
     /// polymorphic / megamorphic / prototype / dictionary sites. Baked by
     /// `Interpreter::bake_property_feedback`.
     pub property_feedback: Option<(u32, u32)>,
+    /// For a `NewObject` that begins an object literal (`{ k: v, … }` with
+    /// constant string keys), the plan to allocate it directly in its final
+    /// hidden class instead of running per-property shape transitions. `None`
+    /// for every other `NewObject` and every non-`NewObject` op. Baked by
+    /// `Interpreter::bake_object_literals`.
+    pub object_literal: Option<ObjectLiteralPlan>,
+}
+
+/// Plan for lowering an object literal (`NewObject` + a source-order run of
+/// `DefineDataProperty` with constant string keys) to a single shaped
+/// allocation in the optimizing tier.
+///
+/// Computed at compile time by replaying the literal's shape transitions from
+/// the empty root, so the final hidden class is known before any code runs and
+/// the per-property `DefineDataProperty` shape walks are elided.
+#[derive(Debug, Clone)]
+pub struct ObjectLiteralPlan {
+    /// Destination register the `NewObject` writes (the literal's object).
+    pub obj_reg: u16,
+    /// Final hidden-class shape the object ends up in, as a compressed
+    /// `Gc<ShapeBody>` offset.
+    pub shape_offset: u32,
+    /// One entry per data property, in slot (source-definition) order: the
+    /// `DefineDataProperty` byte-PC (where the value SSA is captured) and the
+    /// value source register the define reads.
+    pub defines: Vec<ObjectLiteralProp>,
+    /// Byte-PCs of the `LoadString` key-load instructions the builder skips
+    /// (the key is implied by the baked shape).
+    pub key_pcs: Vec<u32>,
+}
+
+/// One data property of an object literal in [`ObjectLiteralPlan`].
+#[derive(Debug, Clone, Copy)]
+pub struct ObjectLiteralProp {
+    /// Byte-PC of the `DefineDataProperty` instruction.
+    pub define_pc: u32,
+    /// Value source register the define reads, in the value slab's slot order.
+    pub value_reg: u16,
 }
 
 /// Frame stack the interpreter dispatches over. Exposed so the JIT crate can

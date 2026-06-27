@@ -368,6 +368,7 @@ fn can_deopt(kind: &NodeKind) -> bool {
             | NodeKind::LoadUpvalue(_)
             | NodeKind::InlineUpvalue { .. }
             | NodeKind::Call { .. }
+            | NodeKind::AllocObjectLiteral { .. }
             | NodeKind::CallMethod { .. }
             | NodeKind::LoadElement(_, _)
             | NodeKind::StoreElement(_, _, _)
@@ -540,7 +541,9 @@ pub fn capture_call_resume_states(
             let node = graph.node(nid);
             if matches!(
                 node.kind,
-                NodeKind::Call { .. } | NodeKind::CallMethod { .. }
+                NodeKind::Call { .. }
+                    | NodeKind::CallMethod { .. }
+                    | NodeKind::AllocObjectLiteral { .. }
             ) {
                 let pc = node.byte_pc;
                 while wi < writes.len() && writes[wi].0 <= pc {
@@ -818,6 +821,7 @@ mod tests {
                 load_array_length: false,
                 load_number: None,
                 property_feedback: None,
+                object_literal: None,
                 arith_feedback: *fb,
             })
             .collect();

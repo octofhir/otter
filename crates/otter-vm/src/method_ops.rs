@@ -1266,6 +1266,45 @@ impl Interpreter {
         Ok(())
     }
 
+    /// JIT bridge for the leaf/no-allocation Map/Set method path.
+    ///
+    /// Returns `Ok(true)` when a live collection method IC validates and the
+    /// matching leaf runtime stub produced a value written to `dst`.
+    /// `Ok(false)` is a guard/stub miss; compiled code must continue to the
+    /// existing direct-call/full-method fallback path. This bridge never
+    /// performs method resolution or calls user code.
+    pub fn jit_runtime_try_collection_leaf_method(
+        &mut self,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        dst: u16,
+        recv_reg: u16,
+        site: usize,
+        arg_regs: &[u16],
+    ) -> Result<bool, VmError> {
+        let recv = *read_register(&stack[frame_index], recv_reg)?;
+        if recv.is_nullish() {
+            return Ok(false);
+        }
+        let Some(op) = self.collection_method_call_ic_op(site, recv) else {
+            return Ok(false);
+        };
+        let Some(stub) = op.leaf_stub() else {
+            return Ok(false);
+        };
+        let key = if let Some(&reg) = arg_regs.first() {
+            *read_register(&stack[frame_index], reg)?
+        } else {
+            Value::undefined()
+        };
+        let result = (stub.entry)(&self.gc_heap, recv.to_abi_bits(), key.to_abi_bits());
+        let Some(value) = result.into_value() else {
+            return Ok(false);
+        };
+        write_register(&mut stack[frame_index], dst, value)?;
+        Ok(true)
+    }
+
     /// Fast `arr.method(args)` dispatch for an ordinary dense array whose
     /// `%Array.prototype%` slot for `method` is still the original builtin,
     /// skipping the per-call `[[Get]]` method-resolution walk and the native
@@ -1375,6 +1414,15 @@ impl Interpreter {
         recv: Value,
         args: &[Value],
     ) -> Option<Result<Value, VmError>> {
+        let op = self.collection_method_call_ic_op(site, recv)?;
+        Some(self.dispatch_collection_builtin(op, recv, args))
+    }
+
+    fn collection_method_call_ic_op(
+        &mut self,
+        site: usize,
+        recv: Value,
+    ) -> Option<CollectionFastOp> {
         let ic = match (*self.method_call_ics.get(site)?).as_ref().copied()? {
             MethodCallIc::Collection(ic) => ic,
             MethodCallIc::Array(_) => return None,
@@ -1418,7 +1466,7 @@ impl Interpreter {
         if !ic.op.matches_builtin(method, &self.gc_heap) {
             return None;
         }
-        Some(self.dispatch_collection_builtin(ic.op, recv, args))
+        Some(ic.op)
     }
 
     /// Direct `map.get/set/has/delete` and `set.add/has/delete` dispatch on an

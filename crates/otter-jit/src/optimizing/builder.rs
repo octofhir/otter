@@ -35,7 +35,7 @@ use otter_vm::{JitFunctionView, JitInlineCallee, JitInlineMethod};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::Unsupported;
-use super::ir::{BlockId, CmpOp, Graph, NodeId, NodeKind, Repr, Terminator};
+use super::ir::{BlockId, CmpOp, Float64UnaryOp, Graph, NodeId, NodeKind, Repr, Terminator};
 
 /// Build a typed SSA graph for `view`, or report why the function is outside the
 /// optimizing subset. When `osr_pc` is set, build only the region reachable from
@@ -979,6 +979,37 @@ impl<'a> Builder<'a> {
                         }
                         Err(reason) => return Err(reason),
                     };
+                    self.graph.set_frame_dst(node, dst);
+                    self.push_body(block, node);
+                    self.def_register(dst, block, node, byte_pc);
+                }
+                // `Math.fn(x)` for the unary methods that are one exact float
+                // instruction. Other methods (ties-to-+Inf `round`, multi-arg
+                // `min`/`max`/`pow`, transcendentals needing libm) decline.
+                Op::MathCall => {
+                    let dst = reg(&operands, 0)?;
+                    let method_id = const_index(&operands, 1)?;
+                    let argc = const_index(&operands, 2)? as usize;
+                    let uop = match otter_bytecode::method_id::MathMethod::from_u32(method_id) {
+                        Some(otter_bytecode::method_id::MathMethod::Sqrt) => Float64UnaryOp::Sqrt,
+                        Some(otter_bytecode::method_id::MathMethod::Abs) => Float64UnaryOp::Abs,
+                        Some(otter_bytecode::method_id::MathMethod::Floor) => Float64UnaryOp::Floor,
+                        Some(otter_bytecode::method_id::MathMethod::Ceil) => Float64UnaryOp::Ceil,
+                        Some(otter_bytecode::method_id::MathMethod::Trunc) => Float64UnaryOp::Trunc,
+                        _ => {
+                            self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
+                            return Ok(());
+                        }
+                    };
+                    if argc != 1 {
+                        self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
+                        return Ok(());
+                    }
+                    let arg = self.read_variable(reg(&operands, 3)?, block);
+                    let f = self.float_node_operand(block, arg, byte_pc);
+                    let node = self
+                        .graph
+                        .add_node(NodeKind::Float64Unary(uop, f), block, byte_pc);
                     self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
                     self.def_register(dst, block, node, byte_pc);

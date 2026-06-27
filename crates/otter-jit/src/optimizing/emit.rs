@@ -59,7 +59,7 @@
 
 use super::Unsupported;
 use super::deopt::{DeoptPoint, OsrEntry};
-use super::ir::{BlockId, CmpOp, Graph, NodeId, NodeKind, Repr, Terminator};
+use super::ir::{BlockId, CmpOp, Float64UnaryOp, Graph, NodeId, NodeKind, Repr, Terminator};
 use super::liveness::Liveness;
 use super::regalloc::{Allocation, EdgeMoves, Location};
 use crate::CompiledCode;
@@ -155,8 +155,9 @@ pub(super) fn emit(
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
     use super::{
-        Allocation, BlockId, CmpOp, DeoptPoint, EdgeMoves, GP_REGS, Graph, Liveness, Location,
-        NodeId, NodeKind, OptimizedCode, OsrEntry, Repr, Terminator, Unsupported,
+        Allocation, BlockId, CmpOp, DeoptPoint, EdgeMoves, Float64UnaryOp, GP_REGS, Graph,
+        Liveness, Location, NodeId, NodeKind, OptimizedCode, OsrEntry, Repr, Terminator,
+        Unsupported,
     };
     use crate::CompiledCode;
     use crate::baseline::{
@@ -1733,6 +1734,27 @@ mod arm64 {
                     NodeKind::Float64Div(_, _) => dynasm!(ops ; .arch aarch64
                         ; fdiv D(FP_LOAD_SCRATCH), D(FP_LOAD_SCRATCH), D(FP_ARITH_SCRATCH)),
                     _ => unreachable!(),
+                }
+                store_fp_loc(ops, loc, FP_LOAD_SCRATCH);
+                Ok(())
+            }
+            NodeKind::Float64Unary(uop, a) => {
+                // Single exact float instruction; total, so a dead result is a
+                // no-op. The operand is already an unboxed `f64`.
+                let Some(loc) = dst else { return Ok(()) };
+                let aloc = require_loc(alloc, *a)?;
+                load_fp_loc(ops, FP_LOAD_SCRATCH, aloc);
+                match uop {
+                    Float64UnaryOp::Sqrt => dynasm!(ops ; .arch aarch64
+                        ; fsqrt D(FP_LOAD_SCRATCH), D(FP_LOAD_SCRATCH)),
+                    Float64UnaryOp::Abs => dynasm!(ops ; .arch aarch64
+                        ; fabs D(FP_LOAD_SCRATCH), D(FP_LOAD_SCRATCH)),
+                    Float64UnaryOp::Floor => dynasm!(ops ; .arch aarch64
+                        ; frintm D(FP_LOAD_SCRATCH), D(FP_LOAD_SCRATCH)),
+                    Float64UnaryOp::Ceil => dynasm!(ops ; .arch aarch64
+                        ; frintp D(FP_LOAD_SCRATCH), D(FP_LOAD_SCRATCH)),
+                    Float64UnaryOp::Trunc => dynasm!(ops ; .arch aarch64
+                        ; frintz D(FP_LOAD_SCRATCH), D(FP_LOAD_SCRATCH)),
                 }
                 store_fp_loc(ops, loc, FP_LOAD_SCRATCH);
                 Ok(())

@@ -91,6 +91,24 @@ impl CmpOp {
     }
 }
 
+/// An exactly-mappable `Math.*` unary, each a single aarch64 float instruction
+/// whose IEEE result matches the JS spec for every input. Functions whose
+/// rounding differs (`Math.round` ties toward `+Inf`, not to even) or that need
+/// a libm call are deliberately excluded — those decline to the baseline.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Float64UnaryOp {
+    /// `Math.sqrt` → `fsqrt`.
+    Sqrt,
+    /// `Math.abs` → `fabs`.
+    Abs,
+    /// `Math.floor` → `frintm` (round toward −∞).
+    Floor,
+    /// `Math.ceil` → `frintp` (round toward +∞).
+    Ceil,
+    /// `Math.trunc` → `frintz` (round toward zero).
+    Trunc,
+}
+
 /// A typed SSA operation.
 #[derive(Clone, Debug)]
 pub enum NodeKind {
@@ -273,6 +291,12 @@ pub enum NodeKind {
     /// Speculative Array `.length` read. The receiver must be a dense Array body
     /// and the length must fit int32; otherwise deopt. Result [`Repr::Int32`].
     LoadArrayLength(NodeId),
+    /// A `Math.*` unary call whose result is an exact single-instruction float
+    /// operation (`Op::MathCall` with one argument already widened to `f64`).
+    /// Total — `NaN` / `±Inf` / `±0` propagate per IEEE, matching the JS spec —
+    /// so no deopt of its own; the operand's widening guard owns non-number
+    /// inputs. Result [`Repr::Float64`].
+    Float64Unary(Float64UnaryOp, NodeId),
     /// Read upvalue `index` from an *inlined closure callee's* own spine, rather
     /// than the running function's context spine (that is [`LoadUpvalue`]). The
     /// `closure` input is the call-site callee value the surrounding
@@ -305,6 +329,7 @@ impl NodeKind {
             | NodeKind::CheckShape(a, _)
             | NodeKind::LoadSlot(a, _)
             | NodeKind::InlineUpvalue { closure: a, .. }
+            | NodeKind::Float64Unary(_, a)
             | NodeKind::LoadArrayLength(a) => {
                 vec![*a]
             }
@@ -367,6 +392,7 @@ impl NodeKind {
             | NodeKind::CheckShape(a, _)
             | NodeKind::LoadSlot(a, _)
             | NodeKind::InlineUpvalue { closure: a, .. }
+            | NodeKind::Float64Unary(_, a)
             | NodeKind::LoadArrayLength(a) => fix(a),
             NodeKind::Int32Add(a, b)
             | NodeKind::Int32Sub(a, b)
@@ -437,6 +463,7 @@ impl NodeKind {
             | NodeKind::Float64Sub(_, _)
             | NodeKind::Float64Mul(_, _)
             | NodeKind::Float64Div(_, _)
+            | NodeKind::Float64Unary(_, _)
             | NodeKind::Int32UshrToFloat64(_, _) => Repr::Float64,
             NodeKind::Int32Compare(_, _, _)
             | NodeKind::Float64Compare(_, _, _)

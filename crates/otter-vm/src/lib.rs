@@ -15023,6 +15023,7 @@ mod tests {
             object_values_ptr_byte: 0,
             jit_proto_byte: 0,
             closure_fid_byte: 0,
+            closure_upvalues_ptr_byte: 0,
             instructions: vec![16u32, 32, 48]
                 .into_iter()
                 .map(|byte_pc| jit::JitInstrView {

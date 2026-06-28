@@ -265,13 +265,8 @@ fn process(value: &Value, depth: usize) -> Result<(), Error> {
 - Keep macro use explicit: JS names, arity, and export shape should remain obvious in the declaration site.
 - Keep code manual when capability checks, complex runtime sequencing, or non-obvious installation order matter more than boilerplate reduction.
 
-## Current Work
-
-See `JIT_DESIGN.md` for the production-JIT plan and live progress log. Phase 0
-(interpreter dispatch surgery) is in progress on the active VM.
-
 ## Project References
 
 - `AGENTS.md` - Detailed agent guidance and architecture
-- `ROADMAP.md` - Feature status and API compatibility
-- `OTTER_VM_PLAN.md` - VM implementation plan
+- `ES_CONFORMANCE.md` - ECMAScript conformance status
+- `NODE_CONFORMANCE.md` - Node.js compatibility status

@@ -451,6 +451,7 @@ Exit criteria:
 - [x] Compiled `Map.set` / `Set.add` hot loop.
 - [ ] String concat specialized node.
 - [x] Baseline primitive string concat `AllocValueStub`.
+- [x] `OTTER_STATS=1` exposes JIT runtime-stub ABI class counters.
 - [ ] Shared object header design.
 - [ ] Map/Set migration to shared object header.
 - [ ] Interpreter quickening and block/backedge metering.

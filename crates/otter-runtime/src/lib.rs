@@ -673,6 +673,16 @@ pub struct RuntimeExecutionStats {
     pub jit_osr_attempts: u64,
     /// JIT property/method/element/global/upvalue runtime stub calls.
     pub jit_runtime_property_stubs: u64,
+    /// JIT method-call runtime stub calls.
+    pub jit_runtime_method_stubs: u64,
+    /// ABI-classified runtime stub transitions from compiled code.
+    pub jit_runtime_stub_transitions: u64,
+    /// ABI-classified leaf runtime stubs.
+    pub jit_leaf_stub_transitions: u64,
+    /// ABI-classified allocating runtime stubs.
+    pub jit_alloc_stub_transitions: u64,
+    /// ABI-classified re-entrant runtime stubs.
+    pub jit_reentrant_stub_transitions: u64,
     /// Total GC-cell bytes allocated since heap creation.
     pub gc_alloc_bytes_total: u64,
     /// Live heap objects after the last stats reconciliation.
@@ -2624,6 +2634,11 @@ impl Runtime {
             jit_compile_attempts: jit.compile_attempts,
             jit_osr_attempts: jit.osr_attempts,
             jit_runtime_property_stubs: jit.runtime_property_stubs,
+            jit_runtime_method_stubs: jit.runtime_method_stubs,
+            jit_runtime_stub_transitions: jit.runtime_stub_transitions,
+            jit_leaf_stub_transitions: jit.leaf_stub_transitions,
+            jit_alloc_stub_transitions: jit.alloc_stub_transitions,
+            jit_reentrant_stub_transitions: jit.reentrant_stub_transitions,
             gc_alloc_bytes_total: gc.alloc_bytes_total,
             gc_live_objects: gc.live_objects,
             gc_live_bytes: gc.live_bytes,

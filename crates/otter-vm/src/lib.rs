@@ -328,6 +328,8 @@ pub struct JitRuntimeStats {
     pub osr_attempts: u64,
     /// JIT property/method/element/global/upvalue runtime stub calls.
     pub runtime_property_stubs: u64,
+    /// JIT method-call runtime stub calls.
+    pub runtime_method_stubs: u64,
     /// ABI-classified runtime stub transitions from compiled code.
     pub runtime_stub_transitions: u64,
     /// ABI-classified leaf runtime stubs. These are the desired hot-path shape.
@@ -3661,9 +3663,9 @@ impl Interpreter {
 
     pub(crate) fn record_jit_runtime_method_stub(&mut self) {
         self.record_jit_runtime_stub_descriptor(native_abi::STUB_JIT_RUNTIME_CALL_METHOD);
-        self.jit_runtime_stats.runtime_property_stubs = self
+        self.jit_runtime_stats.runtime_method_stubs = self
             .jit_runtime_stats
-            .runtime_property_stubs
+            .runtime_method_stubs
             .saturating_add(1);
     }
 

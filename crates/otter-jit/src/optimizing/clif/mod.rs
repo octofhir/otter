@@ -129,7 +129,9 @@ impl otter_vm::JitFunctionCode for CraneliftCode {
                 // SAFETY: `addr` is a finalized entry in the live `_module` mapping
                 // emitted with the shared `JitEntry` ABI; `ptrs` upholds the
                 // reentry contract.
-                unsafe { crate::baseline::enter_compiled(ptrs, addr as *const u8) }
+                unsafe {
+                    crate::baseline::enter_compiled(ptrs, addr as *const u8, std::ptr::null(), 0)
+                }
             }
         }
     }
@@ -143,7 +145,9 @@ impl otter_vm::JitFunctionCode for CraneliftCode {
         // SAFETY: `addr` is a finalized OSR trampoline in the live `_module`
         // mapping; the trampoline reloads the live interpreter registers before
         // joining the loop header, upholding the same reentry contract.
-        Some(unsafe { crate::baseline::enter_compiled(ptrs, addr as *const u8) })
+        Some(unsafe {
+            crate::baseline::enter_compiled(ptrs, addr as *const u8, std::ptr::null(), 0)
+        })
     }
 }
 

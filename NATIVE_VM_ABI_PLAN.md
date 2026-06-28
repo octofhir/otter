@@ -316,15 +316,19 @@ table, so an allocating runtime stub can resolve its `SafepointId` inside the
 machine ABI instead of trusting an out-of-band Rust argument. `runtime_stubs` can
 validate and publish an allocating safepoint backed by that frame-slot window
 through `AllocSafepointFrameRoots`, rejecting unsupported register/spill maps
-until native frame locations are publishable. This gives the next executable
-`Map.set` / `Set.add` stub a machine-callable rooting contract without retaining
-raw untracked values across allocation. The allocating value-stub catalog is no
-longer just passive metadata: `AllocValueStub` carries an optional executable
-entrypoint and common entry-address/raw-invoke helpers. Collection mutation
-stubs now have VM-side executable entries that consume the same context packet
-and safepoint table that baseline code will pass later; string/array/property
-allocating stubs can plug into the same ABI record instead of growing
-per-feature bridge shapes.
+until native frame locations are publishable. The allocating value-stub catalog
+is no longer just passive metadata: `AllocValueStub` carries an optional
+executable entrypoint and common entry-address/raw-invoke helpers. Collection
+mutation stubs now have VM-side executable entries that consume the same context
+packet and safepoint table that baseline code passes at warmed `Map.set` /
+`Set.add` sites. Baseline compiled `CallMethodValue` keeps the existing
+receiver/prototype/builtin guards, builds a stack-local `RuntimeStubAllocContext`
+from `JitCtx`, passes the compiled function's stable safepoint table and raw
+receiver/argument value bits, and writes the relocated `Ok` result directly back
+to the destination frame slot. `Miss` and other non-`Ok` statuses still fall
+through to the existing rooted method fallback, while the fast path avoids the
+generic `NativeCtx` bridge. String/array/property allocating stubs can plug into
+the same ABI record instead of growing per-feature bridge shapes.
 
 Tasks:
 

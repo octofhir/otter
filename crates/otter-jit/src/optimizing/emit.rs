@@ -135,7 +135,7 @@ impl otter_vm::JitFunctionCode for OptimizedCode {
         let entry = unsafe { self.code.entry_ptr() };
         // SAFETY: `entry` points into the live mapping; `_ptrs` upholds the
         // reentry contract.
-        unsafe { crate::baseline::enter_compiled(_ptrs, entry) }
+        unsafe { crate::baseline::enter_compiled(_ptrs, entry, std::ptr::null(), 0) }
     }
 
     fn osr_entry(
@@ -149,7 +149,7 @@ impl otter_vm::JitFunctionCode for OptimizedCode {
         let entry = unsafe { self.code.ptr_at(offset) };
         // SAFETY: same reentry contract as `run_entry`; the trampoline reloads
         // the live interpreter registers before branching to the loop header.
-        Some(unsafe { crate::baseline::enter_compiled(ptrs, entry) })
+        Some(unsafe { crate::baseline::enter_compiled(ptrs, entry, std::ptr::null(), 0) })
     }
 }
 

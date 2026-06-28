@@ -38,7 +38,8 @@
 use otter_bytecode::{Op, Operand};
 use otter_vm::{
     ExecutionContext, Interpreter, JitExecOutcome, JitFrameStack, JitFunctionCode, JitFunctionView,
-    JitReentryPtrs, Value, VmError, runtime_stubs::leaf_no_alloc_stub2_trampoline_pair,
+    JitReentryPtrs, RuntimeStubAllocContext, SafepointRecord, Value, VmError,
+    runtime_stubs::leaf_no_alloc_stub2_trampoline_pair,
 };
 
 use crate::CompiledCode;
@@ -154,6 +155,10 @@ pub struct JitCtx {
     array_index_accessor_protector_ptr: *const bool,
     /// Opaque heap pointer for native leaf runtime stubs.
     gc_heap: *const std::ffi::c_void,
+    /// Base of the active compiled function's safepoint records.
+    safepoint_records: *const SafepointRecord,
+    /// Number of records starting at [`Self::safepoint_records`].
+    safepoint_count: u32,
 }
 
 /// Two-word return of compiled code (`x0`/`x1` on arm64).
@@ -190,6 +195,31 @@ pub(crate) const ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, array_index_accessor_protector_ptr) as u32;
 #[allow(dead_code)]
 pub(crate) const GC_HEAP_OFFSET: u32 = std::mem::offset_of!(JitCtx, gc_heap) as u32;
+pub(crate) const SAFEPOINT_RECORDS_OFFSET: u32 =
+    std::mem::offset_of!(JitCtx, safepoint_records) as u32;
+pub(crate) const SAFEPOINT_COUNT_OFFSET: u32 = std::mem::offset_of!(JitCtx, safepoint_count) as u32;
+pub(crate) const ALLOC_CTX_VM_OFFSET: u32 =
+    std::mem::offset_of!(RuntimeStubAllocContext, vm) as u32;
+pub(crate) const ALLOC_CTX_STACK_OFFSET: u32 =
+    std::mem::offset_of!(RuntimeStubAllocContext, stack) as u32;
+pub(crate) const ALLOC_CTX_CONTEXT_OFFSET: u32 =
+    std::mem::offset_of!(RuntimeStubAllocContext, context) as u32;
+pub(crate) const ALLOC_CTX_SAFEPOINT_RECORDS_OFFSET: u32 =
+    std::mem::offset_of!(RuntimeStubAllocContext, safepoint_records) as u32;
+pub(crate) const ALLOC_CTX_SAFEPOINT_COUNT_OFFSET: u32 =
+    std::mem::offset_of!(RuntimeStubAllocContext, safepoint_count) as u32;
+pub(crate) const ALLOC_CTX_RESERVED0_OFFSET: u32 =
+    std::mem::offset_of!(RuntimeStubAllocContext, reserved0) as u32;
+pub(crate) const ALLOC_CTX_FRAME_INDEX_OFFSET: u32 =
+    std::mem::offset_of!(RuntimeStubAllocContext, frame_index) as u32;
+pub(crate) const ALLOC_CTX_FRAME_SLOTS_OFFSET: u32 =
+    std::mem::offset_of!(RuntimeStubAllocContext, frame_slots) as u32;
+pub(crate) const ALLOC_CTX_FRAME_SLOT_COUNT_OFFSET: u32 =
+    std::mem::offset_of!(RuntimeStubAllocContext, frame_slot_count) as u32;
+pub(crate) const ALLOC_CTX_RESERVED1_OFFSET: u32 =
+    std::mem::offset_of!(RuntimeStubAllocContext, reserved1) as u32;
+pub(crate) const ALLOC_CTX_STACK_SIZE: u32 =
+    ((std::mem::size_of::<RuntimeStubAllocContext>() + 15) & !15) as u32;
 /// Size of one `UpvalueCell` (a 4-byte compressed `Gc<UpvalueCellBody>`).
 pub(crate) const UPVALUE_CELL_SIZE: u32 = 4;
 /// Byte offset of the single `Value` inside an `UpvalueCellBody` from its
@@ -1045,6 +1075,10 @@ pub struct BaselineCode {
     /// ownership / stability contract as [`Self::load_ic_cells`].
     #[allow(dead_code)]
     store_ic_cells: Box<[WhiskerIcCell]>,
+    /// Stable backing store for VM-native allocating-stub safepoints. Emitted
+    /// code passes this table through `JitCtx` into `RuntimeStubAllocContext`;
+    /// the records must therefore live with the executable code object.
+    safepoint_records: Box<[SafepointRecord]>,
 }
 
 impl std::fmt::Debug for BaselineCode {
@@ -1076,7 +1110,14 @@ impl JitFunctionCode for BaselineCode {
         let entry = unsafe { self.code.entry_ptr() };
         // SAFETY: `entry` points into the live mapping; `ptrs` upholds the
         // reentry contract (valid, non-aliased for the call).
-        unsafe { enter_compiled(ptrs, entry) }
+        unsafe {
+            enter_compiled(
+                ptrs,
+                entry,
+                self.safepoint_records.as_ptr(),
+                self.safepoint_records.len() as u32,
+            )
+        }
     }
 
     fn osr_entry(&self, ptrs: JitReentryPtrs, byte_pc: u32) -> Option<JitExecOutcome> {
@@ -1085,7 +1126,14 @@ impl JitFunctionCode for BaselineCode {
         // points at a prologue trampoline emitted with the `JitEntry` ABI.
         let entry = unsafe { self.code.ptr_at(offset) };
         // SAFETY: same reentry contract as `run_entry`.
-        Some(unsafe { enter_compiled(ptrs, entry) })
+        Some(unsafe {
+            enter_compiled(
+                ptrs,
+                entry,
+                self.safepoint_records.as_ptr(),
+                self.safepoint_records.len() as u32,
+            )
+        })
     }
 }
 
@@ -1103,7 +1151,12 @@ impl JitFunctionCode for BaselineCode {
 /// `entry` must point at a prologue emitted with the [`JitEntry`] ABI inside a
 /// live executable mapping that outlives the call, and `ptrs` must uphold the
 /// [`JitReentryPtrs`](otter_vm::JitReentryPtrs) contract.
-pub(crate) unsafe fn enter_compiled(ptrs: JitReentryPtrs, entry: *const u8) -> JitExecOutcome {
+pub(crate) unsafe fn enter_compiled(
+    ptrs: JitReentryPtrs,
+    entry: *const u8,
+    safepoint_records: *const SafepointRecord,
+    safepoint_count: u32,
+) -> JitExecOutcome {
     {
         let stack = ptrs.stack.cast::<JitFrameStack>();
         let vm = ptrs.vm.cast::<Interpreter>();
@@ -1149,6 +1202,8 @@ pub(crate) unsafe fn enter_compiled(ptrs: JitReentryPtrs, entry: *const u8) -> J
             reg_top_ptr,
             array_index_accessor_protector_ptr,
             gc_heap,
+            safepoint_records,
+            safepoint_count,
         };
         // SAFETY: the mapping is live and `entry` was emitted with the
         // `JitEntry` ABI.
@@ -1177,31 +1232,36 @@ fn reg_offset(idx: u16) -> Result<u32, Unsupported> {
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
     use super::{
+        ALLOC_CTX_CONTEXT_OFFSET, ALLOC_CTX_FRAME_INDEX_OFFSET, ALLOC_CTX_FRAME_SLOT_COUNT_OFFSET,
+        ALLOC_CTX_FRAME_SLOTS_OFFSET, ALLOC_CTX_RESERVED0_OFFSET, ALLOC_CTX_RESERVED1_OFFSET,
+        ALLOC_CTX_SAFEPOINT_COUNT_OFFSET, ALLOC_CTX_SAFEPOINT_RECORDS_OFFSET,
+        ALLOC_CTX_STACK_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_VM_OFFSET,
         ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET, BAIL_PC_OFFSET, BaselineCode, CONTEXT_OFFSET,
         DIRECT_ENTRY_OFFSET, DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET,
         DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET,
         GC_HEAP_OFFSET, IC_WAYS, JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS,
         OBJECT_BODY_TYPE_TAG, Op, Operand, REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET,
-        SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_NULL, SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED,
-        STATUS_RETURNED, STATUS_THREW, TAG_FUNCTION_ID, TAG_INT32, TAG_NAN, TAG_PTR_FUNCTION,
-        TAG_PTR_OBJECT, TAG_SPECIAL, THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET,
-        UPVALUES_PTR_OFFSET, Unsupported, VM_OFFSET, WhiskerIcCell, jit_abort_direct_call_stub,
-        jit_backedge_poll_stub, jit_call_method_stub, jit_delegate_op_stub,
-        jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
-        jit_inline_closure_upvalues_stub, jit_load_element_stub, jit_load_global_stub,
-        jit_load_prop_stub, jit_load_prop_window_stub, jit_load_upvalue_stub, jit_make_fn_stub,
-        jit_new_array_stub, jit_new_object_stub, jit_prepare_direct_call_stub,
-        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub, jit_store_element_stub,
-        jit_store_prop_stub, jit_store_prop_window_stub, jit_store_upvalue_stub,
-        jit_write_barrier_stub, jit_write_barrier_window_stub, leaf_no_alloc_stub2_trampoline_pair,
-        reg_offset,
+        SAFEPOINT_COUNT_OFFSET, SAFEPOINT_RECORDS_OFFSET, SPECIAL_FALSE, SPECIAL_HOLE,
+        SPECIAL_NULL, SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
+        TAG_FUNCTION_ID, TAG_INT32, TAG_NAN, TAG_PTR_FUNCTION, TAG_PTR_OBJECT, TAG_SPECIAL,
+        THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET,
+        Unsupported, VM_OFFSET, WhiskerIcCell, jit_abort_direct_call_stub, jit_backedge_poll_stub,
+        jit_call_method_stub, jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
+        jit_finish_direct_call_returned_stub, jit_inline_closure_upvalues_stub,
+        jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub, jit_load_prop_window_stub,
+        jit_load_upvalue_stub, jit_make_fn_stub, jit_new_array_stub, jit_new_object_stub,
+        jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
+        jit_store_element_stub, jit_store_prop_stub, jit_store_prop_window_stub,
+        jit_store_upvalue_stub, jit_write_barrier_stub, jit_write_barrier_window_stub,
+        leaf_no_alloc_stub2_trampoline_pair, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
     use otter_vm::Interpreter;
     use otter_vm::{
-        JitCollectionLeafMethod, JitFunctionView, JitInlineCallee, JitInlineMethod,
-        JitTypedArrayLayout,
+        JitCollectionAllocMethod, JitCollectionLeafMethod, JitFunctionView, JitInlineCallee,
+        JitInlineMethod, JitTypedArrayLayout, STUB_COLLECTION_SET_ADD_ALLOC,
+        runtime_stubs::alloc_value_stub_by_id,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -2121,6 +2181,7 @@ mod arm64 {
                             ops_ref,
                             site,
                             view.collection_leaf_methods.get(&instr.byte_pc),
+                            view.collection_alloc_methods.get(&instr.byte_pc),
                             Some(view),
                             threw,
                         )?;
@@ -2815,6 +2876,9 @@ mod arm64 {
             osr_entries.insert(pc, off);
         }
 
+        let mut safepoint_records: Vec<_> = view.safepoints.values().cloned().collect();
+        safepoint_records.sort_by_key(|record| record.id);
+        let safepoint_records = safepoint_records.into_boxed_slice();
         let buf = ops.finalize().expect("finalize");
         Ok(BaselineCode {
             code: CompiledCode::new(buf, entry),
@@ -2822,6 +2886,7 @@ mod arm64 {
             osr_only,
             load_ic_cells,
             store_ic_cells,
+            safepoint_records,
         })
     }
 
@@ -3942,7 +4007,7 @@ mod arm64 {
         // Ineligible at run time (method changed / shape mismatch): the full
         // in-place method call, which restores nothing (sp untouched here).
         dynasm!(ops ; .arch aarch64 ; =>fallback);
-        emit_method_call(ops, call_operands, site, None, None, threw)?;
+        emit_method_call(ops, call_operands, site, None, None, None, threw)?;
         dynasm!(ops ; .arch aarch64 ; =>after);
         Ok(true)
     }
@@ -4402,6 +4467,152 @@ mod arm64 {
         Ok(true)
     }
 
+    fn emit_collection_alloc_method_guarded_call(
+        ops: &mut Assembler,
+        operands: &[Operand],
+        alloc: &JitCollectionAllocMethod,
+        view: &JitFunctionView,
+        miss: DynamicLabel,
+        done: DynamicLabel,
+    ) -> Result<bool, Unsupported> {
+        if view.cage_base == 0 || alloc.value_arg_count != 3 {
+            return Ok(false);
+        }
+        let Some(stub_addr) =
+            alloc_value_stub_by_id(alloc.alloc_stub_id).and_then(|stub| stub.entry_addr())
+        else {
+            return Ok(false);
+        };
+
+        let dst = reg(operands, 0)?;
+        let recv = reg(operands, 1)?;
+        let argc = const_index(operands, 3)? as usize;
+        let arg0 = if argc == 0 {
+            None
+        } else {
+            Some(reg(operands, 4)?)
+        };
+        let arg1 = if argc <= 1 || alloc.alloc_stub_id == STUB_COLLECTION_SET_ADD_ALLOC.id {
+            None
+        } else {
+            Some(reg(operands, 5)?)
+        };
+        let guard_flags_byte = view.collection_layout.guard_flags_byte;
+        let object_shape_byte = view.object_shape_byte;
+        let object_values_ptr_byte = view.object_values_ptr_byte;
+        let native_static_fn_byte = view.native_static_fn_byte;
+        let method_value_byte = alloc.method_value_byte;
+        let receiver_type_tag = u32::from(alloc.receiver_type_tag);
+        let native_function_type_tag = u32::from(view.collection_layout.native_function_type_tag);
+        let undefined_bits = TAG_SPECIAL << 48;
+
+        load_reg(ops, 9, recv)?;
+        dynasm!(ops
+            ; .arch aarch64
+            ; lsr x10, x9, #48
+            ; movz x11, TAG_PTR_OBJECT as u32
+            ; cmp x10, x11
+            ; b.ne =>miss
+            ; mov w12, w9
+        );
+        emit_load_u64(ops, 13, view.cage_base as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x13, x13, x12
+            ; ldrb w14, [x13]
+            ; cmp w14, receiver_type_tag
+            ; b.ne =>miss
+            ; ldr w14, [x13, guard_flags_byte]
+            ; cbnz w14, =>miss
+        );
+
+        emit_load_u64(ops, 15, view.cage_base as u64);
+        emit_load_u64(ops, 12, u64::from(alloc.proto_offset));
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x15, x15, x12
+            ; ldrb w14, [x15]
+            ; cmp w14, OBJECT_BODY_TYPE_TAG
+            ; b.ne =>miss
+            ; ldr w14, [x15, object_shape_byte]
+        );
+        emit_load_u64(ops, 12, u64::from(alloc.proto_shape));
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp w14, w12
+            ; b.ne =>miss
+            ; ldr x15, [x15, object_values_ptr_byte]
+            ; cbz x15, =>miss
+            ; ldr x9, [x15, method_value_byte]
+            ; lsr x10, x9, #48
+            ; movz x11, TAG_PTR_FUNCTION as u32
+            ; cmp x10, x11
+            ; b.ne =>miss
+            ; mov w12, w9
+        );
+        emit_load_u64(ops, 13, view.cage_base as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x13, x13, x12
+            ; ldrb w14, [x13]
+            ; cmp w14, native_function_type_tag
+            ; b.ne =>miss
+            ; ldr x14, [x13, native_static_fn_byte]
+        );
+        emit_load_u64(ops, 15, alloc.builtin_fn_addr as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp x14, x15
+            ; b.ne =>miss
+
+            ; sub sp, sp, ALLOC_CTX_STACK_SIZE
+            ; ldr x9, [x20, VM_OFFSET]
+            ; str x9, [sp, ALLOC_CTX_VM_OFFSET]
+            ; ldr x9, [x20, STACK_OFFSET]
+            ; str x9, [sp, ALLOC_CTX_STACK_OFFSET]
+            ; ldr x9, [x20, CONTEXT_OFFSET]
+            ; str x9, [sp, ALLOC_CTX_CONTEXT_OFFSET]
+            ; ldr x9, [x20, SAFEPOINT_RECORDS_OFFSET]
+            ; str x9, [sp, ALLOC_CTX_SAFEPOINT_RECORDS_OFFSET]
+            ; ldr w9, [x20, SAFEPOINT_COUNT_OFFSET]
+            ; str w9, [sp, ALLOC_CTX_SAFEPOINT_COUNT_OFFSET]
+            ; str wzr, [sp, ALLOC_CTX_RESERVED0_OFFSET]
+            ; ldr x9, [x20, FRAME_INDEX_OFFSET]
+            ; str x9, [sp, ALLOC_CTX_FRAME_INDEX_OFFSET]
+            ; str x19, [sp, ALLOC_CTX_FRAME_SLOTS_OFFSET]
+            ; movz w9, view.register_count as u32
+            ; strh w9, [sp, ALLOC_CTX_FRAME_SLOT_COUNT_OFFSET]
+            ; movz w9, #0
+            ; strh w9, [sp, ALLOC_CTX_RESERVED1_OFFSET]
+
+            ; mov x0, sp
+        );
+        emit_load_u64(ops, 1, u64::from(alloc.safepoint_id));
+        load_reg(ops, 2, recv)?;
+        if let Some(arg0) = arg0 {
+            load_reg(ops, 3, arg0)?;
+        } else {
+            emit_load_u64(ops, 3, undefined_bits);
+        }
+        if let Some(arg1) = arg1 {
+            load_reg(ops, 4, arg1)?;
+        } else {
+            emit_load_u64(ops, 4, undefined_bits);
+        }
+        emit_load_u64(ops, 16, stub_addr as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; and x1, x1, #0xff
+            ; mov x5, x1
+            ; add sp, sp, ALLOC_CTX_STACK_SIZE
+            ; cbnz x5, =>miss
+        );
+        store_reg(ops, 0, dst)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done);
+        Ok(true)
+    }
+
     /// Emit a direct `CallMethodValue`: resolve the method through the call
     /// site's monomorphic IC and direct-branch to its compiled entry, exactly
     /// like [`emit_call`]; on an ineligible resolution fall back to the in-place
@@ -4412,6 +4623,7 @@ mod arm64 {
         operands: &[Operand],
         site: u64,
         leaf: Option<&JitCollectionLeafMethod>,
+        alloc: Option<&JitCollectionAllocMethod>,
         view: Option<&JitFunctionView>,
         threw: DynamicLabel,
     ) -> Result<(), Unsupported> {
@@ -4426,6 +4638,7 @@ mod arm64 {
 
         let fallback = ops.new_dynamic_label();
         let after_leaf = ops.new_dynamic_label();
+        let after_alloc = ops.new_dynamic_label();
         let done = ops.new_dynamic_label();
 
         if let (Some(leaf), Some(view)) = (leaf, view)
@@ -4434,6 +4647,18 @@ mod arm64 {
             )?
         {
             dynasm!(ops ; .arch aarch64 ; =>after_leaf);
+        }
+        if let (Some(alloc), Some(view)) = (alloc, view)
+            && emit_collection_alloc_method_guarded_call(
+                ops,
+                operands,
+                alloc,
+                view,
+                after_alloc,
+                done,
+            )?
+        {
+            dynasm!(ops ; .arch aarch64 ; =>after_alloc);
         }
 
         // jit_prepare_direct_method_call_stub(ctx, recv, name, site, argc, a0..a2)
@@ -5185,6 +5410,8 @@ mod tests {
             reg_top_ptr: std::ptr::null_mut(),
             array_index_accessor_protector_ptr: &array_index_accessor_protector,
             gc_heap: std::ptr::null(),
+            safepoint_records: std::ptr::null(),
+            safepoint_count: 0,
         };
         // SAFETY: integer-only function; never dereferences the null vm/stack.
         let entry: JitEntry = unsafe { std::mem::transmute(code.code.entry_ptr()) };

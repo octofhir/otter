@@ -1931,13 +1931,14 @@ mod arm64 {
 
     /// Fast-path `ToUint32` for unsigned shifts.
     ///
-    /// Int32-tagged values pass through as raw low-32 bits. Positive finite
-    /// doubles below `2^64` truncate to `u64`; taking the low 32 bits then
-    /// matches ECMAScript modulo `2^32`. Negative, NaN, infinity, huge, string,
-    /// BigInt, and object coercion cases bail to the interpreter.
+    /// Int32-tagged values pass through as raw low-32 bits (a negative int32
+    /// reinterprets to its `mod 2^32` value). Any finite double is truncated
+    /// toward zero and reduced modulo 2^32 — the full ECMAScript `ToUint32`,
+    /// including negatives (`-1 >>> 0 === 4294967295`) — so it stays compiled
+    /// instead of bailing. Only NaN / infinity / `|x| >= 2^63` (which would
+    /// saturate the 64-bit `fcvtzs`) and non-number tags bail.
     fn emit_to_uint32_fast(ops: &mut Assembler, src_x: u32, dst_w: u32, bail: DynamicLabel) {
         let is_non_int = ops.new_dynamic_label();
-        let double_ready = ops.new_dynamic_label();
         let done = ops.new_dynamic_label();
         dynasm!(ops
             ; .arch aarch64
@@ -1955,23 +1956,17 @@ mod arm64 {
             ; fcmp d0, d0
             ; b.vs =>bail
         );
-        emit_load_u64(ops, 14, 0.0f64.to_bits());
+        // Truncate toward zero into i64 (`fcvtzs`); the low 32 bits are the
+        // `mod 2^32` residue regardless of sign. Only `|x| >= 2^63` / infinity
+        // would saturate, so those bail.
+        emit_load_u64(ops, 14, 9_223_372_036_854_775_808.0f64.to_bits());
         dynasm!(ops
             ; .arch aarch64
-            ; fmov d1, x14
-            ; fcmp d0, d1
-            ; b.lt =>bail
-        );
-        emit_load_u64(ops, 14, 18_446_744_073_709_551_616.0f64.to_bits());
-        dynasm!(ops
-            ; .arch aarch64
-            ; fmov d1, x14
-            ; fcmp d0, d1
-            ; b.lt =>double_ready
-            ; b =>bail
-            ; =>double_ready
-            ; fcvtzu x14, d0
-            ; mov W(dst_w), w14
+            ; fabs d1, d0
+            ; fmov d2, x14
+            ; fcmp d1, d2
+            ; b.ge =>bail
+            ; fcvtzs X(dst_w), d0
             ; =>done
         );
     }
@@ -6221,7 +6216,9 @@ mod tests {
     }
 
     #[test]
-    fn ushr_bails_on_negative_double() {
+    fn ushr_wraps_negative_double_mod_uint32() {
+        // `ToUint32` of a negative finite double wraps mod 2^32: `-1 >>> 0`
+        // is `4294967295`, not a bail.
         let v = view(&[
             (
                 Op::Ushr,
@@ -6234,7 +6231,7 @@ mod tests {
             (Op::ReturnValue, vec![Operand::Register(2)]),
         ]);
         let mut regs = [box_f64(-1.0), box_i32(0), 0, 0, 0, 0, 0, 0];
-        assert!(matches!(run(&v, &mut regs), Exit::Bailed));
+        expect_f64(&v, &mut regs, 4_294_967_295.0);
     }
 
     #[test]

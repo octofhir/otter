@@ -350,6 +350,36 @@ pub const STUB_COLLECTION_SET_ADD_ALLOC: RuntimeStubDescriptor = RuntimeStubDesc
     argument_count: 3,
 };
 
+/// Allocating `Map.prototype.get` lookup stub.
+///
+/// Uses the uniform three-value ABI shape `(receiver, key, unused)`. This stub
+/// may materialize or flatten string keys before probing the map, so callers
+/// must publish the same safepoint/root packet as mutation stubs.
+pub const STUB_COLLECTION_MAP_GET_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
+    id: 12,
+    name: "collection_map_get_alloc",
+    class: RuntimeStubClass::Alloc,
+    argument_count: 3,
+};
+
+/// Allocating `Map.prototype.has` lookup stub with the same materializing key
+/// contract as [`STUB_COLLECTION_MAP_GET_ALLOC`].
+pub const STUB_COLLECTION_MAP_HAS_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
+    id: 13,
+    name: "collection_map_has_alloc",
+    class: RuntimeStubClass::Alloc,
+    argument_count: 3,
+};
+
+/// Allocating `Set.prototype.has` lookup stub with the same materializing key
+/// contract as [`STUB_COLLECTION_MAP_GET_ALLOC`].
+pub const STUB_COLLECTION_SET_HAS_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
+    id: 14,
+    name: "collection_set_has_alloc",
+    class: RuntimeStubClass::Alloc,
+    argument_count: 3,
+};
+
 /// Status code returned by a runtime stub.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -626,6 +656,21 @@ mod tests {
             NO_SAFEPOINT
         ));
         assert!(validate_stub_descriptor(STUB_COLLECTION_SET_ADD_ALLOC, 9));
+        assert!(!validate_stub_descriptor(
+            STUB_COLLECTION_MAP_GET_ALLOC,
+            NO_SAFEPOINT
+        ));
+        assert!(validate_stub_descriptor(STUB_COLLECTION_MAP_GET_ALLOC, 9));
+        assert!(!validate_stub_descriptor(
+            STUB_COLLECTION_MAP_HAS_ALLOC,
+            NO_SAFEPOINT
+        ));
+        assert!(validate_stub_descriptor(STUB_COLLECTION_MAP_HAS_ALLOC, 9));
+        assert!(!validate_stub_descriptor(
+            STUB_COLLECTION_SET_HAS_ALLOC,
+            NO_SAFEPOINT
+        ));
+        assert!(validate_stub_descriptor(STUB_COLLECTION_SET_HAS_ALLOC, 9));
     }
 
     #[test]

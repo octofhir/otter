@@ -25,8 +25,9 @@
 
 use crate::native_abi::{
     NO_SAFEPOINT, RuntimeStubAllocContext, RuntimeStubDescriptor, RuntimeStubId, RuntimeStubResult,
-    RuntimeStubResultPair, STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_LEAF,
-    STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
+    RuntimeStubResultPair, STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF,
+    STUB_COLLECTION_MAP_HAS_ALLOC, STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC,
+    STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
     SafepointId, SafepointRecord, TaggedLocationKind, validate_stub_descriptor,
 };
 use crate::{Interpreter, Value, collections};
@@ -353,6 +354,24 @@ pub const COLLECTION_SET_ADD_ALLOC: AllocValueStub = AllocValueStub {
     entry: Some(collection_set_add_alloc),
 };
 
+/// ABI descriptor for materializing `Map.prototype.get` collection lookup.
+pub const COLLECTION_MAP_GET_ALLOC: AllocValueStub = AllocValueStub {
+    descriptor: STUB_COLLECTION_MAP_GET_ALLOC,
+    entry: Some(collection_map_get_alloc),
+};
+
+/// ABI descriptor for materializing `Map.prototype.has` collection lookup.
+pub const COLLECTION_MAP_HAS_ALLOC: AllocValueStub = AllocValueStub {
+    descriptor: STUB_COLLECTION_MAP_HAS_ALLOC,
+    entry: Some(collection_map_has_alloc),
+};
+
+/// ABI descriptor for materializing `Set.prototype.has` collection lookup.
+pub const COLLECTION_SET_HAS_ALLOC: AllocValueStub = AllocValueStub {
+    descriptor: STUB_COLLECTION_SET_HAS_ALLOC,
+    entry: Some(collection_set_has_alloc),
+};
+
 /// Resolve a fixed two-argument leaf/no-allocation stub by ABI descriptor id.
 #[must_use]
 pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocStub2> {
@@ -370,6 +389,9 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
     match id {
         id if id == STUB_COLLECTION_MAP_SET_ALLOC.id => Some(COLLECTION_MAP_SET_ALLOC),
         id if id == STUB_COLLECTION_SET_ADD_ALLOC.id => Some(COLLECTION_SET_ADD_ALLOC),
+        id if id == STUB_COLLECTION_MAP_GET_ALLOC.id => Some(COLLECTION_MAP_GET_ALLOC),
+        id if id == STUB_COLLECTION_MAP_HAS_ALLOC.id => Some(COLLECTION_MAP_HAS_ALLOC),
+        id if id == STUB_COLLECTION_SET_HAS_ALLOC.id => Some(COLLECTION_SET_HAS_ALLOC),
         _ => None,
     }
 }
@@ -452,6 +474,60 @@ pub extern "C" fn collection_set_add_alloc(
     unused_bits: u64,
 ) -> RuntimeStubResultPair {
     RuntimeStubResultPair::from_result(collection_set_add_alloc_inner(
+        ctx,
+        safepoint,
+        recv_bits,
+        value_bits,
+        unused_bits,
+    ))
+}
+
+/// Allocating `Map.prototype.get` lookup stub.
+#[must_use]
+pub extern "C" fn collection_map_get_alloc(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    key_bits: u64,
+    unused_bits: u64,
+) -> RuntimeStubResultPair {
+    RuntimeStubResultPair::from_result(collection_map_get_alloc_inner(
+        ctx,
+        safepoint,
+        recv_bits,
+        key_bits,
+        unused_bits,
+    ))
+}
+
+/// Allocating `Map.prototype.has` lookup stub.
+#[must_use]
+pub extern "C" fn collection_map_has_alloc(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    key_bits: u64,
+    unused_bits: u64,
+) -> RuntimeStubResultPair {
+    RuntimeStubResultPair::from_result(collection_map_has_alloc_inner(
+        ctx,
+        safepoint,
+        recv_bits,
+        key_bits,
+        unused_bits,
+    ))
+}
+
+/// Allocating `Set.prototype.has` lookup stub.
+#[must_use]
+pub extern "C" fn collection_set_has_alloc(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    value_bits: u64,
+    unused_bits: u64,
+) -> RuntimeStubResultPair {
+    RuntimeStubResultPair::from_result(collection_set_has_alloc_inner(
         ctx,
         safepoint,
         recv_bits,
@@ -635,6 +711,157 @@ fn collection_set_add_alloc_inner(
     result
 }
 
+fn collection_map_get_alloc_inner(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    key_bits: u64,
+    unused_bits: u64,
+) -> RuntimeStubResult {
+    let Some(ctx) = alloc_context_mut(ctx) else {
+        return RuntimeStubResult::miss();
+    };
+    let Some(interp) = interpreter_mut(ctx.vm) else {
+        return RuntimeStubResult::miss();
+    };
+    // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
+    // table and frame-slot window must remain live for this call.
+    let Ok(roots) = (unsafe {
+        alloc_value_stub_call_roots(
+            ctx,
+            safepoint,
+            [
+                Value::from_abi_bits(recv_bits),
+                Value::from_abi_bits(key_bits),
+                Value::from_abi_bits(unused_bits),
+            ],
+        )
+    }) else {
+        return RuntimeStubResult::miss();
+    };
+    let depth = interp
+        .gc_heap
+        .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    let result = (|| {
+        let key = roots.value(1);
+        if let Some(string) = key.as_string(&interp.gc_heap) {
+            let _ = string.flatten_in_place(&mut interp.gc_heap);
+        }
+        let recv = roots.value(0);
+        let key = roots.value(1);
+        let Some(map) = recv.as_map() else {
+            return RuntimeStubResult::miss();
+        };
+        RuntimeStubResult::ok_value(
+            collections::map_get(map, &interp.gc_heap, &key).unwrap_or_else(Value::undefined),
+        )
+    })();
+    interp.gc_heap.pop_extra_roots_to(depth - 1);
+    result
+}
+
+fn collection_map_has_alloc_inner(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    key_bits: u64,
+    unused_bits: u64,
+) -> RuntimeStubResult {
+    let Some(ctx) = alloc_context_mut(ctx) else {
+        return RuntimeStubResult::miss();
+    };
+    let Some(interp) = interpreter_mut(ctx.vm) else {
+        return RuntimeStubResult::miss();
+    };
+    // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
+    // table and frame-slot window must remain live for this call.
+    let Ok(roots) = (unsafe {
+        alloc_value_stub_call_roots(
+            ctx,
+            safepoint,
+            [
+                Value::from_abi_bits(recv_bits),
+                Value::from_abi_bits(key_bits),
+                Value::from_abi_bits(unused_bits),
+            ],
+        )
+    }) else {
+        return RuntimeStubResult::miss();
+    };
+    let depth = interp
+        .gc_heap
+        .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    let result = (|| {
+        let key = roots.value(1);
+        if let Some(string) = key.as_string(&interp.gc_heap) {
+            let _ = string.flatten_in_place(&mut interp.gc_heap);
+        }
+        let recv = roots.value(0);
+        let key = roots.value(1);
+        let Some(map) = recv.as_map() else {
+            return RuntimeStubResult::miss();
+        };
+        RuntimeStubResult::ok_value(Value::boolean(collections::map_has(
+            map,
+            &interp.gc_heap,
+            &key,
+        )))
+    })();
+    interp.gc_heap.pop_extra_roots_to(depth - 1);
+    result
+}
+
+fn collection_set_has_alloc_inner(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    value_bits: u64,
+    unused_bits: u64,
+) -> RuntimeStubResult {
+    let Some(ctx) = alloc_context_mut(ctx) else {
+        return RuntimeStubResult::miss();
+    };
+    let Some(interp) = interpreter_mut(ctx.vm) else {
+        return RuntimeStubResult::miss();
+    };
+    // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
+    // table and frame-slot window must remain live for this call.
+    let Ok(roots) = (unsafe {
+        alloc_value_stub_call_roots(
+            ctx,
+            safepoint,
+            [
+                Value::from_abi_bits(recv_bits),
+                Value::from_abi_bits(value_bits),
+                Value::from_abi_bits(unused_bits),
+            ],
+        )
+    }) else {
+        return RuntimeStubResult::miss();
+    };
+    let depth = interp
+        .gc_heap
+        .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    let result = (|| {
+        let value = roots.value(1);
+        if let Some(string) = value.as_string(&interp.gc_heap) {
+            let _ = string.flatten_in_place(&mut interp.gc_heap);
+        }
+        let recv = roots.value(0);
+        let value = roots.value(1);
+        let Some(set) = recv.as_set() else {
+            return RuntimeStubResult::miss();
+        };
+        RuntimeStubResult::ok_value(Value::boolean(collections::set_has(
+            set,
+            &interp.gc_heap,
+            &value,
+        )))
+    })();
+    interp.gc_heap.pop_extra_roots_to(depth - 1);
+    result
+}
+
 fn heap_ref(heap: *const otter_gc::GcHeap) -> Option<&'static otter_gc::GcHeap> {
     if heap.is_null() {
         return None;
@@ -722,6 +949,18 @@ mod tests {
         assert!(COLLECTION_SET_ADD_ALLOC.is_valid_for_safepoint(1));
         assert!(COLLECTION_SET_ADD_ALLOC.has_entry());
         assert!(COLLECTION_SET_ADD_ALLOC.entry_addr().is_some());
+        assert!(!COLLECTION_MAP_GET_ALLOC.is_valid_for_safepoint(NO_SAFEPOINT));
+        assert!(COLLECTION_MAP_GET_ALLOC.is_valid_for_safepoint(1));
+        assert!(COLLECTION_MAP_GET_ALLOC.has_entry());
+        assert!(COLLECTION_MAP_GET_ALLOC.entry_addr().is_some());
+        assert!(!COLLECTION_MAP_HAS_ALLOC.is_valid_for_safepoint(NO_SAFEPOINT));
+        assert!(COLLECTION_MAP_HAS_ALLOC.is_valid_for_safepoint(1));
+        assert!(COLLECTION_MAP_HAS_ALLOC.has_entry());
+        assert!(COLLECTION_MAP_HAS_ALLOC.entry_addr().is_some());
+        assert!(!COLLECTION_SET_HAS_ALLOC.is_valid_for_safepoint(NO_SAFEPOINT));
+        assert!(COLLECTION_SET_HAS_ALLOC.is_valid_for_safepoint(1));
+        assert!(COLLECTION_SET_HAS_ALLOC.has_entry());
+        assert!(COLLECTION_SET_HAS_ALLOC.entry_addr().is_some());
         assert_eq!(
             alloc_value_stub_by_id(STUB_COLLECTION_MAP_SET_ALLOC.id).map(|stub| stub.descriptor),
             Some(STUB_COLLECTION_MAP_SET_ALLOC)
@@ -729,6 +968,18 @@ mod tests {
         assert_eq!(
             alloc_value_stub_by_id(STUB_COLLECTION_SET_ADD_ALLOC.id).map(|stub| stub.descriptor),
             Some(STUB_COLLECTION_SET_ADD_ALLOC)
+        );
+        assert_eq!(
+            alloc_value_stub_by_id(STUB_COLLECTION_MAP_GET_ALLOC.id).map(|stub| stub.descriptor),
+            Some(STUB_COLLECTION_MAP_GET_ALLOC)
+        );
+        assert_eq!(
+            alloc_value_stub_by_id(STUB_COLLECTION_MAP_HAS_ALLOC.id).map(|stub| stub.descriptor),
+            Some(STUB_COLLECTION_MAP_HAS_ALLOC)
+        );
+        assert_eq!(
+            alloc_value_stub_by_id(STUB_COLLECTION_SET_HAS_ALLOC.id).map(|stub| stub.descriptor),
+            Some(STUB_COLLECTION_SET_HAS_ALLOC)
         );
         assert!(alloc_value_stub_by_id(u32::MAX).is_none());
     }
@@ -1104,6 +1355,135 @@ mod tests {
         );
         assert_eq!(result.status, RuntimeStubStatus::Miss);
         assert_eq!(result.into_value(), None);
+    }
+
+    #[test]
+    fn collection_lookup_alloc_entries_materialize_rope_keys() {
+        let mut interp = Interpreter::new();
+        let map = collections::alloc_map(interp.gc_heap_mut()).expect("map");
+        let set = collections::alloc_set(interp.gc_heap_mut()).expect("set");
+        let insert_left =
+            crate::string::JsString::from_str("k", interp.gc_heap_mut()).expect("insert left");
+        let insert_right =
+            crate::string::JsString::from_str("1", interp.gc_heap_mut()).expect("insert right");
+        let insert_rope =
+            crate::string::JsString::concat(insert_left, insert_right, interp.gc_heap_mut())
+                .expect("insert rope");
+        let lookup_left =
+            crate::string::JsString::from_str("k", interp.gc_heap_mut()).expect("lookup left");
+        let lookup_right =
+            crate::string::JsString::from_str("1", interp.gc_heap_mut()).expect("lookup right");
+        let lookup_rope =
+            crate::string::JsString::concat(lookup_left, lookup_right, interp.gc_heap_mut())
+                .expect("lookup rope");
+        let safepoints = [SafepointRecord::frame_slot_window(23, NO_FRAME_STATE, 3)];
+
+        let mut insert_map_slots = [
+            Value::map(map).to_abi_bits(),
+            Value::string(insert_rope).to_abi_bits(),
+            n(77).to_abi_bits(),
+        ];
+        let mut insert_map_ctx = RuntimeStubAllocContext::new(
+            (&mut interp as *mut Interpreter).cast(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            safepoints.as_ptr(),
+            safepoints.len() as u32,
+            0,
+            insert_map_slots.as_mut_ptr(),
+            insert_map_slots.len() as u16,
+        );
+        let inserted = COLLECTION_MAP_SET_ALLOC
+            .invoke_raw(
+                &mut insert_map_ctx,
+                23,
+                insert_map_slots[0],
+                insert_map_slots[1],
+                insert_map_slots[2],
+            )
+            .expect("map set entry");
+        assert_eq!(inserted.status(), RuntimeStubStatus::Ok);
+
+        let mut insert_set_slots = [
+            Value::set(set).to_abi_bits(),
+            Value::string(insert_rope).to_abi_bits(),
+            Value::undefined().to_abi_bits(),
+        ];
+        let mut insert_set_ctx = RuntimeStubAllocContext::new(
+            (&mut interp as *mut Interpreter).cast(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            safepoints.as_ptr(),
+            safepoints.len() as u32,
+            0,
+            insert_set_slots.as_mut_ptr(),
+            insert_set_slots.len() as u16,
+        );
+        let inserted = COLLECTION_SET_ADD_ALLOC
+            .invoke_raw(
+                &mut insert_set_ctx,
+                23,
+                insert_set_slots[0],
+                insert_set_slots[1],
+                insert_set_slots[2],
+            )
+            .expect("set add entry");
+        assert_eq!(inserted.status(), RuntimeStubStatus::Ok);
+
+        let leaf = collection_map_has_leaf(
+            &interp.gc_heap as *const otter_gc::GcHeap,
+            Value::map(map).to_abi_bits(),
+            Value::string(lookup_rope).to_abi_bits(),
+        );
+        assert_eq!(leaf.status, RuntimeStubStatus::Miss);
+
+        let mut map_slots = [
+            Value::map(map).to_abi_bits(),
+            Value::string(lookup_rope).to_abi_bits(),
+            Value::undefined().to_abi_bits(),
+        ];
+        let mut map_ctx = RuntimeStubAllocContext::new(
+            (&mut interp as *mut Interpreter).cast(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            safepoints.as_ptr(),
+            safepoints.len() as u32,
+            0,
+            map_slots.as_mut_ptr(),
+            map_slots.len() as u16,
+        );
+        let get = COLLECTION_MAP_GET_ALLOC
+            .invoke_raw(&mut map_ctx, 23, map_slots[0], map_slots[1], map_slots[2])
+            .expect("map get entry");
+        assert_eq!(get.status(), RuntimeStubStatus::Ok);
+        assert_eq!(get.into_result().into_value(), Some(n(77)));
+
+        let has = COLLECTION_MAP_HAS_ALLOC
+            .invoke_raw(&mut map_ctx, 23, map_slots[0], map_slots[1], map_slots[2])
+            .expect("map has entry");
+        assert_eq!(has.status(), RuntimeStubStatus::Ok);
+        assert_eq!(has.into_result().into_value(), Some(Value::boolean(true)));
+
+        let mut set_slots = [
+            Value::set(set).to_abi_bits(),
+            Value::string(lookup_rope).to_abi_bits(),
+            Value::undefined().to_abi_bits(),
+        ];
+        let mut set_ctx = RuntimeStubAllocContext::new(
+            (&mut interp as *mut Interpreter).cast(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            safepoints.as_ptr(),
+            safepoints.len() as u32,
+            0,
+            set_slots.as_mut_ptr(),
+            set_slots.len() as u16,
+        );
+        let has = COLLECTION_SET_HAS_ALLOC
+            .invoke_raw(&mut set_ctx, 23, set_slots[0], set_slots[1], set_slots[2])
+            .expect("set has entry");
+        assert_eq!(has.status(), RuntimeStubStatus::Ok);
+        assert_eq!(has.into_result().into_value(), Some(Value::boolean(true)));
     }
 
     #[test]

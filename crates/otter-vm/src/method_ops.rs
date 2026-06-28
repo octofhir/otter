@@ -168,9 +168,12 @@ impl CollectionFastOp {
 
     fn alloc_stub_id(self) -> Option<RuntimeStubId> {
         match self {
+            Self::MapGet => Some(crate::native_abi::STUB_COLLECTION_MAP_GET_ALLOC.id),
+            Self::MapHas => Some(crate::native_abi::STUB_COLLECTION_MAP_HAS_ALLOC.id),
             Self::MapSet => Some(crate::native_abi::STUB_COLLECTION_MAP_SET_ALLOC.id),
             Self::SetAdd => Some(crate::native_abi::STUB_COLLECTION_SET_ADD_ALLOC.id),
-            Self::MapGet | Self::MapHas | Self::MapDelete | Self::SetHas | Self::SetDelete => None,
+            Self::SetHas => Some(crate::native_abi::STUB_COLLECTION_SET_HAS_ALLOC.id),
+            Self::MapDelete | Self::SetDelete => None,
         }
     }
 }

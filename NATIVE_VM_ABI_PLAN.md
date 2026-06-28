@@ -292,17 +292,15 @@ compiled `CallMethodValue` now tries a narrow collection-leaf bridge before the
 generic method bridge, so hot `Map.get` / `Map.has` / `Set.has` sites can return
 through the reusable leaf ABI without building the full method-call argument
 path. Fully direct machine calls to the leaf entries remain open.
-`Map.prototype.set` and `Set.prototype.add` now also have concrete `AllocStub`
-descriptors (`collection_map_set_alloc`, `collection_set_add_alloc`) and a
-uniform three-value mutation ABI shape (`receiver`, `arg0`, `arg1_or_undefined`).
+`Map.prototype.set`, `Set.prototype.add`, and materializing collection lookups
+(`Map.get`, `Map.has`, `Set.has`) now have concrete `AllocStub` descriptors with
+a uniform three-value ABI shape (`receiver`, `arg0`, `arg1_or_undefined`).
 `runtime_stubs` can resolve these descriptor ids as allocating ABI records and
 validates that callers name a non-sentinel safepoint. JIT compile snapshots now
-carry `JitCollectionAllocMethod` feedback for warmed `Map.set` / `Set.add`
-sites: receiver/prototype/builtin guards plus the allocating stub id. Baseline
-codegen intentionally does not call these stubs yet; the existing rooted
-fallback remains the only executing mutation path until exact safepoint/root maps
-are published at the machine call site. The first safepoint-map slice is now in
-place: `JitFunctionView` carries baked `SafepointRecord`s keyed by
+carry `JitCollectionAllocMethod` feedback for warmed collection method sites:
+receiver/prototype/builtin guards plus the allocating stub id. The first
+safepoint-map slice is now in place: `JitFunctionView` carries baked
+`SafepointRecord`s keyed by
 `SafepointId`, and `JitCollectionAllocMethod` names the safepoint to publish for
 its call site. Baseline v1 records the full interpreter-visible register window
 as tagged frame-slot roots, matching the current rooted frame model while leaving
@@ -319,16 +317,17 @@ through `AllocSafepointFrameRoots`, rejecting unsupported register/spill maps
 until native frame locations are publishable. The allocating value-stub catalog
 is no longer just passive metadata: `AllocValueStub` carries an optional
 executable entrypoint and common entry-address/raw-invoke helpers. Collection
-mutation stubs now have VM-side executable entries that consume the same context
-packet and safepoint table that baseline code passes at warmed `Map.set` /
-`Set.add` sites. Baseline compiled `CallMethodValue` keeps the existing
-receiver/prototype/builtin guards, builds a stack-local `RuntimeStubAllocContext`
-from `JitCtx`, passes the compiled function's stable safepoint table and raw
-receiver/argument value bits, and writes the relocated `Ok` result directly back
-to the destination frame slot. `Miss` and other non-`Ok` statuses still fall
-through to the existing rooted method fallback, while the fast path avoids the
-generic `NativeCtx` bridge. String/array/property allocating stubs can plug into
-the same ABI record instead of growing per-feature bridge shapes.
+mutation and lookup stubs now have VM-side executable entries that consume the
+same context packet and safepoint table that baseline code passes at warmed
+Map/Set sites. Baseline compiled `CallMethodValue` keeps the existing
+receiver/prototype/builtin guards, tries the `LeafNoAlloc` lookup first where
+available, then builds a stack-local `RuntimeStubAllocContext` from `JitCtx`,
+passes the compiled function's stable safepoint table and raw receiver/argument
+value bits, and writes the relocated `Ok` result directly back to the
+destination frame slot. `Miss` and other non-`Ok` statuses still fall through to
+the existing rooted method fallback, while the fast path avoids the generic
+`NativeCtx` bridge. String/array/property allocating stubs can plug into the same
+ABI record instead of growing per-feature bridge shapes.
 
 Tasks:
 

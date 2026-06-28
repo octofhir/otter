@@ -330,6 +330,10 @@ pub struct JitRuntimeStats {
     pub runtime_property_stubs: u64,
     /// JIT method-call runtime stub calls.
     pub runtime_method_stubs: u64,
+    /// Method-call runtime stubs reached from baseline dynasm code.
+    pub runtime_method_baseline_stubs: u64,
+    /// Method-call runtime stubs reached from optimizing dynasm code.
+    pub runtime_method_optimizing_stubs: u64,
     /// ABI-classified runtime stub transitions from compiled code.
     pub runtime_stub_transitions: u64,
     /// ABI-classified leaf runtime stubs. These are the desired hot-path shape.
@@ -358,6 +362,15 @@ pub struct JitRuntimeStats {
     pub method_number_fast_hits: u64,
     /// JIT method bridge calls that reached generic callable dispatch.
     pub method_generic_calls: u64,
+}
+
+/// Source tier for a compiled `CallMethodValue` runtime bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitRuntimeMethodStubSource {
+    /// Baseline dynasm code emitted the bridge.
+    Baseline,
+    /// Optimizing dynasm code emitted the bridge.
+    Optimizing,
 }
 
 /// Snapshot of VM-published collection method IC mirror slots.
@@ -3727,12 +3740,26 @@ impl Interpreter {
             .saturating_add(1);
     }
 
-    pub(crate) fn record_jit_runtime_method_stub(&mut self) {
+    pub(crate) fn record_jit_runtime_method_stub(&mut self, source: JitRuntimeMethodStubSource) {
         self.record_jit_runtime_stub_descriptor(native_abi::STUB_JIT_RUNTIME_CALL_METHOD);
         self.jit_runtime_stats.runtime_method_stubs = self
             .jit_runtime_stats
             .runtime_method_stubs
             .saturating_add(1);
+        match source {
+            JitRuntimeMethodStubSource::Baseline => {
+                self.jit_runtime_stats.runtime_method_baseline_stubs = self
+                    .jit_runtime_stats
+                    .runtime_method_baseline_stubs
+                    .saturating_add(1);
+            }
+            JitRuntimeMethodStubSource::Optimizing => {
+                self.jit_runtime_stats.runtime_method_optimizing_stubs = self
+                    .jit_runtime_stats
+                    .runtime_method_optimizing_stubs
+                    .saturating_add(1);
+            }
+        }
     }
 
     fn record_jit_runtime_stub_descriptor(&mut self, desc: native_abi::RuntimeStubDescriptor) {

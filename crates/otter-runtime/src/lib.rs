@@ -675,6 +675,10 @@ pub struct RuntimeExecutionStats {
     pub jit_runtime_property_stubs: u64,
     /// JIT method-call runtime stub calls.
     pub jit_runtime_method_stubs: u64,
+    /// JIT method-call runtime stubs reached from baseline dynasm.
+    pub jit_runtime_method_baseline_stubs: u64,
+    /// JIT method-call runtime stubs reached from optimizing dynasm.
+    pub jit_runtime_method_optimizing_stubs: u64,
     /// ABI-classified runtime stub transitions from compiled code.
     pub jit_runtime_stub_transitions: u64,
     /// ABI-classified leaf runtime stubs.
@@ -2666,6 +2670,8 @@ impl Runtime {
             jit_osr_attempts: jit.osr_attempts,
             jit_runtime_property_stubs: jit.runtime_property_stubs,
             jit_runtime_method_stubs: jit.runtime_method_stubs,
+            jit_runtime_method_baseline_stubs: jit.runtime_method_baseline_stubs,
+            jit_runtime_method_optimizing_stubs: jit.runtime_method_optimizing_stubs,
             jit_runtime_stub_transitions: jit.runtime_stub_transitions,
             jit_leaf_stub_transitions: jit.leaf_stub_transitions,
             jit_alloc_stub_transitions: jit.alloc_stub_transitions,

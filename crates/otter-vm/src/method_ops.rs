@@ -1219,8 +1219,9 @@ impl Interpreter {
         call_byte_pc: u32,
         site: usize,
         arg_regs: &[u16],
+        source: crate::JitRuntimeMethodStubSource,
     ) -> Result<(), VmError> {
-        self.record_jit_runtime_method_stub();
+        self.record_jit_runtime_method_stub(source);
         let recv = *read_register(&stack[frame_index], recv_reg)?;
         if recv.is_nullish() {
             let label = if recv.is_null() { "null" } else { "undefined" };

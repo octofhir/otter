@@ -63,6 +63,8 @@ use super::ir::{BlockId, CmpOp, Float64UnaryOp, Graph, NodeId, NodeKind, Repr, T
 use super::liveness::Liveness;
 use super::regalloc::{Allocation, EdgeMoves, Location};
 use crate::CompiledCode;
+use otter_bytecode::Op;
+use otter_vm::{JitFunctionView, NO_FRAME_STATE, SafepointId, SafepointRecord};
 
 /// Number of abstract GP registers handed to the allocator (`Reg(0..7)`), mapped
 /// to physical `x9..x15`.
@@ -89,6 +91,11 @@ pub struct OptimizedCode {
     /// — and their side-effect ordering — exactly as the interpreter runs them,
     /// while the hot loop still tiers up via OSR.
     entry_via_osr_only: bool,
+    /// Safepoint table published through the shared `JitCtx` ABI. The dynasm
+    /// optimizing emitter can materialize the interpreter frame around calls,
+    /// so VM-native allocating stubs can publish frame-slot roots without
+    /// re-entering the method bridge.
+    safepoint_records: Box<[SafepointRecord]>,
 }
 
 impl std::fmt::Debug for OptimizedCode {
@@ -135,7 +142,14 @@ impl otter_vm::JitFunctionCode for OptimizedCode {
         let entry = unsafe { self.code.entry_ptr() };
         // SAFETY: `entry` points into the live mapping; `_ptrs` upholds the
         // reentry contract.
-        unsafe { crate::baseline::enter_compiled(_ptrs, entry, std::ptr::null(), 0) }
+        unsafe {
+            crate::baseline::enter_compiled(
+                _ptrs,
+                entry,
+                self.safepoint_records.as_ptr(),
+                self.safepoint_records.len() as u32,
+            )
+        }
     }
 
     fn osr_entry(
@@ -149,8 +163,72 @@ impl otter_vm::JitFunctionCode for OptimizedCode {
         let entry = unsafe { self.code.ptr_at(offset) };
         // SAFETY: same reentry contract as `run_entry`; the trampoline reloads
         // the live interpreter registers before branching to the loop header.
-        Some(unsafe { crate::baseline::enter_compiled(ptrs, entry, std::ptr::null(), 0) })
+        Some(unsafe {
+            crate::baseline::enter_compiled(
+                ptrs,
+                entry,
+                self.safepoint_records.as_ptr(),
+                self.safepoint_records.len() as u32,
+            )
+        })
     }
+}
+
+fn optimizing_safepoint_records(view: &JitFunctionView) -> Box<[SafepointRecord]> {
+    let mut records: Vec<_> = view.safepoints.values().cloned().collect();
+    let mut next_safepoint = records
+        .iter()
+        .map(|record| record.id)
+        .max()
+        .map_or(1, |id| id.saturating_add(1))
+        .max(1);
+    for instr in &view.instructions {
+        if instr.op != Op::CallMethodValue {
+            continue;
+        }
+        if view.collection_alloc_methods.contains_key(&instr.byte_pc) {
+            continue;
+        }
+        let safepoint = next_safepoint;
+        next_safepoint = next_safepoint.saturating_add(1);
+        records.push(SafepointRecord::frame_slot_window(
+            safepoint,
+            NO_FRAME_STATE,
+            view.register_count,
+        ));
+    }
+    records.sort_by_key(|record| record.id);
+    records.into_boxed_slice()
+}
+
+fn optimizing_call_method_safepoint_id(
+    view: &JitFunctionView,
+    byte_pc: u32,
+) -> Option<SafepointId> {
+    if let Some(alloc) = view.collection_alloc_methods.get(&byte_pc) {
+        return Some(alloc.safepoint_id);
+    }
+    let mut next_safepoint = view
+        .safepoints
+        .values()
+        .map(|record| record.id)
+        .max()
+        .map_or(1, |id| id.saturating_add(1))
+        .max(1);
+    for instr in &view.instructions {
+        if instr.op != Op::CallMethodValue {
+            continue;
+        }
+        if view.collection_alloc_methods.contains_key(&instr.byte_pc) {
+            continue;
+        }
+        let safepoint = next_safepoint;
+        next_safepoint = next_safepoint.saturating_add(1);
+        if instr.byte_pc == byte_pc {
+            return Some(safepoint);
+        }
+    }
+    None
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -180,20 +258,35 @@ mod arm64 {
     };
     use crate::CompiledCode;
     use crate::baseline::{
-        ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET, BAIL_PC_OFFSET, CONTEXT_OFFSET,
-        DIRECT_ENTRY_OFFSET, DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET,
-        DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET,
+        ALLOC_CTX_CONTEXT_OFFSET, ALLOC_CTX_FRAME_INDEX_OFFSET, ALLOC_CTX_FRAME_SLOT_COUNT_OFFSET,
+        ALLOC_CTX_FRAME_SLOTS_OFFSET, ALLOC_CTX_RESERVED0_OFFSET, ALLOC_CTX_RESERVED1_OFFSET,
+        ALLOC_CTX_SAFEPOINT_COUNT_OFFSET, ALLOC_CTX_SAFEPOINT_RECORDS_OFFSET,
+        ALLOC_CTX_STACK_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_VM_OFFSET,
+        ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET, BAIL_PC_OFFSET,
+        COLLECTION_METHOD_IC_ALLOC_STUB_ID_OFFSET, COLLECTION_METHOD_IC_BUILTIN_FN_ADDR_OFFSET,
+        COLLECTION_METHOD_IC_COUNT_OFFSET, COLLECTION_METHOD_IC_LEAF_STUB_ID_OFFSET,
+        COLLECTION_METHOD_IC_METHOD_VALUE_BYTE_OFFSET, COLLECTION_METHOD_IC_PROTO_OFFSET,
+        COLLECTION_METHOD_IC_PROTO_SHAPE_OFFSET, COLLECTION_METHOD_IC_RECEIVER_TYPE_TAG_OFFSET,
+        COLLECTION_METHOD_IC_SLOT_SIZE, COLLECTION_METHOD_IC_STATE_OFFSET,
+        COLLECTION_METHOD_ICS_OFFSET, CONTEXT_OFFSET, DIRECT_ENTRY_OFFSET,
+        DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET,
+        DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET, GC_HEAP_OFFSET,
         JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG, OBJECT_BODY_TYPE_TAG, REG_STACK_BASE_OFFSET,
-        REG_TOP_PTR_OFFSET, SPECIAL_FALSE, SPECIAL_HOLE, SPECIAL_NULL, SPECIAL_TRUE, STACK_OFFSET,
-        STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, TAG_FUNCTION_ID, TAG_INT32, TAG_PTR_FUNCTION,
-        TAG_PTR_OBJECT, TAG_SPECIAL, THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET,
-        UPVALUES_PTR_OFFSET, VM_OFFSET, jit_abort_direct_call_stub, jit_alloc_object_literal_stub,
-        jit_backedge_poll_stub, jit_call_method_stub, jit_finish_direct_call_bailed_stub,
+        REG_TOP_PTR_OFFSET, SAFEPOINT_COUNT_OFFSET, SAFEPOINT_RECORDS_OFFSET, SPECIAL_FALSE,
+        SPECIAL_HOLE, SPECIAL_NULL, SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED,
+        STATUS_THREW, TAG_FUNCTION_ID, TAG_INT32, TAG_PTR_FUNCTION, TAG_PTR_OBJECT, TAG_SPECIAL,
+        THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, VM_OFFSET,
+        jit_abort_direct_call_stub, jit_alloc_object_literal_stub, jit_backedge_poll_stub,
+        jit_call_method_stub_optimizing, jit_finish_direct_call_bailed_stub,
         jit_finish_direct_call_returned_stub, jit_prepare_direct_call_stub,
         jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
     };
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
-    use otter_vm::{Interpreter, JitFunctionView};
+    use otter_vm::{
+        Interpreter, JitFunctionView, STUB_COLLECTION_SET_ADD_ALLOC, SafepointId,
+        jit::{JIT_COLLECTION_METHOD_IC_COLLECTION, JIT_COLLECTION_METHOD_IC_NO_STUB},
+        runtime_stubs::{alloc_value_stub_trampoline_pair, leaf_no_alloc_stub2_trampoline_pair},
+    };
     use rustc_hash::{FxHashMap, FxHashSet};
 
     /// Emit scratch register for parallel-move spill→spill staging and tag
@@ -1020,6 +1113,314 @@ mod arm64 {
         );
     }
 
+    fn load_frame_reg(ops: &mut Assembler, target: u32, regn: u16) -> Result<(), Unsupported> {
+        let off = frame_reg_offset(regn)?;
+        dynasm!(ops ; .arch aarch64 ; ldr X(target), [x19, off]);
+        Ok(())
+    }
+
+    fn store_frame_reg(ops: &mut Assembler, source: u32, regn: u16) -> Result<(), Unsupported> {
+        let off = frame_reg_offset(regn)?;
+        dynasm!(ops ; .arch aarch64 ; str X(source), [x19, off]);
+        Ok(())
+    }
+
+    fn frame_reg_offset(regn: u16) -> Result<u32, Unsupported> {
+        let off = u32::from(regn) * 8;
+        if off > 32760 {
+            return Err(Unsupported::OperandShape("frame register range"));
+        }
+        Ok(off)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_opt_live_collection_leaf_method_guarded_call(
+        ops: &mut Assembler,
+        view: &JitFunctionView,
+        dst_reg: u16,
+        recv_reg: u16,
+        site: u64,
+        arg_regs: &[u16],
+        miss: DynamicLabel,
+        done: DynamicLabel,
+    ) -> Result<bool, Unsupported> {
+        if view.cage_base == 0 {
+            return Ok(false);
+        }
+
+        let key = arg_regs.first().copied();
+        let guard_flags_byte = view.collection_layout.guard_flags_byte;
+        let object_shape_byte = view.object_shape_byte;
+        let object_values_ptr_byte = view.object_values_ptr_byte;
+        let native_static_fn_byte = view.native_static_fn_byte;
+        let native_function_type_tag = u32::from(view.collection_layout.native_function_type_tag);
+
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x17, [x20, COLLECTION_METHOD_ICS_OFFSET]
+            ; cbz x17, =>miss
+            ; ldr w10, [x20, COLLECTION_METHOD_IC_COUNT_OFFSET]
+        );
+        emit_load_u64(ops, 11, site);
+        dynasm!(ops ; .arch aarch64 ; cmp x11, x10 ; b.hs =>miss);
+        emit_load_u64(
+            ops,
+            12,
+            site.saturating_mul(u64::from(COLLECTION_METHOD_IC_SLOT_SIZE)),
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x17, x17, x12
+            ; ldrb w10, [x17, COLLECTION_METHOD_IC_STATE_OFFSET]
+            ; cmp w10, JIT_COLLECTION_METHOD_IC_COLLECTION as u32
+            ; b.ne =>miss
+            ; ldr w11, [x17, COLLECTION_METHOD_IC_LEAF_STUB_ID_OFFSET]
+        );
+        emit_load_u64(ops, 12, u64::from(JIT_COLLECTION_METHOD_IC_NO_STUB));
+        dynasm!(ops ; .arch aarch64 ; cmp x11, x12 ; b.eq =>miss);
+
+        load_frame_reg(ops, 9, recv_reg)?;
+        dynasm!(ops
+            ; .arch aarch64
+            ; lsr x10, x9, #48
+            ; movz x11, TAG_PTR_OBJECT as u32
+            ; cmp x10, x11
+            ; b.ne =>miss
+            ; mov w12, w9
+        );
+        emit_load_u64(ops, 13, view.cage_base as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x13, x13, x12
+            ; ldrb w14, [x13]
+            ; ldrb w15, [x17, COLLECTION_METHOD_IC_RECEIVER_TYPE_TAG_OFFSET]
+            ; cmp w14, w15
+            ; b.ne =>miss
+            ; ldr w14, [x13, guard_flags_byte]
+            ; cbnz w14, =>miss
+        );
+
+        emit_load_u64(ops, 15, view.cage_base as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr w12, [x17, COLLECTION_METHOD_IC_PROTO_OFFSET]
+            ; add x15, x15, x12
+            ; ldrb w14, [x15]
+            ; cmp w14, OBJECT_BODY_TYPE_TAG
+            ; b.ne =>miss
+            ; ldr w14, [x15, object_shape_byte]
+            ; ldr w12, [x17, COLLECTION_METHOD_IC_PROTO_SHAPE_OFFSET]
+            ; cmp w14, w12
+            ; b.ne =>miss
+            ; ldr x15, [x15, object_values_ptr_byte]
+            ; cbz x15, =>miss
+            ; ldr w12, [x17, COLLECTION_METHOD_IC_METHOD_VALUE_BYTE_OFFSET]
+            ; ldr x9, [x15, x12]
+            ; lsr x10, x9, #48
+            ; movz x11, TAG_PTR_FUNCTION as u32
+            ; cmp x10, x11
+            ; b.ne =>miss
+            ; mov w12, w9
+        );
+        emit_load_u64(ops, 13, view.cage_base as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x13, x13, x12
+            ; ldrb w14, [x13]
+            ; cmp w14, native_function_type_tag
+            ; b.ne =>miss
+            ; ldr x14, [x13, native_static_fn_byte]
+            ; ldr x15, [x17, COLLECTION_METHOD_IC_BUILTIN_FN_ADDR_OFFSET]
+            ; cmp x14, x15
+            ; b.ne =>miss
+            ; ldr w11, [x17, COLLECTION_METHOD_IC_LEAF_STUB_ID_OFFSET]
+            ; ldr x0, [x20, GC_HEAP_OFFSET]
+            ; mov x1, x11
+        );
+        load_frame_reg(ops, 2, recv_reg)?;
+        if let Some(key) = key {
+            load_frame_reg(ops, 3, key)?;
+        } else {
+            emit_load_u64(ops, 3, TAG_SPECIAL << 48);
+        }
+        emit_load_u64(
+            ops,
+            16,
+            leaf_no_alloc_stub2_trampoline_pair as *const () as u64,
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; and x1, x1, #0xff
+            ; cbnz x1, =>miss
+        );
+        store_frame_reg(ops, 0, dst_reg)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done);
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_opt_live_collection_alloc_method_guarded_call(
+        ops: &mut Assembler,
+        view: &JitFunctionView,
+        dst_reg: u16,
+        recv_reg: u16,
+        site: u64,
+        arg_regs: &[u16],
+        safepoint: SafepointId,
+        miss: DynamicLabel,
+        done: DynamicLabel,
+    ) -> Result<bool, Unsupported> {
+        if view.cage_base == 0 {
+            return Ok(false);
+        }
+
+        let arg0 = arg_regs.first().copied();
+        let arg1 = arg_regs.get(1).copied();
+        let guard_flags_byte = view.collection_layout.guard_flags_byte;
+        let object_shape_byte = view.object_shape_byte;
+        let object_values_ptr_byte = view.object_values_ptr_byte;
+        let native_static_fn_byte = view.native_static_fn_byte;
+        let native_function_type_tag = u32::from(view.collection_layout.native_function_type_tag);
+        let undefined_bits = TAG_SPECIAL << 48;
+
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x17, [x20, COLLECTION_METHOD_ICS_OFFSET]
+            ; cbz x17, =>miss
+            ; ldr w10, [x20, COLLECTION_METHOD_IC_COUNT_OFFSET]
+        );
+        emit_load_u64(ops, 11, site);
+        dynasm!(ops ; .arch aarch64 ; cmp x11, x10 ; b.hs =>miss);
+        emit_load_u64(
+            ops,
+            12,
+            site.saturating_mul(u64::from(COLLECTION_METHOD_IC_SLOT_SIZE)),
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x17, x17, x12
+            ; ldrb w10, [x17, COLLECTION_METHOD_IC_STATE_OFFSET]
+            ; cmp w10, JIT_COLLECTION_METHOD_IC_COLLECTION as u32
+            ; b.ne =>miss
+            ; ldr w11, [x17, COLLECTION_METHOD_IC_ALLOC_STUB_ID_OFFSET]
+        );
+        emit_load_u64(ops, 12, u64::from(JIT_COLLECTION_METHOD_IC_NO_STUB));
+        dynasm!(ops ; .arch aarch64 ; cmp x11, x12 ; b.eq =>miss);
+
+        load_frame_reg(ops, 9, recv_reg)?;
+        dynasm!(ops
+            ; .arch aarch64
+            ; lsr x10, x9, #48
+            ; movz x11, TAG_PTR_OBJECT as u32
+            ; cmp x10, x11
+            ; b.ne =>miss
+            ; mov w12, w9
+        );
+        emit_load_u64(ops, 13, view.cage_base as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x13, x13, x12
+            ; ldrb w14, [x13]
+            ; ldrb w15, [x17, COLLECTION_METHOD_IC_RECEIVER_TYPE_TAG_OFFSET]
+            ; cmp w14, w15
+            ; b.ne =>miss
+            ; ldr w14, [x13, guard_flags_byte]
+            ; cbnz w14, =>miss
+        );
+
+        emit_load_u64(ops, 15, view.cage_base as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr w12, [x17, COLLECTION_METHOD_IC_PROTO_OFFSET]
+            ; add x15, x15, x12
+            ; ldrb w14, [x15]
+            ; cmp w14, OBJECT_BODY_TYPE_TAG
+            ; b.ne =>miss
+            ; ldr w14, [x15, object_shape_byte]
+            ; ldr w12, [x17, COLLECTION_METHOD_IC_PROTO_SHAPE_OFFSET]
+            ; cmp w14, w12
+            ; b.ne =>miss
+            ; ldr x15, [x15, object_values_ptr_byte]
+            ; cbz x15, =>miss
+            ; ldr w12, [x17, COLLECTION_METHOD_IC_METHOD_VALUE_BYTE_OFFSET]
+            ; ldr x9, [x15, x12]
+            ; lsr x10, x9, #48
+            ; movz x11, TAG_PTR_FUNCTION as u32
+            ; cmp x10, x11
+            ; b.ne =>miss
+            ; mov w12, w9
+        );
+        emit_load_u64(ops, 13, view.cage_base as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x13, x13, x12
+            ; ldrb w14, [x13]
+            ; cmp w14, native_function_type_tag
+            ; b.ne =>miss
+            ; ldr x14, [x13, native_static_fn_byte]
+            ; ldr x15, [x17, COLLECTION_METHOD_IC_BUILTIN_FN_ADDR_OFFSET]
+            ; cmp x14, x15
+            ; b.ne =>miss
+            ; ldr w1, [x17, COLLECTION_METHOD_IC_ALLOC_STUB_ID_OFFSET]
+
+            ; sub sp, sp, ALLOC_CTX_STACK_SIZE
+            ; ldr x9, [x20, VM_OFFSET]
+            ; str x9, [sp, ALLOC_CTX_VM_OFFSET]
+            ; ldr x9, [x20, STACK_OFFSET]
+            ; str x9, [sp, ALLOC_CTX_STACK_OFFSET]
+            ; ldr x9, [x20, CONTEXT_OFFSET]
+            ; str x9, [sp, ALLOC_CTX_CONTEXT_OFFSET]
+            ; ldr x9, [x20, SAFEPOINT_RECORDS_OFFSET]
+            ; str x9, [sp, ALLOC_CTX_SAFEPOINT_RECORDS_OFFSET]
+            ; ldr w9, [x20, SAFEPOINT_COUNT_OFFSET]
+            ; str w9, [sp, ALLOC_CTX_SAFEPOINT_COUNT_OFFSET]
+            ; str wzr, [sp, ALLOC_CTX_RESERVED0_OFFSET]
+            ; ldr x9, [x20, FRAME_INDEX_OFFSET]
+            ; str x9, [sp, ALLOC_CTX_FRAME_INDEX_OFFSET]
+            ; str x19, [sp, ALLOC_CTX_FRAME_SLOTS_OFFSET]
+            ; movz w9, view.register_count as u32
+            ; strh w9, [sp, ALLOC_CTX_FRAME_SLOT_COUNT_OFFSET]
+            ; movz w9, #0
+            ; strh w9, [sp, ALLOC_CTX_RESERVED1_OFFSET]
+
+            ; mov x0, sp
+        );
+        emit_load_u64(ops, 2, u64::from(safepoint));
+        load_frame_reg(ops, 3, recv_reg)?;
+        if let Some(arg0) = arg0 {
+            load_frame_reg(ops, 4, arg0)?;
+        } else {
+            emit_load_u64(ops, 4, undefined_bits);
+        }
+        if let Some(arg1) = arg1 {
+            emit_load_u64(ops, 5, undefined_bits);
+            let set_add = ops.new_dynamic_label();
+            emit_load_u64(ops, 9, u64::from(STUB_COLLECTION_SET_ADD_ALLOC.id));
+            dynasm!(ops ; .arch aarch64 ; cmp x1, x9 ; b.eq =>set_add);
+            load_frame_reg(ops, 5, arg1)?;
+            dynasm!(ops ; .arch aarch64 ; =>set_add);
+        } else {
+            emit_load_u64(ops, 5, undefined_bits);
+        }
+        emit_load_u64(
+            ops,
+            16,
+            alloc_value_stub_trampoline_pair as *const () as u64,
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; and x1, x1, #0xff
+            ; mov x5, x1
+            ; add sp, sp, ALLOC_CTX_STACK_SIZE
+            ; cbnz x5, =>miss
+        );
+        store_frame_reg(ops, 0, dst_reg)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done);
+        Ok(true)
+    }
+
     fn emit_direct_call_tail(
         ops: &mut Assembler,
         dst_reg: u16,
@@ -1487,6 +1888,7 @@ mod arm64 {
             code: CompiledCode::new(buf, entry),
             osr_offsets,
             entry_via_osr_only: !block_deopts.is_empty() || graph.entry != 0,
+            safepoint_records: super::optimizing_safepoint_records(view),
         })
     }
 
@@ -2291,6 +2693,8 @@ mod arm64 {
                     "method call without safepoint state",
                 ))?;
                 let fallback = ops.new_dynamic_label();
+                let after_live_leaf = ops.new_dynamic_label();
+                let after_live_alloc = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 let dst_reg = node
                     .frame_dst
@@ -2300,6 +2704,33 @@ mod arm64 {
                 }
 
                 emit_frame_materialize(ops, graph, alloc, point, box_scratch)?;
+                emit_opt_live_collection_leaf_method_guarded_call(
+                    ops,
+                    view,
+                    dst_reg,
+                    *recv_reg,
+                    *site,
+                    arg_regs,
+                    after_live_leaf,
+                    done,
+                )?;
+                dynasm!(ops ; .arch aarch64 ; =>after_live_leaf);
+                if let Some(safepoint) =
+                    super::optimizing_call_method_safepoint_id(view, node.byte_pc)
+                {
+                    emit_opt_live_collection_alloc_method_guarded_call(
+                        ops,
+                        view,
+                        dst_reg,
+                        *recv_reg,
+                        *site,
+                        arg_regs,
+                        safepoint,
+                        after_live_alloc,
+                        done,
+                    )?;
+                    dynasm!(ops ; .arch aarch64 ; =>after_live_alloc);
+                }
                 dynasm!(ops
                     ; .arch aarch64
                     ; mov x0, x20
@@ -2344,7 +2775,11 @@ mod arm64 {
                     let xn = 5 + slot as u32;
                     dynasm!(ops ; .arch aarch64 ; movz X(xn), arg as u32);
                 }
-                emit_status_stub_call(ops, jit_call_method_stub as *const () as usize, threw);
+                emit_status_stub_call(
+                    ops,
+                    jit_call_method_stub_optimizing as *const () as usize,
+                    threw,
+                );
                 dynasm!(ops ; .arch aarch64 ; =>done);
                 let resume = call_resume_frames.get(&nid).unwrap_or(point);
                 emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;

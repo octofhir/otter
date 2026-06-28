@@ -38,7 +38,8 @@
 use otter_bytecode::{Op, Operand};
 use otter_vm::{
     ExecutionContext, Interpreter, JitExecOutcome, JitFrameStack, JitFunctionCode, JitFunctionView,
-    JitReentryPtrs, RuntimeStubAllocContext, SafepointRecord, Value, VmError,
+    JitReentryPtrs, JitRuntimeMethodStubSource, RuntimeStubAllocContext, SafepointRecord, Value,
+    VmError,
     runtime_stubs::{alloc_value_stub_trampoline_pair, leaf_no_alloc_stub2_trampoline_pair},
 };
 
@@ -1012,6 +1013,57 @@ pub(crate) extern "C" fn jit_call_method_stub(
     a1: u64,
     a2: u64,
 ) -> u64 {
+    jit_call_method_stub_impl(
+        ctx,
+        dst,
+        recv,
+        name_and_site,
+        argc,
+        a0,
+        a1,
+        a2,
+        JitRuntimeMethodStubSource::Baseline,
+    )
+}
+
+/// Optimizing-tier variant of [`jit_call_method_stub`] used only to split
+/// migration stats while preserving the same runtime bridge semantics.
+#[allow(clippy::too_many_arguments)]
+pub(crate) extern "C" fn jit_call_method_stub_optimizing(
+    ctx: *mut JitCtx,
+    dst: u64,
+    recv: u64,
+    name_and_site: u64,
+    argc: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+) -> u64 {
+    jit_call_method_stub_impl(
+        ctx,
+        dst,
+        recv,
+        name_and_site,
+        argc,
+        a0,
+        a1,
+        a2,
+        JitRuntimeMethodStubSource::Optimizing,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn jit_call_method_stub_impl(
+    ctx: *mut JitCtx,
+    dst: u64,
+    recv: u64,
+    name_and_site: u64,
+    argc: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    source: JitRuntimeMethodStubSource,
+) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
@@ -1032,6 +1084,7 @@ pub(crate) extern "C" fn jit_call_method_stub(
         call_byte_pc,
         site,
         &all[..argc],
+        source,
     ) {
         Ok(()) => 0,
         Err(err) => {

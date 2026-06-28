@@ -1884,13 +1884,15 @@ mod arm64 {
 
     /// Fast-path `ToInt32` for bitwise operators.
     ///
-    /// Int32-tagged values are unboxed directly. Doubles are accepted only when
-    /// finite and already inside the signed 32-bit range; all modulo, NaN,
-    /// infinity, string, BigInt, and object coercion cases bail to the
-    /// interpreter for exact ECMAScript semantics.
+    /// Int32-tagged values are unboxed directly. Any finite double is truncated
+    /// toward zero and reduced modulo 2^32 — the full ECMAScript `ToInt32`, not
+    /// just the already-in-range case — so an integer arithmetic result that
+    /// overflowed int32 into a double (e.g. `(a + b) | 0`) stays in compiled
+    /// code instead of bailing. Only NaN / infinity / `|x| >= 2^63` (which would
+    /// saturate the 64-bit `fcvtzs`) and non-number tags (string / BigInt /
+    /// object) bail to the interpreter for exact coercion.
     fn emit_to_int32_fast(ops: &mut Assembler, src_x: u32, dst_w: u32, bail: DynamicLabel) {
         let is_non_int = ops.new_dynamic_label();
-        let double_ready = ops.new_dynamic_label();
         let done = ops.new_dynamic_label();
         dynasm!(ops
             ; .arch aarch64
@@ -1911,22 +1913,18 @@ mod arm64 {
             ; fcmp d0, d0
             ; b.vs =>bail
         );
-        emit_load_u64(ops, 14, (-2_147_483_648.0f64).to_bits());
+        // A finite double with `|x| < 2^63` truncates toward zero into i64
+        // exactly (`fcvtzs`, round-to-zero); its low 32 bits are `ToInt32(x)`
+        // (the truncated integer mod 2^32 mapped to the signed range). Only
+        // `|x| >= 2^63` / infinity would saturate `fcvtzs`, so those bail.
+        emit_load_u64(ops, 14, 9_223_372_036_854_775_808.0f64.to_bits());
         dynasm!(ops
             ; .arch aarch64
-            ; fmov d1, x14
-            ; fcmp d0, d1
-            ; b.lt =>bail
-        );
-        emit_load_u64(ops, 14, 2_147_483_648.0f64.to_bits());
-        dynasm!(ops
-            ; .arch aarch64
-            ; fmov d1, x14
-            ; fcmp d0, d1
-            ; b.lt =>double_ready
-            ; b =>bail
-            ; =>double_ready
-            ; fcvtzs W(dst_w), d0
+            ; fabs d1, d0
+            ; fmov d2, x14
+            ; fcmp d1, d2
+            ; b.ge =>bail
+            ; fcvtzs X(dst_w), d0
             ; =>done
         );
     }
@@ -6132,7 +6130,12 @@ mod tests {
     }
 
     #[test]
-    fn bitwise_or_bails_on_out_of_range_double() {
+    fn bitwise_or_wraps_out_of_range_double_mod_pow2_32() {
+        // A finite double past the signed-32-bit range is the full ECMAScript
+        // `ToInt32`: truncate toward zero, reduce mod 2^32 into the signed
+        // range. `2^31 | 0 == -2^31`, `2^32 + 5 | 0 == 5`. These come up
+        // whenever an int arithmetic result overflows int32 into a double and
+        // is then masked with `| 0`, so they must stay compiled, not bail.
         let v = view(&[
             (
                 Op::BitwiseOr,
@@ -6145,6 +6148,41 @@ mod tests {
             (Op::ReturnValue, vec![Operand::Register(2)]),
         ]);
         let mut regs = [box_f64(2_147_483_648.0), box_i32(0), 0, 0, 0, 0, 0, 0];
+        expect_int(&v, &mut regs, -2_147_483_648);
+        let mut regs = [box_f64(4_294_967_301.0), box_i32(0), 0, 0, 0, 0, 0, 0];
+        expect_int(&v, &mut regs, 5);
+        let mut regs = [box_f64(-2_147_483_649.0), box_i32(0), 0, 0, 0, 0, 0, 0];
+        expect_int(&v, &mut regs, 2_147_483_647);
+    }
+
+    #[test]
+    fn bitwise_or_bails_on_non_finite_double() {
+        // Infinity / NaN / `|x| >= 2^63` would saturate the 64-bit `fcvtzs`, so
+        // they bail to the interpreter for exact coercion (`ToInt32` of each is
+        // `0`).
+        let v = view(&[
+            (
+                Op::BitwiseOr,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
+        ]);
+        let mut regs = [box_f64(f64::INFINITY), box_i32(0), 0, 0, 0, 0, 0, 0];
+        assert!(matches!(run(&v, &mut regs), Exit::Bailed));
+        let mut regs = [
+            box_f64(9_223_372_036_854_775_808.0),
+            box_i32(0),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
         assert!(matches!(run(&v, &mut regs), Exit::Bailed));
     }
 

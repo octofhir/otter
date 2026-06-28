@@ -1058,37 +1058,34 @@ mod tests {
 
     #[test]
     fn cons_concat_round_trips_to_utf16() {
+        // Results within the inline-latin1 cap flatten in place; build operands
+        // long enough that the concatenation stays an unflattened `Cons` rope.
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = empty_roots;
+        let left_units: Vec<u16> = std::iter::repeat(b'a' as u16).take(16).collect();
+        let right_units: Vec<u16> = std::iter::repeat(b'b' as u16).take(16).collect();
         let left = alloc_flat_string_body_with_roots(
             &mut heap,
             JsStringId::new(0),
-            &[b'a' as u16, b'b' as u16],
+            &left_units,
             &mut roots,
         )
         .expect("left");
         let right = alloc_flat_string_body_with_roots(
             &mut heap,
             JsStringId::new(0),
-            &[b'c' as u16, b'd' as u16, b'e' as u16],
+            &right_units,
             &mut roots,
         )
         .expect("right");
         let cons = concat_string_bodies(&mut heap, left, right, &mut roots).expect("cons");
         heap.read_payload(cons, |b| {
-            assert_eq!(b.len(), 5);
+            assert_eq!(b.len(), 32);
             assert!(matches!(b.repr, JsStringBodyRepr::Cons { .. }));
         });
-        assert_eq!(
-            to_utf16_vec(&heap, cons),
-            vec![
-                b'a' as u16,
-                b'b' as u16,
-                b'c' as u16,
-                b'd' as u16,
-                b'e' as u16
-            ]
-        );
+        let mut expected = left_units.clone();
+        expected.extend_from_slice(&right_units);
+        assert_eq!(to_utf16_vec(&heap, cons), expected);
     }
 
     #[test]

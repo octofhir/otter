@@ -915,12 +915,18 @@ mod tests {
 
     #[test]
     fn concat_produces_cons_node() {
+        // Concatenations whose result fits the inline-latin1 cap flatten in
+        // place; a `Cons` node is built only past it, so the operands here are
+        // deliberately long enough to exceed it.
         let mut heap = h();
-        let a = JsString::from_str("a", &mut heap).unwrap();
-        let b = JsString::from_str("b", &mut heap).unwrap();
+        let a = JsString::from_str("aaaaaaaaaaaaaaaa", &mut heap).unwrap();
+        let b = JsString::from_str("bbbbbbbbbbbbbbbb", &mut heap).unwrap();
         let ab = JsString::concat(a, b, &mut heap).unwrap();
-        assert_eq!(ab.len(), 2);
-        assert_eq!(ab.to_lossy_string(&heap), "ab");
+        assert_eq!(ab.len(), 32);
+        assert_eq!(
+            ab.to_lossy_string(&heap),
+            "aaaaaaaaaaaaaaaabbbbbbbbbbbbbbbb"
+        );
         heap.read_payload(ab.handle(), |body| {
             assert!(matches!(body.repr, JsStringBodyRepr::Cons { .. }));
         });

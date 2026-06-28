@@ -1648,8 +1648,11 @@ mod tests {
     fn map_has_leaf_misses_rope_key() {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let map = collections::alloc_map(&mut heap).expect("map");
-        let left = crate::string::JsString::from_str("k", &mut heap).expect("left");
-        let right = crate::string::JsString::from_str("1", &mut heap).expect("right");
+        // Short concatenations flatten in place; long operands keep the key an
+        // unflattened rope so the leaf path exercises its rope miss.
+        let left = crate::string::JsString::from_str("kkkkkkkkkkkkkkkk", &mut heap).expect("left");
+        let right =
+            crate::string::JsString::from_str("1111111111111111", &mut heap).expect("right");
         let rope = crate::string::JsString::concat(left, right, &mut heap).expect("rope");
 
         let result = collection_map_has_leaf(
@@ -1666,17 +1669,24 @@ mod tests {
         let mut interp = Interpreter::new();
         let map = collections::alloc_map(interp.gc_heap_mut()).expect("map");
         let set = collections::alloc_set(interp.gc_heap_mut()).expect("set");
+        // Short concatenations flatten in place; long operands keep the keys
+        // unflattened ropes so the leaf path misses and the alloc path has to
+        // materialize them.
         let insert_left =
-            crate::string::JsString::from_str("k", interp.gc_heap_mut()).expect("insert left");
+            crate::string::JsString::from_str("kkkkkkkkkkkkkkkk", interp.gc_heap_mut())
+                .expect("insert left");
         let insert_right =
-            crate::string::JsString::from_str("1", interp.gc_heap_mut()).expect("insert right");
+            crate::string::JsString::from_str("1111111111111111", interp.gc_heap_mut())
+                .expect("insert right");
         let insert_rope =
             crate::string::JsString::concat(insert_left, insert_right, interp.gc_heap_mut())
                 .expect("insert rope");
         let lookup_left =
-            crate::string::JsString::from_str("k", interp.gc_heap_mut()).expect("lookup left");
+            crate::string::JsString::from_str("kkkkkkkkkkkkkkkk", interp.gc_heap_mut())
+                .expect("lookup left");
         let lookup_right =
-            crate::string::JsString::from_str("1", interp.gc_heap_mut()).expect("lookup right");
+            crate::string::JsString::from_str("1111111111111111", interp.gc_heap_mut())
+                .expect("lookup right");
         let lookup_rope =
             crate::string::JsString::concat(lookup_left, lookup_right, interp.gc_heap_mut())
                 .expect("lookup rope");

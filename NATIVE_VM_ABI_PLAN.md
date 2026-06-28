@@ -110,11 +110,14 @@ Staged, each independently verifiable (diff.mjs 21/21, test262, GC-stress 128):
       self-call can read callee/args from `[x19]`); materialize only callee+args
       on the hot path and the full deopt frame on the bail exit; extend to the
       generic direct-call path.
-- [ ] **6d — lighten the self-call ctx setup.** Avoid the per-call 8-field
-      `JitCtx` copy + window fill: define a self-call entry that takes the new
-      register-window base in a register and shares the parent ctx's invariant
-      fields, resetting only `bail_pc`. The window fill (undefined-init) is only
-      needed for a deopt read — emit it lazily on the bail path, not per call.
+- [x] **6d — lighten the self-call ctx setup.** The recursive callee now reuses
+      the caller's `JitCtx` in place instead of building a fresh one: the per-call
+      `sub sp` + 8-field copy + `self_closure` / `this` copies are gone, replaced
+      by patching the ctx window-base (read once by the callee prologue into a
+      callee-saved register) and resetting `bail_pc`, then restoring the window
+      base on return. fib 63->56.7ms.
+      Remaining lighter-still work: lazy window fill (only on a deopt read, not
+      per call) and dropping the pre-call full-frame materialize (6c-full).
 
 Exit: `fib` / `call-dispatch` recursion is args-in-registers + `bl` with no
 per-call frame rebuild; both within ~1.5x Bun. Direct (non-self) calls share the

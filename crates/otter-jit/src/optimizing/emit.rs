@@ -3090,34 +3090,24 @@ mod arm64 {
             );
         }
 
+        // The recursive callee shares every invariant of this frame's `JitCtx` —
+        // same function (`self_closure`), `vm` / `stack` / `context` /
+        // `frame_index` (a frameless self-call pushes no HoltStack frame), error
+        // slot, upvalue spine, and flat-reg-stack base/top. Only the register
+        // window base differs, and the callee reads it exactly once (its prologue
+        // captures `[ctx] -> x19`, callee-saved). So reuse this frame's ctx in
+        // place: point its window base at the new window and reset `bail_pc` for
+        // the callee, then restore the window base on return. This avoids
+        // rebuilding the whole ctx struct on every recursive call.
         dynasm!(ops
             ; .arch aarch64
-            ; sub sp, sp, JIT_CTX_STACK_SIZE
-            ; str x14, [sp]
-            ; ldr x9, [x20, #8]
-            ; str x9, [sp, #8]
-        );
-        emit_load_u64(ops, 9, undef_bits);
-        dynasm!(ops ; .arch aarch64 ; str x9, [sp, #16] ; str wzr, [sp, BAIL_PC_OFFSET]);
-        for off in [
-            VM_OFFSET,
-            STACK_OFFSET,
-            CONTEXT_OFFSET,
-            FRAME_INDEX_OFFSET,
-            ERROR_SLOT_OFFSET,
-            UPVALUES_PTR_OFFSET,
-            REG_STACK_BASE_OFFSET,
-            REG_TOP_PTR_OFFSET,
-        ] {
-            dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, off] ; str x9, [sp, off]);
-        }
-        dynasm!(ops
-            ; .arch aarch64
-            ; mov x0, sp
+            ; str x14, [x20]
+            ; str wzr, [x20, BAIL_PC_OFFSET]
+            ; mov x0, x20
             ; bl =>self_entry
+            ; str x19, [x20]
             ; cmp x1, STATUS_BAILED as u32
             ; b.eq =>bailed
-            ; add sp, sp, JIT_CTX_STACK_SIZE
             ; cmp x1, STATUS_RETURNED as u32
             ; b.eq =>returned
             ; b =>threw
@@ -3134,8 +3124,7 @@ mod arm64 {
             ; str x0, [x19, dst_off]
             ; b =>done
             ; =>bailed
-            ; ldr w2, [sp, BAIL_PC_OFFSET]
-            ; add sp, sp, JIT_CTX_STACK_SIZE
+            ; ldr w2, [x20, BAIL_PC_OFFSET]
             ; mov x0, x20
             ; mov w1, w2
         );

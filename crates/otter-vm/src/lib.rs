@@ -338,6 +338,26 @@ pub struct JitRuntimeStats {
     pub alloc_stub_transitions: u64,
     /// ABI-classified re-entrant runtime stubs that may call JS/native code.
     pub reentrant_stub_transitions: u64,
+    /// Executed `AllocValueStub` entries that returned `Ok`.
+    pub alloc_value_stub_ok: u64,
+    /// Executed `AllocValueStub` entries that returned `Miss`.
+    pub alloc_value_stub_miss: u64,
+    /// Executed `AllocValueStub` entries that returned `OutOfMemory`.
+    pub alloc_value_stub_out_of_memory: u64,
+    /// Executed `AllocValueStub` entries that returned another non-`Ok` status.
+    pub alloc_value_stub_other: u64,
+    /// JIT method bridge calls served by a live collection method IC.
+    pub method_collection_ic_hits: u64,
+    /// JIT method bridge calls served by collection prototype fast paths.
+    pub method_fast_collection_hits: u64,
+    /// JIT method bridge calls served by array fast paths.
+    pub method_array_fast_hits: u64,
+    /// JIT method bridge calls served by primitive string fast paths.
+    pub method_string_fast_hits: u64,
+    /// JIT method bridge calls served by primitive number fast paths.
+    pub method_number_fast_hits: u64,
+    /// JIT method bridge calls that reached generic callable dispatch.
+    pub method_generic_calls: u64,
 }
 
 /// Observed-callee state for one bytecode `Op::Call` site, the feedback the
@@ -3694,6 +3714,80 @@ impl Interpreter {
                     .saturating_add(1);
             }
         }
+    }
+
+    pub(crate) fn record_jit_alloc_value_stub_status(
+        &mut self,
+        status: native_abi::RuntimeStubStatus,
+    ) {
+        match status {
+            native_abi::RuntimeStubStatus::Ok => {
+                self.jit_runtime_stats.alloc_value_stub_ok =
+                    self.jit_runtime_stats.alloc_value_stub_ok.saturating_add(1);
+            }
+            native_abi::RuntimeStubStatus::Miss => {
+                self.jit_runtime_stats.alloc_value_stub_miss = self
+                    .jit_runtime_stats
+                    .alloc_value_stub_miss
+                    .saturating_add(1);
+            }
+            native_abi::RuntimeStubStatus::OutOfMemory => {
+                self.jit_runtime_stats.alloc_value_stub_out_of_memory = self
+                    .jit_runtime_stats
+                    .alloc_value_stub_out_of_memory
+                    .saturating_add(1);
+            }
+            native_abi::RuntimeStubStatus::Throw
+            | native_abi::RuntimeStubStatus::Deopt
+            | native_abi::RuntimeStubStatus::Interrupt => {
+                self.jit_runtime_stats.alloc_value_stub_other = self
+                    .jit_runtime_stats
+                    .alloc_value_stub_other
+                    .saturating_add(1);
+            }
+        }
+    }
+
+    pub(crate) fn record_jit_method_collection_ic_hit(&mut self) {
+        self.jit_runtime_stats.method_collection_ic_hits = self
+            .jit_runtime_stats
+            .method_collection_ic_hits
+            .saturating_add(1);
+    }
+
+    pub(crate) fn record_jit_method_fast_collection_hit(&mut self) {
+        self.jit_runtime_stats.method_fast_collection_hits = self
+            .jit_runtime_stats
+            .method_fast_collection_hits
+            .saturating_add(1);
+    }
+
+    pub(crate) fn record_jit_method_array_fast_hit(&mut self) {
+        self.jit_runtime_stats.method_array_fast_hits = self
+            .jit_runtime_stats
+            .method_array_fast_hits
+            .saturating_add(1);
+    }
+
+    pub(crate) fn record_jit_method_string_fast_hit(&mut self) {
+        self.jit_runtime_stats.method_string_fast_hits = self
+            .jit_runtime_stats
+            .method_string_fast_hits
+            .saturating_add(1);
+    }
+
+    pub(crate) fn record_jit_method_number_fast_hit(&mut self) {
+        self.jit_runtime_stats.method_number_fast_hits = self
+            .jit_runtime_stats
+            .method_number_fast_hits
+            .saturating_add(1);
+    }
+
+    pub(crate) fn record_jit_method_generic_call(&mut self) {
+        self.jit_runtime_stats.method_generic_calls = self
+            .jit_runtime_stats
+            .method_generic_calls
+            .saturating_add(1);
     }
 
     fn record_runtime_microtask_drain_started(&mut self) {

@@ -469,6 +469,18 @@ pub extern "C" fn leaf_no_alloc_stub2_trampoline_pair(
     RuntimeStubResultPair::from_result(leaf_no_alloc_stub2_trampoline(heap, id, a0_bits, a1_bits))
 }
 
+fn alloc_value_stub_result_pair(
+    ctx: *mut RuntimeStubAllocContext,
+    result: RuntimeStubResult,
+) -> RuntimeStubResultPair {
+    if let Some(ctx) = alloc_context_mut(ctx)
+        && let Some(interp) = interpreter_mut(ctx.vm)
+    {
+        interp.record_jit_alloc_value_stub_status(result.status);
+    }
+    RuntimeStubResultPair::from_result(result)
+}
+
 /// Allocating `Map.prototype.set` mutation stub.
 ///
 /// This entry roots the caller frame through `safepoint` and roots its own ABI
@@ -481,9 +493,10 @@ pub extern "C" fn collection_map_set_alloc(
     key_bits: u64,
     value_bits: u64,
 ) -> RuntimeStubResultPair {
-    RuntimeStubResultPair::from_result(collection_map_set_alloc_inner(
-        ctx, safepoint, recv_bits, key_bits, value_bits,
-    ))
+    alloc_value_stub_result_pair(
+        ctx,
+        collection_map_set_alloc_inner(ctx, safepoint, recv_bits, key_bits, value_bits),
+    )
 }
 
 /// Allocating `Set.prototype.add` mutation stub.
@@ -495,13 +508,10 @@ pub extern "C" fn collection_set_add_alloc(
     value_bits: u64,
     unused_bits: u64,
 ) -> RuntimeStubResultPair {
-    RuntimeStubResultPair::from_result(collection_set_add_alloc_inner(
+    alloc_value_stub_result_pair(
         ctx,
-        safepoint,
-        recv_bits,
-        value_bits,
-        unused_bits,
-    ))
+        collection_set_add_alloc_inner(ctx, safepoint, recv_bits, value_bits, unused_bits),
+    )
 }
 
 /// Allocating `Map.prototype.get` lookup stub.
@@ -513,13 +523,10 @@ pub extern "C" fn collection_map_get_alloc(
     key_bits: u64,
     unused_bits: u64,
 ) -> RuntimeStubResultPair {
-    RuntimeStubResultPair::from_result(collection_map_get_alloc_inner(
+    alloc_value_stub_result_pair(
         ctx,
-        safepoint,
-        recv_bits,
-        key_bits,
-        unused_bits,
-    ))
+        collection_map_get_alloc_inner(ctx, safepoint, recv_bits, key_bits, unused_bits),
+    )
 }
 
 /// Allocating `Map.prototype.has` lookup stub.
@@ -531,13 +538,10 @@ pub extern "C" fn collection_map_has_alloc(
     key_bits: u64,
     unused_bits: u64,
 ) -> RuntimeStubResultPair {
-    RuntimeStubResultPair::from_result(collection_map_has_alloc_inner(
+    alloc_value_stub_result_pair(
         ctx,
-        safepoint,
-        recv_bits,
-        key_bits,
-        unused_bits,
-    ))
+        collection_map_has_alloc_inner(ctx, safepoint, recv_bits, key_bits, unused_bits),
+    )
 }
 
 /// Allocating `Set.prototype.has` lookup stub.
@@ -549,13 +553,10 @@ pub extern "C" fn collection_set_has_alloc(
     value_bits: u64,
     unused_bits: u64,
 ) -> RuntimeStubResultPair {
-    RuntimeStubResultPair::from_result(collection_set_has_alloc_inner(
+    alloc_value_stub_result_pair(
         ctx,
-        safepoint,
-        recv_bits,
-        value_bits,
-        unused_bits,
-    ))
+        collection_set_has_alloc_inner(ctx, safepoint, recv_bits, value_bits, unused_bits),
+    )
 }
 
 /// Allocating `Map.prototype.delete` mutation stub.
@@ -567,13 +568,10 @@ pub extern "C" fn collection_map_delete_alloc(
     key_bits: u64,
     unused_bits: u64,
 ) -> RuntimeStubResultPair {
-    RuntimeStubResultPair::from_result(collection_map_delete_alloc_inner(
+    alloc_value_stub_result_pair(
         ctx,
-        safepoint,
-        recv_bits,
-        key_bits,
-        unused_bits,
-    ))
+        collection_map_delete_alloc_inner(ctx, safepoint, recv_bits, key_bits, unused_bits),
+    )
 }
 
 /// Allocating `Set.prototype.delete` mutation stub.
@@ -585,13 +583,10 @@ pub extern "C" fn collection_set_delete_alloc(
     value_bits: u64,
     unused_bits: u64,
 ) -> RuntimeStubResultPair {
-    RuntimeStubResultPair::from_result(collection_set_delete_alloc_inner(
+    alloc_value_stub_result_pair(
         ctx,
-        safepoint,
-        recv_bits,
-        value_bits,
-        unused_bits,
-    ))
+        collection_set_delete_alloc_inner(ctx, safepoint, recv_bits, value_bits, unused_bits),
+    )
 }
 
 /// Allocating primitive string-concat stub for `+`.
@@ -603,13 +598,10 @@ pub extern "C" fn string_concat_alloc(
     rhs_bits: u64,
     unused_bits: u64,
 ) -> RuntimeStubResultPair {
-    RuntimeStubResultPair::from_result(string_concat_alloc_inner(
+    alloc_value_stub_result_pair(
         ctx,
-        safepoint,
-        lhs_bits,
-        rhs_bits,
-        unused_bits,
-    ))
+        string_concat_alloc_inner(ctx, safepoint, lhs_bits, rhs_bits, unused_bits),
+    )
 }
 
 /// Leaf `Map.prototype.get` probe.

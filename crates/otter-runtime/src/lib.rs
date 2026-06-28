@@ -683,6 +683,26 @@ pub struct RuntimeExecutionStats {
     pub jit_alloc_stub_transitions: u64,
     /// ABI-classified re-entrant runtime stubs.
     pub jit_reentrant_stub_transitions: u64,
+    /// Executed `AllocValueStub` entries that returned `Ok`.
+    pub jit_alloc_value_stub_ok: u64,
+    /// Executed `AllocValueStub` entries that returned `Miss`.
+    pub jit_alloc_value_stub_miss: u64,
+    /// Executed `AllocValueStub` entries that returned `OutOfMemory`.
+    pub jit_alloc_value_stub_out_of_memory: u64,
+    /// Executed `AllocValueStub` entries that returned another non-`Ok` status.
+    pub jit_alloc_value_stub_other: u64,
+    /// JIT method bridge calls served by a live collection method IC.
+    pub jit_method_collection_ic_hits: u64,
+    /// JIT method bridge calls served by collection prototype fast paths.
+    pub jit_method_fast_collection_hits: u64,
+    /// JIT method bridge calls served by array fast paths.
+    pub jit_method_array_fast_hits: u64,
+    /// JIT method bridge calls served by primitive string fast paths.
+    pub jit_method_string_fast_hits: u64,
+    /// JIT method bridge calls served by primitive number fast paths.
+    pub jit_method_number_fast_hits: u64,
+    /// JIT method bridge calls that reached generic callable dispatch.
+    pub jit_method_generic_calls: u64,
     /// Total GC-cell bytes allocated since heap creation.
     pub gc_alloc_bytes_total: u64,
     /// Live heap objects after the last stats reconciliation.
@@ -2639,6 +2659,16 @@ impl Runtime {
             jit_leaf_stub_transitions: jit.leaf_stub_transitions,
             jit_alloc_stub_transitions: jit.alloc_stub_transitions,
             jit_reentrant_stub_transitions: jit.reentrant_stub_transitions,
+            jit_alloc_value_stub_ok: jit.alloc_value_stub_ok,
+            jit_alloc_value_stub_miss: jit.alloc_value_stub_miss,
+            jit_alloc_value_stub_out_of_memory: jit.alloc_value_stub_out_of_memory,
+            jit_alloc_value_stub_other: jit.alloc_value_stub_other,
+            jit_method_collection_ic_hits: jit.method_collection_ic_hits,
+            jit_method_fast_collection_hits: jit.method_fast_collection_hits,
+            jit_method_array_fast_hits: jit.method_array_fast_hits,
+            jit_method_string_fast_hits: jit.method_string_fast_hits,
+            jit_method_number_fast_hits: jit.method_number_fast_hits,
+            jit_method_generic_calls: jit.method_generic_calls,
             gc_alloc_bytes_total: gc.alloc_bytes_total,
             gc_live_objects: gc.live_objects,
             gc_live_bytes: gc.live_bytes,

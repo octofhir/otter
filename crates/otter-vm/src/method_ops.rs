@@ -1234,11 +1234,13 @@ impl Interpreter {
         // the method name, hashing the prototype slot, or string-matching.
         if let Some(result) = self.try_array_method_call_ic(context, site, recv, args.as_slice()) {
             let value = result?;
+            self.record_jit_method_array_fast_hit();
             write_register(&mut stack[frame_index], dst, value)?;
             return Ok(());
         }
         if let Some(result) = self.try_collection_method_call_ic(site, recv, args.as_slice()) {
             let value = result?;
+            self.record_jit_method_collection_ic_hit();
             write_register(&mut stack[frame_index], dst, value)?;
             return Ok(());
         }
@@ -1249,6 +1251,7 @@ impl Interpreter {
             self.try_fast_array_proto_method(context, site, recv, name, args.as_slice())
         {
             let value = result?;
+            self.record_jit_method_array_fast_hit();
             write_register(&mut stack[frame_index], dst, value)?;
             return Ok(());
         }
@@ -1256,6 +1259,7 @@ impl Interpreter {
             self.try_fast_collection_proto_method(site, recv, name, args.as_slice())
         {
             let value = result?;
+            self.record_jit_method_fast_collection_hit();
             write_register(&mut stack[frame_index], dst, value)?;
             return Ok(());
         }
@@ -1264,6 +1268,7 @@ impl Interpreter {
             && let Some(result) =
                 self.try_fast_primitive_string_char_code_at(recv, args.as_slice())?
         {
+            self.record_jit_method_string_fast_hit();
             write_register(&mut stack[frame_index], dst, result)?;
             return Ok(());
         }
@@ -1271,6 +1276,7 @@ impl Interpreter {
             && recv.is_number()
             && let Some(result) = self.try_fast_primitive_number_to_string(recv, args.as_slice())?
         {
+            self.record_jit_method_number_fast_hit();
             write_register(&mut stack[frame_index], dst, result)?;
             return Ok(());
         }
@@ -1282,6 +1288,7 @@ impl Interpreter {
             stack[frame_index].pc = saved_pc;
             return Err(VmError::NotCallable);
         }
+        self.record_jit_method_generic_call();
         if self.jit_hook.is_some()
             && let Ok((method_fid, _, _, _, _, _)) =
                 Self::bytecode_call_target_parts(method, recv, &self.gc_heap)

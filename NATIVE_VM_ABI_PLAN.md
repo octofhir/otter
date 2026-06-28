@@ -66,6 +66,57 @@ materialization, stack walking, and GC-stress validation.
 
 ## Outstanding work
 
+### Phase 6: lightweight self-recursive / direct-call frame ABI (compute gap)
+
+Measured: pure-compute call benches are codegen-bound, not coverage-bound.
+`fib` (2.96x Bun) and `call-dispatch` (3.24x Bun) compile fully into the
+optimizing tier (`fib`: frameless self-recursion, `red=3619`, `jitDirect=0`)
+yet stay ~3x. The dynasm self-recursive-call sequence
+(`emit::emit_self_recursive_call`) rebuilds a full frame per call — and `fib`
+makes 2.7M of them:
+
+- bump a fresh register window on the JIT reg-stack (+ overflow guard);
+- a fill loop writing `undefined` across all `register_count` window slots;
+- copy the entire 8-field `JitCtx` struct onto the stack for the callee;
+- copy args from the caller frame into the new window;
+- `emit_frame_materialize` (box int32->tagged + store live values to the
+  `[x19]` frame) before the call and `emit_frame_reload` (load + unbox) after,
+  because every allocatable GP/FP register is caller-saved and the recursion
+  clobbers them.
+
+JSC/Bun recursion is args-in-registers + `bl` with callee-saved survivors. The
+gap is this per-call frame rebuild, which is the shared frame-header ABI this
+document targets.
+
+Staged, each independently verifiable (diff.mjs 21/21, test262, GC-stress 128):
+
+- [ ] **6a — callee-saved register pool.** Extend the optimizing allocator GP
+      pool `x9..x15` (7, all caller-saved) with `x21..x28` and the FP pool
+      `d0..d5` with `d8..d15`; map the new abstract `Reg` indices in
+      `emit::phys` / `phys_fp`; save/restore the *used* callee-saved registers in
+      both prologues (`emit_prologue` entry + OSR) and every `emit_epilogue`
+      exit; keep the backedge-poll save area caller-saved-only (the Rust poll
+      stub preserves callee-saved). Independently correct with materialize/reload
+      still present; reduces spilling on register-pressured compiled functions.
+- [ ] **6b — call-clobber-aware allocation.** In `regalloc`, mark an interval
+      that spans any `Call` / `CallMethod` position as call-crossing and restrict
+      its candidate registers to the callee-saved sub-pool (spill on overflow).
+      Caller-saved registers are then free to reuse across calls.
+- [ ] **6c — drop per-call materialize/reload.** With 6b, cross-call values live
+      in callee-saved registers (survive the `bl` / the C-ABI direct-call stub).
+      Remove `emit_frame_materialize` / `emit_frame_reload` from the normal call
+      path; materialize the deopt frame from SSA locations only on the bail/deopt
+      exit; read self-call args from their SSA locations instead of `[x19]`.
+- [ ] **6d — lighten the self-call ctx setup.** Avoid the per-call 8-field
+      `JitCtx` copy + window fill: define a self-call entry that takes the new
+      register-window base in a register and shares the parent ctx's invariant
+      fields, resetting only `bail_pc`. The window fill (undefined-init) is only
+      needed for a deopt read — emit it lazily on the bail path, not per call.
+
+Exit: `fib` / `call-dispatch` recursion is args-in-registers + `bl` with no
+per-call frame rebuild; both within ~1.5x Bun. Direct (non-self) calls share the
+same callee-saved survivor convention.
+
 ### Phase 0: transition inventory and counters (partial)
 
 - [ ] Document every live transition: interpreter→native, JIT→VM, JIT→runtime,

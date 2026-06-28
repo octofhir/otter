@@ -66,15 +66,33 @@ use crate::CompiledCode;
 use otter_bytecode::Op;
 use otter_vm::{JitFunctionView, NO_FRAME_STATE, SafepointId, SafepointRecord};
 
-/// Number of abstract GP registers handed to the allocator (`Reg(0..7)`), mapped
-/// to physical `x9..x15`.
-pub const GP_REGS: u32 = 7;
+/// Caller-saved (volatile) GP registers in the allocator pool: abstract
+/// `Reg(0..7)` → physical `x9..x15`. Clobbered across any call.
+pub const CALLER_SAVED_GP: u32 = 7;
 
-/// Number of abstract FP registers handed to the allocator (`Reg(0..6)` of the
-/// `Fp` class), mapped to physical `d0..d5`. `d6`/`d7` are reserved as FP emit
-/// scratch (load staging, box/unbox, arithmetic temporaries), mirroring the
-/// `x16`/`x17` GP scratch pair.
-pub const FP_REGS: u32 = 6;
+/// Callee-saved (non-volatile) GP registers in the allocator pool: abstract
+/// `Reg(7..15)` → physical `x21..x28`. Preserved across a call by the callee's
+/// prologue/epilogue (and by the C ABI for the runtime stubs), so a value live
+/// across a call survives here without a frame round-trip.
+pub const CALLEE_SAVED_GP: u32 = 8;
+
+/// Number of abstract GP registers handed to the allocator (`Reg(0..15)`),
+/// caller-saved `x9..x15` then callee-saved `x21..x28`.
+pub const GP_REGS: u32 = CALLER_SAVED_GP + CALLEE_SAVED_GP;
+
+/// Caller-saved FP registers: abstract `Reg(0..6)` of the `Fp` class → `d0..d5`.
+/// `d6`/`d7` stay reserved as FP emit scratch (load staging, box/unbox,
+/// arithmetic temporaries), mirroring the `x16`/`x17` GP scratch pair.
+pub const CALLER_SAVED_FP: u32 = 6;
+
+/// Callee-saved FP registers: abstract `Reg(6..14)` → `d8..d15`. The arm64 ABI
+/// preserves only the low 64 bits of `d8..d15`; the allocator stores f64s, so
+/// the full register is preserved.
+pub const CALLEE_SAVED_FP: u32 = 8;
+
+/// Number of abstract FP registers handed to the allocator (`Reg(0..14)`),
+/// caller-saved `d0..d5` then callee-saved `d8..d15`.
+pub const FP_REGS: u32 = CALLER_SAVED_FP + CALLEE_SAVED_FP;
 
 /// Finalized optimizing-tier machine code for one function. Wraps a
 /// [`CompiledCode`] and runs through the shared baseline entry, so it inherits
@@ -295,19 +313,28 @@ mod arm64 {
     /// Emit scratch register for loaded values being boxed / tested (`x17`).
     const BOX_SCRATCH: u32 = 17;
 
-    /// Physical register holding abstract allocator `Reg(i)`. `Reg(0..GP_REGS)`
-    /// → `x9..x15`. Scratch `x16`/`x17` are reserved and never returned here.
+    /// Physical register holding abstract allocator `Reg(i)`: caller-saved
+    /// `Reg(0..7)` → `x9..x15`, callee-saved `Reg(7..15)` → `x21..x28`. Scratch
+    /// `x16`/`x17` and reserved `x19`/`x20` are never returned here.
     fn phys(i: u32) -> u32 {
         debug_assert!(i < GP_REGS);
-        9 + i
+        if i < super::CALLER_SAVED_GP {
+            9 + i
+        } else {
+            21 + (i - super::CALLER_SAVED_GP)
+        }
     }
 
-    /// Physical FP register holding `Fp`-class allocator `Reg(i)`.
-    /// `Reg(0..FP_REGS)` → `d0..d5`. FP scratch `d6`/`d7` are reserved and never
-    /// returned here.
+    /// Physical FP register holding `Fp`-class allocator `Reg(i)`: caller-saved
+    /// `Reg(0..6)` → `d0..d5`, callee-saved `Reg(6..14)` → `d8..d15`. FP scratch
+    /// `d6`/`d7` are reserved and never returned here.
     fn phys_fp(i: u32) -> u32 {
         debug_assert!(i < super::FP_REGS);
-        i
+        if i < super::CALLER_SAVED_FP {
+            i
+        } else {
+            8 + (i - super::CALLER_SAVED_FP)
+        }
     }
 
     /// FP scratch register for load staging / verbatim boxing (`d6`).
@@ -351,13 +378,16 @@ mod arm64 {
     }
 
     fn emit_backedge_poll(ops: &mut Assembler, threw: DynamicLabel, save_base: u32) {
-        for i in 0..GP_REGS {
+        // The poll stub follows the C ABI and preserves the callee-saved
+        // allocator registers (`x21..x28`, `d8..d15`), so only the caller-saved
+        // pool needs a round-trip here.
+        for i in 0..super::CALLER_SAVED_GP {
             let reg = phys(i);
             let off = save_base + i * 8;
             dynasm!(ops ; .arch aarch64 ; str X(reg), [sp, off]);
         }
-        for i in 0..super::FP_REGS {
-            let off = save_base + (GP_REGS + i) * 8;
+        for i in 0..super::CALLER_SAVED_FP {
+            let off = save_base + (super::CALLER_SAVED_GP + i) * 8;
             dynasm!(ops ; .arch aarch64 ; str D(phys_fp(i)), [sp, off]);
         }
         dynasm!(ops ; .arch aarch64 ; mov x0, x20);
@@ -367,11 +397,11 @@ mod arm64 {
             ; blr x16
             ; cbnz x0, =>threw
         );
-        for i in 0..super::FP_REGS {
-            let off = save_base + (GP_REGS + i) * 8;
+        for i in 0..super::CALLER_SAVED_FP {
+            let off = save_base + (super::CALLER_SAVED_GP + i) * 8;
             dynasm!(ops ; .arch aarch64 ; ldr D(phys_fp(i)), [sp, off]);
         }
-        for i in 0..GP_REGS {
+        for i in 0..super::CALLER_SAVED_GP {
             let reg = phys(i);
             let off = save_base + i * 8;
             dynasm!(ops ; .arch aarch64 ; ldr X(reg), [sp, off]);
@@ -1508,7 +1538,17 @@ mod arm64 {
     /// Emit the function prologue (copied from the baseline) then reserve the
     /// spill area. Returns the byte size subtracted from `sp` (0 when no spill
     /// area is needed).
-    fn emit_prologue(ops: &mut Assembler, spill_bytes: u32) {
+    /// One callee-saved allocator register to preserve across the function: its
+    /// physical register number, whether it is FP, and the byte offset from `sp`
+    /// of its save slot.
+    #[derive(Clone, Copy)]
+    struct CalleeSavedReg {
+        phys: u32,
+        is_fp: bool,
+        off: u32,
+    }
+
+    fn emit_prologue(ops: &mut Assembler, spill_bytes: u32, callee_saved: &[CalleeSavedReg]) {
         dynasm!(ops
             ; .arch aarch64
             ; stp x29, x30, [sp, #-32]!
@@ -1520,11 +1560,28 @@ mod arm64 {
         if spill_bytes != 0 {
             dynasm!(ops ; .arch aarch64 ; sub sp, sp, spill_bytes);
         }
+        // Preserve the callee-saved allocator registers this body uses, at fixed
+        // offsets above the spill / poll-save area.
+        for cs in callee_saved {
+            if cs.is_fp {
+                dynasm!(ops ; .arch aarch64 ; str D(cs.phys), [sp, cs.off]);
+            } else {
+                dynasm!(ops ; .arch aarch64 ; str X(cs.phys), [sp, cs.off]);
+            }
+        }
     }
 
-    /// Emit the function epilogue: undo the spill reservation, restore the
-    /// callee-saved frame, and return. `x0` (value) and `x1` (status) must be set.
-    fn emit_epilogue(ops: &mut Assembler, spill_bytes: u32) {
+    /// Emit the function epilogue: restore callee-saved allocator registers, undo
+    /// the spill reservation, restore the saved frame, and return. `x0` (value)
+    /// and `x1` (status) must be set.
+    fn emit_epilogue(ops: &mut Assembler, spill_bytes: u32, callee_saved: &[CalleeSavedReg]) {
+        for cs in callee_saved {
+            if cs.is_fp {
+                dynasm!(ops ; .arch aarch64 ; ldr D(cs.phys), [sp, cs.off]);
+            } else {
+                dynasm!(ops ; .arch aarch64 ; ldr X(cs.phys), [sp, cs.off]);
+            }
+        }
         if spill_bytes != 0 {
             dynasm!(ops ; .arch aarch64 ; add sp, sp, spill_bytes);
         }
@@ -1542,12 +1599,13 @@ mod arm64 {
         byte_pc: u32,
         spill_bytes: u32,
         box_scratch: u32,
+        callee_saved: &[CalleeSavedReg],
     ) {
         dynasm!(ops ; .arch aarch64 ; =>fail);
         emit_load_u64(ops, box_scratch, u64::from(byte_pc));
         dynasm!(ops ; .arch aarch64 ; str W(box_scratch), [x20, BAIL_PC_OFFSET]);
         dynasm!(ops ; .arch aarch64 ; movz x1, STATUS_BAILED as u32);
-        emit_epilogue(ops, spill_bytes);
+        emit_epilogue(ops, spill_bytes, callee_saved);
     }
 
     fn emit_osr_reload(
@@ -1636,12 +1694,54 @@ mod arm64 {
 
         // Spill area: one frame slot per value spill slot plus one parallel-move
         // cycle-break scratch slot (`Spill(spill_slots)`). Backedge polls call a
-        // Rust ABI leaf stub, so reserve an additional conservative save area
-        // for every optimizing-tier caller-saved allocatable GP/FP register.
+        // Rust ABI leaf stub, so reserve an additional save area for every
+        // *caller-saved* allocatable GP/FP register (callee-saved survive the
+        // C-ABI poll stub untouched).
         let value_spill_bytes = align16((alloc.spill_slots + 1) * 8);
         let poll_save_base = value_spill_bytes;
-        let poll_save_bytes = (GP_REGS + super::FP_REGS) * 8;
-        let spill_bytes = align16(value_spill_bytes + poll_save_bytes);
+        let poll_save_bytes = (super::CALLER_SAVED_GP + super::CALLER_SAVED_FP) * 8;
+        // Callee-saved registers the allocator actually used. The function's
+        // prologue must preserve them for its own caller (the Rust `JitEntry`
+        // boundary) and, for a self-recursive `bl`, for the calling frame; a
+        // value live across a call can then survive in one without a frame
+        // round-trip. Save only the used ones so leaf functions pay nothing.
+        let mut cs_gp: Vec<u32> = Vec::new();
+        let mut cs_fp: Vec<u32> = Vec::new();
+        for (&value, &loc) in &alloc.location {
+            if let Location::Reg(i) = loc {
+                if matches!(graph.node(value).repr, Repr::Float64) {
+                    if i >= super::CALLER_SAVED_FP {
+                        cs_fp.push(i);
+                    }
+                } else if i >= super::CALLER_SAVED_GP {
+                    cs_gp.push(i);
+                }
+            }
+        }
+        cs_gp.sort_unstable();
+        cs_gp.dedup();
+        cs_fp.sort_unstable();
+        cs_fp.dedup();
+        let cs_base = value_spill_bytes + poll_save_bytes;
+        let mut callee_saved: Vec<CalleeSavedReg> = Vec::new();
+        for (slot, &i) in cs_gp.iter().chain(std::iter::empty()).enumerate() {
+            callee_saved.push(CalleeSavedReg {
+                phys: phys(i),
+                is_fp: false,
+                off: cs_base + slot as u32 * 8,
+            });
+        }
+        let gp_slots = cs_gp.len() as u32;
+        for (slot, &i) in cs_fp.iter().enumerate() {
+            callee_saved.push(CalleeSavedReg {
+                phys: phys_fp(i),
+                is_fp: true,
+                off: cs_base + (gp_slots + slot as u32) * 8,
+            });
+        }
+        let cs_save_bytes = callee_saved.len() as u32 * 8;
+        let spill_bytes = align16(value_spill_bytes + poll_save_bytes + cs_save_bytes);
+        let callee_saved = callee_saved.as_slice();
 
         // One dynamic label per block, addressed by BlockId.
         let block_labels: Vec<DynamicLabel> = (0..graph.blocks.len())
@@ -1666,7 +1766,7 @@ mod arm64 {
         let self_entry = ops.new_dynamic_label();
         let entry = ops.offset();
         dynasm!(&mut ops ; .arch aarch64 ; =>self_entry);
-        emit_prologue(&mut ops, spill_bytes);
+        emit_prologue(&mut ops, spill_bytes, callee_saved);
 
         // Entry param load: each per-register entry def that has a home is a
         // boxed Tagged value sitting in `[x19, r*8]`. Load it into its home so
@@ -1719,6 +1819,7 @@ mod arm64 {
                     nid,
                     spill_bytes,
                     BOX_SCRATCH,
+                    callee_saved,
                 )?;
             }
 
@@ -1733,7 +1834,7 @@ mod arm64 {
                     let repr = graph.node(*v).repr;
                     box_into_gp(&mut ops, 0, repr, loc, BOX_SCRATCH);
                     dynasm!(&mut ops ; .arch aarch64 ; movz x1, STATUS_RETURNED as u32);
-                    emit_epilogue(&mut ops, spill_bytes);
+                    emit_epilogue(&mut ops, spill_bytes, callee_saved);
                 }
                 Terminator::Jump(target) => {
                     if is_backedge(graph, b, *target) {
@@ -1804,6 +1905,7 @@ mod arm64 {
                         point,
                         spill_bytes,
                         BOX_SCRATCH,
+                        callee_saved,
                     )?;
                 }
             }
@@ -1819,6 +1921,7 @@ mod arm64 {
             &deopt_labels,
             spill_bytes,
             BOX_SCRATCH,
+            callee_saved,
         )?;
         dynasm!(&mut ops
             ; .arch aarch64
@@ -1826,7 +1929,7 @@ mod arm64 {
             ; movz x0, #0
             ; movz x1, STATUS_THREW as u32
         );
-        emit_epilogue(&mut ops, spill_bytes);
+        emit_epilogue(&mut ops, spill_bytes, callee_saved);
 
         // OSR-entry trampolines, one per eligible loop header. Each sets up the
         // frame, reloads every live interpreter register from the frame window
@@ -1871,13 +1974,20 @@ mod arm64 {
             }
             let off = ops.offset();
             let osr_fail = ops.new_dynamic_label();
-            emit_prologue(&mut ops, spill_bytes);
+            emit_prologue(&mut ops, spill_bytes, callee_saved);
             for (r, _, home, repr) in reloads {
                 let src_off = u32::from(r) * 8;
                 emit_osr_reload(&mut ops, repr, home, src_off, osr_fail);
             }
             dynasm!(&mut ops ; .arch aarch64 ; b =>block_labels[osr.block as usize]);
-            emit_osr_type_miss(&mut ops, osr_fail, osr.byte_pc, spill_bytes, BOX_SCRATCH);
+            emit_osr_type_miss(
+                &mut ops,
+                osr_fail,
+                osr.byte_pc,
+                spill_bytes,
+                BOX_SCRATCH,
+                callee_saved,
+            );
             osr_offsets.insert(osr.byte_pc, off.0);
         }
 
@@ -1908,6 +2018,7 @@ mod arm64 {
         nid: NodeId,
         spill_bytes: u32,
         box_scratch: u32,
+        callee_saved: &[CalleeSavedReg],
     ) -> Result<(), Unsupported> {
         let node = graph.node(nid);
         let dst = alloc.location.get(&nid).copied();
@@ -2631,7 +2742,7 @@ mod arm64 {
                         ; str W(box_scratch), [x20, BAIL_PC_OFFSET]
                         ; movz x1, STATUS_BAILED as u32
                     );
-                    emit_epilogue(ops, spill_bytes);
+                    emit_epilogue(ops, spill_bytes, callee_saved);
                     dynasm!(ops ; .arch aarch64 ; =>after);
                     return Ok(());
                 }
@@ -2678,7 +2789,7 @@ mod arm64 {
                     ; str W(box_scratch), [x20, BAIL_PC_OFFSET]
                     ; movz x1, STATUS_BAILED as u32
                 );
-                emit_epilogue(ops, spill_bytes);
+                emit_epilogue(ops, spill_bytes, callee_saved);
                 dynasm!(ops ; .arch aarch64 ; =>after);
                 Ok(())
             }
@@ -3060,6 +3171,7 @@ mod arm64 {
     /// Emit every cold deopt exit. Each reconstructs the live interpreter
     /// registers (re-boxed to tagged Values, stored into the frame array), stamps
     /// the resume byte-PC, and returns `STATUS_BAILED`.
+    #[allow(clippy::too_many_arguments)]
     fn emit_deopt_exits(
         ops: &mut Assembler,
         graph: &Graph,
@@ -3068,6 +3180,7 @@ mod arm64 {
         deopt_labels: &FxHashMap<NodeId, DynamicLabel>,
         spill_bytes: u32,
         box_scratch: u32,
+        callee_saved: &[CalleeSavedReg],
     ) -> Result<(), Unsupported> {
         // Deterministic order for reproducible code.
         let mut nodes: Vec<NodeId> = deopt_labels.keys().copied().collect();
@@ -3078,7 +3191,15 @@ mod arm64 {
                 .get(&nid)
                 .ok_or(Unsupported::Unlowered("deopt exit without frame state"))?;
             dynasm!(ops ; .arch aarch64 ; =>label);
-            emit_frame_restore_and_bail(ops, graph, alloc, point, spill_bytes, box_scratch)?;
+            emit_frame_restore_and_bail(
+                ops,
+                graph,
+                alloc,
+                point,
+                spill_bytes,
+                box_scratch,
+                callee_saved,
+            )?;
         }
         Ok(())
     }
@@ -3093,6 +3214,7 @@ mod arm64 {
         point: &DeoptPoint,
         spill_bytes: u32,
         box_scratch: u32,
+        callee_saved: &[CalleeSavedReg],
     ) -> Result<(), Unsupported> {
         for &(regn, value) in &point.registers {
             let node = graph.node(value);
@@ -3106,7 +3228,7 @@ mod arm64 {
         emit_load_u64(ops, box_scratch, u64::from(point.byte_pc));
         dynasm!(ops ; .arch aarch64 ; str W(box_scratch), [x20, BAIL_PC_OFFSET]);
         dynasm!(ops ; .arch aarch64 ; movz x1, STATUS_BAILED as u32);
-        emit_epilogue(ops, spill_bytes);
+        emit_epilogue(ops, spill_bytes, callee_saved);
         Ok(())
     }
 }

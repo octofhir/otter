@@ -279,6 +279,66 @@ pub fn concat_string_bodies(
     }
 
     let new_len = left_len.saturating_add(right_len);
+
+    // Short-result fast path: when the concatenation fits an inline flat body
+    // and both sides are already materialised (non-cons/non-sliced), build the
+    // flat result directly. A `Cons` node for a tiny result (`"k" + i` keys,
+    // small id/label joins) is pure overhead — it retains both children and
+    // forces a rope walk on every later hash/compare and an eventual flatten.
+    // The inline-flat result needs the same single body allocation but stores
+    // its bytes inline and is read in O(1).
+    if (new_len as usize) <= INLINE_LATIN1_CAP {
+        let mut units = [0u16; INLINE_LATIN1_CAP];
+        let mut n = 0usize;
+        let mut all_latin1 = true;
+        let mut both_flat = true;
+        for handle in [left, right] {
+            let flat = heap.read_payload(handle, |b| match flat_content(&b.repr, b.len as usize) {
+                Some(FlatContent::Latin1(bytes)) => {
+                    for &byte in bytes {
+                        units[n] = u16::from(byte);
+                        n += 1;
+                    }
+                    true
+                }
+                Some(FlatContent::Wide(wide)) => {
+                    all_latin1 = false;
+                    for &unit in wide {
+                        units[n] = unit;
+                        n += 1;
+                    }
+                    true
+                }
+                None => false,
+            });
+            if !flat {
+                both_flat = false;
+                break;
+            }
+        }
+        if both_flat {
+            return if all_latin1 {
+                let mut bytes = [0u8; INLINE_LATIN1_CAP];
+                for (dst, &unit) in bytes.iter_mut().zip(units[..n].iter()) {
+                    *dst = unit as u8;
+                }
+                alloc_latin1_string_body_with_roots(
+                    heap,
+                    JsStringId::new(0),
+                    &bytes[..n],
+                    external_visit,
+                )
+            } else {
+                alloc_flat_string_body_with_roots(
+                    heap,
+                    JsStringId::new(0),
+                    &units[..n],
+                    external_visit,
+                )
+            };
+        }
+    }
+
     let projected_depth = left_depth.max(right_depth).saturating_add(1);
 
     // Flatten deeper side eagerly if we'd exceed the depth budget.

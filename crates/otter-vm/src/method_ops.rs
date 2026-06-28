@@ -173,7 +173,8 @@ impl CollectionFastOp {
             Self::MapSet => Some(crate::native_abi::STUB_COLLECTION_MAP_SET_ALLOC.id),
             Self::SetAdd => Some(crate::native_abi::STUB_COLLECTION_SET_ADD_ALLOC.id),
             Self::SetHas => Some(crate::native_abi::STUB_COLLECTION_SET_HAS_ALLOC.id),
-            Self::MapDelete | Self::SetDelete => None,
+            Self::MapDelete => Some(crate::native_abi::STUB_COLLECTION_MAP_DELETE_ALLOC.id),
+            Self::SetDelete => Some(crate::native_abi::STUB_COLLECTION_SET_DELETE_ALLOC.id),
         }
     }
 }

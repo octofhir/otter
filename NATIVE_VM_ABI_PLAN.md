@@ -292,9 +292,10 @@ compiled `CallMethodValue` now tries a narrow collection-leaf bridge before the
 generic method bridge, so hot `Map.get` / `Map.has` / `Set.has` sites can return
 through the reusable leaf ABI without building the full method-call argument
 path. Fully direct machine calls to the leaf entries remain open.
-`Map.prototype.set`, `Set.prototype.add`, and materializing collection lookups
-(`Map.get`, `Map.has`, `Set.has`) now have concrete `AllocStub` descriptors with
-a uniform three-value ABI shape (`receiver`, `arg0`, `arg1_or_undefined`).
+`Map.prototype.set`, `Set.prototype.add`, materializing collection lookups
+(`Map.get`, `Map.has`, `Set.has`), and materializing collection deletes
+(`Map.delete`, `Set.delete`) now have concrete `AllocStub` descriptors with a
+uniform three-value ABI shape (`receiver`, `arg0`, `arg1_or_undefined`).
 `runtime_stubs` can resolve these descriptor ids as allocating ABI records and
 validates that callers name a non-sentinel safepoint. JIT compile snapshots now
 carry `JitCollectionAllocMethod` feedback for warmed collection method sites:

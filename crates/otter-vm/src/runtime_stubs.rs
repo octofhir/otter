@@ -25,10 +25,11 @@
 
 use crate::native_abi::{
     NO_SAFEPOINT, RuntimeStubAllocContext, RuntimeStubDescriptor, RuntimeStubId, RuntimeStubResult,
-    RuntimeStubResultPair, STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF,
-    STUB_COLLECTION_MAP_HAS_ALLOC, STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC,
-    STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
-    SafepointId, SafepointRecord, TaggedLocationKind, validate_stub_descriptor,
+    RuntimeStubResultPair, STUB_COLLECTION_MAP_DELETE_ALLOC, STUB_COLLECTION_MAP_GET_ALLOC,
+    STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_ALLOC, STUB_COLLECTION_MAP_HAS_LEAF,
+    STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_DELETE_ALLOC,
+    STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF, SafepointId, SafepointRecord,
+    TaggedLocationKind, validate_stub_descriptor,
 };
 use crate::{Interpreter, Value, collections};
 use std::cell::UnsafeCell;
@@ -372,6 +373,18 @@ pub const COLLECTION_SET_HAS_ALLOC: AllocValueStub = AllocValueStub {
     entry: Some(collection_set_has_alloc),
 };
 
+/// ABI descriptor for materializing `Map.prototype.delete`.
+pub const COLLECTION_MAP_DELETE_ALLOC: AllocValueStub = AllocValueStub {
+    descriptor: STUB_COLLECTION_MAP_DELETE_ALLOC,
+    entry: Some(collection_map_delete_alloc),
+};
+
+/// ABI descriptor for materializing `Set.prototype.delete`.
+pub const COLLECTION_SET_DELETE_ALLOC: AllocValueStub = AllocValueStub {
+    descriptor: STUB_COLLECTION_SET_DELETE_ALLOC,
+    entry: Some(collection_set_delete_alloc),
+};
+
 /// Resolve a fixed two-argument leaf/no-allocation stub by ABI descriptor id.
 #[must_use]
 pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocStub2> {
@@ -392,6 +405,8 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
         id if id == STUB_COLLECTION_MAP_GET_ALLOC.id => Some(COLLECTION_MAP_GET_ALLOC),
         id if id == STUB_COLLECTION_MAP_HAS_ALLOC.id => Some(COLLECTION_MAP_HAS_ALLOC),
         id if id == STUB_COLLECTION_SET_HAS_ALLOC.id => Some(COLLECTION_SET_HAS_ALLOC),
+        id if id == STUB_COLLECTION_MAP_DELETE_ALLOC.id => Some(COLLECTION_MAP_DELETE_ALLOC),
+        id if id == STUB_COLLECTION_SET_DELETE_ALLOC.id => Some(COLLECTION_SET_DELETE_ALLOC),
         _ => None,
     }
 }
@@ -528,6 +543,42 @@ pub extern "C" fn collection_set_has_alloc(
     unused_bits: u64,
 ) -> RuntimeStubResultPair {
     RuntimeStubResultPair::from_result(collection_set_has_alloc_inner(
+        ctx,
+        safepoint,
+        recv_bits,
+        value_bits,
+        unused_bits,
+    ))
+}
+
+/// Allocating `Map.prototype.delete` mutation stub.
+#[must_use]
+pub extern "C" fn collection_map_delete_alloc(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    key_bits: u64,
+    unused_bits: u64,
+) -> RuntimeStubResultPair {
+    RuntimeStubResultPair::from_result(collection_map_delete_alloc_inner(
+        ctx,
+        safepoint,
+        recv_bits,
+        key_bits,
+        unused_bits,
+    ))
+}
+
+/// Allocating `Set.prototype.delete` mutation stub.
+#[must_use]
+pub extern "C" fn collection_set_delete_alloc(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    value_bits: u64,
+    unused_bits: u64,
+) -> RuntimeStubResultPair {
+    RuntimeStubResultPair::from_result(collection_set_delete_alloc_inner(
         ctx,
         safepoint,
         recv_bits,
@@ -862,6 +913,108 @@ fn collection_set_has_alloc_inner(
     result
 }
 
+fn collection_map_delete_alloc_inner(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    key_bits: u64,
+    unused_bits: u64,
+) -> RuntimeStubResult {
+    let Some(ctx) = alloc_context_mut(ctx) else {
+        return RuntimeStubResult::miss();
+    };
+    let Some(interp) = interpreter_mut(ctx.vm) else {
+        return RuntimeStubResult::miss();
+    };
+    // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
+    // table and frame-slot window must remain live for this call.
+    let Ok(roots) = (unsafe {
+        alloc_value_stub_call_roots(
+            ctx,
+            safepoint,
+            [
+                Value::from_abi_bits(recv_bits),
+                Value::from_abi_bits(key_bits),
+                Value::from_abi_bits(unused_bits),
+            ],
+        )
+    }) else {
+        return RuntimeStubResult::miss();
+    };
+    let depth = interp
+        .gc_heap
+        .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    let result = (|| {
+        let key = roots.value(1);
+        if let Some(string) = key.as_string(&interp.gc_heap) {
+            let _ = string.flatten_in_place(&mut interp.gc_heap);
+        }
+        let recv = roots.value(0);
+        let key = roots.value(1);
+        let Some(map) = recv.as_map() else {
+            return RuntimeStubResult::miss();
+        };
+        RuntimeStubResult::ok_value(Value::boolean(collections::map_delete(
+            map,
+            &mut interp.gc_heap,
+            &key,
+        )))
+    })();
+    interp.gc_heap.pop_extra_roots_to(depth - 1);
+    result
+}
+
+fn collection_set_delete_alloc_inner(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    value_bits: u64,
+    unused_bits: u64,
+) -> RuntimeStubResult {
+    let Some(ctx) = alloc_context_mut(ctx) else {
+        return RuntimeStubResult::miss();
+    };
+    let Some(interp) = interpreter_mut(ctx.vm) else {
+        return RuntimeStubResult::miss();
+    };
+    // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
+    // table and frame-slot window must remain live for this call.
+    let Ok(roots) = (unsafe {
+        alloc_value_stub_call_roots(
+            ctx,
+            safepoint,
+            [
+                Value::from_abi_bits(recv_bits),
+                Value::from_abi_bits(value_bits),
+                Value::from_abi_bits(unused_bits),
+            ],
+        )
+    }) else {
+        return RuntimeStubResult::miss();
+    };
+    let depth = interp
+        .gc_heap
+        .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    let result = (|| {
+        let value = roots.value(1);
+        if let Some(string) = value.as_string(&interp.gc_heap) {
+            let _ = string.flatten_in_place(&mut interp.gc_heap);
+        }
+        let recv = roots.value(0);
+        let value = roots.value(1);
+        let Some(set) = recv.as_set() else {
+            return RuntimeStubResult::miss();
+        };
+        RuntimeStubResult::ok_value(Value::boolean(collections::set_delete(
+            set,
+            &mut interp.gc_heap,
+            &value,
+        )))
+    })();
+    interp.gc_heap.pop_extra_roots_to(depth - 1);
+    result
+}
+
 fn heap_ref(heap: *const otter_gc::GcHeap) -> Option<&'static otter_gc::GcHeap> {
     if heap.is_null() {
         return None;
@@ -961,6 +1114,14 @@ mod tests {
         assert!(COLLECTION_SET_HAS_ALLOC.is_valid_for_safepoint(1));
         assert!(COLLECTION_SET_HAS_ALLOC.has_entry());
         assert!(COLLECTION_SET_HAS_ALLOC.entry_addr().is_some());
+        assert!(!COLLECTION_MAP_DELETE_ALLOC.is_valid_for_safepoint(NO_SAFEPOINT));
+        assert!(COLLECTION_MAP_DELETE_ALLOC.is_valid_for_safepoint(1));
+        assert!(COLLECTION_MAP_DELETE_ALLOC.has_entry());
+        assert!(COLLECTION_MAP_DELETE_ALLOC.entry_addr().is_some());
+        assert!(!COLLECTION_SET_DELETE_ALLOC.is_valid_for_safepoint(NO_SAFEPOINT));
+        assert!(COLLECTION_SET_DELETE_ALLOC.is_valid_for_safepoint(1));
+        assert!(COLLECTION_SET_DELETE_ALLOC.has_entry());
+        assert!(COLLECTION_SET_DELETE_ALLOC.entry_addr().is_some());
         assert_eq!(
             alloc_value_stub_by_id(STUB_COLLECTION_MAP_SET_ALLOC.id).map(|stub| stub.descriptor),
             Some(STUB_COLLECTION_MAP_SET_ALLOC)
@@ -980,6 +1141,14 @@ mod tests {
         assert_eq!(
             alloc_value_stub_by_id(STUB_COLLECTION_SET_HAS_ALLOC.id).map(|stub| stub.descriptor),
             Some(STUB_COLLECTION_SET_HAS_ALLOC)
+        );
+        assert_eq!(
+            alloc_value_stub_by_id(STUB_COLLECTION_MAP_DELETE_ALLOC.id).map(|stub| stub.descriptor),
+            Some(STUB_COLLECTION_MAP_DELETE_ALLOC)
+        );
+        assert_eq!(
+            alloc_value_stub_by_id(STUB_COLLECTION_SET_DELETE_ALLOC.id).map(|stub| stub.descriptor),
+            Some(STUB_COLLECTION_SET_DELETE_ALLOC)
         );
         assert!(alloc_value_stub_by_id(u32::MAX).is_none());
     }
@@ -1464,6 +1633,15 @@ mod tests {
         assert_eq!(has.status(), RuntimeStubStatus::Ok);
         assert_eq!(has.into_result().into_value(), Some(Value::boolean(true)));
 
+        let deleted = COLLECTION_MAP_DELETE_ALLOC
+            .invoke_raw(&mut map_ctx, 23, map_slots[0], map_slots[1], map_slots[2])
+            .expect("map delete entry");
+        assert_eq!(deleted.status(), RuntimeStubStatus::Ok);
+        assert_eq!(
+            deleted.into_result().into_value(),
+            Some(Value::boolean(true))
+        );
+
         let mut set_slots = [
             Value::set(set).to_abi_bits(),
             Value::string(lookup_rope).to_abi_bits(),
@@ -1484,6 +1662,15 @@ mod tests {
             .expect("set has entry");
         assert_eq!(has.status(), RuntimeStubStatus::Ok);
         assert_eq!(has.into_result().into_value(), Some(Value::boolean(true)));
+
+        let deleted = COLLECTION_SET_DELETE_ALLOC
+            .invoke_raw(&mut set_ctx, 23, set_slots[0], set_slots[1], set_slots[2])
+            .expect("set delete entry");
+        assert_eq!(deleted.status(), RuntimeStubStatus::Ok);
+        assert_eq!(
+            deleted.into_result().into_value(),
+            Some(Value::boolean(true))
+        );
     }
 
     #[test]

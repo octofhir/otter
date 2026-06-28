@@ -380,6 +380,24 @@ pub const STUB_COLLECTION_SET_HAS_ALLOC: RuntimeStubDescriptor = RuntimeStubDesc
     argument_count: 3,
 };
 
+/// Allocating `Map.prototype.delete` mutation stub with the same materializing
+/// key contract as [`STUB_COLLECTION_MAP_GET_ALLOC`].
+pub const STUB_COLLECTION_MAP_DELETE_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
+    id: 15,
+    name: "collection_map_delete_alloc",
+    class: RuntimeStubClass::Alloc,
+    argument_count: 3,
+};
+
+/// Allocating `Set.prototype.delete` mutation stub with the same materializing
+/// key contract as [`STUB_COLLECTION_MAP_GET_ALLOC`].
+pub const STUB_COLLECTION_SET_DELETE_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
+    id: 16,
+    name: "collection_set_delete_alloc",
+    class: RuntimeStubClass::Alloc,
+    argument_count: 3,
+};
+
 /// Status code returned by a runtime stub.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -671,6 +689,22 @@ mod tests {
             NO_SAFEPOINT
         ));
         assert!(validate_stub_descriptor(STUB_COLLECTION_SET_HAS_ALLOC, 9));
+        assert!(!validate_stub_descriptor(
+            STUB_COLLECTION_MAP_DELETE_ALLOC,
+            NO_SAFEPOINT
+        ));
+        assert!(validate_stub_descriptor(
+            STUB_COLLECTION_MAP_DELETE_ALLOC,
+            9
+        ));
+        assert!(!validate_stub_descriptor(
+            STUB_COLLECTION_SET_DELETE_ALLOC,
+            NO_SAFEPOINT
+        ));
+        assert!(validate_stub_descriptor(
+            STUB_COLLECTION_SET_DELETE_ALLOC,
+            9
+        ));
     }
 
     #[test]

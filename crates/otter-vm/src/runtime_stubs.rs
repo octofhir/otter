@@ -30,6 +30,7 @@ use crate::native_abi::{
     SafepointId, SafepointRecord, TaggedLocationKind, validate_stub_descriptor,
 };
 use crate::{Interpreter, Value, collections};
+use std::cell::UnsafeCell;
 
 /// Two-argument leaf/no-allocation runtime stub ABI.
 ///
@@ -276,8 +277,8 @@ impl otter_gc::ExtraRootSource for AllocSafepointFrameRoots<'_> {
             // out-of-bounds locations, and requires callers to keep the
             // writable frame window alive while this root source is registered.
             let value =
-                unsafe { &*(self.ctx.frame_slots.add(location.index as usize) as *const Value) };
-            value.trace_value_slots(visitor);
+                unsafe { &mut *(self.ctx.frame_slots.add(location.index as usize) as *mut Value) };
+            value.trace_value_slot_mut(visitor);
         }
     }
 }
@@ -289,19 +290,25 @@ impl otter_gc::ExtraRootSource for AllocSafepointFrameRoots<'_> {
 /// valid if the stub allocates before it reloads from its local ABI variables.
 struct AllocValueStubCallRoots<'a> {
     frame_roots: AllocSafepointFrameRoots<'a>,
-    values: [Value; 3],
+    values: [UnsafeCell<Value>; 3],
 }
 
 impl<'a> AllocValueStubCallRoots<'a> {
     fn new(frame_roots: AllocSafepointFrameRoots<'a>, values: [Value; 3]) -> Self {
         Self {
             frame_roots,
-            values,
+            values: [
+                UnsafeCell::new(values[0]),
+                UnsafeCell::new(values[1]),
+                UnsafeCell::new(values[2]),
+            ],
         }
     }
 
     fn value(&self, index: usize) -> Value {
-        self.values[index]
+        // SAFETY: values are only rewritten by the stop-the-world collector
+        // while this root source is synchronously visiting roots.
+        unsafe { *self.values[index].get() }
     }
 }
 
@@ -309,7 +316,9 @@ impl otter_gc::ExtraRootSource for AllocValueStubCallRoots<'_> {
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
         self.frame_roots.visit_extra_roots(visitor);
         for value in &self.values {
-            value.trace_value_slots(visitor);
+            // SAFETY: `UnsafeCell` makes these stub-local ABI value copies
+            // legitimate mutable root slots for a moving collection.
+            unsafe { (&mut *value.get()).trace_value_slot_mut(visitor) };
         }
     }
 }
@@ -686,6 +695,11 @@ mod tests {
         Value::number_i32(i)
     }
 
+    fn young_object_value(heap: &mut otter_gc::GcHeap) -> Value {
+        let mut no_roots = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
+        Value::object(crate::object::alloc_object_with_roots(heap, &mut no_roots).unwrap())
+    }
+
     #[test]
     fn leaf_stub_entries_match_descriptors() {
         assert!(COLLECTION_MAP_GET_LEAF.is_valid());
@@ -800,6 +814,43 @@ mod tests {
         roots.visit_extra_roots(&mut |slot| seen.push(slot));
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0], slots.as_mut_ptr().cast::<otter_gc::raw::RawGc>());
+    }
+
+    #[test]
+    fn alloc_value_stub_roots_survive_minor_relocation() {
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let frame_value = young_object_value(&mut heap);
+        let arg_value = young_object_value(&mut heap);
+        let frame_before = frame_value.as_raw_gc().expect("frame raw");
+        let arg_before = arg_value.as_raw_gc().expect("arg raw");
+
+        let safepoint = SafepointRecord::frame_slot_window(31, NO_FRAME_STATE, 1);
+        let safepoints = [safepoint.clone()];
+        let mut slots = [frame_value.to_abi_bits()];
+        let ctx = RuntimeStubAllocContext::new(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            safepoints.as_ptr(),
+            safepoints.len() as u32,
+            0,
+            slots.as_mut_ptr(),
+            slots.len() as u16,
+        );
+        // SAFETY: `slots` and `safepoints` remain alive while roots are used.
+        let frame_roots = unsafe { AllocSafepointFrameRoots::new(&ctx, &safepoint) }.unwrap();
+        let roots = AllocValueStubCallRoots::new(
+            frame_roots,
+            [arg_value, Value::undefined(), Value::undefined()],
+        );
+        heap.collect_minor_with_roots(&mut |visitor| roots.visit_extra_roots(visitor));
+
+        let frame_after = Value::from_abi_bits(slots[0])
+            .as_raw_gc()
+            .expect("moved frame raw");
+        let arg_after = roots.value(0).as_raw_gc().expect("moved arg raw");
+        assert_ne!(frame_after, frame_before);
+        assert_ne!(arg_after, arg_before);
     }
 
     #[test]

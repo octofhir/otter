@@ -1949,6 +1949,15 @@ impl Value {
             visitor(slot);
         }
     }
+
+    /// Visit this value as an explicitly mutable root slot.
+    pub(crate) fn trace_value_slot_mut(&mut self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        let tag = top_tag(self.0);
+        if (TAG_PTR_OBJECT..=TAG_PTR_OTHER).contains(&tag) {
+            let slot = &mut self.0 as *mut u64 as *mut otter_gc::raw::RawGc;
+            visitor(slot);
+        }
+    }
 }
 
 /// Default to `undefined`.

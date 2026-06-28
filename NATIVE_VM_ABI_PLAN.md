@@ -425,7 +425,7 @@ Exit criteria:
 - [x] Frame-slot root publisher for `AllocStub` safepoints.
 - [x] Executable-entry slot on generic `AllocValueStub` ABI records.
 - [x] First VM-side executable `AllocStub` runtime stub.
-- [ ] GC-stress coverage for executable `AllocStub` roots.
+- [x] Moving-GC coverage for executable `AllocStub` roots.
 - [ ] JIT call path to stubs without `NativeCtx`.
 - [x] Map/Set feedback model for leaf lookup stubs.
 - [x] Compiled `Map.get` / `Map.has` hot loop.
@@ -606,5 +606,19 @@ mutation helpers, and return the relocated receiver through
 allocation failure returns `OutOfMemory`.
 
 Baseline code still does not call these entries directly. The next required
-slice is GC-stress coverage for the executable root protocol, followed by the
+slice is moving-GC coverage for the executable root protocol, followed by the
 baseline machine-call path.
+
+### 2026-06-28: AllocValueStub moving-root coverage
+
+Touched surface: runtime stubs and GC safepoint ABI metadata.
+
+`AllocValueStubCallRoots` now stores ABI value copies in `UnsafeCell<Value>` so
+they are legitimate mutable root slots during a moving collection. Frame-slot
+safepoint roots are also visited through mutable `Value` slots. The runtime-stub
+tests now force a minor collection through the root publisher and verify that
+both the caller frame slot and the stub-local ABI value copy are rewritten to
+their relocated addresses.
+
+With this coverage in place, the remaining performance slice is the baseline
+machine-call path to these entries.

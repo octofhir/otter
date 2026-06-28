@@ -453,8 +453,8 @@ impl GlobalClass {
     }
 }
 
-/// Default heap cap (256 MiB) when none is configured.
-pub const DEFAULT_MAX_HEAP_BYTES: u64 = 256 * 1024 * 1024;
+/// Default heap cap (2 GiB) when none is configured.
+pub const DEFAULT_MAX_HEAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Default per-`run_*` timeout (30 s) when none is configured.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);

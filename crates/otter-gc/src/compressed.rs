@@ -49,7 +49,7 @@ use crate::page::PAGE_SIZE;
 /// Production embedders that want the full V8-shaped 4 GiB cage
 /// must call `init_cage_with_size(4 * 1024 * 1024 * 1024)` before
 /// the first [`crate::heap::GcHeap::new`].
-pub const DEFAULT_CAGE_SIZE_BYTES: usize = 256 * 1024 * 1024;
+pub const DEFAULT_CAGE_SIZE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 /// Maximum cage size — V8's compressed-pointer cap. `Gc<T>` is a
 /// `u32`, so the cage cannot exceed `u32::MAX + 1` bytes.

@@ -87,18 +87,19 @@ pub type AllocValueStubFn = extern "C" fn(
     u64,
 ) -> RuntimeStubResultPair;
 
-/// Fixed-value allocating runtime stub descriptor.
+/// Fixed-value allocating runtime stub ABI record.
 ///
 /// Generated code supplies the VM-native allocation/rooting context separately
 /// from the raw `Value` arguments:
 /// `(alloc_ctx, safepoint_id, receiver_bits, arg0_bits, arg1_bits)`.
-/// `safepoint_id` must identify a precise map for the current call site. This
-/// scaffold intentionally carries no Rust entrypoint yet; calling these stubs
-/// before the frame/safepoint publisher exists would be unsound for moving GC.
+/// `safepoint_id` must identify a precise map for the current call site.
 #[derive(Clone, Copy)]
 pub struct AllocValueStub {
     /// Passive descriptor shared with profiler/JIT metadata.
     pub descriptor: RuntimeStubDescriptor,
+    /// Machine-callable Rust entrypoint once a concrete stub has a proven
+    /// safepoint/rooting implementation.
+    pub entry: Option<AllocValueStubFn>,
 }
 
 impl AllocValueStub {
@@ -107,6 +108,32 @@ impl AllocValueStub {
     #[must_use]
     pub const fn is_valid_for_safepoint(self, safepoint: SafepointId) -> bool {
         validate_stub_descriptor(self.descriptor, safepoint) && self.descriptor.argument_count == 3
+    }
+
+    /// Whether this ABI record currently has executable machine-call code.
+    #[must_use]
+    pub const fn has_entry(self) -> bool {
+        self.entry.is_some()
+    }
+
+    /// Raw native entry address for generated code.
+    #[must_use]
+    pub fn entry_addr(self) -> Option<usize> {
+        self.entry.map(|entry| entry as usize)
+    }
+
+    /// Invoke this entry with raw ABI bits when executable code is installed.
+    #[must_use]
+    pub fn invoke_raw(
+        self,
+        ctx: *mut RuntimeStubAllocContext,
+        safepoint: SafepointId,
+        recv_bits: u64,
+        arg0_bits: u64,
+        arg1_bits: u64,
+    ) -> Option<RuntimeStubResultPair> {
+        self.entry
+            .map(|entry| entry(ctx, safepoint, recv_bits, arg0_bits, arg1_bits))
     }
 }
 
@@ -242,11 +269,13 @@ pub const COLLECTION_SET_HAS_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
 /// ABI descriptor for `Map.prototype.set` collection mutation.
 pub const COLLECTION_MAP_SET_ALLOC: AllocValueStub = AllocValueStub {
     descriptor: STUB_COLLECTION_MAP_SET_ALLOC,
+    entry: None,
 };
 
 /// ABI descriptor for `Set.prototype.add` collection mutation.
 pub const COLLECTION_SET_ADD_ALLOC: AllocValueStub = AllocValueStub {
     descriptor: STUB_COLLECTION_SET_ADD_ALLOC,
+    entry: None,
 };
 
 /// Resolve a fixed two-argument leaf/no-allocation stub by ABI descriptor id.
@@ -438,8 +467,12 @@ mod tests {
     fn alloc_stub_descriptors_require_safepoints() {
         assert!(!COLLECTION_MAP_SET_ALLOC.is_valid_for_safepoint(NO_SAFEPOINT));
         assert!(COLLECTION_MAP_SET_ALLOC.is_valid_for_safepoint(1));
+        assert!(!COLLECTION_MAP_SET_ALLOC.has_entry());
+        assert_eq!(COLLECTION_MAP_SET_ALLOC.entry_addr(), None);
         assert!(!COLLECTION_SET_ADD_ALLOC.is_valid_for_safepoint(NO_SAFEPOINT));
         assert!(COLLECTION_SET_ADD_ALLOC.is_valid_for_safepoint(1));
+        assert!(!COLLECTION_SET_ADD_ALLOC.has_entry());
+        assert_eq!(COLLECTION_SET_ADD_ALLOC.entry_addr(), None);
         assert_eq!(
             alloc_value_stub_by_id(STUB_COLLECTION_MAP_SET_ALLOC.id).map(|stub| stub.descriptor),
             Some(STUB_COLLECTION_MAP_SET_ALLOC)
@@ -468,6 +501,10 @@ mod tests {
         }
 
         let entry: AllocValueStubFn = probe;
+        let stub = AllocValueStub {
+            descriptor: STUB_COLLECTION_MAP_SET_ALLOC,
+            entry: Some(entry),
+        };
         let mut slots = [Value::undefined().to_abi_bits()];
         let mut ctx = RuntimeStubAllocContext::new(
             std::ptr::null_mut(),
@@ -477,7 +514,11 @@ mod tests {
             slots.as_mut_ptr(),
             slots.len() as u16,
         );
-        let result = entry(&mut ctx, 9, 1, 2, 3);
+        assert!(stub.has_entry());
+        assert!(stub.entry_addr().is_some());
+        let result = stub
+            .invoke_raw(&mut ctx, 9, 1, 2, 3)
+            .expect("executable alloc stub");
         assert_eq!(result.status(), RuntimeStubStatus::Ok);
         assert_eq!(result.value_bits, 1);
     }

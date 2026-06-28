@@ -316,7 +316,12 @@ safepoint backed by that frame-slot window through `AllocSafepointFrameRoots`,
 rejecting unsupported register/spill maps until native frame locations are
 publishable. This gives the next executable `Map.set` / `Set.add` stub a
 machine-callable rooting contract without retaining raw untracked values across
-allocation.
+allocation. The allocating value-stub catalog is no longer just passive
+metadata: `AllocValueStub` carries an optional executable entrypoint and common
+entry-address/raw-invoke helpers. Collection mutation stubs remain `entry: None`
+until their GC-stress-covered implementations land, but string/array/property
+allocating stubs can now plug into the same ABI record instead of growing
+per-feature bridge shapes.
 
 Tasks:
 
@@ -414,6 +419,7 @@ Exit criteria:
 - [x] Baseline frame-slot safepoint records for collection `AllocStub` sites.
 - [x] Explicit `RuntimeStubAllocContext` and `AllocValueStubFn` ABI shape.
 - [x] Frame-slot root publisher for `AllocStub` safepoints.
+- [x] Executable-entry slot on generic `AllocValueStub` ABI records.
 - [ ] First `AllocStub` runtime stub with GC-stress coverage.
 - [ ] JIT call path to stubs without `NativeCtx`.
 - [x] Map/Set feedback model for leaf lookup stubs.
@@ -557,3 +563,15 @@ constructing `NativeCtx`.
 This is still not an executable `Map.set` / `Set.add` fast path. The next slice
 should use this publisher inside the concrete collection `AllocValueStub` entries,
 then add GC-stress coverage before baseline machine code starts calling them.
+
+### 2026-06-28: Generic AllocValueStub entry records
+
+Touched surface: runtime stubs and JIT/runtime ABI vocabulary.
+
+`AllocValueStub` now mirrors the leaf-stub catalog shape: it owns the passive
+descriptor and, when implemented, a machine-callable `AllocValueStubFn`
+entrypoint with shared `entry_addr` / `invoke_raw` helpers. This keeps the
+allocation ABI engine-wide rather than collection-specific. `Map.set` /
+`Set.add` still advertise no executable entrypoint, so generated code cannot
+accidentally call an allocating fast path before exact-root GC stress coverage
+exists.

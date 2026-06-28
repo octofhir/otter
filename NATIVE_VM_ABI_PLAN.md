@@ -90,7 +90,7 @@ document targets.
 
 Staged, each independently verifiable (diff.mjs 21/21, test262, GC-stress 128):
 
-- [ ] **6a — callee-saved register pool.** Extend the optimizing allocator GP
+- [x] **6a — callee-saved register pool.** Extend the optimizing allocator GP
       pool `x9..x15` (7, all caller-saved) with `x21..x28` and the FP pool
       `d0..d5` with `d8..d15`; map the new abstract `Reg` indices in
       `emit::phys` / `phys_fp`; save/restore the *used* callee-saved registers in
@@ -98,15 +98,18 @@ Staged, each independently verifiable (diff.mjs 21/21, test262, GC-stress 128):
       exit; keep the backedge-poll save area caller-saved-only (the Rust poll
       stub preserves callee-saved). Independently correct with materialize/reload
       still present; reduces spilling on register-pressured compiled functions.
-- [ ] **6b — call-clobber-aware allocation.** In `regalloc`, mark an interval
+- [x] **6b — call-clobber-aware allocation.** In `regalloc`, mark an interval
       that spans any `Call` / `CallMethod` position as call-crossing and restrict
       its candidate registers to the callee-saved sub-pool (spill on overflow).
       Caller-saved registers are then free to reuse across calls.
-- [ ] **6c — drop per-call materialize/reload.** With 6b, cross-call values live
-      in callee-saved registers (survive the `bl` / the C-ABI direct-call stub).
-      Remove `emit_frame_materialize` / `emit_frame_reload` from the normal call
-      path; materialize the deopt frame from SSA locations only on the bail/deopt
-      exit; read self-call args from their SSA locations instead of `[x19]`.
+- [~] **6c — drop per-call materialize/reload.** Done for the self-recursive
+      call's post-call `emit_frame_reload` — with 6b every cross-call value is in
+      a callee-saved register or spill slot, both of which the recursion
+      preserves, so only the result is reloaded. Remaining: drop the pre-call
+      full-frame `emit_frame_materialize` too (it still runs every call so the
+      self-call can read callee/args from `[x19]`); materialize only callee+args
+      on the hot path and the full deopt frame on the bail exit; extend to the
+      generic direct-call path.
 - [ ] **6d — lighten the self-call ctx setup.** Avoid the per-call 8-field
       `JitCtx` copy + window fill: define a self-call entry that takes the new
       register-window base in a register and shares the parent ctx's invariant

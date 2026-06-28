@@ -110,7 +110,15 @@ pub fn compile(
     let live_uses = deopt::merge_frame_state_uses([&frames, &call_resume_frames]);
     let deopt_uses = deopt::deopt_value_uses(&live_uses);
     let liveness = liveness::analyze(&graph, &deopt_uses, &block_deopts);
-    let alloc = regalloc::allocate(&graph, &liveness, emit::GP_REGS, emit::FP_REGS, &deopt_uses);
+    let alloc = regalloc::allocate(
+        &graph,
+        &liveness,
+        emit::GP_REGS,
+        emit::FP_REGS,
+        emit::CALLER_SAVED_GP,
+        emit::CALLER_SAVED_FP,
+        &deopt_uses,
+    );
     // OSR entries reuse the same register→value environment reconstruction as the
     // deopt frame states, captured at each loop header instead of each guard.
     let osr_entries = deopt::capture_osr_entries(&graph, &bcl);

@@ -154,6 +154,10 @@ struct Interval {
     /// Positions at which this value is read, ascending. Drives spill heuristics
     /// (furthest next-use) and, later, optimal split points.
     use_positions: Vec<u32>,
+    /// `true` when this value is live across a call position: it must not be
+    /// assigned a caller-saved register, since the call clobbers those. Set by
+    /// [`build_intervals`] from the call-site positions.
+    crosses_call: bool,
     /// Home assigned by the scan (`None` until allocated).
     location: Option<Location>,
 }
@@ -165,6 +169,7 @@ impl Interval {
             class,
             ranges: Vec::new(),
             use_positions: Vec::new(),
+            crosses_call: false,
             location: None,
         }
     }
@@ -278,17 +283,49 @@ pub struct Allocation {
 /// The result is interference-free: no two values live at the same position
 /// share a `Reg` *of the same class*.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn allocate(
     graph: &Graph,
     liveness: &Liveness,
     gp_regs: u32,
     fp_regs: u32,
+    caller_saved_gp: u32,
+    caller_saved_fp: u32,
     deopt_uses: &FxHashMap<NodeId, Vec<NodeId>>,
 ) -> Allocation {
     let numbering = Numbering::build(graph, liveness);
     let loops = detect_loops(graph, liveness, &numbering);
-    let intervals = build_intervals(graph, liveness, &numbering, &loops, deopt_uses);
-    let scan = LinearScan::run(intervals, gp_regs, fp_regs);
+    // Positions of call sites: a value live across one cannot stay in a
+    // caller-saved register (the call clobbers those), so its interval is
+    // pinned to the callee-saved sub-pool (or spilled).
+    let mut call_positions: Vec<u32> = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| {
+            matches!(
+                n.kind,
+                super::ir::NodeKind::Call { .. } | super::ir::NodeKind::CallMethod { .. }
+            )
+        })
+        .filter_map(|(id, _)| numbering.pos_of.get(&(id as NodeId)).copied())
+        .collect();
+    call_positions.sort_unstable();
+    let intervals = build_intervals(
+        graph,
+        liveness,
+        &numbering,
+        &loops,
+        deopt_uses,
+        &call_positions,
+    );
+    let scan = LinearScan::run(
+        intervals,
+        gp_regs,
+        fp_regs,
+        caller_saved_gp,
+        caller_saved_fp,
+    );
     let location = scan.locations();
     let edge_moves = resolve(graph, liveness, &numbering, &scan, &location);
     Allocation {
@@ -462,6 +499,7 @@ fn build_intervals(
     numbering: &Numbering,
     loops: &[NaturalLoop],
     deopt_uses: &FxHashMap<NodeId, Vec<NodeId>>,
+    call_positions: &[u32],
 ) -> Vec<Interval> {
     let mut intervals: FxHashMap<NodeId, Interval> = FxHashMap::default();
 
@@ -539,6 +577,12 @@ fn build_intervals(
         .into_values()
         .filter(|iv| !iv.ranges.is_empty())
         .collect();
+    // Flag intervals that are live across a call site (a call position strictly
+    // inside the live range): those values must avoid caller-saved registers.
+    for iv in &mut result {
+        let (start, end) = (iv.start(), iv.end());
+        iv.crosses_call = call_positions.iter().any(|&c| start < c && c < end);
+    }
     // Deterministic order: by start position, then value id.
     result.sort_by_key(|iv| (iv.start(), iv.value));
     result
@@ -566,16 +610,29 @@ struct LinearScan {
     gp_regs: u32,
     /// Floating-point registers available (`RegClass::Fp`).
     fp_regs: u32,
+    /// Count of caller-saved GP registers — abstract `Reg(0..caller_saved_gp)`.
+    /// A call-crossing interval is forbidden from these.
+    caller_saved_gp: u32,
+    /// Count of caller-saved FP registers — abstract `Reg(0..caller_saved_fp)`.
+    caller_saved_fp: u32,
     /// Spill slots handed out so far.
     spill_slots: u32,
 }
 
 impl LinearScan {
-    fn run(intervals: Vec<Interval>, gp_regs: u32, fp_regs: u32) -> Self {
+    fn run(
+        intervals: Vec<Interval>,
+        gp_regs: u32,
+        fp_regs: u32,
+        caller_saved_gp: u32,
+        caller_saved_fp: u32,
+    ) -> Self {
         let mut scan = LinearScan {
             intervals,
             gp_regs,
             fp_regs,
+            caller_saved_gp,
+            caller_saved_fp,
             spill_slots: 0,
         };
         scan.allocate_all();
@@ -587,6 +644,14 @@ impl LinearScan {
         match class {
             RegClass::Gp => self.gp_regs,
             RegClass::Fp => self.fp_regs,
+        }
+    }
+
+    /// Count of caller-saved registers for `class`.
+    fn caller_saved_of(&self, class: RegClass) -> u32 {
+        match class {
+            RegClass::Gp => self.caller_saved_gp,
+            RegClass::Fp => self.caller_saved_fp,
         }
     }
 
@@ -674,6 +739,17 @@ impl LinearScan {
                 free_until[r as usize] = 0;
             }
         }
+        // A value live across a call must not occupy a caller-saved register —
+        // the call clobbers those. Mark them unavailable for this interval so it
+        // takes a callee-saved register (or spills).
+        if self.intervals[cur].crosses_call {
+            for slot in free_until
+                .iter_mut()
+                .take(self.caller_saved_of(class) as usize)
+            {
+                *slot = 0;
+            }
+        }
 
         // Pick the register free longest.
         let (best_reg, best_free) = free_until
@@ -743,6 +819,16 @@ impl LinearScan {
                     next_use[r as usize] = u;
                     occupied[r as usize] = true;
                 }
+            }
+        }
+
+        // A call-crossing interval cannot land in a caller-saved register; mark
+        // them occupied-now so the furthest-use pick never selects one (ties
+        // resolve to the higher, callee-saved indices).
+        if self.intervals[cur].crosses_call {
+            for r in 0..self.caller_saved_of(class) as usize {
+                next_use[r] = 0;
+                occupied[r] = true;
             }
         }
 
@@ -1029,7 +1115,7 @@ mod tests {
     fn intervals_of(graph: &Graph, live: &Liveness) -> Vec<Interval> {
         let numbering = Numbering::build(graph, live);
         let loops = detect_loops(graph, live, &numbering);
-        build_intervals(graph, live, &numbering, &loops, &FxHashMap::default())
+        build_intervals(graph, live, &numbering, &loops, &FxHashMap::default(), &[])
     }
 
     /// Assert no two values whose intervals overlap share the same `Reg`.
@@ -1080,7 +1166,7 @@ mod tests {
         .expect("diamond builds");
         let live = liveness::analyze(&g, &Default::default(), &Default::default());
 
-        let alloc = allocate(&g, &live, 7, 6, &Default::default());
+        let alloc = allocate(&g, &live, 7, 6, 7, 6, &Default::default());
         assert_interference_free(&g, &live, &alloc);
 
         // The merge phi must be correctly reconciled from *both* predecessors:
@@ -1142,7 +1228,7 @@ mod tests {
         .expect("loop builds");
         let live = liveness::analyze(&g, &Default::default(), &Default::default());
 
-        let alloc = allocate(&g, &live, 7, 6, &Default::default());
+        let alloc = allocate(&g, &live, 7, 6, 7, 6, &Default::default());
         assert_interference_free(&g, &live, &alloc);
 
         // The loop has header phis (i and acc); the back edge must carry phi
@@ -1207,7 +1293,7 @@ mod tests {
         .expect("loop builds");
         let live = liveness::analyze(&g, &Default::default(), &Default::default());
 
-        let alloc = allocate(&g, &live, 1, 6, &Default::default());
+        let alloc = allocate(&g, &live, 1, 6, 1, 6, &Default::default());
         assert_interference_free(&g, &live, &alloc);
         assert!(
             alloc.spill_slots >= 1,

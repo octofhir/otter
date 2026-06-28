@@ -2721,11 +2721,12 @@ mod arm64 {
                         threw,
                     )?;
                     dynasm!(ops ; .arch aarch64 ; =>done);
-                    let resume = call_resume_frames.get(&nid).unwrap_or(point);
-                    emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
+                    // No frame reload: every value live across the call was pinned
+                    // to a callee-saved register (or spilled) by the allocator, so
+                    // the recursion preserved it. Only the call result needs to be
+                    // pulled from the callee's window slot into its home.
                     if value_is_used_after(graph, call_resume_frames, nid)
                         && let Some(loc) = dst
-                        && !resume.registers.iter().any(|&(r, _)| r == dst_reg)
                     {
                         let off = u32::from(dst_reg) * 8;
                         dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
@@ -3331,7 +3332,15 @@ mod tests {
         let deopt_uses = deopt::deopt_value_uses(&live_uses);
         let block_deopts = deopt::capture_deopt_terminators(&g, &bcl);
         let live = liveness::analyze(&g, &deopt_uses, &block_deopts);
-        let alloc = regalloc::allocate(&g, &live, super::GP_REGS, super::FP_REGS, &deopt_uses);
+        let alloc = regalloc::allocate(
+            &g,
+            &live,
+            super::GP_REGS,
+            super::FP_REGS,
+            super::CALLER_SAVED_GP,
+            super::CALLER_SAVED_FP,
+            &deopt_uses,
+        );
         let osr = deopt::capture_osr_entries(&g, &bcl);
         let code = super::emit(
             v,

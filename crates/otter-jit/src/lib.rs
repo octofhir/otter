@@ -70,10 +70,24 @@ impl otter_vm::JitCompilerHook for BaselineJitCompiler {
         // baseline template tier, which serves the broader opcode surface.
         match optimizing::compile(&request.function, osr_pc) {
             Ok(code) => {
-                if trace {
-                    eprintln!("[otter-jit] optimizing tier compiled fid {fid} osr={osr_pc:?}");
+                // A function-entry compile (`osr_pc == None`) that came back
+                // OSR-only has no runnable PC-0 entry — it bails straight to the
+                // interpreter — so serving it on the direct-call path would run
+                // the whole function interpreted. Fall through to the baseline
+                // whole-function body instead; the hot loop still tiers up
+                // through its own `osr_pc = Some(..)` compile cached separately.
+                // OSR requests keep the optimizing code.
+                if osr_pc.is_some() || !code.osr_only() {
+                    if trace {
+                        eprintln!("[otter-jit] optimizing tier compiled fid {fid} osr={osr_pc:?}");
+                    }
+                    return Ok(otter_vm::JitCompileStatus::Compiled { code });
                 }
-                return Ok(otter_vm::JitCompileStatus::Compiled { code });
+                if trace {
+                    eprintln!(
+                        "[otter-jit] optimizing fid {fid} osr-only at entry; using baseline body"
+                    );
+                }
             }
             Err(reason) => {
                 if trace {

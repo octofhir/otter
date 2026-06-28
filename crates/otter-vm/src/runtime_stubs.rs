@@ -73,13 +73,13 @@ impl LeafNoAllocStub2 {
     }
 }
 
-/// Machine-callable fixed three-value allocating runtime stub entry shape.
+/// Machine-callable fixed-value allocating runtime stub entry shape.
 ///
 /// Generated code supplies the VM-native allocation/rooting context separately
 /// from the raw `Value` arguments:
 /// `(alloc_ctx, safepoint_id, receiver_bits, arg0_bits, arg1_bits)`.
 /// `safepoint_id` must identify a precise map for the current call site.
-pub type AllocStub3Fn = extern "C" fn(
+pub type AllocValueStubFn = extern "C" fn(
     *mut RuntimeStubAllocContext,
     SafepointId,
     u64,
@@ -87,7 +87,7 @@ pub type AllocStub3Fn = extern "C" fn(
     u64,
 ) -> RuntimeStubResultPair;
 
-/// Fixed three-value allocating runtime stub descriptor.
+/// Fixed-value allocating runtime stub descriptor.
 ///
 /// Generated code supplies the VM-native allocation/rooting context separately
 /// from the raw `Value` arguments:
@@ -96,12 +96,12 @@ pub type AllocStub3Fn = extern "C" fn(
 /// scaffold intentionally carries no Rust entrypoint yet; calling these stubs
 /// before the frame/safepoint publisher exists would be unsound for moving GC.
 #[derive(Clone, Copy)]
-pub struct AllocStub3 {
+pub struct AllocValueStub {
     /// Passive descriptor shared with profiler/JIT metadata.
     pub descriptor: RuntimeStubDescriptor,
 }
 
-impl AllocStub3 {
+impl AllocValueStub {
     /// `true` when descriptor metadata matches this callable ABI shape for a
     /// concrete allocating call site.
     #[must_use]
@@ -240,12 +240,12 @@ pub const COLLECTION_SET_HAS_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
 };
 
 /// ABI descriptor for `Map.prototype.set` collection mutation.
-pub const COLLECTION_MAP_SET_ALLOC: AllocStub3 = AllocStub3 {
+pub const COLLECTION_MAP_SET_ALLOC: AllocValueStub = AllocValueStub {
     descriptor: STUB_COLLECTION_MAP_SET_ALLOC,
 };
 
 /// ABI descriptor for `Set.prototype.add` collection mutation.
-pub const COLLECTION_SET_ADD_ALLOC: AllocStub3 = AllocStub3 {
+pub const COLLECTION_SET_ADD_ALLOC: AllocValueStub = AllocValueStub {
     descriptor: STUB_COLLECTION_SET_ADD_ALLOC,
 };
 
@@ -260,9 +260,9 @@ pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocS
     }
 }
 
-/// Resolve a fixed three-value allocating stub descriptor by ABI descriptor id.
+/// Resolve a fixed-value allocating stub descriptor by ABI descriptor id.
 #[must_use]
-pub const fn alloc_stub3_by_id(id: RuntimeStubId) -> Option<AllocStub3> {
+pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub> {
     match id {
         id if id == STUB_COLLECTION_MAP_SET_ALLOC.id => Some(COLLECTION_MAP_SET_ALLOC),
         id if id == STUB_COLLECTION_SET_ADD_ALLOC.id => Some(COLLECTION_SET_ADD_ALLOC),
@@ -441,18 +441,18 @@ mod tests {
         assert!(!COLLECTION_SET_ADD_ALLOC.is_valid_for_safepoint(NO_SAFEPOINT));
         assert!(COLLECTION_SET_ADD_ALLOC.is_valid_for_safepoint(1));
         assert_eq!(
-            alloc_stub3_by_id(STUB_COLLECTION_MAP_SET_ALLOC.id).map(|stub| stub.descriptor),
+            alloc_value_stub_by_id(STUB_COLLECTION_MAP_SET_ALLOC.id).map(|stub| stub.descriptor),
             Some(STUB_COLLECTION_MAP_SET_ALLOC)
         );
         assert_eq!(
-            alloc_stub3_by_id(STUB_COLLECTION_SET_ADD_ALLOC.id).map(|stub| stub.descriptor),
+            alloc_value_stub_by_id(STUB_COLLECTION_SET_ADD_ALLOC.id).map(|stub| stub.descriptor),
             Some(STUB_COLLECTION_SET_ADD_ALLOC)
         );
-        assert!(alloc_stub3_by_id(u32::MAX).is_none());
+        assert!(alloc_value_stub_by_id(u32::MAX).is_none());
     }
 
     #[test]
-    fn alloc_stub3_fn_uses_alloc_context_and_pair_result() {
+    fn alloc_value_stub_fn_uses_alloc_context_and_pair_result() {
         extern "C" fn probe(
             ctx: *mut RuntimeStubAllocContext,
             safepoint: SafepointId,
@@ -467,7 +467,7 @@ mod tests {
             RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(recv_bits))
         }
 
-        let entry: AllocStub3Fn = probe;
+        let entry: AllocValueStubFn = probe;
         let mut slots = [Value::undefined().to_abi_bits()];
         let mut ctx = RuntimeStubAllocContext::new(
             std::ptr::null_mut(),

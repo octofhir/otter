@@ -3512,7 +3512,7 @@ impl Interpreter {
             else {
                 continue;
             };
-            if !crate::runtime_stubs::alloc_stub3_by_id(feedback.alloc_stub_id)
+            if !crate::runtime_stubs::alloc_value_stub_by_id(feedback.alloc_stub_id)
                 .is_some_and(|stub| stub.is_valid_for_safepoint(safepoint_id))
             {
                 continue;

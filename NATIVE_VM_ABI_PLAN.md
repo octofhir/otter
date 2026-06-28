@@ -309,8 +309,8 @@ as tagged frame-slot roots, matching the current rooted frame model while leavin
 finer liveness/register/spill maps for a later slice. The allocating-stub call
 packet is also explicit now: `RuntimeStubAllocContext` carries only erased
 VM/stack/context pointers, the current frame index, and the raw tagged frame-slot
-window. The fixed `AllocStub3Fn` shape takes this context plus a safepoint id and
-three raw `Value` arguments, still without exposing or constructing a generic
+window. The fixed `AllocValueStubFn` shape takes this context plus a safepoint id
+and raw `Value` arguments, still without exposing or constructing a generic
 `NativeCtx`. `runtime_stubs` can now validate and publish an allocating
 safepoint backed by that frame-slot window through `AllocSafepointFrameRoots`,
 rejecting unsupported register/spill maps until native frame locations are
@@ -412,7 +412,7 @@ Exit criteria:
 - [x] JIT-readable collection method IC leaf guards.
 - [x] AllocStub descriptor/call-shape scaffold for `Map.set` / `Set.add`.
 - [x] Baseline frame-slot safepoint records for collection `AllocStub` sites.
-- [x] Explicit `RuntimeStubAllocContext` and `AllocStub3Fn` ABI shape.
+- [x] Explicit `RuntimeStubAllocContext` and `AllocValueStubFn` ABI shape.
 - [x] Frame-slot root publisher for `AllocStub` safepoints.
 - [ ] First `AllocStub` runtime stub with GC-stress coverage.
 - [ ] JIT call path to stubs without `NativeCtx`.
@@ -499,7 +499,7 @@ Touched surface: runtime stubs, GC safepoint ABI metadata, and JIT/runtime ABI.
 descriptors with stable runtime stub ids and a fixed machine-call value shape:
 `receiver`, `arg0`, `arg1_or_undefined`. The descriptor layer enforces that
 allocating stubs cannot be validated with `NO_SAFEPOINT`, and `runtime_stubs`
-exposes an `AllocStub3` resolver record without an executable entrypoint. This
+exposes an `AllocValueStub` resolver record without an executable entrypoint. This
 keeps the architecture moving without introducing an unsafe mutation fast path
 before compiled frames can publish exact roots.
 
@@ -534,7 +534,7 @@ Touched surface: runtime stubs, GC safepoint ABI metadata, and JIT/runtime ABI.
 runtime stubs. It carries the erased VM reentry pointers, current frame index,
 and raw tagged frame-slot window, giving a future stub enough information to
 publish/update roots through the safepoint map without constructing `NativeCtx`.
-`runtime_stubs` now names the concrete `AllocStub3Fn` entry shape:
+`runtime_stubs` now names the concrete `AllocValueStubFn` entry shape:
 `(alloc_ctx, safepoint_id, receiver_bits, arg0_bits, arg1_bits) ->
 RuntimeStubResultPair`.
 
@@ -555,5 +555,5 @@ stub ABI root/update live frame values through safepoint metadata without
 constructing `NativeCtx`.
 
 This is still not an executable `Map.set` / `Set.add` fast path. The next slice
-should use this publisher inside the concrete collection `AllocStub3` entries,
+should use this publisher inside the concrete collection `AllocValueStub` entries,
 then add GC-stress coverage before baseline machine code starts calling them.

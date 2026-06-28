@@ -398,6 +398,19 @@ pub const STUB_COLLECTION_SET_DELETE_ALLOC: RuntimeStubDescriptor = RuntimeStubD
     argument_count: 3,
 };
 
+/// Allocating primitive string-concat stub for `+`.
+///
+/// Uses the uniform three-value ABI shape `(lhs, rhs, unused)`. It is only
+/// valid when at least one operand is already a primitive string and no
+/// observable `ToPrimitive` work is needed; other cases miss to the full
+/// bytecode delegate.
+pub const STUB_STRING_CONCAT_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
+    id: 17,
+    name: "string_concat_alloc",
+    class: RuntimeStubClass::Alloc,
+    argument_count: 3,
+};
+
 /// Status code returned by a runtime stub.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -705,6 +718,11 @@ mod tests {
             STUB_COLLECTION_SET_DELETE_ALLOC,
             9
         ));
+        assert!(!validate_stub_descriptor(
+            STUB_STRING_CONCAT_ALLOC,
+            NO_SAFEPOINT
+        ));
+        assert!(validate_stub_descriptor(STUB_STRING_CONCAT_ALLOC, 9));
     }
 
     #[test]

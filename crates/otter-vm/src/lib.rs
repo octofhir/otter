@@ -202,8 +202,8 @@ pub use native_abi::{
     STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC,
     STUB_COLLECTION_SET_HAS_LEAF, STUB_JIT_PREPARE_DIRECT_CALL,
     STUB_JIT_PREPARE_DIRECT_METHOD_CALL, STUB_JIT_PROPERTY_FALLBACK, STUB_JIT_RUNTIME_CALL,
-    STUB_JIT_RUNTIME_CALL_METHOD, SafepointId, SafepointRecord, TaggedLocation, TaggedLocationKind,
-    VARIADIC_STUB_ARGUMENTS, validate_stub_descriptor,
+    STUB_JIT_RUNTIME_CALL_METHOD, STUB_STRING_CONCAT_ALLOC, SafepointId, SafepointRecord,
+    TaggedLocation, TaggedLocationKind, VARIADIC_STUB_ARGUMENTS, validate_stub_descriptor,
 };
 pub use native_function::{
     NativeCall, NativeError, NativeFastFn, NativeFn, NativeFunction, VmIntrinsicFunction,
@@ -2096,9 +2096,12 @@ impl Interpreter {
         function: &crate::executable::ExecutableFunction,
         code: &dyn jit::JitFunctionCode,
     ) -> Option<jit::JitDirectCallPlan> {
+        let (safepoint_records, safepoint_count) = code.safepoint_table();
         Some(jit::JitDirectCallPlan {
             function_id: function.id,
             entry_addr: code.entry_addr()?,
+            safepoint_records,
+            safepoint_count,
             param_count: function.param_count,
             register_count: function.register_count,
         })
@@ -2199,6 +2202,8 @@ impl Interpreter {
         Ok(jit::JitPreparedDirectCall {
             entry_addr: plan.entry_addr,
             regs: frame_desc.value_slots().as_mut_ptr().cast::<u64>(),
+            safepoint_records: plan.safepoint_records,
+            safepoint_count: plan.safepoint_count,
             self_closure: self_closure_bits,
             this_value: this_bits,
             frame_index: frame_desc.index(),

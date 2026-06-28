@@ -28,8 +28,8 @@ use crate::native_abi::{
     RuntimeStubResultPair, STUB_COLLECTION_MAP_DELETE_ALLOC, STUB_COLLECTION_MAP_GET_ALLOC,
     STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_ALLOC, STUB_COLLECTION_MAP_HAS_LEAF,
     STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_DELETE_ALLOC,
-    STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF, SafepointId, SafepointRecord,
-    TaggedLocationKind, validate_stub_descriptor,
+    STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF, STUB_STRING_CONCAT_ALLOC,
+    SafepointId, SafepointRecord, TaggedLocationKind, validate_stub_descriptor,
 };
 use crate::{Interpreter, Value, collections};
 use std::cell::UnsafeCell;
@@ -385,6 +385,12 @@ pub const COLLECTION_SET_DELETE_ALLOC: AllocValueStub = AllocValueStub {
     entry: Some(collection_set_delete_alloc),
 };
 
+/// ABI descriptor for primitive string concatenation.
+pub const STRING_CONCAT_ALLOC: AllocValueStub = AllocValueStub {
+    descriptor: STUB_STRING_CONCAT_ALLOC,
+    entry: Some(string_concat_alloc),
+};
+
 /// Resolve a fixed two-argument leaf/no-allocation stub by ABI descriptor id.
 #[must_use]
 pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocStub2> {
@@ -407,6 +413,7 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
         id if id == STUB_COLLECTION_SET_HAS_ALLOC.id => Some(COLLECTION_SET_HAS_ALLOC),
         id if id == STUB_COLLECTION_MAP_DELETE_ALLOC.id => Some(COLLECTION_MAP_DELETE_ALLOC),
         id if id == STUB_COLLECTION_SET_DELETE_ALLOC.id => Some(COLLECTION_SET_DELETE_ALLOC),
+        id if id == STUB_STRING_CONCAT_ALLOC.id => Some(STRING_CONCAT_ALLOC),
         _ => None,
     }
 }
@@ -583,6 +590,24 @@ pub extern "C" fn collection_set_delete_alloc(
         safepoint,
         recv_bits,
         value_bits,
+        unused_bits,
+    ))
+}
+
+/// Allocating primitive string-concat stub for `+`.
+#[must_use]
+pub extern "C" fn string_concat_alloc(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    lhs_bits: u64,
+    rhs_bits: u64,
+    unused_bits: u64,
+) -> RuntimeStubResultPair {
+    RuntimeStubResultPair::from_result(string_concat_alloc_inner(
+        ctx,
+        safepoint,
+        lhs_bits,
+        rhs_bits,
         unused_bits,
     ))
 }
@@ -1015,6 +1040,58 @@ fn collection_set_delete_alloc_inner(
     result
 }
 
+fn string_concat_alloc_inner(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    lhs_bits: u64,
+    rhs_bits: u64,
+    unused_bits: u64,
+) -> RuntimeStubResult {
+    let Some(ctx) = alloc_context_mut(ctx) else {
+        return RuntimeStubResult::miss();
+    };
+    let Some(interp) = interpreter_mut(ctx.vm) else {
+        return RuntimeStubResult::miss();
+    };
+    // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
+    // table and frame-slot window must remain live for this call.
+    let Ok(roots) = (unsafe {
+        alloc_value_stub_call_roots(
+            ctx,
+            safepoint,
+            [
+                Value::from_abi_bits(lhs_bits),
+                Value::from_abi_bits(rhs_bits),
+                Value::from_abi_bits(unused_bits),
+            ],
+        )
+    }) else {
+        return RuntimeStubResult::miss();
+    };
+    let depth = interp
+        .gc_heap
+        .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    let result = (|| {
+        let lhs = roots.value(0);
+        let rhs = roots.value(1);
+        if lhs.as_string(&interp.gc_heap).is_none() && rhs.as_string(&interp.gc_heap).is_none() {
+            return RuntimeStubResult::miss();
+        }
+        let Ok(lhs_string) = interp.js_string_for_concat(lhs) else {
+            return RuntimeStubResult::miss();
+        };
+        let Ok(rhs_string) = interp.js_string_for_concat(rhs) else {
+            return RuntimeStubResult::miss();
+        };
+        match crate::string::JsString::concat(lhs_string, rhs_string, &mut interp.gc_heap) {
+            Ok(result) => RuntimeStubResult::ok_value(Value::string(result)),
+            Err(_) => RuntimeStubResult::out_of_memory(),
+        }
+    })();
+    interp.gc_heap.pop_extra_roots_to(depth - 1);
+    result
+}
+
 fn heap_ref(heap: *const otter_gc::GcHeap) -> Option<&'static otter_gc::GcHeap> {
     if heap.is_null() {
         return None;
@@ -1122,6 +1199,10 @@ mod tests {
         assert!(COLLECTION_SET_DELETE_ALLOC.is_valid_for_safepoint(1));
         assert!(COLLECTION_SET_DELETE_ALLOC.has_entry());
         assert!(COLLECTION_SET_DELETE_ALLOC.entry_addr().is_some());
+        assert!(!STRING_CONCAT_ALLOC.is_valid_for_safepoint(NO_SAFEPOINT));
+        assert!(STRING_CONCAT_ALLOC.is_valid_for_safepoint(1));
+        assert!(STRING_CONCAT_ALLOC.has_entry());
+        assert!(STRING_CONCAT_ALLOC.entry_addr().is_some());
         assert_eq!(
             alloc_value_stub_by_id(STUB_COLLECTION_MAP_SET_ALLOC.id).map(|stub| stub.descriptor),
             Some(STUB_COLLECTION_MAP_SET_ALLOC)
@@ -1149,6 +1230,10 @@ mod tests {
         assert_eq!(
             alloc_value_stub_by_id(STUB_COLLECTION_SET_DELETE_ALLOC.id).map(|stub| stub.descriptor),
             Some(STUB_COLLECTION_SET_DELETE_ALLOC)
+        );
+        assert_eq!(
+            alloc_value_stub_by_id(STUB_STRING_CONCAT_ALLOC.id).map(|stub| stub.descriptor),
+            Some(STUB_STRING_CONCAT_ALLOC)
         );
         assert!(alloc_value_stub_by_id(u32::MAX).is_none());
     }
@@ -1430,6 +1515,47 @@ mod tests {
             interp.gc_heap_mut(),
             &Value::string(value)
         ));
+    }
+
+    #[test]
+    fn string_concat_alloc_entry_concats_primitive_string_operands() {
+        let mut interp = Interpreter::new();
+        let lhs = crate::string::JsString::from_str("k", interp.gc_heap_mut()).expect("lhs");
+        let safepoints = [SafepointRecord::frame_slot_window(24, NO_FRAME_STATE, 3)];
+        let mut slots = [
+            Value::string(lhs).to_abi_bits(),
+            n(7).to_abi_bits(),
+            Value::undefined().to_abi_bits(),
+        ];
+        let mut ctx = RuntimeStubAllocContext::new(
+            (&mut interp as *mut Interpreter).cast(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            safepoints.as_ptr(),
+            safepoints.len() as u32,
+            0,
+            slots.as_mut_ptr(),
+            slots.len() as u16,
+        );
+
+        let pair = STRING_CONCAT_ALLOC
+            .invoke_raw(&mut ctx, 24, slots[0], slots[1], slots[2])
+            .expect("entry");
+        assert_eq!(pair.status(), RuntimeStubStatus::Ok);
+        let value = pair.into_result().into_value().expect("string");
+        let string = value.as_string(interp.gc_heap()).expect("string value");
+        assert_eq!(string.to_lossy_string(interp.gc_heap()), "k7");
+
+        let pair = STRING_CONCAT_ALLOC
+            .invoke_raw(
+                &mut ctx,
+                24,
+                n(1).to_abi_bits(),
+                n(2).to_abi_bits(),
+                slots[2],
+            )
+            .expect("entry");
+        assert_eq!(pair.status(), RuntimeStubStatus::Miss);
     }
 
     #[test]

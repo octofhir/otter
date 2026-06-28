@@ -264,6 +264,10 @@ pub struct JitDirectCallPlan {
     pub function_id: u32,
     /// Raw compiled entry address.
     pub entry_addr: usize,
+    /// Base of the callee function's safepoint records.
+    pub safepoint_records: *const crate::native_abi::SafepointRecord,
+    /// Number of records starting at [`Self::safepoint_records`].
+    pub safepoint_count: u32,
     /// Number of formal parameter registers.
     pub param_count: u16,
     /// Total callee register-window length.
@@ -283,6 +287,10 @@ pub struct JitPreparedDirectCall {
     pub entry_addr: usize,
     /// Callee register-window base.
     pub regs: *mut u64,
+    /// Base of the callee function's safepoint records.
+    pub safepoint_records: *const crate::native_abi::SafepointRecord,
+    /// Number of records starting at [`Self::safepoint_records`].
+    pub safepoint_count: u32,
     /// Boxed SELF closure bits for the callee context.
     pub self_closure: u64,
     /// Boxed `this` bits for the callee context.
@@ -512,6 +520,13 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// object is installed in the VM JIT code table.
     fn entry_addr(&self) -> Option<usize> {
         None
+    }
+
+    /// Safepoint table for compiled code that can call allocating runtime
+    /// stubs. Tiers without a published VM-native safepoint contract return an
+    /// empty table and must not emit allocating stub calls.
+    fn safepoint_table(&self) -> (*const crate::native_abi::SafepointRecord, u32) {
+        (std::ptr::null(), 0)
     }
 
     /// Execute the compiled function for the frame at `ptrs.frame_index`.

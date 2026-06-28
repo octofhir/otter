@@ -354,7 +354,7 @@ Exit criteria:
 
 ### Phase 3: Compiled loop owns Map/Set and string concat fast paths
 
-Status: not started.
+Status: in progress.
 
 Tasks:
 
@@ -366,6 +366,21 @@ Tasks:
   allocation fast path and deopt fallback;
 - OSR into loops containing these nodes;
 - invalidate on prototype/method/global dependency changes.
+
+Current baseline slice:
+
+- `CallMethodValue` for guarded Map/Set sites can call executable
+  `AllocValueStub` entries without constructing `NativeCtx`;
+- `Map.set`, `Set.add`, `Map.get`, `Map.has`, `Set.has`, `Map.delete`, and
+  `Set.delete` have VM-side allocating stub entries with explicit safepoint
+  root publication;
+- `Op::Add` has a conservative baseline `string_concat_alloc` stub for the
+  primitive string case, so hot `"k" + int` style code can avoid the generic
+  interpreter delegate when no observable object coercion is required. Object
+  operands still miss and fall through to the existing semantic fallback.
+- compiled-to-compiled direct calls now carry the callee's safepoint table into
+  the nested `JitCtx`, so allocating stubs inside direct callees resolve their
+  own safepoint ids rather than the caller's table.
 
 Exit criteria:
 
@@ -430,11 +445,12 @@ Exit criteria:
 - [x] Executable-entry slot on generic `AllocValueStub` ABI records.
 - [x] First VM-side executable `AllocStub` runtime stub.
 - [x] Moving-GC coverage for executable `AllocStub` roots.
-- [ ] JIT call path to stubs without `NativeCtx`.
+- [x] JIT call path to stubs without `NativeCtx`.
 - [x] Map/Set feedback model for leaf lookup stubs.
 - [x] Compiled `Map.get` / `Map.has` hot loop.
-- [ ] Compiled `Map.set` / `Set.add` hot loop.
+- [x] Compiled `Map.set` / `Set.add` hot loop.
 - [ ] String concat specialized node.
+- [x] Baseline primitive string concat `AllocValueStub`.
 - [ ] Shared object header design.
 - [ ] Map/Set migration to shared object header.
 - [ ] Interpreter quickening and block/backedge metering.

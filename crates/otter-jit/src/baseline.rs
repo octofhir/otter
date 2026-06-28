@@ -130,6 +130,10 @@ pub struct JitCtx {
     direct_entry_addr: usize,
     /// Prepared direct-call callee register base.
     direct_regs: *mut u64,
+    /// Prepared direct-call callee safepoint table.
+    direct_safepoint_records: *const SafepointRecord,
+    /// Prepared direct-call callee safepoint count.
+    direct_safepoint_count: u32,
     /// Prepared direct-call callee SELF bits.
     direct_self_closure: u64,
     /// Prepared direct-call callee `this` bits.
@@ -227,6 +231,10 @@ pub(crate) const UPVALUE_CELL_SIZE: u32 = 4;
 pub(crate) const UPVALUE_VALUE_OFFSET: u32 = 8;
 pub(crate) const DIRECT_ENTRY_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_entry_addr) as u32;
 pub(crate) const DIRECT_REGS_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_regs) as u32;
+pub(crate) const DIRECT_SAFEPOINT_RECORDS_OFFSET: u32 =
+    std::mem::offset_of!(JitCtx, direct_safepoint_records) as u32;
+pub(crate) const DIRECT_SAFEPOINT_COUNT_OFFSET: u32 =
+    std::mem::offset_of!(JitCtx, direct_safepoint_count) as u32;
 pub(crate) const DIRECT_SELF_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_self_closure) as u32;
 pub(crate) const DIRECT_THIS_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_this_value) as u32;
 /// Byte offset of the precomputed `this` bits in [`JitCtx`], for inline
@@ -274,6 +282,8 @@ pub(crate) extern "C" fn jit_prepare_direct_call_stub(
         Ok(Some(prepared)) => {
             ctx.direct_entry_addr = prepared.entry_addr;
             ctx.direct_regs = prepared.regs;
+            ctx.direct_safepoint_records = prepared.safepoint_records;
+            ctx.direct_safepoint_count = prepared.safepoint_count;
             ctx.direct_self_closure = prepared.self_closure;
             ctx.direct_this_value = prepared.this_value;
             ctx.direct_frame_index = prepared.frame_index;
@@ -342,6 +352,8 @@ pub(crate) extern "C" fn jit_prepare_direct_method_call_stub(
         Ok(Some(prepared)) => {
             ctx.direct_entry_addr = prepared.entry_addr;
             ctx.direct_regs = prepared.regs;
+            ctx.direct_safepoint_records = prepared.safepoint_records;
+            ctx.direct_safepoint_count = prepared.safepoint_count;
             ctx.direct_self_closure = prepared.self_closure;
             ctx.direct_this_value = prepared.this_value;
             ctx.direct_frame_index = prepared.frame_index;
@@ -1104,6 +1116,13 @@ impl JitFunctionCode for BaselineCode {
         Some(unsafe { self.code.entry_ptr() as usize })
     }
 
+    fn safepoint_table(&self) -> (*const SafepointRecord, u32) {
+        (
+            self.safepoint_records.as_ptr(),
+            self.safepoint_records.len() as u32,
+        )
+    }
+
     fn run_entry(&self, ptrs: JitReentryPtrs) -> JitExecOutcome {
         // SAFETY: the mapping is live and the main entry was emitted with the
         // `JitEntry` ABI.
@@ -1194,6 +1213,8 @@ pub(crate) unsafe fn enter_compiled(
             error: &mut error,
             direct_entry_addr: 0,
             direct_regs: std::ptr::null_mut(),
+            direct_safepoint_records: std::ptr::null(),
+            direct_safepoint_count: 0,
             direct_self_closure: 0,
             direct_this_value: 0,
             direct_frame_index: 0,
@@ -1237,7 +1258,8 @@ mod arm64 {
         ALLOC_CTX_SAFEPOINT_COUNT_OFFSET, ALLOC_CTX_SAFEPOINT_RECORDS_OFFSET,
         ALLOC_CTX_STACK_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_VM_OFFSET,
         ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET, BAIL_PC_OFFSET, BaselineCode, CONTEXT_OFFSET,
-        DIRECT_ENTRY_OFFSET, DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET,
+        DIRECT_ENTRY_OFFSET, DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET,
+        DIRECT_SAFEPOINT_COUNT_OFFSET, DIRECT_SAFEPOINT_RECORDS_OFFSET, DIRECT_SELF_OFFSET,
         DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET,
         GC_HEAP_OFFSET, IC_WAYS, JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS,
         OBJECT_BODY_TYPE_TAG, Op, Operand, REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET,
@@ -1260,7 +1282,8 @@ mod arm64 {
     use otter_vm::Interpreter;
     use otter_vm::{
         JitCollectionAllocMethod, JitCollectionLeafMethod, JitFunctionView, JitInlineCallee,
-        JitInlineMethod, JitTypedArrayLayout, STUB_COLLECTION_SET_ADD_ALLOC,
+        JitInlineMethod, JitTypedArrayLayout, NO_FRAME_STATE, STUB_COLLECTION_SET_ADD_ALLOC,
+        STUB_STRING_CONCAT_ALLOC, SafepointId, SafepointRecord,
         runtime_stubs::alloc_value_stub_by_id,
     };
     use std::collections::{BTreeMap, BTreeSet};
@@ -1413,6 +1436,8 @@ mod arm64 {
     fn emit_add_with_runtime_fallback(
         ops: &mut Assembler,
         operands: &[Operand],
+        string_concat_safepoint: Option<SafepointId>,
+        register_count: u16,
         byte_pc: u32,
         function_id: u32,
         threw: DynamicLabel,
@@ -1422,6 +1447,7 @@ mod arm64 {
         load_reg(ops, 10, rhs)?;
         let float_path = ops.new_dynamic_label();
         let runtime_path = ops.new_dynamic_label();
+        let delegate_path = ops.new_dynamic_label();
         let done = ops.new_dynamic_label();
         dynasm!(ops
             ; .arch aarch64
@@ -1443,11 +1469,82 @@ mod arm64 {
         dynasm!(ops ; .arch aarch64 ; fadd d2, d0, d1);
         emit_box_double(ops, 2, 13);
         store_reg(ops, 13, dst)?;
-        dynasm!(ops ; .arch aarch64 ; b =>done ; =>runtime_path ; mov x0, x20);
+        dynasm!(ops ; .arch aarch64 ; b =>done ; =>runtime_path);
+        if let Some(safepoint) = string_concat_safepoint {
+            emit_string_concat_alloc_call(
+                ops,
+                dst,
+                lhs,
+                rhs,
+                safepoint,
+                register_count,
+                delegate_path,
+                done,
+            )?;
+        }
+        dynasm!(ops ; .arch aarch64 ; =>delegate_path ; mov x0, x20);
         emit_load_u64(ops, 1, u64::from(byte_pc));
         emit_load_u64(ops, 2, u64::from(function_id));
         emit_call_stub(ops, jit_delegate_op_stub as *const () as usize, threw);
         dynasm!(ops ; .arch aarch64 ; =>done);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_string_concat_alloc_call(
+        ops: &mut Assembler,
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+        safepoint: SafepointId,
+        register_count: u16,
+        miss: DynamicLabel,
+        done: DynamicLabel,
+    ) -> Result<(), Unsupported> {
+        let Some(stub_addr) =
+            alloc_value_stub_by_id(STUB_STRING_CONCAT_ALLOC.id).and_then(|stub| stub.entry_addr())
+        else {
+            return Ok(());
+        };
+        let undefined_bits = TAG_SPECIAL << 48;
+        dynasm!(ops
+            ; .arch aarch64
+            ; sub sp, sp, ALLOC_CTX_STACK_SIZE
+            ; ldr x9, [x20, VM_OFFSET]
+            ; str x9, [sp, ALLOC_CTX_VM_OFFSET]
+            ; ldr x9, [x20, STACK_OFFSET]
+            ; str x9, [sp, ALLOC_CTX_STACK_OFFSET]
+            ; ldr x9, [x20, CONTEXT_OFFSET]
+            ; str x9, [sp, ALLOC_CTX_CONTEXT_OFFSET]
+            ; ldr x9, [x20, SAFEPOINT_RECORDS_OFFSET]
+            ; str x9, [sp, ALLOC_CTX_SAFEPOINT_RECORDS_OFFSET]
+            ; ldr w9, [x20, SAFEPOINT_COUNT_OFFSET]
+            ; str w9, [sp, ALLOC_CTX_SAFEPOINT_COUNT_OFFSET]
+            ; str wzr, [sp, ALLOC_CTX_RESERVED0_OFFSET]
+            ; ldr x9, [x20, FRAME_INDEX_OFFSET]
+            ; str x9, [sp, ALLOC_CTX_FRAME_INDEX_OFFSET]
+            ; str x19, [sp, ALLOC_CTX_FRAME_SLOTS_OFFSET]
+            ; movz w9, register_count as u32
+            ; strh w9, [sp, ALLOC_CTX_FRAME_SLOT_COUNT_OFFSET]
+            ; movz w9, #0
+            ; strh w9, [sp, ALLOC_CTX_RESERVED1_OFFSET]
+            ; mov x0, sp
+        );
+        emit_load_u64(ops, 1, u64::from(safepoint));
+        load_reg(ops, 2, lhs)?;
+        load_reg(ops, 3, rhs)?;
+        emit_load_u64(ops, 4, undefined_bits);
+        emit_load_u64(ops, 16, stub_addr as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; and x1, x1, #0xff
+            ; mov x5, x1
+            ; add sp, sp, ALLOC_CTX_STACK_SIZE
+            ; cbnz x5, =>miss
+        );
+        store_reg(ops, 0, dst)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done);
         Ok(())
     }
 
@@ -1850,6 +1947,27 @@ mod arm64 {
         // arm); such code is OSR-only.
         let mut osr_only = false;
 
+        let mut safepoint_records: Vec<_> = view.safepoints.values().cloned().collect();
+        let mut next_safepoint = safepoint_records
+            .iter()
+            .map(|record| record.id)
+            .max()
+            .map_or(1, |id| id.saturating_add(1))
+            .max(1);
+        let mut add_alloc_safepoints: BTreeMap<u32, SafepointId> = BTreeMap::new();
+        for instr in &view.instructions {
+            if instr.op == Op::Add {
+                let safepoint = next_safepoint;
+                next_safepoint = next_safepoint.saturating_add(1);
+                add_alloc_safepoints.insert(instr.byte_pc, safepoint);
+                safepoint_records.push(SafepointRecord::frame_slot_window(
+                    safepoint,
+                    NO_FRAME_STATE,
+                    view.register_count,
+                ));
+            }
+        }
+
         // Loop headers = back-edge targets: the PCs an OSR entry can land on.
         // A branch whose resolved target sits at or before its own PC closes a
         // loop; that target is a basic-block boundary where the interpreter's
@@ -2002,6 +2120,8 @@ mod arm64 {
                 Op::Add => emit_add_with_runtime_fallback(
                     &mut ops,
                     ops_ref,
+                    add_alloc_safepoints.get(&instr.byte_pc).copied(),
+                    view.register_count,
                     instr.byte_pc,
                     view.function_id,
                     threw,
@@ -2876,7 +2996,6 @@ mod arm64 {
             osr_entries.insert(pc, off);
         }
 
-        let mut safepoint_records: Vec<_> = view.safepoints.values().cloned().collect();
         safepoint_records.sort_by_key(|record| record.id);
         let safepoint_records = safepoint_records.into_boxed_slice();
         let buf = ops.finalize().expect("finalize");
@@ -4283,6 +4402,12 @@ mod arm64 {
             ; str x9, [sp, REG_TOP_PTR_OFFSET]
             ; ldr x9, [x20, ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET]
             ; str x9, [sp, ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET]
+            ; ldr x9, [x20, GC_HEAP_OFFSET]
+            ; str x9, [sp, GC_HEAP_OFFSET]
+            ; ldr x9, [x20, DIRECT_SAFEPOINT_RECORDS_OFFSET]
+            ; str x9, [sp, SAFEPOINT_RECORDS_OFFSET]
+            ; ldr w9, [x20, DIRECT_SAFEPOINT_COUNT_OFFSET]
+            ; str w9, [sp, SAFEPOINT_COUNT_OFFSET]
             ; mov x0, sp
             ; ldr x16, [x20, DIRECT_ENTRY_OFFSET]
             ; blr x16
@@ -5402,6 +5527,8 @@ mod tests {
             error: &mut error,
             direct_entry_addr: 0,
             direct_regs: std::ptr::null_mut(),
+            direct_safepoint_records: std::ptr::null(),
+            direct_safepoint_count: 0,
             direct_self_closure: 0,
             direct_this_value: 0,
             direct_frame_index: 0,

@@ -311,17 +311,19 @@ packet is also explicit now: `RuntimeStubAllocContext` carries only erased
 VM/stack/context pointers, the current frame index, and the raw tagged frame-slot
 window. The fixed `AllocValueStubFn` shape takes this context plus a safepoint id
 and raw `Value` arguments, still without exposing or constructing a generic
-`NativeCtx`. `runtime_stubs` can now validate and publish an allocating
-safepoint backed by that frame-slot window through `AllocSafepointFrameRoots`,
-rejecting unsupported register/spill maps until native frame locations are
-publishable. This gives the next executable `Map.set` / `Set.add` stub a
-machine-callable rooting contract without retaining raw untracked values across
-allocation. The allocating value-stub catalog is no longer just passive
-metadata: `AllocValueStub` carries an optional executable entrypoint and common
-entry-address/raw-invoke helpers. Collection mutation stubs remain `entry: None`
-until their GC-stress-covered implementations land, but string/array/property
-allocating stubs can now plug into the same ABI record instead of growing
-per-feature bridge shapes.
+`NativeCtx`. The packet now also names the active function's safepoint-record
+table, so an allocating runtime stub can resolve its `SafepointId` inside the
+machine ABI instead of trusting an out-of-band Rust argument. `runtime_stubs` can
+validate and publish an allocating safepoint backed by that frame-slot window
+through `AllocSafepointFrameRoots`, rejecting unsupported register/spill maps
+until native frame locations are publishable. This gives the next executable
+`Map.set` / `Set.add` stub a machine-callable rooting contract without retaining
+raw untracked values across allocation. The allocating value-stub catalog is no
+longer just passive metadata: `AllocValueStub` carries an optional executable
+entrypoint and common entry-address/raw-invoke helpers. Collection mutation
+stubs remain `entry: None` until their GC-stress-covered implementations land,
+but string/array/property allocating stubs can now plug into the same ABI record
+instead of growing per-feature bridge shapes.
 
 Tasks:
 
@@ -418,6 +420,7 @@ Exit criteria:
 - [x] AllocStub descriptor/call-shape scaffold for `Map.set` / `Set.add`.
 - [x] Baseline frame-slot safepoint records for collection `AllocStub` sites.
 - [x] Explicit `RuntimeStubAllocContext` and `AllocValueStubFn` ABI shape.
+- [x] Safepoint table view in `RuntimeStubAllocContext`.
 - [x] Frame-slot root publisher for `AllocStub` safepoints.
 - [x] Executable-entry slot on generic `AllocValueStub` ABI records.
 - [ ] First `AllocStub` runtime stub with GC-stress coverage.
@@ -575,3 +578,15 @@ allocation ABI engine-wide rather than collection-specific. `Map.set` /
 `Set.add` still advertise no executable entrypoint, so generated code cannot
 accidentally call an allocating fast path before exact-root GC stress coverage
 exists.
+
+### 2026-06-28: AllocStub safepoint table view
+
+Touched surface: runtime stubs, GC safepoint ABI metadata, and JIT/runtime ABI.
+
+`RuntimeStubAllocContext` now carries a raw pointer/count view of the active
+function's `SafepointRecord` table. `runtime_stubs` resolves `SafepointId`
+through that table before publishing frame-slot roots, and reports missing-table,
+`NO_SAFEPOINT`, and unknown-id cases explicitly. This removes the last
+out-of-band Rust assumption from the `AllocValueStub` context packet: executable
+allocating stubs can now consume the same machine ABI shape they will receive
+from baseline code.

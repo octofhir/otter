@@ -142,6 +142,13 @@ impl AllocValueStub {
 pub enum AllocSafepointRootError {
     /// Allocating stubs must name a concrete safepoint.
     NoSafepoint,
+    /// The context packet does not include a safepoint-record table.
+    MissingSafepointRecords,
+    /// The supplied safepoint id is not present in the context table.
+    UnknownSafepoint {
+        /// Requested safepoint id.
+        id: SafepointId,
+    },
     /// The context packet does not include a frame-slot root window.
     MissingFrameSlots,
     /// The safepoint names a root class this frame-window publisher cannot
@@ -159,6 +166,33 @@ pub enum AllocSafepointRootError {
         /// Slot count supplied by the context packet.
         frame_slot_count: u16,
     },
+}
+
+/// Resolve an allocating-stub safepoint id through the context packet table.
+///
+/// # Safety
+///
+/// `ctx.safepoint_records` must point at `ctx.safepoint_count` initialized
+/// [`SafepointRecord`] values that remain alive for the duration of the
+/// allocating stub call.
+pub unsafe fn alloc_safepoint_record(
+    ctx: &RuntimeStubAllocContext,
+    safepoint: SafepointId,
+) -> Result<&SafepointRecord, AllocSafepointRootError> {
+    if safepoint == NO_SAFEPOINT {
+        return Err(AllocSafepointRootError::NoSafepoint);
+    }
+    if !ctx.has_safepoint_records() {
+        return Err(AllocSafepointRootError::MissingSafepointRecords);
+    }
+    // SAFETY: guaranteed by the caller; generated code builds this pointer
+    // from the active function metadata and the stub must not retain it.
+    let records =
+        unsafe { std::slice::from_raw_parts(ctx.safepoint_records, ctx.safepoint_count as usize) };
+    records
+        .iter()
+        .find(|record| record.id == safepoint)
+        .ok_or(AllocSafepointRootError::UnknownSafepoint { id: safepoint })
 }
 
 /// Validate that `safepoint` can be published from `ctx`'s frame-slot window.
@@ -510,6 +544,8 @@ mod tests {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null(),
+            std::ptr::null(),
+            0,
             0,
             slots.as_mut_ptr(),
             slots.len() as u16,
@@ -528,23 +564,31 @@ mod tests {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let map = collections::alloc_map(&mut heap).expect("map");
         let mut slots = [Value::map(map).to_abi_bits(), n(7).to_abi_bits()];
-        let ctx = RuntimeStubAllocContext::new(
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            0,
-            slots.as_mut_ptr(),
-            slots.len() as u16,
-        );
         let safepoint = SafepointRecord {
             id: 12,
             frame_state: NO_FRAME_STATE,
             tagged_locations: vec![TaggedLocation::frame_slot(0), TaggedLocation::frame_slot(1)],
         };
+        let safepoints = [safepoint.clone()];
+        let ctx = RuntimeStubAllocContext::new(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            safepoints.as_ptr(),
+            safepoints.len() as u32,
+            0,
+            slots.as_mut_ptr(),
+            slots.len() as u16,
+        );
 
         assert_eq!(
             validate_alloc_safepoint_frame_roots(&ctx, &safepoint),
             Ok(())
+        );
+        // SAFETY: `safepoints` is alive for the lookup.
+        assert_eq!(
+            unsafe { alloc_safepoint_record(&ctx, 12) },
+            Ok(&safepoints[0])
         );
         // SAFETY: `slots` is a live writable `Value` bit window for the root
         // publisher's full lifetime.
@@ -564,6 +608,8 @@ mod tests {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null(),
+            std::ptr::null(),
+            0,
             0,
             slots.as_mut_ptr(),
             slots.len() as u16,
@@ -577,11 +623,41 @@ mod tests {
             validate_alloc_safepoint_frame_roots(&ctx, &no_safepoint),
             Err(AllocSafepointRootError::NoSafepoint)
         );
+        // SAFETY: the context intentionally names no table, so no pointer is
+        // dereferenced.
+        assert_eq!(
+            unsafe { alloc_safepoint_record(&ctx, 1) },
+            Err(AllocSafepointRootError::MissingSafepointRecords)
+        );
+
+        let safepoints = [SafepointRecord::frame_slot_window(7, NO_FRAME_STATE, 1)];
+        let table_ctx = RuntimeStubAllocContext::new(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            safepoints.as_ptr(),
+            safepoints.len() as u32,
+            0,
+            slots.as_mut_ptr(),
+            slots.len() as u16,
+        );
+        // SAFETY: `safepoints` is alive for the lookup.
+        assert_eq!(
+            unsafe { alloc_safepoint_record(&table_ctx, NO_SAFEPOINT) },
+            Err(AllocSafepointRootError::NoSafepoint)
+        );
+        // SAFETY: `safepoints` is alive for the lookup.
+        assert_eq!(
+            unsafe { alloc_safepoint_record(&table_ctx, 9) },
+            Err(AllocSafepointRootError::UnknownSafepoint { id: 9 })
+        );
 
         let missing_slots_ctx = RuntimeStubAllocContext::new(
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null(),
+            safepoints.as_ptr(),
+            safepoints.len() as u32,
             0,
             std::ptr::null_mut(),
             0,

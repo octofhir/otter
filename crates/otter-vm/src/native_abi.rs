@@ -171,9 +171,10 @@ pub struct RuntimeStubDescriptor {
 ///
 /// This is the fixed machine-call packet for `AllocStub` entries. It is not a
 /// generic native-call context: it contains only the active VM reentry pointers
-/// and the current frame register window that a safepoint map can trace/update.
-/// Generated code builds this packet from its `JitCtx` immediately before an
-/// allocating stub call and must not retain it after the call returns.
+/// the current frame register window that a safepoint map can trace/update, and
+/// the safepoint table for the current compiled function. Generated code builds
+/// this packet from its `JitCtx` immediately before an allocating stub call and
+/// must not retain it after the call returns.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeStubAllocContext {
@@ -183,16 +184,20 @@ pub struct RuntimeStubAllocContext {
     pub stack: *mut std::ffi::c_void,
     /// Erased `*const ExecutionContext`.
     pub context: *const std::ffi::c_void,
+    /// Base of the active function's safepoint records.
+    pub safepoint_records: *const SafepointRecord,
+    /// Number of records starting at [`Self::safepoint_records`].
+    pub safepoint_count: u32,
+    /// Reserved for flags without changing the ABI shape.
+    pub reserved0: u32,
     /// Current frame index within `stack`.
     pub frame_index: usize,
     /// Base of the current frame's tagged register window as raw `Value` bits.
     pub frame_slots: *mut u64,
     /// Number of tagged frame slots starting at [`Self::frame_slots`].
     pub frame_slot_count: u16,
-    /// Reserved for flags without changing the ABI shape.
-    pub reserved0: u16,
     /// Reserved for future safepoint/deopt metadata width.
-    pub reserved1: u32,
+    pub reserved1: u16,
 }
 
 impl RuntimeStubAllocContext {
@@ -202,6 +207,8 @@ impl RuntimeStubAllocContext {
         vm: *mut std::ffi::c_void,
         stack: *mut std::ffi::c_void,
         context: *const std::ffi::c_void,
+        safepoint_records: *const SafepointRecord,
+        safepoint_count: u32,
         frame_index: usize,
         frame_slots: *mut u64,
         frame_slot_count: u16,
@@ -210,10 +217,12 @@ impl RuntimeStubAllocContext {
             vm,
             stack,
             context,
+            safepoint_records,
+            safepoint_count,
+            reserved0: 0,
             frame_index,
             frame_slots,
             frame_slot_count,
-            reserved0: 0,
             reserved1: 0,
         }
     }
@@ -222,6 +231,12 @@ impl RuntimeStubAllocContext {
     #[must_use]
     pub const fn has_frame_slots(self) -> bool {
         !self.frame_slots.is_null() && self.frame_slot_count != 0
+    }
+
+    /// Whether this packet names a concrete safepoint-record table.
+    #[must_use]
+    pub const fn has_safepoint_records(self) -> bool {
+        !self.safepoint_records.is_null() && self.safepoint_count != 0
     }
 }
 
@@ -620,20 +635,28 @@ mod tests {
             std::mem::size_of::<usize>()
         );
         assert!(
+            std::mem::offset_of!(RuntimeStubAllocContext, safepoint_records)
+                > std::mem::offset_of!(RuntimeStubAllocContext, context)
+        );
+        assert!(
             std::mem::offset_of!(RuntimeStubAllocContext, frame_slots)
                 > std::mem::offset_of!(RuntimeStubAllocContext, frame_index)
         );
         let mut slots = [0_u64; 2];
+        let safepoints = [SafepointRecord::frame_slot_window(3, NO_FRAME_STATE, 2)];
         let ctx = RuntimeStubAllocContext::new(
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null(),
+            safepoints.as_ptr(),
+            safepoints.len() as u32,
             7,
             slots.as_mut_ptr(),
             slots.len() as u16,
         );
         assert_eq!(ctx.frame_index, 7);
         assert!(ctx.has_frame_slots());
+        assert!(ctx.has_safepoint_records());
     }
 
     #[test]

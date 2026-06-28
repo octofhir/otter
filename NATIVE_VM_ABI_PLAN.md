@@ -321,9 +321,10 @@ until native frame locations are publishable. This gives the next executable
 raw untracked values across allocation. The allocating value-stub catalog is no
 longer just passive metadata: `AllocValueStub` carries an optional executable
 entrypoint and common entry-address/raw-invoke helpers. Collection mutation
-stubs remain `entry: None` until their GC-stress-covered implementations land,
-but string/array/property allocating stubs can now plug into the same ABI record
-instead of growing per-feature bridge shapes.
+stubs now have VM-side executable entries that consume the same context packet
+and safepoint table that baseline code will pass later; string/array/property
+allocating stubs can plug into the same ABI record instead of growing
+per-feature bridge shapes.
 
 Tasks:
 
@@ -423,7 +424,8 @@ Exit criteria:
 - [x] Safepoint table view in `RuntimeStubAllocContext`.
 - [x] Frame-slot root publisher for `AllocStub` safepoints.
 - [x] Executable-entry slot on generic `AllocValueStub` ABI records.
-- [ ] First `AllocStub` runtime stub with GC-stress coverage.
+- [x] First VM-side executable `AllocStub` runtime stub.
+- [ ] GC-stress coverage for executable `AllocStub` roots.
 - [ ] JIT call path to stubs without `NativeCtx`.
 - [x] Map/Set feedback model for leaf lookup stubs.
 - [x] Compiled `Map.get` / `Map.has` hot loop.
@@ -575,9 +577,9 @@ Touched surface: runtime stubs and JIT/runtime ABI vocabulary.
 descriptor and, when implemented, a machine-callable `AllocValueStubFn`
 entrypoint with shared `entry_addr` / `invoke_raw` helpers. This keeps the
 allocation ABI engine-wide rather than collection-specific. `Map.set` /
-`Set.add` still advertise no executable entrypoint, so generated code cannot
-accidentally call an allocating fast path before exact-root GC stress coverage
-exists.
+At this point `Map.set` / `Set.add` still advertised no executable entrypoint,
+so generated code could not accidentally call an allocating fast path before
+exact-root GC stress coverage existed.
 
 ### 2026-06-28: AllocStub safepoint table view
 
@@ -590,3 +592,19 @@ through that table before publishing frame-slot roots, and reports missing-table
 out-of-band Rust assumption from the `AllocValueStub` context packet: executable
 allocating stubs can now consume the same machine ABI shape they will receive
 from baseline code.
+
+### 2026-06-28: Executable collection AllocValueStub entries
+
+Touched surface: runtime stubs and GC safepoint ABI metadata.
+
+`collection_map_set_alloc` and `collection_set_add_alloc` are now real
+`AllocValueStub` entries. They resolve the safepoint id through
+`RuntimeStubAllocContext`, publish frame-slot roots, root their ABI value copies,
+flatten string keys/values under that root scope, call the existing collection
+mutation helpers, and return the relocated receiver through
+`RuntimeStubResultPair`. Invalid context/safepoint/receiver cases return `Miss`;
+allocation failure returns `OutOfMemory`.
+
+Baseline code still does not call these entries directly. The next required
+slice is GC-stress coverage for the executable root protocol, followed by the
+baseline machine-call path.

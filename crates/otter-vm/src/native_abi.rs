@@ -418,6 +418,16 @@ impl RuntimeStubResult {
         }
     }
 
+    /// Allocation failed while running the stub.
+    #[must_use]
+    pub const fn out_of_memory() -> Self {
+        Self {
+            status: RuntimeStubStatus::OutOfMemory,
+            value_bits: 0,
+            payload: 0,
+        }
+    }
+
     /// Extract the successful boxed VM value.
     #[must_use]
     pub(crate) const fn into_value(self) -> Option<crate::Value> {

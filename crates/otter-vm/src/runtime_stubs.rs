@@ -29,7 +29,7 @@ use crate::native_abi::{
     STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
     SafepointId, SafepointRecord, TaggedLocationKind, validate_stub_descriptor,
 };
-use crate::{Value, collections};
+use crate::{Interpreter, Value, collections};
 
 /// Two-argument leaf/no-allocation runtime stub ABI.
 ///
@@ -282,6 +282,38 @@ impl otter_gc::ExtraRootSource for AllocSafepointFrameRoots<'_> {
     }
 }
 
+/// Root publisher for values passed in ABI registers to an allocating stub.
+///
+/// The safepoint map publishes the caller's frame slots. This publisher also
+/// roots the value copies held by the stub itself, so receiver/arguments remain
+/// valid if the stub allocates before it reloads from its local ABI variables.
+struct AllocValueStubCallRoots<'a> {
+    frame_roots: AllocSafepointFrameRoots<'a>,
+    values: [Value; 3],
+}
+
+impl<'a> AllocValueStubCallRoots<'a> {
+    fn new(frame_roots: AllocSafepointFrameRoots<'a>, values: [Value; 3]) -> Self {
+        Self {
+            frame_roots,
+            values,
+        }
+    }
+
+    fn value(&self, index: usize) -> Value {
+        self.values[index]
+    }
+}
+
+impl otter_gc::ExtraRootSource for AllocValueStubCallRoots<'_> {
+    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
+        self.frame_roots.visit_extra_roots(visitor);
+        for value in &self.values {
+            value.trace_value_slots(visitor);
+        }
+    }
+}
+
 /// Callable ABI entry for `Map.prototype.get`.
 pub const COLLECTION_MAP_GET_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     descriptor: STUB_COLLECTION_MAP_GET_LEAF,
@@ -303,13 +335,13 @@ pub const COLLECTION_SET_HAS_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
 /// ABI descriptor for `Map.prototype.set` collection mutation.
 pub const COLLECTION_MAP_SET_ALLOC: AllocValueStub = AllocValueStub {
     descriptor: STUB_COLLECTION_MAP_SET_ALLOC,
-    entry: None,
+    entry: Some(collection_map_set_alloc),
 };
 
 /// ABI descriptor for `Set.prototype.add` collection mutation.
 pub const COLLECTION_SET_ADD_ALLOC: AllocValueStub = AllocValueStub {
     descriptor: STUB_COLLECTION_SET_ADD_ALLOC,
-    entry: None,
+    entry: Some(collection_set_add_alloc),
 };
 
 /// Resolve a fixed two-argument leaf/no-allocation stub by ABI descriptor id.
@@ -382,6 +414,41 @@ pub extern "C" fn leaf_no_alloc_stub2_trampoline_pair(
     a1_bits: u64,
 ) -> RuntimeStubResultPair {
     RuntimeStubResultPair::from_result(leaf_no_alloc_stub2_trampoline(heap, id, a0_bits, a1_bits))
+}
+
+/// Allocating `Map.prototype.set` mutation stub.
+///
+/// This entry roots the caller frame through `safepoint` and roots its own ABI
+/// value copies before flattening string keys or mutating the collection.
+#[must_use]
+pub extern "C" fn collection_map_set_alloc(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    key_bits: u64,
+    value_bits: u64,
+) -> RuntimeStubResultPair {
+    RuntimeStubResultPair::from_result(collection_map_set_alloc_inner(
+        ctx, safepoint, recv_bits, key_bits, value_bits,
+    ))
+}
+
+/// Allocating `Set.prototype.add` mutation stub.
+#[must_use]
+pub extern "C" fn collection_set_add_alloc(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    value_bits: u64,
+    unused_bits: u64,
+) -> RuntimeStubResultPair {
+    RuntimeStubResultPair::from_result(collection_set_add_alloc_inner(
+        ctx,
+        safepoint,
+        recv_bits,
+        value_bits,
+        unused_bits,
+    ))
 }
 
 /// Leaf `Map.prototype.get` probe.
@@ -458,6 +525,107 @@ pub extern "C" fn collection_set_has_leaf(
     RuntimeStubResult::ok_value(Value::boolean(collections::set_has(set, heap, &key)))
 }
 
+fn collection_map_set_alloc_inner(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    key_bits: u64,
+    value_bits: u64,
+) -> RuntimeStubResult {
+    let Some(ctx) = alloc_context_mut(ctx) else {
+        return RuntimeStubResult::miss();
+    };
+    let Some(interp) = interpreter_mut(ctx.vm) else {
+        return RuntimeStubResult::miss();
+    };
+    // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
+    // table and frame-slot window must remain live for this call.
+    let Ok(roots) = (unsafe {
+        alloc_value_stub_call_roots(
+            ctx,
+            safepoint,
+            [
+                Value::from_abi_bits(recv_bits),
+                Value::from_abi_bits(key_bits),
+                Value::from_abi_bits(value_bits),
+            ],
+        )
+    }) else {
+        return RuntimeStubResult::miss();
+    };
+    let depth = interp
+        .gc_heap
+        .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    let result = (|| {
+        let key = roots.value(1);
+        if let Some(string) = key.as_string(&interp.gc_heap) {
+            let _ = string.flatten_in_place(&mut interp.gc_heap);
+        }
+        let recv = roots.value(0);
+        let key = roots.value(1);
+        let value = roots.value(2);
+        let Some(map) = recv.as_map() else {
+            return RuntimeStubResult::miss();
+        };
+        match collections::map_set(map, &mut interp.gc_heap, key, value) {
+            Ok(()) => RuntimeStubResult::ok_value(roots.value(0)),
+            Err(_) => RuntimeStubResult::out_of_memory(),
+        }
+    })();
+    interp.gc_heap.pop_extra_roots_to(depth - 1);
+    result
+}
+
+fn collection_set_add_alloc_inner(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    value_bits: u64,
+    unused_bits: u64,
+) -> RuntimeStubResult {
+    let Some(ctx) = alloc_context_mut(ctx) else {
+        return RuntimeStubResult::miss();
+    };
+    let Some(interp) = interpreter_mut(ctx.vm) else {
+        return RuntimeStubResult::miss();
+    };
+    // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
+    // table and frame-slot window must remain live for this call.
+    let Ok(roots) = (unsafe {
+        alloc_value_stub_call_roots(
+            ctx,
+            safepoint,
+            [
+                Value::from_abi_bits(recv_bits),
+                Value::from_abi_bits(value_bits),
+                Value::from_abi_bits(unused_bits),
+            ],
+        )
+    }) else {
+        return RuntimeStubResult::miss();
+    };
+    let depth = interp
+        .gc_heap
+        .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    let result = (|| {
+        let value = roots.value(1);
+        if let Some(string) = value.as_string(&interp.gc_heap) {
+            let _ = string.flatten_in_place(&mut interp.gc_heap);
+        }
+        let recv = roots.value(0);
+        let value = roots.value(1);
+        let Some(set) = recv.as_set() else {
+            return RuntimeStubResult::miss();
+        };
+        match collections::set_add(set, &mut interp.gc_heap, value) {
+            Ok(()) => RuntimeStubResult::ok_value(roots.value(0)),
+            Err(_) => RuntimeStubResult::out_of_memory(),
+        }
+    })();
+    interp.gc_heap.pop_extra_roots_to(depth - 1);
+    result
+}
+
 fn heap_ref(heap: *const otter_gc::GcHeap) -> Option<&'static otter_gc::GcHeap> {
     if heap.is_null() {
         return None;
@@ -466,6 +634,39 @@ fn heap_ref(heap: *const otter_gc::GcHeap) -> Option<&'static otter_gc::GcHeap> 
     // leaf stubs neither allocate nor retain it. The returned reference is used
     // only for this call.
     Some(unsafe { &*heap })
+}
+
+fn alloc_context_mut(
+    ctx: *mut RuntimeStubAllocContext,
+) -> Option<&'static mut RuntimeStubAllocContext> {
+    if ctx.is_null() {
+        return None;
+    }
+    // SAFETY: allocating-stub callers pass a live context packet for the
+    // duration of the call and the stub never retains this reference.
+    Some(unsafe { &mut *ctx })
+}
+
+fn interpreter_mut(vm: *mut std::ffi::c_void) -> Option<&'static mut Interpreter> {
+    if vm.is_null() {
+        return None;
+    }
+    // SAFETY: `RuntimeStubAllocContext.vm` is the current isolate
+    // `Interpreter` pointer. The stub executes synchronously on the mutator
+    // thread and does not retain the reference.
+    Some(unsafe { &mut *(vm as *mut Interpreter) })
+}
+
+unsafe fn alloc_value_stub_call_roots<'a>(
+    ctx: &'a RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    values: [Value; 3],
+) -> Result<AllocValueStubCallRoots<'a>, AllocSafepointRootError> {
+    // SAFETY: forwarded from this helper's caller.
+    let record = unsafe { alloc_safepoint_record(ctx, safepoint)? };
+    // SAFETY: forwarded from this helper's caller.
+    let frame_roots = unsafe { AllocSafepointFrameRoots::new(ctx, record)? };
+    Ok(AllocValueStubCallRoots::new(frame_roots, values))
 }
 
 fn leaf_key_is_materialized(heap: &otter_gc::GcHeap, key: Value) -> bool {
@@ -501,12 +702,12 @@ mod tests {
     fn alloc_stub_descriptors_require_safepoints() {
         assert!(!COLLECTION_MAP_SET_ALLOC.is_valid_for_safepoint(NO_SAFEPOINT));
         assert!(COLLECTION_MAP_SET_ALLOC.is_valid_for_safepoint(1));
-        assert!(!COLLECTION_MAP_SET_ALLOC.has_entry());
-        assert_eq!(COLLECTION_MAP_SET_ALLOC.entry_addr(), None);
+        assert!(COLLECTION_MAP_SET_ALLOC.has_entry());
+        assert!(COLLECTION_MAP_SET_ALLOC.entry_addr().is_some());
         assert!(!COLLECTION_SET_ADD_ALLOC.is_valid_for_safepoint(NO_SAFEPOINT));
         assert!(COLLECTION_SET_ADD_ALLOC.is_valid_for_safepoint(1));
-        assert!(!COLLECTION_SET_ADD_ALLOC.has_entry());
-        assert_eq!(COLLECTION_SET_ADD_ALLOC.entry_addr(), None);
+        assert!(COLLECTION_SET_ADD_ALLOC.has_entry());
+        assert!(COLLECTION_SET_ADD_ALLOC.entry_addr().is_some());
         assert_eq!(
             alloc_value_stub_by_id(STUB_COLLECTION_MAP_SET_ALLOC.id).map(|stub| stub.descriptor),
             Some(STUB_COLLECTION_MAP_SET_ALLOC)
@@ -689,6 +890,109 @@ mod tests {
                 index: 0,
             })
         );
+    }
+
+    #[test]
+    fn map_set_alloc_entry_mutates_and_returns_receiver() {
+        let mut interp = Interpreter::new();
+        let map = collections::alloc_map(interp.gc_heap_mut()).expect("map");
+        let key = crate::string::JsString::from_str("k", interp.gc_heap_mut()).expect("key");
+        let safepoints = [SafepointRecord::frame_slot_window(21, NO_FRAME_STATE, 3)];
+        let mut slots = [
+            Value::map(map).to_abi_bits(),
+            Value::string(key).to_abi_bits(),
+            n(99).to_abi_bits(),
+        ];
+        let mut ctx = RuntimeStubAllocContext::new(
+            (&mut interp as *mut Interpreter).cast(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            safepoints.as_ptr(),
+            safepoints.len() as u32,
+            0,
+            slots.as_mut_ptr(),
+            slots.len() as u16,
+        );
+
+        let pair = COLLECTION_MAP_SET_ALLOC
+            .invoke_raw(&mut ctx, 21, slots[0], slots[1], slots[2])
+            .expect("entry");
+        assert_eq!(pair.status(), RuntimeStubStatus::Ok);
+        let result = pair.into_result().into_value().expect("receiver");
+        let map = result.as_map().expect("map receiver");
+        assert_eq!(
+            collections::map_get(map, interp.gc_heap_mut(), &Value::string(key)),
+            Some(n(99))
+        );
+    }
+
+    #[test]
+    fn set_add_alloc_entry_mutates_and_returns_receiver() {
+        let mut interp = Interpreter::new();
+        let set = collections::alloc_set(interp.gc_heap_mut()).expect("set");
+        let value = crate::string::JsString::from_str("v", interp.gc_heap_mut()).expect("value");
+        let safepoints = [SafepointRecord::frame_slot_window(22, NO_FRAME_STATE, 3)];
+        let mut slots = [
+            Value::set(set).to_abi_bits(),
+            Value::string(value).to_abi_bits(),
+            Value::undefined().to_abi_bits(),
+        ];
+        let mut ctx = RuntimeStubAllocContext::new(
+            (&mut interp as *mut Interpreter).cast(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            safepoints.as_ptr(),
+            safepoints.len() as u32,
+            0,
+            slots.as_mut_ptr(),
+            slots.len() as u16,
+        );
+
+        let pair = COLLECTION_SET_ADD_ALLOC
+            .invoke_raw(&mut ctx, 22, slots[0], slots[1], slots[2])
+            .expect("entry");
+        assert_eq!(pair.status(), RuntimeStubStatus::Ok);
+        let result = pair.into_result().into_value().expect("receiver");
+        let set = result.as_set().expect("set receiver");
+        assert!(collections::set_has(
+            set,
+            interp.gc_heap_mut(),
+            &Value::string(value)
+        ));
+    }
+
+    #[test]
+    fn collection_alloc_entries_miss_invalid_context() {
+        let pair = collection_map_set_alloc(
+            std::ptr::null_mut(),
+            1,
+            Value::undefined().to_abi_bits(),
+            Value::undefined().to_abi_bits(),
+            Value::undefined().to_abi_bits(),
+        );
+        assert_eq!(pair.status(), RuntimeStubStatus::Miss);
+
+        let mut interp = Interpreter::new();
+        let safepoints = [SafepointRecord::frame_slot_window(1, NO_FRAME_STATE, 1)];
+        let mut slots = [Value::undefined().to_abi_bits()];
+        let mut ctx = RuntimeStubAllocContext::new(
+            (&mut interp as *mut Interpreter).cast(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            safepoints.as_ptr(),
+            safepoints.len() as u32,
+            0,
+            slots.as_mut_ptr(),
+            slots.len() as u16,
+        );
+        let pair = collection_set_add_alloc(
+            &mut ctx,
+            99,
+            Value::undefined().to_abi_bits(),
+            Value::undefined().to_abi_bits(),
+            Value::undefined().to_abi_bits(),
+        );
+        assert_eq!(pair.status(), RuntimeStubStatus::Miss);
     }
 
     #[test]

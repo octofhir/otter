@@ -182,10 +182,10 @@ pub use dynamic_import::{DynamicImportLoader, DynamicImportLoaderHandle, Dynamic
 pub use error_classes::{ErrorClassRegistry, ErrorKind};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
-    JitCollectionAllocMethod, JitCollectionLayout, JitCollectionLeafMethod, JitCompileError,
-    JitCompileRequest, JitCompileStatus, JitCompilerHook, JitExecOutcome, JitFrameStack,
-    JitFunctionCode, JitFunctionView, JitInlineCallee, JitInlineMethod, JitInstrView,
-    JitReentryPtrs, JitTypedArrayLayout,
+    JitCollectionAllocMethod, JitCollectionLayout, JitCollectionLeafMethod,
+    JitCollectionMethodIcSlot, JitCompileError, JitCompileRequest, JitCompileStatus,
+    JitCompilerHook, JitExecOutcome, JitFrameStack, JitFunctionCode, JitFunctionView,
+    JitInlineCallee, JitInlineMethod, JitInstrView, JitReentryPtrs, JitTypedArrayLayout,
 };
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,

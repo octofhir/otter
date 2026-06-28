@@ -157,6 +157,10 @@ pub struct JitCtx {
     /// read through this pointer at the store site, not at entry, because a
     /// re-entered VM call can invalidate the protector before later stores.
     array_index_accessor_protector_ptr: *const bool,
+    /// Base of the VM-published live collection method IC slots.
+    collection_method_ics: *const otter_vm::JitCollectionMethodIcSlot,
+    /// Number of live collection method IC slots.
+    collection_method_ic_count: u32,
     /// Opaque heap pointer for native leaf runtime stubs.
     gc_heap: *const std::ffi::c_void,
     /// Base of the active compiled function's safepoint records.
@@ -197,6 +201,10 @@ pub(crate) const REG_STACK_BASE_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_s
 pub(crate) const REG_TOP_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_top_ptr) as u32;
 pub(crate) const ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, array_index_accessor_protector_ptr) as u32;
+pub(crate) const COLLECTION_METHOD_ICS_OFFSET: u32 =
+    std::mem::offset_of!(JitCtx, collection_method_ics) as u32;
+pub(crate) const COLLECTION_METHOD_IC_COUNT_OFFSET: u32 =
+    std::mem::offset_of!(JitCtx, collection_method_ic_count) as u32;
 #[allow(dead_code)]
 pub(crate) const GC_HEAP_OFFSET: u32 = std::mem::offset_of!(JitCtx, gc_heap) as u32;
 pub(crate) const SAFEPOINT_RECORDS_OFFSET: u32 =
@@ -1198,6 +1206,8 @@ pub(crate) unsafe fn enter_compiled(
         let reg_top_ptr = unsafe { (*vm).jit_reg_top_ptr() };
         let array_index_accessor_protector_ptr =
             unsafe { (*vm).jit_array_index_accessor_protector_ptr() };
+        let collection_method_ics = unsafe { (*vm).jit_collection_method_ics_ptr() };
+        let collection_method_ic_count = unsafe { (*vm).jit_collection_method_ics_len() };
         let gc_heap = unsafe { (*vm).jit_gc_heap_ptr() };
         let mut error = None;
         let mut ctx = JitCtx {
@@ -1222,6 +1232,8 @@ pub(crate) unsafe fn enter_compiled(
             reg_stack_base,
             reg_top_ptr,
             array_index_accessor_protector_ptr,
+            collection_method_ics,
+            collection_method_ic_count,
             gc_heap,
             safepoint_records,
             safepoint_count,
@@ -1257,7 +1269,8 @@ mod arm64 {
         ALLOC_CTX_FRAME_SLOTS_OFFSET, ALLOC_CTX_RESERVED0_OFFSET, ALLOC_CTX_RESERVED1_OFFSET,
         ALLOC_CTX_SAFEPOINT_COUNT_OFFSET, ALLOC_CTX_SAFEPOINT_RECORDS_OFFSET,
         ALLOC_CTX_STACK_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_VM_OFFSET,
-        ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET, BAIL_PC_OFFSET, BaselineCode, CONTEXT_OFFSET,
+        ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET, BAIL_PC_OFFSET, BaselineCode,
+        COLLECTION_METHOD_IC_COUNT_OFFSET, COLLECTION_METHOD_ICS_OFFSET, CONTEXT_OFFSET,
         DIRECT_ENTRY_OFFSET, DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET,
         DIRECT_SAFEPOINT_COUNT_OFFSET, DIRECT_SAFEPOINT_RECORDS_OFFSET, DIRECT_SELF_OFFSET,
         DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET,
@@ -4402,6 +4415,10 @@ mod arm64 {
             ; str x9, [sp, REG_TOP_PTR_OFFSET]
             ; ldr x9, [x20, ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET]
             ; str x9, [sp, ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET]
+            ; ldr x9, [x20, COLLECTION_METHOD_ICS_OFFSET]
+            ; str x9, [sp, COLLECTION_METHOD_ICS_OFFSET]
+            ; ldr w9, [x20, COLLECTION_METHOD_IC_COUNT_OFFSET]
+            ; str w9, [sp, COLLECTION_METHOD_IC_COUNT_OFFSET]
             ; ldr x9, [x20, GC_HEAP_OFFSET]
             ; str x9, [sp, GC_HEAP_OFFSET]
             ; ldr x9, [x20, DIRECT_SAFEPOINT_RECORDS_OFFSET]
@@ -5540,6 +5557,8 @@ mod tests {
             reg_stack_base: std::ptr::null_mut(),
             reg_top_ptr: std::ptr::null_mut(),
             array_index_accessor_protector_ptr: &array_index_accessor_protector,
+            collection_method_ics: std::ptr::null(),
+            collection_method_ic_count: 0,
             gc_heap: std::ptr::null(),
             safepoint_records: std::ptr::null(),
             safepoint_count: 0,

@@ -86,23 +86,26 @@ pub(crate) fn to_js_string_primitive(
     if let Some(s) = value.as_string(gc_heap) {
         return Ok(s);
     }
+    // Below this point the value IS stringifiable; the only way the conversion
+    // can fail is an allocation failure, which must surface as a catchable
+    // out-of-memory error — not a `TypeMismatch` (that masks heap exhaustion as
+    // a spurious "operation does not accept this value" TypeError).
     if let Some(n) = value.as_number() {
-        return number::ecma::number_to_string(n.as_f64(), gc_heap)
-            .map_err(|_| VmError::TypeMismatch);
+        return number::ecma::number_to_string(n.as_f64(), gc_heap).map_err(crate::oom_to_vm);
     }
     if let Some(b) = value.as_boolean() {
         let text = if b { "true" } else { "false" };
-        return JsString::from_str(text, gc_heap).map_err(|_| VmError::TypeMismatch);
+        return JsString::from_str(text, gc_heap).map_err(crate::oom_to_vm);
     }
     if value.is_null() {
-        return JsString::from_str("null", gc_heap).map_err(|_| VmError::TypeMismatch);
+        return JsString::from_str("null", gc_heap).map_err(crate::oom_to_vm);
     }
     if value.is_undefined() || value.is_hole() {
-        return JsString::from_str("undefined", gc_heap).map_err(|_| VmError::TypeMismatch);
+        return JsString::from_str("undefined", gc_heap).map_err(crate::oom_to_vm);
     }
     if let Some(b) = value.as_big_int() {
         let text = b.to_decimal_string(gc_heap);
-        return JsString::from_str(&text, gc_heap).map_err(|_| VmError::TypeMismatch);
+        return JsString::from_str(&text, gc_heap).map_err(crate::oom_to_vm);
     }
     Err(VmError::TypeMismatch)
 }

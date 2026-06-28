@@ -1062,8 +1062,8 @@ mod tests {
         // long enough that the concatenation stays an unflattened `Cons` rope.
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = empty_roots;
-        let left_units: Vec<u16> = std::iter::repeat(b'a' as u16).take(16).collect();
-        let right_units: Vec<u16> = std::iter::repeat(b'b' as u16).take(16).collect();
+        let left_units: Vec<u16> = std::iter::repeat_n(b'a' as u16, 16).collect();
+        let right_units: Vec<u16> = std::iter::repeat_n(b'b' as u16, 16).collect();
         let left = alloc_flat_string_body_with_roots(
             &mut heap,
             JsStringId::new(0),

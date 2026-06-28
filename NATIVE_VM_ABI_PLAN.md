@@ -452,6 +452,7 @@ Exit criteria:
 - [ ] String concat specialized node.
 - [x] Baseline primitive string concat `AllocValueStub`.
 - [x] `OTTER_STATS=1` exposes JIT runtime-stub ABI class counters.
+- [x] Collection-feedback method sites skip compiled-direct method prepare.
 - [ ] Shared object header design.
 - [ ] Map/Set migration to shared object header.
 - [ ] Interpreter quickening and block/backedge metering.

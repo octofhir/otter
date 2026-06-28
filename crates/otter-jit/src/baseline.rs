@@ -4786,6 +4786,10 @@ mod arm64 {
             dynasm!(ops ; .arch aarch64 ; =>after_alloc);
         }
 
+        if leaf.is_some() || alloc.is_some() {
+            dynasm!(ops ; .arch aarch64 ; b =>fallback);
+        }
+
         // jit_prepare_direct_method_call_stub(ctx, recv, name, site, argc, a0..a2)
         // -> 0 = direct prepared, 1 = throw, 2 = ineligible → in-place fallback.
         dynasm!(ops

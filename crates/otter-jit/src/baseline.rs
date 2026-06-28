@@ -976,6 +976,41 @@ pub(crate) extern "C" fn jit_alloc_object_literal_stub(
     }
 }
 
+/// Optimizing-tier stub: dense-array `push(value)` from compiled code.
+///
+/// The call site guarded the receiver is an ordinary dense array with the
+/// original builtin and materialized the frame for the safepoint, so this
+/// delegates to the rooted [`Interpreter::jit_runtime_array_push`], which reads
+/// the receiver from `frame[recv_reg]`, appends `value` (rooted across any
+/// growth scavenge), and writes the new length to `frame[dst]`. Returns `0` on
+/// success, `1` when the push threw (error parked in `ctx`).
+pub(crate) extern "C" fn jit_array_push_optimizing_stub(
+    ctx: *mut JitCtx,
+    dst: u64,
+    recv_reg: u64,
+    value: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    match vm.jit_runtime_array_push(
+        context,
+        stack,
+        ctx.frame_index,
+        dst as u16,
+        recv_reg as u16,
+        value,
+    ) {
+        Ok(()) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
 /// Bridge stub: allocate an array literal for `NewArray` from compiled code.
 /// The VM decodes the variable source-register list at `byte_pc` and uses the
 /// stack-rooted array allocator, matching interpreter GC semantics.

@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use otter_bytecode::{Op, Operand};
 use otter_vm::jit_feedback::ArithFeedback;
-use otter_vm::{JitFunctionView, JitInlineCallee, JitInlineMethod};
+use otter_vm::{JitArrayMethodKind, JitFunctionView, JitInlineCallee, JitInlineMethod};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::Unsupported;
@@ -1031,6 +1031,42 @@ impl<'a> Builder<'a> {
                         let arg_reg = reg(&operands, 4 + slot)?;
                         arg_regs.push(arg_reg);
                         args.push(self.read_variable(arg_reg, block));
+                    }
+                    // Dense-array `pop()` / `push(value)`: lower to a dedicated
+                    // speculative node (inline leaf pop; safepointed runtime push)
+                    // so the enclosing loop compiles in the optimizing tier instead
+                    // of declining on the method call. Other arities fall through.
+                    if let Some(am) = self.view.array_methods.get(&byte_pc).copied() {
+                        match am.kind {
+                            JitArrayMethodKind::Pop if argc == 0 => {
+                                let node = self.graph.add_node(
+                                    NodeKind::ArrayPop { recv },
+                                    block,
+                                    byte_pc,
+                                );
+                                self.graph.set_frame_dst(node, dst);
+                                self.push_body(block, node);
+                                self.def_register(dst, block, node, byte_pc);
+                                continue;
+                            }
+                            JitArrayMethodKind::Push if argc == 1 => {
+                                let value = args[0];
+                                let node = self.graph.add_node(
+                                    NodeKind::ArrayPush {
+                                        recv,
+                                        value,
+                                        recv_reg,
+                                    },
+                                    block,
+                                    byte_pc,
+                                );
+                                self.graph.set_frame_dst(node, dst);
+                                self.push_body(block, node);
+                                self.def_register(dst, block, node, byte_pc);
+                                continue;
+                            }
+                            _ => {}
+                        }
                     }
                     if let Some(method) = self.view.inline_methods.get(&byte_pc).cloned() {
                         let unsafe_receiver = matches!(

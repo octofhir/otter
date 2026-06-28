@@ -1963,6 +1963,39 @@ impl Interpreter {
     /// Run a resolved `Array.prototype` builtin with the receiver and arguments
     /// rooted across the dispatch (an array method can scavenge and they live
     /// only on this native stack frame).
+    /// Optimizing-tier `Array.prototype.push(value)` runtime entry.
+    ///
+    /// The compiled site has already guarded that `frame[recv_reg]` is an
+    /// ordinary dense array whose `%Array.prototype%` push slot still holds the
+    /// original builtin, and has materialized the live frame for the call's
+    /// safepoint. The receiver is read back from the (rooted) frame window;
+    /// `value_bits` is the boxed argument passed by value (its source register
+    /// may already be reused), decoded before any allocation. The dense push
+    /// itself goes through [`Self::dispatch_array_builtin_rooted`], which roots
+    /// the receiver and argument across the append's potential scavenge, so this
+    /// path is GC-safe even when the backing store grows. The new length is
+    /// written back to `frame[dst]`.
+    pub fn jit_runtime_array_push(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        dst: u16,
+        recv_reg: u16,
+        value_bits: u64,
+    ) -> Result<(), VmError> {
+        let recv = *read_register(&stack[frame_index], recv_reg)?;
+        let value = Value::from_bits(value_bits);
+        let result = self.dispatch_array_builtin_rooted(
+            context,
+            crate::array_prototype::ArrayMethodTag::Push,
+            recv,
+            &[value],
+        )?;
+        write_register(&mut stack[frame_index], dst, result)?;
+        Ok(())
+    }
+
     fn dispatch_array_builtin_rooted(
         &mut self,
         context: &ExecutionContext,

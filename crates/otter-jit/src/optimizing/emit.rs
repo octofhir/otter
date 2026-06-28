@@ -294,7 +294,8 @@ mod arm64 {
         SPECIAL_HOLE, SPECIAL_NULL, SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED,
         STATUS_THREW, TAG_FUNCTION_ID, TAG_INT32, TAG_PTR_FUNCTION, TAG_PTR_OBJECT, TAG_SPECIAL,
         THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, VM_OFFSET,
-        jit_abort_direct_call_stub, jit_alloc_object_literal_stub, jit_backedge_poll_stub,
+        jit_abort_direct_call_stub, jit_alloc_object_literal_stub, jit_array_push_optimizing_stub,
+        jit_backedge_poll_stub,
         jit_call_collection_method_ic_stub, jit_call_method_stub_optimizing,
         jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
         jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
@@ -2002,6 +2003,83 @@ mod arm64 {
         })
     }
 
+    /// Guard a receiver is an ordinary dense `Array` whose `%Array.prototype%`
+    /// still carries the original `push` / `pop` builtin at the cached shape +
+    /// slot, deoptimizing to `exit` on any miss. Leaves the decompressed array
+    /// body pointer in `x0` and the cage base in `x1`; uses `x2..x7` as scratch
+    /// (the optimizing tier keeps allocated values in `x9..x15` / `x21..x28`, so
+    /// the low registers are free here). Mirrors the baseline guard but with the
+    /// optimizing register convention and a deopt exit instead of a bridge miss.
+    fn emit_opt_array_dense_proto_guard(
+        ops: &mut Assembler,
+        view: &JitFunctionView,
+        am: &otter_vm::JitArrayMethod,
+        recv_loc: Location,
+        exit: DynamicLabel,
+    ) {
+        let array_tag = u32::from(view.ta_layout.array_type_tag);
+        let exotic_byte = view.ta_layout.array_exotic_byte;
+        let object_shape_byte = view.object_shape_byte;
+        let object_values_ptr_byte = view.object_values_ptr_byte;
+        let native_static_fn_byte = view.native_static_fn_byte;
+        let native_function_type_tag = u32::from(view.collection_layout.native_function_type_tag);
+        let method_value_byte = am.method_value_byte;
+
+        load_loc(ops, 0, recv_loc);
+        dynasm!(ops
+            ; .arch aarch64
+            ; lsr x3, x0, #48
+            ; movz x4, TAG_PTR_OBJECT as u32
+            ; cmp x3, x4
+            ; b.ne =>exit
+            ; mov w0, w0
+        );
+        emit_load_u64(ops, 1, view.cage_base as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x0, x1, x0                  // x0 = array body ptr
+            ; ldrb w2, [x0]
+            ; cmp w2, array_tag
+            ; b.ne =>exit
+            ; ldr x3, [x0, exotic_byte]
+            ; cbnz x3, =>exit                 // exotic sidecar → not ordinary dense
+        );
+        emit_load_u64(ops, 4, u64::from(am.proto_offset));
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x4, x1, x4                  // x4 = %Array.prototype% body ptr
+            ; ldrb w5, [x4]
+            ; cmp w5, OBJECT_BODY_TYPE_TAG
+            ; b.ne =>exit
+            ; ldr w5, [x4, object_shape_byte]
+        );
+        emit_load_u64(ops, 6, u64::from(am.proto_shape));
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp w5, w6
+            ; b.ne =>exit
+            ; ldr x4, [x4, object_values_ptr_byte]
+            ; cbz x4, =>exit
+            ; ldr x5, [x4, method_value_byte]
+            ; lsr x6, x5, #48
+            ; movz x7, TAG_PTR_FUNCTION as u32
+            ; cmp x6, x7
+            ; b.ne =>exit
+            ; mov w6, w5
+            ; add x6, x1, x6                  // x6 = method fn body ptr
+            ; ldrb w7, [x6]
+            ; cmp w7, native_function_type_tag
+            ; b.ne =>exit
+            ; ldr x7, [x6, native_static_fn_byte]
+        );
+        emit_load_u64(ops, 5, am.builtin_fn_addr as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp x7, x5
+            ; b.ne =>exit                     // prototype builtin overridden → deopt
+        );
+    }
+
     /// Lower one SSA body node. A node's result goes to its home; a node with no
     /// home is dead and emits only the guards that can deopt.
     #[allow(clippy::too_many_arguments)]
@@ -2590,6 +2668,104 @@ mod arm64 {
                 let value_repr = graph.node(*value).kind.repr();
                 let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
                 emit_element_store(ops, view, recv_loc, idx_loc, value_loc, value_repr, exit)
+            }
+            NodeKind::ArrayPop { recv } => {
+                // Inline dense `pop()`: guard, then drop and return the last slot.
+                // Leaf — no allocation/safepoint/barrier; the deopt exit owns every
+                // non-fast case (non-dense receiver, prototype override, sparse
+                // length). An empty array returns undefined without mutating.
+                let recv_loc = require_loc(alloc, *recv)?;
+                let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
+                let am = view
+                    .array_methods
+                    .get(&node.byte_pc)
+                    .ok_or(Unsupported::Unlowered("array pop without feedback"))?;
+                let length_byte = view.ta_layout.array_length_byte;
+                let (ptr_word, len_word) = vec_layout_offsets();
+                let arr_ptr_byte = view.ta_layout.array_elements_byte + ptr_word;
+                let arr_len_byte = view.ta_layout.array_elements_byte + len_word;
+                let empty = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                emit_opt_array_dense_proto_guard(ops, view, am, recv_loc, exit);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr x3, [x0, arr_len_byte]
+                    ; ldr x4, [x0, length_byte]
+                    ; cmp x3, x4
+                    ; b.ne =>exit                 // sparse / length-detached → deopt
+                    ; cbz x3, =>empty
+                    ; sub x3, x3, #1
+                    ; ldr x5, [x0, arr_ptr_byte]
+                    ; lsl x6, x3, #3
+                    ; add x5, x5, x6
+                    ; ldr x6, [x5]                // popped value
+                    ; str x3, [x0, arr_len_byte]
+                    ; str x3, [x0, length_byte]
+                );
+                if let Some(loc) = dst {
+                    store_loc(ops, loc, 6);
+                }
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>empty);
+                emit_load_u64(ops, 6, TAG_SPECIAL << 48);
+                if let Some(loc) = dst {
+                    store_loc(ops, loc, 6);
+                }
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                Ok(())
+            }
+            NodeKind::ArrayPush {
+                recv,
+                value,
+                recv_reg,
+            } => {
+                // Dense `push(value)`: guard, then route the append through a
+                // safepointed runtime stub that handles growth and the
+                // generational barrier in Rust. The guard deopts on every
+                // non-fast case before any frame change; the live frame is
+                // materialized for the call safepoint, the value is passed boxed
+                // by value (its source register may be reused), and the new length
+                // is written back to the frame and reloaded.
+                let point = frames
+                    .get(&nid)
+                    .ok_or(Unsupported::Unlowered("array push without safepoint state"))?;
+                let dst_reg = node
+                    .frame_dst
+                    .ok_or(Unsupported::Unlowered("array push without frame dst"))?;
+                let recv_loc = require_loc(alloc, *recv)?;
+                let value_loc = require_loc(alloc, *value)?;
+                let value_repr = graph.node(*value).kind.repr();
+                let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
+                let am = *view
+                    .array_methods
+                    .get(&node.byte_pc)
+                    .ok_or(Unsupported::Unlowered("array push without feedback"))?;
+                emit_opt_array_dense_proto_guard(ops, view, &am, recv_loc, exit);
+                emit_frame_materialize(ops, graph, alloc, point, box_scratch)?;
+                box_into_gp(ops, 3, value_repr, value_loc, box_scratch);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; mov x0, x20
+                    ; movz x1, u32::from(dst_reg)
+                    ; movz x2, u32::from(*recv_reg)
+                );
+                emit_load_u64(ops, 16, jit_array_push_optimizing_stub as *const () as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; blr x16
+                    ; cmp x0, #1
+                    ; b.eq =>threw
+                );
+                let resume = call_resume_frames.get(&nid).unwrap_or(point);
+                emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
+                if value_is_used_after(graph, call_resume_frames, nid)
+                    && let Some(loc) = dst
+                    && !resume.registers.iter().any(|&(r, _)| r == dst_reg)
+                {
+                    let off = u32::from(dst_reg) * 8;
+                    dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
+                    store_loc(ops, loc, box_scratch);
+                }
+                Ok(())
             }
             NodeKind::StoreSlot(obj, value_byte, value) => {
                 // Write a primitive (int32 / f64) into the shape-guarded

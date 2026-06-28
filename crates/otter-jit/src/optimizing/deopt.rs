@@ -372,6 +372,8 @@ fn can_deopt(kind: &NodeKind) -> bool {
             | NodeKind::CallMethod { .. }
             | NodeKind::LoadElement(_, _)
             | NodeKind::StoreElement(_, _, _)
+            | NodeKind::ArrayPop { .. }
+            | NodeKind::ArrayPush { .. }
             | NodeKind::LoadArrayLength(_)
             | NodeKind::LoadThis
             | NodeKind::Int32Add(_, _)
@@ -544,6 +546,7 @@ pub fn capture_call_resume_states(
                 NodeKind::Call { .. }
                     | NodeKind::CallMethod { .. }
                     | NodeKind::AllocObjectLiteral { .. }
+                    | NodeKind::ArrayPush { .. }
             ) {
                 let pc = node.byte_pc;
                 while wi < writes.len() && writes[wi].0 <= pc {

@@ -327,6 +327,31 @@ pub enum NodeKind {
         /// Upvalue index within the closure's own spine.
         index: u32,
     },
+    /// Speculative dense-array `pop()`. The receiver must be an ordinary dense
+    /// array whose `%Array.prototype%` pop slot still holds the original builtin;
+    /// any miss deoptimizes at the call PC so the interpreter owns the full
+    /// semantics. Leaf — the only mutation shrinks the dense length, so no
+    /// allocation, safepoint, or write barrier is needed and the popped value is
+    /// the result (rooted in the destination). Result [`Repr::Tagged`].
+    ArrayPop {
+        /// Receiver array value.
+        recv: NodeId,
+    },
+    /// Speculative dense-array `push(value)`. The receiver must be an ordinary
+    /// dense array whose `%Array.prototype%` push slot still holds the original
+    /// builtin; any miss deoptimizes at the call PC. The append can grow the
+    /// backing store and store a heap pointer, so the emitter materializes a call
+    /// safepoint and routes the push through a rooted runtime stub (growth and
+    /// the generational barrier handled in Rust). Result is the new length
+    /// [`Repr::Int32`].
+    ArrayPush {
+        /// Receiver array value.
+        recv: NodeId,
+        /// Value to append.
+        value: NodeId,
+        /// Bytecode receiver register (read back from the materialized frame).
+        recv_reg: u16,
+    },
 }
 
 impl NodeKind {
@@ -388,6 +413,8 @@ impl NodeKind {
             }
             NodeKind::CheckFunctionIdentity { callee, .. } => vec![*callee],
             NodeKind::CheckMethodIdentity { recv, .. } => vec![*recv],
+            NodeKind::ArrayPop { recv } => vec![*recv],
+            NodeKind::ArrayPush { recv, value, .. } => vec![*recv, *value],
         }
     }
 
@@ -455,6 +482,11 @@ impl NodeKind {
             }
             NodeKind::CheckFunctionIdentity { callee, .. } => fix(callee),
             NodeKind::CheckMethodIdentity { recv, .. } => fix(recv),
+            NodeKind::ArrayPop { recv } => fix(recv),
+            NodeKind::ArrayPush { recv, value, .. } => {
+                fix(recv);
+                fix(value);
+            }
         }
     }
 
@@ -473,7 +505,8 @@ impl NodeKind {
             | NodeKind::Int32BitAnd(_, _)
             | NodeKind::Int32BitXor(_, _)
             | NodeKind::Int32Shl(_, _)
-            | NodeKind::Int32Shr(_, _) => Repr::Int32,
+            | NodeKind::Int32Shr(_, _)
+            | NodeKind::ArrayPush { .. } => Repr::Int32,
             NodeKind::ConstF64(_)
             | NodeKind::CheckNumber(_)
             | NodeKind::Int32ToFloat64(_)
@@ -506,6 +539,7 @@ impl NodeKind {
             | NodeKind::LoadElement(_, _)
             | NodeKind::StoreElement(_, _, _)
             | NodeKind::InlineUpvalue { .. }
+            | NodeKind::ArrayPop { .. }
             | NodeKind::LoadThis
             | NodeKind::LoadHole => Repr::Tagged,
         }

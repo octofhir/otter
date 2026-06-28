@@ -305,7 +305,9 @@ pub fn allocate(
         .filter(|(_, n)| {
             matches!(
                 n.kind,
-                super::ir::NodeKind::Call { .. } | super::ir::NodeKind::CallMethod { .. }
+                super::ir::NodeKind::Call { .. }
+                    | super::ir::NodeKind::CallMethod { .. }
+                    | super::ir::NodeKind::ArrayPush { .. }
             )
         })
         .filter_map(|(id, _)| numbering.pos_of.get(&(id as NodeId)).copied())

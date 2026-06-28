@@ -1420,9 +1420,9 @@ mod arm64 {
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
     use otter_vm::Interpreter;
     use otter_vm::{
-        JitCollectionAllocMethod, JitCollectionLeafMethod, JitFunctionView, JitInlineCallee,
-        JitInlineMethod, JitTypedArrayLayout, NO_FRAME_STATE, STUB_COLLECTION_SET_ADD_ALLOC,
-        STUB_STRING_CONCAT_ALLOC, SafepointId, SafepointRecord,
+        JitArrayMethod, JitArrayMethodKind, JitCollectionAllocMethod, JitCollectionLeafMethod,
+        JitFunctionView, JitInlineCallee, JitInlineMethod, JitTypedArrayLayout, NO_FRAME_STATE,
+        STUB_COLLECTION_SET_ADD_ALLOC, STUB_STRING_CONCAT_ALLOC, SafepointId, SafepointRecord,
         jit::{JIT_COLLECTION_METHOD_IC_COLLECTION, JIT_COLLECTION_METHOD_IC_NO_STUB},
         runtime_stubs::alloc_value_stub_by_id,
     };
@@ -2444,6 +2444,22 @@ mod arm64 {
                         None => false,
                     };
                     if !inlined {
+                        // Splice an inline dense-array `pop` fast path ahead of the
+                        // method bridge; a guard miss falls through to the bridge,
+                        // a hit jumps past it.
+                        let array_done = ops.new_dynamic_label();
+                        let mut spliced_array = false;
+                        if let Some(am) = view.array_methods.get(&instr.byte_pc).copied()
+                            && matches!(am.kind, JitArrayMethodKind::Pop)
+                        {
+                            let array_miss = ops.new_dynamic_label();
+                            if emit_array_pop_inline(
+                                &mut ops, ops_ref, &am, view, array_miss, array_done,
+                            )? {
+                                dynasm!(ops ; .arch aarch64 ; =>array_miss);
+                                spliced_array = true;
+                            }
+                        }
                         emit_method_call(
                             &mut ops,
                             ops_ref,
@@ -2454,6 +2470,9 @@ mod arm64 {
                             live_method_alloc_safepoints.get(&instr.byte_pc).copied(),
                             threw,
                         )?;
+                        if spliced_array {
+                            dynasm!(ops ; .arch aarch64 ; =>array_done);
+                        }
                     }
                 }
                 // `recv[idx]` — inline dense-`Array` (raw `Value`) and
@@ -4745,6 +4764,150 @@ mod arm64 {
         Ok(true)
     }
 
+    /// Splice an inline `Array.prototype.pop` fast path under a receiver +
+    /// prototype-builtin guard. On a hit it removes and returns the last dense
+    /// element with no call or allocation; on any guard miss it branches to
+    /// `miss` so the caller can continue to the runtime method bridge, and on a
+    /// hit it branches to `done` (past the bridge). Returns `Ok(false)` (nothing
+    /// emitted) when the site can't be served inline: no baked cage base, or
+    /// `pop` called with arguments (only the canonical zero-arg form is modeled).
+    ///
+    /// GC: the only mutation is shrinking the dense `Vec` length, so the dropped
+    /// slot falls outside the traced `[0, len)` range and the returned value is
+    /// rooted in the destination frame slot. No write barrier or safepoint is
+    /// needed and the body pointer is recomputed from the rooted receiver slot.
+    fn emit_array_pop_inline(
+        ops: &mut Assembler,
+        operands: &[Operand],
+        am: &JitArrayMethod,
+        view: &JitFunctionView,
+        miss: DynamicLabel,
+        done: DynamicLabel,
+    ) -> Result<bool, Unsupported> {
+        if view.cage_base == 0 {
+            return Ok(false);
+        }
+        let dst = reg(operands, 0)?;
+        let recv = reg(operands, 1)?;
+        let argc = const_index(operands, 3)? as usize;
+        if argc != 0 {
+            return Ok(false);
+        }
+
+        let cage_base = view.cage_base as u64;
+        let array_tag = u32::from(view.ta_layout.array_type_tag);
+        let exotic_byte = view.ta_layout.array_exotic_byte;
+        let length_byte = view.ta_layout.array_length_byte;
+        let object_shape_byte = view.object_shape_byte;
+        let object_values_ptr_byte = view.object_values_ptr_byte;
+        let native_static_fn_byte = view.native_static_fn_byte;
+        let native_function_type_tag = u32::from(view.collection_layout.native_function_type_tag);
+        let method_value_byte = am.method_value_byte;
+        let (ptr_word, len_word) = vec_layout_offsets();
+        let arr_ptr_byte = view.ta_layout.array_elements_byte + ptr_word;
+        let arr_len_byte = view.ta_layout.array_elements_byte + len_word;
+        let undef = TAG_SPECIAL << 48;
+
+        // Receiver guard: pointer-tagged object whose body is an ordinary dense
+        // Array (array type tag, no exotic sidecar — so no own index/accessor or
+        // sparse storage can change `pop` semantics).
+        load_reg(ops, 9, recv)?;
+        dynasm!(ops
+            ; .arch aarch64
+            ; lsr x10, x9, #48
+            ; movz x11, TAG_PTR_OBJECT as u32
+            ; cmp x10, x11
+            ; b.ne =>miss
+            ; mov w12, w9
+        );
+        emit_load_u64(ops, 13, cage_base);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x13, x13, x12
+            ; ldrb w14, [x13]
+            ; cmp w14, array_tag
+            ; b.ne =>miss
+            ; ldr x14, [x13, exotic_byte]
+            ; cbnz x14, =>miss
+        );
+
+        // Prototype guard: `%Array.prototype%` still carries the original builtin
+        // at the cached shape + slot, so the resolved method can only be it.
+        emit_load_u64(ops, 15, cage_base);
+        emit_load_u64(ops, 12, u64::from(am.proto_offset));
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x15, x15, x12
+            ; ldrb w14, [x15]
+            ; cmp w14, OBJECT_BODY_TYPE_TAG
+            ; b.ne =>miss
+            ; ldr w14, [x15, object_shape_byte]
+        );
+        emit_load_u64(ops, 12, u64::from(am.proto_shape));
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp w14, w12
+            ; b.ne =>miss
+            ; ldr x15, [x15, object_values_ptr_byte]
+            ; cbz x15, =>miss
+            ; ldr x9, [x15, method_value_byte]
+            ; lsr x10, x9, #48
+            ; movz x11, TAG_PTR_FUNCTION as u32
+            ; cmp x10, x11
+            ; b.ne =>miss
+            ; mov w12, w9
+        );
+        emit_load_u64(ops, 13, cage_base);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x13, x13, x12
+            ; ldrb w14, [x13]
+            ; cmp w14, native_function_type_tag
+            ; b.ne =>miss
+            ; ldr x14, [x13, native_static_fn_byte]
+        );
+        emit_load_u64(ops, 15, am.builtin_fn_addr as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp x14, x15
+            ; b.ne =>miss
+        );
+
+        // Recompute the dense-array body pointer (the prototype guard clobbered
+        // x13). The receiver tag is already verified and nothing between here and
+        // the load can move the heap (no call / safepoint on this path).
+        load_reg(ops, 9, recv)?;
+        dynasm!(ops ; .arch aarch64 ; mov w12, w9);
+        emit_load_u64(ops, 13, cage_base);
+        dynasm!(ops ; .arch aarch64 ; add x13, x13, x12);
+
+        // pop body: require the dense invariant (Vec length == logical length);
+        // an empty array returns undefined without mutating, otherwise drop and
+        // return the last slot.
+        let empty = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x10, [x13, arr_len_byte]
+            ; ldr x11, [x13, length_byte]
+            ; cmp x10, x11
+            ; b.ne =>miss
+            ; cbz x10, =>empty
+            ; sub x10, x10, #1
+            ; ldr x12, [x13, arr_ptr_byte]
+            ; lsl x15, x10, #3
+            ; add x12, x12, x15
+            ; ldr x14, [x12]
+            ; str x10, [x13, arr_len_byte]
+            ; str x10, [x13, length_byte]
+        );
+        store_reg(ops, 14, dst)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done ; =>empty);
+        emit_load_u64(ops, 14, undef);
+        store_reg(ops, 14, dst)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done);
+        Ok(true)
+    }
+
     fn emit_live_collection_leaf_method_guarded_call(
         ops: &mut Assembler,
         operands: &[Operand],
@@ -5977,6 +6140,7 @@ mod tests {
             inline_methods: Default::default(),
             collection_leaf_methods: Default::default(),
             collection_alloc_methods: Default::default(),
+            array_methods: Default::default(),
             safepoints: Default::default(),
         }
     }

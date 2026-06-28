@@ -182,10 +182,11 @@ pub use dynamic_import::{DynamicImportLoader, DynamicImportLoaderHandle, Dynamic
 pub use error_classes::{ErrorClassRegistry, ErrorKind};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
-    JitCollectionAllocMethod, JitCollectionLayout, JitCollectionLeafMethod,
-    JitCollectionMethodIcSlot, JitCompileError, JitCompileRequest, JitCompileStatus,
-    JitCompilerHook, JitExecOutcome, JitFrameStack, JitFunctionCode, JitFunctionView,
-    JitInlineCallee, JitInlineMethod, JitInstrView, JitReentryPtrs, JitTypedArrayLayout,
+    JitArrayMethod, JitArrayMethodKind, JitCollectionAllocMethod, JitCollectionLayout,
+    JitCollectionLeafMethod, JitCollectionMethodIcSlot, JitCompileError, JitCompileRequest,
+    JitCompileStatus, JitCompilerHook, JitExecOutcome, JitFrameStack, JitFunctionCode,
+    JitFunctionView, JitInlineCallee, JitInlineMethod, JitInstrView, JitReentryPtrs,
+    JitTypedArrayLayout,
 };
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,
@@ -2901,6 +2902,7 @@ impl Interpreter {
         self.bake_inline_callees(&mut view, context, fid);
         self.bake_collection_leaf_methods(&mut view);
         self.bake_collection_alloc_methods(&mut view);
+        self.bake_array_methods(&mut view);
         let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
         if trace {
             let method_feedback = self
@@ -3579,6 +3581,23 @@ impl Interpreter {
     /// prototype/expando override, prototype shape, and builtin identity at the
     /// slot. Baking only makes those fields machine-readable so the hot path no
     /// longer crosses into Rust just to resolve a `RuntimeStubId`.
+    /// Bake dense-array `push` / `pop` method-call guard metadata so the
+    /// baseline can splice an inline fast path for the site. The runtime method
+    /// bridge re-validates the receiver/prototype/builtin on every miss.
+    fn bake_array_methods(&self, view: &mut jit::JitFunctionView) {
+        for instr in &view.instructions {
+            if instr.op != Op::CallMethodValue {
+                continue;
+            }
+            let Some(site) = instr.property_ic_site else {
+                continue;
+            };
+            if let Some(feedback) = self.jit_array_method_feedback(site) {
+                view.array_methods.insert(instr.byte_pc, feedback);
+            }
+        }
+    }
+
     fn bake_collection_leaf_methods(&self, view: &mut jit::JitFunctionView) {
         for instr in &view.instructions {
             if instr.op != Op::CallMethodValue {
@@ -15780,6 +15799,7 @@ mod tests {
             inline_methods: rustc_hash::FxHashMap::default(),
             collection_leaf_methods: rustc_hash::FxHashMap::default(),
             collection_alloc_methods: rustc_hash::FxHashMap::default(),
+            array_methods: rustc_hash::FxHashMap::default(),
             safepoints: rustc_hash::FxHashMap::default(),
         };
         interp.bake_arith_feedback(&mut view, 5);

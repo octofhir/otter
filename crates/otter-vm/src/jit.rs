@@ -136,6 +136,12 @@ pub struct JitFunctionView {
     /// allocating stub id. Generated code must still attach an exact safepoint
     /// for the call site before it may invoke the stub.
     pub collection_alloc_methods: rustc_hash::FxHashMap<u32, JitCollectionAllocMethod>,
+    /// Dense-array `push` / `pop` method-call feedback keyed by the caller's
+    /// `Op::CallMethodValue` byte-PC. Each entry carries the receiver guard's
+    /// prototype/shape/builtin metadata so the baseline can splice an inline
+    /// fast path (length bump + element move) under a guard, with the runtime
+    /// method bridge as the miss fallback.
+    pub array_methods: rustc_hash::FxHashMap<u32, JitArrayMethod>,
     /// Safepoint records baked for allocating runtime-stub call sites, keyed by
     /// `SafepointId`. Baseline v1 uses frame-slot roots for the full register
     /// window, so allocating stubs can trigger moving GC without keeping raw
@@ -194,6 +200,37 @@ pub struct JitCollectionAllocMethod {
     /// Number of raw boxed `Value` arguments in the uniform mutation ABI. The
     /// current collection mutation shape is `(receiver, arg0, arg1_or_undefined)`.
     pub value_arg_count: u8,
+}
+
+/// Which dense-array builtin a [`JitArrayMethod`] guards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitArrayMethodKind {
+    /// `Array.prototype.pop` — leaf, no allocation.
+    Pop,
+    /// `Array.prototype.push` — may grow the backing store.
+    Push,
+}
+
+/// JIT-readable dense-array `push` / `pop` method IC entry.
+///
+/// Holds no GC pointer: `proto_offset` is a stable compressed offset of the
+/// realm `%Array.prototype%`, `proto_shape` is a plain shape-handle offset, and
+/// the builtin is checked against a stable native `fn` address. The inline fast
+/// path validates the receiver is an ordinary dense array (no exotic sidecar)
+/// and the prototype still carries the original builtin at the cached slot;
+/// any miss falls through to the rooted runtime method bridge.
+#[derive(Debug, Clone, Copy)]
+pub struct JitArrayMethod {
+    /// Compressed offset of the realm `%Array.prototype%` object.
+    pub proto_offset: u32,
+    /// Expected prototype shape handle compressed offset.
+    pub proto_shape: u32,
+    /// Byte offset inside the prototype object's value slab for the method.
+    pub method_value_byte: u32,
+    /// Raw static native builtin function address expected in the method slot.
+    pub builtin_fn_addr: usize,
+    /// Which builtin this site resolved to.
+    pub kind: JitArrayMethodKind,
 }
 
 /// Empty [`JitCollectionMethodIcSlot::state`].

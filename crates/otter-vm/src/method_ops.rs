@@ -1405,6 +1405,42 @@ impl Interpreter {
     /// prototype overrides, even if they point back to the canonical prototype,
     /// are left to the normal fallback path because generated code only checks
     /// the collection body's no-override/no-expando guard flags.
+    /// Snapshot a monomorphic dense-array `push` / `pop` method-call IC into
+    /// JIT-readable guard metadata for an inline fast path. Returns `None` for
+    /// any other method, family, or when the prototype slot no longer holds the
+    /// original native builtin. The emitted guard re-validates the prototype
+    /// shape and builtin identity, so a stale snapshot can only miss to the
+    /// runtime bridge, never miscompile.
+    pub(crate) fn jit_array_method_feedback(
+        &self,
+        site: usize,
+    ) -> Option<crate::jit::JitArrayMethod> {
+        let ic = match (*self.method_call_ics.get(site)?).as_ref().copied()? {
+            MethodCallIc::Array(ic) => ic,
+            MethodCallIc::Collection(_) => return None,
+        };
+        let kind = match ic.tag {
+            crate::array_prototype::ArrayMethodTag::Pop => crate::jit::JitArrayMethodKind::Pop,
+            crate::array_prototype::ArrayMethodTag::Push => crate::jit::JitArrayMethodKind::Push,
+            _ => return None,
+        };
+        let proto = self.realm_intrinsics.array_prototype?;
+        let method = crate::object::data_slot_value_at(proto, &self.gc_heap, ic.proto_slot)?;
+        if !ic.tag.matches_builtin(method, &self.gc_heap) {
+            return None;
+        }
+        let builtin_fn_addr = method
+            .as_native_function()
+            .and_then(|native| native.jit_static_fn_addr(&self.gc_heap))?;
+        Some(crate::jit::JitArrayMethod {
+            proto_offset: proto.offset(),
+            proto_shape: crate::object::shape(proto, &self.gc_heap).offset(),
+            method_value_byte: u32::from(ic.proto_slot) * std::mem::size_of::<Value>() as u32,
+            builtin_fn_addr,
+            kind,
+        })
+    }
+
     pub(crate) fn jit_collection_leaf_method_feedback(
         &self,
         site: usize,

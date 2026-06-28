@@ -59,12 +59,37 @@ impl Interpreter {
         dst: u16,
         name_idx: u32,
     ) -> Result<(), VmError> {
+        // A previously-resolved lexical cell for this load site reads directly,
+        // skipping the name-string hash and const-table lookup. The cell is
+        // permanent once bound, so the only per-read check is the TDZ hole.
+        if let Some(&cell) = self.global_lexical_load_ic.get(&(function_id, name_idx)) {
+            let value = crate::read_upvalue(&self.gc_heap, cell);
+            if !value.is_hole() {
+                write_register(frame, dst, value)?;
+                frame.advance_pc(self.current_byte_len)?;
+                return Ok(());
+            }
+            let name = context
+                .string_constant_str_for_function(function_id, name_idx)
+                .ok_or(VmError::InvalidOperand)?;
+            return Err(self.err_this_uninit(
+                (format!("Cannot access '{name}' before initialization")).into(),
+            ));
+        }
         let name = context
             .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
         // §9.1.1.4 — the global declarative record (script lexicals)
         // shadows the object record.
-        if let Some(value) = self.read_global_lexical(name)? {
+        if let Some((cell, _)) = self.global_lexicals.get(name).copied() {
+            self.global_lexical_load_ic
+                .insert((function_id, name_idx), cell);
+            let value = crate::read_upvalue(&self.gc_heap, cell);
+            if value.is_hole() {
+                return Err(self.err_this_uninit(
+                    (format!("Cannot access '{name}' before initialization")).into(),
+                ));
+            }
             write_register(frame, dst, value)?;
             frame.advance_pc(self.current_byte_len)?;
             return Ok(());

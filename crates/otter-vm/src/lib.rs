@@ -588,6 +588,15 @@ pub struct Interpreter {
     /// as global object properties. Cells start as the TDZ hole.
     pub(crate) global_lexicals:
         rustc_hash::FxHashMap<Box<str>, (crate::UpvalueCell, /* is_const */ bool)>,
+    /// Per-load-site cache of resolved global declarative-record cells, keyed by
+    /// `(function_id, name_constant_index)`. A global lexical binding's cell is
+    /// stable for the realm's lifetime (lexical bindings are never deleted), so
+    /// once a hot `LoadGlobalOrThrow` site resolves to one it can read the cell
+    /// directly on every later hit — skipping the name-string hash, the const
+    /// table lookup, and the object-record `[[Get]]` ladder. The cells are GC
+    /// roots traced alongside [`Self::global_lexicals`]; only lexical hits are
+    /// cached, so object-record globals never produce a stale entry.
+    pub(crate) global_lexical_load_ic: rustc_hash::FxHashMap<(u32, u32), crate::UpvalueCell>,
     /// Depth of active §16.2.1.4 Evaluate calls. Dynamic imports that
     /// land while this is non-zero defer their target's evaluation to
     /// a host job so they cannot preempt the running DFS.
@@ -1461,6 +1470,7 @@ impl Interpreter {
             module_environments: std::collections::HashMap::new(),
             module_init_upvalues: std::collections::HashMap::new(),
             global_lexicals: rustc_hash::FxHashMap::default(),
+            global_lexical_load_ic: rustc_hash::FxHashMap::default(),
             module_hoisted: std::collections::HashSet::new(),
             module_evaluation_depth: 0,
             module_resolution_cache: std::collections::HashMap::new(),
@@ -5292,6 +5302,15 @@ impl Interpreter {
     /// Global declarative-record cells for the GC root walk.
     pub(crate) fn global_lexicals_for_trace(&self) -> impl Iterator<Item = &crate::UpvalueCell> {
         self.global_lexicals.values().map(|(cell, _)| cell)
+    }
+
+    /// Cached global-load cells for the GC root walk. These alias cells already
+    /// held by [`Self::global_lexicals`], but a moving collector rewrites each
+    /// root slot in place, so the cache copies must be visited too.
+    pub(crate) fn global_lexical_load_ic_for_trace(
+        &self,
+    ) -> impl Iterator<Item = &crate::UpvalueCell> {
+        self.global_lexical_load_ic.values()
     }
 
     /// Borrow cached eager + deferred module namespace exotic objects

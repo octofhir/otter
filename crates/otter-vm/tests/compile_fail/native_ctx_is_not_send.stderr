@@ -342,7 +342,7 @@ error[E0277]: `*const UpvalueCellBody` cannot be sent between threads safely
 6 |     assert_send::<otter_vm::NativeCtx<'static>>();
   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*const UpvalueCellBody` cannot be sent between threads safely
   |
-  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `*const UpvalueCellBody`
+  = help: within `((u32, u32), otter_gc::compressed::Gc<UpvalueCellBody>)`, the trait `Send` is not implemented for `*const UpvalueCellBody`
 note: required because it appears within the type `PhantomData<*const UpvalueCellBody>`
  --> $RUST/core/src/marker.rs
   |
@@ -353,31 +353,15 @@ note: required because it appears within the type `otter_gc::compressed::Gc<Upva
   |
   | pub struct Gc<T: ?Sized> {
   |            ^^
-note: required because it appears within the type `Option<otter_gc::compressed::Gc<UpvalueCellBody>>`
- --> $RUST/core/src/option.rs
+  = note: required because it appears within the type `((u32, u32), otter_gc::compressed::Gc<UpvalueCellBody>)`
+  = note: required for `hashbrown::raw::RawTable<((u32, u32), otter_gc::compressed::Gc<UpvalueCellBody>)>` to implement `Send`
+note: required because it appears within the type `hashbrown::map::HashMap<(u32, u32), otter_gc::compressed::Gc<UpvalueCellBody>, rustc_hash::FxBuildHasher>`
+ --> /rust/deps/hashbrown-0.16.1/src/map.rs:185:11
+note: required because it appears within the type `HashMap<(u32, u32), otter_gc::compressed::Gc<UpvalueCellBody>, rustc_hash::FxBuildHasher>`
+ --> $RUST/std/src/collections/hash/map.rs
   |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `otter_vm::call_ops::LeanCallbackRoot`
- --> src/call_ops.rs
-  |
-  | pub(crate) struct LeanCallbackRoot {
-  |                   ^^^^^^^^^^^^^^^^
-note: required because it appears within the type `PhantomData<otter_vm::call_ops::LeanCallbackRoot>`
- --> $RUST/core/src/marker.rs
-  |
-  | pub struct PhantomData<T: PointeeSized>;
-  |            ^^^^^^^^^^^
-note: required because it appears within the type `alloc::raw_vec::RawVec<otter_vm::call_ops::LeanCallbackRoot>`
- --> $RUST/alloc/src/raw_vec/mod.rs
-  |
-  | pub(crate) struct RawVec<T, A: Allocator = Global> {
-  |                   ^^^^^^
-note: required because it appears within the type `Vec<otter_vm::call_ops::LeanCallbackRoot>`
- --> $RUST/alloc/src/vec/mod.rs
-  |
-  | pub struct Vec<T, #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global> {
-  |            ^^^
+  | pub struct HashMap<
+  |            ^^^^^^^
 note: required because it appears within the type `otter_vm::Interpreter`
  --> src/lib.rs
   |

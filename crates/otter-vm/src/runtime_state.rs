@@ -134,6 +134,10 @@ impl<'a> RuntimeState<'a> {
             let p = slot as *const crate::UpvalueCell as *mut otter_gc::raw::RawGc;
             visitor(p);
         }
+        for slot in interp.global_lexical_load_ic_for_trace() {
+            let p = slot as *const crate::UpvalueCell as *mut otter_gc::raw::RawGc;
+            visitor(p);
+        }
         for ns in interp.module_namespaces_for_trace() {
             ns.trace_gc_roots(visitor);
         }

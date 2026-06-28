@@ -468,10 +468,27 @@ fn apply_collection_new_target_prototype(
     let Some(proto) = proto else {
         return Ok(());
     };
+    // Record the override only when `new.target`'s prototype is a genuinely
+    // different object than the realm's canonical collection prototype.
+    // Recording the canonical prototype as an explicit override is observably
+    // identical to leaving it implicit (both resolve methods through the same
+    // object) but it sets `COLLECTION_JIT_FLAG_PROTO_OVERRIDE`, which the
+    // machine-code method guard reads as "not a pristine ordinary collection"
+    // and falls back to the runtime bridge. Keeping the flag clear for ordinary
+    // `new Map()` / `new Set()` lets the direct VM-native method path fire.
+    let canonical_override = |canonical: Option<crate::object::JsObject>| {
+        if canonical.is_some() && proto.as_object() == canonical {
+            None
+        } else {
+            Some(proto)
+        }
+    };
     if let Some(map) = target.as_map() {
-        collections::set_map_prototype_override(map, ctx.heap_mut(), Some(proto));
+        let canonical = ctx.interp_mut().realm_intrinsics.map_prototype;
+        collections::set_map_prototype_override(map, ctx.heap_mut(), canonical_override(canonical));
     } else if let Some(set) = target.as_set() {
-        collections::set_set_prototype_override(set, ctx.heap_mut(), Some(proto));
+        let canonical = ctx.interp_mut().realm_intrinsics.set_prototype;
+        collections::set_set_prototype_override(set, ctx.heap_mut(), canonical_override(canonical));
     } else if let Some(map) = target.as_weak_map() {
         collections::set_weak_map_prototype_override(map, ctx.heap_mut(), Some(proto));
     } else if let Some(set) = target.as_weak_set() {

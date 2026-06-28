@@ -360,6 +360,21 @@ pub struct JitRuntimeStats {
     pub method_generic_calls: u64,
 }
 
+/// Snapshot of VM-published collection method IC mirror slots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JitCollectionMethodIcStats {
+    /// Total mirror slots allocated for method call IC sites.
+    pub slots: u64,
+    /// Empty/uninitialized mirror slots.
+    pub empty_slots: u64,
+    /// Slots currently holding collection method feedback.
+    pub collection_slots: u64,
+    /// Collection slots with a leaf/no-allocation stub id.
+    pub leaf_stub_slots: u64,
+    /// Collection slots with an allocating stub id.
+    pub alloc_stub_slots: u64,
+}
+
 /// Observed-callee state for one bytecode `Op::Call` site, the feedback the
 /// baseline reads to decide whether to inline a tiny leaf callee.
 ///
@@ -1603,6 +1618,31 @@ impl Interpreter {
     #[must_use]
     pub fn jit_runtime_stats(&self) -> JitRuntimeStats {
         self.jit_runtime_stats
+    }
+
+    /// Return the current VM-published collection method IC mirror summary.
+    #[must_use]
+    pub fn jit_collection_method_ic_stats(&self) -> JitCollectionMethodIcStats {
+        let mut stats = JitCollectionMethodIcStats {
+            slots: self.jit_collection_method_ics.len() as u64,
+            ..JitCollectionMethodIcStats::default()
+        };
+        for slot in &self.jit_collection_method_ics {
+            if slot.state == jit::JIT_COLLECTION_METHOD_IC_EMPTY {
+                stats.empty_slots = stats.empty_slots.saturating_add(1);
+                continue;
+            }
+            if slot.is_collection() {
+                stats.collection_slots = stats.collection_slots.saturating_add(1);
+                if slot.leaf_stub_id != jit::JIT_COLLECTION_METHOD_IC_NO_STUB {
+                    stats.leaf_stub_slots = stats.leaf_stub_slots.saturating_add(1);
+                }
+                if slot.alloc_stub_id != jit::JIT_COLLECTION_METHOD_IC_NO_STUB {
+                    stats.alloc_stub_slots = stats.alloc_stub_slots.saturating_add(1);
+                }
+            }
+        }
+        stats
     }
 
     /// Call-count at which a function body is offered to the JIT. Low enough

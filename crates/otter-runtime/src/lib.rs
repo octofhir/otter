@@ -703,6 +703,16 @@ pub struct RuntimeExecutionStats {
     pub jit_method_number_fast_hits: u64,
     /// JIT method bridge calls that reached generic callable dispatch.
     pub jit_method_generic_calls: u64,
+    /// VM-published collection method IC mirror slots.
+    pub jit_collection_method_ic_slots: u64,
+    /// Empty collection method IC mirror slots.
+    pub jit_collection_method_ic_empty_slots: u64,
+    /// Live collection method IC mirror slots.
+    pub jit_collection_method_ic_collection_slots: u64,
+    /// Live collection method IC slots with leaf/no-allocation stubs.
+    pub jit_collection_method_ic_leaf_stub_slots: u64,
+    /// Live collection method IC slots with allocating stubs.
+    pub jit_collection_method_ic_alloc_stub_slots: u64,
     /// Total GC-cell bytes allocated since heap creation.
     pub gc_alloc_bytes_total: u64,
     /// Live heap objects after the last stats reconciliation.
@@ -2627,6 +2637,7 @@ impl Runtime {
         let ic = self.interp.property_ic_stats();
         let budget = self.interp.runtime_budget_stats();
         let jit = self.interp.jit_runtime_stats();
+        let collection_method_ics = self.interp.jit_collection_method_ic_stats();
         let gc = self.interp.gc_heap_mut().gc_stats().clone();
         RuntimeExecutionStats {
             property_load_hits: ic.load_hits,
@@ -2669,6 +2680,11 @@ impl Runtime {
             jit_method_string_fast_hits: jit.method_string_fast_hits,
             jit_method_number_fast_hits: jit.method_number_fast_hits,
             jit_method_generic_calls: jit.method_generic_calls,
+            jit_collection_method_ic_slots: collection_method_ics.slots,
+            jit_collection_method_ic_empty_slots: collection_method_ics.empty_slots,
+            jit_collection_method_ic_collection_slots: collection_method_ics.collection_slots,
+            jit_collection_method_ic_leaf_stub_slots: collection_method_ics.leaf_stub_slots,
+            jit_collection_method_ic_alloc_stub_slots: collection_method_ics.alloc_stub_slots,
             gc_alloc_bytes_total: gc.alloc_bytes_total,
             gc_live_objects: gc.live_objects,
             gc_live_bytes: gc.live_bytes,

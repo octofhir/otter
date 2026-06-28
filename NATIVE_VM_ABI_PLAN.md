@@ -446,16 +446,27 @@ Exit criteria:
 - [x] First VM-side executable `AllocStub` runtime stub.
 - [x] Moving-GC coverage for executable `AllocStub` roots.
 - [x] JIT call path to stubs without `NativeCtx`.
+- [x] VM-published live collection method IC mirror for baseline guards.
+- [x] Baseline live collection leaf/alloc stub guards using mirror slots.
+- [x] Baseline synthetic `CallMethodValue` alloc safepoints for live IC stubs.
 - [x] Map/Set feedback model for leaf lookup stubs.
 - [x] Compiled `Map.get` / `Map.has` hot loop.
 - [x] Compiled `Map.set` / `Set.add` hot loop.
 - [ ] String concat specialized node.
 - [x] Baseline primitive string concat `AllocValueStub`.
 - [x] `OTTER_STATS=1` exposes JIT runtime-stub ABI class counters.
+- [x] `OTTER_STATS=1` exposes live collection method IC mirror summary.
 - [x] Collection-feedback method sites skip compiled-direct method prepare.
 - [ ] Shared object header design.
 - [ ] Map/Set migration to shared object header.
 - [ ] Interpreter quickening and block/backedge metering.
+
+Current `map-set.js` stats still report the hot `CallMethodValue` transitions
+through `jitRuntimeMethodStubs` even with live collection alloc IC slots
+published. The expanded stats show the mirror is populated (`collection` and
+`alloc` slots are present), while the benchmark run records only OSR attempts
+and no function-entry compile attempts. That points the remaining perf wall at
+the OSR/optimizing method-call bridge, outside this baseline/VM ABI slice.
 
 ## Verification Contract
 

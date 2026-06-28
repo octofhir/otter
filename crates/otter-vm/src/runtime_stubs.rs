@@ -469,6 +469,23 @@ pub extern "C" fn leaf_no_alloc_stub2_trampoline_pair(
     RuntimeStubResultPair::from_result(leaf_no_alloc_stub2_trampoline(heap, id, a0_bits, a1_bits))
 }
 
+/// Dynamic trampoline for fixed-value allocating runtime stubs.
+#[must_use]
+pub extern "C" fn alloc_value_stub_trampoline_pair(
+    ctx: *mut RuntimeStubAllocContext,
+    id: RuntimeStubId,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    arg0_bits: u64,
+    arg1_bits: u64,
+) -> RuntimeStubResultPair {
+    let Some(stub) = alloc_value_stub_by_id(id) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    stub.invoke_raw(ctx, safepoint, recv_bits, arg0_bits, arg1_bits)
+        .unwrap_or_else(|| RuntimeStubResultPair::from_result(RuntimeStubResult::miss()))
+}
+
 fn alloc_value_stub_result_pair(
     ctx: *mut RuntimeStubAllocContext,
     result: RuntimeStubResult,

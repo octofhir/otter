@@ -451,6 +451,7 @@ Exit criteria:
 - [x] Baseline synthetic `CallMethodValue` alloc safepoints for live IC stubs.
 - [x] Dynasm optimizing/OSR code publishes safepoint tables through `JitCtx`.
 - [x] Dynasm optimizing/OSR `CallMethodValue` can try live collection stubs.
+- [x] Narrow collection method IC bridge bypasses generic `CallMethodValue`.
 - [x] Map/Set feedback model for leaf lookup stubs.
 - [x] Compiled `Map.get` / `Map.has` hot loop.
 - [x] Compiled `Map.set` / `Set.add` hot loop.
@@ -470,6 +471,15 @@ published. The expanded stats show the mirror is populated (`collection` and
 `alloc` slots are present). Source-split counters show those remaining bridges
 come from baseline (`jitRuntimeMethodBaselineStubs`), not the dynasm optimizing
 emitter (`jitRuntimeMethodOptimizingStubs`).
+
+The next ABI slice moved live Map/Set IC hits out of the universal method
+bridge and into a narrow collection IC bridge that skips name lookup, generic
+callable dispatch, and `NativeCtx`. `map-set.js` drops
+`jitRuntimeMethodStubs` from ~182k to single digits and reports the former hot
+calls under `jitRuntimeCollectionMethodIcStubs`. Wall-clock time is still
+dominated by the Rust transition plus collection primitive work, so the next
+performance step is replacing that narrow bridge with direct machine calls to
+the same `AllocValueStub` / leaf ABI or changing collection layout.
 
 ## Verification Contract
 

@@ -277,9 +277,9 @@ mod arm64 {
         STATUS_THREW, TAG_FUNCTION_ID, TAG_INT32, TAG_PTR_FUNCTION, TAG_PTR_OBJECT, TAG_SPECIAL,
         THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, VM_OFFSET,
         jit_abort_direct_call_stub, jit_alloc_object_literal_stub, jit_backedge_poll_stub,
-        jit_call_method_stub_optimizing, jit_finish_direct_call_bailed_stub,
-        jit_finish_direct_call_returned_stub, jit_prepare_direct_call_stub,
-        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
+        jit_call_collection_method_ic_stub, jit_call_method_stub_optimizing,
+        jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
+        jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
     };
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
     use otter_vm::{
@@ -2731,6 +2731,33 @@ mod arm64 {
                     )?;
                     dynasm!(ops ; .arch aarch64 ; =>after_live_alloc);
                 }
+                dynasm!(
+                    ops
+                    ; .arch aarch64
+                    ; mov x0, x20
+                    ; movz x1, dst_reg as u32
+                    ; movz x2, *recv_reg as u32
+                );
+                emit_load_u64(ops, 3, *site);
+                dynasm!(ops ; .arch aarch64 ; movz x4, arg_regs.len() as u32);
+                for slot in 0..3 {
+                    let arg = arg_regs.get(slot).copied().unwrap_or(0);
+                    let xn = 5 + slot as u32;
+                    dynasm!(ops ; .arch aarch64 ; movz X(xn), arg as u32);
+                }
+                emit_load_u64(
+                    ops,
+                    16,
+                    jit_call_collection_method_ic_stub as *const () as u64,
+                );
+                dynasm!(
+                    ops
+                    ; .arch aarch64
+                    ; blr x16
+                    ; cmp x0, #1
+                    ; b.eq =>threw
+                    ; cbz x0, =>done
+                );
                 dynasm!(ops
                     ; .arch aarch64
                     ; mov x0, x20

@@ -1096,6 +1096,46 @@ fn jit_call_method_stub_impl(
     status
 }
 
+/// Narrow collection-IC method bridge.
+///
+/// Return status: `0` = IC hit and `dst` written, `1` = throw parked in ctx,
+/// `2` = miss, continue to the generic method path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) extern "C" fn jit_call_collection_method_ic_stub(
+    ctx: *mut JitCtx,
+    dst: u64,
+    recv: u64,
+    site: u64,
+    argc: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let all = [a0 as u16, a1 as u16, a2 as u16];
+    let argc = (argc as usize).min(all.len());
+    let status = match vm.jit_runtime_try_collection_method_ic(
+        stack,
+        ctx.frame_index,
+        dst as u16,
+        recv as u16,
+        site as usize,
+        &all[..argc],
+    ) {
+        Ok(true) => 0,
+        Ok(false) => 2,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    };
+    refresh_jit_collection_method_ics(ctx, vm);
+    status
+}
+
 /// Bridge stub: perform a computed `StoreElement` (`recv[idx] = src`) from
 /// compiled code, delegating to the safe
 /// [`Interpreter::jit_runtime_store_element`]. Returns `0` on success, `1` when
@@ -1366,15 +1406,15 @@ mod arm64 {
         TAG_NAN, TAG_PTR_FUNCTION, TAG_PTR_OBJECT, TAG_SPECIAL, THIS_VALUE_OFFSET,
         UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, Unsupported, VM_OFFSET,
         WhiskerIcCell, alloc_value_stub_trampoline_pair, jit_abort_direct_call_stub,
-        jit_backedge_poll_stub, jit_call_method_stub, jit_delegate_op_stub,
-        jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
-        jit_inline_closure_upvalues_stub, jit_load_element_stub, jit_load_global_stub,
-        jit_load_prop_stub, jit_load_prop_window_stub, jit_load_upvalue_stub, jit_make_fn_stub,
-        jit_new_array_stub, jit_new_object_stub, jit_prepare_direct_call_stub,
-        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub, jit_store_element_stub,
-        jit_store_prop_stub, jit_store_prop_window_stub, jit_store_upvalue_stub,
-        jit_write_barrier_stub, jit_write_barrier_window_stub, leaf_no_alloc_stub2_trampoline_pair,
-        reg_offset,
+        jit_backedge_poll_stub, jit_call_collection_method_ic_stub, jit_call_method_stub,
+        jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
+        jit_finish_direct_call_returned_stub, jit_inline_closure_upvalues_stub,
+        jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub, jit_load_prop_window_stub,
+        jit_load_upvalue_stub, jit_make_fn_stub, jit_new_array_stub, jit_new_object_stub,
+        jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
+        jit_store_element_stub, jit_store_prop_stub, jit_store_prop_window_stub,
+        jit_store_upvalue_stub, jit_write_barrier_stub, jit_write_barrier_window_stub,
+        leaf_no_alloc_stub2_trampoline_pair, reg_offset,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -5215,6 +5255,38 @@ mod arm64 {
         {
             dynasm!(ops ; .arch aarch64 ; =>after_live_alloc);
         }
+
+        dynasm!(
+            ops
+            ; .arch aarch64
+            ; mov x0, x20
+            ; movz x1, dst as u32
+            ; movz x2, recv as u32
+        );
+        emit_load_u64(ops, 3, site);
+        dynasm!(ops ; .arch aarch64 ; movz x4, argc as u32);
+        for slot in 0..MAX_METHOD_ARGS {
+            let areg = if slot < argc {
+                reg(operands, 4 + slot)?
+            } else {
+                0
+            };
+            let xn = 5 + slot as u32;
+            dynasm!(ops ; .arch aarch64 ; movz X(xn), areg as u32);
+        }
+        emit_load_u64(
+            ops,
+            16,
+            jit_call_collection_method_ic_stub as *const () as u64,
+        );
+        dynasm!(
+            ops
+            ; .arch aarch64
+            ; blr x16
+            ; cmp x0, #1
+            ; b.eq =>threw
+            ; cbz x0, =>done
+        );
 
         if leaf.is_some() || alloc.is_some() {
             dynasm!(ops ; .arch aarch64 ; b =>fallback);

@@ -334,6 +334,8 @@ pub struct JitRuntimeStats {
     pub runtime_method_baseline_stubs: u64,
     /// Method-call runtime stubs reached from optimizing dynasm code.
     pub runtime_method_optimizing_stubs: u64,
+    /// Narrow collection-IC method bridge calls from compiled code.
+    pub runtime_collection_method_ic_stubs: u64,
     /// ABI-classified runtime stub transitions from compiled code.
     pub runtime_stub_transitions: u64,
     /// ABI-classified leaf runtime stubs. These are the desired hot-path shape.
@@ -3760,6 +3762,14 @@ impl Interpreter {
                     .saturating_add(1);
             }
         }
+    }
+
+    pub(crate) fn record_jit_runtime_collection_method_ic_stub(&mut self) {
+        self.record_jit_runtime_stub_descriptor(native_abi::STUB_JIT_RUNTIME_CALL_METHOD);
+        self.jit_runtime_stats.runtime_collection_method_ic_stubs = self
+            .jit_runtime_stats
+            .runtime_collection_method_ic_stubs
+            .saturating_add(1);
     }
 
     fn record_jit_runtime_stub_descriptor(&mut self, desc: native_abi::RuntimeStubDescriptor) {

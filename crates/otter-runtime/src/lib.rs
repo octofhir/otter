@@ -679,6 +679,8 @@ pub struct RuntimeExecutionStats {
     pub jit_runtime_method_baseline_stubs: u64,
     /// JIT method-call runtime stubs reached from optimizing dynasm.
     pub jit_runtime_method_optimizing_stubs: u64,
+    /// Narrow collection-IC method bridge calls from compiled code.
+    pub jit_runtime_collection_method_ic_stubs: u64,
     /// ABI-classified runtime stub transitions from compiled code.
     pub jit_runtime_stub_transitions: u64,
     /// ABI-classified leaf runtime stubs.
@@ -2672,6 +2674,7 @@ impl Runtime {
             jit_runtime_method_stubs: jit.runtime_method_stubs,
             jit_runtime_method_baseline_stubs: jit.runtime_method_baseline_stubs,
             jit_runtime_method_optimizing_stubs: jit.runtime_method_optimizing_stubs,
+            jit_runtime_collection_method_ic_stubs: jit.runtime_collection_method_ic_stubs,
             jit_runtime_stub_transitions: jit.runtime_stub_transitions,
             jit_leaf_stub_transitions: jit.leaf_stub_transitions,
             jit_alloc_stub_transitions: jit.alloc_stub_transitions,

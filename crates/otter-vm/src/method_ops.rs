@@ -1351,6 +1351,35 @@ impl Interpreter {
 
     /// JIT bridge for the guarded collection method IC only.
     ///
+    /// This accepts any live Map/Set IC operation, including allocating
+    /// mutations and materializing string keys. It deliberately skips method
+    /// name lookup, generic callable dispatch, and `NativeCtx`; callers fall
+    /// back to [`Self::jit_runtime_call_method`] on `Ok(false)`.
+    pub fn jit_runtime_try_collection_method_ic(
+        &mut self,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        dst: u16,
+        recv_reg: u16,
+        site: usize,
+        arg_regs: &[u16],
+    ) -> Result<bool, VmError> {
+        let recv = *read_register(&stack[frame_index], recv_reg)?;
+        let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(arg_regs.len());
+        for &r in arg_regs {
+            args.push(*read_register(&stack[frame_index], r)?);
+        }
+        let Some(result) = self.try_collection_method_call_ic(site, recv, args.as_slice()) else {
+            return Ok(false);
+        };
+        self.record_jit_runtime_collection_method_ic_stub();
+        self.record_jit_method_collection_ic_hit();
+        write_register(&mut stack[frame_index], dst, result?)?;
+        Ok(true)
+    }
+
+    /// JIT bridge for the guarded collection method IC only.
+    ///
     /// Returns the leaf stub descriptor id when receiver/prototype/builtin
     /// guards validate. The caller is responsible for invoking the returned
     /// VM-native leaf ABI entry against raw register-window values.

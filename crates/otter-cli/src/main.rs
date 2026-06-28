@@ -358,6 +358,10 @@ struct RunArgs {
     /// Base file name for `--cpu-prof` artifacts.
     #[arg(long, requires = "cpu_prof")]
     cpu_prof_name: Option<String>,
+    /// GC heap cap in bytes; `0` disables the cap. Default is the runtime's
+    /// built-in limit. Surfaces a catchable `RangeError` when exceeded.
+    #[arg(long)]
+    max_heap_bytes: Option<u64>,
     /// Forwarded target arguments.
     #[arg(trailing_var_arg = true)]
     args: Vec<String>,
@@ -520,6 +524,7 @@ async fn main() -> ExitCode {
                     cpu_prof_dir: PathBuf::from("/tmp/otter-prof"),
                     cpu_prof_interval: 1000,
                     cpu_prof_name: None,
+                    max_heap_bytes: None,
                     args: forwarded_args,
                 },
                 json,
@@ -576,6 +581,7 @@ fn exit_from_result(result: Result<ExitCode, OtterError>, json: bool) -> ExitCod
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_file(
     path: &std::path::Path,
     args: &[String],
@@ -584,6 +590,7 @@ async fn run_file(
     caps: &CapabilitySet,
     startup_timer: &CliStartupTimer,
     cpu_profile: Option<&CpuProfileOptions>,
+    max_heap_bytes: Option<u64>,
 ) -> Result<ExitCode, OtterError> {
     run_file_with_cwd(
         path,
@@ -594,10 +601,12 @@ async fn run_file(
         caps,
         startup_timer,
         cpu_profile,
+        max_heap_bytes,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_file_with_cwd(
     path: &std::path::Path,
     args: &[String],
@@ -607,6 +616,7 @@ async fn run_file_with_cwd(
     caps: &CapabilitySet,
     startup_timer: &CliStartupTimer,
     cpu_profile: Option<&CpuProfileOptions>,
+    max_heap_bytes: Option<u64>,
 ) -> Result<ExitCode, OtterError> {
     if let Some(mode) = dump_mode {
         if cpu_profile.is_some() {
@@ -630,12 +640,16 @@ async fn run_file_with_cwd(
             caps,
             startup_timer,
             profile,
+            max_heap_bytes,
         )
         .await;
     }
     let mut builder = cli_otter_builder(caps)
         .process_argv(process_argv_for_file(path, args))
         .module_loader(cli_loader_config_for_entry(path).await);
+    if let Some(bytes) = max_heap_bytes {
+        builder = builder.max_heap_bytes(bytes);
+    }
     if let Some(cwd) = process_cwd {
         builder = builder.process_cwd(cwd.to_path_buf());
     }
@@ -664,6 +678,7 @@ async fn run_file_with_cwd(
     Ok(ExitCode::from(code))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_file_with_cpu_profile(
     path: &std::path::Path,
     args: &[String],
@@ -672,6 +687,7 @@ async fn run_file_with_cpu_profile(
     caps: &CapabilitySet,
     startup_timer: &CliStartupTimer,
     profile_options: &CpuProfileOptions,
+    max_heap_bytes: Option<u64>,
 ) -> Result<ExitCode, OtterError> {
     let mut builder = otter_runtime::Runtime::builder()
         .capabilities(caps.clone())
@@ -679,6 +695,9 @@ async fn run_file_with_cpu_profile(
         .with_web_apis()
         .process_argv(process_argv_for_file(path, args))
         .module_loader(cli_loader_config_for_entry(path).await);
+    if let Some(bytes) = max_heap_bytes {
+        builder = builder.max_heap_bytes(bytes);
+    }
     if let Some(cwd) = process_cwd {
         builder = builder.process_cwd(cwd.to_path_buf());
     }
@@ -942,6 +961,7 @@ async fn run_target(
 ) -> Result<ExitCode, OtterError> {
     let project_root = std::env::current_dir().map_err(|err| pm_config_error(err.to_string()))?;
     let target_args = args.args.clone();
+    let max_heap_bytes = args.max_heap_bytes;
     let cpu_profile = args.cpu_prof.then(|| CpuProfileOptions {
         dir: args.cpu_prof_dir.clone(),
         interval: args.cpu_prof_interval,
@@ -957,6 +977,7 @@ async fn run_target(
                 caps,
                 startup_timer,
                 cpu_profile.as_ref(),
+                max_heap_bytes,
             )
             .await
         }
@@ -990,6 +1011,7 @@ async fn run_target(
                 caps,
                 startup_timer,
                 cpu_profile.as_ref(),
+                max_heap_bytes,
             )
             .await
         }
@@ -1160,6 +1182,7 @@ async fn run_package_script(
         caps,
         startup_timer,
         cpu_profile,
+        None,
     )
     .await
 }
@@ -2637,6 +2660,7 @@ integrity = "sha512-test"
             cpu_prof_dir: PathBuf::from("/tmp/otter-prof"),
             cpu_prof_interval: 1000,
             cpu_prof_name: None,
+            max_heap_bytes: None,
             args: Vec::new(),
         };
         assert!(matches!(
@@ -2675,6 +2699,7 @@ integrity = "sha512-test"
             cpu_prof_dir: PathBuf::from("/tmp/otter-prof"),
             cpu_prof_interval: 1000,
             cpu_prof_name: None,
+            max_heap_bytes: None,
             args: Vec::new(),
         };
         let err = resolve_run_target(tmp.path(), &args).await.unwrap_err();
@@ -2710,6 +2735,7 @@ integrity = "sha512-test"
             cpu_prof_dir: PathBuf::from("/tmp/otter-prof"),
             cpu_prof_interval: 1000,
             cpu_prof_name: None,
+            max_heap_bytes: None,
             args: Vec::new(),
         };
         let resolved = resolve_run_target(tmp.path(), &args).await.unwrap();
@@ -2770,6 +2796,7 @@ trust = "untrusted"
             cpu_prof_dir: PathBuf::from("/tmp/otter-prof"),
             cpu_prof_interval: 1000,
             cpu_prof_name: None,
+            max_heap_bytes: None,
             args: Vec::new(),
         };
         let resolved = resolve_run_target(tmp.path(), &args).await.unwrap();
@@ -2852,6 +2879,7 @@ if (value !== 53) fail();
             &CapabilitySet::default(),
             &startup_timer,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2882,6 +2910,7 @@ if (process.argv[3] !== "two words") throw new Error("missing second arg");
             &CapabilitySet::default(),
             &startup_timer,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2904,6 +2933,7 @@ if (process.argv[3] !== "two words") throw new Error("missing second arg");
             None,
             &CapabilitySet::default(),
             &startup_timer,
+            None,
             None,
         )
         .await
@@ -2949,6 +2979,7 @@ if (process.argv[3] !== "from-cli") fail();
             false,
             &CapabilitySet::default(),
             &startup_timer,
+            None,
             None,
         )
         .await
@@ -2996,6 +3027,7 @@ if (process.argv[3] !== "from-cli") fail();
             false,
             &CapabilitySet::default(),
             &startup_timer,
+            None,
             None,
         )
         .await
@@ -3589,6 +3621,7 @@ export let value = inner;
             cpu_prof_dir: PathBuf::from("/tmp/otter-prof"),
             cpu_prof_interval: 1000,
             cpu_prof_name: None,
+            max_heap_bytes: None,
             args: Vec::new(),
         };
         let resolved = resolve_run_target(&root, &args).await.unwrap();
@@ -3712,6 +3745,7 @@ export let value = inner;
             None,
             &CapabilitySet::default(),
             &startup_timer,
+            None,
             None,
         )
         .await

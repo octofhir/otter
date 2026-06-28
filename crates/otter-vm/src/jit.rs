@@ -196,6 +196,66 @@ pub struct JitCollectionAllocMethod {
     pub value_arg_count: u8,
 }
 
+/// Empty [`JitCollectionMethodIcSlot::state`].
+pub const JIT_COLLECTION_METHOD_IC_EMPTY: u8 = 0;
+/// Live collection method IC slot.
+pub const JIT_COLLECTION_METHOD_IC_COLLECTION: u8 = 1;
+/// Sentinel for absent leaf/alloc runtime stub ids in
+/// [`JitCollectionMethodIcSlot`].
+pub const JIT_COLLECTION_METHOD_IC_NO_STUB: crate::native_abi::RuntimeStubId =
+    crate::native_abi::RuntimeStubId::MAX;
+
+/// C-layout live method IC slot for Map/Set builtin calls.
+///
+/// This is the JIT-readable mirror of `method_ops::CollectionMethodCallIc`.
+/// It intentionally stores only non-GC metadata and raw codegen constants;
+/// generated code must still revalidate receiver family, prototype shape,
+/// builtin identity, and no receiver override/expando before using a stub id.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JitCollectionMethodIcSlot {
+    /// Slot state; `0` means empty.
+    pub state: u8,
+    /// Expected Map/Set body type tag.
+    pub receiver_type_tag: u8,
+    /// Reserved for stable C layout.
+    pub reserved0: u16,
+    /// Canonical realm prototype compressed offset.
+    pub proto_offset: u32,
+    /// Canonical realm prototype shape compressed offset.
+    pub proto_shape: u32,
+    /// Byte offset of the method value inside the prototype value slab.
+    pub method_value_byte: u32,
+    /// Leaf/no-allocation stub id, or
+    /// [`JIT_COLLECTION_METHOD_IC_NO_STUB`].
+    pub leaf_stub_id: crate::native_abi::RuntimeStubId,
+    /// Allocating stub id, or [`JIT_COLLECTION_METHOD_IC_NO_STUB`].
+    pub alloc_stub_id: crate::native_abi::RuntimeStubId,
+    /// Canonical builtin native entry identity.
+    pub builtin_fn_addr: usize,
+}
+
+impl JitCollectionMethodIcSlot {
+    /// Empty slot.
+    pub const EMPTY: Self = Self {
+        state: JIT_COLLECTION_METHOD_IC_EMPTY,
+        receiver_type_tag: 0,
+        reserved0: 0,
+        proto_offset: 0,
+        proto_shape: 0,
+        method_value_byte: 0,
+        leaf_stub_id: JIT_COLLECTION_METHOD_IC_NO_STUB,
+        alloc_stub_id: JIT_COLLECTION_METHOD_IC_NO_STUB,
+        builtin_fn_addr: 0,
+    };
+
+    /// `true` when this slot contains a collection IC payload.
+    #[must_use]
+    pub const fn is_collection(self) -> bool {
+        self.state == JIT_COLLECTION_METHOD_IC_COLLECTION
+    }
+}
+
 /// A callee the baseline may splice into a caller's `Op::Call` site instead of
 /// emitting the per-call bridge. Carries the callee's own bytecode (the body to
 /// inline) plus the identity it is guarded against: a runtime closure whose bits

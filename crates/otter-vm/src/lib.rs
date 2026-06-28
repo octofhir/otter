@@ -623,6 +623,11 @@ pub struct Interpreter {
     /// by a prototype shape + slot-identity guard. See
     /// [`method_ops::MethodCallIc`].
     method_call_ics: Vec<Option<method_ops::MethodCallIc>>,
+    /// JIT-readable C-layout mirror for live collection method IC entries,
+    /// keyed by the same dense executable IC site id as [`Self::method_call_ics`].
+    /// Non-collection and empty entries are represented as
+    /// [`jit::JitCollectionMethodIcSlot::EMPTY`].
+    jit_collection_method_ics: Vec<jit::JitCollectionMethodIcSlot>,
     /// Cheap aggregate counters for interpreter property IC behavior.
     property_ic_stats: property_ic::PropertyIcStats,
     /// Runtime-installed baseline JIT compiler hook. The hook lives behind a VM
@@ -1437,6 +1442,7 @@ impl Interpreter {
             load_property_ics: Vec::new(),
             store_property_ics: Vec::new(),
             method_call_ics: Vec::new(),
+            jit_collection_method_ics: Vec::new(),
             has_property_ics: Vec::new(),
             property_ic_stats: property_ic::PropertyIcStats::default(),
             jit_hook: None,
@@ -3828,6 +3834,10 @@ impl Interpreter {
         if self.method_call_ics.len() < site_count {
             self.method_call_ics.resize(site_count, None);
         }
+        if self.jit_collection_method_ics.len() < site_count {
+            self.jit_collection_method_ics
+                .resize(site_count, jit::JitCollectionMethodIcSlot::EMPTY);
+        }
     }
 
     /// Install the host-side timer scheduler. Called by the
@@ -5946,6 +5956,20 @@ impl Interpreter {
     /// entries must not allocate, trigger GC, or retain the pointer.
     pub fn jit_gc_heap_ptr(&self) -> *const std::ffi::c_void {
         std::ptr::addr_of!(self.gc_heap).cast::<std::ffi::c_void>()
+    }
+
+    /// Base of the JIT-readable live collection method IC table.
+    ///
+    /// The pointer is stable until the table grows. Compiled entries must read
+    /// the pointer from `JitCtx` for each entry/reentry, not retain it outside
+    /// the dynamic compiled-call extent.
+    pub fn jit_collection_method_ics_ptr(&self) -> *const jit::JitCollectionMethodIcSlot {
+        self.jit_collection_method_ics.as_ptr()
+    }
+
+    /// Number of slots starting at [`Self::jit_collection_method_ics_ptr`].
+    pub fn jit_collection_method_ics_len(&self) -> u32 {
+        self.jit_collection_method_ics.len() as u32
     }
 
     /// Capacity of the flat JIT register stack in slots — the overflow bound

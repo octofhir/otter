@@ -1465,6 +1465,63 @@ impl Interpreter {
         })
     }
 
+    fn clear_jit_collection_method_ic(&mut self, site: usize) {
+        if let Some(slot) = self.jit_collection_method_ics.get_mut(site) {
+            *slot = crate::jit::JitCollectionMethodIcSlot::EMPTY;
+        }
+    }
+
+    fn publish_jit_collection_method_ic(&mut self, site: usize, ic: CollectionMethodCallIc) {
+        let slot = self
+            .jit_collection_method_ic_slot(ic)
+            .unwrap_or(crate::jit::JitCollectionMethodIcSlot::EMPTY);
+        if let Some(dst) = self.jit_collection_method_ics.get_mut(site) {
+            *dst = slot;
+        }
+    }
+
+    fn jit_collection_method_ic_slot(
+        &self,
+        ic: CollectionMethodCallIc,
+    ) -> Option<crate::jit::JitCollectionMethodIcSlot> {
+        let (proto, receiver_type_tag) = if ic.op.is_map() {
+            (
+                self.realm_intrinsics.map_prototype?,
+                crate::collections::MAP_BODY_TYPE_TAG,
+            )
+        } else {
+            (
+                self.realm_intrinsics.set_prototype?,
+                crate::collections::SET_BODY_TYPE_TAG,
+            )
+        };
+        if crate::object::shape_id(proto, &self.gc_heap) != ic.proto_shape {
+            return None;
+        }
+        let method = crate::object::data_slot_value_at(proto, &self.gc_heap, ic.proto_slot)?;
+        if !ic.op.matches_builtin(method, &self.gc_heap) {
+            return None;
+        }
+        let builtin_fn_addr = method
+            .as_native_function()
+            .and_then(|native| native.jit_static_fn_addr(&self.gc_heap))?;
+        Some(crate::jit::JitCollectionMethodIcSlot {
+            state: crate::jit::JIT_COLLECTION_METHOD_IC_COLLECTION,
+            receiver_type_tag,
+            reserved0: 0,
+            proto_offset: proto.offset(),
+            proto_shape: crate::object::shape(proto, &self.gc_heap).offset(),
+            method_value_byte: u32::from(ic.proto_slot) * std::mem::size_of::<Value>() as u32,
+            leaf_stub_id: ic
+                .leaf_stub_id
+                .unwrap_or(crate::jit::JIT_COLLECTION_METHOD_IC_NO_STUB),
+            alloc_stub_id: ic
+                .alloc_stub_id
+                .unwrap_or(crate::jit::JIT_COLLECTION_METHOD_IC_NO_STUB),
+            builtin_fn_addr,
+        })
+    }
+
     /// Fast `arr.method(args)` dispatch for an ordinary dense array whose
     /// `%Array.prototype%` slot for `method` is still the original builtin,
     /// skipping the per-call `[[Get]]` method-resolution walk and the native
@@ -1517,6 +1574,7 @@ impl Interpreter {
                 proto_slot: hit.slot,
                 tag,
             }));
+            self.clear_jit_collection_method_ic(site);
         }
         Some(self.dispatch_array_builtin_rooted(context, tag, recv, args))
     }
@@ -1590,6 +1648,7 @@ impl Interpreter {
         let proto = if let Some(map) = recv.as_map() {
             if !ic.op.is_map() {
                 self.method_call_ics[site] = None;
+                self.clear_jit_collection_method_ic(site);
                 return None;
             }
             let proto = self.realm_intrinsics.map_prototype?;
@@ -1604,6 +1663,7 @@ impl Interpreter {
         } else if let Some(set) = recv.as_set() {
             if !ic.op.is_set() {
                 self.method_call_ics[site] = None;
+                self.clear_jit_collection_method_ic(site);
                 return None;
             }
             let proto = self.realm_intrinsics.set_prototype?;
@@ -1617,6 +1677,7 @@ impl Interpreter {
             proto
         } else {
             self.method_call_ics[site] = None;
+            self.clear_jit_collection_method_ic(site);
             return None;
         };
         if crate::object::shape_id(proto, &self.gc_heap) != ic.proto_shape {
@@ -1701,13 +1762,15 @@ impl Interpreter {
         if let Some(hit) = hit
             && site < self.method_call_ics.len()
         {
-            self.method_call_ics[site] = Some(MethodCallIc::Collection(CollectionMethodCallIc {
+            let ic = CollectionMethodCallIc {
                 proto_shape: hit.shape_id,
                 proto_slot: hit.slot,
                 op,
                 leaf_stub_id: op.leaf_stub_id(),
                 alloc_stub_id: op.alloc_stub_id(),
-            }));
+            };
+            self.method_call_ics[site] = Some(MethodCallIc::Collection(ic));
+            self.publish_jit_collection_method_ic(site, ic);
         }
         Some(self.dispatch_collection_builtin(CollectionFastTarget::new(op), recv, args))
     }

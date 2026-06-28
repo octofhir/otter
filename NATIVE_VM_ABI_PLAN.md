@@ -452,11 +452,15 @@ Exit criteria:
 - [x] Dynasm optimizing/OSR code publishes safepoint tables through `JitCtx`.
 - [x] Dynasm optimizing/OSR `CallMethodValue` can try live collection stubs.
 - [x] Narrow collection method IC bridge bypasses generic `CallMethodValue`.
+- [x] Direct machine-call leaf/alloc collection stubs fire on ordinary Map/Set
+      (narrow bridge now bypassed entirely — see 2026-06-28 slice note).
 - [x] Map/Set feedback model for leaf lookup stubs.
 - [x] Compiled `Map.get` / `Map.has` hot loop.
 - [x] Compiled `Map.set` / `Set.add` hot loop.
-- [ ] String concat specialized node.
+- [ ] String concat specialized node (optimizing-tier IR node; baseline stub +
+      primitive short-concat flatten landed, the speculative deopt node is open).
 - [x] Baseline primitive string concat `AllocValueStub`.
+- [x] Short-concat inline flatten (skip cons rope for small results).
 - [x] `OTTER_STATS=1` exposes JIT runtime-stub ABI class counters.
 - [x] `OTTER_STATS=1` exposes live collection method IC mirror summary.
 - [x] `OTTER_STATS=1` splits method bridges by baseline vs optimizing source.
@@ -465,21 +469,27 @@ Exit criteria:
 - [ ] Map/Set migration to shared object header.
 - [ ] Interpreter quickening and block/backedge metering.
 
-Current `map-set.js` stats still report the hot `CallMethodValue` transitions
-through `jitRuntimeMethodStubs` even with live collection alloc IC slots
-published. The expanded stats show the mirror is populated (`collection` and
-`alloc` slots are present). Source-split counters show those remaining bridges
-come from baseline (`jitRuntimeMethodBaselineStubs`), not the dynasm optimizing
-emitter (`jitRuntimeMethodOptimizingStubs`).
+Update 2026-06-28: the narrow collection IC bridge is now bypassed entirely on
+`map-set.js`. `jitRuntimeCollectionMethodIcStubs` is **0** (was ~182716) and
+`jitRuntimeMethodStubs` is 6; the former hot calls now run as direct machine
+calls to the leaf/alloc `AllocValueStub` ABI (`jitAllocValueStubOk` ~149843,
+`jitLeafStubTransitions` ~90874). The blocker had nothing to do with the bridge
+shape: `new Map()` / `new Set()` recorded their canonical realm prototype as an
+explicit `prototype_override`, setting `COLLECTION_JIT_FLAG_PROTO_OVERRIDE`,
+which the machine guard reads as "not a pristine ordinary collection" and so
+missed on every call. Recording the override only for genuinely non-canonical
+prototypes lets the direct machine path validate (commit `7e0c8d20`).
 
-The next ABI slice moved live Map/Set IC hits out of the universal method
-bridge and into a narrow collection IC bridge that skips name lookup, generic
-callable dispatch, and `NativeCtx`. `map-set.js` drops
-`jitRuntimeMethodStubs` from ~182k to single digits and reports the former hot
-calls under `jitRuntimeCollectionMethodIcStubs`. Wall-clock time is still
-dominated by the Rust transition plus collection primitive work, so the next
-performance step is replacing that narrow bridge with direct machine calls to
-the same `AllocValueStub` / leaf ABI or changing collection layout.
+With the bridge removed, profiling proved wall-clock is dominated by the
+**collection primitive + string subsystem**, not the ABI transition: on string
+keys (`"k"+i`), the `"k"+i` concat alone was ~43% of `map.get` time, key
+flatten/hash ~40%, the probe ~17%. The first structural string win landed:
+short concatenations now build an inline flat body instead of a cons rope
+(commit `31a920cd`), cutting string-keyed `map.get` ~40% and `map-set.js`
+7.45x -> 6.91x node. Remaining levers: Phase 4 object-header unification (drop
+the Map/Set special-case in IC/guard design) and Phase 5 interpreter quickening
+(the loop is still ~72M interpreter reductions), plus the optimizing-tier
+specialized string-concat node.
 
 ## Verification Contract
 
@@ -668,3 +678,29 @@ their relocated addresses.
 
 With this coverage in place, the remaining performance slice is the baseline
 machine-call path to these entries.
+
+### 2026-06-28: Direct machine-call collection path actually fires
+
+Touched surface: runtime stubs, GC safepoint ABI metadata, object/collection
+layout metadata.
+
+The executable leaf/alloc `AllocValueStub` machine path was emitted but missed
+100% of the time, so every call fell through to the narrow Rust bridge
+(`jitRuntimeCollectionMethodIcStubs` ~182716 on `map-set.js`). Root cause: the
+receiver guard checks `COLLECTION_JIT_FLAG_PROTO_OVERRIDE == 0`, but
+`new Map()` / `new Set()` recorded their *canonical* realm prototype as an
+explicit `prototype_override`, setting that flag on every ordinary collection.
+Fix: in `apply_collection_new_target_prototype`, record the override only when
+`new.target`'s prototype differs from the realm canonical prototype
+(subclasses); the canonical case stays implicit (observably identical —
+`prototype_override_is(None, p)` already accepts it). The direct machine path
+now validates: bridge count 182716 -> 0, `jitAllocValueStubOk` ~149843,
+`jitLeafStubTransitions` ~90874. test262 Map 214/214, Set 393/393, JIT on==off.
+
+Profiling after the bridge removal showed the wall-clock floor is the collection
+primitive + string subsystem, so the follow-up slice attacked string concat:
+`concat_string_bodies` built a cons rope even for tiny `"k"+i` results. A short-
+result fast path now copies both already-flat operands into an inline flat body
+(Latin-1 or WTF-16) when the result fits inline, skipping the rope node, its
+child retention, and the per-read rope walk. string-keyed `map.get` micro
+-40%, `map-set.js` 7.45x -> 6.91x node, diff 21/21, conformance unchanged.

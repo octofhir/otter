@@ -1730,16 +1730,23 @@ pub(crate) fn load_own_data_slot_atom(
     hit: AtomOwnPropertyHit,
 ) -> Option<Value> {
     heap.read_payload(obj, |body| {
-        if body_shape_id(heap, body) != hit.shape_id || key.atom().id() != hit.atom_id {
+        // A shaped object's shape handle is interned and immortal, so a handle
+        // match proves identical layout with a single offset compare — no
+        // deref into the shape body to read its id, and no key compare. The
+        // handle also fixes the slot, so the cached `slot` is valid. Dictionary
+        // mode (null handle) reuses a per-object shape id that does not bump on
+        // every slot mutation, so it still confirms the id and the key by name.
+        let shaped = !body.shape.is_null();
+        let shape_ok = if shaped {
+            body.shape == hit.shape
+        } else {
+            body_shape_id(heap, body) == hit.shape_id
+        };
+        if !shape_ok || key.atom().id() != hit.atom_id {
             return None;
         }
         let offset = hit.slot as usize;
-        // A shaped object's shape id uniquely and immutably fixes the slot
-        // layout (shapes are immortal and never reassigned), so the shape-id
-        // guard already proves the key lives at `slot` — no name compare on the
-        // hit. Dictionary mode reuses a per-object shape id that does not bump
-        // on every slot mutation, so it still confirms the key by name.
-        if body.shape.is_null() && !body_key_matches(heap, body, offset, key.name()) {
+        if !shaped && !body_key_matches(heap, body, offset, key.name()) {
             return None;
         }
         debug_assert!(
@@ -1772,14 +1779,21 @@ pub(crate) fn store_own_data_slot_atom(
     value: &Value,
 ) -> Option<()> {
     let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key.name()));
-    let current_shape_id = shape_id(obj, heap);
-    // Shaped objects are proven by the shape-id guard alone (see
-    // `load_own_data_slot_atom`); only dictionary mode confirms by name.
+    // Shaped receivers match on the interned shape handle (one offset compare,
+    // no shape-body deref); dictionary mode falls back to the per-object shape
+    // id plus a name compare. See `load_own_data_slot_atom`.
+    let shape_ok = heap.read_payload(obj, |body| {
+        if !body.shape.is_null() {
+            body.shape == hit.shape
+        } else {
+            body_shape_id(heap, body) == hit.shape_id
+        }
+    });
     let key_matches = heap.read_payload(obj, |body| {
         !body.shape.is_null() || body_key_matches(heap, body, hit.slot as usize, key.name())
     });
     debug_assert!(
-        current_shape_id != hit.shape_id
+        !shape_ok
             || heap.read_payload(obj, |body| body_key_matches(
                 heap,
                 body,
@@ -1797,7 +1811,7 @@ pub(crate) fn store_own_data_slot_atom(
     });
     let success = heap.with_payload(obj, |body| {
         let offset = hit.slot as usize;
-        if current_shape_id != hit.shape_id || key.atom().id() != hit.atom_id || !key_matches {
+        if !shape_ok || key.atom().id() != hit.atom_id || !key_matches {
             return false;
         }
         let Some((flags, is_accessor)) = slot_attrs else {

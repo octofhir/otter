@@ -149,6 +149,28 @@ hot loops — alloc+safepoint+spine write), `StoreElement` object-valued
 (array-ops, object-shapes), `New`/`NewObject` constructors (json) — all
 medium-complexity alloc/safepoint adds, none a clean single-opcode win.
 
+DEEPER PROFILE (samply, atos-resolved): Richards self-time is dominated by
+`dispatch_loop_inner` (the interpreter big-switch, spread across handlers) plus
+`HoltStack::index`/`index_mut` (register reads) and `object::load_own_data_slot_atom`
++ `string::eq_str` (NAME-based property access). So the method BODIES interpret —
+the JIT-"compiled" methods bail/decline, and most calls (jitDirectCalls 260K of
+2.98M bytecodeCalls) never enter compiled code. The fix is to get the bodies
+running compiled with inline property ICs.
+
+CRASH ANCHOR for route B (committed `3cf18d0f` masks it via reject): the
+optimizing-tier SIGSEGV is in fid 27 (a `*Task.run`-shaped method) when it
+fully compiles. Its op pattern (dumped): `LoadProperty`/`LoadElement`, `LooseEqual
+==null` + early `ReturnValue`, three pointer `StoreProperty`, then a TAIL 2-arg
+`CallMethodValue` (`this.scheduler.<m>(a,b)`, mono → inlined) + `ReturnValue`.
+Faithful micros of this shape do NOT crash, so the trigger is more specific —
+likely the inlined scheduler callee (which itself does linked-list work / another
+call) combined with the surrounding compile. Next iteration: bisect fid 27 by
+progressively enriching the repro's inlined callee (give it a pointer store + a
+nested method call + a branch) until it crashes, then root-cause the bad `blr`
+target in the inline/CallMethod emit. Reproduce by temporarily reverting the
+`reject_call_object_mix` CallMethod clause (back to `has_plain_call` only) — fid
+27 then compiles and crashes on entry (pc=0).
+
 Goal: make hot real-workload functions compile into the optimizing tier instead
 of falling back to baseline/interpreter.
 

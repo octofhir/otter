@@ -36,6 +36,16 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 const MARK_COLOR_MASK: u8 = 0b0000_0011;
 const FLAG_YOUNG: u8 = 0b0000_0100;
+
+/// Byte offset of the [`GcHeader`] flag byte from the header base. The
+/// generational write barrier emitted in compiled code reads this byte to test
+/// the young flag without a Rust call.
+pub const HEADER_FLAGS_BYTE_OFFSET: usize = 1;
+
+/// The young-generation flag bit within the [`GcHeader`] flag byte
+/// ([`HEADER_FLAGS_BYTE_OFFSET`]). Exposed so the JIT can emit an inline
+/// generational write barrier (`flags & GENERATION_YOUNG_FLAG`).
+pub const GENERATION_YOUNG_FLAG: u8 = FLAG_YOUNG;
 const FLAG_FORWARDED: u8 = 0b0000_1000;
 const FLAG_PINNED: u8 = 0b0001_0000;
 /// Set once the sweeper has finalized + dropped a dead old/large-space

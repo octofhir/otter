@@ -3580,9 +3580,8 @@ impl Interpreter {
                         method_value_byte,
                         method_on_receiver,
                     } => {
-                        let mut targets: SmallVec<
-                            [PolyMethodTarget; MAX_POLY_METHOD_TARGETS],
-                        > = SmallVec::new();
+                        let mut targets: SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]> =
+                            SmallVec::new();
                         targets.push(PolyMethodTarget {
                             method_fid: *method_fid,
                             recv_shape: *recv_shape,
@@ -3617,7 +3616,8 @@ impl Interpreter {
                 // the site observed several shapes: the others miss its guard and
                 // take the bridge, which is strictly better than no inline.
                 1 => {
-                    view.inline_methods.insert(snap.byte_pc, baked.pop().unwrap());
+                    view.inline_methods
+                        .insert(snap.byte_pc, baked.pop().unwrap());
                 }
                 // Two or more: emit the guarded inline chain.
                 _ => {
@@ -15884,6 +15884,7 @@ mod tests {
             ta_layout: jit::JitTypedArrayLayout::default(),
             object_shape_byte: 0,
             object_values_ptr_byte: 0,
+            gc_barrier: jit::JitGcBarrierLayout::default(),
             jit_proto_byte: 0,
             closure_fid_byte: 0,
             closure_upvalues_ptr_byte: 0,

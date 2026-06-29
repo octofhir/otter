@@ -69,11 +69,15 @@ pub(super) fn build(view: &JitFunctionView, osr_pc: Option<u32>) -> Result<Graph
 /// sealed `LoadSlot`s at baked offsets), not a runtime stub. Gating on it would
 /// reject exactly the fully-inlined method bodies this tier exists to optimize.
 fn reject_call_object_mix(graph: &Graph) -> Result<(), Unsupported> {
-    let has_call = graph
+    let has_plain_call = graph
         .nodes
         .iter()
         .any(|node| matches!(node.kind, NodeKind::Call { .. }));
-    if !has_call {
+    let has_method_call = graph
+        .nodes
+        .iter()
+        .any(|node| matches!(node.kind, NodeKind::CallMethod { .. }));
+    if !has_plain_call && !has_method_call {
         return Ok(());
     }
     // A body whose every call is a frameless self-recursion and whose every
@@ -88,17 +92,27 @@ fn reject_call_object_mix(graph: &Graph) -> Result<(), Unsupported> {
     if graph_allows_frameless_self_call(graph) && all_calls_are_self(graph) {
         return Ok(());
     }
-    let has_runtime_object_op = graph.nodes.iter().any(|node| {
+    // A runtime memory op (an un-baked slot store, element access, or array
+    // length read) bridges through the materialize-frame stub. Note `CallMethod`
+    // is NOT counted here: it is itself a bridging call, accounted for by
+    // `has_method_call`, so a body of purely method calls is not self-rejected.
+    let has_mem_op = graph.nodes.iter().any(|node| {
         matches!(
             node.kind,
             NodeKind::StoreSlot(_, _, _)
                 | NodeKind::LoadElement(_, _)
                 | NodeKind::StoreElement(_, _, _)
                 | NodeKind::LoadArrayLength(_)
-                | NodeKind::CallMethod { .. }
         )
     });
-    if has_runtime_object_op {
+    // Reject the bridge-churn mixes the cost model loses on: a plain `Call`
+    // alongside any other bridging op (a memory op or an un-inlined method
+    // call), or an un-inlined `CallMethod` alongside a memory op. Either way the
+    // baseline's tuned IC sequence wins, and — for the method-call case — keeps
+    // these bodies off the un-inlined-poly-method optimizing path.
+    let reject =
+        (has_plain_call && (has_mem_op || has_method_call)) || (has_method_call && has_mem_op);
+    if reject {
         return Err(Unsupported::Unlowered("call plus object fast path"));
     }
     Ok(())
@@ -871,11 +885,13 @@ impl<'a> Builder<'a> {
                     self.def_register(dst, block, load, byte_pc);
                 }
                 // `StoreProperty obj, name, src` — `CheckShape` + inline
-                // `StoreSlot`, but only for a primitive (int32 / f64 / bool)
-                // value: a primitive `Value` is never a `Gc` pointer, so no
-                // generational write barrier is needed (the optimizing tier has no
-                // safepoint to run one). A pointer-valued store, or a non-own-data
-                // site, bails to the baseline.
+                // `StoreSlot`. A primitive (int32 / f64) value needs no write
+                // barrier (a primitive `Value` is never a `Gc` pointer). A
+                // `Tagged` value may be a heap pointer, so its `StoreSlot` carries
+                // the inline generational card-mark (parent old + child young →
+                // mark the parent's card); the card-mark allocates nothing and
+                // never moves GC, so it needs no safepoint. A non-own-data site
+                // (no baked shape feedback) still bails to the baseline.
                 Op::StoreProperty => {
                     let obj_reg = reg(&operands, 0)?;
                     let src_reg = reg(&operands, 2)?;
@@ -892,7 +908,7 @@ impl<'a> Builder<'a> {
                     let value = self.read_variable(src_reg, block);
                     if !matches!(
                         self.graph.node(value).kind.repr(),
-                        Repr::Int32 | Repr::Float64
+                        Repr::Int32 | Repr::Float64 | Repr::Tagged
                     ) {
                         self.deopt_or_decline(
                             block,
@@ -2480,6 +2496,7 @@ mod tests {
             ta_layout: otter_vm::JitTypedArrayLayout::default(),
             object_shape_byte: 8,
             object_values_ptr_byte: 16,
+            gc_barrier: Default::default(),
             jit_proto_byte: 12,
             closure_fid_byte: 8,
             closure_upvalues_ptr_byte: 16,

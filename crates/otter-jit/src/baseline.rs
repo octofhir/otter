@@ -2509,8 +2509,7 @@ mod arm64 {
                                     &mut ops, ops_ref, &am, view, array_miss, array_done,
                                 )?,
                                 JitArrayMethodKind::Push => emit_array_push_inline(
-                                    &mut ops, ops_ref, &am, view, array_miss, array_done,
-                                    threw,
+                                    &mut ops, ops_ref, &am, view, array_miss, array_done, threw,
                                 )?,
                             };
                             if emitted {
@@ -4438,8 +4437,9 @@ mod arm64 {
         let fallback = ops.new_dynamic_label();
         // One entry label per attempt so each attempt's guard miss can branch to
         // the next attempt; the final attempt's miss branches to `fallback`.
-        let entries: Vec<DynamicLabel> =
-            (0..eligible.len()).map(|_| ops.new_dynamic_label()).collect();
+        let entries: Vec<DynamicLabel> = (0..eligible.len())
+            .map(|_| ops.new_dynamic_label())
+            .collect();
         for (i, method) in eligible.iter().enumerate() {
             dynasm!(ops ; .arch aarch64 ; =>entries[i]);
             let miss = if i + 1 < eligible.len() {
@@ -6406,6 +6406,7 @@ mod tests {
             ta_layout: otter_vm::JitTypedArrayLayout::default(),
             object_shape_byte: 8,
             object_values_ptr_byte: 16,
+            gc_barrier: Default::default(),
             jit_proto_byte: 12,
             closure_fid_byte: 8,
             closure_upvalues_ptr_byte: 16,

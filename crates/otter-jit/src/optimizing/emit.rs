@@ -295,10 +295,10 @@ mod arm64 {
         STATUS_THREW, TAG_FUNCTION_ID, TAG_INT32, TAG_PTR_FUNCTION, TAG_PTR_OBJECT, TAG_SPECIAL,
         THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, VM_OFFSET,
         jit_abort_direct_call_stub, jit_alloc_object_literal_stub, jit_array_push_optimizing_stub,
-        jit_backedge_poll_stub,
-        jit_call_collection_method_ic_stub, jit_call_method_stub_optimizing,
-        jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
-        jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
+        jit_backedge_poll_stub, jit_call_collection_method_ic_stub,
+        jit_call_method_stub_optimizing, jit_finish_direct_call_bailed_stub,
+        jit_finish_direct_call_returned_stub, jit_prepare_direct_call_stub,
+        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
     };
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
     use otter_vm::{
@@ -534,6 +534,116 @@ mod arm64 {
             load_loc(ops, gp_dst, loc);
             box_value(ops, gp_dst, repr, tag_scratch);
         }
+    }
+
+    /// Emit the inline generational write barrier for a pointer-valued slot
+    /// store: mark the parent object's card dirty when an old parent gains a
+    /// young child (the remembered set the scavenger reads on a young
+    /// collection). Mirrors `otter_gc::barrier::write_barrier`'s generational
+    /// arm. The insertion (marking) barrier is dormant under the Phase-1 STW
+    /// collector, so only the card-mark is emitted; it allocates nothing and
+    /// never moves GC, hence needs no safepoint.
+    ///
+    /// Clobbers only the reserved scratch (`x16`/`x17`, `d6`/`d7`); reads the
+    /// boxed parent/child from their SSA locations. All control flow funnels to
+    /// a single `done` label, so a non-pointer / young-parent / old-child store
+    /// falls straight through.
+    fn emit_generational_card_mark(
+        ops: &mut Assembler,
+        view: &JitFunctionView,
+        parent_loc: Location,
+        child_loc: Location,
+    ) -> Result<(), Unsupported> {
+        // The card-mark uses dynasm immediates, which require literal registers
+        // (`x16`/`x17` ≡ `MOVE_SCRATCH`/`BOX_SCRATCH`) and compile-time-const
+        // immediate operands. The stable GcHeader/card ABI bits are otter-jit
+        // consts; `debug_assert` pins them against the values otter-vm baked from
+        // the live `#[repr(C)]` layout so a layout change is caught in tests. The
+        // genuinely layout-variable offsets (cage base, page mask, card-bitmap
+        // offset) are loaded into registers.
+        const GC_FLAGS_BYTE: u32 = 1;
+        const GC_YOUNG_BIT: u32 = 2;
+        const GC_CARD_SHIFT: u32 = 9;
+        debug_assert_eq!(view.gc_barrier.header_flags_byte, GC_FLAGS_BYTE);
+        debug_assert_eq!(view.gc_barrier.young_flag.trailing_zeros(), GC_YOUNG_BIT);
+        debug_assert_eq!(view.gc_barrier.card_shift, GC_CARD_SHIFT);
+        let cage = view.cage_base as u64;
+        let page_mask = view.gc_barrier.page_mask;
+        let bitmap_off = view.gc_barrier.card_bitmap_byte as u64;
+        let done = ops.new_dynamic_label();
+
+        // (1) Child pointer-tag test: a heap pointer NaN-boxes with top16 in
+        // [TAG_PTR_OBJECT(0x7FFC), TAG_PTR_OTHER(0x7FFF)]. `top16 - 0x7FFC <= 3`
+        // (unsigned) is true only for those four tags. x16 = top16.
+        load_loc(ops, MOVE_SCRATCH, child_loc);
+        dynasm!(ops
+            ; .arch aarch64
+            ; lsr x16, x16, #48
+            ; movz w17, #0x7FFC
+            ; sub w16, w16, w17
+            ; cmp w16, #3
+            ; b.hi =>done
+        );
+
+        // (2) Child young? child_hdr = cage_base + low32(child). An old child
+        // needs no remembered-set entry, so a clear young bit skips.
+        load_loc(ops, BOX_SCRATCH, child_loc);
+        dynasm!(ops ; .arch aarch64 ; mov w16, w17);
+        emit_load_u64(ops, BOX_SCRATCH, cage);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x16, x16, x17
+            ; ldrb w17, [x16, #GC_FLAGS_BYTE]
+            ; tbz w17, #GC_YOUNG_BIT, =>done
+        );
+
+        // (3) Parent young? parent_hdr = cage_base + low32(parent). Young parents
+        // are evacuated wholesale by the scavenger, so only an old parent records
+        // a card. x16 = parent_hdr afterwards.
+        load_loc(ops, BOX_SCRATCH, parent_loc);
+        dynasm!(ops ; .arch aarch64 ; mov w16, w17);
+        emit_load_u64(ops, BOX_SCRATCH, cage);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x16, x16, x17
+            ; ldrb w17, [x16, #GC_FLAGS_BYTE]
+            ; tbnz w17, #GC_YOUNG_BIT, =>done
+        );
+
+        // (4) Mark the parent's card. page_base = parent_hdr & page_mask; card =
+        // (parent_hdr - page_base) >> card_shift; set bit (card & 7) in the byte
+        // at page_base + card_bitmap_off + (card >> 3). x16 = parent_hdr.
+        emit_load_u64(ops, BOX_SCRATCH, page_mask);
+        dynasm!(ops
+            ; .arch aarch64
+            ; and x17, x16, x17                  // x17 = page_base
+            ; sub x16, x16, x17                  // x16 = byte_off
+            ; lsr x16, x16, #GC_CARD_SHIFT       // x16 = card
+            ; fmov d7, x16                       // park card
+        );
+        emit_load_u64(ops, MOVE_SCRATCH, bitmap_off);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x17, x17, x16                  // x17 = bitmap base (page_base + off)
+            ; fmov x16, d7                       // x16 = card
+            ; add x17, x17, x16, lsr #3          // x17 = byte addr
+            ; and x16, x16, #7                   // x16 = bit index
+            // mask = 1 << bit, parking the byte address in d7 across the shift.
+            ; fmov d7, x17
+            ; movz w17, #1
+            ; lslv w17, w17, w16                 // x17 = mask
+            ; fmov x16, d7                       // x16 = byte addr
+            // [x16] |= mask, parking mask/addr in d6/d7 across the load.
+            ; fmov d7, x17                       // park mask
+            ; ldrb w17, [x16]                    // x17 = byte
+            ; fmov d6, x16                       // park addr
+            ; fmov x16, d7                       // x16 = mask
+            ; orr w17, w17, w16                  // x17 = byte | mask
+            ; fmov x16, d6                       // x16 = addr
+            ; strb w17, [x16]
+            ; =>done
+        );
+        Ok(())
     }
 
     fn emit_rematerialized_boxed(
@@ -2779,9 +2889,13 @@ mod arm64 {
                 Ok(())
             }
             NodeKind::StoreSlot(obj, value_byte, value) => {
-                // Write a primitive (int32 / f64) into the shape-guarded
-                // receiver's value slab. No write barrier: a primitive `Value` is
-                // never a `Gc` pointer (the builder admits only Int32 / Float64).
+                // Write a value into the shape-guarded receiver's value slab. A
+                // primitive (int32 / f64) needs no write barrier. A `Tagged` value
+                // may be a heap pointer, so a generational card-mark is emitted
+                // inline after the store (parent old + child young → mark the
+                // parent's card). The insertion (marking) barrier is dormant under
+                // the Phase-1 STW collector, so only the card-mark is needed; it
+                // allocates nothing and never moves GC.
                 if *value_byte > 32760 {
                     return Err(Unsupported::Unlowered(
                         "property slot offset out of str range",
@@ -2804,7 +2918,8 @@ mod arm64 {
                 );
                 // Boxed value → x17 (box_scratch). Float boxing uses the FP load
                 // scratch and never touches x16; int32 boxing inserts the tag with
-                // `movk` (the producer zeroed bits 63:32), needing no scratch.
+                // `movk` (the producer zeroed bits 63:32), needing no scratch. A
+                // `Tagged` value is already boxed in its location.
                 match vrepr {
                     Repr::Float64 => {
                         box_into_gp(ops, box_scratch, Repr::Float64, vloc, MOVE_SCRATCH)
@@ -2813,9 +2928,19 @@ mod arm64 {
                         load_loc(ops, box_scratch, vloc);
                         dynasm!(ops ; .arch aarch64 ; movk x17, TAG_INT32 as u32, lsl #48);
                     }
-                    _ => return Err(Unsupported::Unlowered("store-slot value not int32/f64")),
+                    Repr::Tagged => {
+                        load_loc(ops, box_scratch, vloc);
+                    }
+                    _ => {
+                        return Err(Unsupported::Unlowered(
+                            "store-slot value not int32/f64/tagged",
+                        ));
+                    }
                 }
                 dynasm!(ops ; .arch aarch64 ; str x17, [x16, slot_byte]);
+                if matches!(vrepr, Repr::Tagged) {
+                    emit_generational_card_mark(ops, view, oloc, vloc)?;
+                }
                 Ok(())
             }
             NodeKind::AllocObjectLiteral {
@@ -3483,6 +3608,7 @@ mod tests {
             ta_layout: Default::default(),
             object_shape_byte: 8,
             object_values_ptr_byte: 16,
+            gc_barrier: Default::default(),
             jit_proto_byte: 12,
             closure_fid_byte: 8,
             closure_upvalues_ptr_byte: 16,

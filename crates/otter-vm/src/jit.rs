@@ -85,6 +85,11 @@ pub struct JitFunctionView {
     /// OBJECT_BODY_VALUES_PTR_OFFSET`). The emitter reads this pointer after a
     /// shape guard and applies the cached slot-byte offset inside the slab.
     pub object_values_ptr_byte: u32,
+    /// Static GC layout for the inline generational write barrier emitted on a
+    /// pointer-valued `StoreProperty`. Isolate-independent `#[repr(C)]` / `const`
+    /// values; the card-mark is gated on [`cage_base`](Self::cage_base) being
+    /// baked (the emitter decompresses parent/child pointers against it).
+    pub gc_barrier: JitGcBarrierLayout,
     /// Byte offset from a decompressed object pointer to its flat
     /// `[[Prototype]]` mirror (`HEADER_SIZE + OBJECT_BODY_JIT_PROTO_OFFSET`). A
     /// `#[repr(C)]` constant; the method-inline guard reads
@@ -461,6 +466,33 @@ pub struct JitTypedArrayLayout {
     /// prototype/accessor/descriptor/source-text state may make dense stores
     /// observable, so inline stores must miss to the runtime path.
     pub array_exotic_byte: u32,
+}
+
+/// Static GC layout the optimizing tier needs to emit an inline generational
+/// write barrier for a pointer-valued `StoreProperty`. All `#[repr(C)]` /
+/// `const` values, isolate-independent, so baked once from the executable
+/// snapshot rather than per-compile.
+///
+/// The barrier marks the parent object's card dirty when an old parent gains a
+/// young child (the generational remembered set the scavenger reads). The
+/// insertion (marking) barrier is dormant under the Phase-1 STW collector, so
+/// only the card-mark is emitted; it allocates nothing and never moves GC.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JitGcBarrierLayout {
+    /// `GcHeader` flag-byte offset from the header base
+    /// (`HEADER_FLAGS_BYTE_OFFSET`).
+    pub header_flags_byte: u32,
+    /// Young-generation flag bit within the flag byte (`GENERATION_YOUNG_FLAG`).
+    pub young_flag: u32,
+    /// Byte offset of the card-table bitmap inside a `PageHeader`
+    /// (`offset_of!(PageHeader, card_bitmap)`); the page header sits at the
+    /// page base (`page_addr & page_mask`).
+    pub card_bitmap_byte: u32,
+    /// `!(PAGE_SIZE - 1)` — masks a header address down to its page base.
+    pub page_mask: u64,
+    /// `log2(CARD_SIZE)` — right-shift a within-page byte offset to its card
+    /// index.
+    pub card_shift: u32,
 }
 
 /// Owned snapshot of one executable instruction.

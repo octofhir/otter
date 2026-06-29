@@ -1092,6 +1092,7 @@ mod tests {
             ta_layout: otter_vm::JitTypedArrayLayout::default(),
             object_shape_byte: 8,
             object_values_ptr_byte: 16,
+            gc_barrier: Default::default(),
             jit_proto_byte: 12,
             closure_fid_byte: 8,
             closure_upvalues_ptr_byte: 16,

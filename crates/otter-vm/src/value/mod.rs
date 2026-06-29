@@ -171,6 +171,21 @@ pub enum FunctionFamilyKind {
     Unknown,
 }
 
+/// Coarse pointer family for a heap cell, read from
+/// [`otter_gc::header::GcHeader::type_tag`]. Partitions every heap cell
+/// into exactly one family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PtrFamily {
+    /// Ordinary object and every exotic object body.
+    Object,
+    /// String body.
+    String,
+    /// Callable body: closure, bound, native, class-constructor wrapper.
+    Function,
+    /// Misc primitive body: symbol, bigint.
+    Other,
+}
+
 /// Per-body classification for the `TAG_PTR_OTHER` family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OtherFamilyKind {
@@ -228,15 +243,15 @@ impl Value {
     // -----------------------------------------------------------------------
 
     /// `undefined`.
-    pub const UNDEFINED: Value = Value(pack(TAG_SPECIAL, SPECIAL_UNDEFINED), _NOT_SEND);
+    pub const UNDEFINED: Value = Value(VALUE_UNDEFINED, _NOT_SEND);
     /// `null`.
-    pub const NULL: Value = Value(pack(TAG_SPECIAL, SPECIAL_NULL), _NOT_SEND);
+    pub const NULL: Value = Value(VALUE_NULL, _NOT_SEND);
     /// Internal "array hole" sentinel — never observed by user code.
-    pub const HOLE: Value = Value(pack(TAG_SPECIAL, SPECIAL_HOLE), _NOT_SEND);
+    pub const HOLE: Value = Value(VALUE_HOLE, _NOT_SEND);
     /// `false`.
-    pub const FALSE: Value = Value(pack(TAG_SPECIAL, SPECIAL_FALSE), _NOT_SEND);
+    pub const FALSE: Value = Value(VALUE_FALSE, _NOT_SEND);
     /// `true`.
-    pub const TRUE: Value = Value(pack(TAG_SPECIAL, SPECIAL_TRUE), _NOT_SEND);
+    pub const TRUE: Value = Value(VALUE_TRUE, _NOT_SEND);
 
     // -----------------------------------------------------------------------
     // Bit-level access (audited helpers; not part of the public stable
@@ -294,19 +309,23 @@ impl Value {
     #[inline]
     #[must_use]
     pub const fn number_i32(n: i32) -> Self {
-        Self(pack(TAG_INT32, n as u32 as u64), _NOT_SEND)
+        Self(box_int32(n), _NOT_SEND)
     }
 
-    /// Number from an `f64`. NaNs are canonicalised; integer-valued
-    /// finite doubles are *not* automatically demoted to int32 — pass
-    /// through [`NumberValue::canonicalize`] first if you want that.
+    /// Number from an `f64`. NaNs are purified to the canonical pattern
+    /// before the double offset is applied (so no boxed double aliases
+    /// the cell space); integer-valued finite doubles are *not*
+    /// automatically demoted to int32 — pass through
+    /// [`NumberValue::canonicalize`] first if you want that.
     #[inline]
     #[must_use]
     pub fn number_f64(d: f64) -> Self {
-        if d.is_nan() {
-            return Self(CANONICAL_NAN, _NOT_SEND);
-        }
-        Self(d.to_bits(), _NOT_SEND)
+        let bits = if d.is_nan() {
+            CANONICAL_NAN
+        } else {
+            d.to_bits()
+        };
+        Self(box_double(bits), _NOT_SEND)
     }
 
     /// Number from the runtime [`NumberValue`] view, preferring the
@@ -324,7 +343,20 @@ impl Value {
     #[inline]
     #[must_use]
     pub const fn function_id(id: u32) -> Self {
-        Self(pack(TAG_FUNCTION_ID, id as u64), _NOT_SEND)
+        Self(box_function_id(id), _NOT_SEND)
+    }
+
+    /// Build a heap-cell `Value` from a [`otter_gc::raw::RawGc`] compressed
+    /// offset by widening it to the full `cage_base + offset` address.
+    /// Because the cage is 4 GiB-aligned, `cage_base | offset` equals
+    /// `cage_base + offset` and the offset stays verbatim in the low 32
+    /// bits. This is the single funnel every pointer-family constructor
+    /// flows through.
+    #[inline]
+    #[must_use]
+    fn from_cell_offset(offset: u32) -> Self {
+        let addr = (otter_gc::cage_base() as u64) | (offset as u64);
+        Self(addr, _NOT_SEND)
     }
 
     // -----------------------------------------------------------------------
@@ -342,29 +374,29 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn from_object_gc(raw: otter_gc::raw::RawGc) -> Self {
-        Self(pack(TAG_PTR_OBJECT, raw.0 as u64), _NOT_SEND)
+        Self::from_cell_offset(raw.0)
     }
 
-    /// Build a string-family value (`TAG_PTR_STRING`).
+    /// Build a string-family value. Recovered later through
+    /// [`otter_gc::header::GcHeader::type_tag`], not a value tag.
     #[inline]
     #[must_use]
     pub fn from_string_gc(raw: otter_gc::raw::RawGc) -> Self {
-        Self(pack(TAG_PTR_STRING, raw.0 as u64), _NOT_SEND)
+        Self::from_cell_offset(raw.0)
     }
 
-    /// Build a callable-family value (`TAG_PTR_FUNCTION`).
+    /// Build a callable-family value.
     #[inline]
     #[must_use]
     pub fn from_function_gc(raw: otter_gc::raw::RawGc) -> Self {
-        Self(pack(TAG_PTR_FUNCTION, raw.0 as u64), _NOT_SEND)
+        Self::from_cell_offset(raw.0)
     }
 
-    /// Build a "other primitive" value (`TAG_PTR_OTHER`) — symbols,
-    /// bigints.
+    /// Build a "other primitive" value — symbols, bigints.
     #[inline]
     #[must_use]
     pub fn from_other_gc(raw: otter_gc::raw::RawGc) -> Self {
-        Self(pack(TAG_PTR_OTHER, raw.0 as u64), _NOT_SEND)
+        Self::from_cell_offset(raw.0)
     }
 
     /// Build a closure value. Packs the [`JsClosure`] handle under
@@ -490,21 +522,21 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn string_gc(s: JsStringHandle) -> Self {
-        Self(pack(TAG_PTR_STRING, s.offset() as u64), _NOT_SEND)
+        Self::from_cell_offset(s.offset())
     }
 
     /// BigInt value. Packs the [`BigIntHandle`] under `TAG_PTR_OTHER`.
     #[inline]
     #[must_use]
     pub fn big_int_gc(b: BigIntHandle) -> Self {
-        Self(pack(TAG_PTR_OTHER, b.offset() as u64), _NOT_SEND)
+        Self::from_cell_offset(b.offset())
     }
 
     /// Symbol value. Packs the [`SymbolHandle`] under `TAG_PTR_OTHER`.
     #[inline]
     #[must_use]
     pub fn symbol_gc(s: SymbolHandle) -> Self {
-        Self(pack(TAG_PTR_OTHER, s.offset() as u64), _NOT_SEND)
+        Self::from_cell_offset(s.offset())
     }
 
     /// `Temporal.*` value. Object-shaped per Temporal proposal §8.
@@ -565,14 +597,7 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_closure(self, heap: &otter_gc::GcHeap) -> Option<JsClosure> {
-        if top_tag(self.0) != TAG_PTR_FUNCTION {
-            return None;
-        }
-        let raw = self.as_raw_gc()?;
-        if raw.header_type_tag()? != JS_CLOSURE_BODY_TYPE_TAG {
-            return None;
-        }
-        let handle = raw.checked_cast::<JsClosureBody>()?;
+        let handle = self.as_raw_gc()?.checked_cast::<JsClosureBody>()?;
         let function_id = heap.read_payload(handle, |body| body.function_id);
         Some(JsClosure::from_parts(handle, function_id))
     }
@@ -581,9 +606,6 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_object(self) -> Option<JsObject> {
-        if !self.is_object_like() {
-            return None;
-        }
         self.as_raw_gc()?.checked_cast::<ObjectBody>()
     }
 
@@ -591,9 +613,6 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_array(self) -> Option<JsArray> {
-        if !self.is_object_like() {
-            return None;
-        }
         self.as_raw_gc()?.checked_cast::<ArrayBody>()
     }
 
@@ -601,9 +620,6 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_map(self) -> Option<JsMap> {
-        if !self.is_object_like() {
-            return None;
-        }
         self.as_raw_gc()?.checked_cast::<MapBody>()
     }
 
@@ -611,9 +627,6 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_set(self) -> Option<JsSet> {
-        if !self.is_object_like() {
-            return None;
-        }
         self.as_raw_gc()?.checked_cast::<SetBody>()
     }
 
@@ -621,9 +634,6 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_weak_map(self) -> Option<JsWeakMap> {
-        if !self.is_object_like() {
-            return None;
-        }
         self.as_raw_gc()?.checked_cast::<WeakMapBody>()
     }
 
@@ -631,9 +641,6 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_weak_set(self) -> Option<JsWeakSet> {
-        if !self.is_object_like() {
-            return None;
-        }
         self.as_raw_gc()?.checked_cast::<WeakSetBody>()
     }
 
@@ -641,9 +648,6 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_weak_ref(self) -> Option<JsWeakRef> {
-        if !self.is_object_like() {
-            return None;
-        }
         self.as_raw_gc()?.checked_cast::<WeakRefBody>()
     }
 
@@ -651,9 +655,6 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_finalization_registry(self) -> Option<JsFinalizationRegistry> {
-        if !self.is_object_like() {
-            return None;
-        }
         self.as_raw_gc()?.checked_cast::<FinalizationRegistryBody>()
     }
 
@@ -661,9 +662,6 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_bound_function(self) -> Option<BoundFunction> {
-        if top_tag(self.0) != TAG_PTR_FUNCTION {
-            return None;
-        }
         let gc = self.as_raw_gc()?.checked_cast::<BoundFunctionBody>()?;
         Some(BoundFunction::from_gc(gc))
     }
@@ -672,9 +670,6 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_native_function(self) -> Option<NativeFunction> {
-        if top_tag(self.0) != TAG_PTR_FUNCTION {
-            return None;
-        }
         let gc = self.as_raw_gc()?.checked_cast::<NativeFunctionBody>()?;
         Some(NativeFunction::from_gc(gc))
     }
@@ -683,9 +678,6 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_class_constructor(self) -> Option<ClassConstructor> {
-        if top_tag(self.0) != TAG_PTR_FUNCTION {
-            return None;
-        }
         let gc = self.as_raw_gc()?.checked_cast::<ClassConstructorBody>()?;
         Some(ClassConstructor::from_gc(gc))
     }
@@ -694,10 +686,47 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_iterator(self) -> Option<IteratorHandle> {
-        if !self.is_object_like() {
-            return None;
-        }
         self.as_raw_gc()?.checked_cast::<IteratorState>()
+    }
+
+    // -----------------------------------------------------------------------
+    // Heap-cell decoding (the pointer-cheap core).
+    // -----------------------------------------------------------------------
+
+    /// `true` if this value is a heap-cell pointer (full address,
+    /// top 16 bits clear, `OTHER_TAG` clear). A raw bit test, no heap
+    /// access.
+    #[inline]
+    #[must_use]
+    pub fn is_cell(self) -> bool {
+        is_cell_bits(self.0)
+    }
+
+    /// Classify a heap cell into its pointer family by reading
+    /// [`otter_gc::header::GcHeader::type_tag`]. `None` for non-cells.
+    /// Only string / callable / symbol / bigint bodies leave the object
+    /// family; every other body is an object-family member.
+    #[inline]
+    #[must_use]
+    fn ptr_family(self) -> Option<PtrFamily> {
+        let tag = self.read_gc_type_tag()?;
+        Some(
+            if tag == <JsStringBody as otter_gc::SafeTraceable>::TYPE_TAG {
+                PtrFamily::String
+            } else if tag == JS_CLOSURE_BODY_TYPE_TAG
+                || tag == <BoundFunctionBody as otter_gc::SafeTraceable>::TYPE_TAG
+                || tag == <NativeFunctionBody as otter_gc::SafeTraceable>::TYPE_TAG
+                || tag == <ClassConstructorBody as otter_gc::SafeTraceable>::TYPE_TAG
+            {
+                PtrFamily::Function
+            } else if tag == <SymbolBody as otter_gc::SafeTraceable>::TYPE_TAG
+                || tag == <BigIntBody as otter_gc::SafeTraceable>::TYPE_TAG
+            {
+                PtrFamily::Other
+            } else {
+                PtrFamily::Object
+            },
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -708,19 +737,22 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn kind(self) -> ValueKind {
-        if is_double_bits(self.0) {
+        if is_int32_bits(self.0) {
+            return ValueKind::Int32;
+        }
+        if is_number_bits(self.0) {
             return ValueKind::Number;
         }
-        match top_tag(self.0) {
-            TAG_INT32 => ValueKind::Int32,
-            TAG_SPECIAL => ValueKind::Special,
-            TAG_FUNCTION_ID => ValueKind::FunctionId,
-            TAG_PTR_OBJECT => ValueKind::PtrObject,
-            TAG_PTR_STRING => ValueKind::PtrString,
-            TAG_PTR_FUNCTION => ValueKind::PtrFunction,
-            TAG_PTR_OTHER => ValueKind::PtrOther,
-            // Folded into double / unreachable by construction.
-            _ => ValueKind::Number,
+        if is_function_id_bits(self.0) {
+            return ValueKind::FunctionId;
+        }
+        match self.ptr_family() {
+            Some(PtrFamily::Object) => ValueKind::PtrObject,
+            Some(PtrFamily::String) => ValueKind::PtrString,
+            Some(PtrFamily::Function) => ValueKind::PtrFunction,
+            Some(PtrFamily::Other) => ValueKind::PtrOther,
+            // Immediates (null / undefined / bool / hole).
+            None => ValueKind::Special,
         }
     }
 
@@ -767,21 +799,21 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn is_number(self) -> bool {
-        top_tag(self.0) == TAG_INT32 || is_double_bits(self.0)
+        is_number_bits(self.0)
     }
 
     /// Int32 fast-path number.
     #[inline]
     #[must_use]
     pub fn is_int32(self) -> bool {
-        top_tag(self.0) == TAG_INT32
+        is_int32_bits(self.0)
     }
 
-    /// String reference.
+    /// String reference. Reads the body's `GcHeader::type_tag`.
     #[inline]
     #[must_use]
     pub fn is_string(self) -> bool {
-        top_tag(self.0) == TAG_PTR_STRING
+        self.ptr_family() == Some(PtrFamily::String)
     }
 
     /// Anything callable: bytecode function id, closure, bound, native,
@@ -789,24 +821,23 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn is_callable(self) -> bool {
-        let t = top_tag(self.0);
-        t == TAG_FUNCTION_ID || t == TAG_PTR_FUNCTION
+        is_function_id_bits(self.0) || self.ptr_family() == Some(PtrFamily::Function)
     }
 
-    /// Bytecode function reference (no closure).
+    /// Bytecode function reference (no closure). A raw bit test.
     #[inline]
     #[must_use]
     pub fn is_function_id(self) -> bool {
-        top_tag(self.0) == TAG_FUNCTION_ID
+        is_function_id_bits(self.0)
     }
 
-    /// Any reference that occupies the `PTR_OBJECT` family — object,
-    /// array, map, set, promise, etc. Distinguish via
-    /// [`Self::read_gc_type_tag`].
+    /// Any reference in the object family — object, array, map, set,
+    /// promise, etc. Reads the body's `GcHeader::type_tag`; distinguish
+    /// the concrete body via [`Self::read_gc_type_tag`].
     #[inline]
     #[must_use]
     pub fn is_object_like(self) -> bool {
-        top_tag(self.0) == TAG_PTR_OBJECT
+        self.ptr_family() == Some(PtrFamily::Object)
     }
 
     /// ECMA-262 `Type(value) is Object` — any heap-backed reference
@@ -822,11 +853,11 @@ impl Value {
         self.is_object_like() || self.is_callable()
     }
 
-    /// `TAG_PTR_OTHER` family — symbol / bigint.
+    /// Misc-primitive family — symbol / bigint.
     #[inline]
     #[must_use]
     pub fn is_other_primitive(self) -> bool {
-        top_tag(self.0) == TAG_PTR_OTHER
+        self.ptr_family() == Some(PtrFamily::Other)
     }
 
     // -----------------------------------------------------------------------
@@ -839,98 +870,85 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn is_object(self) -> bool {
-        self.is_object_like()
-            && self.read_gc_type_tag() == Some(<ObjectBody as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<ObjectBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// Array body.
     #[inline]
     #[must_use]
     pub fn is_array(self) -> bool {
-        self.is_object_like()
-            && self.read_gc_type_tag() == Some(<ArrayBody as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<ArrayBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// Map body.
     #[inline]
     #[must_use]
     pub fn is_map(self) -> bool {
-        self.is_object_like()
-            && self.read_gc_type_tag() == Some(<MapBody as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<MapBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// Set body.
     #[inline]
     #[must_use]
     pub fn is_set(self) -> bool {
-        self.is_object_like()
-            && self.read_gc_type_tag() == Some(<SetBody as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<SetBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// WeakMap body.
     #[inline]
     #[must_use]
     pub fn is_weak_map(self) -> bool {
-        self.is_object_like()
-            && self.read_gc_type_tag() == Some(<WeakMapBody as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<WeakMapBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// WeakSet body.
     #[inline]
     #[must_use]
     pub fn is_weak_set(self) -> bool {
-        self.is_object_like()
-            && self.read_gc_type_tag() == Some(<WeakSetBody as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<WeakSetBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// WeakRef body.
     #[inline]
     #[must_use]
     pub fn is_weak_ref(self) -> bool {
-        self.is_object_like()
-            && self.read_gc_type_tag() == Some(<WeakRefBody as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<WeakRefBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// FinalizationRegistry body.
     #[inline]
     #[must_use]
     pub fn is_finalization_registry(self) -> bool {
-        self.is_object_like()
-            && self.read_gc_type_tag()
-                == Some(<FinalizationRegistryBody as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag()
+            == Some(<FinalizationRegistryBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// Promise body.
     #[inline]
     #[must_use]
     pub fn is_promise(self) -> bool {
-        self.is_object_like()
-            && self.read_gc_type_tag()
-                == Some(<PurePromiseBody as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<PurePromiseBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// RegExp body.
     #[inline]
     #[must_use]
     pub fn is_regexp(self) -> bool {
-        self.is_object_like()
-            && self.read_gc_type_tag() == Some(<JsRegExpBody as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<JsRegExpBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// Generator body.
     #[inline]
     #[must_use]
     pub fn is_generator(self) -> bool {
-        self.is_object_like()
-            && self.read_gc_type_tag() == Some(<GeneratorBody as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<GeneratorBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// Iterator body.
     #[inline]
     #[must_use]
     pub fn is_iterator(self) -> bool {
-        self.is_object_like()
-            && self.read_gc_type_tag() == Some(<IteratorState as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<IteratorState as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     // -----------------------------------------------------------------------
@@ -941,35 +959,28 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn is_closure(self) -> bool {
-        top_tag(self.0) == TAG_PTR_FUNCTION
-            && self.read_gc_type_tag() == Some(JS_CLOSURE_BODY_TYPE_TAG)
+        self.read_gc_type_tag() == Some(JS_CLOSURE_BODY_TYPE_TAG)
     }
 
     /// Bound function body.
     #[inline]
     #[must_use]
     pub fn is_bound_function(self) -> bool {
-        top_tag(self.0) == TAG_PTR_FUNCTION
-            && self.read_gc_type_tag()
-                == Some(<BoundFunctionBody as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<BoundFunctionBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// Native function body.
     #[inline]
     #[must_use]
     pub fn is_native_function(self) -> bool {
-        top_tag(self.0) == TAG_PTR_FUNCTION
-            && self.read_gc_type_tag()
-                == Some(<NativeFunctionBody as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<NativeFunctionBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// Class-constructor wrapper body.
     #[inline]
     #[must_use]
     pub fn is_class_constructor(self) -> bool {
-        top_tag(self.0) == TAG_PTR_FUNCTION
-            && self.read_gc_type_tag()
-                == Some(<ClassConstructorBody as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<ClassConstructorBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     // -----------------------------------------------------------------------
@@ -991,11 +1002,11 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_number(self) -> Option<NumberValue> {
-        if top_tag(self.0) == TAG_INT32 {
-            return Some(NumberValue::Smi(payload32(self.0) as i32));
+        if is_int32_bits(self.0) {
+            return Some(NumberValue::Smi(unbox_int32(self.0)));
         }
-        if is_double_bits(self.0) {
-            return Some(NumberValue::Double(f64::from_bits(self.0)));
+        if is_number_bits(self.0) {
+            return Some(NumberValue::Double(f64::from_bits(unbox_double(self.0))));
         }
         None
     }
@@ -1011,8 +1022,8 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_i32(self) -> Option<i32> {
-        if top_tag(self.0) == TAG_INT32 {
-            Some(payload32(self.0) as i32)
+        if is_int32_bits(self.0) {
+            Some(unbox_int32(self.0))
         } else {
             None
         }
@@ -1022,23 +1033,20 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_function_id(self) -> Option<u32> {
-        if top_tag(self.0) == TAG_FUNCTION_ID {
-            Some(payload32(self.0))
+        if is_function_id_bits(self.0) {
+            Some(unbox_function_id(self.0))
         } else {
             None
         }
     }
 
-    /// Decode the underlying `RawGc` for any pointer-tag payload.
+    /// Decode the compressed [`otter_gc::raw::RawGc`] offset of a heap
+    /// cell — the low 32 bits of the full address.
     #[inline]
     #[must_use]
     pub fn as_raw_gc(self) -> Option<otter_gc::raw::RawGc> {
-        let t = top_tag(self.0);
-        if matches!(
-            t,
-            TAG_PTR_OBJECT | TAG_PTR_STRING | TAG_PTR_FUNCTION | TAG_PTR_OTHER
-        ) {
-            Some(otter_gc::raw::RawGc(payload32(self.0)))
+        if is_cell_bits(self.0) {
+            Some(otter_gc::raw::RawGc(cell_offset(self.0)))
         } else {
             None
         }
@@ -1338,9 +1346,6 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_generator(self) -> Option<JsGenerator> {
-        if !self.is_object_like() {
-            return None;
-        }
         let gc = self.as_raw_gc()?.checked_cast::<GeneratorBody>()?;
         Some(JsGenerator::from_gc(gc))
     }
@@ -1349,9 +1354,6 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_regexp(self) -> Option<JsRegExp> {
-        if !self.is_object_like() {
-            return None;
-        }
         let gc = self.as_raw_gc()?.checked_cast::<JsRegExpBody>()?;
         Some(JsRegExp::from_gc(gc))
     }
@@ -1363,9 +1365,6 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_promise(self) -> Option<JsPromiseHandle> {
-        if !self.is_object_like() {
-            return None;
-        }
         let gc = self.as_raw_gc()?.checked_cast::<PurePromiseBody>()?;
         Some(JsPromiseHandle::from_pure(PurePromise::from_gc(gc)))
     }
@@ -1374,9 +1373,6 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_string_gc(self) -> Option<JsStringHandle> {
-        if top_tag(self.0) != TAG_PTR_STRING {
-            return None;
-        }
         self.as_raw_gc()?.checked_cast::<JsStringBody>()
     }
 
@@ -1384,9 +1380,6 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_big_int_gc(self) -> Option<BigIntHandle> {
-        if top_tag(self.0) != TAG_PTR_OTHER {
-            return None;
-        }
         self.as_raw_gc()?.checked_cast::<BigIntBody>()
     }
 
@@ -1394,17 +1387,13 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn is_big_int_gc(self) -> bool {
-        top_tag(self.0) == TAG_PTR_OTHER
-            && self.read_gc_type_tag() == Some(<BigIntBody as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<BigIntBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// GC-managed Symbol body handle.
     #[inline]
     #[must_use]
     pub fn as_symbol_gc(self) -> Option<SymbolHandle> {
-        if top_tag(self.0) != TAG_PTR_OTHER {
-            return None;
-        }
         self.as_raw_gc()?.checked_cast::<SymbolBody>()
     }
 
@@ -1412,17 +1401,13 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn is_symbol_gc(self) -> bool {
-        top_tag(self.0) == TAG_PTR_OTHER
-            && self.read_gc_type_tag() == Some(<SymbolBody as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<SymbolBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// GC-managed Temporal body handle.
     #[inline]
     #[must_use]
     pub fn as_temporal_gc(self) -> Option<TemporalHandle> {
-        if !self.is_object_like() {
-            return None;
-        }
         self.as_raw_gc()?.checked_cast::<TemporalBody>()
     }
 
@@ -1430,17 +1415,13 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn is_temporal_gc(self) -> bool {
-        self.is_object_like()
-            && self.read_gc_type_tag() == Some(<TemporalBody as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<TemporalBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// GC-managed Intl body handle.
     #[inline]
     #[must_use]
     pub fn as_intl_gc(self) -> Option<IntlHandle> {
-        if !self.is_object_like() {
-            return None;
-        }
         self.as_raw_gc()?.checked_cast::<IntlBody>()
     }
 
@@ -1448,17 +1429,13 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn is_intl_gc(self) -> bool {
-        self.is_object_like()
-            && self.read_gc_type_tag() == Some(<IntlBody as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<IntlBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// GC-managed Proxy body handle.
     #[inline]
     #[must_use]
     pub fn as_proxy_gc(self) -> Option<ProxyHandle> {
-        if !self.is_object_like() {
-            return None;
-        }
         self.as_raw_gc()?.checked_cast::<ProxyBodyGc>()
     }
 
@@ -1466,17 +1443,13 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn is_proxy_gc(self) -> bool {
-        self.is_object_like()
-            && self.read_gc_type_tag() == Some(<ProxyBodyGc as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<ProxyBodyGc as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// GC-managed DataView body handle.
     #[inline]
     #[must_use]
     pub fn as_data_view_gc(self) -> Option<DataViewHandle> {
-        if !self.is_object_like() {
-            return None;
-        }
         self.as_raw_gc()?.checked_cast::<DataViewBodyGc>()
     }
 
@@ -1484,18 +1457,13 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn is_data_view_gc(self) -> bool {
-        self.is_object_like()
-            && self.read_gc_type_tag()
-                == Some(<DataViewBodyGc as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<DataViewBodyGc as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// GC-managed TypedArray body handle.
     #[inline]
     #[must_use]
     pub fn as_typed_array_gc(self) -> Option<TypedArrayHandle> {
-        if !self.is_object_like() {
-            return None;
-        }
         self.as_raw_gc()?.checked_cast::<TypedArrayBodyGc>()
     }
 
@@ -1503,18 +1471,13 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn is_typed_array_gc(self) -> bool {
-        self.is_object_like()
-            && self.read_gc_type_tag()
-                == Some(<TypedArrayBodyGc as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag() == Some(<TypedArrayBodyGc as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// GC-managed non-shared `ArrayBuffer` body handle.
     #[inline]
     #[must_use]
     pub fn as_local_array_buffer_gc(self) -> Option<LocalArrayBufferHandle> {
-        if !self.is_object_like() {
-            return None;
-        }
         self.as_raw_gc()?.checked_cast::<LocalArrayBufferBodyGc>()
     }
 
@@ -1522,18 +1485,14 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn is_local_array_buffer_gc(self) -> bool {
-        self.is_object_like()
-            && self.read_gc_type_tag()
-                == Some(<LocalArrayBufferBodyGc as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag()
+            == Some(<LocalArrayBufferBodyGc as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// GC-managed `SharedArrayBuffer` body handle.
     #[inline]
     #[must_use]
     pub fn as_shared_array_buffer_gc(self) -> Option<SharedArrayBufferHandle> {
-        if !self.is_object_like() {
-            return None;
-        }
         self.as_raw_gc()?.checked_cast::<SharedArrayBufferBodyGc>()
     }
 
@@ -1541,9 +1500,8 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn is_shared_array_buffer_gc(self) -> bool {
-        self.is_object_like()
-            && self.read_gc_type_tag()
-                == Some(<SharedArrayBufferBodyGc as otter_gc::SafeTraceable>::TYPE_TAG)
+        self.read_gc_type_tag()
+            == Some(<SharedArrayBufferBodyGc as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// `true` when the value is either Local or Shared ArrayBuffer.
@@ -1883,13 +1841,13 @@ impl Value {
         })
     }
 
-    /// Classify a `TAG_PTR_FUNCTION` value into its concrete body kind.
-    /// Returns `None` for non-callable values (including
-    /// `function_id` immediates, which are bytecode-only).
+    /// Classify a callable heap cell into its concrete body kind.
+    /// Returns `None` for non-callable values (including `function_id`
+    /// immediates, which are bytecode-only).
     #[inline]
     #[must_use]
     pub fn function_family_kind(self) -> Option<FunctionFamilyKind> {
-        if top_tag(self.0) != TAG_PTR_FUNCTION {
+        if self.ptr_family() != Some(PtrFamily::Function) {
             return None;
         }
         let tag = self.read_gc_type_tag()?;
@@ -1928,23 +1886,21 @@ impl Value {
     // GC tracing
     // -----------------------------------------------------------------------
 
-    /// Walk every `Gc<…>` slot held directly inside `self` and yield
-    /// its slot pointer to `visitor`.
+    /// Walk the `Gc<…>` slot held directly inside `self` and yield its
+    /// slot pointer to `visitor`.
     ///
-    /// On tagged `Value`, every pointer-tagged variant packs exactly
-    /// one 32-bit GC offset in the low 32 bits of `self.0`. The low
-    /// 32 bits live at byte offset `0..4` on little-endian targets,
-    /// so `&self.0` cast to `*mut RawGc` is a valid slot pointer:
-    /// the collector may rewrite those 4 bytes in place during
-    /// relocation without touching bits 32..48 (reserved zero) or
-    /// the top-16 tag.
+    /// A heap-cell `Value` stores the full `cage_base + offset` address;
+    /// its low 32 bits are the compressed GC offset (the cage is 4 GiB-
+    /// aligned) and its high 32 bits are the constant cage prefix. The
+    /// low word lives at byte offset `0..4` on little-endian targets, so
+    /// `&self.0` cast to `*mut RawGc` is a valid offset slot: the
+    /// collector rewrites those 4 bytes in place on relocation and the
+    /// full address tracks the move automatically.
     ///
-    /// Immediate variants (`undefined`, `null`, `hole`, booleans,
-    /// numbers, function ids) hold no GC slot and are skipped.
-    #[allow(dead_code)] // Wired up at Phase-1 swap; ~150 call sites flip over from legacy::Value.
+    /// Immediates and numbers hold no GC slot and are skipped.
+    #[allow(dead_code)]
     pub fn trace_value_slots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
-        let tag = top_tag(self.0);
-        if (TAG_PTR_OBJECT..=TAG_PTR_OTHER).contains(&tag) {
+        if is_cell_bits(self.0) {
             let slot = &self.0 as *const u64 as *mut otter_gc::raw::RawGc;
             visitor(slot);
         }
@@ -1952,8 +1908,7 @@ impl Value {
 
     /// Visit this value as an explicitly mutable root slot.
     pub(crate) fn trace_value_slot_mut(&mut self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
-        let tag = top_tag(self.0);
-        if (TAG_PTR_OBJECT..=TAG_PTR_OTHER).contains(&tag) {
+        if is_cell_bits(self.0) {
             let slot = &mut self.0 as *mut u64 as *mut otter_gc::raw::RawGc;
             visitor(slot);
         }
@@ -2002,10 +1957,12 @@ impl std::fmt::Debug for Value {
             ValueKind::FunctionId => {
                 write!(f, "Value::FunctionId({})", self.as_function_id().unwrap())
             }
-            ValueKind::PtrObject => write!(f, "Value::PtrObject(0x{:08x})", payload32(self.0)),
-            ValueKind::PtrString => write!(f, "Value::PtrString(0x{:08x})", payload32(self.0)),
-            ValueKind::PtrFunction => write!(f, "Value::PtrFunction(0x{:08x})", payload32(self.0)),
-            ValueKind::PtrOther => write!(f, "Value::PtrOther(0x{:08x})", payload32(self.0)),
+            ValueKind::PtrObject => write!(f, "Value::PtrObject(0x{:08x})", cell_offset(self.0)),
+            ValueKind::PtrString => write!(f, "Value::PtrString(0x{:08x})", cell_offset(self.0)),
+            ValueKind::PtrFunction => {
+                write!(f, "Value::PtrFunction(0x{:08x})", cell_offset(self.0))
+            }
+            ValueKind::PtrOther => write!(f, "Value::PtrOther(0x{:08x})", cell_offset(self.0)),
         }
     }
 }
@@ -2078,24 +2035,26 @@ mod tests {
     }
 
     #[test]
-    fn ptr_tags_round_trip() {
-        // We only test the tag encoding here; the actual GC body
-        // wiring happens through type-specific wrappers.
-        let raw = otter_gc::raw::RawGc(0xDEAD_BEEF);
-        let v = Value::from_object_gc(raw);
+    fn cell_offset_round_trips_through_full_address() {
+        use crate::object::alloc_object_with_roots;
+        use otter_gc::GcHeap;
+        use otter_gc::raw::RawGc;
+
+        let mut heap = GcHeap::new().expect("heap");
+        let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
+        let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("alloc");
+        let offset = obj.raw().0;
+        let v = Value::object(obj);
+        // A cell value carries the full cage_base + offset address with the
+        // compressed offset verbatim in its low 32 bits.
+        assert!(v.is_cell());
+        assert_eq!(v.as_raw_gc().unwrap().0, offset);
         assert!(v.is_object_like());
-        assert_eq!(v.as_raw_gc().unwrap().0, 0xDEAD_BEEF);
-
-        let s = Value::from_string_gc(raw);
-        assert!(s.is_string());
-        assert!(!s.is_object_like());
-
-        let f = Value::from_function_gc(raw);
-        assert!(f.is_callable());
-        assert!(!f.is_function_id());
-
-        let o = Value::from_other_gc(raw);
-        assert!(o.is_other_primitive());
+        // Immediates and numbers are never cells.
+        assert!(!Value::undefined().is_cell());
+        assert!(!Value::number_i32(7).is_cell());
+        assert!(!Value::number_f64(1.5).is_cell());
+        assert!(!Value::function_id(3).is_cell());
     }
 
     #[test]
@@ -2262,12 +2221,27 @@ mod tests {
         assert_eq!(Value::number_f64(f64::NAN).typeof_pure(), Some("number"));
         assert_eq!(Value::function_id(0).typeof_pure(), Some("function"));
 
-        let raw = otter_gc::raw::RawGc(1);
-        assert_eq!(Value::from_function_gc(raw).typeof_pure(), Some("function"));
-        // String is reachable purely from the tag.
-        assert_eq!(Value::from_string_gc(raw).typeof_pure(), Some("string"));
-        // Other (symbol / bigint) needs heap-side primitives.
-        assert_eq!(Value::from_other_gc(raw).typeof_pure(), None);
+        use crate::string::{JsStringId, alloc_flat_string_body_with_roots};
+        use crate::symbol::{WellKnown, alloc_symbol};
+        use crate::{Value as LegacyValue, alloc_closure, alloc_upvalue};
+        use otter_gc::GcHeap;
+        use otter_gc::raw::RawGc;
+        let mut heap = GcHeap::new().expect("heap");
+        let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
+        let cell = alloc_upvalue(&mut heap, LegacyValue::undefined()).expect("cell");
+        let closure = alloc_closure(&mut heap, 1, vec![cell], None, None, None, None).expect("clo");
+        assert_eq!(Value::closure(closure).typeof_pure(), Some("function"));
+        let body = alloc_flat_string_body_with_roots(
+            &mut heap,
+            JsStringId::new(1),
+            &[b'a' as u16],
+            &mut roots,
+        )
+        .expect("string");
+        assert_eq!(Value::string_gc(body).typeof_pure(), Some("string"));
+        // Symbol / bigint need heap-side primitives to finish typeof.
+        let sym = alloc_symbol(&mut heap, None, Some(WellKnown::Iterator), false).expect("sym");
+        assert_eq!(Value::symbol_gc(sym).typeof_pure(), None);
     }
 
     #[test]
@@ -2294,13 +2268,29 @@ mod tests {
 
         // Callables / object-like references are always truthy.
         assert_eq!(Value::function_id(0).to_boolean_pure(), Some(true));
-        let raw = otter_gc::raw::RawGc(1);
-        assert_eq!(Value::from_object_gc(raw).to_boolean_pure(), Some(true));
-        assert_eq!(Value::from_function_gc(raw).to_boolean_pure(), Some(true));
 
-        // String / Other still need heap awareness.
-        assert_eq!(Value::from_string_gc(raw).to_boolean_pure(), None);
-        assert_eq!(Value::from_other_gc(raw).to_boolean_pure(), None);
+        use crate::object::alloc_object_with_roots;
+        use crate::string::{JsStringId, alloc_flat_string_body_with_roots};
+        use crate::{Value as LegacyValue, alloc_closure, alloc_upvalue};
+        use otter_gc::GcHeap;
+        use otter_gc::raw::RawGc;
+        let mut heap = GcHeap::new().expect("heap");
+        let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
+        let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("obj");
+        let cell = alloc_upvalue(&mut heap, LegacyValue::undefined()).expect("cell");
+        let closure = alloc_closure(&mut heap, 1, vec![cell], None, None, None, None).expect("clo");
+        assert_eq!(Value::object(obj).to_boolean_pure(), Some(true));
+        assert_eq!(Value::closure(closure).to_boolean_pure(), Some(true));
+
+        // Strings need a length probe to finish ToBoolean.
+        let body = alloc_flat_string_body_with_roots(
+            &mut heap,
+            JsStringId::new(1),
+            &[b'a' as u16],
+            &mut roots,
+        )
+        .expect("string");
+        assert_eq!(Value::string_gc(body).to_boolean_pure(), None);
     }
 
     #[test]
@@ -2366,10 +2356,30 @@ mod tests {
         assert_eq!(Value::number_f64(1.5).kind(), ValueKind::Number);
         assert_eq!(Value::number_f64(f64::NAN).kind(), ValueKind::Number);
         assert_eq!(Value::function_id(0).kind(), ValueKind::FunctionId);
-        let raw = otter_gc::raw::RawGc(1);
-        assert_eq!(Value::from_object_gc(raw).kind(), ValueKind::PtrObject);
-        assert_eq!(Value::from_string_gc(raw).kind(), ValueKind::PtrString);
-        assert_eq!(Value::from_function_gc(raw).kind(), ValueKind::PtrFunction);
-        assert_eq!(Value::from_other_gc(raw).kind(), ValueKind::PtrOther);
+
+        use crate::bigint::alloc_big_int;
+        use crate::object::alloc_object_with_roots;
+        use crate::string::{JsStringId, alloc_flat_string_body_with_roots};
+        use crate::{Value as LegacyValue, alloc_closure, alloc_upvalue};
+        use num_bigint::BigInt;
+        use otter_gc::GcHeap;
+        use otter_gc::raw::RawGc;
+        let mut heap = GcHeap::new().expect("heap");
+        let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
+        let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("obj");
+        let cell = alloc_upvalue(&mut heap, LegacyValue::undefined()).expect("cell");
+        let closure = alloc_closure(&mut heap, 1, vec![cell], None, None, None, None).expect("clo");
+        let body = alloc_flat_string_body_with_roots(
+            &mut heap,
+            JsStringId::new(1),
+            &[b'a' as u16],
+            &mut roots,
+        )
+        .expect("string");
+        let big = alloc_big_int(&mut heap, BigInt::from(7)).expect("big");
+        assert_eq!(Value::object(obj).kind(), ValueKind::PtrObject);
+        assert_eq!(Value::string_gc(body).kind(), ValueKind::PtrString);
+        assert_eq!(Value::closure(closure).kind(), ValueKind::PtrFunction);
+        assert_eq!(Value::big_int_gc(big).kind(), ValueKind::PtrOther);
     }
 }

@@ -55,6 +55,20 @@ pub const DEFAULT_CAGE_SIZE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 /// `u32`, so the cage cannot exceed `u32::MAX + 1` bytes.
 pub const MAX_CAGE_SIZE_BYTES: usize = 1usize << 32;
 
+/// Cage-base alignment: 4 GiB (`1 << 32`).
+///
+/// The base is aligned so that `cage_base & 0xFFFF_FFFF == 0`. With a
+/// cage no larger than [`MAX_CAGE_SIZE_BYTES`], every in-cage address
+/// is then `cage_base | offset` with the 32-bit offset occupying the
+/// low word verbatim. That is the load-bearing property of the
+/// pointer-cheap value encoding: a heap pointer stored as a full
+/// `cage_base + offset` address carries its compressed offset in its
+/// own low 32 bits, so the moving collector can still rewrite that
+/// 4-byte offset in place during relocation (the high half is the
+/// constant cage prefix) while the interpreter dereferences the full
+/// address with no unmask. See `otter_vm::value`.
+pub const CAGE_ALIGN_BYTES: usize = 1usize << 32;
+
 /// Process-global cage base (null before init). Stored as
 /// `AtomicPtr<u8>` rather than `AtomicUsize` so cage offsets can
 /// be decompressed via `cage_base().add(offset)` — pointer
@@ -408,10 +422,20 @@ const _: () = assert!(std::mem::size_of::<RawGc>() == 4, "RawGc must be 4 bytes"
 /// page free-list. The mutex is taken on page alloc / free only;
 /// hot-path bump alloc inside a page does not touch it.
 pub(crate) struct Cage {
-    /// Cage base pointer. Lives until process exit.
+    /// Cage base pointer — 4 GiB-aligned (see [`CAGE_ALIGN_BYTES`]).
+    /// Lives until process exit. This is the address handed out by
+    /// [`cage_base`]; it is carved from the interior of
+    /// `reservation` so that `base & 0xFFFF_FFFF == 0`.
     base: *mut u8,
     /// Cage size in bytes (multiple of [`PAGE_SIZE`]).
     size: usize,
+    /// Raw allocation pointer returned by the host allocator, kept so
+    /// the over-aligned reservation can be returned with the exact
+    /// layout it was requested with. `base` points at or after this.
+    reservation: *mut u8,
+    /// Layout the reservation was allocated with — required for a
+    /// sound `dealloc`.
+    reservation_layout: Layout,
     /// Free page indices (page 0 is reserved so that `Gc<T>(0)`
     /// stays null). Indices count from 1 to `size / PAGE_SIZE - 1`.
     free_pages: Vec<u32>,
@@ -459,24 +483,57 @@ impl Cage {
             }
             return Ok(());
         }
-        // SAFETY: Layout is built from a non-zero multiple of
-        // PAGE_SIZE that we just validated; `alloc` obtains a
-        // page-aligned region without eagerly zeroing the whole
-        // default cage. Individual pages initialise their headers
-        // in `Page::new`, and returned pages are zeroed before
-        // reuse in `free_page`.
-        let layout = Layout::from_size_align(size_bytes, PAGE_SIZE)
+        // Over-allocate by one full alignment so a 4 GiB-aligned base
+        // is guaranteed to exist inside the reservation, then carve
+        // the aligned cage from its interior. The 4 GiB alignment is
+        // what lets a full `cage_base + offset` address keep its
+        // 32-bit offset in the low word (see [`CAGE_ALIGN_BYTES`]).
+        // The reservation is virtual until faulted, so the extra
+        // alignment slack costs address space, not physical pages.
+        //
+        // SAFETY: Layout is built from a non-zero size we just
+        // validated; `alloc` obtains the region without eagerly
+        // zeroing it. Individual pages initialise their headers in
+        // `Page::new`, and returned pages are zeroed before reuse in
+        // `free_page`.
+        let reservation_size = size_bytes + CAGE_ALIGN_BYTES;
+        let reservation_layout = Layout::from_size_align(reservation_size, PAGE_SIZE)
             .map_err(|_| CageError::InvalidSize(size_bytes))?;
-        let ptr = unsafe { alloc(layout) };
-        if ptr.is_null() {
+        let reservation = unsafe { alloc(reservation_layout) };
+        if reservation.is_null() {
             return Err(CageError::AllocFailed);
         }
+        let base_addr = (reservation as usize)
+            .checked_add(CAGE_ALIGN_BYTES - 1)
+            .map(|a| a & !(CAGE_ALIGN_BYTES - 1))
+            .expect("cage base alignment overflow");
+        // SAFETY: `base_addr` lies within `[reservation, reservation +
+        // reservation_size - size_bytes]` by construction, so the
+        // aligned cage of `size_bytes` is fully inside the reservation.
+        let ptr = base_addr as *mut u8;
+        // The pointer-cheap value encoding requires the cage to sit in
+        // the low-48-bit virtual-address window (so heap pointers have
+        // their top 16 bits clear) and to be 4 GiB-aligned (so the low
+        // 32 bits are exactly the compressed offset). Both hold on
+        // arm64 / x86-64 user space; assert so a future port that
+        // breaks them fails loudly here rather than via silent pointer
+        // corruption.
+        assert!(
+            base_addr & (CAGE_ALIGN_BYTES - 1) == 0,
+            "cage base must be 4 GiB-aligned"
+        );
+        assert!(
+            base_addr >> 48 == 0,
+            "cage base must lie in the low 48-bit VA window"
+        );
         let page_count = (size_bytes / PAGE_SIZE) as u32;
         // Page 0 is reserved so that Gc<T>(0) stays null.
         let free_pages: Vec<u32> = (1..page_count).rev().collect();
         let cage = Cage {
             base: ptr,
             size: size_bytes,
+            reservation,
+            reservation_layout,
             free_pages,
             page_count,
         };
@@ -556,15 +613,16 @@ impl Drop for Cage {
         // Cage lives for process lifetime; this Drop only fires if
         // the static guard is reset (test harness teardown). Free
         // the backing region so leak sanitiser is happy.
-        if !self.base.is_null() {
-            // SAFETY: layout matches the one used in
-            // `ensure_inner`; the pointer was returned by `alloc`
-            // and has not been freed yet.
-            let layout = Layout::from_size_align(self.size, PAGE_SIZE)
-                .expect("cage layout was valid at init");
+        if !self.reservation.is_null() {
+            // SAFETY: `reservation` / `reservation_layout` are the exact
+            // pointer and layout returned by `alloc` in `ensure_inner`
+            // and have not been freed yet. `base` is an interior,
+            // aligned slice of this reservation and must NOT be freed
+            // directly.
             unsafe {
-                dealloc(self.base, layout);
+                dealloc(self.reservation, self.reservation_layout);
             }
+            self.reservation = core::ptr::null_mut();
             self.base = core::ptr::null_mut();
         }
     }

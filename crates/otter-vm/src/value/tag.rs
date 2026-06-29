@@ -1,125 +1,169 @@
-//! NaN-box tag layout for [`crate::value::Value`].
+//! Pointer-cheap NaN-box encoding for [`crate::value::Value`].
 //!
 //! # Encoding
 //!
-//! Every `Value` is a single `u64`. We use the IEEE-754 quiet-NaN payload
-//! region (`0x7FF8_0000_0000_0000..=0xFFFF_FFFF_FFFF_FFFF`) to store typed,
-//! non-double payloads. Doubles that are not NaN occupy the rest of the
-//! `u64` space verbatim; the single canonical NaN (`f64::NAN`) is
-//! encoded as `CANONICAL_NAN`.
+//! Every `Value` is a single `u64` laid out exactly like JavaScriptCore's
+//! 64-bit `JSValue` (`JSCJSValue.h`), chosen so that **heap pointers are
+//! stored verbatim** and need no unmask before a dereference — the hot
+//! property/method path pays nothing to turn a `Value` into an object
+//! address. Doubles pay a single add/subtract at box/unbox time; that is
+//! the conscious trade (we are already competitive on float benches).
 //!
-//! The high 16 bits select the tag. The low 48 bits carry the payload.
+//! ```text
+//! Cell pointer : the full 48-bit address, top 16 bits zero.
+//!                v & (NUMBER_TAG | OTHER_TAG) == 0  &&  v != 0
+//! Int32        : NUMBER_TAG | (i32 as u32)
+//!                (v & NUMBER_TAG) == NUMBER_TAG
+//! Double       : f64.bits + DOUBLE_ENCODE_OFFSET   (NaN purified first)
+//!                (v & NUMBER_TAG) != 0  &&  not int32
+//! Immediates   : null / undefined / false / true / hole — OTHER_TAG-tagged
+//!                low-bit patterns, top 16 bits zero, never a number/cell.
+//! FunctionId   : (id as u64) << 16 | FUNCTION_ID_TAG  (closure-less ref)
+//! ```
 //!
-//! | High 16 bits     | Meaning                                                       |
-//! |------------------|----------------------------------------------------------------|
-//! | not `0x7FFx`     | IEEE-754 double, used verbatim via [`f64::from_bits`]          |
-//! | `0x7FF8`         | canonical quiet NaN = `Number::Double(NaN)`                    |
-//! | `0x7FF9`         | INT32 immediate (low 32 bits = signed i32 payload)             |
-//! | `0x7FFA`         | SPECIAL immediate (low 4 bits select Undef/Null/Hole/Bool kind)|
-//! | `0x7FFB`         | FUNCTION_ID immediate (low 32 bits = bytecode function id)     |
-//! | `0x7FFC`         | TAG_PTR_OBJECT   (low 32 bits = `Gc<…>` offset, type-tag disc) |
-//! | `0x7FFD`         | TAG_PTR_STRING   (low 32 bits = `Gc<JsStringBody>` offset)     |
-//! | `0x7FFE`         | TAG_PTR_FUNCTION (low 32 bits = callable body `Gc<…>` offset)  |
-//! | `0x7FFF`         | TAG_PTR_OTHER    (low 32 bits = misc body `Gc<…>` offset)      |
-//!
-//! Pointer payloads carry the 32-bit GC compressed offset
-//! ([`otter_gc::Gc::offset`]); type discrimination on `TAG_PTR_OBJECT`
-//! and `TAG_PTR_OTHER` happens through [`otter_gc::header::GcHeader::type_tag`]
-//! lookup, matching MEMORY.md's `0x7FFC/0x7FFD/0x7FFE/0x7FFF` scheme.
+//! Heap pointers carry the **full** `cage_base + offset` address. Because
+//! the GC cage is 4 GiB-aligned (`otter_gc::CAGE_ALIGN_BYTES`), the low 32
+//! bits of that address are exactly the [`otter_gc::raw::RawGc`] compressed
+//! offset, and the high half is the constant cage prefix. So the moving
+//! collector still rewrites the 4-byte offset in place during relocation
+//! (the address auto-updates), while the interpreter derefs the full
+//! pointer directly. The four object families (object / string / callable /
+//! other) are read from [`otter_gc::header::GcHeader::type_tag`], not from
+//! the value bits.
 //!
 //! # Invariants
 //!
-//! - Any incoming `f64::NAN` is normalized to [`CANONICAL_NAN`] before
-//!   storage.
-//! - Pointer tags must always carry a 32-bit GC offset payload — bits
-//!   32..48 are reserved and must be zero so `(value.0 & 0xFFFF_FFFF) as u32`
-//!   round-trips through [`otter_gc::Gc::from_offset`].
-//! - The `SPECIAL` kind discriminant occupies the low 4 bits; the rest
-//!   of the payload must be zero so equality compares structurally.
+//! - Cell addresses are ≥8-aligned, so a cell never has `OTHER_TAG` (bit 1)
+//!   set; that is how a cell is told apart from a tagged immediate.
+//! - Every incoming NaN is purified to [`CANONICAL_NAN`] before the double
+//!   offset is applied, so no encoded double aliases the cell space.
+//! - The cage base is 4 GiB-aligned and in the low-48-bit VA window
+//!   (asserted at cage init), so `top16 == 0` for every cell.
 //!
 //! # Spec
 //!
 //! - ECMA-262 §6.1 ECMAScript Language Types
 //! - ECMA-262 §6.1.6.1 The Number Type (NaN canonicalisation)
+//! - JavaScriptCore `JSCJSValue.h` (the encoding mirrored here)
 
-/// High-16-bit base of the IEEE-754 positive quiet-NaN range.
-pub const QNAN_BASE: u64 = 0x7FF8_0000_0000_0000;
+/// High-bits tag marking a number (int32 or boxed double).
+pub const NUMBER_TAG: u64 = 0xfffe_0000_0000_0000;
 
-/// Canonical quiet NaN — the single bit pattern used for any
-/// `Number(NaN)` value. Constants from `f64::NAN` would also work but
-/// we pin the exact pattern so cross-platform behaviour stays stable.
-pub const CANONICAL_NAN: u64 = QNAN_BASE;
+/// Low-bit tag distinguishing a tagged immediate from a cell pointer.
+/// A cell never has this bit set.
+pub const OTHER_TAG: u64 = 0x2;
 
-/// Canonical quiet-NaN high-16-bit pattern.
-pub const TAG_NAN: u16 = 0x7FF8;
-/// 32-bit integer immediate tag (payload = signed `i32` in low 32 bits).
-pub const TAG_INT32: u16 = 0x7FF9;
-/// Special immediate tag (Undefined / Null / Hole / Boolean).
-pub const TAG_SPECIAL: u16 = 0x7FFA;
-/// Bytecode-function-id immediate tag (no closure captured).
-pub const TAG_FUNCTION_ID: u16 = 0x7FFB;
-/// Object-family pointer tag (object, array, map, set, weak*, promise,
-/// proxy, regexp, typed/buffer/data-view, temporal, intl, iterator,
-/// generator, finalization-registry).
-pub const TAG_PTR_OBJECT: u16 = 0x7FFC;
-/// String body pointer tag.
-pub const TAG_PTR_STRING: u16 = 0x7FFD;
-/// Callable body pointer tag (closure, bound, native, class).
-pub const TAG_PTR_FUNCTION: u16 = 0x7FFE;
-/// Miscellaneous primitive body pointer tag (symbol, bigint).
-pub const TAG_PTR_OTHER: u16 = 0x7FFF;
+/// Low-bit marker shared by the two boolean immediates.
+pub const BOOL_TAG: u64 = 0x4;
 
-/// First non-double tag. Any `Value` whose top 16 bits are `>= TAG_INT32`
-/// is a tagged immediate or pointer, *unless* the bits are exactly
-/// [`CANONICAL_NAN`] which represents `Number(NaN)`.
-pub const FIRST_NONDOUBLE_TAG: u16 = TAG_INT32;
+/// Low-bit marker for `undefined`.
+pub const UNDEFINED_TAG: u64 = 0x8;
 
-/// `SPECIAL` sub-kind: `undefined`.
-pub const SPECIAL_UNDEFINED: u64 = 0;
-/// `SPECIAL` sub-kind: `null`.
-pub const SPECIAL_NULL: u64 = 1;
-/// `SPECIAL` sub-kind: internal array hole sentinel.
-pub const SPECIAL_HOLE: u64 = 2;
-/// `SPECIAL` sub-kind: `false`.
-pub const SPECIAL_FALSE: u64 = 3;
-/// `SPECIAL` sub-kind: `true`.
-pub const SPECIAL_TRUE: u64 = 4;
+/// Added to a purified `f64`'s bit pattern when boxing a double, and
+/// subtracted when unboxing. `2^49`.
+pub const DOUBLE_ENCODE_OFFSET: u64 = 0x0002_0000_0000_0000;
 
-/// Build a u64 from a 16-bit tag and a 48-bit payload.
+/// `(v & NOT_CELL_MASK) == 0` (and non-zero) identifies a cell pointer.
+pub const NOT_CELL_MASK: u64 = NUMBER_TAG | OTHER_TAG;
+
+/// Canonical quiet NaN — every `Number(NaN)` boxes from this single
+/// `f64` bit pattern so all NaNs compare bit-equal and none of them
+/// collide with the cell space once the double offset is applied.
+pub const CANONICAL_NAN: u64 = 0x7ff8_0000_0000_0000;
+
+// ---------------------------------------------------------------------------
+// Tagged immediates (full `u64` values; top 16 bits zero, OTHER_TAG set).
+// ---------------------------------------------------------------------------
+
+/// `null` immediate.
+pub const VALUE_NULL: u64 = OTHER_TAG;
+/// `false` immediate.
+pub const VALUE_FALSE: u64 = OTHER_TAG | BOOL_TAG;
+/// `true` immediate.
+pub const VALUE_TRUE: u64 = OTHER_TAG | BOOL_TAG | 0x1;
+/// `undefined` immediate.
+pub const VALUE_UNDEFINED: u64 = OTHER_TAG | UNDEFINED_TAG;
+/// Internal "array hole" sentinel — never observed by user code. A
+/// distinct OTHER_TAG-bearing pattern, disjoint from the spec immediates.
+pub const VALUE_HOLE: u64 = OTHER_TAG | 0x10;
+
+/// Low-16-bit tag selecting the closure-less bytecode-function-id
+/// immediate. The function id lives in bits `[16, 48)`; the low 16 bits
+/// are this constant. OTHER_TAG keeps it out of the cell space and the
+/// `0x20` marker keeps it disjoint from the other immediates.
+pub const FUNCTION_ID_TAG: u64 = OTHER_TAG | 0x20;
+
+/// `true` if the bit pattern encodes a number (int32 or boxed double).
 #[inline(always)]
-pub const fn pack(tag: u16, payload48: u64) -> u64 {
-    debug_assert!(payload48 <= 0x0000_FFFF_FFFF_FFFF);
-    ((tag as u64) << 48) | (payload48 & 0x0000_FFFF_FFFF_FFFF)
+pub const fn is_number_bits(bits: u64) -> bool {
+    (bits & NUMBER_TAG) != 0
 }
 
-/// Extract the 16-bit tag from a `Value` bit pattern.
+/// `true` if the bit pattern encodes an int32 immediate.
 #[inline(always)]
-pub const fn top_tag(bits: u64) -> u16 {
-    (bits >> 48) as u16
+pub const fn is_int32_bits(bits: u64) -> bool {
+    (bits & NUMBER_TAG) == NUMBER_TAG
 }
 
-/// Extract the low-48-bit payload.
-#[inline(always)]
-pub const fn payload48(bits: u64) -> u64 {
-    bits & 0x0000_FFFF_FFFF_FFFF
-}
-
-/// Extract the low-32-bit payload (used for pointers, int32, function-id).
-#[inline(always)]
-pub const fn payload32(bits: u64) -> u32 {
-    bits as u32
-}
-
-/// `true` if the bit pattern is a double (including canonical NaN,
-/// ±Infinity, ±0).
-///
-/// Non-doubles occupy the contiguous high-tag window
-/// `[TAG_INT32 ..= TAG_PTR_OTHER]` (`0x7FF9..=0x7FFF`). Every other
-/// 16-bit prefix — positive finite/inf, the canonical NaN at
-/// `0x7FF8`, and the entire negative half `0x8000..=0xFFFF` — is a
-/// valid IEEE-754 double.
+/// `true` if the bit pattern encodes a boxed (offset) double.
 #[inline(always)]
 pub const fn is_double_bits(bits: u64) -> bool {
-    let tag = top_tag(bits);
-    tag < TAG_INT32 || tag > TAG_PTR_OTHER
+    is_number_bits(bits) && !is_int32_bits(bits)
+}
+
+/// `true` if the bit pattern is a heap-cell pointer (full address,
+/// top 16 bits zero, `OTHER_TAG` clear, non-zero).
+#[inline(always)]
+pub const fn is_cell_bits(bits: u64) -> bool {
+    (bits & NOT_CELL_MASK) == 0 && bits != 0
+}
+
+/// `true` if the bit pattern is the closure-less function-id immediate.
+#[inline(always)]
+pub const fn is_function_id_bits(bits: u64) -> bool {
+    !is_number_bits(bits) && (bits & 0xFFFF) == FUNCTION_ID_TAG
+}
+
+/// Box an `i32` into its int32 immediate pattern.
+#[inline(always)]
+pub const fn box_int32(n: i32) -> u64 {
+    NUMBER_TAG | (n as u32 as u64)
+}
+
+/// Unbox an int32 immediate. Caller guarantees [`is_int32_bits`].
+#[inline(always)]
+pub const fn unbox_int32(bits: u64) -> i32 {
+    bits as u32 as i32
+}
+
+/// Box an `f64` (already NaN-purified) into its offset-double pattern.
+#[inline(always)]
+pub const fn box_double(bits: u64) -> u64 {
+    bits.wrapping_add(DOUBLE_ENCODE_OFFSET)
+}
+
+/// Unbox an offset-double back to raw `f64` bits. Caller guarantees
+/// [`is_double_bits`].
+#[inline(always)]
+pub const fn unbox_double(bits: u64) -> u64 {
+    bits.wrapping_sub(DOUBLE_ENCODE_OFFSET)
+}
+
+/// Box a closure-less function id into its immediate pattern.
+#[inline(always)]
+pub const fn box_function_id(id: u32) -> u64 {
+    ((id as u64) << 16) | FUNCTION_ID_TAG
+}
+
+/// Unbox a function-id immediate. Caller guarantees [`is_function_id_bits`].
+#[inline(always)]
+pub const fn unbox_function_id(bits: u64) -> u32 {
+    (bits >> 16) as u32
+}
+
+/// Low 32 bits of a cell pointer — the [`otter_gc::raw::RawGc`] offset,
+/// since the cage base is 4 GiB-aligned.
+#[inline(always)]
+pub const fn cell_offset(bits: u64) -> u32 {
+    bits as u32
 }

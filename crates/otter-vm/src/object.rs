@@ -436,6 +436,11 @@ pub(crate) struct AtomOwnPropertyHit {
     pub(crate) atom_id: AtomId,
     /// String-keyed own-property slot offset.
     pub(crate) slot: u16,
+    /// `true` when the slot held a plain data property at install. Under a
+    /// matching shape with attributes not overridden in place, the slot kind
+    /// is fixed, so a data hit reads the value without consulting the shape's
+    /// per-slot attributes.
+    pub(crate) is_data: bool,
 }
 
 /// Own-property slot metadata for non-atomized named-property ICs.
@@ -1694,6 +1699,7 @@ pub(crate) fn lookup_own_atom(
                     shape: body.shape,
                     atom_id: key.atom().id(),
                     slot: offset,
+                    is_data: matches!(lookup, PropertyLookup::Data { .. }),
                 }),
                 lookup,
             }
@@ -1753,6 +1759,19 @@ pub(crate) fn load_own_data_slot_atom(
             body_key_matches(heap, body, offset, key.name()),
             "shape-id hit resolved to a slot whose key differs from the request"
         );
+        // Fast path: an ordinary shaped object (no exotic slots, so no mapped
+        // arguments) whose attributes have not been overridden in place reads a
+        // baked data slot straight from the slab — the matching shape fixes the
+        // slot kind and bounds, so neither the per-slot attributes nor the
+        // property count need consulting.
+        if shaped && hit.is_data && !body.slot_attrs_overridden && body.exotic.is_none() {
+            debug_assert!(offset < body_property_count(heap, body));
+            debug_assert!(
+                !body.slot_attrs(heap, offset).1,
+                "baked data slot resolved to an accessor"
+            );
+            return Some(body.data_value(offset));
+        }
         if let Some(cell) = mapped_argument_cell(body, key.name()) {
             return Some(read_upvalue(heap, cell));
         }
@@ -4158,6 +4177,7 @@ mod tests {
                 shape: ShapeHandle::null(),
                 atom_id: key.atom().id(),
                 slot: 0,
+                is_data: true,
             })
         );
         assert!(matches!(

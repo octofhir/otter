@@ -60,17 +60,36 @@ pub(crate) fn compile_function_full(
     // body declaration), which arms the §19.2.1.3 direct-eval check
     // during parameter initialization.
     child.binds_arguments = true;
+    // Whether the function's own name is actually observable inside its body —
+    // by a direct identifier reference (here or in a nested closure) or a direct
+    // eval that could name it through a string literal. A named function
+    // expression whose body never names itself has an unobservable self-binding
+    // (§15.2.5 NamedEvaluation only sets the `name` *property*; it creates no
+    // self-reference binding), so emitting the self-binding `MakeFunction` would
+    // be dead code that also allocates a throwaway closure on every call and
+    // marks the function `makes_function`, defeating method inlining.
+    let mut self_name_referenced = false;
     if let Some(b) = body {
         child.captured_names = capture::analyze_function(Some(params), b);
+        // Cell promotion only needs the *nested* reference test: a
+        // direct depth-0 self-call resolves as a plain local and needs
+        // no upvalue cell, but a nested closure naming the self-name
+        // (or a direct eval) does. The self-binding liveness test below
+        // is broader — see `self_name_referenced`.
+        let self_name_in_inner =
+            contains_direct_eval || capture::inner_references_name(Some(params), b, name);
+        // Self-binding liveness: the §10.2.11 self-binding `MakeFunction`
+        // is dead code unless the name is observable *somewhere* in the
+        // body — including a direct self-recursive call at the function's
+        // own depth (`return f(n - 1)`), which the nested-only test
+        // misses. A direct eval can name it through a string literal.
+        self_name_referenced =
+            contains_direct_eval || capture::body_references_name(Some(params), b, name);
         // §10.2.11 — the function expression's self-name is a funcEnv
         // binding; nested closures referencing it need an upvalue cell.
         // A direct eval in the body can also reference the self-name
         // through a string literal, so it must reach a cell too.
-        if !is_method
-            && !no_self_name
-            && !name.is_empty()
-            && (contains_direct_eval || capture::inner_references_name(Some(params), b, name))
-        {
+        if !is_method && !no_self_name && !name.is_empty() && self_name_in_inner {
             child.captured_names.insert(name.to_string());
         }
         // §19.2.1.3 — a direct eval body reads and writes caller
@@ -128,7 +147,11 @@ pub(crate) fn compile_function_full(
     // binding, not to a re-made closure of itself.
     let fn_self_immutable = std::mem::take(&mut parent.fn_self_immutable_hint);
     let self_make_idx =
-        if is_method || no_self_name || parent.lookup_in_current_scope(name).is_some() {
+        if is_method
+            || no_self_name
+            || !self_name_referenced
+            || parent.lookup_in_current_scope(name).is_some()
+        {
             None
         } else {
             let self_storage = parent.declare_binding(name, false, span)?;

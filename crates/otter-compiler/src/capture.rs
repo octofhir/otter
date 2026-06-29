@@ -81,6 +81,30 @@ pub fn inner_references_name(
     inner.refs.contains(name)
 }
 
+/// `true` when a function body (or its parameter defaults) references
+/// `name` as an identifier *at any depth* — directly in the body
+/// (`return f(n - 1)`) or inside a nested closure. Unlike
+/// [`inner_references_name`], which counts only nested references for
+/// upvalue-cell promotion, this asks whether the function's self-name
+/// is observable at all, which is what decides whether the §10.2.11
+/// self-binding `MakeFunction` is live or dead code. Conservative: a
+/// nested binding that shadows `name` still trips it (the worst case
+/// is emitting an unobservable self-binding, never dropping a live
+/// one).
+#[must_use]
+pub fn body_references_name(
+    params: Option<&FormalParameters<'_>>,
+    body: &FunctionBody<'_>,
+    name: &str,
+) -> bool {
+    let mut any = AnyRefCollector::default();
+    if let Some(p) = params {
+        any.visit_formal_parameters(p);
+    }
+    any.visit_function_body(body);
+    any.refs.contains(name)
+}
+
 /// `true` when a function body contains a direct-eval call site —
 /// a bare `eval(...)` identifier call — at any nesting depth.
 /// §19.2.1.3 EvalDeclarationInstantiation gives such an eval body
@@ -360,6 +384,20 @@ impl<'a> Visit<'a> for OwnNameCollector {
 struct InnerRefCollector {
     refs: HashSet<String>,
     nested_depth: u32,
+}
+
+/// Collects every identifier reference in a function body at any
+/// depth (direct body refs and nested-closure refs alike). Backs
+/// [`body_references_name`]'s "is the self-name observable" question.
+#[derive(Default)]
+struct AnyRefCollector {
+    refs: HashSet<String>,
+}
+
+impl<'a> Visit<'a> for AnyRefCollector {
+    fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
+        self.refs.insert(it.name.as_str().to_string());
+    }
 }
 
 impl<'a> Visit<'a> for InnerRefCollector {

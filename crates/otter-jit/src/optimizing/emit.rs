@@ -2438,9 +2438,20 @@ mod arm64 {
                 }
                 Ok(())
             }
-            NodeKind::TaggedIsNull { value, negate } => {
+            NodeKind::TaggedIsNull {
+                value,
+                negate,
+                nullish,
+            } => {
                 let vloc = require_loc(alloc, *value)?;
                 load_loc(ops, box_scratch, vloc);
+                // `null` = base|1, `undefined` = base|0 (base = TAG_SPECIAL<<48).
+                // For a nullish (`== null`) test, set bit 0 so both collapse onto
+                // the `null` immediate; no other value maps there.
+                if *nullish {
+                    emit_load_u64(ops, MOVE_SCRATCH, 1);
+                    dynasm!(ops ; .arch aarch64 ; orr X(box_scratch), X(box_scratch), X(MOVE_SCRATCH));
+                }
                 emit_load_u64(ops, MOVE_SCRATCH, (TAG_SPECIAL << 48) | SPECIAL_NULL);
                 dynasm!(ops ; .arch aarch64 ; cmp X(box_scratch), X(MOVE_SCRATCH));
                 if let Some(loc) = dst {

@@ -169,13 +169,21 @@ pub enum NodeKind {
     /// `f64 <cmp> f64`. Result [`Repr::Bool`]. IEEE ordered comparison
     /// (a `NaN` operand yields `false` for every relation, matching JS).
     Float64Compare(CmpOp, NodeId, NodeId),
-    /// Strict identity check against the boxed `null` immediate. `negate=false`
-    /// is `value === null`; `negate=true` is `value !== null`.
+    /// Nullish identity check against the boxed `null` (and, when `nullish`,
+    /// `undefined`) immediate. With `nullish=false` this is strict `value ===
+    /// null` (`negate=true` → `!== null`). With `nullish=true` it matches `null`
+    /// OR `undefined`, the speculative lowering of loose `value == null` /
+    /// `value != null` — sound because `x == null` is true iff `x` is one of the
+    /// two nullish values. `null` and `undefined` box to `base|1` and `base|0`
+    /// (differing only in bit 0), so the emitter masks bit 0 before comparing.
     TaggedIsNull {
-        /// Tagged value to compare with `null`.
+        /// Tagged value to compare with `null` (and `undefined` when `nullish`).
         value: NodeId,
-        /// Invert the predicate for strict `!== null`.
+        /// Invert the predicate for `!== null` / `!= null`.
         negate: bool,
+        /// Match `undefined` as well as `null` (loose equality against a nullish
+        /// literal). `false` keeps the strict null-only identity check.
+        nullish: bool,
     },
     /// `int32 | int32`. Result [`Repr::Int32`]. Total (no deopt).
     Int32BitOr(NodeId, NodeId),

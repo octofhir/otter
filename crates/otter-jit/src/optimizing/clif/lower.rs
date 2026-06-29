@@ -471,8 +471,19 @@ impl<'a, 'f> Lower<'a, 'f> {
                 let (x, y) = (self.val(*a)?, self.val(*b)?);
                 Some(self.b.ins().fcmp(float_cc(*op), x, y))
             }
-            NodeKind::TaggedIsNull { value, negate } => {
+            NodeKind::TaggedIsNull {
+                value,
+                negate,
+                nullish,
+            } => {
                 let v = self.val(*value)?;
+                // `null` = base|1, `undefined` = base|0; OR-in bit 0 so a nullish
+                // (`== null`) test collapses both onto the `null` immediate.
+                let v = if *nullish {
+                    self.b.ins().bor_imm(v, 1)
+                } else {
+                    v
+                };
                 let null = self.b.ins().iconst(types::I64, NULL_BITS as i64);
                 let cc = if *negate {
                     IntCC::NotEqual

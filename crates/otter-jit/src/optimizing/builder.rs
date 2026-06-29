@@ -1269,11 +1269,21 @@ impl<'a> Builder<'a> {
                 | Op::GreaterThan
                 | Op::GreaterEq
                 | Op::Equal
-                | Op::NotEqual => {
+                | Op::NotEqual
+                | Op::LooseEqual
+                | Op::LooseNotEqual => {
                     let (dst, lhs, rhs) =
                         (reg(&operands, 0)?, reg(&operands, 1)?, reg(&operands, 2)?);
-                    let cmp = CmpOp::from_op(op).expect("comparison opcode");
-                    let node = match self.compare(block, cmp, lhs, rhs, feedback, byte_pc) {
+                    // Loose `==` / `!=` share the relational lowering: against a
+                    // nullish literal it becomes a null-or-undefined identity
+                    // test, and on numeric feedback it is numeric comparison with
+                    // the same operand guards (a non-number operand deopts).
+                    let (cmp, loose) = match op {
+                        Op::LooseEqual => (CmpOp::Eq, true),
+                        Op::LooseNotEqual => (CmpOp::Ne, true),
+                        other => (CmpOp::from_op(other).expect("comparison opcode"), false),
+                    };
+                    let node = match self.compare(block, cmp, lhs, rhs, feedback, loose, byte_pc) {
                         Ok(node) => node,
                         Err(reason @ Unsupported::TypeFeedback(_)) => {
                             self.deopt_or_decline(block, byte_pc, reason)?;
@@ -2177,12 +2187,20 @@ impl<'a> Builder<'a> {
         lhs: u16,
         rhs: u16,
         feedback: u8,
+        loose: bool,
         byte_pc: u32,
     ) -> Result<NodeId, Unsupported> {
         let lhs_node = self.read_variable(lhs, block);
         let rhs_node = self.read_variable(rhs, block);
-        let lhs_is_null = matches!(self.graph.node(lhs_node).kind, NodeKind::ConstNull);
-        let rhs_is_null = matches!(self.graph.node(rhs_node).kind, NodeKind::ConstNull);
+        // A strict (`===`) comparison only collapses against the `null` literal;
+        // loose (`==`) also collapses against `undefined`, since both nullish
+        // literals make the site a null-or-undefined identity test.
+        let is_nullish_lit = |kind: &NodeKind| {
+            matches!(kind, NodeKind::ConstNull)
+                || (loose && matches!(kind, NodeKind::ConstUndefined))
+        };
+        let lhs_is_null = is_nullish_lit(&self.graph.node(lhs_node).kind);
+        let rhs_is_null = is_nullish_lit(&self.graph.node(rhs_node).kind);
         if matches!(cmp, CmpOp::Eq | CmpOp::Ne) && (lhs_is_null || rhs_is_null) {
             if lhs_is_null && rhs_is_null {
                 return Ok(self.graph.add_node(
@@ -2196,6 +2214,7 @@ impl<'a> Builder<'a> {
                 NodeKind::TaggedIsNull {
                     value,
                     negate: matches!(cmp, CmpOp::Ne),
+                    nullish: loose,
                 },
                 block,
                 byte_pc,

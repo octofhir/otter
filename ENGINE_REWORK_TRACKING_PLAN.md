@@ -129,6 +129,26 @@ polymorphic `CallMethod` bridge with exact safepoint/deopt. That is the next
 slice. Anchors: `builder.rs` ~1073 (only consumes mono `inline_methods`), `emit.rs`
 ~3105 (`CallMethod` bridge), `optimizing_call_method_safepoint_id`.
 
+PROFILE (2026-06-29, `OTTER_JIT=1 OTTER_STATS=1`): Richards otter 1.72s vs node
+0.16s (~11x). `reductionsExecuted=145.8M`, `bytecodeCalls=2.98M` (~48 interpreted
+reductions/call) — the task-method BODIES run in the interpreter, gated behind the
+polymorphic `this.task.run(packet)` site (4 task shapes: Idle/Device/Worker/Handler).
+The baseline already bridges that megamorphic call to the interpreter, so a
+correct opt-tier path that compiles the body wins regardless of the mono-focused
+cost model. Mono-inline-with-deopt is NOT viable (4 interleaved shapes → deopt
+thrash); it needs the FALL-THROUGH guard chain. Implementation reality: the
+optimizing builder is a Braun et al. on-demand-SSA builder whose blocks come from
+the bytecode CFG (`Cfg::discover`); `try_inline_method` splices into the CURRENT
+block with no new blocks. A poly chain needs SYNTHETIC blocks (one guard/inline
+per candidate, miss → next, last miss → bridge/deopt) plus a merge phi for the
+dst register — i.e. extending `cfg.succs/preds/block_of_pc` and `graph.blocks`
+mid-construction. That is the dedicated next slice; it is miscompile-sensitive
+(verify diff 24/24 + GC_STRESS=128 + per-shape correctness) and must not be
+rushed. Other benches' opt-tier declines surveyed: `FreshUpvalue` (nbody, json
+hot loops — alloc+safepoint+spine write), `StoreElement` object-valued
+(array-ops, object-shapes), `New`/`NewObject` constructors (json) — all
+medium-complexity alloc/safepoint adds, none a clean single-opcode win.
+
 Goal: make hot real-workload functions compile into the optimizing tier instead
 of falling back to baseline/interpreter.
 

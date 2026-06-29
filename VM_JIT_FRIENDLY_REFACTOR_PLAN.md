@@ -8,6 +8,42 @@ incremental slices. The only invariants kept are *behavioral* (diff + test262) a
 
 Companion: `VM_ABI_AUDIT.md`.
 
+## Status (2026-06-30, profile-grounded)
+
+Landed: P0 (Value reencoded to the JSC pointer-cheap layout over a 4 GiB-aligned
+cage; interpreter is now the default, `OTTER_JIT=1` opts in). P3 was already
+landed (`VmError` is `Copy`, ≤24 B, dynamic payload in a per-isolate slot). P1's
+object-model work that moves the interpreter: the god-struct split was already in
+place (`ObjectBody` 72 B, exotic fields boxed), and the property-IC hit path now
+matches on the interned shape handle and skips the per-hit name compare, the
+property-count bound, and the slot-attribute lookup for ordinary shaped data
+slots. **Richards interpreter `durationMs` 1818 → ~1515** (the ~20.2M `eq_str`
+name checks are gone from the hit path).
+
+`samply` on the interpreter Richards run after those changes:
+- `dispatch_loop_inner` (the opcode match) dominates self-time and is the
+  inherent stable-Rust dispatch cost — the threaded-dispatch rewrite is retired
+  (needs nightly `become`), so this floor does not move without the JIT.
+- `HoltStack::index`/`index_mut` ≈ 3% — the register-window double indirection
+  (audit area C). Removing it is the **Phase 2** flat-stack work.
+- `load_own_data_slot_atom` ≈ 0.9%, `LoadPropertyIc::load` ≈ 0.8% — the property
+  path is no longer a hot spot.
+
+Consequences for the remaining plan:
+- The **32-bit compressed slab** (below) is now understood to be the wrong next
+  lever for the thermometer: it touches the ~0.9% property path, its payoff is
+  GC-scan/density (a **Phase 4** concern, not interpreter speed), and a naive
+  implementation **regresses** reference-heavy property loads — boxed doubles are
+  8-aligned cells indistinguishable by bits from object-ref cells, so `decompress`
+  would need a `type_tag` read on every cell-property load to tell a `HeapNumber`
+  from a reference. Doing it without that regression requires the shape to track
+  per-slot representation (tagged/smi/double), a shape-system change. It should be
+  sequenced **with Phase 4**, not before it.
+- The interpreter is near its stable-Rust floor; the path from ~1515 to the ≤600
+  target is the optimizing JIT (deferred) or the large Phase 2 dispatch-hot-path
+  items (flat stack + `get_unchecked` register access + pre-decode +
+  superinstructions), each a modest, separately-verified slice.
+
 ## Result targets (the point of the exercise)
 
 Reproduced baseline (JIT off, Richards 80 runs, 2026-06-29): `durationMs=1818.8`,

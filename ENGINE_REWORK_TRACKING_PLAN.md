@@ -135,10 +135,39 @@ Progress / findings:
   the scheduler stores object references into fields everywhere
   (`this.list = currentTcb`, `this.link = link`, `this.currentTcb = new …`).
   The optimizing tier only stores primitive (int32/f64/bool) slot values today —
-  a pointer store bails because there is no safepoint to run the generational
-  write barrier. Lowering pointer `StoreProperty` (and `New`) therefore requires
-  the write-barrier + register-map safepoint work that overlaps Step 3; do it as
-  a dedicated GC-careful slice, not a rushed inline barrier.
+  a pointer store bails (builder.rs ~893). Lowering pointer `StoreProperty` (and
+  `New`) is the next slice; do it as a dedicated GC-careful slice, not a rushed
+  inline barrier.
+
+Confirmed scope notes (measured 2026-06-29):
+
+- Pointer *loads* already lower (LoadSlot of a tagged value needs no barrier).
+  A pointer *store* outside the hot OSR loop already deopts cleanly, so a
+  load-heavy method like the linked-list walk already opt-compiles. The decline
+  is specifically pointer stores that the function cannot deopt around:
+  CONSTRUCTORS (all-stores, loopless — `Node`, `TaskControlBlock`, `Packet`) and
+  field stores INSIDE a hot loop (`this.currentTcb = this.currentTcb.link`).
+- The complete barrier is `gc_heap.record_write(parent, value)` =
+  `write_barrier_raw` per GC edge. In Phase-1 the insertion (marking) barrier is
+  DORMANT (STW marker, `is_marking` always false while compiled code runs), so
+  only the GENERATIONAL card-mark is needed and it is allocation-free and never
+  moves GC — therefore NO safepoint/frame-state is required for it.
+- Inline card-mark recipe (dynasm `StoreSlot`, Tagged value): after the slot
+  store, (1) value pointer-tag test `(top16 - 0x7FFC) <= 3` else skip; (2) parent
+  young? `[parent_hdr+1] & FLAG_YOUNG(0b100)` set → skip; (3) child young?
+  `child_hdr = cage_base + low32(value)`, `[child_hdr+1] & FLAG_YOUNG` clear →
+  skip; (4) `page_base = parent_hdr & ~(PAGE_SIZE-1)` (256KiB); `byte_off =
+  parent_hdr - page_base`; `card = byte_off >> 9` (CARD_SIZE 512); set bit
+  `card&7` in byte `page_base + CARD_BITMAP_OFF + (card>>3)`. parent_hdr =
+  `cage_base + low32(parent_tagged)`; PageHeader sits at page_base
+  (`Page::page_base_of`). Bake into `JitFunctionView` from otter-vm:
+  `offset_of!(PageHeader, card_bitmap)`, `!(PAGE_SIZE-1)`, card-size shift, and
+  expose `FLAG_YOUNG` from otter-gc (otter-jit has no direct otter-gc dep). clif
+  does not lower StoreSlot → property-store functions already route to dynasm, so
+  only emit.rs + builder.rs + the view change are needed. Validate with a
+  pointer-store-in-loop gate + `OTTER_GC_STRESS=128` (old←young correctness) +
+  `node benchmarks/diff.mjs`. trybuild `native_ctx_is_not_send.stderr` may need
+  regen after the view field is added.
 
 Root cause anchors:
 

@@ -1734,9 +1734,18 @@ pub(crate) fn load_own_data_slot_atom(
             return None;
         }
         let offset = hit.slot as usize;
-        if !body_key_matches(heap, body, offset, key.name()) {
+        // A shaped object's shape id uniquely and immutably fixes the slot
+        // layout (shapes are immortal and never reassigned), so the shape-id
+        // guard already proves the key lives at `slot` — no name compare on the
+        // hit. Dictionary mode reuses a per-object shape id that does not bump
+        // on every slot mutation, so it still confirms the key by name.
+        if body.shape.is_null() && !body_key_matches(heap, body, offset, key.name()) {
             return None;
         }
+        debug_assert!(
+            body_key_matches(heap, body, offset, key.name()),
+            "shape-id hit resolved to a slot whose key differs from the request"
+        );
         if let Some(cell) = mapped_argument_cell(body, key.name()) {
             return Some(read_upvalue(heap, cell));
         }
@@ -1764,9 +1773,21 @@ pub(crate) fn store_own_data_slot_atom(
 ) -> Option<()> {
     let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key.name()));
     let current_shape_id = shape_id(obj, heap);
+    // Shaped objects are proven by the shape-id guard alone (see
+    // `load_own_data_slot_atom`); only dictionary mode confirms by name.
     let key_matches = heap.read_payload(obj, |body| {
-        body_key_matches(heap, body, hit.slot as usize, key.name())
+        !body.shape.is_null() || body_key_matches(heap, body, hit.slot as usize, key.name())
     });
+    debug_assert!(
+        current_shape_id != hit.shape_id
+            || heap.read_payload(obj, |body| body_key_matches(
+                heap,
+                body,
+                hit.slot as usize,
+                key.name()
+            )),
+        "shape-id store hit resolved to a slot whose key differs from the request"
+    );
     // The per-slot attributes are read under the same shape that the guards
     // below revalidate, so `with_payload` (which cannot reborrow the heap to
     // walk the hidden class) sees a consistent `(writable, is_accessor)` pair.

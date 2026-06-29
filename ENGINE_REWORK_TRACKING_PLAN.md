@@ -113,7 +113,21 @@ Verification:
 
 ## Step 2: Broaden Optimizing-Tier Coverage For Real OO Code
 
-Status: in progress — `LooseEqual`/`LooseNotEqual` lowering landed (`9e4bef3f`).
+Status: in progress — `LooseEqual`/`LooseNotEqual` (`9e4bef3f`) and pointer
+`StoreProperty` + inline generational write barrier (`3cf18d0f`) landed.
+
+NEXT BLOCKER (surfaced by `3cf18d0f`): the optimizing tier does not lower an
+un-inlined POLYMORPHIC `CallMethod` correctly — enabling pointer stores let
+Richards' polymorphic-dispatch methods (`this.task.run()`) compile past the
+store and reach that path, which SIGSEGV'd (a `blr` to an unmapped target).
+Worked around for now by declining call-plus-memory-op bodies to the baseline
+(`reject_call_object_mix` now counts `CallMethod`), so Richards is correct again
+but its dispatch methods stay in the baseline. The real Richards/DeltaBlue wall
+win needs the optimizing tier to consume `inline_poly_methods` (baked
+most-frequent-first guard chain, like the baseline) OR a correct generic
+polymorphic `CallMethod` bridge with exact safepoint/deopt. That is the next
+slice. Anchors: `builder.rs` ~1073 (only consumes mono `inline_methods`), `emit.rs`
+~3105 (`CallMethod` bridge), `optimizing_call_method_safepoint_id`.
 
 Goal: make hot real-workload functions compile into the optimizing tier instead
 of falling back to baseline/interpreter.

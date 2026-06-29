@@ -125,6 +125,15 @@ pub struct JitFunctionView {
     /// is a tiny body of sealed property loads/stores and pure ops; baked by
     /// `Interpreter::bake_inline_callees`.
     pub inline_methods: rustc_hash::FxHashMap<u32, JitInlineMethod>,
+    /// Inline-candidate method chains for *polymorphic* `Op::CallMethodValue`
+    /// sites, keyed by the caller's call byte-PC. Each value is the
+    /// most-frequent-first list (length ≥ 2) of per-receiver-shape inline
+    /// methods the baseline emits as a guard chain: each entry guards its own
+    /// receiver shape + prototype-method identity and, on a miss, falls through
+    /// to the next entry; a receiver matching none of them takes the in-place
+    /// method bridge. Baked by `Interpreter::bake_inline_callees`. The optimizing
+    /// tier ignores this map and bridges polymorphic method sites.
+    pub inline_poly_methods: rustc_hash::FxHashMap<u32, Vec<JitInlineMethod>>,
     /// Leaf collection method-call feedback keyed by the caller's
     /// `Op::CallMethodValue` byte-PC. These entries are fully JIT-readable:
     /// generated code can validate the receiver/prototype/builtin guards and

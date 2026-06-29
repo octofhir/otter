@@ -414,7 +414,43 @@ pub(crate) enum CallTargetFeedback {
 ///
 /// `recv_shape` is the receiver's hidden-class handle (immortal, so it is safe
 /// to hold untraced and to bake). Absence from the map = unobserved.
+/// Maximum number of distinct `(receiver shape, method)` targets one
+/// polymorphic method-call site keeps for inline guard-chain baking. Mirrors
+/// the V8/JSC polymorphic IC width: enough to cover real OO dispatch (a handful
+/// of sibling classes sharing a method name through one call site) while
+/// bounding both the emitted guard-chain length and the number of
+/// reoptimization evictions a single site can trigger as its target set grows.
+pub(crate) const MAX_POLY_METHOD_TARGETS: usize = 4;
+
+/// One observed `(receiver shape, resolved method)` target at a polymorphic
+/// method-call site. Same layout data the baseline bakes for a monomorphic
+/// inline guard ([`MethodCallFeedback::Mono`]), plus a `hits` counter so the
+/// emitter can order the guard chain most-frequent-first.
 #[derive(Debug, Clone, Copy)]
+pub(crate) struct PolyMethodTarget {
+    pub(crate) method_fid: u32,
+    pub(crate) recv_shape: object::ShapeHandle,
+    pub(crate) proto_shape: object::ShapeHandle,
+    pub(crate) method_value_byte: u32,
+    pub(crate) method_on_receiver: bool,
+    /// Observations that resolved to exactly this target. Used only to order
+    /// the emitted guard chain; not a correctness input.
+    pub(crate) hits: u32,
+}
+
+impl PolyMethodTarget {
+    /// Whether `site`/`method_fid` describe the same layout+identity as this
+    /// target (the inline guard for one cannot serve the other).
+    fn matches(&self, method_fid: u32, site: &MethodSite) -> bool {
+        self.method_fid == method_fid
+            && self.recv_shape.offset() == site.recv_shape.offset()
+            && self.proto_shape.offset() == site.proto_shape.offset()
+            && self.method_value_byte == site.method_value_byte
+            && self.method_on_receiver == site.method_on_receiver
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(crate) enum MethodCallFeedback {
     /// One method function id and one receiver shape observed so far.
     ///
@@ -431,9 +467,16 @@ pub(crate) enum MethodCallFeedback {
         method_value_byte: u32,
         method_on_receiver: bool,
     },
-    /// Receiver shape, prototype shape, method slot, or resolved method
-    /// varied; not inlinable.
-    Poly,
+    /// Two-to-[`MAX_POLY_METHOD_TARGETS`] distinct inlinable targets observed
+    /// at this site. The baseline bakes one inline guard+body per target into a
+    /// most-frequent-first chain; a receiver matching none of the guards falls
+    /// through to the in-place method bridge. Still GC-safe: each target only
+    /// holds immortal shape handles and a function id.
+    Poly(SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]>),
+    /// More than [`MAX_POLY_METHOD_TARGETS`] distinct targets observed; the
+    /// site is too polymorphic to inline profitably and always takes the
+    /// in-place method bridge.
+    Megamorphic,
 }
 
 /// Receiver/prototype layout snapshot for one observed `Op::CallMethodValue`,
@@ -3301,7 +3344,19 @@ impl Interpreter {
         site: MethodSite,
     ) {
         use std::collections::hash_map::Entry;
-        let newly_mono = match self
+        let new_target = PolyMethodTarget {
+            method_fid,
+            recv_shape: site.recv_shape,
+            proto_shape: site.proto_shape,
+            method_value_byte: site.method_value_byte,
+            method_on_receiver: site.method_on_receiver,
+            hits: 1,
+        };
+        // `changed` tracks whether the *set* of inlinable targets grew, which is
+        // what a recompile needs to re-bake. A repeat observation of an
+        // already-known target only bumps an ordering counter and must not evict
+        // (that would thrash the compiled body during steady-state execution).
+        let changed = match self
             .jit_method_site_feedback
             .entry((caller_fid, call_byte_pc))
         {
@@ -3315,26 +3370,56 @@ impl Interpreter {
                 });
                 true
             }
-            Entry::Occupied(mut slot) => {
-                if let MethodCallFeedback::Mono {
+            Entry::Occupied(mut slot) => match slot.get_mut() {
+                MethodCallFeedback::Mono {
                     method_fid: seen_fid,
                     recv_shape: seen_shape,
                     proto_shape: seen_proto_shape,
                     method_value_byte: seen_value_byte,
                     method_on_receiver: seen_method_on_receiver,
-                } = *slot.get()
-                    && (seen_fid != method_fid
-                        || seen_shape.offset() != site.recv_shape.offset()
-                        || seen_proto_shape.offset() != site.proto_shape.offset()
-                        || seen_value_byte != site.method_value_byte
-                        || seen_method_on_receiver != site.method_on_receiver)
-                {
-                    slot.insert(MethodCallFeedback::Poly);
+                } => {
+                    let same = *seen_fid == method_fid
+                        && seen_shape.offset() == site.recv_shape.offset()
+                        && seen_proto_shape.offset() == site.proto_shape.offset()
+                        && *seen_value_byte == site.method_value_byte
+                        && *seen_method_on_receiver == site.method_on_receiver;
+                    if same {
+                        false
+                    } else {
+                        let prior = PolyMethodTarget {
+                            method_fid: *seen_fid,
+                            recv_shape: *seen_shape,
+                            proto_shape: *seen_proto_shape,
+                            method_value_byte: *seen_value_byte,
+                            method_on_receiver: *seen_method_on_receiver,
+                            hits: 1,
+                        };
+                        let mut targets: SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]> =
+                            SmallVec::new();
+                        targets.push(prior);
+                        targets.push(new_target);
+                        *slot.get_mut() = MethodCallFeedback::Poly(targets);
+                        true
+                    }
                 }
-                false
-            }
+                MethodCallFeedback::Poly(targets) => {
+                    if let Some(existing) =
+                        targets.iter_mut().find(|t| t.matches(method_fid, &site))
+                    {
+                        existing.hits = existing.hits.saturating_add(1);
+                        false
+                    } else if targets.len() < MAX_POLY_METHOD_TARGETS {
+                        targets.push(new_target);
+                        true
+                    } else {
+                        *slot.get_mut() = MethodCallFeedback::Megamorphic;
+                        true
+                    }
+                }
+                MethodCallFeedback::Megamorphic => false,
+            },
         };
-        if newly_mono {
+        if changed {
             self.evict_compiled_for_reopt(caller_fid);
         }
     }
@@ -3470,109 +3555,134 @@ impl Interpreter {
             );
         }
 
-        // Method-call sites: snapshot the monomorphic ones first so the per-site
-        // `shape_offset_of` (which needs `&mut self`) does not alias the feedback
-        // map borrow.
-        let method_sites: Vec<(
-            u32,
-            u32,
-            object::ShapeHandle,
-            object::ShapeHandle,
-            u32,
-            bool,
-        )> = self
+        // Method-call sites: snapshot monomorphic and polymorphic feedback for
+        // `fid` first so the per-target `shape_offset_of` (which needs
+        // `&mut self`) does not alias the feedback map borrow. Each snapshot is a
+        // list of candidate targets — one for `Mono`, up to
+        // `MAX_POLY_METHOD_TARGETS` (most-frequent first) for `Poly`.
+        // `Megamorphic` sites are skipped and take the in-place method bridge.
+        struct PolySnapshot {
+            byte_pc: u32,
+            targets: SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]>,
+        }
+        let method_sites: Vec<PolySnapshot> = self
             .jit_method_site_feedback
             .iter()
-            .filter_map(|(&(caller_fid, byte_pc), state)| match *state {
-                MethodCallFeedback::Mono {
-                    method_fid,
-                    recv_shape,
-                    proto_shape,
-                    method_value_byte,
-                    method_on_receiver,
-                } if caller_fid == fid => Some((
-                    byte_pc,
-                    method_fid,
-                    recv_shape,
-                    proto_shape,
-                    method_value_byte,
-                    method_on_receiver,
-                )),
-                _ => None,
+            .filter_map(|(&(caller_fid, byte_pc), state)| {
+                if caller_fid != fid {
+                    return None;
+                }
+                match state {
+                    MethodCallFeedback::Mono {
+                        method_fid,
+                        recv_shape,
+                        proto_shape,
+                        method_value_byte,
+                        method_on_receiver,
+                    } => {
+                        let mut targets: SmallVec<
+                            [PolyMethodTarget; MAX_POLY_METHOD_TARGETS],
+                        > = SmallVec::new();
+                        targets.push(PolyMethodTarget {
+                            method_fid: *method_fid,
+                            recv_shape: *recv_shape,
+                            proto_shape: *proto_shape,
+                            method_value_byte: *method_value_byte,
+                            method_on_receiver: *method_on_receiver,
+                            hits: 1,
+                        });
+                        Some(PolySnapshot { byte_pc, targets })
+                    }
+                    MethodCallFeedback::Poly(observed) => {
+                        let mut targets = observed.clone();
+                        // Most-frequent target first: the common receiver shape
+                        // then hits the shortest guard chain.
+                        targets.sort_by(|a, b| b.hits.cmp(&a.hits));
+                        Some(PolySnapshot { byte_pc, targets })
+                    }
+                    MethodCallFeedback::Megamorphic => None,
+                }
             })
             .collect();
-        for (byte_pc, method_fid, recv_shape, proto_shape, method_value_byte, method_on_receiver) in
-            method_sites
-        {
-            let Some(method) = context.exec_function(method_fid) else {
-                continue;
-            };
-            if method.is_generator
-                || method.is_async
-                || method.is_async_generator
-                || method.needs_arguments
-                || method.has_rest
-                || method.contains_direct_eval
-                || method.is_derived_constructor
-                || method.makes_function
-            {
-                continue;
-            }
-            let Some(method_view) = context.jit_function_view(method_fid) else {
-                continue;
-            };
-            // Resolve every body `LoadProperty`/`StoreProperty` to a sealed value
-            // byte offset in the receiver shape; bail out of inlining the site if
-            // any property is absent, an accessor, or spills past the inline value
-            // capacity. Loads carry the name at operand 2, stores at operand 1.
-            let mut prop_offsets: rustc_hash::FxHashMap<u32, u32> =
-                rustc_hash::FxHashMap::default();
-            let mut ok = true;
-            for instr in &method_view.instructions {
-                let name_operand = match instr.op {
-                    Op::LoadProperty => 2,
-                    Op::StoreProperty => 1,
-                    _ => continue,
-                };
-                let Some(otter_bytecode::Operand::ConstIndex(name_idx)) =
-                    instr.operands.get(name_operand).copied()
-                else {
-                    ok = false;
-                    break;
-                };
-                let Some(key) = context.property_atom(name_idx) else {
-                    ok = false;
-                    break;
-                };
-                match self.shape_offset_of(recv_shape, key.name()) {
-                    Some(slot) => {
-                        let value_byte = slot * std::mem::size_of::<Value>() as u32;
-                        prop_offsets.insert(instr.byte_pc, value_byte);
-                    }
-                    _ => {
-                        ok = false;
-                        break;
-                    }
+        for snap in method_sites {
+            let mut baked: Vec<jit::JitInlineMethod> = Vec::new();
+            for target in &snap.targets {
+                if let Some(method) = self.bake_one_inline_method(context, target) {
+                    baked.push(method);
                 }
             }
-            if !ok {
-                continue;
+            match baked.len() {
+                0 => {}
+                // A single inlinable target is the monomorphic fast path, even if
+                // the site observed several shapes: the others miss its guard and
+                // take the bridge, which is strictly better than no inline.
+                1 => {
+                    view.inline_methods.insert(snap.byte_pc, baked.pop().unwrap());
+                }
+                // Two or more: emit the guarded inline chain.
+                _ => {
+                    view.inline_poly_methods.insert(snap.byte_pc, baked);
+                }
             }
-            view.inline_methods.insert(
-                byte_pc,
-                jit::JitInlineMethod {
-                    method_fid,
-                    recv_shape: recv_shape.offset(),
-                    proto_shape: proto_shape.offset(),
-                    method_value_byte,
-                    method_on_receiver,
-                    param_count: method_view.param_count,
-                    register_count: method_view.register_count,
-                    instructions: method_view.instructions,
-                    prop_offsets,
-                },
-            );
         }
+    }
+
+    /// Bake one inline-method candidate body for a `(method, receiver shape)`
+    /// target, resolving its sealed property loads/stores to value-slab byte
+    /// offsets against the receiver shape. Returns `None` when the method shape
+    /// is ineligible (generator/async/derived-constructor/etc.), its view is
+    /// missing, or any body property fails to resolve to a sealed receiver slot.
+    /// Shared by the monomorphic and polymorphic method-inline bake paths.
+    fn bake_one_inline_method(
+        &mut self,
+        context: &ExecutionContext,
+        target: &PolyMethodTarget,
+    ) -> Option<jit::JitInlineMethod> {
+        let method = context.exec_function(target.method_fid)?;
+        if method.is_generator
+            || method.is_async
+            || method.is_async_generator
+            || method.needs_arguments
+            || method.has_rest
+            || method.contains_direct_eval
+            || method.is_derived_constructor
+            || method.makes_function
+        {
+            return None;
+        }
+        let method_view = context.jit_function_view(target.method_fid)?;
+        // Resolve every body `LoadProperty`/`StoreProperty` to a sealed value
+        // byte offset in the receiver shape; bail out if any property is absent,
+        // an accessor, or spills past the inline value capacity. Loads carry the
+        // name at operand 2, stores at operand 1.
+        let mut prop_offsets: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
+        for instr in &method_view.instructions {
+            let name_operand = match instr.op {
+                Op::LoadProperty => 2,
+                Op::StoreProperty => 1,
+                _ => continue,
+            };
+            let otter_bytecode::Operand::ConstIndex(name_idx) =
+                instr.operands.get(name_operand).copied()?
+            else {
+                return None;
+            };
+            let key = context.property_atom(name_idx)?;
+            let slot = self.shape_offset_of(target.recv_shape, key.name())?;
+            let value_byte = slot * std::mem::size_of::<Value>() as u32;
+            prop_offsets.insert(instr.byte_pc, value_byte);
+        }
+        Some(jit::JitInlineMethod {
+            method_fid: target.method_fid,
+            recv_shape: target.recv_shape.offset(),
+            proto_shape: target.proto_shape.offset(),
+            method_value_byte: target.method_value_byte,
+            method_on_receiver: target.method_on_receiver,
+            param_count: method_view.param_count,
+            register_count: method_view.register_count,
+            instructions: method_view.instructions,
+            prop_offsets,
+        })
     }
 
     /// Bake JIT-readable collection leaf method IC metadata.
@@ -15797,6 +15907,7 @@ mod tests {
                 .collect(),
             inline_callees: rustc_hash::FxHashMap::default(),
             inline_methods: rustc_hash::FxHashMap::default(),
+            inline_poly_methods: rustc_hash::FxHashMap::default(),
             collection_leaf_methods: rustc_hash::FxHashMap::default(),
             collection_alloc_methods: rustc_hash::FxHashMap::default(),
             array_methods: rustc_hash::FxHashMap::default(),

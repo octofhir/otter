@@ -2476,7 +2476,25 @@ mod arm64 {
                             bail,
                             threw,
                         )?,
-                        None => false,
+                        // A polymorphic site (no single monomorphic entry) emits a
+                        // most-frequent-first guard chain over its observed
+                        // receiver shapes, bridging only when none match.
+                        None => match view.inline_poly_methods.get(&instr.byte_pc) {
+                            Some(methods) => try_emit_poly_inline_method_call(
+                                &mut ops,
+                                methods,
+                                ops_ref,
+                                site,
+                                cage_base,
+                                view.object_shape_byte,
+                                view.object_values_ptr_byte,
+                                view.jit_proto_byte,
+                                view.closure_fid_byte,
+                                bail,
+                                threw,
+                            )?,
+                            None => false,
+                        },
                     };
                     if !inlined {
                         // Splice an inline dense-array `pop` / `push` fast path
@@ -4120,41 +4138,13 @@ mod arm64 {
         }
     }
 
-    /// Try to splice `method`'s body into the current `Op::CallMethodValue` site
-    /// instead of building a callee frame. Returns `Ok(true)` when inlined,
-    /// `Ok(false)` when the method fails the op-allowlist / size / arity test (the
-    /// caller then emits the normal method-call bridge).
-    ///
-    /// Soundness: the body runs only after the inline identity guard confirms (a)
-    /// the receiver shape matches the baked one, and (b) the receiver's flat
-    /// prototype still resolves the method slot to the baked `function_id` — both
-    /// re-read every call, so a prototype-method reassignment falls back to the
-    /// in-place full method call (not a bail). The body touches only the
-    /// receiver and performs no allocation, so it has no GC point; it runs in a
-    /// native-stack scratch window with `x19` repointed, restored on every exit.
-    /// A body `StoreProperty` mutates the receiver in place: every store guard
-    /// bails *before* the write, and the emitter rejects any bailing op after a
-    /// store, so a fallback never double-applies a mutation.
-    #[allow(clippy::too_many_arguments)]
-    fn try_emit_inline_method_call(
-        ops: &mut Assembler,
-        method: &JitInlineMethod,
-        call_operands: &[Operand],
-        site: u64,
-        cage_base: usize,
-        object_shape_byte: u32,
-        object_values_ptr_byte: u32,
-        jit_proto_byte: u32,
-        closure_fid_byte: u32,
-        bail: DynamicLabel,
-        threw: DynamicLabel,
-    ) -> Result<bool, Unsupported> {
-        let dst = reg(call_operands, 0)?;
-        let recv_reg = reg(call_operands, 1)?;
-        let argc = const_index(call_operands, 3)? as usize;
-
-        if cage_base == 0
-            || argc != usize::from(method.param_count)
+    /// Whether `method`'s baked body can be spliced inline for a call of `argc`
+    /// arguments. Mirrors the emit-time constraints the inline body relies on:
+    /// arity match, register/instruction/arg budgets, an all-inlinable op set,
+    /// and no bailing op after an in-place `StoreProperty` (a post-store bail
+    /// would re-run the whole method and double-apply the mutation).
+    fn inline_method_emit_eligible(method: &JitInlineMethod, argc: usize) -> bool {
+        if argc != usize::from(method.param_count)
             || argc > INLINE_MAX_ARGS
             || method.register_count >= INLINE_MAX_REGS
             || method.instructions.len() > INLINE_MAX_INSTRS
@@ -4163,21 +4153,51 @@ mod arm64 {
                 .iter()
                 .all(|i| is_inline_method_op(i.op))
         {
-            return Ok(false);
+            return false;
         }
-
-        // An inline `StoreProperty` mutates the receiver in place; a later bail
-        // would re-run the whole method in the interpreter and double-apply the
-        // store. Refuse to inline any body where a bailing op can follow a store.
         let mut store_seen = false;
         for i in &method.instructions {
             if store_seen && !is_nonbailing_after_store(i.op) {
-                return Ok(false);
+                return false;
             }
             if i.op == Op::StoreProperty {
                 store_seen = true;
             }
         }
+        true
+    }
+
+    /// Emit one inline method attempt: the inline identity guard followed by the
+    /// spliced body. On any guard mismatch (receiver tag/shape, prototype
+    /// tag/shape, method-slot tag, or resolved `function_id`) control branches to
+    /// `miss` — for a monomorphic site that is the in-place method bridge; for a
+    /// polymorphic chain it is the next target's guard. On normal completion the
+    /// result is written to the call's `dst` and control branches to `after`. A
+    /// body store-bail unwinds the scratch window and branches to the shared
+    /// `bail`. The caller must have checked [`inline_method_emit_eligible`].
+    ///
+    /// Soundness: the guard re-reads the receiver shape and re-resolves the
+    /// prototype method slot every call, so a prototype-method reassignment or a
+    /// receiver of a different shape lands on `miss` (no stale dispatch). All
+    /// guards run *before* the scratch window is reserved and *before* any
+    /// in-place store, so routing `miss` to a sibling attempt mutates no state.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_inline_method_attempt(
+        ops: &mut Assembler,
+        method: &JitInlineMethod,
+        call_operands: &[Operand],
+        argc: usize,
+        cage_base: usize,
+        object_shape_byte: u32,
+        object_values_ptr_byte: u32,
+        jit_proto_byte: u32,
+        closure_fid_byte: u32,
+        miss: DynamicLabel,
+        after: DynamicLabel,
+        bail: DynamicLabel,
+    ) -> Result<(), Unsupported> {
+        let dst = reg(call_operands, 0)?;
+        let recv_reg = reg(call_operands, 1)?;
 
         let mut clabels: BTreeMap<u32, DynamicLabel> = BTreeMap::new();
         for i in &method.instructions {
@@ -4185,8 +4205,6 @@ mod arm64 {
         }
         let inline_done = ops.new_dynamic_label();
         let inline_bail = ops.new_dynamic_label();
-        let fallback = ops.new_dynamic_label();
-        let after = ops.new_dynamic_label();
         let fid_immediate = ops.new_dynamic_label();
         let fid_compare = ops.new_dynamic_label();
         // One extra slot past the method register window holds `this`.
@@ -4200,7 +4218,7 @@ mod arm64 {
         // read the method slot, and compare the resolved closure's `function_id`
         // to the baked method id. Re-reading the prototype slot every call keeps
         // this sound against prototype-method reassignment: any mismatch (shape,
-        // tag, slot tag, or id) lands on the in-place full method call.
+        // tag, slot tag, or id) lands on `miss`.
         let recv_off = reg_offset(recv_reg)?;
         dynasm!(ops
             ; .arch aarch64
@@ -4208,7 +4226,7 @@ mod arm64 {
             ; lsr x10, x9, #48
             ; movz x11, TAG_PTR_OBJECT as u32
             ; cmp x10, x11
-            ; b.ne =>fallback
+            ; b.ne =>miss
             ; mov w12, w9
         );
         emit_load_u64(ops, 13, cage_base as u64);
@@ -4217,12 +4235,12 @@ mod arm64 {
             ; add x13, x13, x12
             ; ldrb w14, [x13]
             ; cmp w14, OBJECT_BODY_TYPE_TAG
-            ; b.ne =>fallback
+            ; b.ne =>miss
             ; ldr w14, [x13, object_shape_byte]
             ; movz w15, method.recv_shape & 0xffff
             ; movk w15, (method.recv_shape >> 16) & 0xffff, lsl #16
             ; cmp w14, w15
-            ; b.ne =>fallback
+            ; b.ne =>miss
         );
         if !method.method_on_receiver {
             dynasm!(ops
@@ -4230,7 +4248,7 @@ mod arm64 {
                 // Flat prototype: load the compressed handle, bail on null,
                 // then decompress and guard the prototype object's shape.
                 ; ldr w9, [x13, jit_proto_byte]
-                ; cbz w9, =>fallback
+                ; cbz w9, =>miss
             );
             emit_load_u64(ops, 12, cage_base as u64);
             dynasm!(ops
@@ -4238,12 +4256,12 @@ mod arm64 {
                 ; add x13, x12, x9
                 ; ldrb w14, [x13]
                 ; cmp w14, OBJECT_BODY_TYPE_TAG
-                ; b.ne =>fallback
+                ; b.ne =>miss
                 ; ldr w14, [x13, object_shape_byte]
                 ; movz w15, method.proto_shape & 0xffff
                 ; movk w15, (method.proto_shape >> 16) & 0xffff, lsl #16
                 ; cmp w14, w15
-                ; b.ne =>fallback
+                ; b.ne =>miss
             );
         }
         dynasm!(ops
@@ -4253,9 +4271,9 @@ mod arm64 {
             // bytecode reference (`TAG_FUNCTION_ID`, fid in the low 32 bits) or
             // a closure pointer (`TAG_PTR_FUNCTION` → `JsClosureBody`, fid read
             // from its body). Decode the function id into w14 either way, then
-            // compare to the baked id; anything else falls back.
+            // compare to the baked id; anything else misses.
             ; ldr x13, [x13, object_values_ptr_byte]
-            ; cbz x13, =>fallback
+            ; cbz x13, =>miss
             ; ldr x9, [x13, method.method_value_byte]
             ; lsr x10, x9, #48
             ; movz x11, TAG_FUNCTION_ID as u32
@@ -4263,7 +4281,7 @@ mod arm64 {
             ; b.eq =>fid_immediate
             ; movz x11, TAG_PTR_FUNCTION as u32
             ; cmp x10, x11
-            ; b.ne =>fallback
+            ; b.ne =>miss
             ; mov w12, w9
         );
         emit_load_u64(ops, 11, cage_base as u64);
@@ -4274,7 +4292,7 @@ mod arm64 {
             // has no bytecode id at this offset), then read `function_id`.
             ; ldrb w14, [x11]
             ; cmp w14, JS_CLOSURE_BODY_TYPE_TAG
-            ; b.ne =>fallback
+            ; b.ne =>miss
             ; ldr w14, [x11, closure_fid_byte]
             ; b =>fid_compare
             ; =>fid_immediate
@@ -4283,7 +4301,7 @@ mod arm64 {
             ; movz w15, method.method_fid & 0xffff
             ; movk w15, (method.method_fid >> 16) & 0xffff, lsl #16
             ; cmp w14, w15
-            ; b.ne =>fallback
+            ; b.ne =>miss
         );
 
         // Reserve scratch, copy method args into param slots, the receiver into
@@ -4330,9 +4348,121 @@ mod arm64 {
         // Body bail: unwind scratch, then the shared interpreter bail.
         dynasm!(ops ; .arch aarch64 ; =>inline_bail);
         dynasm!(ops ; .arch aarch64 ; add sp, sp, scratch_bytes ; b =>bail);
+        Ok(())
+    }
 
+    /// Splice a tiny monomorphic read-only / sealed-write method body into the
+    /// current `Op::CallMethodValue` site instead of building a callee frame.
+    /// Returns `Ok(true)` when inlined, `Ok(false)` when the method fails the
+    /// op-allowlist / size / arity test (the caller then emits the normal
+    /// method-call bridge). See [`emit_inline_method_attempt`] for the
+    /// guard/body/soundness details; here a guard miss takes the in-place call.
+    #[allow(clippy::too_many_arguments)]
+    fn try_emit_inline_method_call(
+        ops: &mut Assembler,
+        method: &JitInlineMethod,
+        call_operands: &[Operand],
+        site: u64,
+        cage_base: usize,
+        object_shape_byte: u32,
+        object_values_ptr_byte: u32,
+        jit_proto_byte: u32,
+        closure_fid_byte: u32,
+        bail: DynamicLabel,
+        threw: DynamicLabel,
+    ) -> Result<bool, Unsupported> {
+        let argc = const_index(call_operands, 3)? as usize;
+        if cage_base == 0 || !inline_method_emit_eligible(method, argc) {
+            return Ok(false);
+        }
+        let fallback = ops.new_dynamic_label();
+        let after = ops.new_dynamic_label();
+        emit_inline_method_attempt(
+            ops,
+            method,
+            call_operands,
+            argc,
+            cage_base,
+            object_shape_byte,
+            object_values_ptr_byte,
+            jit_proto_byte,
+            closure_fid_byte,
+            fallback,
+            after,
+            bail,
+        )?;
         // Ineligible at run time (method changed / shape mismatch): the full
         // in-place method call, which restores nothing (sp untouched here).
+        dynasm!(ops ; .arch aarch64 ; =>fallback);
+        emit_method_call(ops, call_operands, site, None, None, None, None, threw)?;
+        dynasm!(ops ; .arch aarch64 ; =>after);
+        Ok(true)
+    }
+
+    /// Splice a most-frequent-first chain of inline method attempts for a
+    /// *polymorphic* `Op::CallMethodValue` site. Each attempt guards its own
+    /// receiver shape + prototype-method identity; a miss falls through to the
+    /// next attempt, and a receiver matching none of them takes the in-place
+    /// method bridge. Returns `Ok(false)` (no inline emitted) when no target is
+    /// emit-eligible, so the caller emits the normal bridge.
+    ///
+    /// Soundness is identical to the monomorphic path: every attempt's guards run
+    /// before it reserves a scratch window or performs any in-place store, so a
+    /// guard miss that routes control to a sibling attempt has mutated nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn try_emit_poly_inline_method_call(
+        ops: &mut Assembler,
+        methods: &[JitInlineMethod],
+        call_operands: &[Operand],
+        site: u64,
+        cage_base: usize,
+        object_shape_byte: u32,
+        object_values_ptr_byte: u32,
+        jit_proto_byte: u32,
+        closure_fid_byte: u32,
+        bail: DynamicLabel,
+        threw: DynamicLabel,
+    ) -> Result<bool, Unsupported> {
+        let argc = const_index(call_operands, 3)? as usize;
+        if cage_base == 0 {
+            return Ok(false);
+        }
+        let eligible: Vec<&JitInlineMethod> = methods
+            .iter()
+            .filter(|m| inline_method_emit_eligible(m, argc))
+            .collect();
+        if eligible.is_empty() {
+            return Ok(false);
+        }
+        let after = ops.new_dynamic_label();
+        let fallback = ops.new_dynamic_label();
+        // One entry label per attempt so each attempt's guard miss can branch to
+        // the next attempt; the final attempt's miss branches to `fallback`.
+        let entries: Vec<DynamicLabel> =
+            (0..eligible.len()).map(|_| ops.new_dynamic_label()).collect();
+        for (i, method) in eligible.iter().enumerate() {
+            dynasm!(ops ; .arch aarch64 ; =>entries[i]);
+            let miss = if i + 1 < eligible.len() {
+                entries[i + 1]
+            } else {
+                fallback
+            };
+            emit_inline_method_attempt(
+                ops,
+                method,
+                call_operands,
+                argc,
+                cage_base,
+                object_shape_byte,
+                object_values_ptr_byte,
+                jit_proto_byte,
+                closure_fid_byte,
+                miss,
+                after,
+                bail,
+            )?;
+        }
+        // No guard matched: the full in-place method call (sp untouched here).
         dynasm!(ops ; .arch aarch64 ; =>fallback);
         emit_method_call(ops, call_operands, site, None, None, None, None, threw)?;
         dynasm!(ops ; .arch aarch64 ; =>after);
@@ -6284,6 +6414,7 @@ mod tests {
             instructions,
             inline_callees: Default::default(),
             inline_methods: Default::default(),
+            inline_poly_methods: Default::default(),
             collection_leaf_methods: Default::default(),
             collection_alloc_methods: Default::default(),
             array_methods: Default::default(),

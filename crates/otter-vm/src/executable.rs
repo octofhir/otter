@@ -261,6 +261,7 @@ impl ExecutableFunction {
             // carries none.
             inline_callees: rustc_hash::FxHashMap::default(),
             inline_methods: rustc_hash::FxHashMap::default(),
+            inline_poly_methods: rustc_hash::FxHashMap::default(),
             collection_leaf_methods: rustc_hash::FxHashMap::default(),
             collection_alloc_methods: rustc_hash::FxHashMap::default(),
             array_methods: rustc_hash::FxHashMap::default(),

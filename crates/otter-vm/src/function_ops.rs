@@ -1991,21 +1991,45 @@ impl Interpreter {
                 self.finish_generator_function_prototype(context, function_id, proto, parent)?;
             }
         }
-        let proto_value = Value::object(proto);
-        // §27.5.1 — a generator function's `.prototype` object has NO
-        // own properties (no back-pointing `constructor`); ordinary
-        // functions get the §10.2.5 MakeConstructor pair.
+        // Install `prototype` on the function's property bag first. It is a
+        // non-moving define, and routing it before the constructor install means
+        // the bag's `prototype` slot already tracks `proto` (the collector
+        // forwards live GC slots) when the shape-advancing constructor define
+        // below may relocate the heap.
+        let prototype_desc =
+            object::PropertyDescriptor::data(Value::object(proto), true, false, false);
+        let _ = object::define_own_property(bag, &mut self.gc_heap, "prototype", prototype_desc);
+        // §27.5.1 — a generator function's `.prototype` object has NO own
+        // properties (no back-pointing `constructor`); ordinary functions get
+        // the §10.2.5 MakeConstructor pair. Route the `constructor` install
+        // through the hidden-class-advancing define rather than the
+        // dictionary-mode `object::define_own_property` (which nulls the shape),
+        // so the prototype keeps a fast shape: prototype-style method
+        // definitions (`Foo.prototype.m = ...`) then land in shape slots and
+        // instance method calls stay inline/direct-call guardable instead of
+        // forcing every dispatch through the generic method bridge. The define
+        // allocates a hidden-class child and can move the heap, so the bare
+        // `proto` / `bag` locals may be stale afterward.
         if !context
             .function(function_id)
             .is_some_and(|function| function.is_generator)
         {
-            let constructor =
-                object::PropertyDescriptor::data(constructor_value, true, false, true);
-            let _ =
-                object::define_own_property(proto, &mut self.gc_heap, "constructor", constructor);
+            let constructor_desc = object::PartialPropertyDescriptor {
+                value: Some(constructor_value),
+                writable: Some(true),
+                enumerable: Some(false),
+                configurable: Some(true),
+                ..Default::default()
+            };
+            let _ = self.define_own_property_partial(proto, "constructor", constructor_desc)?;
         }
-        let prototype_desc = object::PropertyDescriptor::data(proto_value, true, false, false);
-        let _ = object::define_own_property(bag, &mut self.gc_heap, "prototype", prototype_desc);
+        // Re-acquire the (possibly relocated) prototype through the function's
+        // bag, which the collector forwarded; the bare `proto` handle may be
+        // stale after the shape allocation above.
+        let proto_value = self
+            .callable_bag_read(owner, function_id)
+            .and_then(|bag| crate::object::get_own(bag, &self.gc_heap, "prototype"))
+            .unwrap_or_else(|| Value::object(proto));
         Ok(proto_value)
     }
 
@@ -2125,21 +2149,45 @@ impl Interpreter {
                 self.finish_generator_function_prototype(context, function_id, proto, parent)?;
             }
         }
-        let proto_value = Value::object(proto);
-        // §27.5.1 — a generator function's `.prototype` object has NO
-        // own properties (no back-pointing `constructor`); ordinary
-        // functions get the §10.2.5 MakeConstructor pair.
+        // Install `prototype` on the function's property bag first. It is a
+        // non-moving define, and routing it before the constructor install means
+        // the bag's `prototype` slot already tracks `proto` (the collector
+        // forwards live GC slots) when the shape-advancing constructor define
+        // below may relocate the heap.
+        let prototype_desc =
+            object::PropertyDescriptor::data(Value::object(proto), true, false, false);
+        let _ = object::define_own_property(bag, &mut self.gc_heap, "prototype", prototype_desc);
+        // §27.5.1 — a generator function's `.prototype` object has NO own
+        // properties (no back-pointing `constructor`); ordinary functions get
+        // the §10.2.5 MakeConstructor pair. Route the `constructor` install
+        // through the hidden-class-advancing define rather than the
+        // dictionary-mode `object::define_own_property` (which nulls the shape),
+        // so the prototype keeps a fast shape: prototype-style method
+        // definitions (`Foo.prototype.m = ...`) then land in shape slots and
+        // instance method calls stay inline/direct-call guardable instead of
+        // forcing every dispatch through the generic method bridge. The define
+        // allocates a hidden-class child and can move the heap, so the bare
+        // `proto` / `bag` locals may be stale afterward.
         if !context
             .function(function_id)
             .is_some_and(|function| function.is_generator)
         {
-            let constructor =
-                object::PropertyDescriptor::data(constructor_value, true, false, true);
-            let _ =
-                object::define_own_property(proto, &mut self.gc_heap, "constructor", constructor);
+            let constructor_desc = object::PartialPropertyDescriptor {
+                value: Some(constructor_value),
+                writable: Some(true),
+                enumerable: Some(false),
+                configurable: Some(true),
+                ..Default::default()
+            };
+            let _ = self.define_own_property_partial(proto, "constructor", constructor_desc)?;
         }
-        let prototype_desc = object::PropertyDescriptor::data(proto_value, true, false, false);
-        let _ = object::define_own_property(bag, &mut self.gc_heap, "prototype", prototype_desc);
+        // Re-acquire the (possibly relocated) prototype through the function's
+        // bag, which the collector forwarded; the bare `proto` handle may be
+        // stale after the shape allocation above.
+        let proto_value = self
+            .callable_bag_read(owner, function_id)
+            .and_then(|bag| crate::object::get_own(bag, &self.gc_heap, "prototype"))
+            .unwrap_or_else(|| Value::object(proto));
         Ok(proto_value)
     }
 

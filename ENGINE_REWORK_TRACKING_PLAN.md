@@ -113,7 +113,7 @@ Verification:
 
 ## Step 2: Broaden Optimizing-Tier Coverage For Real OO Code
 
-Status: pending.
+Status: in progress — `LooseEqual`/`LooseNotEqual` lowering landed (`9e4bef3f`).
 
 Goal: make hot real-workload functions compile into the optimizing tier instead
 of falling back to baseline/interpreter.
@@ -124,6 +124,21 @@ Measured problem:
   `LooseEqual`, `LooseNotEqual`, and `StoreElement`.
 - Current accepted subset is strong for numeric loops but poor for OO benchmark
   kernels.
+
+Progress / findings:
+
+- `LooseEqual`/`LooseNotEqual` now lower (nullish-literal identity test + numeric
+  speculative path with deopt). Isolated loose-eq hot loop: interp 1.20s -> jit
+  0.05s (24x). Richards loose-eq declines eliminated, but Richards wall is
+  unchanged because those functions now decline on the NEXT unsupported op.
+- The dominant remaining Richards blocker is `StoreProperty` of a POINTER value:
+  the scheduler stores object references into fields everywhere
+  (`this.list = currentTcb`, `this.link = link`, `this.currentTcb = new …`).
+  The optimizing tier only stores primitive (int32/f64/bool) slot values today —
+  a pointer store bails because there is no safepoint to run the generational
+  write barrier. Lowering pointer `StoreProperty` (and `New`) therefore requires
+  the write-barrier + register-map safepoint work that overlaps Step 3; do it as
+  a dedicated GC-careful slice, not a rushed inline barrier.
 
 Root cause anchors:
 

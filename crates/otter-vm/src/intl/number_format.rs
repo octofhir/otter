@@ -525,9 +525,9 @@ pub(crate) fn number_format_format_to_parts(
         let ty_s = Value::string(type_lit(ty, ctx)?);
         let val_s = Value::string(JsString::from_str(val, ctx.heap_mut())?);
         let snapshot = elements.clone();
-        let obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s], &[&snapshot])?;
-        crate::object::set(obj, ctx.heap_mut(), "type", ty_s);
-        crate::object::set(obj, ctx.heap_mut(), "value", val_s);
+        let mut obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s], &[&snapshot])?;
+        crate::object::set(&mut obj, ctx.heap_mut(), "type", ty_s);
+        crate::object::set(&mut obj, ctx.heap_mut(), "value", val_s);
         elements.push(Value::object(obj));
     }
     let element_roots = elements.clone();
@@ -640,10 +640,10 @@ pub(crate) fn number_format_format_range_to_parts(
         let val_s = Value::string(JsString::from_str(val, ctx.heap_mut())?);
         let src_s = Value::string(JsString::from_str(src, ctx.heap_mut())?);
         let snapshot = elements.clone();
-        let obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s, &src_s], &[&snapshot])?;
-        crate::object::set(obj, ctx.heap_mut(), "type", ty_s);
-        crate::object::set(obj, ctx.heap_mut(), "value", val_s);
-        crate::object::set(obj, ctx.heap_mut(), "source", src_s);
+        let mut obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s, &src_s], &[&snapshot])?;
+        crate::object::set(&mut obj, ctx.heap_mut(), "type", ty_s);
+        crate::object::set(&mut obj, ctx.heap_mut(), "value", val_s);
+        crate::object::set(&mut obj, ctx.heap_mut(), "source", src_s);
         elements.push(Value::object(obj));
     }
     let element_roots = elements.clone();
@@ -878,40 +878,40 @@ pub(crate) fn number_format_resolved_options(
     if let Some(u) = &unit_display_val {
         value_roots.push(u);
     }
-    let obj = ctx.alloc_object_with_roots(&value_roots, &[])?;
+    let mut obj = ctx.alloc_object_with_roots(&value_roots, &[])?;
     let heap = ctx.heap_mut();
-    crate::object::set(obj, heap, "locale", locale);
-    crate::object::set(obj, heap, "style", style);
+    crate::object::set(&mut obj, heap, "locale", locale);
+    crate::object::set(&mut obj, heap, "style", style);
     if let Some(c) = currency_val {
-        crate::object::set(obj, heap, "currency", c);
+        crate::object::set(&mut obj, heap, "currency", c);
     }
     if let Some(c) = currency_display_val {
-        crate::object::set(obj, heap, "currencyDisplay", c);
+        crate::object::set(&mut obj, heap, "currencyDisplay", c);
     }
     if let Some(c) = currency_sign_val {
-        crate::object::set(obj, heap, "currencySign", c);
+        crate::object::set(&mut obj, heap, "currencySign", c);
     }
     if let Some(u) = unit_val {
-        crate::object::set(obj, heap, "unit", u);
+        crate::object::set(&mut obj, heap, "unit", u);
     }
     if let Some(u) = unit_display_val {
-        crate::object::set(obj, heap, "unitDisplay", u);
+        crate::object::set(&mut obj, heap, "unitDisplay", u);
     }
     crate::object::set(
-        obj,
+        &mut obj,
         heap,
         "minimumFractionDigits",
         Value::number_i32(min_fd),
     );
     crate::object::set(
-        obj,
+        &mut obj,
         heap,
         "maximumFractionDigits",
         Value::number_i32(max_fd),
     );
-    crate::object::set(obj, heap, "useGrouping", Value::boolean(use_grouping));
-    crate::object::set(obj, heap, "notation", notation);
-    crate::object::set(obj, heap, "signDisplay", sign_display);
+    crate::object::set(&mut obj, heap, "useGrouping", Value::boolean(use_grouping));
+    crate::object::set(&mut obj, heap, "notation", notation);
+    crate::object::set(&mut obj, heap, "signDisplay", sign_display);
     Ok(Value::object(obj))
 }
 

@@ -714,9 +714,9 @@ pub(crate) fn date_time_format_format_to_parts(
         let ty_s = Value::string(JsString::from_str(ty, ctx.heap_mut())?);
         let val_s = Value::string(JsString::from_str(val, ctx.heap_mut())?);
         let snapshot = elements.clone();
-        let obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s], &[&snapshot])?;
-        crate::object::set(obj, ctx.heap_mut(), "type", ty_s);
-        crate::object::set(obj, ctx.heap_mut(), "value", val_s);
+        let mut obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s], &[&snapshot])?;
+        crate::object::set(&mut obj, ctx.heap_mut(), "type", ty_s);
+        crate::object::set(&mut obj, ctx.heap_mut(), "value", val_s);
         elements.push(Value::object(obj));
     }
     let element_roots = elements.clone();
@@ -834,10 +834,10 @@ pub(crate) fn date_time_format_format_range_to_parts(
         let val_s = Value::string(JsString::from_str(val, ctx.heap_mut())?);
         let src_s = Value::string(JsString::from_str(src, ctx.heap_mut())?);
         let snapshot = elements.clone();
-        let obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s, &src_s], &[&snapshot])?;
-        crate::object::set(obj, ctx.heap_mut(), "type", ty_s);
-        crate::object::set(obj, ctx.heap_mut(), "value", val_s);
-        crate::object::set(obj, ctx.heap_mut(), "source", src_s);
+        let mut obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s, &src_s], &[&snapshot])?;
+        crate::object::set(&mut obj, ctx.heap_mut(), "type", ty_s);
+        crate::object::set(&mut obj, ctx.heap_mut(), "value", val_s);
+        crate::object::set(&mut obj, ctx.heap_mut(), "source", src_s);
         elements.push(Value::object(obj));
     }
     let element_roots = elements.clone();
@@ -926,10 +926,10 @@ pub(crate) fn date_time_format_resolved_options(
     }
 
     let roots: Vec<&Value> = entries.iter().map(|(_, v)| v).collect();
-    let obj = ctx.alloc_object_with_roots(&roots, &[])?;
+    let mut obj = ctx.alloc_object_with_roots(&roots, &[])?;
     let heap = ctx.heap_mut();
     for (k, v) in &entries {
-        crate::object::set(obj, heap, k, *v);
+        crate::object::set(&mut obj, heap, k, *v);
     }
     Ok(Value::object(obj))
 }

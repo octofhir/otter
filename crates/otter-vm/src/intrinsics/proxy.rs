@@ -83,14 +83,14 @@ fn proxy_revocable_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
             name: "Proxy.revocable",
             reason: "out of memory while creating revoke function".to_string(),
         })?;
-    let obj = ctx
+    let mut obj = ctx
         .alloc_object_with_roots(&[&proxy_value, &revoke], &[args])
         .map_err(|_| NativeError::TypeError {
             name: "Proxy.revocable",
             reason: "out of memory while creating result object".to_string(),
         })?;
-    object::set(obj, ctx.heap_mut(), "proxy", proxy_value);
-    object::set(obj, ctx.heap_mut(), "revoke", revoke);
+    object::set(&mut obj, ctx.heap_mut(), "proxy", proxy_value);
+    object::set(&mut obj, ctx.heap_mut(), "revoke", revoke);
     Ok(Value::object(obj))
 }
 

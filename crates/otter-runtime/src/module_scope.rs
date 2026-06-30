@@ -192,11 +192,11 @@ impl<'a, 'rt> ModuleScope<'a, 'rt> {
     /// Set own property `key = value` on `obj`.
     pub fn set(&mut self, obj: Rooted, key: &str, value: Rooted) {
         let v = self.value(value);
-        let target = self
+        let mut target = self
             .value(obj)
             .as_object()
             .expect("ModuleScope::set target is not an object");
-        object::set(target, self.ctx.heap_mut(), key, v);
+        object::set(&mut target, self.ctx.heap_mut(), key, v);
     }
 
     /// Define a method property on `obj`.

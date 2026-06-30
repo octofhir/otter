@@ -720,11 +720,11 @@ pub(crate) fn format_to_parts(
             None => None,
         };
         let snapshot = elements.clone();
-        let obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s], &[&snapshot])?;
-        crate::object::set(obj, ctx.heap_mut(), "type", ty_s);
-        crate::object::set(obj, ctx.heap_mut(), "value", val_s);
+        let mut obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s], &[&snapshot])?;
+        crate::object::set(&mut obj, ctx.heap_mut(), "type", ty_s);
+        crate::object::set(&mut obj, ctx.heap_mut(), "value", val_s);
         if let Some(u) = unit_v {
-            crate::object::set(obj, ctx.heap_mut(), "unit", u);
+            crate::object::set(&mut obj, ctx.heap_mut(), "unit", u);
         }
         elements.push(Value::object(obj));
     }
@@ -755,24 +755,24 @@ pub(crate) fn resolved_options(
     let locale = Value::string(JsString::from_str(&p.locale, ctx.heap_mut())?);
     let numbering = Value::string(JsString::from_str(&p.numbering_system, ctx.heap_mut())?);
     let style = Value::string(JsString::from_str(&p.style, ctx.heap_mut())?);
-    let obj = ctx.alloc_object_with_roots(&[&locale, &numbering, &style], &[])?;
+    let mut obj = ctx.alloc_object_with_roots(&[&locale, &numbering, &style], &[])?;
     let proto = ctx.cx.interp.object_prototype_object_opt();
     if let Some(proto) = proto {
         crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto));
     }
-    crate::object::set(obj, ctx.heap_mut(), "locale", locale);
-    crate::object::set(obj, ctx.heap_mut(), "numberingSystem", numbering);
-    crate::object::set(obj, ctx.heap_mut(), "style", style);
+    crate::object::set(&mut obj, ctx.heap_mut(), "locale", locale);
+    crate::object::set(&mut obj, ctx.heap_mut(), "numberingSystem", numbering);
+    crate::object::set(&mut obj, ctx.heap_mut(), "style", style);
     for ((unit, _, _), (unit_style, display)) in UNITS.iter().zip(p.units.iter()) {
         let sv = Value::string(JsString::from_str(unit_style, ctx.heap_mut())?);
-        crate::object::set(obj, ctx.heap_mut(), unit, sv);
+        crate::object::set(&mut obj, ctx.heap_mut(), unit, sv);
         let dv = Value::string(JsString::from_str(display, ctx.heap_mut())?);
         let display_key = format!("{unit}Display");
-        crate::object::set(obj, ctx.heap_mut(), &display_key, dv);
+        crate::object::set(&mut obj, ctx.heap_mut(), &display_key, dv);
     }
     if let Some(fd) = p.fractional_digits {
         crate::object::set(
-            obj,
+            &mut obj,
             ctx.heap_mut(),
             "fractionalDigits",
             Value::number_i32(fd as i32),

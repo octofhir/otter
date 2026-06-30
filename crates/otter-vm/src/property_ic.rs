@@ -394,9 +394,9 @@ mod tests {
     #[test]
     fn direct_prototype_load_ic_rejects_dictionary_compatible_prototype() {
         let mut heap = fresh_heap();
-        let proto = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        object::set(proto, &mut heap, "x", Value::boolean(true));
-        object::set(proto, &mut heap, "y", Value::null());
+        let mut proto = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        object::set(&mut proto, &mut heap, "x", Value::boolean(true));
+        object::set(&mut proto, &mut heap, "y", Value::null());
         let receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
         object::set_prototype(receiver, &mut heap, Some(proto));
         let (ic, value) =
@@ -411,9 +411,9 @@ mod tests {
     #[test]
     fn direct_prototype_has_ic_rejects_dictionary_compatible_prototype() {
         let mut heap = fresh_heap();
-        let proto = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        object::set(proto, &mut heap, "x", Value::boolean(true));
-        object::set(proto, &mut heap, "y", Value::null());
+        let mut proto = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        object::set(&mut proto, &mut heap, "x", Value::boolean(true));
+        object::set(&mut proto, &mut heap, "y", Value::null());
         let receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
         object::set_prototype(receiver, &mut heap, Some(proto));
         let key_string = JsString::from_str("x", &mut heap).expect("string");
@@ -428,9 +428,9 @@ mod tests {
     #[test]
     fn direct_prototype_store_transition_rejects_dictionary_compatible_prototype() {
         let mut heap = fresh_heap();
-        let proto = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        object::set(proto, &mut heap, "x", Value::boolean(true));
-        object::set(proto, &mut heap, "y", Value::null());
+        let mut proto = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        object::set(&mut proto, &mut heap, "x", Value::boolean(true));
+        object::set(&mut proto, &mut heap, "y", Value::null());
         let first = object::alloc_object_old_for_fixture(&mut heap).unwrap();
         object::set_prototype(first, &mut heap, Some(proto));
         let transition = object::capture_store_property_transition(

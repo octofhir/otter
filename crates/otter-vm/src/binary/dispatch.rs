@@ -768,10 +768,10 @@ mod tests {
     #[test]
     fn shared_array_buffer_growable_accounts_max_backing_store() {
         let mut interp = crate::Interpreter::with_string_heap_cap(1024 * 1024);
-        let options =
+        let mut options =
             crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("options");
         crate::object::set(
-            options,
+            &mut options,
             interp.gc_heap_mut(),
             "maxByteLength",
             Value::number(NumberValue::from_i32(128)),

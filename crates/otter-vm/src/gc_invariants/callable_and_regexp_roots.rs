@@ -29,9 +29,9 @@ fn bound_function_roots_target_this_and_args_when_rooted() {
     )
     .expect("bound function");
 
-    let global = *interp.global_this();
+    let mut global = *interp.global_this();
     crate::object::set(
-        global,
+        &mut global,
         interp.gc_heap_mut(),
         "__gc_bound_function",
         Value::bound_function(bound),
@@ -66,8 +66,13 @@ fn native_function_captures_root_gc_values_when_rooted() {
         |_, _, _| Ok(Value::undefined()),
     )
     .expect("native");
-    let global = *interp.global_this();
-    crate::object::set(global, interp.gc_heap_mut(), "__gc_native_function", native);
+    let mut global = *interp.global_this();
+    crate::object::set(
+        &mut global,
+        interp.gc_heap_mut(),
+        "__gc_native_function",
+        native,
+    );
 
     let _ = captured;
     interp.force_gc();
@@ -91,9 +96,9 @@ fn regexp_body_survives_force_gc_when_rooted() {
     let units: Vec<u16> = "ab+c".encode_utf16().collect();
     let re = crate::JsRegExp::compile(interp.gc_heap_mut(), &units, "i").expect("regexp");
 
-    let global = *interp.global_this();
+    let mut global = *interp.global_this();
     crate::object::set(
-        global,
+        &mut global,
         interp.gc_heap_mut(),
         "__gc_regexp",
         Value::regexp(re),
@@ -124,7 +129,8 @@ fn bound_native_and_regexp_unrooted_graphs_are_reclaimed() {
     let native_baseline = live_bytes(&mut interp, NATIVE_FUNCTION_BODY_TYPE_TAG);
     let regexp_baseline = live_bytes(&mut interp, REGEXP_BODY_TYPE_TAG);
 
-    let bound_object = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
+    let mut bound_object =
+        crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     let bound = BoundFunction::new(
         interp.gc_heap_mut(),
         Value::object(bound_object),
@@ -133,13 +139,13 @@ fn bound_native_and_regexp_unrooted_graphs_are_reclaimed() {
     )
     .expect("bound");
     crate::object::set(
-        bound_object,
+        &mut bound_object,
         interp.gc_heap_mut(),
         "back",
         Value::bound_function(bound),
     );
 
-    let native_object =
+    let mut native_object =
         crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     let native = native_value_with_captures(
         interp.gc_heap_mut(),
@@ -148,7 +154,7 @@ fn bound_native_and_regexp_unrooted_graphs_are_reclaimed() {
         |_, _, _| Ok(Value::undefined()),
     )
     .expect("native");
-    crate::object::set(native_object, interp.gc_heap_mut(), "back", native);
+    crate::object::set(&mut native_object, interp.gc_heap_mut(), "back", native);
 
     let re = crate::JsRegExp::compile(
         interp.gc_heap_mut(),
@@ -156,10 +162,10 @@ fn bound_native_and_regexp_unrooted_graphs_are_reclaimed() {
         "",
     )
     .expect("regexp");
-    let regexp_object =
+    let mut regexp_object =
         crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     crate::object::set(
-        regexp_object,
+        &mut regexp_object,
         interp.gc_heap_mut(),
         "regexp",
         Value::regexp(re),

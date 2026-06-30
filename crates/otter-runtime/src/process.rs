@@ -45,7 +45,7 @@ pub(crate) fn install_global(
     let snapshot = runtime_process_snapshot();
     let uptime_base_secs = snapshot.run_time_secs;
     let start = Instant::now();
-    let process = interp
+    let mut process = interp
         .alloc_host_object_with_roots(&[], &[])
         .map_err(gc_oom_to_error)?;
     let process_root = Value::object(process);
@@ -83,7 +83,7 @@ pub(crate) fn install_global(
         )
         .map_err(gc_oom_to_error)?;
     otter_vm::object::set(
-        process,
+        &mut process,
         interp.gc_heap_mut(),
         "argv",
         otter_vm::Value::array(argv),
@@ -93,7 +93,7 @@ pub(crate) fn install_global(
         .array_from_elements_host_rooted([], &[&process_root], &[])
         .map_err(gc_oom_to_error)?;
     otter_vm::object::set(
-        process,
+        &mut process,
         interp.gc_heap_mut(),
         "execArgv",
         otter_vm::Value::array(exec_argv),
@@ -101,60 +101,65 @@ pub(crate) fn install_global(
 
     let argv0 = process_argv.first().map(String::as_str).unwrap_or("otter");
     let argv0 = string_value(interp, argv0)?;
-    otter_vm::object::set(process, interp.gc_heap_mut(), "argv0", argv0);
+    otter_vm::object::set(&mut process, interp.gc_heap_mut(), "argv0", argv0);
 
     let exec_path = string_value(interp, &snapshot.exec_path)?;
-    otter_vm::object::set(process, interp.gc_heap_mut(), "execPath", exec_path);
+    otter_vm::object::set(&mut process, interp.gc_heap_mut(), "execPath", exec_path);
 
     let platform = string_value(interp, node_platform())?;
-    otter_vm::object::set(process, interp.gc_heap_mut(), "platform", platform);
+    otter_vm::object::set(&mut process, interp.gc_heap_mut(), "platform", platform);
 
     let arch = string_value(interp, node_arch())?;
-    otter_vm::object::set(process, interp.gc_heap_mut(), "arch", arch);
+    otter_vm::object::set(&mut process, interp.gc_heap_mut(), "arch", arch);
 
     let version = string_value(interp, concat!("v", env!("CARGO_PKG_VERSION")))?;
-    otter_vm::object::set(process, interp.gc_heap_mut(), "version", version);
+    otter_vm::object::set(&mut process, interp.gc_heap_mut(), "version", version);
 
-    let versions = interp
+    let mut versions = interp
         .alloc_host_object_with_roots(&[&process_root], &[])
         .map_err(gc_oom_to_error)?;
     let otter_version = string_value(interp, env!("CARGO_PKG_VERSION"))?;
-    otter_vm::object::set(versions, interp.gc_heap_mut(), "otter", otter_version);
+    otter_vm::object::set(&mut versions, interp.gc_heap_mut(), "otter", otter_version);
     let node_version = string_value(interp, env!("CARGO_PKG_VERSION"))?;
-    otter_vm::object::set(versions, interp.gc_heap_mut(), "node", node_version);
+    otter_vm::object::set(&mut versions, interp.gc_heap_mut(), "node", node_version);
     // The crypto subset (hashing / HMAC / CSPRNG) is available, so advertise an
     // OpenSSL version — the test harness gates `hasCrypto` on `versions.openssl`.
     let openssl_version = string_value(interp, "3.0.0")?;
-    otter_vm::object::set(versions, interp.gc_heap_mut(), "openssl", openssl_version);
-    let v8_version = string_value(interp, "12.0.0")?;
-    otter_vm::object::set(versions, interp.gc_heap_mut(), "v8", v8_version);
     otter_vm::object::set(
-        process,
+        &mut versions,
+        interp.gc_heap_mut(),
+        "openssl",
+        openssl_version,
+    );
+    let v8_version = string_value(interp, "12.0.0")?;
+    otter_vm::object::set(&mut versions, interp.gc_heap_mut(), "v8", v8_version);
+    otter_vm::object::set(
+        &mut process,
         interp.gc_heap_mut(),
         "versions",
         otter_vm::Value::object(versions),
     );
 
-    let release = interp
+    let mut release = interp
         .alloc_host_object_with_roots(&[&process_root], &[])
         .map_err(gc_oom_to_error)?;
     let release_name = string_value(interp, "node")?;
-    otter_vm::object::set(release, interp.gc_heap_mut(), "name", release_name);
+    otter_vm::object::set(&mut release, interp.gc_heap_mut(), "name", release_name);
     otter_vm::object::set(
-        process,
+        &mut process,
         interp.gc_heap_mut(),
         "release",
         otter_vm::Value::object(release),
     );
 
     otter_vm::object::set(
-        process,
+        &mut process,
         interp.gc_heap_mut(),
         "pid",
         Value::number(NumberValue::from_i32(pid_to_i32(snapshot.pid))),
     );
     otter_vm::object::set(
-        process,
+        &mut process,
         interp.gc_heap_mut(),
         "ppid",
         Value::number(NumberValue::from_i32(pid_to_i32(
@@ -163,13 +168,13 @@ pub(crate) fn install_global(
     );
 
     otter_vm::object::set(
-        process,
+        &mut process,
         interp.gc_heap_mut(),
         "exitCode",
         otter_vm::Value::undefined(),
     );
 
-    let env = interp
+    let mut env = interp
         .alloc_host_object_with_roots(&[&process_root], &[])
         .map_err(gc_oom_to_error)?;
     for (name, value) in std::env::vars() {
@@ -183,10 +188,10 @@ pub(crate) fn install_global(
         let value = JsString::from_str(&value, interp.gc_heap_mut())
             .map(otter_vm::Value::string)
             .map_err(string_oom_to_error)?;
-        otter_vm::object::set(env, interp.gc_heap_mut(), &name, value);
+        otter_vm::object::set(&mut env, interp.gc_heap_mut(), &name, value);
     }
     otter_vm::object::set(
-        process,
+        &mut process,
         interp.gc_heap_mut(),
         "env",
         otter_vm::Value::object(env),
@@ -233,7 +238,7 @@ pub(crate) fn install_global(
         NativeCall::Static(process_memory_usage),
     )?;
     let hrtime = hrtime_value(interp, start).map_err(gc_oom_to_error)?;
-    otter_vm::object::set(process, interp.gc_heap_mut(), "hrtime", hrtime);
+    otter_vm::object::set(&mut process, interp.gc_heap_mut(), "hrtime", hrtime);
 
     install_stdio_streams(interp, process, &process_root)?;
 
@@ -273,33 +278,33 @@ pub(crate) fn install_global(
     }
 
     // `process.config.variables.*` is read by the Node test harness at load.
-    let config = interp
+    let mut config = interp
         .alloc_host_object_with_roots(&[&process_root], &[])
         .map_err(gc_oom_to_error)?;
-    let variables = interp
+    let mut variables = interp
         .alloc_host_object_with_roots(&[&process_root], &[])
         .map_err(gc_oom_to_error)?;
     otter_vm::object::set(
-        variables,
+        &mut variables,
         interp.gc_heap_mut(),
         "v8_enable_i18n_support",
         Value::boolean(false),
     );
     otter_vm::object::set(
-        config,
+        &mut config,
         interp.gc_heap_mut(),
         "variables",
         otter_vm::Value::object(variables),
     );
     otter_vm::object::set(
-        process,
+        &mut process,
         interp.gc_heap_mut(),
         "config",
         otter_vm::Value::object(config),
     );
 
     // `process.features.*` — feature flags read by the Node test harness.
-    let features = interp
+    let mut features = interp
         .alloc_host_object_with_roots(&[&process_root], &[])
         .map_err(gc_oom_to_error)?;
     for (name, on) in [
@@ -313,10 +318,15 @@ pub(crate) fn install_global(
         ("require_module", true),
         ("typescript", false),
     ] {
-        otter_vm::object::set(features, interp.gc_heap_mut(), name, Value::boolean(on));
+        otter_vm::object::set(
+            &mut features,
+            interp.gc_heap_mut(),
+            name,
+            Value::boolean(on),
+        );
     }
     otter_vm::object::set(
-        process,
+        &mut process,
         interp.gc_heap_mut(),
         "features",
         otter_vm::Value::object(features),
@@ -386,34 +396,39 @@ fn install_stdio_streams(
 
 fn install_one_stdio(
     interp: &mut Interpreter,
-    process: otter_vm::object::JsObject,
+    mut process: otter_vm::object::JsObject,
     process_root: &Value,
     name: &'static str,
     fd: i32,
     readable: bool,
     write_call: NativeCall,
 ) -> Result<(), OtterError> {
-    let stream = interp
+    let mut stream = interp
         .alloc_host_object_with_roots(&[process_root], &[])
         .map_err(gc_oom_to_error)?;
     let stream_root = Value::object(stream);
     let i32n = |n: i32| Value::number(NumberValue::from_i32(n));
-    otter_vm::object::set(stream, interp.gc_heap_mut(), "isTTY", Value::boolean(false));
-    otter_vm::object::set(stream, interp.gc_heap_mut(), "fd", i32n(fd));
     otter_vm::object::set(
-        stream,
+        &mut stream,
+        interp.gc_heap_mut(),
+        "isTTY",
+        Value::boolean(false),
+    );
+    otter_vm::object::set(&mut stream, interp.gc_heap_mut(), "fd", i32n(fd));
+    otter_vm::object::set(
+        &mut stream,
         interp.gc_heap_mut(),
         "writable",
         Value::boolean(!readable),
     );
     otter_vm::object::set(
-        stream,
+        &mut stream,
         interp.gc_heap_mut(),
         "readable",
         Value::boolean(readable),
     );
-    otter_vm::object::set(stream, interp.gc_heap_mut(), "columns", i32n(80));
-    otter_vm::object::set(stream, interp.gc_heap_mut(), "rows", i32n(24));
+    otter_vm::object::set(&mut stream, interp.gc_heap_mut(), "columns", i32n(80));
+    otter_vm::object::set(&mut stream, interp.gc_heap_mut(), "rows", i32n(24));
 
     define_method_on(
         interp,
@@ -451,7 +466,7 @@ fn install_one_stdio(
             NativeCall::Static(stdio_return_this),
         )?;
     }
-    otter_vm::object::set(process, interp.gc_heap_mut(), name, stream_root);
+    otter_vm::object::set(&mut process, interp.gc_heap_mut(), name, stream_root);
     Ok(())
 }
 
@@ -657,9 +672,9 @@ fn hrtime_value(interp: &mut Interpreter, start: Instant) -> Result<Value, otter
         &[&function],
         &[],
     )?;
-    let object = interp.alloc_host_object_with_roots(&[&function, &bigint], &[])?;
+    let mut object = interp.alloc_host_object_with_roots(&[&function, &bigint], &[])?;
     otter_vm::object::set_call_native(object, interp.gc_heap_mut(), function);
-    otter_vm::object::set(object, interp.gc_heap_mut(), "bigint", bigint);
+    otter_vm::object::set(&mut object, interp.gc_heap_mut(), "bigint", bigint);
     // `process.hrtime` is a callable host object (so it can carry the
     // `.bigint` own property), but a host object defaults to a null
     // `[[Prototype]]`. A callable with no `%Function.prototype%` in its
@@ -732,12 +747,12 @@ fn normalize_exit_code(value: &Value) -> Option<u8> {
 
 fn set_number_property(
     interp: &mut Interpreter,
-    object: otter_vm::JsObject,
+    mut object: otter_vm::JsObject,
     name: &str,
     value: f64,
 ) {
     otter_vm::object::set(
-        object,
+        &mut object,
         interp.gc_heap_mut(),
         name,
         Value::number(NumberValue::from_f64(value)),

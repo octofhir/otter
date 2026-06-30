@@ -138,9 +138,9 @@ pub(crate) fn list_format_format_to_parts(
         let ty_s = Value::string(JsString::from_str(ty, ctx.heap_mut())?);
         let val_s = Value::string(JsString::from_str(val, ctx.heap_mut())?);
         let snapshot = elements.clone();
-        let obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s], &[&snapshot])?;
-        crate::object::set(obj, ctx.heap_mut(), "type", ty_s);
-        crate::object::set(obj, ctx.heap_mut(), "value", val_s);
+        let mut obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s], &[&snapshot])?;
+        crate::object::set(&mut obj, ctx.heap_mut(), "type", ty_s);
+        crate::object::set(&mut obj, ctx.heap_mut(), "value", val_s);
         elements.push(Value::object(obj));
     }
     let element_roots = elements.clone();
@@ -192,10 +192,10 @@ pub(crate) fn list_format_resolved_options(
     let locale = Value::string(JsString::from_str(&payload.locale, ctx.heap_mut())?);
     let kind = Value::string(JsString::from_str(&payload.kind, ctx.heap_mut())?);
     let style = Value::string(JsString::from_str(&payload.style, ctx.heap_mut())?);
-    let obj = ctx.alloc_object_with_roots(&[&locale, &kind, &style], &[])?;
+    let mut obj = ctx.alloc_object_with_roots(&[&locale, &kind, &style], &[])?;
     let heap = ctx.heap_mut();
-    crate::object::set(obj, heap, "locale", locale);
-    crate::object::set(obj, heap, "type", kind);
-    crate::object::set(obj, heap, "style", style);
+    crate::object::set(&mut obj, heap, "locale", locale);
+    crate::object::set(&mut obj, heap, "type", kind);
+    crate::object::set(&mut obj, heap, "style", style);
     Ok(Value::object(obj))
 }

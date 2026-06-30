@@ -293,7 +293,7 @@ fn native_call(
 }
 
 fn set_from_entries_key_heap(
-    target: crate::object::JsObject,
+    mut target: crate::object::JsObject,
     key: &Value,
     value: Value,
     heap: &mut otter_gc::GcHeap,
@@ -303,7 +303,7 @@ fn set_from_entries_key_heap(
         return Ok(());
     }
     let key_str = property_key_from_value(key, heap)?;
-    crate::object::set(target, heap, &key_str, value);
+    crate::object::set(&mut target, heap, &key_str, value);
     Ok(())
 }
 
@@ -1910,7 +1910,7 @@ pub fn call(
         M::GetOwnPropertyDescriptors => {
             let target = expect_object(args.first())?;
             let target_root = Value::object(target);
-            let result = rooted_object(gc_heap, &[&target_root], &[args])?;
+            let mut result = rooted_object(gc_heap, &[&target_root], &[args])?;
             let result_root = Value::object(result);
             let (keys, symbols): (Vec<String>, Vec<JsSymbol>) =
                 crate::object::with_properties(target, gc_heap, |p| {
@@ -1927,7 +1927,7 @@ pub fn call(
                         &[&target_root, &result_root],
                         &[args],
                     )?);
-                    crate::object::set(result, gc_heap, &key, value);
+                    crate::object::set(&mut result, gc_heap, &key, value);
                 }
             }
             for sym in symbols {
@@ -2149,7 +2149,7 @@ pub fn call(
         // are left to follow-ups.
         // <https://tc39.es/ecma262/#sec-object.assign>
         M::Assign => {
-            let target = expect_object(args.first())?;
+            let mut target = expect_object(args.first())?;
             for src in args.iter().skip(1) {
                 if src.is_undefined() || src.is_null() {
                     // Per spec, null/undefined sources are skipped.
@@ -2163,7 +2163,7 @@ pub fn call(
                             .collect()
                     });
                 for (k, v) in entries {
-                    crate::object::set(target, gc_heap, &k, v);
+                    crate::object::set(&mut target, gc_heap, &k, v);
                 }
             }
             Ok(Value::object(target))
@@ -2436,21 +2436,26 @@ fn descriptor_to_object_with_roots(
             }
         }
     }
-    let result = rooted_object(gc_heap, &roots, slice_roots)?;
+    let mut result = rooted_object(gc_heap, &roots, slice_roots)?;
     match &desc.kind {
         DescriptorKind::Data { value } => {
-            crate::object::set(result, gc_heap, "value", *value);
-            crate::object::set(result, gc_heap, "writable", Value::boolean(desc.writable()));
+            crate::object::set(&mut result, gc_heap, "value", *value);
+            crate::object::set(
+                &mut result,
+                gc_heap,
+                "writable",
+                Value::boolean(desc.writable()),
+            );
         }
         DescriptorKind::Accessor { getter, setter } => {
             crate::object::set(
-                result,
+                &mut result,
                 gc_heap,
                 "get",
                 (*getter).unwrap_or(Value::undefined()),
             );
             crate::object::set(
-                result,
+                &mut result,
                 gc_heap,
                 "set",
                 (*setter).unwrap_or(Value::undefined()),
@@ -2458,13 +2463,13 @@ fn descriptor_to_object_with_roots(
         }
     }
     crate::object::set(
-        result,
+        &mut result,
         gc_heap,
         "enumerable",
         Value::boolean(desc.enumerable()),
     );
     crate::object::set(
-        result,
+        &mut result,
         gc_heap,
         "configurable",
         Value::boolean(desc.configurable()),

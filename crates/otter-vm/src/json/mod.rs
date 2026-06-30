@@ -389,13 +389,14 @@ fn native_raw_json(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
     let mut roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         raw_value.trace_value_slots(visitor);
     };
-    let obj = crate::object::alloc_object_with_roots(ctx.heap_mut(), &mut roots).map_err(|_| {
-        NativeError::TypeError {
-            name: "rawJSON",
-            reason: "out of memory".to_string(),
-        }
-    })?;
-    crate::object::set(obj, ctx.heap_mut(), "rawJSON", raw_value);
+    let mut obj =
+        crate::object::alloc_object_with_roots(ctx.heap_mut(), &mut roots).map_err(|_| {
+            NativeError::TypeError {
+                name: "rawJSON",
+                reason: "out of memory".to_string(),
+            }
+        })?;
+    crate::object::set(&mut obj, ctx.heap_mut(), "rawJSON", raw_value);
     crate::object::set_is_raw_json(obj, ctx.heap_mut(), true);
     crate::object::freeze(obj, ctx.heap_mut());
     Ok(Value::object(obj))
@@ -608,9 +609,9 @@ mod tests {
     #[test]
     fn stringify_object_preserves_insertion_order() {
         let mut heap = make_heap();
-        let obj = crate::object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        crate::object::set(obj, &mut heap, "b", n(1));
-        crate::object::set(obj, &mut heap, "a", n(2));
+        let mut obj = crate::object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        crate::object::set(&mut obj, &mut heap, "b", n(1));
+        crate::object::set(&mut obj, &mut heap, "a", n(2));
         let s = stringify(&Value::object(obj), &mut heap).unwrap().unwrap();
         assert_eq!(s, "{\"b\":1,\"a\":2}");
     }
@@ -682,8 +683,9 @@ mod tests {
         // Cyclic — no path walk (cheap identity-pointer set on the
         // hot path; full path tracking can layer on later).
         let mut heap = make_heap();
-        let obj = crate::object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        crate::object::set(obj, &mut heap, "self", Value::object(obj));
+        let mut obj = crate::object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        let self_ref = Value::object(obj);
+        crate::object::set(&mut obj, &mut heap, "self", self_ref);
         let err = stringify(&Value::object(obj), &mut heap).unwrap_err();
         assert!(matches!(err, JsonError::Cyclic));
         assert_eq!(

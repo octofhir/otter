@@ -323,7 +323,7 @@ impl Interpreter {
             // catching them as `try { ... } catch`.
             _ => return None,
         };
-        let obj = if is_oom {
+        let mut obj = if is_oom {
             crate::object::alloc_diagnostic_object(&mut self.gc_heap).ok()?
         } else {
             self.make_error_instance_with_stack_roots(
@@ -347,7 +347,7 @@ impl Interpreter {
         }
         if is_oom && let Ok(message_str) = JsString::from_str(message, self.gc_heap_mut()) {
             crate::object::set(
-                obj,
+                &mut obj,
                 &mut self.gc_heap,
                 "message",
                 Value::string(message_str),
@@ -378,12 +378,12 @@ impl Interpreter {
                         ),
                     );
                 }
-                if let Ok(info) = object::alloc_object_old(self.gc_heap_mut()) {
+                if let Ok(mut info) = object::alloc_object_old(self.gc_heap_mut()) {
                     if let Ok(info_code) =
                         JsString::from_str(system_error_code(message), self.gc_heap_mut())
                     {
                         crate::object::set(
-                            info,
+                            &mut info,
                             &mut self.gc_heap,
                             "code",
                             Value::string(info_code),

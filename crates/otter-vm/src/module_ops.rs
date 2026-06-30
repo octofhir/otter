@@ -1025,10 +1025,10 @@ impl Interpreter {
 
     /// Build a module's `import.meta` object with its `url` property.
     fn build_import_meta(&mut self, url: &str) -> Result<Value, VmError> {
-        let obj = self.alloc_host_object_with_roots(&[], &[])?;
+        let mut obj = self.alloc_host_object_with_roots(&[], &[])?;
         let url_str =
             JsString::from_str(url, &mut self.gc_heap).map_err(|_| VmError::TypeMismatch)?;
-        crate::object::set(obj, &mut self.gc_heap, "url", Value::string(url_str));
+        crate::object::set(&mut obj, &mut self.gc_heap, "url", Value::string(url_str));
         Ok(Value::object(obj))
     }
 

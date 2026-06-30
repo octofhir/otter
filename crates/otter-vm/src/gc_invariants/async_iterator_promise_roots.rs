@@ -39,9 +39,9 @@ fn promise_reaction_graph_survives_force_gc_when_rooted() {
     };
     promise.perform_then(interp.gc_heap_mut(), None, None, capability);
 
-    let global = *interp.global_this();
+    let mut global = *interp.global_this();
     crate::object::set(
-        global,
+        &mut global,
         interp.gc_heap_mut(),
         "promise",
         Value::promise(promise),
@@ -139,8 +139,13 @@ fn iterator_state_holding_array_object_survives_force_gc() {
             origin: crate::BuiltinIteratorOrigin::Array,
         })
         .expect("iterator");
-    let global = *interp.global_this();
-    crate::object::set(global, interp.gc_heap_mut(), "iter", Value::iterator(iter));
+    let mut global = *interp.global_this();
+    crate::object::set(
+        &mut global,
+        interp.gc_heap_mut(),
+        "iter",
+        Value::iterator(iter),
+    );
 
     let _ = object;
     let _ = array;
@@ -168,9 +173,9 @@ fn generator_and_parked_frame_roots_register_values() {
     frame.registers[0] = Value::object(object);
     let generator =
         crate::generator::JsGenerator::new(interp.gc_heap_mut(), frame).expect("generator");
-    let global = *interp.global_this();
+    let mut global = *interp.global_this();
     crate::object::set(
-        global,
+        &mut global,
         interp.gc_heap_mut(),
         "generator",
         Value::generator(generator),
@@ -178,7 +183,7 @@ fn generator_and_parked_frame_roots_register_values() {
 
     let _ = object;
     interp.force_gc();
-    let global = *interp.global_this();
+    let mut global = *interp.global_this();
     let rooted = crate::object::get(global, interp.gc_heap(), "generator")
         .expect("generator root survives force_gc");
     let Some(generator) = rooted.as_generator() else {
@@ -205,7 +210,7 @@ fn generator_and_parked_frame_roots_register_values() {
     };
     promise.perform_async_resume_then(interp.gc_heap_mut(), parked, 0, capability, None);
     crate::object::set(
-        global,
+        &mut global,
         interp.gc_heap_mut(),
         "awaitPromise",
         Value::promise(promise),

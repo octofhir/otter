@@ -89,22 +89,22 @@ pub fn run_builtin_cjs_shim(
     let exports_idx = ctx.interp_mut().push_module_root(exports_val) - 1;
 
     // From here on, re-fetch the relocated `module` handle after each allocation.
-    let module = ctx
+    let mut module = ctx
         .interp_mut()
         .module_root(module_idx)
         .as_object()
         .expect("module object survives module-root rooting");
     let exports_val = ctx.interp_mut().module_root(exports_idx);
-    object::set(module, ctx.heap_mut(), "exports", exports_val);
+    object::set(&mut module, ctx.heap_mut(), "exports", exports_val);
 
     let id_val = runtime_string_value(ctx, name).map_err(|e| e.to_string())?;
-    let module = ctx
+    let mut module = ctx
         .interp_mut()
         .module_root(module_idx)
         .as_object()
         .expect("module object survives module-root rooting");
-    object::set(module, ctx.heap_mut(), "id", id_val);
-    object::set(module, ctx.heap_mut(), "loaded", Value::boolean(false));
+    object::set(&mut module, ctx.heap_mut(), "id", id_val);
+    object::set(&mut module, ctx.heap_mut(), "loaded", Value::boolean(false));
 
     let name_val = runtime_string_value(ctx, name).map_err(|e| e.to_string())?;
     let require_val = make_shim_require(ctx, deps)?;
@@ -141,9 +141,9 @@ pub fn run_builtin_cjs_shim(
 /// The deps are stored on a plain JS object (which roots their values) captured
 /// by the closure; `require(spec)` returns `deps[spec]` or throws.
 fn make_shim_require(ctx: &mut NativeCtx<'_>, deps: &[(&str, Value)]) -> Result<Value, String> {
-    let table = ctx.alloc_object().map_err(|e| e.to_string())?;
+    let mut table = ctx.alloc_object().map_err(|e| e.to_string())?;
     for (spec, value) in deps {
-        object::set(table, ctx.heap_mut(), spec, *value);
+        object::set(&mut table, ctx.heap_mut(), spec, *value);
     }
     let captures: SmallVec<[Value; 4]> = smallvec![Value::object(table)];
     let closure = move |ctx: &mut NativeCtx<'_>,
@@ -260,7 +260,7 @@ fn make_require(
 pub(crate) fn cjs_load(
     ctx: &mut NativeCtx<'_>,
     cfg: &Arc<CjsConfig>,
-    cache: object::JsObject,
+    mut cache: object::JsObject,
     dir: &Path,
     spec: &str,
 ) -> Result<Value, NativeError> {
@@ -285,7 +285,7 @@ pub(crate) fn cjs_load(
         };
         let depth = ctx.interp_mut().push_module_root(value);
         let value = ctx.interp_mut().module_root(depth - 1);
-        object::set(cache, ctx.heap_mut(), &key, value);
+        object::set(&mut cache, ctx.heap_mut(), &key, value);
         let value = object::get(cache, ctx.heap(), &key).unwrap_or(value);
         ctx.interp_mut().pop_module_roots_to(depth - 1);
         return Ok(value);
@@ -342,39 +342,39 @@ pub(crate) fn cjs_instantiate_file(
     let exports_idx = ctx.interp_mut().push_module_root(exports_val) - 1;
 
     // From here on, re-fetch the relocated handles after each allocation.
-    let module = ctx
+    let mut module = ctx
         .interp_mut()
         .module_root(module_idx)
         .as_object()
         .expect("module object survives module-root rooting");
     let exports_val = ctx.interp_mut().module_root(exports_idx);
-    object::set(module, ctx.heap_mut(), "exports", exports_val);
+    object::set(&mut module, ctx.heap_mut(), "exports", exports_val);
 
     let id_val = runtime_string_value(ctx, &id)?;
-    let module = ctx
+    let mut module = ctx
         .interp_mut()
         .module_root(module_idx)
         .as_object()
         .expect("module object survives module-root rooting");
-    object::set(module, ctx.heap_mut(), "id", id_val);
+    object::set(&mut module, ctx.heap_mut(), "id", id_val);
 
     let filename_val = runtime_string_value(ctx, &id)?;
-    let module = ctx
+    let mut module = ctx
         .interp_mut()
         .module_root(module_idx)
         .as_object()
         .expect("module object survives module-root rooting");
-    object::set(module, ctx.heap_mut(), "filename", filename_val);
-    object::set(module, ctx.heap_mut(), "loaded", Value::boolean(false));
+    object::set(&mut module, ctx.heap_mut(), "filename", filename_val);
+    object::set(&mut module, ctx.heap_mut(), "loaded", Value::boolean(false));
 
     // Circular-require guard: cache the partial exports before running.
-    let cache = ctx
+    let mut cache = ctx
         .interp_mut()
         .module_root(cache_idx)
         .as_object()
         .expect("require cache survives module-root rooting");
     let exports_val = ctx.interp_mut().module_root(exports_idx);
-    object::set(cache, ctx.heap_mut(), &id, exports_val);
+    object::set(&mut cache, ctx.heap_mut(), &id, exports_val);
 
     // Per-module bindings.
     let require_val = make_require(ctx, cfg.clone(), cache, dir.clone())?;
@@ -410,11 +410,11 @@ pub(crate) fn cjs_instantiate_file(
     let run = interp.run_callable_sync(&context, &wrapper, exports_val, call_args);
 
     // Relocated handles (the collector may have moved them during the run).
-    let module = interp
+    let mut module = interp
         .module_root(module_idx)
         .as_object()
         .expect("module object survives module-root rooting");
-    let cache = interp
+    let mut cache = interp
         .module_root(cache_idx)
         .as_object()
         .expect("require cache survives module-root rooting");
@@ -424,8 +424,13 @@ pub(crate) fn cjs_instantiate_file(
     let result = run.map(|_ret| {
         // `module.exports` may have been reassigned by the module body.
         let final_exports = object::get(module, interp.gc_heap(), "exports").unwrap_or(exports_val);
-        object::set(module, interp.gc_heap_mut(), "loaded", Value::boolean(true));
-        object::set(cache, interp.gc_heap_mut(), &id, final_exports);
+        object::set(
+            &mut module,
+            interp.gc_heap_mut(),
+            "loaded",
+            Value::boolean(true),
+        );
+        object::set(&mut cache, interp.gc_heap_mut(), &id, final_exports);
         final_exports
     });
 

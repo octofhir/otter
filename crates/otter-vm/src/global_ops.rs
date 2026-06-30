@@ -179,7 +179,7 @@ impl Interpreter {
         // non-writable existing property silently absorbs the write
         // in sloppy mode. Only an absent property is defined fresh.
         if object::get_own_descriptor(self.global_this, &self.gc_heap, name).is_some() {
-            object::set(self.global_this, &mut self.gc_heap, name, value);
+            object::set(&mut self.global_this, &mut self.gc_heap, name, value);
             frame.advance_pc(self.current_byte_len)?;
             return Ok(());
         }
@@ -302,7 +302,7 @@ impl Interpreter {
                     self.err_type((format!("Cannot declare global function '{name}'")).into())
                 );
             }
-            object::set(self.global_this, &mut self.gc_heap, name, value);
+            object::set(&mut self.global_this, &mut self.gc_heap, name, value);
         }
         frame.advance_pc(self.current_byte_len)?;
         Ok(())

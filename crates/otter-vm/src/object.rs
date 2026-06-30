@@ -2760,37 +2760,44 @@ fn record_slot_write(heap: &mut otter_gc::GcHeap, obj: JsObject, slot: Compresse
 
 /// Records the GC store when `value` carries a `Gc<…>` handle so the
 /// marker / scavenger see the new edge.
-pub fn set(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) {
-    let mut obj = obj;
-    let compressed = compress_or_abort(heap, &mut obj, value);
-    let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
+/// Store `value` under string key `key` on `obj`, taking `obj` to dictionary
+/// mode if the key is new.
+///
+/// `obj` is a `&mut` handle because a value-boxing allocation (a wide number
+/// boxes a `HeapNumber`) can trigger a moving GC that relocates a young
+/// receiver. The relocation is reflected back into the caller's handle so a
+/// sequence of `set` calls on a freshly-allocated object never writes through
+/// a stale handle.
+pub fn set(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) {
+    let compressed = compress_or_abort(heap, obj, value);
+    let existing_offset = heap.read_payload(*obj, |body| body_offset_of(heap, body, key));
     if let Some(offset) = existing_offset {
         let i = offset as usize;
         // Overwriting an accessor slot with a data value diverges this slot
         // from its hidden class (which still records the accessor) without a
         // shape transition, so per-slot metadata must be materialized and the
         // shape can no longer be trusted for attribute reads.
-        let is_accessor = heap.read_payload(obj, |body| body.slot_attrs(heap, i).1);
+        let is_accessor = heap.read_payload(*obj, |body| body.slot_attrs(heap, i).1);
         if is_accessor {
-            materialize_slots(obj, heap);
+            materialize_slots(*obj, heap);
         }
-        heap.with_payload(obj, |body| {
+        heap.with_payload(*obj, |body| {
             if is_accessor {
                 body.slots_mut()[i].is_accessor = false;
             }
             body.set_data_value(i, compressed);
         });
-        record_slot_write(heap, obj, compressed);
+        record_slot_write(heap, *obj, compressed);
         return;
     }
-    let index = heap.read_payload(obj, |body| body_property_count(heap, body));
-    heap.with_payload(obj, |body| {
+    let index = heap.read_payload(*obj, |body| body_property_count(heap, body));
+    heap.with_payload(*obj, |body| {
         body.dictionary_shape_id = next_shape_id();
         dict_push_key(body, key.to_owned());
         body.shape = ShapeHandle::null();
         body.push_slot(index, SlotMeta::data_default(), compressed);
     });
-    record_slot_write(heap, obj, compressed);
+    record_slot_write(heap, *obj, compressed);
 }
 
 /// Construction-time data store for callers that already allocated the next
@@ -4169,7 +4176,7 @@ mod tests {
     #[test]
     fn own_property_reads_prefer_installed_shape_offsets() {
         let mut interp = crate::Interpreter::new();
-        let o = interp
+        let mut o = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
 
@@ -4196,7 +4203,7 @@ mod tests {
         });
         assert_eq!(keys, vec!["x"]);
 
-        set(o, interp.gc_heap_mut(), "x", Value::boolean(false));
+        set(&mut o, interp.gc_heap_mut(), "x", Value::boolean(false));
 
         assert_eq!(
             get_own(o, interp.gc_heap(), "x"),
@@ -4309,12 +4316,12 @@ mod tests {
     #[test]
     fn raw_set_invalidates_shape_for_new_property() {
         let mut interp = crate::Interpreter::new();
-        let o = interp
+        let mut o = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
         assert_eq!(shape(o, interp.gc_heap()), interp.shape_root());
 
-        set(o, interp.gc_heap_mut(), "x", Value::boolean(true));
+        set(&mut o, interp.gc_heap_mut(), "x", Value::boolean(true));
 
         assert!(shape(o, interp.gc_heap()).is_null());
         assert_eq!(
@@ -4399,16 +4406,16 @@ mod tests {
     #[test]
     fn set_then_get_roundtrip() {
         let mut heap = fresh_heap();
-        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "x", Value::boolean(true));
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set(&mut o, &mut heap, "x", Value::boolean(true));
         assert!(get(o, &heap, "x").is_some_and(|v| v.as_boolean() == Some(true)));
     }
 
     #[test]
     fn atom_lookup_reports_shape_and_slot_metadata() {
         let mut heap = fresh_heap();
-        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "x", Value::boolean(true));
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set(&mut o, &mut heap, "x", Value::boolean(true));
         let shape = shape_id(o, &heap);
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
@@ -4438,8 +4445,8 @@ mod tests {
     #[test]
     fn atom_slot_guard_rejects_shape_change() {
         let mut heap = fresh_heap();
-        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "x", Value::boolean(true));
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set(&mut o, &mut heap, "x", Value::boolean(true));
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
             "x",
@@ -4450,7 +4457,7 @@ mod tests {
             Some(Value::boolean(true))
         );
 
-        set(o, &mut heap, "y", Value::null());
+        set(&mut o, &mut heap, "y", Value::null());
 
         assert_eq!(load_own_data_slot_atom(o, &heap, key, hit), None);
     }
@@ -4458,8 +4465,8 @@ mod tests {
     #[test]
     fn atom_slot_store_updates_guarded_data_slot() {
         let mut heap = fresh_heap();
-        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "x", Value::boolean(true));
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set(&mut o, &mut heap, "x", Value::boolean(true));
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
             "x",
@@ -4475,7 +4482,7 @@ mod tests {
             Some(Value::boolean(false))
         );
 
-        set(o, &mut heap, "y", Value::null());
+        set(&mut o, &mut heap, "y", Value::null());
 
         assert_eq!(
             store_own_data_slot_atom(o, &mut heap, key, hit, &Value::boolean(true)),
@@ -4520,7 +4527,7 @@ mod tests {
     #[test]
     fn atom_add_transition_rejects_changed_direct_prototype_shape() {
         let mut heap = fresh_heap();
-        let proto = alloc_object_old_for_fixture(&mut heap).unwrap();
+        let mut proto = alloc_object_old_for_fixture(&mut heap).unwrap();
         let first = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(first, &mut heap, Some(proto));
         let key = AtomizedPropertyKey::new(
@@ -4530,7 +4537,7 @@ mod tests {
         let transition =
             capture_store_property_transition(first, &mut heap, key, &Value::boolean(true))
                 .expect("transition install");
-        set(proto, &mut heap, "x", Value::null());
+        set(&mut proto, &mut heap, "x", Value::null());
 
         let second = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(second, &mut heap, Some(proto));
@@ -4581,8 +4588,8 @@ mod tests {
     #[test]
     fn raw_atom_add_transition_rejects_unshared_inherited_dictionary_shape() {
         let mut heap = fresh_heap();
-        let proto = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(proto, &mut heap, "x", Value::boolean(true));
+        let mut proto = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set(&mut proto, &mut heap, "x", Value::boolean(true));
         let first = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(first, &mut heap, Some(proto));
         let key = AtomizedPropertyKey::new(
@@ -4611,8 +4618,8 @@ mod tests {
     #[test]
     fn atom_add_transition_rejects_inherited_data_after_writable_change() {
         let mut heap = fresh_heap();
-        let proto = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(proto, &mut heap, "x", Value::boolean(true));
+        let mut proto = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set(&mut proto, &mut heap, "x", Value::boolean(true));
         let first = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(first, &mut heap, Some(proto));
         let key = AtomizedPropertyKey::new(
@@ -4664,11 +4671,11 @@ mod tests {
     #[test]
     fn shape_id_changes_on_new_property_not_overwrite() {
         let mut heap = fresh_heap();
-        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
         let empty = shape_id(o, &heap);
-        set(o, &mut heap, "x", Value::boolean(true));
+        set(&mut o, &mut heap, "x", Value::boolean(true));
         let with_x = shape_id(o, &heap);
-        set(o, &mut heap, "x", Value::boolean(false));
+        set(&mut o, &mut heap, "x", Value::boolean(false));
 
         assert_ne!(empty, with_x);
         assert_eq!(shape_id(o, &heap), with_x);
@@ -4684,10 +4691,10 @@ mod tests {
     #[test]
     fn insertion_order_is_preserved() {
         let mut heap = fresh_heap();
-        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "a", Value::boolean(true));
-        set(o, &mut heap, "b", Value::boolean(false));
-        set(o, &mut heap, "c", Value::null());
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set(&mut o, &mut heap, "a", Value::boolean(true));
+        set(&mut o, &mut heap, "b", Value::boolean(false));
+        set(&mut o, &mut heap, "c", Value::null());
         let keys: Vec<String> =
             with_properties(o, &heap, |p| p.keys().map(str::to_string).collect());
         assert_eq!(keys, vec!["a", "b", "c"]);
@@ -4696,14 +4703,14 @@ mod tests {
     #[test]
     fn integer_index_keys_sort_before_strings() {
         let mut heap = fresh_heap();
-        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "b", Value::boolean(true));
-        set(o, &mut heap, "10", Value::boolean(true));
-        set(o, &mut heap, "2", Value::boolean(true));
-        set(o, &mut heap, "a", Value::boolean(true));
-        set(o, &mut heap, "1", Value::boolean(true));
-        set(o, &mut heap, "01", Value::boolean(true));
-        set(o, &mut heap, "4294967295", Value::boolean(true));
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set(&mut o, &mut heap, "b", Value::boolean(true));
+        set(&mut o, &mut heap, "10", Value::boolean(true));
+        set(&mut o, &mut heap, "2", Value::boolean(true));
+        set(&mut o, &mut heap, "a", Value::boolean(true));
+        set(&mut o, &mut heap, "1", Value::boolean(true));
+        set(&mut o, &mut heap, "01", Value::boolean(true));
+        set(&mut o, &mut heap, "4294967295", Value::boolean(true));
 
         let keys: Vec<String> =
             with_properties(o, &heap, |p| p.keys().map(str::to_string).collect());
@@ -4713,8 +4720,8 @@ mod tests {
     #[test]
     fn delete_removes_property() {
         let mut heap = fresh_heap();
-        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "x", Value::boolean(true));
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set(&mut o, &mut heap, "x", Value::boolean(true));
         assert!(delete(o, &mut heap, "x"));
         assert!(get(o, &heap, "x").is_none());
         // §10.1.10 — deleting a missing property still reports
@@ -4725,9 +4732,9 @@ mod tests {
     #[test]
     fn handle_copy_shares_storage() {
         let mut heap = fresh_heap();
-        let a = alloc_object_old_for_fixture(&mut heap).unwrap();
+        let mut a = alloc_object_old_for_fixture(&mut heap).unwrap();
         let b = a; // Copy
-        set(a, &mut heap, "x", Value::boolean(true));
+        set(&mut a, &mut heap, "x", Value::boolean(true));
         assert_eq!(a, b);
         assert!(get(b, &heap, "x").is_some_and(|v| v.as_boolean() == Some(true)));
     }
@@ -4778,10 +4785,10 @@ mod tests {
     #[test]
     fn overwrite_does_not_grow_shape() {
         let mut heap = fresh_heap();
-        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "x", Value::boolean(true));
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set(&mut o, &mut heap, "x", Value::boolean(true));
         let s1 = shape_id(o, &heap);
-        set(o, &mut heap, "x", Value::null());
+        set(&mut o, &mut heap, "x", Value::null());
         let s2 = shape_id(o, &heap);
         assert_eq!(s1, s2);
         assert_eq!(len(o, &heap), 1);
@@ -4790,9 +4797,9 @@ mod tests {
     #[test]
     fn delete_switches_to_dictionary_shape() {
         let mut heap = fresh_heap();
-        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "a", Value::boolean(true));
-        set(o, &mut heap, "b", Value::null());
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set(&mut o, &mut heap, "a", Value::boolean(true));
+        set(&mut o, &mut heap, "b", Value::null());
         let before = shape_id(o, &heap);
         assert!(supports_fast_property_ic(o, &heap));
         delete(o, &mut heap, "a");
@@ -4899,8 +4906,8 @@ mod tests {
     #[test]
     fn freeze_makes_object_non_writable() {
         let mut heap = fresh_heap();
-        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "x", Value::boolean(true));
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set(&mut o, &mut heap, "x", Value::boolean(true));
         freeze(o, &mut heap);
         assert!(is_frozen(o, &heap));
         assert!(is_sealed(o, &heap));
@@ -4919,8 +4926,8 @@ mod tests {
     #[test]
     fn seal_blocks_new_properties() {
         let mut heap = fresh_heap();
-        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "a", Value::null());
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set(&mut o, &mut heap, "a", Value::null());
         seal(o, &mut heap);
         assert!(is_sealed(o, &heap));
         assert!(!is_frozen(o, &heap));

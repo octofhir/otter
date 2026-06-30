@@ -182,19 +182,20 @@ pub(crate) fn collator_resolved_options(
     let case_first = Value::string(JsString::from_str(&payload.case_first, ctx.heap_mut())?);
     let ignore_punctuation = payload.ignore_punctuation;
     let numeric = payload.numeric;
-    let obj = ctx.alloc_object_with_roots(&[&locale, &usage, &sensitivity, &case_first], &[])?;
+    let mut obj =
+        ctx.alloc_object_with_roots(&[&locale, &usage, &sensitivity, &case_first], &[])?;
     let heap = ctx.heap_mut();
-    crate::object::set(obj, heap, "locale", locale);
-    crate::object::set(obj, heap, "usage", usage);
-    crate::object::set(obj, heap, "sensitivity", sensitivity);
+    crate::object::set(&mut obj, heap, "locale", locale);
+    crate::object::set(&mut obj, heap, "usage", usage);
+    crate::object::set(&mut obj, heap, "sensitivity", sensitivity);
     crate::object::set(
-        obj,
+        &mut obj,
         heap,
         "ignorePunctuation",
         Value::boolean(ignore_punctuation),
     );
-    crate::object::set(obj, heap, "numeric", Value::boolean(numeric));
-    crate::object::set(obj, heap, "caseFirst", case_first);
+    crate::object::set(&mut obj, heap, "numeric", Value::boolean(numeric));
+    crate::object::set(&mut obj, heap, "caseFirst", case_first);
     Ok(Value::object(obj))
 }
 

@@ -74,6 +74,40 @@ const FLAG_REMEMBERED: u8 = 0b0100_0000;
 /// REMEMBERED_FLAG; if old ∧ young-child ∧ ¬remembered → cold-call push`.
 pub const REMEMBERED_FLAG: u8 = FLAG_REMEMBERED;
 
+// Frozen flag-byte assignment. The inline generational barrier the optimizing
+// tier will emit tests the young and remembered bits at a fixed mask, and the
+// flag byte sits at a fixed offset in the header, so pin every bit. A reorder
+// or overlap is a compile error rather than a barrier that tests the wrong bit.
+const _: () = assert!(MARK_COLOR_MASK == 0b0000_0011);
+const _: () = assert!(FLAG_YOUNG == 0b0000_0100);
+const _: () = assert!(FLAG_FORWARDED == 0b0000_1000);
+const _: () = assert!(FLAG_PINNED == 0b0001_0000);
+const _: () = assert!(FLAG_SWEPT == 0b0010_0000);
+const _: () = assert!(FLAG_REMEMBERED == 0b0100_0000);
+const _: () = assert!(HEADER_FLAGS_BYTE_OFFSET == 1);
+// Each flag is a single distinct bit, none overlapping another or the 2-bit
+// mark-color field — so a flag mutation never disturbs the color and vice
+// versa. The OR of all five single-bit flags equals their sum iff they are
+// pairwise disjoint.
+const _: () = assert!(
+    FLAG_YOUNG + FLAG_FORWARDED + FLAG_PINNED + FLAG_SWEPT + FLAG_REMEMBERED
+        == (FLAG_YOUNG | FLAG_FORWARDED | FLAG_PINNED | FLAG_SWEPT | FLAG_REMEMBERED)
+);
+const _: () = assert!(
+    (FLAG_YOUNG | FLAG_FORWARDED | FLAG_PINNED | FLAG_SWEPT | FLAG_REMEMBERED) & MARK_COLOR_MASK
+        == 0
+);
+// `clear_mark` clears only the color field, so the swept and remembered bits
+// survive it — load-bearing for idempotent sweep and for a remembered parent
+// staying recorded across an old-gen mark reset.
+const _: () = assert!(FLAG_SWEPT & MARK_COLOR_MASK == 0);
+const _: () = assert!(FLAG_REMEMBERED & MARK_COLOR_MASK == 0);
+// The top bit stays free for a future flag.
+const _: () = assert!(
+    (MARK_COLOR_MASK | FLAG_YOUNG | FLAG_FORWARDED | FLAG_PINNED | FLAG_SWEPT | FLAG_REMEMBERED)
+        == 0b0111_1111
+);
+
 /// Tri-color marker state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -325,6 +359,9 @@ const _: () = assert!(
     std::mem::align_of::<GcHeader>() <= 8,
     "GcHeader alignment must be <= 8 bytes"
 );
+// The baked flag-byte offset must match the real field: the inline barrier
+// loads `flags` at this displacement off the header base.
+const _: () = assert!(std::mem::offset_of!(GcHeader, flags) == HEADER_FLAGS_BYTE_OFFSET);
 
 #[cfg(test)]
 mod tests {

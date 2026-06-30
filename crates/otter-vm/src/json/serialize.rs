@@ -193,34 +193,65 @@ impl Interpreter {
         reviver: &Value,
         source: Option<&crate::json::parse::SourceNode>,
     ) -> Result<Value, VmError> {
-        let value = self.get_property_value_for_call(context, holder, name)?;
+        // `holder` and `value` are parked on the scratch root stack: every
+        // recursive revive, the reviver context build, the key-argument
+        // string, and the reviver call below can scavenge, and reading or
+        // writing through a moved handle would touch freed heap. Each step
+        // re-reads from the slot.
+        let holder_root = self.json_root_push(holder);
+        let value0 = self.get_property_value_for_call(context, holder, name)?;
+        let value_root = self.json_root_push(value0);
 
-        if value.is_object_type() {
-            if self.json_is_array(&value)? {
-                let len = self.json_length(context, &value)?;
+        if self.json_root_get(value_root).is_object_type() {
+            if self.json_is_array(&self.json_root_get(value_root))? {
+                let len = self.json_length(context, &self.json_root_get(value_root))?;
                 for index in 0..len {
                     let key = index.to_string();
                     let child = source.and_then(|s| s.array_child(index));
-                    self.internalize_one(context, value, &key, reviver, child)?;
+                    self.internalize_one(
+                        context,
+                        self.json_root_get(value_root),
+                        &key,
+                        reviver,
+                        child,
+                    )?;
                 }
             } else {
                 // EnumerableOwnPropertyNames is snapshotted up front so
                 // a reviver mutating later siblings cannot perturb the
                 // key set already chosen (§25.5.1.1 step 2.c.i).
-                let keys = self.json_enumerable_string_keys(context, &value)?;
+                let keys =
+                    self.json_enumerable_string_keys(context, &self.json_root_get(value_root))?;
                 for key in keys {
                     let child = source.and_then(|s| s.object_child(&key));
-                    self.internalize_one(context, value, &key, reviver, child)?;
+                    self.internalize_one(
+                        context,
+                        self.json_root_get(value_root),
+                        &key,
+                        reviver,
+                        child,
+                    )?;
                 }
             }
         }
 
         // §25.5.1.1 — the reviver receives a `context` object whose
-        // own `source` property is present only for primitive leaves.
+        // own `source` property is present only for primitive leaves. Park
+        // every reviver argument so a later argument's allocation cannot
+        // dangle an earlier one before the call assembles them.
         let name_arg = self.json_key_value(name)?;
-        let context_obj = self.json_make_reviver_context(value, source)?;
-        let args: SmallVec<[Value; 8]> = smallvec![name_arg, value, context_obj];
-        self.run_callable_sync(context, reviver, holder, args)
+        let name_root = self.json_root_push(name_arg);
+        let context_obj = self.json_make_reviver_context(self.json_root_get(value_root), source)?;
+        let context_root = self.json_root_push(context_obj);
+        let args: SmallVec<[Value; 8]> = smallvec![
+            self.json_root_get(name_root),
+            self.json_root_get(value_root),
+            self.json_root_get(context_root),
+        ];
+        let holder = self.json_root_get(holder_root);
+        let result = self.run_callable_sync(context, reviver, holder, args);
+        self.json_root_pop_to(holder_root);
+        result
     }
 
     /// Build the reviver `context` object: a plain `%Object.prototype%`
@@ -232,6 +263,12 @@ impl Interpreter {
         source: Option<&crate::json::parse::SourceNode>,
     ) -> Result<Value, VmError> {
         let obj = self.json_make_plain_object()?;
+        // Root the context object and the leaf value across the re-parse and
+        // string allocations below: under GC both can move, and writing
+        // `source` through a stale receiver handle (or comparing a stale leaf)
+        // would read or corrupt freed heap.
+        let obj_root = self.json_root_push(Value::object(obj));
+        let value_root = self.json_root_push(value);
         if !value.is_object_type()
             && let Some(src) = source.and_then(|s| s.source())
         {
@@ -242,15 +279,22 @@ impl Interpreter {
             let still_original = crate::json::parse::parse(src, self.gc_heap_mut())
                 .ok()
                 .is_some_and(|parsed| {
-                    crate::abstract_ops::same_value(&value, &parsed, self.gc_heap())
+                    let leaf = self.json_root_get(value_root);
+                    crate::abstract_ops::same_value(&leaf, &parsed, self.gc_heap())
                 });
             if still_original {
                 let js = JsString::from_str(src, self.gc_heap_mut())
                     .map_err(|_| self.err_type(("out of memory".to_string()).into()))?;
-                object::set(obj, self.gc_heap_mut(), "source", Value::string(js));
+                let obj_now = self
+                    .json_root_get(obj_root)
+                    .as_object()
+                    .expect("rooted reviver context object");
+                object::set(obj_now, self.gc_heap_mut(), "source", Value::string(js));
             }
         }
-        Ok(Value::object(obj))
+        let result = self.json_root_get(obj_root);
+        self.json_root_pop_to(obj_root);
+        Ok(result)
     }
 
     /// Allocate an empty `%Object.prototype%`-backed object.
@@ -276,13 +320,20 @@ impl Interpreter {
         reviver: &Value,
         source: Option<&crate::json::parse::SourceNode>,
     ) -> Result<(), VmError> {
+        // The recursive revive moves the heap; root `holder` so the define /
+        // delete below targets the live object, not a stale handle.
+        let holder_root = self.json_root_push(holder);
         let new_element = self.internalize_json_property(context, holder, key, reviver, source)?;
         let property_key = crate::VmPropertyKey::OwnedString(key.to_string());
         if new_element.is_undefined() {
+            let holder = self.json_root_get(holder_root);
             self.ordinary_delete_value(context, holder, &property_key, 0)?;
         } else {
+            // Park the revived value across the define's transition allocation.
+            let elem_root = self.json_root_push(new_element);
+            let holder = self.json_root_get(holder_root);
             let descriptor = object::PartialPropertyDescriptor {
-                value: Some(new_element),
+                value: Some(self.json_root_get(elem_root)),
                 writable: Some(true),
                 enumerable: Some(true),
                 configurable: Some(true),
@@ -290,6 +341,7 @@ impl Interpreter {
             };
             self.define_own_property_value(context, &holder, &property_key, descriptor)?;
         }
+        self.json_root_pop_to(holder_root);
         Ok(())
     }
 
@@ -895,10 +947,29 @@ impl Interpreter {
         };
         let obj = object::alloc_object_with_roots(self.gc_heap_mut(), &mut roots)
             .map_err(|_| self.err_type(("out of memory".to_string()).into()))?;
+        // `set_prototype_value` and `set` intern the key and transition the
+        // shape — allocations that can move the young receiver. Root `obj` (and
+        // `value`) and re-read the receiver after each so the writes never go
+        // through a stale handle, and return the moved handle.
+        let obj_root = self.json_root_push(Value::object(obj));
+        let value_root = self.json_root_push(value);
         let object_proto = self.object_prototype_object_opt();
-        object::set_prototype_value(obj, self.gc_heap_mut(), object_proto.map(Value::object));
-        object::set(obj, self.gc_heap_mut(), "", value);
-        Ok(obj)
+        let recv = self.json_root_get_object(obj_root);
+        object::set_prototype_value(recv, self.gc_heap_mut(), object_proto.map(Value::object));
+        let recv = self.json_root_get_object(obj_root);
+        let leaf = self.json_root_get(value_root);
+        object::set(recv, self.gc_heap_mut(), "", leaf);
+        let result = self.json_root_get_object(obj_root);
+        self.json_root_pop_to(obj_root);
+        Ok(result)
+    }
+
+    /// Read a rooted object handle, refreshed after any intervening GC. Panics
+    /// if the rooted slot is not an object (a caller bug).
+    fn json_root_get_object(&self, root: usize) -> object::JsObject {
+        self.json_root_get(root)
+            .as_object()
+            .expect("rooted JSON handle must be an object")
     }
 
     /// Build the `key` argument passed to `toJSON` / the replacer.

@@ -14,6 +14,33 @@
 //! - Pending records identify their originating pc before resume.
 //! - GC-bearing frame fields are visited by trace_frame_slots.
 //!
+//! # Frame ABI (frozen)
+//!
+//! The optimizing tier bakes constant displacements against a frame's register
+//! window and references the frame header by field, and the deopt frame-state
+//! record is keyed by these slots, so the following layout is a stable contract
+//! — change a literal only in lockstep with the codegen and the deopt record.
+//!
+//! - **Register window.** A frame's registers are a contiguous run of [`Value`]
+//!   slots. Register `r` lives at `window_base + r * size_of::<Value>()`; the
+//!   stride is 8 bytes ([`REGISTER_SLOT_BYTES`]). For a [`FrameRegisters::Window`]
+//!   the base is `ptr` and `base_off` is its slot index in the flat register
+//!   stack; an [`FrameRegisters::Owned`] window has the same per-register layout
+//!   in its own buffer.
+//! - **Calling convention.** Argument `i` (declaration order) is delivered in
+//!   window register `i` for `i < arity`; the caller writes the arguments into
+//!   the callee window starting at register 0 before transferring control. The
+//!   prologue binds each into its local storage. Locals and scratch temporaries
+//!   occupy registers above the arguments.
+//! - **`this` / new.target are header fields, not window registers.** They live
+//!   in [`Frame::this_value`] (and the cold record) and are materialized into a
+//!   register on demand by the load opcodes, so a callee never reserves a window
+//!   slot for them.
+//! - **Header.** [`Frame::function_id`] + [`Frame::pc`] identify the resume
+//!   point; [`Frame::return_register`] names the caller register that receives
+//!   the completion value (`None` for `<main>`); [`Frame::upvalues`] is the
+//!   captured-cell spine indexed by the upvalue opcodes.
+//!
 //! # See also
 //! - [crate::frame_ops]
 //! - [crate::executable]
@@ -29,6 +56,13 @@ use crate::{
 };
 
 pub(crate) type UpvalueSpine = Box<[UpvalueCell]>;
+
+/// Byte stride between adjacent registers in a frame window. Register `r` sits
+/// at `window_base + r * REGISTER_SLOT_BYTES`. Frozen: the optimizing tier
+/// bakes this stride into every windowed register access and the deopt record
+/// reconstructs interpreter registers at this stride.
+pub(crate) const REGISTER_SLOT_BYTES: usize = std::mem::size_of::<Value>();
+const _: () = assert!(REGISTER_SLOT_BYTES == 8);
 
 // Hot frame fits in two 64 B cache lines. Cold protocol state (try
 // handlers, async parking, pending ToPrimitive/bind/iterator ladders,

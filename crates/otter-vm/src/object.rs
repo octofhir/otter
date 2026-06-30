@@ -651,12 +651,6 @@ impl ObjectBody {
         decompress(self.values[i], heap)
     }
 
-    /// Read the raw compressed slot `i` without decompressing.
-    #[inline]
-    fn data_slot(&self, i: usize) -> CompressedValue {
-        self.values[i]
-    }
-
     /// Write a pre-compressed data value into string-keyed slot `i`.
     #[inline]
     fn set_data_value(&mut self, i: usize, value: CompressedValue) {

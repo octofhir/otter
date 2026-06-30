@@ -557,8 +557,9 @@ pub struct ObjectBody {
     /// write through [`ObjectBody::exotic_mut`].
     exotic: Option<Box<ExoticSlots>>,
     /// In-body storage for the first [`INLINE_SLOT_CAP`] string-keyed slots, so
-    /// a small object needs no separate slab allocation and its slots live in
-    /// the GC page (the precondition for a precise old→young remembered set).
+    /// a small object needs no separate slab allocation and keeps its hot slots
+    /// in the same cache line as the shape and `values_ptr` (the
+    /// allocation-locality merit every surveyed engine except QuickJS keeps).
     /// Active while `slab_len <= INLINE_SLOT_CAP`; growth past the cap migrates
     /// every slot wholesale into `values` and leaves this array unused.
     /// `values_ptr` always points at whichever buffer is active, so the slot
@@ -571,7 +572,16 @@ pub struct ObjectBody {
 /// In-body inline string-keyed slot capacity. Objects with this many own data
 /// properties or fewer carry their slab in [`ObjectBody::inline_values`]; larger
 /// objects spill the whole slab to the out-of-line `values` vector.
-pub(crate) const INLINE_SLOT_CAP: usize = 4;
+///
+/// Held to 2 (not 4): the object-granular remembered set records the parent
+/// object and re-traces it through the refreshed slab base, so it does not
+/// matter for GC precision whether a small object's slots are in-page or in
+/// the malloc `values` Vec. The inline cap therefore exists purely for
+/// allocation locality, and a flat reservation of 4 charged every body — the
+/// dominant `{}` / class-instance case included — 8 bytes of always-present
+/// slack it usually does not use. Two inline slots cover the large majority of
+/// objects with ≤2 own string-keyed properties at half the slack.
+pub(crate) const INLINE_SLOT_CAP: usize = 2;
 
 /// Rarely-used `ObjectBody` slots, boxed out of the hot object so plain
 /// objects stay small. Every field here is absent on a plain `{}` / class
@@ -656,8 +666,10 @@ const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET.is_multiple_of(4));
 
 // Pin the hot object footprint. Per-slot metadata lives out of line only for
 // dictionary-mode / attribute-overridden objects, while string-keyed values use
-// one contiguous slab addressed from a cached pointer.
-const _: () = assert!(std::mem::size_of::<ObjectBody>() == 96);
+// one contiguous slab addressed from a cached pointer. Shrinking
+// `INLINE_SLOT_CAP` 4 -> 2 dropped two inline `CompressedValue`s (8 bytes) off
+// the tail.
+const _: () = assert!(std::mem::size_of::<ObjectBody>() == 88);
 
 impl ObjectBody {
     /// Number of live string-keyed slots.

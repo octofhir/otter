@@ -5724,7 +5724,7 @@ impl Interpreter {
 
     fn update_array_prototype_length_after_index_store(
         &mut self,
-        obj: object::JsObject,
+        mut obj: object::JsObject,
         key: &str,
     ) {
         if self.realm_intrinsics.array_prototype != Some(obj) {
@@ -5740,7 +5740,7 @@ impl Interpreter {
             .unwrap_or(0.0);
         if new_len > current {
             object::set(
-                obj,
+                &mut obj,
                 &mut self.gc_heap,
                 "length",
                 Value::number(NumberValue::from_f64(new_len)),
@@ -5810,7 +5810,7 @@ impl Interpreter {
         if let Some(next_shape) = next_shape {
             object::set_with_shape(obj, &mut self.gc_heap, key, value, next_shape, old_count);
         } else {
-            object::set(obj, &mut self.gc_heap, key, value);
+            object::set(&mut obj, &mut self.gc_heap, key, value);
         }
         self.update_array_prototype_length_after_index_store(obj, key);
         Ok(())
@@ -5844,7 +5844,7 @@ impl Interpreter {
         if let Some(next_shape) = next_shape {
             object::set_with_shape(obj, &mut self.gc_heap, key, value, next_shape, old_count);
         } else {
-            object::set(obj, &mut self.gc_heap, key, value);
+            object::set(&mut obj, &mut self.gc_heap, key, value);
         }
         self.update_array_prototype_length_after_index_store(obj, key);
         Ok(())
@@ -12107,12 +12107,17 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("String")
             .expect("String.prototype")
             .as_object()
             .expect("String.prototype object");
-        object::set(proto, interp.gc_heap_mut(), "slice", Value::number_i32(1));
+        object::set(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "slice",
+            Value::number_i32(1),
+        );
         let recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
 
         let context = ExecutionContext::from_module(module.clone());
@@ -12154,14 +12159,14 @@ mod tests {
         }
 
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("String")
             .expect("String.prototype")
             .as_object()
             .expect("String.prototype object");
         let replacement = native_value_static(interp.gc_heap_mut(), "replacement", 1, replacement)
             .expect("replacement");
-        object::set(proto, interp.gc_heap_mut(), "charCodeAt", replacement);
+        object::set(&mut proto, interp.gc_heap_mut(), "charCodeAt", replacement);
         let recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
 
         let stack = call_char_code_at(&mut interp, recv).expect("charCodeAt shadow should resolve");
@@ -12172,13 +12177,13 @@ mod tests {
     #[test]
     fn call_method_string_char_code_at_non_callable_shadows_builtin() {
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("String")
             .expect("String.prototype")
             .as_object()
             .expect("String.prototype object");
         object::set(
-            proto,
+            &mut proto,
             interp.gc_heap_mut(),
             "charCodeAt",
             Value::number_i32(1),
@@ -12237,13 +12242,13 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("Number")
             .expect("Number.prototype")
             .as_object()
             .expect("Number.prototype object");
         object::set(
-            proto,
+            &mut proto,
             interp.gc_heap_mut(),
             "toString",
             Value::number_i32(1),
@@ -12292,14 +12297,14 @@ mod tests {
         }
 
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("Number")
             .expect("Number.prototype")
             .as_object()
             .expect("Number.prototype object");
         let replacement = native_value_static(interp.gc_heap_mut(), "replacement", 1, replacement)
             .expect("replacement");
-        object::set(proto, interp.gc_heap_mut(), "toString", replacement);
+        object::set(&mut proto, interp.gc_heap_mut(), "toString", replacement);
 
         let stack = call_number_to_string(&mut interp, Value::number_i32(42), None)
             .expect("Number.prototype.toString shadow should resolve");
@@ -12384,12 +12389,17 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("Boolean")
             .expect("Boolean.prototype")
             .as_object()
             .expect("Boolean.prototype object");
-        object::set(proto, interp.gc_heap_mut(), "valueOf", Value::number_i32(1));
+        object::set(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "valueOf",
+            Value::number_i32(1),
+        );
 
         let context = ExecutionContext::from_module(module.clone());
         let mut stack: HoltStack = HoltStack::new();
@@ -12427,13 +12437,13 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("BigInt")
             .expect("BigInt.prototype")
             .as_object()
             .expect("BigInt.prototype object");
         object::set(
-            proto,
+            &mut proto,
             interp.gc_heap_mut(),
             "toString",
             Value::number_i32(1),
@@ -12477,12 +12487,17 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("Symbol")
             .expect("Symbol.prototype")
             .as_object()
             .expect("Symbol.prototype object");
-        object::set(proto, interp.gc_heap_mut(), "valueOf", Value::number_i32(1));
+        object::set(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "valueOf",
+            Value::number_i32(1),
+        );
         let symbol = JsSymbol::new(interp.gc_heap_mut(), None).expect("symbol allocation");
 
         let context = ExecutionContext::from_module(module.clone());
@@ -12521,12 +12536,17 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("WeakRef")
             .expect("WeakRef.prototype")
             .as_object()
             .expect("WeakRef.prototype object");
-        object::set(proto, interp.gc_heap_mut(), "deref", Value::number_i32(1));
+        object::set(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "deref",
+            Value::number_i32(1),
+        );
         let target = Value::object(
             crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut())
                 .expect("target object"),
@@ -12574,13 +12594,13 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("FinalizationRegistry")
             .expect("FinalizationRegistry.prototype")
             .as_object()
             .expect("FinalizationRegistry.prototype object");
         object::set(
-            proto,
+            &mut proto,
             interp.gc_heap_mut(),
             "unregister",
             Value::number_i32(1),
@@ -12630,9 +12650,9 @@ mod tests {
         };
         let mut interp = Interpreter::new();
         let promise = promise_dispatch::pending_runtime_rooted(&mut interp, &[], &[]).unwrap();
-        let bag = property_dispatch::promise_ensure_expando_pub(interp.gc_heap_mut(), &promise)
+        let mut bag = property_dispatch::promise_ensure_expando_pub(interp.gc_heap_mut(), &promise)
             .expect("promise expando");
-        object::set(bag, interp.gc_heap_mut(), "then", Value::number_i32(1));
+        object::set(&mut bag, interp.gc_heap_mut(), "then", Value::number_i32(1));
 
         let context = ExecutionContext::from_module(module.clone());
         let mut stack: HoltStack = HoltStack::new();
@@ -12671,12 +12691,17 @@ mod tests {
         };
         let mut interp = Interpreter::new();
         let promise = promise_dispatch::pending_runtime_rooted(&mut interp, &[], &[]).unwrap();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("Promise")
             .expect("Promise.prototype")
             .as_object()
             .expect("Promise.prototype object");
-        object::set(proto, interp.gc_heap_mut(), "then", Value::number_i32(1));
+        object::set(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "then",
+            Value::number_i32(1),
+        );
 
         let context = ExecutionContext::from_module(module.clone());
         let mut stack: HoltStack = HoltStack::new();
@@ -12760,9 +12785,9 @@ mod tests {
         let mut interp = Interpreter::new();
         let units: Vec<u16> = "x".encode_utf16().collect();
         let regexp = JsRegExp::compile(interp.gc_heap_mut(), &units, "").expect("regexp");
-        let bag = property_dispatch::regexp_ensure_expando_pub(interp.gc_heap_mut(), &regexp)
+        let mut bag = property_dispatch::regexp_ensure_expando_pub(interp.gc_heap_mut(), &regexp)
             .expect("regexp expando");
-        object::set(bag, interp.gc_heap_mut(), "exec", Value::number_i32(1));
+        object::set(&mut bag, interp.gc_heap_mut(), "exec", Value::number_i32(1));
 
         let context = ExecutionContext::from_module(module.clone());
         let mut stack: HoltStack = HoltStack::new();
@@ -12800,12 +12825,17 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("RegExp")
             .expect("RegExp.prototype")
             .as_object()
             .expect("RegExp.prototype object");
-        object::set(proto, interp.gc_heap_mut(), "exec", Value::number_i32(1));
+        object::set(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "exec",
+            Value::number_i32(1),
+        );
         let units: Vec<u16> = "x".encode_utf16().collect();
         let regexp = JsRegExp::compile(interp.gc_heap_mut(), &units, "").expect("regexp");
 
@@ -12845,12 +12875,17 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("Date")
             .expect("Date.prototype")
             .as_object()
             .expect("Date.prototype object");
-        object::set(proto, interp.gc_heap_mut(), "getTime", Value::number_i32(1));
+        object::set(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "getTime",
+            Value::number_i32(1),
+        );
         let date =
             crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("date object");
         object::set_prototype(date, interp.gc_heap_mut(), Some(proto));
@@ -12892,12 +12927,17 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("Date")
             .expect("Date.prototype")
             .as_object()
             .expect("Date.prototype object");
-        object::set(proto, interp.gc_heap_mut(), "setTime", Value::number_i32(1));
+        object::set(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "setTime",
+            Value::number_i32(1),
+        );
         let date =
             crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("date object");
         object::set_prototype(date, interp.gc_heap_mut(), Some(proto));
@@ -12951,10 +12991,10 @@ mod tests {
             1,
         )
         .expect("typed array");
-        let bag =
+        let mut bag =
             property_dispatch::typed_array_ensure_expando_pub(interp.gc_heap_mut(), &typed_array)
                 .expect("typed array expando");
-        object::set(bag, interp.gc_heap_mut(), "map", Value::number_i32(1));
+        object::set(&mut bag, interp.gc_heap_mut(), "map", Value::number_i32(1));
 
         let context = ExecutionContext::from_module(module.clone());
         let mut stack: HoltStack = HoltStack::new();
@@ -12992,12 +13032,17 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("Int8Array")
             .expect("Int8Array.prototype")
             .as_object()
             .expect("Int8Array.prototype object");
-        object::set(proto, interp.gc_heap_mut(), "map", Value::number_i32(1));
+        object::set(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "map",
+            Value::number_i32(1),
+        );
         let buffer =
             crate::binary::alloc_local_array_buffer(interp.gc_heap_mut(), vec![0], None, None)
                 .expect("array buffer");
@@ -13047,12 +13092,17 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("Int8Array")
             .expect("Int8Array.prototype")
             .as_object()
             .expect("Int8Array.prototype object");
-        object::set(proto, interp.gc_heap_mut(), "slice", Value::number_i32(1));
+        object::set(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "slice",
+            Value::number_i32(1),
+        );
         let buffer =
             crate::binary::alloc_local_array_buffer(interp.gc_heap_mut(), vec![0], None, None)
                 .expect("array buffer");
@@ -13102,12 +13152,17 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("Iterator")
             .expect("Iterator.prototype")
             .as_object()
             .expect("Iterator.prototype object");
-        object::set(proto, interp.gc_heap_mut(), "toArray", Value::number_i32(1));
+        object::set(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "toArray",
+            Value::number_i32(1),
+        );
         let source = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
             [Value::number(NumberValue::from_i32(1))],
@@ -13154,12 +13209,17 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("Map")
             .expect("Map.prototype")
             .as_object()
             .expect("Map.prototype object");
-        object::set(proto, interp.gc_heap_mut(), "forEach", Value::number_i32(1));
+        object::set(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "forEach",
+            Value::number_i32(1),
+        );
         let map = crate::collections::alloc_map(interp.gc_heap_mut()).expect("map");
 
         let context = ExecutionContext::from_module(module.clone());
@@ -13198,12 +13258,17 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("Set")
             .expect("Set.prototype")
             .as_object()
             .expect("Set.prototype object");
-        object::set(proto, interp.gc_heap_mut(), "forEach", Value::number_i32(1));
+        object::set(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "forEach",
+            Value::number_i32(1),
+        );
         let set = crate::collections::alloc_set(interp.gc_heap_mut()).expect("set");
 
         let context = ExecutionContext::from_module(module.clone());
@@ -13242,12 +13307,17 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("Map")
             .expect("Map.prototype")
             .as_object()
             .expect("Map.prototype object");
-        object::set(proto, interp.gc_heap_mut(), "get", Value::number_i32(1));
+        object::set(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "get",
+            Value::number_i32(1),
+        );
         let map = crate::collections::alloc_map(interp.gc_heap_mut()).expect("map");
 
         let context = ExecutionContext::from_module(module.clone());
@@ -13286,12 +13356,17 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("Set")
             .expect("Set.prototype")
             .as_object()
             .expect("Set.prototype object");
-        object::set(proto, interp.gc_heap_mut(), "add", Value::number_i32(1));
+        object::set(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "add",
+            Value::number_i32(1),
+        );
         let set = crate::collections::alloc_set(interp.gc_heap_mut()).expect("set");
 
         let context = ExecutionContext::from_module(module.clone());
@@ -13330,12 +13405,17 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("WeakMap")
             .expect("WeakMap.prototype")
             .as_object()
             .expect("WeakMap.prototype object");
-        object::set(proto, interp.gc_heap_mut(), "get", Value::number_i32(1));
+        object::set(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "get",
+            Value::number_i32(1),
+        );
         let weak_map = crate::collections::alloc_weak_map(interp.gc_heap_mut()).expect("weak map");
 
         let context = ExecutionContext::from_module(module.clone());
@@ -13374,12 +13454,17 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("WeakSet")
             .expect("WeakSet.prototype")
             .as_object()
             .expect("WeakSet.prototype object");
-        object::set(proto, interp.gc_heap_mut(), "add", Value::number_i32(1));
+        object::set(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "add",
+            Value::number_i32(1),
+        );
         let weak_set = crate::collections::alloc_weak_set(interp.gc_heap_mut()).expect("weak set");
 
         let context = ExecutionContext::from_module(module.clone());
@@ -13418,12 +13503,17 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("ArrayBuffer")
             .expect("ArrayBuffer.prototype")
             .as_object()
             .expect("ArrayBuffer.prototype object");
-        object::set(proto, interp.gc_heap_mut(), "slice", Value::number_i32(1));
+        object::set(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "slice",
+            Value::number_i32(1),
+        );
         let buffer =
             crate::binary::alloc_local_array_buffer(interp.gc_heap_mut(), vec![0], None, None)
                 .expect("array buffer");
@@ -13465,13 +13555,13 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("DataView")
             .expect("DataView.prototype")
             .as_object()
             .expect("DataView.prototype object");
         object::set(
-            proto,
+            &mut proto,
             interp.gc_heap_mut(),
             "getUint8",
             Value::number_i32(1),
@@ -13519,12 +13609,17 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("Set")
             .expect("Set.prototype")
             .as_object()
             .expect("Set.prototype object");
-        object::set(proto, interp.gc_heap_mut(), "union", Value::number_i32(1));
+        object::set(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "union",
+            Value::number_i32(1),
+        );
         let set = crate::collections::alloc_set(interp.gc_heap_mut()).expect("set");
 
         let context = ExecutionContext::from_module(module.clone());
@@ -13569,10 +13664,10 @@ mod tests {
         frame.registers[0] = Value::function(0);
         stack.push(frame);
         let function_value = Value::function(0);
-        let bag = interp
+        let mut bag = interp
             .function_user_bag_stack_rooted(&stack, None, 0, &[&function_value])
             .expect("function user bag");
-        object::set(bag, interp.gc_heap_mut(), "call", Value::number_i32(1));
+        object::set(&mut bag, interp.gc_heap_mut(), "call", Value::number_i32(1));
 
         let err = interp
             .do_call_method_value(
@@ -13610,11 +13705,11 @@ mod tests {
         frame.registers[0] = Value::function(0);
         stack.push(frame);
         let function_value = Value::function(0);
-        let bag = interp
+        let mut bag = interp
             .function_user_bag_stack_rooted(&stack, None, 0, &[&function_value])
             .expect("function user bag");
         object::set(
-            bag,
+            &mut bag,
             interp.gc_heap_mut(),
             "hasOwnProperty",
             Value::number_i32(1),
@@ -13693,13 +13788,13 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("Object")
             .expect("Object.prototype")
             .as_object()
             .expect("Object.prototype object");
         object::set(
-            proto,
+            &mut proto,
             interp.gc_heap_mut(),
             "hasOwnProperty",
             Value::number_i32(1),
@@ -13744,13 +13839,13 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let proto = interp
+        let mut proto = interp
             .constructor_prototype_value("Object")
             .expect("Object.prototype")
             .as_object()
             .expect("Object.prototype object");
         object::set(
-            proto,
+            &mut proto,
             interp.gc_heap_mut(),
             "hasOwnProperty",
             Value::number_i32(1),
@@ -13803,12 +13898,17 @@ mod tests {
             .expect("String.prototype")
             .as_object()
             .expect("String.prototype object");
-        let obj =
+        let mut obj =
             object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("string wrapper");
         object::set_prototype(obj, interp.gc_heap_mut(), Some(proto));
         let data = JsString::from_str("abc", interp.gc_heap_mut()).expect("string data");
         object::set_string_data(obj, interp.gc_heap_mut(), data);
-        object::set(obj, interp.gc_heap_mut(), "replace", Value::number_i32(1));
+        object::set(
+            &mut obj,
+            interp.gc_heap_mut(),
+            "replace",
+            Value::number_i32(1),
+        );
         let search = Value::string(JsString::from_str("a", interp.gc_heap_mut()).expect("search"));
         let repl =
             native_value_static(interp.gc_heap_mut(), "replacement", 1, replacement).expect("repl");
@@ -14093,7 +14193,7 @@ mod tests {
         let mut interp = Interpreter::new();
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
-        let host = interp
+        let mut host = interp
             .alloc_host_object_with_roots(&[], &[])
             .expect("host object allocation");
         let host_root = Value::object(host);
@@ -14105,7 +14205,12 @@ mod tests {
                 &[elements.as_slice()],
             )
             .expect("host array allocation");
-        object::set(host, interp.gc_heap_mut(), "items", Value::array(array));
+        object::set(
+            &mut host,
+            interp.gc_heap_mut(),
+            "items",
+            Value::array(array),
+        );
 
         let after = interp.gc_heap_mut().stats().new_allocated_bytes;
         assert!(
@@ -15392,8 +15497,8 @@ mod tests {
         let apply =
             native_value_static(interp.gc_heap_mut(), "apply", 3, return_argv_array).unwrap();
         let target = native_value_static(interp.gc_heap_mut(), "target", 0, target_noop).unwrap();
-        let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
-        object::set(handler, interp.gc_heap_mut(), "apply", apply);
+        let mut handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
+        object::set(&mut handler, interp.gc_heap_mut(), "apply", apply);
         let proxy = Value::proxy(
             crate::proxy::JsProxy::new(interp.gc_heap_mut(), target, Value::object(handler))
                 .unwrap(),
@@ -15471,8 +15576,8 @@ mod tests {
         let mut interp = Interpreter::new();
         let construct =
             native_value_static(interp.gc_heap_mut(), "construct", 3, return_proxy_arg).unwrap();
-        let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
-        object::set(handler, interp.gc_heap_mut(), "construct", construct);
+        let mut handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
+        object::set(&mut handler, interp.gc_heap_mut(), "construct", construct);
         let proxy = Value::proxy(
             crate::proxy::JsProxy::new(
                 interp.gc_heap_mut(),
@@ -15522,8 +15627,8 @@ mod tests {
         let apply =
             native_value_static(interp.gc_heap_mut(), "apply", 3, return_argv_array).unwrap();
         let target = native_value_static(interp.gc_heap_mut(), "target", 0, target_noop).unwrap();
-        let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
-        object::set(handler, interp.gc_heap_mut(), "apply", apply);
+        let mut handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
+        object::set(&mut handler, interp.gc_heap_mut(), "apply", apply);
         let proxy = Value::proxy(
             crate::proxy::JsProxy::new(interp.gc_heap_mut(), target, Value::object(handler))
                 .unwrap(),
@@ -15639,8 +15744,8 @@ mod tests {
         let mut interp = Interpreter::new();
         let construct =
             native_value_static(interp.gc_heap_mut(), "construct", 3, return_argv_array).unwrap();
-        let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
-        object::set(handler, interp.gc_heap_mut(), "construct", construct);
+        let mut handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
+        object::set(&mut handler, interp.gc_heap_mut(), "construct", construct);
         let proxy = Value::proxy(
             crate::proxy::JsProxy::new(
                 interp.gc_heap_mut(),

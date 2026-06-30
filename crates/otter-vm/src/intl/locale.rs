@@ -609,8 +609,8 @@ pub(crate) fn get_text_info(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Val
         if rtl { "rtl" } else { "ltr" },
         ctx.heap_mut(),
     )?);
-    let obj = ordinary_object(ctx, &[&direction])?;
-    crate::object::set(obj, ctx.heap_mut(), "direction", direction);
+    let mut obj = ordinary_object(ctx, &[&direction])?;
+    crate::object::set(&mut obj, ctx.heap_mut(), "direction", direction);
     Ok(Value::object(obj))
 }
 
@@ -628,9 +628,9 @@ pub(crate) fn get_week_info(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Val
     };
     let weekend = string_array_i32(ctx, &[6, 7])?;
     let first_day_v = Value::number_i32(first_day);
-    let obj = ordinary_object(ctx, &[&first_day_v, &weekend])?;
-    crate::object::set(obj, ctx.heap_mut(), "firstDay", first_day_v);
-    crate::object::set(obj, ctx.heap_mut(), "weekend", weekend);
+    let mut obj = ordinary_object(ctx, &[&first_day_v, &weekend])?;
+    crate::object::set(&mut obj, ctx.heap_mut(), "firstDay", first_day_v);
+    crate::object::set(&mut obj, ctx.heap_mut(), "weekend", weekend);
     Ok(Value::object(obj))
 }
 

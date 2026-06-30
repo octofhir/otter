@@ -268,7 +268,7 @@ impl Interpreter {
                 *read_register(frame, src_reg)?,
             )
         };
-        if let (Some(target_obj), Some(src_obj)) = (target.as_object(), src.as_object()) {
+        if let (Some(mut target_obj), Some(src_obj)) = (target.as_object(), src.as_object()) {
             let existing: std::collections::HashSet<String> = self
                 .enumerable_own_string_keys_for_value(context, target, 0)?
                 .into_iter()
@@ -279,7 +279,7 @@ impl Interpreter {
                     continue;
                 }
                 if let Some(value) = crate::object::get(src_obj, &self.gc_heap, &name) {
-                    crate::object::set(target_obj, &mut self.gc_heap, &name, value);
+                    crate::object::set(&mut target_obj, &mut self.gc_heap, &name, value);
                 }
             }
         }
@@ -980,7 +980,7 @@ impl Interpreter {
                 if let Some(proto) = object_proto.as_ref() {
                     result_value_roots.push(proto);
                 }
-                let result = self.alloc_stack_rooted_object_with_value_roots(
+                let mut result = self.alloc_stack_rooted_object_with_value_roots(
                     stack,
                     result_value_roots.as_slice(),
                     args,
@@ -1030,7 +1030,7 @@ impl Interpreter {
                             &[args],
                         )?;
                         let desc_value = Value::object(desc_obj);
-                        object::set(result, &mut self.gc_heap, &key, desc_value);
+                        object::set(&mut result, &mut self.gc_heap, &key, desc_value);
                     }
                     let length_desc = crate::object::PropertyDescriptor::data(
                         Value::number_f64(units.len() as f64),
@@ -1045,7 +1045,7 @@ impl Interpreter {
                         &[args],
                     )?;
                     let length_value = Value::object(length_obj);
-                    object::set(result, &mut self.gc_heap, "length", length_value);
+                    object::set(&mut result, &mut self.gc_heap, "length", length_value);
                 } else if own_property_descriptors_uses_internal_methods(target) {
                     // §20.1.2.10.1 step 3 — drive the spec
                     // ladder via `own_property_keys_value`, then
@@ -1083,7 +1083,7 @@ impl Interpreter {
                         let desc_value = Value::object(desc_obj);
                         if let Some(s) = current_key.as_string(&self.gc_heap) {
                             let key_string = s.to_lossy_string(&self.gc_heap);
-                            object::set(result, &mut self.gc_heap, &key_string, desc_value);
+                            object::set(&mut result, &mut self.gc_heap, &key_string, desc_value);
                         } else if let Some(sym) = current_key.as_symbol(&self.gc_heap)
                             && !object::set_symbol(
                                 result,
@@ -1321,7 +1321,7 @@ impl Interpreter {
         }
         // §6.2.5.4 FromPropertyDescriptor step 2 — descriptor objects
         // inherit `%Object.prototype%`.
-        let result = self.alloc_stack_rooted_object_with_value_roots_and_slices(
+        let mut result = self.alloc_stack_rooted_object_with_value_roots_and_slices(
             stack,
             roots.as_slice(),
             slice_roots,
@@ -1331,9 +1331,9 @@ impl Interpreter {
         }
         match &desc.kind {
             object::DescriptorKind::Data { value } => {
-                object::set(result, &mut self.gc_heap, "value", *value);
+                object::set(&mut result, &mut self.gc_heap, "value", *value);
                 object::set(
-                    result,
+                    &mut result,
                     &mut self.gc_heap,
                     "writable",
                     Value::boolean(desc.writable()),
@@ -1341,13 +1341,13 @@ impl Interpreter {
             }
             object::DescriptorKind::Accessor { getter, setter } => {
                 object::set(
-                    result,
+                    &mut result,
                     &mut self.gc_heap,
                     "get",
                     (*getter).unwrap_or(Value::undefined()),
                 );
                 object::set(
-                    result,
+                    &mut result,
                     &mut self.gc_heap,
                     "set",
                     (*setter).unwrap_or(Value::undefined()),
@@ -1355,13 +1355,13 @@ impl Interpreter {
             }
         }
         object::set(
-            result,
+            &mut result,
             &mut self.gc_heap,
             "enumerable",
             Value::boolean(desc.enumerable()),
         );
         object::set(
-            result,
+            &mut result,
             &mut self.gc_heap,
             "configurable",
             Value::boolean(desc.configurable()),

@@ -231,9 +231,9 @@ fn clone_to_index(
         let flags_val = string_value(ctx, &flags)?;
         let ctor_val = ctor(ctx, "RegExp")?;
         let instance = ctx.construct(ctor_val, &[source_val, flags_val])?;
-        if let Some(obj) = instance.as_object() {
+        if let Some(mut obj) = instance.as_object() {
             object::set(
-                obj,
+                &mut obj,
                 ctx.heap_mut(),
                 "lastIndex",
                 number_value(last_index as f64),
@@ -341,10 +341,10 @@ fn clone_to_index(
         for (key, val) in props {
             let child_idx = clone_to_index(ctx, val, memo)?;
             let child = read_root(ctx, child_idx);
-            let live = read_root(ctx, obj_idx)
+            let mut live = read_root(ctx, obj_idx)
                 .as_object()
                 .ok_or_else(|| type_error("object clone relocated".to_string()))?;
-            object::set(live, ctx.heap_mut(), &key, child);
+            object::set(&mut live, ctx.heap_mut(), &key, child);
         }
         return Ok(obj_idx);
     }
@@ -379,8 +379,8 @@ fn clone_error(
     if let Some(cause) = object::get(obj, ctx.heap(), "cause") {
         let cause_idx = clone_to_index(ctx, cause, memo)?;
         let cause_v = read_root(ctx, cause_idx);
-        if let Some(inst) = read_root(ctx, idx).as_object() {
-            object::set(inst, ctx.heap_mut(), "cause", cause_v);
+        if let Some(mut inst) = read_root(ctx, idx).as_object() {
+            object::set(&mut inst, ctx.heap_mut(), "cause", cause_v);
         }
     }
     Ok(idx)

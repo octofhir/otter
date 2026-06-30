@@ -17,7 +17,7 @@ impl BuiltinIntrinsic for Intrinsic {
 
     fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
         let global_root = Value::object(global);
-        let temporal =
+        let mut temporal =
             NamespaceBuilder::from_spec_with_value_roots(heap, &TEMPORAL_SPEC, vec![global_root])?
                 .build()?;
         let temporal_value = Value::object(temporal);
@@ -38,7 +38,7 @@ impl BuiltinIntrinsic for Intrinsic {
             vec![global_root, temporal_value],
         )?
         .build()?;
-        object::set(temporal, heap, NOW_SPEC.name, Value::object(now));
+        object::set(&mut temporal, heap, NOW_SPEC.name, Value::object(now));
         Ok(())
     }
 

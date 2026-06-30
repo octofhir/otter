@@ -232,20 +232,20 @@ fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
     let call: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
         let specifier = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
         let id = spawn_worker_record(&host, specifier)?;
-        let worker = ctx.alloc_object()?;
+        let mut worker = ctx.alloc_object()?;
         let worker_value = Value::object(worker);
         object::set(
-            worker,
+            &mut worker,
             ctx.heap_mut(),
             "__otterWorkerId",
             Value::number_f64(id as f64),
         );
-        object::set(worker, ctx.heap_mut(), "onmessage", Value::null());
-        object::set(worker, ctx.heap_mut(), "onerror", Value::null());
-        object::set(worker, ctx.heap_mut(), "onmessageerror", Value::null());
+        object::set(&mut worker, ctx.heap_mut(), "onmessage", Value::null());
+        object::set(&mut worker, ctx.heap_mut(), "onerror", Value::null());
+        object::set(&mut worker, ctx.heap_mut(), "onmessageerror", Value::null());
         let listeners = ctx.alloc_object()?;
         object::set(
-            worker,
+            &mut worker,
             ctx.heap_mut(),
             "__otterListeners",
             Value::object(listeners),
@@ -287,7 +287,7 @@ fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
                 Ok(Value::undefined())
             },
         )?;
-        object::set(worker, ctx.heap_mut(), "postMessage", post);
+        object::set(&mut worker, ctx.heap_mut(), "postMessage", post);
 
         let terminate_host = host.clone();
         let terminate = ctx.native_value_with_captures(
@@ -308,7 +308,7 @@ fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
                 Ok(Value::undefined())
             },
         )?;
-        object::set(worker, ctx.heap_mut(), "terminate", terminate);
+        object::set(&mut worker, ctx.heap_mut(), "terminate", terminate);
 
         let dispatch = ctx.native_value_with_captures(
             "dispatchEvent",
@@ -330,7 +330,7 @@ fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
                 Ok(Value::boolean(true))
             },
         )?;
-        object::set(worker, ctx.heap_mut(), "dispatchEvent", dispatch);
+        object::set(&mut worker, ctx.heap_mut(), "dispatchEvent", dispatch);
         let add = ctx.native_value_with_captures(
             "addEventListener",
             smallvec![],
@@ -349,7 +349,7 @@ fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
                 Ok(Value::undefined())
             },
         )?;
-        object::set(worker, ctx.heap_mut(), "addEventListener", add);
+        object::set(&mut worker, ctx.heap_mut(), "addEventListener", add);
         let remove = ctx.native_value_with_captures(
             "removeEventListener",
             smallvec![],
@@ -366,7 +366,7 @@ fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
                 Ok(Value::undefined())
             },
         )?;
-        object::set(worker, ctx.heap_mut(), "removeEventListener", remove);
+        object::set(&mut worker, ctx.heap_mut(), "removeEventListener", remove);
 
         install_worker_poll_timer(ctx, host.clone(), worker)?;
         Ok(worker_value)
@@ -514,7 +514,7 @@ fn worker_drain_call(host: Arc<WorkerHostState>) -> NativeCall {
 fn install_worker_poll_timer(
     ctx: &mut NativeCtx<'_>,
     host: Arc<WorkerHostState>,
-    worker: object::JsObject,
+    mut worker: object::JsObject,
 ) -> Result<(), NativeError> {
     let worker_value = Value::object(worker);
     let poll = ctx.native_value_with_captures(
@@ -579,7 +579,7 @@ fn install_worker_poll_timer(
             smallvec![poll, Value::number_f64(1.0)],
         )
         .map_err(vm_error_to_native)?;
-    object::set(worker, ctx.heap_mut(), "__otterPoll", token);
+    object::set(&mut worker, ctx.heap_mut(), "__otterPoll", token);
     Ok(())
 }
 
@@ -628,7 +628,7 @@ fn dispatch_event_object(
 
 fn worker_listener_store(
     ctx: &mut NativeCtx<'_>,
-    worker: object::JsObject,
+    mut worker: object::JsObject,
 ) -> Result<object::JsObject, NativeError> {
     if let Some(store) =
         object::get(worker, ctx.heap(), "__otterListeners").and_then(|value| value.as_object())
@@ -637,7 +637,7 @@ fn worker_listener_store(
     }
     let store = ctx.alloc_object()?;
     object::set(
-        worker,
+        &mut worker,
         ctx.heap_mut(),
         "__otterListeners",
         Value::object(store),
@@ -651,12 +651,12 @@ fn add_worker_event_listener(
     ty: &str,
     listener: Value,
 ) -> Result<(), NativeError> {
-    let store = worker_listener_store(ctx, worker)?;
+    let mut store = worker_listener_store(ctx, worker)?;
     let list = match object::get(store, ctx.heap(), ty).and_then(|value| value.as_array()) {
         Some(list) => list,
         None => {
             let list = ctx.array_from_elements(Vec::new())?;
-            object::set(store, ctx.heap_mut(), ty, Value::array(list));
+            object::set(&mut store, ctx.heap_mut(), ty, Value::array(list));
             list
         }
     };
@@ -684,7 +684,7 @@ fn remove_worker_event_listener(
     ty: &str,
     listener: Value,
 ) -> Result<(), NativeError> {
-    let store = worker_listener_store(ctx, worker)?;
+    let mut store = worker_listener_store(ctx, worker)?;
     let Some(list) = object::get(store, ctx.heap(), ty).and_then(|value| value.as_array()) else {
         return Ok(());
     };
@@ -694,7 +694,7 @@ fn remove_worker_event_listener(
         .filter(|value| *value != listener)
         .collect();
     let next = ctx.array_from_elements(kept)?;
-    object::set(store, ctx.heap_mut(), ty, Value::array(next));
+    object::set(&mut store, ctx.heap_mut(), ty, Value::array(next));
     Ok(())
 }
 
@@ -874,29 +874,29 @@ fn worker_event_to_value(
     ctx: &mut NativeCtx<'_>,
     event: WorkerEvent,
 ) -> Result<Value, NativeError> {
-    let object = ctx.alloc_object()?;
+    let mut object = ctx.alloc_object()?;
     match event {
         WorkerEvent::Message(payload) => {
             let data = materialize_worker_payload(ctx, &payload)?;
             let ty = string_value(ctx, "message")?;
-            object::set(object, ctx.heap_mut(), "type", ty);
-            object::set(object, ctx.heap_mut(), "data", data);
+            object::set(&mut object, ctx.heap_mut(), "type", ty);
+            object::set(&mut object, ctx.heap_mut(), "data", data);
         }
         WorkerEvent::Error(message) => {
             let ty = string_value(ctx, "error")?;
             let message = string_value(ctx, &message)?;
-            object::set(object, ctx.heap_mut(), "type", ty);
-            object::set(object, ctx.heap_mut(), "message", message);
+            object::set(&mut object, ctx.heap_mut(), "type", ty);
+            object::set(&mut object, ctx.heap_mut(), "message", message);
         }
         WorkerEvent::MessageError(message) => {
             let ty = string_value(ctx, "messageerror")?;
             let message = string_value(ctx, &message)?;
-            object::set(object, ctx.heap_mut(), "type", ty);
-            object::set(object, ctx.heap_mut(), "message", message);
+            object::set(&mut object, ctx.heap_mut(), "type", ty);
+            object::set(&mut object, ctx.heap_mut(), "message", message);
         }
         WorkerEvent::Closed => {
             let ty = string_value(ctx, "close")?;
-            object::set(object, ctx.heap_mut(), "type", ty);
+            object::set(&mut object, ctx.heap_mut(), "type", ty);
         }
     }
     Ok(Value::object(object))
@@ -1159,10 +1159,10 @@ fn materialize_worker_payload(
             Ok(Value::array(array))
         }
         WorkerPayload::Object(properties) => {
-            let object = ctx.alloc_object()?;
+            let mut object = ctx.alloc_object()?;
             for (key, value) in properties {
                 let value = materialize_worker_payload(ctx, value)?;
-                object::set(object, ctx.heap_mut(), key, value);
+                object::set(&mut object, ctx.heap_mut(), key, value);
             }
             Ok(Value::object(object))
         }

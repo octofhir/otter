@@ -89,9 +89,9 @@ fn weak_ref_target_becomes_unavailable_after_force_gc() {
     let mut interp = Interpreter::new();
     let target = alloc_old_object(interp.gc_heap_mut()).expect("target");
     let weak_ref = alloc_weak_ref(interp.gc_heap_mut(), &Value::object(target)).expect("weak ref");
-    let global = *interp.global_this();
+    let mut global = *interp.global_this();
     crate::object::set(
-        global,
+        &mut global,
         interp.gc_heap_mut(),
         "wr",
         Value::weak_ref(weak_ref),
@@ -117,9 +117,9 @@ fn finalization_registry_registers_without_strong_target_retention() {
     })
     .expect("native cleanup");
     let registry = alloc_finalization_registry(interp.gc_heap_mut(), callback).expect("registry");
-    let global = *interp.global_this();
+    let mut global = *interp.global_this();
     crate::object::set(
-        global,
+        &mut global,
         interp.gc_heap_mut(),
         "registry",
         Value::finalization_registry(registry),
@@ -222,9 +222,9 @@ fn finalization_registry_schedules_cleanup_microtask() {
         None,
     )
     .expect("register");
-    let global = *interp.global_this();
+    let mut global = *interp.global_this();
     crate::object::set(
-        global,
+        &mut global,
         interp.gc_heap_mut(),
         "registry",
         Value::finalization_registry(registry),
@@ -284,9 +284,9 @@ fn finalization_callback_cannot_observe_collected_target_through_weak_ref() {
         None,
     )
     .expect("register");
-    let global = *interp.global_this();
+    let mut global = *interp.global_this();
     crate::object::set(
-        global,
+        &mut global,
         interp.gc_heap_mut(),
         "registry",
         Value::finalization_registry(registry),
@@ -326,9 +326,9 @@ fn finalization_cleanup_job_carries_registry_context() {
         None,
     )
     .expect("register");
-    let global = *interp.global_this();
+    let mut global = *interp.global_this();
     crate::object::set(
-        global,
+        &mut global,
         interp.gc_heap_mut(),
         "registry",
         Value::finalization_registry(registry),
@@ -371,9 +371,9 @@ fn pending_finalization_microtask_roots_held_value_across_next_gc() {
         None,
     )
     .expect("register");
-    let global = *interp.global_this();
+    let mut global = *interp.global_this();
     crate::object::set(
-        global,
+        &mut global,
         interp.gc_heap_mut(),
         "registry",
         Value::finalization_registry(registry),
@@ -411,9 +411,9 @@ fn cleanup_callback_allocates_only_after_raw_gc_sweep_boundary() {
         None,
     )
     .expect("register");
-    let global = *interp.global_this();
+    let mut global = *interp.global_this();
     crate::object::set(
-        global,
+        &mut global,
         interp.gc_heap_mut(),
         "registry",
         Value::finalization_registry(registry),

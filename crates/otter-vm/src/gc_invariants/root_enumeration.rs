@@ -110,9 +110,9 @@ fn globals_keep_object_alive() {
         interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
     let stashed =
         crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("alloc_object");
-    let global = *interp.global_this();
+    let mut global = *interp.global_this();
     crate::object::set(
-        global,
+        &mut global,
         interp.gc_heap_mut(),
         "__gc_roots_test_stash",
         crate::Value::object(stashed),
@@ -160,7 +160,7 @@ fn module_env_keeps_object_alive() {
     //   module_environments[url] → module_env → property slot.
     let baseline =
         interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
-    let module_env =
+    let mut module_env =
         crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("alloc_object");
     let url: std::sync::Arc<str> = std::sync::Arc::from("file:///gc_roots_test.js");
     interp.register_module_env(std::sync::Arc::clone(&url), module_env);
@@ -168,7 +168,7 @@ fn module_env_keeps_object_alive() {
     let stashed =
         crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("alloc_object");
     crate::object::set(
-        module_env,
+        &mut module_env,
         interp.gc_heap_mut(),
         "stash",
         crate::Value::object(stashed),
@@ -216,9 +216,9 @@ fn array_element_root_survives_force_gc() {
     let arr = crate::test_support::alloc_old_array(interp.gc_heap_mut()).expect("alloc array");
     crate::array::push(arr, interp.gc_heap_mut(), crate::Value::boolean(true))
         .expect("push element");
-    let global_this = *interp.global_this();
+    let mut global_this = *interp.global_this();
     crate::object::set(
-        global_this,
+        &mut global_this,
         interp.gc_heap_mut(),
         "__array_root",
         crate::Value::array(arr),
@@ -254,9 +254,9 @@ fn map_entry_root_survives_force_gc() {
     )
     .expect("map set");
 
-    let global_this = *interp.global_this();
+    let mut global_this = *interp.global_this();
     crate::object::set(
-        global_this,
+        &mut global_this,
         interp.gc_heap_mut(),
         "__map_root",
         crate::Value::map(map),
@@ -295,21 +295,21 @@ fn weak_collections_root_survives_force_gc() {
     crate::collections::weak_set_add(set, interp.gc_heap_mut(), crate::Value::object(key))
         .expect("weak set add");
 
-    let global_this = *interp.global_this();
+    let mut global_this = *interp.global_this();
     crate::object::set(
-        global_this,
+        &mut global_this,
         interp.gc_heap_mut(),
         "__weak_map_root",
         crate::Value::weak_map(map),
     );
     crate::object::set(
-        global_this,
+        &mut global_this,
         interp.gc_heap_mut(),
         "__weak_set_root",
         crate::Value::weak_set(set),
     );
     crate::object::set(
-        global_this,
+        &mut global_this,
         interp.gc_heap_mut(),
         "__weak_key_root",
         crate::Value::object(key),
@@ -359,9 +359,9 @@ fn promise_resolution_root_survives_force_gc() {
     let object = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     promise.fulfill(interp.gc_heap_mut(), crate::Value::object(object));
 
-    let global_this = *interp.global_this();
+    let mut global_this = *interp.global_this();
     crate::object::set(
-        global_this,
+        &mut global_this,
         interp.gc_heap_mut(),
         "__promise_root",
         crate::Value::promise(promise),
@@ -455,9 +455,9 @@ fn parked_frame_keeps_alive() {
         None,
     );
 
-    let global_this = *interp.global_this();
+    let mut global_this = *interp.global_this();
     crate::object::set(
-        global_this,
+        &mut global_this,
         interp.gc_heap_mut(),
         "__parked_frame_promise_root",
         Value::promise(promise),
@@ -488,9 +488,9 @@ fn bound_function_root_survives_force_gc() {
         smallvec::smallvec![crate::Value::boolean(true)],
     )
     .expect("bound");
-    let global_this = *interp.global_this();
+    let mut global_this = *interp.global_this();
     crate::object::set(
-        global_this,
+        &mut global_this,
         interp.gc_heap_mut(),
         "__bound_root",
         crate::Value::bound_function(bound),
@@ -517,9 +517,9 @@ fn regexp_root_survives_force_gc() {
     let mut interp = Interpreter::new();
     let pattern: Vec<u16> = "a+".encode_utf16().collect();
     let re = crate::JsRegExp::compile(interp.gc_heap_mut(), &pattern, "g").expect("regexp");
-    let global_this = *interp.global_this();
+    let mut global_this = *interp.global_this();
     crate::object::set(
-        global_this,
+        &mut global_this,
         interp.gc_heap_mut(),
         "__regexp_root",
         crate::Value::regexp(re),

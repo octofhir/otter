@@ -672,10 +672,10 @@ fn finish_builder(
                     value.trace_value_slots(visitor);
                 }
             };
-            let obj = crate::object::alloc_object_with_roots(gc_heap, &mut roots)
+            let mut obj = crate::object::alloc_object_with_roots(gc_heap, &mut roots)
                 .map_err(|_| ParseError::at(pos, "JSON.parse: out of memory"))?;
             for (k, v) in entries {
-                crate::object::set(obj, gc_heap, &k, v);
+                crate::object::set(&mut obj, gc_heap, &k, v);
             }
             // Install the realm `%Object.prototype%` at construction time when the
             // caller supplied it, after the own keys are defined so an own

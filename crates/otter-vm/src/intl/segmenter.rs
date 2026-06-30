@@ -153,14 +153,14 @@ pub(crate) fn segmenter_segment(
     let prepared_values: Vec<Value> = prepared.iter().map(|(value, _, _)| *value).collect();
     let mut elements: Vec<Value> = Vec::with_capacity(prepared.len());
     for (seg_str, idx, wordlike) in &prepared {
-        let obj =
+        let mut obj =
             ctx.alloc_object_with_roots(&[seg_str, &input_value], &[&prepared_values, &elements])?;
         let heap = ctx.heap_mut();
-        crate::object::set(obj, heap, "segment", *seg_str);
-        crate::object::set(obj, heap, "index", Value::number_i32(*idx));
-        crate::object::set(obj, heap, "input", input_value);
+        crate::object::set(&mut obj, heap, "segment", *seg_str);
+        crate::object::set(&mut obj, heap, "index", Value::number_i32(*idx));
+        crate::object::set(&mut obj, heap, "input", input_value);
         if granularity_word {
-            crate::object::set(obj, heap, "isWordLike", Value::boolean(*wordlike));
+            crate::object::set(&mut obj, heap, "isWordLike", Value::boolean(*wordlike));
         }
         elements.push(Value::object(obj));
     }
@@ -193,9 +193,9 @@ pub(crate) fn segmenter_resolved_options(
     let payload = require_payload(ctx, "resolvedOptions")?;
     let locale = Value::string(JsString::from_str(&payload.locale, ctx.heap_mut())?);
     let granularity = Value::string(JsString::from_str(&payload.granularity, ctx.heap_mut())?);
-    let obj = ctx.alloc_object_with_roots(&[&locale, &granularity], &[])?;
+    let mut obj = ctx.alloc_object_with_roots(&[&locale, &granularity], &[])?;
     let heap = ctx.heap_mut();
-    crate::object::set(obj, heap, "locale", locale);
-    crate::object::set(obj, heap, "granularity", granularity);
+    crate::object::set(&mut obj, heap, "locale", locale);
+    crate::object::set(&mut obj, heap, "granularity", granularity);
     Ok(Value::object(obj))
 }

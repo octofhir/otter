@@ -285,11 +285,16 @@ impl Interpreter {
             if still_original {
                 let js = JsString::from_str(src, self.gc_heap_mut())
                     .map_err(|_| self.err_type(("out of memory".to_string()).into()))?;
-                let obj_now = self
+                let mut obj_now = self
                     .json_root_get(obj_root)
                     .as_object()
                     .expect("rooted reviver context object");
-                object::set(obj_now, self.gc_heap_mut(), "source", Value::string(js));
+                object::set(
+                    &mut obj_now,
+                    self.gc_heap_mut(),
+                    "source",
+                    Value::string(js),
+                );
             }
         }
         let result = self.json_root_get(obj_root);
@@ -956,9 +961,9 @@ impl Interpreter {
         let object_proto = self.object_prototype_object_opt();
         let recv = self.json_root_get_object(obj_root);
         object::set_prototype_value(recv, self.gc_heap_mut(), object_proto.map(Value::object));
-        let recv = self.json_root_get_object(obj_root);
+        let mut recv = self.json_root_get_object(obj_root);
         let leaf = self.json_root_get(value_root);
-        object::set(recv, self.gc_heap_mut(), "", leaf);
+        object::set(&mut recv, self.gc_heap_mut(), "", leaf);
         let result = self.json_root_get_object(obj_root);
         self.json_root_pop_to(obj_root);
         Ok(result)

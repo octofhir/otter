@@ -168,10 +168,10 @@ pub(crate) fn install_placeholder(
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
     let global_root = Value::object(global);
-    let placeholder = alloc_object_with_value_roots(heap, &[&global_root])?;
+    let mut placeholder = alloc_object_with_value_roots(heap, &[&global_root])?;
     let placeholder_root = Value::object(placeholder);
     let proto = alloc_object_with_value_roots(heap, &[&global_root, &placeholder_root])?;
-    object::set(placeholder, heap, "prototype", Value::object(proto));
+    object::set(&mut placeholder, heap, "prototype", Value::object(proto));
     define_global(global, heap, name, Value::object(placeholder));
     Ok(())
 }

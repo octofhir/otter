@@ -243,11 +243,11 @@ pub(crate) fn display_names_resolved_options(
     let kind = Value::string(JsString::from_str(&payload.kind, ctx.heap_mut())?);
     let style = Value::string(JsString::from_str(&payload.style, ctx.heap_mut())?);
     let fallback = Value::string(JsString::from_str(&payload.fallback, ctx.heap_mut())?);
-    let obj = ctx.alloc_object_with_roots(&[&locale, &kind, &style, &fallback], &[])?;
+    let mut obj = ctx.alloc_object_with_roots(&[&locale, &kind, &style, &fallback], &[])?;
     let heap = ctx.heap_mut();
-    crate::object::set(obj, heap, "locale", locale);
-    crate::object::set(obj, heap, "type", kind);
-    crate::object::set(obj, heap, "style", style);
-    crate::object::set(obj, heap, "fallback", fallback);
+    crate::object::set(&mut obj, heap, "locale", locale);
+    crate::object::set(&mut obj, heap, "type", kind);
+    crate::object::set(&mut obj, heap, "style", style);
+    crate::object::set(&mut obj, heap, "fallback", fallback);
     Ok(Value::object(obj))
 }

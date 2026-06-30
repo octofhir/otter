@@ -185,13 +185,28 @@ pub(crate) fn plural_rules_resolved_options(
     let mid = payload.minimum_integer_digits as i32;
     let mfd = payload.minimum_fraction_digits as i32;
     let xfd = payload.maximum_fraction_digits as i32;
-    let obj = ctx.alloc_object_with_roots(&[&locale, &kind], &[])?;
+    let mut obj = ctx.alloc_object_with_roots(&[&locale, &kind], &[])?;
     let heap = ctx.heap_mut();
-    crate::object::set(obj, heap, "locale", locale);
-    crate::object::set(obj, heap, "type", kind);
-    crate::object::set(obj, heap, "minimumIntegerDigits", Value::number_i32(mid));
-    crate::object::set(obj, heap, "minimumFractionDigits", Value::number_i32(mfd));
-    crate::object::set(obj, heap, "maximumFractionDigits", Value::number_i32(xfd));
+    crate::object::set(&mut obj, heap, "locale", locale);
+    crate::object::set(&mut obj, heap, "type", kind);
+    crate::object::set(
+        &mut obj,
+        heap,
+        "minimumIntegerDigits",
+        Value::number_i32(mid),
+    );
+    crate::object::set(
+        &mut obj,
+        heap,
+        "minimumFractionDigits",
+        Value::number_i32(mfd),
+    );
+    crate::object::set(
+        &mut obj,
+        heap,
+        "maximumFractionDigits",
+        Value::number_i32(xfd),
+    );
     Ok(Value::object(obj))
 }
 

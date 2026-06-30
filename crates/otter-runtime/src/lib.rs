@@ -2009,7 +2009,7 @@ impl Runtime {
     ) -> Result<otter_vm::Value, OtterError> {
         let proto = self.interp.error_classes_for_trace().prototype(kind);
         let proto_root = otter_vm::Value::object(proto);
-        let obj = self
+        let mut obj = self
             .interp
             .alloc_host_object_with_roots(&[&proto_root], &[])?;
         otter_vm::object::set_prototype(obj, self.interp.gc_heap_mut(), Some(proto));
@@ -2019,7 +2019,7 @@ impl Runtime {
                 message: err.to_string(),
             })?;
         otter_vm::object::set(
-            obj,
+            &mut obj,
             self.interp.gc_heap_mut(),
             "message",
             otter_vm::Value::string(message_str),
@@ -2375,7 +2375,7 @@ impl Runtime {
             let data = materialize_data(&mut ctx)
                 .map_err(map_native_error)
                 .map_err(MessageEventDispatchError::Materialize)?;
-            let event = ctx
+            let mut event = ctx
                 .alloc_object()
                 .map_err(|err| OtterError::OutOfMemory {
                     requested_bytes: err.requested_bytes(),
@@ -2390,8 +2390,8 @@ impl Runtime {
                     })
                     .map_err(MessageEventDispatchError::Materialize)?,
             );
-            otter_vm::object::set(event, ctx.heap_mut(), "type", ty);
-            otter_vm::object::set(event, ctx.heap_mut(), "data", data);
+            otter_vm::object::set(&mut event, ctx.heap_mut(), "type", ty);
+            otter_vm::object::set(&mut event, ctx.heap_mut(), "data", data);
             otter_vm::Value::object(event)
         };
 
@@ -4064,9 +4064,9 @@ impl DynLoadError {
 /// marker for its separately linked fragments.
 const DYNAMIC_INIT_MARKER: &str = "__otter_module_inited__";
 
-fn otter_vm_init_marker_install(interp: &mut otter_vm::Interpreter, env: otter_vm::JsObject) {
+fn otter_vm_init_marker_install(interp: &mut otter_vm::Interpreter, mut env: otter_vm::JsObject) {
     otter_vm::object::set(
-        env,
+        &mut env,
         interp.gc_heap_mut(),
         DYNAMIC_INIT_MARKER,
         otter_vm::Value::boolean(true),
@@ -4079,7 +4079,7 @@ fn alloc_dynamic_import_meta(
     url: &str,
 ) -> Result<otter_vm::JsObject, DynLoadError> {
     let env_root = otter_vm::Value::object(env);
-    let import_meta = interp
+    let mut import_meta = interp
         .alloc_host_object_with_roots(&[&env_root], &[])
         .map_err(|e| {
             DynLoadError::type_error(format!("dynamic import: alloc import_meta failed: {e}"))
@@ -4090,7 +4090,7 @@ fn alloc_dynamic_import_meta(
         ))
     })?;
     otter_vm::object::set(
-        import_meta,
+        &mut import_meta,
         interp.gc_heap_mut(),
         "url",
         otter_vm::Value::string(url_string),

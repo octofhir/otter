@@ -232,9 +232,9 @@ pub(crate) fn relative_time_format_format_to_parts(
 ) -> Result<Value, NativeError> {
     let s = relative_time_format_format(ctx, args)?;
     let literal = Value::string(JsString::from_str("literal", ctx.heap_mut())?);
-    let part = ctx.alloc_object_with_roots(&[&literal, &s], &[])?;
-    crate::object::set(part, ctx.heap_mut(), "type", literal);
-    crate::object::set(part, ctx.heap_mut(), "value", s);
+    let mut part = ctx.alloc_object_with_roots(&[&literal, &s], &[])?;
+    crate::object::set(&mut part, ctx.heap_mut(), "type", literal);
+    crate::object::set(&mut part, ctx.heap_mut(), "value", s);
     let elements = vec![Value::object(part)];
     let roots = ctx.collect_native_roots();
     let this_value = *ctx.this_value();
@@ -266,11 +266,12 @@ pub(crate) fn relative_time_format_resolved_options(
         &payload.numbering_system,
         ctx.heap_mut(),
     )?);
-    let obj = ctx.alloc_object_with_roots(&[&locale, &style, &numeric, &numbering_system], &[])?;
+    let mut obj =
+        ctx.alloc_object_with_roots(&[&locale, &style, &numeric, &numbering_system], &[])?;
     let heap = ctx.heap_mut();
-    crate::object::set(obj, heap, "locale", locale);
-    crate::object::set(obj, heap, "style", style);
-    crate::object::set(obj, heap, "numeric", numeric);
-    crate::object::set(obj, heap, "numberingSystem", numbering_system);
+    crate::object::set(&mut obj, heap, "locale", locale);
+    crate::object::set(&mut obj, heap, "style", style);
+    crate::object::set(&mut obj, heap, "numeric", numeric);
+    crate::object::set(&mut obj, heap, "numberingSystem", numbering_system);
     Ok(Value::object(obj))
 }

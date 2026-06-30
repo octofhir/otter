@@ -5405,7 +5405,7 @@ impl Interpreter {
                         // [[Set]]).
                         return self.ordinary_set_on_receiver(context, key, value, &receiver);
                     }
-                    let bag = crate::property_dispatch::typed_array_ensure_expando_pub(
+                    let mut bag = crate::property_dispatch::typed_array_ensure_expando_pub(
                         &mut self.gc_heap,
                         &t,
                     )?;
@@ -5428,7 +5428,7 @@ impl Interpreter {
                                 return self
                                     .ordinary_set_on_receiver(context, key, value, &receiver);
                             }
-                            object::set(bag, &mut self.gc_heap, &name, value);
+                            object::set(&mut bag, &mut self.gc_heap, &name, value);
                             return Ok(true);
                         }
                         object::PropertyLookup::Accessor { setter, .. } => {
@@ -5754,7 +5754,8 @@ impl Interpreter {
             // accessor invokes its setter; an own miss continues the
             // walk through the Temporal instance's real [[Prototype]]
             // (so `dt.year = x`, a getter-only accessor, rejects).
-            let bag = crate::property_dispatch::temporal_ensure_expando_pub(&mut self.gc_heap, &t)?;
+            let mut bag =
+                crate::property_dispatch::temporal_ensure_expando_pub(&mut self.gc_heap, &t)?;
             let same_receiver = receiver
                 .as_temporal(&self.gc_heap)
                 .is_some_and(|r| r.ptr_eq(t));
@@ -5779,7 +5780,7 @@ impl Interpreter {
                         object::set_symbol(bag, &mut self.gc_heap, *sym, value);
                     } else {
                         object::set(
-                            bag,
+                            &mut bag,
                             &mut self.gc_heap,
                             key.string_name()
                                 .expect("non-symbol key has string spelling"),

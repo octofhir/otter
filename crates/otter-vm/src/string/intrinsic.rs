@@ -51,7 +51,7 @@ fn pin_string_data_and_aliases(
     let descriptor = ctor
         .own_property_descriptor(heap, "prototype")
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let prototype = match descriptor.and_then(|d| match d.kind {
+    let mut prototype = match descriptor.and_then(|d| match d.kind {
         crate::object::DescriptorKind::Data { value } => value.as_object(),
         _ => None,
     }) {
@@ -63,10 +63,10 @@ fn pin_string_data_and_aliases(
     crate::object::set_string_data(prototype, heap, empty_str);
 
     if let Some(start_fn) = object::get(prototype, heap, "trimStart") {
-        object::set(prototype, heap, "trimLeft", start_fn);
+        object::set(&mut prototype, heap, "trimLeft", start_fn);
     }
     if let Some(end_fn) = object::get(prototype, heap, "trimEnd") {
-        object::set(prototype, heap, "trimRight", end_fn);
+        object::set(&mut prototype, heap, "trimRight", end_fn);
     }
     Ok(())
 }

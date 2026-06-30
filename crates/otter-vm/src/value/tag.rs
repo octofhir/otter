@@ -93,6 +93,31 @@ pub const VALUE_HOLE: u64 = OTHER_TAG | 0x10;
 /// `0x20` marker keeps it disjoint from the other immediates.
 pub const FUNCTION_ID_TAG: u64 = OTHER_TAG | 0x20;
 
+// Frozen encoding: the optimizing tier bakes these exact bit patterns into
+// emitted box/unbox and the deopt frame-state record, so an accidental edit
+// is a compile error here rather than a silent interpreter/JIT divergence.
+// Move a literal only in lockstep with the codegen that bakes it.
+const _: () = assert!(NUMBER_TAG == 0xfffe_0000_0000_0000);
+const _: () = assert!(OTHER_TAG == 0x2);
+const _: () = assert!(BOOL_TAG == 0x4);
+const _: () = assert!(UNDEFINED_TAG == 0x8);
+const _: () = assert!(DOUBLE_ENCODE_OFFSET == 1 << 49);
+const _: () = assert!(NOT_CELL_MASK == NUMBER_TAG | OTHER_TAG);
+const _: () = assert!(CANONICAL_NAN == 0x7ff8_0000_0000_0000);
+// A cell pointer carries none of the non-cell bits; every tagged immediate
+// carries OTHER_TAG, so a cell is never mistaken for an immediate (and vice
+// versa) by the single `bits & NOT_CELL_MASK` test the guard lowers.
+const _: () = assert!(OTHER_TAG & 1 == 0 && OTHER_TAG != 0);
+const _: () = assert!(VALUE_NULL & NOT_CELL_MASK != 0);
+const _: () = assert!(VALUE_UNDEFINED & NOT_CELL_MASK != 0);
+const _: () = assert!(VALUE_TRUE & NOT_CELL_MASK != 0);
+const _: () = assert!(VALUE_FALSE & NOT_CELL_MASK != 0);
+const _: () = assert!(VALUE_HOLE & NOT_CELL_MASK != 0);
+const _: () = assert!(FUNCTION_ID_TAG & NOT_CELL_MASK != 0);
+// The boxed-double offset purifies into the number space: a boxed double's
+// top bits carry NUMBER_TAG, disjoint from the immediate patterns above.
+const _: () = assert!(CANONICAL_NAN.wrapping_add(DOUBLE_ENCODE_OFFSET) & NUMBER_TAG != 0);
+
 /// `true` if the bit pattern encodes a number (int32 or boxed double).
 #[inline(always)]
 pub const fn is_number_bits(bits: u64) -> bool {

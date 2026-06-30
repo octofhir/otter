@@ -411,7 +411,7 @@ impl ShapeId {
     /// Placeholder for fast-shaped objects that have never needed dictionary
     /// identity. Shape-backed objects read identity from the installed GC shape;
     /// dictionary-mode transitions overwrite this with [`next_shape_id`].
-    const UNASSIGNED: Self = Self(0);
+    pub(crate) const UNASSIGNED: Self = Self(0);
 
     /// Raw VM-local id. Exposed to the [`crate::inspect`] snapshot
     /// surface so embedder DTOs can carry a stable identity without

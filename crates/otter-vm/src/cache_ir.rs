@@ -35,6 +35,15 @@ use crate::object::{
 use crate::property_atom::AtomizedPropertyKey;
 use crate::{JsObject, JsString, Value};
 
+/// Version stamp for the [`CacheStub`] / [`CacheOp`] feedback ABI.
+///
+/// The optimizing tier transpiles a [`CacheStubSnapshot`] taken at compile
+/// time and records the version it compiled against, so a stub whose op
+/// semantics or table encoding later change (a bumped version) is recognized as
+/// incompatible rather than mis-transpiled. Bump whenever a [`CacheOp`]
+/// variant's meaning, operand assignment, or table indexing changes.
+pub(crate) const CACHE_STUB_ABI_VERSION: u32 = 1;
+
 /// Operand slot in a stub's tiny register file. `0` is the receiver; `1` is the
 /// receiver's prototype after [`CacheOp::LoadPrototype`].
 type OperandId = u8;
@@ -502,5 +511,112 @@ impl CacheStub {
         for transition in &self.transitions {
             transition.trace_roots(visitor);
         }
+    }
+
+    /// Take an immutable copy-on-compile snapshot of this stub. Captures the
+    /// stub's program and tables at this instant so the optimizing tier reads a
+    /// stable view for the duration of a compile, decoupled from later
+    /// interpreter updates to the live site.
+    #[allow(dead_code)] // consumed by the optimizing tier when it re-enables.
+    #[must_use]
+    pub(crate) fn snapshot(&self) -> CacheStubSnapshot {
+        CacheStubSnapshot {
+            stub: self.clone(),
+            version: CACHE_STUB_ABI_VERSION,
+        }
+    }
+}
+
+/// Immutable copy-on-compile view of a [`CacheStub`].
+///
+/// The optimizing tier must read a site's cache from a stable snapshot for the
+/// duration of a compile, never the live mutable stub the interpreter keeps
+/// updating. A snapshot owns an independent clone of the stub's program and
+/// tables taken at one instant, so a later interpreter update to the site never
+/// shifts the shape ids or slot offsets the compile baked. The captured
+/// [`CACHE_STUB_ABI_VERSION`] lets a transpiler reject a stub whose ABI changed
+/// under it.
+///
+/// GC-safe with no tracing required: every shape the tables reference is
+/// interned, immortal, and pinned in non-moving old space, so a snapshot's
+/// captured shape ids and transition targets neither dangle nor relocate while
+/// it is held. [`Self::trace_roots`] is offered for callers that root it anyway.
+#[allow(dead_code)] // the read surface the optimizing tier lowers from on re-enable.
+#[derive(Debug, Clone)]
+pub(crate) struct CacheStubSnapshot {
+    stub: CacheStub,
+    version: u32,
+}
+
+#[allow(dead_code)] // forward ABI: every accessor is a compile-time reader for the JIT.
+impl CacheStubSnapshot {
+    /// ABI version this snapshot was taken under.
+    #[must_use]
+    pub(crate) fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Own-data load hit, if this site is a monomorphic own-data load.
+    #[must_use]
+    pub(crate) fn own_data_hit(&self) -> Option<AtomOwnPropertyHit> {
+        self.stub.own_data_hit()
+    }
+
+    /// Direct-prototype data load: the guarded prototype shape and the hit.
+    #[must_use]
+    pub(crate) fn direct_prototype_load(&self) -> Option<(ShapeId, AtomOwnPropertyHit)> {
+        self.stub.direct_prototype_load()
+    }
+
+    /// Existing-own-data store hit.
+    #[must_use]
+    pub(crate) fn store_own_data_hit(&self) -> Option<AtomOwnPropertyHit> {
+        self.stub.store_own_data_hit()
+    }
+
+    /// Replayed add-transition of an add-a-slot store stub.
+    #[must_use]
+    pub(crate) fn store_transition_ref(&self) -> Option<&StorePropertyTransition> {
+        self.stub.store_transition_ref()
+    }
+
+    /// Visit GC roots — the target shapes of replayed transitions. Not required
+    /// (referenced shapes are immortal and pinned) but offered for callers that
+    /// choose to root the snapshot.
+    pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
+        self.stub.trace_roots(visitor);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_is_independent_of_later_site_updates() {
+        // A monomorphic own-data store stub at slot 7. The hit's exact
+        // contents are irrelevant here; the snapshot semantics are.
+        let hit = AtomOwnPropertyHit {
+            shape_id: ShapeId::UNASSIGNED,
+            shape: object::ShapeHandle::null(),
+            atom_id: crate::property_atom::AtomId::from_constant_index(7),
+            slot: 7,
+            is_data: true,
+        };
+        let mut site = CacheStub::store_own_data(hit);
+        let snap = site.snapshot();
+
+        // The snapshot reads the captured store hit and the current ABI version.
+        assert_eq!(snap.version(), CACHE_STUB_ABI_VERSION);
+        assert!(snap.store_own_data_hit().is_some());
+        assert!(snap.own_data_hit().is_none());
+
+        // The live site is then replaced by a different (load) stub, as happens
+        // when the interpreter re-profiles the site. The snapshot, owning its
+        // own clone, is unaffected.
+        site = CacheStub::load_own_data(hit);
+        assert!(site.own_data_hit().is_some());
+        assert!(snap.store_own_data_hit().is_some());
+        assert!(snap.own_data_hit().is_none());
     }
 }

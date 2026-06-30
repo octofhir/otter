@@ -700,7 +700,7 @@ pub struct Interpreter {
     store_property_ics: Vec<property_ic::PropertyIcEntry<property_ic::StorePropertyIc>>,
     /// Monomorphic `HasProperty` inline caches keyed by dense executable IC
     /// site id. These only cover ordinary own/direct-prototype data presence.
-    has_property_ics: Vec<property_ic::PropertyIcEntry<property_ic::HasPropertyIc>>,
+    has_property_ics: Vec<property_ic::PropertyIcEntry<cache_ir::CacheStub>>,
     /// Monomorphic method-call inline caches keyed by dense executable IC site
     /// id. Each entry records a resolved prototype builtin (`Array`, `Map`, or
     /// `Set`) so a hot `recv.method(args)` site skips the per-call name

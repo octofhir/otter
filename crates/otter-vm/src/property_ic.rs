@@ -9,7 +9,6 @@
 //! # Contents
 //! - [`StorePropertyIc`] — existing-own-slot and guarded store-
 //!   transition cache.
-//! - [`HasPropertyIc`] — own/direct-prototype presence cache.
 //! - [`PropertyIcEntry`] — per-site cache state and miss policy.
 //! - [`PropertyIcStats`] — aggregate IC counters for diagnostics/tests.
 //!
@@ -33,11 +32,10 @@
 //! - [`crate::property_dispatch`]
 
 use crate::object::{
-    self, AtomOwnPropertyHit, OwnPropertySlotHit, ShapeId, StorePropertyTransition,
-    StorePropertyTransitionKind,
+    self, AtomOwnPropertyHit, ShapeId, StorePropertyTransition, StorePropertyTransitionKind,
 };
 use crate::property_atom::AtomizedPropertyKey;
-use crate::{JsObject, JsString, Value};
+use crate::{JsObject, Value};
 use otter_gc::raw::SlotVisitor;
 use smallvec::SmallVec;
 
@@ -293,134 +291,6 @@ impl PropertyIcEntry<StorePropertyIc> {
     }
 }
 
-/// Monomorphic `HasProperty` cache for ordinary data-property presence.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum HasPropertyIc {
-    /// Receiver owns the data slot.
-    OwnData {
-        /// Guarded key as loaded by the `in` bytecode.
-        key: JsString,
-        /// Guarded receiver slot metadata.
-        hit: OwnPropertySlotHit,
-    },
-    /// Receiver's direct prototype owns the data slot.
-    DirectPrototypeData {
-        /// Receiver shape observed before walking to `[[Prototype]]`.
-        receiver_shape_id: ShapeId,
-        /// Guarded key as loaded by the `in` bytecode.
-        key: JsString,
-        /// Guarded direct-prototype slot metadata.
-        hit: OwnPropertySlotHit,
-    },
-}
-
-impl HasPropertyIc {
-    /// Create an own-data presence IC.
-    #[must_use]
-    pub(crate) fn own_data(key: JsString, hit: OwnPropertySlotHit) -> Self {
-        Self::OwnData { key, hit }
-    }
-
-    /// Create a direct-prototype data presence IC.
-    #[must_use]
-    pub(crate) fn direct_prototype_data(
-        receiver_shape_id: ShapeId,
-        key: JsString,
-        hit: OwnPropertySlotHit,
-    ) -> Self {
-        Self::DirectPrototypeData {
-            receiver_shape_id,
-            key,
-            hit,
-        }
-    }
-
-    /// Own-data IC metadata when the receiver shape/key guard matches.
-    #[must_use]
-    pub(crate) fn own_hit(
-        &self,
-        shape_id: ShapeId,
-        key_value: JsString,
-        heap: &otter_gc::GcHeap,
-    ) -> Option<OwnPropertySlotHit> {
-        let Self::OwnData { key, hit } = self else {
-            return None;
-        };
-        (hit.shape_id == shape_id && key.equals(key_value, heap)).then_some(*hit)
-    }
-
-    /// Direct-prototype IC metadata when the receiver shape/key guard matches.
-    #[must_use]
-    pub(crate) fn direct_prototype_hit(
-        &self,
-        receiver_shape_id: ShapeId,
-        key_value: JsString,
-        heap: &otter_gc::GcHeap,
-    ) -> Option<OwnPropertySlotHit> {
-        let Self::DirectPrototypeData {
-            receiver_shape_id: cached_receiver_shape_id,
-            key,
-            hit,
-        } = self
-        else {
-            return None;
-        };
-        (*cached_receiver_shape_id == receiver_shape_id && key.equals(key_value, heap))
-            .then_some(*hit)
-    }
-
-    /// Replay this IC against an ordinary object receiver.
-    #[must_use]
-    pub(crate) fn probe(
-        &self,
-        obj: JsObject,
-        heap: &otter_gc::GcHeap,
-        key: JsString,
-    ) -> Option<()> {
-        let receiver_shape_id = object::shape_id(obj, heap);
-        if let Some(hit) = self.own_hit(receiver_shape_id, key, heap)
-            && object::has_own_slot(obj, heap, hit)
-        {
-            return Some(());
-        }
-        if let Some(hit) = self.direct_prototype_hit(receiver_shape_id, key, heap)
-            && let Some(proto) = object::prototype(obj, heap)
-            && object::supports_fast_property_ic(proto, heap)
-            && object::has_own_slot(proto, heap, hit)
-        {
-            return Some(());
-        }
-        None
-    }
-
-    /// Build a presence IC candidate for the current receiver/key pair.
-    #[must_use]
-    pub(crate) fn install_candidate(
-        obj: JsObject,
-        heap: &otter_gc::GcHeap,
-        key: JsString,
-    ) -> Option<Self> {
-        if !object::supports_fast_property_ic(obj, heap) {
-            return None;
-        }
-        let key_name = key.to_lossy_string(heap);
-        let receiver_shape_id = object::shape_id(obj, heap);
-        let (own_hit, own_lookup) = object::lookup_own_slot(obj, heap, &key_name);
-        if let (Some(hit), object::PropertyLookup::Data { .. }) = (own_hit, own_lookup) {
-            return Some(Self::own_data(key, hit));
-        }
-        let proto = object::prototype(obj, heap)?;
-        if !object::supports_fast_property_ic(proto, heap) {
-            return None;
-        }
-        let (proto_hit, proto_lookup) = object::lookup_own_slot(proto, heap, &key_name);
-        if let (Some(hit), object::PropertyLookup::Data { .. }) = (proto_hit, proto_lookup) {
-            return Some(Self::direct_prototype_data(receiver_shape_id, key, hit));
-        }
-        None
-    }
-}
-
 /// Monomorphic `StoreProperty` cache for ordinary data-slot writes.
 #[derive(Debug, Clone)]
 pub(crate) enum StorePropertyIc {
@@ -556,7 +426,7 @@ impl StorePropertyIc {
 
 #[cfg(test)]
 mod tests {
-    use super::{HasPropertyIc, PropertyIcEntry, PropertyIcKind, PropertyIcStats, StorePropertyIc};
+    use super::{PropertyIcEntry, PropertyIcKind, PropertyIcStats, StorePropertyIc};
     use crate::object::{self, PropertyDescriptor};
     use crate::property_atom::{AtomId, AtomizedPropertyKey, PropertyAtom};
     use crate::{JsString, Value};
@@ -686,11 +556,12 @@ mod tests {
         let receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
         object::set_prototype(receiver, &mut heap, Some(proto));
         let key_string = JsString::from_str("x", &mut heap).expect("string");
-        let ic = HasPropertyIc::install_candidate(receiver, &heap, key_string).expect("has ic");
+        let ic =
+            crate::cache_ir::CacheStub::install_has(receiver, &heap, key_string).expect("has ic");
 
         assert!(object::delete(proto, &mut heap, "y"));
 
-        assert_eq!(ic.probe(receiver, &heap, key_string), None);
+        assert_eq!(ic.run_has(receiver, &heap, key_string), None);
     }
 
     #[test]

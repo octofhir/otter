@@ -32,7 +32,7 @@ use crate::{
     is_restricted_function_property, object,
     operand_decode::{const_operand, register_operand},
     property_atom::AtomizedPropertyKey,
-    property_ic::{HasPropertyIc, PropertyIcKind, StorePropertyIc},
+    property_ic::{PropertyIcKind, StorePropertyIc},
     read_register, regexp_prototype, symbol, symbol_prototype, temporal, value_kind_name,
     write_register,
 };
@@ -5837,7 +5837,7 @@ impl Interpreter {
             let mut probe_hit = false;
             for idx in 0..entries_len {
                 let ic = self.has_property_ics[site].entries()[idx].clone();
-                if ic.probe(obj, &self.gc_heap, key_string).is_some() {
+                if ic.run_has(obj, &self.gc_heap, key_string).is_some() {
                     probe_hit = true;
                     break;
                 }
@@ -5863,7 +5863,7 @@ impl Interpreter {
                 );
             }
             if !site_disabled
-                && let Some(ic) = HasPropertyIc::install_candidate(obj, &self.gc_heap, key_string)
+                && let Some(ic) = cache_ir::CacheStub::install_has(obj, &self.gc_heap, key_string)
             {
                 self.has_property_ics[site].install_with_stats(
                     &mut self.property_ic_stats,

@@ -27,9 +27,9 @@
 
 use smallvec::SmallVec;
 
-use crate::object::{self, AtomOwnPropertyHit, ShapeId};
+use crate::object::{self, AtomOwnPropertyHit, OwnPropertySlotHit, ShapeId};
 use crate::property_atom::AtomizedPropertyKey;
-use crate::{JsObject, Value};
+use crate::{JsObject, JsString, Value};
 
 /// Operand slot in a stub's tiny register file. `0` is the receiver; `1` is the
 /// receiver's prototype after [`CacheOp::LoadPrototype`].
@@ -54,12 +54,26 @@ pub(crate) enum CacheOp {
         /// Operand to write the prototype into.
         dst: OperandId,
     },
+    /// Guard that the runtime key equals `keys[key]`. Used by `HasProperty`,
+    /// whose `in` key is a dynamic operand rather than a bytecode atom.
+    GuardKey {
+        /// Index into the stub's `keys`.
+        key: u8,
+    },
     /// Terminal (load): produce the data value at `hits[hit]` on
     /// `operands[obj]`, validating the slot's shape/atom/key guard.
     LoadDataSlotResult {
         /// Operand holding the object that owns the slot.
         obj: OperandId,
         /// Index into the stub's `hits`.
+        hit: u8,
+    },
+    /// Terminal (has): succeed when `slot_hits[hit]` is still present on
+    /// `operands[obj]`.
+    HasDataSlot {
+        /// Operand holding the object that owns the slot.
+        obj: OperandId,
+        /// Index into the stub's `slot_hits`.
         hit: u8,
     },
 }
@@ -73,6 +87,12 @@ pub(crate) struct CacheStub {
     shape_ids: SmallVec<[ShapeId; 1]>,
     /// Atom-aware own-property hits consumed by load terminals.
     hits: SmallVec<[AtomOwnPropertyHit; 1]>,
+    /// Slot hits consumed by `has` terminals.
+    slot_hits: SmallVec<[OwnPropertySlotHit; 1]>,
+    /// Property-name keys guarded by [`CacheOp::GuardKey`]. Interned/long-lived
+    /// like every cached property name, so they are not separately traced
+    /// (matching the load/has IC root set).
+    keys: SmallVec<[JsString; 1]>,
 }
 
 impl CacheStub {
@@ -104,6 +124,7 @@ impl CacheStub {
             ops,
             shape_ids: SmallVec::from_elem(receiver_shape_id, 1),
             hits: SmallVec::from_elem(hit, 1),
+            ..Self::default()
         }
     }
 
@@ -115,15 +136,26 @@ impl CacheStub {
     }
 
     /// Run the shared guard prefix, resolving operands; returns the operand file
-    /// on success or `None` on any guard miss.
+    /// on success or `None` on any guard miss. `has_key` is the runtime key for
+    /// [`CacheOp::GuardKey`] (only present on `HasProperty` stubs).
     #[inline]
-    fn run_guards(&self, recv: JsObject, heap: &otter_gc::GcHeap) -> Option<[Option<JsObject>; 2]> {
+    fn run_guards(
+        &self,
+        recv: JsObject,
+        heap: &otter_gc::GcHeap,
+        has_key: Option<JsString>,
+    ) -> Option<[Option<JsObject>; 2]> {
         let mut operands: [Option<JsObject>; 2] = [Some(recv), None];
         for op in &self.ops {
             match *op {
                 CacheOp::GuardShapeId { obj, shape } => {
                     let obj = Self::operand(&operands, obj)?;
                     if object::shape_id(obj, heap) != self.shape_ids[shape as usize] {
+                        return None;
+                    }
+                }
+                CacheOp::GuardKey { key } => {
+                    if !self.keys[key as usize].equals(has_key?, heap) {
                         return None;
                     }
                 }
@@ -136,7 +168,7 @@ impl CacheStub {
                     operands[dst as usize] = Some(proto);
                 }
                 // Terminals are handled by the per-kind executors below.
-                CacheOp::LoadDataSlotResult { .. } => break,
+                CacheOp::LoadDataSlotResult { .. } | CacheOp::HasDataSlot { .. } => break,
             }
         }
         Some(operands)
@@ -156,12 +188,91 @@ impl CacheStub {
         if let [CacheOp::LoadDataSlotResult { obj: 0, hit: 0 }] = self.ops.as_slice() {
             return object::load_own_data_slot_atom(recv, heap, key, self.hits[0]);
         }
-        let operands = self.run_guards(recv, heap)?;
+        let operands = self.run_guards(recv, heap, None)?;
         let CacheOp::LoadDataSlotResult { obj, hit } = self.ops.last().copied()? else {
             return None;
         };
         let obj = Self::operand(&operands, obj)?;
         object::load_own_data_slot_atom(obj, heap, key, self.hits[hit as usize])
+    }
+
+    /// Own-data presence: receiver owns the slot.
+    #[must_use]
+    pub(crate) fn has_own_data(key: JsString, hit: OwnPropertySlotHit) -> Self {
+        let mut ops = SmallVec::new();
+        ops.push(CacheOp::GuardKey { key: 0 });
+        ops.push(CacheOp::HasDataSlot { obj: 0, hit: 0 });
+        Self {
+            ops,
+            slot_hits: SmallVec::from_elem(hit, 1),
+            keys: SmallVec::from_elem(key, 1),
+            ..Self::default()
+        }
+    }
+
+    /// Direct-prototype presence: the receiver's prototype owns the slot.
+    #[must_use]
+    pub(crate) fn has_direct_prototype_data(
+        receiver_shape_id: ShapeId,
+        key: JsString,
+        hit: OwnPropertySlotHit,
+    ) -> Self {
+        let mut ops = SmallVec::new();
+        ops.push(CacheOp::GuardKey { key: 0 });
+        ops.push(CacheOp::GuardShapeId { obj: 0, shape: 0 });
+        ops.push(CacheOp::LoadPrototype { obj: 0, dst: 1 });
+        ops.push(CacheOp::HasDataSlot { obj: 1, hit: 0 });
+        Self {
+            ops,
+            shape_ids: SmallVec::from_elem(receiver_shape_id, 1),
+            slot_hits: SmallVec::from_elem(hit, 1),
+            keys: SmallVec::from_elem(key, 1),
+            ..Self::default()
+        }
+    }
+
+    /// Execute as a `HasProperty` cache. `Some(())` on a confirmed hit.
+    #[must_use]
+    pub(crate) fn run_has(
+        &self,
+        recv: JsObject,
+        heap: &otter_gc::GcHeap,
+        key: JsString,
+    ) -> Option<()> {
+        let operands = self.run_guards(recv, heap, Some(key))?;
+        let CacheOp::HasDataSlot { obj, hit } = self.ops.last().copied()? else {
+            return None;
+        };
+        let obj = Self::operand(&operands, obj)?;
+        object::has_own_slot(obj, heap, self.slot_hits[hit as usize]).then_some(())
+    }
+
+    /// Build a `HasProperty` stub for the current receiver/key pair. `None` when
+    /// the access is not IC-eligible.
+    #[must_use]
+    pub(crate) fn install_has(
+        obj: JsObject,
+        heap: &otter_gc::GcHeap,
+        key: JsString,
+    ) -> Option<Self> {
+        if !object::supports_fast_property_ic(obj, heap) {
+            return None;
+        }
+        let key_name = key.to_lossy_string(heap);
+        let receiver_shape_id = object::shape_id(obj, heap);
+        let (own_hit, own_lookup) = object::lookup_own_slot(obj, heap, &key_name);
+        if let (Some(hit), object::PropertyLookup::Data { .. }) = (own_hit, own_lookup) {
+            return Some(Self::has_own_data(key, hit));
+        }
+        let proto = object::prototype(obj, heap)?;
+        if !object::supports_fast_property_ic(proto, heap) {
+            return None;
+        }
+        let (proto_hit, proto_lookup) = object::lookup_own_slot(proto, heap, &key_name);
+        if let (Some(hit), object::PropertyLookup::Data { .. }) = (proto_hit, proto_lookup) {
+            return Some(Self::has_direct_prototype_data(receiver_shape_id, key, hit));
+        }
+        None
     }
 
     /// Build a `LoadProperty` stub for the current receiver/key pair, returning
@@ -227,6 +338,44 @@ impl CacheStub {
                     CacheOp::GuardShapeId { obj: 0, shape: 0 },
                     CacheOp::LoadPrototype { obj: 0, dst: 1 },
                     CacheOp::LoadDataSlotResult { obj: 1, hit: 0 },
+                ],
+                [shape_id],
+                [hit],
+            ) => Some((*shape_id, *hit)),
+            _ => None,
+        }
+    }
+
+    /// The own-data slot hit of an own-data presence stub, for devtools.
+    #[must_use]
+    pub(crate) fn has_own_slot_hit(&self) -> Option<OwnPropertySlotHit> {
+        match (self.ops.as_slice(), self.slot_hits.as_slice()) {
+            (
+                [
+                    CacheOp::GuardKey { key: 0 },
+                    CacheOp::HasDataSlot { obj: 0, hit: 0 },
+                ],
+                [hit],
+            ) => Some(*hit),
+            _ => None,
+        }
+    }
+
+    /// The `(receiver shape id, prototype slot hit)` of a direct-prototype
+    /// presence stub, for devtools.
+    #[must_use]
+    pub(crate) fn has_direct_prototype(&self) -> Option<(ShapeId, OwnPropertySlotHit)> {
+        match (
+            self.ops.as_slice(),
+            self.shape_ids.as_slice(),
+            self.slot_hits.as_slice(),
+        ) {
+            (
+                [
+                    CacheOp::GuardKey { key: 0 },
+                    CacheOp::GuardShapeId { obj: 0, shape: 0 },
+                    CacheOp::LoadPrototype { obj: 0, dst: 1 },
+                    CacheOp::HasDataSlot { obj: 1, hit: 0 },
                 ],
                 [shape_id],
                 [hit],

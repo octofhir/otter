@@ -27,7 +27,11 @@
 
 use smallvec::SmallVec;
 
-use crate::object::{self, AtomOwnPropertyHit, OwnPropertySlotHit, ShapeId};
+use otter_gc::raw::SlotVisitor;
+
+use crate::object::{
+    self, AtomOwnPropertyHit, OwnPropertySlotHit, ShapeId, StorePropertyTransition,
+};
 use crate::property_atom::AtomizedPropertyKey;
 use crate::{JsObject, JsString, Value};
 
@@ -76,10 +80,23 @@ pub(crate) enum CacheOp {
         /// Index into the stub's `slot_hits`.
         hit: u8,
     },
+    /// Terminal (store): write the rhs into the existing writable data slot at
+    /// `hits[hit]` on `operands[obj]`.
+    StoreDataSlot {
+        /// Operand holding the object that owns the slot.
+        obj: OperandId,
+        /// Index into the stub's `hits`.
+        hit: u8,
+    },
+    /// Terminal (store): add a data slot by replaying `transitions[transition]`.
+    StoreAddTransition {
+        /// Index into the stub's `transitions`.
+        transition: u8,
+    },
 }
 
 /// A cache stub: a linear op program plus the data its ops reference.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct CacheStub {
     /// The guard/load program, run in order against operand `0` (the receiver).
     ops: SmallVec<[CacheOp; 4]>,
@@ -93,6 +110,9 @@ pub(crate) struct CacheStub {
     /// like every cached property name, so they are not separately traced
     /// (matching the load/has IC root set).
     keys: SmallVec<[JsString; 1]>,
+    /// Hidden-class transitions replayed by [`CacheOp::StoreAddTransition`].
+    /// Their target shapes are GC roots, visited by [`CacheStub::trace_roots`].
+    transitions: SmallVec<[StorePropertyTransition; 1]>,
 }
 
 impl CacheStub {
@@ -168,7 +188,10 @@ impl CacheStub {
                     operands[dst as usize] = Some(proto);
                 }
                 // Terminals are handled by the per-kind executors below.
-                CacheOp::LoadDataSlotResult { .. } | CacheOp::HasDataSlot { .. } => break,
+                CacheOp::LoadDataSlotResult { .. }
+                | CacheOp::HasDataSlot { .. }
+                | CacheOp::StoreDataSlot { .. }
+                | CacheOp::StoreAddTransition { .. } => break,
             }
         }
         Some(operands)
@@ -381,6 +404,103 @@ impl CacheStub {
                 [hit],
             ) => Some((*shape_id, *hit)),
             _ => None,
+        }
+    }
+
+    /// Existing-own-data store: receiver owns a writable data slot.
+    #[must_use]
+    pub(crate) fn store_own_data(hit: AtomOwnPropertyHit) -> Self {
+        let mut ops = SmallVec::new();
+        ops.push(CacheOp::StoreDataSlot { obj: 0, hit: 0 });
+        Self {
+            ops,
+            hits: SmallVec::from_elem(hit, 1),
+            ..Self::default()
+        }
+    }
+
+    /// Add-a-slot store: replay a captured hidden-class transition.
+    #[must_use]
+    pub(crate) fn store_transition(transition: StorePropertyTransition) -> Self {
+        let mut ops = SmallVec::new();
+        ops.push(CacheOp::StoreAddTransition { transition: 0 });
+        Self {
+            ops,
+            transitions: SmallVec::from_elem(transition, 1),
+            ..Self::default()
+        }
+    }
+
+    /// Execute as a `StoreProperty` cache. `Some(())` once the write completes.
+    pub(crate) fn run_store(
+        &self,
+        recv: JsObject,
+        heap: &mut otter_gc::GcHeap,
+        key: AtomizedPropertyKey<'_>,
+        value: &Value,
+    ) -> Option<()> {
+        if !object::supports_fast_property_ic(recv, heap) {
+            return None;
+        }
+        match self.ops.last().copied()? {
+            CacheOp::StoreDataSlot { obj: 0, hit } => {
+                object::store_own_data_slot_atom(recv, heap, key, self.hits[hit as usize], value)
+            }
+            CacheOp::StoreAddTransition { transition } => object::replay_store_property_transition(
+                recv,
+                heap,
+                key,
+                &self.transitions[transition as usize],
+                value,
+            ),
+            _ => None,
+        }
+    }
+
+    /// Build an existing-own-data store stub for the current receiver/key pair.
+    /// Add-transition stubs are captured by the shape-transition layer (which
+    /// performs the write while recording replay metadata) and installed via
+    /// [`Self::store_transition`].
+    #[must_use]
+    pub(crate) fn install_store_existing(
+        obj: JsObject,
+        heap: &otter_gc::GcHeap,
+        key: AtomizedPropertyKey<'_>,
+    ) -> Option<Self> {
+        if !object::supports_fast_property_ic(obj, heap) {
+            return None;
+        }
+        let atom_lookup = object::lookup_own_atom(obj, heap, key);
+        let (Some(hit), object::PropertyLookup::Data { flags, .. }) =
+            (atom_lookup.hit, atom_lookup.lookup)
+        else {
+            return None;
+        };
+        flags.writable().then(|| Self::store_own_data(hit))
+    }
+
+    /// The existing-own-data store hit, for the compiled-call plan.
+    #[must_use]
+    pub(crate) fn store_own_data_hit(&self) -> Option<AtomOwnPropertyHit> {
+        match (self.ops.as_slice(), self.hits.as_slice()) {
+            ([CacheOp::StoreDataSlot { obj: 0, hit: 0 }], [hit]) => Some(*hit),
+            _ => None,
+        }
+    }
+
+    /// The replayed transition of an add-transition store stub, for devtools.
+    #[must_use]
+    pub(crate) fn store_transition_ref(&self) -> Option<&StorePropertyTransition> {
+        match (self.ops.as_slice(), self.transitions.as_slice()) {
+            ([CacheOp::StoreAddTransition { transition: 0 }], [t]) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// Visit GC roots in stub data — the target shapes of replayed transitions.
+    pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
+        for transition in &self.transitions {
+            transition.trace_roots(visitor);
         }
     }
 }

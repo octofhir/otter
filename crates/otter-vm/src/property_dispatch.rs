@@ -32,7 +32,7 @@ use crate::{
     is_restricted_function_property, object,
     operand_decode::{const_operand, register_operand},
     property_atom::AtomizedPropertyKey,
-    property_ic::{PropertyIcKind, StorePropertyIc},
+    property_ic::PropertyIcKind,
     read_register, regexp_prototype, symbol, symbol_prototype, temporal, value_kind_name,
     write_register,
 };
@@ -3372,7 +3372,7 @@ impl Interpreter {
         for idx in 0..entries_len {
             let ic = self.store_property_ics[site].entries()[idx].clone();
             if ic
-                .store(obj, &mut self.gc_heap, atomized_key, &value)
+                .run_store(obj, &mut self.gc_heap, atomized_key, &value)
                 .is_some()
             {
                 self.property_ic_stats.record_hit(PropertyIcKind::Store);
@@ -3392,13 +3392,10 @@ impl Interpreter {
             );
         }
         if !self.store_property_ics[site].is_megamorphic()
-            && let Some(ic) = StorePropertyIc::existing_own_data_install_candidate(
-                obj,
-                &self.gc_heap,
-                atomized_key,
-            )
+            && let Some(ic) =
+                cache_ir::CacheStub::install_store_existing(obj, &self.gc_heap, atomized_key)
             && ic
-                .store(obj, &mut self.gc_heap, atomized_key, &value)
+                .run_store(obj, &mut self.gc_heap, atomized_key, &value)
                 .is_some()
         {
             self.store_property_ics[site].install_with_stats(
@@ -3893,7 +3890,7 @@ impl Interpreter {
                 // which conflicts with a long-lived borrow of the entries slice.
                 let ic = self.store_property_ics[site].entries()[idx].clone();
                 if ic
-                    .store(obj, &mut self.gc_heap, atomized_key, &value)
+                    .run_store(obj, &mut self.gc_heap, atomized_key, &value)
                     .is_some()
                 {
                     store_hit = true;
@@ -3922,13 +3919,10 @@ impl Interpreter {
                 );
             }
             if !self.store_property_ics[site].is_megamorphic()
-                && let Some(ic) = StorePropertyIc::existing_own_data_install_candidate(
-                    obj,
-                    &self.gc_heap,
-                    atomized_key,
-                )
+                && let Some(ic) =
+                    cache_ir::CacheStub::install_store_existing(obj, &self.gc_heap, atomized_key)
                 && ic
-                    .store(obj, &mut self.gc_heap, atomized_key, &value)
+                    .run_store(obj, &mut self.gc_heap, atomized_key, &value)
                     .is_some()
             {
                 self.store_property_ics[site].install_with_stats(
@@ -3963,7 +3957,7 @@ impl Interpreter {
             return 0;
         }
         for ic in self.store_property_ics[site].entries() {
-            if let StorePropertyIc::ExistingOwnDataStore { hit } = ic
+            if let Some(hit) = ic.store_own_data_hit()
                 && hit.shape.offset() == recv_shape
             {
                 let value_byte = u32::from(hit.slot) * std::mem::size_of::<Value>() as u32;
@@ -5405,7 +5399,7 @@ impl Interpreter {
                 // entries slice.
                 let ic = self.store_property_ics[site].entries()[idx].clone();
                 if ic
-                    .store(obj, &mut self.gc_heap, atomized_key, &value)
+                    .run_store(obj, &mut self.gc_heap, atomized_key, &value)
                     .is_some()
                 {
                     store_hit = true;
@@ -5750,15 +5744,13 @@ impl Interpreter {
                             self.store_property_ics[site].install_with_stats(
                                 &mut self.property_ic_stats,
                                 PropertyIcKind::Store,
-                                StorePropertyIc::transition(transition),
+                                cache_ir::CacheStub::store_transition(transition),
                             );
-                        } else if let Some(ic) =
-                            StorePropertyIc::existing_own_data_install_candidate(
-                                obj,
-                                &self.gc_heap,
-                                atomized_key,
-                            )
-                        {
+                        } else if let Some(ic) = cache_ir::CacheStub::install_store_existing(
+                            obj,
+                            &self.gc_heap,
+                            atomized_key,
+                        ) {
                             self.store_property_ics[site].install_with_stats(
                                 &mut self.property_ic_stats,
                                 PropertyIcKind::Store,

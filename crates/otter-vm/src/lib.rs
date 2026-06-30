@@ -697,7 +697,7 @@ pub struct Interpreter {
     /// Monomorphic `StoreProperty` inline caches keyed by
     /// dense executable IC site id. These only cover ordinary own writable
     /// data slots; every miss falls back to full `[[Set]]` semantics.
-    store_property_ics: Vec<property_ic::PropertyIcEntry<property_ic::StorePropertyIc>>,
+    store_property_ics: Vec<property_ic::PropertyIcEntry<cache_ir::CacheStub>>,
     /// Monomorphic `HasProperty` inline caches keyed by dense executable IC
     /// site id. These only cover ordinary own/direct-prototype data presence.
     has_property_ics: Vec<property_ic::PropertyIcEntry<cache_ir::CacheStub>>,
@@ -3074,10 +3074,14 @@ impl Interpreter {
                     self.store_property_ics
                         .get(site)
                         .and_then(|e| match e.entries() {
-                            [property_ic::StorePropertyIc::ExistingOwnDataStore { hit }] => Some((
-                                hit.shape.offset(),
-                                u32::from(hit.slot) * std::mem::size_of::<Value>() as u32,
-                            )),
+                            [stub] if stub.store_own_data_hit().is_some() => {
+                                stub.store_own_data_hit().map(|hit| {
+                                    (
+                                        hit.shape.offset(),
+                                        u32::from(hit.slot) * std::mem::size_of::<Value>() as u32,
+                                    )
+                                })
+                            }
                             _ => None,
                         })
                 }
@@ -5564,7 +5568,7 @@ impl Interpreter {
     /// Borrow store-property ICs for root tracing of cached GC shape handles.
     pub(crate) fn store_property_ics_for_trace(
         &self,
-    ) -> &[property_ic::PropertyIcEntry<property_ic::StorePropertyIc>] {
+    ) -> &[property_ic::PropertyIcEntry<cache_ir::CacheStub>] {
         &self.store_property_ics
     }
 

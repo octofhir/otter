@@ -71,6 +71,7 @@ pub mod bootstrap_weak_refs;
 pub mod bound_function;
 pub mod cache_ir;
 pub mod class_constructor;
+pub mod deopt;
 pub mod dynamic_import;
 pub mod error_classes;
 mod error_ops;

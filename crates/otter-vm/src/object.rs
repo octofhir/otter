@@ -556,7 +556,22 @@ pub struct ObjectBody {
     /// ordinary object never pays for these ~140 bytes. Allocated on first
     /// write through [`ObjectBody::exotic_mut`].
     exotic: Option<Box<ExoticSlots>>,
+    /// In-body storage for the first [`INLINE_SLOT_CAP`] string-keyed slots, so
+    /// a small object needs no separate slab allocation and its slots live in
+    /// the GC page (the precondition for a precise old→young remembered set).
+    /// Active while `slab_len <= INLINE_SLOT_CAP`; growth past the cap migrates
+    /// every slot wholesale into `values` and leaves this array unused.
+    /// `values_ptr` always points at whichever buffer is active, so the slot
+    /// access path and the JIT both index it uniformly.
+    inline_values: [CompressedValue; INLINE_SLOT_CAP],
+    /// Count of live string-keyed slots, across `inline_values` or `values`.
+    slab_len: u16,
 }
+
+/// In-body inline string-keyed slot capacity. Objects with this many own data
+/// properties or fewer carry their slab in [`ObjectBody::inline_values`]; larger
+/// objects spill the whole slab to the out-of-line `values` vector.
+pub(crate) const INLINE_SLOT_CAP: usize = 4;
 
 /// Rarely-used `ObjectBody` slots, boxed out of the hot object so plain
 /// objects stay small. Every field here is absent on a plain `{}` / class
@@ -642,19 +657,80 @@ const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET.is_multiple_of(4));
 // Pin the hot object footprint. Per-slot metadata lives out of line only for
 // dictionary-mode / attribute-overridden objects, while string-keyed values use
 // one contiguous slab addressed from a cached pointer.
-const _: () = assert!(std::mem::size_of::<ObjectBody>() == 72);
+const _: () = assert!(std::mem::size_of::<ObjectBody>() == 96);
 
 impl ObjectBody {
+    /// Number of live string-keyed slots.
+    #[inline]
+    fn slab_len(&self) -> usize {
+        self.slab_len as usize
+    }
+
+    /// Whether the slab is held inline in the body (small object) rather than in
+    /// the out-of-line `values` vector.
+    #[inline]
+    fn slab_is_inline(&self) -> bool {
+        self.slab_len() <= INLINE_SLOT_CAP
+    }
+
+    /// Read the compressed word for string-keyed slot `i`.
+    #[inline]
+    fn slot_word(&self, i: usize) -> CompressedValue {
+        if self.slab_is_inline() {
+            self.inline_values[i]
+        } else {
+            self.values[i]
+        }
+    }
+
     /// Read and decompress the data value for string-keyed slot `i`.
     #[inline]
     fn data_value(&self, heap: &otter_gc::GcHeap, i: usize) -> Value {
-        decompress(self.values[i], heap)
+        decompress(self.slot_word(i), heap)
     }
 
     /// Write a pre-compressed data value into string-keyed slot `i`.
     #[inline]
     fn set_data_value(&mut self, i: usize, value: CompressedValue) {
-        self.values[i] = value;
+        if self.slab_is_inline() {
+            self.inline_values[i] = value;
+        } else {
+            self.values[i] = value;
+        }
+    }
+
+    /// Append one slab word, migrating the inline slab to `values` on the
+    /// transition past [`INLINE_SLOT_CAP`].
+    #[inline]
+    fn push_slab_word(&mut self, value: CompressedValue) {
+        let len = self.slab_len();
+        if len < INLINE_SLOT_CAP {
+            self.inline_values[len] = value;
+        } else if len == INLINE_SLOT_CAP {
+            // Spill: move the inline slab out of line, then append.
+            debug_assert!(self.values.is_empty(), "overflow slab already populated");
+            self.values.extend_from_slice(&self.inline_values);
+            self.values.push(value);
+        } else {
+            self.values.push(value);
+        }
+        self.slab_len += 1;
+        self.refresh_values_ptr();
+    }
+
+    /// Remove the slab word at `i`, shifting later words down. Stays out of line
+    /// once spilled (delete normalizes to dictionary mode, an uncommon path).
+    #[inline]
+    fn remove_slab_word(&mut self, i: usize) {
+        if self.slab_is_inline() {
+            let len = self.slab_len();
+            self.inline_values.copy_within(i + 1..len, i);
+            self.inline_values[len - 1] = CompressedValue::default();
+        } else {
+            self.values.remove(i);
+        }
+        self.slab_len -= 1;
+        self.refresh_values_ptr();
     }
 
     /// Append a new string-keyed own slot at flat index `index` (the pre-append
@@ -665,9 +741,8 @@ impl ObjectBody {
     /// index-aligned with the value array. For an accessor slot `value` is the
     /// [`AccessorCellBody`] handle produced by [`SlotData::into_flat`].
     fn push_slot(&mut self, index: usize, meta: SlotMeta, value: CompressedValue) {
-        debug_assert_eq!(self.values.len(), index, "value slab append desynced");
-        self.values.push(value);
-        self.refresh_values_ptr();
+        debug_assert_eq!(self.slab_len(), index, "value slab append desynced");
+        self.push_slab_word(value);
         if self.slots_materialized() {
             debug_assert_eq!(self.slots().len(), index, "materialized slots desynced");
             self.slots_mut().push(meta);
@@ -797,18 +872,22 @@ impl ObjectBody {
     /// materializing per-slot metadata first), so `slots()` is authoritative.
     fn remove_slot(&mut self, i: usize) {
         let len = self.slots().len();
-        debug_assert_eq!(self.values.len(), len, "value slab metadata desynced");
-        self.values.remove(i);
-        self.refresh_values_ptr();
+        debug_assert_eq!(self.slab_len(), len, "value slab metadata desynced");
+        self.remove_slab_word(i);
         self.slots_mut().remove(i);
     }
 
-    /// Refresh the cached slab pointer after any operation that may reallocate
-    /// or empty the value vector.
+    /// Refresh the cached slab base after any operation that may move the slab
+    /// (inline ↔ out-of-line migration, vector realloc, body relocation). Points
+    /// at the active buffer — the in-body inline array for a small object, the
+    /// out-of-line vector once spilled — so slot access and the JIT both index
+    /// `values_ptr` uniformly. `null` only for a slotless object.
     #[inline]
     fn refresh_values_ptr(&mut self) {
-        self.values_ptr = if self.values.is_empty() {
+        self.values_ptr = if self.slab_len == 0 {
             std::ptr::null_mut()
+        } else if self.slab_is_inline() {
+            self.inline_values.as_mut_ptr()
         } else {
             self.values.as_mut_ptr()
         };
@@ -1023,16 +1102,24 @@ impl otter_gc::SafeTraceable for ObjectBody {
         // Trace cells in place so the moving scavenger rewrites the live slot,
         // not a copy; an accessor cell traces its own getter/setter through its
         // `Traceable` impl.
-        for (i, slot) in self.values.iter().enumerate() {
+        // The relocating scavenger memcpy's this body, which leaves the cached
+        // `values_ptr` aimed at the pre-move inline array. Recompute it from the
+        // post-move body so both the slot path and a baked JIT load read the live
+        // base; the inline slab lives in the body and therefore moves with it.
+        // SAFETY: sole mutation of a non-slot field during trace; the collector
+        // owns the object and holds no aliasing reference across this write.
+        let base = unsafe {
+            let me = (self as *const Self).cast_mut();
+            (*me).refresh_values_ptr();
+            (*me).values_ptr
+        };
+        for i in 0..self.slab_len() {
+            // SAFETY: `base` is the live slab base and `i < slab_len`.
+            let word = unsafe { base.add(i) };
+            let slot = unsafe { *word };
             if !slot.is_gc_offset() {
                 continue;
             }
-            // The slab's mutable base; the collector rewrites slots in place, so
-            // route writes through the body's own `*mut` rather than a pointer
-            // derived from this shared borrow. `values_ptr` tracks `values` and
-            // never reallocates during a trace (no slot is pushed here).
-            // SAFETY: `i < values.len()`, so `values_ptr.add(i)` is in bounds.
-            let word = unsafe { self.values_ptr.add(i) };
             if slot.0 & 0b111 == 0 {
                 // Cell ref: the compressed word is the bare 8-aligned offset, so
                 // it is itself a `RawGc` slot the collector rewrites in place.
@@ -1110,6 +1197,8 @@ fn empty_object_body() -> ObjectBody {
         shape: ShapeHandle::null(),
         values_ptr: std::ptr::null_mut(),
         values: Vec::new(),
+        inline_values: [CompressedValue::default(); INLINE_SLOT_CAP],
+        slab_len: 0,
         dictionary_shape_id: ShapeId::UNASSIGNED,
         shape_cache_mode: ShapeCacheMode::Fast,
         jit_proto: otter_gc::Gc::null(),
@@ -1190,10 +1279,7 @@ pub(crate) fn initialize_shaped_data_slots(obj: JsObject, heap: &mut GcHeap, val
             !body.shape.is_null(),
             "bulk slot init only applies to shaped objects"
         );
-        debug_assert!(
-            body.values.is_empty(),
-            "bulk slot init requires a fresh object"
-        );
+        debug_assert!(body.slab_len == 0, "bulk slot init requires a fresh object");
         debug_assert_eq!(
             expected,
             compressed.len(),
@@ -1213,7 +1299,7 @@ pub(crate) fn initialize_shaped_data_slots(obj: JsObject, heap: &mut GcHeap, val
 pub(crate) fn set_fresh_object_shape(obj: JsObject, heap: &mut GcHeap, shape: ShapeHandle) {
     heap.with_payload(obj, |body| {
         debug_assert!(
-            body.values.is_empty(),
+            body.slab_len == 0,
             "fast constructor shape install requires a fresh object"
         );
         debug_assert!(
@@ -1271,6 +1357,8 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
             shape: ShapeHandle::null(),
             values_ptr: std::ptr::null_mut(),
             values: Vec::new(),
+            inline_values: [CompressedValue::default(); INLINE_SLOT_CAP],
+            slab_len: 0,
             dictionary_shape_id: next_shape_id(),
             shape_cache_mode: ShapeCacheMode::Fast,
             jit_proto: otter_gc::Gc::null(),
@@ -1297,6 +1385,8 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
             shape,
             values_ptr: std::ptr::null_mut(),
             values: Vec::new(),
+            inline_values: [CompressedValue::default(); INLINE_SLOT_CAP],
+            slab_len: 0,
             dictionary_shape_id: ShapeId::UNASSIGNED,
             shape_cache_mode: ShapeCacheMode::Fast,
             jit_proto: otter_gc::Gc::null(),

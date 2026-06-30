@@ -417,12 +417,20 @@ impl PromiseBuilder {
             &resolve_roots,
             slice_roots,
         )?;
+        // The resolve-native allocation may have relocated the young promise
+        // body; refresh the handle from the rooted `promise_value`.
+        let promise = promise_value
+            .as_promise()
+            .expect("rooted promise survives allocation");
         let mut reject_roots = Vec::with_capacity(value_roots.len() + 2);
         reject_roots.extend_from_slice(value_roots);
         reject_roots.push(&promise_value);
         reject_roots.push(&resolve);
         let reject =
             make_reject_native_runtime_rooted(interp, promise, &reject_roots, slice_roots)?;
+        let promise = promise_value
+            .as_promise()
+            .expect("rooted promise survives allocation");
         Ok((promise, resolve, reject))
     }
 
@@ -446,12 +454,18 @@ impl PromiseBuilder {
             &resolve_roots,
             slice_roots,
         )?;
+        let promise = promise_value
+            .as_promise()
+            .expect("rooted promise survives allocation");
         let mut reject_roots = Vec::with_capacity(value_roots.len() + 2);
         reject_roots.extend_from_slice(value_roots);
         reject_roots.push(&promise_value);
         reject_roots.push(&resolve);
         let reject =
             make_reject_native_stack_rooted(interp, stack, promise, &reject_roots, slice_roots)?;
+        let promise = promise_value
+            .as_promise()
+            .expect("rooted promise survives allocation");
         Ok((promise, resolve, reject))
     }
 
@@ -473,11 +487,17 @@ impl PromiseBuilder {
             &resolve_roots,
             slice_roots,
         )?;
+        let promise = promise_value
+            .as_promise()
+            .expect("rooted promise survives allocation");
         let mut reject_roots = Vec::with_capacity(value_roots.len() + 2);
         reject_roots.extend_from_slice(value_roots);
         reject_roots.push(&promise_value);
         reject_roots.push(&resolve);
         let reject = make_reject_native_native_rooted(ctx, promise, &reject_roots, slice_roots)?;
+        let promise = promise_value
+            .as_promise()
+            .expect("rooted promise survives allocation");
         Ok((promise, resolve, reject))
     }
 
@@ -2846,6 +2866,23 @@ fn attach_then(
     }
 }
 
+/// Read the settled promise handle from a settle-native's GC-traced captures.
+///
+/// The promise is stored as `captures[0]` (a `Value::promise`) so the moving
+/// collector rewrites its offset when the young promise body relocates. The
+/// resolve/reject pair is built by allocating two native-function bodies, each
+/// of which scavenges; a handle closed over by value at construction time would
+/// be left pointing at the body's pre-move slot — since reused by another young
+/// object — so settling it would fault on a foreign payload. Reading the handle
+/// back from the traced capture keeps it current.
+fn settle_native_promise(captures: &[Value]) -> JsPromiseHandle {
+    captures
+        .first()
+        .copied()
+        .and_then(Value::as_promise)
+        .expect("promise settle native function captures the promise handle at index 0")
+}
+
 fn make_resolve_native_runtime_rooted(
     interp: &mut Interpreter,
     promise: JsPromiseHandle,
@@ -2861,7 +2898,14 @@ fn make_resolve_native_runtime_rooted(
         smallvec![Value::promise(promise)],
         value_roots,
         slice_roots,
-        move |ctx, args, _captures| resolve_native_body(ctx, args, promise, &captured_context),
+        move |ctx, args, captures| {
+            resolve_native_body(
+                ctx,
+                args,
+                settle_native_promise(captures),
+                &captured_context,
+            )
+        },
     )
 }
 
@@ -2882,7 +2926,14 @@ fn make_resolve_native_stack_rooted(
         smallvec![Value::promise(promise)],
         value_roots,
         slice_roots,
-        move |ctx, args, _captures| resolve_native_body(ctx, args, promise, &captured_context),
+        move |ctx, args, captures| {
+            resolve_native_body(
+                ctx,
+                args,
+                settle_native_promise(captures),
+                &captured_context,
+            )
+        },
     )
 }
 
@@ -2901,7 +2952,14 @@ fn make_resolve_native_native_rooted(
         smallvec![Value::promise(promise)],
         value_roots,
         slice_roots,
-        move |ctx, args, _captures| resolve_native_body(ctx, args, promise, &captured_context),
+        move |ctx, args, captures| {
+            resolve_native_body(
+                ctx,
+                args,
+                settle_native_promise(captures),
+                &captured_context,
+            )
+        },
     )
 }
 
@@ -3096,7 +3154,8 @@ fn make_reject_native_runtime_rooted(
         smallvec![Value::promise(promise)],
         value_roots,
         slice_roots,
-        move |ctx, args, _captures| {
+        move |ctx, args, captures| {
+            let promise = settle_native_promise(captures);
             let interp = ctx.interp_mut();
             if matches!(promise.state(interp.gc_heap()), PromiseState::Pending) {
                 let reason = args.first().cloned().unwrap_or(Value::undefined());
@@ -3123,7 +3182,8 @@ fn make_reject_native_stack_rooted(
         smallvec![Value::promise(promise)],
         value_roots,
         slice_roots,
-        move |ctx, args, _captures| {
+        move |ctx, args, captures| {
+            let promise = settle_native_promise(captures);
             let interp = ctx.interp_mut();
             if matches!(promise.state(interp.gc_heap()), PromiseState::Pending) {
                 let reason = args.first().cloned().unwrap_or(Value::undefined());
@@ -3148,7 +3208,8 @@ fn make_reject_native_native_rooted(
         smallvec![Value::promise(promise)],
         value_roots,
         slice_roots,
-        move |ctx, args, _captures| {
+        move |ctx, args, captures| {
+            let promise = settle_native_promise(captures);
             let interp = ctx.interp_mut();
             if matches!(promise.state(interp.gc_heap()), PromiseState::Pending) {
                 let reason = args.first().cloned().unwrap_or(Value::undefined());
